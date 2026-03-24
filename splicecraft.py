@@ -1456,7 +1456,7 @@ class FetchModal(ModalScreen):
         with Vertical(id="fetch-box"):
             yield Static(" Fetch GenBank Record ", id="fetch-title")
             yield Label("NCBI Accession  (e.g.  M77789  for pUC19,  Y14837  for pUC57):")
-            yield Input(placeholder="M77789", id="fetch-acc", value="M77789")
+            yield Input(placeholder="MW463917.1", id="fetch-acc", value="MW463917.1")
             yield Label("Email  (required by NCBI Entrez):")
             yield Input(placeholder="you@example.com", id="fetch-email")
             with Horizontal(id="fetch-btns"):
@@ -1839,6 +1839,21 @@ UnsavedQuitModal { align: center middle; }
                 self._apply_record(record)
                 self._source_path = path
             self.call_after_refresh(_load_preload)
+        elif not _load_library():
+            self._seed_default_library()
+
+    @work(thread=True)
+    def _seed_default_library(self) -> None:
+        """Fetch MW463917.1 and pre-populate the library on first run."""
+        try:
+            record = fetch_genbank("MW463917.1")
+            def _add():
+                lib = self.query_one("#library", LibraryPanel)
+                lib.add_entry(record)
+                self._apply_record(record)
+            self.call_from_thread(_add)
+        except Exception:
+            pass
 
     # ── Keyboard: cursor movement, copy, undo/redo ─────────────────────────────
 
