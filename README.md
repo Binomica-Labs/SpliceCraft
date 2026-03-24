@@ -17,6 +17,8 @@
 ╚═══════════════════════════════════════════════════════════════════════════════╝
 ```
 
+![SpliceCraft screenshot](screenshot.jpg)
+
 A terminal-based circular plasmid map viewer and sequence editor, rendered entirely in your
 shell. Fetch any GenBank record by accession, load local files, annotate features, and edit
 sequences — without ever leaving the terminal.
