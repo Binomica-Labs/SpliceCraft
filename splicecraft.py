@@ -553,18 +553,20 @@ class PlasmidMap(Widget):
     can_focus = True
 
     BINDINGS = [
-        Binding("left",        "rotate_cw",      "Rotate ←",     show=True),
-        Binding("right",       "rotate_ccw",      "Rotate →",     show=True),
-        Binding("shift+left",  "rotate_cw_lg",   "Rotate ←←",    show=False),
-        Binding("shift+right", "rotate_ccw_lg",  "Rotate →→",    show=False),
-        Binding("home",        "reset_origin",   "Reset",        show=False),
-        Binding("comma",       "aspect_dec",     "Circle wider",  show=False),
-        Binding("full_stop",   "aspect_inc",     "Circle taller", show=False),
+        Binding("left",        "rotate_cw",        "Rotate ←",      show=True),
+        Binding("right",       "rotate_ccw",        "Rotate →",      show=True),
+        Binding("shift+left",  "rotate_cw_lg",     "Rotate ←←",     show=False),
+        Binding("shift+right", "rotate_ccw_lg",    "Rotate →→",     show=False),
+        Binding("home",        "reset_origin",     "Reset",         show=False),
+        Binding("comma",       "aspect_dec",       "Circle wider",   show=False),
+        Binding("full_stop",   "aspect_inc",       "Circle taller",  show=False),
+        Binding("v",           "toggle_map_view",  "Toggle view",    show=False),
     ]
 
     origin_bp:    reactive[int]   = reactive(0)
     selected_idx: reactive[int]   = reactive(-1)
     _aspect:      reactive[float] = reactive(2.0)
+    _map_mode:    reactive[str]   = reactive("circular")
 
     # ── Messages ───────────────────────────────────────────────────────────────
 
@@ -650,6 +652,10 @@ class PlasmidMap(Widget):
         self._aspect = round(max(0.5, self._aspect - 0.05), 3)
         self.notify(f"Aspect {self._aspect:.2f}  (press . to heighten)", timeout=1.5)
 
+    def action_toggle_map_view(self):
+        self._map_mode = "linear" if self._map_mode == "circular" else "circular"
+        self.refresh()
+
     def select_feature(self, idx: int) -> None:
         self.selected_idx = idx
         self.refresh()
@@ -685,7 +691,10 @@ class PlasmidMap(Widget):
     def on_click(self, event: Click):
         if not self.record:
             return
-        idx = self._feat_at(event.x, event.y)
+        if self._map_mode == "linear":
+            idx = self._feat_at_linear(event.x, event.y)
+        else:
+            idx = self._feat_at(event.x, event.y)
         self.selected_idx = idx
         f = self._feats[idx] if idx >= 0 else None
         self.post_message(self.FeatureSelected(idx, f))
@@ -733,10 +742,10 @@ class PlasmidMap(Widget):
         if w < 30 or h < 14:
             return Text(f"  Window too small ({w}×{h})", style="dim red")
         key = (w, h, self.origin_bp, self.selected_idx, self._aspect,
-               len(self._feats), len(self._restr_feats))
+               len(self._feats), len(self._restr_feats), self._map_mode)
         if self._render_cache and self._render_cache[0] == key:
             return self._render_cache[1]
-        result = self._draw(w, h)
+        result = self._draw_linear(w, h) if self._map_mode == "linear" else self._draw(w, h)
         self._render_cache = (key, result)
         return result
 
@@ -889,6 +898,181 @@ class PlasmidMap(Widget):
             (orig_txt, "dim cyan"),
         ]):
             canvas.put_text(cx - len(txt) // 2, cy - 1 + i, txt, sty)
+
+        return bc.combine(canvas)
+
+    # ── Linear map ─────────────────────────────────────────────────────────────
+
+    def _feat_at_linear(self, x: int, y: int) -> int:
+        """Return feature index at terminal cell (x, y) in linear view, or -1."""
+        if not self._total:
+            return -1
+        w, h      = self.size.width, self.size.height
+        margin_l  = 5
+        margin_r  = 2
+        usable_w  = w - margin_l - margin_r
+        backbone_row = max(4, h // 2)
+        if x < margin_l or x >= w - margin_r or usable_w <= 0:
+            return -1
+        bp = int((x - margin_l) / usable_w * self._total)
+        above = y < backbone_row
+        below = y > backbone_row
+        for i, f in enumerate(self._feats):
+            s, e = f["start"], f["end"]
+            in_range = (s <= bp <= e) if e > s else (bp >= s or bp <= e)
+            if not in_range:
+                continue
+            if above and f["strand"] >= 0:
+                return i
+            if below and f["strand"] < 0:
+                return i
+        return -1
+
+    def _draw_linear(self, w: int, h: int) -> Text:
+        """Render a horizontal linear plasmid map."""
+        canvas = _Canvas(w, h)
+        bc     = _BrailleCanvas(w, h)
+        total  = self._total
+
+        if not total:
+            canvas.put_text(w // 2 - 9, h // 2, "No record loaded", "dim")
+            return bc.combine(canvas)
+
+        # ── Layout ──
+        margin_l     = 5
+        margin_r     = 2
+        usable_w     = w - margin_l - margin_r
+        px_w         = usable_w * 2
+        px_start     = margin_l * 2
+        backbone_row = max(4, h // 2)
+        backbone_py  = backbone_row * 4 + 1   # braille pixel row
+
+        _BIT      = (0, 3, 1, 4, 2, 5, 6, 7)
+        bc_bits   = bc._bits
+        bc_colors = bc._colors
+        bc_prio   = bc._prio
+        bc_cols   = bc.cols
+        bc_rows   = bc.rows
+
+        def bp_to_px(bp: int) -> int:
+            return px_start + int(bp / total * px_w)
+
+        def _set(px: int, py: int, color: str, prio: int) -> None:
+            pcol, prow = px >> 1, py >> 2
+            if 0 <= pcol < bc_cols and 0 <= prow < bc_rows:
+                bc_bits[prow][pcol]   |= 1 << _BIT[(py & 3) << 1 | (px & 1)]
+                if prio >= bc_prio[prow][pcol]:
+                    bc_colors[prow][pcol] = color
+                    bc_prio[prow][pcol]   = prio
+
+        # ── Backbone ──
+        for px in range(px_start, px_start + px_w + 1):
+            _set(px, backbone_py, "color(238)", 1)
+
+        # ── Ticks + bp labels ──
+        tick_int  = _nice_tick(total)
+        label_row = backbone_row + 1
+        bp = 0
+        while bp <= total:
+            tx = margin_l + bp * usable_w // total
+            canvas.put(tx, backbone_row, "┼", "color(250)")
+            lbl = _format_bp(bp)
+            if label_row < h:
+                canvas.put_text(tx - len(lbl) // 2, label_row, lbl, "color(245)")
+            bp += tick_int
+        # Right cap
+        end_tx = min(margin_l + usable_w, w - 1)
+        canvas.put(end_tx, backbone_row, "┤", "color(250)")
+
+        # ── Restriction site marks ──
+        for rf in self._restr_feats:
+            mid_bp = (rf["start"] + rf["end"]) // 2
+            rx_c   = margin_l + mid_bp * usable_w // total
+            if margin_l <= rx_c < w - margin_r:
+                canvas.put(rx_c, backbone_row - 1, "▪", rf["color"])
+
+        # ── Lane assignment (greedy interval scheduling) ──
+        fwd_ends: list[int] = []   # rightmost braille-x used per fwd lane
+        rev_ends: list[int] = []
+        feat_meta: list[tuple[bool, int]] = []   # (is_fwd, lane_idx)
+
+        for feat in self._feats:
+            is_fwd = feat["strand"] >= 0
+            x0, x1 = bp_to_px(feat["start"]), bp_to_px(feat["end"])
+            ends   = fwd_ends if is_fwd else rev_ends
+            lane   = len(ends)
+            for li, ex in enumerate(ends):
+                if x0 > ex + 2:
+                    lane = li
+                    ends[li] = x1
+                    break
+            else:
+                ends.append(x1)
+            feat_meta.append((is_fwd, lane))
+
+        # ── Draw features ──
+        lane_gap    = 3    # braille rows between backbone and first lane
+        bar_half    = 2    # half-height of feature bar in braille rows
+        lane_stride = 7    # braille rows between lane centres
+
+        for i, (feat, (is_fwd, lane)) in enumerate(zip(self._feats, feat_meta)):
+            start_bp = feat["start"]
+            end_bp   = feat["end"]
+            strand   = feat["strand"]
+            color    = feat["color"]
+            label    = feat.get("label", feat.get("type", ""))
+
+            # Handle wrap-around features
+            if end_bp > start_bp:
+                segments = [(bp_to_px(start_bp), bp_to_px(end_bp))]
+            else:
+                segments = [(bp_to_px(start_bp), px_start + px_w),
+                            (px_start, bp_to_px(end_bp))]
+
+            center_py = (backbone_py - lane_gap - bar_half - lane * lane_stride
+                         if is_fwd else
+                         backbone_py + lane_gap + bar_half + lane * lane_stride)
+            bar_top    = center_py - bar_half
+            bar_bottom = center_py + bar_half
+
+            if bar_top < 0 or bar_bottom >= h * 4:
+                continue
+
+            is_sel = (i == self.selected_idx)
+            prio   = 3 if is_sel else 2
+            style  = ("reverse " + color) if is_sel else color
+            feat_ty = center_py >> 2
+
+            for sx0, sx1 in segments:
+                sx0 = max(px_start, min(sx0, px_start + px_w))
+                sx1 = max(px_start, min(sx1, px_start + px_w))
+                if sx1 <= sx0:
+                    continue
+
+                # Fill bar in braille
+                for py in range(bar_top, bar_bottom + 1):
+                    for px in range(sx0, sx1):
+                        _set(px, py, style, prio)
+
+                # Arrowhead character
+                if strand >= 0:
+                    canvas.put(min(sx1 >> 1, w - margin_r - 1), feat_ty, "▶", style)
+                else:
+                    canvas.put(max(sx0 >> 1, margin_l), feat_ty, "◀", style)
+
+                # Label inside bar
+                x0c, x1c = sx0 >> 1, sx1 >> 1
+                bar_chars = x1c - x0c
+                if bar_chars >= 3:
+                    lbl = label[:bar_chars - 2]
+                    lx  = x0c + (bar_chars - len(lbl)) // 2
+                    canvas.put_text(lx, feat_ty, lbl, style)
+
+        # ── Header ──
+        name = (self.record.name or self.record.id or "?")[:w // 3]
+        canvas.put_text(margin_l, 0, f"{name}  {total:,} bp", "bold white")
+        hint = "[ linear  ·  v = circular ]"
+        canvas.put_text(w - len(hint) - 1, 0, hint, "dim")
 
         return bc.combine(canvas)
 
@@ -1657,6 +1841,7 @@ UnsavedQuitModal { align: center middle; }
         Binding("shift+[",     "rotate_cw_lg",     "Rotate ←←",     show=False, priority=True),
         Binding("shift+]",     "rotate_ccw_lg",    "Rotate →→",     show=False, priority=True),
         Binding("home",        "reset_origin",     "Reset origin",  show=True,  priority=True),
+        Binding("v",           "toggle_map_view",  "⊙/─ View",      show=True,  priority=True),
         Binding("q",           "quit",             "Quit",          show=True),
     ]
 
@@ -1696,6 +1881,9 @@ UnsavedQuitModal { align: center middle; }
 
     def action_reset_origin(self):
         self.query_one("#plasmid-map", PlasmidMap).action_reset_origin()
+
+    def action_toggle_map_view(self):
+        self.query_one("#plasmid-map", PlasmidMap).action_toggle_map_view()
 
     def action_edit_seq(self) -> None:
         sp = self.query_one("#seq-panel", SequencePanel)
