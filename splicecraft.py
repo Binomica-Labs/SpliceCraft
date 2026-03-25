@@ -151,10 +151,131 @@ def _scan_restriction_sites(seq: str) -> list[dict]:
     return feats
 
 
+def _assign_chunk_features(
+    chunk_feats: list[dict], chunk_start: int, chunk_end: int
+) -> tuple[list[list[dict]], list[list[dict]]]:
+    """
+    Forward-strand features always go above DNA; reverse-strand always below.
+    Within each group, overlapping features are stacked into greedy lanes
+    (each lane is a list of non-overlapping features).  Capped at 3 lanes/side.
+    """
+    def _greedy_lanes(feats: list[dict]) -> list[list[dict]]:
+        sorted_f = sorted(feats, key=lambda f: max(f["start"], chunk_start))
+        lanes: list[list[dict]] = []
+        lane_ends: list[int]    = []
+        for f in sorted_f:
+            bar_s = max(f["start"], chunk_start)
+            bar_e = min(f["end"],   chunk_end)
+            if bar_e - bar_s <= 0:
+                continue
+            placed = False
+            for i, end in enumerate(lane_ends):
+                if bar_s >= end:
+                    lanes[i].append(f)
+                    lane_ends[i] = bar_e
+                    placed = True
+                    break
+            if not placed:
+                lanes.append([f])
+                lane_ends.append(bar_e)
+        return lanes[:3]
+
+    fwd = [f for f in chunk_feats if f["strand"] >= 0]
+    rev = [f for f in chunk_feats if f["strand"] <  0]
+    return _greedy_lanes(fwd), _greedy_lanes(rev)
+
+
+def _render_feature_row_pair(
+    result: "Text",
+    feats: list[dict],
+    chunk_start: int,
+    chunk_end: int,
+    prefix_w: int,
+    is_below_dna: bool,
+    show_connectors: bool,
+) -> None:
+    """
+    Append one label row + optional connector row + one braille-bar row to result.
+    For above-DNA: label / [connector] / bar.
+    For below-DNA: bar / [connector] / label.
+    Multiple non-overlapping features share the same pair of rows horizontally.
+    """
+    content_w = chunk_end - chunk_start
+    label_arr: list[tuple[str, str]] = [(" ", "")] * content_w
+    bar_arr:   list[tuple[str, str]] = [(" ", "")] * content_w
+    conn_arr:  list[tuple[str, str]] = [(" ", "")] * content_w
+
+    for f in feats:
+        bar_s = max(f["start"], chunk_start) - chunk_start
+        bar_e = min(f["end"],   chunk_end)   - chunk_start
+        bar_len = bar_e - bar_s
+        if bar_len <= 0:
+            continue
+        starts_here = f["start"] >= chunk_start
+        ends_here   = f["end"]   <= chunk_end
+        strand      = f["strand"]
+        color       = f["color"]
+        label       = f.get("label", f.get("type", ""))
+
+        # Label (centered in feature span)
+        lbl = label[:bar_len]
+        pad = bar_len - len(lbl)
+        pl  = pad // 2
+        lbl_str = " " * pl + lbl + " " * (pad - pl)
+        for i, ch in enumerate(lbl_str):
+            if 0 <= bar_s + i < content_w:
+                label_arr[bar_s + i] = (ch, color)
+
+        # Braille bar
+        if bar_len == 1:
+            # Triangle points inward toward the DNA line
+            bar_str = "▲" if is_below_dna else "▼"
+        elif strand >= 0:
+            bar_str = "⣿" * (bar_len - (1 if ends_here   else 0)) + ("▶" if ends_here   else "")
+        else:
+            bar_str = ("◀" if starts_here else "") + "⣿" * (bar_len - (1 if starts_here else 0))
+        for i, ch in enumerate(bar_str):
+            if 0 <= bar_s + i < content_w:
+                bar_arr[bar_s + i] = (ch, color)
+
+        # Connector tick at midpoint of feature span
+        mid = bar_s + bar_len // 2
+        if 0 <= mid < content_w:
+            conn_arr[mid] = ("┊", color)
+
+    def _write_arr(arr: list[tuple[str, str]]) -> None:
+        result.append(" " * prefix_w)
+        run: list[str] = []
+        sty = ""
+        for ch, s in arr:
+            if s == sty:
+                run.append(ch)
+            else:
+                if run:
+                    result.append("".join(run), style=sty)
+                run = [ch]
+                sty = s
+        if run:
+            result.append("".join(run), style=sty)
+        result.append("\n")
+
+    if not is_below_dna:
+        _write_arr(label_arr)
+        if show_connectors:
+            _write_arr(conn_arr)
+        _write_arr(bar_arr)
+    else:
+        _write_arr(bar_arr)
+        if show_connectors:
+            _write_arr(conn_arr)
+        _write_arr(label_arr)
+
+
 def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                     sel_range: "tuple[int,int] | None" = None,
                     user_sel:  "tuple[int,int] | None" = None,
-                    cursor_pos: int = -1) -> Text:
+                    cursor_pos: int = -1,
+                    show_connectors: bool = False) -> Text:
     """Rich Text of the sequence with per-position feature coloring.
 
     sel_range  — feature highlight: bold + underline on feature bases
@@ -162,6 +283,7 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     cursor_pos — click cursor: │ inserted before cursor_pos
     Annotation bars appear below each DNA line (one bar per overlapping
     non-site feature, capped at 4, largest first).
+    Each feature renders as:  label row  /  [connector row]  /  braille bar row.
     """
     n = len(seq)
     styles = ["color(252)"] * n
@@ -186,14 +308,26 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
 
     for chunk_start in range(0, n, line_width):
         chunk_end = min(chunk_start + line_width, n)
+
+        # ── Assign features to above / below lanes ──
+        chunk_feats = [
+            f for f in annot_feats
+            if f["start"] < chunk_end and f["end"] > chunk_start
+        ]
+        above_lanes, below_lanes = _assign_chunk_features(chunk_feats, chunk_start, chunk_end)
+
+        # ── Feature rows ABOVE DNA (forward strand) ──
+        for lane in above_lanes:
+            _render_feature_row_pair(result, lane, chunk_start, chunk_end,
+                                     10, False, show_connectors)
+
+        # ── DNA sequence line ──
         result.append(f"{chunk_start + 1:>8}  ", style="color(245)")
 
-        # RLE sequence line — priority: user_sel > feat_sel > plain
-        # Cursor is a │ inserted *before* cursor_pos
+        # RLE sequence — priority: user_sel > feat_sel > plain
         run_chars: list[str] = []
         run_style = ""
         for i in range(chunk_start, chunk_end):
-            # Insert │ cursor before this position
             if cursor_pos == i:
                 if run_chars:
                     result.append("".join(run_chars), style=run_style)
@@ -218,45 +352,14 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                 run_chars = [seq_upper[i]]
         if run_chars:
             result.append("".join(run_chars), style=run_style)
-        # Cursor at end of this line (after last char of chunk)
         if chunk_start <= cursor_pos == chunk_end:
             result.append("│", style="bold white")
         result.append("\n")
 
-        # Annotation bars (up to 4 features overlapping this chunk)
-        chunk_feats = [
-            f for f in annot_feats
-            if f["start"] < chunk_end and f["end"] > chunk_start
-        ]
-        for f in chunk_feats[:4]:
-            bar_s = max(f["start"], chunk_start) - chunk_start
-            bar_e = min(f["end"],   chunk_end)   - chunk_start
-            bar_len = bar_e - bar_s
-            if bar_len <= 0:
-                continue
-            starts_here = f["start"] >= chunk_start
-            ends_here   = f["end"]   <= chunk_end
-            strand      = f["strand"]
-            if strand >= 0:
-                lc = "━" if starts_here else "╌"
-                rc = "▶" if ends_here   else "╌"
-            else:
-                lc = "◀" if starts_here else "╌"
-                rc = "━" if ends_here   else "╌"
-            if bar_len == 1:
-                bar = ("▶" if ends_here   else "━") if strand >= 0 else \
-                      ("◀" if starts_here else "━")
-            elif bar_len == 2:
-                bar = lc + rc
-            else:
-                inner = bar_len - 2
-                lbl   = f["label"][:inner]
-                pad   = inner - len(lbl)
-                pl    = pad // 2
-                bar   = lc + "━" * pl + lbl + "━" * (pad - pl) + rc
-            result.append(" " * (10 + bar_s))
-            result.append(bar, style=f["color"])
-            result.append("\n")
+        # ── Feature rows BELOW DNA (reverse strand) ──
+        for lane in below_lanes:
+            _render_feature_row_pair(result, lane, chunk_start, chunk_end,
+                                     10, True, show_connectors)
 
     return result
 
@@ -581,9 +684,10 @@ class PlasmidMap(Widget):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.record  = None
-        self._feats:       list[dict] = []
-        self._restr_feats: list[dict] = []   # restriction site overlay
-        self._total: int = 0
+        self._feats:          list[dict] = []
+        self._restr_feats:    list[dict] = []   # restriction site overlay
+        self._total:          int  = 0
+        self._show_connectors: bool = False
 
     def on_mount(self) -> None:
         detected = _detect_char_aspect()
@@ -742,7 +846,8 @@ class PlasmidMap(Widget):
         if w < 30 or h < 14:
             return Text(f"  Window too small ({w}×{h})", style="dim red")
         key = (w, h, self.origin_bp, self.selected_idx, self._aspect,
-               len(self._feats), len(self._restr_feats), self._map_mode)
+               len(self._feats), len(self._restr_feats), self._map_mode,
+               self._show_connectors)
         if self._render_cache and self._render_cache[0] == key:
             return self._render_cache[1]
         result = self._draw_linear(w, h) if self._map_mode == "linear" else self._draw(w, h)
@@ -795,19 +900,28 @@ class PlasmidMap(Widget):
                     bc_colors[prow][pcol] = "color(238)"
                     bc_prio[prow][pcol]   = 1
 
-        # ── Position ticks ────────────────────────────────────────────────────
+        # ── Position ticks (inside the circle) ───────────────────────────────
+        # TICK_DR_MARK  — radial inset for the ┼ graduation mark
+        # TICK_DR_LABEL — radial inset for the bp number label
+        # Both are negative so they sit inside the backbone ring.
+        # These values scale automatically with the aspect ratio (, / . keys).
+        TICK_DR_MARK  = -2
+        TICK_DR_LABEL = -5
+
         tick_int = _nice_tick(total)
         bp = 0
         while bp < total:
-            angle = bp2a(bp)
-            tx, ty = a2xy(angle, dr=2)
+            angle  = bp2a(bp)
+            tx, ty = a2xy(angle, dr=TICK_DR_MARK)
             canvas.put(tx, ty, "┼", "color(250)")
-            label = _format_bp(bp)
-            lx, ly = a2xy(angle, dr=4)
+            label  = _format_bp(bp)
+            lx, ly = a2xy(angle, dr=TICK_DR_LABEL)
+            # Inside the circle: text points inward, so alignment is flipped
+            # vs outside placement (right-side labels hang left, left-side hang right).
             if math.cos(angle) >= 0:
-                canvas.put_text(lx, ly, label, "color(245)")
-            else:
                 canvas.put_text(lx - len(label) + 1, ly, label, "color(245)")
+            else:
+                canvas.put_text(lx, ly, label, "color(245)")
             bp += tick_int
 
         # ── Restriction site marks ─────────────────────────────────────────────
@@ -871,22 +985,71 @@ class PlasmidMap(Widget):
             canvas.put(ax, ay, _arrow_char(tip_tan), "bold " + style)
 
             mid_bp = (start_bp + (end_bp - start_bp) // 2) % total
-            label_slots.append((bp2a(mid_bp), f["label"][:16], color))
+            label_slots.append((bp2a(mid_bp), f["label"], color))
 
-        # ── Labels ────────────────────────────────────────────────────────────
-        label_slots.sort(key=lambda t: t[0])
-        last_ly = -99
+        # ── Labels: place each as close to the arc as possible ───────────────
+        # Greedily try increasing dr until the label's bounding box doesn't
+        # overlap any already-placed label.
+        # ↓ Tune this to control how far labels sit from the arc.
+        LABEL_DR_MIN = 9          # minimum radial clearance from arc edge
+        dr_min = LABEL_DR_MIN
+        dr_max = max(rx // 2 + 6, LABEL_DR_MIN + 10)
+
+        # placed: list of (x0, x1, row) bounding boxes of accepted labels
+        placed_boxes: list[tuple[int, int, int]] = []
+        final_labels: list[tuple[float, str, str, int, int, int]] = []
+        # angle, lbl, color, chosen_dr, lx, ly
+
         for angle, lbl, color in label_slots:
-            lx, ly = a2xy(angle, dr=rx // 3 + 5)
-            if abs(ly - last_ly) < 2:
-                continue
-            last_ly = ly
+            on_right = math.cos(angle) >= 0
+            chosen = None
+            for dr in range(dr_min, dr_max + 1):
+                lx, ly = a2xy(angle, dr=dr)
+                if not (0 <= ly < h):
+                    continue
+                lbl_x0 = lx if on_right else max(0, lx - len(lbl) + 1)
+                lbl_x1 = lx + len(lbl) - 1 if on_right else lx
+                # Check against every already-placed box
+                ok = True
+                for bx0, bx1, by in placed_boxes:
+                    if by == ly and not (lbl_x1 < bx0 or lbl_x0 > bx1):
+                        ok = False
+                        break
+                if ok:
+                    chosen = (dr, lx, ly, lbl_x0, lbl_x1)
+                    break
+            if chosen is None:
+                # Couldn't fit without overlap — place at max dr anyway
+                lx, ly = a2xy(angle, dr=dr_max)
+                lbl_x0 = lx if on_right else max(0, lx - len(lbl) + 1)
+                lbl_x1 = lx + len(lbl) - 1 if on_right else lx
+                chosen = (dr_max, lx, ly, lbl_x0, lbl_x1)
+            dr_c, lx, ly, lbl_x0, lbl_x1 = chosen
+            placed_boxes.append((lbl_x0, lbl_x1, ly))
+            final_labels.append((angle, lbl, color, dr_c, lx, ly))
+
+        # Render
+        for angle, lbl, color, dr_c, lx, ly in final_labels:
+            on_right = math.cos(angle) >= 0
+
+            # Dot just outside the arc
             dot_x, dot_y = a2xy(angle, dr=3)
             canvas.put(dot_x, dot_y, "·", color)
-            if math.cos(angle) >= 0:
+
+            # Optional connector line from dot to label
+            if self._show_connectors:
+                lbl_mid_x = lx + len(lbl) // 2 if on_right else lx - len(lbl) // 2
+                steps = max(1, abs(lbl_mid_x - dot_x) + abs(ly - dot_y))
+                for t in range(1, steps):
+                    px = dot_x + (lbl_mid_x - dot_x) * t // steps
+                    py = dot_y + (ly        - dot_y) * t // steps
+                    if 0 <= px < w and 0 <= py < h and canvas._chars[py][px] == " ":
+                        canvas.put(px, py, "·", color)
+
+            if on_right:
                 canvas.put_text(lx, ly, lbl, color)
             else:
-                canvas.put_text(lx - len(lbl) + 1, ly, lbl, color)
+                canvas.put_text(max(0, lx - len(lbl) + 1), ly, lbl, color)
 
         # ── Center info ───────────────────────────────────────────────────────
         name     = (self.record.name or self.record.id or "?")[:w // 3]
@@ -1043,6 +1206,9 @@ class PlasmidMap(Widget):
             style  = ("reverse " + color) if is_sel else color
             feat_ty = center_py >> 2
 
+            # Label row: above bar for forward, below for reverse
+            label_ty = feat_ty - 1 if is_fwd else feat_ty + 1
+
             for sx0, sx1 in segments:
                 sx0 = max(px_start, min(sx0, px_start + px_w))
                 sx1 = max(px_start, min(sx1, px_start + px_w))
@@ -1060,13 +1226,13 @@ class PlasmidMap(Widget):
                 else:
                     canvas.put(max(sx0 >> 1, margin_l), feat_ty, "◀", style)
 
-                # Label inside bar
+                # Label above (fwd) or below (rev) the bar
                 x0c, x1c = sx0 >> 1, sx1 >> 1
-                bar_chars = x1c - x0c
-                if bar_chars >= 3:
-                    lbl = label[:bar_chars - 2]
-                    lx  = x0c + (bar_chars - len(lbl)) // 2
-                    canvas.put_text(lx, feat_ty, lbl, style)
+                max_lbl_w = x1c - x0c
+                if max_lbl_w >= 1 and 0 <= label_ty < h:
+                    lbl = label[:max_lbl_w]
+                    lx  = x0c + (max_lbl_w - len(lbl)) // 2
+                    canvas.put_text(lx, label_ty, lbl, style)
 
         # ── Header ──
         name = (self.record.name or self.record.id or "?")[:w // 3]
@@ -1309,6 +1475,7 @@ class SequencePanel(Widget):
         self._cursor_pos:   int                     = -1    # -1 = no cursor
         self._view_cache_key: "tuple | None"        = None
         self._view_cache_txt: "Text | None"         = None
+        self._show_connectors:  bool = False
         # Drag-to-select state
         self._drag_start_bp:    int  = -1
         self._has_dragged:      bool = False
@@ -1459,26 +1626,48 @@ class SequencePanel(Widget):
             [f for f in self._feats if f.get("type") != "site"],
             key=lambda f: -(f["end"] - f["start"]),
         )
+        rpg = 2 + (1 if self._show_connectors else 0)  # rows per feature group
         n   = len(self._seq)
         row = 0
+        seq_col = vp_x - 10  # column within content (10 = 8-char line num + 2 spaces)
+
         for chunk_start in range(0, n, line_width):
-            chunk_end = min(chunk_start + line_width, n)
+            chunk_end   = min(chunk_start + line_width, n)
+            chunk_feats = [f for f in annot_feats
+                           if f["start"] < chunk_end and f["end"] > chunk_start]
+            above_lanes, below_lanes = _assign_chunk_features(chunk_feats, chunk_start, chunk_end)
+
+            # Above feature rows (forward strand)
+            for lane in above_lanes:
+                for _ in range(rpg):
+                    if row == content_row:
+                        for f in lane:
+                            bar_s = max(f["start"], chunk_start) - chunk_start
+                            bar_e = min(f["end"],   chunk_end)   - chunk_start
+                            if bar_s <= seq_col < bar_e:
+                                return (f["start"] + f["end"]) // 2
+                        return lane[0]["start"]
+                    row += 1
+
+            # DNA row
             if row == content_row:
-                # Clicked on a DNA row
-                seq_col = vp_x - 10   # 10 = 8-char line num + 2 spaces
                 if 0 <= seq_col <= (chunk_end - chunk_start):
                     return chunk_start + seq_col
                 return -1
             row += 1
-            # Annotation bar rows
-            chunk_annot = [
-                f for f in annot_feats
-                if f["start"] < chunk_end and f["end"] > chunk_start
-            ]
-            for f in chunk_annot[:4]:
-                if row == content_row:
-                    return (f["start"] + f["end"]) // 2
-                row += 1
+
+            # Below feature rows (reverse strand)
+            for lane in below_lanes:
+                for _ in range(rpg):
+                    if row == content_row:
+                        for f in lane:
+                            bar_s = max(f["start"], chunk_start) - chunk_start
+                            bar_e = min(f["end"],   chunk_end)   - chunk_start
+                            if bar_s <= seq_col < bar_e:
+                                return (f["start"] + f["end"]) // 2
+                        return lane[0]["start"]
+                    row += 1
+
             if row > content_row:
                 break
         return -1
@@ -1492,21 +1681,21 @@ class SequencePanel(Widget):
         )
 
     def _bp_to_content_row(self, bp: int) -> int:
-        """Return the content row index (0-based) that contains bp."""
+        """Return the content row index (0-based) of the DNA line containing bp."""
         line_width  = max(20, self.size.width - 14)
         annot_feats = self._annot_feats_sorted()
+        rpg = 2 + (1 if self._show_connectors else 0)
         n   = len(self._seq)
         row = 0
         for chunk_start in range(0, n, line_width):
-            chunk_end = min(chunk_start + line_width, n)
+            chunk_end   = min(chunk_start + line_width, n)
+            chunk_feats = [f for f in annot_feats
+                           if f["start"] < chunk_end and f["end"] > chunk_start]
+            above_lanes, below_lanes = _assign_chunk_features(chunk_feats, chunk_start, chunk_end)
+            above_rows = len(above_lanes) * rpg
             if bp < chunk_end:
-                return row
-            row += 1
-            n_bars = sum(
-                1 for f in annot_feats
-                if f["start"] < chunk_end and f["end"] > chunk_start
-            )
-            row += min(n_bars, 4)
+                return row + above_rows   # DNA row within this chunk
+            row += above_rows + 1 + len(below_lanes) * rpg
         return row
 
     def _scroll_to_row(self, row: int) -> None:
@@ -1524,14 +1713,16 @@ class SequencePanel(Widget):
             return
         line_width = max(20, self.size.width - 14)
         key = (id(self._seq), id(self._feats), line_width,
-               self._sel_range, self._user_sel, self._cursor_pos)
+               self._sel_range, self._user_sel, self._cursor_pos,
+               self._show_connectors)
         if key != self._view_cache_key:
             self._view_cache_txt = _build_seq_text(
                 self._seq, self._feats,
-                line_width = line_width,
-                sel_range  = self._sel_range,
-                user_sel   = self._user_sel,
-                cursor_pos = self._cursor_pos,
+                line_width      = line_width,
+                sel_range       = self._sel_range,
+                user_sel        = self._user_sel,
+                cursor_pos      = self._cursor_pos,
+                show_connectors = self._show_connectors,
             )
             self._view_cache_key = key
         view.update(self._view_cache_txt)
@@ -1842,6 +2033,8 @@ UnsavedQuitModal { align: center middle; }
         Binding("shift+]",     "rotate_ccw_lg",    "Rotate →→",     show=False, priority=True),
         Binding("home",        "reset_origin",     "Reset origin",  show=True,  priority=True),
         Binding("v",           "toggle_map_view",  "⊙/─ View",      show=True,  priority=True),
+        Binding("l",           "toggle_connectors","Connectors",    show=True,  priority=True),
+        Binding("delete",      "delete_feature",   "Del feature",   show=True,  priority=True),
         Binding("q",           "quit",             "Quit",          show=True),
     ]
 
@@ -1884,6 +2077,18 @@ UnsavedQuitModal { align: center middle; }
 
     def action_toggle_map_view(self):
         self.query_one("#plasmid-map", PlasmidMap).action_toggle_map_view()
+
+    def action_toggle_connectors(self):
+        sp = self.query_one("#seq-panel", SequencePanel)
+        pm = self.query_one("#plasmid-map", PlasmidMap)
+        sp._show_connectors  = not sp._show_connectors
+        pm._show_connectors  = sp._show_connectors
+        sp._view_cache_key   = None   # invalidate seq panel cache
+        pm._render_cache     = None   # invalidate map cache
+        sp._refresh_view()
+        pm.refresh()
+        state = "on" if sp._show_connectors else "off"
+        self.notify(f"Label connectors {state}")
 
     def action_edit_seq(self) -> None:
         sp = self.query_one("#seq-panel", SequencePanel)
@@ -2006,6 +2211,48 @@ UnsavedQuitModal { align: center middle; }
             ))
 
         return new_record
+
+    def _rebuild_record_without_feature(self, feat_idx: int):
+        """Create a new SeqRecord with the feat_idx-th non-source feature removed."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+
+        new_record = SeqRecord(
+            Seq(str(self._current_record.seq)),
+            id=self._current_record.id,
+            name=self._current_record.name,
+            description=self._current_record.description,
+            annotations=dict(self._current_record.annotations),
+        )
+        non_source_idx = 0
+        for feat in self._current_record.features:
+            if feat.type == "source":
+                new_record.features.append(SeqFeature(
+                    feat.location, type=feat.type,
+                    qualifiers=dict(feat.qualifiers),
+                ))
+                continue
+            if non_source_idx != feat_idx:
+                new_record.features.append(SeqFeature(
+                    feat.location, type=feat.type,
+                    qualifiers=dict(feat.qualifiers),
+                ))
+            non_source_idx += 1
+        return new_record
+
+    def action_delete_feature(self):
+        pm = self.query_one("#plasmid-map", PlasmidMap)
+        if pm.selected_idx < 0 or not pm._feats:
+            self.notify("No feature selected.", severity="warning")
+            return
+        feat = pm._feats[pm.selected_idx]
+        label = feat.get("label") or feat.get("type", "feature")
+        self._push_undo()
+        new_record = self._rebuild_record_without_feature(pm.selected_idx)
+        sp = self.query_one("#seq-panel", SequencePanel)
+        self._apply_snapshot(str(new_record.seq), sp._cursor_pos, new_record)
+        self.notify(f"Deleted '{label}'  (Ctrl+Z to undo)")
 
     def action_add_to_library(self):
         if self._current_record is None:
