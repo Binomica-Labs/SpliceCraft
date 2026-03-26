@@ -2297,6 +2297,157 @@ class OpenFileModal(ModalScreen):
         self.dismiss(None)
 
 
+# ── Dropdown menu modal ────────────────────────────────────────────────────────
+
+class DropdownScreen(ModalScreen):
+    """Transparent overlay showing a positioned dropdown menu."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = """
+    DropdownScreen {
+        background: transparent;
+    }
+    """
+
+    def __init__(self, items: list, x: int, y: int) -> None:
+        super().__init__()
+        self._items = items   # (label, action_str | None)
+        self._x = x
+        self._y = y
+        self._cursor = next(
+            (i for i, (_, a) in enumerate(items) if a is not None), 0
+        )
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            self._render_content(),
+            id="dropdown-box",
+        )
+
+    def on_mount(self) -> None:
+        inner_w = max((len(lbl) for lbl, _ in self._items), default=10) + 4
+        box_h   = len(self._items) + 2
+        box = self.query_one("#dropdown-box", Static)
+        box.styles.offset = (self._x, self._y)
+        box.styles.width  = inner_w
+        box.styles.height = box_h
+        box.styles.border = ("solid", "white")
+        box.styles.background = "black"
+
+    def _render_content(self) -> Text:
+        inner_w = max((len(lbl) for lbl, _ in self._items), default=10) + 4
+        sep_line = "\u2500" * (inner_w - 2)
+        result = Text()
+        for i, (label, action) in enumerate(self._items):
+            is_sep      = (label == "---")
+            is_selected = (i == self._cursor and not is_sep and action is not None)
+            is_disabled = (action is None and not is_sep)
+
+            if is_sep:
+                line = Text(sep_line + "\n", style="white")
+            else:
+                padded = f" {label:<{inner_w - 3}}"
+                if is_selected:
+                    line = Text(padded + "\n", style="reverse white")
+                elif is_disabled:
+                    line = Text(padded + "\n", style="dim white")
+                else:
+                    line = Text(padded + "\n", style="white")
+            result.append_text(line)
+        return result
+
+    def _refresh_box(self) -> None:
+        box = self.query_one("#dropdown-box", Static)
+        box.update(self._render_content())
+
+    def on_key(self, event) -> None:
+        items = self._items
+        if event.key == "up":
+            pos = self._cursor - 1
+            while pos >= 0 and (items[pos][0] == "---" or items[pos][1] is None):
+                pos -= 1
+            if pos >= 0:
+                self._cursor = pos
+                self._refresh_box()
+            event.stop()
+        elif event.key == "down":
+            pos = self._cursor + 1
+            while pos < len(items) and (items[pos][0] == "---" or items[pos][1] is None):
+                pos += 1
+            if pos < len(items):
+                self._cursor = pos
+                self._refresh_box()
+            event.stop()
+        elif event.key == "enter":
+            label, action = items[self._cursor]
+            if action is not None:
+                self.dismiss(action)
+            event.stop()
+
+    def on_click(self, event: Click) -> None:
+        bx = self._x
+        by = self._y
+        inner_w = max((len(lbl) for lbl, _ in self._items), default=10) + 4
+        bh = len(self._items) + 2
+        cx, cy = event.screen_x, event.screen_y
+        if bx <= cx < bx + inner_w and by <= cy < by + bh:
+            row_in_box = cy - by - 1  # -1 for top border
+            if 0 <= row_in_box < len(self._items):
+                label, action = self._items[row_in_box]
+                if label == "---" or action is None:
+                    event.stop()
+                    return
+                self.dismiss(action)
+        else:
+            self.dismiss(None)
+        event.stop()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── Menu bar widget ────────────────────────────────────────────────────────────
+
+class MenuBar(Widget):
+    DEFAULT_CSS = """
+    MenuBar {
+        height: 1;
+        background: $primary-darken-3;
+        layout: horizontal;
+    }
+    MenuBar Static {
+        width: auto;
+        padding: 0 2;
+        color: $text;
+    }
+    MenuBar Static:hover {
+        background: $primary;
+    }
+    """
+
+    MENUS = ["File", "Edit", "Enzymes", "Features", "Primers", "Genes"]
+
+    def compose(self) -> ComposeResult:
+        for name in self.MENUS:
+            yield Static(name, classes="menu-item", id=f"menu-{name.lower()}")
+
+    def on_click(self, event: Click) -> None:
+        for name in self.MENUS:
+            widget_id = f"menu-{name.lower()}"
+            try:
+                item = self.query_one(f"#{widget_id}", Static)
+                region = item.region
+                if (region.x <= event.screen_x < region.x + region.width and
+                        region.y <= event.screen_y < region.y + region.height):
+                    x = region.x
+                    y = region.y + 1
+                    self.app.open_menu(name, x, y)
+                    break
+            except Exception:
+                pass
+
+
 # ── Unsaved-changes quit dialog ────────────────────────────────────────────────
 
 class UnsavedQuitModal(ModalScreen):
@@ -2338,11 +2489,14 @@ class PlasmidApp(App):
     _source_path:   "str | None" = None   # file the current record was loaded from
     _unsaved:        bool         = False  # True when there are unsaved edits
     _MAX_UNDO = 50
+    _restr_unique_only: bool = True
+    _restr_min_len: int = 6
 
     CSS = """
 Screen { background: $background; }
 
 /* ── Layout ─────────────────────────────────────────────── */
+MenuBar { height: 1; dock: top; }
 #main-row   { height: 1fr; }
 #center-col { width: 1fr; height: 1fr; }
 #map-row    { height: 1fr; }
@@ -2422,6 +2576,7 @@ UnsavedQuitModal { align: center middle; }
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield MenuBar()
         with Horizontal(id="main-row"):
             yield LibraryPanel(id="library")
             with Vertical(id="center-col"):
@@ -2520,13 +2675,13 @@ UnsavedQuitModal { align: center middle; }
             self._current_record = new_record
             pm.load_record(new_record)
             self.query_one("#sidebar", FeatureSidebar).populate(pm._feats)
-            restr = _scan_restriction_sites(new_seq)
+            restr = _scan_restriction_sites(new_seq, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only)
             pm._restr_feats = restr
             pm.refresh()
             sp.update_seq(new_seq, pm._feats + restr)
             self.notify(f"Sequence updated  ({len(new_seq):,} bp)")
         else:
-            restr = _scan_restriction_sites(new_seq)
+            restr = _scan_restriction_sites(new_seq, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only)
             pm._restr_feats = restr
             pm.refresh()
             sp.update_seq(new_seq, pm._feats + restr)
@@ -2742,7 +2897,7 @@ UnsavedQuitModal { align: center middle; }
         if record is not None:
             pm.load_record(record)
             sidebar.populate(pm._feats)
-            restr = _scan_restriction_sites(seq)
+            restr = _scan_restriction_sites(seq, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only)
             pm._restr_feats = restr
             pm.refresh()
             sp.update_seq(seq, pm._feats + restr)
@@ -2865,7 +3020,7 @@ UnsavedQuitModal { align: center middle; }
         sidebar.populate(pm._feats)
 
         seq_str = str(record.seq)
-        restr   = _scan_restriction_sites(seq_str)
+        restr   = _scan_restriction_sites(seq_str, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only)
 
         # Store restriction sites on the map for visual overlay
         pm._restr_feats = restr
@@ -2944,13 +3099,116 @@ UnsavedQuitModal { align: center middle; }
     def _library_add_current(self, _):
         self.action_add_to_library()
 
+    # ── Menu bar ───────────────────────────────────────────────────────────────
+
+    def _rescan_restrictions(self) -> None:
+        """Re-scan restriction sites with current settings and update UI."""
+        sp = self.query_one("#seq-panel", SequencePanel)
+        pm = self.query_one("#plasmid-map", PlasmidMap)
+        if not sp._seq:
+            return
+        restr = _scan_restriction_sites(
+            sp._seq,
+            min_recognition_len=self._restr_min_len,
+            unique_only=self._restr_unique_only,
+        )
+        pm._restr_feats = restr
+        pm.refresh()
+        sp.update_seq(sp._seq, pm._feats + restr)
+
+    def open_menu(self, name: str, x: int, y: int) -> None:
+        """Build menu item list for name and push DropdownScreen."""
+        ck = "\u2713"  # checkmark
+        nc = " "
+        u  = ck if self._restr_unique_only else nc
+        m6 = ck if self._restr_min_len == 6  else nc
+        m4 = ck if self._restr_min_len == 4  else nc
+
+        menus = {
+            "File": [
+                ("Open .gb file",   "open_file"),
+                ("Fetch from NCBI", "fetch"),
+                ("---",             None),
+                ("Add to Library",  "add_to_library"),
+                ("Save",            "save"),
+                ("---",             None),
+                ("Quit",            "quit"),
+            ],
+            "Edit": [
+                ("Edit Sequence",   "edit_seq"),
+                ("---",             None),
+                ("Undo",            "undo"),
+                ("Redo",            "redo"),
+                ("---",             None),
+                ("Delete Feature",  "delete_feature"),
+            ],
+            "Enzymes": [
+                (f"[{u}] Unique cutters",   "toggle_restr_unique"),
+                (f"[{m6}] 6+ bp sites",     "toggle_restr_min6"),
+                (f"[{m4}] 4+ bp sites",     "toggle_restr_min4"),
+                ("---",                      None),
+                ("Toggle connectors",        "toggle_connectors"),
+            ],
+            "Features": [
+                ("Add Feature...",   "add_feature"),
+                ("Delete Feature",   "delete_feature"),
+                ("---",              None),
+                ("Toggle connectors","toggle_connectors"),
+            ],
+            "Primers": [
+                ("Design Primer... (coming soon)", None),
+            ],
+            "Genes": [
+                ("Annotate from NCBI... (coming soon)", None),
+            ],
+        }
+        items = menus.get(name, [])
+        self.push_screen(
+            DropdownScreen(items, x, y),
+            callback=self._menu_action,
+        )
+
+    def _menu_action(self, action: "str | None") -> None:
+        if action is None:
+            return
+        # Handle toggle actions directly since they need state updates
+        if action in ("toggle_restr_unique", "toggle_restr_min6", "toggle_restr_min4"):
+            getattr(self, f"action_{action}")()
+        else:
+            self.call_action(action)
+
+    def action_toggle_restr_unique(self) -> None:
+        self._restr_unique_only = not self._restr_unique_only
+        self._rescan_restrictions()
+        state = "on" if self._restr_unique_only else "off"
+        self.notify(f"Unique cutters {state}")
+
+    def action_toggle_restr_min6(self) -> None:
+        self._restr_min_len = 6
+        self._rescan_restrictions()
+        self.notify("Showing 6+ bp recognition sites")
+
+    def action_toggle_restr_min4(self) -> None:
+        self._restr_min_len = 4
+        self._rescan_restrictions()
+        self.notify("Showing 4+ bp recognition sites")
+
+    def action_add_feature(self) -> None:
+        self.notify("Add feature: coming soon", severity="information")
+
+    def action_undo(self) -> None:
+        self._action_undo()
+
+    def action_redo(self) -> None:
+        self._action_redo()
+
     # ── Sequence edits ─────────────────────────────────────────────────────────
 
     @on(SequencePanel.SequenceChanged)
     def _seq_changed(self, event: SequencePanel.SequenceChanged):
         # Update restriction site overlay whenever sequence changes
         pm    = self.query_one("#plasmid-map", PlasmidMap)
-        restr = _scan_restriction_sites(event.seq)
+        restr = _scan_restriction_sites(event.seq, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only)
         pm._restr_feats = restr
         pm.refresh()
 
