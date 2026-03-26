@@ -409,12 +409,13 @@ def _scan_restriction_sites(
                 continue
             seen.add(key)
             hits.append({
-                "type":   "resite",
-                "start":  p,
-                "end":    p + site_len,
-                "strand": 1,
-                "color":  color,
-                "label":  name,
+                "type":    "resite",
+                "start":   p,
+                "end":     p + site_len,
+                "strand":  1,
+                "color":   color,
+                "label":   name,
+                "cut_col": fwd_cut if 0 < fwd_cut < site_len else None,
             })
             cut_bp = min(p + fwd_cut, n - 1)
             hits.append({
@@ -437,12 +438,13 @@ def _scan_restriction_sites(
                 continue
             seen.add(key)
             hits.append({
-                "type":   "resite",
-                "start":  orig_start,
-                "end":    orig_start + site_len,
-                "strand": -1,
-                "color":  color,
-                "label":  name,
+                "type":    "resite",
+                "start":   orig_start,
+                "end":     orig_start + site_len,
+                "strand":  -1,
+                "color":   color,
+                "label":   name,
+                "cut_col": rev_cut if 0 < rev_cut < site_len else None,
             })
             cut_bp = min(orig_start + rev_cut, n - 1)
             hits.append({
@@ -534,6 +536,53 @@ def _render_feature_row_pair(
         color       = f["color"]
         label       = f.get("label", f.get("type", ""))
 
+        feat_type = f.get("type", "")
+
+        if feat_type == "resite":
+            # ── Parenthesis-style RE site: ( EnzymeName ) ─────────────────
+            # Bar row:   ( EnzymeName )  — bold white name, colored parens
+            # Label row: ↓ or ↑ at the intra-site cut column (if cut is
+            #            within the recognition site; Type IIS cuts elsewhere)
+            cut_col = f.get("cut_col")   # 0-based offset from f["start"], or None
+
+            # Opening / closing parens
+            if starts_here and bar_len >= 1:
+                bar_arr[bar_s] = ("(", color)
+            if ends_here and bar_len >= 1:
+                bar_arr[bar_s + bar_len - 1] = (")", color)
+
+            # Enzyme name: bold white, centered in the interior
+            interior_start = (1 if starts_here else 0)
+            interior_end   = (bar_len - 1 if ends_here else bar_len)
+            interior_len   = interior_end - interior_start
+            if interior_len > 0:
+                name_str  = label[:interior_len]
+                name_pad  = interior_len - len(name_str)
+                name_lpad = name_pad // 2
+                for j, ch in enumerate(name_str):
+                    pos = bar_s + interior_start + name_lpad + j
+                    if 0 <= pos < content_w:
+                        bar_arr[pos] = (ch, "bold white")
+
+            # Cut marker in the label row so it doesn't obscure the name
+            if cut_col is not None:
+                visible_offset = cut_col - max(0, chunk_start - f["start"])
+                cut_pos = bar_s + visible_offset
+                if 0 <= cut_pos < content_w:
+                    cut_ch = "↑" if is_below_dna else "↓"
+                    label_arr[cut_pos] = (cut_ch, "bold " + color)
+
+            # Connector tick at midpoint
+            mid = bar_s + bar_len // 2
+            if 0 <= mid < content_w:
+                conn_arr[mid] = ("┊", color)
+            continue   # skip the regular label/bar/conn logic below
+
+        elif feat_type == "recut":
+            continue   # cut position is rendered inside the resite bar; skip here
+
+        # ── Standard feature (non-RE) ──────────────────────────────────────
+
         # Label (centered in feature span)
         lbl = label[:bar_len]
         pad = bar_len - len(lbl)
@@ -544,12 +593,7 @@ def _render_feature_row_pair(
                 label_arr[bar_s + i] = (ch, color)
 
         # Braille bar
-        feat_type = f.get("type", "")
-        if feat_type == "recut":
-            # Cut-site marker: arrow pointing toward the DNA line
-            bar_str = "↑" if is_below_dna else "↓"
-        elif bar_len == 1:
-            # Single-bp feature triangle points inward toward the DNA line
+        if bar_len == 1:
             bar_str = "▲" if is_below_dna else "▼"
         elif strand >= 0:
             bar_str = "⣿" * (bar_len - (1 if ends_here   else 0)) + ("▶" if ends_here   else "")
@@ -621,10 +665,10 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     seq_upper = seq.upper()
     result    = Text(no_wrap=False)
 
-    # Annotation-bar features: exclude old-style "site" markers, largest first
-    # resite / recut types are included so they appear in the sequence panel
+    # Annotation-bar features: exclude old "site" and "recut" (cut pos is
+    # embedded inside the resite bar; recut only used by the map overlays).
     annot_feats = sorted(
-        [f for f in feats if f.get("type") not in ("site",)],
+        [f for f in feats if f.get("type") not in ("site", "recut")],
         key=lambda f: -(f["end"] - f["start"]),
     )
 
@@ -1864,6 +1908,8 @@ class SequencePanel(Widget):
         self._mouse_button_held: bool = False
         self._drag_was_shift:   bool = False
         self._last_was_drag:    bool = False
+        # Set by _click_to_bp when the click lands on a resite bar row
+        self._last_resite_click: "dict | None" = None
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -1982,9 +2028,22 @@ class SequencePanel(Widget):
             self._last_was_drag = False
             return
         self._last_was_drag = False
+        self._last_resite_click = None
         bp = self._click_to_bp(event.screen_x, event.screen_y)
         if bp < 0:
             return
+
+        # If the click landed on a restriction site bar, highlight that span
+        resite = self._last_resite_click
+        self._last_resite_click = None
+        if resite is not None:
+            self._sel_range  = (resite["start"], min(resite["end"], len(self._seq)))
+            self._user_sel   = None
+            self._cursor_pos = resite["start"]
+            self._refresh_view()
+            self._scroll_to_row(self._bp_to_content_row(resite["start"]))
+            return
+
         double = event.chain >= 2
         self.post_message(self.SequenceClick(bp, double=double))
 
@@ -2005,7 +2064,7 @@ class SequencePanel(Widget):
 
         line_width  = max(20, self.size.width - 14)
         annot_feats = sorted(
-            [f for f in self._feats if f.get("type") != "site"],
+            [f for f in self._feats if f.get("type") not in ("site", "recut")],
             key=lambda f: -(f["end"] - f["start"]),
         )
         rpg = 2 + (1 if self._show_connectors else 0)  # rows per feature group
@@ -2027,6 +2086,8 @@ class SequencePanel(Widget):
                             bar_s = max(f["start"], chunk_start) - chunk_start
                             bar_e = min(f["end"],   chunk_end)   - chunk_start
                             if bar_s <= seq_col < bar_e:
+                                if f.get("type") == "resite":
+                                    self._last_resite_click = f
                                 return (f["start"] + f["end"]) // 2
                         return lane[0]["start"]
                     row += 1
@@ -2046,6 +2107,8 @@ class SequencePanel(Widget):
                             bar_s = max(f["start"], chunk_start) - chunk_start
                             bar_e = min(f["end"],   chunk_end)   - chunk_start
                             if bar_s <= seq_col < bar_e:
+                                if f.get("type") == "resite":
+                                    self._last_resite_click = f
                                 return (f["start"] + f["end"]) // 2
                         return lane[0]["start"]
                     row += 1
@@ -2058,7 +2121,7 @@ class SequencePanel(Widget):
 
     def _annot_feats_sorted(self) -> list:
         return sorted(
-            [f for f in self._feats if f.get("type") != "site"],
+            [f for f in self._feats if f.get("type") not in ("site", "recut")],
             key=lambda f: -(f["end"] - f["start"]),
         )
 
