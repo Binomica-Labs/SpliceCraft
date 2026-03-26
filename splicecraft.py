@@ -23,6 +23,7 @@ Run standalone:
 
 import json
 import math
+import re
 import sys
 from io import StringIO
 from pathlib import Path
@@ -94,26 +95,253 @@ def _save_library(entries: list[dict]) -> None:
 
 # ── Restriction sites ──────────────────────────────────────────────────────────
 
-_RESTRICTION_SITES: dict[str, str] = {
-    "EcoRI":   "GAATTC",
-    "BamHI":   "GGATCC",
-    "HindIII": "AAGCTT",
-    "NcoI":    "CCATGG",
-    "NdeI":    "CATATG",
-    "XhoI":    "CTCGAG",
-    "SalI":    "GTCGAC",
-    "KpnI":    "GGTACC",
-    "SacI":    "GAGCTC",
-    "SpeI":    "ACTAGT",
-    "XbaI":    "TCTAGA",
-    "BsaI":    "GGTCTC",
-    "BsmBI":   "CGTCTC",
-    "BbsI":    "GAAGAC",
-    "NotI":    "GCGGCCGC",
-    "PstI":    "CTGCAG",
-    "SphI":    "GCATGC",
-    "ClaI":    "ATCGAT",
+# Comprehensive NEB enzyme catalog.
+# Each entry maps enzyme name → (recognition_sequence, fwd_cut, rev_cut).
+#
+# Cut position convention (0-based, relative to start of recognition sequence):
+#   0          = before first base of recognition seq
+#   len(seq)   = after last base of recognition seq
+#   >len(seq)  = downstream of recognition seq (Type IIS)
+#   negative   = upstream of recognition seq
+#
+# IUPAC ambiguity codes used in recognition sequences:
+#   R=A/G  Y=C/T  W=A/T  S=G/C  M=A/C  K=G/T
+#   B=not-A  D=not-C  H=not-G  V=not-T  N=any
+#
+# Examples:
+#   EcoRI  G^AATTC / CTTAA^G  → fwd=1, rev=5
+#   BamHI  G^GATCC / CCTAG^G  → fwd=1, rev=5
+#   SmaI   CCC^GGG / GGG^CCC  → fwd=3, rev=3  (blunt)
+#   BsaI   GGTCTC(1/5)        → recognition=6bp, fwd=6+1=7, rev=6+5=11
+#
+_NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
+
+    # ── Common Type IIP — 6-bp palindromic cutters ─────────────────────────────
+    "EcoRI":     ("GAATTC",       1,  5),  # G^AATTC   / CTTAA^G     5' overhang
+    "EcoRV":     ("GATATC",       3,  3),  # GAT^ATC   / GAT^ATC     blunt
+    "BamHI":     ("GGATCC",       1,  5),  # G^GATCC   / CCTAG^G     5' overhang
+    "HindIII":   ("AAGCTT",       1,  5),  # A^AGCTT   / TTCGA^A     5' overhang
+    "NcoI":      ("CCATGG",       1,  5),  # C^CATGG   / GGTAC^C     5' overhang
+    "NdeI":      ("CATATG",       2,  4),  # CA^TATG   / GTAT^AC     5' overhang
+    "XhoI":      ("CTCGAG",       1,  5),  # C^TCGAG   / GAGCT^C     5' overhang
+    "SalI":      ("GTCGAC",       1,  5),  # G^TCGAC   / CAGCT^G     5' overhang
+    "KpnI":      ("GGTACC",       5,  1),  # GGTAC^C   / G^GTACC     3' overhang
+    "SacI":      ("GAGCTC",       5,  1),  # GAGCT^C   / G^AGCTC     3' overhang
+    "SacII":     ("CCGCGG",       4,  2),  # CCGC^GG   / CC^GCGG     3' overhang
+    "SpeI":      ("ACTAGT",       1,  5),  # A^CTAGT   / TGATC^A     5' overhang
+    "XbaI":      ("TCTAGA",       1,  5),  # T^CTAGA   / AGATC^T     5' overhang
+    "NotI":      ("GCGGCCGC",     2,  6),  # GC^GGCCGC / CGCCGG^CG   5' overhang (8-cutter)
+    "PstI":      ("CTGCAG",       5,  1),  # CTGCA^G   / G^CTGCA     3' overhang
+    "SphI":      ("GCATGC",       5,  1),  # GCATG^C   / C^GCATG     3' overhang
+    "ClaI":      ("ATCGAT",       2,  4),  # AT^CGAT   / CGAT^AT     5' overhang
+    "NheI":      ("GCTAGC",       1,  5),  # G^CTAGC   / CGATC^G     5' overhang
+    "AvaI":      ("CYCGRG",       1,  5),  # C^YCGRG                 5' overhang (degenerate)
+    "AvaII":     ("GGWCC",        1,  4),  # G^GWCC    / CCWG^G      5' overhang
+    "AvrII":     ("CCTAGG",       1,  5),  # C^CTAGG   / GGATC^C     5' overhang
+    "BclI":      ("TGATCA",       1,  5),  # T^GATCA   / AGTCA^T     5' overhang (dam-sensitive)
+    "BglII":     ("AGATCT",       1,  5),  # A^GATCT   / TCTAG^A     5' overhang
+    "BsiWI":     ("CGTACG",       1,  5),  # C^GTACG   / GCATG^C     5' overhang
+    "BspEI":     ("TCCGGA",       1,  5),  # T^CCGGA   / AGGCC^T     5' overhang
+    "BsrGI":     ("TGTACA",       1,  5),  # T^GTACA   / ACATG^T     5' overhang
+    "BssHII":    ("GCGCGC",       1,  5),  # G^CGCGC   / CGCGC^G     5' overhang
+    "BstBI":     ("TTCGAA",       2,  4),  # TT^CGAA   / AAGC^TT     5' overhang
+    "BstEII":    ("GGTNACC",      1,  5),  # G^GTNACC  / CCANT^GG    5' overhang
+    "BstXI":     ("CCANNNNNTGG",  8,  4),  # CCANN4^TGG/ CCA^N5TGG   3' overhang
+    "BstYI":     ("RGATCY",       1,  5),  # R^GATCY   / YCTAG^R     5' overhang
+    "CpoI":      ("CGGWCCG",      2,  5),  # CG^GWCCG  / CGCC^WGG    5' overhang
+    "DraI":      ("TTTAAA",       3,  3),  # TTT^AAA   / TTT^AAA     blunt
+    "DraIII":    ("CACNNNGTG",    6,  3),  # CACNNN^GTG/ GTG^NNNGTG  3' overhang
+    "EagI":      ("CGGCCG",       1,  5),  # C^GGCCG   / GCCGG^C     5' overhang (NotI subset)
+    "Eco47III":  ("AGCGCT",       3,  3),  # AGC^GCT                 blunt
+    "Eco53kI":   ("GAGCTC",       5,  1),  # GAGCT^C                 3' overhang (SacI isoschizomer)
+    "EcoNI":     ("CCTNNNNNAGG",  5,  6),  # CCTNN^NNNAGG            5' overhang
+    "FseI":      ("GGCCGGCC",     6,  2),  # GGCCGG^CC / CC^GGCCGG   3' overhang (8-cutter)
+    "FspI":      ("TGCGCA",       3,  3),  # TGC^GCA                 blunt
+    "HaeII":     ("RGCGCY",       5,  1),  # RGCGC^Y   / R^GCGCY     3' overhang
+    "HaeIII":    ("GGCC",         2,  2),  # GG^CC                   blunt (4-cutter)
+    "HincII":    ("GTYRAC",       3,  3),  # GTY^RAC                 blunt
+    "HindII":    ("GTYRAC",       3,  3),  # GTY^RAC                 blunt (HincII isoschizomer)
+    "HpaI":      ("GTTAAC",       3,  3),  # GTT^AAC                 blunt
+    "HpaII":     ("CCGG",         1,  3),  # C^CGG     / CGG^C        5' overhang (4-cutter)
+    "MfeI":      ("CAATTG",       1,  5),  # C^AATTG   / GTTAA^C     EcoRI-compatible ends
+    "MluI":      ("ACGCGT",       1,  5),  # A^CGCGT   / TGCGC^A     5' overhang
+    "MscI":      ("TGGCCA",       3,  3),  # TGG^CCA                 blunt
+    "MspI":      ("CCGG",         1,  3),  # C^CGG     / CGG^C        5' overhang (HpaII isoschizomer)
+    "MunI":      ("CAATTG",       1,  5),  # C^AATTG                 MfeI isoschizomer
+    "NarI":      ("GGCGCC",       2,  4),  # GG^CGCC   / CGCG^CC     3' overhang
+    "NruI":      ("TCGCGA",       3,  3),  # TCG^CGA                 blunt
+    "NsiI":      ("ATGCAT",       5,  1),  # ATGCA^T   / T^ATGCA     PstI-compatible ends
+    "NspI":      ("RCATGY",       5,  1),  # RCATG^Y   / R^CATGY     3' overhang
+    "PacI":      ("TTAATTAA",     5,  3),  # TTAAT^TAA / TTA^ATTAA   3' overhang (8-cutter)
+    "PaeR7I":    ("CTCGAG",       1,  5),  # C^TCGAG                 XhoI isoschizomer
+    "PciI":      ("ACATGT",       1,  5),  # A^CATGT   / TGTAC^A     5' overhang
+    "PmeI":      ("GTTTAAAC",     4,  4),  # GTTT^AAAC               blunt (8-cutter)
+    "PmlI":      ("CACGTG",       3,  3),  # CAC^GTG                 blunt
+    "PscI":      ("ACATGT",       1,  5),  # A^CATGT                 PciI isoschizomer
+    "PvuI":      ("CGATCG",       4,  2),  # CGATC^G   / G^CGATC     3' overhang
+    "PvuII":     ("CAGCTG",       3,  3),  # CAG^CTG                 blunt
+    "RsrII":     ("CGGWCCG",      2,  5),  # CG^GWCCG                CpoI isoschizomer
+    "SbfI":      ("CCTGCAGG",     6,  2),  # CCTGCA^GG / CC^TGCAGG   PstI-compatible (8-cutter)
+    "ScaI":      ("AGTACT",       3,  3),  # AGT^ACT                 blunt
+    "SfiI":      ("GGCCNNNNNGGCC",8,  4),  # GGCCN4^NGGCC            3' overhang (13-bp)
+    "SgrAI":     ("CRCCGGYG",     2,  6),  # CR^CCGGYG / GCCGGR^C    5' overhang
+    "SmaI":      ("CCCGGG",       3,  3),  # CCC^GGG                 blunt
+    "SnaBI":     ("TACGTA",       3,  3),  # TAC^GTA                 blunt
+    "SrfI":      ("GCCCGGGC",     4,  4),  # GCCC^GGGC               blunt (8-cutter)
+    "StuI":      ("AGGCCT",       3,  3),  # AGG^CCT                 blunt
+    "SwaI":      ("ATTTAAAT",     4,  4),  # ATTT^AAAT               blunt (8-cutter)
+    "Tth111I":   ("GACNNNGTC",    4,  5),  # GACN^NNGTC              1-base 3' overhang
+    "XmaI":      ("CCCGGG",       1,  5),  # C^CCGGG   / GGGCC^C     5' overhang (SmaI isoschizomer)
+    "XmnI":      ("GAANNNNTTC",   5,  5),  # GAANN^NNTTC             blunt
+
+    # ── Rare 8-cutters ─────────────────────────────────────────────────────────
+    "AscI":      ("GGCGCGCC",     2,  6),  # GG^CGCGCC / CGCGCC^GG   5' overhang
+    "AsiSI":     ("GCGATCGC",     5,  3),  # GCGAT^CGC / GCG^ATCGC   3' overhang
+
+    # ── Degenerate / IUPAC recognition sequences ───────────────────────────────
+    "AccI":      ("GTYRAC",       2,  4),  # GT^YRAC                 3' overhang
+    "AclI":      ("AACGTT",       2,  4),  # AA^CGTT                 3' overhang
+    "AfeI":      ("AGCGCT",       3,  3),  # AGC^GCT                 blunt (Eco47III isoschizomer)
+    "AflII":     ("CTTAAG",       1,  5),  # C^TTAAG                 MfeI-compatible ends
+    "AflIII":    ("ACRYGT",       1,  5),  # A^CRYGT                 MluI-compatible ends
+    "AgeI":      ("ACCGGT",       1,  5),  # A^CCGGT   / TGGCC^A     5' overhang
+    "AhdI":      ("GACNNNNNGTC",  6,  5),  # GACNNNN^NGTC            1-base 3' overhang
+    "AluI":      ("AGCT",         2,  2),  # AG^CT                   blunt (4-cutter)
+    "ApaI":      ("GGGCCC",       5,  1),  # GGGCC^C   / G^GGCCC     3' overhang
+    "ApaLI":     ("GTGCAC",       1,  5),  # G^TGCAC                 SphI-compatible ends
+    "ApoI":      ("RAATTY",       1,  5),  # R^AATTY                 EcoRI isoschizomer (degenerate)
+    "AatII":     ("GACGTC",       5,  1),  # GACGT^C   / G^ACGTC     3' overhang
+    "BaeGI":     ("GKGCMC",       5,  1),  # GKGCM^C   / G^KGCMC     3' overhang
+    "BglI":      ("GCCNNNNNGGC",  7,  4),  # GCCNNNN^NGGC            3' overhang
+    "BmgBI":     ("CACGTC",       3,  3),  # CAC^GTC                 blunt
+    "BsaAI":     ("YACGTR",       3,  3),  # YAC^GTR                 blunt
+    "BsaBI":     ("GATNNNNATC",   5,  5),  # GATN4^ATC               blunt
+    "BsaHI":     ("GRCGYC",       2,  4),  # GR^CGYC                 3' overhang
+    "BsaWI":     ("WCCGGW",       1,  5),  # W^CCGGW                 5' overhang
+    "BseYI":     ("CCCAGC",       5,  1),  # CCCAG^C   / C^CCAGC     3' overhang
+    "BsiEI":     ("CGRYCG",       4,  2),  # CGRY^CG                 3' overhang
+    "BsiHKAI":   ("GWGCWC",       5,  1),  # GWGCW^C                 3' overhang
+    "BsrFI":     ("RCCGGY",       1,  5),  # R^CCGGY                 5' overhang
+    "Bsp1286I":  ("GDGCHC",       5,  1),  # GDGCH^C                 3' overhang
+    "BspHI":     ("TCATGA",       1,  5),  # T^CATGA                 NcoI-compatible ends
+    "BsrI":      ("ACTGG",        1,  1),  # ACT^GG                  degenerate Type IIS-like
+    "BstAPI":    ("GCANNNNNTGC",  7,  5),  # GCANNNN^NTGC            3' overhang
+    "BstNI":     ("CCWGG",        2,  3),  # CC^WGG    / WGG^CC      3' overhang
+    "BstUI":     ("CGCG",         2,  2),  # CG^CG                   blunt (4-cutter; methylation-sensitive)
+    "BstZ17I":   ("GTATAC",       3,  3),  # GTA^TAC                 blunt
+    "BtgI":      ("CCRYGG",       1,  5),  # C^CRYGG                 5' overhang
+    "Cac8I":     ("GCNNGC",       3,  3),  # GCN^NGC                 blunt
+    "CviAII":    ("CATG",         1,  3),  # C^ATG                   NcoI-compatible ends (4-cutter)
+    "CviQI":     ("GTAC",         1,  3),  # G^TAC                   KpnI subset (4-cutter)
+    "DpnI":      ("GATC",         2,  2),  # GA^TC                   blunt; cuts only methylated
+    "DpnII":     ("GATC",         0,  4),  # ^GATC     / GATC^       5' overhang (4-cutter)
+    "DrdI":      ("GACNNNNNNGTC", 7,  5),  # GACNNNNN^NGTC           3' overhang
+    "EcoO109I":  ("RGGNCCY",      2,  5),  # RG^GNCCY                5' overhang
+    "HphI":      ("GGTGA",        8, 12),  # GGTGA(8/7) downstream   Type IIS
+    "KasI":      ("GGCGCC",       1,  5),  # G^GCGCC                 5' overhang (NarI isoschizomer)
+    "MboI":      ("GATC",         0,  4),  # ^GATC                   DpnII isoschizomer
+    "MboII":     ("GAAGA",        8, 12),  # GAAGA(8/7) downstream   Type IIS
+    "MlyI":      ("GAGTC",       10, 10),  # GAGTC(5/5) downstream   blunt, Type IIS
+    "MmeI":      ("TCCRAC",      20, 18),  # TCCRAC(20/18)           Type IIS far-cutter
+    "MspA1I":    ("CMGCKG",       3,  3),  # CMG^CKG                 blunt
+    "NgoMIV":    ("GCCGGC",       1,  5),  # G^CCGGC                 5' overhang (EagI-compatible)
+    "NmeAIII":   ("GCCGAG",      21, 19),  # GCCGAG(15/13)           Type IIS far-cutter
+    "NspI":      ("RCATGY",       5,  1),  # RCATG^Y                 3' overhang
+    "PflMI":     ("CCANNNNNTGG",  7,  4),  # CCANN4^NTGG             3' overhang (BstXI isoschizomer)
+    "PspOMI":    ("GGGCCC",       1,  5),  # G^GGCCC                 ApaI isoschizomer (5' overhang)
+    "Sau3AI":    ("GATC",         0,  4),  # ^GATC                   BamHI-compatible ends (4-cutter)
+    "SbfI":      ("CCTGCAGG",     6,  2),  # CCTGCA^GG               already PstI-compatible (see above)
+    "SfcI":      ("CTRYAG",       1,  5),  # C^TRYAG                 5' overhang
+    "SspI":      ("AATATT",       3,  3),  # AAT^ATT                 blunt
+    "TaqI":      ("TCGA",         1,  3),  # T^CGA     / CGT^A       5' overhang (heat-stable)
+    "Van91I":    ("CCANNNNNTGG",  7,  4),  # PflMI isoschizomer
+    "ZraI":      ("GACGTC",       3,  3),  # GAC^GTC                 blunt (AatII-related)
+
+    # ── Type IIS — cut outside recognition sequence ────────────────────────────
+    # fwd/rev positions are still offsets from start of recognition seq.
+    # For an n-bp recognition sequence cutting d1/d2 downstream:
+    #   fwd = n + d1,  rev = n + d2
+    "BaeI":      ("ACNNNNGTAYYC",-10, -7), # cuts 10/15 upstream (negative = upstream)
+    "BbsI":      ("GAAGAC",       8, 12),  # GAAGAC(2/6)  BpiI isoschizomer
+    "BcoDI":     ("GTCTC",        6, 10),  # GTCTC(1/5)   BsaI 5-bp variant
+    "BceAI":     ("ACGGC",        9, 11),  # ACGGC(4/6)
+    "BciVI":     ("GTATCC",      12,  6),  # GTATCC(6/5)  asymmetric
+    "BfuAI":     ("ACCTGC",      10, 14),  # ACCTGC(4/8)  BspMI isoschizomer
+    "BmrI":      ("ACTGGN",       6,  5),  # cuts 1 past end of recog
+    "BpiI":      ("GAAGAC",       8, 12),  # BbsI isoschizomer
+    "BsaI":      ("GGTCTC",       7, 11),  # GGTCTC(1/5)  Golden Gate workhorse
+    "BsaXI":     ("ACNNNNNCTCC",  3, 12),  # cuts upstream and downstream (unusual)
+    "BsbI":      ("CAACAC",      17, 15),  # far-cutter
+    "BseJI":     ("GAAGAC",       8, 12),  # BbsI isoschizomer
+    "BseLI":     ("CCNNNNNNNGG",  7,  4),  # 3' overhang
+    "BseMII":    ("CTCAG",       10,  8),  # CTCAG(5/3)
+    "BseRI":     ("GAGGAG",      10, 14),  # GAGGAG(10/8)
+    "BsgI":      ("GTGCAG",      22, 20),  # GTGCAG(16/14) far-cutter
+    "BslI":      ("CCNNNNNNNGG",  7,  4),  # 3' overhang (BseLI variant)
+    "BsmAI":     ("GTCTC",        6, 10),  # GTCTC(1/5)   BsaI isoschizomer (5-bp)
+    "BsmBI":     ("CGTCTC",       7, 11),  # CGTCTC(1/5)  Esp3I isoschizomer
+    "BsmFI":     ("GGGAC",       15, 19),  # GGGAC(10/14)
+    "BsmI":      ("GAATGC",       7,  1),  # GAATGC(1/-1) asymmetric Type IIS
+    "BspLU11III":("ACATGT",       1,  5),  # PciI isoschizomer (not strictly IIS)
+    "BspMI":     ("ACCTGC",      10, 14),  # ACCTGC(4/8)
+    "BspQI":     ("GCTCTTC",      8, 11),  # SapI isoschizomer
+    "BspTNI":    ("GGTCTC",       7, 11),  # BsaI isoschizomer
+    "BsrBI":     ("CCGCTC",       3,  3),  # cuts within recog (special case)
+    "BsrDI":     ("GCAATG",       8,  6),  # GCAATG(2/0)
+    "BssSI":     ("CACGAG",      -5, -1),  # cuts upstream of recognition
+    "BtgZI":     ("GCGATG",      16, 20),  # GCGATG(10/14)
+    "BtsCI":     ("GGATG",        5,  3),  # GGATG(2/0)
+    "BtsI":      ("GCAGTG",       8,  6),  # GCAGTG(2/0)
+    "BtsImutI":  ("CAGTG",        5,  3),  # BtsCI variant
+    "EarI":      ("CTCTTC",      10,  6),  # CTCTTC(4/1)  SapI-related
+    "Esp3I":     ("CGTCTC",       7, 11),  # BsmBI isoschizomer
+    "PaqCI":     ("CACCTGC",     11, 15),  # CACCTGC(4/8)
+    "SapI":      ("GCTCTTC",      8, 11),  # GCTCTTC(1/4)
+    "BsmBI-v2":  ("CGTCTC",       7, 11),  # v2/HF variant
+
+    # ── High-Fidelity (HF) and v2 variants — same recognition/cut as canonical ─
+    "AgeI-HF":   ("ACCGGT",       1,  5),
+    "BamHI-HF":  ("GGATCC",       1,  5),
+    "BclI-HF":   ("TGATCA",       1,  5),
+    "BmtI":      ("GCTAGC",       1,  5),  # NheI isoschizomer / HF variant
+    "BsiWI-HF":  ("CGTACG",       1,  5),
+    "BsrFI-v2":  ("RCCGGY",       1,  5),
+    "BsrGI-HF":  ("TGTACA",       1,  5),
+    "BssSI-v2":  ("CACGAG",      -5, -1),
+    "BstEII-HF": ("GGTNACC",      1,  5),
+    "BstZ17I-HF":("GTATAC",       3,  3),
+    "DraIII-HF": ("CACNNNGTG",    6,  3),
+    "EcoRI-HF":  ("GAATTC",       1,  5),
+    "EcoRV-HF":  ("GATATC",       3,  3),
+    "HindIII-HF":("AAGCTT",       1,  5),
+    "KpnI-HF":   ("GGTACC",       5,  1),
+    "MfeI-HF":   ("CAATTG",       1,  5),
+    "MluI-HF":   ("ACGCGT",       1,  5),
+    "MunI-HF":   ("CAATTG",       1,  5),
+    "NcoI-HF":   ("CCATGG",       1,  5),
+    "NheI-HF":   ("GCTAGC",       1,  5),
+    "NotI-HF":   ("GCGGCCGC",     2,  6),
+    "NruI-HF":   ("TCGCGA",       3,  3),
+    "NsiI-HF":   ("ATGCAT",       5,  1),
+    "PstI-HF":   ("CTGCAG",       5,  1),
+    "PvuI-HF":   ("CGATCG",       4,  2),
+    "PvuII-HF":  ("CAGCTG",       3,  3),
+    "SacI-HF":   ("GAGCTC",       5,  1),
+    "SalI-HF":   ("GTCGAC",       1,  5),
+    "SbfI-HF":   ("CCTGCAGG",     6,  2),
+    "ScaI-HF":   ("AGTACT",       3,  3),
+    "SpeI-HF":   ("ACTAGT",       1,  5),
+    "SphI-HF":   ("GCATGC",       5,  1),
+    "TaqI-v2":   ("TCGA",         1,  3),
+    "XhoI-HF":   ("CTCGAG",       1,  5),
 }
+
+# Flat recognition-sequence-only dict derived from _NEB_ENZYMES (used by
+# _scan_restriction_sites and _RESTR_COLOR below).
+_RESTRICTION_SITES: dict[str, str] = {
+    name: seq for name, (seq, _, _) in _NEB_ENZYMES.items()
+}
+
 
 _RESTR_PALETTE: list[str] = [
     "color(220)", "color(208)", "color(196)", "color(160)",
@@ -128,26 +356,97 @@ _RESTR_COLOR: dict[str, str] = {
 }
 
 
+_IUPAC_RE: dict[str, str] = {
+    "A": "A", "C": "C", "G": "G", "T": "T",
+    "R": "[AG]", "Y": "[CT]", "W": "[AT]", "S": "[CG]",
+    "M": "[AC]", "K": "[GT]", "B": "[CGT]", "D": "[AGT]",
+    "H": "[ACT]", "V": "[ACG]", "N": "[ACGT]",
+}
+
+
+def _iupac_pattern(site: str) -> "re.Pattern[str]":
+    return re.compile("".join(_IUPAC_RE.get(c, c) for c in site.upper()))
+
+
+def _rc(seq: str) -> str:
+    return seq.upper().translate(str.maketrans("ACGT", "TGCA"))[::-1]
+
+
 def _scan_restriction_sites(seq: str) -> list[dict]:
-    """Scan both strands; return feature-like dicts for every hit."""
+    """Scan both strands; return resite + recut dicts for every hit.
+
+    resite — the recognition sequence span (colored bar)
+    recut  — the cut position (single-bp marker: ↓ above or ↑ below DNA)
+    """
     seq_u = seq.upper()
-    comp  = str.maketrans("ACGT", "TGCA")
-    seq_rc = seq_u.translate(comp)[::-1]
     n = len(seq_u)
     feats: list[dict] = []
-    for name, site in _RESTRICTION_SITES.items():
-        color = _RESTR_COLOR[name]
-        pos = 0
-        while (p := seq_u.find(site, pos)) != -1:
-            feats.append({"type": "site", "start": p, "end": p + len(site),
-                          "strand": 1,  "color": color, "label": name})
-            pos = p + 1
-        pos = 0
-        while (p := seq_rc.find(site, pos)) != -1:
-            start = n - p - len(site)
-            feats.append({"type": "site", "start": start, "end": start + len(site),
-                          "strand": -1, "color": color, "label": name})
-            pos = p + 1
+    seen: set[tuple[str, int, int]] = set()   # deduplicate palindromes
+
+    for name, (site, fwd_cut, rev_cut) in _NEB_ENZYMES.items():
+        color   = _RESTR_COLOR[name]
+        pat     = _iupac_pattern(site)
+        site_len = len(site)
+
+        # Forward strand scan
+        for m in pat.finditer(seq_u):
+            p = m.start()
+            key = (name, p, 1)
+            if key in seen:
+                continue
+            seen.add(key)
+            feats.append({
+                "type":   "resite",
+                "start":  p,
+                "end":    p + site_len,
+                "strand": 1,
+                "color":  color,
+                "label":  name,
+            })
+            # Cut position: fwd_cut bp from recognition start, clamped to seq
+            cut_bp = min(p + fwd_cut, n - 1)
+            feats.append({
+                "type":   "recut",
+                "start":  cut_bp,
+                "end":    cut_bp + 1,
+                "strand": 1,
+                "color":  color,
+                "label":  name,
+            })
+
+        # Reverse strand scan (search rc pattern in seq_u; positions translated back)
+        rc_site = _rc(site)
+        if rc_site != site.upper():  # non-palindrome: search rc separately
+            rc_pat = _iupac_pattern(rc_site)
+        else:
+            rc_pat = pat  # palindrome: same pattern, but we still record strand=-1
+        for m in rc_pat.finditer(seq_u):
+            p = m.start()
+            # Canonical start on fwd strand: same as match start (rc hit IS on fwd coords)
+            orig_start = n - p - site_len
+            key = (name, orig_start, -1)
+            if key in seen:
+                continue
+            seen.add(key)
+            feats.append({
+                "type":   "resite",
+                "start":  orig_start,
+                "end":    orig_start + site_len,
+                "strand": -1,
+                "color":  color,
+                "label":  name,
+            })
+            # rev_cut is offset from recognition start on rc strand
+            cut_bp = min(orig_start + rev_cut, n - 1)
+            feats.append({
+                "type":   "recut",
+                "start":  cut_bp,
+                "end":    cut_bp + 1,
+                "strand": -1,
+                "color":  color,
+                "label":  name,
+            })
+
     return feats
 
 
@@ -227,8 +526,12 @@ def _render_feature_row_pair(
                 label_arr[bar_s + i] = (ch, color)
 
         # Braille bar
-        if bar_len == 1:
-            # Triangle points inward toward the DNA line
+        feat_type = f.get("type", "")
+        if feat_type == "recut":
+            # Cut-site marker: arrow pointing toward the DNA line
+            bar_str = "↑" if is_below_dna else "↓"
+        elif bar_len == 1:
+            # Single-bp feature triangle points inward toward the DNA line
             bar_str = "▲" if is_below_dna else "▼"
         elif strand >= 0:
             bar_str = "⣿" * (bar_len - (1 if ends_here   else 0)) + ("▶" if ends_here   else "")
@@ -300,9 +603,10 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     seq_upper = seq.upper()
     result    = Text(no_wrap=False)
 
-    # Annotation-bar features: exclude restriction sites, largest first
+    # Annotation-bar features: exclude old-style "site" markers, largest first
+    # resite / recut types are included so they appear in the sequence panel
     annot_feats = sorted(
-        [f for f in feats if f.get("type") != "site"],
+        [f for f in feats if f.get("type") not in ("site",)],
         key=lambda f: -(f["end"] - f["start"]),
     )
 
@@ -925,10 +1229,43 @@ class PlasmidMap(Widget):
             bp += tick_int
 
         # ── Restriction site marks ─────────────────────────────────────────────
+        # resite: draw a thin arc just outside (+) or inside (-) the backbone
+        # recut:  draw a radial tick crossing the backbone at the cut position
+        restr_labels: list[tuple[float, str, str]] = []
         for rf in self._restr_feats:
-            mid_bp = (rf["start"] + rf["end"]) // 2
-            tx, ty = a2xy(bp2a(mid_bp), dr=5)
-            canvas.put(tx, ty, "▪", rf["color"])
+            color = rf["color"]
+            if rf["type"] == "resite":
+                dr_lo = 4 if rf["strand"] >= 0 else -5
+                dr_hi = dr_lo + 1
+                start_a = bp2a(rf["start"])
+                end_a   = bp2a(rf["end"])
+                span_a  = (end_a - start_a) % TWO_PI or TWO_PI
+                arc_steps = max(4, int(span_a / TWO_PI * n_steps))
+                inv_arc   = 1.0 / arc_steps if arc_steps else 1.0
+                for dr_i in range(2):
+                    dr     = dr_lo + (dr_hi - dr_lo) * dr_i
+                    _rx2dr = (rx + dr) * 2
+                    _ry4dr = (ry + dr * _ry_rx) * 4
+                    for s in range(arc_steps + 1):
+                        a  = start_a + s * inv_arc * span_a
+                        px = round(cx2 + _rx2dr * math.cos(a))
+                        py = round(cy4 + _ry4dr * math.sin(a))
+                        pcol, prow = px >> 1, py >> 2
+                        if 0 <= pcol < bc_cols and 0 <= prow < bc_rows:
+                            bc_bits[prow][pcol]   |= 1 << _BIT[(py & 3) << 1 | (px & 1)]
+                            if 1 >= bc_prio[prow][pcol]:
+                                bc_colors[prow][pcol] = color
+                                bc_prio[prow][pcol]   = 1
+                # Collect label at midpoint
+                mid_bp = (rf["start"] + rf["end"]) // 2
+                restr_labels.append((bp2a(mid_bp), rf["label"], color))
+            elif rf["type"] == "recut":
+                # Radial tick crossing the backbone at cut position
+                cut_a = bp2a(rf["start"])
+                for dr in range(-1, 3):
+                    tx, ty = a2xy(cut_a, dr=dr)
+                    if 0 <= tx < w and 0 <= ty < h:
+                        canvas.put(tx, ty, "┼" if dr == 0 else "·", color)
 
         # ── Features (large → small) ──────────────────────────────────────────
         feats_sorted = sorted(
@@ -986,6 +1323,10 @@ class PlasmidMap(Widget):
 
             mid_bp = (start_bp + (end_bp - start_bp) // 2) % total
             label_slots.append((bp2a(mid_bp), f["label"], color))
+
+        # Add restriction site labels (from resite entries only)
+        for angle, lbl, color in restr_labels:
+            label_slots.append((angle, lbl, color))
 
         # ── Labels: place each as close to the arc as possible ───────────────
         # Greedily try increasing dr until the label's bounding box doesn't
@@ -1148,11 +1489,34 @@ class PlasmidMap(Widget):
         canvas.put(end_tx, backbone_row, "┤", "color(250)")
 
         # ── Restriction site marks ──
+        # resite: thin braille arc above (fwd) or below (rev) backbone
+        # recut:  radial tick at cut position
         for rf in self._restr_feats:
-            mid_bp = (rf["start"] + rf["end"]) // 2
-            rx_c   = margin_l + mid_bp * usable_w // total
-            if margin_l <= rx_c < w - margin_r:
-                canvas.put(rx_c, backbone_row - 1, "▪", rf["color"])
+            color = rf["color"]
+            if rf["type"] == "resite":
+                x0 = margin_l + rf["start"] * usable_w // total
+                x1 = margin_l + rf["end"]   * usable_w // total
+                x0 = max(margin_l, min(x0, w - margin_r - 1))
+                x1 = max(margin_l, min(x1, w - margin_r - 1))
+                dy = -2 if rf["strand"] >= 0 else 2
+                bar_py = backbone_py + dy * 4
+                for bx in range(x0 * 2, x1 * 2 + 1):
+                    pcol, prow = bx >> 1, bar_py >> 2
+                    if 0 <= pcol < bc_cols and 0 <= prow < bc_rows:
+                        bc_bits[prow][pcol]   |= 1 << _BIT[(bar_py & 3) << 1 | (bx & 1)]
+                        if 1 >= bc_prio[prow][pcol]:
+                            bc_colors[prow][pcol] = color
+                            bc_prio[prow][pcol]   = 1
+            elif rf["type"] == "recut":
+                cut_x = margin_l + rf["start"] * usable_w // total
+                if margin_l <= cut_x < w - margin_r:
+                    row_above = backbone_row - 1
+                    row_below = backbone_row + 1
+                    canvas.put(cut_x, backbone_row, "┼", color)
+                    if 0 <= row_above < h:
+                        canvas.put(cut_x, row_above, "↓" if rf["strand"] >= 0 else " ", color)
+                    if 0 <= row_below < h:
+                        canvas.put(cut_x, row_below, "↑" if rf["strand"] < 0 else " ", color)
 
         # ── Lane assignment (greedy interval scheduling) ──
         fwd_ends: list[int] = []   # rightmost braille-x used per fwd lane

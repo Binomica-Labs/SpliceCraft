@@ -34,6 +34,20 @@
   line from the arc to the label in the circular map.  Both panels respond to the same
   toggle.
 
+- **Full NEB restriction enzyme catalog** — ~200 enzymes from New England Biolabs,
+  including Type IIS (BsaI, BsmBI, BbsI, …) with non-palindromic cut sites.  Each hit
+  is visualized as two distinct overlays:
+  - **Recognition sequence bar** (`resite`) — thin braille arc outside the backbone for
+    forward-strand hits, inside for reverse-strand hits; same strand-above/below layout
+    in the sequence panel.
+  - **Cut site marker** (`recut`) — `↓` (forward) or `↑` (reverse) arrow in the
+    sequence panel; radial `┼` tick on the circular and linear map at the exact cut
+    position.  Type IIS cut sites appear displaced from the recognition sequence as
+    expected.
+  - Recognition sequence IUPAC codes (R, Y, W, S, M, K, B, D, H, V, N) are handled
+    via regex; both strands are scanned.  Enzyme labels appear in the circular map
+    alongside regular feature labels using the same proximity placement algorithm.
+
 - **Circular map: inside tick marks** — bp graduation marks and labels now sit *inside*
   the backbone ring rather than outside, keeping the outer ring clean for feature labels.
   Two constants (`TICK_DR_MARK`, `TICK_DR_LABEL`) control the inset depth and scale
