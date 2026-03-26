@@ -372,21 +372,34 @@ def _rc(seq: str) -> str:
     return seq.upper().translate(str.maketrans("ACGT", "TGCA"))[::-1]
 
 
-def _scan_restriction_sites(seq: str) -> list[dict]:
+def _scan_restriction_sites(
+    seq: str,
+    min_recognition_len: int = 6,
+    unique_only: bool = True,
+) -> list[dict]:
     """Scan both strands; return resite + recut dicts for every hit.
 
     resite — the recognition sequence span (colored bar)
     recut  — the cut position (single-bp marker: ↓ above or ↑ below DNA)
+
+    min_recognition_len — skip enzymes whose recognition site is shorter than this
+                          (default 6 to reduce noise from 4-cutters)
+    unique_only         — if True, only include enzymes that cut exactly once
+                          (forward + reverse strand combined; default True)
     """
     seq_u = seq.upper()
     n = len(seq_u)
-    feats: list[dict] = []
+    # Per-enzyme results collected first so we can filter to unique cutters
+    by_enzyme: dict[str, list[dict]] = {}
     seen: set[tuple[str, int, int]] = set()   # deduplicate palindromes
 
     for name, (site, fwd_cut, rev_cut) in _NEB_ENZYMES.items():
-        color   = _RESTR_COLOR[name]
-        pat     = _iupac_pattern(site)
+        if len(site) < min_recognition_len:
+            continue
+        color    = _RESTR_COLOR[name]
+        pat      = _iupac_pattern(site)
         site_len = len(site)
+        hits: list[dict] = []
 
         # Forward strand scan
         for m in pat.finditer(seq_u):
@@ -395,7 +408,7 @@ def _scan_restriction_sites(seq: str) -> list[dict]:
             if key in seen:
                 continue
             seen.add(key)
-            feats.append({
+            hits.append({
                 "type":   "resite",
                 "start":  p,
                 "end":    p + site_len,
@@ -403,9 +416,8 @@ def _scan_restriction_sites(seq: str) -> list[dict]:
                 "color":  color,
                 "label":  name,
             })
-            # Cut position: fwd_cut bp from recognition start, clamped to seq
             cut_bp = min(p + fwd_cut, n - 1)
-            feats.append({
+            hits.append({
                 "type":   "recut",
                 "start":  cut_bp,
                 "end":    cut_bp + 1,
@@ -414,21 +426,17 @@ def _scan_restriction_sites(seq: str) -> list[dict]:
                 "label":  name,
             })
 
-        # Reverse strand scan (search rc pattern in seq_u; positions translated back)
+        # Reverse strand scan
         rc_site = _rc(site)
-        if rc_site != site.upper():  # non-palindrome: search rc separately
-            rc_pat = _iupac_pattern(rc_site)
-        else:
-            rc_pat = pat  # palindrome: same pattern, but we still record strand=-1
+        rc_pat  = _iupac_pattern(rc_site) if rc_site != site.upper() else pat
         for m in rc_pat.finditer(seq_u):
             p = m.start()
-            # Canonical start on fwd strand: same as match start (rc hit IS on fwd coords)
             orig_start = n - p - site_len
             key = (name, orig_start, -1)
             if key in seen:
                 continue
             seen.add(key)
-            feats.append({
+            hits.append({
                 "type":   "resite",
                 "start":  orig_start,
                 "end":    orig_start + site_len,
@@ -436,9 +444,8 @@ def _scan_restriction_sites(seq: str) -> list[dict]:
                 "color":  color,
                 "label":  name,
             })
-            # rev_cut is offset from recognition start on rc strand
             cut_bp = min(orig_start + rev_cut, n - 1)
-            feats.append({
+            hits.append({
                 "type":   "recut",
                 "start":  cut_bp,
                 "end":    cut_bp + 1,
@@ -447,6 +454,17 @@ def _scan_restriction_sites(seq: str) -> list[dict]:
                 "label":  name,
             })
 
+        if hits:
+            by_enzyme[name] = hits
+
+    feats: list[dict] = []
+    for name, hits in by_enzyme.items():
+        # Count recognition-sequence hits (resite only) across both strands
+        if unique_only:
+            n_sites = sum(1 for h in hits if h["type"] == "resite")
+            if n_sites != 1:
+                continue
+        feats.extend(hits)
     return feats
 
 
