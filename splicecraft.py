@@ -693,11 +693,6 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
         # Row 2: dotted divider   →  "         ·····  "
         # Row 3: rev-comp strand  →  "      3'─TACG…─5'"
         #
-        # prefix_w is 10 for feature rows (kept unchanged so feature bar
-        # column arithmetic works).  The strand prefix "5'─" / "3'─" adds
-        # 3 more columns before the actual bases.
-        strand_pfx = 10   # matches prefix_w used in feature rows
-
         # ── Row 1: 5' forward strand ──
         result.append(f"{chunk_start + 1:>8}  5'─", style="color(245)")
         run_chars: list[str] = []
@@ -731,13 +726,8 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
             result.append("│", style="bold white")
         result.append("─3'\n", style="color(245)")
 
-        # ── Row 2: dotted divider ──
-        result.append(" " * strand_pfx + "   ", style="")
-        result.append("·" * (chunk_end - chunk_start), style="color(238)")
-        result.append("\n")
-
-        # ── Row 3: 3' reverse-complement strand ──
-        result.append(" " * strand_pfx + "3'─", style="color(245)")
+        # ── Row 2: 3' reverse-complement strand ──
+        result.append(" " * 10 + "3'─", style="color(245)")
         run_chars = []
         run_style = ""
         for i in range(chunk_start, chunk_end):
@@ -2133,8 +2123,8 @@ class SequencePanel(Widget):
                         return lane[0]["start"]
                     row += 1
 
-            # DNA rows: fwd strand, dotted divider, RC strand (3 rows total)
-            for _ in range(3):
+            # DNA rows: fwd strand + RC strand (2 rows)
+            for _ in range(2):
                 if row == content_row:
                     if 0 <= seq_col_dna < (chunk_end - chunk_start):
                         return chunk_start + seq_col_dna
@@ -2182,7 +2172,7 @@ class SequencePanel(Widget):
             above_rows = len(above_lanes) * rpg
             if bp < chunk_end:
                 return row + above_rows   # forward-strand DNA row within this chunk
-            row += above_rows + 3 + len(below_lanes) * rpg
+            row += above_rows + 2 + len(below_lanes) * rpg
         return row
 
     def _scroll_to_row(self, row: int) -> None:
@@ -2198,7 +2188,8 @@ class SequencePanel(Widget):
         if not self._seq:
             view.update(Text("  No sequence loaded.", style="dim italic"))
             return
-        line_width = max(20, self.size.width - 14)
+        # 10-char line-number prefix + "5'─" (3) + seq + "─3'" (3) = prefix 16
+        line_width = max(20, self.size.width - 16)
         key = (id(self._seq), id(self._feats), line_width,
                self._sel_range, self._user_sel, self._cursor_pos,
                self._show_connectors)
