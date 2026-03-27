@@ -689,67 +689,56 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                                      10, False, show_connectors)
 
         # ── Double-stranded DNA block ─────────────────────────────────────
-        # Row 1: forward strand   →  "   1  5'─ATGC…─3'"
-        # Row 2: dotted divider   →  "         ·····  "
-        # Row 3: rev-comp strand  →  "      3'─TACG…─5'"
+        # ── Rows 1+2: double-stranded DNA block ──────────────────────────
+        # Forward strand:  "   1  5'─ATGC…─3'"
+        # RC strand:       "      3'─TACG…─5'"
         #
-        # ── Row 1: 5' forward strand ──
-        result.append(f"{chunk_start + 1:>8}  5'─", style="color(245)")
-        run_chars: list[str] = []
-        run_style = ""
+        # ALIGNMENT GUARANTEE: no extra characters are ever inserted into
+        # either strand — both always emit exactly (chunk_end-chunk_start)
+        # base characters between their fixed-width prefixes and suffixes.
+        # The cursor is shown as a reverse-video highlight on the base IN
+        # PLACE rather than as an inserted │ glyph, so column counts match.
+
+        def _strand_chars(bases: "list[str]") -> None:
+            """Append base chars with RLE styling into result."""
+            run: list[str] = []
+            sty = ""
+            for ch, s in bases:
+                if s == sty:
+                    run.append(ch)
+                else:
+                    if run:
+                        result.append("".join(run), style=sty)
+                    run, sty = [ch], s
+            if run:
+                result.append("".join(run), style=sty)
+
+        fwd_bases: list[tuple[str, str]] = []
+        rc_bases:  list[tuple[str, str]] = []
         for i in range(chunk_start, chunk_end):
-            if cursor_pos == i:
-                if run_chars:
-                    result.append("".join(run_chars), style=run_style)
-                    run_chars = []
-                    run_style = ""
-                result.append("│", style="bold white")
             base   = styles[i]
             in_usr = (usr_s <= i < usr_e)
             in_sel = (sel_s <= i < sel_e)
-            if in_usr:
+            is_cur = (cursor_pos == i)
+            if is_cur:
+                sty = "reverse bold white"
+            elif in_usr:
                 sty = base + " on color(237)"
             elif in_sel:
                 sty = "bold underline " + base
             else:
                 sty = base
-            if sty == run_style:
-                run_chars.append(seq_upper[i])
-            else:
-                if run_chars:
-                    result.append("".join(run_chars), style=run_style)
-                run_style = sty
-                run_chars = [seq_upper[i]]
-        if run_chars:
-            result.append("".join(run_chars), style=run_style)
-        if chunk_start <= cursor_pos == chunk_end:
-            result.append("│", style="bold white")
+            fwd_bases.append((seq_upper[i],               sty))
+            rc_bases.append( (seq_upper[i].translate(_COMP), sty))
+
+        # Forward strand
+        result.append(f"{chunk_start + 1:>8}  5'─", style="color(245)")
+        _strand_chars(fwd_bases)
         result.append("─3'\n", style="color(245)")
 
-        # ── Row 2: 3' reverse-complement strand ──
+        # Reverse-complement strand (aligned column-for-column)
         result.append(" " * 10 + "3'─", style="color(245)")
-        run_chars = []
-        run_style = ""
-        for i in range(chunk_start, chunk_end):
-            comp_base = seq_upper[i].translate(_COMP)
-            base   = styles[i]
-            in_usr = (usr_s <= i < usr_e)
-            in_sel = (sel_s <= i < sel_e)
-            if in_usr:
-                sty = base + " on color(237)"
-            elif in_sel:
-                sty = "bold underline " + base
-            else:
-                sty = base
-            if sty == run_style:
-                run_chars.append(comp_base)
-            else:
-                if run_chars:
-                    result.append("".join(run_chars), style=run_style)
-                run_style = sty
-                run_chars = [comp_base]
-        if run_chars:
-            result.append("".join(run_chars), style=run_style)
+        _strand_chars(rc_bases)
         result.append("─5'\n", style="color(245)")
 
         # ── Feature rows BELOW DNA (reverse strand) ──
@@ -2092,7 +2081,7 @@ class SequencePanel(Widget):
         except Exception:
             return -1
 
-        line_width  = max(20, self.size.width - 14)
+        line_width  = max(20, self.size.width - 16)
         annot_feats = sorted(
             [f for f in self._feats if f.get("type") not in ("site", "recut")],
             key=lambda f: -(f["end"] - f["start"]),
@@ -2159,7 +2148,7 @@ class SequencePanel(Widget):
 
     def _bp_to_content_row(self, bp: int) -> int:
         """Return the content row index (0-based) of the DNA line containing bp."""
-        line_width  = max(20, self.size.width - 14)
+        line_width  = max(20, self.size.width - 16)
         annot_feats = self._annot_feats_sorted()
         rpg = 2 + (1 if self._show_connectors else 0)
         n   = len(self._seq)
