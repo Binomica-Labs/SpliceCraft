@@ -663,6 +663,7 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     usr_e  = user_sel[1]  if user_sel  else -1
 
     seq_upper = seq.upper()
+    _COMP     = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")   # base complement
     result    = Text(no_wrap=False)
 
     # Annotation-bar features: exclude old "site" and "recut" (cut pos is
@@ -687,10 +688,18 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
             _render_feature_row_pair(result, lane, chunk_start, chunk_end,
                                      10, False, show_connectors)
 
-        # ── DNA sequence line ──
-        result.append(f"{chunk_start + 1:>8}  ", style="color(245)")
+        # ── Double-stranded DNA block ─────────────────────────────────────
+        # Row 1: forward strand   →  "   1  5'─ATGC…─3'"
+        # Row 2: dotted divider   →  "         ·····  "
+        # Row 3: rev-comp strand  →  "      3'─TACG…─5'"
+        #
+        # prefix_w is 10 for feature rows (kept unchanged so feature bar
+        # column arithmetic works).  The strand prefix "5'─" / "3'─" adds
+        # 3 more columns before the actual bases.
+        strand_pfx = 10   # matches prefix_w used in feature rows
 
-        # RLE sequence — priority: user_sel > feat_sel > plain
+        # ── Row 1: 5' forward strand ──
+        result.append(f"{chunk_start + 1:>8}  5'─", style="color(245)")
         run_chars: list[str] = []
         run_style = ""
         for i in range(chunk_start, chunk_end):
@@ -720,7 +729,38 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
             result.append("".join(run_chars), style=run_style)
         if chunk_start <= cursor_pos == chunk_end:
             result.append("│", style="bold white")
+        result.append("─3'\n", style="color(245)")
+
+        # ── Row 2: dotted divider ──
+        result.append(" " * strand_pfx + "   ", style="")
+        result.append("·" * (chunk_end - chunk_start), style="color(238)")
         result.append("\n")
+
+        # ── Row 3: 3' reverse-complement strand ──
+        result.append(" " * strand_pfx + "3'─", style="color(245)")
+        run_chars = []
+        run_style = ""
+        for i in range(chunk_start, chunk_end):
+            comp_base = seq_upper[i].translate(_COMP)
+            base   = styles[i]
+            in_usr = (usr_s <= i < usr_e)
+            in_sel = (sel_s <= i < sel_e)
+            if in_usr:
+                sty = base + " on color(237)"
+            elif in_sel:
+                sty = "bold underline " + base
+            else:
+                sty = base
+            if sty == run_style:
+                run_chars.append(comp_base)
+            else:
+                if run_chars:
+                    result.append("".join(run_chars), style=run_style)
+                run_style = sty
+                run_chars = [comp_base]
+        if run_chars:
+            result.append("".join(run_chars), style=run_style)
+        result.append("─5'\n", style="color(245)")
 
         # ── Feature rows BELOW DNA (reverse strand) ──
         for lane in below_lanes:
@@ -2070,7 +2110,8 @@ class SequencePanel(Widget):
         rpg = 2 + (1 if self._show_connectors else 0)  # rows per feature group
         n   = len(self._seq)
         row = 0
-        seq_col = vp_x - 10  # column within content (10 = 8-char line num + 2 spaces)
+        seq_col     = vp_x - 10   # offset for feature bar rows (prefix_w = 10)
+        seq_col_dna = vp_x - 13   # offset for DNA rows (10 + 3 for '5'─' / '3'─')
 
         for chunk_start in range(0, n, line_width):
             chunk_end   = min(chunk_start + line_width, n)
@@ -2092,12 +2133,13 @@ class SequencePanel(Widget):
                         return lane[0]["start"]
                     row += 1
 
-            # DNA row
-            if row == content_row:
-                if 0 <= seq_col <= (chunk_end - chunk_start):
-                    return chunk_start + seq_col
-                return -1
-            row += 1
+            # DNA rows: fwd strand, dotted divider, RC strand (3 rows total)
+            for _ in range(3):
+                if row == content_row:
+                    if 0 <= seq_col_dna < (chunk_end - chunk_start):
+                        return chunk_start + seq_col_dna
+                    return -1
+                row += 1
 
             # Below feature rows (reverse strand)
             for lane in below_lanes:
@@ -2139,8 +2181,8 @@ class SequencePanel(Widget):
             above_lanes, below_lanes = _assign_chunk_features(chunk_feats, chunk_start, chunk_end)
             above_rows = len(above_lanes) * rpg
             if bp < chunk_end:
-                return row + above_rows   # DNA row within this chunk
-            row += above_rows + 1 + len(below_lanes) * rpg
+                return row + above_rows   # forward-strand DNA row within this chunk
+            row += above_rows + 3 + len(below_lanes) * rpg
         return row
 
     def _scroll_to_row(self, row: int) -> None:
