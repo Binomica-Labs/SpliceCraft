@@ -650,7 +650,8 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     non-site feature, capped at 4, largest first).
     Each feature renders as:  label row  /  [connector row]  /  braille bar row.
     """
-    n = len(seq)
+    n     = len(seq)
+    num_w = len(str(n)) if n else 1    # minimum digits needed for line numbers
     styles = ["color(252)"] * n
     for f in reversed(feats):          # reversed so first feature wins
         col = f["color"]
@@ -664,7 +665,7 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
 
     seq_upper = seq.upper()
     _COMP     = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")   # base complement
-    result    = Text(no_wrap=False)
+    result    = Text(no_wrap=True, overflow="crop")
 
     # Annotation-bar features: exclude old "site" and "recut" (cut pos is
     # embedded inside the resite bar; recut only used by the map overlays).
@@ -686,7 +687,7 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
         # ── Feature rows ABOVE DNA (forward strand) ──
         for lane in above_lanes:
             _render_feature_row_pair(result, lane, chunk_start, chunk_end,
-                                     10, False, show_connectors)
+                                     num_w + 2, False, show_connectors)
 
         # ── Double-stranded DNA block ─────────────────────────────────────
         # ── Rows 1+2: double-stranded DNA block ──────────────────────────
@@ -732,19 +733,19 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
             rc_bases.append( (seq_upper[i].translate(_COMP), sty))
 
         # Forward strand
-        result.append(f"{chunk_start + 1:>8}  5'─", style="color(245)")
+        result.append(f"{chunk_start + 1:>{num_w}}  ", style="color(245)")
         _strand_chars(fwd_bases)
-        result.append("─3'\n", style="color(245)")
+        result.append("\n")
 
         # Reverse-complement strand (aligned column-for-column)
-        result.append(" " * 10 + "3'─", style="color(245)")
+        result.append(" " * (num_w + 2), style="color(245)")
         _strand_chars(rc_bases)
-        result.append("─5'\n", style="color(245)")
+        result.append("\n")
 
         # ── Feature rows BELOW DNA (reverse strand) ──
         for lane in below_lanes:
             _render_feature_row_pair(result, lane, chunk_start, chunk_end,
-                                     10, True, show_connectors)
+                                     num_w + 2, True, show_connectors)
 
     return result
 
@@ -2066,6 +2067,10 @@ class SequencePanel(Widget):
         double = event.chain >= 2
         self.post_message(self.SequenceClick(bp, double=double))
 
+    def _seq_render_width(self) -> int:
+        """Character width of the render area, minus the 2-col vertical scrollbar."""
+        return max(20, self.size.width - 2)
+
     def _click_to_bp(self, screen_x: int, screen_y: int) -> int:
         """Map absolute screen coords to a bp index, or -1 if not on a base."""
         if not self._seq:
@@ -2081,16 +2086,16 @@ class SequencePanel(Widget):
         except Exception:
             return -1
 
-        line_width  = max(20, self.size.width - 16)
+        n           = len(self._seq)
+        num_w       = len(str(n)) if n else 1
+        line_width  = max(20, self._seq_render_width() - (num_w + 2))
         annot_feats = sorted(
             [f for f in self._feats if f.get("type") not in ("site", "recut")],
             key=lambda f: -(f["end"] - f["start"]),
         )
-        rpg = 2 + (1 if self._show_connectors else 0)  # rows per feature group
-        n   = len(self._seq)
-        row = 0
-        seq_col     = vp_x - 10   # offset for feature bar rows (prefix_w = 10)
-        seq_col_dna = vp_x - 13   # offset for DNA rows (10 + 3 for '5'─' / '3'─')
+        rpg     = 2 + (1 if self._show_connectors else 0)  # rows per feature group
+        row     = 0
+        seq_col = vp_x - (num_w + 2)   # offset past the num+2-space prefix
 
         for chunk_start in range(0, n, line_width):
             chunk_end   = min(chunk_start + line_width, n)
@@ -2115,8 +2120,8 @@ class SequencePanel(Widget):
             # DNA rows: fwd strand + RC strand (2 rows)
             for _ in range(2):
                 if row == content_row:
-                    if 0 <= seq_col_dna < (chunk_end - chunk_start):
-                        return chunk_start + seq_col_dna
+                    if 0 <= seq_col < (chunk_end - chunk_start):
+                        return chunk_start + seq_col
                     return -1
                 row += 1
 
@@ -2148,10 +2153,11 @@ class SequencePanel(Widget):
 
     def _bp_to_content_row(self, bp: int) -> int:
         """Return the content row index (0-based) of the DNA line containing bp."""
-        line_width  = max(20, self.size.width - 16)
+        n           = len(self._seq)
+        num_w       = len(str(n)) if n else 1
+        line_width  = max(20, self._seq_render_width() - (num_w + 2))
         annot_feats = self._annot_feats_sorted()
         rpg = 2 + (1 if self._show_connectors else 0)
-        n   = len(self._seq)
         row = 0
         for chunk_start in range(0, n, line_width):
             chunk_end   = min(chunk_start + line_width, n)
@@ -2177,8 +2183,10 @@ class SequencePanel(Widget):
         if not self._seq:
             view.update(Text("  No sequence loaded.", style="dim italic"))
             return
-        # 10-char line-number prefix + "5'─" (3) + seq + "─3'" (3) = prefix 16
-        line_width = max(20, self.size.width - 16)
+        # num_w-char line number + "  " (2) + seq = num_w + 2 overhead
+        # Use actual scroll-container content width (excludes 2-col vertical scrollbar)
+        num_w      = len(str(len(self._seq))) if self._seq else 1
+        line_width = max(20, self._seq_render_width() - (num_w + 2))
         key = (id(self._seq), id(self._feats), line_width,
                self._sel_range, self._user_sel, self._cursor_pos,
                self._show_connectors)
