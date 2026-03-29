@@ -1965,9 +1965,6 @@ class SequencePanel(Widget):
         self._user_sel  = None          # clear shift-selection on programmatic highlight
         self._refresh_view()
 
-        # Scroll to feature start (accounting for annotation bar rows)
-        self._scroll_to_row(self._bp_to_content_row(start))
-
         trans_box = self.query_one("#seq-trans", Static)
         if feat.get("type") == "CDS":
             aa   = _translate_cds(self._seq, start, end, feat.get("strand", 1))
@@ -1991,7 +1988,7 @@ class SequencePanel(Widget):
         self._sel_range  = None
         self._cursor_pos = start
         self._refresh_view()
-        self._scroll_to_row(self._bp_to_content_row(start))
+        self._ensure_cursor_visible()
 
     # ── Mouse / click ──────────────────────────────────────────────────────────
 
@@ -2017,7 +2014,7 @@ class SequencePanel(Widget):
             self._cursor_pos = bp
             self._user_sel   = None
         self._refresh_view()
-        self._scroll_to_row(self._bp_to_content_row(bp))
+        self._ensure_cursor_visible()
 
     def on_mouse_move(self, event: MouseMove) -> None:
         if not self._mouse_button_held or self._drag_start_bp < 0:
@@ -2057,11 +2054,9 @@ class SequencePanel(Widget):
         resite = self._last_resite_click
         self._last_resite_click = None
         if resite is not None:
-            self._sel_range  = (resite["start"], min(resite["end"], len(self._seq)))
-            self._user_sel   = None
-            self._cursor_pos = resite["start"]
+            self._sel_range = (resite["start"], min(resite["end"], len(self._seq)))
+            self._user_sel  = None
             self._refresh_view()
-            self._scroll_to_row(self._bp_to_content_row(resite["start"]))
             return
 
         double = event.chain >= 2
@@ -2170,6 +2165,12 @@ class SequencePanel(Widget):
             row += above_rows + 2 + len(below_lanes) * rpg
         return row
 
+    def _line_width(self) -> int:
+        """Number of bp per displayed line."""
+        n = len(self._seq)
+        num_w = len(str(n)) if n else 1
+        return max(20, self._seq_render_width() - (num_w + 2))
+
     def _scroll_to_row(self, row: int) -> None:
         try:
             self.query_one("#seq-scroll", ScrollableContainer).scroll_to(
@@ -2177,6 +2178,32 @@ class SequencePanel(Widget):
             )
         except Exception:
             pass
+
+    def _ensure_cursor_visible(self) -> None:
+        """Scroll just enough so the cursor's DNA line is fully visible.
+
+        Deferred to run after the next refresh so that the scroll container
+        has already processed any content update (which can reset scroll_y).
+        """
+        if self._cursor_pos < 0 or not self._seq:
+            return
+        row = self._bp_to_content_row(self._cursor_pos)
+        row_bottom = row + 1   # fwd + rc strand = 2 rows
+
+        def _do_scroll():
+            try:
+                scroll = self.query_one("#seq-scroll", ScrollableContainer)
+                vp_top = int(scroll.scroll_y)
+                vp_h   = scroll.size.height
+                vp_bottom = vp_top + vp_h - 1
+                if row < vp_top:
+                    scroll.scroll_to(0, row, animate=False)
+                elif row_bottom > vp_bottom:
+                    scroll.scroll_to(0, row_bottom - vp_h + 1, animate=False)
+            except Exception:
+                pass
+
+        self.call_after_refresh(_do_scroll)
 
     def _refresh_view(self) -> None:
         view = self.query_one("#seq-view", Static)
@@ -2200,7 +2227,22 @@ class SequencePanel(Widget):
                 show_connectors = self._show_connectors,
             )
             self._view_cache_key = key
+
+        # Preserve scroll position across content update
+        try:
+            scroll = self.query_one("#seq-scroll", ScrollableContainer)
+            saved_y = scroll.scroll_y
+        except Exception:
+            saved_y = None
         view.update(self._view_cache_txt)
+        if saved_y is not None and saved_y > 0:
+            def _restore():
+                try:
+                    scroll = self.query_one("#seq-scroll", ScrollableContainer)
+                    scroll.scroll_to(0, saved_y, animate=False)
+                except Exception:
+                    pass
+            self.call_after_refresh(_restore)
 
     def on_resize(self, _) -> None:
         self._refresh_view()
@@ -2958,17 +3000,24 @@ UnsavedQuitModal { align: center middle; }
         # ── Arrow keys: move sequence cursor ──────────────────────────────────
         if sp._cursor_pos < 0 or not sp._seq:
             return
+        n = len(sp._seq)
         if event.key == "left":
             new_pos = max(0, sp._cursor_pos - 1)
         elif event.key == "right":
-            new_pos = min(len(sp._seq), sp._cursor_pos + 1)
+            new_pos = min(n - 1, sp._cursor_pos + 1)
+        elif event.key == "up":
+            lw = sp._line_width()
+            new_pos = max(0, sp._cursor_pos - lw)
+        elif event.key == "down":
+            lw = sp._line_width()
+            new_pos = min(n - 1, sp._cursor_pos + lw)
         else:
             return
         event.stop()
         sp._cursor_pos = new_pos
         sp._user_sel   = None
         sp._refresh_view()
-        sp._scroll_to_row(sp._bp_to_content_row(new_pos))
+        sp._ensure_cursor_visible()
 
     # ── Undo / redo ────────────────────────────────────────────────────────────
 
