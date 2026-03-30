@@ -78,20 +78,28 @@ _FEATURE_PALETTE: list[str] = [
 # ── Library persistence ────────────────────────────────────────────────────────
 
 _LIBRARY_FILE = Path(__file__).parent / "plasmid_library.json"
+_library_cache: "list | None" = None
 
 def _load_library() -> list[dict]:
+    global _library_cache
+    if _library_cache is not None:
+        return list(_library_cache)
     if _LIBRARY_FILE.exists():
         try:
-            return json.loads(_LIBRARY_FILE.read_text())
+            _library_cache = json.loads(_LIBRARY_FILE.read_text())
+            return list(_library_cache)
         except Exception:
             pass
+    _library_cache = []
     return []
 
 def _save_library(entries: list[dict]) -> None:
+    global _library_cache
     try:
         _LIBRARY_FILE.write_text(json.dumps(entries, indent=2))
     except Exception:
         pass
+    _library_cache = list(entries)
 
 # ── Restriction sites ──────────────────────────────────────────────────────────
 
@@ -741,10 +749,14 @@ def _chunk_lane_groups(
       re_above → onebp_above → reg_above → DNA → reg_below → onebp_below → re_below
     Multi-bp regular features are closest to DNA; 1bp features next; RE sites farthest.
     """
-    regular = [f for f in chunk_feats if f.get("type") != "resite"]
-    resites = [f for f in chunk_feats if f.get("type") == "resite"]
-    onebp   = [f for f in regular if f["end"] - f["start"] == 1]
-    multibp = [f for f in regular if f["end"] - f["start"] != 1]
+    resites, onebp, multibp = [], [], []
+    for f in chunk_feats:
+        if f.get("type") == "resite":
+            resites.append(f)
+        elif f["end"] - f["start"] == 1:
+            onebp.append(f)
+        else:
+            multibp.append(f)
     reg_above,   reg_below   = _assign_chunk_features(multibp, chunk_start, chunk_end)
     onebp_above, onebp_below = _assign_chunk_features(onebp,   chunk_start, chunk_end)
     re_above,    re_below    = _assign_chunk_features(resites, chunk_start, chunk_end)
@@ -915,23 +927,15 @@ _CODON_TABLE: dict[str, str] = {
     "GGT": "G", "GGC": "G", "GGA": "G", "GGG": "G",
 }
 
-def _copy_to_clipboard(text: str) -> bool:
-    """Copy text to system clipboard via xclip / xsel / wl-copy. Returns True on success."""
-    import subprocess
-    for cmd in (
-        ["xclip", "-selection", "clipboard"],
-        ["xsel", "--clipboard", "--input"],
-        ["wl-copy"],
-    ):
-        try:
-            subprocess.run(cmd, input=text.encode(), check=True, timeout=3,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return True
-        except Exception:
-            continue
+def _copy_to_clipboard_osc52(text: str) -> bool:
+    """Copy text via OSC 52 escape sequence — works in Windows Terminal, iTerm2, most modern terminals."""
+    import base64
+    encoded = base64.b64encode(text.encode()).decode()
+    seq = f"\033]52;c;{encoded}\007"
     try:
-        import pyperclip
-        pyperclip.copy(text)
+        with open("/dev/tty", "w") as tty:
+            tty.write(seq)
+            tty.flush()
         return True
     except Exception:
         return False
@@ -1062,18 +1066,6 @@ class _Canvas:
     def put_text(self, col: int, row: int, text: str, style: str = ""):
         for j, ch in enumerate(text):
             self.put(col + j, row, ch, style)
-
-    def to_rich_text(self) -> Text:
-        result = Text(no_wrap=True, overflow="crop")
-        for r in range(self.h):
-            for c in range(self.w):
-                ch = self._chars[r][c]
-                st = self._styles[r][c]
-                result.append(ch, style=st) if st else result.append(ch)
-            if r < self.h - 1:
-                result.append("\n")
-        return result
-
 
 class _BrailleCanvas:
     """
@@ -1377,7 +1369,7 @@ class PlasmidMap(Widget):
         if w < 30 or h < 14:
             return Text(f"  Window too small ({w}×{h})", style="dim red")
         key = (w, h, self.origin_bp, self.selected_idx, self._aspect,
-               len(self._feats), len(self._restr_feats), self._map_mode,
+               id(self._feats), id(self._restr_feats), self._map_mode,
                self._show_connectors)
         if self._render_cache and self._render_cache[0] == key:
             return self._render_cache[1]
@@ -1563,8 +1555,8 @@ class PlasmidMap(Widget):
         dr_min = LABEL_DR_MIN
         dr_max = max(rx // 2 + 6, LABEL_DR_MIN + 10)
 
-        # placed: list of (x0, x1, row) bounding boxes of accepted labels
-        placed_boxes: list[tuple[int, int, int]] = []
+        # placed: dict keyed by row → list of (x0, x1) bounding boxes
+        placed_by_row: dict[int, list] = {}
         final_labels: list[tuple[float, str, str, int, int, int]] = []
         # angle, lbl, color, chosen_dr, lx, ly
 
@@ -1577,10 +1569,10 @@ class PlasmidMap(Widget):
                     continue
                 lbl_x0 = lx if on_right else max(0, lx - len(lbl) + 1)
                 lbl_x1 = lx + len(lbl) - 1 if on_right else lx
-                # Check against every already-placed box
+                # Check against already-placed boxes on the same row only
                 ok = True
-                for bx0, bx1, by in placed_boxes:
-                    if by == ly and not (lbl_x1 < bx0 or lbl_x0 > bx1):
+                for bx0, bx1 in placed_by_row.get(ly, []):
+                    if not (lbl_x1 < bx0 or lbl_x0 > bx1):
                         ok = False
                         break
                 if ok:
@@ -1593,7 +1585,7 @@ class PlasmidMap(Widget):
                 lbl_x1 = lx + len(lbl) - 1 if on_right else lx
                 chosen = (dr_max, lx, ly, lbl_x0, lbl_x1)
             dr_c, lx, ly, lbl_x0, lbl_x1 = chosen
-            placed_boxes.append((lbl_x0, lbl_x1, ly))
+            placed_by_row.setdefault(ly, []).append((lbl_x0, lbl_x1))
             final_labels.append((angle, lbl, color, dr_c, lx, ly))
 
         # Render
@@ -2079,6 +2071,7 @@ class SequencePanel(Widget):
         self._view_cache_txt: "Text | None"         = None
         self._show_connectors:  bool = False
         self._re_highlight: "dict | None" = None  # RE cut visualization
+        self._sel_anchor:   int         = -1    # anchor for Shift+arrow extension
         # Drag-to-select state
         self._drag_start_bp:    int  = -1
         self._has_dragged:      bool = False
@@ -2087,6 +2080,7 @@ class SequencePanel(Widget):
         self._last_was_drag:    bool = False
         # Set by _click_to_bp when the click lands on a resite bar row
         self._last_resite_click: "dict | None" = None
+        self._sorted_feats_cache: "list | None" = None
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -2103,15 +2097,22 @@ class SequencePanel(Widget):
         """Called after loading a record or committing an edit."""
         self._seq          = seq
         self._feats        = feats
+        self._sorted_feats_cache = None
         self._sel_range    = None
         self._user_sel     = None
         self._cursor_pos   = -1
         self._re_highlight = None
+        self._sel_anchor   = -1
         self.remove_class("has-trans")
         self._refresh_view()
 
-    def highlight_feature(self, feat: "dict | None") -> None:
-        """Highlight a feature's region in the sequence; show CDS translation."""
+    def highlight_feature(self, feat: "dict | None", cursor_bp: int = -1) -> None:
+        """Highlight a feature's region in the sequence; show CDS translation.
+
+        cursor_bp: if >= 0, anchor the cursor (and scroll) at this bp position.
+                   Use this for sequence-panel clicks so scroll stays at the
+                   clicked position rather than jumping to the feature start.
+        """
         self._re_highlight = None
         if feat is None or not self._seq:
             self._sel_range = None
@@ -2120,9 +2121,14 @@ class SequencePanel(Widget):
             return
 
         start, end = feat["start"], min(feat["end"], len(self._seq))
-        self._sel_range = (start, end)
-        self._user_sel  = None          # clear shift-selection on programmatic highlight
+        self._sel_range  = (start, end)
+        self._user_sel   = None          # clear shift-selection on programmatic highlight
+        self._sel_anchor = -1
+        if cursor_bp >= 0:
+            self._cursor_pos = cursor_bp
         self._refresh_view()
+        if cursor_bp >= 0:
+            self._ensure_cursor_visible()
 
         trans_box = self.query_one("#seq-trans", Static)
         if feat.get("type") == "CDS":
@@ -2137,17 +2143,44 @@ class SequencePanel(Widget):
         else:
             self.remove_class("has-trans")
 
-    def select_feature_range(self, feat: dict) -> None:
-        """Double-click highlight: set user_sel to the entire feature span."""
+    def select_feature_range(self, feat: dict, cursor_bp: int = -1) -> None:
+        """Highlight the entire feature span as a copyable selection.
+
+        cursor_bp: if >= 0 (sequence-panel click), keep cursor at that bp and
+                   anchor the Shift+arrow selection there. Otherwise cursor goes
+                   to the feature end so Shift+arrow naturally extends outward.
+        """
         if not self._seq or feat is None:
             return
         start = feat["start"]
         end   = min(feat["end"], len(self._seq))
-        self._user_sel   = (start, end)
-        self._sel_range  = None
-        self._cursor_pos = start
+        self._user_sel  = (start, end)
+        self._sel_range = None
+        self._re_highlight = None
+        if cursor_bp >= 0:
+            # Sequence-panel click: cursor stays at click; anchor at feature start
+            self._cursor_pos = cursor_bp
+            self._sel_anchor = start
+        else:
+            # Map/sidebar/double-click: cursor at feature end, anchor at start
+            self._cursor_pos = max(start, end - 1)
+            self._sel_anchor = start
         self._refresh_view()
         self._ensure_cursor_visible()
+
+        # Show CDS translation when applicable
+        trans_box = self.query_one("#seq-trans", Static)
+        if feat.get("type") == "CDS":
+            aa   = _translate_cds(self._seq, start, end, feat.get("strand", 1))
+            n_aa = len(aa.rstrip("*"))
+            t    = Text()
+            t.append(f" {feat['label']}  ", style=f"bold {feat['color']}")
+            t.append(f"({n_aa} aa)  ", style="dim")
+            t.append(aa[:self.size.width - 4], style=feat["color"])
+            trans_box.update(t)
+            self.add_class("has-trans")
+        else:
+            self.remove_class("has-trans")
 
     # ── Mouse / click ──────────────────────────────────────────────────────────
 
@@ -2162,16 +2195,19 @@ class SequencePanel(Widget):
         self._has_dragged       = False
         self._drag_was_shift    = event.shift
         if event.shift and self._cursor_pos >= 0:
-            # Shift+click: extend selection from cursor to here
-            s = min(self._cursor_pos, bp)
-            e = max(self._cursor_pos, bp) + 1
+            # Shift+click: extend selection from anchor (or cursor) to here
+            anchor = self._sel_anchor if self._sel_anchor >= 0 else self._cursor_pos
+            self._sel_anchor = anchor
+            s = min(anchor, bp)
+            e = max(anchor, bp) + 1
             self._user_sel   = (s, e)
             self._cursor_pos = bp
             self._sel_range  = None
         else:
-            # Plain click: place cursor, clear selection
+            # Plain click: place cursor, clear selection and anchor
             self._cursor_pos = bp
             self._user_sel   = None
+            self._sel_anchor = -1
         self._refresh_view()
         self._ensure_cursor_visible()
 
@@ -2279,7 +2315,7 @@ class SequencePanel(Widget):
                     if f.get("type") == "resite":
                         self._last_resite_click = f
                     return (f["start"] + f["end"]) // 2
-            return lane[0]["start"]
+            return -1
 
         for chunk_start in range(0, n, line_width):
             chunk_end   = min(chunk_start + line_width, n)
@@ -2318,10 +2354,12 @@ class SequencePanel(Widget):
     # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _annot_feats_sorted(self) -> list:
-        return sorted(
-            [f for f in self._feats if f.get("type") not in ("site", "recut")],
-            key=lambda f: -(f["end"] - f["start"]),
-        )
+        if self._sorted_feats_cache is None:
+            self._sorted_feats_cache = sorted(
+                [f for f in self._feats if f.get("type") not in ("site", "recut")],
+                key=lambda f: -(f["end"] - f["start"]),
+            )
+        return self._sorted_feats_cache
 
     def _bp_to_content_row(self, bp: int) -> int:
         """Return the content row index (0-based) of the DNA line containing bp."""
@@ -2387,6 +2425,10 @@ class SequencePanel(Widget):
 
     def _refresh_view(self) -> None:
         view = self.query_one("#seq-view", Static)
+        try:
+            scroll = self.query_one("#seq-scroll", ScrollableContainer)
+        except Exception:
+            scroll = None
         if not self._seq:
             view.update(Text("  No sequence loaded.", style="dim italic"))
             return
@@ -2413,19 +2455,12 @@ class SequencePanel(Widget):
             self._view_cache_key = key
 
         # Preserve scroll position across content update
-        try:
-            scroll = self.query_one("#seq-scroll", ScrollableContainer)
-            saved_y = scroll.scroll_y
-        except Exception:
-            saved_y = None
+        saved_y = scroll.scroll_y if scroll is not None else None
         view.update(self._view_cache_txt)
         if saved_y is not None and saved_y > 0:
             def _restore():
-                try:
-                    scroll = self.query_one("#seq-scroll", ScrollableContainer)
+                if scroll is not None:
                     scroll.scroll_to(0, saved_y, animate=False)
-                except Exception:
-                    pass
             self.call_after_refresh(_restore)
 
     def on_resize(self, _) -> None:
@@ -3163,11 +3198,14 @@ UnsavedQuitModal { align: center middle; }
                 sel = sp._user_sel or sp._sel_range
                 if sel:
                     text = seq[sel[0]:sel[1]].upper()
-                    if _copy_to_clipboard(text):
+                    try:
+                        self.copy_to_clipboard(text)
                         self.notify(f"Copied {len(text)} bp to clipboard")
-                    else:
-                        self.notify("Clipboard unavailable (install xclip / xsel / wl-copy)",
-                                    severity="warning")
+                    except Exception:
+                        if _copy_to_clipboard_osc52(text):
+                            self.notify(f"Copied {len(text)} bp to clipboard")
+                        else:
+                            self.notify("Clipboard unavailable", severity="warning")
                 else:
                     self.notify("No selection — Shift+click or double-click a feature first",
                                 severity="information")
@@ -3186,25 +3224,36 @@ UnsavedQuitModal { align: center middle; }
             event.stop()
             return
 
-        # ── Arrow keys: move sequence cursor ──────────────────────────────────
+        # ── Arrow keys: move cursor; Shift+arrow extends selection ───────────
         if sp._cursor_pos < 0 or not sp._seq:
             return
-        n = len(sp._seq)
-        if event.key == "left":
+        n  = len(sp._seq)
+        k  = event.key
+        lw = sp._line_width()
+        if k in ("left", "shift+left"):
             new_pos = max(0, sp._cursor_pos - 1)
-        elif event.key == "right":
+        elif k in ("right", "shift+right"):
             new_pos = min(n - 1, sp._cursor_pos + 1)
-        elif event.key == "up":
-            lw = sp._line_width()
+        elif k in ("up", "shift+up"):
             new_pos = max(0, sp._cursor_pos - lw)
-        elif event.key == "down":
-            lw = sp._line_width()
+        elif k in ("down", "shift+down"):
             new_pos = min(n - 1, sp._cursor_pos + lw)
         else:
             return
         event.stop()
-        sp._cursor_pos = new_pos
-        sp._user_sel   = None
+        if k.startswith("shift+"):
+            # Extend or shrink selection; anchor is set on first Shift+arrow press
+            if sp._sel_anchor < 0:
+                sp._sel_anchor = sp._cursor_pos
+            sp._cursor_pos = new_pos
+            s = min(sp._sel_anchor, new_pos)
+            e = max(sp._sel_anchor, new_pos) + 1
+            sp._user_sel  = (s, e)
+            sp._sel_range = None
+        else:
+            sp._cursor_pos = new_pos
+            sp._user_sel   = None
+            sp._sel_anchor = -1
         sp._refresh_view()
         sp._ensure_cursor_visible()
 
@@ -3382,7 +3431,7 @@ UnsavedQuitModal { align: center middle; }
         self._mark_clean()
         self.notify(
             f"Loaded {record.name}  ({len(record.seq):,} bp, "
-            f"{len(pm._feats)} features, {len(restr)} restriction sites)"
+            f"{len(pm._feats)} features, {len(self._restr_cache)} restriction sites)"
         )
 
     # ── Feature selection: map ↔ sidebar ↔ sequence panel ─────────────────────
@@ -3406,11 +3455,8 @@ UnsavedQuitModal { align: center middle; }
             pm.select_feature(best_idx)
             sidebar.show_detail(f)
             sidebar.highlight_row(best_idx)
-            if event.double:
-                # Double-click: highlight entire feature span as editable selection
-                seq_pnl.select_feature_range(f)
-            else:
-                seq_pnl.highlight_feature(f)
+            # Single or double click: select full feature range (copyable highlight)
+            seq_pnl.select_feature_range(f, cursor_bp=bp)
 
     @on(PlasmidMap.FeatureSelected)
     def _map_feat_selected(self, event: PlasmidMap.FeatureSelected):
