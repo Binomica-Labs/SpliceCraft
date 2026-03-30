@@ -246,11 +246,9 @@ _NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
     "MspA1I":    ("CMGCKG",       3,  3),  # CMG^CKG                 blunt
     "NgoMIV":    ("GCCGGC",       1,  5),  # G^CCGGC                 5' overhang (EagI-compatible)
     "NmeAIII":   ("GCCGAG",      21, 19),  # GCCGAG(15/13)           Type IIS far-cutter
-    "NspI":      ("RCATGY",       5,  1),  # RCATG^Y                 3' overhang
     "PflMI":     ("CCANNNNNTGG",  7,  4),  # CCANN4^NTGG             3' overhang (BstXI isoschizomer)
     "PspOMI":    ("GGGCCC",       1,  5),  # G^GGCCC                 ApaI isoschizomer (5' overhang)
     "Sau3AI":    ("GATC",         0,  4),  # ^GATC                   BamHI-compatible ends (4-cutter)
-    "SbfI":      ("CCTGCAGG",     6,  2),  # CCTGCA^GG               already PstI-compatible (see above)
     "SfcI":      ("CTRYAG",       1,  5),  # C^TRYAG                 5' overhang
     "SspI":      ("AATATT",       3,  3),  # AAT^ATT                 blunt
     "TaqI":      ("TCGA",         1,  3),  # T^CGA     / CGT^A       5' overhang (heat-stable)
@@ -364,12 +362,23 @@ _IUPAC_RE: dict[str, str] = {
 }
 
 
-def _iupac_pattern(site: str) -> "re.Pattern[str]":
-    return re.compile("".join(_IUPAC_RE.get(c, c) for c in site.upper()))
+_PATTERN_CACHE: dict[str, "re.Pattern[str]"] = {}
 
+def _iupac_pattern(site: str) -> "re.Pattern[str]":
+    if site not in _PATTERN_CACHE:
+        _PATTERN_CACHE[site] = re.compile(
+            "".join(_IUPAC_RE.get(c, c) for c in site.upper())
+        )
+    return _PATTERN_CACHE[site]
+
+
+_IUPAC_COMP = str.maketrans(
+    "ACGTRYWSMKBDHVN",
+    "TGCAYRWSKMVHDBN",
+)
 
 def _rc(seq: str) -> str:
-    return seq.upper().translate(str.maketrans("ACGT", "TGCA"))[::-1]
+    return seq.upper().translate(_IUPAC_COMP)[::-1]
 
 
 def _scan_restriction_sites(
@@ -408,14 +417,17 @@ def _scan_restriction_sites(
             if key in seen:
                 continue
             seen.add(key)
+            # ext_cut_bp: absolute cut position when cut falls outside recognition
+            _ext = (p + fwd_cut) if (fwd_cut <= 0 or fwd_cut >= site_len) else None
             hits.append({
-                "type":    "resite",
-                "start":   p,
-                "end":     p + site_len,
-                "strand":  1,
-                "color":   color,
-                "label":   name,
-                "cut_col": fwd_cut if 0 < fwd_cut < site_len else None,
+                "type":       "resite",
+                "start":      p,
+                "end":        p + site_len,
+                "strand":     1,
+                "color":      color,
+                "label":      name,
+                "cut_col":    fwd_cut if 0 < fwd_cut < site_len else None,
+                "ext_cut_bp": _ext,
             })
             cut_bp = min(p + fwd_cut, n - 1)
             hits.append({
@@ -427,45 +439,67 @@ def _scan_restriction_sites(
                 "label":  name,
             })
 
-        # Reverse strand scan
+        # Reverse strand handling
         rc_site = _rc(site)
-        rc_pat  = _iupac_pattern(rc_site) if rc_site != site.upper() else pat
-        for m in rc_pat.finditer(seq_u):
-            p = m.start()
-            orig_start = n - p - site_len
-            key = (name, orig_start, -1)
-            if key in seen:
-                continue
-            seen.add(key)
-            hits.append({
-                "type":    "resite",
-                "start":   orig_start,
-                "end":     orig_start + site_len,
-                "strand":  -1,
-                "color":   color,
-                "label":   name,
-                "cut_col": rev_cut if 0 < rev_cut < site_len else None,
-            })
-            cut_bp = min(orig_start + rev_cut, n - 1)
-            hits.append({
-                "type":   "recut",
-                "start":  cut_bp,
-                "end":    cut_bp + 1,
-                "strand": -1,
-                "color":  color,
-                "label":  name,
-            })
+        is_palindrome = (rc_site == site.upper())
+
+        if is_palindrome:
+            # Palindromic: forward scan already found all physical sites.
+            # One resite + one recut per match is sufficient.
+            pass
+        else:
+            # Non-palindromic: scan for RC on forward strand to find
+            # reverse-strand binding sites at their correct positions.
+            rc_pat = _iupac_pattern(rc_site)
+            for m in rc_pat.finditer(seq_u):
+                p = m.start()
+                key = (name, p, -1)
+                if key in seen:
+                    continue
+                seen.add(key)
+                # Cut column within the bar: enzyme's fwd_cut mapped to
+                # the reversed orientation displayed on the forward strand
+                rev_cut_col = site_len - 1 - fwd_cut
+                _top_cut_bp = p + site_len - 1 - rev_cut   # top-strand cut in fwd coords
+                _top_cut_outside = (_top_cut_bp < p or _top_cut_bp >= p + site_len)
+                hits.append({
+                    "type":       "resite",
+                    "start":      p,
+                    "end":        p + site_len,
+                    "strand":     -1,
+                    "color":      color,
+                    "label":      name,
+                    "cut_col":    rev_cut_col if 0 <= rev_cut_col < site_len else None,
+                    "ext_cut_bp": _top_cut_bp if _top_cut_outside else None,
+                })
+                # Bottom-strand cut (enzyme's fwd_cut mapped to fwd coords)
+                cut_bp = p + site_len - 1 - fwd_cut
+                cut_bp = max(0, min(cut_bp, n - 1))
+                hits.append({
+                    "type":   "recut",
+                    "start":  cut_bp,
+                    "end":    cut_bp + 1,
+                    "strand": -1,
+                    "color":  color,
+                    "label":  name,
+                })
 
         if hits:
             by_enzyme[name] = hits
 
     feats: list[dict] = []
+    placed: set[tuple[int, int]] = set()   # (start, end) of resites already shown
     for name, hits in by_enzyme.items():
         # Count recognition-sequence hits (resite only) across both strands
         if unique_only:
             n_sites = sum(1 for h in hits if h["type"] == "resite")
             if n_sites != 1:
                 continue
+        # Skip isoschizomers / HF-variants that land on an already-placed site
+        positions = {(h["start"], h["end"]) for h in hits if h["type"] == "resite"}
+        if positions & placed:
+            continue
+        placed |= positions
         feats.extend(hits)
     return feats
 
@@ -512,11 +546,16 @@ def _render_feature_row_pair(
     prefix_w: int,
     is_below_dna: bool,
     show_connectors: bool,
+    flip_label_bar: bool = False,
+    single_row: bool = False,
 ) -> None:
     """
     Append one label row + optional connector row + one braille-bar row to result.
     For above-DNA: label / [connector] / bar.
     For below-DNA: bar / [connector] / label.
+    When single_row=True (RE lanes), collapse to one content row: the cut arrow is
+    placed just outside the bracket (left of '(' above DNA, right of ')' below) only
+    if that cell is a space, so it never overwrites another character.
     Multiple non-overlapping features share the same pair of rows horizontally.
     """
     content_w = chunk_end - chunk_start
@@ -565,12 +604,29 @@ def _render_feature_row_pair(
                         bar_arr[pos] = (ch, "bold white")
 
             # Cut marker in the label row so it doesn't obscure the name
+            cut_ch = "↑" if is_below_dna else "↓"
             if cut_col is not None:
                 visible_offset = cut_col - max(0, chunk_start - f["start"])
                 cut_pos = bar_s + visible_offset
                 if 0 <= cut_pos < content_w:
-                    cut_ch = "↑" if is_below_dna else "↓"
                     label_arr[cut_pos] = (cut_ch, "bold " + color)
+
+            # Type IIS: dashed bridge from recognition bar to cut site
+            ext_cut_bp = f.get("ext_cut_bp")
+            if ext_cut_bp is not None and chunk_start <= ext_cut_bp < chunk_end:
+                cut_abs = ext_cut_bp - chunk_start
+                if 0 <= cut_abs < content_w:
+                    label_arr[cut_abs] = (cut_ch, "bold " + color)
+                # Bridge in bar_arr: from recognition end rightward, or from
+                # cut leftward to recognition start (upstream cutters)
+                if cut_abs >= bar_s + bar_len:       # downstream cut
+                    for j in range(bar_s + bar_len, cut_abs):
+                        if 0 <= j < content_w and bar_arr[j][0] == " ":
+                            bar_arr[j] = ("╌", color)
+                elif cut_abs < bar_s:                # upstream cut
+                    for j in range(cut_abs + 1, bar_s):
+                        if 0 <= j < content_w and bar_arr[j][0] == " ":
+                            bar_arr[j] = ("╌", color)
 
             # Connector tick at midpoint
             mid = bar_s + bar_len // 2
@@ -624,31 +680,94 @@ def _render_feature_row_pair(
             result.append("".join(run), style=sty)
         result.append("\n")
 
+    if single_row:
+        # Place cut arrow adjacent to the bracket — never overlapping a name char.
+        for f in feats:
+            if f.get("type") != "resite":
+                continue
+            bar_s  = max(f["start"], chunk_start) - chunk_start
+            bar_e  = min(f["end"],   chunk_end)   - chunk_start
+            cut_ch = "↑" if is_below_dna else "↓"
+            color  = f["color"]
+            if not is_below_dna:
+                # Above DNA: try left of opening paren, then right of closing paren
+                if bar_s > 0 and bar_arr[bar_s - 1][0] == " ":
+                    bar_arr[bar_s - 1] = (cut_ch, "bold " + color)
+                elif bar_e < content_w and bar_arr[bar_e][0] == " ":
+                    bar_arr[bar_e] = (cut_ch, "bold " + color)
+            else:
+                # Below DNA: try right of closing paren, then left of opening paren
+                if bar_e < content_w and bar_arr[bar_e][0] == " ":
+                    bar_arr[bar_e] = (cut_ch, "bold " + color)
+                elif bar_s > 0 and bar_arr[bar_s - 1][0] == " ":
+                    bar_arr[bar_s - 1] = (cut_ch, "bold " + color)
+            # Type IIS: ext_cut_bp arrow goes into bar_arr at the actual cut position
+            ext_cut_bp = f.get("ext_cut_bp")
+            if ext_cut_bp is not None and chunk_start <= ext_cut_bp < chunk_end:
+                cut_abs = ext_cut_bp - chunk_start
+                if 0 <= cut_abs < content_w and bar_arr[cut_abs][0] == " ":
+                    bar_arr[cut_abs] = (cut_ch, "bold " + color)
+        if not is_below_dna:
+            _write_arr(bar_arr)
+            if show_connectors:
+                _write_arr(conn_arr)
+        else:
+            if show_connectors:
+                _write_arr(conn_arr)
+            _write_arr(bar_arr)
+        return
+
+    first_arr  = bar_arr   if flip_label_bar else label_arr
+    second_arr = label_arr if flip_label_bar else bar_arr
     if not is_below_dna:
-        _write_arr(label_arr)
+        _write_arr(first_arr)
         if show_connectors:
             _write_arr(conn_arr)
-        _write_arr(bar_arr)
+        _write_arr(second_arr)
     else:
-        _write_arr(bar_arr)
+        _write_arr(second_arr)
         if show_connectors:
             _write_arr(conn_arr)
-        _write_arr(label_arr)
+        _write_arr(first_arr)
+
+
+def _chunk_lane_groups(
+    chunk_feats: list[dict], chunk_start: int, chunk_end: int,
+) -> "tuple[list, list, list, list, list, list]":
+    """Split chunk features into separate lane groups for rendering order.
+
+    Returns (re_above, onebp_above, reg_above, reg_below, onebp_below, re_below).
+    Rendering order top→bottom:
+      re_above → onebp_above → reg_above → DNA → reg_below → onebp_below → re_below
+    Multi-bp regular features are closest to DNA; 1bp features next; RE sites farthest.
+    """
+    regular = [f for f in chunk_feats if f.get("type") != "resite"]
+    resites = [f for f in chunk_feats if f.get("type") == "resite"]
+    onebp   = [f for f in regular if f["end"] - f["start"] == 1]
+    multibp = [f for f in regular if f["end"] - f["start"] != 1]
+    reg_above,   reg_below   = _assign_chunk_features(multibp, chunk_start, chunk_end)
+    onebp_above, onebp_below = _assign_chunk_features(onebp,   chunk_start, chunk_end)
+    re_above,    re_below    = _assign_chunk_features(resites, chunk_start, chunk_end)
+    return re_above, onebp_above, reg_above, reg_below, onebp_below, re_below
 
 
 def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                     sel_range: "tuple[int,int] | None" = None,
                     user_sel:  "tuple[int,int] | None" = None,
                     cursor_pos: int = -1,
-                    show_connectors: bool = False) -> Text:
+                    show_connectors: bool = False,
+                    re_highlight: "dict | None" = None) -> Text:
     """Rich Text of the sequence with per-position feature coloring.
 
-    sel_range  — feature highlight: bold + underline on feature bases
-    user_sel   — shift-click selection: subtle background, used by edit dialog
-    cursor_pos — click cursor: │ inserted before cursor_pos
-    Annotation bars appear below each DNA line (one bar per overlapping
-    non-site feature, capped at 4, largest first).
-    Each feature renders as:  label row  /  [connector row]  /  braille bar row.
+    sel_range    — feature highlight: bold + underline on feature bases
+    user_sel     — shift-click selection: subtle background, used by edit dialog
+    cursor_pos   — click cursor: reverse-video highlight on base at cursor_pos
+    re_highlight — dict with keys: start, end, fwd_cut_bp, rev_cut_bp, color, name
+                   When set, highlights the recognition bases on both strands
+                   and marks cut positions with reverse-video.
+
+    Rendering order (closest to DNA first):
+      RE sites (far) → regular feature bars (close) → DNA → regular (close) → RE (far)
     """
     n     = len(seq)
     num_w = len(str(n)) if n else 1    # minimum digits needed for line numbers
@@ -662,6 +781,13 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     sel_e  = sel_range[1] if sel_range else -1
     usr_s  = user_sel[0]  if user_sel  else -1
     usr_e  = user_sel[1]  if user_sel  else -1
+
+    # RE highlight ranges
+    reh_s       = re_highlight["start"]      if re_highlight else -1
+    reh_e       = re_highlight["end"]        if re_highlight else -1
+    reh_fwd_cut = re_highlight["fwd_cut_bp"] if re_highlight else -1
+    reh_rev_cut = re_highlight["rev_cut_bp"] if re_highlight else -1
+    reh_color   = re_highlight["color"]      if re_highlight else ""
 
     seq_upper = seq.upper()
     _COMP     = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")   # base complement
@@ -677,28 +803,30 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     for chunk_start in range(0, n, line_width):
         chunk_end = min(chunk_start + line_width, n)
 
-        # ── Assign features to above / below lanes ──
+        # ── Assign features to lane groups ──
         chunk_feats = [
             f for f in annot_feats
             if f["start"] < chunk_end and f["end"] > chunk_start
         ]
-        above_lanes, below_lanes = _assign_chunk_features(chunk_feats, chunk_start, chunk_end)
+        re_above, onebp_above, reg_above, reg_below, onebp_below, re_below = (
+            _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
+        )
 
-        # ── Feature rows ABOVE DNA (forward strand) ──
-        for lane in above_lanes:
+        # ── Rows ABOVE DNA (far → close): RE → 1bp → multi-bp ──
+        for lane in re_above:
+            _render_feature_row_pair(result, lane, chunk_start, chunk_end,
+                                     num_w + 2, False, show_connectors,
+                                     flip_label_bar=True)
+        for lane in onebp_above:
+            _render_feature_row_pair(result, lane, chunk_start, chunk_end,
+                                     num_w + 2, False, show_connectors)
+        for lane in reg_above:
             _render_feature_row_pair(result, lane, chunk_start, chunk_end,
                                      num_w + 2, False, show_connectors)
 
         # ── Double-stranded DNA block ─────────────────────────────────────
-        # ── Rows 1+2: double-stranded DNA block ──────────────────────────
-        # Forward strand:  "   1  5'─ATGC…─3'"
-        # RC strand:       "      3'─TACG…─5'"
-        #
-        # ALIGNMENT GUARANTEE: no extra characters are ever inserted into
-        # either strand — both always emit exactly (chunk_end-chunk_start)
-        # base characters between their fixed-width prefixes and suffixes.
         # The cursor is shown as a reverse-video highlight on the base IN
-        # PLACE rather than as an inserted │ glyph, so column counts match.
+        # PLACE rather than as an inserted glyph, so column counts match.
 
         def _strand_chars(bases: "list[str]") -> None:
             """Append base chars with RLE styling into result."""
@@ -720,17 +848,27 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
             base   = styles[i]
             in_usr = (usr_s <= i < usr_e)
             in_sel = (sel_s <= i < sel_e)
+            in_re  = (reh_s <= i < reh_e)
             is_cur = (cursor_pos == i)
+
             if is_cur:
-                sty = "reverse bold white"
+                fwd_sty = "reverse bold white"
+                rev_sty = fwd_sty
+            elif in_re:
+                # Entire recognition region: white background, black text
+                fwd_sty = f"reverse bold {reh_color}"
+                rev_sty = f"reverse bold {reh_color}"
             elif in_usr:
-                sty = base + " on color(237)"
+                fwd_sty = base + " on color(237)"
+                rev_sty = fwd_sty
             elif in_sel:
-                sty = "bold underline " + base
+                fwd_sty = "bold underline " + base
+                rev_sty = fwd_sty
             else:
-                sty = base
-            fwd_bases.append((seq_upper[i],               sty))
-            rc_bases.append( (seq_upper[i].translate(_COMP), sty))
+                fwd_sty = base
+                rev_sty = base
+            fwd_bases.append((seq_upper[i],                    fwd_sty))
+            rc_bases.append( (seq_upper[i].translate(_COMP),   rev_sty))
 
         # Forward strand
         result.append(f"{chunk_start + 1:>{num_w}}  ", style="color(245)")
@@ -742,10 +880,17 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
         _strand_chars(rc_bases)
         result.append("\n")
 
-        # ── Feature rows BELOW DNA (reverse strand) ──
-        for lane in below_lanes:
+        # ── Rows BELOW DNA (close → far): multi-bp → 1bp → RE ──
+        for lane in reg_below:
             _render_feature_row_pair(result, lane, chunk_start, chunk_end,
                                      num_w + 2, True, show_connectors)
+        for lane in onebp_below:
+            _render_feature_row_pair(result, lane, chunk_start, chunk_end,
+                                     num_w + 2, True, show_connectors)
+        for lane in re_below:
+            _render_feature_row_pair(result, lane, chunk_start, chunk_end,
+                                     num_w + 2, True, show_connectors,
+                                     flip_label_bar=True)
 
     return result
 
@@ -1803,6 +1948,8 @@ class LibraryPanel(Widget):
                          tooltip="Remove selected")
 
     def on_mount(self):
+        self._active_id:    "str | None" = None
+        self._active_dirty: bool         = False
         t = self.query_one("#lib-table", DataTable)
         t.add_columns("Name", "bp")
         self._repopulate()
@@ -1811,8 +1958,10 @@ class LibraryPanel(Widget):
         t = self.query_one("#lib-table", DataTable)
         t.clear()
         for entry in _load_library():
+            is_dirty = (entry["id"] == self._active_id and self._active_dirty)
+            name_disp = ("*" + entry["name"])[:14] if is_dirty else entry["name"][:14]
             t.add_row(
-                entry["name"][:14],
+                name_disp,
                 f"{entry['size']:,}",
                 key=entry["id"],
             )
@@ -1849,8 +1998,15 @@ class LibraryPanel(Widget):
     def _btn_add(self):
         self.post_message(self.AddCurrentRequested())
 
+    def set_active(self, entry_id: "str | None") -> None:
+        """Mark which library entry is currently loaded (clears dirty flag)."""
+        self._active_id    = entry_id
+        self._active_dirty = False
+
     def set_dirty(self, dirty: bool) -> None:
-        """Show/hide unsaved-changes marker in the panel header."""
+        """Show unsaved-changes marker on the active row and in the panel header."""
+        self._active_dirty = dirty
+        self._repopulate()
         self.query_one("#lib-hdr", Static).update(
             " * Library" if dirty else " Library"
         )
@@ -1922,6 +2078,7 @@ class SequencePanel(Widget):
         self._view_cache_key: "tuple | None"        = None
         self._view_cache_txt: "Text | None"         = None
         self._show_connectors:  bool = False
+        self._re_highlight: "dict | None" = None  # RE cut visualization
         # Drag-to-select state
         self._drag_start_bp:    int  = -1
         self._has_dragged:      bool = False
@@ -1944,16 +2101,18 @@ class SequencePanel(Widget):
 
     def update_seq(self, seq: str, feats: list[dict]) -> None:
         """Called after loading a record or committing an edit."""
-        self._seq        = seq
-        self._feats      = feats
-        self._sel_range  = None
-        self._user_sel   = None
-        self._cursor_pos = -1
+        self._seq          = seq
+        self._feats        = feats
+        self._sel_range    = None
+        self._user_sel     = None
+        self._cursor_pos   = -1
+        self._re_highlight = None
         self.remove_class("has-trans")
         self._refresh_view()
 
     def highlight_feature(self, feat: "dict | None") -> None:
         """Highlight a feature's region in the sequence; show CDS translation."""
+        self._re_highlight = None
         if feat is None or not self._seq:
             self._sel_range = None
             self.remove_class("has-trans")
@@ -2050,15 +2209,34 @@ class SequencePanel(Widget):
         if bp < 0:
             return
 
-        # If the click landed on a restriction site bar, highlight that span
+        # If the click landed on a restriction site bar, highlight the recognition span
         resite = self._last_resite_click
         self._last_resite_click = None
         if resite is not None:
-            self._sel_range = (resite["start"], min(resite["end"], len(self._seq)))
-            self._user_sel  = None
+            hi_start = resite["start"]
+            hi_end   = min(resite["end"], len(self._seq))
+            ext_cut  = resite.get("ext_cut_bp")
+            if ext_cut is not None:
+                if ext_cut >= hi_end:
+                    hi_end   = min(ext_cut + 1, len(self._seq))
+                elif ext_cut < hi_start:
+                    hi_start = ext_cut
+            self._re_highlight = {
+                "start":      hi_start,
+                "end":        hi_end,
+                "fwd_cut_bp": -1,
+                "rev_cut_bp": -1,
+                "color":      resite["color"],
+                "name":       resite["label"],
+            }
+            self._sel_range  = None
+            self._user_sel   = None
+            self._cursor_pos = -1
             self._refresh_view()
             return
 
+        # Regular click: clear any RE highlight
+        self._re_highlight = None
         double = event.chain >= 2
         self.post_message(self.SequenceClick(bp, double=double))
 
@@ -2092,24 +2270,30 @@ class SequencePanel(Widget):
         row     = 0
         seq_col = vp_x - (num_w + 2)   # offset past the num+2-space prefix
 
+        def _check_lane(lane):
+            """Check if click hit a feature in this lane; return bp or None."""
+            for f in lane:
+                bar_s = max(f["start"], chunk_start) - chunk_start
+                bar_e = min(f["end"],   chunk_end)   - chunk_start
+                if bar_s <= seq_col < bar_e:
+                    if f.get("type") == "resite":
+                        self._last_resite_click = f
+                    return (f["start"] + f["end"]) // 2
+            return lane[0]["start"]
+
         for chunk_start in range(0, n, line_width):
             chunk_end   = min(chunk_start + line_width, n)
             chunk_feats = [f for f in annot_feats
                            if f["start"] < chunk_end and f["end"] > chunk_start]
-            above_lanes, below_lanes = _assign_chunk_features(chunk_feats, chunk_start, chunk_end)
+            re_above, onebp_above, reg_above, reg_below, onebp_below, re_below = (
+                _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
+            )
 
-            # Above feature rows (forward strand)
-            for lane in above_lanes:
+            # Above: RE (far) → 1bp → multi-bp (close to DNA)
+            for lane in (*re_above, *onebp_above, *reg_above):
                 for _ in range(rpg):
                     if row == content_row:
-                        for f in lane:
-                            bar_s = max(f["start"], chunk_start) - chunk_start
-                            bar_e = min(f["end"],   chunk_end)   - chunk_start
-                            if bar_s <= seq_col < bar_e:
-                                if f.get("type") == "resite":
-                                    self._last_resite_click = f
-                                return (f["start"] + f["end"]) // 2
-                        return lane[0]["start"]
+                        return _check_lane(lane)
                     row += 1
 
             # DNA rows: fwd strand + RC strand (2 rows)
@@ -2120,18 +2304,11 @@ class SequencePanel(Widget):
                     return -1
                 row += 1
 
-            # Below feature rows (reverse strand)
-            for lane in below_lanes:
+            # Below: multi-bp (close) → 1bp → RE (far)
+            for lane in (*reg_below, *onebp_below, *re_below):
                 for _ in range(rpg):
                     if row == content_row:
-                        for f in lane:
-                            bar_s = max(f["start"], chunk_start) - chunk_start
-                            bar_e = min(f["end"],   chunk_end)   - chunk_start
-                            if bar_s <= seq_col < bar_e:
-                                if f.get("type") == "resite":
-                                    self._last_resite_click = f
-                                return (f["start"] + f["end"]) // 2
-                        return lane[0]["start"]
+                        return _check_lane(lane)
                     row += 1
 
             if row > content_row:
@@ -2158,11 +2335,14 @@ class SequencePanel(Widget):
             chunk_end   = min(chunk_start + line_width, n)
             chunk_feats = [f for f in annot_feats
                            if f["start"] < chunk_end and f["end"] > chunk_start]
-            above_lanes, below_lanes = _assign_chunk_features(chunk_feats, chunk_start, chunk_end)
-            above_rows = len(above_lanes) * rpg
+            re_above, onebp_above, reg_above, reg_below, onebp_below, re_below = (
+                _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
+            )
+            above_rows = (len(re_above) + len(onebp_above) + len(reg_above)) * rpg
             if bp < chunk_end:
                 return row + above_rows   # forward-strand DNA row within this chunk
-            row += above_rows + 2 + len(below_lanes) * rpg
+            below_rows = (len(reg_below) + len(onebp_below) + len(re_below)) * rpg
+            row += above_rows + 2 + below_rows
         return row
 
     def _line_width(self) -> int:
@@ -2214,9 +2394,12 @@ class SequencePanel(Widget):
         # Use actual scroll-container content width (excludes 2-col vertical scrollbar)
         num_w      = len(str(len(self._seq))) if self._seq else 1
         line_width = max(20, self._seq_render_width() - (num_w + 2))
+        reh_key = (
+            self._re_highlight["start"], self._re_highlight["end"]
+        ) if self._re_highlight else None
         key = (id(self._seq), id(self._feats), line_width,
                self._sel_range, self._user_sel, self._cursor_pos,
-               self._show_connectors)
+               self._show_connectors, reh_key)
         if key != self._view_cache_key:
             self._view_cache_txt = _build_seq_text(
                 self._seq, self._feats,
@@ -2225,6 +2408,7 @@ class SequencePanel(Widget):
                 user_sel        = self._user_sel,
                 cursor_pos      = self._cursor_pos,
                 show_connectors = self._show_connectors,
+                re_highlight    = self._re_highlight,
             )
             self._view_cache_key = key
 
@@ -2626,6 +2810,8 @@ class PlasmidApp(App):
     _MAX_UNDO = 50
     _restr_unique_only: bool = True
     _restr_min_len: int = 6
+    _show_restr: bool = True
+    _restr_cache: "list" = []
 
     CSS = """
 Screen { background: $background; }
@@ -2705,6 +2891,7 @@ UnsavedQuitModal { align: center middle; }
         Binding("home",        "reset_origin",     "Reset origin",  show=True,  priority=True),
         Binding("v",           "toggle_map_view",  "⊙/─ View",      show=True,  priority=True),
         Binding("l",           "toggle_connectors","Connectors",    show=True,  priority=True),
+        Binding("r",           "toggle_restr",     "RE sites",      show=True,  priority=True),
         Binding("delete",      "delete_feature",   "Del feature",   show=True,  priority=True),
         Binding("q",           "quit",             "Quit",          show=True),
     ]
@@ -2805,21 +2992,23 @@ UnsavedQuitModal { align: center middle; }
 
         new_cursor = s + len(new_bases)
 
+        self._restr_cache = _scan_restriction_sites(
+            new_seq, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only
+        )
+        displayed = self._restr_cache if self._show_restr else []
         if self._current_record is not None:
             new_record = self._rebuild_record_with_edit(new_seq, mode, s, e, new_bases)
             self._current_record = new_record
             pm.load_record(new_record)
             self.query_one("#sidebar", FeatureSidebar).populate(pm._feats)
-            restr = _scan_restriction_sites(new_seq, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only)
-            pm._restr_feats = restr
+            pm._restr_feats = displayed
             pm.refresh()
-            sp.update_seq(new_seq, pm._feats + restr)
+            sp.update_seq(new_seq, pm._feats + displayed)
             self.notify(f"Sequence updated  ({len(new_seq):,} bp)")
         else:
-            restr = _scan_restriction_sites(new_seq, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only)
-            pm._restr_feats = restr
+            pm._restr_feats = displayed
             pm.refresh()
-            sp.update_seq(new_seq, pm._feats + restr)
+            sp.update_seq(new_seq, pm._feats + displayed)
 
         self._mark_dirty()
 
@@ -3039,10 +3228,13 @@ UnsavedQuitModal { align: center middle; }
         if record is not None:
             pm.load_record(record)
             sidebar.populate(pm._feats)
-            restr = _scan_restriction_sites(seq, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only)
-            pm._restr_feats = restr
+            self._restr_cache = _scan_restriction_sites(
+                seq, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only
+            )
+            displayed = self._restr_cache if self._show_restr else []
+            pm._restr_feats = displayed
             pm.refresh()
-            sp.update_seq(seq, pm._feats + restr)
+            sp.update_seq(seq, pm._feats + displayed)
         else:
             sp.update_seq(seq, [])
         sp._cursor_pos = cursor_pos
@@ -3095,24 +3287,33 @@ UnsavedQuitModal { align: center middle; }
             pass
 
     def _do_save(self) -> bool:
-        """Write current record to its source file. Returns True on success."""
+        """Save current record to its source file and/or library. Returns True on success."""
         if self._current_record is None:
             self.notify("Nothing to save.", severity="warning")
             return False
-        if not self._source_path:
-            self.notify(
-                "No source file — open a .gb file first, or use 'a' to add to library.",
-                severity="warning",
-            )
-            return False
+
+        # Write to source file if one is known
+        if self._source_path:
+            try:
+                Path(self._source_path).write_text(_record_to_gb_text(self._current_record))
+            except Exception as exc:
+                self.notify(f"Save failed: {exc}", severity="error")
+                return False
+
+        # Always update the library entry (add or overwrite)
         try:
-            Path(self._source_path).write_text(_record_to_gb_text(self._current_record))
-            self._mark_clean()
-            self.notify(f"Saved → {self._source_path}")
-            return True
+            lib = self.query_one("#library", LibraryPanel)
+            lib.add_entry(self._current_record)
         except Exception as exc:
-            self.notify(f"Save failed: {exc}", severity="error")
+            self.notify(f"Library update failed: {exc}", severity="error")
             return False
+
+        self._mark_clean()
+        if self._source_path:
+            self.notify(f"Saved → {self._source_path}")
+        else:
+            self.notify(f"Saved {self._current_record.name} to library")
+        return True
 
     def action_save(self) -> None:
         self._do_save()
@@ -3162,15 +3363,22 @@ UnsavedQuitModal { align: center middle; }
         sidebar.populate(pm._feats)
 
         seq_str = str(record.seq)
-        restr   = _scan_restriction_sites(seq_str, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only)
+        self._restr_cache = _scan_restriction_sites(
+            seq_str, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only
+        )
+        displayed = self._restr_cache if self._show_restr else []
 
         # Store restriction sites on the map for visual overlay
-        pm._restr_feats = restr
+        pm._restr_feats = displayed
         pm.refresh()
 
         # Sequence panel: feature coloring = record feats + restriction sites
-        seq_pnl.update_seq(seq_str, pm._feats + restr)
+        seq_pnl.update_seq(seq_str, pm._feats + displayed)
 
+        try:
+            self.query_one("#library", LibraryPanel).set_active(record.id)
+        except Exception:
+            pass
         self._mark_clean()
         self.notify(
             f"Loaded {record.name}  ({len(record.seq):,} bp, "
@@ -3249,14 +3457,33 @@ UnsavedQuitModal { align: center middle; }
         pm = self.query_one("#plasmid-map", PlasmidMap)
         if not sp._seq:
             return
-        restr = _scan_restriction_sites(
+        self._restr_cache = _scan_restriction_sites(
             sp._seq,
             min_recognition_len=self._restr_min_len,
             unique_only=self._restr_unique_only,
         )
-        pm._restr_feats = restr
+        displayed = self._restr_cache if self._show_restr else []
+        pm._restr_feats = displayed
         pm.refresh()
-        sp.update_seq(sp._seq, pm._feats + restr)
+        sp.update_seq(sp._seq, pm._feats + displayed)
+
+    def _apply_restr_visibility(self) -> None:
+        """Push current cache to map/sequence panel respecting _show_restr flag."""
+        sp = self.query_one("#seq-panel", SequencePanel)
+        pm = self.query_one("#plasmid-map", PlasmidMap)
+        if not sp._seq:
+            return
+        # Rescan if cache is stale or empty (e.g. loaded before cache was wired up)
+        if self._show_restr and not self._restr_cache:
+            self._restr_cache = _scan_restriction_sites(
+                sp._seq,
+                min_recognition_len=self._restr_min_len,
+                unique_only=self._restr_unique_only,
+            )
+        displayed = self._restr_cache if self._show_restr else []
+        pm._restr_feats = displayed
+        pm.refresh()
+        sp.update_seq(sp._seq, pm._feats + displayed)
 
     def open_menu(self, name: str, x: int, y: int) -> None:
         """Build menu item list for name and push DropdownScreen."""
@@ -3265,6 +3492,7 @@ UnsavedQuitModal { align: center middle; }
         u  = ck if self._restr_unique_only else nc
         m6 = ck if self._restr_min_len == 6  else nc
         m4 = ck if self._restr_min_len == 4  else nc
+        rs = ck if self._show_restr        else nc
 
         menus = {
             "File": [
@@ -3285,11 +3513,13 @@ UnsavedQuitModal { align: center middle; }
                 ("Delete Feature",  "delete_feature"),
             ],
             "Enzymes": [
-                (f"[{u}] Unique cutters",   "toggle_restr_unique"),
-                (f"[{m6}] 6+ bp sites",     "toggle_restr_min6"),
-                (f"[{m4}] 4+ bp sites",     "toggle_restr_min4"),
-                ("---",                      None),
-                ("Toggle connectors",        "toggle_connectors"),
+                (f"[{rs}] Show RE sites  [r]",   "toggle_restr"),
+                ("---",                            None),
+                (f"[{u}] Unique cutters",         "toggle_restr_unique"),
+                (f"[{m6}] 6+ bp sites",           "toggle_restr_min6"),
+                (f"[{m4}] 4+ bp sites",           "toggle_restr_min4"),
+                ("---",                            None),
+                ("Toggle connectors",              "toggle_connectors"),
             ],
             "Features": [
                 ("Add Feature...",   "add_feature"),
@@ -3314,10 +3544,16 @@ UnsavedQuitModal { align: center middle; }
         if action is None:
             return
         # Handle toggle actions directly since they need state updates
-        if action in ("toggle_restr_unique", "toggle_restr_min6", "toggle_restr_min4"):
+        if action in ("toggle_restr", "toggle_restr_unique", "toggle_restr_min6", "toggle_restr_min4"):
             getattr(self, f"action_{action}")()
         else:
             self.call_action(action)
+
+    def action_toggle_restr(self) -> None:
+        self._show_restr = not self._show_restr
+        self._apply_restr_visibility()
+        state = "shown" if self._show_restr else "hidden"
+        self.notify(f"Restriction enzymes {state}")
 
     def action_toggle_restr_unique(self) -> None:
         self._restr_unique_only = not self._restr_unique_only
@@ -3349,9 +3585,14 @@ UnsavedQuitModal { align: center middle; }
     @on(SequencePanel.SequenceChanged)
     def _seq_changed(self, event: SequencePanel.SequenceChanged):
         # Update restriction site overlay whenever sequence changes
-        pm    = self.query_one("#plasmid-map", PlasmidMap)
-        restr = _scan_restriction_sites(event.seq, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only)
-        pm._restr_feats = restr
+        pm = self.query_one("#plasmid-map", PlasmidMap)
+        self._restr_cache = _scan_restriction_sites(
+            event.seq,
+            min_recognition_len=self._restr_min_len,
+            unique_only=self._restr_unique_only,
+        )
+        displayed = self._restr_cache if self._show_restr else []
+        pm._restr_feats = displayed
         pm.refresh()
 
 

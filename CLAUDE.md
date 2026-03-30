@@ -2,7 +2,7 @@
 
 ## What is SpliceCraft?
 
-A **terminal-based circular plasmid map viewer and sequence editor** built with Python/Textual/Biopython. Single-file app (`splicecraft.py`, ~3337 lines). Renders Unicode braille-dot circular and linear plasmid maps directly in the terminal.
+A **terminal-based circular plasmid map viewer and sequence editor** built with Python/Textual/Biopython. Single-file app (`splicecraft.py`, ~3440 lines). Renders Unicode braille-dot circular and linear plasmid maps directly in the terminal.
 
 **Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs org, user ATinyGreenCell)
 
@@ -10,19 +10,19 @@ A **terminal-based circular plasmid map viewer and sequence editor** built with 
 
 ### Top-level structure (line numbers approximate):
 - **Lines 1–95:** Imports, dependency check, library persistence (`plasmid_library.json`)
-- **Lines 96–370:** NEB restriction enzyme catalog (~200 enzymes), IUPAC regex, reverse-complement helper
-- **Lines 371–470:** `_scan_restriction_sites()` — scans both strands, returns resite + recut dicts
-- **Lines 473–750:** Sequence panel rendering — `_assign_chunk_features()`, `_render_feature_row_pair()`, `_build_seq_text()` — forward-strand features above DNA, reverse below, braille bars with arrowheads
-- **Lines 753–900:** Codon table, clipboard, CDS translation, GenBank I/O (fetch from NCBI, load local .gb)
-- **Lines 901–1014:** `_Canvas` (2D char grid) and `_BrailleCanvas` (sub-character resolution via Unicode braille U+2800–U+28FF)
-- **Lines 1024–1690:** `PlasmidMap` widget — circular + linear map rendering, feature arcs, restriction site overlays, label placement algorithm, tick marks
-- **Lines 1692–1770:** `FeatureSidebar` — DataTable of features with detail panel
-- **Lines 1770–1870:** `LibraryPanel` — persistent plasmid collection (JSON), add/remove entries
-- **Lines 1872–2207:** `SequencePanel` — DNA viewer with click-to-cursor, drag selection, double-stranded display, feature annotation bars
-- **Lines 2209–2500:** Modal dialogs — `EditSeqDialog`, `FetchModal`, `OpenFileModal`, `DropdownScreen`
-- **Lines 2503–2542:** `MenuBar` widget — File, Edit, Enzymes, Features, Primers, Genes
-- **Lines 2544–2572:** `UnsavedQuitModal`
-- **Lines 2575–3337:** `PlasmidApp` (main app) — keybindings, undo/redo stack, record loading, feature selection coordination between map/sidebar/sequence panel, menu actions, entry point
+- **Lines 96–375:** NEB restriction enzyme catalog (~200 enzymes), IUPAC regex, cached pattern compilation, IUPAC-aware reverse-complement helper
+- **Lines 386–480:** `_scan_restriction_sites()` — scans both strands, returns resite + recut dicts; palindrome-aware (skips reverse scan for palindromic sites)
+- **Lines 483–800:** Sequence panel rendering — `_assign_chunk_features()`, `_render_feature_row_pair()`, `_build_seq_text()` — forward-strand features above DNA, reverse below, braille bars with arrowheads
+- **Lines 800–950:** Codon table, clipboard, CDS translation, GenBank I/O (fetch from NCBI, load local .gb)
+- **Lines 950–1070:** `_Canvas` (2D char grid) and `_BrailleCanvas` (sub-character resolution via Unicode braille U+2800–U+28FF)
+- **Lines 1070–1740:** `PlasmidMap` widget — circular + linear map rendering, feature arcs, restriction site overlays, label placement algorithm, tick marks
+- **Lines 1740–1820:** `FeatureSidebar` — DataTable of features with detail panel
+- **Lines 1820–1920:** `LibraryPanel` — persistent plasmid collection (JSON), add/remove entries
+- **Lines 1920–2260:** `SequencePanel` — DNA viewer with click-to-cursor, drag selection, double-stranded display, feature annotation bars
+- **Lines 2260–2550:** Modal dialogs — `EditSeqDialog`, `FetchModal`, `OpenFileModal`, `DropdownScreen`
+- **Lines 2550–2600:** `MenuBar` widget — File, Edit, Enzymes, Features, Primers, Genes
+- **Lines 2600–2630:** `UnsavedQuitModal`
+- **Lines 2630–3440:** `PlasmidApp` (main app) — keybindings, undo/redo stack, record loading, feature selection coordination between map/sidebar/sequence panel, menu actions, entry point
 
 ### Key design patterns:
 - **All rendering uses Rich `Text` objects** — no curses
@@ -30,7 +30,7 @@ A **terminal-based circular plasmid map viewer and sequence editor** built with 
 - **Feature coordination:** map click -> sidebar highlight -> sequence scroll (and vice versa via messages)
 - **Undo/redo:** snapshot-based (stores full seq + cursor + SeqRecord), max 50
 - **Restriction sites:** scanned on load/edit, stored as `resite` (recognition bar) + `recut` (cut marker) dicts
-- **Caching:** both PlasmidMap and SequencePanel cache rendered output keyed on state
+- **Caching:** PlasmidMap, SequencePanel, and regex patterns all cache rendered/compiled output keyed on state
 
 ## Current state (as of latest commit)
 
@@ -55,6 +55,13 @@ A **terminal-based circular plasmid map viewer and sequence editor** built with 
 - **Primers > Design Primer** — not implemented
 - **Genes > Annotate from NCBI** — not implemented
 - **Features > Add Feature** — stub only (`action_add_feature` just shows notification)
+
+### Bugs fixed (2026-03-30):
+- **Palindromic RE double-counting** — `_scan_restriction_sites()` was scanning both strands for palindromic enzymes, creating 2 resites per physical site. The `unique_only` filter excluded all common palindromic enzymes (EcoRI, BamHI, HindIII, etc.). **Fix:** skip reverse scan for palindromes; add bottom-strand recut only.
+- **Reverse-strand resite positions** — non-palindromic reverse-strand hits were placed at `n - p - site_len` instead of `p` (forward-strand coordinate). **Fix:** use `p` directly; map cut positions via `site_len - 1 - fwd_cut`.
+- **`_rc()` IUPAC handling** — reverse-complement only translated ACGT, leaving ambiguity codes (R/Y/W/S/M/K etc.) unchanged. **Fix:** added full IUPAC complement table (`_IUPAC_COMP`).
+- **Regex recompilation** — `_iupac_pattern()` recompiled ~200 patterns on every restriction scan. **Fix:** added `_PATTERN_CACHE` dict.
+- **Duplicate enzyme entries** — SbfI and NspI each defined twice in `_NEB_ENZYMES`. **Fix:** removed duplicates.
 
 ## How to run
 
