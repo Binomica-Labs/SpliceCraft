@@ -2929,6 +2929,7 @@ UnsavedQuitModal { align: center middle; }
         Binding("r",           "toggle_restr",     "RE sites",      show=True,  priority=True),
         Binding("delete",      "delete_feature",   "Del feature",   show=True,  priority=True),
         Binding("q",           "quit",             "Quit",          show=True),
+        Binding("ctrl+c",      "copy_selection",   "",              show=False, priority=True),
     ]
 
     def compose(self) -> ComposeResult:
@@ -3188,29 +3189,28 @@ UnsavedQuitModal { align: center middle; }
 
     # ── Keyboard: cursor movement, copy, undo/redo ─────────────────────────────
 
+    def action_copy_selection(self) -> None:
+        sp  = self.query_one("#seq-panel", SequencePanel)
+        seq = sp._seq
+        if not seq:
+            return
+        sel = sp._user_sel or sp._sel_range
+        if sel:
+            text = seq[sel[0]:sel[1]].upper()
+            try:
+                self.copy_to_clipboard(text)
+                self.notify(f"Copied {len(text)} bp to clipboard")
+            except Exception:
+                if _copy_to_clipboard_osc52(text):
+                    self.notify(f"Copied {len(text)} bp to clipboard")
+                else:
+                    self.notify("Clipboard unavailable", severity="warning")
+        else:
+            self.notify("No selection — click a feature or drag to select",
+                        severity="information")
+
     def on_key(self, event) -> None:
         sp = self.query_one("#seq-panel", SequencePanel)
-
-        # ── Ctrl+C: copy selection ────────────────────────────────────────────
-        if event.key == "ctrl+c":
-            seq = sp._seq
-            if seq:
-                sel = sp._user_sel or sp._sel_range
-                if sel:
-                    text = seq[sel[0]:sel[1]].upper()
-                    try:
-                        self.copy_to_clipboard(text)
-                        self.notify(f"Copied {len(text)} bp to clipboard")
-                    except Exception:
-                        if _copy_to_clipboard_osc52(text):
-                            self.notify(f"Copied {len(text)} bp to clipboard")
-                        else:
-                            self.notify("Clipboard unavailable", severity="warning")
-                else:
-                    self.notify("No selection — Shift+click or double-click a feature first",
-                                severity="information")
-            event.stop()
-            return
 
         # ── Ctrl+Z: undo ──────────────────────────────────────────────────────
         if event.key == "ctrl+z":
