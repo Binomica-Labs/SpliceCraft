@@ -2780,7 +2780,7 @@ class MenuBar(Widget):
     }
     """
 
-    MENUS = ["File", "Edit", "Enzymes", "Features", "Primers", "Genes"]
+    MENUS = ["File", "Edit", "Enzymes", "Features", "Primers", "Parts", "Constructor"]
 
     def compose(self) -> ComposeResult:
         for name in self.MENUS:
@@ -2800,6 +2800,435 @@ class MenuBar(Widget):
                     break
             except Exception:
                 pass
+
+
+# ── Golden Braid L0 part catalog (shared by Parts Bin and Constructor) ─────────
+
+# (Name, Type, Position, 5' OH, 3' OH, Backbone, Selection Marker)
+_GB_L0_PARTS: list[tuple] = [
+    # ── Promoters (Position 1: GGAG → TGAC) ────────────────────────────
+    ("CaMV 35S",          "Promoter",   "Pos 1",   "GGAG", "TGAC", "pUPD2", "Spectinomycin"),
+    ("Nos",               "Promoter",   "Pos 1",   "GGAG", "TGAC", "pUPD2", "Spectinomycin"),
+    ("AtUBQ10",           "Promoter",   "Pos 1",   "GGAG", "TGAC", "pUPD2", "Spectinomycin"),
+    ("ZmUBI1",            "Promoter",   "Pos 1",   "GGAG", "TGAC", "pUPD2", "Spectinomycin"),
+    ("AtRPS5a",           "Promoter",   "Pos 1",   "GGAG", "TGAC", "pUPD2", "Spectinomycin"),
+    # ── 5′ UTRs (Position 2: TGAC → AATG) ─────────────────────────────
+    ("TMV Omega",         "5' UTR",     "Pos 2",   "TGAC", "AATG", "pUPD2", "Spectinomycin"),
+    ("Nos 5'UTR",         "5' UTR",     "Pos 2",   "TGAC", "AATG", "pUPD2", "Spectinomycin"),
+    ("ADH1 5'UTR",        "5' UTR",     "Pos 2",   "TGAC", "AATG", "pUPD2", "Spectinomycin"),
+    # ── CDS with stop (Positions 3-4: AATG → GCTT) ─────────────────────
+    ("eGFP",              "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("mCherry",           "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("mVenus",            "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("mTurquoise2",       "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("GUS (uidA)",        "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("Luciferase (LUC+)", "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("NptII (KanR)",      "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("hptII (HygR)",      "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("Bar (BastaR)",      "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("Cas9 (SpCas9)",     "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    # ── CDS without stop (Position 3: AATG → TTCG) ─────────────────────
+    ("eGFP (no stop)",    "CDS-NS",     "Pos 3",   "AATG", "TTCG", "pUPD2", "Spectinomycin"),
+    ("mCherry (no stop)", "CDS-NS",     "Pos 3",   "AATG", "TTCG", "pUPD2", "Spectinomycin"),
+    # ── C-terminal tags (Position 4: TTCG → GCTT) ──────────────────────
+    ("GFP C-tag",         "C-tag",      "Pos 4",   "TTCG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("HA tag",            "C-tag",      "Pos 4",   "TTCG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("6xHis tag",         "C-tag",      "Pos 4",   "TTCG", "GCTT", "pUPD2", "Spectinomycin"),
+    # ── Terminators (Position 5: GCTT → CGCT) ──────────────────────────
+    ("Nos terminator",    "Terminator", "Pos 5",   "GCTT", "CGCT", "pUPD2", "Spectinomycin"),
+    ("CaMV 35S term",     "Terminator", "Pos 5",   "GCTT", "CGCT", "pUPD2", "Spectinomycin"),
+    ("OCS terminator",    "Terminator", "Pos 5",   "GCTT", "CGCT", "pUPD2", "Spectinomycin"),
+    ("rbcS terminator",   "Terminator", "Pos 5",   "GCTT", "CGCT", "pUPD2", "Spectinomycin"),
+    ("HSP18.2 term",      "Terminator", "Pos 5",   "GCTT", "CGCT", "pUPD2", "Spectinomycin"),
+]
+
+_GB_TYPE_COLORS: dict[str, str] = {
+    "Promoter":   "green",
+    "5' UTR":     "cyan",
+    "CDS":        "yellow",
+    "CDS-NS":     "dark_orange",
+    "C-tag":      "magenta",
+    "Terminator": "blue",
+}
+
+# ── Parts bin modal ────────────────────────────────────────────────────────────
+
+class PartsBinModal(ModalScreen):
+    """Golden Braid-compatible L0 parts library browser."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="parts-box"):
+            yield Static(" Parts Bin  —  Golden Braid L0 Parts ", id="parts-title")
+            yield DataTable(id="parts-table", cursor_type="row", zebra_stripes=True)
+            yield Static("", id="parts-detail")
+            with Horizontal(id="parts-btns"):
+                yield Button("New Part", id="btn-new-part", variant="success")
+                yield Button("Close",    id="btn-parts-close")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#parts-table", DataTable)
+        t.add_columns("Name", "Type", "Position", "5' OH", "3' OH", "Backbone", "Selection")
+        for row in _GB_L0_PARTS:
+            name, ptype, pos, oh5, oh3, backbone, marker = row
+            color = _GB_TYPE_COLORS.get(ptype, "white")
+            t.add_row(
+                Text(name,  style=color),
+                Text(ptype, style=f"dim {color}"),
+                pos,
+                Text(oh5,   style="bold cyan"),
+                Text(oh3,   style="bold cyan"),
+                backbone,
+                marker,
+            )
+
+    @on(DataTable.RowHighlighted, "#parts-table")
+    def _row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        idx = event.cursor_row
+        if idx < 0 or idx >= len(_GB_L0_PARTS):
+            return
+        name, ptype, pos, oh5, oh3, backbone, marker = _GB_L0_PARTS[idx]
+        color = _GB_TYPE_COLORS.get(ptype, "white")
+        t = Text()
+        t.append(f"{name}", style=f"bold {color}")
+        t.append(f"  [{ptype}]", style=f"dim {color}")
+        t.append("\n")
+        t.append(f"Position: {pos}   ", style="white")
+        t.append("5′ overhang: ", style="dim")
+        t.append(oh5, style="bold cyan")
+        t.append("   3′ overhang: ", style="dim")
+        t.append(oh3, style="bold cyan")
+        t.append("\n")
+        t.append(f"Backbone: {backbone}   Selection: {marker}", style="dim")
+        self.query_one("#parts-detail", Static).update(t)
+
+    @on(Button.Pressed, "#btn-new-part")
+    def _new_part(self, _) -> None:
+        self.app.notify("New Part editor coming soon.", severity="information")
+
+    @on(Button.Pressed, "#btn-parts-close")
+    def _close(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── Constructor modal ──────────────────────────────────────────────────────────
+
+class ConstructorModal(ModalScreen):
+    """Golden Braid TU Constructor — assemble L0 parts into a transcription unit."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    # L1 destination backbone info
+    _BACKBONES: dict = {
+        "Alpha1": {"id": "pDGB1_alpha1", "selection": "Spectinomycin", "note": "L1 alpha orientation"},
+        "Alpha2": {"id": "pDGB1_alpha2", "selection": "Spectinomycin", "note": "L1 alpha orientation"},
+        "Omega1": {"id": "pDGB1_omega1", "selection": "Kanamycin",     "note": "L1 omega orientation"},
+        "Omega2": {"id": "pDGB1_omega2", "selection": "Kanamycin",     "note": "L1 omega orientation"},
+    }
+
+    # Golden Braid L1 boundary overhangs
+    _TU_START = "GGAG"
+    _TU_END   = "CGCT"
+
+    # Part types that occupy each positional slot (for duplicate detection)
+    _POS_SLOT: dict = {
+        "Promoter":   1,
+        "5' UTR":     2,
+        "CDS":        3,
+        "CDS-NS":     3,
+        "C-tag":      4,
+        "Terminator": 5,
+    }
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lane:     list[tuple] = []
+        self._backbone: str         = "Alpha1"
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ctor-box"):
+            yield Static(
+                " Constructor  —  Golden Braid TU Assembly ", id="ctor-title"
+            )
+            with Horizontal(id="ctor-main"):
+                # Left: parts palette
+                with Vertical(id="ctor-palette-col"):
+                    yield Static(" Parts Palette ", id="ctor-palette-hdr")
+                    yield DataTable(
+                        id="ctor-palette", cursor_type="row", zebra_stripes=True
+                    )
+                    yield Button(
+                        "→  Add to Lane", id="btn-ctor-add", variant="primary"
+                    )
+                # Right: assembly lane
+                with Vertical(id="ctor-lane-col"):
+                    yield Static(" Assembly Lane ", id="ctor-lane-hdr")
+                    yield DataTable(
+                        id="ctor-lane", cursor_type="row", zebra_stripes=True
+                    )
+                    with Horizontal(id="ctor-lane-btns"):
+                        yield Button("↑",        id="btn-lane-up")
+                        yield Button("↓",        id="btn-lane-down")
+                        yield Button("✕ Remove", id="btn-lane-remove", variant="error")
+            # Backbone selector
+            with Horizontal(id="ctor-backbone-row"):
+                yield Static("Backbone:", id="ctor-backbone-label")
+                for bb in self._BACKBONES:
+                    classes = "bb-btn bb-active" if bb == self._backbone else "bb-btn"
+                    yield Button(bb, id=f"btn-bb-{bb}", classes=classes)
+            # Overhang chain + validation messages
+            yield Static("", id="ctor-validation")
+            # Bottom actions
+            with Horizontal(id="ctor-btns"):
+                yield Button(
+                    "Simulate Assembly", id="btn-ctor-simulate",
+                    variant="success", disabled=True
+                )
+                yield Button("Clear Lane", id="btn-ctor-clear", variant="warning")
+                yield Button("Close",      id="btn-ctor-close")
+
+    def on_mount(self) -> None:
+        # Populate palette
+        pt = self.query_one("#ctor-palette", DataTable)
+        pt.add_columns("Name", "Type", "Pos", "5' OH", "3' OH")
+        for row in _GB_L0_PARTS:
+            name, ptype, pos, oh5, oh3, *_ = row
+            color = _GB_TYPE_COLORS.get(ptype, "white")
+            pt.add_row(
+                Text(name,  style=color),
+                Text(ptype, style=f"dim {color}"),
+                pos,
+                Text(oh5,   style="bold cyan"),
+                Text(oh3,   style="bold cyan"),
+            )
+        # Set up lane columns
+        lt = self.query_one("#ctor-lane", DataTable)
+        lt.add_columns("#", "Name", "Type", "5' OH", "3' OH")
+        self._refresh_validation()
+
+    # ── Lane management ───────────────────────────────────────────────────────
+
+    def _refresh_lane(self, restore_cursor: int = -1) -> None:
+        lt = self.query_one("#ctor-lane", DataTable)
+        lt.clear()
+        for i, row in enumerate(self._lane):
+            name, ptype, pos, oh5, oh3, *_ = row
+            color = _GB_TYPE_COLORS.get(ptype, "white")
+            lt.add_row(
+                str(i + 1),
+                Text(name,  style=color),
+                Text(ptype, style=f"dim {color}"),
+                Text(oh5,   style="bold cyan"),
+                Text(oh3,   style="bold cyan"),
+            )
+        if restore_cursor >= 0 and restore_cursor < len(self._lane):
+            try:
+                lt.move_cursor(row=restore_cursor)
+            except Exception:
+                pass
+
+    def _add_selected_part(self) -> None:
+        pt  = self.query_one("#ctor-palette", DataTable)
+        idx = pt.cursor_row
+        if 0 <= idx < len(_GB_L0_PARTS):
+            self._lane.append(_GB_L0_PARTS[idx])
+            self._refresh_lane(restore_cursor=len(self._lane) - 1)
+            self._refresh_validation()
+
+    # ── Grammar validation ────────────────────────────────────────────────────
+
+    def _validate(self) -> tuple[bool, list[str]]:
+        """Return (is_valid, error_list). Valid = complete, correctly-chained TU."""
+        if not self._lane:
+            return False, ["Lane is empty — add L0 parts to build a TU."]
+
+        errors: list[str] = []
+
+        # 1. Boundary overhangs
+        if self._lane[0][3] != self._TU_START:
+            errors.append(
+                f"First part must carry the {self._TU_START} overhang "
+                f"(Promoter, Pos 1). Got {self._lane[0][3]!r}."
+            )
+        if self._lane[-1][4] != self._TU_END:
+            errors.append(
+                f"Last part must carry the {self._TU_END} overhang "
+                f"(Terminator, Pos 5). Got {self._lane[-1][4]!r}."
+            )
+
+        # 2. Overhang continuity
+        for i in range(len(self._lane) - 1):
+            oh3 = self._lane[i][4]
+            oh5 = self._lane[i + 1][3]
+            if oh3 != oh5:
+                errors.append(
+                    f"Overhang mismatch at junction {i+1}→{i+2}: "
+                    f"{self._lane[i][0]!r} ends {oh3!r} but "
+                    f"{self._lane[i+1][0]!r} starts {oh5!r}."
+                )
+
+        # 3. Duplicate positional slots
+        seen: dict[int, str] = {}
+        for row in self._lane:
+            name, ptype = row[0], row[1]
+            slot = self._POS_SLOT.get(ptype)
+            if slot is not None:
+                if slot in seen:
+                    errors.append(
+                        f"Slot {slot} occupied twice: {seen[slot]!r} and {name!r}."
+                    )
+                else:
+                    seen[slot] = name
+
+        # 4. CDS-NS ↔ C-tag pairing
+        for i, row in enumerate(self._lane):
+            if row[1] == "CDS-NS":
+                nxt = self._lane[i + 1][1] if i + 1 < len(self._lane) else None
+                if nxt != "C-tag":
+                    errors.append(
+                        f"{row[0]!r} has no stop codon — must be immediately "
+                        f"followed by a C-terminal tag (Pos 4)."
+                    )
+            elif row[1] == "C-tag":
+                prv = self._lane[i - 1][1] if i > 0 else None
+                if prv != "CDS-NS":
+                    errors.append(
+                        f"{row[0]!r} (C-tag, Pos 4) must follow a no-stop CDS "
+                        f"(Pos 3). Found: {prv!r}."
+                    )
+
+        # 5. Mandatory parts
+        types = {r[1] for r in self._lane}
+        if "Promoter" not in types:
+            errors.append("Missing Promoter (Pos 1, 5' OH: GGAG).")
+        if "CDS" not in types and not ("CDS-NS" in types and "C-tag" in types):
+            errors.append(
+                "Missing CDS (Pos 3-4). Add a CDS, or a CDS-NS + C-tag pair."
+            )
+        if "Terminator" not in types:
+            errors.append("Missing Terminator (Pos 5, 3' OH: CGCT).")
+
+        return len(errors) == 0, errors
+
+    def _build_chain(self) -> Text:
+        """Render the overhang chain with colour-coded junctions."""
+        t = Text()
+        if not self._lane:
+            t.append("(empty)", style="dim")
+            return t
+
+        # Opening backbone overhang
+        start_ok = (self._lane[0][3] == self._TU_START)
+        t.append("5'-", style="dim")
+        t.append(self._TU_START, style="bold green" if start_ok else "bold red")
+
+        for i, row in enumerate(self._lane):
+            name, ptype, pos, oh5, oh3, *_ = row
+            color   = _GB_TYPE_COLORS.get(ptype, "white")
+            # incoming junction colour
+            exp_in  = self._TU_START if i == 0 else self._lane[i - 1][4]
+            junc_ok = (oh5 == exp_in)
+            dash    = "—" if junc_ok else "≠"
+            t.append(dash, style="white" if junc_ok else "bold red")
+            t.append(f"[{name}]", style=color)
+            t.append("—", style="white")
+            # outgoing OH colour
+            exp_out  = self._lane[i + 1][3] if i + 1 < len(self._lane) else self._TU_END
+            oh3_ok   = (oh3 == exp_out)
+            t.append(oh3, style="bold cyan" if oh3_ok else "bold red")
+
+        t.append("-3'", style="dim")
+        return t
+
+    def _refresh_validation(self) -> None:
+        is_valid, errors = self._validate()
+        bb     = self._BACKBONES[self._backbone]
+        vbox   = self.query_one("#ctor-validation", Static)
+        sim    = self.query_one("#btn-ctor-simulate", Button)
+        sim.disabled = not is_valid
+
+        t = Text()
+        t.append_text(self._build_chain())
+        t.append("\n")
+        if is_valid:
+            t.append(
+                f"✓  Valid TU — assembles into {self._backbone} "
+                f"({bb['id']}, {bb['selection']} selection, {bb['note']})",
+                style="bold green",
+            )
+        else:
+            for err in errors:
+                t.append(f"✗  {err}\n", style="bold red")
+        vbox.update(t)
+
+    # ── Button handlers ───────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-ctor-add")
+    def _on_add(self, _) -> None:
+        self._add_selected_part()
+
+    @on(Button.Pressed, "#btn-lane-up")
+    def _on_up(self, _) -> None:
+        lt  = self.query_one("#ctor-lane", DataTable)
+        idx = lt.cursor_row
+        if idx <= 0 or idx >= len(self._lane):
+            return
+        self._lane[idx - 1], self._lane[idx] = self._lane[idx], self._lane[idx - 1]
+        self._refresh_lane(restore_cursor=idx - 1)
+        self._refresh_validation()
+
+    @on(Button.Pressed, "#btn-lane-down")
+    def _on_down(self, _) -> None:
+        lt  = self.query_one("#ctor-lane", DataTable)
+        idx = lt.cursor_row
+        if idx < 0 or idx >= len(self._lane) - 1:
+            return
+        self._lane[idx], self._lane[idx + 1] = self._lane[idx + 1], self._lane[idx]
+        self._refresh_lane(restore_cursor=idx + 1)
+        self._refresh_validation()
+
+    @on(Button.Pressed, "#btn-lane-remove")
+    def _on_remove(self, _) -> None:
+        lt  = self.query_one("#ctor-lane", DataTable)
+        idx = lt.cursor_row
+        if 0 <= idx < len(self._lane):
+            self._lane.pop(idx)
+            self._refresh_lane(restore_cursor=min(idx, len(self._lane) - 1))
+            self._refresh_validation()
+
+    @on(Button.Pressed, ".bb-btn")
+    def _on_backbone(self, event: Button.Pressed) -> None:
+        bb = (event.button.id or "").replace("btn-bb-", "")
+        if bb not in self._BACKBONES:
+            return
+        self._backbone = bb
+        for name in self._BACKBONES:
+            btn = self.query_one(f"#btn-bb-{name}", Button)
+            btn.set_class(name == bb, "bb-active")
+        self._refresh_validation()
+
+    @on(Button.Pressed, "#btn-ctor-simulate")
+    def _on_simulate(self, _) -> None:
+        self.app.notify("Simulate Assembly: coming soon.", severity="information")
+
+    @on(Button.Pressed, "#btn-ctor-clear")
+    def _on_clear(self, _) -> None:
+        self._lane.clear()
+        self._refresh_lane()
+        self._refresh_validation()
+
+    @on(Button.Pressed, "#btn-ctor-close")
+    def _on_close(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 # ── Unsaved-changes quit dialog ────────────────────────────────────────────────
@@ -2911,6 +3340,45 @@ UnsavedQuitModal { align: center middle; }
 #quit-msg   { color: $text-muted; margin-bottom: 1; }
 #quit-btns  { height: 3; margin-top: 1; }
 #quit-btns Button { margin-right: 1; }
+
+/* ── Constructor modal ───────────────────────────────────── */
+ConstructorModal { align: center middle; }
+#ctor-box {
+    width: 116; height: 42;
+    background: $surface; border: solid $accent; padding: 1 2;
+}
+#ctor-title       { background: $accent-darken-2; padding: 0 1; margin-bottom: 1; }
+#ctor-main        { height: 20; }
+#ctor-palette-col { width: 1fr; border-right: solid $primary-darken-2; padding-right: 1; }
+#ctor-palette-hdr { background: $primary-darken-2; padding: 0 1; }
+#ctor-palette     { height: 1fr; }
+#ctor-lane-col    { width: 1fr; padding-left: 1; }
+#ctor-lane-hdr    { background: $primary-darken-2; padding: 0 1; }
+#ctor-lane        { height: 1fr; }
+#ctor-lane-btns   { height: 3; margin-top: 0; }
+#ctor-lane-btns Button { min-width: 5; margin-right: 1; }
+#ctor-backbone-row { height: 3; margin-top: 1; align: left middle; }
+#ctor-backbone-label { width: auto; padding: 0 1; color: $text-muted; }
+.bb-btn           { min-width: 9; margin-right: 1; }
+.bb-active        { background: $accent; color: $text; }
+#ctor-validation  {
+    height: 5; border: solid $primary-darken-2;
+    padding: 0 1; margin-top: 1; overflow-x: auto;
+}
+#ctor-btns        { height: 3; margin-top: 1; }
+#ctor-btns Button { margin-right: 1; }
+
+/* ── Parts bin modal ─────────────────────────────────────── */
+PartsBinModal { align: center middle; }
+#parts-box {
+    width: 110; height: 36;
+    background: $surface; border: solid $success; padding: 1 2;
+}
+#parts-title  { background: $success-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#parts-table  { height: 1fr; }
+#parts-detail { height: 5; border-top: solid $accent; padding: 0 1; color: $text-muted; }
+#parts-btns   { height: 3; margin-top: 1; }
+#parts-btns Button { margin-right: 1; }
 """
 
     BINDINGS = [
@@ -3576,8 +4044,11 @@ UnsavedQuitModal { align: center middle; }
             "Primers": [
                 ("Design Primer... (coming soon)", None),
             ],
-            "Genes": [
-                ("Annotate from NCBI... (coming soon)", None),
+            "Parts": [
+                ("Parts Bin",  "open_parts_bin"),
+            ],
+            "Constructor": [
+                ("Assembly Constructor", "open_constructor"),
             ],
         }
         items = menus.get(name, [])
@@ -3593,7 +4064,7 @@ UnsavedQuitModal { align: center middle; }
         if action in ("toggle_restr", "toggle_restr_unique", "toggle_restr_min6", "toggle_restr_min4"):
             getattr(self, f"action_{action}")()
         else:
-            self.call_action(action)
+            getattr(self, f"action_{action}")()
 
     def action_toggle_restr(self) -> None:
         self._show_restr = not self._show_restr
@@ -3619,6 +4090,12 @@ UnsavedQuitModal { align: center middle; }
 
     def action_add_feature(self) -> None:
         self.notify("Add feature: coming soon", severity="information")
+
+    def action_open_parts_bin(self) -> None:
+        self.push_screen(PartsBinModal())
+
+    def action_open_constructor(self) -> None:
+        self.push_screen(ConstructorModal())
 
     def action_undo(self) -> None:
         self._action_undo()
