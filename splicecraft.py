@@ -3993,11 +3993,10 @@ PartsBinModal { align: center middle; }
         self._undo_stack: list = []
         self._redo_stack: list = []
         if self._preload_record is not None:
+            # CLI preload (e.g. `python3 splicecraft.py L09137`) is an import
+            # and should be persisted to the library like any other import.
             def _load_preload():
-                record = self._preload_record
-                path   = getattr(record, "_tui_source", None)
-                self._apply_record(record)
-                self._source_path = path
+                self._import_and_persist(self._preload_record)
             self.call_after_refresh(_load_preload)
         elif not _load_library():
             self._seed_default_library()
@@ -4213,18 +4212,48 @@ PartsBinModal { align: center middle; }
     # ── Fetch / open ───────────────────────────────────────────────────────────
 
     def action_fetch(self):
-        self.push_screen(FetchModal(), callback=self._apply_record)
+        # Auto-persist: fetched records go straight into the library so the
+        # user never has to remember to press `a`. See _import_and_persist.
+        self.push_screen(FetchModal(), callback=self._import_and_persist)
 
     def action_open_file(self):
-        def _cb(record):
-            if record is None:
-                return
-            path = getattr(record, "_tui_source", None)
-            self._apply_record(record)
-            self._source_path = path   # restore after _apply_record clears it
-        self.push_screen(OpenFileModal(), callback=_cb)
+        # Same auto-persist policy as fetch; _import_and_persist preserves
+        # the record's _tui_source path for later "Save" operations.
+        self.push_screen(OpenFileModal(), callback=self._import_and_persist)
 
     # ── Central record loader ──────────────────────────────────────────────────
+
+    def _import_and_persist(self, record) -> None:
+        """Apply a freshly-imported record to the UI AND save it to the library.
+
+        Used by the three "user imported a plasmid" entry points — NCBI fetch,
+        open local file, and CLI preload. Library loads, pLannotate merges,
+        and undo/redo go through `_apply_record` directly so they don't
+        re-save the same record.
+
+        `add_entry` dedupes by `record.id`, so re-importing an existing entry
+        updates it in place rather than creating a duplicate.
+        """
+        if record is None:
+            return
+        # _apply_record clears self._source_path; preserve the file path if
+        # the record came from a local .gb file (it's stashed on the record
+        # by load_genbank callers).
+        source_path = getattr(record, "_tui_source", None)
+        self._apply_record(record)
+        if source_path is not None:
+            self._source_path = source_path
+        try:
+            lib = self.query_one("#library", LibraryPanel)
+            lib.add_entry(record)
+            self.notify(f"Saved {record.name} to library.", timeout=4)
+        except Exception:
+            # UI already loaded the record; log and warn but don't hide it.
+            _log.exception("auto-persist on import failed")
+            self.notify(
+                "Loaded record but could not save to library (see log).",
+                severity="warning",
+            )
 
     def _apply_record(self, record) -> None:
         """Load a SeqRecord into all panels."""

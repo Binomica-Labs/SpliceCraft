@@ -180,6 +180,103 @@ class TestNoNetworkAccess:
 # pLannotate UI entry points (button + shortcut, pLannotate itself mocked)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class TestImportAutoPersist:
+    """Every 'user imports a plasmid' entry point should auto-save the
+    record to the library. Library loads, pLannotate merges, and undo/redo
+    should NOT re-save."""
+
+    async def test_preload_record_is_auto_added_to_library(
+        self, tiny_record, isolated_library
+    ):
+        """A CLI-preloaded record (python3 splicecraft.py myplasmid.gb)
+        should appear in the library JSON after mount."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Library JSON on disk should contain the record
+            lib_entries = sc._load_library()
+            ids = [e["id"] for e in lib_entries]
+            assert tiny_record.id in ids, (
+                f"preloaded record {tiny_record.id} not saved to library; "
+                f"library contains {ids}"
+            )
+
+    async def test_library_load_does_not_duplicate(
+        self, tiny_record, isolated_library
+    ):
+        """Clicking a library row fires _library_load → _apply_record (NOT
+        _import_and_persist), so the same record must not be added twice."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            before = len(sc._load_library())
+            # Simulate clicking the library row by sending the same message
+            # the DataTable would post
+            app.post_message(
+                sc.LibraryPanel.PlasmidLoad(sc._load_library()[0])
+            )
+            await pilot.pause(0.05)
+            after = len(sc._load_library())
+            assert after == before, (
+                f"library_load should not add entries: {before} → {after}"
+            )
+
+    async def test_fetch_callback_adds_to_library(
+        self, tiny_record, isolated_library, monkeypatch
+    ):
+        """When FetchModal dismisses with a record, the app callback
+        (_import_and_persist) should save it to the library."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Call the helper directly — the modal → callback route is
+            # equivalent to this once the modal dismisses.
+            app._import_and_persist(tiny_record)
+            await pilot.pause(0.05)
+            entries = sc._load_library()
+            assert any(e["id"] == tiny_record.id for e in entries), (
+                f"fetched record not persisted; library: "
+                f"{[e['id'] for e in entries]}"
+            )
+
+    async def test_import_of_duplicate_id_updates_in_place(
+        self, tiny_record, isolated_library, monkeypatch
+    ):
+        """Re-importing a record with the same id should update the existing
+        entry rather than create a duplicate (the add_entry dedup contract)."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._import_and_persist(tiny_record)
+            await pilot.pause(0.05)
+            n_first  = len(sc._load_library())
+            app._import_and_persist(tiny_record)
+            await pilot.pause(0.05)
+            n_second = len(sc._load_library())
+            assert n_first == n_second, (
+                f"re-import duplicated the entry: {n_first} → {n_second}"
+            )
+            # And the record is present exactly once
+            ids = [e["id"] for e in sc._load_library()]
+            assert ids.count(tiny_record.id) == 1
+
+    async def test_import_none_is_noop(self, isolated_library):
+        """Cancelled fetch/open modals dismiss with None — the helper must
+        handle it silently."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            before = len(sc._load_library())
+            app._import_and_persist(None)
+            await pilot.pause(0.05)
+            assert len(sc._load_library()) == before
+
+
 class TestPlannotateUIEntryPoints:
     async def test_annotate_button_exists_in_library(self, tiny_record,
                                                       isolated_library):
