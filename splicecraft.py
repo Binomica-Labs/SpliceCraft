@@ -628,9 +628,16 @@ def _render_feature_row_pair(
     single_row: bool = False,
 ) -> None:
     """
-    Append one label row + optional connector row + one braille-bar row to result.
+    Append one label row + optional connector row + one feature-bar row to result.
     For above-DNA: label / [connector] / bar.
     For below-DNA: bar / [connector] / label.
+
+    Feature bars use ▒ (medium-shade / dither) as the fill glyph so the bar
+    reads as a single flat coloured tone rather than a pattern of distinct dots.
+    This is DELIBERATELY different from PlasmidMap, which still uses braille
+    sub-character rendering (U+2800–U+28FF) for the circular-map feature arcs —
+    only the sequence panel switched off braille.
+
     When single_row=True (RE lanes), collapse to one content row: the cut arrow is
     placed just outside the bracket (left of '(' above DNA, right of ')' below) only
     if that cell is a space, so it never overwrites another character.
@@ -726,13 +733,15 @@ def _render_feature_row_pair(
             if 0 <= bar_s + i < content_w:
                 label_arr[bar_s + i] = (ch, color)
 
-        # Braille bar
+        # Dithered feature bar — medium-shade fill + directional arrowhead at
+        # the feature end (strand direction preserved). 1 bp features get a
+        # triangle pointing toward the DNA row.
         if bar_len == 1:
             bar_str = "▲" if is_below_dna else "▼"
         elif strand >= 0:
-            bar_str = "⣿" * (bar_len - (1 if ends_here   else 0)) + ("▶" if ends_here   else "")
+            bar_str = "▒" * (bar_len - (1 if ends_here   else 0)) + ("▶" if ends_here   else "")
         else:
-            bar_str = ("◀" if starts_here else "") + "⣿" * (bar_len - (1 if starts_here else 0))
+            bar_str = ("◀" if starts_here else "") + "▒" * (bar_len - (1 if starts_here else 0))
         for i, ch in enumerate(bar_str):
             if 0 <= bar_s + i < content_w:
                 bar_arr[bar_s + i] = (ch, color)
