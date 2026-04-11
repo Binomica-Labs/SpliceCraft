@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# pytest
+.pytest_cache/
+
+# User-local runtime data (library is user-specific; seeded on first run)
+plasmid_library.json
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

@@ -22,10 +22,15 @@ Run standalone:
 """
 
 import json
+import logging
 import math
+import os
+import platform
 import re
 import sys
+import uuid as _uuid
 from io import StringIO
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 # ── Dependency check ───────────────────────────────────────────────────────────
@@ -49,19 +54,64 @@ def _check_deps():
 
 _check_deps()
 
+# ── Logging ────────────────────────────────────────────────────────────────────
+# Borrowed from ScriptoScope: rotating file log with an 8-char session ID prefix
+# on every line so multi-run logs are greppable. Default path /tmp/splicecraft.log,
+# overridable via $SPLICECRAFT_LOG. UI never sees raw tracebacks — they go here.
+
+_LOG_PATH   = os.environ.get("SPLICECRAFT_LOG") or "/tmp/splicecraft.log"
+_SESSION_ID = _uuid.uuid4().hex[:8]
+
+class _SessionFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.session = _SESSION_ID
+        return True
+
+_log = logging.getLogger("splicecraft")
+_log.setLevel(logging.INFO)
+_log.propagate = False
+if not _log.handlers:
+    try:
+        _handler = RotatingFileHandler(
+            _LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8"
+        )
+        _handler.setFormatter(logging.Formatter(
+            fmt="%(asctime)s [%(session)s] %(levelname)-5s "
+                "%(name)s.%(funcName)s:%(lineno)d %(message)s"
+        ))
+        _handler.addFilter(_SessionFilter())
+        _log.addHandler(_handler)
+    except OSError:
+        # Fall back to a no-op handler if /tmp is read-only (rare; shouldn't crash UI)
+        _log.addHandler(logging.NullHandler())
+
+def _log_startup_banner() -> None:
+    def _ver(import_name: str) -> str:
+        try:
+            mod = __import__(import_name)
+            return getattr(mod, "__version__", "unknown")
+        except ImportError:
+            return "NOT INSTALLED"
+    _log.info("=" * 60)
+    _log.info("SpliceCraft session %s starting", _SESSION_ID)
+    _log.info("python    : %s", sys.version.split()[0])
+    _log.info("platform  : %s", platform.platform())
+    _log.info("textual   : %s", _ver("textual"))
+    _log.info("biopython : %s", _ver("Bio"))
+    _log.info("log path  : %s", _LOG_PATH)
+    _log.info("=" * 60)
+
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, ScrollableContainer
-from textual.coordinate import Coordinate
 from textual.events import Click, MouseDown, MouseMove, MouseUp, MouseScrollDown, MouseScrollUp
 from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import (
-    Button, DataTable, Footer, Header, Input, Label,
-    Select, Static, TabbedContent, TabPane,
+    Button, DataTable, Footer, Header, Input, Label, Static,
 )
 from rich.text import Text
 
@@ -89,7 +139,7 @@ def _load_library() -> list[dict]:
             _library_cache = json.loads(_LIBRARY_FILE.read_text())
             return list(_library_cache)
         except Exception:
-            pass
+            _log.exception("Failed to load library from %s", _LIBRARY_FILE)
     _library_cache = []
     return []
 
@@ -98,7 +148,7 @@ def _save_library(entries: list[dict]) -> None:
     try:
         _LIBRARY_FILE.write_text(json.dumps(entries, indent=2))
     except Exception:
-        pass
+        _log.exception("Failed to save library to %s", _LIBRARY_FILE)
     _library_cache = list(entries)
 
 # ── Restriction sites ──────────────────────────────────────────────────────────
@@ -389,6 +439,35 @@ def _rc(seq: str) -> str:
     return seq.upper().translate(_IUPAC_COMP)[::-1]
 
 
+# Pre-built per-enzyme scan records: immutable derived values (compiled pattern,
+# palindrome flag, RC pattern, color) computed once at import time rather than
+# on every _scan_restriction_sites call. Iterating the pre-built list avoids
+# ~200 per-call _iupac_pattern + _rc + dict-lookup + len calls per scan.
+#
+# Each entry is a tuple:
+#   (name, site, site_len, fwd_cut, rev_cut, color, pat, is_palindrome, rc_pat)
+# rc_pat is None for palindromic enzymes (no reverse scan needed).
+_SCAN_CATALOG: "list[tuple]" = []
+
+
+def _rebuild_scan_catalog() -> None:
+    """(Re)populate `_SCAN_CATALOG` from `_NEB_ENZYMES`. Called at import
+    time; also exposed so tests / future catalog edits can refresh it."""
+    _SCAN_CATALOG.clear()
+    for name, (site, fwd_cut, rev_cut) in _NEB_ENZYMES.items():
+        site_u  = site.upper()
+        pat     = _iupac_pattern(site_u)
+        rc_site = _rc(site_u)
+        is_pal  = (rc_site == site_u)
+        rc_pat  = None if is_pal else _iupac_pattern(rc_site)
+        _SCAN_CATALOG.append((
+            name, site_u, len(site_u), fwd_cut, rev_cut,
+            _RESTR_COLOR[name], pat, is_pal, rc_pat,
+        ))
+
+_rebuild_scan_catalog()
+
+
 def _scan_restriction_sites(
     seq: str,
     min_recognition_len: int = 6,
@@ -410,12 +489,10 @@ def _scan_restriction_sites(
     by_enzyme: dict[str, list[dict]] = {}
     seen: set[tuple[str, int, int]] = set()   # deduplicate palindromes
 
-    for name, (site, fwd_cut, rev_cut) in _NEB_ENZYMES.items():
-        if len(site) < min_recognition_len:
+    for entry in _SCAN_CATALOG:
+        name, site, site_len, fwd_cut, rev_cut, color, pat, is_palindrome, rc_pat = entry
+        if site_len < min_recognition_len:
             continue
-        color    = _RESTR_COLOR[name]
-        pat      = _iupac_pattern(site)
-        site_len = len(site)
         hits: list[dict] = []
 
         # Forward strand scan
@@ -447,18 +524,11 @@ def _scan_restriction_sites(
                 "label":  name,
             })
 
-        # Reverse strand handling
-        rc_site = _rc(site)
-        is_palindrome = (rc_site == site.upper())
-
-        if is_palindrome:
-            # Palindromic: forward scan already found all physical sites.
-            # One resite + one recut per match is sufficient.
-            pass
-        else:
+        # Reverse strand handling — uses precomputed is_palindrome and rc_pat
+        # from _SCAN_CATALOG (no per-call _rc / _iupac_pattern work).
+        if not is_palindrome:
             # Non-palindromic: scan for RC on forward strand to find
             # reverse-strand binding sites at their correct positions.
-            rc_pat = _iupac_pattern(rc_site)
             for m in rc_pat.finditer(seq_u):
                 p = m.start()
                 key = (name, p, -1)
@@ -763,6 +833,38 @@ def _chunk_lane_groups(
     return re_above, onebp_above, reg_above, reg_below, onebp_below, re_below
 
 
+# Per-(seq_id, feats_id) cache for expensive inputs of _build_seq_text that
+# only depend on sequence and features, not on cursor/selection/line_width.
+# Cache holds (styles_list, annot_feats_sorted). Invalidated by id — lists
+# are reassigned on load, never mutated in place (see CLAUDE.md).
+_BUILD_SEQ_CACHE: dict = {}
+
+def _build_seq_inputs(seq: str, feats: list[tuple]) -> tuple:
+    """Return (styles, annot_feats) for a given sequence/feature pair,
+    memoised by identity. Both outputs are expensive on large plasmids and
+    independent of cursor/selection state."""
+    key = (id(seq), id(feats), len(seq), len(feats))
+    hit = _BUILD_SEQ_CACHE.get(key)
+    if hit is not None:
+        return hit
+    n = len(seq)
+    styles = ["color(252)"] * n
+    for f in reversed(feats):          # reversed so first feature wins
+        col = f["color"]
+        for i in range(f["start"], min(f["end"], n)):
+            styles[i] = col
+    annot_feats = sorted(
+        [f for f in feats if f.get("type") not in ("site", "recut")],
+        key=lambda f: -(f["end"] - f["start"]),
+    )
+    # Cap the cache at 4 entries (one active + a few stale) — we're keying
+    # on id() so size stays tiny; this is just belt-and-braces.
+    if len(_BUILD_SEQ_CACHE) >= 4:
+        _BUILD_SEQ_CACHE.clear()
+    _BUILD_SEQ_CACHE[key] = (styles, annot_feats)
+    return styles, annot_feats
+
+
 def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                     sel_range: "tuple[int,int] | None" = None,
                     user_sel:  "tuple[int,int] | None" = None,
@@ -783,11 +885,7 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     """
     n     = len(seq)
     num_w = len(str(n)) if n else 1    # minimum digits needed for line numbers
-    styles = ["color(252)"] * n
-    for f in reversed(feats):          # reversed so first feature wins
-        col = f["color"]
-        for i in range(f["start"], min(f["end"], n)):
-            styles[i] = col
+    styles, annot_feats = _build_seq_inputs(seq, feats)
 
     sel_s  = sel_range[0] if sel_range else -1
     sel_e  = sel_range[1] if sel_range else -1
@@ -804,13 +902,6 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     seq_upper = seq.upper()
     _COMP     = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")   # base complement
     result    = Text(no_wrap=True, overflow="crop")
-
-    # Annotation-bar features: exclude old "site" and "recut" (cut pos is
-    # embedded inside the resite bar; recut only used by the map overlays).
-    annot_feats = sorted(
-        [f for f in feats if f.get("type") not in ("site", "recut")],
-        key=lambda f: -(f["end"] - f["start"]),
-    )
 
     for chunk_start in range(0, n, line_width):
         chunk_end = min(chunk_start + line_width, n)
@@ -854,9 +945,14 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
             if run:
                 result.append("".join(run), style=sty)
 
+        # Perf: translate the whole chunk once instead of per-base.
+        chunk_fwd = seq_upper[chunk_start:chunk_end]
+        chunk_rev = chunk_fwd.translate(_COMP)
+        chunk_len = chunk_end - chunk_start
         fwd_bases: list[tuple[str, str]] = []
         rc_bases:  list[tuple[str, str]] = []
-        for i in range(chunk_start, chunk_end):
+        for j in range(chunk_len):
+            i      = chunk_start + j
             base   = styles[i]
             in_usr = (usr_s <= i < usr_e)
             in_sel = (sel_s <= i < sel_e)
@@ -879,8 +975,8 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
             else:
                 fwd_sty = base
                 rev_sty = base
-            fwd_bases.append((seq_upper[i],                    fwd_sty))
-            rc_bases.append( (seq_upper[i].translate(_COMP),   rev_sty))
+            fwd_bases.append((chunk_fwd[j], fwd_sty))
+            rc_bases.append( (chunk_rev[j], rev_sty))
 
         # Forward strand
         result.append(f"{chunk_start + 1:>{num_w}}  ", style="color(245)")
@@ -1540,7 +1636,10 @@ class PlasmidMap(Widget):
             ax, ay = a2xy(tip_a, dr=dr_lo + 1)
             canvas.put(ax, ay, _arrow_char(tip_tan), "bold " + style)
 
-            mid_bp = (start_bp + (end_bp - start_bp) // 2) % total
+            # Arc length on a circular plasmid: ((end - start) mod total) handles
+            # wrap-around (end < start) without putting the label opposite the arc.
+            arc_len = (end_bp - start_bp) % total
+            mid_bp  = (start_bp + arc_len // 2) % total
             label_slots.append((bp2a(mid_bp), f["label"], color))
 
         # Add restriction site labels (from resite entries only)
@@ -1855,6 +1954,19 @@ class FeatureSidebar(Widget):
 
     def populate(self, feats: list[dict]) -> None:
         t = self.query_one("#feat-table", DataTable)
+        # Suppress the RowHighlighted cascade that fires when DataTable auto-
+        # moves the cursor to row 0 after clear()+add_row. Without this guard,
+        # every record load triggers a redundant SequencePanel rebuild (the
+        # cascade routes through PlasmidApp._sidebar_row_activated → seq_pnl.
+        # highlight_feature → _refresh_view). Measured savings: ~50 ms per
+        # load on 10 kb plasmids, ~110 ms on 20 kb. See CLAUDE.md perf notes.
+        #
+        # Textual posts RowHighlighted asynchronously, so we can't use a
+        # simple try/finally: the handler would see _populating == False
+        # because populate() has already returned by the time the message is
+        # dispatched. Instead we set the flag True here and schedule its
+        # reset via call_after_refresh, which runs AFTER all pending messages.
+        self._populating = True
         t.clear()
         for f in feats:
             strand_sym = "+" if f["strand"] == 1 else ("−" if f["strand"] == -1 else "·")
@@ -1865,6 +1977,9 @@ class FeatureSidebar(Widget):
                 bp_str,
                 strand_sym,
             )
+        def _clear_populating():
+            self._populating = False
+        self.call_after_refresh(_clear_populating)
 
     def show_detail(self, f: dict | None) -> None:
         box = self.query_one("#detail-box", Static)
@@ -1884,6 +1999,7 @@ class FeatureSidebar(Widget):
         box.update(t)
 
     _prog_row: int = -1   # cursor moves driven by highlight_row, not the user
+    _populating: bool = False   # suppress RowActivated cascade during populate()
 
     def highlight_row(self, idx: int) -> None:
         """Move cursor to row; suppresses the resulting RowActivated echo."""
@@ -1898,6 +2014,9 @@ class FeatureSidebar(Widget):
 
     @on(DataTable.RowHighlighted, "#feat-table")
     def _row_highlighted(self, event: DataTable.RowHighlighted):
+        # Ignore every auto-highlight that fires while populate() is running.
+        if self._populating:
+            return
         if event.cursor_row == self._prog_row:
             self._prog_row = -1
             return
@@ -2593,6 +2712,7 @@ class FetchModal(ModalScreen):
             record = fetch_genbank(acc, email)
             self.app.call_from_thread(self.dismiss, record)
         except Exception as exc:
+            _log.exception("NCBI fetch failed for %s", acc)
             def _err():
                 self.query_one("#fetch-status", Static).update(
                     f"[red]Error: {exc}[/red]"
@@ -3653,7 +3773,8 @@ PartsBinModal { align: center middle; }
                 self._apply_record(record)
             self.call_from_thread(_add)
         except Exception:
-            pass
+            # First-run seed is best-effort: silent in UI, logged for debugging.
+            _log.exception("Default library seed (MW463917.1) failed")
 
     # ── Keyboard: cursor movement, copy, undo/redo ─────────────────────────────
 
@@ -4122,6 +4243,7 @@ PartsBinModal { align: center middle; }
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
+    _log_startup_banner()
     arg = sys.argv[1] if len(sys.argv) > 1 else None
     app = PlasmidApp()
 
@@ -4131,6 +4253,7 @@ def main():
                 record = load_genbank(arg)
                 record._tui_source = str(Path(arg).resolve())
             except Exception as exc:
+                _log.exception("Failed to load %s", arg)
                 print(f"Could not load {arg!r}: {exc}", file=sys.stderr)
                 sys.exit(1)
         else:
@@ -4139,11 +4262,18 @@ def main():
                 record = fetch_genbank(arg)
                 print(f"  Got: {record.name}  ({len(record.seq)} bp)")
             except Exception as exc:
+                _log.exception("NCBI fetch failed for %s", arg)
                 print(f"Fetch failed: {exc}", file=sys.stderr)
                 sys.exit(1)
         app._preload_record = record
 
-    app.run()
+    try:
+        app.run()
+    except Exception:
+        _log.exception("App terminated with unhandled exception")
+        raise
+    finally:
+        _log.info("SpliceCraft session %s ending", _SESSION_ID)
 
 
 if __name__ == "__main__":
