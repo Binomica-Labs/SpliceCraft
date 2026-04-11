@@ -13,8 +13,8 @@ A **terminal-based circular plasmid map viewer and sequence editor** built with 
 **Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs org, user ATinyGreenCell)
 
 - **Single-file architecture:** the entire app is `splicecraft.py` (~4,200 lines). Intentional — avoids import complexity and keeps the codebase greppable. (Sibling project ScriptoScope follows the same convention at ~8,600 lines.)
-- **Test suite:** 99 tests across 5 files in `tests/` (added 2026-04-11). Full run ~11 s. See the **Test suite** section below.
-- **Dependencies** (system-wide via `--break-system-packages` on Ubuntu/WSL2): `textual`, `biopython`, plus `pytest` and `pytest-asyncio` for the test suite. `Bio.Seq` and `Bio.SeqRecord` are the only Biopython surfaces touched in hot paths.
+- **Test suite:** 127 tests across 6 files in `tests/` (last refresh 2026-04-11). Full run ~15 s. See the **Test suite** section below.
+- **Dependencies** (system-wide via `--break-system-packages` on Ubuntu/WSL2): `textual`, `biopython`, plus `pytest` and `pytest-asyncio` for the test suite. `Bio.Seq` and `Bio.SeqRecord` are the only Biopython surfaces touched in hot paths. **Optional runtime:** `pLannotate` (conda, GPL-3) for the Shift+A annotation feature — SpliceCraft works fine without it and notifies the user how to install if they press Shift+A.
 
 ## How to run
 
@@ -23,10 +23,24 @@ cd ~/SpliceCraft
 python3 splicecraft.py              # empty canvas
 python3 splicecraft.py L09137       # fetch pUC19 from NCBI
 python3 splicecraft.py myplasmid.gb # open local GenBank file
-python3 -m pytest -q                # run the 99-test sanity suite
+python3 -m pytest -q                # run the 127-test sanity suite
 ```
 
 Logs are written to `/tmp/splicecraft.log` (override with `$SPLICECRAFT_LOG`). Each log line is prefixed with an 8-char session ID so multi-run logs grep cleanly.
+
+### Optional: pLannotate for automatic annotation
+
+Press **Shift+A** (or click the ◈ button in the library panel) to run pLannotate on the current plasmid. SpliceCraft only calls it as a subprocess — it is never imported (pLannotate is GPL-3 and keeping it behind a subprocess boundary avoids license entanglement).
+
+Install pLannotate in a dedicated conda env:
+```bash
+conda create -n plannotate -c conda-forge -c bioconda plannotate
+conda activate plannotate
+plannotate setupdb          # downloads ~500 MB of BLAST/diamond DBs
+# then run SpliceCraft from the same conda env
+```
+
+If pLannotate is not on `PATH`, Shift+A just notifies the user with these instructions and returns — nothing crashes.
 
 ## Architecture (single file: `splicecraft.py`)
 
@@ -166,17 +180,18 @@ New cache-hit test (`test_warm_cache_skips_styles_work`) asserts that `_BUILD_SE
 ## Test suite
 
 Added 2026-04-11 to protect the sacred invariants. Modeled on ScriptoScope's
-layout. Full suite runs in ~11 s; the biology-correctness subset runs in
+layout. Full suite runs in ~15 s; the biology-correctness subset runs in
 < 1 s and is the fastest feedback loop.
 
 ### Running
 
 ```bash
-python3 -m pytest -q                       # all 99 tests
-python3 -m pytest tests/test_dna_sanity.py # only biology (< 1 s)
-python3 -m pytest tests/test_smoke.py      # only TUI smoke (~9 s)
-python3 -m pytest -k "palindrome"          # only palindrome-related tests
-python3 -m pytest -x                       # stop on first failure
+python3 -m pytest -q                        # all 127 tests
+python3 -m pytest tests/test_dna_sanity.py  # only biology (< 1 s)
+python3 -m pytest tests/test_plannotate.py  # only pLannotate integration (~1 s)
+python3 -m pytest tests/test_smoke.py       # only TUI smoke (~9 s)
+python3 -m pytest -k "palindrome"           # only palindrome-related tests
+python3 -m pytest -x                        # stop on first failure
 ```
 
 `pyproject.toml` sets `asyncio_mode = "auto"` so async test functions don't
@@ -191,7 +206,8 @@ need `@pytest.mark.asyncio`. `tests/conftest.py` prepends the repo root to
 | `tests/test_dna_sanity.py` | 53 | All 5 sacred invariants. `_rc` IUPAC involution + ground truth + Biopython cross-check; `_iupac_pattern` degenerate expansion + cache identity; `_CODON_TABLE` 64-entry completeness + Biopython cross-check; `_NEB_ENZYMES` schema, no duplicates, IUPAC regex compiles, Type IIS cut-outside-recognition; `_scan_restriction_sites` palindrome dedup, non-palindrome forward-coordinate positioning (2026-03-30 regression guard), unique_only filter, min_recognition_len filter; `_translate_cds` forward & reverse strands, stop padding, partial codons, unknown codon → `?`. | 0.6 s |
 | `tests/test_circular_math.py` | 13 | Wrap-around midpoint formula (2026-04-11 regression guard); `PlasmidMap._bp_in` for wrapped and non-wrapped features, origin crossings, zero-width features. | 0.7 s |
 | `tests/test_genbank_io.py` | 14 | `load_genbank` file round-trip preserves sequence bytes + feature type + strand; `_record_to_gb_text` / `_gb_text_to_record` text round-trip; `_save_library` / `_load_library` JSON round-trip, corruption recovery, cache memoization. | 1.3 s |
-| `tests/test_smoke.py` | 10 | Textual app mounts with preloaded record, all 4 panels present (`#plasmid-map`, `#sidebar`, `#seq-panel`, `#library`), features loaded, sequence populated, restriction scan ran on load, rotation keys, view toggle, RE toggle, mount works without a preload, no-network guard (monkeypatches `fetch_genbank`). | 9 s |
+| `tests/test_plannotate.py` | 24 | pLannotate integration — availability detection for every failure mode (none missing, only plannotate, missing blastn, missing diamond, all ready, cache reuse); size-cap preflight (>50 kb rejected); feature merging (preserves originals, appends with `note="pLannotate"`, skips duplicates, doesn't mutate original); subprocess error paths (not installed, missing db, nonzero exit, timeout, FileNotFoundError at exec, no output file); happy path with mocked subprocess writing a real .gbk into the real tmpdir. pLannotate is never actually invoked by tests — `shutil.which` and `subprocess.run` are always monkeypatched. | 1.3 s |
+| `tests/test_smoke.py` | 14 | Textual app mounts with preloaded record, all 4 panels present, features loaded, sequence populated, restriction scan ran on load, rotation keys, view toggle, RE toggle, mount works without a preload, no-network guard. Plus pLannotate UI entry points: library `#btn-lib-annot` exists, Shift+A binding registered, Shift+A on empty state notifies gracefully, Shift+A with pLannotate missing notifies install instructions and does NOT invoke subprocess. | 9 s |
 | `tests/test_performance.py` | 9 | Budget enforcement: scan pUC19 < 30 ms, scan 10 kb < 150 ms, scan scaling < 8× for 4× more DNA (catches O(n²) regressions), `_iupac_pattern` warm < 5 ms for 200 lookups, warm strictly faster than cold, `_rc(10 kb)` < 2 ms, `_build_seq_text(pUC19)` < 25 ms, `_build_seq_text(20 kb)` < 200 ms, `_BUILD_SEQ_CACHE` populated after first call. Budgets are 4-70× over current baseline, so machine noise doesn't trip them but a real regression will. | 2.7 s |
 
 ### Sacred invariant → test mapping
@@ -247,10 +263,60 @@ Braille circular map, NCBI fetch, local .gb loading, library, feature sidebar, s
 
 ### Stubs (visible in menus, not implemented)
 - **Primers > Design Primer** — `coming soon` notification only
-- **Genes > Annotate from NCBI** — not implemented
 - **Features > Add Feature** (`action_add_feature`) — `coming soon` notification only
 - **Build > Simulate Assembly** — `coming soon` notification
 - **Build > New Part editor** — `coming soon` notification
+
+## pLannotate integration
+
+Shift+A (or the ◈ button in the library panel, or `Features > Annotate with pLannotate` in the menu) runs pLannotate on the currently-loaded plasmid and merges the results into the current record.
+
+### Design principles
+
+1. **Subprocess only, never import.** pLannotate is GPL-3 — importing it would arguably create a combined work under GPL. Calling `plannotate batch` as a subprocess keeps the boundary clean. See `_run_plannotate()` at ~line 1190.
+2. **Optional runtime dependency.** SpliceCraft works without pLannotate. The user only finds out it's optional when they press Shift+A; at that point, the UI shows an actionable install hint (`conda create -n plannotate ...`).
+3. **Size cap preflighted.** pLannotate's hard-coded `MAX_PLAS_SIZE` is 50 kb; we refuse larger inputs instantly instead of waiting 30 s for pLannotate to do the same.
+4. **Merge, don't replace.** Existing features are preserved; pLannotate hits are appended with a `note="pLannotate"` qualifier so users can tell them apart. A pLannotate hit at the same `(type, start, end, strand)` as an existing feature is skipped.
+5. **Background worker.** `_run_plannotate_worker(@work(thread=True))` runs the subprocess off the main thread; UI updates go through `call_from_thread`. The worker emits an initial "Running pLannotate…" notify and a final "Added N features" or error notify.
+6. **Undo-able.** `_run_plannotate_worker` calls `_push_undo()` before applying the merged record, so Ctrl+Z restores the pre-annotation state.
+7. **Dirty flag.** After a successful annotation, the library panel marker shows `*Name` — the user saves the annotated version to the library with plain `a`.
+
+### Code layout
+
+| Function / class | ~Line | Purpose |
+|---|---:|---|
+| `PlannotateError` (+ 4 subclasses) | 1118 | Exception hierarchy with `user_msg` / `detail` attrs for UI display |
+| `_PLANNOTATE_MAX_BP = 50_000` | 1132 | Matches pLannotate's `MAX_PLAS_SIZE` |
+| `_plannotate_status()` | 1140 | `shutil.which`-based probe for `plannotate`, `blastn`, `diamond`. Cached in `_PLANNOTATE_CHECK_CACHE` |
+| `_plannotate_install_hint()` | 1159 | Friendly `conda create ...` instructions for notifications |
+| `_run_plannotate(record, timeout=180)` | 1169 | Runs the subprocess, catches every failure mode, returns a parsed SeqRecord. Raises `PlannotateError` subclasses |
+| `_merge_plannotate_features(orig, annotated)` | 1251 | Pure function: returns a new SeqRecord preserving originals, appending pLannotate hits tagged with `note="pLannotate"` |
+| `LibraryPanel.AnnotateRequested` | ~2050 | Message posted by the `◈` button |
+| `LibraryPanel._btn_annotate` | ~2120 | Resolves the focused row and posts the message |
+| `PlasmidApp.action_annotate_plasmid` | ~4460 | Shift+A action: preflights availability + size, kicks off the worker |
+| `PlasmidApp._run_plannotate_worker` | ~4500 | `@work(thread=True)` — subprocess + merge + UI update |
+| `PlasmidApp._library_annotate_requested` | ~4350 | Handles the library message; loads the focused entry first if needed |
+
+### Failure modes and their notifications
+
+| Condition | Notification | `_run_plannotate` exception |
+|---|---|---|
+| `plannotate` not on PATH | "pLannotate not installed. Install via conda: …" | `PlannotateNotInstalled` |
+| `blastn` or `diamond` missing | "pLannotate needs blastn + diamond on PATH. …" | `PlannotateNotInstalled` |
+| Databases not downloaded (pLannotate prints this to stdout and exits 0 — insidious) | "pLannotate databases not installed. Run: plannotate setupdb" | `PlannotateMissingDb` |
+| Record > 50 kb | "pLannotate caps inputs at 50,000 bp (this plasmid: N bp)" | `PlannotateTooLarge` (also preflighted in `action_annotate_plasmid`) |
+| Subprocess timeout (>180 s) | "pLannotate crashed: …" via `call_from_thread` | `PlannotateFailed` |
+| Subprocess returns non-zero | "pLannotate failed: <last 500 chars of stderr>" | `PlannotateFailed` |
+| Output `.gbk` not written | "pLannotate produced no .gbk output" | `PlannotateFailed` |
+| Biopython can't parse output | "could not parse pLannotate output: <detail>" | `PlannotateFailed` |
+| Unknown crash | "pLannotate crashed: <exc>" + full traceback in `/tmp/splicecraft.log` | any `Exception` |
+| No record loaded | "Load a plasmid first (press 'f' or 'o')." | N/A (preflighted) |
+| Successful with new features | "Added N pLannotate features. Press 'a' to save to library." | — |
+| Successful but all hits duplicated existing features | "pLannotate found no new features (all hits duplicated existing annotations)." | — |
+
+### License note for future maintainers
+
+**Never `import plannotate` from SpliceCraft.** Always shell out via `_run_plannotate()`. If a future optimization makes you tempted to use pLannotate's Python API directly, check with the user first — SpliceCraft is not currently GPL-licensed, and importing a GPL module would arguably make the combined work GPL.
 
 ## Patterns worth porting from ScriptoScope (`/home/seb/proteoscope/scriptoscope.py`)
 
@@ -313,7 +379,7 @@ Either direction is viable. The single-file convention and shared logging/error 
 If you are picking this up cold:
 
 1. **Read this file first.** It gives you architecture without reading 4,200 lines.
-2. **Run `python3 -m pytest -q`** before and after any change. 99 tests, ~11 s. The biology-correctness subset (`tests/test_dna_sanity.py`) runs in < 1 s if you want a faster inner loop.
+2. **Run `python3 -m pytest -q`** before and after any change. 127 tests, ~15 s. The biology-correctness subset (`tests/test_dna_sanity.py`) runs in < 1 s if you want a faster inner loop.
 3. **Check `/tmp/splicecraft.log`** (or `$SPLICECRAFT_LOG`) when debugging runtime issues. Every session has a unique 8-char ID.
 4. **Don't break the sacred invariants.** Every one of them has a test (see the mapping table above). If you're touching `_scan_restriction_sites`, `_rc`, `_iupac_pattern`, `_translate_cds`, `_bp_in`, or the feature-midpoint formula, the relevant tests will tell you immediately if you got it wrong.
 5. **Follow the error handling convention**: `_log.exception` for the stack trace, `notify()` or `Static.update("[red]...[/]")` for the user. Never let raw tracebacks hit the TUI.

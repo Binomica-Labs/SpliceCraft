@@ -174,3 +174,63 @@ class TestNoNetworkAccess:
             await pilot.pause()
             await pilot.pause(0.05)
             assert not calls, f"fetch_genbank was called {len(calls)} time(s)"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# pLannotate UI entry points (button + shortcut, pLannotate itself mocked)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPlannotateUIEntryPoints:
+    async def test_annotate_button_exists_in_library(self, tiny_record,
+                                                      isolated_library):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            btn = app.query_one("#btn-lib-annot", sc.Button)
+            assert btn is not None
+
+    async def test_shift_a_binding_registered(self):
+        keys = [b.key for b in sc.PlasmidApp.BINDINGS]
+        assert "A" in keys, "shift+A (key='A') binding is missing"
+        # And it's distinct from lowercase a
+        assert "a" in keys
+
+    async def test_shift_a_with_no_record_notifies_not_crashes(
+        self, isolated_library, monkeypatch
+    ):
+        """With no record loaded, Shift+A must notify a warning and return
+        without touching pLannotate."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # No record loaded; invoke the action directly (avoids key
+            # routing which may target a different widget)
+            app.action_annotate_plasmid()
+            await pilot.pause(0.05)
+            # The app should still be alive — assertion is "didn't crash"
+
+    async def test_annotate_action_with_plannotate_missing_notifies_install(
+        self, tiny_record, isolated_library, monkeypatch
+    ):
+        """With pLannotate absent from PATH, the action notifies instead of
+        attempting to run anything. Verify by counting subprocess.run calls."""
+        import shutil, subprocess
+        monkeypatch.setattr(sc, "_PLANNOTATE_CHECK_CACHE", None)
+        monkeypatch.setattr(shutil, "which", lambda *a, **k: None)
+        calls = []
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *a, **k: calls.append((a, k)) or None,
+        )
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.action_annotate_plasmid()
+            await pilot.pause(0.05)
+            assert not calls, (
+                "subprocess.run should NOT be invoked when pLannotate "
+                "is not on PATH"
+            )

@@ -1143,6 +1143,216 @@ def _gb_text_to_record(text: str):
     from Bio import SeqIO
     return SeqIO.read(StringIO(text), "genbank")
 
+
+# ── External annotation (pLannotate) ──────────────────────────────────────────
+#
+# Integration with pLannotate (https://github.com/mmcguffi/pLannotate) as an
+# OPTIONAL runtime dependency. pLannotate is GPL-3 so we only call its CLI
+# as a subprocess — we never `import plannotate` (which would arguably create
+# a combined work under GPL).
+#
+# If pLannotate is not installed (shutil.which returns None), the UI entry
+# points notify the user with install instructions and no error propagates.
+#
+# Install path (from the pLannotate README):
+#     conda create -n plannotate -c conda-forge -c bioconda plannotate
+#     conda activate plannotate
+#     plannotate setupdb        # ~500 MB database, one-time
+#
+# pLannotate refuses inputs larger than 50 kb (its MAX_PLAS_SIZE constant),
+# so we preflight that too and give a specific error.
+
+class PlannotateError(Exception):
+    """Base class for pLannotate errors carrying a user-facing message."""
+    def __init__(self, user_msg: str, detail: str = ""):
+        super().__init__(user_msg if not detail else f"{user_msg}: {detail}")
+        self.user_msg = user_msg
+        self.detail   = detail
+
+class PlannotateNotInstalled(PlannotateError): pass
+class PlannotateMissingDb(PlannotateError):   pass
+class PlannotateTooLarge(PlannotateError):    pass
+class PlannotateFailed(PlannotateError):      pass
+
+# pLannotate's hard-coded maximum plasmid size (MAX_PLAS_SIZE in its resources).
+_PLANNOTATE_MAX_BP = 50_000
+
+# Cached availability probe — cleared by setting to None.
+_PLANNOTATE_CHECK_CACHE: "dict | None" = None
+
+def _plannotate_status() -> dict:
+    """Check whether pLannotate + BLAST+ + diamond are on PATH. Cached."""
+    global _PLANNOTATE_CHECK_CACHE
+    if _PLANNOTATE_CHECK_CACHE is not None:
+        return _PLANNOTATE_CHECK_CACHE
+    import shutil
+    status = {
+        "installed": shutil.which("plannotate") is not None,
+        "blast":     shutil.which("blastn")     is not None,
+        "diamond":   shutil.which("diamond")    is not None,
+    }
+    status["ready"] = all((status["installed"], status["blast"], status["diamond"]))
+    _PLANNOTATE_CHECK_CACHE = status
+    return status
+
+def _plannotate_install_hint() -> str:
+    """User-friendly install instructions for notifications."""
+    return (
+        "Install via conda:  conda create -n plannotate "
+        "-c conda-forge -c bioconda plannotate && "
+        "conda activate plannotate && plannotate setupdb"
+    )
+
+def _run_plannotate(record, timeout: int = 180):
+    """Run `plannotate batch` on a temporary copy of `record` and return the
+    parsed output as a Biopython SeqRecord. Raises a PlannotateError subclass
+    on any failure; callers are expected to catch and surface `err.user_msg`.
+
+    Never imports `plannotate` — invokes the CLI as a subprocess so the GPL
+    boundary stays clean.
+    """
+    import os
+    import subprocess
+    import tempfile
+
+    status = _plannotate_status()
+    if not status["installed"]:
+        raise PlannotateNotInstalled(
+            "pLannotate is not installed", _plannotate_install_hint()
+        )
+    if not status["blast"] or not status["diamond"]:
+        missing = []
+        if not status["blast"]:   missing.append("blastn")
+        if not status["diamond"]: missing.append("diamond")
+        raise PlannotateNotInstalled(
+            f"pLannotate requires {' + '.join(missing)} on PATH",
+            _plannotate_install_hint(),
+        )
+
+    n = len(record.seq)
+    if n > _PLANNOTATE_MAX_BP:
+        raise PlannotateTooLarge(
+            f"pLannotate max input is {_PLANNOTATE_MAX_BP:,} bp "
+            f"(this record: {n:,} bp)"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="splicecraft_plan_") as tmp:
+        in_path = os.path.join(tmp, "input.gb")
+        with open(in_path, "w", encoding="utf-8") as fh:
+            fh.write(_record_to_gb_text(record))
+
+        try:
+            result = subprocess.run(
+                [
+                    "plannotate", "batch",
+                    "-i", in_path,
+                    "-o", tmp,
+                    "-f", "annotated",
+                    "-s", "",           # no "_pLann" suffix
+                ],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except FileNotFoundError:
+            # PATH said plannotate existed, but the binary disappeared between
+            # the `which` check and the subprocess. Rare; report as not-installed.
+            raise PlannotateNotInstalled(
+                "pLannotate not found on PATH", _plannotate_install_hint()
+            )
+        except subprocess.TimeoutExpired:
+            raise PlannotateFailed(
+                f"pLannotate timed out after {timeout}s",
+                f"input was {n:,} bp",
+            )
+
+        combined_out = (result.stdout or "") + (result.stderr or "")
+        if "Databases not downloaded" in combined_out:
+            raise PlannotateMissingDb(
+                "pLannotate databases not installed",
+                "Run: plannotate setupdb",
+            )
+
+        if result.returncode != 0:
+            err_tail = combined_out[-500:].strip() or "(no output)"
+            raise PlannotateFailed("pLannotate failed", err_tail)
+
+        # Locate output GenBank. `plannotate batch` writes <file_name>.gbk; we
+        # passed `-f annotated` so look for annotated.gbk first, then any .gbk
+        # that isn't our input.
+        out_gb = os.path.join(tmp, "annotated.gbk")
+        if not os.path.exists(out_gb):
+            candidates = [
+                f for f in os.listdir(tmp)
+                if f.endswith(".gbk") and f != "input.gb"
+            ]
+            if not candidates:
+                raise PlannotateFailed("pLannotate produced no .gbk output")
+            out_gb = os.path.join(tmp, candidates[0])
+
+        try:
+            annotated = load_genbank(out_gb)
+        except Exception as exc:
+            raise PlannotateFailed("could not parse pLannotate output", str(exc))
+
+    return annotated
+
+
+def _merge_plannotate_features(original, annotated):
+    """Return a NEW SeqRecord with `original`'s sequence and features, plus
+    any non-duplicate features from `annotated` tagged with a "pLannotate"
+    note qualifier.
+
+    - Preserves the original sequence (annotated may round-trip differently).
+    - Skips feature type "source" (GenBank boilerplate).
+    - Skips a pLannotate feature if (type, start, end, strand) matches an
+      existing feature — avoids duplicating features the user already has.
+    """
+    from copy import deepcopy
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+
+    merged = SeqRecord(
+        Seq(str(original.seq)),
+        id=original.id,
+        name=original.name,
+        description=original.description,
+        annotations=dict(original.annotations),
+    )
+    for feat in original.features:
+        merged.features.append(deepcopy(feat))
+
+    existing_keys = {
+        (f.type, int(f.location.start), int(f.location.end), f.location.strand)
+        for f in original.features if f.type != "source"
+    }
+    n_added = 0
+    for feat in annotated.features:
+        if feat.type == "source":
+            continue
+        key = (
+            feat.type,
+            int(feat.location.start),
+            int(feat.location.end),
+            feat.location.strand,
+        )
+        if key in existing_keys:
+            continue
+        new_feat = deepcopy(feat)
+        # Tag with a "pLannotate" note so users (and future loads) can tell
+        # where each feature came from.
+        notes = new_feat.qualifiers.get("note", [])
+        if isinstance(notes, str):
+            notes = [notes]
+        if not any("pLannotate" in n for n in notes):
+            notes = ["pLannotate"] + list(notes)
+        new_feat.qualifiers["note"] = notes
+        merged.features.append(new_feat)
+        n_added += 1
+
+    # Stash the count so the UI caller can surface it in a notification.
+    merged._plannotate_added = n_added
+    return merged
+
+
 # ── Core drawing ───────────────────────────────────────────────────────────────
 
 class _Canvas:
@@ -2049,6 +2259,13 @@ class LibraryPanel(Widget):
         """User pressed '+' to add the currently-loaded record."""
         pass
 
+    class AnnotateRequested(Message):
+        """User pressed the annotate button on a selected library row.
+        entry_id is the library key of the row with the cursor."""
+        def __init__(self, entry_id: "str | None"):
+            self.entry_id = entry_id
+            super().__init__()
+
     def compose(self) -> ComposeResult:
         yield Static(" Library", id="lib-hdr")
         yield DataTable(id="lib-table", cursor_type="row", zebra_stripes=True)
@@ -2057,6 +2274,8 @@ class LibraryPanel(Widget):
                          tooltip="Add current plasmid")
             yield Button("−", id="btn-lib-del", variant="error",
                          tooltip="Remove selected")
+            yield Button("◈", id="btn-lib-annot", variant="primary",
+                         tooltip="Annotate selected (pLannotate)  —  shortcut: Shift+A")
 
     def on_mount(self):
         self._active_id:    "str | None" = None
@@ -2108,6 +2327,17 @@ class LibraryPanel(Widget):
     @on(Button.Pressed, "#btn-lib-add")
     def _btn_add(self):
         self.post_message(self.AddCurrentRequested())
+
+    @on(Button.Pressed, "#btn-lib-annot")
+    def _btn_annotate(self):
+        # Annotate the currently-focused row if any, else the active record.
+        t = self.query_one("#lib-table", DataTable)
+        entry_id: "str | None" = None
+        if t.row_count > 0 and 0 <= t.cursor_row < t.row_count:
+            row_keys = list(t.rows.keys())
+            if 0 <= t.cursor_row < len(row_keys):
+                entry_id = row_keys[t.cursor_row].value
+        self.post_message(self.AnnotateRequested(entry_id))
 
     def set_active(self, entry_id: "str | None") -> None:
         """Mark which library entry is currently loaded (clears dirty flag)."""
@@ -3505,6 +3735,7 @@ PartsBinModal { align: center middle; }
         Binding("f",           "fetch",            "Fetch GenBank", show=True),
         Binding("o",           "open_file",        "Open .gb file", show=True),
         Binding("a",           "add_to_library",   "Add to lib",    show=True),
+        Binding("A",           "annotate_plasmid", "Annotate",      show=True,  key_display="A"),
         Binding("E",           "edit_seq",         "Edit seq",      show=True,  key_display="E"),
         Binding("S",           "save",             "Save",          show=True,  key_display="S"),
         Binding("[",           "rotate_cw",        "Rotate ←",      show=True,  priority=True),
@@ -3533,7 +3764,7 @@ PartsBinModal { align: center middle; }
         yield Static(
             Text(
                 "  [ ] rotate   ← → cursor/map   Shift coarse   Home reset"
-                "   f fetch   o open   a add-to-lib   E edit seq   S save   , / . circle",
+                "   f fetch   o open   a add-to-lib   A annotate   E edit seq   S save   , / . circle",
                 style="color(245)",
                 no_wrap=True,
             ),
@@ -4084,6 +4315,37 @@ PartsBinModal { align: center middle; }
     def _library_add_current(self, _):
         self.action_add_to_library()
 
+    @on(LibraryPanel.AnnotateRequested)
+    def _library_annotate_requested(self, event: LibraryPanel.AnnotateRequested):
+        """Library's ◈ button was clicked. If the focused row isn't the
+        currently-loaded record, load it first, then run annotation."""
+        if event.entry_id is None:
+            # No row focused — fall back to annotating the current record.
+            self.action_annotate_plasmid()
+            return
+        need_load = (
+            self._current_record is None
+            or self._current_record.id != event.entry_id
+        )
+        if need_load:
+            for entry in _load_library():
+                if entry.get("id") == event.entry_id:
+                    try:
+                        record = _gb_text_to_record(entry.get("gb_text", ""))
+                        self._apply_record(record)
+                    except Exception as exc:
+                        _log.exception("library load for annotation failed")
+                        self.notify(
+                            f"Failed to load library entry: {exc}",
+                            severity="error",
+                        )
+                        return
+                    break
+            else:
+                self.notify("Library entry not found.", severity="warning")
+                return
+        self.action_annotate_plasmid()
+
     # ── Menu bar ───────────────────────────────────────────────────────────────
 
     def _rescan_restrictions(self) -> None:
@@ -4157,10 +4419,12 @@ PartsBinModal { align: center middle; }
                 ("Toggle connectors",              "toggle_connectors"),
             ],
             "Features": [
-                ("Add Feature...",   "add_feature"),
-                ("Delete Feature",   "delete_feature"),
-                ("---",              None),
-                ("Toggle connectors","toggle_connectors"),
+                ("Add Feature...",              "add_feature"),
+                ("Delete Feature",              "delete_feature"),
+                ("---",                         None),
+                ("Annotate with pLannotate",    "annotate_plasmid"),
+                ("---",                         None),
+                ("Toggle connectors",           "toggle_connectors"),
             ],
             "Primers": [
                 ("Design Primer... (coming soon)", None),
@@ -4211,6 +4475,93 @@ PartsBinModal { align: center middle; }
 
     def action_add_feature(self) -> None:
         self.notify("Add feature: coming soon", severity="information")
+
+    # ── pLannotate annotation ──────────────────────────────────────────────────
+
+    def action_annotate_plasmid(self) -> None:
+        """Run pLannotate on the currently-loaded record (shortcut: Shift+A)."""
+        if self._current_record is None:
+            self.notify(
+                "Load a plasmid first (press 'f' to fetch or 'o' to open).",
+                severity="warning",
+            )
+            return
+        status = _plannotate_status()
+        if not status["ready"]:
+            # Specific, actionable error. Detect which piece is missing so the
+            # user knows what to install.
+            if not status["installed"]:
+                self.notify(
+                    "pLannotate not installed. " + _plannotate_install_hint(),
+                    severity="error", timeout=10,
+                )
+            else:
+                missing = [k for k in ("blast", "diamond") if not status[k]]
+                self.notify(
+                    f"pLannotate needs {' + '.join(missing)} on PATH. "
+                    + _plannotate_install_hint(),
+                    severity="error", timeout=10,
+                )
+            return
+        # Preflight the size cap so the user gets the error instantly instead
+        # of waiting for pLannotate to reject it.
+        n = len(self._current_record.seq)
+        if n > _PLANNOTATE_MAX_BP:
+            self.notify(
+                f"pLannotate caps inputs at {_PLANNOTATE_MAX_BP:,} bp "
+                f"(this plasmid: {n:,} bp).",
+                severity="warning",
+            )
+            return
+        self.notify(
+            f"Running pLannotate on {self._current_record.name} "
+            f"({n:,} bp)… this takes 5-30 s.",
+            timeout=15,
+        )
+        self._run_plannotate_worker(self._current_record)
+
+    @work(thread=True)
+    def _run_plannotate_worker(self, record) -> None:
+        """Background worker: runs pLannotate subprocess, merges, applies.
+        Errors are logged and surfaced to the UI via notify(); nothing raw
+        reaches the user."""
+        try:
+            annotated = _run_plannotate(record)
+            merged    = _merge_plannotate_features(record, annotated)
+        except PlannotateError as exc:
+            _log.info("pLannotate: %s", exc)
+            def _notify_err():
+                self.notify(exc.user_msg, severity="error", timeout=10)
+            self.call_from_thread(_notify_err)
+            return
+        except Exception as exc:
+            _log.exception("pLannotate worker crashed")
+            def _notify_crash():
+                self.notify(
+                    f"pLannotate crashed: {exc}", severity="error", timeout=10,
+                )
+            self.call_from_thread(_notify_crash)
+            return
+
+        n_added = getattr(merged, "_plannotate_added", 0)
+        def _apply():
+            if n_added == 0:
+                self.notify(
+                    "pLannotate found no new features (all hits duplicated "
+                    "existing annotations).",
+                    severity="information",
+                )
+                return
+            self._push_undo()          # annotation is undo-able
+            self._apply_record(merged)
+            self.query_one("#library", LibraryPanel).set_dirty(True)
+            self.notify(
+                f"Added {n_added} pLannotate feature"
+                f"{'s' if n_added != 1 else ''}. "
+                "Press 'a' to save to library.",
+                timeout=6,
+            )
+        self.call_from_thread(_apply)
 
     def action_open_parts_bin(self) -> None:
         self.push_screen(PartsBinModal())
