@@ -2275,6 +2275,19 @@ class LibraryPanel(Widget):
             self.entry_id = entry_id
             super().__init__()
 
+    class GainedFocus(Message):
+        """Posted when the library panel (or any descendant) gains focus.
+        The app handles this by clearing the currently-selected feature so
+        pressing Delete in the library cannot accidentally hit a feature
+        that's no longer visually in focus."""
+        pass
+
+    def on_descendant_focus(self, _event):
+        # DataTable inside the library panel is what actually gets focus;
+        # Textual reports it to us via a DescendantFocus event. Propagate
+        # to the app as a panel-level signal.
+        self.post_message(self.GainedFocus())
+
     def compose(self) -> ComposeResult:
         yield Static(" Library", id="lib-hdr")
         yield DataTable(id="lib-table", cursor_type="row", zebra_stripes=True)
@@ -3621,6 +3634,56 @@ class UnsavedQuitModal(ModalScreen):
     def action_cancel(self): self.dismiss(None)
 
 
+class LibraryDeleteConfirmModal(ModalScreen):
+    """Shown when the user presses Delete while focused on the library panel.
+
+    Default focus is on the [No] button — the Delete key is easy to press
+    by accident after tabbing into the library, so we require a deliberate
+    left-arrow + Enter (or Tab + Enter) to confirm the removal. Escape or
+    No dismisses with False; Yes dismisses with True.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, name: str, size: int, entry_id: str):
+        super().__init__()
+        self.entry_name = name
+        self.entry_size = size
+        self.entry_id   = entry_id
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="libdel-dlg"):
+            yield Static(" Remove from library ", id="libdel-title")
+            yield Static(
+                f"  Remove [bold]{self.entry_name}[/bold] "
+                f"({self.entry_size:,} bp) from the library?\n\n"
+                f"  [dim]This removes the stored GenBank copy from "
+                f"plasmid_library.json.\n"
+                f"  The current on-screen record is not affected.[/dim]",
+                id="libdel-msg",
+                markup=True,
+            )
+            with Horizontal(id="libdel-btns"):
+                yield Button("No",           id="btn-libdel-no",  variant="primary")
+                yield Button("Yes, remove",  id="btn-libdel-yes", variant="error")
+
+    def on_mount(self) -> None:
+        # Default focus on "No" — the whole point of this dialog is to catch
+        # a handslip, so Enter should do nothing destructive.
+        self.query_one("#btn-libdel-no", Button).focus()
+
+    @on(Button.Pressed, "#btn-libdel-no")
+    def _no(self, _):
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-libdel-yes")
+    def _yes(self, _):
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 # ── Main app ───────────────────────────────────────────────────────────────────
 
 class PlasmidApp(App):
@@ -3699,6 +3762,17 @@ UnsavedQuitModal { align: center middle; }
 #quit-msg   { color: $text-muted; margin-bottom: 1; }
 #quit-btns  { height: 3; margin-top: 1; }
 #quit-btns Button { margin-right: 1; }
+
+/* ── Library-delete confirmation ─────────────────────────── */
+LibraryDeleteConfirmModal { align: center middle; }
+#libdel-dlg {
+    width: 64; height: auto;
+    background: $surface; border: solid $error; padding: 1 2;
+}
+#libdel-title { background: $error-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#libdel-msg   { color: $text-muted; margin-bottom: 1; }
+#libdel-btns  { height: 3; margin-top: 1; }
+#libdel-btns Button { margin-right: 1; min-width: 14; }
 
 /* ── Constructor modal ───────────────────────────────────── */
 ConstructorModal { align: center middle; }
@@ -3966,7 +4040,26 @@ PartsBinModal { align: center middle; }
             non_source_idx += 1
         return new_record
 
+    def _focus_is_in_library(self) -> bool:
+        """True when keyboard focus sits on the LibraryPanel or a descendant
+        (e.g. the library DataTable). Used by the Delete key handler to decide
+        whether the user meant to delete a feature or a library entry."""
+        node = self.focused
+        while node is not None:
+            if isinstance(node, LibraryPanel):
+                return True
+            node = getattr(node, "parent", None)
+        return False
+
     def action_delete_feature(self):
+        # Focus-aware routing: when the keyboard focus is inside the library,
+        # Delete targets the highlighted library row (with a confirmation
+        # dialog defaulting to No), NOT the currently-selected feature. This
+        # prevents a handslip after tabbing into the library from silently
+        # deleting a feature the user forgot they had selected.
+        if self._focus_is_in_library():
+            self._request_library_delete()
+            return
         pm = self.query_one("#plasmid-map", PlasmidMap)
         if pm.selected_idx < 0 or not pm._feats:
             self.notify("No feature selected.", severity="warning")
@@ -3978,6 +4071,50 @@ PartsBinModal { align: center middle; }
         sp = self.query_one("#seq-panel", SequencePanel)
         self._apply_snapshot(str(new_record.seq), sp._cursor_pos, new_record)
         self.notify(f"Deleted '{label}'  (Ctrl+Z to undo)")
+
+    def _request_library_delete(self) -> None:
+        """Called from action_delete_feature when the library has focus.
+        Pops LibraryDeleteConfirmModal on the currently-highlighted row;
+        on confirmation, removes the entry from plasmid_library.json."""
+        lib = self.query_one("#library", LibraryPanel)
+        t = lib.query_one("#lib-table", DataTable)
+        if t.row_count == 0:
+            self.notify("Library is empty.", severity="warning")
+            return
+        if not (0 <= t.cursor_row < t.row_count):
+            self.notify("No library row highlighted.", severity="warning")
+            return
+        row_keys = list(t.rows.keys())
+        if t.cursor_row >= len(row_keys):
+            return
+        entry_id = row_keys[t.cursor_row].value
+
+        # Look up name and size for a user-friendly dialog message
+        name, size = "?", 0
+        for e in _load_library():
+            if e.get("id") == entry_id:
+                name = e.get("name") or e.get("id") or "?"
+                size = e.get("size", 0)
+                break
+
+        def _on_confirm(result: "bool | None") -> None:
+            if result is not True:
+                return
+            entries = [e for e in _load_library() if e.get("id") != entry_id]
+            _save_library(entries)
+            lib._repopulate()
+            # If we just deleted the currently-loaded record's entry, mark
+            # the header so the user knows they no longer have an active
+            # library binding for it.
+            if (self._current_record is not None
+                    and self._current_record.id == entry_id):
+                lib.set_active(None)
+            self.notify(f"Removed '{name}' from library.")
+
+        self.push_screen(
+            LibraryDeleteConfirmModal(name, size, entry_id),
+            callback=_on_confirm,
+        )
 
     def action_add_to_library(self):
         if self._current_record is None:
@@ -4352,6 +4489,25 @@ PartsBinModal { align: center middle; }
     @on(LibraryPanel.AddCurrentRequested)
     def _library_add_current(self, _):
         self.action_add_to_library()
+
+    @on(LibraryPanel.GainedFocus)
+    def _library_gained_focus(self, _event) -> None:
+        """Library panel (or its DataTable) just gained focus — clear any
+        currently-selected feature so the Delete key can't accidentally hit
+        one. The feature stays in the record; the user just re-clicks it in
+        the map or sidebar to re-select."""
+        try:
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+        except Exception:
+            return
+        if pm.selected_idx < 0:
+            return   # nothing to clear
+        pm.selected_idx = -1
+        pm.refresh()
+        try:
+            self.query_one("#sidebar", FeatureSidebar).show_detail(None)
+        except Exception:
+            pass
 
     @on(LibraryPanel.AnnotateRequested)
     def _library_annotate_requested(self, event: LibraryPanel.AnnotateRequested):

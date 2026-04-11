@@ -180,6 +180,186 @@ class TestNoNetworkAccess:
 # pLannotate UI entry points (button + shortcut, pLannotate itself mocked)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class TestDeleteFocusRouting:
+    """Delete key must be focus-aware: pressing Delete with library focus
+    should offer to delete the library entry (with a confirmation defaulting
+    to No), NOT silently delete a feature the user forgot they had selected
+    in the map. Pressing Delete elsewhere still deletes the selected feature."""
+
+    async def test_focus_is_in_library_helper_true_for_library(
+        self, tiny_record, isolated_library
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Focus the library's DataTable
+            lib_table = app.query_one("#lib-table")
+            lib_table.focus()
+            await pilot.pause(0.05)
+            assert app._focus_is_in_library() is True
+
+    async def test_focus_is_in_library_helper_false_for_map(
+        self, tiny_record, isolated_library
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm.focus()
+            await pilot.pause(0.05)
+            assert app._focus_is_in_library() is False
+
+    async def test_library_focus_clears_feature_selection(
+        self, tiny_record, isolated_library
+    ):
+        """When focus moves INTO the library from elsewhere, any currently-
+        selected feature in the map must be deselected. Mount auto-focuses
+        the library table on first load, so we explicitly move focus to the
+        map first to create a real transition."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            if len(pm._feats) == 0:
+                pytest.skip("fixture has no features")
+            # Move focus OUT of the library first (mount auto-focused it)
+            pm.focus()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm.select_feature(0)
+            assert pm.selected_idx == 0
+            # Now focus the library's DataTable — this is the real transition.
+            # GainedFocus dispatch is async; pause twice to let the message
+            # be posted, routed, and the handler run.
+            app.query_one("#lib-table").focus()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert pm.selected_idx == -1, (
+                "feature selection should clear when library gains focus"
+            )
+
+    async def test_delete_with_library_focus_opens_confirm_modal(
+        self, tiny_record, isolated_library
+    ):
+        """Delete key with library focused must push the confirmation modal,
+        NOT silently delete a feature."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Focus the library DataTable and make sure cursor is on a row
+            lib_table = app.query_one("#lib-table")
+            lib_table.focus()
+            await pilot.pause(0.05)
+            # Invoke the action directly to avoid focus/key-routing races
+            app.action_delete_feature()
+            await pilot.pause(0.05)
+            # The modal should now be on top of the screen stack
+            from splicecraft import LibraryDeleteConfirmModal
+            top = app.screen
+            assert isinstance(top, LibraryDeleteConfirmModal), (
+                f"expected LibraryDeleteConfirmModal on top, got {type(top).__name__}"
+            )
+
+    async def test_confirm_modal_default_focus_is_no(
+        self, tiny_record, isolated_library
+    ):
+        """Modal mounts → the [No] button must be focused. This is the whole
+        point of the dialog — Enter should be a safe no-op."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.query_one("#lib-table").focus()
+            await pilot.pause(0.05)
+            app.action_delete_feature()
+            await pilot.pause(0.05)
+            from splicecraft import LibraryDeleteConfirmModal
+            modal = app.screen
+            assert isinstance(modal, LibraryDeleteConfirmModal)
+            no_btn = modal.query_one("#btn-libdel-no", sc.Button)
+            # Either app.focused IS the No button, or the No button has
+            # `has_focus` set
+            assert app.focused is no_btn or no_btn.has_focus, (
+                f"expected [No] focused; got {app.focused!r}"
+            )
+
+    async def test_confirm_no_keeps_entry_in_library(
+        self, tiny_record, isolated_library
+    ):
+        """Pressing No in the dialog must leave the library unchanged."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            before_ids = [e["id"] for e in sc._load_library()]
+            app.query_one("#lib-table").focus()
+            await pilot.pause(0.05)
+            app.action_delete_feature()
+            await pilot.pause(0.05)
+            from splicecraft import LibraryDeleteConfirmModal
+            modal = app.screen
+            assert isinstance(modal, LibraryDeleteConfirmModal)
+            modal.dismiss(False)
+            await pilot.pause(0.05)
+            after_ids = [e["id"] for e in sc._load_library()]
+            assert after_ids == before_ids
+
+    async def test_confirm_yes_removes_entry_from_library(
+        self, tiny_record, isolated_library
+    ):
+        """Pressing Yes in the dialog must delete the highlighted entry."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # tiny_record was auto-persisted during mount; it should be in lib
+            before_ids = [e["id"] for e in sc._load_library()]
+            assert tiny_record.id in before_ids
+            app.query_one("#lib-table").focus()
+            await pilot.pause(0.05)
+            # Move DataTable cursor to the tiny_record row (should already be
+            # there since it's the only entry)
+            app.action_delete_feature()
+            await pilot.pause(0.05)
+            from splicecraft import LibraryDeleteConfirmModal
+            modal = app.screen
+            assert isinstance(modal, LibraryDeleteConfirmModal)
+            modal.dismiss(True)
+            await pilot.pause(0.05)
+            after_ids = [e["id"] for e in sc._load_library()]
+            assert tiny_record.id not in after_ids, (
+                f"expected {tiny_record.id} removed; library now: {after_ids}"
+            )
+
+    async def test_delete_with_map_focus_still_deletes_feature(
+        self, tiny_record, isolated_library
+    ):
+        """Classic feature-delete path must still work when the library does
+        NOT have focus. Guards against over-broad routing."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            if len(pm._feats) == 0:
+                pytest.skip("fixture has no features")
+            n_feats_before = len(pm._feats)
+            # Focus the map and select a feature
+            pm.focus()
+            pm.select_feature(0)
+            await pilot.pause(0.05)
+            assert not app._focus_is_in_library()
+            app.action_delete_feature()
+            await pilot.pause(0.05)
+            # Feature should be gone
+            pm_after = app.query_one("#plasmid-map", sc.PlasmidMap)
+            assert len(pm_after._feats) == n_feats_before - 1
+
+
 class TestImportAutoPersist:
     """Every 'user imports a plasmid' entry point should auto-save the
     record to the library. Library loads, pLannotate merges, and undo/redo
