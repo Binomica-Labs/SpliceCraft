@@ -1669,8 +1669,12 @@ class PlasmidMap(Widget):
 
     # ── Render ─────────────────────────────────────────────────────────────────
 
-    # cache: (w, h, origin_bp, selected_idx, _aspect, n_feats, n_restr) → Text
-    _render_cache: "tuple | None" = None
+    # (w, h, origin_bp, selected_idx, _aspect, n_feats, n_restr, ...) → Text
+    # NOTE: do NOT rename this to `_render_cache` — Textual.Widget has its
+    # own internal `_render_cache` attribute (a _RenderCache dataclass for
+    # strip caching) and the two would collide, producing confusing bugs
+    # when either side's cache is inspected.
+    _draw_cache: "tuple | None" = None
 
     def render(self) -> Text:
         if not self.record:
@@ -1685,11 +1689,11 @@ class PlasmidMap(Widget):
             return Text(f"  Window too small ({w}×{h})", style="dim red")
         key = (w, h, self.origin_bp, self.selected_idx, self._aspect,
                id(self._feats), id(self._restr_feats), self._map_mode,
-               self._show_connectors)
-        if self._render_cache and self._render_cache[0] == key:
-            return self._render_cache[1]
+               self._show_connectors, self.record.name)
+        if self._draw_cache and self._draw_cache[0] == key:
+            return self._draw_cache[1]
         result = self._draw_linear(w, h) if self._map_mode == "linear" else self._draw(w, h)
-        self._render_cache = (key, result)
+        self._draw_cache = (key, result)
         return result
 
     def _draw(self, w: int, h: int) -> Text:
@@ -2249,7 +2253,7 @@ class LibraryPanel(Widget):
 
     DEFAULT_CSS = """
     LibraryPanel {
-        width: 24;
+        width: 26;
         border-right: solid $primary;
     }
     #lib-hdr   { background: $primary; padding: 0 1; }
@@ -2270,6 +2274,13 @@ class LibraryPanel(Widget):
 
     class AnnotateRequested(Message):
         """User pressed the annotate button on a selected library row.
+        entry_id is the library key of the row with the cursor."""
+        def __init__(self, entry_id: "str | None"):
+            self.entry_id = entry_id
+            super().__init__()
+
+    class RenameRequested(Message):
+        """User pressed the rename (✎) button with a library row focused.
         entry_id is the library key of the row with the cursor."""
         def __init__(self, entry_id: "str | None"):
             self.entry_id = entry_id
@@ -2298,6 +2309,8 @@ class LibraryPanel(Widget):
                          tooltip="Remove selected")
             yield Button("◈", id="btn-lib-annot", variant="primary",
                          tooltip="Annotate selected (pLannotate)  —  shortcut: Shift+A")
+            yield Button("✎", id="btn-lib-rename", variant="default",
+                         tooltip="Rename selected plasmid")
 
     def on_mount(self):
         self._active_id:    "str | None" = None
@@ -2360,6 +2373,19 @@ class LibraryPanel(Widget):
             if 0 <= t.cursor_row < len(row_keys):
                 entry_id = row_keys[t.cursor_row].value
         self.post_message(self.AnnotateRequested(entry_id))
+
+    @on(Button.Pressed, "#btn-lib-rename")
+    def _btn_rename(self):
+        # Rename only works on the row with the DataTable cursor — if the
+        # library is empty or no row is focused, we send None and the app
+        # will notify the user.
+        t = self.query_one("#lib-table", DataTable)
+        entry_id: "str | None" = None
+        if t.row_count > 0 and 0 <= t.cursor_row < t.row_count:
+            row_keys = list(t.rows.keys())
+            if 0 <= t.cursor_row < len(row_keys):
+                entry_id = row_keys[t.cursor_row].value
+        self.post_message(self.RenameRequested(entry_id))
 
     def set_active(self, entry_id: "str | None") -> None:
         """Mark which library entry is currently loaded (clears dirty flag)."""
@@ -3634,6 +3660,71 @@ class UnsavedQuitModal(ModalScreen):
     def action_cancel(self): self.dismiss(None)
 
 
+class RenamePlasmidModal(ModalScreen):
+    """Prompt for a new name for a library entry.
+
+    Dismisses with the new name (a non-empty string) or None on cancel.
+    Input validation (non-empty, trimmed, collision check) lives in the
+    app-side handler — the modal just collects a value.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, current_name: str, entry_id: str):
+        super().__init__()
+        self.current_name = current_name
+        self.entry_id     = entry_id
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rename-dlg"):
+            yield Static(" Rename plasmid ", id="rename-title")
+            yield Label(f"Current name:  {self.current_name}")
+            yield Label("New name:")
+            yield Input(
+                value=self.current_name,
+                placeholder="enter a new name",
+                id="rename-input",
+            )
+            yield Static("", id="rename-status", markup=True)
+            with Horizontal(id="rename-btns"):
+                yield Button("Save",   id="btn-rename-save",   variant="primary")
+                yield Button("Cancel", id="btn-rename-cancel")
+
+    def on_mount(self) -> None:
+        # Default focus on the Input, text pre-selected via select_on_focus
+        # (Textual Input defaults to selecting all when focused, which is
+        # what you want for a rename — typing replaces the old name).
+        inp = self.query_one("#rename-input", Input)
+        inp.focus()
+
+    @on(Button.Pressed, "#btn-rename-save")
+    def _save(self, _):
+        self._try_submit()
+
+    @on(Input.Submitted, "#rename-input")
+    def _submitted(self, _):
+        self._try_submit()
+
+    def _try_submit(self) -> None:
+        new_name = self.query_one("#rename-input", Input).value.strip()
+        status   = self.query_one("#rename-status", Static)
+        if not new_name:
+            status.update("[red]Name cannot be empty.[/red]")
+            return
+        if new_name == self.current_name:
+            # No-op rename — treat as cancel so the app doesn't bother writing.
+            self.dismiss(None)
+            return
+        self.dismiss(new_name)
+
+    @on(Button.Pressed, "#btn-rename-cancel")
+    def _cancel_btn(self, _):
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class LibraryDeleteConfirmModal(ModalScreen):
     """Shown when the user presses Delete while focused on the library panel.
 
@@ -3774,6 +3865,18 @@ LibraryDeleteConfirmModal { align: center middle; }
 #libdel-btns  { height: 3; margin-top: 1; }
 #libdel-btns Button { margin-right: 1; min-width: 14; }
 
+/* ── Rename plasmid dialog ───────────────────────────────── */
+RenamePlasmidModal { align: center middle; }
+#rename-dlg {
+    width: 60; height: auto;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#rename-title  { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#rename-input  { margin-top: 0; margin-bottom: 1; }
+#rename-status { height: 1; color: $text-muted; }
+#rename-btns   { height: 3; margin-top: 1; }
+#rename-btns Button { margin-right: 1; }
+
 /* ── Constructor modal ───────────────────────────────────── */
 ConstructorModal { align: center middle; }
 #ctor-box {
@@ -3881,7 +3984,7 @@ PartsBinModal { align: center middle; }
         sp._show_connectors  = not sp._show_connectors
         pm._show_connectors  = sp._show_connectors
         sp._view_cache_key   = None   # invalidate seq panel cache
-        pm._render_cache     = None   # invalidate map cache
+        pm._draw_cache       = None   # invalidate map draw cache
         sp._refresh_view()
         pm.refresh()
         state = "on" if sp._show_connectors else "off"
@@ -4508,6 +4611,106 @@ PartsBinModal { align: center middle; }
             self.query_one("#sidebar", FeatureSidebar).show_detail(None)
         except Exception:
             pass
+
+    @on(LibraryPanel.RenameRequested)
+    def _library_rename_requested(self, event: LibraryPanel.RenameRequested):
+        """Library's ✎ button was clicked. Opens RenamePlasmidModal; on Save,
+        updates the library JSON (both the `name` field and the stored
+        gb_text's LOCUS line) and — if the renamed entry is currently loaded
+        — mutates `self._current_record.name` in place so the circular map,
+        title bar, and next save all show the new name immediately."""
+        if event.entry_id is None:
+            self.notify("Highlight a library row first.", severity="warning")
+            return
+        current_name: "str | None" = None
+        for e in _load_library():
+            if e.get("id") == event.entry_id:
+                current_name = e.get("name") or e.get("id")
+                break
+        if current_name is None:
+            self.notify("Library entry not found.", severity="warning")
+            return
+
+        def _on_result(new_name: "str | None") -> None:
+            if new_name is None:
+                return   # user cancelled or no-op rename
+            # Collision check: refuse if another entry already has that name
+            # (different id). Same-entry is already filtered by the modal.
+            for e in _load_library():
+                if (e.get("id") != event.entry_id
+                        and e.get("name") == new_name):
+                    self.notify(
+                        f"A plasmid named {new_name!r} already exists.",
+                        severity="error",
+                    )
+                    return
+            self._rename_library_entry(event.entry_id, new_name)
+
+        self.push_screen(
+            RenamePlasmidModal(current_name, event.entry_id),
+            callback=_on_result,
+        )
+
+    def _rename_library_entry(self, entry_id: str, new_name: str) -> None:
+        """Persist a rename:
+          1. Update the `name` field in the library JSON for this entry
+          2. Re-serialize the stored gb_text so the LOCUS line carries the
+             new name — otherwise re-loading the library would show the old
+             name from the GenBank record's internal header
+          3. If this entry is the currently-loaded record, mutate
+             `self._current_record.name` in place, invalidate the
+             PlasmidMap render cache, refresh the map, and update the
+             window title bar
+        """
+        entries = _load_library()
+        for e in entries:
+            if e.get("id") == entry_id:
+                e["name"] = new_name
+                # Re-serialize the stored gb_text with the new LOCUS name.
+                # If the gb_text can't be parsed for any reason, fall back
+                # to just updating the JSON `name` field — the library row
+                # will show the new name and the next explicit save will
+                # fix the gb_text.
+                try:
+                    rec = _gb_text_to_record(e.get("gb_text", ""))
+                    rec.name = new_name
+                    rec.id   = entry_id   # don't let SeqIO rewrite the id
+                    e["gb_text"] = _record_to_gb_text(rec)
+                except Exception:
+                    _log.exception(
+                        "rename: could not re-serialize gb_text for %s",
+                        entry_id,
+                    )
+                break
+        else:
+            self.notify("Library entry vanished.", severity="warning")
+            return
+        _save_library(entries)
+
+        # Refresh the library table so the new name shows.
+        lib = self.query_one("#library", LibraryPanel)
+        lib._repopulate()
+
+        # If this is the currently-loaded record, update the in-memory object
+        # so the map, title bar, and every other bit of UI tracking `record.
+        # name` pick up the new name without a full reload.
+        if (self._current_record is not None
+                and self._current_record.id == entry_id):
+            self._current_record.name = new_name
+            try:
+                pm = self.query_one("#plasmid-map", PlasmidMap)
+                # record.name is in the cache key, but nuke it explicitly
+                # for belt-and-braces (in case future refactors drop the
+                # name from the key).
+                pm._draw_cache = None
+                pm.refresh()
+            except Exception:
+                pass
+            # Refresh the window title via _mark_clean (which rebuilds it
+            # from self._current_record.name).
+            self._mark_clean()
+
+        self.notify(f"Renamed to {new_name}.")
 
     @on(LibraryPanel.AnnotateRequested)
     def _library_annotate_requested(self, event: LibraryPanel.AnnotateRequested):

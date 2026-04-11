@@ -180,6 +180,224 @@ class TestNoNetworkAccess:
 # pLannotate UI entry points (button + shortcut, pLannotate itself mocked)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class TestLibraryRename:
+    """Library panel rename (✎ button). Verifies the button exists, the
+    modal opens with the current name, saving persists the new name to
+    the library JSON AND mutates the currently-loaded record's name so
+    the plasmid map header picks up the change without a reload.
+
+    Collision check: refuses to rename to the name of another existing
+    entry. Empty names are rejected by the modal itself (we test the
+    modal-side validator via `_try_submit`)."""
+
+    async def test_rename_button_exists(self, tiny_record, isolated_library):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            btn = app.query_one("#btn-lib-rename", sc.Button)
+            assert btn is not None
+
+    async def test_rename_opens_modal_with_current_name(
+        self, tiny_record, isolated_library
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.post_message(sc.LibraryPanel.RenameRequested(tiny_record.id))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            from splicecraft import RenamePlasmidModal
+            modal = app.screen
+            assert isinstance(modal, RenamePlasmidModal), (
+                f"expected RenamePlasmidModal, got {type(modal).__name__}"
+            )
+            inp = modal.query_one("#rename-input", sc.Input)
+            assert inp.value == tiny_record.name
+
+    async def test_rename_save_persists_to_library_json(
+        self, tiny_record, isolated_library
+    ):
+        """After Save, the library JSON's `name` field is the new name and
+        the stored gb_text parses back to a record with matching name."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            new_name = "pACYC-custom"
+            # Call the backend directly — no modal round-trip needed to test
+            # the persistence logic
+            app._rename_library_entry(tiny_record.id, new_name)
+            await pilot.pause(0.05)
+
+            entries = sc._load_library()
+            match = [e for e in entries if e["id"] == tiny_record.id]
+            assert len(match) == 1
+            assert match[0]["name"] == new_name
+            # gb_text should round-trip to a record with the new name
+            reloaded = sc._gb_text_to_record(match[0]["gb_text"])
+            assert reloaded.name == new_name
+
+    async def test_rename_updates_currently_loaded_record(
+        self, tiny_record, isolated_library
+    ):
+        """If the renamed entry is currently loaded, _current_record.name
+        is mutated in place so the map header picks it up."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            old_name = app._current_record.name
+            new_name = "my-lab-plasmid"
+            assert old_name != new_name
+            app._rename_library_entry(tiny_record.id, new_name)
+            await pilot.pause(0.05)
+            assert app._current_record.name == new_name
+            # PlasmidMap uses record.name during render — its record field
+            # is the same object, so it should see the new name.
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            assert pm.record.name == new_name
+
+    async def test_rename_invalidates_map_draw_cache(
+        self, tiny_record, isolated_library
+    ):
+        """PlasmidMap._draw_cache holds a (key, Text) tuple. Rename must
+        either nuke it or the cache key must differ for the new name."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            # Force one render so _draw_cache has an entry
+            pm.render()
+            key_before = pm._draw_cache[0] if pm._draw_cache else None
+            app._rename_library_entry(tiny_record.id, "renamed-test")
+            await pilot.pause(0.05)
+            # After rename, _draw_cache is either None (nuked) OR a fresh
+            # entry with a different key (record.name is part of the key).
+            if pm._draw_cache is not None:
+                key_after = pm._draw_cache[0]
+                assert key_after != key_before, (
+                    "draw cache key must change after rename"
+                )
+                # And the new key's name field must be the new name
+                assert "renamed-test" in key_after, (
+                    f"expected 'renamed-test' in cache key; got {key_after}"
+                )
+
+    async def test_rename_rejects_duplicate_name(
+        self, tiny_record, isolated_library, monkeypatch
+    ):
+        """If another entry already has the target name, the rename is
+        refused with an error notification and the library is unchanged."""
+        # Seed the library with two entries: tiny_record and a fake second
+        from copy import deepcopy
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        second = SeqRecord(
+            Seq("ACGT" * 30), id="OTHER01", name="other",
+            description="another plasmid",
+        )
+        second.annotations["molecule_type"] = "DNA"
+        second.annotations["topology"]      = "circular"
+
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Add a second entry manually via the library panel
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib.add_entry(second)
+            await pilot.pause(0.05)
+            # Now try to rename tiny_record to 'other' — should fail
+            def _cb(result):
+                pass
+            collisions = []
+            orig_notify = app.notify
+            def _spy_notify(msg, **kw):
+                collisions.append((msg, kw))
+                return orig_notify(msg, **kw)
+            monkeypatch.setattr(app, "notify", _spy_notify)
+            # Fire the RenameRequested handler path with a fake callback
+            # that asserts the collision path by calling the inner _on_result
+            # equivalent directly: the handler opens a modal with callback —
+            # easier to test the collision branch by looking at the spy.
+            app.post_message(sc.LibraryPanel.RenameRequested(tiny_record.id))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Now dismiss the modal with the colliding name
+            from splicecraft import RenamePlasmidModal
+            modal = app.screen
+            assert isinstance(modal, RenamePlasmidModal)
+            modal.dismiss("other")
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # The entry should still have its original name
+            entries = sc._load_library()
+            tiny_entry = [e for e in entries if e["id"] == tiny_record.id][0]
+            assert tiny_entry["name"] == tiny_record.name, (
+                "rename to a colliding name should have been refused"
+            )
+            # And an error notification should have fired
+            err_notes = [
+                m for m, kw in collisions
+                if kw.get("severity") == "error" and "already exists" in m
+            ]
+            assert err_notes, "expected an 'already exists' error notification"
+
+    async def test_rename_modal_empty_name_rejected(
+        self, tiny_record, isolated_library
+    ):
+        """Modal validator rejects an empty name and does NOT dismiss."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.post_message(sc.LibraryPanel.RenameRequested(tiny_record.id))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            from splicecraft import RenamePlasmidModal
+            modal = app.screen
+            assert isinstance(modal, RenamePlasmidModal)
+            # Blank out the input and try to save
+            modal.query_one("#rename-input", sc.Input).value = "   "
+            modal._try_submit()
+            await pilot.pause(0.05)
+            # Modal should still be up (not dismissed)
+            assert app.screen is modal
+            # And the status line should show an error message.
+            status = modal.query_one("#rename-status", sc.Static)
+            status_text = str(status.content)
+            assert "empty" in status_text.lower() or "cannot" in status_text.lower(), (
+                f"expected error message in rename status; got {status_text!r}"
+            )
+
+    async def test_rename_modal_cancel_is_noop(
+        self, tiny_record, isolated_library
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            original_name = app._current_record.name
+            app.post_message(sc.LibraryPanel.RenameRequested(tiny_record.id))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            from splicecraft import RenamePlasmidModal
+            modal = app.screen
+            assert isinstance(modal, RenamePlasmidModal)
+            modal.dismiss(None)   # cancel path
+            await pilot.pause(0.05)
+            assert app._current_record.name == original_name
+            # Library entry unchanged
+            entries = sc._load_library()
+            assert any(
+                e["id"] == tiny_record.id and e["name"] == original_name
+                for e in entries
+            )
+
+
 class TestDeleteFocusRouting:
     """Delete key must be focus-aware: pressing Delete with library focus
     should offer to delete the library entry (with a confirmation defaulting
@@ -427,6 +645,16 @@ class TestImportAutoPersist:
     ):
         """Re-importing a record with the same id should update the existing
         entry rather than create a duplicate (the add_entry dedup contract)."""
+        # Block the network seed worker from firing when library starts empty.
+        # Without this, the mount handler sees an empty library and kicks off
+        # `_seed_default_library` which calls fetch_genbank → a live NCBI
+        # fetch that races our assertions.
+        monkeypatch.setattr(
+            sc, "fetch_genbank",
+            lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError("network disabled in tests")
+            ),
+        )
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
@@ -444,9 +672,15 @@ class TestImportAutoPersist:
             ids = [e["id"] for e in sc._load_library()]
             assert ids.count(tiny_record.id) == 1
 
-    async def test_import_none_is_noop(self, isolated_library):
+    async def test_import_none_is_noop(self, isolated_library, monkeypatch):
         """Cancelled fetch/open modals dismiss with None — the helper must
-        handle it silently."""
+        handle it silently. Also blocks the seed worker (see above)."""
+        monkeypatch.setattr(
+            sc, "fetch_genbank",
+            lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError("network disabled in tests")
+            ),
+        )
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
