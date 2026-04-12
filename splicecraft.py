@@ -2442,7 +2442,7 @@ class LibraryPanel(Widget):
         yield Static(" Library", id="lib-hdr")
         yield DataTable(id="lib-table", cursor_type="row", zebra_stripes=True)
         with Horizontal(id="lib-btns"):
-            yield Button("+", id="btn-lib-add", variant="success",
+            yield Button("+", id="btn-lib-add", variant="primary",
                          tooltip="Add current plasmid")
             yield Button("−", id="btn-lib-del", variant="error",
                          tooltip="Remove selected")
@@ -3767,7 +3767,7 @@ class PartsBinModal(Screen):
             yield DataTable(id="parts-table", cursor_type="row", zebra_stripes=True)
             yield Static("", id="parts-detail")
             with Horizontal(id="parts-btns"):
-                yield Button("New Part", id="btn-new-part", variant="success")
+                yield Button("New Part", id="btn-new-part", variant="primary")
                 yield Button("Close",    id="btn-parts-close")
         yield Footer()
 
@@ -3987,7 +3987,7 @@ class DomesticatorModal(ModalScreen):
                     "Design Primers", id="btn-dom-design", variant="primary",
                 )
                 yield Button(
-                    "Save to Parts Bin", id="btn-dom-save", variant="success",
+                    "Save to Parts Bin", id="btn-dom-save", variant="primary",
                     disabled=True,
                 )
                 yield Button("Cancel", id="btn-dom-cancel")
@@ -4203,9 +4203,9 @@ class ConstructorModal(ModalScreen):
             with Horizontal(id="ctor-btns"):
                 yield Button(
                     "Simulate Assembly", id="btn-ctor-simulate",
-                    variant="success", disabled=True
+                    variant="primary", disabled=True
                 )
-                yield Button("Clear Lane", id="btn-ctor-clear", variant="warning")
+                yield Button("Clear Lane", id="btn-ctor-clear", variant="default")
                 yield Button("Close",      id="btn-ctor-close")
 
     def on_mount(self) -> None:
@@ -4567,9 +4567,9 @@ class PrimerDesignScreen(Screen):
             # ── Action buttons ─────────────────────────────────────────────
             with Horizontal(id="pd-btns"):
                 yield Button("Save to Primer Library", id="btn-pd-save",
-                             variant="success", disabled=True)
+                             variant="primary", disabled=True)
                 yield Button("Add as Features to Map", id="btn-pd-feat",
-                             variant="warning", disabled=True)
+                             variant="primary", disabled=True)
                 yield Button("Close", id="btn-pd-close")
 
             # ── Primer library table ───────────────────────────────────────
@@ -5044,7 +5044,7 @@ class LibraryDeleteConfirmModal(ModalScreen):
                 markup=True,
             )
             with Horizontal(id="libdel-btns"):
-                yield Button("No",           id="btn-libdel-no",  variant="primary")
+                yield Button("No",           id="btn-libdel-no",  variant="default")
                 yield Button("Yes, remove",  id="btn-libdel-yes", variant="error")
 
     def on_mount(self) -> None:
@@ -5253,10 +5253,10 @@ DomesticatorModal { align: center middle; }
     height: auto; max-height: 8;
     border: solid $primary-darken-2; padding: 0 1; margin-top: 1;
 }
-#pd-result-names { height: 3; }
+#pd-result-names { height: 4; }
 #pd-fn-col    { width: 1fr; padding-right: 1; }
 #pd-rn-col    { width: 1fr; }
-#pd-btns      { height: 3; }
+#pd-btns      { height: 3; margin-top: 0; }
 #pd-btns Button { margin-right: 1; }
 #pd-lib-hdr   { background: $accent-darken-2; color: $text; padding: 0 1; }
 #pd-lib-table { height: 1fr; min-height: 6; }
