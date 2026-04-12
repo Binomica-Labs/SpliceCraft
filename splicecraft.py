@@ -3412,6 +3412,176 @@ def _save_parts_bin(entries: list[dict]) -> None:
     _parts_bin_cache = list(entries)
 
 
+# ── Primer design (Primer3-backed) ─────────────────────────────────────────────
+#
+# Two primer types:
+#   Detection — diagnostic PCR primers flanking a target region.
+#               Primer3 picks the thermodynamically ideal pair.
+#   Cloning   — primers with restriction-enzyme tails + GCGC padding for
+#               cloning a region into a new vector.
+#
+# Primer library persists to primers.json (same dir as plasmid_library.json).
+
+_PRIMERS_FILE = Path(__file__).parent / "primers.json"
+_primers_cache: "list | None" = None
+
+def _load_primers() -> list[dict]:
+    global _primers_cache
+    if _primers_cache is not None:
+        return list(_primers_cache)
+    if _PRIMERS_FILE.exists():
+        try:
+            _primers_cache = json.loads(_PRIMERS_FILE.read_text())
+            return list(_primers_cache)
+        except Exception:
+            _log.exception("Failed to load primers from %s", _PRIMERS_FILE)
+    _primers_cache = []
+    return []
+
+def _save_primers(entries: list[dict]) -> None:
+    global _primers_cache
+    try:
+        _PRIMERS_FILE.write_text(json.dumps(entries, indent=2))
+    except Exception:
+        _log.exception("Failed to save primers to %s", _PRIMERS_FILE)
+    _primers_cache = list(entries)
+
+
+# Common cloning enzymes for the RE-site dropdown in the cloning primer panel.
+# Sorted alphabetically; each tuple is (display_label, enzyme_name).
+_CLONING_RE_OPTIONS: list[tuple[str, str]] = sorted([
+    (f"{name}  ({site})", name)
+    for name, (site, fc, rc) in _NEB_ENZYMES.items()
+    if name in {
+        "EcoRI", "BamHI", "XhoI", "NdeI", "NcoI", "XbaI", "SpeI", "PstI",
+        "HindIII", "SalI", "NotI", "BglII", "KpnI", "SacI", "NheI", "BsaI",
+        "BsmBI", "BbsI", "SapI", "AgeI", "EcoRV", "ClaI", "MfeI", "MluI",
+        "NruI", "SphI", "SfiI", "AvrII", "BsiWI", "BsrGI", "BstBI",
+    }
+], key=lambda t: t[0])
+
+
+def _design_detection_primers(
+    template_seq: str,
+    target_start: int,
+    target_end: int,
+    product_min: int = 450,
+    product_max: int = 550,
+    target_tm: float = 60.0,
+    primer_len: int = 25,
+) -> dict:
+    """Design diagnostic PCR primers flanking a target region using Primer3.
+
+    Primer3 picks the most thermodynamically ideal pair that amplifies a
+    product of `product_min`..`product_max` bp spanning the target region.
+
+    Returns a dict with keys: fwd_seq, rev_seq, fwd_tm, rev_tm, fwd_pos,
+    rev_pos, product_size, or an 'error' key on failure.
+    """
+    import primer3
+    seq = template_seq.upper()
+
+    target_len = target_end - target_start
+    if target_len < 1:
+        return {"error": "Target region is empty."}
+
+    try:
+        result = primer3.design_primers(
+            seq_args={
+                "SEQUENCE_TEMPLATE": seq,
+                "SEQUENCE_TARGET": [target_start, target_len],
+            },
+            global_args={
+                "PRIMER_TASK": "generic",
+                "PRIMER_PICK_LEFT_PRIMER": 1,
+                "PRIMER_PICK_RIGHT_PRIMER": 1,
+                "PRIMER_OPT_SIZE": primer_len,
+                "PRIMER_MIN_SIZE": max(15, primer_len - 5),
+                "PRIMER_MAX_SIZE": min(36, primer_len + 5),
+                "PRIMER_OPT_TM": target_tm,
+                "PRIMER_MIN_TM": target_tm - 3,
+                "PRIMER_MAX_TM": target_tm + 3,
+                "PRIMER_PRODUCT_SIZE_RANGE": [[product_min, product_max]],
+                "PRIMER_NUM_RETURN": 1,
+            },
+        )
+    except (OSError, Exception) as exc:
+        # Primer3 raises OSError on internally-inconsistent parameters
+        # (e.g. PRIMER_MAX_SIZE > min PRIMER_PRODUCT_SIZE_RANGE).
+        return {"error": f"Primer3 rejected parameters: {exc}"}
+
+    n_found = result.get("PRIMER_PAIR_NUM_RETURNED", 0)
+    if n_found == 0:
+        explain = result.get("PRIMER_LEFT_EXPLAIN", "")
+        return {"error": f"Primer3 found no valid pair. {explain}"}
+
+    fwd_pos = result["PRIMER_LEFT_0"]     # (start, length)
+    rev_pos = result["PRIMER_RIGHT_0"]    # (start, length) — start is 3' end
+
+    return {
+        "fwd_seq":      result["PRIMER_LEFT_0_SEQUENCE"],
+        "rev_seq":      result["PRIMER_RIGHT_0_SEQUENCE"],
+        "fwd_tm":       round(result["PRIMER_LEFT_0_TM"], 1),
+        "rev_tm":       round(result["PRIMER_RIGHT_0_TM"], 1),
+        "fwd_pos":      (fwd_pos[0], fwd_pos[0] + fwd_pos[1]),   # (start, end)
+        "rev_pos":      (rev_pos[0] - rev_pos[1] + 1, rev_pos[0] + 1),
+        "product_size": result["PRIMER_PAIR_0_PRODUCT_SIZE"],
+    }
+
+
+def _design_cloning_primers(
+    template_seq: str,
+    start: int,
+    end: int,
+    re_5prime: str,
+    re_3prime: str,
+    target_tm: float = 57.0,
+    padding: str = "GCGC",
+) -> dict:
+    """Design cloning primers with restriction-enzyme tails + GCGC padding.
+
+    Structure (5'→3'):
+        Forward: [padding] [5' RE site]    [binding region →]
+        Reverse: [padding] [3' RE site RC] [← binding region RC]
+
+    Returns dict with keys: fwd_full, rev_full, fwd_binding, rev_binding,
+    fwd_tm, rev_tm, re_5prime, re_3prime, insert_seq, or 'error'.
+    """
+    if re_5prime not in _NEB_ENZYMES:
+        return {"error": f"Unknown enzyme: {re_5prime}"}
+    if re_3prime not in _NEB_ENZYMES:
+        return {"error": f"Unknown enzyme: {re_3prime}"}
+
+    site_5, _, _ = _NEB_ENZYMES[re_5prime]
+    site_3, _, _ = _NEB_ENZYMES[re_3prime]
+
+    insert = template_seq[start:end].upper()
+    if len(insert) < 18:
+        return {"error": "Region too short (< 18 bp)."}
+
+    fwd_bind, fwd_tm = _pick_binding_region(insert, target_tm)
+    rev_bind, rev_tm = _pick_binding_region(_rc(insert), target_tm)
+
+    fwd_full = padding + site_5 + fwd_bind
+    rev_full = padding + _rc(site_3) + rev_bind
+
+    return {
+        "fwd_full":    fwd_full,
+        "rev_full":    rev_full,
+        "fwd_binding": fwd_bind,
+        "rev_binding": rev_bind,
+        "fwd_tm":      round(fwd_tm, 1),
+        "rev_tm":      round(rev_tm, 1),
+        "re_5prime":   re_5prime,
+        "re_3prime":   re_3prime,
+        "site_5":      site_5,
+        "site_3":      site_3,
+        "insert_seq":  insert,
+        "fwd_pos":     (start, start + len(fwd_bind)),
+        "rev_pos":     (end - len(rev_bind), end),
+    }
+
+
 # ── Parts bin modal ────────────────────────────────────────────────────────────
 
 class PartsBinModal(Screen):
@@ -4108,6 +4278,360 @@ class ConstructorModal(ModalScreen):
         self.dismiss(None)
 
 
+# ── Primer design screen (full-screen) ─────────────────────────────────────────
+
+class PrimerDesignScreen(Screen):
+    """Full-screen Primer3-backed primer design workbench.
+
+    Two workflows:
+      Detection — diagnostic PCR primers (Primer3 picks ideal pair).
+      Cloning   — primers with restriction-enzyme tails + GCGC padding.
+
+    Designed primers are saved to primers.json and optionally added as
+    primer_bind features to the currently-loaded plasmid.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Close")]
+
+    def __init__(self, template_seq: str, feats: list[dict],
+                 plasmid_name: str = ""):
+        super().__init__()
+        self._template     = template_seq.upper()
+        self._feats        = feats
+        self._plasmid_name = plasmid_name
+        self._det_result:  "dict | None" = None
+        self._clo_result:  "dict | None" = None
+
+    def compose(self) -> ComposeResult:
+        # Feature dropdown
+        feat_opts: list[tuple[str, str]] = []
+        for f in self._feats:
+            if f.get("type") in ("resite", "recut"):
+                continue
+            label = f.get("label", f.get("type", "?"))
+            feat_opts.append(
+                (f"{label}  ({f['start']+1}‥{f['end']})", f"{f['start']}-{f['end']}")
+            )
+        # RE site dropdown
+        re_opts = _CLONING_RE_OPTIONS
+
+        yield Header()
+        with Vertical(id="pd-box"):
+            yield Static(" Primer Design  —  Primer3 ", id="pd-title")
+
+            # ── Source / region row ────────────────────────────────────────
+            with Horizontal(id="pd-source-row"):
+                with Vertical(id="pd-feat-col"):
+                    yield Label("Feature")
+                    yield Select(feat_opts, id="pd-feat",
+                                 prompt="(select or enter manually)")
+                with Vertical(id="pd-start-col"):
+                    yield Label("Start")
+                    yield Input(placeholder="1", id="pd-start", type="integer")
+                with Vertical(id="pd-end-col"):
+                    yield Label("End")
+                    yield Input(
+                        placeholder=str(len(self._template)) if self._template else "",
+                        id="pd-end", type="integer")
+                with Vertical(id="pd-name-col"):
+                    yield Label("Part name")
+                    yield Input(value=self._plasmid_name, id="pd-part-name")
+
+            # ── Detection primers ──────────────────────────────────────────
+            yield Static(
+                " [bold]Detection Primers[/bold]  [dim](diagnostic PCR)[/dim]",
+                id="pd-det-hdr", markup=True,
+            )
+            with Horizontal(id="pd-det-row"):
+                yield Label("Product ")
+                yield Input(value="450", id="pd-det-min", type="integer")
+                yield Label("–")
+                yield Input(value="550", id="pd-det-max", type="integer")
+                yield Label(" bp   Tm ")
+                yield Input(value="60", id="pd-det-tm", type="integer")
+                yield Label("°C   Len ")
+                yield Input(value="25", id="pd-det-len", type="integer")
+                yield Label(" bp")
+                yield Button("Design Detection", id="btn-det-design",
+                             variant="primary")
+
+            # ── Cloning primers ────────────────────────────────────────────
+            yield Static(
+                " [bold]Cloning Primers[/bold]  [dim](RE tails + GCGC padding)[/dim]",
+                id="pd-clo-hdr", markup=True,
+            )
+            with Horizontal(id="pd-clo-row"):
+                with Vertical(id="pd-clo-5col"):
+                    yield Label("5' RE site")
+                    yield Select(re_opts, id="pd-re5", value="EcoRI")
+                with Vertical(id="pd-clo-3col"):
+                    yield Label("3' RE site")
+                    yield Select(re_opts, id="pd-re3", value="BamHI")
+                with Vertical(id="pd-clo-tmcol"):
+                    yield Label("Binding Tm")
+                    yield Input(value="57", id="pd-clo-tm", type="integer")
+                yield Button("Design Cloning", id="btn-clo-design",
+                             variant="primary")
+
+            # ── Results panel ──────────────────────────────────────────────
+            yield Static("", id="pd-results", markup=True)
+            with Horizontal(id="pd-result-names"):
+                with Vertical(id="pd-fn-col"):
+                    yield Label("Fwd name")
+                    yield Input(id="pd-fwd-name", placeholder="fwd primer name")
+                with Vertical(id="pd-rn-col"):
+                    yield Label("Rev name")
+                    yield Input(id="pd-rev-name", placeholder="rev primer name")
+
+            # ── Action buttons ─────────────────────────────────────────────
+            with Horizontal(id="pd-btns"):
+                yield Button("Save to Primer Library", id="btn-pd-save",
+                             variant="success", disabled=True)
+                yield Button("Add as Features to Map", id="btn-pd-feat",
+                             variant="warning", disabled=True)
+                yield Button("Close", id="btn-pd-close")
+
+            # ── Primer library table ───────────────────────────────────────
+            yield Static(" Primer Library ", id="pd-lib-hdr")
+            yield DataTable(id="pd-lib-table", cursor_type="row",
+                            zebra_stripes=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        t = self.query_one("#pd-lib-table", DataTable)
+        t.add_columns("Name", "Sequence", "Tm", "Type", "Source")
+        self._refresh_library_table()
+
+    def _refresh_library_table(self) -> None:
+        t = self.query_one("#pd-lib-table", DataTable)
+        t.clear()
+        for p in _load_primers():
+            t.add_row(
+                Text(p.get("name", "?"), style="bold"),
+                Text(p.get("sequence", "")[:40], style="dim color(252)"),
+                f"{p.get('tm', 0):.1f}°C",
+                p.get("primer_type", "?"),
+                p.get("source", ""),
+            )
+
+    # ── Feature dropdown → fill start/end ──────────────────────────────────
+
+    @on(Select.Changed, "#pd-feat")
+    def _feat_selected(self, event: Select.Changed) -> None:
+        val = event.value
+        if not isinstance(val, str) or "-" not in val:
+            return
+        parts = val.split("-", 1)
+        try:
+            self.query_one("#pd-start", Input).value = str(int(parts[0]) + 1)
+            self.query_one("#pd-end", Input).value = parts[1]
+            # Auto-set part name from the feature label
+            for f in self._feats:
+                if f"{f['start']}-{f['end']}" == val:
+                    name_inp = self.query_one("#pd-part-name", Input)
+                    if not name_inp.value.strip():
+                        name_inp.value = f.get("label", "")
+                    break
+        except ValueError:
+            pass
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    def _read_region(self) -> "tuple[int, int, str] | None":
+        """Read and validate start/end/part-name from the inputs.
+        Returns (start_0based, end, part_name) or None after notifying."""
+        try:
+            start = int(self.query_one("#pd-start", Input).value) - 1
+            end   = int(self.query_one("#pd-end", Input).value)
+        except ValueError:
+            self.app.notify("Enter valid start and end positions.", severity="error")
+            return None
+        if start < 0 or end <= start or end > len(self._template):
+            self.app.notify(
+                f"Invalid region: {start+1}–{end} "
+                f"(sequence is {len(self._template)} bp).", severity="error")
+            return None
+        name = self.query_one("#pd-part-name", Input).value.strip() or "primer"
+        return start, end, name
+
+    def _show_result(self, design: dict, primer_type: str,
+                     fwd_key: str, rev_key: str) -> None:
+        """Display a primer pair in the results panel and fill the name
+        inputs with the default naming scheme."""
+        status = self.query_one("#pd-results", Static)
+        t = Text()
+        t.append("Forward (5'→3'):\n", style="bold green")
+        t.append(f"  {design[fwd_key]}\n", style="green")
+        t.append(f"  Tm {design['fwd_tm']:.1f}°C   "
+                 f"{len(design[fwd_key])} nt\n", style="dim")
+        t.append("Reverse (5'→3'):\n", style="bold red")
+        t.append(f"  {design[rev_key]}\n", style="red")
+        t.append(f"  Tm {design['rev_tm']:.1f}°C   "
+                 f"{len(design[rev_key])} nt\n", style="dim")
+        if "product_size" in design:
+            t.append(f"Product: {design['product_size']} bp\n", style="white")
+        if "re_5prime" in design:
+            t.append(
+                f"5' RE: {design['re_5prime']} ({design['site_5']})   "
+                f"3' RE: {design['re_3prime']} ({design['site_3']})\n",
+                style="cyan",
+            )
+        status.update(t)
+
+        name = self.query_one("#pd-part-name", Input).value.strip() or "primer"
+        suffix = "DET" if primer_type == "detection" else "CLO"
+        self.query_one("#pd-fwd-name", Input).value = f"{name}-{suffix}-F"
+        self.query_one("#pd-rev-name", Input).value = f"{name}-{suffix}-R"
+        self.query_one("#btn-pd-save", Button).disabled = False
+        self.query_one("#btn-pd-feat", Button).disabled = False
+
+    # ── Detection design ───────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-det-design")
+    def _design_detection(self, _) -> None:
+        region = self._read_region()
+        if region is None:
+            return
+        start, end, name = region
+        self._clo_result = None
+        try:
+            p_min = int(self.query_one("#pd-det-min", Input).value)
+            p_max = int(self.query_one("#pd-det-max", Input).value)
+            tm    = float(self.query_one("#pd-det-tm", Input).value)
+            plen  = int(self.query_one("#pd-det-len", Input).value)
+        except ValueError:
+            self.app.notify("Invalid detection primer parameters.", severity="error")
+            return
+        result = _design_detection_primers(
+            self._template, start, end,
+            product_min=p_min, product_max=p_max,
+            target_tm=tm, primer_len=plen,
+        )
+        if "error" in result:
+            self.query_one("#pd-results", Static).update(
+                f"[red]{result['error']}[/red]")
+            self._det_result = None
+            return
+        self._det_result = result
+        self._det_result["_type"] = "detection"
+        self._show_result(result, "detection", "fwd_seq", "rev_seq")
+
+    # ── Cloning design ─────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-clo-design")
+    def _design_cloning(self, _) -> None:
+        region = self._read_region()
+        if region is None:
+            return
+        start, end, name = region
+        self._det_result = None
+        re5 = self.query_one("#pd-re5", Select).value
+        re3 = self.query_one("#pd-re3", Select).value
+        if not isinstance(re5, str) or not isinstance(re3, str):
+            self.app.notify("Select both restriction enzymes.", severity="error")
+            return
+        try:
+            tm = float(self.query_one("#pd-clo-tm", Input).value)
+        except ValueError:
+            tm = 57.0
+        result = _design_cloning_primers(
+            self._template, start, end, re5, re3, target_tm=tm,
+        )
+        if "error" in result:
+            self.query_one("#pd-results", Static).update(
+                f"[red]{result['error']}[/red]")
+            self._clo_result = None
+            return
+        self._clo_result = result
+        self._clo_result["_type"] = "cloning"
+        self._show_result(result, "cloning", "fwd_full", "rev_full")
+
+    # ── Save to primer library ─────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-pd-save")
+    def _save_primers(self, _) -> None:
+        result = self._det_result or self._clo_result
+        if result is None:
+            return
+        fwd_name = self.query_one("#pd-fwd-name", Input).value.strip()
+        rev_name = self.query_one("#pd-rev-name", Input).value.strip()
+        if not fwd_name or not rev_name:
+            self.app.notify("Enter primer names before saving.", severity="error")
+            return
+        ptype = result.get("_type", "?")
+        fwd_key = "fwd_seq" if ptype == "detection" else "fwd_full"
+        rev_key = "rev_seq" if ptype == "detection" else "rev_full"
+
+        entries = _load_primers()
+        for pname, seq, tm, pos in [
+            (fwd_name, result[fwd_key], result["fwd_tm"], result["fwd_pos"]),
+            (rev_name, result[rev_key], result["rev_tm"], result["rev_pos"]),
+        ]:
+            # Remove any existing primer with the same name (update in place)
+            entries = [e for e in entries if e.get("name") != pname]
+            entries.insert(0, {
+                "name":        pname,
+                "sequence":    seq,
+                "tm":          tm,
+                "primer_type": ptype,
+                "source":      self._plasmid_name,
+                "pos_start":   pos[0],
+                "pos_end":     pos[1],
+                "strand":      1 if pname.endswith("-F") else -1,
+            })
+        _save_primers(entries)
+        self._refresh_library_table()
+        self.app.notify(f"Saved {fwd_name} + {rev_name} to primer library.")
+
+    # ── Add as features to the map ─────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-pd-feat")
+    def _add_features(self, _) -> None:
+        result = self._det_result or self._clo_result
+        if result is None:
+            return
+        rec = getattr(self.app, "_current_record", None)
+        if rec is None:
+            self.app.notify("No plasmid loaded.", severity="warning")
+            return
+        fwd_name = self.query_one("#pd-fwd-name", Input).value.strip() or "fwd"
+        rev_name = self.query_one("#pd-rev-name", Input).value.strip() or "rev"
+        fwd_pos  = result["fwd_pos"]
+        rev_pos  = result["rev_pos"]
+
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+
+        rec.features.append(SeqFeature(
+            FeatureLocation(fwd_pos[0], fwd_pos[1], strand=1),
+            type="primer_bind",
+            qualifiers={"label": [fwd_name]},
+        ))
+        rec.features.append(SeqFeature(
+            FeatureLocation(rev_pos[0], rev_pos[1], strand=-1),
+            type="primer_bind",
+            qualifiers={"label": [rev_name]},
+        ))
+        # Re-apply the record to refresh map + sidebar + sequence panel
+        try:
+            self.app._apply_record(rec)
+            # Also save the updated record back to the library
+            lib = self.app.query_one("#library")
+            lib.add_entry(rec)
+        except Exception:
+            _log.exception("Failed to add primer features to map")
+        self.app.notify(
+            f"Added {fwd_name} + {rev_name} as primer_bind features.")
+
+    # ── Close ──────────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-pd-close")
+    def _close(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ── Unsaved-changes quit dialog ────────────────────────────────────────────────
 
 class UnsavedQuitModal(ModalScreen):
@@ -4416,6 +4940,40 @@ DomesticatorModal { align: center middle; }
 }
 #dom-btns   { height: 3; margin-top: 1; }
 #dom-btns Button { margin-right: 1; }
+
+/* ── Primer design screen (full-screen) ─────────────────── */
+#pd-box {
+    width: 100%; height: 1fr;
+    background: $surface; padding: 0 2;
+}
+#pd-title     { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#pd-source-row { height: 5; }
+#pd-feat-col  { width: 2fr; padding-right: 1; }
+#pd-start-col { width: 1fr; padding-right: 1; }
+#pd-end-col   { width: 1fr; padding-right: 1; }
+#pd-name-col  { width: 2fr; }
+#pd-det-hdr   { height: 1; margin-top: 1; }
+#pd-det-row   { height: 3; align: left middle; }
+#pd-det-row Label { width: auto; padding: 0 0; }
+#pd-det-row Input { width: 6; }
+#pd-det-row Button { margin-left: 1; min-width: 20; }
+#pd-clo-hdr   { height: 1; margin-top: 1; }
+#pd-clo-row   { height: 5; }
+#pd-clo-5col  { width: 1fr; padding-right: 1; }
+#pd-clo-3col  { width: 1fr; padding-right: 1; }
+#pd-clo-tmcol { width: auto; padding-right: 1; }
+#pd-clo-row Button { margin-top: 2; min-width: 20; }
+#pd-results   {
+    height: auto; max-height: 10;
+    border: solid $primary-darken-2; padding: 0 1; margin-top: 1;
+}
+#pd-result-names { height: 4; margin-top: 1; }
+#pd-fn-col    { width: 1fr; padding-right: 1; }
+#pd-rn-col    { width: 1fr; }
+#pd-btns      { height: 3; margin-top: 1; }
+#pd-btns Button { margin-right: 1; }
+#pd-lib-hdr   { background: $accent-darken-2; color: $text; padding: 0 1; margin-top: 1; }
+#pd-lib-table { height: 1fr; min-height: 4; }
 """
 
     BINDINGS = [
@@ -5294,7 +5852,7 @@ DomesticatorModal { align: center middle; }
             self.action_open_constructor()
             return
         if name == "Primers":
-            self.notify("Design Primer: coming soon", severity="information")
+            self.action_open_primer_design()
             return
 
         # ── Multi-action menus (dropdown) ──────────────────────────────────
@@ -5475,6 +6033,19 @@ DomesticatorModal { align: center middle; }
 
     def action_open_constructor(self) -> None:
         self.push_screen(ConstructorModal())
+
+    def action_open_primer_design(self) -> None:
+        """Open the full-screen Primer Design workbench. Passes the current
+        plasmid's sequence and features so the user can select regions."""
+        rec = self._current_record
+        seq   = str(rec.seq) if rec else ""
+        name  = rec.name if rec else ""
+        feats = []
+        try:
+            feats = self.query_one("#plasmid-map", PlasmidMap)._feats
+        except Exception:
+            pass
+        self.push_screen(PrimerDesignScreen(seq, feats, name))
 
     def action_undo(self) -> None:
         self._action_undo()
