@@ -4384,6 +4384,14 @@ class PrimerDesignScreen(Screen):
         self._template     = template_seq.upper()
         self._feats        = feats
         self._plasmid_name = plasmid_name
+        # Default part name = first non-RE feature label, NOT the plasmid name.
+        # Users expect to design primers for a specific feature, not the whole
+        # plasmid. Falls back to plasmid name if no features exist.
+        self._default_part_name = plasmid_name
+        for f in feats:
+            if f.get("type") not in ("resite", "recut", "source"):
+                self._default_part_name = f.get("label", plasmid_name)
+                break
         self._det_result:  "dict | None" = None
         self._clo_result:  "dict | None" = None
 
@@ -4420,7 +4428,8 @@ class PrimerDesignScreen(Screen):
                         id="pd-end", type="integer")
                 with Vertical(id="pd-name-col"):
                     yield Label("Part name")
-                    yield Input(value=self._plasmid_name, id="pd-part-name")
+                    yield Input(value="", id="pd-part-name",
+                                placeholder=self._default_part_name)
 
             # ── Detection primers ──────────────────────────────────────────
             yield Static(
@@ -4480,6 +4489,9 @@ class PrimerDesignScreen(Screen):
             yield Static(" Primer Library ", id="pd-lib-hdr")
             yield DataTable(id="pd-lib-table", cursor_type="row",
                             zebra_stripes=True)
+            with Horizontal(id="pd-lib-btns"):
+                yield Button("Rename", id="btn-pdlib-rename", variant="default")
+                yield Button("Delete", id="btn-pdlib-del", variant="error")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -4510,12 +4522,12 @@ class PrimerDesignScreen(Screen):
         try:
             self.query_one("#pd-start", Input).value = str(int(parts[0]) + 1)
             self.query_one("#pd-end", Input).value = parts[1]
-            # Auto-set part name from the feature label
+            # Always set part name to the feature label when a feature is
+            # selected — the user expects primer names based on the FEATURE
+            # (e.g. "ampR-DET-F"), not the plasmid.
             for f in self._feats:
                 if f"{f['start']}-{f['end']}" == val:
-                    name_inp = self.query_one("#pd-part-name", Input)
-                    if not name_inp.value.strip():
-                        name_inp.value = f.get("label", "")
+                    self.query_one("#pd-part-name", Input).value = f.get("label", "")
                     break
         except ValueError:
             pass
@@ -4706,6 +4718,67 @@ class PrimerDesignScreen(Screen):
             _log.exception("Failed to add primer features to map")
         self.app.notify(
             f"Added {fwd_name} + {rev_name} as primer_bind features.")
+
+    # ── Primer library management ─────────────────────────────────────────
+
+    def _selected_primer_name(self) -> "str | None":
+        """Return the name of the currently-highlighted primer in the library
+        table, or None if nothing is selected."""
+        t = self.query_one("#pd-lib-table", DataTable)
+        primers = _load_primers()
+        if t.row_count == 0 or not (0 <= t.cursor_row < len(primers)):
+            return None
+        return primers[t.cursor_row].get("name")
+
+    @on(Button.Pressed, "#btn-pdlib-rename")
+    def _rename_primer(self, _) -> None:
+        old_name = self._selected_primer_name()
+        if old_name is None:
+            self.app.notify("Highlight a primer to rename.", severity="warning")
+            return
+
+        def _on_result(new_name: "str | None") -> None:
+            if new_name is None or new_name == old_name:
+                return
+            entries = _load_primers()
+            # Check collision
+            if any(e.get("name") == new_name for e in entries):
+                self.app.notify(
+                    f"A primer named {new_name!r} already exists.",
+                    severity="error")
+                return
+            for e in entries:
+                if e.get("name") == old_name:
+                    e["name"] = new_name
+                    break
+            _save_primers(entries)
+            self._refresh_library_table()
+            self.app.notify(f"Renamed {old_name!r} → {new_name!r}")
+
+        self.app.push_screen(
+            RenamePlasmidModal(old_name, old_name),
+            callback=_on_result,
+        )
+
+    @on(Button.Pressed, "#btn-pdlib-del")
+    def _delete_primer(self, _) -> None:
+        pname = self._selected_primer_name()
+        if pname is None:
+            self.app.notify("Highlight a primer to delete.", severity="warning")
+            return
+
+        def _on_confirm(result: "bool | None") -> None:
+            if result is not True:
+                return
+            entries = [e for e in _load_primers() if e.get("name") != pname]
+            _save_primers(entries)
+            self._refresh_library_table()
+            self.app.notify(f"Deleted primer {pname!r}.")
+
+        self.app.push_screen(
+            LibraryDeleteConfirmModal(pname, 0, pname),
+            callback=_on_confirm,
+        )
 
     # ── Close ──────────────────────────────────────────────────────────────
 
@@ -5039,9 +5112,9 @@ DomesticatorModal { align: center middle; }
 #pd-name-col  { width: 2fr; }
 #pd-det-hdr   { height: 1; margin-top: 1; }
 #pd-det-row   { height: 3; align: left middle; }
-#pd-det-row Label { width: auto; padding: 0 0; }
-#pd-det-row Input { width: 6; }
-#pd-det-row Button { margin-left: 1; min-width: 20; }
+#pd-det-row Label { width: auto; padding: 0 1; content-align: center middle; }
+#pd-det-row Input { width: 10; }
+#pd-det-row Button { margin-left: 2; min-width: 20; }
 #pd-clo-hdr   { height: 1; margin-top: 1; }
 #pd-clo-row   { height: 5; }
 #pd-clo-5col  { width: 1fr; padding-right: 1; }
@@ -5059,6 +5132,8 @@ DomesticatorModal { align: center middle; }
 #pd-btns Button { margin-right: 1; }
 #pd-lib-hdr   { background: $accent-darken-2; color: $text; padding: 0 1; margin-top: 1; }
 #pd-lib-table { height: 1fr; min-height: 4; }
+#pd-lib-btns  { height: 3; margin-top: 0; }
+#pd-lib-btns Button { margin-right: 1; min-width: 10; }
 """
 
     BINDINGS = [
