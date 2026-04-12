@@ -108,7 +108,7 @@ from textual.containers import Horizontal, Vertical, ScrollableContainer
 from textual.events import Click, MouseDown, MouseMove, MouseUp, MouseScrollDown, MouseScrollUp
 from textual.message import Message
 from textual.reactive import reactive
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
 from textual.widgets import (
     Button, DataTable, Footer, Header, Input, Label, Select, Static,
@@ -3409,8 +3409,12 @@ def _save_parts_bin(entries: list[dict]) -> None:
 
 # ── Parts bin modal ────────────────────────────────────────────────────────────
 
-class PartsBinModal(ModalScreen):
-    """Golden Braid-compatible L0 parts library browser.
+class PartsBinModal(Screen):
+    """Golden Braid-compatible L0 parts library — full-screen view.
+
+    Uses Screen (not ModalScreen) so it fills the terminal cleanly instead
+    of floating a fixed-size box on a dark overlay. Escape or the Close
+    button pops back to the main app.
 
     Shows both the built-in reference catalog (_GB_L0_PARTS) and user-created
     parts from parts_bin.json. User parts appear first and include sequence
@@ -3420,6 +3424,7 @@ class PartsBinModal(ModalScreen):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
     def compose(self) -> ComposeResult:
+        yield Header()
         with Vertical(id="parts-box"):
             yield Static(" Parts Bin  —  Golden Braid L0 Parts ", id="parts-title")
             yield DataTable(id="parts-table", cursor_type="row", zebra_stripes=True)
@@ -3427,6 +3432,7 @@ class PartsBinModal(ModalScreen):
             with Horizontal(id="parts-btns"):
                 yield Button("New Part", id="btn-new-part", variant="success")
                 yield Button("Close",    id="btn-parts-close")
+        yield Footer()
 
     def _all_rows(self) -> list[dict]:
         """Combine user-created parts (first) + built-in catalog into a
@@ -4372,11 +4378,10 @@ ConstructorModal { align: center middle; }
 #ctor-btns        { height: 3; margin-top: 1; }
 #ctor-btns Button { margin-right: 1; }
 
-/* ── Parts bin modal ─────────────────────────────────────── */
-PartsBinModal { align: center middle; }
+/* ── Parts bin (full-screen) ─────────────────────────────── */
 #parts-box {
-    width: 110; height: 36;
-    background: $surface; border: solid $success; padding: 1 2;
+    width: 100%; height: 1fr;
+    background: $surface; padding: 0 2;
 }
 #parts-title  { background: $success-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #parts-table  { height: 1fr; }
