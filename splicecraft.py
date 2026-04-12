@@ -3741,6 +3741,32 @@ def _design_cloning_primers(
     )
 
 
+def _design_generic_primers(
+    template_seq: str,
+    start: int,
+    end: int,
+    target_tm: float = 60.0,
+) -> dict:
+    """Design simple binding primers (no tails, no RE sites, no overhangs).
+
+    Forward primer: optimal binding region at the start of the region.
+    Reverse primer: optimal binding region at the end (reverse-complement).
+    """
+    insert = template_seq[start:end].upper()
+    if len(insert) < 18:
+        return {"error": "Region too short (< 18 bp)."}
+    fwd_bind, fwd_tm = _pick_binding_region(insert, target_tm)
+    rev_bind, rev_tm = _pick_binding_region(_rc(insert), target_tm)
+    return {
+        "fwd_seq":  fwd_bind,
+        "rev_seq":  rev_bind,
+        "fwd_tm":   round(fwd_tm, 1),
+        "rev_tm":   round(rev_tm, 1),
+        "fwd_pos":  (start, start + len(fwd_bind)),
+        "rev_pos":  (end - len(rev_bind), end),
+    }
+
+
 # ── Parts bin modal ────────────────────────────────────────────────────────────
 
 class PartsBinModal(Screen):
@@ -4480,7 +4506,7 @@ class PrimerDesignScreen(Screen):
         self._lib_selected: set[int] = set()   # multi-selected library rows
 
     def compose(self) -> ComposeResult:
-        # Feature dropdown
+        # Feature dropdown options
         feat_opts: list[tuple[str, str]] = []
         for f in self._feats:
             if f.get("type") in ("resite", "recut"):
@@ -4489,14 +4515,22 @@ class PrimerDesignScreen(Screen):
             feat_opts.append(
                 (f"{label}  ({f['start']+1}‥{f['end']})", f"{f['start']}-{f['end']}")
             )
-        # RE site dropdown
         re_opts = _CLONING_RE_OPTIONS
+        gb_opts = [
+            (f"{k}  ({v[0]}: {v[1]}→{v[2]})", k) for k, v in _GB_POSITIONS.items()
+        ]
+        mode_opts = [
+            ("Detection  (diagnostic PCR)",       "detection"),
+            ("Cloning  (RE tails + GCGC)",        "cloning"),
+            ("Golden Braid  (L0 domestication)",  "goldenbraid"),
+            ("Generic  (binding only)",           "generic"),
+        ]
 
         yield Header()
         with Vertical(id="pd-box"):
             yield Static(" Primer Design  —  Primer3 ", id="pd-title")
 
-            # ── Source / region row ────────────────────────────────────────
+            # ── Source row ─────────────────────────────────────────────────
             with Horizontal(id="pd-source-row"):
                 with Vertical(id="pd-feat-col"):
                     yield Label("Feature")
@@ -4515,15 +4549,22 @@ class PrimerDesignScreen(Screen):
                     yield Input(value="", id="pd-part-name",
                                 placeholder=self._default_part_name)
 
-            # ── Feature info (auto-updated when feature is selected) ─────
+            # ── Custom sequence input ──────────────────────────────────────
+            yield Label("Custom sequence (paste DNA if not using a library feature):")
+            yield Input(placeholder="ATGAAAGAT...", id="pd-custom-seq")
+
+            # ── Feature info ───────────────────────────────────────────────
             yield Static("", id="pd-feat-info", markup=True)
 
-            # ── Detection primers ──────────────────────────────────────────
-            yield Static(
-                " [bold]Detection Primers[/bold]  [dim](diagnostic PCR)[/dim]",
-                id="pd-det-hdr", markup=True,
-            )
-            with Horizontal(id="pd-det-row"):
+            # ── Primer type selector ───────────────────────────────────────
+            with Horizontal(id="pd-mode-row"):
+                with Vertical(id="pd-mode-col"):
+                    yield Label("Primer type")
+                    yield Select(mode_opts, id="pd-mode", value="detection")
+                yield Button("Design", id="btn-pd-design", variant="primary")
+
+            # ── Mode: Detection ────────────────────────────────────────────
+            with Horizontal(id="pd-panel-det", classes="pd-mode-panel"):
                 yield Label("Product ")
                 yield Input(value="450", id="pd-det-min", type="integer")
                 yield Label("–")
@@ -4533,32 +4574,37 @@ class PrimerDesignScreen(Screen):
                 yield Label("°C   Len ")
                 yield Input(value="25", id="pd-det-len", type="integer")
                 yield Label(" bp")
-                yield Button("Design Detection", id="btn-det-design",
-                             variant="primary")
 
-            # ── Cloning primers ────────────────────────────────────────────
-            yield Static(
-                " [bold]Cloning Primers[/bold]  [dim](RE tails + GCGC padding)[/dim]",
-                id="pd-clo-hdr", markup=True,
-            )
-            with Horizontal(id="pd-clo-row"):
+            # ── Mode: Cloning ──────────────────────────────────────────────
+            with Horizontal(id="pd-panel-clo", classes="pd-mode-panel"):
                 with Vertical(id="pd-clo-5col"):
                     yield Label("5' RE site")
                     yield Select(re_opts, id="pd-re5", value="EcoRI")
-                    yield Input(placeholder="or custom seq (e.g. GAATTC)",
+                    yield Input(placeholder="or custom (e.g. GAATTC)",
                                 id="pd-cust5")
                 with Vertical(id="pd-clo-3col"):
                     yield Label("3' RE site")
                     yield Select(re_opts, id="pd-re3", value="BamHI")
-                    yield Input(placeholder="or custom seq (e.g. GGATCC)",
+                    yield Input(placeholder="or custom (e.g. GGATCC)",
                                 id="pd-cust3")
                 with Vertical(id="pd-clo-tmcol"):
-                    yield Label("Binding Tm")
+                    yield Label("Tm")
                     yield Input(value="60", id="pd-clo-tm", type="integer")
-                yield Button("Design Cloning", id="btn-clo-design",
-                             variant="primary")
 
-            # ── Results panel ──────────────────────────────────────────────
+            # ── Mode: Golden Braid ─────────────────────────────────────────
+            with Horizontal(id="pd-panel-gb", classes="pd-mode-panel"):
+                with Vertical(id="pd-gb-type-col"):
+                    yield Label("Part type")
+                    yield Select(gb_opts, id="pd-gb-type", value="CDS")
+                yield Static("", id="pd-gb-oh-info", markup=True)
+
+            # ── Mode: Generic ──────────────────────────────────────────────
+            with Horizontal(id="pd-panel-gen", classes="pd-mode-panel"):
+                yield Label("Tm ")
+                yield Input(value="60", id="pd-gen-tm", type="integer")
+                yield Label(" °C")
+
+            # ── Results ────────────────────────────────────────────────────
             yield Static("", id="pd-results", markup=True)
             with Horizontal(id="pd-result-names"):
                 with Vertical(id="pd-fn-col"):
@@ -4574,7 +4620,7 @@ class PrimerDesignScreen(Screen):
                              variant="primary", disabled=True)
                 yield Button("Close", id="btn-pd-close")
 
-            # ── Primer library table ───────────────────────────────────────
+            # ── Primer library ─────────────────────────────────────────────
             yield Static(" Primer Library ", id="pd-lib-hdr")
             yield DataTable(id="pd-lib-table", cursor_type="row",
                             zebra_stripes=True)
@@ -4591,10 +4637,19 @@ class PrimerDesignScreen(Screen):
             )
         yield Footer()
 
+    _MODE_PANELS = {
+        "detection":   "#pd-panel-det",
+        "cloning":     "#pd-panel-clo",
+        "goldenbraid": "#pd-panel-gb",
+        "generic":     "#pd-panel-gen",
+    }
+
     def on_mount(self) -> None:
         t = self.query_one("#pd-lib-table", DataTable)
         t.add_columns("Name", "Sequence", "Len", "Tm", "Type", "Source")
         self._refresh_library_table()
+        # Show only the detection panel on startup
+        self._switch_mode("detection")
 
     def _refresh_library_table(self) -> None:
         t = self.query_one("#pd-lib-table", DataTable)
@@ -4617,6 +4672,53 @@ class PrimerDesignScreen(Screen):
             )
         if primers and 0 <= saved_cursor < len(primers):
             t.move_cursor(row=saved_cursor)
+
+    # ── Mode switching ───────────────────────────────────────────────────
+
+    def _switch_mode(self, mode: str) -> None:
+        """Show only the panel for `mode`, hide the others."""
+        for m, sel in self._MODE_PANELS.items():
+            try:
+                panel = self.query_one(sel)
+                panel.display = (m == mode)
+            except Exception:
+                pass
+        # Update GB overhang info when switching to golden braid
+        if mode == "goldenbraid":
+            self._update_gb_oh()
+
+    @on(Select.Changed, "#pd-mode")
+    def _mode_changed(self, event: Select.Changed) -> None:
+        val = event.value
+        if isinstance(val, str) and val in self._MODE_PANELS:
+            self._switch_mode(val)
+
+    @on(Select.Changed, "#pd-gb-type")
+    def _gb_type_changed(self, _event) -> None:
+        self._update_gb_oh()
+
+    def _update_gb_oh(self) -> None:
+        sel = self.query_one("#pd-gb-type", Select)
+        val = sel.value
+        if not isinstance(val, str) or val not in _GB_POSITIONS:
+            return
+        pos, oh5, oh3 = _GB_POSITIONS[val]
+        self.query_one("#pd-gb-oh-info", Static).update(
+            f"  [dim]{pos}[/dim]   "
+            f"5′: [bold cyan]{oh5}[/bold cyan]  →  "
+            f"3′: [bold cyan]{oh3}[/bold cyan]"
+        )
+
+    # ── Custom sequence → override template ────────────────────────────
+
+    @on(Input.Changed, "#pd-custom-seq")
+    def _custom_seq_changed(self, event: Input.Changed) -> None:
+        """When the user types a custom sequence, auto-fill start=1 and
+        end=len, and clear the feature dropdown."""
+        seq = event.value.strip().upper()
+        if seq and set(seq) <= set("ACGTRYWSMKBDHVN"):
+            self.query_one("#pd-start", Input).value = "1"
+            self.query_one("#pd-end", Input).value = str(len(seq))
 
     # ── Feature dropdown → fill start/end ──────────────────────────────────
 
@@ -4757,92 +4859,133 @@ class PrimerDesignScreen(Screen):
         self.query_one("#pd-rev-name", Input).value = f"{name}-{suffix}-R"
         self.query_one("#btn-pd-save", Button).disabled = False
 
-    # ── Detection design ───────────────────────────────────────────────────
+    # ── Unified design button ─────────────────────────────────────────────
 
-    @on(Button.Pressed, "#btn-det-design")
-    def _design_detection(self, _) -> None:
-        region = self._read_region()
+    @on(Button.Pressed, "#btn-pd-design")
+    def _do_design(self, _) -> None:
+        """Single Design button dispatches to the active primer mode."""
+        mode_val = self.query_one("#pd-mode", Select).value
+        if not isinstance(mode_val, str):
+            self.app.notify("Select a primer type.", severity="error")
+            return
+
+        # Resolve template: custom sequence overrides loaded plasmid
+        custom = self.query_one("#pd-custom-seq", Input).value.strip().upper()
+        if custom and set(custom) <= set("ACGTRYWSMKBDHVN"):
+            template = custom
+        else:
+            template = self._template
+        if not template:
+            self.app.notify("No sequence available. Load a plasmid or paste a custom sequence.", severity="error")
+            return
+
+        region = self._read_region_from(template)
         if region is None:
             return
         start, end, name = region
+        self._det_result = None
         self._clo_result = None
+
+        if mode_val == "detection":
+            self._run_detection(template, start, end)
+        elif mode_val == "cloning":
+            self._run_cloning(template, start, end)
+        elif mode_val == "goldenbraid":
+            self._run_goldenbraid(template, start, end)
+        elif mode_val == "generic":
+            self._run_generic(template, start, end)
+
+    def _read_region_from(self, template: str) -> "tuple[int, int, str] | None":
+        """Like _read_region but uses the given template length for validation."""
+        try:
+            start = int(self.query_one("#pd-start", Input).value) - 1
+            end   = int(self.query_one("#pd-end", Input).value)
+        except ValueError:
+            self.app.notify("Enter valid start and end positions.", severity="error")
+            return None
+        if start < 0 or end <= start or end > len(template):
+            self.app.notify(
+                f"Invalid region: {start+1}–{end} (sequence is {len(template)} bp).",
+                severity="error")
+            return None
+        name = self.query_one("#pd-part-name", Input).value.strip() or "primer"
+        return start, end, name
+
+    def _run_detection(self, template: str, start: int, end: int) -> None:
         try:
             p_min = int(self.query_one("#pd-det-min", Input).value)
             p_max = int(self.query_one("#pd-det-max", Input).value)
             tm    = float(self.query_one("#pd-det-tm", Input).value)
             plen  = int(self.query_one("#pd-det-len", Input).value)
         except ValueError:
-            self.app.notify("Invalid detection primer parameters.", severity="error")
+            self.app.notify("Invalid detection parameters.", severity="error")
             return
         result = _design_detection_primers(
-            self._template, start, end,
-            product_min=p_min, product_max=p_max,
+            template, start, end, product_min=p_min, product_max=p_max,
             target_tm=tm, primer_len=plen,
         )
         if "error" in result:
-            self.query_one("#pd-results", Static).update(
-                f"[red]{result['error']}[/red]")
-            self._det_result = None
+            self.query_one("#pd-results", Static).update(f"[red]{result['error']}[/red]")
             return
         self._det_result = result
         self._det_result["_type"] = "detection"
         self._show_result(result, "detection", "fwd_seq", "rev_seq")
 
-    # ── Cloning design ─────────────────────────────────────────────────────
-
-    @on(Button.Pressed, "#btn-clo-design")
-    def _design_cloning(self, _) -> None:
-        region = self._read_region()
-        if region is None:
-            return
-        start, end, name = region
-        self._det_result = None
-
-        # Check custom cutter sequences first; fall back to dropdown
+    def _run_cloning(self, template: str, start: int, end: int) -> None:
         cust5 = self.query_one("#pd-cust5", Input).value.strip().upper()
         cust3 = self.query_one("#pd-cust3", Input).value.strip().upper()
         re5 = self.query_one("#pd-re5", Select).value
         re3 = self.query_one("#pd-re3", Select).value
-
-        # Resolve what to pass: custom sequence takes priority over dropdown
         if cust5 and set(cust5) <= set("ACGTRYWSMKBDHVN"):
-            site_5 = cust5
-            name_5 = f"custom({cust5})"
+            site_5, name_5 = cust5, f"custom({cust5})"
         elif isinstance(re5, str) and re5 in _NEB_ENZYMES:
-            site_5 = _NEB_ENZYMES[re5][0]
-            name_5 = re5
+            site_5, name_5 = _NEB_ENZYMES[re5][0], re5
         else:
-            self.app.notify("Select a 5' RE site or enter a custom sequence.",
-                            severity="error")
+            self.app.notify("Select a 5' RE or enter a custom sequence.", severity="error")
             return
-
         if cust3 and set(cust3) <= set("ACGTRYWSMKBDHVN"):
-            site_3 = cust3
-            name_3 = f"custom({cust3})"
+            site_3, name_3 = cust3, f"custom({cust3})"
         elif isinstance(re3, str) and re3 in _NEB_ENZYMES:
-            site_3 = _NEB_ENZYMES[re3][0]
-            name_3 = re3
+            site_3, name_3 = _NEB_ENZYMES[re3][0], re3
         else:
-            self.app.notify("Select a 3' RE site or enter a custom sequence.",
-                            severity="error")
+            self.app.notify("Select a 3' RE or enter a custom sequence.", severity="error")
             return
-
         try:
             tm = float(self.query_one("#pd-clo-tm", Input).value)
         except ValueError:
             tm = 60.0
         result = _design_cloning_primers_raw(
-            self._template, start, end, site_5, site_3, name_5, name_3,
-            target_tm=tm,
+            template, start, end, site_5, site_3, name_5, name_3, target_tm=tm,
         )
         if "error" in result:
-            self.query_one("#pd-results", Static).update(
-                f"[red]{result['error']}[/red]")
-            self._clo_result = None
+            self.query_one("#pd-results", Static).update(f"[red]{result['error']}[/red]")
             return
         self._clo_result = result
         self._clo_result["_type"] = "cloning"
         self._show_result(result, "cloning", "fwd_full", "rev_full")
+
+    def _run_goldenbraid(self, template: str, start: int, end: int) -> None:
+        pt = self.query_one("#pd-gb-type", Select).value
+        if not isinstance(pt, str) or pt not in _GB_POSITIONS:
+            self.app.notify("Select a GB part type.", severity="error")
+            return
+        result = _design_gb_primers(template, start, end, pt)
+        self._clo_result = result
+        self._clo_result["_type"] = "goldenbraid"
+        self._show_result(result, "goldenbraid", "fwd_full", "rev_full")
+
+    def _run_generic(self, template: str, start: int, end: int) -> None:
+        try:
+            tm = float(self.query_one("#pd-gen-tm", Input).value)
+        except ValueError:
+            tm = 60.0
+        result = _design_generic_primers(template, start, end, target_tm=tm)
+        if "error" in result:
+            self.query_one("#pd-results", Static).update(f"[red]{result['error']}[/red]")
+            return
+        self._det_result = result
+        self._det_result["_type"] = "generic"
+        self._show_result(result, "generic", "fwd_seq", "rev_seq")
 
     # ── Save to primer library ─────────────────────────────────────────────
 
@@ -5349,19 +5492,22 @@ DomesticatorModal { align: center middle; }
 #pd-start-col { width: 1fr; padding-right: 1; }
 #pd-end-col   { width: 1fr; padding-right: 1; }
 #pd-name-col  { width: 2fr; }
+#pd-custom-seq { margin-bottom: 0; }
 #pd-feat-info { height: 1; }
-#pd-det-hdr   { height: 1; }
-#pd-det-row   { height: 3; align: left middle; }
-#pd-det-row Label { width: auto; padding: 0 1; content-align: center middle; }
-#pd-det-row Input { width: 10; }
-#pd-det-row Button { margin-left: 2; min-width: 20; }
-#pd-clo-hdr   { height: 1; margin-top: 1; }
-#pd-clo-row   { height: 7; }
-#pd-clo-5col  { width: 1fr; max-width: 36; padding-right: 1; }
-#pd-clo-3col  { width: 1fr; max-width: 36; padding-right: 1; }
+#pd-mode-row  { height: 4; }
+#pd-mode-col  { width: 1fr; max-width: 40; padding-right: 1; }
+#pd-mode-row Button { margin-top: 1; min-width: 16; }
+.pd-mode-panel { height: 3; align: left middle; }
+.pd-mode-panel Label { width: auto; padding: 0 1; content-align: center middle; }
+.pd-mode-panel Input { width: 10; }
+#pd-panel-clo { height: 6; }
+#pd-clo-5col  { width: 1fr; max-width: 32; padding-right: 1; }
+#pd-clo-3col  { width: 1fr; max-width: 32; padding-right: 1; }
 #pd-cust5, #pd-cust3 { width: 100%; margin-top: 0; }
 #pd-clo-tmcol { width: auto; padding-right: 1; }
-#pd-clo-row Button { margin-top: 1; min-width: 20; }
+#pd-panel-gb  { height: 4; }
+#pd-gb-type-col { width: 1fr; max-width: 40; padding-right: 1; }
+#pd-gb-oh-info  { width: auto; content-align: left middle; }
 #pd-results   {
     height: auto; max-height: 8;
     border: solid $primary-darken-2; padding: 0 1; margin-top: 1;
