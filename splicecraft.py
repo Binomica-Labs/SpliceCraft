@@ -4498,6 +4498,12 @@ class PrimerDesignScreen(Screen):
         BINDINGS so they appear in the Footer."""
         pass
 
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        """Always allow Screen-level actions. Without this, the App's
+        check_action (which blocks non-default-screen actions) was
+        suppressing the Footer display of our m/M/S bindings."""
+        return True
+
     def __init__(self, template_seq: str, feats: list[dict],
                  plasmid_name: str = ""):
         super().__init__()
@@ -4566,8 +4572,8 @@ class PrimerDesignScreen(Screen):
                         self._plasmid_name or "(no plasmid loaded)",
                         id="pd-plasmid-name",
                     )
-                    yield Button("Change…", id="btn-pd-pickplasmid",
-                                 variant="default")
+                    yield Button("Select Plasmid", id="btn-pd-pickplasmid",
+                                 variant="primary")
                 with Horizontal(id="pd-source-row"):
                     with Vertical(id="pd-feat-col"):
                         yield Label("Feature")
@@ -4667,16 +4673,18 @@ class PrimerDesignScreen(Screen):
             yield Static(" Primer Library ", id="pd-lib-hdr")
             yield DataTable(id="pd-lib-table", cursor_type="row",
                             zebra_stripes=True)
-            # ── Custom hint bar (reliable — Footer truncates bindings) ────
-            yield Static(
-                "  [bold]esc[/bold] Close   "
-                "[bold]m[/bold] Mark (★)   "
-                "[bold]M[/bold] Mark All   "
-                "[bold]S[/bold] Change Status",
-                id="pd-hint-bar",
-                markup=True,
-            )
-        yield Footer()
+        # Footer replacement: Textual 8.2 has a ReactiveError bug when
+        # Footer is used inside a pushed Screen ("Unable to bind data;
+        # Footer is not defined on PlasmidApp"). The bug causes the
+        # Footer widget to render as an empty strip with no key hints.
+        # We render our own hint bar styled identically to a Footer so
+        # the user sees the keybindings regardless of the Textual bug.
+        yield Static(
+            " [b]esc[/b] Close   [b]m[/b] Mark (★)   "
+            "[b]M[/b] Mark All   [b]S[/b] Change Status",
+            id="pd-footer-shim",
+            markup=True,
+        )
 
     _MODE_PANELS = {
         "detection":   "#pd-panel-det",
@@ -5793,26 +5801,27 @@ DomesticatorModal { align: center middle; }
 #pd-mode-col  { width: 1fr; max-width: 40; padding-right: 1; }
 #pd-mode-row Button { margin-top: 1; min-width: 16; }
 .pd-source-panel { height: auto; }
-#pd-plasmid-row  { height: 3; align: left middle; }
+#pd-plasmid-row  { height: 3; align: center middle; }
 #pd-plasmid-name {
     width: auto; max-width: 40;
     padding: 0 1;
-    content-align: left middle;
+    content-align: center middle;
     color: $accent;
 }
-#pd-plasmid-row Button { min-width: 12; margin-left: 1; }
+#pd-plasmid-row Button { min-width: 18; margin-left: 2; }
 #pd-custom-seq { height: 10; min-height: 10; }
-#pd-hint-bar {
+#pd-footer-shim {
+    dock: bottom;
     height: 1;
-    background: $primary-darken-2;
-    color: $text;
+    background: $footer-background;
+    color: $footer-foreground;
     padding: 0 1;
 }
 #pd-custom-seq { height: 4; min-height: 4; }
 #pd-feat-info { height: 1; }
 .pd-mode-panel { height: 3; align: left middle; }
 .pd-mode-panel Label { width: auto; padding: 0 0 0 1; content-align: center middle; }
-.pd-mode-panel Input { width: 10; margin: 0 0; }
+.pd-mode-panel Input { width: 20; margin: 0 0; }
 #pd-gen-source { width: 24; }
 #pd-panel-clo { height: 6; }
 #pd-clo-5col  { width: 1fr; max-width: 32; padding-right: 1; }
@@ -5860,7 +5869,14 @@ DomesticatorModal { align: center middle; }
     # Everything else is suppressed to prevent confusing cross-screen
     # side-effects (e.g. pressing 'f' in the Primer Design screen should
     # not open a GenBank fetch modal underneath it).
-    _ALWAYS_ALLOWED_ACTIONS: set[str] = set()  # no app-level actions leak into pushed screens
+    # Actions that are always allowed — even on non-default screens.
+    # These include Screen-level actions that every screen needs (cancel,
+    # focus_next, noop placeholders). The critical guard below checks
+    # self.screen.id; only app-level (main-screen) shortcuts like f, o, a,
+    # A, E, r, v, etc. get blocked.
+    _ALWAYS_ALLOWED_ACTIONS: set[str] = {
+        "cancel", "focus_next", "noop",
+    }
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         """Textual calls this before executing any App-level binding action.
