@@ -40,15 +40,18 @@ and edit sequences — without ever leaving the terminal.
 ## Quick start
 
 ```bash
-pip install splicecraft
+pipx install splicecraft
 splicecraft              # empty canvas
 splicecraft L09137       # fetch pUC19 from NCBI
 splicecraft myplasmid.gb # open a local GenBank file
 ```
 
-**That's it.** All required dependencies are installed automatically. User data
-lives in the platform-appropriate data directory (see the Installation section
-below).
+**That's it.** `pipx` creates an isolated virtual environment for SpliceCraft
+and its dependencies, so it won't clash with system Python packages. If you
+don't have pipx yet: `sudo apt install pipx` on Debian/Ubuntu/WSL2,
+`brew install pipx` on macOS, or `python -m pip install --user pipx` elsewhere.
+User data lives in the platform-appropriate data directory (see the
+Installation section below).
 
 ---
 
@@ -111,18 +114,45 @@ below).
 
 Requires **Python 3.10+**.
 
-### From PyPI (recommended)
+### With pipx (recommended)
 
 ```bash
-pip install splicecraft
-splicecraft              # empty canvas
-splicecraft L09137       # fetch pUC19 from NCBI
-splicecraft myplasmid.gb # open a local GenBank file
+pipx install splicecraft
 ```
 
-All required dependencies (`textual`, `biopython`, `primer3-py`, `platformdirs`)
-are pulled in automatically. User data (library, parts bin, primers) lives in
-the platform-appropriate data directory:
+`pipx` installs SpliceCraft (and its Textual / Biopython / primer3-py /
+platformdirs deps) into an isolated virtual environment and places the
+`splicecraft` command on your `PATH`. This is the right approach on
+modern Debian, Ubuntu, Fedora, and WSL2, where `pip install` into the
+system Python is blocked by [PEP 668](https://peps.python.org/pep-0668/).
+
+If you don't already have pipx:
+
+```bash
+sudo apt install pipx           # Debian / Ubuntu / WSL2
+brew install pipx               # macOS
+python -m pip install --user pipx  # everywhere else
+pipx ensurepath                 # one-time; adds ~/.local/bin to PATH
+```
+
+### With pip inside a venv
+
+If you prefer a plain pip workflow, use a virtual environment:
+
+```bash
+python3 -m venv ~/.venvs/splicecraft
+~/.venvs/splicecraft/bin/pip install splicecraft
+~/.venvs/splicecraft/bin/splicecraft
+```
+
+(Plain `pip install splicecraft` into system Python works on older
+distros and inside conda envs, but will be rejected by PEP 668 on any
+recent Debian-family system — use `pipx` or a venv instead.)
+
+### User data location
+
+User data (library, parts bin, primers) lives in the platform-appropriate
+data directory:
 
   | Platform | Path |
   |---|---|
@@ -137,7 +167,7 @@ Override with `SPLICECRAFT_DATA_DIR=/path/to/dir splicecraft`.
 ```bash
 git clone https://github.com/Binomica-Labs/SpliceCraft.git
 cd SpliceCraft
-pip install -e .
+pip install -e .        # inside a venv, or pass --break-system-packages
 ```
 
 ### Optional dependencies
@@ -159,7 +189,6 @@ notifies the user how to install it if pressed.
 ## Usage
 
 ```bash
-# After pip install:
 splicecraft              # empty canvas
 splicecraft L09137       # fetch pUC19 from NCBI on launch
 splicecraft myplasmid.gb # open a local GenBank file
