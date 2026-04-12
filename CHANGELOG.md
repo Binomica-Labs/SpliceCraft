@@ -4,6 +4,34 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Golden Braid primer validation** — `_design_gb_primers` now returns a
+  clear error when the selected region is shorter than 18 bp, instead of
+  silently producing a too-short primer with `Tm=0.0`. `_run_goldenbraid`
+  surfaces that error in red in the results pane.
+- **pLannotate race condition** — if the user loaded a different plasmid
+  while pLannotate was still running, the worker would silently replace
+  the newly-loaded plasmid with the merged old one. The worker now checks
+  `self._current_record is record` before applying and drops the stale
+  result with a warning.
+- **Undo stack leaked across plasmid loads** — pressing `Ctrl+Z` after
+  switching plasmids could yank the user back to an unrelated edit on
+  the previous plasmid. `_apply_record` now clears undo/redo on a fresh
+  load (fetch / file open / library pick). In-place record changes
+  (pLannotate merge, sequence edits) keep their undo entries intact.
+- **Wrap-around restriction sites** — enzymes whose recognition sequence
+  spans the origin of a circular plasmid are now found and rendered as
+  two linked pieces (labeled tail + unlabeled head). Previously those
+  sites were silently invisible.
+- **Zero-width feature click detection** — a malformed feature with
+  `start == end` used to match every click on the backbone in linear
+  view. The linear click handler now shares `_bp_in`'s half-open
+  `[start, end)` semantics, making zero-width features unclickable.
+- **Shrink-guard widened** — the data-safety guard now logs any library
+  shrink (not just nukes to zero entries), making accidental entry
+  deletion easier to audit in `/tmp/splicecraft.log`.
+
 ### Added
 
 - **Feature deletion** — press `Delete` to remove the selected feature (annotation only,

@@ -393,6 +393,49 @@ class TestRestrictionScan:
         bst = self._resites(feats, "BstEII")
         assert len(bst) == 4
 
+    def test_circular_wraparound_ecori_found(self):
+        """A palindromic site that spans the origin is found when circular=True."""
+        # seq[-3:] + seq[:3] == 'GAATTC' (EcoRI)
+        seq = "TTC" + "ACGTACGTACGTACGTACGT" + "GAA"  # 27 bp
+        feats = sc._scan_restriction_sites(seq, min_recognition_len=6,
+                                           unique_only=True, circular=True)
+        eco = self._resites(feats, "EcoRI")
+        # Wrap site emits two pieces; the labeled tail is what counts as a site.
+        assert len(eco) == 1, f"Expected 1 labeled wrap-around EcoRI, got {len(eco)}"
+        r = eco[0]
+        assert r["start"] == len(seq) - 3 and r["end"] == len(seq), r
+        # And there is an unlabeled continuation piece on the head.
+        all_eco_resites = [f for f in feats
+                           if f.get("type") == "resite" and f.get("color") == r["color"]]
+        heads = [h for h in all_eco_resites if h.get("start") == 0]
+        assert len(heads) == 1 and heads[0]["end"] == 3
+
+    def test_circular_wraparound_not_found_when_linear(self):
+        """Same wrap site does NOT appear with circular=False."""
+        seq = "TTC" + "ACGTACGTACGTACGTACGT" + "GAA"
+        feats = sc._scan_restriction_sites(seq, min_recognition_len=6,
+                                           unique_only=True, circular=False)
+        assert not self._resites(feats, "EcoRI")
+
+    def test_circular_wraparound_recut_position(self):
+        """Wrap-around EcoRI (cuts after G^AATTC). Site spans n-3..n+2, so the
+        cut is at (n-3)+1 = n-2 (just after the G, still in the tail)."""
+        seq = "TTC" + "ACGTACGTACGTACGTACGT" + "GAA"
+        feats = sc._scan_restriction_sites(seq, min_recognition_len=6,
+                                           unique_only=True, circular=True)
+        cuts = self._recuts(feats, "EcoRI")
+        assert len(cuts) == 1
+        assert cuts[0]["start"] == len(seq) - 2
+
+    def test_circular_wraparound_unique_filter(self):
+        """A single wrap-around site must pass unique_only=True even though
+        it produces two resite pieces — only the labeled one counts."""
+        seq = "TTC" + "ACGTACGTACGTACGTACGT" + "GAA"
+        feats = sc._scan_restriction_sites(seq, min_recognition_len=6,
+                                           unique_only=True, circular=True)
+        labeled = [f for f in feats if f.get("label") == "EcoRI" and f.get("type") == "resite"]
+        assert len(labeled) == 1
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CDS translation

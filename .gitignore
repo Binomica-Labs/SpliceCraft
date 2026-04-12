@@ -22,3 +22,6 @@ primers.json
 .idea/
 *.swp
 .DS_Store
+
+# Claude Code local settings / cache
+.claude/

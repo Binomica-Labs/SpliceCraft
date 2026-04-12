@@ -229,13 +229,15 @@ def _safe_save_json(path: Path, entries: list, label: str) -> None:
             _log.warning("Could not create backup for %s", path)
 
     # Shrink guard: log a loud warning if we're about to lose entries.
-    # This doesn't BLOCK the write (legitimate deletes reduce the count)
-    # but makes accidental nukes visible in the log file.
-    if existing_count > 0 and len(entries) == 0:
+    # Any shrink is logged so accidental nukes are auditable; going to zero
+    # from a populated file is almost always a bug (user never legitimately
+    # empties the whole library at once) so the .bak is explicitly preserved
+    # and the warning cites the path for recovery.
+    if existing_count > 0 and len(entries) < existing_count:
         _log.warning(
-            "SHRINK GUARD: %s is being overwritten with 0 entries "
+            "SHRINK GUARD: %s is being overwritten with %d entries "
             "(was %d). If this is unexpected, restore from %s.bak",
-            label, existing_count, path,
+            label, len(entries), existing_count, path,
         )
 
     # 2. Atomic write: tempfile in same dir → os.replace
@@ -649,6 +651,7 @@ def _scan_restriction_sites(
     seq: str,
     min_recognition_len: int = 6,
     unique_only: bool = True,
+    circular: bool = True,
 ) -> list[dict]:
     """Scan both strands; return resite + recut dicts for every hit.
 
@@ -659,6 +662,15 @@ def _scan_restriction_sites(
                           (default 6 to reduce noise from 4-cutters)
     unique_only         — if True, only include enzymes that cut exactly once
                           (forward + reverse strand combined; default True)
+    circular            — if True (default), recognition sequences that span
+                          the origin (bp n-1 → bp 0) are also found. SpliceCraft
+                          is a plasmid viewer, so circularity is on by default.
+
+    Wrap-around resites are emitted as TWO pieces so the existing linear-span
+    rendering in the map / sequence panel stays correct: one piece on the
+    "tail" (start..n) with the enzyme label, one unlabeled piece on the
+    "head" (0..tail_len). The single-bp recut marker is placed at its real
+    absolute position modulo n.
     """
     seq_u = seq.upper()
     n = len(seq_u)
@@ -666,32 +678,80 @@ def _scan_restriction_sites(
     by_enzyme: dict[str, list[dict]] = {}
     seen: set[tuple[str, int, int]] = set()   # deduplicate palindromes
 
+    # For circular sequences, scan an augmented copy that includes up to
+    # site_len-1 bp re-attached from the beginning so matches starting near
+    # the end (that would otherwise be truncated) are found too.
+    max_site_len = max((e[2] for e in _SCAN_CATALOG), default=0)
+    scan_seq = (seq_u + seq_u[: max_site_len - 1]) if (circular and n > 0) else seq_u
+
+    def _emit_resite(hits, p, site_len, strand, color, name,
+                     cut_col, ext_cut_bp):
+        """Emit one or two resite dicts depending on wrap. Labels only on the
+        first piece so the map doesn't double-print. For wrapped sites, the
+        cut_col / ext_cut_bp fields are only meaningful on the piece that
+        actually contains the cut; we attach them to the tail piece by default
+        and clear them on the head piece."""
+        if p + site_len <= n:
+            hits.append({
+                "type":       "resite",
+                "start":      p,
+                "end":        p + site_len,
+                "strand":     strand,
+                "color":      color,
+                "label":      name,
+                "cut_col":    cut_col,
+                "ext_cut_bp": ext_cut_bp,
+            })
+            return
+        # Wraps origin: tail [p, n) + head [0, (p + site_len) - n).
+        tail_len = n - p
+        head_len = (p + site_len) - n
+        # Tail piece (labeled): owns cut_col/ext_cut_bp if the cut is within
+        # the tail portion (col < tail_len); otherwise passes to head piece.
+        tail_cut_col = cut_col if (cut_col is not None and cut_col < tail_len) else None
+        head_cut_col = ((cut_col - tail_len) if (cut_col is not None and cut_col >= tail_len)
+                        else None)
+        hits.append({
+            "type":       "resite",
+            "start":      p,
+            "end":        n,
+            "strand":     strand,
+            "color":      color,
+            "label":      name,
+            "cut_col":    tail_cut_col,
+            "ext_cut_bp": ext_cut_bp if tail_cut_col is not None else None,
+        })
+        hits.append({
+            "type":       "resite",
+            "start":      0,
+            "end":        head_len,
+            "strand":     strand,
+            "color":      color,
+            "label":      "",     # unlabeled continuation
+            "cut_col":    head_cut_col,
+            "ext_cut_bp": ext_cut_bp if head_cut_col is not None else None,
+        })
+
     for entry in _SCAN_CATALOG:
         name, site, site_len, fwd_cut, rev_cut, color, pat, is_palindrome, rc_pat = entry
         if site_len < min_recognition_len:
             continue
         hits: list[dict] = []
 
-        # Forward strand scan
-        for m in pat.finditer(seq_u):
+        # Forward strand scan (over augmented sequence if circular)
+        for m in pat.finditer(scan_seq):
             p = m.start()
+            if p >= n:
+                continue   # duplicate of match already found at p - n
             key = (name, p, 1)
             if key in seen:
                 continue
             seen.add(key)
             # ext_cut_bp: absolute cut position when cut falls outside recognition
-            _ext = (p + fwd_cut) if (fwd_cut <= 0 or fwd_cut >= site_len) else None
-            hits.append({
-                "type":       "resite",
-                "start":      p,
-                "end":        p + site_len,
-                "strand":     1,
-                "color":      color,
-                "label":      name,
-                "cut_col":    fwd_cut if 0 < fwd_cut < site_len else None,
-                "ext_cut_bp": _ext,
-            })
-            cut_bp = min(p + fwd_cut, n - 1)
+            _ext = ((p + fwd_cut) % n) if (fwd_cut <= 0 or fwd_cut >= site_len) else None
+            _cc  = fwd_cut if 0 < fwd_cut < site_len else None
+            _emit_resite(hits, p, site_len, 1, color, name, _cc, _ext)
+            cut_bp = (p + fwd_cut) % n if n > 0 else 0
             hits.append({
                 "type":   "recut",
                 "start":  cut_bp,
@@ -706,8 +766,10 @@ def _scan_restriction_sites(
         if not is_palindrome:
             # Non-palindromic: scan for RC on forward strand to find
             # reverse-strand binding sites at their correct positions.
-            for m in rc_pat.finditer(seq_u):
+            for m in rc_pat.finditer(scan_seq):
                 p = m.start()
+                if p >= n:
+                    continue   # duplicate of match already found at p - n
                 key = (name, p, -1)
                 if key in seen:
                     continue
@@ -715,21 +777,13 @@ def _scan_restriction_sites(
                 # Cut column within the bar: enzyme's fwd_cut mapped to
                 # the reversed orientation displayed on the forward strand
                 rev_cut_col = site_len - 1 - fwd_cut
-                _top_cut_bp = p + site_len - 1 - rev_cut   # top-strand cut in fwd coords
-                _top_cut_outside = (_top_cut_bp < p or _top_cut_bp >= p + site_len)
-                hits.append({
-                    "type":       "resite",
-                    "start":      p,
-                    "end":        p + site_len,
-                    "strand":     -1,
-                    "color":      color,
-                    "label":      name,
-                    "cut_col":    rev_cut_col if 0 <= rev_cut_col < site_len else None,
-                    "ext_cut_bp": _top_cut_bp if _top_cut_outside else None,
-                })
+                _top_cut_bp = (p + site_len - 1 - rev_cut) % n   # top-strand cut in fwd coords
+                _top_cut_outside = ((_top_cut_bp - p) % n) >= site_len
+                _cc  = rev_cut_col if 0 <= rev_cut_col < site_len else None
+                _ext = _top_cut_bp if _top_cut_outside else None
+                _emit_resite(hits, p, site_len, -1, color, name, _cc, _ext)
                 # Bottom-strand cut (enzyme's fwd_cut mapped to fwd coords)
-                cut_bp = p + site_len - 1 - fwd_cut
-                cut_bp = max(0, min(cut_bp, n - 1))
+                cut_bp = (p + site_len - 1 - fwd_cut) % n if n > 0 else 0
                 hits.append({
                     "type":   "recut",
                     "start":  cut_bp,
@@ -745,13 +799,19 @@ def _scan_restriction_sites(
     feats: list[dict] = []
     placed: set[tuple[int, int]] = set()   # (start, end) of resites already shown
     for name, hits in by_enzyme.items():
-        # Count recognition-sequence hits (resite only) across both strands
+        # Count LABELED resites only — a wrap-around hit is emitted as one
+        # labeled piece + one unlabeled continuation, but counts as 1 site.
         if unique_only:
-            n_sites = sum(1 for h in hits if h["type"] == "resite")
+            n_sites = sum(
+                1 for h in hits if h["type"] == "resite" and h.get("label")
+            )
             if n_sites != 1:
                 continue
         # Skip isoschizomers / HF-variants that land on an already-placed site
-        positions = {(h["start"], h["end"]) for h in hits if h["type"] == "resite"}
+        positions = {
+            (h["start"], h["end"]) for h in hits
+            if h["type"] == "resite" and h.get("label")
+        }
         if positions & placed:
             continue
         placed |= positions
@@ -2160,9 +2220,10 @@ class PlasmidMap(Widget):
         above = y < backbone_row
         below = y > backbone_row
         for i, f in enumerate(self._feats):
-            s, e = f["start"], f["end"]
-            in_range = (s <= bp <= e) if e > s else (bp >= s or bp <= e)
-            if not in_range:
+            # Use half-open [start, end) to match _bp_in elsewhere. This
+            # also makes zero-width features (s == e) unclickable instead
+            # of matching every column on the backbone.
+            if not self._bp_in(bp, f):
                 continue
             if above and f["strand"] >= 0:
                 return i
@@ -3532,6 +3593,15 @@ def _design_gb_primers(
     """
     pos_label, oh5, oh3 = _GB_POSITIONS[part_type]
     insert = template_seq[start:end].upper()
+
+    # Need at least 18 bp to pick a proper binding region — otherwise
+    # _pick_binding_region returns the whole (too-short) insert with Tm=0.
+    if len(insert) < 18:
+        return {
+            "error": f"Golden Braid region is too short ({len(insert)} bp). "
+                     f"Select at least 18 bp (recommended 25+ bp for a "
+                     f"robust binding region).",
+        }
 
     # Forward binding: first 18-25 bp of the insert
     fwd_bind, fwd_tm = _pick_binding_region(insert, target_tm)
@@ -5230,6 +5300,9 @@ class PrimerDesignScreen(Screen):
             self.app.notify("Select a GB part type.", severity="error")
             return
         result = _design_gb_primers(template, start, end, pt)
+        if "error" in result:
+            self.query_one("#pd-results", Static).update(f"[red]{result['error']}[/red]")
+            return
         self._clo_result = result
         self._clo_result["_type"] = "goldenbraid"
         self._show_result(result, "goldenbraid", "fwd_full", "rev_full")
@@ -6519,10 +6592,21 @@ DomesticatorModal { align: center middle; }
                 severity="warning",
             )
 
-    def _apply_record(self, record) -> None:
-        """Load a SeqRecord into all panels."""
+    def _apply_record(self, record, *, clear_undo: bool = True) -> None:
+        """Load a SeqRecord into all panels.
+
+        `clear_undo=True` (default) drops any undo/redo history from the
+        previous plasmid — correct for fresh loads (fetch, file open,
+        library pick) where Ctrl+Z otherwise yanks the user back to an
+        unrelated edit on the previous plasmid. In-place record changes
+        (pLannotate merge, edits) should pass clear_undo=False so they
+        remain undo-able.
+        """
         if record is None:
             return
+        if clear_undo:
+            self._undo_stack.clear()
+            self._redo_stack.clear()
         self._current_record = record
         self._source_path    = None   # caller sets this if it came from a file
 
@@ -6975,6 +7059,16 @@ DomesticatorModal { align: center middle; }
 
         n_added = getattr(merged, "_plannotate_added", 0)
         def _apply():
+            # Guard against races: if the user loaded a different plasmid
+            # while pLannotate was running, silently applying the merged
+            # OLD record would clobber their newer work.
+            if self._current_record is not record:
+                self.notify(
+                    "pLannotate finished, but you've loaded a different "
+                    "plasmid in the meantime — discarding annotation result.",
+                    severity="warning", timeout=8,
+                )
+                return
             if n_added == 0:
                 self.notify(
                     "pLannotate found no new features (all hits duplicated "
@@ -6983,7 +7077,7 @@ DomesticatorModal { align: center middle; }
                 )
                 return
             self._push_undo()          # annotation is undo-able
-            self._apply_record(merged)
+            self._apply_record(merged, clear_undo=False)
             self.query_one("#library", LibraryPanel).set_dirty(True)
             self.notify(
                 f"Added {n_added} pLannotate feature"
