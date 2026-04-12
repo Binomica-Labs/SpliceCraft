@@ -1368,20 +1368,48 @@ def _nice_tick(total: int) -> int:
 
 # ── GenBank I/O ────────────────────────────────────────────────────────────────
 
+def _pick_single_record(records: list, source: str):
+    """Given a list of SeqRecords, return the single one if there's exactly
+    one, else raise ValueError with a user-friendly message. Used by both
+    NCBI fetch and file load so the error text is consistent.
+    """
+    if not records:
+        raise ValueError(
+            f"{source} contained no GenBank records. Is it a valid .gb/.gbk file?"
+        )
+    if len(records) > 1:
+        ids = ", ".join(r.id for r in records[:3])
+        more = f" (and {len(records) - 3} more)" if len(records) > 3 else ""
+        raise ValueError(
+            f"{source} contains {len(records)} records — SpliceCraft loads "
+            f"one plasmid at a time. Split the file or extract a single "
+            f"record first (found: {ids}{more})."
+        )
+    return records[0]
+
 def fetch_genbank(accession: str, email: str = "splicecraft@local"):
-    """Fetch a GenBank record by accession from NCBI Entrez. Returns SeqRecord."""
+    """Fetch a GenBank record by accession from NCBI Entrez. Returns SeqRecord.
+
+    Raises ValueError with a user-friendly message if NCBI returns no
+    records (obsolete accession) or multiple records.
+    """
     from Bio import Entrez, SeqIO
     Entrez.email = email
     with Entrez.efetch(
         db="nucleotide", id=accession, rettype="gb", retmode="text"
     ) as handle:
-        record = SeqIO.read(handle, "genbank")
-    return record
+        records = list(SeqIO.parse(handle, "genbank"))
+    return _pick_single_record(records, f"NCBI accession {accession!r}")
 
 def load_genbank(path: str):
-    """Load a GenBank (.gb/.gbk) file. Returns SeqRecord."""
+    """Load a GenBank (.gb/.gbk) file. Returns SeqRecord.
+
+    Raises ValueError with a user-friendly message if the file has no
+    records or multiple records.
+    """
     from Bio import SeqIO
-    return SeqIO.read(path, "genbank")
+    records = list(SeqIO.parse(path, "genbank"))
+    return _pick_single_record(records, path)
 
 def _record_to_gb_text(record) -> str:
     """Serialize a SeqRecord to GenBank format text."""
@@ -1786,26 +1814,43 @@ class PlasmidMap(Widget):
 
     def _parse(self, record) -> list[dict]:
         feats = []
+        # Import once outside the loop to avoid repeated import work.
+        try:
+            from Bio.SeqFeature import CompoundLocation
+        except ImportError:
+            CompoundLocation = None
+        # Counters the caller can inspect after load_record() to decide
+        # whether to notify the user.
+        self._n_flattened  = 0
+        self._n_skipped    = 0
         for feat in record.features:
             if feat.type in ("source",):
                 continue
-            start  = int(feat.location.start)
-            end    = int(feat.location.end)
+            # Biopython's UnknownPosition / BetweenPosition can't be cast to int.
+            # Skip such features with a log entry rather than crashing the whole
+            # import. Compound locations with fuzzy endpoints (e.g. `<100..200`)
+            # ARE castable, so this only catches genuinely unknown coords.
+            try:
+                start = int(feat.location.start)
+                end   = int(feat.location.end)
+            except (TypeError, ValueError):
+                self._n_skipped += 1
+                _log.warning(
+                    "Skipped feature %s with non-integer coords (type=%s)",
+                    _feat_label(feat), feat.type,
+                )
+                continue
             strand = getattr(feat.location, "strand", 1) or 1
             # Compound / joined locations (e.g. join(100..200,300..400)) are
             # flattened to their outer bounds. Plasmid features are virtually
             # never compound (no introns), but if an imported GenBank file has
             # one, we render the full span rather than silently dropping it.
-            # The log records which features were flattened for debugging.
-            try:
-                from Bio.SeqFeature import CompoundLocation
-                if isinstance(feat.location, CompoundLocation):
-                    _log.info(
-                        "Flattened compound feature %s (%d..%d) to outer bounds",
-                        _feat_label(feat), start, end,
-                    )
-            except ImportError:
-                pass
+            if CompoundLocation is not None and isinstance(feat.location, CompoundLocation):
+                self._n_flattened += 1
+                _log.info(
+                    "Flattened compound feature %s (%d..%d) to outer bounds",
+                    _feat_label(feat), start, end,
+                )
             idx    = len(feats)
             feats.append({
                 "type":   feat.type,
@@ -6639,6 +6684,32 @@ DomesticatorModal { align: center middle; }
             f"Loaded {record.name}  ({len(record.seq):,} bp, "
             f"{len(pm._feats)} features, {len(self._restr_cache)} restriction sites)"
         )
+
+        # Heads-up for non-fatal import oddities that the user should know
+        # about: skipped features (UnknownPosition), compound locations
+        # flattened to outer bounds, and linear topology auto-detection.
+        n_skip = getattr(pm, "_n_skipped", 0)
+        if n_skip:
+            self.notify(
+                f"⚠ Skipped {n_skip} feature(s) with unknown coordinates — "
+                f"see {_LOG_PATH} for details.",
+                severity="warning", timeout=8,
+            )
+        n_flat = getattr(pm, "_n_flattened", 0)
+        if n_flat:
+            self.notify(
+                f"⚠ {n_flat} feature(s) have joined coordinates (e.g. exons); "
+                f"rendered as outer-bounds span.",
+                severity="warning", timeout=8,
+            )
+        topology = (record.annotations or {}).get("topology", "").lower()
+        if topology == "linear" and pm._map_mode != "linear":
+            pm._map_mode = "linear"
+            self.notify(
+                "File declares linear topology — switched to linear view "
+                "(press 'v' to toggle).",
+                severity="information", timeout=8,
+            )
 
     # ── Feature selection: map ↔ sidebar ↔ sequence panel ─────────────────────
 

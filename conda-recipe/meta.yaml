@@ -1,0 +1,71 @@
+{% set name = "splicecraft" %}
+{% set version = "0.2.2" %}
+
+# Conda-forge / bioconda recipe for SpliceCraft.
+#
+# This recipe lives in the SpliceCraft repo as a reference; the canonical
+# copy belongs at:
+#   https://github.com/bioconda/bioconda-recipes/tree/master/recipes/splicecraft/
+#
+# After a new PyPI release, bump `version` above and regenerate `source.sha256`:
+#
+#   curl -sL https://pypi.io/packages/source/s/splicecraft/splicecraft-X.Y.Z.tar.gz | sha256sum
+#
+# …then open a PR against bioconda-recipes. Bot feedback arrives within minutes.
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  url: https://pypi.io/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
+  # Regenerate this on every version bump (see comment above).
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+
+build:
+  noarch: python
+  number: 0
+  script: {{ PYTHON }} -m pip install . --no-deps --no-build-isolation -vv
+  entry_points:
+    - splicecraft = splicecraft:main
+
+requirements:
+  host:
+    - python >=3.10
+    - pip
+    - hatchling >=1.24
+  run:
+    - python >=3.10
+    - textual >=8.2.3
+    - biopython >=1.87
+    - primer3-py >=2.3.0
+    - platformdirs >=4.2
+
+test:
+  imports:
+    - splicecraft
+  commands:
+    - splicecraft --version
+  requires:
+    - pip
+
+about:
+  home: https://github.com/Binomica-Labs/SpliceCraft
+  license: MIT
+  license_family: MIT
+  license_file: LICENSE
+  summary: Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench
+  description: |
+    SpliceCraft renders circular and linear plasmid maps directly in the
+    terminal using Unicode braille dot-matrix graphics. Features include NCBI
+    GenBank fetch, local .gb/.gbk loading, ~200 NEB restriction enzymes with
+    Type IIS support, Primer3-backed primer design (detection, cloning, and
+    Golden Braid L0 domestication), a persistent plasmid library, a Parts
+    Bin and Assembly Constructor for Golden Braid cloning, and an optional
+    pLannotate integration for automatic feature annotation.
+  dev_url: https://github.com/Binomica-Labs/SpliceCraft
+  doc_url: https://github.com/Binomica-Labs/SpliceCraft
+
+extra:
+  recipe-maintainers:
+    - ATinyGreenCell

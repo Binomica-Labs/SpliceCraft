@@ -148,3 +148,90 @@ class TestLibraryPersistence:
         once = sc._load_library()
         twice = sc._load_library()
         assert once == twice == entries
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Multi-record / malformed file handling (added 2026-04-12)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestMultiRecordFiles:
+    """`load_genbank` used to propagate Biopython's raw `More than one record`
+    exception when a file contained multiple records. It now raises a
+    user-friendly ValueError listing the accessions."""
+
+    def _two_record_text(self, tiny_record):
+        text1 = sc._record_to_gb_text(tiny_record)
+        # Make a second record with a different id. GenBank requires
+        # molecule_type in annotations for Biopython to write it.
+        from Bio.SeqRecord import SeqRecord
+        r2 = SeqRecord(
+            tiny_record.seq, id="ALT12345", name="ALT",
+            annotations={"molecule_type": "DNA"},
+        )
+        text2 = sc._record_to_gb_text(r2)
+        return text1 + text2
+
+    def test_two_records_raises_value_error_with_ids(self, tmp_path, tiny_record):
+        gb = tmp_path / "multi.gb"
+        gb.write_text(self._two_record_text(tiny_record))
+        with pytest.raises(ValueError, match="2 records"):
+            sc.load_genbank(str(gb))
+
+    def test_empty_file_raises_value_error(self, tmp_path):
+        gb = tmp_path / "empty.gb"
+        gb.write_text("")
+        with pytest.raises(ValueError, match="no GenBank records"):
+            sc.load_genbank(str(gb))
+
+    def test_non_genbank_text_raises_value_error(self, tmp_path):
+        gb = tmp_path / "notgb.gb"
+        gb.write_text(">fasta header\nACGTACGT\n")   # FASTA, not GenBank
+        with pytest.raises(ValueError, match="no GenBank records"):
+            sc.load_genbank(str(gb))
+
+
+class TestParseRobustness:
+    """`PlasmidMap._parse` must tolerate unusual features (compound locations,
+    UnknownPosition) without crashing — users must be warned, not locked out."""
+
+    def test_compound_location_counted_and_flattened(self, tiny_record):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        # Build a fresh record with a compound-location feature
+        from copy import deepcopy
+        rec = deepcopy(tiny_record)
+        compound = CompoundLocation([
+            FeatureLocation(10, 30, strand=1),
+            FeatureLocation(50, 80, strand=1),
+        ])
+        rec.features.append(SeqFeature(compound, type="mRNA",
+                                       qualifiers={"label": ["spliced"]}))
+        pm = sc.PlasmidMap.__new__(sc.PlasmidMap)  # don't mount
+        feats = pm._parse(rec)
+        # The mRNA feature is rendered at outer bounds [10, 80)
+        spliced = [f for f in feats if f.get("label") == "spliced"]
+        assert len(spliced) == 1
+        assert spliced[0]["start"] == 10 and spliced[0]["end"] == 80
+        # Counter surfaces for the caller to notify
+        assert pm._n_flattened == 1
+        assert pm._n_skipped == 0
+
+    def test_unknown_position_is_skipped_not_crashed(self, tiny_record):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, UnknownPosition
+        from copy import deepcopy
+        rec = deepcopy(tiny_record)
+        # Feature with an unknown end coordinate — real-world rare but legal.
+        # Biopython doesn't accept UnknownPosition objects directly in
+        # FeatureLocation constructor post-1.80, so monkeypatch the _parse
+        # path with a feature whose int() cast will fail.
+        class BadLoc:
+            start = 10
+            end = "not-an-int"   # will fail int()
+            strand = 1
+        bad = SeqFeature(type="regulatory", qualifiers={"label": ["bad"]})
+        bad.location = BadLoc()
+        rec.features.append(bad)
+        pm = sc.PlasmidMap.__new__(sc.PlasmidMap)
+        feats = pm._parse(rec)
+        # The bad feature is silently dropped (caller notifies via _n_skipped)
+        assert not any(f.get("label") == "bad" for f in feats)
+        assert pm._n_skipped == 1
