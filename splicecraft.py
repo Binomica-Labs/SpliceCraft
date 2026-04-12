@@ -3650,31 +3650,36 @@ def _design_detection_primers(
     }
 
 
-def _design_cloning_primers(
+def _design_cloning_primers_raw(
     template_seq: str,
     start: int,
     end: int,
-    re_5prime: str,
-    re_3prime: str,
+    site_5: str,
+    site_3: str,
+    name_5: str = "5'site",
+    name_3: str = "3'site",
     target_tm: float = 60.0,
     padding: str = "GCGC",
 ) -> dict:
-    """Design cloning primers with restriction-enzyme tails + GCGC padding.
+    """Design cloning primers with arbitrary recognition-site tails + padding.
+
+    Accepts raw site sequences (not just NEB enzyme names) so users can
+    enter custom cutter sequences.
 
     Structure (5'→3'):
-        Forward: [padding] [5' RE site]    [binding region →]
-        Reverse: [padding] [3' RE site RC] [← binding region RC]
+        Forward: [padding] [5' site]    [binding region →]
+        Reverse: [padding] [RC 3' site] [← binding region RC]
 
     Returns dict with keys: fwd_full, rev_full, fwd_binding, rev_binding,
-    fwd_tm, rev_tm, re_5prime, re_3prime, insert_seq, or 'error'.
+    fwd_tm, rev_tm, re_5prime, re_3prime, site_5, site_3, insert_seq,
+    fwd_pos, rev_pos, or 'error'.
     """
-    if re_5prime not in _NEB_ENZYMES:
-        return {"error": f"Unknown enzyme: {re_5prime}"}
-    if re_3prime not in _NEB_ENZYMES:
-        return {"error": f"Unknown enzyme: {re_3prime}"}
-
-    site_5, _, _ = _NEB_ENZYMES[re_5prime]
-    site_3, _, _ = _NEB_ENZYMES[re_3prime]
+    site_5 = site_5.upper()
+    site_3 = site_3.upper()
+    if not site_5 or not set(site_5) <= set("ACGTRYWSMKBDHVN"):
+        return {"error": f"Invalid 5' site sequence: {site_5!r}"}
+    if not site_3 or not set(site_3) <= set("ACGTRYWSMKBDHVN"):
+        return {"error": f"Invalid 3' site sequence: {site_3!r}"}
 
     insert = template_seq[start:end].upper()
     if len(insert) < 18:
@@ -3693,14 +3698,38 @@ def _design_cloning_primers(
         "rev_binding": rev_bind,
         "fwd_tm":      round(fwd_tm, 1),
         "rev_tm":      round(rev_tm, 1),
-        "re_5prime":   re_5prime,
-        "re_3prime":   re_3prime,
+        "re_5prime":   name_5,
+        "re_3prime":   name_3,
         "site_5":      site_5,
         "site_3":      site_3,
         "insert_seq":  insert,
         "fwd_pos":     (start, start + len(fwd_bind)),
         "rev_pos":     (end - len(rev_bind), end),
     }
+
+
+def _design_cloning_primers(
+    template_seq: str,
+    start: int,
+    end: int,
+    re_5prime: str,
+    re_3prime: str,
+    target_tm: float = 60.0,
+    padding: str = "GCGC",
+) -> dict:
+    """Design cloning primers using NEB enzyme names. Delegates to
+    _design_cloning_primers_raw after looking up recognition sites."""
+    if re_5prime not in _NEB_ENZYMES:
+        return {"error": f"Unknown enzyme: {re_5prime}"}
+    if re_3prime not in _NEB_ENZYMES:
+        return {"error": f"Unknown enzyme: {re_3prime}"}
+    site_5, _, _ = _NEB_ENZYMES[re_5prime]
+    site_3, _, _ = _NEB_ENZYMES[re_3prime]
+    return _design_cloning_primers_raw(
+        template_seq, start, end, site_5, site_3,
+        name_5=re_5prime, name_3=re_3prime,
+        target_tm=target_tm, padding=padding,
+    )
 
 
 # ── Parts bin modal ────────────────────────────────────────────────────────────
@@ -4494,9 +4523,13 @@ class PrimerDesignScreen(Screen):
                 with Vertical(id="pd-clo-5col"):
                     yield Label("5' RE site")
                     yield Select(re_opts, id="pd-re5", value="EcoRI")
+                    yield Input(placeholder="or custom seq (e.g. GAATTC)",
+                                id="pd-cust5")
                 with Vertical(id="pd-clo-3col"):
                     yield Label("3' RE site")
                     yield Select(re_opts, id="pd-re3", value="BamHI")
+                    yield Input(placeholder="or custom seq (e.g. GGATCC)",
+                                id="pd-cust3")
                 with Vertical(id="pd-clo-tmcol"):
                     yield Label("Binding Tm")
                     yield Input(value="60", id="pd-clo-tm", type="integer")
@@ -4660,17 +4693,43 @@ class PrimerDesignScreen(Screen):
             return
         start, end, name = region
         self._det_result = None
+
+        # Check custom cutter sequences first; fall back to dropdown
+        cust5 = self.query_one("#pd-cust5", Input).value.strip().upper()
+        cust3 = self.query_one("#pd-cust3", Input).value.strip().upper()
         re5 = self.query_one("#pd-re5", Select).value
         re3 = self.query_one("#pd-re3", Select).value
-        if not isinstance(re5, str) or not isinstance(re3, str):
-            self.app.notify("Select both restriction enzymes.", severity="error")
+
+        # Resolve what to pass: custom sequence takes priority over dropdown
+        if cust5 and set(cust5) <= set("ACGTRYWSMKBDHVN"):
+            site_5 = cust5
+            name_5 = f"custom({cust5})"
+        elif isinstance(re5, str) and re5 in _NEB_ENZYMES:
+            site_5 = _NEB_ENZYMES[re5][0]
+            name_5 = re5
+        else:
+            self.app.notify("Select a 5' RE site or enter a custom sequence.",
+                            severity="error")
             return
+
+        if cust3 and set(cust3) <= set("ACGTRYWSMKBDHVN"):
+            site_3 = cust3
+            name_3 = f"custom({cust3})"
+        elif isinstance(re3, str) and re3 in _NEB_ENZYMES:
+            site_3 = _NEB_ENZYMES[re3][0]
+            name_3 = re3
+        else:
+            self.app.notify("Select a 3' RE site or enter a custom sequence.",
+                            severity="error")
+            return
+
         try:
             tm = float(self.query_one("#pd-clo-tm", Input).value)
         except ValueError:
-            tm = 57.0
-        result = _design_cloning_primers(
-            self._template, start, end, re5, re3, target_tm=tm,
+            tm = 60.0
+        result = _design_cloning_primers_raw(
+            self._template, start, end, site_5, site_3, name_5, name_3,
+            target_tm=tm,
         )
         if "error" in result:
             self.query_one("#pd-results", Static).update(
@@ -5158,11 +5217,12 @@ DomesticatorModal { align: center middle; }
 #pd-det-row Input { width: 10; }
 #pd-det-row Button { margin-left: 2; min-width: 20; }
 #pd-clo-hdr   { height: 1; margin-top: 1; }
-#pd-clo-row   { height: 5; }
-#pd-clo-5col  { width: 1fr; padding-right: 1; }
-#pd-clo-3col  { width: 1fr; padding-right: 1; }
+#pd-clo-row   { height: auto; }
+#pd-clo-5col  { width: auto; min-width: 30; padding-right: 1; }
+#pd-clo-3col  { width: auto; min-width: 30; padding-right: 1; }
+#pd-cust5, #pd-cust3 { width: 100%; margin-top: 0; }
 #pd-clo-tmcol { width: auto; padding-right: 1; }
-#pd-clo-row Button { margin-top: 2; min-width: 20; }
+#pd-clo-row Button { margin-top: 1; min-width: 20; }
 #pd-results   {
     height: auto; max-height: 10;
     border: solid $primary-darken-2; padding: 0 1; margin-top: 1;
@@ -5173,7 +5233,7 @@ DomesticatorModal { align: center middle; }
 #pd-btns      { height: 3; margin-top: 1; }
 #pd-btns Button { margin-right: 1; }
 #pd-lib-hdr   { background: $accent-darken-2; color: $text; padding: 0 1; margin-top: 1; }
-#pd-lib-table { height: 1fr; min-height: 4; }
+#pd-lib-table { height: 1fr; min-height: 8; }
 #pd-lib-btns  { height: 3; margin-top: 0; }
 #pd-lib-btns Button { margin-right: 1; min-width: 10; }
 """
