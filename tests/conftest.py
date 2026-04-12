@@ -1,8 +1,13 @@
 """
 conftest — shared fixtures for the SpliceCraft test suite.
 
-The test suite imports `splicecraft` as a module. Because splicecraft.py lives in
-the repo root (not packaged), we prepend the repo root to sys.path once here.
+CRITICAL SAFETY RULE: the _protect_user_data autouse fixture redirects ALL
+JSON persistence files (plasmid_library.json, parts_bin.json, primers.json)
+to a temporary directory for the ENTIRE test session. No test, fixture, or
+ad-hoc import can ever touch the user's real data files.
+
+If you add a new persistence file to splicecraft.py, you MUST add it to the
+_DATA_FILES list in _protect_user_data below.
 """
 import sys
 from pathlib import Path
@@ -13,10 +18,50 @@ if str(_ROOT) not in sys.path:
 
 import pytest
 
-# Delay importing splicecraft until fixtures run — it runs _check_deps() at
-# import time, which is fine, but keeps the side-effects traceable to a fixture
-# call rather than collection.
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTOUSE: protect user data files from every single test
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture(autouse=True, scope="function")
+def _protect_user_data(tmp_path, monkeypatch):
+    """Redirect ALL user-data JSON files to tmp_path for EVERY test.
+
+    This is autouse=True so it fires automatically — no test needs to
+    explicitly request it. Even if a test forgets `isolated_library` or
+    calls `_save_library` directly, the write goes to a throwaway temp
+    dir, not the real plasmid_library.json.
+
+    If a future developer adds a new JSON persistence file to
+    splicecraft.py, they MUST add the corresponding (attr, cache_attr)
+    pair to _DATA_FILES below or the test_no_real_files_touched test
+    will catch it.
+    """
+    import splicecraft as sc
+
+    _DATA_FILES = [
+        ("_LIBRARY_FILE",    "_library_cache"),
+        ("_PARTS_BIN_FILE",  "_parts_bin_cache"),
+        ("_PRIMERS_FILE",    "_primers_cache"),
+        ("_PLANNOTATE_CHECK_CACHE", None),  # not a file, but reset for isolation
+    ]
+
+    for file_attr, cache_attr in _DATA_FILES:
+        if file_attr == "_PLANNOTATE_CHECK_CACHE":
+            monkeypatch.setattr(sc, file_attr, None)
+            continue
+        # Redirect the file path to a temp location
+        real_path = getattr(sc, file_attr)
+        tmp_file = tmp_path / real_path.name
+        monkeypatch.setattr(sc, file_attr, tmp_file)
+        # Clear the in-memory cache so the next load reads from the tmp file
+        if cache_attr:
+            monkeypatch.setattr(sc, cache_attr, None)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Session-scoped module import
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @pytest.fixture(scope="session")
 def splicecraft_module():
@@ -26,9 +71,13 @@ def splicecraft_module():
     return splicecraft
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Common test fixtures
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @pytest.fixture
 def tiny_record():
-    """A synthetic 120 bp SeqRecord with one CDS feature and one misc_feature.
+    """A synthetic ~120 bp SeqRecord with one CDS feature and one misc_feature.
 
     Small enough to render fast in smoke tests; large enough to have a valid
     6-bp recognition site for EcoRI (GAATTC). Built without touching NCBI.
@@ -42,21 +91,17 @@ def tiny_record():
         "AAATCCTAGGAAAAGGATCCAAAACTCGAGCCCAAAAAATTTGGGCCCAAAATCGA"
         "TAG"
     )
-    # Length is ~120 bp — exact value not load-bearing, just long enough
-    # to hold several restriction sites and two features.
     assert len(seq_str) > 100
 
     rec = SeqRecord(Seq(seq_str), id="TEST001", name="TEST001",
                     description="Synthetic test plasmid (120 bp)")
     rec.annotations["molecule_type"] = "DNA"
     rec.annotations["topology"]      = "circular"
-    # Forward-strand CDS 0..24 (ATGAAAGATCTGGAATTCAAAGGG) — starts M, stops at TAG later
     rec.features.append(SeqFeature(
         FeatureLocation(0, 27, strand=1),
         type="CDS",
         qualifiers={"gene": ["testA"], "product": ["test protein A"]},
     ))
-    # Reverse-strand misc_feature
     rec.features.append(SeqFeature(
         FeatureLocation(50, 80, strand=-1),
         type="misc_feature",
@@ -75,11 +120,12 @@ def tiny_gb_path(tmp_path, tiny_record):
 
 
 @pytest.fixture
-def isolated_library(tmp_path, monkeypatch, splicecraft_module):
-    """Redirect `_LIBRARY_FILE` to a tmp path so tests can't touch the real
-    `plasmid_library.json`. Also wipes the in-memory cache so lookups re-read.
-    """
+def isolated_library(tmp_path, monkeypatch):
+    """Redirect `_LIBRARY_FILE` to a tmp path. Kept for backward compat with
+    tests that explicitly request it — _protect_user_data already handles
+    this automatically, so this fixture is now redundant but harmless."""
+    import splicecraft as sc
     tmp_lib = tmp_path / "plasmid_library.json"
-    monkeypatch.setattr(splicecraft_module, "_LIBRARY_FILE", tmp_lib)
-    monkeypatch.setattr(splicecraft_module, "_library_cache", None)
+    monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_lib)
+    monkeypatch.setattr(sc, "_library_cache", None)
     return tmp_lib

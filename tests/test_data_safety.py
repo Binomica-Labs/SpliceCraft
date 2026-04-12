@@ -1,6 +1,10 @@
 """
 test_data_safety — user data is precious and must never be silently lost.
 
+CRITICAL: TestRealFilesNeverTouched verifies that the autouse fixture in
+conftest.py properly redirects ALL persistence paths to temp dirs. If this
+test fails, it means a save operation could nuke the user's real data.
+
 These tests verify:
   1. _safe_save_json creates a .bak backup before overwriting
   2. _safe_save_json uses atomic writes (tempfile + os.replace)
@@ -247,3 +251,77 @@ class TestStartupDataCheck:
             await pilot.pause()
             await pilot.pause(0.05)
             # App is alive despite corrupt file
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CRITICAL: verify the autouse fixture protects real user files
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRealFilesNeverTouched:
+    """Verify that the conftest.py _protect_user_data autouse fixture
+    actually redirects ALL persistence paths to temp dirs.
+
+    If ANY of these tests fail, it means a test could write to the user's
+    real plasmid_library.json / parts_bin.json / primers.json — which is
+    a catastrophic data-loss bug.
+    """
+
+    def test_library_file_is_redirected(self):
+        """_LIBRARY_FILE must NOT point to the repo root during tests."""
+        assert "/tmp" in str(sc._LIBRARY_FILE) or "pytest" in str(sc._LIBRARY_FILE), (
+            f"_LIBRARY_FILE points to {sc._LIBRARY_FILE} — "
+            f"expected a tmp dir, not the real repo!"
+        )
+
+    def test_parts_bin_file_is_redirected(self):
+        assert "/tmp" in str(sc._PARTS_BIN_FILE) or "pytest" in str(sc._PARTS_BIN_FILE), (
+            f"_PARTS_BIN_FILE points to {sc._PARTS_BIN_FILE} — "
+            f"expected a tmp dir!"
+        )
+
+    def test_primers_file_is_redirected(self):
+        assert "/tmp" in str(sc._PRIMERS_FILE) or "pytest" in str(sc._PRIMERS_FILE), (
+            f"_PRIMERS_FILE points to {sc._PRIMERS_FILE} — "
+            f"expected a tmp dir!"
+        )
+
+    def test_save_library_writes_to_tmp(self):
+        """Actually call _save_library and verify the write landed in /tmp,
+        not in the repo directory."""
+        sc._save_library([{"id": "SAFETY_TEST", "name": "safety"}])
+        assert sc._LIBRARY_FILE.exists()
+        assert "/tmp" in str(sc._LIBRARY_FILE) or "pytest" in str(sc._LIBRARY_FILE)
+        import json
+        data = json.loads(sc._LIBRARY_FILE.read_text())
+        assert data[0]["id"] == "SAFETY_TEST"
+
+    def test_save_parts_bin_writes_to_tmp(self):
+        sc._save_parts_bin([{"name": "SAFETY_TEST"}])
+        assert sc._PARTS_BIN_FILE.exists()
+        assert "/tmp" in str(sc._PARTS_BIN_FILE) or "pytest" in str(sc._PARTS_BIN_FILE)
+
+    def test_save_primers_writes_to_tmp(self):
+        sc._save_primers([{"name": "SAFETY_TEST"}])
+        assert sc._PRIMERS_FILE.exists()
+        assert "/tmp" in str(sc._PRIMERS_FILE) or "pytest" in str(sc._PRIMERS_FILE)
+
+    def test_real_repo_files_untouched(self):
+        """The actual files in the repo root must NOT contain SAFETY_TEST
+        entries — if they do, the autouse fixture failed."""
+        import json
+        repo_root = Path(__file__).resolve().parent.parent
+        for fname in ["plasmid_library.json", "parts_bin.json", "primers.json"]:
+            p = repo_root / fname
+            if not p.exists():
+                continue
+            try:
+                data = json.loads(p.read_text())
+                for entry in data:
+                    assert entry.get("id") != "SAFETY_TEST", (
+                        f"SAFETY_TEST leaked into real {fname}!"
+                    )
+                    assert entry.get("name") != "SAFETY_TEST", (
+                        f"SAFETY_TEST leaked into real {fname}!"
+                    )
+            except json.JSONDecodeError:
+                pass  # corrupt file — not our problem here
