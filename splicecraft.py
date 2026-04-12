@@ -3015,7 +3015,10 @@ class EditSeqDialog(ModalScreen):
 
     _VALID = frozenset("ATCGNRYSWKMBDHV")   # IUPAC DNA codes
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
 
     def __init__(self, mode: str, existing: str = "",
                  start: int = 0, end: int = 0):
@@ -3097,7 +3100,10 @@ class EditSeqDialog(ModalScreen):
 # ── Fetch modal ────────────────────────────────────────────────────────────────
 
 class FetchModal(ModalScreen):
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="fetch-box"):
@@ -3151,7 +3157,10 @@ class FetchModal(ModalScreen):
 # ── Open-file modal ────────────────────────────────────────────────────────────
 
 class OpenFileModal(ModalScreen):
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="open-box"):
@@ -3746,7 +3755,10 @@ class PartsBinModal(Screen):
     + primer data; built-in parts have no sequence (shown as "—").
     """
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -3907,7 +3919,10 @@ class DomesticatorModal(ModalScreen):
     for Golden Braid L0 assembly.
     """
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
 
     def __init__(self, template_seq: str, feats: list[dict]):
         super().__init__()
@@ -4117,7 +4132,10 @@ class DomesticatorModal(ModalScreen):
 class ConstructorModal(ModalScreen):
     """Golden Braid TU Constructor — assemble L0 parts into a transcription unit."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
 
     # L1 destination backbone info
     _BACKBONES: dict = {
@@ -4896,7 +4914,10 @@ class PrimerDesignScreen(Screen):
 class UnsavedQuitModal(ModalScreen):
     """Shown when the user tries to quit with unsaved edits."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "focus_next", "Next button", show=False),
+    ]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="quit-dlg"):
@@ -4925,12 +4946,16 @@ class UnsavedQuitModal(ModalScreen):
 class RenamePlasmidModal(ModalScreen):
     """Prompt for a new name for a library entry.
 
+    Tab cycles between the Input and Save/Cancel buttons.
     Dismisses with the new name (a non-empty string) or None on cancel.
     Input validation (non-empty, trimmed, collision check) lives in the
     app-side handler — the modal just collects a value.
     """
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
 
     def __init__(self, current_name: str, entry_id: str):
         super().__init__()
@@ -4988,15 +5013,17 @@ class RenamePlasmidModal(ModalScreen):
 
 
 class LibraryDeleteConfirmModal(ModalScreen):
-    """Shown when the user presses Delete while focused on the library panel.
+    """Generic delete-confirmation modal. Used by the plasmid library,
+    primer library, and any future list that needs handslip protection.
 
-    Default focus is on the [No] button — the Delete key is easy to press
-    by accident after tabbing into the library, so we require a deliberate
-    left-arrow + Enter (or Tab + Enter) to confirm the removal. Escape or
-    No dismisses with False; Yes dismisses with True.
+    Default focus is on [No]. Tab cycles between [No] and [Yes, remove].
+    Escape dismisses as False (cancel).
     """
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "focus_next", "Next button", show=False),
+    ]
 
     def __init__(self, name: str, size: int, entry_id: str):
         super().__init__()
@@ -5005,14 +5032,14 @@ class LibraryDeleteConfirmModal(ModalScreen):
         self.entry_id   = entry_id
 
     def compose(self) -> ComposeResult:
+        size_str = f" ({self.entry_size:,} bp)" if self.entry_size > 0 else ""
         with Vertical(id="libdel-dlg"):
             yield Static(" Remove from library ", id="libdel-title")
             yield Static(
-                f"  Remove [bold]{self.entry_name}[/bold] "
-                f"({self.entry_size:,} bp) from the library?\n\n"
-                f"  [dim]This removes the stored GenBank copy from "
-                f"plasmid_library.json.\n"
-                f"  The current on-screen record is not affected.[/dim]",
+                f"  Remove [bold]{self.entry_name}[/bold]"
+                f"{size_str} from the library?\n\n"
+                f"  [dim]This cannot be undone from within the app.\n"
+                f"  A backup (.bak) of the library file is kept.[/dim]",
                 id="libdel-msg",
                 markup=True,
             )
@@ -5021,8 +5048,6 @@ class LibraryDeleteConfirmModal(ModalScreen):
                 yield Button("Yes, remove",  id="btn-libdel-yes", variant="error")
 
     def on_mount(self) -> None:
-        # Default focus on "No" — the whole point of this dialog is to catch
-        # a handslip, so Enter should do nothing destructive.
         self.query_one("#btn-libdel-no", Button).focus()
 
     @on(Button.Pressed, "#btn-libdel-no")
