@@ -125,6 +125,109 @@ _FEATURE_PALETTE: list[str] = [
     "color(105)",  "color(154)",  "color(203)",  "color(81)",   "color(185)",
 ]
 
+# ── Safe JSON persistence ──────────────────────────────────────────────────────
+#
+# All user data (plasmid library, parts bin, primer library) goes through
+# _safe_save_json which:
+#   1. Backs up the existing file to *.bak BEFORE overwriting
+#   2. Writes via tempfile + os.replace (atomic on POSIX — the file is either
+#      fully written or not at all; no partial-write corruption)
+#   3. Logs every write with entry count for post-mortem debugging
+#
+# _safe_load_json handles the read side:
+#   - Missing file → [] (first run, not an error)
+#   - Corrupt file → attempt restore from .bak; if .bak also corrupt → []
+#   - Returns (entries, warning_message_or_None)
+
+def _safe_save_json(path: Path, entries: list, label: str) -> None:
+    """Atomically write `entries` as JSON to `path`, backing up first.
+
+    The .bak file is the user's safety net — if a write goes wrong or the
+    app crashes mid-save, the previous version survives as path.bak.
+    """
+    import os
+    import tempfile
+
+    # 1. Back up the existing file (if it has content)
+    if path.exists():
+        try:
+            existing = path.read_bytes()
+            if existing.strip():
+                bak = path.with_suffix(path.suffix + ".bak")
+                bak.write_bytes(existing)
+        except OSError:
+            _log.warning("Could not create backup for %s", path)
+
+    # 2. Atomic write: tempfile in same dir → os.replace
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(entries, fh, indent=2)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp_name, str(path))
+            _log.info("Saved %s: %d entries to %s", label, len(entries), path)
+        except Exception:
+            # Clean up the temp file on failure
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        _log.exception("Failed to save %s to %s", label, path)
+
+
+def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
+    """Load a JSON array from `path`. Returns (entries, warning_or_None).
+
+    - Missing file → ([], None) — normal first run, no warning.
+    - Valid file   → (entries, None).
+    - Corrupt file → attempt .bak restore; if .bak is valid →
+      (bak_entries, warning). If .bak also corrupt → ([], warning).
+    """
+    if not path.exists():
+        return [], None
+
+    # Try the main file
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(entries, list):
+            return entries, None
+        _log.warning("%s: expected list, got %s", path, type(entries).__name__)
+    except Exception:
+        _log.exception("Corrupt %s file: %s", label, path)
+
+    # Main file is corrupt — try the .bak
+    bak = path.with_suffix(path.suffix + ".bak")
+    if bak.exists():
+        try:
+            entries = json.loads(bak.read_text(encoding="utf-8"))
+            if isinstance(entries, list):
+                _log.info("Restored %s from backup %s (%d entries)",
+                          label, bak, len(entries))
+                # Overwrite the corrupt main file with the good backup
+                try:
+                    import shutil
+                    shutil.copy2(str(bak), str(path))
+                except OSError:
+                    pass
+                return entries, (
+                    f"{label} was corrupt — restored {len(entries)} entries "
+                    f"from backup."
+                )
+        except Exception:
+            _log.exception("Backup %s also corrupt: %s", label, bak)
+
+    return [], f"{label} is corrupt and no valid backup was found. Starting empty."
+
+
 # ── Library persistence ────────────────────────────────────────────────────────
 
 _LIBRARY_FILE = Path(__file__).parent / "plasmid_library.json"
@@ -134,21 +237,15 @@ def _load_library() -> list[dict]:
     global _library_cache
     if _library_cache is not None:
         return list(_library_cache)
-    if _LIBRARY_FILE.exists():
-        try:
-            _library_cache = json.loads(_LIBRARY_FILE.read_text())
-            return list(_library_cache)
-        except Exception:
-            _log.exception("Failed to load library from %s", _LIBRARY_FILE)
-    _library_cache = []
-    return []
+    entries, warning = _safe_load_json(_LIBRARY_FILE, "Plasmid library")
+    if warning:
+        _log.warning(warning)
+    _library_cache = entries
+    return list(_library_cache)
 
 def _save_library(entries: list[dict]) -> None:
     global _library_cache
-    try:
-        _LIBRARY_FILE.write_text(json.dumps(entries, indent=2))
-    except Exception:
-        _log.exception("Failed to save library to %s", _LIBRARY_FILE)
+    _safe_save_json(_LIBRARY_FILE, entries, "Plasmid library")
     _library_cache = list(entries)
 
 # ── Restriction sites ──────────────────────────────────────────────────────────
@@ -3394,21 +3491,15 @@ def _load_parts_bin() -> list[dict]:
     global _parts_bin_cache
     if _parts_bin_cache is not None:
         return list(_parts_bin_cache)
-    if _PARTS_BIN_FILE.exists():
-        try:
-            _parts_bin_cache = json.loads(_PARTS_BIN_FILE.read_text())
-            return list(_parts_bin_cache)
-        except Exception:
-            _log.exception("Failed to load parts bin from %s", _PARTS_BIN_FILE)
-    _parts_bin_cache = []
-    return []
+    entries, warning = _safe_load_json(_PARTS_BIN_FILE, "Parts bin")
+    if warning:
+        _log.warning(warning)
+    _parts_bin_cache = entries
+    return list(_parts_bin_cache)
 
 def _save_parts_bin(entries: list[dict]) -> None:
     global _parts_bin_cache
-    try:
-        _PARTS_BIN_FILE.write_text(json.dumps(entries, indent=2))
-    except Exception:
-        _log.exception("Failed to save parts bin to %s", _PARTS_BIN_FILE)
+    _safe_save_json(_PARTS_BIN_FILE, entries, "Parts bin")
     _parts_bin_cache = list(entries)
 
 
@@ -3429,21 +3520,15 @@ def _load_primers() -> list[dict]:
     global _primers_cache
     if _primers_cache is not None:
         return list(_primers_cache)
-    if _PRIMERS_FILE.exists():
-        try:
-            _primers_cache = json.loads(_PRIMERS_FILE.read_text())
-            return list(_primers_cache)
-        except Exception:
-            _log.exception("Failed to load primers from %s", _PRIMERS_FILE)
-    _primers_cache = []
-    return []
+    entries, warning = _safe_load_json(_PRIMERS_FILE, "Primer library")
+    if warning:
+        _log.warning(warning)
+    _primers_cache = entries
+    return list(_primers_cache)
 
 def _save_primers(entries: list[dict]) -> None:
     global _primers_cache
-    try:
-        _PRIMERS_FILE.write_text(json.dumps(entries, indent=2))
-    except Exception:
-        _log.exception("Failed to save primers to %s", _PRIMERS_FILE)
+    _safe_save_json(_PRIMERS_FILE, entries, "Primer library")
     _primers_cache = list(entries)
 
 
@@ -5291,14 +5376,42 @@ DomesticatorModal { align: center middle; }
     def on_mount(self) -> None:
         self._undo_stack: list = []
         self._redo_stack: list = []
+        # Validate all user-data files before anything else. Corrupt files
+        # are auto-restored from .bak if possible; the user is notified
+        # either way so they know the state of their data.
+        self._check_data_files()
         if self._preload_record is not None:
-            # CLI preload (e.g. `python3 splicecraft.py L09137`) is an import
-            # and should be persisted to the library like any other import.
             def _load_preload():
                 self._import_and_persist(self._preload_record)
             self.call_after_refresh(_load_preload)
         elif not _load_library():
             self._seed_default_library()
+
+    def _check_data_files(self) -> None:
+        """Validate plasmid library, parts bin, and primer library on startup.
+
+        For each file:
+          - Missing → first run, no warning.
+          - Valid JSON array → all good.
+          - Corrupt → _safe_load_json attempts .bak restore and returns a
+            warning message that we surface to the user via notify().
+          - Manually deleted mid-session → next load returns [], no crash.
+
+        This runs BEFORE any load call so the caches are cold and
+        _safe_load_json actually reads the files.
+        """
+        global _library_cache, _parts_bin_cache, _primers_cache
+        for path, label, cache_attr in [
+            (_LIBRARY_FILE,    "Plasmid library", "_library_cache"),
+            (_PARTS_BIN_FILE,  "Parts bin",       "_parts_bin_cache"),
+            (_PRIMERS_FILE,    "Primer library",  "_primers_cache"),
+        ]:
+            # Force a cold read (bypass cache) so we actually check the file
+            globals()[cache_attr] = None
+            entries, warning = _safe_load_json(path, label)
+            globals()[cache_attr] = entries
+            if warning:
+                self.notify(warning, severity="warning", timeout=12)
 
     @work(thread=True)
     def _seed_default_library(self) -> None:

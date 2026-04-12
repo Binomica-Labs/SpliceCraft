@@ -10,6 +10,7 @@ __pycache__/
 plasmid_library.json
 parts_bin.json
 primers.json
+*.json.bak
 
 # Editor / OS
 .vscode/
