@@ -111,7 +111,7 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
 from textual.widgets import (
-    Button, DataTable, Footer, Header, Input, Label, Select, Static,
+    Button, DataTable, Footer, Header, Input, Label, Select, Static, TextArea,
 )
 from rich.text import Text
 
@@ -4486,10 +4486,11 @@ class PrimerDesignScreen(Screen):
     """
 
     BINDINGS = [
-        Binding("escape", "cancel",     "Close",      show=True),
-        Binding("m",      "noop",       "m mark",     show=True, key_display="m"),
-        Binding("M",      "noop",       "M mark all", show=True, key_display="M"),
-        Binding("tab",    "focus_next", "",            show=False),
+        Binding("escape", "cancel",     "Close",       show=True),
+        Binding("m",      "noop",       "m mark",      show=True, key_display="m"),
+        Binding("M",      "noop",       "M mark all",  show=True, key_display="M"),
+        Binding("S",      "noop",       "S status",    show=True, key_display="S"),
+        Binding("tab",    "focus_next", "",             show=False),
     ]
 
     def action_noop(self) -> None:
@@ -4571,9 +4572,9 @@ class PrimerDesignScreen(Screen):
                     yield Input(value="", id="pd-part-name",
                                 placeholder=self._default_part_name)
 
-            # ── Custom sequence ────────────────────────────────────────────
-            yield Input(placeholder="Custom sequence (paste DNA if not in library)",
-                        id="pd-custom-seq")
+            # ── Custom sequence (multi-line, scrollable, selection = target) ─
+            yield Label("Custom sequence (highlight region to target, or use entire):")
+            yield TextArea("", id="pd-custom-seq")
 
             # ── Feature info ───────────────────────────────────────────────
             yield Static("", id="pd-feat-info", markup=True)
@@ -4734,11 +4735,13 @@ class PrimerDesignScreen(Screen):
 
     # ── Custom sequence → override template ────────────────────────────
 
-    @on(Input.Changed, "#pd-custom-seq")
-    def _custom_seq_changed(self, event: Input.Changed) -> None:
-        """When the user types a custom sequence, auto-fill start=1 and
-        end=len, and clear the feature dropdown."""
-        seq = event.value.strip().upper()
+    @on(TextArea.Changed, "#pd-custom-seq")
+    def _custom_seq_changed(self, event: TextArea.Changed) -> None:
+        """When the user pastes a custom sequence, auto-fill start=1 and
+        end=len. Selected text within the TextArea will be used as the
+        target region when designing (handled in _do_design)."""
+        ta = self.query_one("#pd-custom-seq", TextArea)
+        seq = ta.text.strip().upper().replace("\n", "").replace(" ", "")
         if seq and set(seq) <= set("ACGTRYWSMKBDHVN"):
             self.query_one("#pd-start", Input).value = "1"
             self.query_one("#pd-end", Input).value = str(len(seq))
@@ -4833,8 +4836,22 @@ class PrimerDesignScreen(Screen):
                 self._lib_selected = set(range(len(primers)))
             self._refresh_library_table()
             event.stop()
+        elif event.key == "S":
+            # Shift+S = cycle status: Designed → Ordered → Validated → Designed
+            row = t.cursor_row
+            if 0 <= row < len(primers):
+                _CYCLE = ["Designed", "Ordered", "Validated"]
+                cur = primers[row].get("status", "Designed")
+                nxt = _CYCLE[(_CYCLE.index(cur) + 1) % 3] if cur in _CYCLE else _CYCLE[0]
+                entries = _load_primers()
+                if row < len(entries):
+                    entries[row]["status"] = nxt
+                    _save_primers(entries)
+                    self._refresh_library_table()
+                    name = primers[row].get("name", "?")
+                    self.app.notify(f"{name}: {nxt}")
+            event.stop()
         elif event.key == "delete":
-            # Delete marked primers (with confirmation) or cursor primer
             self._delete_marked_or_cursor()
             event.stop()
 
@@ -4930,10 +4947,20 @@ class PrimerDesignScreen(Screen):
             self.app.notify("Select a primer type.", severity="error")
             return
 
-        # Resolve template: custom sequence overrides loaded plasmid
-        custom = self.query_one("#pd-custom-seq", Input).value.strip().upper()
-        if custom and set(custom) <= set("ACGTRYWSMKBDHVN"):
-            template = custom
+        # Resolve template: custom sequence overrides loaded plasmid.
+        # If text is selected inside the TextArea, use ONLY the selection
+        # as the template (and reset start/end to cover it). Otherwise use
+        # the full TextArea text, or fall back to the loaded plasmid.
+        ta = self.query_one("#pd-custom-seq", TextArea)
+        raw_text = ta.text.strip().upper().replace("\n", "").replace(" ", "")
+        selected = ta.selected_text.strip().upper().replace("\n", "").replace(" ", "")
+        if selected and set(selected) <= set("ACGTRYWSMKBDHVN"):
+            template = selected
+            # Override start/end to the full selection
+            self.query_one("#pd-start", Input).value = "1"
+            self.query_one("#pd-end", Input).value = str(len(selected))
+        elif raw_text and set(raw_text) <= set("ACGTRYWSMKBDHVN"):
+            template = raw_text
         else:
             template = self._template
         if not template:
@@ -5568,11 +5595,11 @@ DomesticatorModal { align: center middle; }
 #pd-mode-row  { height: 4; }
 #pd-mode-col  { width: 1fr; max-width: 40; padding-right: 1; }
 #pd-mode-row Button { margin-top: 1; min-width: 16; }
-#pd-custom-seq { margin-bottom: 0; }
+#pd-custom-seq { height: 4; min-height: 4; }
 #pd-feat-info { height: 1; }
 .pd-mode-panel { height: 3; align: left middle; }
 .pd-mode-panel Label { width: auto; padding: 0 0 0 1; content-align: center middle; }
-.pd-mode-panel Input { width: 8; margin: 0 0; }
+.pd-mode-panel Input { width: 10; margin: 0 0; }
 #pd-gen-source { width: 24; }
 #pd-panel-clo { height: 6; }
 #pd-clo-5col  { width: 1fr; max-width: 32; padding-right: 1; }
