@@ -5218,8 +5218,8 @@ DomesticatorModal { align: center middle; }
 #pd-det-row Button { margin-left: 2; min-width: 20; }
 #pd-clo-hdr   { height: 1; margin-top: 1; }
 #pd-clo-row   { height: auto; }
-#pd-clo-5col  { width: auto; min-width: 30; padding-right: 1; }
-#pd-clo-3col  { width: auto; min-width: 30; padding-right: 1; }
+#pd-clo-5col  { width: 1fr; max-width: 36; padding-right: 1; }
+#pd-clo-3col  { width: 1fr; max-width: 36; padding-right: 1; }
 #pd-cust5, #pd-cust3 { width: 100%; margin-top: 0; }
 #pd-clo-tmcol { width: auto; padding-right: 1; }
 #pd-clo-row Button { margin-top: 1; min-width: 20; }
