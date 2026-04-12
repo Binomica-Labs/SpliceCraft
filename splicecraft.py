@@ -4579,10 +4579,16 @@ class PrimerDesignScreen(Screen):
             yield DataTable(id="pd-lib-table", cursor_type="row",
                             zebra_stripes=True)
             with Horizontal(id="pd-lib-btns"):
-                yield Button("Add Selected to Map", id="btn-pdlib-addmap",
-                             variant="primary", disabled=True)
+                yield Button("Add Primers to Map", id="btn-pdlib-addmap",
+                             variant="primary")
                 yield Button("Rename", id="btn-pdlib-rename", variant="default")
                 yield Button("Delete", id="btn-pdlib-del", variant="error")
+            yield Static(
+                "  [dim]m[/dim] mark/unmark   "
+                "[dim]ctrl+m[/dim] mark/unmark all   "
+                "[dim]marked primers shown with[/dim] [bold]★[/bold]",
+                id="pd-lib-hint", markup=True,
+            )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -4592,19 +4598,25 @@ class PrimerDesignScreen(Screen):
 
     def _refresh_library_table(self) -> None:
         t = self.query_one("#pd-lib-table", DataTable)
+        saved_cursor = t.cursor_row if t.row_count > 0 else 0
         t.clear()
-        self._lib_selected.clear()
-        for p in _load_primers():
+        primers = _load_primers()
+        # Clamp selections to valid range (data may have changed)
+        self._lib_selected &= set(range(len(primers)))
+        for i, p in enumerate(primers):
             seq = p.get("sequence", "")
+            marked = i in self._lib_selected
+            mark   = "★ " if marked else "  "
             t.add_row(
-                Text(p.get("name", "?"), style="bold"),
+                Text(mark + p.get("name", "?"), style="bold"),
                 Text(seq[:36], style="dim color(252)"),
                 f"{len(seq)} nt",
                 f"{p.get('tm', 0):.1f}°C",
                 p.get("primer_type", "?"),
                 p.get("source", ""),
             )
-        self._update_add_map_button()
+        if primers and 0 <= saved_cursor < len(primers):
+            t.move_cursor(row=saved_cursor)
 
     # ── Feature dropdown → fill start/end ──────────────────────────────────
 
@@ -4664,12 +4676,11 @@ class PrimerDesignScreen(Screen):
         except ValueError:
             pass
 
-    # ── Primer library multi-select (Shift+Up/Down) ──────────────────────
+    # ── Primer library mark/unmark (m / ctrl+m) ──────────────────────────
 
     def on_key(self, event) -> None:
-        """Intercept Shift+Up/Down when the library table is focused to
-        build a multi-selection set. Plain arrow keys clear the selection
-        to just the cursor row (single-select)."""
+        """Handle m (mark/unmark cursor row) and ctrl+m (mark/unmark all)
+        when the library table is focused."""
         try:
             t = self.query_one("#pd-lib-table", DataTable)
         except Exception:
@@ -4678,39 +4689,24 @@ class PrimerDesignScreen(Screen):
             return
 
         primers = _load_primers()
-        if event.key == "shift+down":
-            self._lib_selected.add(t.cursor_row)
-            if t.cursor_row < t.row_count - 1:
-                t.move_cursor(row=t.cursor_row + 1)
-                self._lib_selected.add(t.cursor_row)
-            self._update_add_map_button()
+        if event.key == "m":
+            row = t.cursor_row
+            if 0 <= row < len(primers):
+                if row in self._lib_selected:
+                    self._lib_selected.discard(row)
+                else:
+                    self._lib_selected.add(row)
+                self._refresh_library_table()
             event.stop()
-        elif event.key == "shift+up":
-            self._lib_selected.add(t.cursor_row)
-            if t.cursor_row > 0:
-                t.move_cursor(row=t.cursor_row - 1)
-                self._lib_selected.add(t.cursor_row)
-            self._update_add_map_button()
+        elif event.key == "ctrl+m":
+            if len(self._lib_selected) == len(primers) and len(primers) > 0:
+                # All marked → unmark all
+                self._lib_selected.clear()
+            else:
+                # Mark all
+                self._lib_selected = set(range(len(primers)))
+            self._refresh_library_table()
             event.stop()
-        elif event.key in ("down", "up"):
-            self._lib_selected.clear()
-
-    @on(DataTable.RowHighlighted, "#pd-lib-table")
-    def _lib_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        """On single click (no shift), clear multi-selection to just the
-        cursor row."""
-        if event.cursor_row not in self._lib_selected:
-            self._lib_selected.clear()
-            self._lib_selected.add(event.cursor_row)
-        self._update_add_map_button()
-
-    def _update_add_map_button(self) -> None:
-        """Enable 'Add Selected to Map' if any library rows are selected."""
-        try:
-            btn = self.query_one("#btn-pdlib-addmap", Button)
-            btn.disabled = len(self._lib_selected) == 0
-        except Exception:
-            pass
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -4896,7 +4892,10 @@ class PrimerDesignScreen(Screen):
         """Add ALL multi-selected primers from the library as primer_bind
         features on the currently-loaded plasmid."""
         if not self._lib_selected:
-            self.app.notify("No primers selected.", severity="warning")
+            self.app.notify(
+                "No primers marked. Press m to mark primers first.",
+                severity="warning",
+            )
             return
         rec = getattr(self.app, "_current_record", None)
         if rec is None:
@@ -5376,6 +5375,7 @@ DomesticatorModal { align: center middle; }
 #pd-lib-table { height: 1fr; min-height: 6; }
 #pd-lib-btns  { height: 3; margin-top: 0; }
 #pd-lib-btns Button { margin-right: 1; min-width: 10; }
+#pd-lib-hint  { height: 1; color: $text-muted; }
 """
 
     BINDINGS = [
