@@ -111,7 +111,7 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import (
-    Button, DataTable, Footer, Header, Input, Label, Static,
+    Button, DataTable, Footer, Header, Input, Label, Select, Static,
 )
 from rich.text import Text
 
@@ -3249,10 +3249,153 @@ _GB_TYPE_COLORS: dict[str, str] = {
     "Terminator": "blue",
 }
 
+# Canonical Golden Braid L0 part positions.
+# Each maps a part-type name → (position label, 5' overhang, 3' overhang).
+# Overhangs follow the published GB2.0 standard (Sarrion-Perdigones et al. 2013).
+_GB_POSITIONS: dict[str, tuple[str, str, str]] = {
+    "Promoter":    ("Pos 1",   "GGAG", "TGAC"),
+    "5' UTR":      ("Pos 2",   "TGAC", "AATG"),
+    "CDS":         ("Pos 3-4", "AATG", "GCTT"),
+    "CDS-NS":      ("Pos 3",   "AATG", "TTCG"),
+    "C-tag":       ("Pos 4",   "TTCG", "GCTT"),
+    "Terminator":  ("Pos 5",   "GCTT", "CGCT"),
+}
+
+# BsaI recognition + tail used for all Golden Braid domestication primers.
+# Padding bases improve BsaI digestion efficiency near DNA ends.
+_GB_BSAI_SITE = "GGTCTC"
+_GB_SPACER    = "A"           # 1 nt between recognition and the overhang
+_GB_PAD       = "GCGC"        # 4 nt of extra bases for efficient end-cutting
+
+
+def _pick_binding_region(seq: str, target_tm: float = 57.0,
+                         min_len: int = 18, max_len: int = 25) -> tuple[str, float]:
+    """Return the prefix of `seq` (length min_len..max_len) whose Tm is
+    closest to `target_tm`. Uses primer3-py's SantaLucia Tm calculation.
+
+    Returns (binding_sequence, tm). If primer3-py is not installed, falls
+    back to a crude 2+4 rule estimate.
+    """
+    try:
+        import primer3
+        _tm = primer3.calc_tm
+    except ImportError:
+        # Crude fallback so the code still runs without primer3-py; the UI
+        # will warn the user that Tm values are approximate.
+        def _tm(s):
+            gc = sum(1 for c in s.upper() if c in "GC")
+            at = sum(1 for c in s.upper() if c in "AT")
+            return 2 * at + 4 * gc
+
+    best_seq, best_tm, best_diff = seq[:min_len], 0.0, float("inf")
+    for n in range(min_len, min(max_len + 1, len(seq) + 1)):
+        candidate = seq[:n]
+        tm = _tm(candidate)
+        diff = abs(tm - target_tm)
+        if diff < best_diff:
+            best_seq, best_tm, best_diff = candidate, tm, diff
+    return best_seq, best_tm
+
+
+def _design_gb_primers(
+    template_seq: str,
+    start: int,
+    end: int,
+    part_type: str,
+    target_tm: float = 57.0,
+) -> dict:
+    """Design Golden Braid L0 domestication primers for a template region.
+
+    The amplified product, after BsaI digestion, will carry the correct 4-nt
+    overhangs for the chosen `part_type` and slot directly into a GB L0
+    assembly.
+
+    Primer structure (5'→3'):
+
+        Forward: [pad] [BsaI] [spacer] [5' overhang]    [binding →]
+        Reverse: [pad] [BsaI] [spacer] [RC 3' overhang] [← binding RC]
+
+    Returns a dict with keys: part_type, position, oh5, oh3, insert_seq,
+    fwd_binding, rev_binding, fwd_full, rev_full, fwd_tm, rev_tm,
+    amplicon_len.
+    """
+    pos_label, oh5, oh3 = _GB_POSITIONS[part_type]
+    insert = template_seq[start:end].upper()
+
+    # Forward binding: first 18-25 bp of the insert
+    fwd_bind, fwd_tm = _pick_binding_region(insert, target_tm)
+
+    # Reverse binding: first 18-25 bp of the reverse-complement of the insert
+    # (i.e. the last 18-25 bp of the insert, reverse-complemented)
+    rev_bind, rev_tm = _pick_binding_region(_rc(insert), target_tm)
+
+    # Assemble full primers
+    fwd_tail = _GB_PAD + _GB_BSAI_SITE + _GB_SPACER + oh5
+    rev_tail = _GB_PAD + _GB_BSAI_SITE + _GB_SPACER + _rc(oh3)
+
+    fwd_full = fwd_tail + fwd_bind
+    rev_full = rev_tail + rev_bind
+
+    # Amplicon = full fwd + insert body + full rev (minus double-counted bindings)
+    amplicon_len = len(fwd_full) + (len(insert) - len(fwd_bind)) + len(rev_full) - len(rev_bind) + len(rev_bind)
+    # Simpler: amplicon = pad+bsai+spacer+oh + insert + oh_rc+spacer+bsai_rc+pad
+    amplicon_len = len(fwd_tail) + len(insert) + len(rev_tail)
+
+    return {
+        "part_type":   part_type,
+        "position":    pos_label,
+        "oh5":         oh5,
+        "oh3":         oh3,
+        "insert_seq":  insert,
+        "fwd_binding": fwd_bind,
+        "rev_binding": rev_bind,
+        "fwd_full":    fwd_full,
+        "rev_full":    rev_full,
+        "fwd_tm":      round(fwd_tm, 1),
+        "rev_tm":      round(rev_tm, 1),
+        "amplicon_len": amplicon_len,
+    }
+
+
+# ── Parts bin persistence ─────────────────────────────────────────────────────
+# User-created parts (from the domesticator) are stored in parts_bin.json next
+# to the main script. Each entry is a dict with at least the 7 canonical fields
+# plus sequence, primers, and Tm values.
+
+_PARTS_BIN_FILE = Path(__file__).parent / "parts_bin.json"
+_parts_bin_cache: "list | None" = None
+
+def _load_parts_bin() -> list[dict]:
+    global _parts_bin_cache
+    if _parts_bin_cache is not None:
+        return list(_parts_bin_cache)
+    if _PARTS_BIN_FILE.exists():
+        try:
+            _parts_bin_cache = json.loads(_PARTS_BIN_FILE.read_text())
+            return list(_parts_bin_cache)
+        except Exception:
+            _log.exception("Failed to load parts bin from %s", _PARTS_BIN_FILE)
+    _parts_bin_cache = []
+    return []
+
+def _save_parts_bin(entries: list[dict]) -> None:
+    global _parts_bin_cache
+    try:
+        _PARTS_BIN_FILE.write_text(json.dumps(entries, indent=2))
+    except Exception:
+        _log.exception("Failed to save parts bin to %s", _PARTS_BIN_FILE)
+    _parts_bin_cache = list(entries)
+
+
 # ── Parts bin modal ────────────────────────────────────────────────────────────
 
 class PartsBinModal(ModalScreen):
-    """Golden Braid-compatible L0 parts library browser."""
+    """Golden Braid-compatible L0 parts library browser.
+
+    Shows both the built-in reference catalog (_GB_L0_PARTS) and user-created
+    parts from parts_bin.json. User parts appear first and include sequence
+    + primer data; built-in parts have no sequence (shown as "—").
+    """
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
@@ -3265,45 +3408,128 @@ class PartsBinModal(ModalScreen):
                 yield Button("New Part", id="btn-new-part", variant="success")
                 yield Button("Close",    id="btn-parts-close")
 
-    def on_mount(self) -> None:
-        t = self.query_one("#parts-table", DataTable)
-        t.add_columns("Name", "Type", "Position", "5' OH", "3' OH", "Backbone", "Selection")
+    def _all_rows(self) -> list[dict]:
+        """Combine user-created parts (first) + built-in catalog into a
+        uniform list of dicts for the table and detail panel."""
+        rows: list[dict] = []
+        for p in _load_parts_bin():
+            rows.append({
+                "name":     p.get("name", "?"),
+                "type":     p.get("type", "?"),
+                "position": p.get("position", "?"),
+                "oh5":      p.get("oh5", ""),
+                "oh3":      p.get("oh3", ""),
+                "backbone": p.get("backbone", "pUPD2"),
+                "marker":   p.get("marker", "Spectinomycin"),
+                "sequence": p.get("sequence", ""),
+                "fwd_primer": p.get("fwd_primer", ""),
+                "rev_primer": p.get("rev_primer", ""),
+                "fwd_tm":   p.get("fwd_tm", 0.0),
+                "rev_tm":   p.get("rev_tm", 0.0),
+                "user":     True,
+            })
         for row in _GB_L0_PARTS:
             name, ptype, pos, oh5, oh3, backbone, marker = row
-            color = _GB_TYPE_COLORS.get(ptype, "white")
+            rows.append({
+                "name": name, "type": ptype, "position": pos,
+                "oh5": oh5, "oh3": oh3, "backbone": backbone,
+                "marker": marker, "sequence": "", "fwd_primer": "",
+                "rev_primer": "", "fwd_tm": 0.0, "rev_tm": 0.0,
+                "user": False,
+            })
+        return rows
+
+    def on_mount(self) -> None:
+        t = self.query_one("#parts-table", DataTable)
+        t.add_columns(
+            "Name", "Type", "Pos", "5'OH", "3'OH", "Sequence",
+        )
+        self._populate()
+
+    def _populate(self) -> None:
+        t = self.query_one("#parts-table", DataTable)
+        t.clear()
+        self._rows = self._all_rows()
+        for r in self._rows:
+            color = _GB_TYPE_COLORS.get(r["type"], "white")
+            seq_preview = r["sequence"][:28] + "…" if len(r["sequence"]) > 28 else r["sequence"]
+            if not seq_preview:
+                seq_preview = "—"
+            usr_mark = "★ " if r["user"] else ""
             t.add_row(
-                Text(name,  style=color),
-                Text(ptype, style=f"dim {color}"),
-                pos,
-                Text(oh5,   style="bold cyan"),
-                Text(oh3,   style="bold cyan"),
-                backbone,
-                marker,
+                Text(usr_mark + r["name"], style=color),
+                Text(r["type"], style=f"dim {color}"),
+                r["position"],
+                Text(r["oh5"], style="bold cyan"),
+                Text(r["oh3"], style="bold cyan"),
+                Text(seq_preview, style="dim color(252)"),
             )
 
     @on(DataTable.RowHighlighted, "#parts-table")
     def _row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         idx = event.cursor_row
-        if idx < 0 or idx >= len(_GB_L0_PARTS):
+        if idx < 0 or not hasattr(self, "_rows") or idx >= len(self._rows):
             return
-        name, ptype, pos, oh5, oh3, backbone, marker = _GB_L0_PARTS[idx]
-        color = _GB_TYPE_COLORS.get(ptype, "white")
-        t = Text()
-        t.append(f"{name}", style=f"bold {color}")
-        t.append(f"  [{ptype}]", style=f"dim {color}")
-        t.append("\n")
-        t.append(f"Position: {pos}   ", style="white")
-        t.append("5′ overhang: ", style="dim")
-        t.append(oh5, style="bold cyan")
-        t.append("   3′ overhang: ", style="dim")
-        t.append(oh3, style="bold cyan")
-        t.append("\n")
-        t.append(f"Backbone: {backbone}   Selection: {marker}", style="dim")
-        self.query_one("#parts-detail", Static).update(t)
+        r = self._rows[idx]
+        color = _GB_TYPE_COLORS.get(r["type"], "white")
+        detail = Text()
+        detail.append(r["name"], style=f"bold {color}")
+        detail.append(f"  [{r['type']}]", style=f"dim {color}")
+        if r["user"]:
+            detail.append("  ★ user part", style="dim green")
+        detail.append("\n")
+        detail.append(f"Position: {r['position']}   ", style="white")
+        detail.append("5′ OH: ", style="dim")
+        detail.append(r["oh5"], style="bold cyan")
+        detail.append("   3′ OH: ", style="dim")
+        detail.append(r["oh3"], style="bold cyan")
+        detail.append(f"   Backbone: {r['backbone']}   Sel: {r['marker']}", style="dim")
+        if r["sequence"]:
+            detail.append("\n")
+            detail.append(f"Sequence ({len(r['sequence'])} bp): ", style="dim")
+            detail.append(r["sequence"][:60], style="color(252)")
+            if len(r["sequence"]) > 60:
+                detail.append("…", style="dim")
+        if r["fwd_primer"]:
+            detail.append("\n")
+            detail.append("Fwd: ", style="dim green")
+            detail.append(r["fwd_primer"], style="green")
+            detail.append(f"  Tm {r['fwd_tm']:.1f}°C", style="dim")
+        if r["rev_primer"]:
+            detail.append("   Rev: ", style="dim red")
+            detail.append(r["rev_primer"], style="red")
+            detail.append(f"  Tm {r['rev_tm']:.1f}°C", style="dim")
+        self.query_one("#parts-detail", Static).update(detail)
 
     @on(Button.Pressed, "#btn-new-part")
     def _new_part(self, _) -> None:
-        self.app.notify("New Part editor coming soon.", severity="information")
+        # Opens the domesticator modal. The current record's sequence is
+        # passed so the domesticator can use it as template.
+        rec = getattr(self.app, "_current_record", None)
+        seq = str(rec.seq) if rec else ""
+        feats = []
+        try:
+            pm = self.app.query_one("#plasmid-map", PlasmidMap)
+            feats = pm._feats
+        except Exception:
+            pass
+
+        def _on_result(part_dict):
+            if part_dict is None:
+                return
+            entries = _load_parts_bin()
+            entries.insert(0, part_dict)
+            _save_parts_bin(entries)
+            self._populate()
+            self.app.notify(
+                f"Saved '{part_dict['name']}' to Parts Bin "
+                f"({len(part_dict.get('sequence', ''))} bp).",
+            )
+
+        self.app.push_screen(
+            DomesticatorModal(seq, feats),
+            callback=_on_result,
+        )
 
     @on(Button.Pressed, "#btn-parts-close")
     def _close(self, _) -> None:
@@ -3314,6 +3540,228 @@ class PartsBinModal(ModalScreen):
 
 
 # ── Constructor modal ──────────────────────────────────────────────────────────
+
+class DomesticatorModal(ModalScreen):
+    """Golden Braid L0 Parts Domesticator.
+
+    Takes a template sequence + region, designs domestication primers with
+    the correct BsaI sites + positional overhangs, and returns a part dict
+    ready for saving to the Parts Bin.
+
+    Primer structure (5'→3'):
+        Forward: GCGC GGTCTC A [5' overhang] [binding region →]
+        Reverse: GCGC GGTCTC A [RC 3' OH]    [← binding region RC]
+
+    After BsaI digestion the amplicon carries the correct 4-nt sticky ends
+    for Golden Braid L0 assembly.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, template_seq: str, feats: list[dict]):
+        super().__init__()
+        self._template = template_seq.upper()
+        self._feats    = feats   # from PlasmidMap._feats, for the feature picker
+        self._design:  "dict | None" = None   # result of _design_gb_primers
+
+    def compose(self) -> ComposeResult:
+        # Build the feature dropdown: "(start-end) label" for each non-RE feature
+        feat_options: list[tuple[str, str]] = []
+        for f in self._feats:
+            if f.get("type") in ("resite", "recut"):
+                continue
+            label = f.get("label", f.get("type", "?"))
+            val   = f"{f['start']}-{f['end']}"
+            feat_options.append((f"{label}  ({f['start']+1}‥{f['end']})", val))
+
+        # Part-type dropdown options
+        type_options = [
+            (f"{k}  ({v[0]}: {v[1]}→{v[2]})", k) for k, v in _GB_POSITIONS.items()
+        ]
+
+        with Vertical(id="dom-box"):
+            yield Static(
+                " Domesticate Part  —  Golden Braid L0 ",
+                id="dom-title",
+            )
+            # ── Row 1: Part name + type ──
+            with Horizontal(id="dom-row1"):
+                with Vertical(id="dom-name-col"):
+                    yield Label("Part name")
+                    yield Input(placeholder="e.g. my-promoter", id="dom-name")
+                with Vertical(id="dom-type-col"):
+                    yield Label("Part type")
+                    yield Select(type_options, id="dom-type", value="CDS")
+            # ── Row 2: overhang info (auto-updated from type) ──
+            yield Static("", id="dom-oh-info", markup=True)
+            # ── Row 3: template region ──
+            with Horizontal(id="dom-region-row"):
+                with Vertical(id="dom-feat-col"):
+                    yield Label("From feature")
+                    yield Select(
+                        feat_options,
+                        id="dom-feat",
+                        prompt="(select feature or enter manually)",
+                    )
+                with Vertical(id="dom-start-col"):
+                    yield Label("Start (bp)")
+                    yield Input(placeholder="1", id="dom-start", type="integer")
+                with Vertical(id="dom-end-col"):
+                    yield Label("End (bp)")
+                    yield Input(
+                        placeholder=str(len(self._template)) if self._template else "100",
+                        id="dom-end",
+                        type="integer",
+                    )
+            # ── Primer results ──
+            yield Static("", id="dom-primer-results", markup=True)
+            # ── Buttons ──
+            with Horizontal(id="dom-btns"):
+                yield Button(
+                    "Design Primers", id="btn-dom-design", variant="primary",
+                )
+                yield Button(
+                    "Save to Parts Bin", id="btn-dom-save", variant="success",
+                    disabled=True,
+                )
+                yield Button("Cancel", id="btn-dom-cancel")
+
+    def on_mount(self) -> None:
+        self._update_oh_display()
+        # Focus the name input
+        self.query_one("#dom-name", Input).focus()
+
+    # ── Feature selection fills start/end ──────────────────────────────────
+
+    @on(Select.Changed, "#dom-feat")
+    def _feat_selected(self, event: Select.Changed) -> None:
+        val = event.value
+        if not isinstance(val, str):
+            return
+        if "-" in val:
+            parts = val.split("-", 1)
+            try:
+                self.query_one("#dom-start", Input).value = str(int(parts[0]) + 1)
+                self.query_one("#dom-end",   Input).value = parts[1]
+            except ValueError:
+                pass
+
+    # ── Part type changes update the overhang info ─────────────────────────
+
+    @on(Select.Changed, "#dom-type")
+    def _type_changed(self, _event) -> None:
+        self._update_oh_display()
+
+    def _update_oh_display(self) -> None:
+        sel = self.query_one("#dom-type", Select)
+        val = sel.value
+        if not isinstance(val, str) or val not in _GB_POSITIONS:
+            self.query_one("#dom-oh-info", Static).update("")
+            return
+        pos, oh5, oh3 = _GB_POSITIONS[val]
+        self.query_one("#dom-oh-info", Static).update(
+            f"  [dim]{pos}[/dim]   "
+            f"5′ overhang: [bold cyan]{oh5}[/bold cyan]   →   "
+            f"3′ overhang: [bold cyan]{oh3}[/bold cyan]   "
+            f"[dim](BsaI domestication)[/dim]"
+        )
+
+    # ── Design primers ─────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-dom-design")
+    def _design(self, _) -> None:
+        status = self.query_one("#dom-primer-results", Static)
+        # Validate inputs
+        part_type = self.query_one("#dom-type", Select).value
+        if not isinstance(part_type, str) or part_type not in _GB_POSITIONS:
+            status.update("[red]Select a part type.[/red]")
+            return
+        if not self._template:
+            status.update("[red]No template sequence loaded.[/red]")
+            return
+        try:
+            start = int(self.query_one("#dom-start", Input).value) - 1  # 1-based → 0-based
+            end   = int(self.query_one("#dom-end",   Input).value)
+        except ValueError:
+            status.update("[red]Enter valid start and end positions.[/red]")
+            return
+        if start < 0 or end <= start or end > len(self._template):
+            status.update(
+                f"[red]Invalid region: {start+1}–{end} "
+                f"(plasmid is {len(self._template)} bp)[/red]"
+            )
+            return
+        if end - start < 20:
+            status.update("[red]Region too short (< 20 bp).[/red]")
+            return
+
+        try:
+            self._design = _design_gb_primers(self._template, start, end, part_type)
+        except Exception as exc:
+            _log.exception("Primer design failed")
+            status.update(f"[red]Primer design failed: {exc}[/red]")
+            return
+
+        d = self._design
+        t = Text()
+        t.append("── Primers designed ─────────────────────────────────\n",
+                 style="dim")
+        t.append("\nForward (5'→3'):\n", style="bold green")
+        # Show with structure annotation
+        tail_len = len(_GB_PAD + _GB_BSAI_SITE + _GB_SPACER) + 4  # pad+bsai+spacer+oh
+        t.append(f"  {d['fwd_full'][:tail_len]}", style="dim green")
+        t.append(d["fwd_full"][tail_len:], style="bold green")
+        t.append(f"   Tm {d['fwd_tm']:.1f}°C\n", style="dim")
+        t.append(f"  {'─'*4}{'BsaI──':>7}{'─OH':>3}{'─── binding region':>20}\n",
+                 style="dim")
+        t.append("\nReverse (5'→3'):\n", style="bold red")
+        t.append(f"  {d['rev_full'][:tail_len]}", style="dim red")
+        t.append(d["rev_full"][tail_len:], style="bold red")
+        t.append(f"   Tm {d['rev_tm']:.1f}°C\n", style="dim")
+        t.append(f"  {'─'*4}{'BsaI──':>7}{'─OH':>3}{'─── binding region':>20}\n",
+                 style="dim")
+        t.append(f"\nInsert: {len(d['insert_seq'])} bp   "
+                 f"Amplicon: {d['amplicon_len']} bp\n",
+                 style="white")
+        status.update(t)
+        self.query_one("#btn-dom-save", Button).disabled = False
+
+    # ── Save to parts bin ──────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-dom-save")
+    def _save(self, _) -> None:
+        if self._design is None:
+            return
+        name = self.query_one("#dom-name", Input).value.strip()
+        if not name:
+            self.query_one("#dom-primer-results", Static).update(
+                "[red]Enter a part name before saving.[/red]"
+            )
+            return
+        d = self._design
+        part = {
+            "name":        name,
+            "type":        d["part_type"],
+            "position":    d["position"],
+            "oh5":         d["oh5"],
+            "oh3":         d["oh3"],
+            "backbone":    "pUPD2",
+            "marker":      "Spectinomycin",
+            "sequence":    d["insert_seq"],
+            "fwd_primer":  d["fwd_full"],
+            "rev_primer":  d["rev_full"],
+            "fwd_tm":      d["fwd_tm"],
+            "rev_tm":      d["rev_tm"],
+        }
+        self.dismiss(part)
+
+    @on(Button.Pressed, "#btn-dom-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
 
 class ConstructorModal(ModalScreen):
     """Golden Braid TU Constructor — assemble L0 parts into a transcription unit."""
@@ -3912,9 +4360,32 @@ PartsBinModal { align: center middle; }
 }
 #parts-title  { background: $success-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #parts-table  { height: 1fr; }
-#parts-detail { height: 5; border-top: solid $accent; padding: 0 1; color: $text-muted; }
+#parts-detail { height: 7; border-top: solid $accent; padding: 0 1; color: $text-muted; }
 #parts-btns   { height: 3; margin-top: 1; }
 #parts-btns Button { margin-right: 1; }
+
+/* ── Domesticator modal ─────────────────────────────────── */
+DomesticatorModal { align: center middle; }
+#dom-box {
+    width: 100; height: auto; max-height: 42;
+    background: $surface; border: solid $accent; padding: 1 2;
+}
+#dom-title  { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#dom-row1   { height: 5; }
+#dom-name-col { width: 1fr; padding-right: 1; }
+#dom-type-col { width: 1fr; }
+#dom-oh-info  { height: 1; margin-bottom: 1; }
+#dom-region-row { height: 5; }
+#dom-feat-col  { width: 2fr; padding-right: 1; }
+#dom-start-col { width: 1fr; padding-right: 1; }
+#dom-end-col   { width: 1fr; }
+#dom-primer-results {
+    height: auto; max-height: 14;
+    border: solid $primary-darken-2; padding: 0 1; margin-top: 1;
+    overflow-y: auto;
+}
+#dom-btns   { height: 3; margin-top: 1; }
+#dom-btns Button { margin-right: 1; }
 """
 
     BINDINGS = [

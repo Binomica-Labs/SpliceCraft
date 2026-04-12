@@ -8,6 +8,7 @@ __pycache__/
 
 # User-local runtime data (library is user-specific; seeded on first run)
 plasmid_library.json
+parts_bin.json
 
 # Editor / OS
 .vscode/
