@@ -4477,6 +4477,7 @@ class PrimerDesignScreen(Screen):
                 break
         self._det_result:  "dict | None" = None
         self._clo_result:  "dict | None" = None
+        self._lib_selected: set[int] = set()   # multi-selected library rows
 
     def compose(self) -> ComposeResult:
         # Feature dropdown
@@ -4580,6 +4581,8 @@ class PrimerDesignScreen(Screen):
             yield DataTable(id="pd-lib-table", cursor_type="row",
                             zebra_stripes=True)
             with Horizontal(id="pd-lib-btns"):
+                yield Button("Add Selected to Map", id="btn-pdlib-addmap",
+                             variant="primary", disabled=True)
                 yield Button("Rename", id="btn-pdlib-rename", variant="default")
                 yield Button("Delete", id="btn-pdlib-del", variant="error")
         yield Footer()
@@ -4591,17 +4594,26 @@ class PrimerDesignScreen(Screen):
 
     def _refresh_library_table(self) -> None:
         t = self.query_one("#pd-lib-table", DataTable)
+        saved_cursor = t.cursor_row if t.row_count > 0 else 0
         t.clear()
-        for p in _load_primers():
+        primers = _load_primers()
+        for i, p in enumerate(primers):
             seq = p.get("sequence", "")
+            selected = i in self._lib_selected
+            marker   = "▸ " if selected else "  "
+            name_sty = "bold reverse" if selected else "bold"
             t.add_row(
-                Text(p.get("name", "?"), style="bold"),
+                Text(marker + p.get("name", "?"), style=name_sty),
                 Text(seq[:36], style="dim color(252)"),
                 f"{len(seq)} nt",
                 f"{p.get('tm', 0):.1f}°C",
                 p.get("primer_type", "?"),
                 p.get("source", ""),
             )
+        # Restore cursor position
+        if primers and 0 <= saved_cursor < len(primers):
+            t.move_cursor(row=saved_cursor)
+        self._update_add_map_button()
 
     # ── Feature dropdown → fill start/end ──────────────────────────────────
 
@@ -4659,6 +4671,60 @@ class PrimerDesignScreen(Screen):
                     f"[dim]— detection range 450–550 bp[/dim]"
                 )
         except ValueError:
+            pass
+
+    # ── Primer library multi-select (Shift+Up/Down) ──────────────────────
+
+    def on_key(self, event) -> None:
+        """Intercept Shift+Up/Down when the library table is focused to
+        build a multi-selection set. Plain arrow keys clear the selection
+        to just the cursor row (single-select)."""
+        try:
+            t = self.query_one("#pd-lib-table", DataTable)
+        except Exception:
+            return
+        if self.app.focused is not t:
+            return
+
+        primers = _load_primers()
+        if event.key == "shift+down":
+            self._lib_selected.add(t.cursor_row)
+            if t.cursor_row < t.row_count - 1:
+                t.move_cursor(row=t.cursor_row + 1)
+                self._lib_selected.add(t.cursor_row)
+            self._refresh_library_table()
+            event.stop()
+        elif event.key == "shift+up":
+            self._lib_selected.add(t.cursor_row)
+            if t.cursor_row > 0:
+                t.move_cursor(row=t.cursor_row - 1)
+                self._lib_selected.add(t.cursor_row)
+            self._refresh_library_table()
+            event.stop()
+        elif event.key in ("down", "up"):
+            # Normal movement: clear multi-selection (DataTable moves cursor)
+            self._lib_selected.clear()
+
+    @on(DataTable.RowHighlighted, "#pd-lib-table")
+    def _lib_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """On single click (no shift), clear multi-selection to just the
+        cursor row. Enable the 'Add Selected to Map' button if any rows
+        are selected."""
+        # If the user just shift-arrowed, _lib_selected was already updated
+        # in on_key and we don't want to clear it here. We detect this by
+        # checking whether the new cursor is already in the selection.
+        if event.cursor_row not in self._lib_selected:
+            self._lib_selected.clear()
+            self._lib_selected.add(event.cursor_row)
+            self._refresh_library_table()
+        self._update_add_map_button()
+
+    def _update_add_map_button(self) -> None:
+        """Enable 'Add Selected to Map' if any library rows are selected."""
+        try:
+            btn = self.query_one("#btn-pdlib-addmap", Button)
+            btn.disabled = len(self._lib_selected) == 0
+        except Exception:
             pass
 
     # ── Helpers ────────────────────────────────────────────────────────────
@@ -4877,6 +4943,68 @@ class PrimerDesignScreen(Screen):
             _log.exception("Failed to add primer features to map")
         self.app.notify(
             f"Added {fwd_name} + {rev_name} as primer_bind features.")
+
+    # ── Add selected library primers as features ──────────────────────────
+
+    @on(Button.Pressed, "#btn-pdlib-addmap")
+    def _add_selected_to_map(self, _) -> None:
+        """Add ALL multi-selected primers from the library as primer_bind
+        features on the currently-loaded plasmid."""
+        if not self._lib_selected:
+            self.app.notify("No primers selected.", severity="warning")
+            return
+        rec = getattr(self.app, "_current_record", None)
+        if rec is None:
+            self.app.notify("No plasmid loaded.", severity="warning")
+            return
+
+        primers = _load_primers()
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+
+        added = []
+        for idx in sorted(self._lib_selected):
+            if idx < 0 or idx >= len(primers):
+                continue
+            p = primers[idx]
+            p_start = p.get("pos_start", 0)
+            p_end   = p.get("pos_end", 0)
+            strand  = p.get("strand", 1)
+            name    = p.get("name", "primer")
+            if p_end <= p_start:
+                continue
+            # Don't duplicate: skip if a primer_bind with the same label
+            # and position already exists on the record
+            already = any(
+                f.type == "primer_bind"
+                and int(f.location.start) == p_start
+                and int(f.location.end) == p_end
+                for f in rec.features
+            )
+            if already:
+                continue
+            rec.features.append(SeqFeature(
+                FeatureLocation(p_start, p_end, strand=strand),
+                type="primer_bind",
+                qualifiers={"label": [name]},
+            ))
+            added.append(name)
+
+        if not added:
+            self.app.notify("Selected primers are already on the map.",
+                            severity="information")
+            return
+
+        try:
+            self.app._apply_record(rec)
+            lib = self.app.query_one("#library")
+            lib.add_entry(rec)
+        except Exception:
+            _log.exception("Failed to add primer features to map")
+
+        self.app.notify(
+            f"Added {len(added)} primer{'s' if len(added) != 1 else ''} "
+            f"as features: {', '.join(added)}"
+        )
 
     # ── Primer library management ─────────────────────────────────────────
 
