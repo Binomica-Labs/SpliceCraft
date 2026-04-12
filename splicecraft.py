@@ -5081,6 +5081,27 @@ DomesticatorModal { align: center middle; }
         Binding("ctrl+c",      "copy_selection",   "",              show=False, priority=True),
     ]
 
+    # Actions that remain available even when a screen is pushed on top.
+    # Everything else is suppressed to prevent confusing cross-screen
+    # side-effects (e.g. pressing 'f' in the Primer Design screen should
+    # not open a GenBank fetch modal underneath it).
+    _ALWAYS_ALLOWED_ACTIONS: set[str] = {"quit"}
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        """Textual calls this before executing any App-level binding action.
+
+        When a Screen or ModalScreen is pushed on top of the default screen,
+        we suppress all app-level actions EXCEPT quit. Screen-level bindings
+        (defined on the pushed Screen itself) are unaffected — they go
+        through the Screen's own check_action, not this one.
+        """
+        if action in self._ALWAYS_ALLOWED_ACTIONS:
+            return True
+        # If we're NOT on the default (main) screen, block the action.
+        if self.screen.id != "_default":
+            return False
+        return True
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield MenuBar()
