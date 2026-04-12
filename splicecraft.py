@@ -4505,6 +4505,11 @@ class PrimerDesignScreen(Screen):
         self._clo_result:  "dict | None" = None
         self._lib_selected: set[int] = set()   # multi-selected library rows
 
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
+
     def compose(self) -> ComposeResult:
         # Feature dropdown options
         feat_opts: list[tuple[str, str]] = []
@@ -4530,6 +4535,13 @@ class PrimerDesignScreen(Screen):
         with Vertical(id="pd-box"):
             yield Static(" Primer Design  —  Primer3 ", id="pd-title")
 
+            # ── Primer type (top of screen) ────────────────────────────────
+            with Horizontal(id="pd-mode-row"):
+                with Vertical(id="pd-mode-col"):
+                    yield Label("Primer type")
+                    yield Select(mode_opts, id="pd-mode", value="detection")
+                yield Button("Design", id="btn-pd-design", variant="primary")
+
             # ── Source row ─────────────────────────────────────────────────
             with Horizontal(id="pd-source-row"):
                 with Vertical(id="pd-feat-col"):
@@ -4549,31 +4561,26 @@ class PrimerDesignScreen(Screen):
                     yield Input(value="", id="pd-part-name",
                                 placeholder=self._default_part_name)
 
-            # ── Custom sequence input ──────────────────────────────────────
-            yield Label("Custom sequence (paste DNA if not using a library feature):")
-            yield Input(placeholder="ATGAAAGAT...", id="pd-custom-seq")
+            # ── Custom sequence ────────────────────────────────────────────
+            yield Input(placeholder="Custom sequence (paste DNA if not in library)",
+                        id="pd-custom-seq")
 
             # ── Feature info ───────────────────────────────────────────────
             yield Static("", id="pd-feat-info", markup=True)
 
-            # ── Primer type selector ───────────────────────────────────────
-            with Horizontal(id="pd-mode-row"):
-                with Vertical(id="pd-mode-col"):
-                    yield Label("Primer type")
-                    yield Select(mode_opts, id="pd-mode", value="detection")
-                yield Button("Design", id="btn-pd-design", variant="primary")
-
             # ── Mode: Detection ────────────────────────────────────────────
             with Horizontal(id="pd-panel-det", classes="pd-mode-panel"):
-                yield Label("Product ")
+                yield Label("Product")
                 yield Input(value="450", id="pd-det-min", type="integer")
                 yield Label("–")
                 yield Input(value="550", id="pd-det-max", type="integer")
-                yield Label(" bp   Tm ")
+                yield Label("bp")
+                yield Label("Tm")
                 yield Input(value="60", id="pd-det-tm", type="integer")
-                yield Label("°C   Len ")
+                yield Label("°C")
+                yield Label("Len")
                 yield Input(value="25", id="pd-det-len", type="integer")
-                yield Label(" bp")
+                yield Label("bp")
 
             # ── Mode: Cloning ──────────────────────────────────────────────
             with Horizontal(id="pd-panel-clo", classes="pd-mode-panel"):
@@ -4600,12 +4607,11 @@ class PrimerDesignScreen(Screen):
 
             # ── Mode: Generic ──────────────────────────────────────────────
             with Horizontal(id="pd-panel-gen", classes="pd-mode-panel"):
-                yield Label("Tm ")
+                yield Label("Tm")
                 yield Input(value="60", id="pd-gen-tm", type="integer")
-                yield Label(" °C")
+                yield Label("°C")
 
-            # ── Results ────────────────────────────────────────────────────
-            yield Static("", id="pd-results", markup=True)
+            # ── Primer names ───────────────────────────────────────────────
             with Horizontal(id="pd-result-names"):
                 with Vertical(id="pd-fn-col"):
                     yield Label("Fwd name")
@@ -4614,27 +4620,28 @@ class PrimerDesignScreen(Screen):
                     yield Label("Rev name")
                     yield Input(id="pd-rev-name", placeholder="rev primer name")
 
-            # ── Action buttons ─────────────────────────────────────────────
-            with Horizontal(id="pd-btns"):
-                yield Button("Save to Primer Library", id="btn-pd-save",
-                             variant="primary", disabled=True)
-                yield Button("Close", id="btn-pd-close")
+            # ── Results (below names) ──────────────────────────────────────
+            yield Static("", id="pd-results", markup=True)
 
-            # ── Primer library ─────────────────────────────────────────────
-            yield Static(" Primer Library ", id="pd-lib-hdr")
-            yield DataTable(id="pd-lib-table", cursor_type="row",
-                            zebra_stripes=True)
-            with Horizontal(id="pd-lib-btns"):
+            # ── All buttons on one row ─────────────────────────────────────
+            with Horizontal(id="pd-btns"):
+                yield Button("Save to Library", id="btn-pd-save",
+                             variant="primary", disabled=True)
                 yield Button("Add Primers to Map", id="btn-pdlib-addmap",
                              variant="primary")
                 yield Button("Rename", id="btn-pdlib-rename", variant="default")
                 yield Button("Delete", id="btn-pdlib-del", variant="error")
+                yield Button("Close", id="btn-pd-close")
+
+            # ── Primer library ─────────────────────────────────────────────
             yield Static(
-                "  [dim]m[/dim] mark/unmark   "
-                "[dim]ctrl+m[/dim] mark/unmark all   "
-                "[dim]marked primers shown with[/dim] [bold]★[/bold]",
-                id="pd-lib-hint", markup=True,
+                " Primer Library   [dim]m[/dim] mark  "
+                "[dim]ctrl+m[/dim] mark all  "
+                "[dim]★[/dim] = marked",
+                id="pd-lib-hdr", markup=True,
             )
+            yield DataTable(id="pd-lib-table", cursor_type="row",
+                            zebra_stripes=True)
         yield Footer()
 
     _MODE_PANELS = {
@@ -4800,15 +4807,50 @@ class PrimerDesignScreen(Screen):
                     self._lib_selected.add(row)
                 self._refresh_library_table()
             event.stop()
-        elif event.key == "ctrl+m":
+        elif event.key in ("ctrl+m", "ctrl+M"):
             if len(self._lib_selected) == len(primers) and len(primers) > 0:
-                # All marked → unmark all
                 self._lib_selected.clear()
             else:
-                # Mark all
                 self._lib_selected = set(range(len(primers)))
             self._refresh_library_table()
             event.stop()
+        elif event.key == "delete":
+            # Delete marked primers (with confirmation) or cursor primer
+            self._delete_marked_or_cursor()
+            event.stop()
+
+    def _delete_marked_or_cursor(self) -> None:
+        """If primers are marked, confirm deletion of all marked. Otherwise
+        confirm deletion of the cursor row."""
+        primers = _load_primers()
+        if self._lib_selected:
+            count = len(self._lib_selected)
+            names = [primers[i].get("name", "?") for i in sorted(self._lib_selected)
+                     if 0 <= i < len(primers)]
+            label = f"{count} marked primer{'s' if count != 1 else ''}"
+        else:
+            name = self._selected_primer_name()
+            if name is None:
+                self.app.notify("No primer selected.", severity="warning")
+                return
+            names = [name]
+            label = f"primer {name!r}"
+
+        def _on_confirm(result):
+            if result is not True:
+                return
+            entries = _load_primers()
+            name_set = set(names)
+            entries = [e for e in entries if e.get("name") not in name_set]
+            _save_primers(entries)
+            self._lib_selected.clear()
+            self._refresh_library_table()
+            self.app.notify(f"Deleted {len(names)} primer{'s' if len(names) != 1 else ''}.")
+
+        self.app.push_screen(
+            LibraryDeleteConfirmModal(label, 0, ""),
+            callback=_on_confirm,
+        )
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -5136,23 +5178,7 @@ class PrimerDesignScreen(Screen):
 
     @on(Button.Pressed, "#btn-pdlib-del")
     def _delete_primer(self, _) -> None:
-        pname = self._selected_primer_name()
-        if pname is None:
-            self.app.notify("Highlight a primer to delete.", severity="warning")
-            return
-
-        def _on_confirm(result: "bool | None") -> None:
-            if result is not True:
-                return
-            entries = [e for e in _load_primers() if e.get("name") != pname]
-            _save_primers(entries)
-            self._refresh_library_table()
-            self.app.notify(f"Deleted primer {pname!r}.")
-
-        self.app.push_screen(
-            LibraryDeleteConfirmModal(pname, 0, pname),
-            callback=_on_confirm,
-        )
+        self._delete_marked_or_cursor()
 
     # ── Close ──────────────────────────────────────────────────────────────
 
@@ -5492,14 +5518,14 @@ DomesticatorModal { align: center middle; }
 #pd-start-col { width: 1fr; padding-right: 1; }
 #pd-end-col   { width: 1fr; padding-right: 1; }
 #pd-name-col  { width: 2fr; }
-#pd-custom-seq { margin-bottom: 0; }
-#pd-feat-info { height: 1; }
 #pd-mode-row  { height: 4; }
 #pd-mode-col  { width: 1fr; max-width: 40; padding-right: 1; }
 #pd-mode-row Button { margin-top: 1; min-width: 16; }
+#pd-custom-seq { margin-bottom: 0; }
+#pd-feat-info { height: 1; }
 .pd-mode-panel { height: 3; align: left middle; }
-.pd-mode-panel Label { width: auto; padding: 0 1; content-align: center middle; }
-.pd-mode-panel Input { width: 10; }
+.pd-mode-panel Label { width: auto; padding: 0 0 0 1; content-align: center middle; }
+.pd-mode-panel Input { width: 8; margin: 0 0; }
 #pd-panel-clo { height: 6; }
 #pd-clo-5col  { width: 1fr; max-width: 32; padding-right: 1; }
 #pd-clo-3col  { width: 1fr; max-width: 32; padding-right: 1; }
@@ -5508,20 +5534,18 @@ DomesticatorModal { align: center middle; }
 #pd-panel-gb  { height: 4; }
 #pd-gb-type-col { width: 1fr; max-width: 40; padding-right: 1; }
 #pd-gb-oh-info  { width: auto; content-align: left middle; }
-#pd-results   {
-    height: auto; max-height: 8;
-    border: solid $primary-darken-2; padding: 0 1; margin-top: 1;
-}
 #pd-result-names { height: 4; }
 #pd-fn-col    { width: 1fr; padding-right: 1; }
 #pd-rn-col    { width: 1fr; }
-#pd-btns      { height: 3; margin-top: 0; }
+#pd-results   {
+    height: auto; max-height: 8;
+    border: solid $primary-darken-2; padding: 0 1;
+}
+#pd-btns      { height: 3; }
 #pd-btns Button { margin-right: 1; }
+#pd-btns #btn-pd-close { dock: right; }
 #pd-lib-hdr   { background: $accent-darken-2; color: $text; padding: 0 1; }
 #pd-lib-table { height: 1fr; min-height: 6; }
-#pd-lib-btns  { height: 3; margin-top: 0; }
-#pd-lib-btns Button { margin-right: 1; min-width: 10; }
-#pd-lib-hint  { height: 1; color: $text-muted; }
 """
 
     BINDINGS = [
