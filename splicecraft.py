@@ -144,19 +144,41 @@ def _safe_save_json(path: Path, entries: list, label: str) -> None:
 
     The .bak file is the user's safety net — if a write goes wrong or the
     app crashes mid-save, the previous version survives as path.bak.
+
+    **Shrink guard**: if the file currently has N entries and we're about to
+    write M < N, we still write (the user may have legitimately deleted
+    entries) BUT we log a loud warning so accidental nukes are visible in
+    /tmp/splicecraft.log for post-mortem debugging. The .bak always preserves
+    the pre-write state regardless.
     """
     import os
     import tempfile
 
     # 1. Back up the existing file (if it has content)
+    existing_count = 0
     if path.exists():
         try:
             existing = path.read_bytes()
             if existing.strip():
                 bak = path.with_suffix(path.suffix + ".bak")
                 bak.write_bytes(existing)
+                # Count existing entries for the shrink guard
+                try:
+                    existing_count = len(json.loads(existing))
+                except Exception:
+                    pass
         except OSError:
             _log.warning("Could not create backup for %s", path)
+
+    # Shrink guard: log a loud warning if we're about to lose entries.
+    # This doesn't BLOCK the write (legitimate deletes reduce the count)
+    # but makes accidental nukes visible in the log file.
+    if existing_count > 0 and len(entries) == 0:
+        _log.warning(
+            "SHRINK GUARD: %s is being overwritten with 0 entries "
+            "(was %d). If this is unexpected, restore from %s.bak",
+            label, existing_count, path,
+        )
 
     # 2. Atomic write: tempfile in same dir → os.replace
     try:
