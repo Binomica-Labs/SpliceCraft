@@ -17,13 +17,38 @@
 ╚═══════════════════════════════════════════════════════════════════════════════╝
 ```
 
+[![PyPI](https://img.shields.io/pypi/v/splicecraft.svg)](https://pypi.org/project/splicecraft/)
+[![Python](https://img.shields.io/pypi/pyversions/splicecraft.svg)](https://pypi.org/project/splicecraft/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Status: Beta](https://img.shields.io/badge/status-beta-orange.svg)](https://github.com/Binomica-Labs/SpliceCraft)
+
 ![SpliceCraft screenshot](https://raw.githubusercontent.com/Binomica-Labs/SpliceCraft/master/screenshot.jpg)
+
+> ⚠️ **Beta software.** SpliceCraft is under active development and the API,
+> UI, and on-disk file formats may change between releases. Your data files
+> (`plasmid_library.json`, `parts_bin.json`, `primers.json`) are auto-backed
+> up to `*.bak` on every save, but please keep your own off-disk copies of
+> anything critical. **Do not use SpliceCraft as your sole system of record
+> for cloning work until it exits beta.**
 
 A terminal-based circular plasmid map viewer, sequence editor, **primer design
 workbench**, and **Golden Braid parts domesticator** — rendered entirely in your
 shell. Fetch any GenBank record by accession, load local files, annotate features
 with pLannotate, design diagnostic / cloning / Golden Braid primers with Primer3,
 and edit sequences — without ever leaving the terminal.
+
+## Quick start
+
+```bash
+pip install splicecraft
+splicecraft              # empty canvas
+splicecraft L09137       # fetch pUC19 from NCBI
+splicecraft myplasmid.gb # open a local GenBank file
+```
+
+**That's it.** All required dependencies are installed automatically. User data
+lives in the platform-appropriate data directory (see the Installation section
+below).
 
 ---
 
