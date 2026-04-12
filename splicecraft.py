@@ -33,6 +33,64 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+__version__ = "0.2.0"
+
+# ── User data directory ────────────────────────────────────────────────────────
+# All user-writable state (library, parts bin, primers, .bak files) lives in
+# the platform-appropriate data dir:
+#   Linux:   ~/.local/share/splicecraft/
+#   macOS:   ~/Library/Application Support/splicecraft/
+#   Windows: %APPDATA%\splicecraft\
+# Override with $SPLICECRAFT_DATA_DIR (useful for tests and portable installs).
+
+def _user_data_dir() -> Path:
+    override = os.environ.get("SPLICECRAFT_DATA_DIR")
+    if override:
+        p = Path(override).expanduser()
+    else:
+        try:
+            from platformdirs import user_data_dir
+            p = Path(user_data_dir("splicecraft", appauthor=False, roaming=False))
+        except ImportError:
+            p = Path.home() / ".local" / "share" / "splicecraft"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+_DATA_DIR = _user_data_dir()
+
+
+def _migrate_legacy_data() -> None:
+    """One-shot migration from Path(__file__).parent → _DATA_DIR.
+    Idempotent: only copies files whose destination doesn't already exist.
+    Preserves the source files (copy, not move) so a dev running from the
+    repo checkout can still use them via $SPLICECRAFT_DATA_DIR."""
+    import shutil
+    legacy_root = Path(__file__).parent
+    if legacy_root.resolve() == _DATA_DIR.resolve():
+        return   # running from the data dir itself (no migration needed)
+    names = [
+        "plasmid_library.json", "parts_bin.json", "primers.json",
+        "plasmid_library.json.bak", "parts_bin.json.bak", "primers.json.bak",
+    ]
+    migrated = []
+    for name in names:
+        src = legacy_root / name
+        dst = _DATA_DIR / name
+        if src.exists() and not dst.exists():
+            try:
+                shutil.copy2(src, dst)
+                migrated.append(name)
+            except OSError:
+                pass
+    if migrated:
+        try:
+            (_DATA_DIR / ".migrated").write_text("\n".join(migrated))
+        except OSError:
+            pass
+
+_migrate_legacy_data()
+
+
 # ── Dependency check ───────────────────────────────────────────────────────────
 
 _REQUIRED = {
@@ -252,7 +310,7 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
 
 # ── Library persistence ────────────────────────────────────────────────────────
 
-_LIBRARY_FILE = Path(__file__).parent / "plasmid_library.json"
+_LIBRARY_FILE = _DATA_DIR / "plasmid_library.json"
 _library_cache: "list | None" = None
 
 def _load_library() -> list[dict]:
@@ -3515,7 +3573,7 @@ def _design_gb_primers(
 # to the main script. Each entry is a dict with at least the 7 canonical fields
 # plus sequence, primers, and Tm values.
 
-_PARTS_BIN_FILE = Path(__file__).parent / "parts_bin.json"
+_PARTS_BIN_FILE = _DATA_DIR / "parts_bin.json"
 _parts_bin_cache: "list | None" = None
 
 def _load_parts_bin() -> list[dict]:
@@ -3544,7 +3602,7 @@ def _save_parts_bin(entries: list[dict]) -> None:
 #
 # Primer library persists to primers.json (same dir as plasmid_library.json).
 
-_PRIMERS_FILE = Path(__file__).parent / "primers.json"
+_PRIMERS_FILE = _DATA_DIR / "primers.json"
 _primers_cache: "list | None" = None
 
 def _load_primers() -> list[dict]:
@@ -6979,8 +7037,24 @@ DomesticatorModal { align: center middle; }
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
-    _log_startup_banner()
     arg = sys.argv[1] if len(sys.argv) > 1 else None
+    # Handle --version / -V without loading the TUI
+    if arg in ("--version", "-V"):
+        print(f"splicecraft {__version__}")
+        return
+    if arg in ("--help", "-h"):
+        print(
+            f"splicecraft {__version__}\n"
+            "Usage: splicecraft [ACCESSION | FILE.gb]\n\n"
+            "  splicecraft             # empty canvas\n"
+            "  splicecraft L09137      # fetch pUC19 from NCBI\n"
+            "  splicecraft my.gb       # open a local GenBank file\n\n"
+            "Data files (library, parts, primers) live in:\n"
+            f"  {_DATA_DIR}\n"
+            "Override with $SPLICECRAFT_DATA_DIR."
+        )
+        return
+    _log_startup_banner()
     app = PlasmidApp()
 
     if arg:

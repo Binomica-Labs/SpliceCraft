@@ -6,6 +6,11 @@ __pycache__/
 # pytest
 .pytest_cache/
 
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
 # User-local runtime data (library is user-specific; seeded on first run)
 plasmid_library.json
 parts_bin.json

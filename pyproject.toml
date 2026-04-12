@@ -1,7 +1,75 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name            = "splicecraft"
+version         = "0.2.0"
+description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
+readme          = "README.md"
+requires-python = ">=3.10"
+license         = { file = "LICENSE" }
+authors = [
+    { name = "Binomica Labs" },
+]
+keywords = [
+    "bioinformatics", "plasmid", "genbank", "molecular-biology",
+    "tui", "terminal", "primer3", "golden-braid", "cloning",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Terminals",
+]
+dependencies = [
+    "textual>=8.2.3",
+    "biopython>=1.87",
+    "primer3-py>=2.3.0",
+    "platformdirs>=4.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0",
+    "pytest-asyncio>=1.3",
+    "build",
+    "twine",
+]
+
+[project.urls]
+Homepage   = "https://github.com/Binomica-Labs/SpliceCraft"
+Repository = "https://github.com/Binomica-Labs/SpliceCraft"
+Issues     = "https://github.com/Binomica-Labs/SpliceCraft/issues"
+Changelog  = "https://github.com/Binomica-Labs/SpliceCraft/blob/master/CHANGELOG.md"
+
+[project.scripts]
+splicecraft = "splicecraft:main"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["splicecraft.py"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "splicecraft.py",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "screenshot.jpg",
+    "tests/**",
+    "pyproject.toml",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-# Suppress DeprecationWarnings from upstream libs during the test run.
 filterwarnings = [
     "ignore::DeprecationWarning:Bio.*",
     "ignore::PendingDeprecationWarning:Bio.*",

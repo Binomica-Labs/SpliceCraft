@@ -17,7 +17,7 @@
 ╚═══════════════════════════════════════════════════════════════════════════════╝
 ```
 
-![SpliceCraft screenshot](screenshot.jpg)
+![SpliceCraft screenshot](https://raw.githubusercontent.com/Binomica-Labs/SpliceCraft/master/screenshot.jpg)
 
 A terminal-based circular plasmid map viewer, sequence editor, **primer design
 workbench**, and **Golden Braid parts domesticator** — rendered entirely in your
@@ -86,10 +86,33 @@ and edit sequences — without ever leaving the terminal.
 
 Requires **Python 3.10+**.
 
-### Required dependencies
+### From PyPI (recommended)
 
 ```bash
-pip install textual biopython primer3-py
+pip install splicecraft
+splicecraft              # empty canvas
+splicecraft L09137       # fetch pUC19 from NCBI
+splicecraft myplasmid.gb # open a local GenBank file
+```
+
+All required dependencies (`textual`, `biopython`, `primer3-py`, `platformdirs`)
+are pulled in automatically. User data (library, parts bin, primers) lives in
+the platform-appropriate data directory:
+
+  | Platform | Path |
+  |---|---|
+  | Linux   | `~/.local/share/splicecraft/` |
+  | macOS   | `~/Library/Application Support/splicecraft/` |
+  | Windows | `%APPDATA%\splicecraft\` |
+
+Override with `SPLICECRAFT_DATA_DIR=/path/to/dir splicecraft`.
+
+### From source
+
+```bash
+git clone https://github.com/Binomica-Labs/SpliceCraft.git
+cd SpliceCraft
+pip install -e .
 ```
 
 ### Optional dependencies
@@ -106,27 +129,21 @@ plannotate setupdb          # one-time ~500 MB BLAST database download
 SpliceCraft runs fine without pLannotate — the annotation feature just
 notifies the user how to install it if pressed.
 
-### Clone the repository
-
-```bash
-git clone https://github.com/Binomica-Labs/SpliceCraft.git
-cd SpliceCraft
-```
-
 ---
 
 ## Usage
 
 ```bash
-# Open the TUI with an empty canvas
-python3 splicecraft.py
-
-# Fetch pUC19 from NCBI on launch
-python3 splicecraft.py L09137
-
-# Open a local GenBank file
-python3 splicecraft.py myplasmid.gb
+# After pip install:
+splicecraft              # empty canvas
+splicecraft L09137       # fetch pUC19 from NCBI on launch
+splicecraft myplasmid.gb # open a local GenBank file
+splicecraft --version    # print version
+splicecraft --help       # quick usage hint
 ```
+
+If running from a git clone (`pip install -e .`), the same commands work;
+you can also still run `python3 splicecraft.py` directly.
 
 ---
 
