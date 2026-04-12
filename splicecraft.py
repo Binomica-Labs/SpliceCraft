@@ -4514,6 +4514,9 @@ class PrimerDesignScreen(Screen):
                     yield Input(value="", id="pd-part-name",
                                 placeholder=self._default_part_name)
 
+            # ── Feature info (auto-updated when feature is selected) ─────
+            yield Static("", id="pd-feat-info", markup=True)
+
             # ── Detection primers ──────────────────────────────────────────
             yield Static(
                 " [bold]Detection Primers[/bold]  [dim](diagnostic PCR)[/dim]",
@@ -4609,15 +4612,52 @@ class PrimerDesignScreen(Screen):
             return
         parts = val.split("-", 1)
         try:
-            self.query_one("#pd-start", Input).value = str(int(parts[0]) + 1)
+            start = int(parts[0])
+            end   = int(parts[1])
+            self.query_one("#pd-start", Input).value = str(start + 1)
             self.query_one("#pd-end", Input).value = parts[1]
-            # Always set part name to the feature label when a feature is
-            # selected — the user expects primer names based on the FEATURE
-            # (e.g. "ampR-DET-F"), not the plasmid.
+            feat_len = end - start
+
+            # Always set part name to the feature label
+            feat_label = ""
             for f in self._feats:
                 if f"{f['start']}-{f['end']}" == val:
-                    self.query_one("#pd-part-name", Input).value = f.get("label", "")
+                    feat_label = f.get("label", "")
+                    self.query_one("#pd-part-name", Input).value = feat_label
                     break
+
+            # Show feature length info + auto-adjust detection product range
+            info = self.query_one("#pd-feat-info", Static)
+            min_primeable = 50   # 2 × 25 bp primers — absolute minimum
+
+            if feat_len < min_primeable:
+                info.update(
+                    f"  [bold]{feat_label}[/bold]  "
+                    f"[red]{feat_len} bp — too short to prime "
+                    f"(need ≥{min_primeable} bp for two ~25 bp primers)[/red]"
+                )
+            elif feat_len < 450:
+                # Feature is smaller than the default 450-550 range —
+                # auto-adjust to fit inside the feature.
+                rec_min = max(min_primeable, feat_len - 100)
+                rec_max = feat_len
+                self.query_one("#pd-det-min", Input).value = str(rec_min)
+                self.query_one("#pd-det-max", Input).value = str(rec_max)
+                info.update(
+                    f"  [bold]{feat_label}[/bold]  "
+                    f"[yellow]{feat_len} bp[/yellow]  "
+                    f"[dim]— adjusted detection range to "
+                    f"{rec_min}–{rec_max} bp to fit inside feature[/dim]"
+                )
+            else:
+                # Feature is large enough for the default range — reset to defaults
+                self.query_one("#pd-det-min", Input).value = "450"
+                self.query_one("#pd-det-max", Input).value = "550"
+                info.update(
+                    f"  [bold]{feat_label}[/bold]  "
+                    f"[green]{feat_len} bp[/green]  "
+                    f"[dim]— detection range 450–550 bp[/dim]"
+                )
         except ValueError:
             pass
 
@@ -5237,6 +5277,7 @@ DomesticatorModal { align: center middle; }
 #pd-start-col { width: 1fr; padding-right: 1; }
 #pd-end-col   { width: 1fr; padding-right: 1; }
 #pd-name-col  { width: 2fr; }
+#pd-feat-info { height: 1; }
 #pd-det-hdr   { height: 1; }
 #pd-det-row   { height: 3; align: left middle; }
 #pd-det-row Label { width: auto; padding: 0 1; content-align: center middle; }
