@@ -4486,11 +4486,11 @@ class PrimerDesignScreen(Screen):
     """
 
     BINDINGS = [
-        Binding("escape", "cancel",     "Close",       show=True),
-        Binding("m",      "noop",       "m mark",      show=True, key_display="m"),
-        Binding("M",      "noop",       "M mark all",  show=True, key_display="M"),
-        Binding("S",      "noop",       "S status",    show=True, key_display="S"),
-        Binding("tab",    "focus_next", "",             show=False),
+        Binding("escape",  "cancel",     "Close",         show=True),
+        Binding("m",       "noop",       "Mark (★)",      show=True, key_display="m"),
+        Binding("shift+m", "noop",       "Mark All",      show=True, key_display="M"),
+        Binding("shift+s", "noop",       "Change Status", show=True, key_display="S"),
+        Binding("tab",     "focus_next", "",               show=False),
     ]
 
     def action_noop(self) -> None:
@@ -4537,39 +4537,61 @@ class PrimerDesignScreen(Screen):
             ("Generic  (binding only)",           "generic"),
         ]
 
+        source_opts = [
+            ("Feature From Map",        "feature"),
+            ("Custom Sequence",         "custom"),
+        ]
+
         yield Header()
         with Vertical(id="pd-box"):
             yield Static(" Primer Design  —  Primer3 ", id="pd-title")
 
-            # ── Primer type (top of screen) ────────────────────────────────
+            # ── Source selector + primer type + design button ──────────────
             with Horizontal(id="pd-mode-row"):
+                with Vertical(id="pd-source-col"):
+                    yield Label("Source")
+                    yield Select(source_opts, id="pd-source",
+                                 value="feature", allow_blank=False)
                 with Vertical(id="pd-mode-col"):
                     yield Label("Primer type")
-                    yield Select(mode_opts, id="pd-mode", value="detection")
+                    yield Select(mode_opts, id="pd-mode", value="detection",
+                                 allow_blank=False)
                 yield Button("Design", id="btn-pd-design", variant="primary")
 
-            # ── Source row ─────────────────────────────────────────────────
-            with Horizontal(id="pd-source-row"):
-                with Vertical(id="pd-feat-col"):
-                    yield Label("Feature")
-                    yield Select(feat_opts, id="pd-feat",
-                                 prompt="(select or enter manually)")
-                with Vertical(id="pd-start-col"):
-                    yield Label("Start")
-                    yield Input(placeholder="1", id="pd-start", type="integer")
-                with Vertical(id="pd-end-col"):
-                    yield Label("End")
-                    yield Input(
-                        placeholder=str(len(self._template)) if self._template else "",
-                        id="pd-end", type="integer")
-                with Vertical(id="pd-name-col"):
-                    yield Label("Part name")
-                    yield Input(value="", id="pd-part-name",
-                                placeholder=self._default_part_name)
+            # ── Source: Feature From Map (default) ─────────────────────────
+            with Vertical(id="pd-src-feature", classes="pd-source-panel"):
+                with Horizontal(id="pd-plasmid-row"):
+                    yield Label("Plasmid: ")
+                    yield Static(
+                        self._plasmid_name or "(no plasmid loaded)",
+                        id="pd-plasmid-name",
+                    )
+                    yield Button("Change…", id="btn-pd-pickplasmid",
+                                 variant="default")
+                with Horizontal(id="pd-source-row"):
+                    with Vertical(id="pd-feat-col"):
+                        yield Label("Feature")
+                        yield Select(feat_opts, id="pd-feat",
+                                     prompt="(select or enter manually)")
+                    with Vertical(id="pd-start-col"):
+                        yield Label("Start")
+                        yield Input(placeholder="1", id="pd-start",
+                                    type="integer")
+                    with Vertical(id="pd-end-col"):
+                        yield Label("End")
+                        yield Input(
+                            placeholder=str(len(self._template)) if self._template else "",
+                            id="pd-end", type="integer")
+                    with Vertical(id="pd-name-col"):
+                        yield Label("Part name")
+                        yield Input(value="", id="pd-part-name",
+                                    placeholder=self._default_part_name)
 
-            # ── Custom sequence (multi-line, scrollable, selection = target) ─
-            yield Label("Custom sequence (highlight region to target, or use entire):")
-            yield TextArea("", id="pd-custom-seq")
+            # ── Source: Custom Sequence ────────────────────────────────────
+            with Vertical(id="pd-src-custom", classes="pd-source-panel"):
+                yield Label("Custom sequence (highlight region to target, "
+                            "or use entire):")
+                yield TextArea("", id="pd-custom-seq")
 
             # ── Feature info ───────────────────────────────────────────────
             yield Static("", id="pd-feat-info", markup=True)
@@ -4654,12 +4676,103 @@ class PrimerDesignScreen(Screen):
         "generic":     "#pd-panel-gen",
     }
 
+    _SOURCE_PANELS = {
+        "feature":  "#pd-src-feature",
+        "custom":   "#pd-src-custom",
+    }
+
+    def _switch_source(self, src: str) -> None:
+        for s, sel in self._SOURCE_PANELS.items():
+            try:
+                self.query_one(sel).display = (s == src)
+            except Exception:
+                pass
+
+    @on(Select.Changed, "#pd-source")
+    def _source_changed(self, event: Select.Changed) -> None:
+        val = event.value
+        if isinstance(val, str) and val in self._SOURCE_PANELS:
+            self._switch_source(val)
+
+    @on(Button.Pressed, "#btn-pd-pickplasmid")
+    def _pick_plasmid(self, _) -> None:
+        """Open the plasmid picker modal; on selection, swap the template
+        and feature list to the chosen plasmid."""
+        current_id = None
+        rec = getattr(self.app, "_current_record", None)
+        if rec is not None:
+            current_id = rec.id
+
+        def _on_result(entry_id):
+            if entry_id is None:
+                return
+            for entry in _load_library():
+                if entry.get("id") == entry_id:
+                    gb = entry.get("gb_text", "")
+                    if not gb:
+                        self.app.notify("Library entry has no sequence.",
+                                        severity="warning")
+                        return
+                    try:
+                        new_rec = _gb_text_to_record(gb)
+                    except Exception as exc:
+                        self.app.notify(f"Failed to load: {exc}",
+                                        severity="error")
+                        return
+                    self._template = str(new_rec.seq).upper()
+                    self._plasmid_name = new_rec.name
+                    self._feats = self._parse_features_from_record(new_rec)
+                    self.query_one("#pd-plasmid-name", Static).update(
+                        new_rec.name)
+                    self._update_feature_dropdown()
+                    self.app.notify(f"Loaded {new_rec.name} as primer template.")
+                    return
+            self.app.notify("Entry not found.", severity="warning")
+
+        self.app.push_screen(PlasmidPickerModal(current_id),
+                             callback=_on_result)
+
+    def _parse_features_from_record(self, record) -> list[dict]:
+        """Minimal feature parse from a SeqRecord — matches the keys used
+        by the compose-time feat_opts list."""
+        feats = []
+        for feat in record.features:
+            if feat.type == "source":
+                continue
+            s = int(feat.location.start)
+            e = int(feat.location.end)
+            strand = getattr(feat.location, "strand", 1) or 1
+            feats.append({
+                "type":   feat.type,
+                "start":  s,
+                "end":    e,
+                "strand": strand,
+                "label":  _feat_label(feat),
+                "color":  "white",
+            })
+        return feats
+
+    def _update_feature_dropdown(self) -> None:
+        """Rebuild the feature dropdown options from self._feats."""
+        sel = self.query_one("#pd-feat", Select)
+        feat_opts: list[tuple[str, str]] = []
+        for f in self._feats:
+            if f.get("type") in ("resite", "recut"):
+                continue
+            label = f.get("label", f.get("type", "?"))
+            feat_opts.append(
+                (f"{label}  ({f['start']+1}‥{f['end']})",
+                 f"{f['start']}-{f['end']}")
+            )
+        sel.set_options(feat_opts)
+
     def on_mount(self) -> None:
         t = self.query_one("#pd-lib-table", DataTable)
         t.add_columns("Name", "Sequence", "Len", "Tm", "Type", "Source", "Date", "Status")
         self._refresh_library_table()
         # Show only the detection panel on startup
         self._switch_mode("detection")
+        self._switch_source("feature")
 
     _STATUS_COLORS = {
         "Designed":  "cyan",
@@ -4821,7 +4934,7 @@ class PrimerDesignScreen(Screen):
                     self._lib_selected.add(row)
                 self._refresh_library_table()
             event.stop()
-        elif event.key == "M":
+        elif event.key in ("M", "shift+m"):
             # Shift+M = mark all / unmark all (ctrl+m doesn't work in
             # terminals — Ctrl+M sends CR which is indistinguishable
             # from Enter)
@@ -4831,7 +4944,7 @@ class PrimerDesignScreen(Screen):
                 self._lib_selected = set(range(len(primers)))
             self._refresh_library_table()
             event.stop()
-        elif event.key == "S":
+        elif event.key in ("S", "shift+s"):
             # Shift+S = cycle status: Designed → Ordered → Validated → Designed
             row = t.cursor_row
             if 0 <= row < len(primers):
@@ -5293,6 +5406,74 @@ class UnsavedQuitModal(ModalScreen):
     def action_cancel(self): self.dismiss(None)
 
 
+class PlasmidPickerModal(ModalScreen):
+    """Scrollable plasmid-picker modal. Shows all entries from the library.
+    Dismisses with the selected entry's id, or None on cancel.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",     "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, current_id: "str | None" = None):
+        super().__init__()
+        self._current_id = current_id
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pick-dlg"):
+            yield Static(" Select plasmid from library ", id="pick-title")
+            yield DataTable(id="pick-table", cursor_type="row",
+                            zebra_stripes=True)
+            with Horizontal(id="pick-btns"):
+                yield Button("Select",  id="btn-pick-ok",     variant="primary")
+                yield Button("Cancel",  id="btn-pick-cancel")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#pick-table", DataTable)
+        t.add_columns("Name", "ID", "Size", "Features")
+        cursor = 0
+        entries = _load_library()
+        for i, e in enumerate(entries):
+            t.add_row(
+                Text(e.get("name", "?"), style="bold"),
+                e.get("id", "?"),
+                f"{e.get('size', 0):,} bp",
+                f"{e.get('n_feats', 0)}",
+                key=e.get("id"),
+            )
+            if self._current_id and e.get("id") == self._current_id:
+                cursor = i
+        if entries:
+            t.move_cursor(row=cursor)
+            t.focus()
+
+    @on(Button.Pressed, "#btn-pick-ok")
+    def _select(self, _):
+        t = self.query_one("#pick-table", DataTable)
+        if t.row_count == 0:
+            self.dismiss(None)
+            return
+        row_keys = list(t.rows.keys())
+        if 0 <= t.cursor_row < len(row_keys):
+            self.dismiss(row_keys[t.cursor_row].value)
+        else:
+            self.dismiss(None)
+
+    @on(DataTable.RowSelected, "#pick-table")
+    def _row_selected(self, event):
+        # Enter-key selection = same as clicking Select
+        if event.row_key and event.row_key.value:
+            self.dismiss(event.row_key.value)
+
+    @on(Button.Pressed, "#btn-pick-cancel")
+    def _cancel_btn(self, _):
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class RenamePlasmidModal(ModalScreen):
     """Prompt for a new name for a library entry.
 
@@ -5502,6 +5683,17 @@ LibraryDeleteConfirmModal { align: center middle; }
 #libdel-btns  { height: 3; margin-top: 1; }
 #libdel-btns Button { margin-right: 1; min-width: 14; }
 
+/* ── Plasmid picker modal ────────────────────────────────── */
+PlasmidPickerModal { align: center middle; }
+#pick-dlg {
+    width: 80; height: 26;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#pick-title  { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#pick-table  { height: 1fr; }
+#pick-btns   { height: 3; margin-top: 1; }
+#pick-btns Button { margin-right: 1; min-width: 14; }
+
 /* ── Rename plasmid dialog ───────────────────────────────── */
 RenamePlasmidModal { align: center middle; }
 #rename-dlg {
@@ -5588,8 +5780,14 @@ DomesticatorModal { align: center middle; }
 #pd-end-col   { width: 1fr; padding-right: 1; }
 #pd-name-col  { width: 2fr; }
 #pd-mode-row  { height: 4; }
+#pd-source-col { width: 1fr; max-width: 30; padding-right: 1; }
 #pd-mode-col  { width: 1fr; max-width: 40; padding-right: 1; }
 #pd-mode-row Button { margin-top: 1; min-width: 16; }
+.pd-source-panel { height: auto; }
+#pd-plasmid-row  { height: 3; align: left middle; }
+#pd-plasmid-row Label { width: auto; padding: 0 1; content-align: center middle; }
+#pd-plasmid-name { width: 1fr; content-align: left middle; color: $accent; }
+#pd-plasmid-row Button { min-width: 12; }
 #pd-custom-seq { height: 4; min-height: 4; }
 #pd-feat-info { height: 1; }
 .pd-mode-panel { height: 3; align: left middle; }
