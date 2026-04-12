@@ -4516,11 +4516,6 @@ class PrimerDesignScreen(Screen):
         self._clo_result:  "dict | None" = None
         self._lib_selected: set[int] = set()   # multi-selected library rows
 
-    BINDINGS = [
-        Binding("escape", "cancel", "Close"),
-        Binding("tab",    "focus_next", "Next", show=False),
-    ]
-
     def compose(self) -> ComposeResult:
         # Feature dropdown options
         feat_opts: list[tuple[str, str]] = []
@@ -5647,7 +5642,7 @@ DomesticatorModal { align: center middle; }
     # Everything else is suppressed to prevent confusing cross-screen
     # side-effects (e.g. pressing 'f' in the Primer Design screen should
     # not open a GenBank fetch modal underneath it).
-    _ALWAYS_ALLOWED_ACTIONS: set[str] = {"quit"}
+    _ALWAYS_ALLOWED_ACTIONS: set[str] = set()  # no app-level actions leak into pushed screens
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         """Textual calls this before executing any App-level binding action.
