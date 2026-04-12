@@ -4673,18 +4673,7 @@ class PrimerDesignScreen(Screen):
             yield Static(" Primer Library ", id="pd-lib-hdr")
             yield DataTable(id="pd-lib-table", cursor_type="row",
                             zebra_stripes=True)
-        # Footer replacement: Textual 8.2 has a ReactiveError bug when
-        # Footer is used inside a pushed Screen ("Unable to bind data;
-        # Footer is not defined on PlasmidApp"). The bug causes the
-        # Footer widget to render as an empty strip with no key hints.
-        # We render our own hint bar styled identically to a Footer so
-        # the user sees the keybindings regardless of the Textual bug.
-        yield Static(
-            " [b]esc[/b] Close   [b]m[/b] Mark (★)   "
-            "[b]M[/b] Mark All   [b]S[/b] Change Status",
-            id="pd-footer-shim",
-            markup=True,
-        )
+        yield Footer()
 
     _MODE_PANELS = {
         "detection":   "#pd-panel-det",
@@ -5810,13 +5799,6 @@ DomesticatorModal { align: center middle; }
 }
 #pd-plasmid-row Button { min-width: 18; margin-left: 2; }
 #pd-custom-seq { height: 10; min-height: 10; }
-#pd-footer-shim {
-    dock: bottom;
-    height: 1;
-    background: $footer-background;
-    color: $footer-foreground;
-    padding: 0 1;
-}
 #pd-custom-seq { height: 4; min-height: 4; }
 #pd-feat-info { height: 1; }
 .pd-mode-panel { height: 3; align: left middle; }
