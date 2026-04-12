@@ -4485,7 +4485,17 @@ class PrimerDesignScreen(Screen):
     primer_bind features to the currently-loaded plasmid.
     """
 
-    BINDINGS = [Binding("escape", "cancel", "Close")]
+    BINDINGS = [
+        Binding("escape", "cancel",     "Close",      show=True),
+        Binding("m",      "noop",       "m mark",     show=True, key_display="m"),
+        Binding("M",      "noop",       "M mark all", show=True, key_display="M"),
+        Binding("tab",    "focus_next", "",            show=False),
+    ]
+
+    def action_noop(self) -> None:
+        """Placeholder — m/M are handled in on_key, but declared in
+        BINDINGS so they appear in the Footer."""
+        pass
 
     def __init__(self, template_seq: str, feats: list[dict],
                  plasmid_name: str = ""):
@@ -4610,6 +4620,8 @@ class PrimerDesignScreen(Screen):
                 yield Label("Tm")
                 yield Input(value="60", id="pd-gen-tm", type="integer")
                 yield Label("°C")
+                yield Label("  Source ID")
+                yield Input(placeholder="e.g. synthetic frag", id="pd-gen-source")
 
             # ── Primer names ───────────────────────────────────────────────
             with Horizontal(id="pd-result-names"):
@@ -4634,12 +4646,7 @@ class PrimerDesignScreen(Screen):
                 yield Button("Close", id="btn-pd-close")
 
             # ── Primer library ─────────────────────────────────────────────
-            yield Static(
-                " Primer Library   [dim]m[/dim] mark  "
-                "[dim]ctrl+m[/dim] mark all  "
-                "[dim]★[/dim] = marked",
-                id="pd-lib-hdr", markup=True,
-            )
+            yield Static(" Primer Library ", id="pd-lib-hdr")
             yield DataTable(id="pd-lib-table", cursor_type="row",
                             zebra_stripes=True)
         yield Footer()
@@ -4653,29 +4660,38 @@ class PrimerDesignScreen(Screen):
 
     def on_mount(self) -> None:
         t = self.query_one("#pd-lib-table", DataTable)
-        t.add_columns("Name", "Sequence", "Len", "Tm", "Type", "Source")
+        t.add_columns("Name", "Sequence", "Len", "Tm", "Type", "Source", "Date", "Status")
         self._refresh_library_table()
         # Show only the detection panel on startup
         self._switch_mode("detection")
+
+    _STATUS_COLORS = {
+        "Designed":  "cyan",
+        "Ordered":   "yellow",
+        "Validated": "green",
+    }
 
     def _refresh_library_table(self) -> None:
         t = self.query_one("#pd-lib-table", DataTable)
         saved_cursor = t.cursor_row if t.row_count > 0 else 0
         t.clear()
         primers = _load_primers()
-        # Clamp selections to valid range (data may have changed)
         self._lib_selected &= set(range(len(primers)))
         for i, p in enumerate(primers):
-            seq = p.get("sequence", "")
+            seq    = p.get("sequence", "")
             marked = i in self._lib_selected
             mark   = "★ " if marked else "  "
+            status = p.get("status", "Designed")
+            s_color = self._STATUS_COLORS.get(status, "white")
             t.add_row(
                 Text(mark + p.get("name", "?"), style="bold"),
-                Text(seq[:36], style="dim color(252)"),
+                Text(seq[:30], style="dim color(252)"),
                 f"{len(seq)} nt",
                 f"{p.get('tm', 0):.1f}°C",
                 p.get("primer_type", "?"),
                 p.get("source", ""),
+                p.get("date", ""),
+                Text(status, style=s_color),
             )
         if primers and 0 <= saved_cursor < len(primers):
             t.move_cursor(row=saved_cursor)
@@ -4807,7 +4823,10 @@ class PrimerDesignScreen(Screen):
                     self._lib_selected.add(row)
                 self._refresh_library_table()
             event.stop()
-        elif event.key in ("ctrl+m", "ctrl+M"):
+        elif event.key == "M":
+            # Shift+M = mark all / unmark all (ctrl+m doesn't work in
+            # terminals — Ctrl+M sends CR which is indistinguishable
+            # from Enter)
             if len(self._lib_selected) == len(primers) and len(primers) > 0:
                 self._lib_selected.clear()
             else:
@@ -5032,28 +5051,54 @@ class PrimerDesignScreen(Screen):
     # ── Save to primer library ─────────────────────────────────────────────
 
     @on(Button.Pressed, "#btn-pd-save")
-    def _save_primers(self, _) -> None:
+    def _save_primers_btn(self, _) -> None:
         result = self._det_result or self._clo_result
         if result is None:
+            self.app.notify("Design primers first.", severity="warning")
             return
         fwd_name = self.query_one("#pd-fwd-name", Input).value.strip()
         rev_name = self.query_one("#pd-rev-name", Input).value.strip()
         if not fwd_name or not rev_name:
             self.app.notify("Enter primer names before saving.", severity="error")
             return
+
         ptype = result.get("_type", "?")
-        fwd_key = "fwd_seq" if ptype == "detection" else "fwd_full"
-        rev_key = "rev_seq" if ptype == "detection" else "rev_full"
+        fwd_key = "fwd_seq" if ptype in ("detection", "generic") else "fwd_full"
+        rev_key = "rev_seq" if ptype in ("detection", "generic") else "rev_full"
 
-        # Source = the feature/part name the primers were designed for (not
-        # the plasmid name). This matches the primer naming convention:
-        # "ampR-DET-F" → source is "ampR", not "pUC19".
-        part_name = self.query_one("#pd-part-name", Input).value.strip() or "primer"
+        # Source = plasmid name (not feature name). For generic mode,
+        # use the source-ID input if filled.
+        if ptype == "generic":
+            source = self.query_one("#pd-gen-source", Input).value.strip()
+            if not source:
+                source = self._plasmid_name or "custom"
+        else:
+            source = self._plasmid_name or "custom"
 
+        # Check for duplicate SEQUENCES (not names) already in the library
         entries = _load_primers()
+        fwd_seq = result[fwd_key]
+        rev_seq = result[rev_key]
+        existing_seqs = {e.get("sequence", "").upper() for e in entries}
+        dupes = []
+        if fwd_seq.upper() in existing_seqs:
+            dupes.append(fwd_name)
+        if rev_seq.upper() in existing_seqs:
+            dupes.append(rev_name)
+        if dupes:
+            self.app.notify(
+                f"Duplicate sequence already in library: {', '.join(dupes)}. "
+                f"Primer not saved — rename or modify the design.",
+                severity="warning", timeout=8,
+            )
+            return
+
+        import datetime
+        today = datetime.date.today().isoformat()
+
         for pname, seq, tm, pos in [
-            (fwd_name, result[fwd_key], result["fwd_tm"], result["fwd_pos"]),
-            (rev_name, result[rev_key], result["rev_tm"], result["rev_pos"]),
+            (fwd_name, fwd_seq, result["fwd_tm"], result["fwd_pos"]),
+            (rev_name, rev_seq, result["rev_tm"], result["rev_pos"]),
         ]:
             entries = [e for e in entries if e.get("name") != pname]
             entries.insert(0, {
@@ -5061,10 +5106,12 @@ class PrimerDesignScreen(Screen):
                 "sequence":    seq,
                 "tm":          tm,
                 "primer_type": ptype,
-                "source":      part_name,
+                "source":      source,
                 "pos_start":   pos[0],
                 "pos_end":     pos[1],
                 "strand":      1 if pname.endswith("-F") else -1,
+                "date":        today,
+                "status":      "Designed",
             })
         _save_primers(entries)
         self._refresh_library_table()
@@ -5526,6 +5573,7 @@ DomesticatorModal { align: center middle; }
 .pd-mode-panel { height: 3; align: left middle; }
 .pd-mode-panel Label { width: auto; padding: 0 0 0 1; content-align: center middle; }
 .pd-mode-panel Input { width: 8; margin: 0 0; }
+#pd-gen-source { width: 24; }
 #pd-panel-clo { height: 6; }
 #pd-clo-5col  { width: 1fr; max-width: 32; padding-right: 1; }
 #pd-clo-3col  { width: 1fr; max-width: 32; padding-right: 1; }
