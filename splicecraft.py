@@ -4560,8 +4560,8 @@ class PrimerDesignScreen(Screen):
 
             # ── Source: Feature From Map (default) ─────────────────────────
             with Vertical(id="pd-src-feature", classes="pd-source-panel"):
+                yield Label("Plasmid")
                 with Horizontal(id="pd-plasmid-row"):
-                    yield Label("Plasmid: ")
                     yield Static(
                         self._plasmid_name or "(no plasmid loaded)",
                         id="pd-plasmid-name",
@@ -4667,6 +4667,15 @@ class PrimerDesignScreen(Screen):
             yield Static(" Primer Library ", id="pd-lib-hdr")
             yield DataTable(id="pd-lib-table", cursor_type="row",
                             zebra_stripes=True)
+            # ── Custom hint bar (reliable — Footer truncates bindings) ────
+            yield Static(
+                "  [bold]esc[/bold] Close   "
+                "[bold]m[/bold] Mark (★)   "
+                "[bold]M[/bold] Mark All   "
+                "[bold]S[/bold] Change Status",
+                id="pd-hint-bar",
+                markup=True,
+            )
         yield Footer()
 
     _MODE_PANELS = {
@@ -5785,9 +5794,20 @@ DomesticatorModal { align: center middle; }
 #pd-mode-row Button { margin-top: 1; min-width: 16; }
 .pd-source-panel { height: auto; }
 #pd-plasmid-row  { height: 3; align: left middle; }
-#pd-plasmid-row Label { width: auto; padding: 0 1; content-align: center middle; }
-#pd-plasmid-name { width: 1fr; content-align: left middle; color: $accent; }
-#pd-plasmid-row Button { min-width: 12; }
+#pd-plasmid-name {
+    width: auto; max-width: 40;
+    padding: 0 1;
+    content-align: left middle;
+    color: $accent;
+}
+#pd-plasmid-row Button { min-width: 12; margin-left: 1; }
+#pd-custom-seq { height: 10; min-height: 10; }
+#pd-hint-bar {
+    height: 1;
+    background: $primary-darken-2;
+    color: $text;
+    padding: 0 1;
+}
 #pd-custom-seq { height: 4; min-height: 4; }
 #pd-feat-info { height: 1; }
 .pd-mode-panel { height: 3; align: left middle; }
