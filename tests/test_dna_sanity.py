@@ -447,3 +447,31 @@ class TestTranslateCds:
         seq = "ATG" + "ANA" + "TAG"
         aa = sc._translate_cds(seq, 0, 9, strand=1)
         assert "?" in aa
+
+    def test_reverse_strand_uses_full_iupac_rc(self):
+        """Regression for the 2026-04-12 fix: _translate_cds used a bare
+        ACGT→TGCA maketrans for reverse-strand RC, which left IUPAC codes
+        (R, Y, W, S, M, K, B, D, H, V) unchanged instead of complementing
+        them. For example, R (A/G) should complement to Y (C/T), but the
+        old code left it as R — producing the wrong codon on the reverse
+        strand and a silent mistranslation.
+
+        This test builds a CDS with R (purine = A or G) and verifies that
+        the reverse-strand translation matches the forward-strand translation.
+        With the old buggy code, the RC'd codon would be ARG→AYG, which
+        maps to a different (or unknown) amino acid."""
+        # Forward CDS: ATG ARG TAG → has R at position 4
+        fwd_cds = "ATGARGTAG"
+        from Bio.Seq import Seq
+        rc_cds = str(Seq(fwd_cds).reverse_complement())
+        # Build a genome with the RC version on the forward strand
+        full = "AA" + rc_cds + "AA"
+        # Forward translation for reference
+        fwd_aa = sc._translate_cds(fwd_cds, 0, 9, strand=1)
+        # Reverse-strand translation should produce the SAME protein
+        rev_aa = sc._translate_cds(full, 2, 11, strand=-1)
+        assert rev_aa == fwd_aa, (
+            f"reverse-strand translation should match forward: "
+            f"fwd={fwd_aa!r} rev={rev_aa!r} "
+            f"(old bug: R not complemented to Y in RC step)"
+        )

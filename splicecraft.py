@@ -1047,10 +1047,16 @@ def _copy_to_clipboard_osc52(text: str) -> bool:
 
 
 def _translate_cds(full_seq: str, start: int, end: int, strand: int) -> str:
-    """Translate a CDS region to single-letter AA string (stop codon → *)."""
+    """Translate a CDS region to single-letter AA string (stop codon → *).
+
+    Uses _IUPAC_COMP for the reverse-complement step so IUPAC ambiguity codes
+    (N, R, Y, etc.) are handled correctly. An earlier version used a bare
+    ACGT-only maketrans which would silently pass degenerate bases through
+    unchanged — producing wrong codons and silent mistranslation.
+    """
     sub = full_seq[start:end].upper()
     if strand == -1:
-        sub = sub.translate(str.maketrans("ACGT", "TGCA"))[::-1]
+        sub = sub.translate(_IUPAC_COMP)[::-1]
     aa = [_CODON_TABLE.get(sub[i:i+3], "?") for i in range(0, len(sub) - 2, 3)]
     result = "".join(aa)
     if result and not result.endswith("*"):
@@ -1549,6 +1555,20 @@ class PlasmidMap(Widget):
             start  = int(feat.location.start)
             end    = int(feat.location.end)
             strand = getattr(feat.location, "strand", 1) or 1
+            # Compound / joined locations (e.g. join(100..200,300..400)) are
+            # flattened to their outer bounds. Plasmid features are virtually
+            # never compound (no introns), but if an imported GenBank file has
+            # one, we render the full span rather than silently dropping it.
+            # The log records which features were flattened for debugging.
+            try:
+                from Bio.SeqFeature import CompoundLocation
+                if isinstance(feat.location, CompoundLocation):
+                    _log.info(
+                        "Flattened compound feature %s (%d..%d) to outer bounds",
+                        _feat_label(feat), start, end,
+                    )
+            except ImportError:
+                pass
             idx    = len(feats)
             feats.append({
                 "type":   feat.type,
