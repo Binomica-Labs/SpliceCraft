@@ -3072,13 +3072,18 @@ class OpenFileModal(ModalScreen):
 # ── Dropdown menu modal ────────────────────────────────────────────────────────
 
 class DropdownScreen(ModalScreen):
-    """Transparent overlay showing a positioned dropdown menu."""
+    """Lightweight overlay showing a positioned dropdown menu.
+
+    Uses a near-transparent backdrop so the main app stays visible — the
+    dropdown looks like a real popup anchored to the menu bar, not a
+    separate "screen". Click outside the box dismisses.
+    """
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
     DEFAULT_CSS = """
     DropdownScreen {
-        background: transparent;
+        background: rgba(0, 0, 0, 0.15);
     }
     """
 
@@ -3104,8 +3109,8 @@ class DropdownScreen(ModalScreen):
         box.styles.offset = (self._x, self._y)
         box.styles.width  = inner_w
         box.styles.height = box_h
-        box.styles.border = ("solid", "white")
-        box.styles.background = "black"
+        box.styles.border = ("solid", "#555555")
+        box.styles.background = "#1e1e1e"
 
     def _render_content(self) -> Text:
         inner_w = max((len(lbl) for lbl, _ in self._items), default=10) + 4
@@ -5276,7 +5281,23 @@ DomesticatorModal { align: center middle; }
         sp.update_seq(sp._seq, pm._feats + displayed)
 
     def open_menu(self, name: str, x: int, y: int) -> None:
-        """Build menu item list for name and push DropdownScreen."""
+        """Open a menu. Single-action menus skip the dropdown and fire their
+        action directly; multi-action menus show the dropdown list."""
+
+        # ── Direct-action menus (no dropdown) ──────────────────────────────
+        # These open their target screen / notification instantly, avoiding
+        # the jarring dark-overlay intermediate.
+        if name == "Parts":
+            self.action_open_parts_bin()
+            return
+        if name == "Constructor":
+            self.action_open_constructor()
+            return
+        if name == "Primers":
+            self.notify("Design Primer: coming soon", severity="information")
+            return
+
+        # ── Multi-action menus (dropdown) ──────────────────────────────────
         ck = "\u2713"  # checkmark
         nc = " "
         u  = ck if self._restr_unique_only else nc
@@ -5319,17 +5340,10 @@ DomesticatorModal { align: center middle; }
                 ("---",                         None),
                 ("Toggle connectors",           "toggle_connectors"),
             ],
-            "Primers": [
-                ("Design Primer... (coming soon)", None),
-            ],
-            "Parts": [
-                ("Parts Bin",  "open_parts_bin"),
-            ],
-            "Constructor": [
-                ("Assembly Constructor", "open_constructor"),
-            ],
         }
         items = menus.get(name, [])
+        if not items:
+            return
         self.push_screen(
             DropdownScreen(items, x, y),
             callback=self._menu_action,
