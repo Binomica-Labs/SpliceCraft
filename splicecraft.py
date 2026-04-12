@@ -3412,7 +3412,7 @@ _GB_SPACER    = "A"           # 1 nt between recognition and the overhang
 _GB_PAD       = "GCGC"        # 4 nt of extra bases for efficient end-cutting
 
 
-def _pick_binding_region(seq: str, target_tm: float = 57.0,
+def _pick_binding_region(seq: str, target_tm: float = 60.0,
                          min_len: int = 18, max_len: int = 25) -> tuple[str, float]:
     """Return the prefix of `seq` (length min_len..max_len) whose Tm is
     closest to `target_tm`. Uses primer3-py's SantaLucia Tm calculation.
@@ -3446,7 +3446,7 @@ def _design_gb_primers(
     start: int,
     end: int,
     part_type: str,
-    target_tm: float = 57.0,
+    target_tm: float = 60.0,
 ) -> dict:
     """Design Golden Braid L0 domestication primers for a template region.
 
@@ -3616,9 +3616,11 @@ def _design_detection_primers(
                 "PRIMER_TASK": "generic",
                 "PRIMER_PICK_LEFT_PRIMER": 1,
                 "PRIMER_PICK_RIGHT_PRIMER": 1,
+                # primer_len is the OPTIMAL length — Primer3 will expand
+                # or contract within the min/max range to find the best Tm.
                 "PRIMER_OPT_SIZE": primer_len,
-                "PRIMER_MIN_SIZE": max(15, primer_len - 5),
-                "PRIMER_MAX_SIZE": min(36, primer_len + 5),
+                "PRIMER_MIN_SIZE": max(15, primer_len - 8),
+                "PRIMER_MAX_SIZE": min(36, primer_len + 8),
                 "PRIMER_OPT_TM": target_tm,
                 "PRIMER_MIN_TM": target_tm - 3,
                 "PRIMER_MAX_TM": target_tm + 3,
@@ -3654,7 +3656,7 @@ def _design_cloning_primers(
     end: int,
     re_5prime: str,
     re_3prime: str,
-    target_tm: float = 57.0,
+    target_tm: float = 60.0,
     padding: str = "GCGC",
 ) -> dict:
     """Design cloning primers with restriction-enzyme tails + GCGC padding.
@@ -4497,7 +4499,7 @@ class PrimerDesignScreen(Screen):
                     yield Select(re_opts, id="pd-re3", value="BamHI")
                 with Vertical(id="pd-clo-tmcol"):
                     yield Label("Binding Tm")
-                    yield Input(value="57", id="pd-clo-tm", type="integer")
+                    yield Input(value="60", id="pd-clo-tm", type="integer")
                 yield Button("Design Cloning", id="btn-clo-design",
                              variant="primary")
 
@@ -4530,16 +4532,18 @@ class PrimerDesignScreen(Screen):
 
     def on_mount(self) -> None:
         t = self.query_one("#pd-lib-table", DataTable)
-        t.add_columns("Name", "Sequence", "Tm", "Type", "Source")
+        t.add_columns("Name", "Sequence", "Len", "Tm", "Type", "Source")
         self._refresh_library_table()
 
     def _refresh_library_table(self) -> None:
         t = self.query_one("#pd-lib-table", DataTable)
         t.clear()
         for p in _load_primers():
+            seq = p.get("sequence", "")
             t.add_row(
                 Text(p.get("name", "?"), style="bold"),
-                Text(p.get("sequence", "")[:40], style="dim color(252)"),
+                Text(seq[:36], style="dim color(252)"),
+                f"{len(seq)} nt",
                 f"{p.get('tm', 0):.1f}°C",
                 p.get("primer_type", "?"),
                 p.get("source", ""),
@@ -4693,19 +4697,23 @@ class PrimerDesignScreen(Screen):
         fwd_key = "fwd_seq" if ptype == "detection" else "fwd_full"
         rev_key = "rev_seq" if ptype == "detection" else "rev_full"
 
+        # Source = the feature/part name the primers were designed for (not
+        # the plasmid name). This matches the primer naming convention:
+        # "ampR-DET-F" → source is "ampR", not "pUC19".
+        part_name = self.query_one("#pd-part-name", Input).value.strip() or "primer"
+
         entries = _load_primers()
         for pname, seq, tm, pos in [
             (fwd_name, result[fwd_key], result["fwd_tm"], result["fwd_pos"]),
             (rev_name, result[rev_key], result["rev_tm"], result["rev_pos"]),
         ]:
-            # Remove any existing primer with the same name (update in place)
             entries = [e for e in entries if e.get("name") != pname]
             entries.insert(0, {
                 "name":        pname,
                 "sequence":    seq,
                 "tm":          tm,
                 "primer_type": ptype,
-                "source":      self._plasmid_name,
+                "source":      part_name,
                 "pos_start":   pos[0],
                 "pos_end":     pos[1],
                 "strand":      1 if pname.endswith("-F") else -1,
