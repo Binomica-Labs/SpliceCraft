@@ -5203,37 +5203,38 @@ DomesticatorModal { align: center middle; }
 /* ── Primer design screen (full-screen) ─────────────────── */
 #pd-box {
     width: 100%; height: 1fr;
-    background: $surface; padding: 0 2;
+    background: $surface; padding: 0 1;
+    overflow-y: auto;
 }
-#pd-title     { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
-#pd-source-row { height: 5; }
+#pd-title     { background: $primary-darken-2; color: $text; padding: 0 1; }
+#pd-source-row { height: 4; }
 #pd-feat-col  { width: 2fr; padding-right: 1; }
 #pd-start-col { width: 1fr; padding-right: 1; }
 #pd-end-col   { width: 1fr; padding-right: 1; }
 #pd-name-col  { width: 2fr; }
-#pd-det-hdr   { height: 1; margin-top: 1; }
+#pd-det-hdr   { height: 1; }
 #pd-det-row   { height: 3; align: left middle; }
 #pd-det-row Label { width: auto; padding: 0 1; content-align: center middle; }
 #pd-det-row Input { width: 10; }
 #pd-det-row Button { margin-left: 2; min-width: 20; }
 #pd-clo-hdr   { height: 1; margin-top: 1; }
-#pd-clo-row   { height: auto; }
+#pd-clo-row   { height: 7; }
 #pd-clo-5col  { width: 1fr; max-width: 36; padding-right: 1; }
 #pd-clo-3col  { width: 1fr; max-width: 36; padding-right: 1; }
 #pd-cust5, #pd-cust3 { width: 100%; margin-top: 0; }
 #pd-clo-tmcol { width: auto; padding-right: 1; }
 #pd-clo-row Button { margin-top: 1; min-width: 20; }
 #pd-results   {
-    height: auto; max-height: 10;
+    height: auto; max-height: 8;
     border: solid $primary-darken-2; padding: 0 1; margin-top: 1;
 }
-#pd-result-names { height: 4; margin-top: 1; }
+#pd-result-names { height: 3; }
 #pd-fn-col    { width: 1fr; padding-right: 1; }
 #pd-rn-col    { width: 1fr; }
-#pd-btns      { height: 3; margin-top: 1; }
+#pd-btns      { height: 3; }
 #pd-btns Button { margin-right: 1; }
-#pd-lib-hdr   { background: $accent-darken-2; color: $text; padding: 0 1; margin-top: 1; }
-#pd-lib-table { height: 1fr; min-height: 8; }
+#pd-lib-hdr   { background: $accent-darken-2; color: $text; padding: 0 1; }
+#pd-lib-table { height: 1fr; min-height: 6; }
 #pd-lib-btns  { height: 3; margin-top: 0; }
 #pd-lib-btns Button { margin-right: 1; min-width: 10; }
 """
