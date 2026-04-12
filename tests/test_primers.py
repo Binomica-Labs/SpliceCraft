@@ -38,9 +38,14 @@ def isolated_primers(tmp_path, monkeypatch):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestDetectionPrimers:
+    """Detection primers bind INSIDE the selected region (not flanking it).
+    Both primers sit within [start, end] and the amplicon is product_min..
+    product_max bp. This is the standard diagnostic PCR approach."""
+
     def test_returns_valid_pair(self, random_seq_3k):
+        # Region must be >= product_min so primers can fit inside
         r = sc._design_detection_primers(
-            random_seq_3k, 500, 600, product_min=400, product_max=700,
+            random_seq_3k, 100, 800, product_min=450, product_max=550,
         )
         assert "error" not in r
         assert r["fwd_seq"]
@@ -48,8 +53,8 @@ class TestDetectionPrimers:
 
     def test_tm_in_range(self, random_seq_3k):
         r = sc._design_detection_primers(
-            random_seq_3k, 500, 600, target_tm=60.0,
-            product_min=400, product_max=700,
+            random_seq_3k, 100, 800, target_tm=60.0,
+            product_min=450, product_max=550,
         )
         assert "error" not in r
         assert 55 < r["fwd_tm"] < 65
@@ -57,39 +62,57 @@ class TestDetectionPrimers:
 
     def test_product_size_in_range(self, random_seq_3k):
         r = sc._design_detection_primers(
-            random_seq_3k, 500, 600,
-            product_min=450, product_max=600,
+            random_seq_3k, 100, 800,
+            product_min=450, product_max=550,
         )
         assert "error" not in r
-        assert 450 <= r["product_size"] <= 600
+        assert 450 <= r["product_size"] <= 550
 
-    def test_fwd_upstream_of_target(self, random_seq_3k):
+    def test_primers_inside_region(self, random_seq_3k):
+        """Both primers must bind INSIDE the selected region — this is the
+        key semantic difference from the old SEQUENCE_TARGET approach."""
         r = sc._design_detection_primers(
-            random_seq_3k, 500, 600,
-            product_min=400, product_max=700,
+            random_seq_3k, 200, 1200,
+            product_min=450, product_max=550,
         )
         assert "error" not in r
-        assert r["fwd_pos"][0] < 500, "fwd primer should start before target"
-
-    def test_rev_downstream_of_target(self, random_seq_3k):
-        r = sc._design_detection_primers(
-            random_seq_3k, 500, 600,
-            product_min=400, product_max=700,
-        )
-        assert "error" not in r
-        assert r["rev_pos"][1] > 600, "rev primer should end after target"
+        assert r["fwd_pos"][0] >= 200, "fwd must be inside region"
+        assert r["fwd_pos"][1] <= 1200, "fwd end must be inside region"
+        assert r["rev_pos"][0] >= 200, "rev start must be inside region"
+        assert r["rev_pos"][1] <= 1200, "rev must be inside region"
 
     def test_empty_target_returns_error(self, random_seq_3k):
         r = sc._design_detection_primers(random_seq_3k, 500, 500)
         assert "error" in r
 
-    def test_impossible_constraints_returns_error(self, random_seq_3k):
-        # 10bp product range on a 100bp target — impossible
+    def test_region_smaller_than_product_returns_error(self, random_seq_3k):
+        """If the region is shorter than the minimum product size, we should
+        get a clear error rather than letting Primer3 fail cryptically."""
         r = sc._design_detection_primers(
-            random_seq_3k, 500, 600,
+            random_seq_3k, 500, 600,  # 100 bp region
+            product_min=450, product_max=550,  # but product needs 450+
+        )
+        assert "error" in r
+        assert "shorter" in r["error"].lower()
+
+    def test_impossible_constraints_returns_error(self, random_seq_3k):
+        r = sc._design_detection_primers(
+            random_seq_3k, 100, 800,
             product_min=10, product_max=20,
         )
         assert "error" in r
+
+    def test_large_gene_works(self, random_seq_3k):
+        """An 861 bp gene (like ampR) with 450-550 product range should work
+        because primers go INSIDE the region. This was the original bug."""
+        r = sc._design_detection_primers(
+            random_seq_3k, 100, 961,  # 861 bp region like ampR
+            product_min=450, product_max=550,
+        )
+        assert "error" not in r
+        assert 450 <= r["product_size"] <= 550
+        assert r["fwd_pos"][0] >= 100
+        assert r["rev_pos"][1] <= 961
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

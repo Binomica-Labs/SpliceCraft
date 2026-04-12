@@ -3577,10 +3577,15 @@ def _design_detection_primers(
     target_tm: float = 60.0,
     primer_len: int = 25,
 ) -> dict:
-    """Design diagnostic PCR primers flanking a target region using Primer3.
+    """Design diagnostic PCR primers WITHIN a selected region using Primer3.
 
-    Primer3 picks the most thermodynamically ideal pair that amplifies a
-    product of `product_min`..`product_max` bp spanning the target region.
+    Both primers bind INSIDE the region (target_start..target_end) and the
+    amplicon is product_min..product_max bp. This is the standard approach
+    for detection/screening primers: you pick a gene or feature and want a
+    ~500 bp diagnostic band from within it.
+
+    Uses SEQUENCE_INCLUDED_REGION (not SEQUENCE_TARGET) so Primer3 places
+    both primers inside the selected region rather than trying to flank it.
 
     Returns a dict with keys: fwd_seq, rev_seq, fwd_tm, rev_tm, fwd_pos,
     rev_pos, product_size, or an 'error' key on failure.
@@ -3588,15 +3593,24 @@ def _design_detection_primers(
     import primer3
     seq = template_seq.upper()
 
-    target_len = target_end - target_start
-    if target_len < 1:
+    region_len = target_end - target_start
+    if region_len < 1:
         return {"error": "Target region is empty."}
+    if region_len < product_min:
+        return {
+            "error": f"Region ({region_len} bp) is shorter than minimum "
+                     f"product size ({product_min} bp). Select a larger "
+                     f"region or reduce the product size."
+        }
 
     try:
         result = primer3.design_primers(
             seq_args={
                 "SEQUENCE_TEMPLATE": seq,
-                "SEQUENCE_TARGET": [target_start, target_len],
+                # INCLUDED_REGION: primers must bind WITHIN this region.
+                # This is the key difference from SEQUENCE_TARGET (which
+                # would require primers to sit OUTSIDE the target).
+                "SEQUENCE_INCLUDED_REGION": [target_start, region_len],
             },
             global_args={
                 "PRIMER_TASK": "generic",
@@ -3613,8 +3627,6 @@ def _design_detection_primers(
             },
         )
     except (OSError, Exception) as exc:
-        # Primer3 raises OSError on internally-inconsistent parameters
-        # (e.g. PRIMER_MAX_SIZE > min PRIMER_PRODUCT_SIZE_RANGE).
         return {"error": f"Primer3 rejected parameters: {exc}"}
 
     n_found = result.get("PRIMER_PAIR_NUM_RETURNED", 0)
