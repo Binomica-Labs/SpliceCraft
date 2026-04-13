@@ -921,3 +921,65 @@ class TestSidebarDetailWrapFeature:
             rendered = str(box.render())
             # One hyphen-separator only, no comma.
             assert "," not in rendered.split("(")[0]
+
+
+class TestUndoSnapshotIndependence:
+    """Defensive guard for an invariant that's currently easy to break by
+    accident: undo/redo snapshots must be INDEPENDENT of the live record,
+    so a future contributor who writes
+    `self._current_record.features.append(...)` instead of building a fresh
+    SeqRecord can't retroactively poison earlier undo entries.
+
+    Today no code mutates _current_record in place, so this test wouldn't
+    fail without the deep-copy — but locking the contract down with a test
+    means a regression to in-place mutation will be caught immediately
+    rather than discovered in production via a baffling Ctrl+Z bug."""
+
+    async def test_push_undo_then_inplace_mutation_does_not_poison_snapshot(
+        self, tiny_record, isolated_library,
+    ):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            n_before = len(app._current_record.features)
+            app._push_undo()
+            # Simulate the dangerous pattern a future contributor might add
+            app._current_record.features.append(SeqFeature(
+                FeatureLocation(0, 5, strand=1),
+                type="misc_feature",
+                qualifiers={"label": ["poison"]},
+            ))
+            # Snapshot must NOT have grown — it's a deep copy.
+            _, _, snapshot_record = app._undo_stack[-1]
+            assert len(snapshot_record.features) == n_before, (
+                "Undo snapshot was poisoned by an in-place mutation of "
+                "_current_record. _push_undo must deep-copy."
+            )
+
+    async def test_action_undo_redo_snapshots_are_independent(
+        self, tiny_record, isolated_library,
+    ):
+        """Round-trip: push_undo, _action_undo (redo snapshot taken), mutate
+        in place, verify the redo snapshot survives."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._push_undo()
+            n_before = len(app._current_record.features)
+            app._action_undo()
+            # _action_undo just pushed a redo snapshot — capture it before
+            # poisoning the live record.
+            _, _, redo_snapshot = app._redo_stack[-1]
+            app._current_record.features.append(SeqFeature(
+                FeatureLocation(0, 5, strand=1),
+                type="misc_feature",
+                qualifiers={"label": ["poison"]},
+            ))
+            assert len(redo_snapshot.features) == n_before, (
+                "Redo snapshot was poisoned by in-place mutation of "
+                "_current_record. _action_undo must deep-copy."
+            )

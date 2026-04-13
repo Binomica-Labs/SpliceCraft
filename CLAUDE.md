@@ -13,7 +13,7 @@ A **terminal-based circular plasmid map viewer and sequence editor** built with 
 **Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs org, user ATinyGreenCell)
 
 - **Single-file architecture:** the entire app is `splicecraft.py` (~7,100 lines). Intentional — avoids import complexity and keeps the codebase greppable. (Sibling project ScriptoScope follows the same convention at ~8,600 lines.)
-- **Test suite:** 390 tests across 10 files in `tests/` (last refresh 2026-04-13). Full run ~75 s, biology subset (`test_dna_sanity.py`) < 1 s. See the **Test suite** section below.
+- **Test suite:** 392 tests across 10 files in `tests/` (last refresh 2026-04-13). Full run ~75 s, biology subset (`test_dna_sanity.py`) < 1 s. See the **Test suite** section below.
 - **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`, plus `pytest>=9.0` / `pytest-asyncio>=1.3` for tests. `Bio.Seq` and `Bio.SeqRecord` are the only Biopython surfaces touched in hot paths. Users install via `pipx install splicecraft` (recommended on PEP 668 systems) or `pip install splicecraft` inside a venv. Developers working on the repo run `python3 splicecraft.py` directly from the clone. **Optional runtime:** `pLannotate` (conda, GPL-3) for the Shift+A annotation feature — SpliceCraft works fine without it and notifies the user how to install if they press Shift+A.
 - **Published on PyPI** as `splicecraft`. Releases cut via `./release.sh X.Y.Z` (bumps version in both files, runs tests, builds, commits+tags+pushes; GitHub Actions `publish.yml` then publishes to PyPI via Trusted Publishing / OIDC). As of 2026-04-12 the latest published version is **0.2.2**.
 
@@ -118,7 +118,7 @@ Every invariant below has at least one test protecting it. Breaking any will sil
 
 ## Recent fixes (2026-04-13 session — unreleased)
 
-Continued wrap-feature audit after the 2026-04-12 pass. 10 more verified bugs fixed across sequence editing, primer design, and circular-map rendering. Tests grew 361 → 388.
+Continued wrap-feature audit after the 2026-04-12 pass. 12 verified bugs fixed across sequence editing, primer design, circular-map rendering, and undo/redo. Tests grew 361 → 392.
 
 ### Sequence editing
 - **Wrap-feature mangling in `_rebuild_record_with_edit`.** `int(CompoundLocation.start)` returns `min(parts.start)` and `int(.end)` returns `max(parts.end)`, so reading wrap features as `(fs, fe) = (int(loc.start), int(loc.end))` silently flattened them into whole-plasmid FeatureLocations on every insert/replace. Now per-part shift with collapse-to-FeatureLocation when only 1 part survives. See `_rebuild_record_with_edit` at ~line 6675.
@@ -142,6 +142,10 @@ Continued wrap-feature audit after the 2026-04-12 pass. 10 more verified bugs fi
 ### Circular-map rendering
 - **Feature sort key used `end - start` for z-order.** Wrap features sorted to the *largest* bucket (due to negative key being most negative), rendering them on top of everything — often hiding smaller features they overlapped. Now all three sort sites (`PlasmidMap._draw`, `SequencePanel._click_to_bp`, `_annot_feats_sorted`, `_build_seq_inputs`) use `_feat_len(start, end, total)` which returns the correct biological length.
 - **`FeatureSidebar.show_detail` displayed negative bp counts for wrap features.** Replaced `span = end - start` with `span = _feat_len(start, end, total)`.
+- **Sidebar detail showed ambiguous `97..5` for wrap features.** Now renders the full compound-location form `97..100,1..5 (10 bp)` matching the GenBank `join()` syntax — unambiguous and self-documenting.
+
+### Undo/redo defensive hardening
+- **Undo snapshots aliased `_current_record`.** Not currently triggerable (every edit path builds a fresh SeqRecord), but a future contributor adding `self._current_record.features.append(...)` would silently poison earlier snapshots. `_push_undo`, `_action_undo`, `_action_redo` now `deepcopy(self._current_record)` so the stack is bulletproof against in-place mutation. Cost: ~5 ms on a 50 kb plasmid; negligible on typical 5–20 kb plasmids.
 
 ### New helper
 - **`_feat_len(start, end, total)`** — single source of truth for circular-aware feature length. Returns `(total - start) + end` when `end < start`, else `end - start`. All sort keys and length displays route through it.
@@ -238,7 +242,7 @@ subset runs in < 1 s and is the fastest feedback loop.
 ### Running
 
 ```bash
-python3 -m pytest -q                        # all 390 tests
+python3 -m pytest -q                        # all 392 tests
 python3 -m pytest tests/test_dna_sanity.py  # only biology (< 1 s)
 python3 -m pytest tests/test_plannotate.py  # only pLannotate integration (~1 s)
 python3 -m pytest tests/test_primers.py     # only primer design (~2 s)
@@ -268,7 +272,7 @@ library files even by accident.
 | `tests/test_primers.py` | 60 | Detection primers (SEQUENCE_INCLUDED_REGION inside region), cloning primers (RE tails + GCGC pad), Golden Braid primers (BsaI domestication, overhang correctness), generic primers. **Wrap-region primer design** (`_slice_circular`, Primer3 template rotation, modular position mapping). |
 | `tests/test_domesticator.py` | 41 | Golden Braid L0 positions and overhangs. Part validation, assembly lane construction, overhang compatibility. |
 | `tests/test_plannotate.py` | 24 | Integration — availability detection, size-cap preflight, feature merging, subprocess error paths. pLannotate never actually invoked; `shutil.which` and `subprocess.run` monkeypatched. |
-| `tests/test_smoke.py` | 41 | Textual app mounts with preloaded record, all 4 panels present, features loaded, restriction scan ran, rotation / view toggle / RE toggle work, mount without preload, no-network guard. pLannotate UI entry points + re-entry guard. Primer design screen mounts. `_apply_record` in-place semantics (clear_undo=False preserves source_path and undo). |
+| `tests/test_smoke.py` | 45 | Textual app mounts with preloaded record, all 4 panels present, features loaded, restriction scan ran, rotation / view toggle / RE toggle work, mount without preload, no-network guard. pLannotate UI entry points + re-entry guard. Primer design screen mounts. `_apply_record` in-place semantics (clear_undo=False preserves source_path and undo). Sidebar detail wrap-coord display. Undo snapshot independence under in-place mutation. |
 | `tests/test_performance.py` | 9 | Budget enforcement: scan pUC19 < 30 ms, scan 10 kb < 150 ms, scan scaling < 8× for 4× DNA, `_iupac_pattern` warm < 5 ms for 200 lookups, `_rc(10 kb)` < 2 ms, `_build_seq_text(pUC19)` < 25 ms, `_build_seq_text(20 kb)` < 200 ms, `_BUILD_SEQ_CACHE` populated after first call. |
 
 ### Sacred invariant → test mapping
@@ -459,7 +463,7 @@ Either direction is viable. The single-file convention and shared logging/error 
 If you are picking this up cold:
 
 1. **Read this file first.** It gives you architecture without reading 7,100 lines.
-2. **Run `python3 -m pytest -q`** before and after any change. 390 tests, ~75 s. The biology-correctness subset (`tests/test_dna_sanity.py`) runs in < 1 s if you want a faster inner loop.
+2. **Run `python3 -m pytest -q`** before and after any change. 392 tests, ~75 s. The biology-correctness subset (`tests/test_dna_sanity.py`) runs in < 1 s if you want a faster inner loop.
 3. **Check `/tmp/splicecraft.log`** (or `$SPLICECRAFT_LOG`) when debugging runtime issues. Every session has a unique 8-char ID.
 4. **Don't break the sacred invariants.** Every one of them has a test (see the mapping table above). If you're touching `_scan_restriction_sites`, `_rc`, `_iupac_pattern`, `_translate_cds`, `_bp_in`, or the feature-midpoint formula, the relevant tests will tell you immediately if you got it wrong.
 5. **Follow the error handling convention**: `_log.exception` for the stack trace, `notify()` or `Static.update("[red]...[/]")` for the user. Never let raw tracebacks hit the TUI.

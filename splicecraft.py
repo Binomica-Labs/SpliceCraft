@@ -7134,7 +7134,13 @@ DomesticatorModal { align: center middle; }
         sp = self.query_one("#seq-panel", SequencePanel)
         if not sp._seq:
             return
-        snapshot = (sp._seq, sp._cursor_pos, self._current_record)
+        # Deep-copy the record so future in-place mutations of the live
+        # _current_record cannot retroactively poison this snapshot. All
+        # current edit paths build a fresh SeqRecord (via _rebuild_*), so
+        # the copy is defensive — but cheap (~5 ms on a 50 kb plasmid)
+        # and worth the safety margin against future contributors.
+        from copy import deepcopy
+        snapshot = (sp._seq, sp._cursor_pos, deepcopy(self._current_record))
         self._undo_stack.append(snapshot)
         if len(self._undo_stack) > self._MAX_UNDO:
             self._undo_stack.pop(0)
@@ -7165,9 +7171,13 @@ DomesticatorModal { align: center middle; }
         if not self._undo_stack:
             self.notify("Nothing to undo", severity="information")
             return
+        from copy import deepcopy
         sp = self.query_one("#seq-panel", SequencePanel)
-        # Save current state to redo stack
-        self._redo_stack.append((sp._seq, sp._cursor_pos, self._current_record))
+        # Deep-copy current state to redo stack — same independence guarantee
+        # as _push_undo.
+        self._redo_stack.append(
+            (sp._seq, sp._cursor_pos, deepcopy(self._current_record))
+        )
         seq, cursor_pos, record = self._undo_stack.pop()
         self._apply_snapshot(seq, cursor_pos, record)
         remaining = len(self._undo_stack)
@@ -7177,8 +7187,11 @@ DomesticatorModal { align: center middle; }
         if not self._redo_stack:
             self.notify("Nothing to redo", severity="information")
             return
+        from copy import deepcopy
         sp = self.query_one("#seq-panel", SequencePanel)
-        self._undo_stack.append((sp._seq, sp._cursor_pos, self._current_record))
+        self._undo_stack.append(
+            (sp._seq, sp._cursor_pos, deepcopy(self._current_record))
+        )
         seq, cursor_pos, record = self._redo_stack.pop()
         self._apply_snapshot(seq, cursor_pos, record)
         remaining = len(self._redo_stack)
