@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- **SnapGene (.dna) file import** — `File → Open` and the `o` hotkey
+  now accept SnapGene's native binary `.dna` format via Biopython's
+  built-in parser. No manual GenBank export step required. Files are
+  dispatched by extension (`.gb`, `.gbk`, `.genbank` → GenBank;
+  `.dna` → SnapGene), case-insensitively. Malformed `.dna` files
+  produce a user-friendly error pointing to the likely cause.
+
 ### Fixed
 
 - **Golden Braid primer validation** — `_design_gb_primers` now returns a

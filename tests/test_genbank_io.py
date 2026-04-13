@@ -235,3 +235,308 @@ class TestParseRobustness:
         # The bad feature is silently dropped (caller notifies via _n_skipped)
         assert not any(f.get("label") == "bad" for f in feats)
         assert pm._n_skipped == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2026-04-13 parser polish — empty labels, out-of-range clamps, wrap detection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFeatLabelFallback:
+    """Empty qualifier values (e.g. /label="") must fall through to the
+    next candidate qualifier or to feat.type so users never see a
+    blank entry in the sidebar."""
+
+    def test_empty_label_falls_back_to_type(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        f = SeqFeature(FeatureLocation(0, 10), type="misc_feature",
+                       qualifiers={"label": [""]})
+        assert sc._feat_label(f) == "misc_feature"
+
+    def test_empty_label_falls_back_to_gene(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        f = SeqFeature(FeatureLocation(0, 10), type="CDS",
+                       qualifiers={"label": [""], "gene": ["ampR"]})
+        assert sc._feat_label(f) == "ampR"
+
+    def test_whitespace_only_label_falls_back(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        f = SeqFeature(FeatureLocation(0, 10), type="gene",
+                       qualifiers={"label": ["   "]})
+        assert sc._feat_label(f) == "gene"
+
+    def test_real_label_truncates_at_28(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        f = SeqFeature(FeatureLocation(0, 10), type="gene",
+                       qualifiers={"label": ["a" * 50]})
+        assert sc._feat_label(f) == "a" * 28
+
+
+class TestParseClamping:
+    """Features with out-of-range coordinates are clamped to
+    [0, len(seq)] rather than rendered past the end of the map."""
+
+    def _make_record(self, seq_len: int = 400):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        return SeqRecord(Seq("A" * seq_len), id="X",
+                         annotations={"molecule_type": "DNA"})
+
+    def test_end_beyond_seq_clamped(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = self._make_record(400)
+        rec.features.append(SeqFeature(
+            FeatureLocation(350, 500, strand=1), type="gene",
+            qualifiers={"label": ["beyond"]}))
+        pm = sc.PlasmidMap.__new__(sc.PlasmidMap)
+        feats = pm._parse(rec)
+        assert feats[0]["start"] == 350 and feats[0]["end"] == 400
+        assert pm._n_clamped == 1
+
+    def test_negative_start_clamped_to_zero(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = self._make_record(400)
+        # Direct construction: Biopython usually rejects negatives, so
+        # simulate via a custom location object that returns negatives.
+        class NegLoc:
+            start = -5
+            end = 10
+            strand = 1
+        f = SeqFeature(type="gene", qualifiers={"label": ["neg"]})
+        f.location = NegLoc()
+        rec.features.append(f)
+        pm = sc.PlasmidMap.__new__(sc.PlasmidMap)
+        feats = pm._parse(rec)
+        assert feats[0]["start"] == 0 and feats[0]["end"] == 10
+        assert pm._n_clamped == 1
+
+    def test_in_range_not_counted(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = self._make_record(400)
+        rec.features.append(SeqFeature(
+            FeatureLocation(10, 100, strand=1), type="gene",
+            qualifiers={"label": ["ok"]}))
+        pm = sc.PlasmidMap.__new__(sc.PlasmidMap)
+        feats = pm._parse(rec)
+        assert pm._n_clamped == 0
+
+
+class TestWrapFeatureDetection:
+    """GenBank join(n-X..n, 1..Y) on circular plasmids now turns into
+    a proper wrap feature (end<start) instead of being flattened to
+    whole-plasmid outer bounds."""
+
+    def _make_record(self, seq_len: int = 400):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        return SeqRecord(Seq("A" * seq_len), id="X",
+                         annotations={"molecule_type": "DNA"})
+
+    def test_wrap_detected_two_parts(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        rec = self._make_record(400)
+        cl = CompoundLocation([
+            FeatureLocation(350, 400, strand=1),
+            FeatureLocation(0, 50, strand=1),
+        ])
+        rec.features.append(SeqFeature(cl, type="gene",
+                                       qualifiers={"label": ["wrap"]}))
+        pm = sc.PlasmidMap.__new__(sc.PlasmidMap)
+        feats = pm._parse(rec)
+        f = feats[0]
+        assert f["start"] == 350 and f["end"] == 50, (
+            f"Expected wrap start=350 end=50, got {f['start']}..{f['end']}"
+        )
+        # Wrap features are not counted as "flattened" because we
+        # preserve their wrap semantics rather than losing information.
+        assert pm._n_flattened == 0
+
+    def test_non_wrap_compound_still_flattened(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        rec = self._make_record(400)
+        cl = CompoundLocation([
+            FeatureLocation(100, 200, strand=1),
+            FeatureLocation(250, 350, strand=1),
+        ])
+        rec.features.append(SeqFeature(cl, type="mRNA",
+                                       qualifiers={"label": ["exons"]}))
+        pm = sc.PlasmidMap.__new__(sc.PlasmidMap)
+        feats = pm._parse(rec)
+        f = feats[0]
+        assert f["start"] == 100 and f["end"] == 350
+        assert pm._n_flattened == 1
+
+
+class TestRecordToGbTextResilience:
+    """_record_to_gb_text defaults molecule_type to 'DNA' if the
+    caller's record lacks it, so saving primer-annotated plasmids
+    doesn't crash when the record came from an unusual source."""
+
+    def test_missing_molecule_type_defaults_to_dna(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec = SeqRecord(Seq("ACGT" * 25), id="X")
+        # No annotations at all — must not crash
+        text = sc._record_to_gb_text(rec)
+        assert "LOCUS" in text
+        assert "DNA" in text.splitlines()[0]
+
+    def test_existing_molecule_type_preserved(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec = SeqRecord(Seq("ACGU" * 25), id="X",
+                        annotations={"molecule_type": "RNA"})
+        text = sc._record_to_gb_text(rec)
+        assert "RNA" in text.splitlines()[0]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SnapGene (.dna) import — format-detection dispatch (added 2026-04-13)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPlasmidFormatDetection:
+    """`_detect_plasmid_format` picks the right Biopython SeqIO format
+    key from the file extension so `load_genbank` can load both
+    GenBank (.gb/.gbk) and SnapGene (.dna) natively."""
+
+    def test_gb_extension(self):
+        assert sc._detect_plasmid_format("x.gb") == "genbank"
+
+    def test_gbk_extension(self):
+        assert sc._detect_plasmid_format("/path/to/x.gbk") == "genbank"
+
+    def test_genbank_extension(self):
+        assert sc._detect_plasmid_format("x.genbank") == "genbank"
+
+    def test_dna_extension_is_snapgene(self):
+        assert sc._detect_plasmid_format("x.dna") == "snapgene"
+
+    def test_dna_uppercase(self):
+        """Case-insensitive — users drag-dropping files from macOS/Windows
+        sometimes have capitalized extensions."""
+        assert sc._detect_plasmid_format("plasmid.DNA") == "snapgene"
+        assert sc._detect_plasmid_format("foo.GB") == "genbank"
+
+    def test_unknown_extension_defaults_genbank(self):
+        """Fallthrough default is GenBank since that's the most common
+        plasmid format; parser will raise a clear error if the content
+        doesn't match."""
+        assert sc._detect_plasmid_format("x.txt") == "genbank"
+        assert sc._detect_plasmid_format("no-extension") == "genbank"
+
+
+class TestSnapGeneDispatch:
+    """`load_genbank(path)` dispatches to the SnapGene parser when the
+    file extension is .dna, so users can import SnapGene-native files
+    just by opening them — no need for a SnapGene → GenBank export first."""
+
+    def test_dna_path_calls_snapgene_parser(self, tmp_path, monkeypatch,
+                                             tiny_record):
+        """The parser path is verified by monkeypatching SeqIO.parse to
+        record the format string it was called with."""
+        called_fmt = {}
+
+        def fake_parse(path, fmt):
+            called_fmt["fmt"] = fmt
+            called_fmt["path"] = path
+            return iter([tiny_record])
+
+        from Bio import SeqIO
+        monkeypatch.setattr(SeqIO, "parse", fake_parse)
+
+        # Create a real .dna file stub — contents don't matter because
+        # SeqIO.parse is mocked. Just needs the extension.
+        dna_file = tmp_path / "plasmid.dna"
+        dna_file.write_bytes(b"fake binary")
+
+        rec = sc.load_genbank(str(dna_file))
+        assert called_fmt["fmt"] == "snapgene"
+        assert called_fmt["path"] == str(dna_file)
+        # tiny_record is returned through _pick_single_record
+        assert rec is tiny_record
+
+    def test_gb_path_still_uses_genbank_parser(self, tmp_path, monkeypatch,
+                                                tiny_record):
+        """Regression guard: .gb files still dispatch to the genbank
+        parser, not snapgene."""
+        called_fmt = {}
+
+        def fake_parse(path, fmt):
+            called_fmt["fmt"] = fmt
+            return iter([tiny_record])
+
+        from Bio import SeqIO
+        monkeypatch.setattr(SeqIO, "parse", fake_parse)
+
+        gb_file = tmp_path / "plasmid.gb"
+        gb_file.write_text("stub")
+        sc.load_genbank(str(gb_file))
+        assert called_fmt["fmt"] == "genbank"
+
+    def test_malformed_dna_raises_helpful_error(self, tmp_path):
+        """A .dna file that isn't actually a SnapGene binary should
+        produce a user-friendly error, not a raw struct.error."""
+        bad = tmp_path / "broken.dna"
+        bad.write_bytes(b"not a snapgene file")
+        with pytest.raises(ValueError, match="SnapGene"):
+            sc.load_genbank(str(bad))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SnapGene — real-file integration (uses fixtures in tests/*.dna if present)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _dna_fixtures():
+    """Collect any .dna files sitting next to this test module.
+    Skipped entirely if none are present (e.g. on a fresh clone that
+    didn't pull the fixtures)."""
+    from pathlib import Path
+    tests_dir = Path(__file__).parent
+    return sorted(tests_dir.glob("*.dna"))
+
+
+@pytest.mark.skipif(not _dna_fixtures(),
+                    reason="no tests/*.dna SnapGene fixtures present")
+class TestSnapGeneRealFiles:
+    """Integration tests against real SnapGene (.dna) files. Each file
+    must parse, have a non-empty sequence, at least one feature, and
+    a sensible id/name (backfilled from the filename stem)."""
+
+    @pytest.mark.parametrize("path", _dna_fixtures(),
+                             ids=[p.name for p in _dna_fixtures()])
+    def test_file_parses(self, path):
+        rec = sc.load_genbank(str(path))
+        assert len(rec.seq) > 0, f"{path.name} has empty sequence"
+        # id/name must be filled, not Biopython sentinels
+        assert rec.id and not rec.id.startswith("<unknown")
+        assert rec.name and not rec.name.startswith("<unknown")
+        # At least one non-source feature
+        feats = [f for f in rec.features if f.type != "source"]
+        assert feats, f"{path.name} has no features"
+
+    @pytest.mark.parametrize("path", _dna_fixtures(),
+                             ids=[p.name for p in _dna_fixtures()])
+    def test_round_trip_through_genbank_text(self, path):
+        """Load → _record_to_gb_text → _gb_text_to_record preserves the
+        sequence. This is the path used when saving a SnapGene import
+        to the plasmid library (which stores records as GenBank text
+        inside plasmid_library.json)."""
+        rec = sc.load_genbank(str(path))
+        text = sc._record_to_gb_text(rec)
+        rec2 = sc._gb_text_to_record(text)
+        assert str(rec.seq) == str(rec2.seq)
+
+    @pytest.mark.parametrize("path", _dna_fixtures(),
+                             ids=[p.name for p in _dna_fixtures()])
+    def test_features_parse_without_skip_or_clamp(self, path):
+        """Real SnapGene files shouldn't trigger the UnknownPosition
+        skip path or the out-of-range clamp path — if they do, something
+        weird is going on with the import."""
+        rec = sc.load_genbank(str(path))
+        pm = sc.PlasmidMap.__new__(sc.PlasmidMap)
+        pm._parse(rec)
+        assert pm._n_skipped == 0, (
+            f"{path.name}: {pm._n_skipped} feature(s) unexpectedly skipped"
+        )
+        assert pm._n_clamped == 0, (
+            f"{path.name}: {pm._n_clamped} feature(s) unexpectedly clamped"
+        )

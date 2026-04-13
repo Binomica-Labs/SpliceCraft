@@ -43,7 +43,7 @@ and edit sequences — without ever leaving the terminal.
 pipx install splicecraft
 splicecraft              # empty canvas
 splicecraft L09137       # fetch pUC19 from NCBI
-splicecraft myplasmid.gb # open a local GenBank file
+splicecraft myplasmid.gb # open a local GenBank (.gb/.gbk) or SnapGene (.dna) file
 ```
 
 **That's it.** `pipx` creates an isolated virtual environment for SpliceCraft
@@ -65,7 +65,7 @@ Installation section below).
 - **Dithered sequence panel** — per-base DNA viewer with feature bars, restriction
   site overlays, and double-stranded display
 - **Live NCBI fetch** — pull any GenBank record by accession number on demand
-- **Local file support** — open `.gb` / `.gbk` files directly from disk
+- **Local file support** — open `.gb` / `.gbk` (GenBank) or `.dna` (SnapGene native) files directly from disk
 - **Free rotation** — spin the origin left or right with `[` / `]`
 - **Restriction enzyme overlay** — 200+ NEB enzymes including Type IIS
   (BsaI, BsmBI, BbsI, SapI) with visible recognition arcs + cut markers
@@ -191,7 +191,7 @@ notifies the user how to install it if pressed.
 ```bash
 splicecraft              # empty canvas
 splicecraft L09137       # fetch pUC19 from NCBI on launch
-splicecraft myplasmid.gb # open a local GenBank file
+splicecraft myplasmid.gb # open a local GenBank (.gb/.gbk) or SnapGene (.dna) file
 splicecraft --version    # print version
 splicecraft --help       # quick usage hint
 ```

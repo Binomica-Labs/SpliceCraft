@@ -66,6 +66,12 @@ include = [
     "tests/**",
     "pyproject.toml",
 ]
+# .dna (SnapGene binary) fixtures live in tests/ for local integration
+# tests but are NOT redistributed through PyPI — they're real lab
+# plasmids, and the pytest suite skips the related tests when absent.
+exclude = [
+    "tests/*.dna",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

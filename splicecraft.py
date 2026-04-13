@@ -6,7 +6,7 @@ SpliceCraft — terminal circular plasmid map viewer.
 
 Features:
   - Fetch any GenBank record by accession (pUC19 = L09137)
-  - Load local .gb / .gbk files
+  - Load local .gb / .gbk (GenBank) or .dna (SnapGene) files
   - Circular map with per-strand feature rings and arrowheads
   - Rotate origin freely with ← → keys or mouse scroll
   - Click map to select feature; click sidebar row to highlight on map
@@ -1357,7 +1357,10 @@ def _feat_label(feat) -> str:
         if q in feat.qualifiers:
             v = feat.qualifiers[q]
             s = v[0] if isinstance(v, list) else v
-            return s[:28]
+            # Empty qualifier values fall through to the next candidate
+            # so we don't show a blank name in the sidebar.
+            if isinstance(s, str) and s.strip():
+                return s[:28]
     return feat.type
 
 def _nice_tick(total: int) -> int:
@@ -1402,19 +1405,85 @@ def fetch_genbank(accession: str, email: str = "splicecraft@local"):
         records = list(SeqIO.parse(handle, "genbank"))
     return _pick_single_record(records, f"NCBI accession {accession!r}")
 
+def _detect_plasmid_format(path: str) -> str:
+    """Pick a Biopython SeqIO format key from a file path's extension.
+
+    Supported:
+      - GenBank        (.gb, .gbk, .genbank)       → "genbank"
+      - SnapGene       (.dna)                       → "snapgene"
+
+    Extensions are matched case-insensitively. Unknown extensions
+    default to "genbank" since that's the most common plasmid format;
+    the parser will then raise a clear error if the contents don't
+    match.
+    """
+    from pathlib import Path
+    suffix = Path(path).suffix.lower()
+    if suffix == ".dna":
+        return "snapgene"
+    # .gb, .gbk, .genbank, or anything else — try GenBank.
+    return "genbank"
+
+
 def load_genbank(path: str):
-    """Load a GenBank (.gb/.gbk) file. Returns SeqRecord.
+    """Load a plasmid file (GenBank .gb/.gbk or SnapGene .dna). Returns
+    SeqRecord.
+
+    Despite the name (kept for backward compatibility), this also
+    handles SnapGene native .dna files via Biopython's `snapgene`
+    parser. Dispatch is based on file extension.
+
+    For SnapGene files, Biopython leaves `record.id` / `record.name`
+    as `<unknown id>` / `<unknown name>` sentinels (SnapGene's own
+    name/title metadata is not exposed through SeqIO). Backfill both
+    from the file stem so the library and map title show something
+    human-readable instead of `<unknown name>`.
 
     Raises ValueError with a user-friendly message if the file has no
     records or multiple records.
     """
     from Bio import SeqIO
-    records = list(SeqIO.parse(path, "genbank"))
-    return _pick_single_record(records, path)
+    from pathlib import Path as _P
+    fmt = _detect_plasmid_format(path)
+    try:
+        records = list(SeqIO.parse(path, fmt))
+    except ValueError as exc:
+        # SnapGene parser raises ValueError on malformed files; rewrap
+        # with a more useful message.
+        if fmt == "snapgene":
+            raise ValueError(
+                f"Could not parse SnapGene file {path}: {exc}. "
+                f"If this file was exported from an old SnapGene version, "
+                f"try re-exporting as .dna from a current SnapGene release."
+            ) from exc
+        raise
+    rec = _pick_single_record(records, path)
+
+    # SnapGene (and occasionally minimally-annotated GenBank) records
+    # leave id/name as Biopython sentinels. Fall back to the filename
+    # so the UI has something meaningful to display.
+    stem = _P(path).stem or "plasmid"
+    # Sanitize: GenBank LOCUS names can't contain spaces; replace them
+    # so round-tripping through _record_to_gb_text doesn't explode.
+    safe_stem = stem.replace(" ", "_")[:16] or "plasmid"
+    if not rec.id or rec.id.startswith("<unknown"):
+        rec.id = safe_stem
+    if not rec.name or rec.name.startswith("<unknown"):
+        rec.name = safe_stem
+    return rec
 
 def _record_to_gb_text(record) -> str:
-    """Serialize a SeqRecord to GenBank format text."""
+    """Serialize a SeqRecord to GenBank format text.
+
+    Biopython's genbank writer requires `molecule_type` in annotations
+    — if the record came from elsewhere and doesn't have it, default to
+    "DNA" rather than crashing. Applies to the record's annotations
+    dict in place (safe; only fills a missing key, never overwrites).
+    """
     from Bio import SeqIO
+    if not getattr(record, "annotations", None):
+        record.annotations = {}
+    record.annotations.setdefault("molecule_type", "DNA")
     buf = StringIO()
     SeqIO.write(record, buf, "genbank")
     return buf.getvalue()
@@ -1822,8 +1891,10 @@ class PlasmidMap(Widget):
             CompoundLocation = None
         # Counters the caller can inspect after load_record() to decide
         # whether to notify the user.
-        self._n_flattened  = 0
-        self._n_skipped    = 0
+        self._n_flattened   = 0
+        self._n_skipped     = 0
+        self._n_clamped     = 0
+        total = len(record.seq) if getattr(record, "seq", None) is not None else 0
         for feat in record.features:
             if feat.type in ("source",):
                 continue
@@ -1842,16 +1913,56 @@ class PlasmidMap(Widget):
                 )
                 continue
             strand = getattr(feat.location, "strand", 1) or 1
-            # Compound / joined locations (e.g. join(100..200,300..400)) are
-            # flattened to their outer bounds. Plasmid features are virtually
-            # never compound (no introns), but if an imported GenBank file has
-            # one, we render the full span rather than silently dropping it.
-            if CompoundLocation is not None and isinstance(feat.location, CompoundLocation):
-                self._n_flattened += 1
-                _log.info(
-                    "Flattened compound feature %s (%d..%d) to outer bounds",
-                    _feat_label(feat), start, end,
+
+            # Compound / joined locations need special handling:
+            #   * join(100..200, 300..400) on a 500 bp seq   → flatten to 100..400
+            #   * join(450..500, 1..50)   on a 500 bp seq   → WRAPPING feature;
+            #     rebuild as start=450, end=50 (end < start) so the existing
+            #     _bp_in / wrap-midpoint machinery renders the correct arc.
+            is_compound = (CompoundLocation is not None
+                           and isinstance(feat.location, CompoundLocation))
+            if is_compound:
+                parts = sorted(
+                    feat.location.parts,
+                    key=lambda p: int(p.start),
                 )
+                if (
+                    total > 0 and len(parts) == 2
+                    and int(parts[0].start) == 0
+                    and int(parts[-1].end) == total
+                    and int(parts[0].end) < int(parts[-1].start)
+                ):
+                    # Origin-spanning wrap: head at [0, parts[0].end),
+                    # tail at [parts[-1].start, total). Represent as
+                    # start=tail, end=head so end<start signals wrap.
+                    start = int(parts[-1].start)
+                    end   = int(parts[0].end)
+                    _log.info(
+                        "Detected wrap feature %s (%d..%d → wraps origin)",
+                        _feat_label(feat), start, end,
+                    )
+                else:
+                    self._n_flattened += 1
+                    _log.info(
+                        "Flattened compound feature %s (%d..%d) to outer bounds",
+                        _feat_label(feat), start, end,
+                    )
+
+            # Clamp coords that exceed the sequence length — rendering
+            # math assumes start, end ∈ [0, total].
+            if total > 0:
+                clamped_start = max(0, min(start, total))
+                clamped_end   = max(0, min(end,   total))
+                if (clamped_start, clamped_end) != (start, end):
+                    self._n_clamped += 1
+                    _log.warning(
+                        "Clamped feature %s coords (%d..%d → %d..%d) to "
+                        "sequence length %d",
+                        _feat_label(feat), start, end,
+                        clamped_start, clamped_end, total,
+                    )
+                    start, end = clamped_start, clamped_end
+
             idx    = len(feats)
             feats.append({
                 "type":   feat.type,
@@ -3329,8 +3440,8 @@ class OpenFileModal(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="open-box"):
-            yield Static(" Open GenBank File ", id="open-title")
-            yield Label("File path  (.gb / .gbk):")
+            yield Static(" Open Plasmid File ", id="open-title")
+            yield Label("File path  (.gb / .gbk / .dna):")
             yield Input(placeholder="/path/to/plasmid.gb", id="open-path")
             with Horizontal(id="open-btns"):
                 yield Button("Open", id="btn-open", variant="primary")
@@ -6215,7 +6326,7 @@ DomesticatorModal { align: center middle; }
 
     BINDINGS = [
         Binding("f",           "fetch",            "Fetch GenBank", show=True),
-        Binding("o",           "open_file",        "Open .gb file", show=True),
+        Binding("o",           "open_file",        "Open file",     show=True),
         Binding("a",           "add_to_library",   "Add to lib",    show=True),
         Binding("A",           "annotate_plasmid", "Annotate",      show=True,  key_display="A"),
         Binding("E",           "edit_seq",         "Edit seq",      show=True,  key_display="E"),
@@ -6912,6 +7023,13 @@ DomesticatorModal { align: center middle; }
                 f"rendered as outer-bounds span.",
                 severity="warning", timeout=8,
             )
+        n_clamp = getattr(pm, "_n_clamped", 0)
+        if n_clamp:
+            self.notify(
+                f"⚠ {n_clamp} feature(s) had coordinates outside the "
+                f"sequence length — clamped to fit.",
+                severity="warning", timeout=8,
+            )
         topology = (record.annotations or {}).get("topology", "").lower()
         if topology == "linear" and pm._map_mode != "linear":
             pm._map_mode = "linear"
@@ -7195,7 +7313,7 @@ DomesticatorModal { align: center middle; }
 
         menus = {
             "File": [
-                ("Open .gb file",   "open_file"),
+                ("Open file (.gb / .dna)", "open_file"),
                 ("Fetch from NCBI", "fetch"),
                 ("---",             None),
                 ("Add to Library",  "add_to_library"),
