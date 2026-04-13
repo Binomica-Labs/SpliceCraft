@@ -686,12 +686,13 @@ def _scan_restriction_sites(
     scan_seq = (seq_u + seq_u[: max_site_len - 1]) if (circular and n > 0) else seq_u
 
     def _emit_resite(hits, p, site_len, strand, color, name,
-                     cut_col, ext_cut_bp):
+                     cut_col, ext_cut_bp, ohang_s=None, ohang_e=None):
         """Emit one or two resite dicts depending on wrap. Labels only on the
         first piece so the map doesn't double-print. For wrapped sites, the
         cut_col / ext_cut_bp fields are only meaningful on the piece that
         actually contains the cut; we attach them to the tail piece by default
-        and clear them on the head piece."""
+        and clear them on the head piece.
+        ohang_s / ohang_e: absolute bp positions of the single-stranded overhang."""
         if p + site_len <= n:
             hits.append({
                 "type":       "resite",
@@ -702,6 +703,8 @@ def _scan_restriction_sites(
                 "label":      name,
                 "cut_col":    cut_col,
                 "ext_cut_bp": ext_cut_bp,
+                "ohang_s":    ohang_s,
+                "ohang_e":    ohang_e,
             })
             return
         # Wraps origin: tail [p, n) + head [0, (p + site_len) - n).
@@ -721,6 +724,8 @@ def _scan_restriction_sites(
             "label":      name,
             "cut_col":    tail_cut_col,
             "ext_cut_bp": ext_cut_bp if tail_cut_col is not None else None,
+            "ohang_s":    ohang_s,
+            "ohang_e":    ohang_e,
         })
         hits.append({
             "type":       "resite",
@@ -731,6 +736,8 @@ def _scan_restriction_sites(
             "label":      "",     # unlabeled continuation
             "cut_col":    head_cut_col,
             "ext_cut_bp": ext_cut_bp if head_cut_col is not None else None,
+            "ohang_s":    ohang_s,
+            "ohang_e":    ohang_e,
         })
 
     for entry in _SCAN_CATALOG:
@@ -751,7 +758,10 @@ def _scan_restriction_sites(
             # ext_cut_bp: absolute cut position when cut falls outside recognition
             _ext = ((p + fwd_cut) % n) if (fwd_cut <= 0 or fwd_cut >= site_len) else None
             _cc  = fwd_cut if 0 < fwd_cut < site_len else None
-            _emit_resite(hits, p, site_len, 1, color, name, _cc, _ext)
+            # Overhang: single-stranded region between the two strand cuts
+            _ohang_s = (p + min(fwd_cut, rev_cut)) % n if n else 0
+            _ohang_e = (p + max(fwd_cut, rev_cut)) % n if n else 0
+            _emit_resite(hits, p, site_len, 1, color, name, _cc, _ext, _ohang_s, _ohang_e)
             cut_bp = (p + fwd_cut) % n if n > 0 else 0
             hits.append({
                 "type":   "recut",
@@ -782,9 +792,14 @@ def _scan_restriction_sites(
                 _top_cut_outside = ((_top_cut_bp - p) % n) >= site_len
                 _cc  = rev_cut_col if 0 <= rev_cut_col < site_len else None
                 _ext = _top_cut_bp if _top_cut_outside else None
-                _emit_resite(hits, p, site_len, -1, color, name, _cc, _ext)
+                # Overhang: single-stranded region between the two strand cuts
+                _bot_cut_bp = (p + site_len - 1 - fwd_cut) % n
+                _r_ohang_s = min(_top_cut_bp, _bot_cut_bp)
+                _r_ohang_e = max(_top_cut_bp, _bot_cut_bp)
+                _emit_resite(hits, p, site_len, -1, color, name, _cc, _ext,
+                             _r_ohang_s, _r_ohang_e)
                 # Bottom-strand cut (enzyme's fwd_cut mapped to fwd coords)
-                cut_bp = (p + site_len - 1 - fwd_cut) % n if n > 0 else 0
+                cut_bp = _bot_cut_bp
                 hits.append({
                     "type":   "recut",
                     "start":  cut_bp,
@@ -950,6 +965,7 @@ def _render_feature_row_pair(
                     for j in range(cut_abs + 1, bar_s):
                         if 0 <= j < content_w and bar_arr[j][0] == " ":
                             bar_arr[j] = ("╌", color)
+
 
             # Connector tick at midpoint
             mid = bar_s + bar_len // 2
@@ -1134,10 +1150,10 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     num_w = len(str(n)) if n else 1    # minimum digits needed for line numbers
     styles, annot_feats = _build_seq_inputs(seq, feats)
 
-    sel_s  = sel_range[0] if sel_range else -1
-    sel_e  = sel_range[1] if sel_range else -1
-    usr_s  = user_sel[0]  if user_sel  else -1
-    usr_e  = user_sel[1]  if user_sel  else -1
+    sel_s  = sel_range[0]    if sel_range    else -1
+    sel_e  = sel_range[1]    if sel_range    else -1
+    usr_s  = user_sel[0]     if user_sel     else -1
+    usr_e  = user_sel[1]     if user_sel     else -1
 
     # RE highlight ranges
     reh_s       = re_highlight["start"]      if re_highlight else -1
@@ -3073,6 +3089,7 @@ class SequencePanel(Widget):
             return
         self._last_was_drag = False
         self._last_resite_click = None
+        self._cut_highlight = None
         bp = self._click_to_bp(event.screen_x, event.screen_y)
         if bp < 0:
             return
