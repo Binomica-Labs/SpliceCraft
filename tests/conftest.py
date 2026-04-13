@@ -40,9 +40,10 @@ def _protect_user_data(tmp_path, monkeypatch):
     import splicecraft as sc
 
     _DATA_FILES = [
-        ("_LIBRARY_FILE",    "_library_cache"),
-        ("_PARTS_BIN_FILE",  "_parts_bin_cache"),
-        ("_PRIMERS_FILE",    "_primers_cache"),
+        ("_LIBRARY_FILE",       "_library_cache"),
+        ("_PARTS_BIN_FILE",     "_parts_bin_cache"),
+        ("_PRIMERS_FILE",       "_primers_cache"),
+        ("_CODON_TABLES_FILE",  "_codon_tables_cache"),
         ("_PLANNOTATE_CHECK_CACHE", None),  # not a file, but reset for isolation
     ]
 

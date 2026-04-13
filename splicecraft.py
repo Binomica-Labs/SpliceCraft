@@ -169,8 +169,8 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
 from textual.widgets import (
-    Button, DataTable, Footer, Header, Input, Label, RadioButton, RadioSet,
-    Select, Static, TabbedContent, TabPane, TextArea,
+    Button, DataTable, Footer, Header, Input, Label, ListItem, ListView,
+    RadioButton, RadioSet, Select, Static, TabbedContent, TabPane, TextArea,
 )
 from rich.text import Text
 
@@ -3728,7 +3728,8 @@ class MenuBar(Widget):
     }
     """
 
-    MENUS = ["File", "Edit", "Enzymes", "Features", "Primers", "Parts", "Constructor"]
+    MENUS = ["File", "Edit", "Enzymes", "Features", "Primers", "Mutagenize",
+             "Parts", "Constructor"]
 
     def compose(self) -> ComposeResult:
         for name in self.MENUS:
@@ -4012,6 +4013,399 @@ def _save_primers(entries: list[dict]) -> None:
     _primers_cache = list(entries)
 
 
+# ── Codon usage registry + harmonization (shared across modals) ───────────────
+#
+# Persistent JSON library of codon usage tables, plus pure-function harmonizer
+# and restriction-site fixer. Vendored from superfolder_aeblue/codon_tables.py
+# and codon_harmonize.py (2026-04-13) to keep the single-file convention.
+#
+# Storage schema (one entry per species in codon_tables.json):
+#   {"name": "E. coli K12", "taxid": "83333", "source": "builtin"|"kazusa"|"user",
+#    "added": "YYYY-MM-DD", "raw": {"GCT": ["A", 55], ...}}
+# In-memory form uses tuples (aa, count); the "raw" JSON list is converted on
+# load. Dedup key is the taxid when present, else the display name.
+
+_CODON_GENETIC_CODE: dict[str, str] = {
+    "TTT": "F", "TTC": "F", "TTA": "L", "TTG": "L",
+    "CTT": "L", "CTC": "L", "CTA": "L", "CTG": "L",
+    "ATT": "I", "ATC": "I", "ATA": "I", "ATG": "M",
+    "GTT": "V", "GTC": "V", "GTA": "V", "GTG": "V",
+    "TCT": "S", "TCC": "S", "TCA": "S", "TCG": "S",
+    "CCT": "P", "CCC": "P", "CCA": "P", "CCG": "P",
+    "ACT": "T", "ACC": "T", "ACA": "T", "ACG": "T",
+    "GCT": "A", "GCC": "A", "GCA": "A", "GCG": "A",
+    "TAT": "Y", "TAC": "Y", "TAA": "*", "TAG": "*",
+    "CAT": "H", "CAC": "H", "CAA": "Q", "CAG": "Q",
+    "AAT": "N", "AAC": "N", "AAA": "K", "AAG": "K",
+    "GAT": "D", "GAC": "D", "GAA": "E", "GAG": "E",
+    "TGT": "C", "TGC": "C", "TGA": "*", "TGG": "W",
+    "CGT": "R", "CGC": "R", "CGA": "R", "CGG": "R",
+    "AGT": "S", "AGC": "S", "AGA": "R", "AGG": "R",
+    "GGT": "G", "GGC": "G", "GGA": "G", "GGG": "G",
+}
+
+_CODON_BUILTIN_K12: dict[str, tuple[str, int]] = {
+    "GGG": ("G",  44), "GGA": ("G",  47), "GGT": ("G", 109), "GGC": ("G", 171),
+    "GAG": ("E",  94), "GAA": ("E", 224), "GAT": ("D", 194), "GAC": ("D", 105),
+    "GTG": ("V", 135), "GTA": ("V",  59), "GTT": ("V",  86), "GTC": ("V",  60),
+    "GCG": ("A", 197), "GCA": ("A", 108), "GCT": ("A",  55), "GCC": ("A", 162),
+    "AGG": ("R",   8), "AGA": ("R",   7), "AGT": ("S",  37), "AGC": ("S",  85),
+    "AAG": ("K",  62), "AAA": ("K", 170), "AAT": ("N", 112), "AAC": ("N", 125),
+    "ATG": ("M", 127), "ATA": ("I",  19), "ATT": ("I", 156), "ATC": ("I",  93),
+    "ACG": ("T",  59), "ACA": ("T",  33), "ACT": ("T",  41), "ACC": ("T", 117),
+    "TGG": ("W",  55), "TGT": ("C",  30), "TGC": ("C",  41),
+    "TAT": ("Y",  86), "TAC": ("Y",  75),
+    "TTG": ("L",  61), "TTA": ("L",  78), "TTT": ("F", 101), "TTC": ("F",  77),
+    "TCG": ("S",  41), "TCA": ("S",  40), "TCT": ("S",  29), "TCC": ("S",  28),
+    "CGG": ("R",  21), "CGA": ("R",  22), "CGT": ("R", 108), "CGC": ("R", 133),
+    "CAG": ("Q", 142), "CAA": ("Q",  62), "CAT": ("H",  81), "CAC": ("H",  67),
+    "CTG": ("L", 240), "CTA": ("L",  27), "CTT": ("L",  61), "CTC": ("L",  54),
+    "CCG": ("P", 137), "CCA": ("P",  34), "CCT": ("P",  43), "CCC": ("P",  33),
+    "TAA": ("*",   9), "TAG": ("*",   0), "TGA": ("*",   5),
+}
+
+# Forbidden sites for the harmonizer's restriction-site fixer. Keys are the
+# forward site only; the fixer adds the reverse complement automatically if
+# the site is non-palindromic.
+_CODON_DEFAULT_FORBIDDEN: dict[str, str] = {
+    "BsaI":    "GGTCTC",
+    "BsmBI":   "CGTCTC",
+    "BbsI":    "GAAGAC",
+    "EcoRI":   "GAATTC",
+    "NdeI":    "CATATG",
+    "XhoI":    "CTCGAG",
+    "BamHI":   "GGATCC",
+    "HindIII": "AAGCTT",
+    "NcoI":    "CCATGG",
+    "SalI":    "GTCGAC",
+    "KpnI":    "GGTACC",
+    "SacI":    "GAGCTC",
+}
+
+_CODON_TABLES_FILE = _DATA_DIR / "codon_tables.json"
+_codon_tables_cache: "list | None" = None
+
+
+def _codon_raw_to_json(raw: dict) -> dict:
+    """Convert in-memory {codon: (aa, count)} → JSON-safe {codon: [aa, count]}."""
+    return {c: [aa, int(n)] for c, (aa, n) in raw.items()}
+
+
+def _codon_raw_from_json(blob: dict) -> dict:
+    """Inverse of _codon_raw_to_json. Accepts either tuples or 2-item lists."""
+    out: dict = {}
+    for c, v in blob.items():
+        if isinstance(v, (list, tuple)) and len(v) == 2:
+            out[c.upper()] = (str(v[0]), int(v[1]))
+    return out
+
+
+def _codon_tables_load() -> list[dict]:
+    """Load codon-table registry. Returns a list of dicts; each entry has
+    an extra 'raw' in-memory form with tuples. Seeds built-in E. coli K12
+    on first run so the library is never empty."""
+    global _codon_tables_cache
+    if _codon_tables_cache is not None:
+        return list(_codon_tables_cache)
+    entries, warning = _safe_load_json(_CODON_TABLES_FILE, "Codon table library")
+    if warning:
+        _log.warning("Codon table library: %s", warning)
+    fixed: list = []
+    for e in entries:
+        raw = _codon_raw_from_json(e.get("raw", {}))
+        if not raw:
+            continue
+        fixed.append({
+            "name":   e.get("name", "?"),
+            "taxid":  str(e.get("taxid", "")),
+            "source": e.get("source", "user"),
+            "added":  e.get("added", ""),
+            "raw":    raw,
+        })
+    # Seed built-in K12 if not present
+    if not any(e.get("taxid") == "83333" for e in fixed):
+        import datetime
+        fixed.insert(0, {
+            "name":   "E. coli K12",
+            "taxid":  "83333",
+            "source": "builtin",
+            "added":  datetime.date.today().isoformat(),
+            "raw":    dict(_CODON_BUILTIN_K12),
+        })
+        _codon_tables_cache = fixed
+        _codon_tables_save(fixed)
+    else:
+        _codon_tables_cache = fixed
+    return list(_codon_tables_cache)
+
+
+def _codon_tables_save(entries: list[dict]) -> None:
+    """Persist registry to disk via _safe_save_json (atomic, .bak)."""
+    global _codon_tables_cache
+    serializable = [{
+        "name":   e.get("name", "?"),
+        "taxid":  str(e.get("taxid", "")),
+        "source": e.get("source", "user"),
+        "added":  e.get("added", ""),
+        "raw":    _codon_raw_to_json(e.get("raw", {})),
+    } for e in entries]
+    _safe_save_json(_CODON_TABLES_FILE, serializable, "Codon table library")
+    _codon_tables_cache = list(entries)
+
+
+def _codon_tables_add(name: str, taxid: str, raw: dict,
+                      source: str = "user") -> dict:
+    """Insert or replace a table in the registry. Dedup key is taxid when
+    non-empty, else name. Returns the stored entry."""
+    import datetime
+    entries = _codon_tables_load()
+    taxid = str(taxid or "").strip()
+    name  = (name or "?").strip() or "?"
+    entry = {
+        "name":   name,
+        "taxid":  taxid,
+        "source": source,
+        "added":  datetime.date.today().isoformat(),
+        "raw":    dict(raw),
+    }
+    def _same(e):
+        if taxid and e.get("taxid") == taxid:
+            return True
+        if not taxid and e.get("name") == name:
+            return True
+        return False
+    kept = [e for e in entries if not _same(e)]
+    kept.append(entry)
+    _codon_tables_save(kept)
+    return entry
+
+
+def _codon_tables_get(key: str) -> "dict | None":
+    """Look up a table by taxid or name (case-insensitive). Returns the
+    in-memory entry (with 'raw' as tuples) or None."""
+    key = (key or "").strip().lower()
+    if not key:
+        return None
+    for e in _codon_tables_load():
+        if str(e.get("taxid", "")).lower() == key:
+            return e
+        if str(e.get("name", "")).lower() == key:
+            return e
+    return None
+
+
+def _codon_search(query: str, entries: "list | None" = None) -> list[dict]:
+    """Case-insensitive substring search over name + taxid."""
+    if entries is None:
+        entries = _codon_tables_load()
+    q = (query or "").strip().lower()
+    if not q:
+        return list(entries)
+    return [e for e in entries
+            if q in str(e.get("name", "")).lower()
+            or q in str(e.get("taxid", "")).lower()]
+
+
+def _codon_parse_kazusa_html(html: str) -> "dict | None":
+    """Parse Kazusa showcodon.cgi GCG-format HTML. Returns {codon: (aa, count)}
+    or None on failure."""
+    pre = re.search(r"<[Pp][Rr][Ee]>(.*?)</[Pp][Rr][Ee]>", html, re.DOTALL)
+    text = pre.group(1) if pre else html
+    pat = re.compile(r"\b([ACGTU]{3})\b\s+(\d+(?:\.\d+)?)", re.IGNORECASE)
+    raw: dict = {}
+    for m in pat.finditer(text):
+        rna = m.group(1).upper()
+        dna = rna.replace("U", "T")
+        if dna not in _CODON_GENETIC_CODE or dna in raw:
+            continue
+        try:
+            count = round(float(m.group(2)))
+        except ValueError:
+            continue
+        raw[dna] = (_CODON_GENETIC_CODE[dna], count)
+    if len([c for c in raw if raw[c][0] != "?"]) < 60:
+        return None
+    return raw
+
+
+def _codon_fetch_kazusa(taxid: str, timeout: float = 15.0) -> tuple:
+    """Fetch codon usage from Kazusa for an NCBI taxid. Returns
+    (raw_dict_or_None, status_message). Pure network call — callers should
+    invoke from a worker thread."""
+    import urllib.request
+    taxid = str(taxid).strip()
+    if not taxid.isdigit():
+        return None, f"Invalid taxid '{taxid}' (must be numeric)"
+    url = (f"https://www.kazusa.or.jp/codon/cgi-bin/showcodon.cgi"
+           f"?species={taxid}&aa=1&style=GCG")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        _log.exception("Kazusa fetch failed for taxid %s", taxid)
+        return None, f"Network error: {exc}"
+    low = html.lower()
+    if "not found" in low or "no data" in low:
+        return None, f"Taxid {taxid} not found in Kazusa database"
+    raw = _codon_parse_kazusa_html(html)
+    if raw is None:
+        return None, f"Could not parse Kazusa table for taxid {taxid}"
+    return raw, f"Fetched from Kazusa: {len(raw)} codons (taxid {taxid})"
+
+
+def _codon_build_aa_map(raw: dict) -> tuple[dict, dict]:
+    """Given {codon: (aa, count)}, return (aa_codons, codon_frac) where
+    aa_codons[aa] = [(codon, frac), ...] sorted by fraction descending, and
+    codon_frac[codon] = fractional usage for its amino acid."""
+    from collections import defaultdict
+    aa_total: dict = defaultdict(int)
+    for codon, (aa, count) in raw.items():
+        aa_total[aa] += int(count)
+    codon_frac: dict = {}
+    for codon, (aa, count) in raw.items():
+        total = aa_total.get(aa, 0) or 1
+        codon_frac[codon] = count / total
+    aa_codons: dict = defaultdict(list)
+    for codon, (aa, count) in raw.items():
+        if aa == "*":
+            continue
+        aa_codons[aa].append((codon, codon_frac[codon]))
+    for aa in aa_codons:
+        aa_codons[aa].sort(key=lambda x: -x[1])
+    return dict(aa_codons), codon_frac
+
+
+def _codon_harmonize(protein: str, raw: dict) -> str:
+    """Distribute synonymous codons across the protein so each amino acid's
+    codon distribution matches the target organism (Angov 2011, adapted).
+    Appends a TAA stop. Raises ValueError on unknown amino acids."""
+    aa_codons, _ = _codon_build_aa_map(raw)
+    aa_positions: dict = {}
+    for i, aa in enumerate(protein):
+        aa = aa.upper()
+        aa_positions.setdefault(aa, []).append(i)
+    codon_at = [""] * len(protein)
+    for aa, positions in aa_positions.items():
+        n = len(positions)
+        codons_for_aa = aa_codons.get(aa, [])
+        if not codons_for_aa:
+            raise ValueError(f"No codons for amino acid '{aa}' in this table")
+        if len(codons_for_aa) == 1:
+            for pos in positions:
+                codon_at[pos] = codons_for_aa[0][0]
+            continue
+        targets: list = []
+        remainders: list = []
+        allocated = 0
+        for codon, frac in codons_for_aa:
+            exact   = n * frac
+            floored = int(exact)
+            targets.append(floored)
+            remainders.append((exact - floored, len(targets) - 1))
+            allocated += floored
+        shortage = n - allocated
+        remainders.sort(key=lambda x: -x[0])
+        for k in range(shortage):
+            targets[remainders[k][1]] += 1
+        queues = [[codon] * cnt
+                  for (codon, _), cnt in zip(codons_for_aa, targets) if cnt > 0]
+        interleaved: list = []
+        i = 0
+        while any(queues):
+            q = queues[i % len(queues)]
+            if q:
+                interleaved.append(q.pop(0))
+            i += 1
+        for pos, codon in zip(positions, interleaved):
+            codon_at[pos] = codon
+    return "".join(codon_at) + "TAA"
+
+
+def _codon_fix_sites(dna: str, protein: str, raw: dict,
+                     sites: "dict | None" = None) -> tuple:
+    """Substitute synonymous codons to remove internal restriction sites.
+    `sites` is a forward-strand {name: site} dict; reverse complements are
+    added automatically for non-palindromic sites. Returns (new_dna, fixes)."""
+    if sites is None:
+        sites = _CODON_DEFAULT_FORBIDDEN
+    expanded: dict = {}
+    for name, site in sites.items():
+        site = site.upper()
+        expanded[name] = site
+        rc = _mut_revcomp(site)
+        if rc != site:
+            expanded[f"{name}_rc"] = rc
+    aa_codons, _ = _codon_build_aa_map(raw)
+    dna_list = list(dna)
+    fixes: list[str] = []
+    for enzyme, site in expanded.items():
+        pos = 0
+        while True:
+            seq = "".join(dna_list)
+            idx = seq.find(site, pos)
+            if idx == -1:
+                break
+            fixed = False
+            lo_codon = max(0, (idx // 3) - 1)
+            hi_codon = (idx + len(site)) // 3 + 2
+            for codon_idx in range(lo_codon, hi_codon):
+                codon_start = codon_idx * 3
+                if codon_start + 3 > len(dna_list) - 3:  # skip stop codon
+                    break
+                if codon_idx >= len(protein):
+                    break
+                aa = protein[codon_idx].upper()
+                current = "".join(dna_list[codon_start:codon_start + 3])
+                for alt, frac in aa_codons.get(aa, []):
+                    if alt == current:
+                        continue
+                    test = dna_list[:]
+                    test[codon_start:codon_start + 3] = list(alt)
+                    if site not in "".join(test):
+                        dna_list = test
+                        strand = " (rc)" if enzyme.endswith("_rc") else ""
+                        fixes.append(
+                            f"{enzyme.replace('_rc', '')}{strand} at nt {idx+1}: "
+                            f"{current}→{alt} (codon {codon_idx+1} {aa}, "
+                            f"freq={frac:.3f})"
+                        )
+                        fixed = True
+                        break
+                if fixed:
+                    break
+            if not fixed:
+                pos = idx + 1
+    return "".join(dna_list), fixes
+
+
+def _codon_cai(dna: str, raw: dict) -> float:
+    """Codon Adaptation Index (geometric mean of per-codon freq ÷ peak freq
+    of its amino-acid synonymy group). Skips stops and unknown codons."""
+    import math
+    aa_codons, codon_frac = _codon_build_aa_map(raw)
+    w: list[float] = []
+    for i in range(0, len(dna) - 2, 3):
+        codon = dna[i:i + 3].upper()
+        entry = raw.get(codon)
+        if not entry or entry[0] == "*":
+            continue
+        peak = aa_codons[entry[0]][0][1] if entry[0] in aa_codons else 0.0
+        if peak > 0:
+            w.append(codon_frac.get(codon, 0.0) / peak)
+    if not w:
+        return 0.0
+    return math.exp(sum(math.log(max(v, 1e-10)) for v in w) / len(w))
+
+
+def _codon_gc(dna: str) -> float:
+    """GC%. Empty string → 0."""
+    if not dna:
+        return 0.0
+    gc = sum(1 for c in dna.upper() if c in "GC")
+    return gc / len(dna) * 100.0
+
+
 # Common cloning enzymes for the RE-site dropdown in the cloning primer panel.
 # Sorted alphabetically; each tuple is (display_label, enzyme_name).
 _CLONING_RE_OPTIONS: list[tuple[str, str]] = sorted([
@@ -4252,6 +4646,341 @@ def _design_generic_primers(
         "fwd_pos":  fwd_pos,
         "rev_pos":  rev_pos,
     }
+
+
+# ── SOE-PCR mutagenesis primer design ──────────────────────────────────────────
+#
+# Ported from superfolder_aeblue/mutagenesis_primers.py. Designs a 4-primer /
+# 3-reaction SOE (Splicing by Overlap Extension) workflow to introduce a
+# single-residue point mutation into a CDS and produce a Golden Braid
+# B3-B5-compatible amplicon in one pot.
+#
+# OUTER primers (constant per CDS):
+#   FWD:  CCCC-GGTCTC-A-AATG-[CDS body from codon 2] → B3 overhang AATG
+#   REV:  CCCC-GGTCTC-A-AACG-[revcomp of CDS end]    → B5 overhang CGTT
+# INNER primers (one pair per mutation): mutant codon centered in anneal region,
+# REV = revcomp(FWD). Edge cases (mutation < 60 nt from either CDS end) swap the
+# inner pair for a single "modified outer" primer and a 2-primer direct PCR.
+#
+# Codon table is E. coli K12 (Kazusa taxid 83333). This is a single-organism
+# convenience; callers designing for other hosts should review mut_codon choice.
+
+_MUT_CODON_USAGE = {
+    "GGG": ("G", 44),  "GGA": ("G", 47),  "GGT": ("G", 109), "GGC": ("G", 171),
+    "GAG": ("E", 94),  "GAA": ("E", 224), "GAT": ("D", 194), "GAC": ("D", 105),
+    "GTG": ("V", 135), "GTA": ("V", 59),  "GTT": ("V", 86),  "GTC": ("V", 60),
+    "GCG": ("A", 197), "GCA": ("A", 108), "GCT": ("A", 55),  "GCC": ("A", 162),
+    "AGG": ("R", 8),   "AGA": ("R", 7),   "AGT": ("S", 37),  "AGC": ("S", 85),
+    "AAG": ("K", 62),  "AAA": ("K", 170), "AAT": ("N", 112), "AAC": ("N", 125),
+    "ATG": ("M", 127), "ATA": ("I", 19),  "ATT": ("I", 156), "ATC": ("I", 93),
+    "ACG": ("T", 59),  "ACA": ("T", 33),  "ACT": ("T", 41),  "ACC": ("T", 117),
+    "TGG": ("W", 55),  "TGT": ("C", 30),  "TGC": ("C", 41),
+    "TAT": ("Y", 86),  "TAC": ("Y", 75),
+    "TTG": ("L", 61),  "TTA": ("L", 78),  "TTT": ("F", 101), "TTC": ("F", 77),
+    "TCG": ("S", 41),  "TCA": ("S", 40),  "TCT": ("S", 29),  "TCC": ("S", 28),
+    "CGG": ("R", 21),  "CGA": ("R", 22),  "CGT": ("R", 108), "CGC": ("R", 133),
+    "CAG": ("Q", 142), "CAA": ("Q", 62),  "CAT": ("H", 81),  "CAC": ("H", 67),
+    "CTG": ("L", 240), "CTA": ("L", 27),  "CTT": ("L", 61),  "CTC": ("L", 54),
+    "CCG": ("P", 137), "CCA": ("P", 34),  "CCT": ("P", 43),  "CCC": ("P", 33),
+    "TAA": ("*", 9),   "TAG": ("*", 0),   "TGA": ("*", 5),
+}
+_MUT_CODON_TO_AA = {c: aa for c, (aa, _) in _MUT_CODON_USAGE.items()}
+_MUT_STOPS       = {"TAA", "TAG", "TGA"}
+
+def _mut_aa_to_codons() -> dict:
+    from collections import defaultdict
+    totals = defaultdict(int)
+    for c, (aa, n) in _MUT_CODON_USAGE.items():
+        totals[aa] += n
+    result: dict = defaultdict(list)
+    for c, (aa, n) in _MUT_CODON_USAGE.items():
+        if aa == "*":
+            continue
+        result[aa].append((c, n / totals[aa] if totals[aa] else 0.0))
+    for aa in result:
+        result[aa].sort(key=lambda x: -x[1])
+    return dict(result)
+
+_MUT_AA_TO_CODONS = _mut_aa_to_codons()
+
+_MUT_BSAI_FWD_TAIL = "CCCC" + "GGTCTCA" + "AATG"   # 15 nt; AATG = A(extra)+ATG ovhg
+_MUT_BSAI_REV_TAIL = "CCCC" + "GGTCTCA" + "AACG"   # 15 nt; AACG = revcomp(CGTT)
+_MUT_MIN_SOE_FRAG  = 60                             # nt; below this → edge case
+
+_MUT_P3 = dict(mv_conc=50.0, dv_conc=1.5, dntp_conc=0.2, dna_conc=250.0)
+
+
+def _mut_parse(s: str) -> tuple:
+    """Parse a mutation string like 'W140F'. Returns (wt_aa, pos_1based, mut_aa)."""
+    m = re.fullmatch(r"([A-Za-z\*])(\d+)([A-Za-z\*])", s.strip())
+    if not m:
+        raise ValueError(f"Cannot parse '{s}'. Use format: [WT][pos][MUT], e.g. W140F")
+    return m.group(1).upper(), int(m.group(2)), m.group(3).upper()
+
+
+def _mut_revcomp(seq: str) -> str:
+    return seq.upper().translate(str.maketrans("ACGT", "TGCA"))[::-1]
+
+
+def _mut_translate(dna: str) -> str:
+    aa: list = []
+    for i in range(0, len(dna) - 2, 3):
+        c = dna[i:i+3].upper()
+        if c in _MUT_STOPS:
+            break
+        aa.append(_MUT_CODON_TO_AA.get(c, "?"))
+    return "".join(aa)
+
+
+def _mut_tm(seq: str) -> float:
+    try:
+        import primer3
+        return primer3.calc_tm(seq, **_MUT_P3)
+    except Exception:
+        gc = sum(1 for c in seq.upper() if c in "GC")
+        at = sum(1 for c in seq.upper() if c in "AT")
+        return 2 * at + 4 * gc
+
+
+def _mut_hairpin_dg(seq: str) -> float:
+    try:
+        import primer3
+        return primer3.calc_hairpin(seq, **_MUT_P3).dg
+    except Exception:
+        return 0.0
+
+
+def _mut_homodimer_dg(seq: str) -> float:
+    try:
+        import primer3
+        return primer3.calc_homodimer(seq, **_MUT_P3).dg
+    except Exception:
+        return 0.0
+
+
+def _mut_gc_pct(seq: str) -> float:
+    s = seq.upper()
+    return (s.count("G") + s.count("C")) / len(s) * 100 if seq else 0.0
+
+
+def _mut_ends_gc(seq: str) -> bool:
+    return bool(seq) and seq[-1].upper() in "GC"
+
+
+def _mut_score_outer(anneal: str, target_tm: float = 60.0) -> float:
+    t  = _mut_tm(anneal)
+    gc = _mut_gc_pct(anneal)
+    hp = _mut_hairpin_dg(anneal)
+    return (
+        abs(t - target_tm) * 2.0
+        + (0 if _mut_ends_gc(anneal) else 4.0)
+        + max(0, -hp - 1000) / 400.0
+        + abs(gc - 50) * 0.1
+    )
+
+
+def _mut_design_fwd_anneal(dna: str) -> "dict | None":
+    body = dna[3:]
+    best = None
+    for length in range(18, 28):
+        anneal = body[:length]
+        if len(anneal) < 18:
+            continue
+        s = _mut_score_outer(anneal)
+        if best is None or s < best["score"]:
+            best = {
+                "anneal": anneal,
+                "full":   _MUT_BSAI_FWD_TAIL + anneal,
+                "tm_anneal": _mut_tm(anneal),
+                "gc":     _mut_gc_pct(anneal),
+                "score":  s,
+            }
+    return best
+
+
+def _mut_design_rev_anneal(dna: str) -> "dict | None":
+    end_rc = _mut_revcomp(dna)
+    best = None
+    for length in range(18, 28):
+        anneal = end_rc[:length]
+        if len(anneal) < 18:
+            continue
+        s = _mut_score_outer(anneal)
+        if best is None or s < best["score"]:
+            best = {
+                "anneal": anneal,
+                "full":   _MUT_BSAI_REV_TAIL + anneal,
+                "tm_anneal": _mut_tm(anneal),
+                "gc":     _mut_gc_pct(anneal),
+                "score":  s,
+            }
+    return best
+
+
+def _mut_design_outer(dna: str) -> dict:
+    """Constant FWD/REV outer primers with BsaI-AATG / BsaI-AACG tails."""
+    fwd = _mut_design_fwd_anneal(dna)
+    rev = _mut_design_rev_anneal(dna)
+    if fwd is None or rev is None:
+        raise RuntimeError("CDS is too short to design outer primers (need ≥ 21 nt).")
+    return {
+        "fwd": fwd, "rev": rev,
+        "b3_overhang": "AATG",
+        "b5_overhang": "CGTT",
+        "fwd_anneal_start": 3,
+    }
+
+
+def _mut_design_modified_outer(dna_mut: str, near_start: bool) -> dict:
+    """Edge-case: mutation < 60 nt from a CDS end → fold mutant codon into a
+    single outer primer. PCR becomes a 2-primer direct reaction, no SOE."""
+    if near_start:
+        p = _mut_design_fwd_anneal(dna_mut)
+        if p is None:
+            raise RuntimeError("Modified FWD outer design failed.")
+        p["label"]    = "modified_FWD_outer"
+        p["partner"]  = "REV_outer (unchanged)"
+        p["replaces"] = "FWD_outer"
+    else:
+        p = _mut_design_rev_anneal(dna_mut)
+        if p is None:
+            raise RuntimeError("Modified REV outer design failed.")
+        p["label"]    = "modified_REV_outer"
+        p["partner"]  = "FWD_outer (unchanged)"
+        p["replaces"] = "REV_outer"
+    return p
+
+
+def _mut_design_inner(dna: str, mut_pos_1: int, mut_aa: str, wt_aa: str,
+                      codon_table: "dict | None" = None) -> dict:
+    """Inner mutagenic pair (FWD carries mutant codon; REV = revcomp(FWD)).
+
+    `codon_table` is an optional {codon: (aa, count)} map used to pick the
+    mutant codon. Defaults to E. coli K12 (_MUT_AA_TO_CODONS)."""
+    idx      = mut_pos_1 - 1
+    nt_start = idx * 3
+
+    wt_codon  = dna[nt_start:nt_start + 3]
+    if len(wt_codon) < 3:
+        raise ValueError(
+            f"Position {mut_pos_1} is past the end of the CDS."
+        )
+    wt_actual = _MUT_CODON_TO_AA.get(wt_codon, "?")
+    if wt_actual != wt_aa:
+        raise ValueError(
+            f"Position {mut_pos_1}: mutation says WT='{wt_aa}' but DNA codon "
+            f"'{wt_codon}' encodes '{wt_actual}'."
+        )
+
+    if codon_table:
+        aa_map, _ = _codon_build_aa_map(codon_table)
+    else:
+        aa_map = _MUT_AA_TO_CODONS
+
+    if mut_aa == "*":
+        mut_codon = "TAA"
+    else:
+        mut_codon = next(
+            (c for c, _f in aa_map.get(mut_aa, []) if c != wt_codon),
+            None,
+        )
+        if mut_codon is None:
+            raise ValueError(f"No alternative codon available for '{mut_aa}' "
+                             "in the selected codon table")
+
+    mut_dna = dna[:nt_start] + mut_codon + dna[nt_start + 3:]
+
+    TM_TARGET      = 60.0
+    TM_MIN, TM_MAX = 55.0, 75.0
+    GC_MIN, GC_MAX = 35.0, 68.0
+    seq_len = len(mut_dna)
+
+    candidates: list = []
+    for left_ext in range(5, 28):
+        for right_ext in range(5, 28):
+            lo  = max(0, nt_start - left_ext)
+            hi  = min(seq_len, nt_start + 3 + right_ext)
+            fwd = mut_dna[lo:hi]
+            if len(fwd) < 15 or len(fwd) > 58:
+                continue
+            t  = _mut_tm(fwd)
+            gc = _mut_gc_pct(fwd)
+            if not (TM_MIN <= t <= TM_MAX):
+                continue
+            if not (GC_MIN <= gc <= GC_MAX):
+                continue
+            hp = _mut_hairpin_dg(fwd)
+            hd = _mut_homodimer_dg(fwd)
+            score = (
+                abs(t - TM_TARGET) * 2.0
+                + (0 if _mut_ends_gc(fwd) else 4.0)
+                + max(0, -hp - 1000) / 400.0
+                + max(0, -hd - 2000) / 400.0
+                + abs(gc - 50) * 0.1
+                - (len(fwd) * 0.15 if abs(t - TM_TARGET) <= 1.0 else 0)
+            )
+            candidates.append({
+                "fwd": fwd, "rev": _mut_revcomp(fwd),
+                "tm": t, "gc": gc, "length": len(fwd),
+                "hairpin_dg": hp, "homodimer_dg": hd, "score": score, "lo": lo,
+            })
+
+    if not candidates:
+        raise RuntimeError(
+            f"No valid inner primers found for {wt_aa}{mut_pos_1}{mut_aa}. "
+            "Mutation may be too close to sequence ends."
+        )
+
+    seen: dict = {}
+    for c in sorted(candidates, key=lambda x: x["score"]):
+        if c["fwd"] not in seen:
+            seen[c["fwd"]] = c
+    ranked = sorted(seen.values(), key=lambda x: x["score"])[:5]
+    for i, c in enumerate(ranked):
+        c["rank"] = i + 1
+
+    best_lo = ranked[0]["lo"]
+    best_hi = best_lo + ranked[0]["length"]
+    fwd_anneal_start = 3
+    frag_a = best_hi - fwd_anneal_start
+    frag_b = seq_len - best_lo
+
+    near_start = frag_a < _MUT_MIN_SOE_FRAG
+    near_end   = frag_b < _MUT_MIN_SOE_FRAG
+
+    edge_case = None
+    if near_start or near_end:
+        modified_outer = _mut_design_modified_outer(mut_dna, near_start=near_start)
+        edge_case = {
+            "near_start":     near_start,
+            "near_end":       near_end,
+            "frag_a":         frag_a,
+            "frag_b":         frag_b,
+            "modified_outer": modified_outer,
+        }
+
+    return {
+        "mutation":    f"{wt_aa}{mut_pos_1}{mut_aa}",
+        "nt_position": nt_start + 1,
+        "wt_codon":    wt_codon,
+        "mut_codon":   mut_codon,
+        "nt_changes":  sum(a != b for a, b in zip(wt_codon, mut_codon)),
+        "candidates":  ranked,
+        "edge_case":   edge_case,
+    }
+
+
+def _mut_extract_cds(full_seq: str, start: int, end: int, strand: int) -> str:
+    """Return the CDS DNA in its biological 5'→3' orientation, handling
+    origin-wrap (end < start) and reverse-strand features."""
+    if end < start:
+        sub = full_seq[start:] + full_seq[:end]
+    else:
+        sub = full_seq[start:end]
+    sub = sub.upper()
+    if strand == -1:
+        sub = _mut_revcomp(sub)
+    return sub
 
 
 # ── Parts bin modal ────────────────────────────────────────────────────────────
@@ -4958,6 +5687,741 @@ class ConstructorModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-ctor-close")
     def _on_close(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── Species picker (shared modal for codon-table selection) ────────────────────
+
+class SpeciesPickerModal(ModalScreen):
+    """Reusable codon-table picker — any modal that cares about codon usage
+    (Mutagenize, future codon-optimize, future gene-synthesis) can
+    ``push_screen(SpeciesPickerModal(), callback=...)``. The callback
+    receives the selected entry dict (with 'raw' as tuples) or None.
+
+    Shows the persistent registry with a substring filter. Users can fetch
+    any NCBI taxid from Kazusa via a worker thread; the fetched table is
+    added to the registry automatically so it's available in future
+    sessions.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._fetching = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="sp-box"):
+            yield Static(" Codon Usage Table  —  Pick or Fetch ", id="sp-title")
+            yield Label("Filter species")
+            yield Input(placeholder="type to filter by name or taxid",
+                        id="sp-filter")
+            yield ListView(id="sp-list")
+            yield Static("", id="sp-info", markup=True)
+            with Horizontal(id="sp-fetch-row"):
+                yield Input(placeholder="NCBI taxid (e.g. 9606 for Human)",
+                            id="sp-taxid")
+                yield Input(placeholder="Display name (optional)",
+                            id="sp-name")
+                yield Button("Fetch from Kazusa", id="btn-sp-fetch",
+                             variant="primary")
+            with Horizontal(id="sp-btns"):
+                yield Button("Use Selected", id="btn-sp-use", variant="primary",
+                             disabled=True)
+                yield Button("Delete", id="btn-sp-delete", disabled=True)
+                yield Button("Cancel  [Esc]", id="btn-sp-cancel")
+
+    def on_mount(self) -> None:
+        self._refresh_list("")
+        self.query_one("#sp-filter", Input).focus()
+
+    def _refresh_list(self, query: str) -> None:
+        lv = self.query_one("#sp-list", ListView)
+        lv.clear()
+        self._entries: list = _codon_search(query)
+        for e in self._entries:
+            tax = f" (taxid {e['taxid']})" if e.get("taxid") else ""
+            src = e.get("source", "user")
+            tag = f"[{src}]"
+            lv.append(ListItem(Label(f"{e['name']}{tax}   [dim]{tag}[/dim]",
+                                     markup=True)))
+        info = self.query_one("#sp-info", Static)
+        if not self._entries:
+            info.update("[dim]No matching entries. Use the fetch row below to "
+                        "import a new table from Kazusa.[/dim]")
+        else:
+            info.update(f"[dim]{len(self._entries)} table(s) in library.[/dim]")
+        self.query_one("#btn-sp-use", Button).disabled = True
+        self.query_one("#btn-sp-delete", Button).disabled = True
+
+    @on(Input.Changed, "#sp-filter")
+    def _filter_changed(self, event: Input.Changed) -> None:
+        self._refresh_list(event.value)
+
+    @on(ListView.Selected, "#sp-list")
+    def _list_selected(self, _) -> None:
+        lv = self.query_one("#sp-list", ListView)
+        if lv.index is None:
+            return
+        self.query_one("#btn-sp-use", Button).disabled = False
+        entry = self._entries[lv.index]
+        self.query_one("#btn-sp-delete", Button).disabled = (
+            entry.get("source") == "builtin"
+        )
+
+    @on(ListView.Highlighted, "#sp-list")
+    def _list_highlighted(self, _) -> None:
+        lv = self.query_one("#sp-list", ListView)
+        if lv.index is None:
+            return
+        entry = self._entries[lv.index]
+        self.query_one("#btn-sp-use", Button).disabled = False
+        self.query_one("#btn-sp-delete", Button).disabled = (
+            entry.get("source") == "builtin"
+        )
+
+    @on(Button.Pressed, "#btn-sp-use")
+    def _use(self, _) -> None:
+        lv = self.query_one("#sp-list", ListView)
+        if lv.index is None:
+            return
+        self.dismiss(self._entries[lv.index])
+
+    @on(Button.Pressed, "#btn-sp-delete")
+    def _delete(self, _) -> None:
+        lv = self.query_one("#sp-list", ListView)
+        if lv.index is None:
+            return
+        entry = self._entries[lv.index]
+        if entry.get("source") == "builtin":
+            return
+        all_entries = _codon_tables_load()
+        kept = [e for e in all_entries
+                if (e.get("taxid") or e.get("name")) !=
+                   (entry.get("taxid") or entry.get("name"))]
+        _codon_tables_save(kept)
+        self._refresh_list(self.query_one("#sp-filter", Input).value)
+
+    @on(Button.Pressed, "#btn-sp-fetch")
+    def _fetch(self, _) -> None:
+        if self._fetching:
+            return
+        taxid = self.query_one("#sp-taxid", Input).value.strip()
+        name  = self.query_one("#sp-name", Input).value.strip()
+        info  = self.query_one("#sp-info", Static)
+        if not taxid.isdigit():
+            info.update("[red]Enter a numeric NCBI taxid (e.g. 9606, 4932, 10090).[/red]")
+            return
+        self._fetching = True
+        self.query_one("#btn-sp-fetch", Button).disabled = True
+        info.update(f"[yellow]Fetching taxid {taxid} from Kazusa…[/yellow]")
+        self._do_fetch(taxid, name)
+
+    @work(thread=True)
+    def _do_fetch(self, taxid: str, name: str) -> None:
+        raw, msg = _codon_fetch_kazusa(taxid)
+        self.app.call_from_thread(self._fetch_done, taxid, name, raw, msg)
+
+    def _fetch_done(self, taxid: str, name: str,
+                    raw: "dict | None", msg: str) -> None:
+        self._fetching = False
+        # If the user dismissed the modal mid-fetch, persist the result (so
+        # they don't lose a successful HTTP round-trip) but skip the UI calls.
+        if not self.is_mounted:
+            if raw is not None:
+                display = name or f"Species (taxid {taxid})"
+                try:
+                    _codon_tables_add(display, taxid, raw, source="kazusa")
+                except Exception:
+                    _log.exception("Codon-table add failed for taxid %s", taxid)
+            return
+        try:
+            info = self.query_one("#sp-info", Static)
+            btn  = self.query_one("#btn-sp-fetch", Button)
+            btn.disabled = False
+            if raw is None:
+                info.update(f"[red]{msg}[/red]")
+                return
+            display = name or f"Species (taxid {taxid})"
+            _codon_tables_add(display, taxid, raw, source="kazusa")
+            info.update(f"[green]{msg} — added as '{display}'.[/green]")
+            self._refresh_list(self.query_one("#sp-filter", Input).value)
+            for i, e in enumerate(self._entries):
+                if str(e.get("taxid")) == str(taxid):
+                    self.query_one("#sp-list", ListView).index = i
+                    break
+        except Exception:
+            _log.exception("SpeciesPickerModal fetch-callback failed")
+
+    @on(Button.Pressed, "#btn-sp-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── Mutagenize modal ───────────────────────────────────────────────────────────
+
+class MutagenizeModal(ModalScreen):
+    """SOE-PCR site-directed mutagenesis primer designer.
+
+    Pick a CDS feature from the loaded plasmid, enter a mutation string
+    (e.g. W140F), and design the 4-primer SOE set — 2 constant outer primers
+    (BsaI-AATG / BsaI-AACG tails → GB B3/B5 overhangs) and 1 inner pair for
+    this mutation. Edge cases (mutation within 60 nt of either CDS end) are
+    resolved by swapping the inner pair for a single modified outer primer
+    and a 2-primer direct PCR.
+
+    Save to primer library persists via `_save_primers` (atomic JSON with
+    .bak, sacred invariant #7).
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, template_seq: str, feats: list, plasmid_name: str = ""):
+        super().__init__()
+        self._template     = (template_seq or "").upper()
+        self._feats        = feats or []
+        self._plasmid_name = plasmid_name
+        self._outer:  "dict | None" = None
+        self._inner:  "dict | None" = None
+        self._cds_dna:   str        = ""   # CDS (5'→3', post-strand, post-harmonize)
+        self._cds_meta:  "dict | None" = None
+        # Codon-table for mut_codon picking + harmonization (library entry dict)
+        self._codon_entry: "dict | None" = None
+        # For library source — current plasmid's features + template
+        self._lib_template: str = ""
+        self._lib_feats:    list = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="mut-box"):
+            yield Static(
+                " Mutagenize  —  Golden Braid SOE-PCR Site-Directed Mutagenesis ",
+                id="mut-title",
+            )
+            # ── Source selector ──
+            yield Label("CDS source")
+            yield Select(
+                [
+                    ("Current map features", "map"),
+                    ("Plasmid library",       "lib"),
+                    ("Protein sequence (harmonize)", "prot"),
+                ],
+                id="mut-source", value="map", allow_blank=False,
+            )
+
+            # ── Source-specific bodies (toggled via .display) ──
+            with Vertical(id="mut-src-map"):
+                yield Label("CDS feature  (from the loaded plasmid)")
+                yield Select(self._build_cds_options(self._template, self._feats),
+                             id="mut-cds", prompt="(select a CDS feature)")
+
+            with Vertical(id="mut-src-lib"):
+                yield Label("Plasmid  (from your library)")
+                yield Select(self._build_library_options(),
+                             id="mut-lib", prompt="(select a plasmid)")
+                yield Label("CDS feature")
+                yield Select([("(load a plasmid first)", "_none")],
+                             id="mut-lib-cds", prompt="(select a CDS feature)")
+
+            with Vertical(id="mut-src-prot"):
+                yield Label("Protein sequence  (AA, 1-letter; stops optional)")
+                yield TextArea("", id="mut-prot-aa")
+                with Horizontal(id="mut-prot-row"):
+                    yield Input(placeholder="Name (e.g. aeBlue)", id="mut-prot-name")
+                    yield Button("Harmonize → CDS", id="btn-mut-harmonize",
+                                 variant="primary")
+
+            yield Static("", id="mut-cds-info", markup=True)
+
+            # ── Codon table picker ──
+            with Horizontal(id="mut-codon-row"):
+                yield Static("Codon table: [bold]E. coli K12[/bold] (taxid 83333)",
+                             id="mut-codon-label", markup=True)
+                yield Button("Change…", id="btn-mut-codon", variant="default")
+
+            # ── Mutation + Design ──
+            with Horizontal(id="mut-row2"):
+                with Vertical(id="mut-mut-col"):
+                    yield Label("Mutation  (e.g. W140F)")
+                    yield Input(placeholder="W140F", id="mut-input")
+                with Vertical(id="mut-btn-col"):
+                    yield Label(" ")
+                    yield Button("Design SOE Primers", id="btn-mut-design",
+                                 variant="primary")
+
+            yield Static("", id="mut-results", markup=True)
+            with Horizontal(id="mut-btns"):
+                yield Button("Save to Primer Library", id="btn-mut-save",
+                             variant="primary", disabled=True)
+                yield Button("Cancel  [Esc]", id="btn-mut-cancel")
+
+    # ── Option builders ────────────────────────────────────────────────────
+
+    def _build_cds_options(self, template: str, feats: list) -> list:
+        opts: list = []
+        total = len(template)
+        for f in feats:
+            if f.get("type") not in ("CDS", "gene"):
+                continue
+            start = f.get("start")
+            end   = f.get("end")
+            if start is None or end is None:
+                continue
+            strand = f.get("strand", 1)
+            span_bp = _feat_len(start, end, total) if total else (end - start)
+            if span_bp < 30 or span_bp % 3 != 0:
+                continue
+            label = f.get("label", f.get("type", "CDS"))
+            strand_s = "+" if strand == 1 else "−"
+            lo_disp = start + 1
+            hi_disp = end if end > start else f"{total},1..{end}"
+            opt_label = f"{label}  ({strand_s}{lo_disp}‥{hi_disp}, {span_bp} bp)"
+            opts.append((opt_label, f"{start}:{end}:{strand}"))
+        if not opts:
+            opts = [("(no CDS features on this plasmid)", "_none")]
+        return opts
+
+    def _build_library_options(self) -> list:
+        try:
+            entries = _load_library()
+        except Exception:
+            _log.exception("Mutagenize: failed to load plasmid library")
+            entries = []
+        opts: list = []
+        for i, e in enumerate(entries):
+            nm = e.get("name", f"entry_{i}")
+            if not e.get("gb_text"):
+                continue
+            opts.append((nm, str(i)))
+        if not opts:
+            opts = [("(plasmid library is empty)", "_none")]
+        return opts
+
+    def on_mount(self) -> None:
+        # Seed built-in K12 via registry load
+        try:
+            _codon_tables_load()
+            self._codon_entry = _codon_tables_get("83333")
+        except Exception:
+            _log.exception("Mutagenize: codon registry load failed")
+            self._codon_entry = None
+        self._apply_source("map")
+        info = self.query_one("#mut-cds-info", Static)
+        info.update("[dim]Pick a source and CDS, then enter a mutation like "
+                    "[bold]W140F[/bold] and press Design.[/dim]")
+
+    # ── Source switching ──────────────────────────────────────────────────
+
+    @on(Select.Changed, "#mut-source")
+    def _source_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, str):
+            self._apply_source(event.value)
+
+    def _apply_source(self, src: str) -> None:
+        self.query_one("#mut-src-map", Vertical).display  = (src == "map")
+        self.query_one("#mut-src-lib", Vertical).display  = (src == "lib")
+        self.query_one("#mut-src-prot", Vertical).display = (src == "prot")
+        # Clear any previously-loaded CDS so the user knows they need to re-pick
+        self._cds_dna  = ""
+        self._cds_meta = None
+        self.query_one("#mut-cds-info", Static).update("")
+        self.query_one("#btn-mut-save", Button).disabled = True
+
+    # ── Map source ────────────────────────────────────────────────────────
+
+    @on(Select.Changed, "#mut-cds")
+    def _map_cds_changed(self, event: Select.Changed) -> None:
+        self._load_cds_from_feature(event.value, self._template, self._feats,
+                                    origin="map")
+
+    # ── Library source ────────────────────────────────────────────────────
+
+    @on(Select.Changed, "#mut-lib")
+    def _lib_changed(self, event: Select.Changed) -> None:
+        val = event.value
+        cds_select = self.query_one("#mut-lib-cds", Select)
+        info = self.query_one("#mut-cds-info", Static)
+        if not isinstance(val, str) or val == "_none" or not val.isdigit():
+            cds_select.set_options([("(load a plasmid first)", "_none")])
+            self._lib_template = ""
+            self._lib_feats    = []
+            return
+        entries = _load_library()
+        try:
+            entry = entries[int(val)]
+        except (IndexError, ValueError):
+            info.update("[red]Library entry not found.[/red]")
+            return
+        gb = entry.get("gb_text", "")
+        if not gb:
+            info.update("[red]This library entry has no GenBank text.[/red]")
+            return
+        try:
+            rec = _gb_text_to_record(gb)
+        except Exception as exc:
+            _log.exception("Mutagenize: library entry parse failed")
+            info.update(f"[red]Could not parse library GenBank: {exc}[/red]")
+            return
+        self._lib_template = str(rec.seq).upper()
+        total = len(self._lib_template)
+        self._lib_feats    = []
+        for f in rec.features:
+            if f.type not in ("CDS", "gene"):
+                continue
+            loc = f.location
+            # CompoundLocation (origin-wrap): int(loc.start)/int(loc.end) would
+            # flatten parts into min/max, losing the wrap. Use parts explicitly
+            # so wrap CDS features (end < start) round-trip correctly through
+            # _mut_extract_cds. Single-part FeatureLocation.parts == [self].
+            parts = list(loc.parts) if hasattr(loc, "parts") and loc.parts else [loc]
+            start = int(parts[0].start) % total if total else int(parts[0].start)
+            end   = int(parts[-1].end)   % total if total else int(parts[-1].end)
+            strand = 1 if (loc.strand in (None, 1)) else -1
+            label  = (f.qualifiers.get("label") or
+                      f.qualifiers.get("gene")  or
+                      f.qualifiers.get("product") or [f.type])[0]
+            self._lib_feats.append({
+                "type":   f.type, "label": label, "strand": strand,
+                "start":  start,  "end":   end,
+            })
+        self._plasmid_name = entry.get("name", "")
+        opts = self._build_cds_options(self._lib_template, self._lib_feats)
+        cds_select.set_options(opts)
+
+    @on(Select.Changed, "#mut-lib-cds")
+    def _lib_cds_changed(self, event: Select.Changed) -> None:
+        self._load_cds_from_feature(event.value, self._lib_template,
+                                    self._lib_feats, origin="lib")
+
+    def _load_cds_from_feature(self, val, template: str, feats: list,
+                               origin: str) -> None:
+        info = self.query_one("#mut-cds-info", Static)
+        if not isinstance(val, str) or val == "_none" or ":" not in val:
+            self._cds_dna  = ""
+            self._cds_meta = None
+            info.update("")
+            return
+        try:
+            s, e, st = val.split(":")
+            start, end, strand = int(s), int(e), int(st)
+        except ValueError:
+            info.update("[red]Malformed CDS selection.[/red]")
+            return
+        cds = _mut_extract_cds(template, start, end, strand)
+        if len(cds) < 30 or len(cds) % 3 != 0:
+            info.update("[red]CDS too short or not a multiple of 3.[/red]")
+            self._cds_dna  = ""
+            self._cds_meta = None
+            return
+        protein = _mut_translate(cds)
+        label = "CDS"
+        for f in feats:
+            if (f.get("start") == start and f.get("end") == end
+                    and f.get("strand", 1) == strand):
+                label = f.get("label", f.get("type", "CDS"))
+                break
+        self._cds_dna  = cds
+        self._cds_meta = {"start": start, "end": end, "strand": strand,
+                          "name": label, "origin": origin}
+        self._update_cds_info(cds, protein, strand_label=(
+            "+" if strand == 1 else "−"
+        ))
+
+    def _update_cds_info(self, cds: str, protein: str,
+                         strand_label: str = "·") -> None:
+        atg = ("[green]ATG[/green]" if cds.startswith("ATG")
+               else "[yellow]no ATG at 5'[/yellow]")
+        stop_tag = cds[-3:] if len(cds) >= 3 else ""
+        stop_s = (f"[green]{stop_tag}[/green]" if stop_tag in _MUT_STOPS
+                  else f"[yellow]{stop_tag} (no stop)[/yellow]")
+        info = self.query_one("#mut-cds-info", Static)
+        info.update(
+            f"  [dim]{len(cds)} nt · {len(protein)} aa · strand "
+            f"{strand_label}[/dim]   start {atg}   stop {stop_s}"
+        )
+
+    # ── Protein-input source ──────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-mut-harmonize")
+    def _harmonize(self, _) -> None:
+        info = self.query_one("#mut-cds-info", Static)
+        if self._codon_entry is None:
+            info.update("[red]No codon table selected.[/red]")
+            return
+        aa_raw = self.query_one("#mut-prot-aa", TextArea).text
+        # Strip whitespace, digits, FASTA header markers, and separators —
+        # but NOT '*' (stop): that's a meaningful, invalid-in-middle char
+        # we want to flag explicitly rather than silently drop.
+        aa = re.sub(r"[\s\d>_\-]", "", aa_raw).upper()
+        if not aa:
+            info.update("[red]Enter a protein sequence.[/red]")
+            return
+        # Allow a single trailing stop but reject mid-sequence stops.
+        if "*" in aa[:-1]:
+            info.update("[red]Stop codon '*' not allowed in the middle of the "
+                        "protein sequence.[/red]")
+            return
+        if aa.endswith("*"):
+            aa = aa[:-1]
+        valid_aa = set("ACDEFGHIKLMNPQRSTVWY")
+        bad = sorted({c for c in aa if c not in valid_aa})
+        if bad:
+            info.update(f"[red]Invalid amino-acid letters: {''.join(bad)}[/red]")
+            return
+        try:
+            cds = _codon_harmonize(aa, self._codon_entry["raw"])
+            cds, fixes = _codon_fix_sites(
+                cds, aa, self._codon_entry["raw"],
+                sites={"BsaI": "GGTCTC"},  # only guard the tail enzyme
+            )
+        except Exception as exc:
+            _log.exception("Mutagenize: harmonize failed")
+            info.update(f"[red]Harmonization failed: {exc}[/red]")
+            return
+        name = self.query_one("#mut-prot-name", Input).value.strip() or "protein"
+        self._cds_dna  = cds
+        self._cds_meta = {"start": 0, "end": len(cds), "strand": 1,
+                          "name": name, "origin": "prot"}
+        self._plasmid_name = name
+        protein = _mut_translate(cds)
+        atg = "[green]ATG[/green]" if cds.startswith("ATG") else "[yellow]no ATG[/yellow]"
+        stop_tag = cds[-3:] if len(cds) >= 3 else ""
+        stop_s = (f"[green]{stop_tag}[/green]" if stop_tag in _MUT_STOPS
+                  else f"[yellow]{stop_tag}[/yellow]")
+        fix_note = f" · {len(fixes)} BsaI fix(es)" if fixes else ""
+        info.update(
+            f"  [dim]{len(cds)} nt · {len(protein)} aa · harmonized · "
+            f"CAI {_codon_cai(cds, self._codon_entry['raw']):.2f} · "
+            f"GC {_codon_gc(cds):.1f}%{fix_note}[/dim]   "
+            f"start {atg}   stop {stop_s}"
+        )
+
+    # ── Codon-table picker ───────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-mut-codon")
+    def _pick_codon_table(self, _) -> None:
+        self.app.push_screen(SpeciesPickerModal(), callback=self._codon_picked)
+
+    def _codon_picked(self, entry: "dict | None") -> None:
+        if not entry:
+            return
+        self._codon_entry = entry
+        lbl = self.query_one("#mut-codon-label", Static)
+        tax = f" (taxid {entry['taxid']})" if entry.get("taxid") else ""
+        lbl.update(f"Codon table: [bold]{entry['name']}[/bold]{tax}")
+
+    # ── Design ───────────────────────────────────────────────────────────
+
+    @on(Input.Submitted, "#mut-input")
+    def _mut_enter(self, _) -> None:
+        self.query_one("#btn-mut-design", Button).press()
+
+    @on(Button.Pressed, "#btn-mut-design")
+    def _design(self, _) -> None:
+        status = self.query_one("#mut-results", Static)
+        if not self._cds_dna:
+            status.update("[red]Load a CDS first (pick a source above).[/red]")
+            return
+        mut_val = self.query_one("#mut-input", Input).value.strip()
+        if not mut_val:
+            status.update("[red]Enter a mutation (e.g. W140F).[/red]")
+            return
+        try:
+            wt_aa, pos, mut_aa = _mut_parse(mut_val)
+        except ValueError as exc:
+            status.update(f"[red]{exc}[/red]")
+            return
+        if mut_aa == wt_aa:
+            status.update(f"[red]Position {pos} is already '{wt_aa}' — "
+                          "WT and mutant are identical.[/red]")
+            return
+        protein = _mut_translate(self._cds_dna)
+        if pos < 1 or pos > len(protein):
+            status.update(f"[red]Position {pos} out of range "
+                          f"(protein is {len(protein)} aa).[/red]")
+            return
+        actual = protein[pos - 1]
+        if actual != wt_aa:
+            status.update(f"[red]Position {pos} is '{actual}', not '{wt_aa}'.[/red]")
+            return
+        codon_raw = (self._codon_entry or {}).get("raw")
+        try:
+            outer = _mut_design_outer(self._cds_dna)
+            inner = _mut_design_inner(self._cds_dna, pos, mut_aa, wt_aa,
+                                      codon_table=codon_raw)
+        except Exception as exc:
+            _log.exception("Mutagenesis primer design failed")
+            status.update(f"[red]Primer design failed: {exc}[/red]")
+            return
+
+        self._outer = outer
+        self._inner = inner
+        status.update(self._render_results())
+        self.query_one("#btn-mut-save", Button).disabled = False
+
+    def _render_results(self) -> Text:
+        t = Text()
+        outer = self._outer or {}
+        inner = self._inner or {}
+        mutation = inner.get("mutation", "?")
+        wt_codon = inner.get("wt_codon", "???")
+        mut_codon = inner.get("mut_codon", "???")
+        nt_pos   = inner.get("nt_position", 0)
+        nt_chg   = inner.get("nt_changes", 0)
+        t.append(f"── {mutation}  ·  codon {wt_codon}→{mut_codon} "
+                 f"({nt_chg} nt change{'s' if nt_chg != 1 else ''}) "
+                 f"·  CDS nt {nt_pos}–{nt_pos + 2} ──\n", style="bold")
+
+        fwd_o = outer.get("fwd", {})
+        rev_o = outer.get("rev", {})
+        t.append("\nOuter primers  ", style="bold")
+        t.append("(constant for this CDS — order once)\n", style="dim")
+        t.append("  FWD  ", style="green bold")
+        full = fwd_o.get("full", "")
+        tl = len(_MUT_BSAI_FWD_TAIL)
+        t.append(full[:tl], style="dim green")
+        t.append(full[tl:], style="green")
+        t.append(f"   Tm {fwd_o.get('tm_anneal', 0):.1f}°C  "
+                 f"{len(full)} bp\n", style="dim")
+        t.append("  REV  ", style="red bold")
+        full = rev_o.get("full", "")
+        t.append(full[:tl], style="dim red")
+        t.append(full[tl:], style="red")
+        t.append(f"   Tm {rev_o.get('tm_anneal', 0):.1f}°C  "
+                 f"{len(full)} bp\n", style="dim")
+
+        ec = inner.get("edge_case")
+        if ec:
+            side = "CDS start" if ec["near_start"] else "CDS end"
+            mod  = ec["modified_outer"]
+            which = "A" if ec["near_start"] else "B"
+            frag_bp = ec["frag_a"] if ec["near_start"] else ec["frag_b"]
+            t.append(f"\n⚠  Edge case — mutation too close to {side} "
+                     f"(SOE fragment {which} = {frag_bp} nt < {_MUT_MIN_SOE_FRAG}).\n",
+                     style="yellow bold")
+            t.append("   Use the modified outer primer in a 2-primer direct PCR "
+                     "(no SOE needed):\n", style="dim")
+            t.append(f"  {mod['label']}  ", style="magenta bold")
+            t.append(mod["full"], style="magenta")
+            t.append(f"   Tm {mod['tm_anneal']:.1f}°C  {len(mod['full'])} bp\n",
+                     style="dim")
+            t.append(f"   Partner: {mod['partner']}\n", style="dim")
+        else:
+            best = inner["candidates"][0]
+            t.append("\nInner pair  ", style="bold")
+            t.append(f"(one per mutation — Tm {best['tm']:.1f}°C, "
+                     f"{best['length']} bp)\n", style="dim")
+            t.append("  FWD  ", style="green bold")
+            t.append(best["fwd"], style="green")
+            t.append(f"   Tm {best['tm']:.1f}°C  GC {best['gc']:.1f}%\n",
+                     style="dim")
+            t.append("  REV  ", style="red bold")
+            t.append(best["rev"], style="red")
+            t.append("   (revcomp of FWD)\n", style="dim")
+
+        t.append("\nProtocol: ", style="bold")
+        if ec:
+            t.append("PCR with the modified outer + unchanged partner → "
+                     "BsaI Golden Gate.\n", style="dim")
+        else:
+            t.append("PCR1 FWD_outer+REV_inner, PCR2 FWD_inner+REV_outer, "
+                     "PCR3 joins A+B → BsaI Golden Gate.\n", style="dim")
+        return t
+
+    # ── Save to primer library ────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-mut-save")
+    def _save(self, _) -> None:
+        if not (self._outer and self._inner and self._cds_meta):
+            return
+        import datetime
+        today = datetime.date.today().isoformat()
+        construct = self._cds_meta.get("name") or self._plasmid_name or "CDS"
+        safe_construct = re.sub(r"[^\w\-]+", "_", construct).strip("_") or "CDS"
+        mutation = self._inner["mutation"]
+
+        existing  = _load_primers()
+        seen_seqs = {e.get("sequence", "").upper() for e in existing}
+        entries   = list(existing)
+
+        def _upsert(name: str, seq: str, tm: float, ptype: str, strand: int) -> bool:
+            """Insert a primer record, replacing any existing row with the
+            same name. Returns False if the sequence is already stored under
+            a different name (skips that primer so we don't silently clobber
+            user-edited variants)."""
+            if seq.upper() in seen_seqs and not any(
+                e.get("name") == name and e.get("sequence", "").upper() == seq.upper()
+                for e in entries
+            ):
+                return False
+            nonlocal_entries = [e for e in entries if e.get("name") != name]
+            nonlocal_entries.insert(0, {
+                "name":        name,
+                "sequence":    seq,
+                "tm":          round(tm, 1),
+                "primer_type": ptype,
+                "source":      f"mutagenize:{safe_construct}:{mutation}",
+                "pos_start":   -1,
+                "pos_end":     -1,
+                "strand":      strand,
+                "date":        today,
+                "status":      "Designed",
+            })
+            entries.clear()
+            entries.extend(nonlocal_entries)
+            seen_seqs.add(seq.upper())
+            return True
+
+        saved: list = []
+        skipped: list = []
+        outer_fwd = self._outer["fwd"]
+        outer_rev = self._outer["rev"]
+        # Outer primers — named per-construct (shared across mutations)
+        for (name, p, ptype, strand) in [
+            (f"OUTER_FWD_{safe_construct}", outer_fwd, "mutagenesis_outer_fwd", 1),
+            (f"OUTER_REV_{safe_construct}", outer_rev, "mutagenesis_outer_rev", -1),
+        ]:
+            ok = _upsert(name, p["full"], p["tm_anneal"], ptype, strand)
+            (saved if ok else skipped).append(name)
+
+        ec = self._inner.get("edge_case")
+        if ec:
+            mod = ec["modified_outer"]
+            strand = 1 if ec["near_start"] else -1
+            name = f"{mod['label']}_{safe_construct}_{mutation}"
+            ok = _upsert(name, mod["full"], mod["tm_anneal"],
+                         "mutagenesis_modified_outer", strand)
+            (saved if ok else skipped).append(name)
+        else:
+            best = self._inner["candidates"][0]
+            for (name, seq, ptype, strand) in [
+                (f"INNER_FWD_{safe_construct}_{mutation}", best["fwd"],
+                 "mutagenesis_inner_fwd", 1),
+                (f"INNER_REV_{safe_construct}_{mutation}", best["rev"],
+                 "mutagenesis_inner_rev", -1),
+            ]:
+                ok = _upsert(name, seq, best["tm"], ptype, strand)
+                (saved if ok else skipped).append(name)
+
+        _save_primers(entries)
+        parts = [f"Saved {len(saved)} primer{'s' if len(saved) != 1 else ''} to library"]
+        if skipped:
+            parts.append(f"({len(skipped)} duplicate sequence(s) skipped)")
+        self.app.notify(" ".join(parts))
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-mut-cancel")
+    def _cancel_btn(self, _) -> None:
         self.dismiss(None)
 
     def action_cancel(self) -> None:
@@ -6457,6 +7921,51 @@ DomesticatorModal { align: center middle; }
 #dom-btns   { height: 3; margin-top: 1; }
 #dom-btns Button { margin-right: 1; }
 
+/* ── Mutagenize modal ───────────────────────────────────── */
+MutagenizeModal { align: center middle; }
+#mut-box {
+    width: 115; height: auto; max-height: 46;
+    background: $surface; border: solid $accent; padding: 1 2;
+}
+#mut-title    { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#mut-box Label { color: $text-muted; margin-top: 1; }
+#mut-src-map, #mut-src-lib, #mut-src-prot { height: auto; }
+#mut-prot-aa  { height: 6; border: solid $primary-darken-2; }
+#mut-prot-row { height: 3; margin-top: 1; }
+#mut-prot-row Input { width: 2fr; margin-right: 1; }
+#mut-prot-row Button { width: 1fr; }
+#mut-cds-info { height: 1; margin: 0 0 1 0; }
+#mut-codon-row { height: 3; margin: 1 0; }
+#mut-codon-label { width: 4fr; padding: 1 1 0 1; }
+#mut-codon-row Button { width: 1fr; }
+#mut-row2     { height: 5; }
+#mut-mut-col  { width: 3fr; padding-right: 1; }
+#mut-btn-col  { width: 2fr; }
+#btn-mut-design { width: 100%; }
+#mut-results {
+    height: auto; max-height: 16;
+    border: solid $primary-darken-2; padding: 0 1; margin-top: 1;
+    overflow-y: auto;
+}
+#mut-btns     { height: 3; margin-top: 1; }
+#mut-btns Button { margin-right: 1; }
+
+/* ── Species picker modal ───────────────────────────────── */
+SpeciesPickerModal { align: center middle; }
+#sp-box {
+    width: 90; height: auto; max-height: 34;
+    background: $surface; border: solid $accent; padding: 1 2;
+}
+#sp-title    { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#sp-box Label { color: $text-muted; margin-top: 1; }
+#sp-list     { height: 12; border: solid $primary-darken-2; }
+#sp-info     { height: 1; margin: 1 0; }
+#sp-fetch-row { height: 3; margin-top: 1; }
+#sp-fetch-row Input { width: 2fr; margin-right: 1; }
+#sp-fetch-row Button { width: 1fr; }
+#sp-btns     { height: 3; margin-top: 1; }
+#sp-btns Button { margin-right: 1; }
+
 /* ── Primer design screen (full-screen, Option B tabbed layout) ────── */
 #pd-box {
     width: 100%; height: 1fr;
@@ -7656,6 +9165,9 @@ DomesticatorModal { align: center middle; }
         if name == "Primers":
             self.action_open_primer_design()
             return
+        if name == "Mutagenize":
+            self.action_open_mutagenize()
+            return
 
         # ── Multi-action menus (dropdown) ──────────────────────────────────
         ck = "\u2713"  # checkmark
@@ -7875,6 +9387,28 @@ DomesticatorModal { align: center middle; }
         except Exception:
             pass
         self.push_screen(PrimerDesignScreen(seq, feats, name))
+
+    def action_open_mutagenize(self) -> None:
+        """Open the SOE-PCR site-directed mutagenesis primer designer.
+        Requires a loaded plasmid with at least one CDS feature."""
+        rec = self._current_record
+        if rec is None:
+            self.notify("Load a plasmid first (press 'f' or 'o').",
+                        severity="warning")
+            return
+        seq = str(rec.seq)
+        feats: list = []
+        try:
+            feats = self.query_one("#plasmid-map", PlasmidMap)._feats
+        except Exception:
+            pass
+        if not any(f.get("type") in ("CDS", "gene") for f in feats):
+            self.notify(
+                "No CDS features on this plasmid — nothing to mutagenize.",
+                severity="warning",
+            )
+            return
+        self.push_screen(MutagenizeModal(seq, feats, rec.name or ""))
 
     def action_undo(self) -> None:
         self._action_undo()
