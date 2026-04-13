@@ -484,3 +484,226 @@ class TestPrimerDesignScreenLayout:
             assert screen.query_one("#pd-start", Input).value == ""
             assert screen.query_one("#pd-end",   Input).value == ""
             assert screen.query_one("#pd-part-name", Input).value == ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Wrap-region primer design (regression guard for 2026-04-13 fix)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSliceCircular:
+    """_slice_circular is the contract at the heart of wrap-region design —
+    test it directly so the primer-design tests can rely on it."""
+
+    def test_normal_slice(self):
+        assert sc._slice_circular("ABCDEFGHIJ", 2, 6) == "CDEF"
+
+    def test_wrap_slice(self):
+        # [8:2) wraps → seq[8:] + seq[:2] = "IJ" + "AB"
+        assert sc._slice_circular("ABCDEFGHIJ", 8, 2) == "IJAB"
+
+    def test_equal_endpoints_is_empty(self):
+        # end == start is treated as an empty region (not a full-plasmid
+        # wrap); callers that want the whole sequence should pass (0, len).
+        assert sc._slice_circular("ABCDEFGHIJ", 3, 3) == ""
+
+    def test_zero_start_normal(self):
+        assert sc._slice_circular("ABCDEFGHIJ", 0, 5) == "ABCDE"
+
+
+class TestWrapRegionGeneric:
+    """_design_generic_primers on a wrap region should produce valid primers
+    AND map the reported positions back to original template coordinates."""
+
+    def test_wrap_region_produces_primers(self):
+        # 3 kb plasmid, region [2900, 100) — 200 bp crossing origin
+        import random
+        rng = random.Random(0xBEEF)
+        seq = "".join(rng.choice("ACGT") for _ in range(3000))
+        r = sc._design_generic_primers(seq, 2900, 100)
+        assert "error" not in r
+        assert r["fwd_seq"]
+        assert r["rev_seq"]
+
+    def test_wrap_region_fwd_pos_starts_before_origin(self):
+        import random
+        rng = random.Random(0xBEEF)
+        seq = "".join(rng.choice("ACGT") for _ in range(3000))
+        r = sc._design_generic_primers(seq, 2900, 100)
+        # fwd_pos starts at 2900 (user-specified start)
+        assert r["fwd_pos"][0] == 2900
+        # fwd_pos end is modular — lands near 2900 + binding_len, possibly wrapped
+        assert 0 <= r["fwd_pos"][1] < 3000
+
+    def test_wrap_region_rev_pos_ends_at_user_end(self):
+        import random
+        rng = random.Random(0xBEEF)
+        seq = "".join(rng.choice("ACGT") for _ in range(3000))
+        r = sc._design_generic_primers(seq, 2900, 100)
+        # rev_pos should end at 100 (user-specified end)
+        assert r["rev_pos"][1] == 100
+
+    def test_wrap_region_binding_actually_appears_in_wrapped_insert(self):
+        """The forward binding must literally appear at the start of the
+        wrapped insert (template[2900:] + template[:100])."""
+        import random
+        rng = random.Random(0xBEEF)
+        seq = "".join(rng.choice("ACGT") for _ in range(3000))
+        r = sc._design_generic_primers(seq, 2900, 100)
+        wrapped_insert = seq[2900:] + seq[:100]
+        assert wrapped_insert.startswith(r["fwd_seq"])
+        # Reverse binding is the RC of the end of the insert
+        assert wrapped_insert.endswith(sc._rc(r["rev_seq"]))
+
+
+class TestWrapRegionCloning:
+    def test_wrap_region_produces_primers(self):
+        import random
+        rng = random.Random(0xF00D)
+        seq = "".join(rng.choice("ACGT") for _ in range(3000))
+        r = sc._design_cloning_primers(seq, 2900, 200, "EcoRI", "BamHI")
+        assert "error" not in r
+        assert r["fwd_full"].startswith("GCGC")
+        assert "GAATTC" in r["fwd_full"]
+
+    def test_wrap_region_preserves_re_sites(self):
+        import random
+        rng = random.Random(0xF00D)
+        seq = "".join(rng.choice("ACGT") for _ in range(3000))
+        r = sc._design_cloning_primers(seq, 2900, 200, "XhoI", "HindIII")
+        assert "CTCGAG" in r["fwd_full"]         # XhoI
+        assert "AAGCTT" in r["rev_full"]         # HindIII (palindrome)
+
+    def test_wrap_region_insert_is_wrapped_concatenation(self):
+        import random
+        rng = random.Random(0xF00D)
+        seq = "".join(rng.choice("ACGT") for _ in range(3000))
+        r = sc._design_cloning_primers(seq, 2900, 200, "EcoRI", "BamHI")
+        assert r["insert_seq"] == seq[2900:] + seq[:200]
+
+
+class TestWrapRegionGoldenBraid:
+    def test_wrap_region_produces_primers(self):
+        # Need a wrap region free of internal BsaI sites. Build a
+        # deterministic sequence and avoid GGTCTC / GAGACC.
+        import random
+        rng = random.Random(0xCAFE)
+        seq = "".join(rng.choice("ACGT") for _ in range(3000))
+        # Ensure no BsaI sites by scanning
+        if "GGTCTC" in seq or "GAGACC" in seq:
+            seq = seq.replace("GGTCTC", "GCTGTC").replace("GAGACC", "GACCGA")
+        r = sc._design_gb_primers(seq, 2900, 200, "CDS")
+        assert "error" not in r
+        assert r["fwd_binding"]
+        assert r["rev_binding"]
+
+
+class TestWrapRegionDetection:
+    """Detection primers on wrap regions need the template to be rotated
+    because Primer3 is linear-only. After Primer3 returns, positions must
+    be unrotated back to original template coordinates."""
+
+    def test_wrap_region_produces_primers(self):
+        import random
+        rng = random.Random(0xDEAD)
+        seq = "".join(rng.choice("ACGT") for _ in range(3000))
+        # Region [2500, 500) — 1000 bp wrap region
+        r = sc._design_detection_primers(
+            seq, 2500, 500, product_min=450, product_max=550,
+        )
+        assert "error" not in r
+        assert 450 <= r["product_size"] <= 550
+
+    def test_wrap_region_primer_seqs_appear_in_wrapped_template(self):
+        import random
+        rng = random.Random(0xDEAD)
+        seq = "".join(rng.choice("ACGT") for _ in range(3000))
+        wrapped = seq[2500:] + seq[:500]
+        r = sc._design_detection_primers(
+            seq, 2500, 500, product_min=450, product_max=550,
+        )
+        assert "error" not in r
+        assert r["fwd_seq"] in wrapped
+        assert sc._rc(r["rev_seq"]) in wrapped
+
+    def test_wrap_region_positions_are_modular(self):
+        """Returned positions should be in [0, total) — never negative or
+        past the template end, even when the primer landed on the wrap
+        side of the rotation."""
+        import random
+        rng = random.Random(0xDEAD)
+        seq = "".join(rng.choice("ACGT") for _ in range(3000))
+        r = sc._design_detection_primers(
+            seq, 2500, 500, product_min=450, product_max=550,
+        )
+        assert "error" not in r
+        for pos in (r["fwd_pos"][0], r["fwd_pos"][1],
+                    r["rev_pos"][0], r["rev_pos"][1]):
+            assert 0 <= pos < 3000
+
+
+class TestLinearRegionStillWorks:
+    """Sanity check: all the existing linear-region tests still pass the
+    new code paths unchanged."""
+
+    def test_linear_detection_unchanged(self):
+        import random
+        rng = random.Random(0xBEEF)
+        seq = "".join(rng.choice("ACGT") for _ in range(3000))
+        r = sc._design_detection_primers(
+            seq, 100, 800, product_min=450, product_max=550,
+        )
+        assert "error" not in r
+        assert r["fwd_pos"][0] >= 100 and r["fwd_pos"][1] <= 800
+
+    def test_linear_generic_unchanged(self):
+        import random
+        rng = random.Random(0xBEEF)
+        seq = "".join(rng.choice("ACGT") for _ in range(3000))
+        r = sc._design_generic_primers(seq, 100, 500)
+        assert r["fwd_pos"] == (100, 100 + len(r["fwd_seq"]))
+        assert r["rev_pos"] == (500 - len(r["rev_seq"]), 500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Wrap-region UI hooks (screen mounts, feat_selected handles wrap-feature length)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+TERMINAL_SIZE = (200, 60)
+
+class TestWrapRegionUI:
+    async def test_wrap_hint_present_on_mount(self):
+        """The hint telling users they can enter start > end for wrap
+        regions should always be visible on mount."""
+        from textual.widgets import Static
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            screen = sc.PrimerDesignScreen("ACGT" * 800, [], "test")
+            app.push_screen(screen)
+            await pilot.pause()
+            hint = app.screen.query_one("#pd-wrap-hint", Static)
+            rendered = str(hint.render())
+            assert "Start > End" in rendered
+            assert "origin" in rendered
+
+    async def test_feat_selected_on_wrap_feature_fills_inputs(self):
+        """Selecting a wrap feature should populate start/end correctly
+        AND compute a positive feat_len so the detection range isn't
+        auto-adjusted to a negative value."""
+        from textual.widgets import Input, Select
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            # Wrap feature: start=2900, end=200 on 3000 bp plasmid
+            feats = [{"start": 2900, "end": 200, "label": "wrapCDS",
+                      "type": "CDS", "strand": 1}]
+            screen = sc.PrimerDesignScreen("A" * 3000, feats, "test")
+            app.push_screen(screen)
+            await pilot.pause()
+            # Simulate selecting the wrap feature
+            screen.query_one("#pd-feat", Select).value = "2900-200"
+            await pilot.pause()
+            assert screen.query_one("#pd-start", Input).value == "2901"
+            assert screen.query_one("#pd-end", Input).value == "200"
+            # No crash — in buggy version feat_len=-2700 caused
+            # detection product range to go negative.

@@ -358,3 +358,51 @@ class TestRotationInvariance:
         assert (500 + total) % total == 500
         assert (500 - total) % total == 500
         assert (500 + 2 * total) % total == 500
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _feat_len — circular-aware feature length (added 2026-04-13)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Several sort keys and UI displays used to compute feature length as
+# `end - start`, which is *negative* for wrap features. Wrap features then
+# sorted to the front (highest priority = smallest length after negation)
+# and displayed with negative bp counts in the sidebar. _feat_len is the
+# single source of truth; callers pass it (start, end, total) and get the
+# real biological length back.
+
+class TestFeatLen:
+    def test_linear_feature(self):
+        assert sc._feat_len(100, 200, 1000) == 100
+
+    def test_wrap_feature(self):
+        # start=950, end=100 on 1000 bp plasmid = 150 bp total
+        assert sc._feat_len(950, 100, 1000) == 150
+
+    def test_feature_at_origin(self):
+        assert sc._feat_len(0, 100, 1000) == 100
+
+    def test_feature_ending_at_origin(self):
+        # end=0 means wrap, contains [start:len) plus [0:0) = (total - start)
+        assert sc._feat_len(800, 0, 1000) == 200
+
+    def test_full_length_feature(self):
+        assert sc._feat_len(0, 1000, 1000) == 1000
+
+    def test_single_bp(self):
+        assert sc._feat_len(50, 51, 1000) == 1
+
+    def test_wrap_single_bp(self):
+        # start=999, end=0 wraps 1 bp across origin
+        assert sc._feat_len(999, 0, 1000) == 1
+
+    def test_sort_key_orders_wrap_features_correctly(self):
+        """The original bug: `-end + start` makes wrap features sort to the
+        front (most negative = largest when negated). _feat_len fixes this."""
+        feats = [
+            {"start": 100, "end": 200, "name": "small_linear"},   # 100 bp
+            {"start": 950, "end": 100, "name": "wrap_150"},       # 150 bp
+            {"start": 500, "end": 900, "name": "big_linear"},     # 400 bp
+        ]
+        by_len_desc = sorted(feats, key=lambda f: -sc._feat_len(f["start"], f["end"], 1000))
+        assert [f["name"] for f in by_len_desc] == ["big_linear", "wrap_150", "small_linear"]

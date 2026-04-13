@@ -13,7 +13,7 @@ A **terminal-based circular plasmid map viewer and sequence editor** built with 
 **Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs org, user ATinyGreenCell)
 
 - **Single-file architecture:** the entire app is `splicecraft.py` (~7,100 lines). Intentional — avoids import complexity and keeps the codebase greppable. (Sibling project ScriptoScope follows the same convention at ~8,600 lines.)
-- **Test suite:** 250 tests across 9 files in `tests/` (last refresh 2026-04-12). Full run ~55 s, biology subset (`test_dna_sanity.py`) < 1 s. See the **Test suite** section below.
+- **Test suite:** 388 tests across 10 files in `tests/` (last refresh 2026-04-13). Full run ~75 s, biology subset (`test_dna_sanity.py`) < 1 s. See the **Test suite** section below.
 - **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`, plus `pytest>=9.0` / `pytest-asyncio>=1.3` for tests. `Bio.Seq` and `Bio.SeqRecord` are the only Biopython surfaces touched in hot paths. Users install via `pipx install splicecraft` (recommended on PEP 668 systems) or `pip install splicecraft` inside a venv. Developers working on the repo run `python3 splicecraft.py` directly from the clone. **Optional runtime:** `pLannotate` (conda, GPL-3) for the Shift+A annotation feature — SpliceCraft works fine without it and notifies the user how to install if they press Shift+A.
 - **Published on PyPI** as `splicecraft`. Releases cut via `./release.sh X.Y.Z` (bumps version in both files, runs tests, builds, commits+tags+pushes; GitHub Actions `publish.yml` then publishes to PyPI via Trusted Publishing / OIDC). As of 2026-04-12 the latest published version is **0.2.2**.
 
@@ -116,6 +116,36 @@ Every invariant below has at least one test protecting it. Breaking any will sil
 
 7. **Data-file saves always back up.** `_safe_save_json` writes a `.bak` of the existing file before replacing it, via `tempfile.mkstemp` + `os.fsync` + `os.replace`. If the about-to-be-written list is smaller than the existing one, a SHRINK GUARD warning is logged. Never bypass `_safe_save_json` by writing JSON directly — it is the user's only recovery path from a buggy save.
 
+## Recent fixes (2026-04-13 session — unreleased)
+
+Continued wrap-feature audit after the 2026-04-12 pass. 10 more verified bugs fixed across sequence editing, primer design, and circular-map rendering. Tests grew 361 → 388.
+
+### Sequence editing
+- **Wrap-feature mangling in `_rebuild_record_with_edit`.** `int(CompoundLocation.start)` returns `min(parts.start)` and `int(.end)` returns `max(parts.end)`, so reading wrap features as `(fs, fe) = (int(loc.start), int(loc.end))` silently flattened them into whole-plasmid FeatureLocations on every insert/replace. Now per-part shift with collapse-to-FeatureLocation when only 1 part survives. See `_rebuild_record_with_edit` at ~line 6675.
+- **1-bp ghost stubs after delete.** `max(new_fs + 1, min(new_fe, new_len))` forced every post-edit feature to be at least 1 bp wide. Features fully consumed by a replace/delete survived as 1-bp stubs instead of being dropped. Clamp removed; zero-width features are now dropped.
+
+### Undo/redo coherence
+- **`_source_path` cleared on every in-place record change.** `_apply_record` unconditionally cleared `_source_path`, so after a pLannotate merge or primer-add, Ctrl+S no longer targeted the original file. The clear is now tied to `clear_undo=True` (i.e. fresh loads only).
+- **Primer add-to-map aliased the undo snapshot.** `_add_selected_to_map` mutated `_current_record.features` directly; undo snapshots shared the object, so Ctrl+Z gave back a "pristine" state that wasn't. Now builds a fresh record via deepcopy and calls `_apply_record(clear_undo=False)`.
+
+### Concurrent workers
+- **pLannotate re-entry guard.** Second Shift+A while a first run is in flight could spawn parallel workers wasting 5-30s CPU. Added `_plannotate_running` flag with `finally` cleanup so only one run can be in flight at a time.
+- **pLannotate merge missed `_mark_dirty`.** Worker called `lib.set_dirty(True)` (library panel marker) but not `self._unsaved=True`, so the quit prompt was silent on unsaved pLannotate edits. Now calls `_mark_dirty()` which flips both.
+
+### Primer design on wrap regions (the big one)
+- **`_design_gb/cloning/generic_primers` used `seq[start:end]` unconditionally.** Returned "" for wrap regions (end < start). Now use `_slice_circular(seq, start, end)` helper which returns `seq[start:] + seq[:end]` for wrap. Primer positions for wrap regions are computed via modular arithmetic: `(start + len(fwd_bind)) % total`, `(end - len(rev_bind)) % total`.
+- **`_design_detection_primers` is Primer3-backed.** Primer3 is linear-only, so wrap regions now rotate the template to `seq[start:] + seq[:start]` before calling Primer3, then unrotate the returned positions back to original-template coordinates via `(coord + rotation) % total`.
+- **Validators rejected wrap regions outright.** `_read_region_from` and `DomesticatorModal._design` both had `end <= start` as a "bad region" guard. Now accept `end < start` as a wrap indicator (but still reject `end == start` as empty).
+- **`_add_selected_to_map` silently dropped wrap primers.** `if p_end <= p_start: continue` skipped every wrap primer with no notification. Now builds a `CompoundLocation([FL(p_start, total), FL(0, p_end)])` for wrap primers so they land on the map with both tail and head arcs visible.
+- **`_feat_selected` computed feat_len as `end - start`.** Selecting a wrap feature in the primer-design dropdown gave a negative length, which the detection range auto-adjuster then set to bizarre values. Now uses `_feat_len(start, end, total)`.
+
+### Circular-map rendering
+- **Feature sort key used `end - start` for z-order.** Wrap features sorted to the *largest* bucket (due to negative key being most negative), rendering them on top of everything — often hiding smaller features they overlapped. Now all three sort sites (`PlasmidMap._draw`, `SequencePanel._click_to_bp`, `_annot_feats_sorted`, `_build_seq_inputs`) use `_feat_len(start, end, total)` which returns the correct biological length.
+- **`FeatureSidebar.show_detail` displayed negative bp counts for wrap features.** Replaced `span = end - start` with `span = _feat_len(start, end, total)`.
+
+### New helper
+- **`_feat_len(start, end, total)`** — single source of truth for circular-aware feature length. Returns `(total - start) + end` when `end < start`, else `end - start`. All sort keys and length displays route through it.
+
 ## Recent fixes (2026-04-12 session — shipped as v0.2.2)
 
 Six verified bugs fixed after a parallel review pass. Tests grew 246 → 250.
@@ -208,7 +238,7 @@ subset runs in < 1 s and is the fastest feedback loop.
 ### Running
 
 ```bash
-python3 -m pytest -q                        # all 250 tests
+python3 -m pytest -q                        # all 388 tests
 python3 -m pytest tests/test_dna_sanity.py  # only biology (< 1 s)
 python3 -m pytest tests/test_plannotate.py  # only pLannotate integration (~1 s)
 python3 -m pytest tests/test_primers.py     # only primer design (~2 s)
@@ -230,14 +260,15 @@ library files even by accident.
 
 | File | Tests | Covers |
 |------|------:|--------|
-| `tests/test_dna_sanity.py` | 58 | Sacred invariants 1-6 (RE scan, `_rc`, `_iupac_pattern`, codon table, **circular wrap scan**). `_NEB_ENZYMES` schema, no duplicates, IUPAC regex compiles, Type IIS cut-outside-recognition. `_translate_cds` forward & reverse strands, stop padding, partial codons, unknown codon → `?`. |
-| `tests/test_circular_math.py` | 13 | Sacred invariant #5 (wrap midpoint). `PlasmidMap._bp_in` for wrapped / non-wrapped / zero-width features. |
-| `tests/test_genbank_io.py` | 14 | `load_genbank` round-trip preserves sequence + features + strand. `_save_library` / `_load_library` JSON round-trip, corruption recovery, cache memoization. |
+| `tests/test_dna_sanity.py` | 74 | Sacred invariants 1-6 (RE scan, `_rc`, `_iupac_pattern`, codon table, **circular wrap scan**). `_NEB_ENZYMES` schema, no duplicates, IUPAC regex compiles, Type IIS cut-outside-recognition. `_translate_cds` forward & reverse strands, stop padding, partial codons, unknown codon → `?`. |
+| `tests/test_circular_math.py` | 38 | Sacred invariant #5 (wrap midpoint). `PlasmidMap._bp_in` for wrapped / non-wrapped / zero-width features. `_feat_len` circular-aware length helper. |
+| `tests/test_edit_record.py` | 14 | Regression guard for `_rebuild_record_with_edit`: wrap features survive insert/replace as CompoundLocation, collapse to FeatureLocation when only 1 part remains, features fully consumed by replace are dropped (not left as 1-bp stubs). Reverse-strand wraps keep strand. |
+| `tests/test_genbank_io.py` | 59 | `load_genbank` round-trip preserves sequence + features + strand. `_save_library` / `_load_library` JSON round-trip, corruption recovery, cache memoization. |
 | `tests/test_data_safety.py` | 28 | Sacred invariant #7 (atomic saves). `_safe_save_json` preserves `.bak`, `_safe_load_json` restores from `.bak` on corrupt main, `_protect_user_data` fixture confirmed working. |
-| `tests/test_primers.py` | 28 | Detection primers (SEQUENCE_INCLUDED_REGION inside region), cloning primers (RE tails + GCGC pad), Golden Braid primers (BsaI domestication, overhang correctness), generic primers. |
+| `tests/test_primers.py` | 60 | Detection primers (SEQUENCE_INCLUDED_REGION inside region), cloning primers (RE tails + GCGC pad), Golden Braid primers (BsaI domestication, overhang correctness), generic primers. **Wrap-region primer design** (`_slice_circular`, Primer3 template rotation, modular position mapping). |
 | `tests/test_domesticator.py` | 41 | Golden Braid L0 positions and overhangs. Part validation, assembly lane construction, overhang compatibility. |
 | `tests/test_plannotate.py` | 24 | Integration — availability detection, size-cap preflight, feature merging, subprocess error paths. pLannotate never actually invoked; `shutil.which` and `subprocess.run` monkeypatched. |
-| `tests/test_smoke.py` | 35 | Textual app mounts with preloaded record, all 4 panels present, features loaded, restriction scan ran, rotation / view toggle / RE toggle work, mount without preload, no-network guard. pLannotate UI entry points (Shift+A binding, install-hint notify). Primer design screen mounts. |
+| `tests/test_smoke.py` | 41 | Textual app mounts with preloaded record, all 4 panels present, features loaded, restriction scan ran, rotation / view toggle / RE toggle work, mount without preload, no-network guard. pLannotate UI entry points + re-entry guard. Primer design screen mounts. `_apply_record` in-place semantics (clear_undo=False preserves source_path and undo). |
 | `tests/test_performance.py` | 9 | Budget enforcement: scan pUC19 < 30 ms, scan 10 kb < 150 ms, scan scaling < 8× for 4× DNA, `_iupac_pattern` warm < 5 ms for 200 lookups, `_rc(10 kb)` < 2 ms, `_build_seq_text(pUC19)` < 25 ms, `_build_seq_text(20 kb)` < 200 ms, `_BUILD_SEQ_CACHE` populated after first call. |
 
 ### Sacred invariant → test mapping
@@ -428,7 +459,7 @@ Either direction is viable. The single-file convention and shared logging/error 
 If you are picking this up cold:
 
 1. **Read this file first.** It gives you architecture without reading 7,100 lines.
-2. **Run `python3 -m pytest -q`** before and after any change. 250 tests, ~55 s. The biology-correctness subset (`tests/test_dna_sanity.py`) runs in < 1 s if you want a faster inner loop.
+2. **Run `python3 -m pytest -q`** before and after any change. 388 tests, ~75 s. The biology-correctness subset (`tests/test_dna_sanity.py`) runs in < 1 s if you want a faster inner loop.
 3. **Check `/tmp/splicecraft.log`** (or `$SPLICECRAFT_LOG`) when debugging runtime issues. Every session has a unique 8-char ID.
 4. **Don't break the sacred invariants.** Every one of them has a test (see the mapping table above). If you're touching `_scan_restriction_sites`, `_rc`, `_iupac_pattern`, `_translate_cds`, `_bp_in`, or the feature-midpoint formula, the relevant tests will tell you immediately if you got it wrong.
 5. **Follow the error handling convention**: `_log.exception` for the stack trace, `notify()` or `Static.update("[red]...[/]")` for the user. Never let raw tracebacks hit the TUI.

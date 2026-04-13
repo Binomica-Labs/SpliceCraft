@@ -619,6 +619,25 @@ def _rc(seq: str) -> str:
     return seq.upper().translate(_IUPAC_COMP)[::-1]
 
 
+def _feat_len(start: int, end: int, total: int) -> int:
+    """Circular-aware feature length. A wrap feature (end < start) is
+    (total - start) + end bp long; a linear feature is end - start."""
+    return (total - start) + end if end < start else end - start
+
+
+def _slice_circular(seq: str, start: int, end: int) -> str:
+    """Circular-aware slice. If end > start this is a normal slice; if
+    end < start the slice wraps the origin and returns seq[start:] + seq[:end].
+    end == start is treated as empty (not "wrap whole plasmid") — callers
+    that want the latter should pass explicit boundaries. Used by the
+    primer-design helpers so a region straddling the origin can be
+    primer-designed without special casing at every call site.
+    """
+    if end >= start:
+        return seq[start:end]
+    return seq[start:] + seq[:end]
+
+
 # Pre-built per-enzyme scan records: immutable derived values (compiled pattern,
 # palindrome flag, RC pattern, color) computed once at import time rather than
 # on every _scan_restriction_sites call. Iterating the pre-built list avoids
@@ -1142,8 +1161,7 @@ def _build_seq_inputs(seq: str, feats: list[tuple]) -> tuple:
                 styles[i] = col
     annot_feats = sorted(
         [f for f in feats if f.get("type") not in ("site", "recut")],
-        key=lambda f: -(f["end"] - f["start"]) if f["end"] >= f["start"]
-                      else -((f["end"] - f["start"]) % max(n, 1)),
+        key=lambda f: -_feat_len(f["start"], f["end"], max(n, 1)),
     )
     # Cap the cache at 4 entries (one active + a few stale) — we're keying
     # on id() so size stays tiny; this is just belt-and-braces.
@@ -2300,7 +2318,7 @@ class PlasmidMap(Widget):
         # ── Features (large → small) ──────────────────────────────────────────
         feats_sorted = sorted(
             enumerate(self._feats),
-            key=lambda iv: -(iv[1]["end"] - iv[1]["start"]),
+            key=lambda iv: -_feat_len(iv[1]["start"], iv[1]["end"], total),
         )
         label_slots: list[tuple[float, str, str]] = []
         N_DR = 4   # radial samples per arc (was 6; 4 is visually identical)
@@ -2712,7 +2730,11 @@ class FeatureSidebar(Widget):
             box.update(Text(""))
             return
         strand_sym = "+" if f["strand"] == 1 else ("−" if f["strand"] == -1 else "·")
-        span = f["end"] - f["start"]
+        # Wrap features need modular length (end < start means the feature
+        # crosses the origin); naive end-start is negative and misleading.
+        rec = getattr(self.app, "_current_record", None)
+        total = len(rec.seq) if rec else max(f["end"], f["start"]) + 1
+        span = _feat_len(f["start"], f["end"], total)
         t = Text()
         t.append(f["type"],  style=f"bold {f['color']}")
         t.append("\n")
@@ -3199,7 +3221,7 @@ class SequencePanel(Widget):
         line_width  = max(20, self._seq_render_width() - (num_w + 2))
         annot_feats = sorted(
             [f for f in self._feats if f.get("type") not in ("site", "recut")],
-            key=lambda f: -(f["end"] - f["start"]),
+            key=lambda f: -_feat_len(f["start"], f["end"], n),
         )
         rpg     = 2 + (1 if self._show_connectors else 0)  # rows per feature group
         row     = 0
@@ -3253,9 +3275,10 @@ class SequencePanel(Widget):
 
     def _annot_feats_sorted(self) -> list:
         if self._sorted_feats_cache is None:
+            n = len(self._seq)
             self._sorted_feats_cache = sorted(
                 [f for f in self._feats if f.get("type") not in ("site", "recut")],
-                key=lambda f: -(f["end"] - f["start"]),
+                key=lambda f: -_feat_len(f["start"], f["end"], n),
             )
         return self._sorted_feats_cache
 
@@ -3849,7 +3872,9 @@ def _design_gb_primers(
     amplicon_len.
     """
     pos_label, oh5, oh3 = _GB_POSITIONS[part_type]
-    insert = template_seq[start:end].upper()
+    total  = len(template_seq)
+    insert = _slice_circular(template_seq.upper(), start, end)
+    wraps  = end < start
 
     # Need at least 18 bp to pick a proper binding region — otherwise
     # _pick_binding_region returns the whole (too-short) insert with Tm=0.
@@ -3903,9 +3928,14 @@ def _design_gb_primers(
     # start of the insert; the reverse primer binds the bottom strand at
     # the end of the insert (positions are reported in forward-strand
     # coordinates). Save-to-library needs these to add primer_bind
-    # features to the map.
-    fwd_pos = (start, start + len(fwd_bind))
-    rev_pos = (end - len(rev_bind), end)
+    # features to the map. For wrap regions, compute positions with
+    # modular arithmetic so they land on the real plasmid coordinates.
+    if wraps:
+        fwd_pos = (start, (start + len(fwd_bind)) % total)
+        rev_pos = ((end - len(rev_bind)) % total, end)
+    else:
+        fwd_pos = (start, start + len(fwd_bind))
+        rev_pos = (end - len(rev_bind), end)
 
     return {
         "part_type":    part_type,
@@ -4015,9 +4045,24 @@ def _design_detection_primers(
     rev_pos, product_size, or an 'error' key on failure.
     """
     import primer3
-    seq = template_seq.upper()
+    seq   = template_seq.upper()
+    total = len(seq)
+    wraps = target_end < target_start
 
-    region_len = target_end - target_start
+    # Primer3 is linear-only. For a wrap region we rotate the template
+    # so the region becomes contiguous at [0, region_len), run Primer3,
+    # then unrotate the returned positions via (coord + rotation) % total.
+    if wraps:
+        rotation    = target_start
+        p3_seq      = seq[target_start:] + seq[:target_start]
+        region_len  = (total - target_start) + target_end
+        p3_start    = 0
+    else:
+        rotation    = 0
+        p3_seq      = seq
+        region_len  = target_end - target_start
+        p3_start    = target_start
+
     if region_len < 1:
         return {"error": "Target region is empty."}
     if region_len < product_min:
@@ -4030,11 +4075,11 @@ def _design_detection_primers(
     try:
         result = primer3.design_primers(
             seq_args={
-                "SEQUENCE_TEMPLATE": seq,
+                "SEQUENCE_TEMPLATE": p3_seq,
                 # INCLUDED_REGION: primers must bind WITHIN this region.
                 # This is the key difference from SEQUENCE_TARGET (which
                 # would require primers to sit OUTSIDE the target).
-                "SEQUENCE_INCLUDED_REGION": [target_start, region_len],
+                "SEQUENCE_INCLUDED_REGION": [p3_start, region_len],
             },
             global_args={
                 "PRIMER_TASK": "generic",
@@ -4060,16 +4105,22 @@ def _design_detection_primers(
         explain = result.get("PRIMER_LEFT_EXPLAIN", "")
         return {"error": f"Primer3 found no valid pair. {explain}"}
 
-    fwd_pos = result["PRIMER_LEFT_0"]     # (start, length)
-    rev_pos = result["PRIMER_RIGHT_0"]    # (start, length) — start is 3' end
+    fwd_pos = result["PRIMER_LEFT_0"]     # (start, length) on p3_seq
+    rev_pos = result["PRIMER_RIGHT_0"]    # (start, length) — start is 3' end on p3_seq
+
+    # Unrotate positions back to original-template coordinates.
+    fwd_start = (fwd_pos[0] + rotation) % total
+    fwd_end   = (fwd_pos[0] + fwd_pos[1] + rotation) % total
+    rev_start = (rev_pos[0] - rev_pos[1] + 1 + rotation) % total
+    rev_end   = (rev_pos[0] + 1 + rotation) % total
 
     return {
         "fwd_seq":      result["PRIMER_LEFT_0_SEQUENCE"],
         "rev_seq":      result["PRIMER_RIGHT_0_SEQUENCE"],
         "fwd_tm":       round(result["PRIMER_LEFT_0_TM"], 1),
         "rev_tm":       round(result["PRIMER_RIGHT_0_TM"], 1),
-        "fwd_pos":      (fwd_pos[0], fwd_pos[0] + fwd_pos[1]),   # (start, end)
-        "rev_pos":      (rev_pos[0] - rev_pos[1] + 1, rev_pos[0] + 1),
+        "fwd_pos":      (fwd_start, fwd_end),
+        "rev_pos":      (rev_start, rev_end),
         "product_size": result["PRIMER_PAIR_0_PRODUCT_SIZE"],
     }
 
@@ -4105,7 +4156,9 @@ def _design_cloning_primers_raw(
     if not site_3 or not set(site_3) <= set("ACGTRYWSMKBDHVN"):
         return {"error": f"Invalid 3' site sequence: {site_3!r}"}
 
-    insert = template_seq[start:end].upper()
+    total  = len(template_seq)
+    insert = _slice_circular(template_seq.upper(), start, end)
+    wraps  = end < start
     if len(insert) < 18:
         return {"error": "Region too short (< 18 bp)."}
 
@@ -4114,6 +4167,13 @@ def _design_cloning_primers_raw(
 
     fwd_full = padding + site_5 + fwd_bind
     rev_full = padding + _rc(site_3) + rev_bind
+
+    if wraps:
+        fwd_pos = (start, (start + len(fwd_bind)) % total)
+        rev_pos = ((end - len(rev_bind)) % total, end)
+    else:
+        fwd_pos = (start, start + len(fwd_bind))
+        rev_pos = (end - len(rev_bind), end)
 
     return {
         "fwd_full":    fwd_full,
@@ -4127,8 +4187,8 @@ def _design_cloning_primers_raw(
         "site_5":      site_5,
         "site_3":      site_3,
         "insert_seq":  insert,
-        "fwd_pos":     (start, start + len(fwd_bind)),
-        "rev_pos":     (end - len(rev_bind), end),
+        "fwd_pos":     fwd_pos,
+        "rev_pos":     rev_pos,
     }
 
 
@@ -4167,18 +4227,26 @@ def _design_generic_primers(
     Forward primer: optimal binding region at the start of the region.
     Reverse primer: optimal binding region at the end (reverse-complement).
     """
-    insert = template_seq[start:end].upper()
+    total  = len(template_seq)
+    insert = _slice_circular(template_seq.upper(), start, end)
+    wraps  = end < start
     if len(insert) < 18:
         return {"error": "Region too short (< 18 bp)."}
     fwd_bind, fwd_tm = _pick_binding_region(insert, target_tm)
     rev_bind, rev_tm = _pick_binding_region(_rc(insert), target_tm)
+    if wraps:
+        fwd_pos = (start, (start + len(fwd_bind)) % total)
+        rev_pos = ((end - len(rev_bind)) % total, end)
+    else:
+        fwd_pos = (start, start + len(fwd_bind))
+        rev_pos = (end - len(rev_bind), end)
     return {
         "fwd_seq":  fwd_bind,
         "rev_seq":  rev_bind,
         "fwd_tm":   round(fwd_tm, 1),
         "rev_tm":   round(rev_tm, 1),
-        "fwd_pos":  (start, start + len(fwd_bind)),
-        "rev_pos":  (end - len(rev_bind), end),
+        "fwd_pos":  fwd_pos,
+        "rev_pos":  rev_pos,
     }
 
 
@@ -4492,13 +4560,18 @@ class DomesticatorModal(ModalScreen):
         except ValueError:
             status.update("[red]Enter valid start and end positions.[/red]")
             return
-        if start < 0 or end <= start or end > len(self._template):
+        total = len(self._template)
+        if start < 0 or end < 0 or start >= total or end > total:
             status.update(
                 f"[red]Invalid region: {start+1}–{end} "
-                f"(plasmid is {len(self._template)} bp)[/red]"
+                f"(plasmid is {total} bp)[/red]"
             )
             return
-        if end - start < 20:
+        if start == end:
+            status.update("[red]Region is empty.[/red]")
+            return
+        region_len = _feat_len(start, end, total)
+        if region_len < 20:
             status.update("[red]Region too short (< 20 bp).[/red]")
             return
 
@@ -5017,6 +5090,12 @@ class PrimerDesignScreen(Screen):
                                         "entry will be used:")
                             yield TextArea("", id="pd-custom-seq")
 
+                        yield Static(
+                            "[dim]Tip: enter Start > End to design primers "
+                            "across the origin (e.g. 2900..200 on a 3 kb "
+                            "plasmid).[/dim]",
+                            id="pd-wrap-hint", markup=True,
+                        )
                         yield Static("", id="pd-feat-info", markup=True)
 
                     # ─── 2. MODE ────────────────────────────────────────
@@ -5429,7 +5508,10 @@ class PrimerDesignScreen(Screen):
             end   = int(parts[1])
             self.query_one("#pd-start", Input).value = str(start + 1)
             self.query_one("#pd-end", Input).value = parts[1]
-            feat_len = end - start
+            # Wrap features have end < start; their length is
+            # (total - start) + end, not end - start.
+            total = len(self._template)
+            feat_len = (total - start) + end if end < start else end - start
 
             # Always set part name to the feature label
             feat_label = ""
@@ -5562,20 +5644,12 @@ class PrimerDesignScreen(Screen):
 
     def _read_region(self) -> "tuple[int, int, str] | None":
         """Read and validate start/end/part-name from the inputs.
-        Returns (start_0based, end, part_name) or None after notifying."""
-        try:
-            start = int(self.query_one("#pd-start", Input).value) - 1
-            end   = int(self.query_one("#pd-end", Input).value)
-        except ValueError:
-            self.app.notify("Enter valid start and end positions.", severity="error")
-            return None
-        if start < 0 or end <= start or end > len(self._template):
-            self.app.notify(
-                f"Invalid region: {start+1}–{end} "
-                f"(sequence is {len(self._template)} bp).", severity="error")
-            return None
-        name = self.query_one("#pd-part-name", Input).value.strip() or "primer"
-        return start, end, name
+        Returns (start_0based, end, part_name) or None after notifying.
+
+        `end <= start` is accepted as a wrap region on a circular plasmid;
+        see _read_region_from for details.
+        """
+        return self._read_region_from(self._template)
 
     def _show_result(self, design: dict, primer_type: str,
                      fwd_key: str, rev_key: str) -> None:
@@ -5651,16 +5725,28 @@ class PrimerDesignScreen(Screen):
             self._run_generic(template, start, end)
 
     def _read_region_from(self, template: str) -> "tuple[int, int, str] | None":
-        """Like _read_region but uses the given template length for validation."""
+        """Like _read_region but uses the given template length for validation.
+
+        `end <= start` is accepted as a wrap-around region on a circular
+        plasmid — the primer-design helpers slice template[start:] + template[:end]
+        and map primer positions back with modular arithmetic. We still
+        reject negative start, end past template, and same-position empties.
+        """
         try:
             start = int(self.query_one("#pd-start", Input).value) - 1
             end   = int(self.query_one("#pd-end", Input).value)
         except ValueError:
             self.app.notify("Enter valid start and end positions.", severity="error")
             return None
-        if start < 0 or end <= start or end > len(template):
+        total = len(template)
+        if start < 0 or end < 0 or start >= total or end > total:
             self.app.notify(
-                f"Invalid region: {start+1}–{end} (sequence is {len(template)} bp).",
+                f"Invalid region: {start+1}–{end} (sequence is {total} bp).",
+                severity="error")
+            return None
+        if end == start:
+            self.app.notify(
+                f"Region is empty (start and end both at {start+1}).",
                 severity="error")
             return None
         name = self.query_one("#pd-part-name", Input).value.strip() or "primer"
@@ -5833,7 +5919,7 @@ class PrimerDesignScreen(Screen):
             return
 
         primers = _load_primers()
-        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         from copy import deepcopy
@@ -5849,6 +5935,7 @@ class PrimerDesignScreen(Screen):
         for f in rec.features:
             new_rec.features.append(deepcopy(f))
 
+        total = len(new_rec.seq)
         added = []
         for idx in sorted(self._lib_selected):
             if idx < 0 or idx >= len(primers):
@@ -5858,21 +5945,40 @@ class PrimerDesignScreen(Screen):
             p_end   = p.get("pos_end", 0)
             strand  = p.get("strand", 1)
             name    = p.get("name", "primer")
-            if p_end <= p_start:
+            if p_end == p_start:
                 continue
+            # Wrap primer: pos_end < pos_start means the binding region
+            # crosses the origin. Represent as a CompoundLocation so
+            # downstream parsers (and GenBank exports) keep the two pieces.
+            if p_end < p_start and 0 <= p_end and p_start < total:
+                loc = CompoundLocation([
+                    FeatureLocation(p_start, total, strand=strand),
+                    FeatureLocation(0,       p_end, strand=strand),
+                ])
+            elif 0 <= p_start < p_end <= total:
+                loc = FeatureLocation(p_start, p_end, strand=strand)
+            else:
+                # Positions out of range for the current plasmid — skip.
+                continue
+
             # Don't duplicate: skip if a primer_bind with the same label
             # and position already exists on the record
+            def _loc_matches(f_loc) -> bool:
+                if isinstance(f_loc, CompoundLocation) and isinstance(loc, CompoundLocation):
+                    return [(int(p.start), int(p.end)) for p in f_loc.parts] == \
+                           [(int(p.start), int(p.end)) for p in loc.parts]
+                if isinstance(f_loc, FeatureLocation) and isinstance(loc, FeatureLocation):
+                    return int(f_loc.start) == p_start and int(f_loc.end) == p_end
+                return False
+
             already = any(
-                f.type == "primer_bind"
-                and int(f.location.start) == p_start
-                and int(f.location.end) == p_end
+                f.type == "primer_bind" and _loc_matches(f.location)
                 for f in new_rec.features
             )
             if already:
                 continue
             new_rec.features.append(SeqFeature(
-                FeatureLocation(p_start, p_end, strand=strand),
-                type="primer_bind",
+                loc, type="primer_bind",
                 qualifiers={"label": [name]},
             ))
             added.append(name)
@@ -6433,6 +6539,7 @@ DomesticatorModal { align: center middle; }
 #pd-custom-seq { height: 6; min-height: 4; }
 
 #pd-feat-info { height: 1; margin-top: 1; }
+#pd-wrap-hint { height: 1; margin-top: 1; }
 
 /* MODE — stacked radio set (all 4 options visible) */
 #pd-mode-radio { height: auto; padding: 0 1; background: transparent; border: none; }
