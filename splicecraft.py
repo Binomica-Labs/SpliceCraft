@@ -169,7 +169,8 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
 from textual.widgets import (
-    Button, DataTable, Footer, Header, Input, Label, Select, Static, TextArea,
+    Button, DataTable, Footer, Header, Input, Label, RadioButton, RadioSet,
+    Select, Static, TabbedContent, TabPane, TextArea,
 )
 from rich.text import Text
 
@@ -3667,18 +3668,29 @@ def _design_gb_primers(
     # Simpler: amplicon = pad+bsai+spacer+oh + insert + oh_rc+spacer+bsai_rc+pad
     amplicon_len = len(fwd_tail) + len(insert) + len(rev_tail)
 
+    # Positions of the primer binding regions on the TEMPLATE (not the
+    # full amplicon). The forward primer binds the top strand at the
+    # start of the insert; the reverse primer binds the bottom strand at
+    # the end of the insert (positions are reported in forward-strand
+    # coordinates). Save-to-library needs these to add primer_bind
+    # features to the map.
+    fwd_pos = (start, start + len(fwd_bind))
+    rev_pos = (end - len(rev_bind), end)
+
     return {
-        "part_type":   part_type,
-        "position":    pos_label,
-        "oh5":         oh5,
-        "oh3":         oh3,
-        "insert_seq":  insert,
-        "fwd_binding": fwd_bind,
-        "rev_binding": rev_bind,
-        "fwd_full":    fwd_full,
-        "rev_full":    rev_full,
-        "fwd_tm":      round(fwd_tm, 1),
-        "rev_tm":      round(rev_tm, 1),
+        "part_type":    part_type,
+        "position":     pos_label,
+        "oh5":          oh5,
+        "oh3":          oh3,
+        "insert_seq":   insert,
+        "fwd_binding":  fwd_bind,
+        "rev_binding":  rev_bind,
+        "fwd_full":     fwd_full,
+        "rev_full":     rev_full,
+        "fwd_tm":       round(fwd_tm, 1),
+        "rev_tm":       round(rev_tm, 1),
+        "fwd_pos":      fwd_pos,
+        "rev_pos":      rev_pos,
         "amplicon_len": amplicon_len,
     }
 
@@ -4709,145 +4721,219 @@ class PrimerDesignScreen(Screen):
         gb_opts = [
             (f"{k}  ({v[0]}: {v[1]}→{v[2]})", k) for k, v in _GB_POSITIONS.items()
         ]
-        mode_opts = [
-            ("Detection  (diagnostic PCR)",       "detection"),
-            ("Cloning  (RE tails + GCGC)",        "cloning"),
-            ("Golden Braid  (L0 domestication)",  "goldenbraid"),
-            ("Generic  (binding only)",           "generic"),
-        ]
-
         source_opts = [
-            ("Feature From Map",        "feature"),
-            ("Custom Sequence",         "custom"),
+            ("Feature from map",    "feature"),
+            ("Custom sequence",     "custom"),
         ]
 
         yield Header()
         with Vertical(id="pd-box"):
             yield Static(" Primer Design  —  Primer3 ", id="pd-title")
 
-            # ── Source selector + primer type + design button ──────────────
-            with Horizontal(id="pd-mode-row"):
-                with Vertical(id="pd-source-col"):
-                    yield Label("Source")
-                    yield Select(source_opts, id="pd-source",
-                                 value="feature", allow_blank=False)
-                with Vertical(id="pd-mode-col"):
-                    yield Label("Primer type")
-                    yield Select(mode_opts, id="pd-mode", value="detection",
-                                 allow_blank=False)
-                yield Button("Design", id="btn-pd-design", variant="primary")
+            # ═══ Open-book split: workflow on the left, library on the right
+            with Horizontal(id="pd-book"):
 
-            # ── Source: Feature From Map (default) ─────────────────────────
-            with Vertical(id="pd-src-feature", classes="pd-source-panel"):
-                yield Label("Plasmid")
-                with Horizontal(id="pd-plasmid-row"):
-                    yield Static(
-                        self._plasmid_name or "(no plasmid loaded)",
-                        id="pd-plasmid-name",
-                    )
-                    yield Button("Select Plasmid", id="btn-pd-pickplasmid",
-                                 variant="primary")
-                with Horizontal(id="pd-source-row"):
-                    with Vertical(id="pd-feat-col"):
-                        yield Label("Feature")
-                        yield Select(feat_opts, id="pd-feat",
-                                     prompt="(select or enter manually)")
-                    with Vertical(id="pd-start-col"):
-                        yield Label("Start")
-                        yield Input(placeholder="1", id="pd-start",
-                                    type="integer")
-                    with Vertical(id="pd-end-col"):
-                        yield Label("End")
-                        yield Input(
-                            placeholder=str(len(self._template)) if self._template else "",
-                            id="pd-end", type="integer")
-                    with Vertical(id="pd-name-col"):
-                        yield Label("Part name")
-                        yield Input(value="", id="pd-part-name",
+                # ╔════════════════════════ LEFT PAGE ════════════════════╗
+                with Vertical(id="pd-left-page"):
+
+                    # ─── 1. TEMPLATE ────────────────────────────────────
+                    with Vertical(classes="pd-section",
+                                  id="pd-template-section"):
+                        yield Static("1. TEMPLATE", classes="pd-section-hdr")
+
+                        # Source toggle + plasmid chooser
+                        with Horizontal(id="pd-src-row"):
+                            yield Label("Source:", classes="pd-fld-lbl")
+                            yield Select(source_opts, id="pd-source",
+                                         value="feature", allow_blank=False)
+                            yield Label("Plasmid:", classes="pd-fld-lbl",
+                                        id="pd-plasmid-lbl")
+                            yield Static(
+                                self._plasmid_name or "(no plasmid loaded)",
+                                id="pd-plasmid-name",
+                            )
+                            yield Button("Change",
+                                         id="btn-pd-pickplasmid",
+                                         variant="default")
+
+                        # Feature-from-map row
+                        with Horizontal(id="pd-src-feature",
+                                        classes="pd-source-panel"):
+                            with Vertical(id="pd-feat-col"):
+                                yield Label("Feature")
+                                yield Select(feat_opts, id="pd-feat",
+                                             prompt="(select feature)")
+                            with Vertical(id="pd-start-col"):
+                                yield Label("Start")
+                                yield Input(placeholder="1", id="pd-start",
+                                            type="integer")
+                            with Vertical(id="pd-end-col"):
+                                yield Label("End")
+                                yield Input(
+                                    placeholder=str(len(self._template))
+                                    if self._template else "",
+                                    id="pd-end", type="integer")
+                            with Vertical(id="pd-name-col"):
+                                yield Label("Part name")
+                                yield Input(
+                                    value="", id="pd-part-name",
                                     placeholder=self._default_part_name)
 
-            # ── Source: Custom Sequence ────────────────────────────────────
-            with Vertical(id="pd-src-custom", classes="pd-source-panel"):
-                yield Label("Custom sequence (highlight region to target, "
-                            "or use entire):")
-                yield TextArea("", id="pd-custom-seq")
+                        # Custom sequence row
+                        with Vertical(id="pd-src-custom",
+                                      classes="pd-source-panel"):
+                            yield Label("Paste sequence — highlight to "
+                                        "target a region, or the full "
+                                        "entry will be used:")
+                            yield TextArea("", id="pd-custom-seq")
 
-            # ── Feature info ───────────────────────────────────────────────
-            yield Static("", id="pd-feat-info", markup=True)
+                        yield Static("", id="pd-feat-info", markup=True)
 
-            # ── Mode: Detection ────────────────────────────────────────────
-            with Horizontal(id="pd-panel-det", classes="pd-mode-panel"):
-                yield Label("Product")
-                yield Input(value="450", id="pd-det-min", type="integer")
-                yield Label("–")
-                yield Input(value="550", id="pd-det-max", type="integer")
-                yield Label("bp")
-                yield Label("Tm")
-                yield Input(value="60", id="pd-det-tm", type="integer")
-                yield Label("°C")
-                yield Label("Len")
-                yield Input(value="25", id="pd-det-len", type="integer")
-                yield Label("bp")
+                    # ─── 2. MODE ────────────────────────────────────────
+                    with Vertical(classes="pd-section",
+                                  id="pd-mode-section"):
+                        yield Static("2. MODE", classes="pd-section-hdr")
+                        with RadioSet(id="pd-mode-radio"):
+                            yield RadioButton(
+                                "Detection  [dim](diagnostic PCR)[/dim]",
+                                id="rb-detection", value=True)
+                            yield RadioButton(
+                                "Cloning  [dim](RE tails + GCGC)[/dim]",
+                                id="rb-cloning")
+                            yield RadioButton(
+                                "Golden Braid  [dim](L0 domestication)[/dim]",
+                                id="rb-goldenbraid")
+                            yield RadioButton(
+                                "Generic  [dim](binding only)[/dim]",
+                                id="rb-generic")
 
-            # ── Mode: Cloning ──────────────────────────────────────────────
-            with Horizontal(id="pd-panel-clo", classes="pd-mode-panel"):
-                with Vertical(id="pd-clo-5col"):
-                    yield Label("5' RE site")
-                    yield Select(re_opts, id="pd-re5", value="EcoRI")
-                    yield Input(placeholder="or custom (e.g. GAATTC)",
-                                id="pd-cust5")
-                with Vertical(id="pd-clo-3col"):
-                    yield Label("3' RE site")
-                    yield Select(re_opts, id="pd-re3", value="BamHI")
-                    yield Input(placeholder="or custom (e.g. GGATCC)",
-                                id="pd-cust3")
-                with Vertical(id="pd-clo-tmcol"):
-                    yield Label("Tm")
-                    yield Input(value="60", id="pd-clo-tm", type="integer")
+                    # ─── 3. PARAMETERS (+ Design button) ────────────────
+                    # Cloning / GB are restacked to 2-3 internal rows so
+                    # the whole panel fits inside the narrower left page.
+                    with Vertical(classes="pd-section",
+                                  id="pd-params-section"):
+                        yield Static("3. PARAMETERS",
+                                     classes="pd-section-hdr")
 
-            # ── Mode: Golden Braid ─────────────────────────────────────────
-            with Horizontal(id="pd-panel-gb", classes="pd-mode-panel"):
-                with Vertical(id="pd-gb-type-col"):
-                    yield Label("Part type")
-                    yield Select(gb_opts, id="pd-gb-type", value="CDS")
-                yield Static("", id="pd-gb-oh-info", markup=True)
+                        # Detection — still one row
+                        with Horizontal(id="pd-panel-det",
+                                        classes="pd-mode-panel"):
+                            yield Label("Product")
+                            yield Input(value="450", id="pd-det-min",
+                                        type="integer")
+                            yield Label("–")
+                            yield Input(value="550", id="pd-det-max",
+                                        type="integer")
+                            yield Label("bp")
+                            yield Label(" Tm")
+                            yield Input(value="60", id="pd-det-tm",
+                                        type="integer")
+                            yield Label("°C")
+                            yield Label(" Len")
+                            yield Input(value="25", id="pd-det-len",
+                                        type="integer")
 
-            # ── Mode: Generic ──────────────────────────────────────────────
-            with Horizontal(id="pd-panel-gen", classes="pd-mode-panel"):
-                yield Label("Tm")
-                yield Input(value="60", id="pd-gen-tm", type="integer")
-                yield Label("°C")
-                yield Label("  Source ID")
-                yield Input(placeholder="e.g. synthetic frag", id="pd-gen-source")
+                        # Cloning — stacked in 3 rows (fits half-width)
+                        with Vertical(id="pd-panel-clo",
+                                      classes="pd-mode-panel"):
+                            with Horizontal(classes="pd-mode-row"):
+                                yield Label("5' RE  ")
+                                yield Select(re_opts, id="pd-re5",
+                                             value="EcoRI")
+                                yield Label("  or  ")
+                                yield Input(placeholder="GAATTC",
+                                            id="pd-cust5")
+                            with Horizontal(classes="pd-mode-row"):
+                                yield Label("3' RE  ")
+                                yield Select(re_opts, id="pd-re3",
+                                             value="BamHI")
+                                yield Label("  or  ")
+                                yield Input(placeholder="GGATCC",
+                                            id="pd-cust3")
+                            with Horizontal(classes="pd-mode-row"):
+                                yield Label("Tm     ")
+                                yield Input(value="60", id="pd-clo-tm",
+                                            type="integer")
+                                yield Label(" °C")
 
-            # ── Primer names ───────────────────────────────────────────────
-            with Horizontal(id="pd-result-names"):
-                with Vertical(id="pd-fn-col"):
-                    yield Label("Fwd name")
-                    yield Input(id="pd-fwd-name", placeholder="fwd primer name")
-                with Vertical(id="pd-rn-col"):
-                    yield Label("Rev name")
-                    yield Input(id="pd-rev-name", placeholder="rev primer name")
+                        # Golden Braid — stacked in 2 rows
+                        with Vertical(id="pd-panel-gb",
+                                      classes="pd-mode-panel"):
+                            with Horizontal(classes="pd-mode-row"):
+                                yield Label("Part type  ")
+                                yield Select(gb_opts, id="pd-gb-type",
+                                             value="CDS")
+                            yield Static("", id="pd-gb-oh-info",
+                                         markup=True)
 
-            # ── Results (below names) ──────────────────────────────────────
-            yield Static("", id="pd-results", markup=True)
+                        # Generic — still one row
+                        with Horizontal(id="pd-panel-gen",
+                                        classes="pd-mode-panel"):
+                            yield Label("Tm")
+                            yield Input(value="60", id="pd-gen-tm",
+                                        type="integer")
+                            yield Label("°C")
+                            yield Label(" Source ID")
+                            yield Input(placeholder="e.g. synthetic frag",
+                                        id="pd-gen-source")
 
-            # ── All buttons on one row ─────────────────────────────────────
-            with Horizontal(id="pd-btns"):
-                yield Button("Save to Library", id="btn-pd-save",
-                             variant="primary", disabled=True)
-                yield Button("Add Primers to Map", id="btn-pdlib-addmap",
-                             variant="primary")
-                yield Button("Rename", id="btn-pdlib-rename", variant="default")
-                yield Button("Delete", id="btn-pdlib-del", variant="error")
-                yield Button("Close", id="btn-pd-close")
+                        # Design button — docked at the bottom of section 3
+                        with Horizontal(id="pd-design-row"):
+                            yield Button("Design primers",
+                                         id="btn-pd-design",
+                                         variant="primary")
 
-            # ── Primer library ─────────────────────────────────────────────
-            yield Static(" Primer Library ", id="pd-lib-hdr")
-            yield DataTable(id="pd-lib-table", cursor_type="row",
-                            zebra_stripes=True)
+                # ╔═══════════════════════ RIGHT PAGE ════════════════════╗
+                with Vertical(id="pd-right-page"):
+
+                    # ─── RESULTS — sits above the library so newly-
+                    # designed primers appear next to where you'll save them
+                    with Vertical(classes="pd-section",
+                                  id="pd-results-section"):
+                        yield Static("RESULTS", classes="pd-section-hdr")
+                        yield Static(
+                            "[dim]Set a template and parameters, then "
+                            "press  [bold]Design primers[/bold]  to "
+                            "generate a primer pair.[/dim]",
+                            id="pd-results", markup=True,
+                        )
+                        # Names on their own row so inputs fill the full
+                        # right-page width (~2× longer than when they
+                        # shared a row with the buttons).
+                        with Horizontal(id="pd-result-names"):
+                            yield Input(id="pd-fwd-name",
+                                        placeholder="fwd primer name")
+                            yield Input(id="pd-rev-name",
+                                        placeholder="rev primer name")
+                        with Horizontal(id="pd-result-actions"):
+                            yield Button("Save to Library",
+                                         id="btn-pd-save",
+                                         variant="primary", disabled=True)
+                            yield Button("Add to Map",
+                                         id="btn-pdlib-addmap",
+                                         variant="default")
+
+                    # ─── PRIMER LIBRARY ─────────────────────────────────
+                    with Horizontal(id="pd-lib-hdr-row"):
+                        yield Static("PRIMER LIBRARY", id="pd-lib-hdr")
+                        yield Button("Rename", id="btn-pdlib-rename",
+                                     variant="default")
+                        yield Button("Delete", id="btn-pdlib-del",
+                                     variant="error")
+                        yield Button("Close", id="btn-pd-close",
+                                     variant="default")
+                    yield DataTable(id="pd-lib-table", cursor_type="row",
+                                    zebra_stripes=True)
         yield Footer()
 
+    # RadioButton id → internal mode name. Each mode has a matching
+    # parameter panel in the 3. PARAMETERS section; only one is shown.
+    _RB_TO_MODE = {
+        "rb-detection":   "detection",
+        "rb-cloning":     "cloning",
+        "rb-goldenbraid": "goldenbraid",
+        "rb-generic":     "generic",
+    }
     _MODE_PANELS = {
         "detection":   "#pd-panel-det",
         "cloning":     "#pd-panel-clo",
@@ -4860,18 +4946,57 @@ class PrimerDesignScreen(Screen):
         "custom":   "#pd-src-custom",
     }
 
+    def _current_mode(self) -> str:
+        """Resolve the active RadioButton → mode name."""
+        try:
+            rs = self.query_one("#pd-mode-radio", RadioSet)
+            # RadioSet's pressed_button is the currently-selected button
+            pressed = rs.pressed_button
+            if pressed is not None:
+                return self._RB_TO_MODE.get(pressed.id or "", "detection")
+        except Exception:
+            pass
+        return "detection"
+
+    def _switch_mode(self, mode: str) -> None:
+        """Show the parameter panel for `mode`, hide the others."""
+        for m, sel in self._MODE_PANELS.items():
+            try:
+                self.query_one(sel).display = (m == mode)
+            except Exception:
+                pass
+        if mode == "goldenbraid":
+            try:
+                self._update_gb_oh()
+            except Exception:
+                pass
+
     def _switch_source(self, src: str) -> None:
         for s, sel in self._SOURCE_PANELS.items():
             try:
                 self.query_one(sel).display = (s == src)
             except Exception:
                 pass
+        # Hide the plasmid chooser when source=custom (it's irrelevant)
+        try:
+            for wid in ("pd-plasmid-lbl", "pd-plasmid-name",
+                        "btn-pd-pickplasmid"):
+                self.query_one(f"#{wid}").display = (src == "feature")
+        except Exception:
+            pass
 
     @on(Select.Changed, "#pd-source")
     def _source_changed(self, event: Select.Changed) -> None:
         val = event.value
         if isinstance(val, str) and val in self._SOURCE_PANELS:
             self._switch_source(val)
+
+    @on(RadioSet.Changed, "#pd-mode-radio")
+    def _mode_changed(self, event: RadioSet.Changed) -> None:
+        """User clicked a different mode in the wizard."""
+        rb_id = (event.pressed.id or "") if event.pressed else ""
+        mode = self._RB_TO_MODE.get(rb_id, "detection")
+        self._switch_mode(mode)
 
     @on(Button.Pressed, "#btn-pd-pickplasmid")
     def _pick_plasmid(self, _) -> None:
@@ -4949,9 +5074,10 @@ class PrimerDesignScreen(Screen):
         t = self.query_one("#pd-lib-table", DataTable)
         t.add_columns("Name", "Sequence", "Len", "Tm", "Type", "Source", "Date", "Status")
         self._refresh_library_table()
-        # Show only the detection panel on startup
-        self._switch_mode("detection")
+        # Source defaults to Feature from map; mode defaults to Detection
+        # (the Detection RadioButton has value=True).
         self._switch_source("feature")
+        self._switch_mode("detection")
 
     _STATUS_COLORS = {
         "Designed":  "cyan",
@@ -4984,25 +5110,7 @@ class PrimerDesignScreen(Screen):
         if primers and 0 <= saved_cursor < len(primers):
             t.move_cursor(row=saved_cursor)
 
-    # ── Mode switching ───────────────────────────────────────────────────
-
-    def _switch_mode(self, mode: str) -> None:
-        """Show only the panel for `mode`, hide the others."""
-        for m, sel in self._MODE_PANELS.items():
-            try:
-                panel = self.query_one(sel)
-                panel.display = (m == mode)
-            except Exception:
-                pass
-        # Update GB overhang info when switching to golden braid
-        if mode == "goldenbraid":
-            self._update_gb_oh()
-
-    @on(Select.Changed, "#pd-mode")
-    def _mode_changed(self, event: Select.Changed) -> None:
-        val = event.value
-        if isinstance(val, str) and val in self._MODE_PANELS:
-            self._switch_mode(val)
+    # ── GB type selector ─────────────────────────────────────────────────
 
     @on(Select.Changed, "#pd-gb-type")
     def _gb_type_changed(self, _event) -> None:
@@ -5229,10 +5337,7 @@ class PrimerDesignScreen(Screen):
     @on(Button.Pressed, "#btn-pd-design")
     def _do_design(self, _) -> None:
         """Single Design button dispatches to the active primer mode."""
-        mode_val = self.query_one("#pd-mode", Select).value
-        if not isinstance(mode_val, str):
-            self.app.notify("Select a primer type.", severity="error")
-            return
+        mode_val = self._current_mode()
 
         # Resolve template: custom sequence overrides loaded plasmid.
         # If text is selected inside the TextArea, use ONLY the selection
@@ -5949,58 +6054,163 @@ DomesticatorModal { align: center middle; }
 #dom-btns   { height: 3; margin-top: 1; }
 #dom-btns Button { margin-right: 1; }
 
-/* ── Primer design screen (full-screen) ─────────────────── */
+/* ── Primer design screen (full-screen, Option B tabbed layout) ────── */
 #pd-box {
     width: 100%; height: 1fr;
     background: $surface; padding: 0 1;
     overflow-y: auto;
 }
-#pd-title     { background: $primary-darken-2; color: $text; padding: 0 1; }
-#pd-source-row { height: 4; }
-#pd-feat-col  { width: 2fr; padding-right: 1; }
-#pd-start-col { width: 1fr; padding-right: 1; }
-#pd-end-col   { width: 1fr; padding-right: 1; }
-#pd-name-col  { width: 2fr; }
-#pd-mode-row  { height: 4; }
-#pd-source-col { width: 1fr; max-width: 30; padding-right: 1; }
-#pd-mode-col  { width: 1fr; max-width: 40; padding-right: 1; }
-#pd-mode-row Button { margin-top: 1; min-width: 16; }
-.pd-source-panel { height: auto; }
-#pd-plasmid-row  { height: 3; align: center middle; }
+#pd-title { background: $primary-darken-2; color: $text; padding: 0 1; }
+
+/* Section wrapper: titled box around each logical group. Height hugs
+   content (no flex-grow) so sections stack tightly without leftover rows. */
+.pd-section {
+    width: 100%;
+    height: auto;
+    border: round $primary-darken-2;
+    padding: 0 1;
+    margin: 1 0 0 0;
+}
+.pd-section-hdr {
+    width: 100%; height: 1;
+    color: $text;
+    background: $primary-darken-2;
+    text-style: bold;
+    padding: 0 1;
+    margin: 0 0 0 0;
+}
+
+/* ── Open-book split: workflow (left page) + library (right page).
+   Left gets 3fr because it has more content (template + mode + params +
+   results); right gets 2fr (library datatable). Mins keep each page
+   usable on narrow terminals. ── */
+#pd-book { width: 100%; height: 1fr; }
+#pd-left-page {
+    width: 3fr;
+    min-width: 60;
+    height: 1fr;
+    padding-right: 1;
+}
+#pd-right-page {
+    width: 2fr;
+    min-width: 44;
+    height: 1fr;
+}
+
+/* Sections stack vertically inside the left page, all full-width.
+   Template and Mode get margin-top: 0 so the page starts compactly:
+   Panel 1 moves up 1 row (closes the title→panel-1 gap), Panel 2 moves
+   up 2 rows (same gap closed plus cascade from Panel 1 moving up),
+   Panel 3 stays on its margin-top:1 and cascades up 2 rows too. */
+#pd-template-section,
+#pd-mode-section,
+#pd-params-section { width: 100%; height: auto; }
+#pd-template-section { margin-top: 0; }
+#pd-mode-section     { margin-top: 0; }
+
+/* Results section (right page, above library). Gets more height for
+   the roomy 2-row name/button layout. */
+#pd-results-section { width: 100%; height: auto; margin: 0 0 1 0; }
+
+/* TEMPLATE */
+#pd-src-row { height: 3; align: left middle; }
+#pd-src-row Label { width: auto; padding: 0 1 0 0; content-align: center middle; }
+#pd-src-row #pd-source { width: 22; }
+#pd-plasmid-lbl { margin-left: 2; }
 #pd-plasmid-name {
     width: auto; max-width: 40;
     padding: 0 1;
-    content-align: center middle;
+    content-align: left middle;
     color: $accent;
 }
-#pd-plasmid-row Button { min-width: 18; margin-left: 2; }
-#pd-custom-seq { height: 10; min-height: 10; }
-#pd-custom-seq { height: 4; min-height: 4; }
-#pd-feat-info { height: 1; }
-.pd-mode-panel { height: 3; align: left middle; }
-.pd-mode-panel Label { width: auto; padding: 0 0 0 1; content-align: center middle; }
-.pd-mode-panel Input { width: 20; margin: 0 0; }
-#pd-gen-source { width: 24; }
-#pd-panel-clo { height: 6; }
-#pd-clo-5col  { width: 1fr; max-width: 32; padding-right: 1; }
-#pd-clo-3col  { width: 1fr; max-width: 32; padding-right: 1; }
-#pd-cust5, #pd-cust3 { width: 100%; margin-top: 0; }
-#pd-clo-tmcol { width: auto; padding-right: 1; }
-#pd-panel-gb  { height: 4; }
-#pd-gb-type-col { width: 1fr; max-width: 40; padding-right: 1; }
-#pd-gb-oh-info  { width: auto; content-align: left middle; }
-#pd-result-names { height: 4; }
-#pd-fn-col    { width: 1fr; padding-right: 1; }
-#pd-rn-col    { width: 1fr; }
-#pd-results   {
-    height: auto; max-height: 8;
-    border: solid $primary-darken-2; padding: 0 1;
+#pd-src-row #btn-pd-pickplasmid { min-width: 10; margin-left: 1; }
+
+.pd-source-panel { height: auto; }
+#pd-src-feature { height: 4; margin-top: 1; }
+#pd-feat-col  { width: 3fr; padding-right: 1; }
+#pd-start-col { width: 9;  padding-right: 1; }
+#pd-end-col   { width: 9;  padding-right: 1; }
+#pd-name-col  { width: 2fr; min-width: 18; }
+#pd-feat      { width: 100%; }
+#pd-start, #pd-end { width: 100%; }
+#pd-part-name { width: 100%; }
+
+#pd-src-custom { height: auto; margin-top: 1; }
+#pd-custom-seq { height: 6; min-height: 4; }
+
+#pd-feat-info { height: 1; margin-top: 1; }
+
+/* MODE — stacked radio set (all 4 options visible) */
+#pd-mode-radio { height: auto; padding: 0 1; background: transparent; border: none; }
+#pd-mode-radio RadioButton { padding: 0 1; margin: 0; background: transparent; }
+
+/* PARAMETERS — mode panels + docked Design button, one active at a time.
+   height: auto so single-row panels (Detection, Generic) stay 3 rows and
+   multi-row panels (Cloning = 3 inner rows, GB = 2) expand accordingly. */
+.pd-mode-panel { height: auto; padding: 0; }
+/* Each inner row inside a multi-row panel. */
+.pd-mode-row { height: 3; align: left middle; padding: 0; }
+/* Labels & inputs uniform across all rows. */
+.pd-mode-panel Label, .pd-mode-row Label {
+    width: auto; padding: 0 0 0 1; content-align: center middle;
 }
-#pd-btns      { height: 3; }
-#pd-btns Button { margin-right: 1; }
-#pd-btns #btn-pd-close { dock: right; }
-#pd-lib-hdr   { background: $accent-darken-2; color: $text; padding: 0 1; }
-#pd-lib-table { height: 1fr; min-height: 6; }
+.pd-mode-panel Input { width: 10; margin: 0 0; }
+/* Single-row (Horizontal) panels also need an align rule. */
+#pd-panel-det, #pd-panel-gen { height: 3; align: left middle; }
+
+/* Detection: product min/max (3-4 digit bp); Tm, Len (2-3 digit). */
+#pd-det-min, #pd-det-max { width: 10; }
+#pd-det-tm, #pd-det-len  { width: 10; }
+
+/* Cloning: RE Select fits longest label (~21 chars) + chrome;
+   custom-RE Input roomy for 6-12 bp recognition sites + padding. */
+#pd-re5, #pd-re3     { width: 28; }
+#pd-cust5, #pd-cust3 { width: 18; }
+#pd-clo-tm           { width: 10; }
+
+/* Golden Braid: part-type Select (labels up to 30 chars); oh-info fills. */
+#pd-gb-type    { width: 40; }
+#pd-gb-oh-info { width: 1fr; content-align: left middle; padding-left: 2; }
+
+/* Generic: source ID is free text. */
+#pd-gen-tm     { width: 10; }
+#pd-gen-source { width: 32; }
+
+/* DESIGN button — lives inside section 3 now; just one row tall, centered.
+   No external margins — the section's own margin-top handles separation. */
+#pd-design-row { height: 3; align: center middle; margin: 1 0 0 0; }
+#pd-design-row Button { min-width: 26; }
+
+/* ── RESULTS section ── */
+#pd-results { height: auto; min-height: 4; max-height: 14; padding: 0 1; }
+/* Name inputs: full-width row so each fwd/rev box is ~2× longer than
+   when it shared a row with the Save/Add-to-Map buttons. */
+#pd-result-names { height: 3; align: left middle; margin-top: 1; }
+#pd-result-names Input { width: 1fr; margin-right: 1; }
+/* Action buttons now sit on their own row below the name inputs. */
+#pd-result-actions { height: 3; align: right middle; margin-top: 0; }
+#pd-result-actions Button { min-width: 18; margin-left: 1; }
+
+/* ── PRIMER LIBRARY (right page) — header bar + DataTable ── */
+/* Sits at the top of pd-right-page, no outer margin (the book's own gap
+   between left and right pages is pd-left-page's padding-right). */
+#pd-lib-hdr-row {
+    height: 3;
+    align: left middle;
+    background: $accent-darken-2;
+    padding: 0 1;
+    margin-top: 0;
+}
+#pd-lib-hdr {
+    width: 1fr;
+    color: $text;
+    text-style: bold;
+    content-align: left middle;
+}
+#pd-lib-hdr-row Button { min-width: 10; margin-left: 1; }
+#pd-lib-table { width: 100%; height: 1fr; min-height: 6; }
+
+.pd-fld-lbl { width: auto; padding: 0 1 0 0; }
 """
 
     BINDINGS = [
