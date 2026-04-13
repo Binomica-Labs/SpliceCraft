@@ -966,7 +966,6 @@ def _render_feature_row_pair(
                         if 0 <= j < content_w and bar_arr[j][0] == " ":
                             bar_arr[j] = ("╌", color)
 
-
             # Connector tick at midpoint
             mid = bar_s + bar_len // 2
             if 0 <= mid < content_w:
@@ -3089,7 +3088,6 @@ class SequencePanel(Widget):
             return
         self._last_was_drag = False
         self._last_resite_click = None
-        self._cut_highlight = None
         bp = self._click_to_bp(event.screen_x, event.screen_y)
         if bp < 0:
             return
