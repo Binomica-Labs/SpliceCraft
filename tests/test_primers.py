@@ -398,3 +398,72 @@ class TestPrimerDesignScreenLayout:
             ids_inside = {w.id for w in hdr.walk_children()}
             assert "btn-pdlib-rename" in ids_inside
             assert "btn-pdlib-del" in ids_inside
+
+    async def test_reset_for_new_design_clears_pair_state(self, tmp_path,
+                                                           monkeypatch):
+        """After a save-to-library completes, the modal state specific
+        to a designed primer pair is cleared (result cache, primer
+        names, Save button, Results pane, feature selection, start/end,
+        part name, feature info). Template / mode / parameters are
+        deliberately preserved."""
+        from textual.widgets import Input, Button, Static, Select
+        # Redirect primers.json to a tmp path (conftest's autouse
+        # fixture already does this, but be explicit.)
+        p = tmp_path / "primers.json"
+        monkeypatch.setattr(sc, "_PRIMERS_FILE", p)
+        monkeypatch.setattr(sc, "_primers_cache", None, raising=False)
+
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            # Seed the screen with one feature so its Select has a
+            # value we can observe getting reset.
+            feats = [{"type": "CDS", "start": 10, "end": 100,
+                      "strand": 1, "label": "gene1",
+                      "color": "color(39)"}]
+            screen = sc.PrimerDesignScreen("ACGT" * 200, feats, "test")
+            app.push_screen(screen)
+            await pilot.pause()
+
+            # Simulate the post-design state.
+            screen._det_result = {
+                "_type":    "detection",
+                "fwd_seq":  "ACGT" * 5,
+                "rev_seq":  "TGCA" * 5,
+                "fwd_tm":   60.0,
+                "rev_tm":   60.0,
+                "fwd_pos":  (0, 20),
+                "rev_pos":  (100, 120),
+                "product_size": 120,
+            }
+            screen.query_one("#pd-fwd-name", Input).value = "test-F"
+            screen.query_one("#pd-rev-name", Input).value = "test-R"
+            screen.query_one("#btn-pd-save", Button).disabled = False
+            screen.query_one("#pd-results", Static).update("some result text")
+            screen.query_one("#pd-feat", Select).value = "10-100"
+            screen.query_one("#pd-start", Input).value = "11"
+            screen.query_one("#pd-end",   Input).value = "100"
+            screen.query_one("#pd-part-name", Input).value = "gene1"
+            screen.query_one("#pd-feat-info", Static).update(
+                "gene1  90 bp"
+            )
+            await pilot.pause()
+
+            # Trigger the reset
+            screen._reset_for_new_design()
+            await pilot.pause()
+
+            # Per-pair output cleared
+            assert screen._det_result is None
+            assert screen._clo_result is None
+            assert screen.query_one("#pd-fwd-name", Input).value == ""
+            assert screen.query_one("#pd-rev-name", Input).value == ""
+            assert screen.query_one("#btn-pd-save", Button).disabled is True
+
+            # Feature selection cleared. Select.clear() sets the value
+            # to a blank sentinel (BLANK or NULL depending on Textual
+            # version) — assert it's no longer the real option value.
+            assert screen.query_one("#pd-feat", Select).value != "10-100"
+            assert screen.query_one("#pd-start", Input).value == ""
+            assert screen.query_one("#pd-end",   Input).value == ""
+            assert screen.query_one("#pd-part-name", Input).value == ""

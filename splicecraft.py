@@ -1357,9 +1357,14 @@ def _feat_label(feat) -> str:
         if q in feat.qualifiers:
             v = feat.qualifiers[q]
             s = v[0] if isinstance(v, list) else v
-            # Empty qualifier values fall through to the next candidate
-            # so we don't show a blank name in the sidebar.
-            if isinstance(s, str) and s.strip():
+            if not isinstance(s, str):
+                continue
+            # Collapse whitespace characters (newline, tab, vertical tab)
+            # into single spaces so a multi-line /note="…" qualifier
+            # doesn't break the sidebar row or clobber the map label.
+            # Then strip and fall through if the result is empty.
+            s = " ".join(s.split())
+            if s:
                 return s[:28]
     return feat.type
 
@@ -1915,10 +1920,16 @@ class PlasmidMap(Widget):
             strand = getattr(feat.location, "strand", 1) or 1
 
             # Compound / joined locations need special handling:
-            #   * join(100..200, 300..400) on a 500 bp seq   → flatten to 100..400
-            #   * join(450..500, 1..50)   on a 500 bp seq   → WRAPPING feature;
+            #   * parts that are CONTIGUOUS (each part.end == next.start):
+            #     not really split — SnapGene emits these for some
+            #     annotation internals; treat as a single plain feature
+            #     from [first.start, last.end) with no "flattened" warning
+            #     because no information is lost.
+            #   * join(450..500, 1..50) on a 500 bp seq → WRAPPING feature;
             #     rebuild as start=450, end=50 (end < start) so the existing
             #     _bp_in / wrap-midpoint machinery renders the correct arc.
+            #   * join(100..200, 300..400) on a 500 bp seq (truly split,
+            #     e.g. exons of an mRNA) → flatten to 100..400 + warn.
             is_compound = (CompoundLocation is not None
                            and isinstance(feat.location, CompoundLocation))
             if is_compound:
@@ -1926,12 +1937,17 @@ class PlasmidMap(Widget):
                     feat.location.parts,
                     key=lambda p: int(p.start),
                 )
-                if (
+                is_contiguous = all(
+                    int(parts[i].end) == int(parts[i + 1].start)
+                    for i in range(len(parts) - 1)
+                )
+                is_wrap = (
                     total > 0 and len(parts) == 2
                     and int(parts[0].start) == 0
                     and int(parts[-1].end) == total
                     and int(parts[0].end) < int(parts[-1].start)
-                ):
+                )
+                if is_wrap:
                     # Origin-spanning wrap: head at [0, parts[0].end),
                     # tail at [parts[-1].start, total). Represent as
                     # start=tail, end=head so end<start signals wrap.
@@ -1941,6 +1957,10 @@ class PlasmidMap(Widget):
                         "Detected wrap feature %s (%d..%d → wraps origin)",
                         _feat_label(feat), start, end,
                     )
+                elif is_contiguous:
+                    # Adjacent sub-parts — outer bounds ARE the real span,
+                    # no info lost, no need to warn the user.
+                    pass
                 else:
                     self._n_flattened += 1
                     _log.info(
@@ -5003,9 +5023,7 @@ class PrimerDesignScreen(Screen):
                                   id="pd-results-section"):
                         yield Static("RESULTS", classes="pd-section-hdr")
                         yield Static(
-                            "[dim]Set a template and parameters, then "
-                            "press  [bold]Design primers[/bold]  to "
-                            "generate a primer pair.[/dim]",
+                            self._RESULTS_EMPTY_HINT,
                             id="pd-results", markup=True,
                         )
                         # Names on their own row so inputs fill the full
@@ -5195,6 +5213,53 @@ class PrimerDesignScreen(Screen):
         "Ordered":   "yellow",
         "Validated": "green",
     }
+
+    _RESULTS_EMPTY_HINT = (
+        "[dim]Set a template and parameters, then "
+        "press  [bold]Design primers[/bold]  to "
+        "generate a primer pair.[/dim]"
+    )
+
+    def _reset_for_new_design(self) -> None:
+        """Clear the state specific to a single primer-pair design so
+        the user can start fresh for the next pair. Called after a
+        successful save-to-library.
+
+        Reset:
+          - primer-pair output (results cache, names, Save button,
+            Results pane hint)
+          - feature selection + start/end + part name + feature info
+            (so the user picks a new region for the next design)
+
+        Preserved:
+          - plasmid (Source, Change-plasmid button)
+          - mode + mode-specific parameters (Tm, product size, RE
+            sites, etc.) — a common workflow is to tweak params and
+            redesign with the same settings
+          - custom-sequence TextArea content (if the user pasted one)
+        """
+        self._det_result = None
+        self._clo_result = None
+        try:
+            # Per-pair output
+            self.query_one("#pd-fwd-name", Input).value = ""
+            self.query_one("#pd-rev-name", Input).value = ""
+            self.query_one("#btn-pd-save", Button).disabled = True
+            self.query_one("#pd-results", Static).update(
+                self._RESULTS_EMPTY_HINT
+            )
+
+            # Feature + region selection. Select.clear() sets the value
+            # to Select.BLANK (= False), resetting to the prompt state.
+            self.query_one("#pd-feat", Select).clear()
+            self.query_one("#pd-start", Input).value = ""
+            self.query_one("#pd-end",   Input).value = ""
+            self.query_one("#pd-part-name", Input).value = ""
+            self.query_one("#pd-feat-info", Static).update("")
+        except Exception:
+            # Widgets may not exist if the screen is being dismissed
+            # concurrently; ignore silently.
+            pass
 
     def _refresh_library_table(self) -> None:
         t = self.query_one("#pd-lib-table", DataTable)
@@ -5649,6 +5714,7 @@ class PrimerDesignScreen(Screen):
         _save_primers(entries)
         self._refresh_library_table()
         self.app.notify(f"Saved {fwd_name} + {rev_name} to primer library.")
+        self._reset_for_new_design()
 
     # ── Add selected library primers as features ──────────────────────────
 

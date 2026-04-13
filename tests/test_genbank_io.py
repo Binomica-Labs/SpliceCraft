@@ -270,6 +270,40 @@ class TestFeatLabelFallback:
                        qualifiers={"label": ["a" * 50]})
         assert sc._feat_label(f) == "a" * 28
 
+    def test_newline_in_label_collapsed(self):
+        """Multi-line /note="..." qualifiers picked up as the label
+        must have newlines/tabs collapsed to single spaces — raw
+        newlines would break the sidebar row and map label."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        f = SeqFeature(FeatureLocation(0, 10), type="CDS",
+                       qualifiers={"product": ["Line one\nLine two"]})
+        assert sc._feat_label(f) == "Line one Line two"
+
+    def test_tab_in_label_collapsed(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        f = SeqFeature(FeatureLocation(0, 10), type="CDS",
+                       qualifiers={"product": ["name\twith\ttabs"]})
+        assert sc._feat_label(f) == "name with tabs"
+
+    def test_runs_of_whitespace_collapsed(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        f = SeqFeature(FeatureLocation(0, 10), type="gene",
+                       qualifiers={"label": ["many    spaces   here"]})
+        assert sc._feat_label(f) == "many spaces here"
+
+    def test_whitespace_only_label_falls_back(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        f = SeqFeature(FeatureLocation(0, 10), type="CDS",
+                       qualifiers={"label": ["\n\n\t  "],
+                                   "gene":  ["ampR"]})
+        assert sc._feat_label(f) == "ampR"
+
+    def test_non_ascii_preserved(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        f = SeqFeature(FeatureLocation(0, 10), type="CDS",
+                       qualifiers={"product": ["β-galactosidase"]})
+        assert sc._feat_label(f) == "β-galactosidase"
+
 
 class TestParseClamping:
     """Features with out-of-range coordinates are clamped to
@@ -364,6 +398,28 @@ class TestWrapFeatureDetection:
         f = feats[0]
         assert f["start"] == 100 and f["end"] == 350
         assert pm._n_flattened == 1
+
+    def test_contiguous_compound_not_flagged_as_flattened(self):
+        """SnapGene emits adjacent-parts CompoundLocations like
+        parts=[(46, 47), (47, 52)] for a 6-bp RE site, where the
+        outer bounds perfectly capture the real feature. Those don't
+        represent lost information, so we must NOT bother the user
+        with a ⚠ "features flattened" notification."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        rec = self._make_record(400)
+        cl = CompoundLocation([
+            FeatureLocation(46, 47, strand=1),
+            FeatureLocation(47, 52, strand=1),
+        ])
+        rec.features.append(SeqFeature(cl, type="misc_feature",
+                                       qualifiers={"label": ["EcoRI"]}))
+        pm = sc.PlasmidMap.__new__(sc.PlasmidMap)
+        feats = pm._parse(rec)
+        f = feats[0]
+        # Outer bounds = the real span
+        assert f["start"] == 46 and f["end"] == 52
+        # Crucially: contiguous, so NOT counted as flattened
+        assert pm._n_flattened == 0
 
 
 class TestRecordToGbTextResilience:
