@@ -2735,12 +2735,16 @@ class FeatureSidebar(Widget):
         rec = getattr(self.app, "_current_record", None)
         total = len(rec.seq) if rec else max(f["end"], f["start"]) + 1
         span = _feat_len(f["start"], f["end"], total)
+        if f["end"] < f["start"]:
+            coord_str = f"{f['start']+1}‥{total},1‥{f['end']}"
+        else:
+            coord_str = f"{f['start']+1}‥{f['end']}"
         t = Text()
         t.append(f["type"],  style=f"bold {f['color']}")
         t.append("\n")
         t.append(f["label"], style="white")
         t.append("\n")
-        t.append(f"{f['start']+1}‥{f['end']} ({span:,} bp)", style="dim")
+        t.append(f"{coord_str} ({span:,} bp)", style="dim")
         t.append("\n")
         t.append(f"Strand: {strand_sym}", style="dim")
         box.update(t)

@@ -13,7 +13,7 @@ A **terminal-based circular plasmid map viewer and sequence editor** built with 
 **Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs org, user ATinyGreenCell)
 
 - **Single-file architecture:** the entire app is `splicecraft.py` (~7,100 lines). Intentional — avoids import complexity and keeps the codebase greppable. (Sibling project ScriptoScope follows the same convention at ~8,600 lines.)
-- **Test suite:** 388 tests across 10 files in `tests/` (last refresh 2026-04-13). Full run ~75 s, biology subset (`test_dna_sanity.py`) < 1 s. See the **Test suite** section below.
+- **Test suite:** 390 tests across 10 files in `tests/` (last refresh 2026-04-13). Full run ~75 s, biology subset (`test_dna_sanity.py`) < 1 s. See the **Test suite** section below.
 - **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`, plus `pytest>=9.0` / `pytest-asyncio>=1.3` for tests. `Bio.Seq` and `Bio.SeqRecord` are the only Biopython surfaces touched in hot paths. Users install via `pipx install splicecraft` (recommended on PEP 668 systems) or `pip install splicecraft` inside a venv. Developers working on the repo run `python3 splicecraft.py` directly from the clone. **Optional runtime:** `pLannotate` (conda, GPL-3) for the Shift+A annotation feature — SpliceCraft works fine without it and notifies the user how to install if they press Shift+A.
 - **Published on PyPI** as `splicecraft`. Releases cut via `./release.sh X.Y.Z` (bumps version in both files, runs tests, builds, commits+tags+pushes; GitHub Actions `publish.yml` then publishes to PyPI via Trusted Publishing / OIDC). As of 2026-04-12 the latest published version is **0.2.2**.
 
@@ -238,7 +238,7 @@ subset runs in < 1 s and is the fastest feedback loop.
 ### Running
 
 ```bash
-python3 -m pytest -q                        # all 388 tests
+python3 -m pytest -q                        # all 390 tests
 python3 -m pytest tests/test_dna_sanity.py  # only biology (< 1 s)
 python3 -m pytest tests/test_plannotate.py  # only pLannotate integration (~1 s)
 python3 -m pytest tests/test_primers.py     # only primer design (~2 s)
@@ -459,7 +459,7 @@ Either direction is viable. The single-file convention and shared logging/error 
 If you are picking this up cold:
 
 1. **Read this file first.** It gives you architecture without reading 7,100 lines.
-2. **Run `python3 -m pytest -q`** before and after any change. 388 tests, ~75 s. The biology-correctness subset (`tests/test_dna_sanity.py`) runs in < 1 s if you want a faster inner loop.
+2. **Run `python3 -m pytest -q`** before and after any change. 390 tests, ~75 s. The biology-correctness subset (`tests/test_dna_sanity.py`) runs in < 1 s if you want a faster inner loop.
 3. **Check `/tmp/splicecraft.log`** (or `$SPLICECRAFT_LOG`) when debugging runtime issues. Every session has a unique 8-char ID.
 4. **Don't break the sacred invariants.** Every one of them has a test (see the mapping table above). If you're touching `_scan_restriction_sites`, `_rc`, `_iupac_pattern`, `_translate_cds`, `_bp_in`, or the feature-midpoint formula, the relevant tests will tell you immediately if you got it wrong.
 5. **Follow the error handling convention**: `_log.exception` for the stack trace, `notify()` or `Static.update("[red]...[/]")` for the user. Never let raw tracebacks hit the TUI.

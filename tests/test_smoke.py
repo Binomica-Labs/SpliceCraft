@@ -864,3 +864,60 @@ class TestPlannotateReentryGuard:
             await pilot.pause(0.05)
             assert hasattr(app, "_plannotate_running")
             assert app._plannotate_running is False
+
+
+class TestSidebarDetailWrapFeature:
+    """The sidebar detail pane must render wrap features with an unambiguous
+    compound-location string. A naive '{start+1}..{end}' shows '97..5' for a
+    wrap, which a casual reader could mis-interpret as a 3-bp reverse range.
+    Added 2026-04-13 alongside the _feat_len fix — users kept asking in the
+    issue tracker 'what does 97..5 mean?'."""
+
+    async def test_wrap_feature_coord_string_includes_origin(
+        self, isolated_library,
+    ):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        rec = SeqRecord(Seq("A" * 100), id="wrap_test",
+                        annotations={"molecule_type": "DNA"})
+        wrap_loc = CompoundLocation([
+            FeatureLocation(95, 100, strand=1),
+            FeatureLocation(0, 5, strand=1),
+        ])
+        rec.features.append(SeqFeature(wrap_loc, type="CDS",
+                                       qualifiers={"label": ["wrapCDS"]}))
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sidebar = app.query_one("#sidebar", sc.FeatureSidebar)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            wrap_feat = next(f for f in pm._feats if f.get("label") == "wrapCDS")
+            sidebar.show_detail(wrap_feat)
+            box = sidebar.query_one("#detail-box")
+            rendered = str(box.render())
+            # Must reference both halves (tail 96..100 and head 1..5)
+            assert "96" in rendered and "100" in rendered
+            assert "1‥5" in rendered or "1..5" in rendered
+            # Length displayed is 10 bp (5 + 5), not the wrong 'end - start'
+            assert "10 bp" in rendered or "10\xa0bp" in rendered
+
+    async def test_linear_feature_coord_string_unchanged(
+        self, tiny_record, isolated_library,
+    ):
+        """A linear feature must still render as '{start+1}‥{end} (N bp)' —
+        the wrap fix must not regress the common case."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sidebar = app.query_one("#sidebar", sc.FeatureSidebar)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            linear = next(f for f in pm._feats if f["end"] > f["start"])
+            sidebar.show_detail(linear)
+            box = sidebar.query_one("#detail-box")
+            rendered = str(box.render())
+            # One hyphen-separator only, no comma.
+            assert "," not in rendered.split("(")[0]
