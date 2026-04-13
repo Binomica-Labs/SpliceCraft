@@ -707,8 +707,13 @@ def _scan_restriction_sites(
         # Wraps origin: tail [p, n) + head [0, (p + site_len) - n).
         tail_len = n - p
         head_len = (p + site_len) - n
-        # Tail piece (labeled): owns cut_col/ext_cut_bp if the cut is within
-        # the tail portion (col < tail_len); otherwise passes to head piece.
+        # cut_col (bar-relative) maps to whichever piece actually contains the
+        # cut. ext_cut_bp (absolute) is unrelated to the tail/head split — it's
+        # only meaningful when cut_col is None (Type IIS cuts outside the
+        # recognition sequence). Attach it to both pieces so the cut arrow is
+        # drawn regardless of which chunk contains the external cut position;
+        # the chunk-level `chunk_start <= ext_cut_bp < chunk_end` test makes
+        # the render idempotent. Regression guard added 2026-04-13.
         tail_cut_col = cut_col if (cut_col is not None and cut_col < tail_len) else None
         head_cut_col = ((cut_col - tail_len) if (cut_col is not None and cut_col >= tail_len)
                         else None)
@@ -720,7 +725,7 @@ def _scan_restriction_sites(
             "color":      color,
             "label":      name,
             "cut_col":    tail_cut_col,
-            "ext_cut_bp": ext_cut_bp if tail_cut_col is not None else None,
+            "ext_cut_bp": ext_cut_bp,
         })
         hits.append({
             "type":       "resite",
@@ -730,7 +735,7 @@ def _scan_restriction_sites(
             "color":      color,
             "label":      "",     # unlabeled continuation
             "cut_col":    head_cut_col,
-            "ext_cut_bp": ext_cut_bp if head_cut_col is not None else None,
+            "ext_cut_bp": ext_cut_bp,
         })
 
     for entry in _SCAN_CATALOG:
@@ -1086,6 +1091,34 @@ def _chunk_lane_groups(
 # are reassigned on load, never mutated in place (see CLAUDE.md).
 _BUILD_SEQ_CACHE: dict = {}
 
+
+def _feats_in_chunk(
+    feats: list[dict], chunk_start: int, chunk_end: int, total: int
+) -> list[dict]:
+    """Return features overlapping [chunk_start, chunk_end), with wrap-around
+    features (end < start) split into tail [start, total) + head [0, end)
+    virtual pieces. The tail keeps the label; the head is unlabeled so the
+    name only appears once per chunk row. Non-wrapped features pass through
+    unchanged (same dict identity).
+
+    Needed because the naive overlap test `start < chunk_end and end > chunk_start`
+    drops wrap features from every chunk (both halves fail the conjunction).
+    """
+    out: list[dict] = []
+    for f in feats:
+        s, e = f["start"], f["end"]
+        if e >= s:
+            if s < chunk_end and e > chunk_start:
+                out.append(f)
+            continue
+        # Wrap feature: split into tail + head.
+        if s < chunk_end and total > chunk_start:
+            out.append({**f, "end": total})
+        if 0 < chunk_end and e > chunk_start:
+            out.append({**f, "start": 0, "label": ""})
+    return out
+
+
 def _build_seq_inputs(seq: str, feats: list[tuple]) -> tuple:
     """Return (styles, annot_feats) for a given sequence/feature pair,
     memoised by identity. Both outputs are expensive on large plasmids and
@@ -1098,11 +1131,19 @@ def _build_seq_inputs(seq: str, feats: list[tuple]) -> tuple:
     styles = ["color(252)"] * n
     for f in reversed(feats):          # reversed so first feature wins
         col = f["color"]
-        for i in range(f["start"], min(f["end"], n)):
-            styles[i] = col
+        if f["end"] >= f["start"]:
+            for i in range(f["start"], min(f["end"], n)):
+                styles[i] = col
+        else:
+            # Wrap feature: colour tail [start, n) + head [0, end).
+            for i in range(f["start"], n):
+                styles[i] = col
+            for i in range(0, min(f["end"], n)):
+                styles[i] = col
     annot_feats = sorted(
         [f for f in feats if f.get("type") not in ("site", "recut")],
-        key=lambda f: -(f["end"] - f["start"]),
+        key=lambda f: -(f["end"] - f["start"]) if f["end"] >= f["start"]
+                      else -((f["end"] - f["start"]) % max(n, 1)),
     )
     # Cap the cache at 4 entries (one active + a few stale) — we're keying
     # on id() so size stays tiny; this is just belt-and-braces.
@@ -1154,10 +1195,9 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
         chunk_end = min(chunk_start + line_width, n)
 
         # ── Assign features to lane groups ──
-        chunk_feats = [
-            f for f in annot_feats
-            if f["start"] < chunk_end and f["end"] > chunk_start
-        ]
+        # _feats_in_chunk handles wrap features (end < start) by splitting
+        # into tail + head virtual pieces before the overlap test.
+        chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
         re_above, onebp_above, reg_above, reg_below, onebp_below, re_below = (
             _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
         )
@@ -1291,8 +1331,16 @@ def _translate_cds(full_seq: str, start: int, end: int, strand: int) -> str:
     (N, R, Y, etc.) are handled correctly. An earlier version used a bare
     ACGT-only maketrans which would silently pass degenerate bases through
     unchanged — producing wrong codons and silent mistranslation.
+
+    Wrapped CDSes (end < start) are represented that way by the GenBank loader
+    for `join(tail..end, 0..head)` origin-spanning features on circular
+    plasmids. We concatenate the tail + head before translating so the
+    protein comes out correctly. Regression guard added 2026-04-13.
     """
-    sub = full_seq[start:end].upper()
+    if end < start:
+        sub = (full_seq[start:] + full_seq[:end]).upper()
+    else:
+        sub = full_seq[start:end].upper()
     if strand == -1:
         sub = sub.translate(_IUPAC_COMP)[::-1]
     aa = [_CODON_TABLE.get(sub[i:i+3], "?") for i in range(0, len(sub) - 2, 3)]
@@ -1396,18 +1444,28 @@ def _pick_single_record(records: list, source: str):
         )
     return records[0]
 
+_NCBI_TIMEOUT_S = 30   # cap long NCBI hangs; the UI worker can't otherwise cancel
+
 def fetch_genbank(accession: str, email: str = "splicecraft@local"):
     """Fetch a GenBank record by accession from NCBI Entrez. Returns SeqRecord.
 
     Raises ValueError with a user-friendly message if NCBI returns no
-    records (obsolete accession) or multiple records.
+    records (obsolete accession) or multiple records. A 30 s socket timeout
+    is applied so a silent network stall surfaces as an error instead of
+    pinning the worker thread forever.
     """
+    import socket
     from Bio import Entrez, SeqIO
     Entrez.email = email
-    with Entrez.efetch(
-        db="nucleotide", id=accession, rettype="gb", retmode="text"
-    ) as handle:
-        records = list(SeqIO.parse(handle, "genbank"))
+    prev_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(_NCBI_TIMEOUT_S)
+    try:
+        with Entrez.efetch(
+            db="nucleotide", id=accession, rettype="gb", retmode="text"
+        ) as handle:
+            records = list(SeqIO.parse(handle, "genbank"))
+    finally:
+        socket.setdefaulttimeout(prev_timeout)
     return _pick_single_record(records, f"NCBI accession {accession!r}")
 
 def _detect_plasmid_format(path: str) -> str:
@@ -2625,16 +2683,25 @@ class FeatureSidebar(Widget):
         # dispatched. Instead we set the flag True here and schedule its
         # reset via call_after_refresh, which runs AFTER all pending messages.
         self._populating = True
-        t.clear()
-        for f in feats:
-            strand_sym = "+" if f["strand"] == 1 else ("−" if f["strand"] == -1 else "·")
-            bp_str     = f"{f['start']+1}‥{f['end']}"
-            t.add_row(
-                Text(f["type"][:12],  style=f["color"]),
-                Text(f["label"][:14], style=f["color"]),
-                bp_str,
-                strand_sym,
-            )
+        try:
+            t.clear()
+            for f in feats:
+                strand_sym = "+" if f["strand"] == 1 else ("−" if f["strand"] == -1 else "·")
+                bp_str     = f"{f['start']+1}‥{f['end']}"
+                t.add_row(
+                    Text(f["type"][:12],  style=f["color"]),
+                    Text(f["label"][:14], style=f["color"]),
+                    bp_str,
+                    strand_sym,
+                )
+        except Exception:
+            # Malformed feature dict (missing color/type/label) would otherwise
+            # leave _populating=True forever, blocking every RowHighlighted
+            # event and breaking the sidebar until app restart. Reset the flag
+            # synchronously before re-raising so the cascade can recover.
+            self._populating = False
+            _log.exception("FeatureSidebar.populate failed mid-loop")
+            raise
         def _clear_populating():
             self._populating = False
         self.call_after_refresh(_clear_populating)
@@ -3151,8 +3218,7 @@ class SequencePanel(Widget):
 
         for chunk_start in range(0, n, line_width):
             chunk_end   = min(chunk_start + line_width, n)
-            chunk_feats = [f for f in annot_feats
-                           if f["start"] < chunk_end and f["end"] > chunk_start]
+            chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
             re_above, onebp_above, reg_above, reg_below, onebp_below, re_below = (
                 _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
             )
@@ -3203,8 +3269,7 @@ class SequencePanel(Widget):
         row = 0
         for chunk_start in range(0, n, line_width):
             chunk_end   = min(chunk_start + line_width, n)
-            chunk_feats = [f for f in annot_feats
-                           if f["start"] < chunk_end and f["end"] > chunk_start]
+            chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
             re_above, onebp_above, reg_above, reg_below, onebp_below, re_below = (
                 _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
             )
@@ -3433,9 +3498,18 @@ class FetchModal(ModalScreen):
         except Exception as exc:
             _log.exception("NCBI fetch failed for %s", acc)
             def _err():
-                self.query_one("#fetch-status", Static).update(
-                    f"[red]Error: {exc}[/red]"
-                )
+                # Modal may have been dismissed while the fetch was in flight;
+                # query_one would then raise NoMatches. Fall back to a toast.
+                try:
+                    self.query_one("#fetch-status", Static).update(
+                        f"[red]Error: {exc}[/red]"
+                    )
+                except Exception:
+                    try:
+                        self.app.notify(f"NCBI fetch failed: {exc}",
+                                        severity="error", timeout=8)
+                    except Exception:
+                        pass
             self.app.call_from_thread(_err)
 
     @on(Input.Submitted)
@@ -3736,7 +3810,13 @@ def _pick_binding_region(seq: str, target_tm: float = 60.0,
             at = sum(1 for c in s.upper() if c in "AT")
             return 2 * at + 4 * gc
 
-    best_seq, best_tm, best_diff = seq[:min_len], 0.0, float("inf")
+    # Defensive init: if the caller forgot the len(seq) >= min_len guard,
+    # the loop below won't execute and we'd otherwise return Tm=0 with a
+    # too-short binding. Compute Tm for whatever is there so downstream
+    # validation (low Tm, short primer) still trips honestly.
+    best_seq = seq[:max(min_len, 1)]
+    best_tm  = _tm(best_seq) if best_seq else 0.0
+    best_diff = float("inf")
     for n in range(min_len, min(max_len + 1, len(seq) + 1)):
         candidate = seq[:n]
         tm = _tm(candidate)
@@ -3778,6 +3858,25 @@ def _design_gb_primers(
             "error": f"Golden Braid region is too short ({len(insert)} bp). "
                      f"Select at least 18 bp (recommended 25+ bp for a "
                      f"robust binding region).",
+        }
+
+    # Internal BsaI site check — a GGTCTC (or GAGACC on the bottom strand)
+    # inside the insert will be cut during domestication and fragment the
+    # part. GB L0 parts must be domesticated to remove these; catching it
+    # here lets the user pick another region or redesign their template.
+    bsai_rc  = _rc(_GB_BSAI_SITE)
+    bad_fwd  = insert.find(_GB_BSAI_SITE)
+    bad_rev  = insert.find(bsai_rc)
+    if bad_fwd != -1 or bad_rev != -1:
+        hits = []
+        if bad_fwd != -1:
+            hits.append(f"{_GB_BSAI_SITE} at +{bad_fwd + 1}")
+        if bad_rev != -1:
+            hits.append(f"{bsai_rc} at +{bad_rev + 1}")
+        return {
+            "error": f"Internal BsaI site found ({'; '.join(hits)}). "
+                     f"The part would self-digest during domestication — "
+                     f"pick a different region or silently mutate the site first.",
         }
 
     # Forward binding: first 18-25 bp of the insert
@@ -6776,9 +6875,14 @@ DomesticatorModal { align: center middle; }
         try:
             record = fetch_genbank("MW463917.1")
             def _add():
+                # If the user loaded or fetched a different plasmid while the
+                # seed fetch was in flight, _apply_record would silently stomp
+                # their record with the seed. Add the entry to the library so
+                # they can pick it later, but skip the apply in that case.
                 lib = self.query_one("#library", LibraryPanel)
                 lib.add_entry(record)
-                self._apply_record(record)
+                if self._current_record is None:
+                    self._apply_record(record)
             self.call_from_thread(_add)
         except Exception:
             # First-run seed is best-effort: silent in UI, logged for debugging.
@@ -7613,10 +7717,18 @@ def main():
             "Override with $SPLICECRAFT_DATA_DIR."
         )
         return
+    if len(sys.argv) > 2:
+        print(
+            f"splicecraft takes at most one argument (got {len(sys.argv) - 1}: "
+            f"{' '.join(sys.argv[1:])}). Pass a single accession or file.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     _log_startup_banner()
     app = PlasmidApp()
 
     if arg:
+        looks_like_file = arg.lower().endswith((".gb", ".gbk", ".genbank", ".dna"))
         if Path(arg).exists():
             try:
                 record = load_genbank(arg)
@@ -7625,6 +7737,11 @@ def main():
                 _log.exception("Failed to load %s", arg)
                 print(f"Could not load {arg!r}: {exc}", file=sys.stderr)
                 sys.exit(1)
+        elif looks_like_file:
+            # Clear "file not found" message instead of confusingly trying
+            # to fetch a file-looking string from NCBI.
+            print(f"File not found: {arg}", file=sys.stderr)
+            sys.exit(1)
         else:
             print(f"Fetching {arg!r} from NCBI…", flush=True)
             try:

@@ -282,6 +282,23 @@ class TestDesignerUniformShape:
         # but positions are reported in forward coords)
         assert r["rev_pos"] == (300 - len(r["rev_binding"]), 300)
 
+    def test_goldenbraid_flags_internal_bsai(self):
+        """Regression guard: a GGTCTC inside the insert is self-domesticating
+        and must be flagged, not silently passed through."""
+        core = "ATGAAACGTGATTTAGCC" * 5   # 90 bp, no BsaI
+        with_fwd_bsai = core + "GGTCTC" + core
+        r = sc._design_gb_primers(with_fwd_bsai, 0, len(with_fwd_bsai), "CDS")
+        assert "error" in r
+        assert "BsaI" in r["error"]
+
+    def test_goldenbraid_flags_reverse_bsai(self):
+        """GAGACC (RC of GGTCTC) on the top strand also fragments the part."""
+        core = "ATGAAACGTGATTTAGCC" * 5
+        with_rev_bsai = core + "GAGACC" + core
+        r = sc._design_gb_primers(with_rev_bsai, 0, len(with_rev_bsai), "CDS")
+        assert "error" in r
+        assert "BsaI" in r["error"]
+
     def test_generic_has_required_keys(self):
         seq = self._valid_template()
         r = sc._design_generic_primers(seq, 50, 300)
