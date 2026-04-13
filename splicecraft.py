@@ -5512,10 +5512,9 @@ class PrimerDesignScreen(Screen):
             end   = int(parts[1])
             self.query_one("#pd-start", Input).value = str(start + 1)
             self.query_one("#pd-end", Input).value = parts[1]
-            # Wrap features have end < start; their length is
-            # (total - start) + end, not end - start.
+            # Wrap features have end < start; _feat_len handles that.
             total = len(self._template)
-            feat_len = (total - start) + end if end < start else end - start
+            feat_len = _feat_len(start, end, total)
 
             # Always set part name to the feature label
             feat_label = ""
