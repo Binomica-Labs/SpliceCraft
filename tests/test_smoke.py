@@ -745,3 +745,122 @@ class TestPlannotateUIEntryPoints:
                 "subprocess.run should NOT be invoked when pLannotate "
                 "is not on PATH"
             )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _apply_record source_path + dirty-flag handling (regression guard 2026-04-13)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Before today's fix, _apply_record always cleared _source_path — even when
+# called with clear_undo=False for an in-place update (pLannotate merge,
+# primer-add). That meant after annotating, Ctrl+S no longer targeted the
+# user's original .gb file. Also, pLannotate used lib.set_dirty(True) alone,
+# which only updated the library panel's marker but left self._unsaved=False,
+# so the user could quit without being prompted to save.
+
+class TestApplyRecordInPlaceSemantics:
+    """`_apply_record(record, clear_undo=False)` is the "in-place update"
+    path — it must not clobber `_source_path`, and the caller is expected
+    to call `_mark_dirty()` afterwards to set `_unsaved=True`."""
+
+    async def test_clear_undo_true_clears_source_path(
+        self, tiny_record, isolated_library
+    ):
+        """Fresh-load semantics: loading a different record from the library
+        should clear the path of whatever was previously open."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._source_path = "/tmp/old.gb"
+            app._apply_record(tiny_record)   # default clear_undo=True
+            assert app._source_path is None
+
+    async def test_clear_undo_false_preserves_source_path(
+        self, tiny_record, isolated_library
+    ):
+        """In-place-update semantics: after pLannotate merge or primer-add,
+        the user's original source file should still be the Ctrl+S target."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._source_path = "/tmp/myfile.gb"
+            app._apply_record(tiny_record, clear_undo=False)
+            assert app._source_path == "/tmp/myfile.gb"
+
+    async def test_clear_undo_false_preserves_undo_stack(
+        self, tiny_record, isolated_library
+    ):
+        """The undo stack itself must not be wiped by an in-place update —
+        otherwise the pre-merge / pre-primer-add state becomes un-recoverable."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._undo_stack.append(("DUMMY_SEQ", 0, tiny_record))
+            app._apply_record(tiny_record, clear_undo=False)
+            assert len(app._undo_stack) == 1
+            assert app._undo_stack[0][0] == "DUMMY_SEQ"
+
+    async def test_mark_dirty_after_in_place_update_flips_unsaved(
+        self, tiny_record, isolated_library
+    ):
+        """In-place update flow: _apply_record(clear_undo=False) calls
+        _mark_clean internally, so callers must invoke _mark_dirty()
+        afterwards to make the app's _unsaved flag reflect reality."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._apply_record(tiny_record, clear_undo=False)
+            # _apply_record calls _mark_clean internally
+            assert app._unsaved is False
+            # The fix: callers must mark dirty after in-place updates
+            app._mark_dirty()
+            assert app._unsaved is True
+
+
+class TestPlannotateReentryGuard:
+    """Re-entry guard: pressing Shift+A while pLannotate is already running
+    must not spawn a second subprocess. Regression guard for 2026-04-13."""
+
+    async def test_action_noop_when_plannotate_running(
+        self, tiny_record, isolated_library, monkeypatch
+    ):
+        """Set the running flag, call action_annotate_plasmid, confirm
+        no subprocess was invoked."""
+        import shutil, subprocess
+        # Pretend pLannotate is fully installed so the code reaches the
+        # re-entry guard (otherwise it short-circuits on "not installed").
+        monkeypatch.setattr(sc, "_PLANNOTATE_CHECK_CACHE", None)
+        monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+        calls = []
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *a, **k: calls.append((a, k)) or None,
+        )
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Simulate a pLannotate run already in flight
+            app._plannotate_running = True
+            app.action_annotate_plasmid()
+            await pilot.pause(0.05)
+            assert not calls, (
+                "subprocess.run should NOT be invoked while "
+                "_plannotate_running is True"
+            )
+
+    async def test_flag_exists_after_mount(
+        self, tiny_record, isolated_library
+    ):
+        """The flag is initialized in on_mount — regression guard for
+        future refactors that might forget to set it up."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert hasattr(app, "_plannotate_running")
+            assert app._plannotate_running is False

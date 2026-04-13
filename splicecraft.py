@@ -5834,6 +5834,20 @@ class PrimerDesignScreen(Screen):
 
         primers = _load_primers()
         from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from copy import deepcopy
+
+        # Build a fresh record rather than mutating self.app._current_record:
+        # the undo stack aliases the live record, and appending features in
+        # place would silently corrupt prior undo snapshots.
+        new_rec = SeqRecord(
+            Seq(str(rec.seq)),
+            id=rec.id, name=rec.name, description=rec.description,
+            annotations=dict(rec.annotations),
+        )
+        for f in rec.features:
+            new_rec.features.append(deepcopy(f))
 
         added = []
         for idx in sorted(self._lib_selected):
@@ -5852,11 +5866,11 @@ class PrimerDesignScreen(Screen):
                 f.type == "primer_bind"
                 and int(f.location.start) == p_start
                 and int(f.location.end) == p_end
-                for f in rec.features
+                for f in new_rec.features
             )
             if already:
                 continue
-            rec.features.append(SeqFeature(
+            new_rec.features.append(SeqFeature(
                 FeatureLocation(p_start, p_end, strand=strand),
                 type="primer_bind",
                 qualifiers={"label": [name]},
@@ -5869,9 +5883,13 @@ class PrimerDesignScreen(Screen):
             return
 
         try:
-            self.app._apply_record(rec)
+            # clear_undo=False keeps the primer-add in the undo stack AND
+            # preserves _source_path so Ctrl+S still targets the right file.
+            self.app._push_undo()
+            self.app._apply_record(new_rec, clear_undo=False)
+            self.app._mark_dirty()
             lib = self.app.query_one("#library")
-            lib.add_entry(rec)
+            lib.add_entry(new_rec)
         except Exception:
             _log.exception("Failed to add primer features to map")
 
@@ -6660,18 +6678,49 @@ DomesticatorModal { align: center middle; }
 
     def _rebuild_record_with_edit(self, new_seq: str, mode: str,
                                    s: int, e: int, new_bases: str):
-        """Rebuild SeqRecord after an insert/replace, shifting feature coords precisely."""
+        """Rebuild SeqRecord after an insert/replace, shifting feature coords precisely.
+
+        Wrap features (origin-spanning CompoundLocations of the canonical
+        `join(tail..total, 1..head)` form) and other compound locations
+        are shifted per-part so the wrap structure survives the edit.
+        Features consumed entirely by a replace are dropped — we never
+        leave 1-bp ghost stubs behind.
+        """
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
-        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
 
         ins_len  = len(new_bases)
         del_len  = 0 if mode == "insert" else (e - s)
         delta    = ins_len - del_len
         new_len  = len(new_seq)
-        # For insert: the edit region is [s, s); e == s
-        # For replace: the edit region is [s, e)
-        edit_end = s if mode == "insert" else e
+
+        def _shift_range(fs: int, fe: int):
+            """Return post-edit (new_fs, new_fe) for a simple [fs, fe) range,
+            or None if the range was consumed entirely by a replace."""
+            if mode == "insert":
+                if fe <= s:
+                    new_fs, new_fe = fs, fe
+                elif fs >= s:
+                    new_fs, new_fe = fs + ins_len, fe + ins_len
+                else:
+                    new_fs, new_fe = fs, fe + ins_len
+            else:  # replace [s, e)
+                if fe <= s:
+                    new_fs, new_fe = fs, fe
+                elif fs >= e:
+                    new_fs, new_fe = fs + delta, fe + delta
+                elif fs <= s and fe >= e:
+                    new_fs, new_fe = fs, fe + delta
+                elif fs < s:
+                    new_fs, new_fe = fs, s + ins_len
+                else:
+                    new_fs, new_fe = s, fe + delta
+            new_fs = max(0, min(new_fs, new_len))
+            new_fe = max(0, min(new_fe, new_len))
+            if new_fe <= new_fs:
+                return None
+            return (new_fs, new_fe)
 
         new_record = SeqRecord(
             Seq(new_seq),
@@ -6682,32 +6731,39 @@ DomesticatorModal { align: center middle; }
         )
 
         for feat in self._current_record.features:
-            fs = int(feat.location.start)
-            fe = int(feat.location.end)
-
-            if mode == "insert":
-                if fe <= s:
-                    new_fs, new_fe = fs, fe           # entirely before insert
-                elif fs >= s:
-                    new_fs, new_fe = fs + ins_len, fe + ins_len  # entirely after
+            loc = feat.location
+            if isinstance(loc, CompoundLocation):
+                new_parts = []
+                for part in loc.parts:
+                    shifted = _shift_range(int(part.start), int(part.end))
+                    if shifted is None:
+                        continue
+                    n_fs, n_fe = shifted
+                    new_parts.append(FeatureLocation(
+                        n_fs, n_fe,
+                        strand=getattr(part, "strand", None),
+                    ))
+                if not new_parts:
+                    continue  # feature entirely consumed
+                if len(new_parts) == 1:
+                    new_loc = new_parts[0]
                 else:
-                    new_fs, new_fe = fs, fe + ins_len  # spans insert → expand
-            else:  # replace [s, e)
-                if fe <= s:
-                    new_fs, new_fe = fs, fe             # entirely before
-                elif fs >= e:
-                    new_fs, new_fe = fs + delta, fe + delta  # entirely after
-                elif fs <= s and fe >= e:
-                    new_fs, new_fe = fs, fe + delta     # spans replaced region
-                elif fs < s:
-                    new_fs, new_fe = fs, s + ins_len    # overlaps start of region
-                else:
-                    new_fs, new_fe = s, fe + delta      # overlaps end of region
+                    new_loc = CompoundLocation(
+                        new_parts,
+                        operator=getattr(loc, "operator", "join"),
+                    )
+            else:
+                shifted = _shift_range(int(loc.start), int(loc.end))
+                if shifted is None:
+                    continue  # feature entirely consumed
+                n_fs, n_fe = shifted
+                new_loc = FeatureLocation(
+                    n_fs, n_fe,
+                    strand=getattr(loc, "strand", 1),
+                )
 
-            new_fe = max(new_fs + 1, min(new_fe, new_len))
             new_record.features.append(SeqFeature(
-                FeatureLocation(new_fs, new_fe,
-                                strand=getattr(feat.location, "strand", 1)),
+                new_loc,
                 type=feat.type,
                 qualifiers=dict(feat.qualifiers),
             ))
@@ -6832,6 +6888,10 @@ DomesticatorModal { align: center middle; }
     def on_mount(self) -> None:
         self._undo_stack: list = []
         self._redo_stack: list = []
+        # Re-entrancy guard for pLannotate: spawning a second subprocess
+        # while the first is still running wastes 5-30 s of CPU and risks
+        # the stale-check discarding the newer result. See action_annotate_plasmid.
+        self._plannotate_running: bool = False
         # Validate all user-data files before anything else. Corrupt files
         # are auto-restored from .bak if possible; the user is notified
         # either way so they know the state of their data.
@@ -7132,19 +7192,20 @@ DomesticatorModal { align: center middle; }
         """Load a SeqRecord into all panels.
 
         `clear_undo=True` (default) drops any undo/redo history from the
-        previous plasmid — correct for fresh loads (fetch, file open,
-        library pick) where Ctrl+Z otherwise yanks the user back to an
-        unrelated edit on the previous plasmid. In-place record changes
-        (pLannotate merge, edits) should pass clear_undo=False so they
-        remain undo-able.
+        previous plasmid AND clears `_source_path` — correct for fresh
+        loads (fetch, file open, library pick) where Ctrl+Z otherwise
+        yanks the user back to an unrelated edit. In-place record changes
+        (pLannotate merge, primer-add) should pass clear_undo=False so
+        they remain undo-able and keep Ctrl+S targeted at the original
+        file path.
         """
         if record is None:
             return
         if clear_undo:
             self._undo_stack.clear()
             self._redo_stack.clear()
+            self._source_path = None   # caller sets this if it came from a file
         self._current_record = record
-        self._source_path    = None   # caller sets this if it came from a file
 
         pm      = self.query_one("#plasmid-map", PlasmidMap)
         sidebar = self.query_one("#sidebar",     FeatureSidebar)
@@ -7563,6 +7624,13 @@ DomesticatorModal { align: center middle; }
 
     def action_annotate_plasmid(self) -> None:
         """Run pLannotate on the currently-loaded record (shortcut: Shift+A)."""
+        if getattr(self, "_plannotate_running", False):
+            self.notify(
+                "pLannotate is already running — wait for the current run "
+                "to finish.",
+                severity="information",
+            )
+            return
         if self._current_record is None:
             self.notify(
                 "Load a plasmid first (press 'f' to fetch or 'o' to open).",
@@ -7601,60 +7669,70 @@ DomesticatorModal { align: center middle; }
             f"({n:,} bp)… this takes 5-30 s.",
             timeout=15,
         )
+        self._plannotate_running = True
         self._run_plannotate_worker(self._current_record)
 
     @work(thread=True)
     def _run_plannotate_worker(self, record) -> None:
         """Background worker: runs pLannotate subprocess, merges, applies.
         Errors are logged and surfaced to the UI via notify(); nothing raw
-        reaches the user."""
+        reaches the user. The `_plannotate_running` re-entry flag is
+        cleared unconditionally in `_finally` so a crashed run does not
+        lock the user out of future annotation attempts."""
+        merged = None
+        err = None
         try:
-            annotated = _run_plannotate(record)
-            merged    = _merge_plannotate_features(record, annotated)
-        except PlannotateError as exc:
-            _log.info("pLannotate: %s", exc)
-            def _notify_err():
-                self.notify(exc.user_msg, severity="error", timeout=10)
-            self.call_from_thread(_notify_err)
-            return
-        except Exception as exc:
-            _log.exception("pLannotate worker crashed")
-            def _notify_crash():
+            try:
+                annotated = _run_plannotate(record)
+                merged    = _merge_plannotate_features(record, annotated)
+            except PlannotateError as exc:
+                _log.info("pLannotate: %s", exc)
+                err = ("error", exc.user_msg)
+            except Exception as exc:
+                _log.exception("pLannotate worker crashed")
+                err = ("crash", str(exc))
+        finally:
+            def _finally():
+                self._plannotate_running = False
+                if err is not None:
+                    kind, msg = err
+                    if kind == "error":
+                        self.notify(msg, severity="error", timeout=10)
+                    else:
+                        self.notify(f"pLannotate crashed: {msg}",
+                                    severity="error", timeout=10)
+                    return
+                # Guard against races: if the user loaded a different plasmid
+                # while pLannotate was running, silently applying the merged
+                # OLD record would clobber their newer work.
+                if self._current_record is not record:
+                    self.notify(
+                        "pLannotate finished, but you've loaded a different "
+                        "plasmid in the meantime — discarding annotation result.",
+                        severity="warning", timeout=8,
+                    )
+                    return
+                n_added = getattr(merged, "_plannotate_added", 0)
+                if n_added == 0:
+                    self.notify(
+                        "pLannotate found no new features (all hits duplicated "
+                        "existing annotations).",
+                        severity="information",
+                    )
+                    return
+                self._push_undo()          # annotation is undo-able
+                self._apply_record(merged, clear_undo=False)
+                # Mark dirty AFTER _apply_record (which calls _mark_clean
+                # internally) so the user gets prompted on quit and sees the
+                # * in the title.
+                self._mark_dirty()
                 self.notify(
-                    f"pLannotate crashed: {exc}", severity="error", timeout=10,
+                    f"Added {n_added} pLannotate feature"
+                    f"{'s' if n_added != 1 else ''}. "
+                    "Press 'a' to save to library.",
+                    timeout=6,
                 )
-            self.call_from_thread(_notify_crash)
-            return
-
-        n_added = getattr(merged, "_plannotate_added", 0)
-        def _apply():
-            # Guard against races: if the user loaded a different plasmid
-            # while pLannotate was running, silently applying the merged
-            # OLD record would clobber their newer work.
-            if self._current_record is not record:
-                self.notify(
-                    "pLannotate finished, but you've loaded a different "
-                    "plasmid in the meantime — discarding annotation result.",
-                    severity="warning", timeout=8,
-                )
-                return
-            if n_added == 0:
-                self.notify(
-                    "pLannotate found no new features (all hits duplicated "
-                    "existing annotations).",
-                    severity="information",
-                )
-                return
-            self._push_undo()          # annotation is undo-able
-            self._apply_record(merged, clear_undo=False)
-            self.query_one("#library", LibraryPanel).set_dirty(True)
-            self.notify(
-                f"Added {n_added} pLannotate feature"
-                f"{'s' if n_added != 1 else ''}. "
-                "Press 'a' to save to library.",
-                timeout=6,
-            )
-        self.call_from_thread(_apply)
+            self.call_from_thread(_finally)
 
     def action_open_parts_bin(self) -> None:
         self.push_screen(PartsBinModal())
