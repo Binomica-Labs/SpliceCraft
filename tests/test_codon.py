@@ -59,6 +59,54 @@ class TestRegistry:
         assert sc._codon_search("") == sc._codon_tables_load()
         assert sc._codon_search("no_such_species_xyz") == []
 
+    def test_search_by_genus_prefix(self):
+        sc._codon_tables_load()
+        raw = {"ATG": ("M", 5), "TAA": ("*", 1)}
+        sc._codon_tables_add("Escherichia coli O157",  "900001", raw)
+        sc._codon_tables_add("Escherichia albertii",   "900002", raw)
+        sc._codon_tables_add("Salmonella enterica",    "900003", raw)
+        hits = sc._codon_search("Escherichia")
+        names = [e["name"] for e in hits]
+        assert "Escherichia coli O157"  in names
+        assert "Escherichia albertii"   in names
+        assert "Salmonella enterica"    not in names
+        # Alphabetical clustering within same rank
+        assert names.index("Escherichia albertii") < names.index("Escherichia coli O157")
+
+    def test_search_by_species_prefix(self):
+        sc._codon_tables_load()
+        raw = {"ATG": ("M", 5), "TAA": ("*", 1)}
+        sc._codon_tables_add("Escherichia coli Z",  "900011", raw)
+        sc._codon_tables_add("Salmonella typhi",    "900012", raw)
+        hits = sc._codon_search("typh")
+        names = [e["name"] for e in hits]
+        assert "Salmonella typhi"   in names
+        assert "Escherichia coli Z" not in names
+
+    def test_search_by_taxid_prefix(self):
+        sc._codon_tables_load()
+        raw = {"ATG": ("M", 5), "TAA": ("*", 1)}
+        sc._codon_tables_add("T species", "900099", raw)
+        hits = sc._codon_search("9000")
+        assert any(e["taxid"] == "900099" for e in hits)
+
+    def test_search_exact_taxid_ranks_first(self):
+        sc._codon_tables_load()
+        raw = {"ATG": ("M", 5), "TAA": ("*", 1)}
+        # Exact-match taxid vs. a species whose name substring-matches "83333"
+        sc._codon_tables_add("Bogus 83333 label", "555555", raw)
+        hits = sc._codon_search("83333")
+        assert hits[0]["taxid"] == "83333"   # exact-match beats substring
+
+    def test_search_genus_beats_name_substring(self):
+        sc._codon_tables_load()
+        raw = {"ATG": ("M", 5), "TAA": ("*", 1)}
+        sc._codon_tables_add("Escherichia coli A", "900101", raw)
+        sc._codon_tables_add("Notesch species",    "900102", raw)  # "esch" substring only
+        hits = sc._codon_search("esch")
+        names = [e["name"] for e in hits]
+        assert names.index("Escherichia coli A") < names.index("Notesch species")
+
 
 # ── Harmonization ─────────────────────────────────────────────────────────────
 
@@ -230,6 +278,168 @@ class TestKazusaParse:
         html = "<pre>AUG 100\nGGG 50\nGAA 75\nCUG 240\nGCG 197\n"
         # Not enough codons to pass validation, should return None
         assert sc._codon_parse_kazusa_html(html) is None
+
+
+# ── NCBI taxid lookup ─────────────────────────────────────────────────────────
+
+class _FakeResponse:
+    """Minimal urlopen() context-manager stand-in that yields canned bytes."""
+    def __init__(self, body: bytes):
+        self._body = body
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
+    def read(self):
+        return self._body
+
+
+class TestNcbiPrepTerm:
+    def test_single_token_uses_subtree_or_wildcard(self):
+        """Single-word queries should combine exact-taxon subtree (all species
+        in that genus) with a wildcard prefix so 'Escher' still matches."""
+        term = sc._ncbi_prep_term("Escherichia")
+        assert "Escherichia[Subtree] AND species[Rank]" in term
+        assert "Escherichia*" in term
+        # Partial prefix also uses the OR form — wildcard does the work
+        term2 = sc._ncbi_prep_term("Escher")
+        assert "Escher[Subtree] AND species[Rank]" in term2
+        assert "Escher*" in term2
+        # Whitespace is stripped
+        assert sc._ncbi_prep_term("  Homo ").startswith("(Homo[Subtree]")
+
+    def test_multi_word_appends_trailing_wildcard(self):
+        assert sc._ncbi_prep_term("Homo sapiens")     == "Homo sapiens*"
+        assert sc._ncbi_prep_term("Saccharomyces ce") == "Saccharomyces ce*"
+
+    def test_preserves_user_wildcards_and_fields(self):
+        assert sc._ncbi_prep_term("Escher*")               == "Escher*"
+        assert sc._ncbi_prep_term("coli[Scientific Name]") == "coli[Scientific Name]"
+
+    def test_empty_stays_empty(self):
+        assert sc._ncbi_prep_term("")    == ""
+        assert sc._ncbi_prep_term("  ")  == ""
+
+
+class TestNcbiSearch:
+    def test_empty_query_returns_empty(self):
+        hits, total, msg = sc._ncbi_taxid_search("")
+        assert hits == []
+        assert total == 0
+        assert "empty" in msg.lower()
+
+    def test_multiple_hits_batched_esummary(self, monkeypatch):
+        """Verifies esummary is called once with a comma-joined id list and
+        ScientificName is picked up per-DocSum."""
+        esearch_xml = (b"<?xml version=\"1.0\"?><eSearchResult>"
+                       b"<Count>3</Count><IdList>"
+                       b"<Id>561</Id><Id>562</Id><Id>564</Id>"
+                       b"</IdList></eSearchResult>")
+        esummary_xml = (b"<?xml version=\"1.0\"?><eSummaryResult>"
+                        b"<DocSum><Id>561</Id>"
+                        b"<Item Name=\"ScientificName\" Type=\"String\">"
+                        b"Escherichia</Item></DocSum>"
+                        b"<DocSum><Id>562</Id>"
+                        b"<Item Name=\"ScientificName\" Type=\"String\">"
+                        b"Escherichia coli</Item></DocSum>"
+                        b"<DocSum><Id>564</Id>"
+                        b"<Item Name=\"ScientificName\" Type=\"String\">"
+                        b"Escherichia fergusonii</Item></DocSum>"
+                        b"</eSummaryResult>")
+        calls: list[str] = []
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            calls.append(url)
+            if "esearch" in url:
+                return _FakeResponse(esearch_xml)
+            return _FakeResponse(esummary_xml)
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        hits, total, msg = sc._ncbi_taxid_search("Escher")
+        assert [h["taxid"] for h in hits] == ["561", "562", "564"]
+        assert [h["name"]  for h in hits] == [
+            "Escherichia", "Escherichia coli", "Escherichia fergusonii",
+        ]
+        assert total == 3
+        # One esearch, one esummary — batch worked
+        assert sum("esearch"  in u for u in calls) == 1
+        assert sum("esummary" in u for u in calls) == 1
+        # The esearch URL must carry both halves of the OR term: the
+        # Subtree+species-rank clause and the wildcard fallback. Both are
+        # URL-encoded.
+        esearch_url = next(u for u in calls if "esearch" in u)
+        assert "Escher%5BSubtree%5D" in esearch_url   # [Subtree]
+        assert "species%5BRank%5D"   in esearch_url   # [Rank]
+        assert "Escher%2A"           in esearch_url   # * wildcard
+
+    def test_total_higher_than_retrieved_mentions_refine(self, monkeypatch):
+        """When total hit count exceeds retmax, the status message should
+        nudge the user to refine."""
+        esearch_xml = (b"<?xml version=\"1.0\"?><eSearchResult>"
+                       b"<Count>1200</Count><IdList>"
+                       b"<Id>1</Id></IdList></eSearchResult>")
+        esummary_xml = (b"<?xml version=\"1.0\"?><eSummaryResult>"
+                        b"<DocSum><Id>1</Id>"
+                        b"<Item Name=\"ScientificName\" Type=\"String\">"
+                        b"root</Item></DocSum></eSummaryResult>")
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            return _FakeResponse(esearch_xml if "esearch" in url else esummary_xml)
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        hits, total, msg = sc._ncbi_taxid_search("a")
+        assert len(hits) == 1
+        assert total == 1200
+        assert "refine" in msg.lower()
+
+    def test_no_results(self, monkeypatch):
+        xml = (b"<?xml version=\"1.0\"?><eSearchResult>"
+               b"<Count>0</Count><IdList></IdList></eSearchResult>")
+
+        def fake_urlopen(req, timeout=None):
+            return _FakeResponse(xml)
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        hits, total, msg = sc._ncbi_taxid_search("zzznope")
+        assert hits == []
+        assert total == 0
+        assert "no ncbi" in msg.lower()
+
+    def test_network_error(self, monkeypatch):
+        def boom(req, timeout=None):
+            raise OSError("connection refused")
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", boom)
+        hits, total, msg = sc._ncbi_taxid_search("Homo sapiens")
+        assert hits == []
+        assert total == 0
+        assert "network error" in msg.lower()
+
+    def test_esummary_failure_still_returns_ids(self, monkeypatch):
+        """If esummary fails after esearch succeeds, hits come back with
+        fallback '(taxid N)' names so the user can still pick one."""
+        esearch_xml = (b"<?xml version=\"1.0\"?><eSearchResult>"
+                       b"<Count>1</Count><IdList><Id>4932</Id></IdList>"
+                       b"</eSearchResult>")
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "esearch" in url:
+                return _FakeResponse(esearch_xml)
+            raise OSError("esummary down")
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        hits, total, msg = sc._ncbi_taxid_search("Saccharomyces cerevisiae")
+        assert len(hits) == 1
+        assert hits[0]["taxid"] == "4932"
+        assert "(taxid 4932)" in hits[0]["name"]
 
 
 # ── Integration with _mut_design_inner ────────────────────────────────────────

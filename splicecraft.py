@@ -1934,9 +1934,10 @@ class PlasmidMap(Widget):
     # ── Messages ───────────────────────────────────────────────────────────────
 
     class FeatureSelected(Message):
-        def __init__(self, idx: int, feat_dict: dict | None):
+        def __init__(self, idx: int, feat_dict: dict | None, bp: int = -1):
             self.idx       = idx
             self.feat_dict = feat_dict
+            self.bp        = bp   # bp at click point, or -1 if unknown
             super().__init__()
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -2120,36 +2121,37 @@ class PlasmidMap(Widget):
     def on_mouse_scroll_down(self, _: MouseScrollDown):
         self.action_rotate_ccw()
 
-    def _feat_at(self, x: int, y: int) -> int:
+    def _feat_at(self, x: int, y: int) -> tuple[int, int]:
+        """Return (feature_idx, click_bp) at terminal cell (x, y), or (-1, -1)."""
         if not self.record or not self._total:
-            return -1
+            return -1, -1
         w, h = self.size.width, self.size.height
         cx, cy, rx, ry = self._geometry(w, h)
         if rx == 0 or ry == 0:
-            return -1
+            return -1, -1
         dc_n = (x - cx) / rx
         dr_n = (y - cy) / ry
         r_norm = math.sqrt(dc_n ** 2 + dr_n ** 2)
         if r_norm < 0.75 or r_norm > 1.35:
-            return -1
+            return -1, -1
         angle = math.atan2(dr_n, dc_n)
         angle_norm = (angle + math.pi / 2) % (2 * math.pi)
         bp = int(self.origin_bp + self._total * angle_norm / (2 * math.pi)) % self._total
         for i, f in enumerate(self._feats):
             if self._bp_in(bp, f):
-                return i
-        return -1
+                return i, bp
+        return -1, -1
 
     def on_click(self, event: Click):
         if not self.record:
             return
         if self._map_mode == "linear":
-            idx = self._feat_at_linear(event.x, event.y)
+            idx, bp = self._feat_at_linear(event.x, event.y)
         else:
-            idx = self._feat_at(event.x, event.y)
+            idx, bp = self._feat_at(event.x, event.y)
         self.selected_idx = idx
         f = self._feats[idx] if idx >= 0 else None
-        self.post_message(self.FeatureSelected(idx, f))
+        self.post_message(self.FeatureSelected(idx, f, bp))
 
     def _bp_in(self, bp: int, f: dict) -> bool:
         s, e = f["start"], f["end"]
@@ -2458,17 +2460,18 @@ class PlasmidMap(Widget):
 
     # ── Linear map ─────────────────────────────────────────────────────────────
 
-    def _feat_at_linear(self, x: int, y: int) -> int:
-        """Return feature index at terminal cell (x, y) in linear view, or -1."""
+    def _feat_at_linear(self, x: int, y: int) -> tuple[int, int]:
+        """Return (feature_idx, click_bp) at terminal cell (x, y) in linear view,
+        or (-1, -1) if outside the map region / no feature matched."""
         if not self._total:
-            return -1
+            return -1, -1
         w, h      = self.size.width, self.size.height
         margin_l  = 5
         margin_r  = 2
         usable_w  = w - margin_l - margin_r
         backbone_row = max(4, h // 2)
         if x < margin_l or x >= w - margin_r or usable_w <= 0:
-            return -1
+            return -1, -1
         bp = int((x - margin_l) / usable_w * self._total)
         above = y < backbone_row
         below = y > backbone_row
@@ -2479,10 +2482,10 @@ class PlasmidMap(Widget):
             if not self._bp_in(bp, f):
                 continue
             if above and f["strand"] >= 0:
-                return i
+                return i, bp
             if below and f["strand"] < 0:
-                return i
-        return -1
+                return i, bp
+        return -1, -1
 
     def _draw_linear(self, w: int, h: int) -> Text:
         """Render a horizontal linear plasmid map."""
@@ -4194,16 +4197,59 @@ def _codon_tables_get(key: str) -> "dict | None":
     return None
 
 
+def _codon_name_parts(name: str) -> tuple[str, str]:
+    """Return (genus, species) as lowercased tokens from an entry name.
+
+    Genus = first whitespace-delimited token; species = second token (or "").
+    Names like "E. coli K12" yield ("e.", "coli"); "Escherichia coli" yields
+    ("escherichia", "coli"). No normalization between abbreviated and
+    unabbreviated genera — users search what they see.
+    """
+    parts = (name or "").strip().split()
+    genus   = parts[0].lower() if parts else ""
+    species = parts[1].lower() if len(parts) > 1 else ""
+    return genus, species
+
+
 def _codon_search(query: str, entries: "list | None" = None) -> list[dict]:
-    """Case-insensitive substring search over name + taxid."""
+    """Ranked search over taxid, genus, species, and full name.
+
+    Rank 0: taxid exact match
+    Rank 1: taxid prefix match
+    Rank 2: genus prefix (first whitespace token of name)
+    Rank 3: species prefix (second whitespace token)
+    Rank 4: substring anywhere in the full name
+
+    Results are sorted by (rank, name) so same-genus entries cluster and
+    the strongest match wins. An empty/whitespace query returns the
+    registry in its persisted order, unchanged, to preserve caller
+    expectations (the filter field shows "all tables" when cleared).
+    """
     if entries is None:
         entries = _codon_tables_load()
     q = (query or "").strip().lower()
     if not q:
         return list(entries)
-    return [e for e in entries
-            if q in str(e.get("name", "")).lower()
-            or q in str(e.get("taxid", "")).lower()]
+    ranked: list[tuple[int, str, dict]] = []
+    for e in entries:
+        name_lc  = str(e.get("name", "")).lower()
+        taxid_lc = str(e.get("taxid", "")).lower()
+        genus, species = _codon_name_parts(e.get("name", ""))
+        if taxid_lc and taxid_lc == q:
+            rank = 0
+        elif taxid_lc and taxid_lc.startswith(q):
+            rank = 1
+        elif genus and genus.startswith(q):
+            rank = 2
+        elif species and species.startswith(q):
+            rank = 3
+        elif q in name_lc:
+            rank = 4
+        else:
+            continue
+        ranked.append((rank, name_lc, e))
+    ranked.sort(key=lambda t: (t[0], t[1]))
+    return [t[2] for t in ranked]
 
 
 def _codon_parse_kazusa_html(html: str) -> "dict | None":
@@ -4226,6 +4272,97 @@ def _codon_parse_kazusa_html(html: str) -> "dict | None":
     if len([c for c in raw if raw[c][0] != "?"]) < 60:
         return None
     return raw
+
+
+def _ncbi_prep_term(query: str) -> str:
+    """Turn a user query into an NCBI Entrez term.
+
+    * Single token (typed-as-genus): combine an exact-taxon subtree search
+      restricted to species rank with a wildcard prefix search via OR, so
+      typing 'Escherichia' returns every Escherichia species (subtree hit)
+      AND typing a partial like 'Escher' still matches via the wildcard.
+    * Multi-word query: append '*' to the trailing token so 'Homo sapien'
+      matches 'Homo sapiens' etc.
+    * User-supplied wildcards or field tags pass through untouched.
+    """
+    q = (query or "").strip()
+    if not q or "*" in q or "[" in q:
+        return q
+    tokens = q.split()
+    if len(tokens) == 1:
+        t = tokens[0]
+        return f"({t}[Subtree] AND species[Rank]) OR {t}*"
+    tokens[-1] = tokens[-1] + "*"
+    return " ".join(tokens)
+
+
+def _ncbi_taxid_search(query: str, retmax: int = 200,
+                      timeout: float = 15.0) -> tuple:
+    """Search NCBI taxonomy for candidates matching `query`. Returns
+    (hits, total_count, status_message) where each hit is
+    {'taxid': str, 'name': str}. Names come from a batched esummary call
+    (one round-trip for up to `retmax` ids). Partial queries are auto-
+    wildcarded via `_ncbi_prep_term`. Pure network — run from a worker."""
+    import urllib.request, urllib.parse
+    import xml.etree.ElementTree as ET
+    q = (query or "").strip()
+    if not q:
+        return [], 0, "Empty query"
+    term = _ncbi_prep_term(q)
+    base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+    params = urllib.parse.urlencode({
+        "db": "taxonomy", "term": term,
+        "retmax": str(retmax), "retmode": "xml",
+    })
+    try:
+        req = urllib.request.Request(f"{base}/esearch.fcgi?{params}",
+                                     headers={"User-Agent": "SpliceCraft/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            xml_data = r.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        _log.exception("NCBI esearch failed for %r", q)
+        return [], 0, f"Network error: {exc}"
+    try:
+        root = ET.fromstring(xml_data)
+    except ET.ParseError as exc:
+        return [], 0, f"Could not parse NCBI response: {exc}"
+    ids = [e.text for e in root.findall(".//Id") if e.text]
+    count_elem = root.find(".//Count")
+    try:
+        total = int(count_elem.text) if count_elem is not None and count_elem.text else len(ids)
+    except ValueError:
+        total = len(ids)
+    if not ids:
+        return [], 0, f"No NCBI taxonomy entry for '{q}'"
+    # Batched esummary: one round-trip for all retrieved ids
+    names_by_id: dict[str, str] = {}
+    try:
+        sparams = urllib.parse.urlencode({
+            "db": "taxonomy", "id": ",".join(ids), "retmode": "xml",
+        })
+        req = urllib.request.Request(f"{base}/esummary.fcgi?{sparams}",
+                                     headers={"User-Agent": "SpliceCraft/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            sxml = r.read().decode("utf-8", errors="replace")
+        sroot = ET.fromstring(sxml)
+        for doc in sroot.findall(".//DocSum"):
+            did_el = doc.find("Id")
+            if did_el is None or not did_el.text:
+                continue
+            did = did_el.text
+            for item in doc.findall("Item"):
+                if item.get("Name") == "ScientificName" and item.text:
+                    names_by_id[did] = item.text
+                    break
+    except Exception:
+        _log.exception("NCBI esummary failed for ids %s", ids[:3])
+    hits = [{"taxid": tid,
+             "name":  names_by_id.get(tid, f"(taxid {tid})")}
+            for tid in ids]
+    msg = f"{total} hit(s) for '{q}'"
+    if total > len(hits):
+        msg = f"Showing {len(hits)} of {total} hits for '{q}' (refine to narrow)"
+    return hits, total, msg
 
 
 def _codon_fetch_kazusa(taxid: str, timeout: float = 15.0) -> tuple:
@@ -4730,6 +4867,183 @@ def _mut_translate(dna: str) -> str:
             break
         aa.append(_MUT_CODON_TO_AA.get(c, "?"))
     return "".join(aa)
+
+
+_MUT_PREVIEW_DNA_COLOR = "color(118)"   # CDS-green, main-app-like
+_MUT_PREVIEW_AA_COLOR  = "color(141)"   # purple
+_MUT_PREVIEW_MUT_COLOR = "color(208)"   # orange (mutated codon + AA)
+
+
+def _mut_build_preview_text(cds_dna: str,
+                            protein_override: str = "",
+                            mutation: "dict | None" = None,
+                            line_width: int = 90,
+                            cursor_aa: int = -1,
+                            dna_color: str = _MUT_PREVIEW_DNA_COLOR,
+                            aa_color:  str = _MUT_PREVIEW_AA_COLOR,
+                            mut_color: str = _MUT_PREVIEW_MUT_COLOR) -> Text:
+    """Build a Rich Text preview of the (optionally mutagenized) CDS.
+
+    Two modes:
+
+    * **DNA + AA**: `cds_dna` is non-empty. DNA is rendered main-app-style
+      (green by default) with line numbers. Beneath each DNA row sits an
+      AA row — one letter per codon, centered under the middle base of
+      that codon, in purple. Stop codons show as `*` (not truncated,
+      unlike `_mut_translate`, so the user can see the end of the CDS).
+    * **AA only**: `cds_dna` is empty but `protein_override` is set. Used
+      while the user is typing a protein in the custom-protein source
+      before harmonization produces any DNA.
+
+    `mutation` (dict with `wt_codon` / `mut_codon` / `nt_position` 1-based,
+    as produced by `_mut_design_inner`) substitutes the mutant codon into
+    the displayed DNA and highlights the three mutated bases plus the AA
+    letter below in solid orange.
+
+    `cursor_aa` (>= 0) marks the AA the user is focused on — it gets a
+    reverse-video highlight across both DNA (the whole codon) and AA
+    rows. Reverse style stacks with mutation: cursor-on-mutation ends up
+    as reversed orange, which still reads as "cursor here, mutant here".
+    """
+    t = Text(no_wrap=True, overflow="crop")
+    if not cds_dna:
+        aa = (protein_override or "").upper()
+        if not aa:
+            return t
+        for i in range(0, len(aa), line_width):
+            chunk = aa[i:i + line_width]
+            for j, ch in enumerate(chunk):
+                idx = i + j
+                if idx == cursor_aa:
+                    t.append(ch, style=f"bold reverse {aa_color}")
+                else:
+                    t.append(ch, style=f"bold {aa_color}")
+            t.append("\n")
+        return t
+
+    # Line width must be a multiple of 3 so codons don't straddle lines.
+    lw = max(3, (line_width // 3) * 3)
+
+    dna = cds_dna.upper()
+    mut_lo = mut_hi = -1
+    if mutation:
+        wt_c  = (mutation.get("wt_codon")  or "").upper()
+        mut_c = (mutation.get("mut_codon") or "").upper()
+        try:
+            nt_pos = int(mutation.get("nt_position") or 0)
+        except (TypeError, ValueError):
+            nt_pos = 0
+        if wt_c and mut_c and 1 <= nt_pos <= len(dna) - 2:
+            lo = nt_pos - 1
+            dna = dna[:lo] + mut_c + dna[lo + 3:]
+            mut_lo, mut_hi = lo, lo + 3
+
+    n     = len(dna)
+    num_w = len(str(n)) if n else 1
+    cur_dna_lo = cursor_aa * 3 if cursor_aa >= 0 else -1
+    cur_dna_hi = cur_dna_lo + 3 if cursor_aa >= 0 else -1
+
+    def _base_style(i: int) -> str:
+        is_mut = mut_lo <= i < mut_hi
+        is_cur = cur_dna_lo <= i < cur_dna_hi
+        if is_mut and is_cur:
+            return f"bold reverse {mut_color}"
+        if is_mut:
+            return f"bold {mut_color}"
+        if is_cur:
+            return f"reverse {dna_color}"
+        return dna_color
+
+    def _aa_style(aa_idx: int) -> str:
+        mid_i  = aa_idx * 3 + 1
+        is_mut = mut_lo <= mid_i < mut_hi
+        is_cur = (aa_idx == cursor_aa)
+        if is_mut and is_cur:
+            return f"bold reverse {mut_color}"
+        if is_mut:
+            return f"bold {mut_color}"
+        if is_cur:
+            return f"bold reverse {aa_color}"
+        return f"bold {aa_color}"
+
+    for chunk_start in range(0, n, lw):
+        chunk_end = min(chunk_start + lw, n)
+        t.append(f"{chunk_start + 1:>{num_w}d}  ", style="dim")
+        # DNA row
+        for i in range(chunk_start, chunk_end):
+            t.append(dna[i], style=_base_style(i))
+        t.append("\n")
+        # AA row — one letter centered under each codon's middle base
+        t.append(" " * (num_w + 2))
+        for i in range(chunk_start, chunk_end):
+            if i % 3 == 1:
+                aa_idx = i // 3
+                codon  = dna[aa_idx * 3:aa_idx * 3 + 3]
+                aa_ch  = _MUT_CODON_TO_AA.get(codon, "?")
+                t.append(aa_ch, style=_aa_style(aa_idx))
+            else:
+                t.append(" ")
+        t.append("\n")
+
+    return t
+
+
+def _mut_next_cursor(current: int, protein_len: int, line_width: int,
+                     dna_mode: bool, direction: str) -> int:
+    """Compute the next cursor position given an arrow-key direction.
+
+    * `current` — current cursor AA index; -1 means no cursor yet.
+    * `direction` ∈ {"left", "right", "up", "down"}.
+    * Up/Down step by one row's worth of amino acids (`line_width // 3`
+      in DNA mode, `line_width` in AA-only mode).
+    * Result is clamped to `[0, protein_len)`. -1 is returned for empty
+      proteins. First press after no-cursor snaps to index 0 regardless
+      of direction so arrow keys "wake up" the cursor intuitively.
+    """
+    if protein_len <= 0:
+        return -1
+    if current < 0:
+        return 0
+    step = max(1, (line_width // 3) if dna_mode else line_width)
+    if   direction == "left":  new_idx = current - 1
+    elif direction == "right": new_idx = current + 1
+    elif direction == "up":    new_idx = current - step
+    elif direction == "down":  new_idx = current + step
+    else:                      return current
+    return max(0, min(protein_len - 1, new_idx))
+
+
+def _mut_click_to_aa_index(dna_mode: bool, dna_len: int, protein_len: int,
+                           line_width: int, pad: int,
+                           vp_x: int, content_row: int) -> int:
+    """Translate a click at (vp_x, content_row) inside the preview widget
+    to an amino-acid index, or -1 if the click missed an AA.
+
+    Pure arithmetic — factored out so it can be unit-tested without
+    standing up a Textual event loop. `content_row` is the click's
+    row relative to the *content* (viewport row + scroll offset), not
+    the raw event.y. `vp_x` is the column relative to the widget.
+    """
+    if protein_len <= 0 or line_width <= 0:
+        return -1
+    if dna_mode:
+        # Two rendered rows per logical codon-line (DNA + AA)
+        logical_line = content_row // 2
+        bp_start = logical_line * line_width
+        if bp_start < 0 or bp_start >= dna_len:
+            return -1
+        c_data = vp_x - pad
+        if c_data < 0 or c_data >= line_width:
+            return -1
+        codon_idx_in_line = c_data // 3
+        aa_idx = bp_start // 3 + codon_idx_in_line
+    else:
+        if content_row < 0:
+            return -1
+        aa_idx = content_row * line_width + (vp_x - pad)
+    if aa_idx < 0 or aa_idx >= protein_len:
+        return -1
+    return aa_idx
 
 
 def _mut_tm(seq: str) -> float:
@@ -5693,6 +6007,113 @@ class ConstructorModal(ModalScreen):
         self.dismiss(None)
 
 
+# ── NCBI taxon picker (sub-modal for species-name → taxid lookup) ─────────────
+
+class NcbiTaxonPickerModal(ModalScreen):
+    """Shown when the user types a non-numeric query in the Kazusa fetch
+    field. Searches NCBI taxonomy (with an auto-wildcard so partial names
+    like 'Escher' match) and lists candidates with their scientific names.
+
+    Dismiss: {'taxid': str, 'name': str} when the user picks an entry, or
+    None on cancel. The parent (SpeciesPickerModal) then drives the actual
+    Kazusa fetch.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, initial_query: str) -> None:
+        super().__init__()
+        self._initial_query = initial_query
+        self._searching     = False
+        self._hits: list[dict] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ncbi-box"):
+            yield Static(" NCBI Taxonomy  —  Pick a Species ", id="ncbi-title")
+            yield Label("Refine search  (partial names OK — 'Escher' → Escherichia*)")
+            yield Input(value=self._initial_query,
+                        placeholder="genus or species (e.g. Escherichia, Homo sapiens)",
+                        id="ncbi-query")
+            yield Static("", id="ncbi-info", markup=True)
+            yield ListView(id="ncbi-list")
+            with Horizontal(id="ncbi-btns"):
+                yield Button("Fetch Selected", id="btn-ncbi-use",
+                             variant="primary", disabled=True)
+                yield Button("Cancel  [Esc]", id="btn-ncbi-cancel")
+
+    def on_mount(self) -> None:
+        if self._initial_query:
+            self._start_search(self._initial_query)
+        self.query_one("#ncbi-query", Input).focus()
+
+    def _start_search(self, query: str) -> None:
+        if self._searching or not query.strip():
+            return
+        self._searching = True
+        self.query_one("#ncbi-info", Static).update(
+            f"[yellow]Searching NCBI for '{query}'…[/yellow]"
+        )
+        self.query_one("#btn-ncbi-use", Button).disabled = True
+        self._do_search(query.strip())
+
+    @work(thread=True)
+    def _do_search(self, query: str) -> None:
+        hits, total, msg = _ncbi_taxid_search(query)
+        self.app.call_from_thread(self._search_done, hits, total, msg)
+
+    def _search_done(self, hits: list, total: int, msg: str) -> None:
+        self._searching = False
+        if not self.is_mounted:
+            return
+        self._hits = hits
+        lv = self.query_one("#ncbi-list", ListView)
+        lv.clear()
+        for h in hits:
+            lv.append(ListItem(Label(
+                f"{h['name']}  [dim](taxid {h['taxid']})[/dim]",
+                markup=True,
+            )))
+        info = self.query_one("#ncbi-info", Static)
+        if hits:
+            info.update(f"[dim]{msg}[/dim]")
+        else:
+            info.update(f"[red]{msg}[/red]")
+
+    @on(Input.Submitted, "#ncbi-query")
+    def _on_submit(self, _event: Input.Submitted) -> None:
+        self._start_search(self.query_one("#ncbi-query", Input).value)
+
+    @on(ListView.Highlighted, "#ncbi-list")
+    def _list_highlighted(self, _) -> None:
+        lv = self.query_one("#ncbi-list", ListView)
+        if lv.index is None:
+            return
+        self.query_one("#btn-ncbi-use", Button).disabled = False
+
+    @on(ListView.Selected, "#ncbi-list")
+    def _list_selected(self, _) -> None:
+        lv = self.query_one("#ncbi-list", ListView)
+        if lv.index is None:
+            return
+        self.dismiss(self._hits[lv.index])
+
+    @on(Button.Pressed, "#btn-ncbi-use")
+    def _use(self, _) -> None:
+        lv = self.query_one("#ncbi-list", ListView)
+        if lv.index is None:
+            return
+        self.dismiss(self._hits[lv.index])
+
+    @on(Button.Pressed, "#btn-ncbi-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ── Species picker (shared modal for codon-table selection) ────────────────────
 
 class SpeciesPickerModal(ModalScreen):
@@ -5719,12 +6140,14 @@ class SpeciesPickerModal(ModalScreen):
         with Vertical(id="sp-box"):
             yield Static(" Codon Usage Table  —  Pick or Fetch ", id="sp-title")
             yield Label("Filter species")
-            yield Input(placeholder="type to filter by name or taxid",
+            yield Input(placeholder="search by genus, species, or taxid "
+                                    "(e.g. Escherichia, coli, 9606)",
                         id="sp-filter")
             yield ListView(id="sp-list")
             yield Static("", id="sp-info", markup=True)
             with Horizontal(id="sp-fetch-row"):
-                yield Input(placeholder="NCBI taxid (e.g. 9606 for Human)",
+                yield Input(placeholder="taxid or name (e.g. 9606, Homo sapiens, "
+                                        "Escherichia coli)",
                             id="sp-taxid")
                 yield Input(placeholder="Display name (optional)",
                             id="sp-name")
@@ -5755,9 +6178,32 @@ class SpeciesPickerModal(ModalScreen):
             info.update("[dim]No matching entries. Use the fetch row below to "
                         "import a new table from Kazusa.[/dim]")
         else:
-            info.update(f"[dim]{len(self._entries)} table(s) in library.[/dim]")
+            summary = self._genus_summary(query, self._entries)
+            if summary:
+                info.update(f"[dim]{summary}[/dim]")
+            else:
+                info.update(f"[dim]{len(self._entries)} table(s) in library.[/dim]")
         self.query_one("#btn-sp-use", Button).disabled = True
         self.query_one("#btn-sp-delete", Button).disabled = True
+
+    @staticmethod
+    def _genus_summary(query: str, entries: list) -> str:
+        """When the filter matches a genus and all shown entries share it,
+        return a 'N species of <Genus>' string. Otherwise ''."""
+        q = (query or "").strip()
+        if not q or not entries:
+            return ""
+        genera = {str(e.get("name", "")).split()[0]
+                  for e in entries
+                  if str(e.get("name", "")).split()}
+        if len(genera) != 1:
+            return ""
+        genus = next(iter(genera))
+        if not genus.lower().startswith(q.lower()):
+            return ""
+        n = len(entries)
+        noun = "entry" if n == 1 else "entries"
+        return f"{n} {noun} in genus {genus}."
 
     @on(Input.Changed, "#sp-filter")
     def _filter_changed(self, event: Input.Changed) -> None:
@@ -5811,16 +6257,41 @@ class SpeciesPickerModal(ModalScreen):
     def _fetch(self, _) -> None:
         if self._fetching:
             return
-        taxid = self.query_one("#sp-taxid", Input).value.strip()
+        query = self.query_one("#sp-taxid", Input).value.strip()
         name  = self.query_one("#sp-name", Input).value.strip()
         info  = self.query_one("#sp-info", Static)
-        if not taxid.isdigit():
-            info.update("[red]Enter a numeric NCBI taxid (e.g. 9606, 4932, 10090).[/red]")
+        if not query:
+            info.update("[red]Enter an NCBI taxid or species/genus name.[/red]")
             return
-        self._fetching = True
-        self.query_one("#btn-sp-fetch", Button).disabled = True
-        info.update(f"[yellow]Fetching taxid {taxid} from Kazusa…[/yellow]")
-        self._do_fetch(taxid, name)
+        if query.isdigit():
+            # Numeric taxid: go straight to Kazusa
+            self._fetching = True
+            self.query_one("#btn-sp-fetch", Button).disabled = True
+            info.update(f"[yellow]Fetching taxid {query} from Kazusa…[/yellow]")
+            self._do_fetch(query, name)
+            return
+        # Non-numeric: push the NCBI picker sub-modal. Button stays enabled
+        # during the sub-modal so Esc-cancel can return to a clean state.
+        def _picked(hit: "dict | None") -> None:
+            if hit is None:
+                try:
+                    self._refresh_list(self.query_one("#sp-filter", Input).value)
+                except Exception:
+                    pass
+                return
+            taxid = hit["taxid"]
+            display = name or hit.get("name") or f"Species (taxid {taxid})"
+            self._fetching = True
+            try:
+                self.query_one("#btn-sp-fetch", Button).disabled = True
+                self.query_one("#sp-info", Static).update(
+                    f"[yellow]Fetching taxid {taxid} ({display}) from Kazusa…[/yellow]"
+                )
+            except Exception:
+                pass
+            self._do_fetch(taxid, display)
+
+        self.app.push_screen(NcbiTaxonPickerModal(query), callback=_picked)
 
     @work(thread=True)
     def _do_fetch(self, taxid: str, name: str) -> None:
@@ -5859,6 +6330,237 @@ class SpeciesPickerModal(ModalScreen):
             _log.exception("SpeciesPickerModal fetch-callback failed")
 
     @on(Button.Pressed, "#btn-sp-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── Mutagenize helpers (preview widget + AA picker sub-modal) ─────────────────
+
+class _MutPreview(Static):
+    """Focus-and-click-aware Static for the Mutagenize CDS preview.
+
+    Single click places the cursor on the clicked AA (and takes focus so
+    subsequent keys are routed here). Double click OR Enter posts
+    `AARequested(aa_index, aa_letter)`, which the parent handles by
+    opening the AA picker. Arrow keys move the cursor — Left/Right step
+    by one AA, Up/Down step by one displayed row's worth of AAs.
+
+    Owns its own render state (DNA, mutation, cursor) so it can redraw
+    itself after any cursor change without the parent having to re-run
+    its full `_update_preview` pipeline.
+    """
+
+    can_focus = True
+
+    BINDINGS = [
+        Binding("left",  "cursor_left",    "Prev AA",       show=False),
+        Binding("right", "cursor_right",   "Next AA",       show=False),
+        Binding("up",    "cursor_up",      "Prev row",      show=False),
+        Binding("down",  "cursor_down",    "Next row",      show=False),
+        Binding("enter", "cursor_request", "Mutate",        show=False),
+    ]
+
+    class AARequested(Message):
+        """Emitted when the user commits to mutating the focused AA
+        (via double-click or Enter)."""
+        def __init__(self, aa_index: int, aa_letter: str) -> None:
+            self.aa_index  = aa_index
+            self.aa_letter = aa_letter
+            super().__init__()
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Source content (what parent passes in)
+        self._cds_dna_src:      str  = ""
+        self._mutation_src:     "dict | None" = None
+        self._protein_override: str  = ""
+        self._line_width:       int  = 90
+        # Derived, post-mutation display state
+        self._eff_dna:     str  = ""
+        self._protein:     str  = ""
+        self._pad:         int  = 0
+        self._dna_mode:    bool = False
+        # Cursor (-1 = not placed yet)
+        self._cursor_aa:   int  = -1
+
+    def bind_content(self, *, dna: str = "", mutation: "dict | None" = None,
+                     protein_override: str = "", line_width: int = 90) -> None:
+        """Replace the content being previewed. Resets cursor to -1 so it
+        doesn't point into a stale AA when the CDS changes."""
+        self._cds_dna_src      = dna or ""
+        self._mutation_src     = mutation
+        self._protein_override = protein_override or ""
+        self._line_width       = max(1, line_width)
+        self._cursor_aa        = -1
+        self._recompute_display()
+        self._render_and_update()
+
+    def _recompute_display(self) -> None:
+        if self._cds_dna_src:
+            lw  = max(3, (self._line_width // 3) * 3)
+            dna = self._cds_dna_src.upper()
+            if self._mutation_src:
+                mut_c  = (self._mutation_src.get("mut_codon") or "").upper()
+                try:
+                    nt_pos = int(self._mutation_src.get("nt_position") or 0)
+                except (TypeError, ValueError):
+                    nt_pos = 0
+                if mut_c and 1 <= nt_pos <= len(dna) - 2:
+                    lo  = nt_pos - 1
+                    dna = dna[:lo] + mut_c + dna[lo + 3:]
+            self._eff_dna  = dna
+            self._protein  = "".join(
+                _MUT_CODON_TO_AA.get(dna[i:i + 3].upper(), "?")
+                for i in range(0, len(dna) - 2, 3)
+            )
+            self._pad      = len(str(len(dna))) + 2
+            self._dna_mode = True
+        else:
+            self._eff_dna  = ""
+            self._protein  = (self._protein_override or "").upper()
+            self._pad      = 0
+            self._dna_mode = False
+        if self._cursor_aa >= len(self._protein):
+            self._cursor_aa = -1
+
+    def _render_and_update(self) -> None:
+        t = _mut_build_preview_text(
+            self._cds_dna_src,
+            protein_override=self._protein_override,
+            mutation=self._mutation_src,
+            line_width=self._line_width,
+            cursor_aa=self._cursor_aa,
+        )
+        self.update(t)
+
+    # ── Mouse ──────────────────────────────────────────────────────────
+
+    def on_click(self, event: Click) -> None:
+        if not self._protein:
+            return
+        self.focus()
+        try:
+            reg  = self.region
+            vp_x = event.screen_x - reg.x
+            vp_y = event.screen_y - reg.y
+            if vp_x < 0 or vp_y < 0 or vp_x >= reg.width or vp_y >= reg.height:
+                return
+            content_row = vp_y + int(self.scroll_y)
+        except Exception:
+            return
+        lw = (max(3, (self._line_width // 3) * 3) if self._dna_mode
+              else max(1, self._line_width))
+        aa_idx = _mut_click_to_aa_index(
+            self._dna_mode, len(self._eff_dna), len(self._protein),
+            lw, self._pad, vp_x, content_row,
+        )
+        if aa_idx < 0:
+            return
+        aa_letter = self._protein[aa_idx]
+        if aa_letter == "?":
+            return
+        # Always place cursor on click
+        self._cursor_aa = aa_idx
+        self._render_and_update()
+        # Double-click commits to mutation
+        if event.chain >= 2:
+            self.post_message(self.AARequested(aa_idx, aa_letter))
+
+    # ── Keyboard navigation ────────────────────────────────────────────
+
+    def _move_cursor(self, direction: str) -> None:
+        if not self._protein:
+            return
+        new_idx = _mut_next_cursor(
+            self._cursor_aa, len(self._protein),
+            self._line_width, self._dna_mode, direction,
+        )
+        if new_idx != self._cursor_aa:
+            self._cursor_aa = new_idx
+            self._render_and_update()
+
+    def action_cursor_left(self)  -> None: self._move_cursor("left")
+    def action_cursor_right(self) -> None: self._move_cursor("right")
+    def action_cursor_up(self)    -> None: self._move_cursor("up")
+    def action_cursor_down(self)  -> None: self._move_cursor("down")
+
+    def action_cursor_request(self) -> None:
+        if not self._protein or self._cursor_aa < 0:
+            return
+        aa_letter = self._protein[self._cursor_aa]
+        if aa_letter == "?":
+            return
+        self.post_message(self.AARequested(self._cursor_aa, aa_letter))
+
+
+class AminoAcidPickerModal(ModalScreen):
+    """Tiny picker shown when the user clicks an AA in the Mutagenize
+    preview. Returns the selected one-letter AA on dismiss, or None on
+    cancel. The WT amino at the clicked position is filtered out so
+    the user can't pick a no-op mutation."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    # 20 standard amino acids + stop. Ordered alphabetically by one-letter.
+    _AA_CATALOG: list[tuple[str, str, str]] = [
+        ("A", "Ala", "Alanine"),       ("C", "Cys", "Cysteine"),
+        ("D", "Asp", "Aspartate"),     ("E", "Glu", "Glutamate"),
+        ("F", "Phe", "Phenylalanine"), ("G", "Gly", "Glycine"),
+        ("H", "His", "Histidine"),     ("I", "Ile", "Isoleucine"),
+        ("K", "Lys", "Lysine"),        ("L", "Leu", "Leucine"),
+        ("M", "Met", "Methionine"),    ("N", "Asn", "Asparagine"),
+        ("P", "Pro", "Proline"),       ("Q", "Gln", "Glutamine"),
+        ("R", "Arg", "Arginine"),      ("S", "Ser", "Serine"),
+        ("T", "Thr", "Threonine"),     ("V", "Val", "Valine"),
+        ("W", "Trp", "Tryptophan"),    ("Y", "Tyr", "Tyrosine"),
+        ("*", "***", "Stop codon"),
+    ]
+
+    def __init__(self, position: int, wt_aa: str) -> None:
+        super().__init__()
+        self._position = position
+        self._wt_aa    = (wt_aa or "").upper()
+        self._choices: list[str] = [
+            a for (a, _, _) in self._AA_CATALOG if a != self._wt_aa
+        ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="aa-pick-box"):
+            yield Static(f" Mutate {self._wt_aa}{self._position}  →  ? ",
+                         id="aa-pick-title")
+            yield Label("[dim]Pick the replacement amino acid. "
+                        "Esc to cancel.[/dim]", markup=True)
+            items: list = []
+            for (a, tl, fn) in self._AA_CATALOG:
+                if a == self._wt_aa:
+                    continue
+                items.append(ListItem(Label(
+                    f"[bold]{a}[/bold]   {tl}   [dim]{fn}[/dim]",
+                    markup=True,
+                )))
+            yield ListView(*items, id="aa-pick-list")
+            with Horizontal(id="aa-pick-btns"):
+                yield Button("Cancel  [Esc]", id="btn-aa-pick-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#aa-pick-list", ListView).focus()
+        except Exception:
+            pass
+
+    @on(ListView.Selected, "#aa-pick-list")
+    def _selected(self, _event) -> None:
+        lv = self.query_one("#aa-pick-list", ListView)
+        if lv.index is None or lv.index >= len(self._choices):
+            return
+        self.dismiss(self._choices[lv.index])
+
+    @on(Button.Pressed, "#btn-aa-pick-cancel")
     def _cancel_btn(self, _) -> None:
         self.dismiss(None)
 
@@ -5949,6 +6651,11 @@ class MutagenizeModal(ModalScreen):
                              id="mut-codon-label", markup=True)
                 yield Button("Change…", id="btn-mut-codon", variant="default")
 
+            # ── CDS preview  (DNA + AA, or AA only for the protein source) ──
+            # Click-aware: clicking an AA opens AminoAcidPickerModal and
+            # seeds #mut-input with the resulting W140F-style shorthand.
+            yield _MutPreview("", id="mut-preview", markup=False)
+
             # ── Mutation + Design ──
             with Horizontal(id="mut-row2"):
                 with Vertical(id="mut-mut-col"):
@@ -6019,6 +6726,7 @@ class MutagenizeModal(ModalScreen):
         info = self.query_one("#mut-cds-info", Static)
         info.update("[dim]Pick a source and CDS, then enter a mutation like "
                     "[bold]W140F[/bold] and press Design.[/dim]")
+        self._update_preview()
 
     # ── Source switching ──────────────────────────────────────────────────
 
@@ -6031,11 +6739,16 @@ class MutagenizeModal(ModalScreen):
         self.query_one("#mut-src-map", Vertical).display  = (src == "map")
         self.query_one("#mut-src-lib", Vertical).display  = (src == "lib")
         self.query_one("#mut-src-prot", Vertical).display = (src == "prot")
-        # Clear any previously-loaded CDS so the user knows they need to re-pick
+        # Clear any previously-loaded CDS so the user knows they need to re-pick.
+        # Also drop the last designed primers so the preview doesn't keep
+        # highlighting a stale mutation from the previous source.
         self._cds_dna  = ""
         self._cds_meta = None
+        self._outer    = None
+        self._inner    = None
         self.query_one("#mut-cds-info", Static).update("")
         self.query_one("#btn-mut-save", Button).disabled = True
+        self._update_preview()
 
     # ── Map source ────────────────────────────────────────────────────────
 
@@ -6133,9 +6846,13 @@ class MutagenizeModal(ModalScreen):
         self._cds_dna  = cds
         self._cds_meta = {"start": start, "end": end, "strand": strand,
                           "name": label, "origin": origin}
+        # A new CDS invalidates any mutation designed against the previous one
+        self._outer = None
+        self._inner = None
         self._update_cds_info(cds, protein, strand_label=(
             "+" if strand == 1 else "−"
         ))
+        self._update_preview()
 
     def _update_cds_info(self, cds: str, protein: str,
                          strand_label: str = "·") -> None:
@@ -6193,6 +6910,9 @@ class MutagenizeModal(ModalScreen):
         self._cds_meta = {"start": 0, "end": len(cds), "strand": 1,
                           "name": name, "origin": "prot"}
         self._plasmid_name = name
+        # Fresh harmonized CDS invalidates any previously designed primers
+        self._outer = None
+        self._inner = None
         protein = _mut_translate(cds)
         atg = "[green]ATG[/green]" if cds.startswith("ATG") else "[yellow]no ATG[/yellow]"
         stop_tag = cds[-3:] if len(cds) >= 3 else ""
@@ -6204,6 +6924,67 @@ class MutagenizeModal(ModalScreen):
             f"CAI {_codon_cai(cds, self._codon_entry['raw']):.2f} · "
             f"GC {_codon_gc(cds):.1f}%{fix_note}[/dim]   "
             f"start {atg}   stop {stop_s}"
+        )
+        self._update_preview()
+
+    # ── CDS preview  (DNA + AA; AA-only while typing protein) ────────────
+
+    def _update_preview(self) -> None:
+        """Refresh the `#mut-preview` pane by handing current state to the
+        preview widget, which owns its own rendering + cursor management.
+        Called on every state change that could alter what the user sees:
+        source switch, CDS load, harmonize, design, or live typing in
+        the protein textarea.
+        """
+        try:
+            preview = self.query_one("#mut-preview", _MutPreview)
+        except Exception:
+            return
+        lw = 90
+        if self._cds_dna:
+            preview.bind_content(
+                dna=self._cds_dna,
+                mutation=self._inner or None,
+                line_width=lw,
+            )
+        else:
+            aa_raw = ""
+            try:
+                if self.query_one("#mut-source", Select).value == "prot":
+                    aa_raw = self.query_one("#mut-prot-aa", TextArea).text
+            except Exception:
+                aa_raw = ""
+            aa_clean = re.sub(r"[\s\d>_\-*]", "", aa_raw or "").upper()
+            preview.bind_content(protein_override=aa_clean, line_width=lw)
+
+    @on(TextArea.Changed, "#mut-prot-aa")
+    def _on_prot_aa_changed(self, _event) -> None:
+        # Only live-update while we have no harmonized CDS yet; once the
+        # user harmonizes, self._cds_dna takes over and further edits to
+        # the textarea shouldn't clobber the DNA preview.
+        if not self._cds_dna:
+            self._update_preview()
+
+    @on(_MutPreview.AARequested)
+    def _on_preview_aa_requested(self, event: "_MutPreview.AARequested") -> None:
+        """Preview fired AARequested (double-click or Enter on a focused
+        AA) → open the picker → seed the mutation textbox with
+        `{WT}{pos}{NEW}` (e.g. 'W140F')."""
+        position = event.aa_index + 1   # biology convention: 1-based
+        wt_aa    = event.aa_letter
+
+        def _picked(new_aa: "str | None") -> None:
+            if not new_aa:
+                return
+            try:
+                self.query_one("#mut-input", Input).value = (
+                    f"{wt_aa}{position}{new_aa}"
+                )
+            except Exception:
+                _log.exception("Mutagenize: failed to set mutation input")
+
+        self.app.push_screen(
+            AminoAcidPickerModal(position, wt_aa), callback=_picked,
         )
 
     # ── Codon-table picker ───────────────────────────────────────────────
@@ -6268,6 +7049,7 @@ class MutagenizeModal(ModalScreen):
         self._inner = inner
         status.update(self._render_results())
         self.query_one("#btn-mut-save", Button).disabled = False
+        self._update_preview()
 
     def _render_results(self) -> Text:
         t = Text()
@@ -7942,13 +8724,30 @@ MutagenizeModal { align: center middle; }
 #mut-mut-col  { width: 3fr; padding-right: 1; }
 #mut-btn-col  { width: 2fr; }
 #btn-mut-design { width: 100%; }
+#mut-preview {
+    height: auto; max-height: 10;
+    border: solid $primary-darken-2; padding: 0 1; margin-top: 1;
+    overflow-y: auto; overflow-x: auto;
+}
 #mut-results {
-    height: auto; max-height: 16;
+    height: auto; max-height: 12;
     border: solid $primary-darken-2; padding: 0 1; margin-top: 1;
     overflow-y: auto;
 }
 #mut-btns     { height: 3; margin-top: 1; }
 #mut-btns Button { margin-right: 1; }
+
+/* ── AA picker sub-modal (from clicking an AA in the preview) ────────── */
+AminoAcidPickerModal { align: center middle; }
+#aa-pick-box {
+    width: 60; height: auto; max-height: 30;
+    background: $surface; border: solid $accent; padding: 1 2;
+}
+#aa-pick-title { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#aa-pick-box Label { color: $text-muted; margin: 0 0 1 0; }
+#aa-pick-list  { height: auto; max-height: 20; border: solid $primary-darken-2; }
+#aa-pick-btns  { height: 3; margin-top: 1; }
+#aa-pick-btns Button { margin-right: 1; }
 
 /* ── Species picker modal ───────────────────────────────── */
 SpeciesPickerModal { align: center middle; }
@@ -8933,7 +9732,12 @@ SpeciesPickerModal { align: center middle; }
         sidebar.show_detail(event.feat_dict)
         if event.idx >= 0:
             sidebar.highlight_row(event.idx)
-        seq_pnl.highlight_feature(event.feat_dict)
+        if event.feat_dict is not None and event.bp >= 0:
+            # Cursor lands on the clicked base (already inside the feature via
+            # _bp_in); feature span becomes the copyable selection.
+            seq_pnl.select_feature_range(event.feat_dict, cursor_bp=event.bp)
+        else:
+            seq_pnl.highlight_feature(event.feat_dict)
 
     @on(FeatureSidebar.RowActivated)
     def _sidebar_row_activated(self, event: FeatureSidebar.RowActivated):
