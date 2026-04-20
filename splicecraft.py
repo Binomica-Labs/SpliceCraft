@@ -1657,6 +1657,145 @@ def _gb_text_to_record(text: str):
     return SeqIO.read(StringIO(text), "genbank")
 
 
+# ── GenBank export (NCBI-compliant normalization + atomic write) ──────────────
+#
+# Biopython's SeqIO.write produces compliant GenBank output when annotations
+# include the INSDC-mandated fields. `_normalize_for_genbank` fills in the
+# minimum set a plasmid record needs to round-trip cleanly through any NCBI-
+# compliant parser. The normalization is non-destructive: the caller's
+# record is never mutated (shallow copy with fresh annotations dict).
+#
+# Defaults chosen for a synthetic plasmid of unknown provenance:
+#   topology        = circular   (SpliceCraft only works on plasmids)
+#   molecule_type   = DNA
+#   data_file_division = SYN     (synthetic; matches what NCBI assigns to
+#                                 user-submitted plasmids)
+#   date            = today, formatted DD-MMM-YYYY
+#   organism        = "synthetic construct"
+#   taxonomy        = ["other sequences", "artificial sequences"]
+#
+# These match what NCBI emits for synthetic constructs submitted via BankIt.
+
+_GB_LOCUS_NAME_MAX = 28  # NCBI relaxed LOCUS name length (spec is 16)
+
+
+def _normalize_for_genbank(record):
+    """Return a shallow copy of `record` with NCBI-required fields filled in.
+
+    Idempotent — existing values are preserved. Only fills gaps. Caller's
+    record is never mutated.
+    """
+    from copy import copy as _shallow_copy
+    from datetime import datetime as _dt
+
+    rec = _shallow_copy(record)
+    anns = dict(getattr(record, "annotations", None) or {})
+
+    anns.setdefault("molecule_type", "DNA")
+    anns.setdefault("topology", "circular")
+    anns.setdefault("data_file_division", "SYN")
+
+    if not anns.get("date"):
+        anns["date"] = _dt.now().strftime("%d-%b-%Y").upper()
+
+    if not anns.get("accessions"):
+        acc = rec.id if rec.id and rec.id != "<unknown id>" else ""
+        anns["accessions"] = [acc]
+
+    if not anns.get("organism"):
+        anns["organism"] = "synthetic construct"
+    if not anns.get("source"):
+        anns["source"] = anns["organism"]
+    if not anns.get("taxonomy"):
+        anns["taxonomy"] = ["other sequences", "artificial sequences"]
+
+    rec.annotations = anns
+
+    # LOCUS name: spec is 16 chars; NCBI accepts up to 28 in practice.
+    # Biopython itself warns if >16 but does not fail.
+    if rec.name and len(rec.name) > _GB_LOCUS_NAME_MAX:
+        rec.name = rec.name[:_GB_LOCUS_NAME_MAX]
+    if not rec.name or rec.name == "<unknown name>":
+        rec.name = (rec.id or "PLASMID")[:_GB_LOCUS_NAME_MAX] or "PLASMID"
+
+    if not rec.description or rec.description == "<unknown description>":
+        rec.description = rec.name
+
+    if not rec.id or rec.id == "<unknown id>":
+        rec.id = rec.name
+
+    return rec
+
+
+def _export_genbank_to_path(record, path) -> dict:
+    """Write `record` to `path` as a GenBank file. Atomic + round-trip verified.
+
+    Returns a small summary dict `{"path", "bp", "features"}` for UI reporting.
+
+    Raises:
+      OSError on filesystem failures (write, replace, fsync).
+      ValueError if the round-trip parse fails or the parsed record
+        disagrees with the source on sequence length, sequence content,
+        or feature count — meaning the export is not byte-safe.
+
+    The round-trip happens BEFORE the target file is touched, so a failed
+    export never leaves a half-written / corrupt .gb at `path`.
+    """
+    import os
+    import tempfile
+    from pathlib import Path as _Path
+
+    p = _Path(path).expanduser()
+    normalized = _normalize_for_genbank(record)
+    text = _record_to_gb_text(normalized)
+
+    # Round-trip verify before touching the filesystem
+    try:
+        parsed = _gb_text_to_record(text)
+    except Exception as exc:
+        raise ValueError(f"export round-trip parse failed: {exc}") from exc
+    if len(parsed.seq) != len(normalized.seq):
+        raise ValueError(
+            f"export round-trip sequence length mismatch "
+            f"({len(parsed.seq)} vs {len(normalized.seq)})"
+        )
+    if str(parsed.seq).upper() != str(normalized.seq).upper():
+        raise ValueError("export round-trip sequence content mismatch")
+    if len(parsed.features) != len(normalized.features):
+        raise ValueError(
+            f"export round-trip feature count mismatch "
+            f"({len(parsed.features)} vs {len(normalized.features)})"
+        )
+
+    # Atomic write — tempfile in the target's directory, then os.replace.
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=f".{p.name}.", suffix=".tmp", dir=str(p.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, str(p))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+    _log.info(
+        "Exported GenBank to %s (%d bp, %d features)",
+        p, len(normalized.seq), len(normalized.features),
+    )
+    return {"path": str(p), "bp": len(normalized.seq),
+            "features": len(normalized.features)}
+
+
 # ── External annotation (pLannotate) ──────────────────────────────────────────
 #
 # Integration with pLannotate (https://github.com/mmcguffi/pLannotate) as an
@@ -3705,6 +3844,84 @@ class OpenFileModal(ModalScreen):
         self.dismiss(None)
 
     def action_cancel(self):
+        self.dismiss(None)
+
+
+# ── Export-GenBank modal ───────────────────────────────────────────────────────
+
+class ExportGenBankModal(ModalScreen):
+    """Prompt for a target path, write the current record as GenBank.
+
+    On submit, dismisses with a summary dict from `_export_genbank_to_path`
+    (keys: path, bp, features) or None if cancelled. The caller is
+    expected to show a notification on success.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",      "Cancel"),
+        Binding("tab",    "focus_next",  "Next",   show=False),
+    ]
+
+    def __init__(self, record, default_path: str = "") -> None:
+        super().__init__()
+        self._record = record
+        self._default_path = default_path
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="export-box"):
+            yield Static(" Export as GenBank ", id="export-title")
+            name = getattr(self._record, "name", "") or "plasmid"
+            bp = len(getattr(self._record, "seq", "") or "")
+            feats = len(getattr(self._record, "features", []) or [])
+            yield Label(f"[{name}]  {bp} bp, {feats} features")
+            yield Label("Output path (.gb):")
+            yield Input(
+                value=self._default_path,
+                placeholder="/path/to/plasmid.gb",
+                id="export-path",
+            )
+            with Horizontal(id="export-btns"):
+                yield Button("Export",  id="btn-export", variant="primary")
+                yield Button("Cancel",  id="btn-cancel-export")
+            yield Static("", id="export-status", markup=True)
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#export-path", Input).focus()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-export")
+    def _do_export(self) -> None:
+        try:
+            inp = self.query_one("#export-path", Input)
+            status = self.query_one("#export-status", Static)
+        except NoMatches:
+            return
+        path = inp.value.strip()
+        if not path:
+            status.update("[red]Enter an output path.[/red]")
+            return
+        try:
+            summary = _export_genbank_to_path(self._record, path)
+        except (OSError, ValueError) as exc:
+            _log.exception("GenBank export to %s failed", path)
+            status.update(f"[red]Export failed: {exc}[/red]")
+            return
+        self.dismiss(summary)
+
+    @on(Input.Submitted)
+    def _submitted(self) -> None:
+        try:
+            self.query_one("#btn-export", Button).press()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-cancel-export")
+    def _cancel_btn(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
         self.dismiss(None)
 
 
@@ -8734,6 +8951,18 @@ OpenFileModal { align: center middle; }
 #open-btns Button { margin-right: 1; }
 #open-status { height: 1; margin-top: 1; }
 
+/* ── Export-GenBank modal ────────────────────────────────── */
+ExportGenBankModal { align: center middle; }
+#export-box {
+    width: 72; height: auto;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#export-title { background: $primary; padding: 0 1; margin-bottom: 1; }
+#export-box Label { color: $text-muted; margin-top: 1; }
+#export-btns { height: 3; margin-top: 1; }
+#export-btns Button { margin-right: 1; }
+#export-status { height: 2; margin-top: 1; }
+
 /* ── Edit-sequence dialog ────────────────────────────────── */
 EditSeqDialog { align: center middle; }
 #edit-dlg {
@@ -9891,6 +10120,42 @@ SpeciesPickerModal { align: center middle; }
         # the record's _tui_source path for later "Save" operations.
         self.push_screen(OpenFileModal(), callback=self._import_and_persist)
 
+    def action_export_genbank(self) -> None:
+        """Prompt for a path and write the current record as GenBank.
+
+        Uses the record's `_tui_source` path as the default if present, or
+        `{record.name}.gb` in the cwd otherwise. Export is round-trip
+        verified before any file is touched (see `_export_genbank_to_path`).
+        """
+        if self._current_record is None:
+            self.notify("No plasmid loaded.", severity="warning")
+            return
+        # Default: prefer the record's source file if it was opened from
+        # disk and was already .gb; fall back to a file beside the cwd.
+        src = getattr(self._current_record, "_tui_source", None) \
+              or getattr(self, "_source_path", None)
+        if src and str(src).lower().endswith((".gb", ".gbk")):
+            default = str(src)
+        else:
+            name = self._current_record.name or "plasmid"
+            default = f"{name}.gb"
+
+        def _on_done(result):
+            if result is None:
+                return
+            path = result.get("path", "?")
+            bp = result.get("bp", 0)
+            feats = result.get("features", 0)
+            self.notify(
+                f"Exported {feats} features / {bp} bp → {path}",
+                timeout=8,
+            )
+
+        self.push_screen(
+            ExportGenBankModal(self._current_record, default_path=default),
+            callback=_on_done,
+        )
+
     # ── Central record loader ──────────────────────────────────────────────────
 
     def _import_and_persist(self, record) -> None:
@@ -10301,6 +10566,7 @@ SpeciesPickerModal { align: center middle; }
                 ("---",             None),
                 ("Add to Library",  "add_to_library"),
                 ("Save",            "save"),
+                ("Export as GenBank (.gb)...", "export_genbank"),
                 ("---",             None),
                 ("Quit",            "quit"),
             ],

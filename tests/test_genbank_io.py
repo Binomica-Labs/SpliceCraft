@@ -597,3 +597,177 @@ class TestSnapGeneRealFiles:
         assert pm._n_clamped == 0, (
             f"{path.name}: {pm._n_clamped} feature(s) unexpectedly clamped"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GenBank export — `_normalize_for_genbank` + `_export_genbank_to_path`
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestNormalizeForGenbank:
+    """`_normalize_for_genbank` fills in INSDC-mandated fields that Biopython's
+    writer needs. Caller's record must never be mutated."""
+
+    def test_fills_molecule_type_default(self, tiny_record):
+        # Erase molecule_type to simulate an imported-from-somewhere record
+        rec = tiny_record
+        rec.annotations = {k: v for k, v in rec.annotations.items()
+                           if k != "molecule_type"}
+        normalized = sc._normalize_for_genbank(rec)
+        assert normalized.annotations["molecule_type"] == "DNA"
+
+    def test_fills_topology_circular_default(self, tiny_record):
+        rec = tiny_record
+        rec.annotations = {k: v for k, v in rec.annotations.items()
+                           if k != "topology"}
+        normalized = sc._normalize_for_genbank(rec)
+        assert normalized.annotations["topology"] == "circular"
+
+    def test_fills_division_syn_default(self, tiny_record):
+        """Synthetic plasmids default to the SYN division code."""
+        normalized = sc._normalize_for_genbank(tiny_record)
+        assert normalized.annotations["data_file_division"] == "SYN"
+
+    def test_fills_date_in_genbank_format(self, tiny_record):
+        """Date must be DD-MMM-YYYY uppercase (e.g. '20-APR-2026')."""
+        import re
+        normalized = sc._normalize_for_genbank(tiny_record)
+        assert re.match(r"^\d{2}-[A-Z]{3}-\d{4}$",
+                        normalized.annotations["date"])
+
+    def test_preserves_existing_topology(self, tiny_record):
+        """If topology is already set to 'linear', don't silently flip it."""
+        tiny_record.annotations["topology"] = "linear"
+        normalized = sc._normalize_for_genbank(tiny_record)
+        assert normalized.annotations["topology"] == "linear"
+
+    def test_preserves_existing_molecule_type(self, tiny_record):
+        tiny_record.annotations["molecule_type"] = "ss-DNA"
+        normalized = sc._normalize_for_genbank(tiny_record)
+        assert normalized.annotations["molecule_type"] == "ss-DNA"
+
+    def test_caller_record_not_mutated(self, tiny_record):
+        """Sacred: normalize is pure — caller's annotations dict is intact."""
+        before_keys = set(tiny_record.annotations.keys())
+        before_id = id(tiny_record.annotations)
+        _ = sc._normalize_for_genbank(tiny_record)
+        assert set(tiny_record.annotations.keys()) == before_keys
+        assert id(tiny_record.annotations) == before_id
+
+    def test_truncates_long_locus_name(self, tiny_record):
+        """NCBI accepts LOCUS names up to 28 chars; longer must be truncated."""
+        tiny_record.name = "A" * 50
+        normalized = sc._normalize_for_genbank(tiny_record)
+        assert len(normalized.name) == 28
+
+    def test_fills_accessions_from_id(self, tiny_record):
+        tiny_record.annotations.pop("accessions", None)
+        normalized = sc._normalize_for_genbank(tiny_record)
+        assert normalized.annotations["accessions"] == [tiny_record.id]
+
+    def test_fills_organism_synthetic_construct(self, tiny_record):
+        normalized = sc._normalize_for_genbank(tiny_record)
+        assert normalized.annotations["organism"] == "synthetic construct"
+        assert "artificial sequences" in normalized.annotations["taxonomy"]
+
+
+class TestExportGenBankToPath:
+    """`_export_genbank_to_path` writes atomically AND round-trip verifies
+    before touching the filesystem. A failed round-trip must leave no file."""
+
+    def test_writes_file(self, tiny_record, tmp_path):
+        out = tmp_path / "out.gb"
+        summary = sc._export_genbank_to_path(tiny_record, out)
+        assert out.exists()
+        assert summary["path"] == str(out)
+        assert summary["bp"] == len(tiny_record.seq)
+
+    def test_roundtrip_sequence_matches(self, tiny_record, tmp_path):
+        out = tmp_path / "out.gb"
+        sc._export_genbank_to_path(tiny_record, out)
+        reloaded = sc.load_genbank(str(out))
+        assert str(reloaded.seq).upper() == str(tiny_record.seq).upper()
+
+    def test_roundtrip_feature_count_matches(self, tiny_record, tmp_path):
+        """Non-source feature count must survive export + reload."""
+        out = tmp_path / "out.gb"
+        sc._export_genbank_to_path(tiny_record, out)
+        reloaded = sc.load_genbank(str(out))
+        orig_non_source = [f for f in tiny_record.features if f.type != "source"]
+        reload_non_source = [f for f in reloaded.features if f.type != "source"]
+        assert len(reload_non_source) == len(orig_non_source)
+
+    def test_roundtrip_reverse_strand_preserved(self, tiny_record, tmp_path):
+        """Strand=-1 features must round-trip as `complement(...)` locations."""
+        out = tmp_path / "out.gb"
+        sc._export_genbank_to_path(tiny_record, out)
+        reloaded = sc.load_genbank(str(out))
+        minus = [f for f in reloaded.features if f.location.strand == -1]
+        assert len(minus) == 1
+        assert minus[0].type == "misc_feature"
+
+    def test_roundtrip_cds_qualifiers_preserved(self, tiny_record, tmp_path):
+        out = tmp_path / "out.gb"
+        sc._export_genbank_to_path(tiny_record, out)
+        reloaded = sc.load_genbank(str(out))
+        cds = [f for f in reloaded.features if f.type == "CDS"]
+        assert len(cds) == 1
+        assert cds[0].qualifiers.get("gene") == ["testA"]
+
+    def test_roundtrip_topology_circular_preserved(self, tiny_record, tmp_path):
+        out = tmp_path / "out.gb"
+        sc._export_genbank_to_path(tiny_record, out)
+        reloaded = sc.load_genbank(str(out))
+        assert reloaded.annotations.get("topology") == "circular"
+
+    def test_wrap_feature_roundtrip(self, tiny_record, tmp_path):
+        """Compound (wrap) locations must survive export + reload as join(...)."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        # Build a wrap feature that spans the origin of the 120 bp plasmid
+        total = len(tiny_record.seq)
+        parts = [FeatureLocation(total - 10, total, strand=1),
+                 FeatureLocation(0, 5, strand=1)]
+        tiny_record.features.append(SeqFeature(
+            CompoundLocation(parts),
+            type="misc_feature",
+            qualifiers={"label": ["wrap_region"]},
+        ))
+        out = tmp_path / "out.gb"
+        sc._export_genbank_to_path(tiny_record, out)
+        reloaded = sc.load_genbank(str(out))
+        wraps = [f for f in reloaded.features
+                 if "wrap_region" in f.qualifiers.get("label", [])]
+        assert len(wraps) == 1
+        # CompoundLocation has .parts; FeatureLocation does not
+        assert hasattr(wraps[0].location, "parts")
+        assert len(wraps[0].location.parts) == 2
+
+    def test_atomic_no_leftover_tmp_on_write(self, tiny_record, tmp_path):
+        """After a successful export, no `.tmp` hidden files must linger."""
+        out = tmp_path / "out.gb"
+        sc._export_genbank_to_path(tiny_record, out)
+        leftovers = list(tmp_path.glob(".*.tmp"))
+        assert leftovers == []
+
+    def test_fills_missing_annotations_on_export(self, tmp_path):
+        """A bare-bones SeqRecord with no annotations must still export."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        bare = SeqRecord(Seq("ATGCATGCATGC" * 10), id="BARE", name="BARE",
+                         description="")
+        out = tmp_path / "bare.gb"
+        sc._export_genbank_to_path(bare, out)
+        reloaded = sc.load_genbank(str(out))
+        assert reloaded.annotations["molecule_type"] == "DNA"
+        assert reloaded.annotations["topology"] == "circular"
+
+    def test_export_parent_dir_created(self, tiny_record, tmp_path):
+        """Intermediate directories are created as needed."""
+        out = tmp_path / "nested" / "deep" / "out.gb"
+        sc._export_genbank_to_path(tiny_record, out)
+        assert out.exists()
+
+    def test_target_path_contains_spaces(self, tiny_record, tmp_path):
+        """Paths with spaces (common on macOS / Windows) must not break."""
+        out = tmp_path / "my plasmids" / "some name.gb"
+        sc._export_genbank_to_path(tiny_record, out)
+        assert out.exists()
