@@ -12,10 +12,10 @@ A **terminal-based circular plasmid map viewer, sequence editor, and cloning/mut
 
 **Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs org, user ATinyGreenCell)
 
-- **Single-file architecture:** the entire app is `splicecraft.py` (~10,360 lines). Intentional — avoids import complexity and keeps the codebase greppable. Sibling project ScriptoScope follows the same convention at ~8,600 lines.
-- **Test suite:** 483 tests across 12 files in `tests/` (last refresh 2026-04-20). Full run ~75 s, biology subset (`test_dna_sanity.py`) < 1 s.
-- **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`, plus `pytest>=9.0` / `pytest-asyncio>=1.3` for tests. Users install via `pipx install splicecraft`. **Optional runtime:** `pLannotate` (conda, GPL-3) for the Shift+A annotation feature.
-- **Published on PyPI** as `splicecraft`. Releases cut via `./release.sh X.Y.Z` (bumps version in both `pyproject.toml` and `splicecraft.py`, runs tests, builds, commits+tags+pushes; GitHub Actions `publish.yml` then publishes via Trusted Publishing / OIDC). Latest published: **v0.3.0**.
+- **Single-file architecture:** the entire app is `splicecraft.py` (~10,620 lines). Intentional — avoids import complexity and keeps the codebase greppable. Sibling project ScriptoScope follows the same convention at ~8,600 lines.
+- **Test suite:** 508 tests across 13 files in `tests/` (last refresh 2026-04-20). Full run ~95 s, biology subset (`test_dna_sanity.py`) < 1 s. `test_invariants_hypothesis.py` adds property-based fuzzing on top of hand-written regression tests.
+- **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`, plus `pytest>=9.0` / `pytest-asyncio>=1.3` / `hypothesis>=6.100` for tests. Users install via `pipx install splicecraft`. **Optional runtime:** `pLannotate` (conda, GPL-3) for the Shift+A annotation feature.
+- **Published on PyPI** as `splicecraft`. Releases cut via `./release.sh X.Y.Z` (bumps version in both `pyproject.toml` and `splicecraft.py`, runs tests, builds, commits+tags+pushes; GitHub Actions `publish.yml` then publishes via Trusted Publishing / OIDC). Latest published: **v0.3.1**.
 
 ## How to run
 
@@ -31,7 +31,7 @@ pipx install splicecraft
 splicecraft
 ```
 
-Logs: `/tmp/splicecraft.log` (override with `$SPLICECRAFT_LOG`). Each line is prefixed with an 8-char session ID for multi-run grepping.
+Logs: `~/.local/share/splicecraft/logs/splicecraft.log` (override with `$SPLICECRAFT_LOG`). Each line is prefixed with an 8-char session ID for multi-run grepping.
 
 ### Optional: pLannotate for automatic annotation
 
@@ -51,40 +51,41 @@ If pLannotate is not on `PATH`, Shift+A notifies the user and returns — nothin
 
 | Lines | Section |
 |-------|---------|
-| 1–185 | Docstring, imports, user data dir (`platformdirs`), legacy migration, dependency check, rotating session-tagged logger, feature-colour palette |
-| 188–314 | Atomic JSON persistence (`_safe_save_json` / `_safe_load_json` — tempfile + `os.replace` + `.bak` + shrink guard) |
-| 315–337 | Library cache loaders (`_load_library` / `_save_library`) |
-| 338–1377 | NEB enzyme catalog (~204), IUPAC tables + cached regex, `_rc`, `_scan_restriction_sites` (palindrome-aware, wrap-around), `_assign_chunk_features`, `_render_feature_row_pair`, memoized `_build_seq_inputs` and `_build_seq_text`, OSC-52 clipboard, `_translate_cds` |
-| 1378–1450 | Char-aspect detection + label helpers |
-| 1451–1588 | GenBank I/O (`fetch_genbank`, `load_genbank` auto-detecting `.gb`/`.dna`, `_record_to_gb_text`) |
-| 1589–1804 | **pLannotate** subprocess integration (`PlannotateError` hierarchy, `_run_plannotate`, `_merge_plannotate_features`) |
-| 1805–1914 | `_Canvas` + `_BrailleCanvas` (sub-cell braille resolution) |
-| 1915–2682 | `PlasmidMap` widget — circular/linear draw, label placement, `_draw_cache` |
-| 2683–2797 | `FeatureSidebar` — scrollable feature table with click-to-select |
-| 2798–2965 | `LibraryPanel` — plasmid library list, rename/delete buttons |
-| 2966–3414 | `SequencePanel` — DNA viewer, click-to-cursor, drag selection |
-| 3415–3732 | Core modals (`EditSeqDialog`, `FetchModal`, `OpenFileModal`, `DropdownScreen`) |
-| 3733–3774 | `MenuBar` widget |
-| 3775–3983 | Golden Braid L0 position catalog (BsaI overhangs, position constraints) |
-| 3984–4038 | Parts-bin + primer-library persistence |
-| 4039–4825 | Codon-usage registry (`_codon_*`), Kazusa parser, NCBI taxid search (`_safe_xml_parse`), harmonization, CAI/GC |
-| 4826–5337 | SOE-PCR site-directed mutagenesis primer design (`_mut_*`) |
-| 5338–5498 | `PartsBinModal` |
-| 5499–6047 | `DomesticatorModal` + `ConstructorModal` (Golden Braid L0 UI) |
-| 6048–6385 | `NcbiTaxonPickerModal` + `SpeciesPickerModal` (codon-table picker) |
-| 6386–6616 | Mutagenize helpers (`_MutPreview`, `AminoAcidPickerModal`) |
-| 6617–7261 | `MutagenizeModal` — full mutagenesis workflow |
-| 7262–8360 | `PrimerDesignScreen` — full-screen primer workbench |
-| 8361–8581 | Small modals (`UnsavedQuitModal`, `PlasmidPickerModal`, `RenamePlasmidModal`, `LibraryDeleteConfirmModal`) |
-| 8582–10293 | `PlasmidApp` — main controller, keybindings, undo/redo, `@work` threads |
-| 10294–end | `main()` entry point |
+| 1–200 | Docstring, imports, user data dir (`platformdirs`), legacy migration, dependency check, rotating session-tagged logger (log file in `_DATA_DIR/logs`), feature-colour palette |
+| 201–385 | Atomic JSON persistence (`_safe_save_json` / `_safe_load_json` + `_extract_entries` — schema-envelope format `{"_schema_version": 1, "entries": [...]}` with legacy bare-list back-compat; tempfile + `os.replace` + `.bak` + shrink guard) |
+| 386–408 | Library cache loaders (`_load_library` / `_save_library`) |
+| 409–1448 | NEB enzyme catalog (~204), IUPAC tables + cached regex, `_rc`, `_scan_restriction_sites` (palindrome-aware, wrap-around), `_assign_chunk_features`, `_render_feature_row_pair`, memoized `_build_seq_inputs` and `_build_seq_text`, OSC-52 clipboard, `_translate_cds` |
+| 1449–1521 | Char-aspect detection + label helpers |
+| 1522–1659 | GenBank I/O (`fetch_genbank`, `load_genbank` auto-detecting `.gb`/`.dna`, `_record_to_gb_text`, `_gb_text_to_record`) |
+| 1660–1875 | **pLannotate** subprocess integration (`PlannotateError` hierarchy, `_run_plannotate`, `_merge_plannotate_features`) |
+| 1876–1985 | `_Canvas` + `_BrailleCanvas` (sub-cell braille resolution) |
+| 1986–2753 | `PlasmidMap` widget — circular/linear draw, label placement, `_draw_cache` |
+| 2754–2868 | `FeatureSidebar` — scrollable feature table with click-to-select |
+| 2869–3036 | `LibraryPanel` — plasmid library list, rename/delete buttons |
+| 3037–3485 | `SequencePanel` — DNA viewer, click-to-cursor, drag selection |
+| 3486–3825 | Core modals (`EditSeqDialog`, `FetchModal` with in-flight staleness guard, `OpenFileModal`, `DropdownScreen`) |
+| 3826–3867 | `MenuBar` widget |
+| 3868–4076 | Golden Braid L0 position catalog (BsaI overhangs, position constraints) |
+| 4077–4130 | Parts-bin + primer-library persistence |
+| 4131–4925 | Codon-usage registry (`_codon_*`), Kazusa parser, NCBI taxid search (`_safe_xml_parse`), harmonization, CAI/GC. Crash-recovery config (`_CRASH_RECOVERY_DIR`) sits at the top of this slab |
+| 4926–5437 | SOE-PCR site-directed mutagenesis primer design (`_mut_*`) |
+| 5438–5598 | `PartsBinModal` |
+| 5599–6147 | `DomesticatorModal` + `ConstructorModal` (Golden Braid L0 UI) |
+| 6148–6485 | `NcbiTaxonPickerModal` + `SpeciesPickerModal` (codon-table picker) |
+| 6486–6716 | Mutagenize helpers (`_MutPreview`, `AminoAcidPickerModal`) |
+| 6717–7361 | `MutagenizeModal` — full mutagenesis workflow |
+| 7362–8460 | `PrimerDesignScreen` — full-screen primer workbench |
+| 8461–8681 | Small modals (`UnsavedQuitModal`, `PlasmidPickerModal`, `RenamePlasmidModal`, `LibraryDeleteConfirmModal`) |
+| 8682–10551 | `PlasmidApp` — main controller, keybindings, per-plasmid undo/redo stashes, crash-recovery autosave, `@work` threads |
+| 10552–end | `main()` entry point |
 
 ### Key design patterns
 
 - **Rich `Text` for all rendering** — no curses.
 - **Braille canvas** gives sub-character pixel resolution (2×4 dots per terminal cell).
 - **Feature coordination:** map click → sidebar highlight → sequence scroll (and back via Textual messages).
-- **Undo/redo:** snapshot-based (full seq + cursor + `deepcopy` of SeqRecord), max 50.
+- **Undo/redo:** snapshot-based (full seq + cursor + `deepcopy` of SeqRecord), max 50. **Per-plasmid stashes**: switching plasmids stashes the outgoing history under the old `record.id` and restores the incoming plasmid's history (LRU-capped at 10 plasmids). Ctrl+Z never yanks you to an unrelated edit.
+- **Crash-recovery autosave:** every dirty edit debounces (3 s) a write of the current record to `_DATA_DIR/crash_recovery/{safe_id}.gb`. Cleared on successful save or explicit abandon. On startup a non-empty dir notifies the user so they can recover.
 - **Restriction sites:** scanned on load/edit, stored as `resite` (recognition bar) + `recut` (cut marker) dicts.
 - **Caching:** `PlasmidMap._draw_cache`, `_BUILD_SEQ_CACHE`, `_PATTERN_CACHE`, `_SCAN_CATALOG` — all keyed on inputs (including `id(self._feats)` since lists are reassigned, not mutated, on load).
 - **Workers:** `@work(thread=True)` for NCBI fetch, library seed, pLannotate, Kazusa codon fetch. Results pushed back via `call_from_thread`, with stale-record guards where the worker captures `self._current_record`.
@@ -93,7 +94,7 @@ If pLannotate is not on `PATH`, Shift+A notifies the user and returns — nothin
 
 ```python
 _log = logging.getLogger("splicecraft")
-# Rotating file at /tmp/splicecraft.log, 2MB × 2 backups
+# Rotating file at _DATA_DIR/logs/splicecraft.log (platform-specific), 2MB × 2 backups
 # Every line prefixed with [session_id] for multi-run grepping
 ```
 
@@ -118,7 +119,7 @@ Every invariant below has at least one test protecting it. See the **Sacred inva
 
 6. **Circular wrap-around restriction scanning.** `_scan_restriction_sites(circular=True)` (default) scans `seq + seq[:max_site_len-1]` so recognition sequences spanning the origin are found. Each wrap-around hit is emitted as **two resite pieces** (labeled tail `[p, n)` + unlabeled head `[0, (p+site_len) - n)`) and **one recut** at `(p + fwd_cut) % n`. Downstream code that counts resites for filtering must count only labeled pieces.
 
-7. **Data-file saves always back up.** `_safe_save_json` writes a `.bak` of the existing file before replacing it, via `tempfile.mkstemp` + `os.fsync` + `os.replace`. Shrink guard logs a warning if writing fewer entries than exist. Never bypass `_safe_save_json` — it is the user's only recovery path.
+7. **Data-file saves always back up.** `_safe_save_json` writes a `.bak` of the existing file before replacing it, via `tempfile.mkstemp` + `os.fsync` + `os.replace`. Shrink guard logs a warning if writing fewer entries than exist. Writes envelope format `{"_schema_version": 1, "entries": [...]}` — loaders accept both envelope and legacy bare-list (pre-0.3.1) via `_extract_entries`, so upgrades never lose data. Future-version writes warn but still load. Never bypass `_safe_save_json` — it is the user's only recovery path.
 
 8. **Wrap-aware feature length everywhere.** Use `_feat_len(start, end, total)` — returns `(total - start) + end` when `end < start`, else `end - start`. All sort keys, length displays, and biological-length checks must route through it. Naive `end - start` gives negative values for wrap features and breaks z-order, primer design, and sidebar displays.
 
@@ -132,22 +133,23 @@ These are the load-bearing pure functions other code depends on. Most are at mod
 
 | Helper | Line | Purpose |
 |---|---:|---|
-| `_safe_save_json` / `_safe_load_json` | 202 / 271 | Atomic JSON I/O with `.bak` recovery. All four libraries go through these. |
-| `_iupac_pattern` | 609 | IUPAC→regex compiler, cached in `_PATTERN_CACHE`. |
-| `_IUPAC_COMP`, `_DNA_COMP_PRESERVE_CASE` | 617 / 623 | Module-level `str.maketrans` tables (hot-path complement). |
-| `_rc` | 626 | IUPAC-aware reverse complement. |
-| `_feat_len`, `_slice_circular`, `_bp_in` | 630 / 636 / — | Wrap-aware geometry. Any "is bp X in feature?" or "how long is this feature" uses these. |
-| `_scan_restriction_sites` | 678 | Palindrome-aware, wrap-aware restriction scan. Returns `(resites, recuts)` lists. |
-| `_build_seq_inputs` / `_build_seq_text` | 1149 / 1182 | Sequence-panel renderer, memoized via `_BUILD_SEQ_CACHE`. |
-| `_translate_cds` | 1352 | Forward and reverse CDS → protein. Cross-validated against Biopython. |
-| `fetch_genbank` / `load_genbank` | 1474 / 1516 | NCBI Entrez fetch + local `.gb`/`.dna` load. |
-| `_record_to_gb_text` / `_gb_text_to_record` | 1563 / 1583 | Serialise/deserialise SeqRecords as GenBank text. Caller's record is never mutated. |
-| `_run_plannotate`, `_merge_plannotate_features` | 1648 / 1748 | pLannotate subprocess + merge. |
-| `_pick_binding_region` | 3843 | Primer3-compatible region selection. |
-| `_design_*_primers` | 3878+ | Detection, cloning, Golden Braid, generic primer design. |
-| `_codon_*` | 4112+ | Codon-usage registry, harmonization, NCBI taxid search with `_safe_xml_parse` guard. |
-| `_mut_*` | 4865+ | SOE-PCR mutagenesis primers, AA picker helpers. |
+| `_safe_save_json` / `_safe_load_json` / `_extract_entries` | 251 / 331 / 228 | Atomic JSON I/O with `.bak` recovery and schema-envelope format. All four libraries go through these. |
+| `_iupac_pattern` | 680 | IUPAC→regex compiler, cached in `_PATTERN_CACHE`. |
+| `_IUPAC_COMP`, `_DNA_COMP_PRESERVE_CASE` | ~690 | Module-level `str.maketrans` tables (hot-path complement). |
+| `_rc` | 697 | IUPAC-aware reverse complement. |
+| `_feat_len`, `_slice_circular`, `_bp_in` | 701 / 707 / — | Wrap-aware geometry. Any "is bp X in feature?" or "how long is this feature" uses these. |
+| `_scan_restriction_sites` | 749 | Palindrome-aware, wrap-aware restriction scan. Returns `(resites, recuts)` lists. |
+| `_build_seq_inputs` / `_build_seq_text` | 1220 / 1253 | Sequence-panel renderer, memoized via `_BUILD_SEQ_CACHE`. |
+| `_translate_cds` | 1423 | Forward and reverse CDS → protein. Cross-validated against Biopython. |
+| `fetch_genbank` / `load_genbank` | 1545 / 1587 | NCBI Entrez fetch + local `.gb`/`.dna` load. |
+| `_record_to_gb_text` / `_gb_text_to_record` | 1634 / 1654 | Serialise/deserialise SeqRecords as GenBank text. Caller's record is never mutated. |
+| `_run_plannotate`, `_merge_plannotate_features` | 1719 / 1819 | pLannotate subprocess + merge. |
+| `_pick_binding_region` | 3936 | Primer3-compatible region selection. |
+| `_design_*_primers` | 3971+ | Detection, cloning, Golden Braid, generic primer design. |
+| `_codon_*` | 4212+ | Codon-usage registry, harmonization, NCBI taxid search with `_safe_xml_parse` guard. |
+| `_mut_*` | 4965+ | SOE-PCR mutagenesis primers, AA picker helpers. |
 | `_rebuild_record_with_edit` | in `PlasmidApp` | Edit pipeline that preserves wrap features. Sacred invariant #9. |
+| `_autosave_*` / `_stash_current_undo_and_load` | in `PlasmidApp` | Crash-recovery autosave + per-plasmid undo/redo stack stashing. |
 
 ## pLannotate integration
 
@@ -164,7 +166,31 @@ Shift+A (or ◈ in the library panel, or `Features > Annotate with pLannotate`) 
 7. **Undo-able.** Worker calls `_push_undo()` before applying merged record.
 8. **Dirty flag.** Marks both `lib.set_dirty(True)` and `self._unsaved=True` via `_mark_dirty()`.
 
-Failure modes (`PlannotateNotInstalled`, `PlannotateMissingDb`, `PlannotateTooLarge`, `PlannotateFailed`) map to actionable user notifications. Full traceback always written to `/tmp/splicecraft.log`.
+Failure modes (`PlannotateNotInstalled`, `PlannotateMissingDb`, `PlannotateTooLarge`, `PlannotateFailed`) map to actionable user notifications. Full traceback always written to `~/.local/share/splicecraft/logs/splicecraft.log`.
+
+## On-disk JSON format (schema v1)
+
+All four persisted libraries (`library.json`, `parts_bin.json`, `primers.json`, `codon_tables.json`) use the envelope shape:
+
+```json
+{"_schema_version": 1, "entries": [...]}
+```
+
+**Legacy compatibility.** SpliceCraft < 0.3.1 wrote a bare JSON list. `_extract_entries` accepts both; a legacy file is silently rewritten as an envelope on the next save. When bumping `_CURRENT_SCHEMA_VERSION`, teach `_extract_entries` how to migrate entries forward *in the loader* so old files keep working. Files written by a newer SpliceCraft (higher version) still load but emit a warning so users know fields may drop on save.
+
+## Crash-recovery autosave
+
+Dirty edits trigger a 3-second debounced write of the current record to `_CRASH_RECOVERY_DIR/{safe_id}.gb` (default `~/.local/share/splicecraft/crash_recovery/`). The file is deleted on successful save (`_mark_clean`) or explicit abandon. On startup `_check_crash_recovery()` scans the dir and notifies the user if any `.gb` files survive — that means the prior session crashed before saving. The user recovers via File > Open on the named file.
+
+Design notes:
+- **`_autosave_path(record)`** sanitises `record.id` with `re.sub(r'[^A-Za-z0-9._-]', '_', ...)` and caps at 80 chars.
+- **Atomic write** — `tempfile.mkstemp` in the target dir + `os.replace`, matching `_safe_save_json`'s guarantees.
+- **Best-effort only** — `except Exception: _log.exception(...)` so a write failure never interrupts the user. Autosave is a safety net, not a source of truth.
+- **Debounced via `self.set_timer`** — rapid edits coalesce into one write. `_mark_dirty` restarts the countdown; `_mark_clean` cancels it implicitly by deleting the target.
+
+## Per-plasmid undo/redo stashes
+
+`_apply_record(clear_undo=True)` (the "switch plasmid" path) stashes the outgoing plasmid's undo/redo stacks under its `record.id` in `_stashed_undo_stacks` / `_stashed_redo_stacks`, and restores the incoming plasmid's own history if it was edited before. LRU-capped at `_MAX_PLASMIDS_WITH_UNDO = 10` so opening dozens of plasmids can't balloon memory. The `_current_undo_key` tracks which plasmid's stack is live. `clear_undo=False` (in-place edits — pLannotate merge, primer-add) leaves the stacks intact.
 
 ## Test suite
 
@@ -173,13 +199,14 @@ Originally added 2026-04-11 to protect the sacred invariants; expanded each sess
 ### Running
 
 ```bash
-python3 -m pytest -q                        # all 483 tests
-python3 -m pytest tests/test_dna_sanity.py  # only biology (< 1 s)
-python3 -m pytest -k "palindrome"           # filter by name
-python3 -m pytest -x                        # stop on first failure
+python3 -m pytest -q                                # all 508 tests
+python3 -m pytest tests/test_dna_sanity.py          # only biology (< 1 s)
+python3 -m pytest tests/test_invariants_hypothesis.py  # property-based fuzzing
+python3 -m pytest -k "palindrome"                   # filter by name
+python3 -m pytest -x                                # stop on first failure
 ```
 
-`pyproject.toml` sets `asyncio_mode = "auto"` so async tests don't need `@pytest.mark.asyncio`. `tests/conftest.py` defines `tiny_record` / `tiny_gb_path` / `isolated_library` fixtures, and installs the **autouse** `_protect_user_data` fixture that monkeypatches `_LIBRARY_FILE`, `_PARTS_BIN_FILE`, `_PRIMERS_FILE`, `_CODON_TABLES_FILE`, and their caches to tmp paths. **No test can write to real user files.**
+`pyproject.toml` sets `asyncio_mode = "auto"` so async tests don't need `@pytest.mark.asyncio`. `tests/conftest.py` defines `tiny_record` / `tiny_gb_path` / `isolated_library` fixtures, and installs the **autouse** `_protect_user_data` fixture that monkeypatches `_LIBRARY_FILE`, `_PARTS_BIN_FILE`, `_PRIMERS_FILE`, `_CODON_TABLES_FILE`, `_CRASH_RECOVERY_DIR`, and their caches to tmp paths. **No test can write to real user files.**
 
 ### Files
 
@@ -188,14 +215,15 @@ python3 -m pytest -x                        # stop on first failure
 | `test_dna_sanity.py` | 74 | Sacred invariants 1–6; Type IIS cut-outside-recognition; `_translate_cds` forward & reverse |
 | `test_primers.py` | 60 | Detection / cloning / Golden Braid / generic; **wrap-region primer design** (template rotation, modular position mapping) |
 | `test_genbank_io.py` | 59 | `load_genbank` round-trip (GenBank + SnapGene `.dna`); `_save_library` / `_load_library` JSON round-trip + corruption recovery |
+| `test_smoke.py` | 52 | Textual app mounts; panels present; rotation / view-toggle / RE-toggle; pLannotate UI + re-entry guard; `_apply_record` semantics; sidebar wrap-coord display; undo snapshot independence; **per-plasmid undo stashes + LRU eviction**; **crash-recovery autosave** |
 | `test_mutagenize.py` | 49 | SOE-PCR primer design, codon substitution, `_mut_revcomp` / translate / CAI round-trips |
-| `test_smoke.py` | 45 | Textual app mounts; panels present; rotation / view-toggle / RE-toggle; pLannotate UI + re-entry guard; `_apply_record` semantics; sidebar wrap-coord display; undo snapshot independence |
 | `test_codon.py` | 42 | Codon registry persistence, harmonization, Kazusa parser, NCBI taxid XML safety, CAI/GC math |
 | `test_domesticator.py` | 41 | Golden Braid L0 positions / overhangs, part validation, assembly lanes |
 | `test_circular_math.py` | 38 | Sacred invariant #5 (wrap midpoint); `_bp_in` / `_feat_len` for wrapped / non-wrapped / zero-width |
-| `test_data_safety.py` | 28 | Sacred invariant #7 (atomic saves, `.bak` recovery); `_protect_user_data` fixture confirmation |
+| `test_data_safety.py` | 35 | Sacred invariant #7 (atomic saves, `.bak` recovery); **schema-envelope round-trip + legacy bare-list back-compat + future-version warning + shrink-guard counting both formats**; `_protect_user_data` fixture confirmation |
 | `test_plannotate.py` | 24 | Availability detection, size-cap preflight, feature merging, subprocess error paths (subprocess never actually invoked) |
 | `test_edit_record.py` | 14 | Sacred invariant #9: wrap features survive insert/replace as CompoundLocation; fully-consumed features dropped (no 1-bp stubs) |
+| `test_invariants_hypothesis.py` | 11 | Property-based fuzzing of sacred invariants #3, #5, #8: `_rc` involution + IUPAC closure + Biopython cross-check; `_feat_len` bounds + linear/wrap formulas; `_bp_in` count matches `_feat_len`; wrap midpoint lies on arc |
 | `test_performance.py` | 9 | Budget enforcement (loose, 4–20× headroom): scan pUC19 < 30 ms, scan 10 kb < 150 ms, `_iupac_pattern` warm < 5 ms, `_rc(10 kb)` < 2 ms, `_build_seq_text(20 kb)` < 200 ms, `_BUILD_SEQ_CACHE` populated after first call |
 
 ### Sacred invariant → test mapping
@@ -204,12 +232,12 @@ python3 -m pytest -x                        # stop on first failure
 |---|---|---|
 | #1 Palindrome forward only | `test_dna_sanity.py` | `TestRestrictionScan::test_ecori_single_site_not_double_counted`, `::test_palindromes_produce_one_recut_per_site` |
 | #2 Reverse-strand forward coord | `test_dna_sanity.py` | `TestRestrictionScan::test_non_palindrome_on_reverse_strand_uses_forward_coordinate` |
-| #3 `_rc()` IUPAC | `test_dna_sanity.py` | `TestReverseComplement::test_rc_handles_each_iupac_code`, `::test_rc_is_involutive` |
+| #3 `_rc()` IUPAC | `test_dna_sanity.py`, `test_invariants_hypothesis.py` | `TestReverseComplement::test_rc_handles_each_iupac_code`, `::test_rc_is_involutive`; `TestReverseComplementProperties::*` (fuzzed) |
 | #4 Regex cache | `test_dna_sanity.py`, `test_performance.py` | `TestIUPACPattern::test_pattern_cache_*`, `TestIUPACPatternCachePerformance::test_warm_cache_is_near_free` |
-| #5 Wrap midpoint | `test_circular_math.py` | `TestFeatureMidpoint::test_wrap_around_*` |
+| #5 Wrap midpoint | `test_circular_math.py`, `test_invariants_hypothesis.py` | `TestFeatureMidpoint::test_wrap_around_*`; `TestWrapMidpointProperties::*` (fuzzed) |
 | #6 Circular wrap RE scan | `test_dna_sanity.py` | `TestRestrictionScan::test_circular_wraparound_*` |
-| #7 Atomic saves | `test_data_safety.py` | `TestSafeSaveJson::*`, `TestSafeLoadJson::*`, `TestRealFilesNeverTouched` |
-| #8 `_feat_len` | `test_circular_math.py` | `TestFeatLen::*` |
+| #7 Atomic saves | `test_data_safety.py` | `TestSafeSaveJson::*`, `TestSafeLoadJson::*`, `TestSchemaVersioning::*`, `TestRealFilesNeverTouched` |
+| #8 `_feat_len` | `test_circular_math.py`, `test_invariants_hypothesis.py` | `TestFeatLen::*`; `TestFeatLenProperties::*`, `TestBpInProperties::*` (fuzzed) |
 | #9 Wrap edit integrity | `test_edit_record.py` | (whole file) |
 | #10 Undo deepcopy | `test_smoke.py` | `TestUndoSnapshotIndependence::*` |
 
@@ -220,6 +248,7 @@ python3 -m pytest -x                        # stop on first failure
 - **Regression guards cite the date** — every test protecting a past bug has a docstring like `# Regression guard for 2026-03-30 fix`.
 - **No network, no real files** — all tests use synthetic `SeqRecord`s and monkeypatched paths.
 - **Performance budgets are LOOSE** (6–20× headroom). They catch architectural regressions, not micro-perf drift.
+- **Property-based fuzzing** (`test_invariants_hypothesis.py`) complements hand-written regression tests. Use `@given` + `@settings(max_examples=..., deadline=None)` and `assume(...)` for filtering. Anchor every property to a sacred invariant so a Hypothesis failure maps to a concrete design contract.
 
 ### Adding a new test
 
@@ -242,7 +271,7 @@ What was profiled but deliberately **not touched**: Textual compositor (framewor
 
 ## Release + versioning
 
-Versions live in `pyproject.toml` and `splicecraft.py::__version__`; `release.sh` updates both via sed. See `git log --oneline` for full release history. Recent: v0.3.0 (Mutagenize modal with codon registry/harmonization), v0.2.8 (deep-copy record in undo/redo snapshots).
+Versions live in `pyproject.toml` and `splicecraft.py::__version__`; `release.sh` updates both via sed. See `git log --oneline` for full release history. Recent: v0.3.1 (schema-versioned JSON envelope + crash-recovery autosave + per-plasmid undo stashes + Hypothesis property tests), v0.3.0 (Mutagenize modal with codon registry/harmonization), v0.2.8 (deep-copy record in undo/redo snapshots).
 
 ### Stubs still in menus (not implemented)
 - **Features > Add Feature** — `coming soon`
@@ -279,7 +308,7 @@ Use case: new sequence transform, new analysis, new format. Pick this whenever t
 Use case: a new user-facing collection (like parts bin, primers, codon tables).
 
 1. Define `_MYTHING_FILE = _USER_DATA_DIR / "mything.json"` near the other four.
-2. Write `_load_mything()` and `_save_mything(entries)` that route through `_safe_load_json` / `_safe_save_json` — **never** bypass these (sacred invariant #7).
+2. Write `_load_mything()` and `_save_mything(entries)` that route through `_safe_load_json` / `_safe_save_json` — **never** bypass these (sacred invariant #7). Envelope format + legacy back-compat come for free.
 3. Filter `isinstance(entry, dict)` after load so hand-edited files can't crash `.get()` callers.
 4. Add `_MYTHING_FILE` to the `_protect_user_data` autouse fixture in `tests/conftest.py`, plus a `_mything_cache` reset.
 5. Cover corruption recovery in `test_data_safety.py` or a new `test_mything_io.py`.
@@ -344,8 +373,8 @@ Either direction is viable. The single-file convention and shared logging/error 
 ## For future agents
 
 1. **Read this file first.** It gives you architecture without reading 10k lines.
-2. **Run `python3 -m pytest -q`** before and after any change. 483 tests, ~75 s. Biology subset (`tests/test_dna_sanity.py`) runs in < 1 s for a fast inner loop.
-3. **Check `/tmp/splicecraft.log`** (or `$SPLICECRAFT_LOG`) when debugging. Every session has a unique 8-char ID.
+2. **Run `python3 -m pytest -q`** before and after any change. 508 tests, ~95 s. Biology subset (`tests/test_dna_sanity.py`) runs in < 1 s for a fast inner loop.
+3. **Check `~/.local/share/splicecraft/logs/splicecraft.log`** (or `$SPLICECRAFT_LOG`) when debugging. Every session has a unique 8-char ID.
 4. **Don't break the sacred invariants.** Each has a test (see mapping table). If you touch `_scan_restriction_sites`, `_rc`, `_iupac_pattern`, `_translate_cds`, `_bp_in`, `_feat_len`, the midpoint formula, or `_rebuild_record_with_edit`, the relevant tests will tell you immediately.
 5. **Follow the error-handling convention**: `_log.exception` for stack traces, `notify()` or `Static.update("[red]...[/]")` for the user. Narrow `except` types. Never let raw tracebacks hit the TUI.
 6. **When in doubt about real-world behavior** — eyeball it on pUC19 (`L09137`) and pACYC184 (`MW463917.1`), both fetched at first-run.

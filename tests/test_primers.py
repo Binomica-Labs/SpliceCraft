@@ -214,7 +214,7 @@ class TestPrimerPersistence:
         sc._save_primers([{"name": "x", "sequence": "ATG"}])
         assert isolated_primers.exists()
         parsed = json.loads(isolated_primers.read_text())
-        assert parsed[0]["name"] == "x"
+        assert parsed["entries"][0]["name"] == "x"
 
     def test_corrupted_file_returns_empty(self, isolated_primers):
         isolated_primers.write_text("{bad")

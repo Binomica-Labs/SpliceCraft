@@ -59,6 +59,10 @@ def _protect_user_data(tmp_path, monkeypatch):
         if cache_attr:
             monkeypatch.setattr(sc, cache_attr, None)
 
+    # Crash-recovery autosave dir: redirect so tests can't leave files in
+    # the user's real _DATA_DIR/crash_recovery on disk.
+    monkeypatch.setattr(sc, "_CRASH_RECOVERY_DIR", tmp_path / "crash_recovery")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Session-scoped module import

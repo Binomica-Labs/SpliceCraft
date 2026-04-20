@@ -803,6 +803,66 @@ class TestApplyRecordInPlaceSemantics:
             assert len(app._undo_stack) == 1
             assert app._undo_stack[0][0] == "DUMMY_SEQ"
 
+    async def test_per_plasmid_undo_restored_on_switch_back(
+        self, tiny_record, isolated_library
+    ):
+        """Load plasmid A, push an undo snapshot, switch to plasmid B, then
+        switch back to A — A's undo history must be restored (not reset
+        to empty as it was before per-plasmid stacks were introduced)."""
+        from copy import deepcopy
+        from Bio.SeqRecord import SeqRecord
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Prime plasmid A (tiny_record)
+            app._apply_record(tiny_record, clear_undo=True)
+            app._undo_stack.append(("A_SEQ", 0, tiny_record))
+            # Build a second plasmid B with a distinct id
+            rec_b = deepcopy(tiny_record)
+            rec_b.id = "PLASMID_B_XYZ"
+            rec_b.name = "PLASMID_B"
+            # Switch to B — A's stack should be stashed
+            app._apply_record(rec_b, clear_undo=True)
+            assert app._undo_stack == []
+            assert "pUC19_MINI" in app._stashed_undo_stacks or \
+                   tiny_record.id in app._stashed_undo_stacks
+            # Switch back to A — A's stack must be restored
+            app._apply_record(tiny_record, clear_undo=True)
+            assert len(app._undo_stack) == 1
+            assert app._undo_stack[0][0] == "A_SEQ"
+
+    async def test_per_plasmid_undo_lru_eviction(
+        self, tiny_record, isolated_library
+    ):
+        """With _MAX_PLASMIDS_WITH_UNDO slots in the stash, loading a new
+        plasmid once the cap is full must evict the least-recently-used
+        plasmid's stashed history."""
+        from copy import deepcopy
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._MAX_PLASMIDS_WITH_UNDO = 3
+            # Load 5 plasmids A-E, pushing an undo snapshot into each.
+            # The stash holds non-current plasmids only, so after E is
+            # loaded the stash contains the 4 that were swapped out
+            # (A, B, C, D) minus anything past the cap.
+            ids = ["PID_A", "PID_B", "PID_C", "PID_D", "PID_E"]
+            for pid in ids:
+                rec = deepcopy(tiny_record)
+                rec.id = pid
+                app._apply_record(rec, clear_undo=True)
+                app._undo_stack.append((f"{pid}_SEQ", 0, rec))
+            # Stash capacity is 3. A was swapped out first → evicted.
+            # B, C, D survive; E is live.
+            assert "PID_A" not in app._stashed_undo_stacks
+            assert "PID_B" in app._stashed_undo_stacks
+            assert "PID_C" in app._stashed_undo_stacks
+            assert "PID_D" in app._stashed_undo_stacks
+            assert "PID_E" not in app._stashed_undo_stacks
+            assert app._current_undo_key == "PID_E"
+
     async def test_mark_dirty_after_in_place_update_flips_unsaved(
         self, tiny_record, isolated_library
     ):
@@ -819,6 +879,86 @@ class TestApplyRecordInPlaceSemantics:
             # The fix: callers must mark dirty after in-place updates
             app._mark_dirty()
             assert app._unsaved is True
+
+
+class TestCrashRecoveryAutosave:
+    """Crash-recovery autosave writes the current record to
+    `_CRASH_RECOVERY_DIR/{safe_id}.gb` so an unexpected exit doesn't lose
+    edits. The file is deleted on successful save or explicit abandon."""
+
+    async def test_mark_dirty_schedules_autosave(
+        self, tiny_record, isolated_library
+    ):
+        """`_mark_dirty` must register a debounced autosave timer."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._mark_dirty()
+            assert app._autosave_timer is not None
+
+    async def test_do_autosave_writes_genbank_file(
+        self, tiny_record, isolated_library
+    ):
+        """Forcing `_do_autosave` must write a valid GenBank file at the
+        record's autosave path."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._unsaved = True
+            app._do_autosave()
+            path = app._autosave_path(app._current_record)
+            assert path is not None and path.exists()
+            # Should be parseable GenBank
+            from Bio import SeqIO
+            roundtrip = SeqIO.read(str(path), "genbank")
+            assert str(roundtrip.seq) == str(app._current_record.seq)
+
+    async def test_mark_clean_clears_autosave_file(
+        self, tiny_record, isolated_library
+    ):
+        """A successful save (→ `_mark_clean`) must delete the recovery
+        file so next startup doesn't flag a stale recovery."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._unsaved = True
+            app._do_autosave()
+            path = app._autosave_path(app._current_record)
+            assert path.exists()
+            app._mark_clean()
+            assert not path.exists()
+
+    async def test_autosave_skipped_when_clean(
+        self, tiny_record, isolated_library
+    ):
+        """If the record isn't dirty, autosave must not write anything."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._unsaved = False
+            app._do_autosave()
+            path = app._autosave_path(app._current_record)
+            assert path is None or not path.exists()
+
+    async def test_autosave_path_sanitises_unsafe_ids(self, tiny_record,
+                                                       isolated_library):
+        """Record ids can contain characters that are unsafe for filenames
+        (slashes, spaces). The autosave helper must sanitise them."""
+        from copy import deepcopy
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            bad = deepcopy(tiny_record)
+            bad.id = "some/weird id.with:chars"
+            path = app._autosave_path(bad)
+            assert path is not None
+            assert "/" not in path.name
+            assert ":" not in path.name
 
 
 class TestPlannotateReentryGuard:

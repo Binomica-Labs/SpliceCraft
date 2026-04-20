@@ -180,7 +180,7 @@ class TestPartsBinPersistence:
         sc._save_parts_bin(parts)
         assert isolated_parts_bin.exists()
         parsed = json.loads(isolated_parts_bin.read_text())
-        assert parsed == parts
+        assert parsed["entries"] == parts
 
     def test_corrupted_file_returns_empty(self, isolated_parts_bin):
         isolated_parts_bin.write_text("{bad json")

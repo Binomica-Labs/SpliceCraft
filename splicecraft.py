@@ -113,11 +113,25 @@ def _check_deps():
 _check_deps()
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-# Borrowed from ScriptoScope: rotating file log with an 8-char session ID prefix
-# on every line so multi-run logs are greppable. Default path /tmp/splicecraft.log,
-# overridable via $SPLICECRAFT_LOG. UI never sees raw tracebacks — they go here.
+# Rotating file log with an 8-char session ID prefix on every line so multi-run
+# logs are greppable. Default path is `_DATA_DIR/logs/splicecraft.log` so logs
+# survive reboots on systemd-tmpfiles distros (which wipe /tmp on boot).
+# Overridable via $SPLICECRAFT_LOG. UI never sees raw tracebacks — they go here.
 
-_LOG_PATH   = os.environ.get("SPLICECRAFT_LOG") or "/tmp/splicecraft.log"
+def _default_log_path() -> str:
+    override = os.environ.get("SPLICECRAFT_LOG")
+    if override:
+        return override
+    try:
+        log_dir = _DATA_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return str(log_dir / "splicecraft.log")
+    except OSError:
+        # Fall back to /tmp if the data dir is somehow unwritable (read-only
+        # home, quota, etc.) — better than crashing at import time.
+        return "/tmp/splicecraft.log"
+
+_LOG_PATH   = _default_log_path()
 _SESSION_ID = _uuid.uuid4().hex[:8]
 
 class _SessionFilter(logging.Filter):
@@ -140,7 +154,7 @@ if not _log.handlers:
         _handler.addFilter(_SessionFilter())
         _log.addHandler(_handler)
     except OSError:
-        # Fall back to a no-op handler if /tmp is read-only (rare; shouldn't crash UI)
+        # Last-resort no-op handler if the log dir is read-only.
         _log.addHandler(logging.NullHandler())
 
 def _log_startup_banner() -> None:
@@ -187,8 +201,8 @@ _FEATURE_PALETTE: list[str] = [
 
 # ── Safe JSON persistence ──────────────────────────────────────────────────────
 #
-# All user data (plasmid library, parts bin, primer library) goes through
-# _safe_save_json which:
+# All user data (plasmid library, parts bin, primer library, codon tables)
+# goes through _safe_save_json which:
 #   1. Backs up the existing file to *.bak BEFORE overwriting
 #   2. Writes via tempfile + os.replace (atomic on POSIX — the file is either
 #      fully written or not at all; no partial-write corruption)
@@ -198,9 +212,47 @@ _FEATURE_PALETTE: list[str] = [
 #   - Missing file → [] (first run, not an error)
 #   - Corrupt file → attempt restore from .bak; if .bak also corrupt → []
 #   - Returns (entries, warning_message_or_None)
+#
+# ── On-disk format ────────────────────────────────────────────────────────────
+# Current format (schema version 1):
+#
+#     {"_schema_version": 1, "entries": [...]}
+#
+# Legacy format (pre-0.3.1) was a bare JSON list. Loaders accept both so users
+# upgrading in-place don't need to regenerate their libraries; the legacy file
+# gets silently rewritten as an envelope on the next save.
 
-def _safe_save_json(path: Path, entries: list, label: str) -> None:
+_CURRENT_SCHEMA_VERSION = 1
+
+
+def _extract_entries(raw, label: str) -> "tuple[list | None, str | None]":
+    """Return (entries, warning) from a parsed-JSON payload.
+
+    Accepts both the envelope format `{"_schema_version": N, "entries": [...]}`
+    and the legacy bare-list format. Returns (None, warning) on unknown shape
+    so the caller can fall through to the .bak.
+    """
+    if isinstance(raw, list):
+        return raw, None
+    if isinstance(raw, dict) and isinstance(raw.get("entries"), list):
+        version = raw.get("_schema_version")
+        if version is not None and version > _CURRENT_SCHEMA_VERSION:
+            # Written by a newer SpliceCraft. Load the entries but warn so
+            # the user knows fields may be silently dropped on re-save.
+            return list(raw["entries"]), (
+                f"{label} was written by a newer SpliceCraft "
+                f"(schema v{version} > v{_CURRENT_SCHEMA_VERSION}) — some "
+                f"fields may be lost on save."
+            )
+        return list(raw["entries"]), None
+    return None, f"{label}: unexpected JSON shape ({type(raw).__name__})"
+
+
+def _safe_save_json(path: Path, entries: list, label: str,
+                    schema_version: int = _CURRENT_SCHEMA_VERSION) -> None:
     """Atomically write `entries` as JSON to `path`, backing up first.
+
+    Writes the envelope format `{"_schema_version": N, "entries": [...]}`.
 
     The .bak file is the user's safety net — if a write goes wrong or the
     app crashes mid-save, the previous version survives as path.bak.
@@ -208,7 +260,7 @@ def _safe_save_json(path: Path, entries: list, label: str) -> None:
     **Shrink guard**: if the file currently has N entries and we're about to
     write M < N, we still write (the user may have legitimately deleted
     entries) BUT we log a loud warning so accidental nukes are visible in
-    /tmp/splicecraft.log for post-mortem debugging. The .bak always preserves
+    the session log for post-mortem debugging. The .bak always preserves
     the pre-write state regardless.
     """
     import os
@@ -222,9 +274,14 @@ def _safe_save_json(path: Path, entries: list, label: str) -> None:
             if existing.strip():
                 bak = path.with_suffix(path.suffix + ".bak")
                 bak.write_bytes(existing)
-                # Count existing entries for the shrink guard
+                # Count existing entries for the shrink guard. Accept both
+                # envelope and legacy formats so upgrades don't trip the
+                # shrink guard on their first save.
                 try:
-                    existing_count = len(json.loads(existing))
+                    prev = json.loads(existing)
+                    prev_entries, _ = _extract_entries(prev, label)
+                    if prev_entries is not None:
+                        existing_count = len(prev_entries)
                 except Exception:
                     pass
         except OSError:
@@ -242,6 +299,8 @@ def _safe_save_json(path: Path, entries: list, label: str) -> None:
             label, len(entries), existing_count, path,
         )
 
+    payload = {"_schema_version": schema_version, "entries": entries}
+
     # 2. Atomic write: tempfile in same dir → os.replace
     try:
         fd, tmp_name = tempfile.mkstemp(
@@ -249,14 +308,15 @@ def _safe_save_json(path: Path, entries: list, label: str) -> None:
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(entries, fh, indent=2)
+                json.dump(payload, fh, indent=2)
                 fh.flush()
                 try:
                     os.fsync(fh.fileno())
                 except OSError:
                     pass
             os.replace(tmp_name, str(path))
-            _log.info("Saved %s: %d entries to %s", label, len(entries), path)
+            _log.info("Saved %s: %d entries to %s (schema v%d)",
+                      label, len(entries), path, schema_version)
         except Exception:
             # Clean up the temp file on failure
             try:
@@ -269,7 +329,12 @@ def _safe_save_json(path: Path, entries: list, label: str) -> None:
 
 
 def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
-    """Load a JSON array from `path`. Returns (entries, warning_or_None).
+    """Load a JSON payload from `path`. Returns (entries, warning_or_None).
+
+    Accepts both the current envelope format (`{"_schema_version": N,
+    "entries": [...]}`) and the legacy flat-list format written by
+    SpliceCraft < 0.3.1. The legacy file gets silently rewritten as an
+    envelope on the next save.
 
     - Missing file → ([], None) — normal first run, no warning.
     - Valid file   → (entries, None).
@@ -280,11 +345,14 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
         return [], None
 
     # Try the main file
+    main_warning: "str | None" = None
     try:
-        entries = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(entries, list):
-            return entries, None
-        _log.warning("%s: expected list, got %s", path, type(entries).__name__)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        entries, shape_warn = _extract_entries(raw, label)
+        if entries is not None:
+            return entries, shape_warn
+        _log.warning("%s: %s", path, shape_warn)
+        main_warning = shape_warn
     except Exception:
         _log.exception("Corrupt %s file: %s", label, path)
 
@@ -292,8 +360,9 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
     bak = path.with_suffix(path.suffix + ".bak")
     if bak.exists():
         try:
-            entries = json.loads(bak.read_text(encoding="utf-8"))
-            if isinstance(entries, list):
+            raw = json.loads(bak.read_text(encoding="utf-8"))
+            entries, _ = _extract_entries(raw, label)
+            if entries is not None:
                 _log.info("Restored %s from backup %s (%d entries)",
                           label, bak, len(entries))
                 # Overwrite the corrupt main file with the good backup
@@ -309,7 +378,9 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
         except Exception:
             _log.exception("Backup %s also corrupt: %s", label, bak)
 
-    return [], f"{label} is corrupt and no valid backup was found. Starting empty."
+    return [], (main_warning
+                or f"{label} is corrupt and no valid backup was found. "
+                   "Starting empty.")
 
 
 # ── Library persistence ────────────────────────────────────────────────────────
@@ -3542,23 +3613,45 @@ class FetchModal(ModalScreen):
     def _do_fetch(self, acc: str, email: str):
         try:
             record = fetch_genbank(acc, email)
-            self.app.call_from_thread(self.dismiss, record)
         except Exception as exc:
             _log.exception("NCBI fetch failed for %s", acc)
             def _err():
                 # Modal may have been dismissed while the fetch was in flight;
                 # query_one would then raise NoMatches. Fall back to a toast.
-                try:
-                    self.query_one("#fetch-status", Static).update(
-                        f"[red]Error: {exc}[/red]"
-                    )
-                except Exception:
+                if not self.is_mounted:
                     try:
                         self.app.notify(f"NCBI fetch failed: {exc}",
                                         severity="error", timeout=8)
                     except Exception:
-                        pass
+                        _log.exception("notify fallback for fetch error failed")
+                    return
+                try:
+                    self.query_one("#fetch-status", Static).update(
+                        f"[red]Error: {exc}[/red]"
+                    )
+                except NoMatches:
+                    try:
+                        self.app.notify(f"NCBI fetch failed: {exc}",
+                                        severity="error", timeout=8)
+                    except Exception:
+                        _log.exception("notify fallback for fetch error failed")
             self.app.call_from_thread(_err)
+            return
+
+        # Staleness guard: user may have hit Escape (which runs `dismiss(None)`
+        # via action_cancel) while the HTTP round-trip was in flight. Calling
+        # `self.dismiss(record)` on an already-dismissed modal raises, and even
+        # if it didn't, we'd be stomping whatever the user did next. Silently
+        # drop the fetched record if the modal is no longer mounted.
+        def _apply():
+            if not self.is_mounted:
+                _log.info(
+                    "Fetch %s completed after modal was dismissed; discarding.",
+                    acc,
+                )
+                return
+            self.dismiss(record)
+        self.app.call_from_thread(_apply)
 
     @on(Input.Submitted)
     def _submitted(self):
@@ -4107,6 +4200,13 @@ _CODON_DEFAULT_FORBIDDEN: dict[str, str] = {
 
 _CODON_TABLES_FILE = _DATA_DIR / "codon_tables.json"
 _codon_tables_cache: "list | None" = None
+
+# ── Crash-recovery autosave ────────────────────────────────────────────────────
+# Every edit marks the record dirty, which (debounced) writes the current record
+# to _CRASH_RECOVERY_DIR/{safe_id}.gb. A successful save or clean-state flip
+# deletes the file. On startup we scan the dir and notify the user if any
+# leftover autosaves exist (i.e. the last session crashed before save).
+_CRASH_RECOVERY_DIR = _DATA_DIR / "crash_recovery"
 
 
 def _codon_raw_to_json(raw: dict) -> dict:
@@ -9354,16 +9454,29 @@ SpeciesPickerModal { align: center middle; }
     # ── Mount: auto-load preloaded record ──────────────────────────────────────
 
     def on_mount(self) -> None:
+        # Per-plasmid undo: switching plasmids stashes the old stacks under
+        # the old record.id and restores this plasmid's own history if it
+        # was edited before. See _stash_current_undo_and_load.
         self._undo_stack: list = []
         self._redo_stack: list = []
+        self._stashed_undo_stacks: "dict[str, list]" = {}
+        self._stashed_redo_stacks: "dict[str, list]" = {}
+        self._stash_order: list[str] = []  # LRU
+        self._MAX_PLASMIDS_WITH_UNDO = 10
+        self._current_undo_key: "str | None" = None
         # Re-entrancy guard for pLannotate: spawning a second subprocess
         # while the first is still running wastes 5-30 s of CPU and risks
         # the stale-check discarding the newer result. See action_annotate_plasmid.
         self._plannotate_running: bool = False
+        # Crash-recovery autosave: debounced so rapid edits coalesce into one
+        # write. Cleared whenever the record is saved / marked clean.
+        self._autosave_timer = None
+        self._AUTOSAVE_DEBOUNCE_S = 3.0
         # Validate all user-data files before anything else. Corrupt files
         # are auto-restored from .bak if possible; the user is notified
         # either way so they know the state of their data.
         self._check_data_files()
+        self._check_crash_recovery()
         if self._preload_record is not None:
             def _load_preload():
                 self._import_and_persist(self._preload_record)
@@ -9396,6 +9509,106 @@ SpeciesPickerModal { align: center middle; }
             globals()[cache_attr] = entries
             if warning:
                 self.notify(warning, severity="warning", timeout=12)
+
+    # ── Crash-recovery autosave ────────────────────────────────────────────────
+
+    def _autosave_path(self, record) -> "Path | None":
+        """Return the autosave file path for `record`, or None if no id."""
+        if record is None or not getattr(record, "id", ""):
+            return None
+        import re
+        safe = re.sub(r'[^A-Za-z0-9._-]', '_', record.id)[:80]
+        if not safe:
+            return None
+        return _CRASH_RECOVERY_DIR / f"{safe}.gb"
+
+    def _schedule_autosave(self) -> None:
+        """Debounce: restart the countdown to the next autosave write."""
+        try:
+            if self._autosave_timer is not None:
+                self._autosave_timer.stop()
+        except Exception:
+            pass
+        try:
+            self._autosave_timer = self.set_timer(
+                self._AUTOSAVE_DEBOUNCE_S, self._do_autosave
+            )
+        except Exception:
+            # set_timer can fail during test teardown; autosave is best-effort.
+            self._autosave_timer = None
+
+    def _do_autosave(self) -> None:
+        """Write the current record to its autosave file (atomic)."""
+        if self._current_record is None or not self._unsaved:
+            return
+        path = self._autosave_path(self._current_record)
+        if path is None:
+            return
+        try:
+            import os
+            import tempfile
+            _CRASH_RECOVERY_DIR.mkdir(parents=True, exist_ok=True)
+            text = _record_to_gb_text(self._current_record)
+            fd, tmp = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass
+                os.replace(tmp, str(path))
+                _log.info("Autosaved %s to %s (%d bp)",
+                          self._current_record.name, path,
+                          len(self._current_record.seq))
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except Exception:
+            # Autosave is a safety net — never interrupt the user if it fails.
+            _log.exception("Autosave to %s failed", path)
+
+    def _clear_autosave(self, record) -> None:
+        """Delete the autosave file for `record` (called after save / abandon)."""
+        path = self._autosave_path(record)
+        if path is None or not path.exists():
+            return
+        try:
+            path.unlink()
+            _log.info("Cleared autosave %s", path)
+        except OSError:
+            _log.exception("Failed to clear autosave %s", path)
+
+    def _check_crash_recovery(self) -> None:
+        """On startup, warn the user if leftover autosaves exist.
+
+        A .gb file in `_CRASH_RECOVERY_DIR` means the previous session
+        made unsaved edits and didn't cleanly save or abandon. The user
+        can recover via File > Open or by inspecting the directory.
+        """
+        try:
+            if not _CRASH_RECOVERY_DIR.exists():
+                return
+            leftovers = sorted(_CRASH_RECOVERY_DIR.glob("*.gb"))
+        except OSError:
+            _log.exception("Could not scan crash-recovery dir")
+            return
+        if not leftovers:
+            return
+        names = ", ".join(p.stem for p in leftovers[:3])
+        if len(leftovers) > 3:
+            names += f" (+{len(leftovers) - 3} more)"
+        self.notify(
+            f"Unsaved recovery files from a prior session: {names}. "
+            f"Open via File > Open from {_CRASH_RECOVERY_DIR}",
+            severity="warning", timeout=15,
+        )
 
     @work(thread=True)
     def _seed_default_library(self) -> None:
@@ -9488,6 +9701,41 @@ SpeciesPickerModal { align: center middle; }
 
     # ── Undo / redo ────────────────────────────────────────────────────────────
 
+    def _stash_current_undo_and_load(self, new_key: "str | None") -> None:
+        """Move the live undo/redo stacks into `_stashed_*_stacks[old_key]` and
+        load `new_key`'s stashed stacks (empty if never seen).
+
+        Called only from `_apply_record(clear_undo=True)` — the "switch
+        plasmid" path. Lets the user flip between open plasmids without
+        losing either one's edit history. LRU-capped at
+        `_MAX_PLASMIDS_WITH_UNDO` so opening dozens of plasmids can't
+        balloon memory.
+        """
+        if self._current_undo_key == new_key:
+            return
+        # Stash the outgoing plasmid's stacks if non-empty
+        old_key = self._current_undo_key
+        if old_key is not None and (self._undo_stack or self._redo_stack):
+            self._stashed_undo_stacks[old_key] = list(self._undo_stack)
+            self._stashed_redo_stacks[old_key] = list(self._redo_stack)
+            if old_key in self._stash_order:
+                self._stash_order.remove(old_key)
+            self._stash_order.append(old_key)
+            while len(self._stash_order) > self._MAX_PLASMIDS_WITH_UNDO:
+                evict = self._stash_order.pop(0)
+                self._stashed_undo_stacks.pop(evict, None)
+                self._stashed_redo_stacks.pop(evict, None)
+        # Load the incoming plasmid's stacks (empty list if never seen)
+        if new_key is not None:
+            self._undo_stack = self._stashed_undo_stacks.pop(new_key, [])
+            self._redo_stack = self._stashed_redo_stacks.pop(new_key, [])
+            if new_key in self._stash_order:
+                self._stash_order.remove(new_key)
+        else:
+            self._undo_stack = []
+            self._redo_stack = []
+        self._current_undo_key = new_key
+
     def _push_undo(self) -> None:
         sp = self.query_one("#seq-panel", SequencePanel)
         if not sp._seq:
@@ -9566,6 +9814,7 @@ SpeciesPickerModal { align: center middle; }
             self.query_one("#library", LibraryPanel).set_dirty(True)
         except NoMatches:
             pass
+        self._schedule_autosave()
 
     def _mark_clean(self) -> None:
         self._unsaved = False
@@ -9576,6 +9825,8 @@ SpeciesPickerModal { align: center middle; }
             self.query_one("#library", LibraryPanel).set_dirty(False)
         except NoMatches:
             pass
+        # Successful save / explicit clean → delete the recovery file
+        self._clear_autosave(self._current_record)
 
     def _do_save(self) -> bool:
         """Save current record to its source file and/or library. Returns True on success."""
@@ -9622,6 +9873,9 @@ SpeciesPickerModal { align: center middle; }
             if self._do_save():
                 self.exit()
         elif result == "abandon":
+            # User chose to discard unsaved work — clear the autosave so
+            # next startup doesn't flag recovery for a file they abandoned.
+            self._clear_autosave(self._current_record)
             self.exit()
         # None = cancel → stay
 
@@ -9674,19 +9928,23 @@ SpeciesPickerModal { align: center middle; }
     def _apply_record(self, record, *, clear_undo: bool = True) -> None:
         """Load a SeqRecord into all panels.
 
-        `clear_undo=True` (default) drops any undo/redo history from the
-        previous plasmid AND clears `_source_path` — correct for fresh
-        loads (fetch, file open, library pick) where Ctrl+Z otherwise
-        yanks the user back to an unrelated edit. In-place record changes
-        (pLannotate merge, primer-add) should pass clear_undo=False so
-        they remain undo-able and keep Ctrl+S targeted at the original
-        file path.
+        `clear_undo=True` (default) is for fresh loads (fetch, file open,
+        library pick) — it **stashes** the outgoing plasmid's undo/redo
+        stacks under its record.id and restores the incoming plasmid's
+        stacks if it was edited before (see `_stash_current_undo_and_load`).
+        Users flipping between open plasmids keep per-plasmid history so
+        Ctrl+Z never yanks you to an unrelated edit, but switching back to
+        a previously-edited plasmid resurrects its history. Also clears
+        `_source_path` so Ctrl+S can't accidentally overwrite the old file.
+
+        `clear_undo=False` is for in-place record changes (pLannotate merge,
+        primer-add) — the stacks stay intact and the edit remains undo-able.
         """
         if record is None:
             return
         if clear_undo:
-            self._undo_stack.clear()
-            self._redo_stack.clear()
+            new_key = record.id if record.id else None
+            self._stash_current_undo_and_load(new_key)
             self._source_path = None   # caller sets this if it came from a file
         self._current_record = record
 

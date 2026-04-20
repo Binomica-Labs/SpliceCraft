@@ -33,7 +33,9 @@ class TestSafeSaveJson:
         p = tmp_path / "test.json"
         sc._safe_save_json(p, [{"id": "A"}], "test")
         assert p.exists()
-        assert json.loads(p.read_text()) == [{"id": "A"}]
+        raw = json.loads(p.read_text())
+        assert raw == {"_schema_version": sc._CURRENT_SCHEMA_VERSION,
+                       "entries": [{"id": "A"}]}
 
     def test_creates_bak_on_overwrite(self, tmp_path):
         p = tmp_path / "test.json"
@@ -42,10 +44,9 @@ class TestSafeSaveJson:
         bak = tmp_path / "test.json.bak"
         assert bak.exists()
         # .bak should contain the FIRST version (pre-overwrite)
-        bak_data = json.loads(bak.read_text())
-        assert bak_data == [{"id": "first"}]
+        assert json.loads(bak.read_text())["entries"] == [{"id": "first"}]
         # Main file should contain the second version
-        assert json.loads(p.read_text()) == [{"id": "second"}]
+        assert json.loads(p.read_text())["entries"] == [{"id": "second"}]
 
     def test_bak_not_created_for_first_write(self, tmp_path):
         p = tmp_path / "test.json"
@@ -62,10 +63,10 @@ class TestSafeSaveJson:
         sc._safe_save_json(p, [{"id": "good"}], "test")
         # Second write succeeds too
         sc._safe_save_json(p, [{"id": "updated"}], "test")
-        assert json.loads(p.read_text()) == [{"id": "updated"}]
+        assert json.loads(p.read_text())["entries"] == [{"id": "updated"}]
         # .bak holds the previous good version
         bak = tmp_path / "test.json.bak"
-        assert json.loads(bak.read_text()) == [{"id": "good"}]
+        assert json.loads(bak.read_text())["entries"] == [{"id": "good"}]
 
     def test_empty_file_no_bak(self, tmp_path):
         """An empty file should NOT generate a .bak (nothing to back up)."""
@@ -79,7 +80,7 @@ class TestSafeSaveJson:
         p = tmp_path / "test.json"
         entries = [{"name": "x", "seq": "ACGT"}, {"name": "y", "seq": "TGCA"}]
         sc._safe_save_json(p, entries, "test")
-        assert json.loads(p.read_text()) == entries
+        assert json.loads(p.read_text())["entries"] == entries
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -132,13 +133,125 @@ class TestSafeLoadJson:
         assert warning is not None
 
     def test_non_list_json_treated_as_corrupt(self, tmp_path):
-        """A JSON file containing a dict instead of a list is invalid for
-        our persistence format — should be treated as corrupt."""
+        """A JSON file containing a dict WITHOUT the envelope shape is
+        invalid for our persistence format — should be treated as corrupt
+        (returns [] since there's no .bak)."""
         p = tmp_path / "test.json"
         p.write_text('{"not": "a list"}')
         entries, warning = sc._safe_load_json(p, "test")
-        # Should attempt .bak restore or return []
-        assert entries == [] or isinstance(entries, list)
+        assert entries == []
+        assert warning is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Schema versioning — envelope format + legacy bare-list compatibility
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSchemaVersioning:
+    """The on-disk format went from a bare JSON list to
+    `{"_schema_version": N, "entries": [...]}` in v0.3.1. Loaders accept
+    both so upgrades don't lose user data."""
+
+    def test_legacy_flat_list_loads_without_warning(self, tmp_path):
+        """Files written by SpliceCraft < 0.3.1 are bare JSON lists.
+        They must load cleanly with no warning."""
+        p = tmp_path / "legacy.json"
+        p.write_text(json.dumps([{"id": "L1"}, {"id": "L2"}]))
+        entries, warning = sc._safe_load_json(p, "test")
+        assert entries == [{"id": "L1"}, {"id": "L2"}]
+        assert warning is None
+
+    def test_envelope_loads_without_warning(self, tmp_path):
+        p = tmp_path / "new.json"
+        p.write_text(json.dumps({
+            "_schema_version": sc._CURRENT_SCHEMA_VERSION,
+            "entries": [{"id": "E1"}],
+        }))
+        entries, warning = sc._safe_load_json(p, "test")
+        assert entries == [{"id": "E1"}]
+        assert warning is None
+
+    def test_future_schema_version_warns_but_loads(self, tmp_path):
+        """A file written by a newer SpliceCraft (higher schema version)
+        must still load, but emit a warning so the user knows fields
+        may be dropped on save."""
+        p = tmp_path / "future.json"
+        p.write_text(json.dumps({
+            "_schema_version": sc._CURRENT_SCHEMA_VERSION + 99,
+            "entries": [{"id": "F1", "new_field": "unknown"}],
+        }))
+        entries, warning = sc._safe_load_json(p, "test")
+        assert entries == [{"id": "F1", "new_field": "unknown"}]
+        assert warning is not None
+        assert "newer" in warning.lower()
+
+    def test_envelope_roundtrip_preserves_entries(self, tmp_path):
+        """Save + reload must yield the original entries unchanged."""
+        p = tmp_path / "roundtrip.json"
+        original = [{"id": "A", "seq": "ACGT"}, {"id": "B", "seq": "TTTT"}]
+        sc._safe_save_json(p, original, "test")
+        entries, warning = sc._safe_load_json(p, "test")
+        assert entries == original
+        assert warning is None
+
+    def test_legacy_file_rewrites_as_envelope_on_next_save(self, tmp_path):
+        """Upgrading users: a legacy bare-list file should be silently
+        rewritten as an envelope on the next save."""
+        p = tmp_path / "upgrade.json"
+        # Simulate a legacy file
+        p.write_text(json.dumps([{"id": "OLD"}]))
+        # Load it (accepts legacy shape)
+        loaded, _ = sc._safe_load_json(p, "test")
+        assert loaded == [{"id": "OLD"}]
+        # Save new entries
+        sc._safe_save_json(p, [{"id": "NEW"}], "test")
+        # File on disk is now envelope-shaped
+        raw = json.loads(p.read_text())
+        assert isinstance(raw, dict)
+        assert raw["_schema_version"] == sc._CURRENT_SCHEMA_VERSION
+        assert raw["entries"] == [{"id": "NEW"}]
+
+    def _capture_splicecraft_warnings(self):
+        """Attach a handler to the splicecraft logger and return (handler, records).
+        caplog can't see it otherwise because _log.propagate is False."""
+        import logging
+
+        records: list[logging.LogRecord] = []
+
+        class _ListHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        h = _ListHandler(level=logging.WARNING)
+        sc._log.addHandler(h)
+        return h, records
+
+    def test_shrink_guard_counts_envelope_entries(self, tmp_path):
+        """When overwriting an envelope file with fewer entries, the
+        shrink guard must log a warning comparing the correct counts
+        (not 2 vs 1 for the 2-key envelope dict)."""
+        p = tmp_path / "shrink.json"
+        sc._safe_save_json(p, [{"id": "A"}, {"id": "B"}, {"id": "C"}], "test")
+        h, records = self._capture_splicecraft_warnings()
+        try:
+            sc._safe_save_json(p, [{"id": "A"}], "test")
+        finally:
+            sc._log.removeHandler(h)
+        msgs = [r.getMessage() for r in records]
+        assert any("SHRINK GUARD" in m and "was 3" in m for m in msgs), msgs
+
+    def test_shrink_guard_counts_legacy_entries(self, tmp_path):
+        """Upgrading users: if the on-disk file is still a legacy bare
+        list, the shrink guard must still count its entries correctly."""
+        p = tmp_path / "shrink_legacy.json"
+        p.write_text(json.dumps([{"id": "A"}, {"id": "B"}, {"id": "C"}]))
+        h, records = self._capture_splicecraft_warnings()
+        try:
+            sc._safe_save_json(p, [{"id": "A"}], "test")
+        finally:
+            sc._log.removeHandler(h)
+        msgs = [r.getMessage() for r in records]
+        assert any("SHRINK GUARD" in m and "was 3" in m for m in msgs), msgs
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -153,7 +266,7 @@ class TestPersistenceIntegration:
         sc._save_library([{"id": "B", "name": "second"}])
         bak = tmp_path / "lib.json.bak"
         assert bak.exists()
-        assert json.loads(bak.read_text())[0]["id"] == "A"
+        assert json.loads(bak.read_text())["entries"][0]["id"] == "A"
 
     def test_parts_bin_save_creates_bak(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_path / "parts.json")
@@ -293,7 +406,7 @@ class TestRealFilesNeverTouched:
         assert "/tmp" in str(sc._LIBRARY_FILE) or "pytest" in str(sc._LIBRARY_FILE)
         import json
         data = json.loads(sc._LIBRARY_FILE.read_text())
-        assert data[0]["id"] == "SAFETY_TEST"
+        assert data["entries"][0]["id"] == "SAFETY_TEST"
 
     def test_save_parts_bin_writes_to_tmp(self):
         sc._save_parts_bin([{"name": "SAFETY_TEST"}])
@@ -315,13 +428,15 @@ class TestRealFilesNeverTouched:
             if not p.exists():
                 continue
             try:
-                data = json.loads(p.read_text())
-                for entry in data:
-                    assert entry.get("id") != "SAFETY_TEST", (
-                        f"SAFETY_TEST leaked into real {fname}!"
-                    )
-                    assert entry.get("name") != "SAFETY_TEST", (
-                        f"SAFETY_TEST leaked into real {fname}!"
-                    )
+                raw = json.loads(p.read_text())
             except json.JSONDecodeError:
-                pass  # corrupt file — not our problem here
+                continue  # corrupt file — not our problem here
+            # Support both legacy bare-list and current envelope format
+            data = raw["entries"] if isinstance(raw, dict) and "entries" in raw else raw
+            for entry in data:
+                assert entry.get("id") != "SAFETY_TEST", (
+                    f"SAFETY_TEST leaked into real {fname}!"
+                )
+                assert entry.get("name") != "SAFETY_TEST", (
+                    f"SAFETY_TEST leaked into real {fname}!"
+                )
