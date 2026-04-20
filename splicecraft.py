@@ -4346,6 +4346,64 @@ def _save_primers(entries: list[dict]) -> None:
     _primers_cache = list(entries)
 
 
+# ── Feature library persistence ───────────────────────────────────────────────
+#
+# User-created features (from the Add Feature modal or extracted from existing
+# plasmids) persist to features.json. An entry is a dict:
+#
+#     {
+#       "name":         "lacZ-alpha",           # label for the sidebar
+#       "feature_type": "CDS",                  # INSDC feature-table type
+#       "sequence":     "ATG...TAA",            # 5'→3' forward-strand DNA
+#       "strand":       1 | -1,                 # direction when inserted
+#       "qualifiers":   {"gene": ["lacZ"], ...}, # GenBank-compatible qualifiers
+#       "description":  "(free text)"           # optional
+#     }
+#
+# The `feature_type` is validated against a curated list of INSDC-standard
+# types (see `_GENBANK_FEATURE_TYPES`). Unknown types are accepted with a
+# warning — some in-house projects use non-standard types and we shouldn't
+# block them, but the warning flags risk of downstream tool incompatibility.
+
+_FEATURES_FILE = _DATA_DIR / "features.json"
+_features_cache: "list | None" = None
+
+# Curated INSDC / GenBank feature-table types relevant to plasmid work.
+# Full spec: https://www.insdc.org/submitting-standards/feature-table/
+# Ordered by frequency so the modal dropdown puts CDS / gene / promoter at the
+# top. The `source` type is excluded because each record already has exactly
+# one `source` feature spanning the whole molecule — adding more would be
+# invalid GenBank.
+_GENBANK_FEATURE_TYPES: tuple = (
+    "CDS", "gene", "mRNA", "tRNA", "rRNA", "ncRNA", "misc_RNA",
+    "promoter", "terminator", "RBS", "polyA_signal", "regulatory",
+    "5'UTR", "3'UTR", "intron", "exon", "operon",
+    "primer_bind", "protein_bind", "misc_binding",
+    "repeat_region", "LTR", "mobile_element",
+    "rep_origin", "oriT",
+    "sig_peptide", "mat_peptide", "transit_peptide", "propeptide",
+    "misc_feature", "misc_recomb", "stem_loop", "variation",
+)
+
+
+def _load_features() -> list[dict]:
+    global _features_cache
+    if _features_cache is not None:
+        return list(_features_cache)
+    entries, warning = _safe_load_json(_FEATURES_FILE, "Feature library")
+    if warning:
+        _log.warning(warning)
+    entries = [e for e in entries if isinstance(e, dict)]
+    _features_cache = entries
+    return list(_features_cache)
+
+
+def _save_features(entries: list[dict]) -> None:
+    global _features_cache
+    _safe_save_json(_FEATURES_FILE, entries, "Feature library")
+    _features_cache = list(entries)
+
+
 # ── Codon usage registry + harmonization (shared across modals) ───────────────
 #
 # Persistent JSON library of codon usage tables, plus pure-function harmonizer
