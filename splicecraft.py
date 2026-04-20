@@ -5943,34 +5943,35 @@ class AddFeatureModal(ModalScreen):
 
         with Vertical(id="addfeat-dlg"):
             yield Static(" Add Feature ", id="addfeat-title")
-            yield Label("Name:")
-            yield Input(value=name, placeholder="e.g. lacZ-alpha",
-                        id="addfeat-name")
+            with ScrollableContainer(id="addfeat-body"):
+                yield Label("Name:")
+                yield Input(value=name, placeholder="e.g. lacZ-alpha",
+                            id="addfeat-name")
 
-            with Horizontal(id="addfeat-row1"):
-                with Vertical(id="addfeat-type-col"):
-                    yield Label("Feature type:")
-                    yield Select(type_options, value=feat_type,
-                                 id="addfeat-type", allow_blank=False)
-                with Vertical(id="addfeat-strand-col"):
-                    yield Label("Strand:")
-                    with RadioSet(id="addfeat-strand"):
-                        yield RadioButton("Forward (+)",
-                                          value=(strand != -1),
-                                          id="addfeat-strand-fwd")
-                        yield RadioButton("Reverse (−)",
-                                          value=(strand == -1),
-                                          id="addfeat-strand-rev")
+                with Horizontal(id="addfeat-row1"):
+                    with Vertical(id="addfeat-type-col"):
+                        yield Label("Feature type:")
+                        yield Select(type_options, value=feat_type,
+                                     id="addfeat-type", allow_blank=False)
+                    with Vertical(id="addfeat-strand-col"):
+                        yield Label("Strand:")
+                        with RadioSet(id="addfeat-strand"):
+                            yield RadioButton("Forward (+)",
+                                              value=(strand != -1),
+                                              id="addfeat-strand-fwd")
+                            yield RadioButton("Reverse (−)",
+                                              value=(strand == -1),
+                                              id="addfeat-strand-rev")
 
-            yield Label("Sequence  (5'→3', ACGT/IUPAC; whitespace ignored):")
-            yield TextArea(sequence, id="addfeat-seq")
-            yield Label("Qualifiers  (e.g.  gene=lacZ; product=LacZ alpha):")
-            yield Input(value=quals_str,
-                        placeholder="key=value; key=value",
-                        id="addfeat-quals")
-            yield Label("Description  (optional):")
-            yield Input(value=description, placeholder="free text",
-                        id="addfeat-desc")
+                yield Label("Sequence  (5'→3', ACGT/IUPAC; whitespace ignored):")
+                yield TextArea(sequence, id="addfeat-seq")
+                yield Label("Qualifiers  (e.g.  gene=lacZ; product=LacZ alpha):")
+                yield Input(value=quals_str,
+                            placeholder="key=value; key=value",
+                            id="addfeat-quals")
+                yield Label("Description  (optional):")
+                yield Input(value=description, placeholder="free text",
+                            id="addfeat-desc")
             yield Static("", id="addfeat-status", markup=True)
             with Horizontal(id="addfeat-btns"):
                 yield Button("Import from plasmid…",
@@ -9517,15 +9518,17 @@ PlasmidFeaturePickerModal { align: center middle; }
 /* ── Add-feature modal ───────────────────────────────────── */
 AddFeatureModal { align: center middle; }
 #addfeat-dlg {
-    width: 82; height: auto; max-height: 90%;
+    width: 82; height: 90%; max-height: 40;
     background: $surface; border: solid $primary; padding: 1 2;
 }
 #addfeat-title { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #addfeat-dlg Label { color: $text-muted; margin-top: 1; }
-#addfeat-row1       { height: auto; }
-#addfeat-type-col   { width: 1fr; margin-right: 2; }
-#addfeat-strand-col { width: 30; }
-#addfeat-seq    { height: 8; margin-top: 0; }
+#addfeat-body       { height: 1fr; overflow-y: auto; }
+#addfeat-row1       { height: 6; }
+#addfeat-type-col   { width: 1fr; height: 6; margin-right: 2; }
+#addfeat-strand-col { width: 30; height: 6; }
+#addfeat-type-col Label, #addfeat-strand-col Label { margin-top: 0; height: 1; }
+#addfeat-seq    { height: 6; min-height: 4; margin-top: 0; }
 #addfeat-status { height: 2; margin-top: 1; }
 #addfeat-btns   { height: 3; margin-top: 1; }
 #addfeat-btns Button { margin-right: 1; }
