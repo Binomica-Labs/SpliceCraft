@@ -298,9 +298,48 @@ always recoverable via the `.bak` file.
 ## Tests
 
 ```bash
-python3 -m pytest -q          # full suite (246 tests, ~45 s)
+python3 -m pytest -q          # full suite (483 tests, ~75 s)
 python3 -m pytest tests/test_dna_sanity.py    # biology correctness only (< 1s)
 ```
+
+---
+
+## Codebase tour
+
+SpliceCraft is a single-file Python app (`splicecraft.py`, ~10,360 lines) built on
+Textual + Biopython. The single-file layout is intentional — no import puzzles,
+and everything is greppable from one place.
+
+### Layout at a glance
+
+| Region | Contents |
+|--------|----------|
+| Top of file | imports, user data dir (`platformdirs`), rotating session-tagged logger, `_safe_save_json` / `_safe_load_json` (atomic writes + `.bak` recovery) |
+| Biology core | NEB enzyme catalog, IUPAC-aware `_rc`, `_scan_restriction_sites` (palindrome- and wrap-aware), sequence panel renderer, `_translate_cds` |
+| I/O | `fetch_genbank` (NCBI Entrez), `load_genbank` (`.gb` / `.gbk` / `.dna`), pLannotate subprocess integration |
+| Rendering | `_Canvas` + `_BrailleCanvas` (sub-cell dot matrix), `PlasmidMap`, `SequencePanel`, `FeatureSidebar`, `LibraryPanel`, `MenuBar` |
+| Workbenches | `PrimerDesignScreen` (detection / cloning / Golden Braid / generic), `MutagenizeModal` (SOE-PCR mutagenesis), `DomesticatorModal` + `ConstructorModal` (Golden Braid L0) |
+| Registries | codon-usage tables, parts bin, primer library — all persisted as JSON with automatic `.bak` backups |
+| Controller | `PlasmidApp` — keybindings, undo/redo (50-deep snapshot stack), `@work` threads for NCBI / pLannotate / Kazusa |
+
+### Contributor docs
+
+`CLAUDE.md` at the repo root is the **agent + contributor handover document**.
+It covers the 10 sacred invariants (biology correctness rules with test coverage),
+the error-handling convention, performance notes, and modular recipes for adding
+modals, workers, menus, or persisted libraries without tripping the invariants.
+Read it before touching the rendering layer, record pipeline, or primer design.
+
+### Running the suite
+
+```bash
+python3 -m pytest -q                   # full suite (~75 s)
+python3 -m pytest tests/test_dna_sanity.py    # biology only (< 1 s)
+```
+
+All tests run offline against synthetic `SeqRecord`s and monkeypatched data paths;
+an autouse fixture in `tests/conftest.py` guarantees no test can write to real
+user files.
 
 ---
 
