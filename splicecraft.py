@@ -8541,7 +8541,7 @@ class PlasmidApp(App):
     _MAX_UNDO = 50
     _restr_unique_only: bool = True
     _restr_min_len: int = 6
-    _show_restr: bool = True
+    _show_restr: bool = False
     _restr_cache: "list" = []
 
     CSS = """
