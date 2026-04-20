@@ -163,6 +163,7 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, ScrollableContainer
+from textual.css.query import NoMatches
 from textual.events import Click, MouseDown, MouseMove, MouseUp, MouseScrollDown, MouseScrollUp
 from textual.message import Message
 from textual.reactive import reactive
@@ -170,7 +171,7 @@ from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
 from textual.widgets import (
     Button, DataTable, Footer, Header, Input, Label, ListItem, ListView,
-    RadioButton, RadioSet, Select, Static, TabbedContent, TabPane, TextArea,
+    RadioButton, RadioSet, Select, Static, TextArea,
 )
 from rich.text import Text
 
@@ -323,6 +324,9 @@ def _load_library() -> list[dict]:
     entries, warning = _safe_load_json(_LIBRARY_FILE, "Plasmid library")
     if warning:
         _log.warning(warning)
+    # Drop non-dict entries (hand-edited JSON, schema drift) so that
+    # .get() calls downstream don't raise AttributeError.
+    entries = [e for e in entries if isinstance(e, dict)]
     _library_cache = entries
     return list(_library_cache)
 
@@ -614,6 +618,10 @@ _IUPAC_COMP = str.maketrans(
     "ACGTRYWSMKBDHVN",
     "TGCAYRWSKMVHDBN",
 )
+
+# Case-preserving ACGT complement used by the sequence-panel renderer.
+_DNA_COMP_PRESERVE_CASE = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
+
 
 def _rc(seq: str) -> str:
     return seq.upper().translate(_IUPAC_COMP)[::-1]
@@ -1206,7 +1214,6 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     reh_color   = re_highlight["color"]      if re_highlight else ""
 
     seq_upper = seq.upper()
-    _COMP     = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")   # base complement
     result    = Text(no_wrap=True, overflow="crop")
 
     for chunk_start in range(0, n, line_width):
@@ -1252,7 +1259,7 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
 
         # Perf: translate the whole chunk once instead of per-base.
         chunk_fwd = seq_upper[chunk_start:chunk_end]
-        chunk_rev = chunk_fwd.translate(_COMP)
+        chunk_rev = chunk_fwd.translate(_DNA_COMP_PRESERVE_CASE)
         chunk_len = chunk_end - chunk_start
         fwd_bases: list[tuple[str, str]] = []
         rc_bases:  list[tuple[str, str]] = []
@@ -1558,15 +1565,19 @@ def _record_to_gb_text(record) -> str:
 
     Biopython's genbank writer requires `molecule_type` in annotations
     — if the record came from elsewhere and doesn't have it, default to
-    "DNA" rather than crashing. Applies to the record's annotations
-    dict in place (safe; only fills a missing key, never overwrites).
+    "DNA" rather than crashing. The fill-in happens on a shallow
+    SeqRecord copy so the caller's record is never mutated (avoids
+    subtle races with concurrent readers and surprise side effects for
+    callers that compare records by annotation contents).
     """
     from Bio import SeqIO
-    if not getattr(record, "annotations", None):
-        record.annotations = {}
-    record.annotations.setdefault("molecule_type", "DNA")
+    from copy import copy as _shallow_copy
+    anns = dict(getattr(record, "annotations", None) or {})
+    anns.setdefault("molecule_type", "DNA")
+    rec = _shallow_copy(record)
+    rec.annotations = anns
     buf = StringIO()
-    SeqIO.write(record, buf, "genbank")
+    SeqIO.write(rec, buf, "genbank")
     return buf.getvalue()
 
 def _gb_text_to_record(text: str):
@@ -1703,7 +1714,14 @@ def _run_plannotate(record, timeout: int = 180):
             )
 
         if result.returncode != 0:
-            err_tail = combined_out[-500:].strip() or "(no output)"
+            # Strip control chars so ANSI/escape sequences from pLannotate's
+            # stderr can't corrupt the Textual rendering when surfaced via
+            # notify(). Keep tabs/newlines for readability.
+            raw_tail = combined_out[-500:]
+            err_tail = "".join(
+                ch for ch in raw_tail
+                if ch in "\t\n" or (ch.isprintable() and ord(ch) >= 0x20)
+            ).strip() or "(no output)"
             raise PlannotateFailed("pLannotate failed", err_tail)
 
         # Locate output GenBank. `plannotate batch` writes <file_name>.gbk; we
@@ -3321,7 +3339,7 @@ class SequencePanel(Widget):
             self.query_one("#seq-scroll", ScrollableContainer).scroll_to(
                 0, row, animate=False
             )
-        except Exception:
+        except NoMatches:
             pass
 
     def _ensure_cursor_visible(self) -> None:
@@ -3338,15 +3356,15 @@ class SequencePanel(Widget):
         def _do_scroll():
             try:
                 scroll = self.query_one("#seq-scroll", ScrollableContainer)
-                vp_top = int(scroll.scroll_y)
-                vp_h   = scroll.size.height
-                vp_bottom = vp_top + vp_h - 1
-                if row < vp_top:
-                    scroll.scroll_to(0, row, animate=False)
-                elif row_bottom > vp_bottom:
-                    scroll.scroll_to(0, row_bottom - vp_h + 1, animate=False)
-            except Exception:
-                pass
+            except NoMatches:
+                return
+            vp_top = int(scroll.scroll_y)
+            vp_h   = scroll.size.height
+            vp_bottom = vp_top + vp_h - 1
+            if row < vp_top:
+                scroll.scroll_to(0, row, animate=False)
+            elif row_bottom > vp_bottom:
+                scroll.scroll_to(0, row_bottom - vp_h + 1, animate=False)
 
         self.call_after_refresh(_do_scroll)
 
@@ -3354,7 +3372,7 @@ class SequencePanel(Widget):
         view = self.query_one("#seq-view", Static)
         try:
             scroll = self.query_one("#seq-scroll", ScrollableContainer)
-        except Exception:
+        except NoMatches:
             scroll = None
         if not self._seq:
             view.update(Text("  No sequence loaded.", style="dim italic"))
@@ -3743,15 +3761,15 @@ class MenuBar(Widget):
             widget_id = f"menu-{name.lower()}"
             try:
                 item = self.query_one(f"#{widget_id}", Static)
-                region = item.region
-                if (region.x <= event.screen_x < region.x + region.width and
-                        region.y <= event.screen_y < region.y + region.height):
-                    x = region.x
-                    y = region.y + 1
-                    self.app.open_menu(name, x, y)
-                    break
-            except Exception:
-                pass
+            except NoMatches:
+                continue
+            region = item.region
+            if (region.x <= event.screen_x < region.x + region.width and
+                    region.y <= event.screen_y < region.y + region.height):
+                x = region.x
+                y = region.y + 1
+                self.app.open_menu(name, x, y)
+                break
 
 
 # ── Golden Braid L0 part catalog (shared by Parts Bin and Constructor) ─────────
@@ -3978,6 +3996,7 @@ def _load_parts_bin() -> list[dict]:
     entries, warning = _safe_load_json(_PARTS_BIN_FILE, "Parts bin")
     if warning:
         _log.warning(warning)
+    entries = [e for e in entries if isinstance(e, dict)]
     _parts_bin_cache = entries
     return list(_parts_bin_cache)
 
@@ -4007,6 +4026,7 @@ def _load_primers() -> list[dict]:
     entries, warning = _safe_load_json(_PRIMERS_FILE, "Primer library")
     if warning:
         _log.warning(warning)
+    entries = [e for e in entries if isinstance(e, dict)]
     _primers_cache = entries
     return list(_primers_cache)
 
@@ -4115,6 +4135,8 @@ def _codon_tables_load() -> list[dict]:
         _log.warning("Codon table library: %s", warning)
     fixed: list = []
     for e in entries:
+        if not isinstance(e, dict):
+            continue
         raw = _codon_raw_from_json(e.get("raw", {}))
         if not raw:
             continue
@@ -4274,6 +4296,22 @@ def _codon_parse_kazusa_html(html: str) -> "dict | None":
     return raw
 
 
+def _safe_xml_parse(xml_data: str):
+    """Parse XML with basic defense against billion-laughs / XXE tricks.
+
+    Python's stdlib ET (expat) already refuses to fetch external entities
+    since 3.7.1, so the remaining attack surface is DTD-declared entity
+    expansion. Rejecting any DOCTYPE/ENTITY up front is a dep-free guard
+    against a compromised NCBI mirror or MITM. NCBI's real responses
+    have no DTD, so this never false-positives.
+    """
+    import xml.etree.ElementTree as ET
+    head = xml_data[:4096].lower()
+    if "<!doctype" in head or "<!entity" in head:
+        raise ET.ParseError("XML contains DTD/ENTITY — refusing to parse")
+    return ET.fromstring(xml_data)
+
+
 def _ncbi_prep_term(query: str) -> str:
     """Turn a user query into an NCBI Entrez term.
 
@@ -4323,7 +4361,7 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
         _log.exception("NCBI esearch failed for %r", q)
         return [], 0, f"Network error: {exc}"
     try:
-        root = ET.fromstring(xml_data)
+        root = _safe_xml_parse(xml_data)
     except ET.ParseError as exc:
         return [], 0, f"Could not parse NCBI response: {exc}"
     ids = [e.text for e in root.findall(".//Id") if e.text]
@@ -4344,7 +4382,7 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
                                      headers={"User-Agent": "SpliceCraft/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             sxml = r.read().decode("utf-8", errors="replace")
-        sroot = ET.fromstring(sxml)
+        sroot = _safe_xml_parse(sxml)
         for doc in sroot.findall(".//DocSum"):
             did_el = doc.find("Id")
             if did_el is None or not did_el.text:
@@ -4856,7 +4894,7 @@ def _mut_parse(s: str) -> tuple:
 
 
 def _mut_revcomp(seq: str) -> str:
-    return seq.upper().translate(str.maketrans("ACGT", "TGCA"))[::-1]
+    return seq.upper().translate(_IUPAC_COMP)[::-1]
 
 
 def _mut_translate(dna: str) -> str:
@@ -5430,7 +5468,7 @@ class PartsBinModal(Screen):
         try:
             pm = self.app.query_one("#plasmid-map", PlasmidMap)
             feats = pm._feats
-        except Exception:
+        except NoMatches:
             pass
 
         def _on_result(part_dict):
@@ -6060,7 +6098,11 @@ class NcbiTaxonPickerModal(ModalScreen):
 
     @work(thread=True)
     def _do_search(self, query: str) -> None:
-        hits, total, msg = _ncbi_taxid_search(query)
+        try:
+            hits, total, msg = _ncbi_taxid_search(query)
+        except Exception as exc:
+            _log.exception("NCBI taxonomy search worker failed for %r", query)
+            hits, total, msg = [], 0, f"Search failed: {exc}"
         self.app.call_from_thread(self._search_done, hits, total, msg)
 
     def _search_done(self, hits: list, total: int, msg: str) -> None:
@@ -6276,7 +6318,7 @@ class SpeciesPickerModal(ModalScreen):
             if hit is None:
                 try:
                     self._refresh_list(self.query_one("#sp-filter", Input).value)
-                except Exception:
+                except NoMatches:
                     pass
                 return
             taxid = hit["taxid"]
@@ -6287,7 +6329,7 @@ class SpeciesPickerModal(ModalScreen):
                 self.query_one("#sp-info", Static).update(
                     f"[yellow]Fetching taxid {taxid} ({display}) from Kazusa…[/yellow]"
                 )
-            except Exception:
+            except NoMatches:
                 pass
             self._do_fetch(taxid, display)
 
@@ -6295,7 +6337,11 @@ class SpeciesPickerModal(ModalScreen):
 
     @work(thread=True)
     def _do_fetch(self, taxid: str, name: str) -> None:
-        raw, msg = _codon_fetch_kazusa(taxid)
+        try:
+            raw, msg = _codon_fetch_kazusa(taxid)
+        except Exception as exc:
+            _log.exception("Kazusa fetch worker failed for taxid %s", taxid)
+            raw, msg = None, f"Fetch failed: {exc}"
         self.app.call_from_thread(self._fetch_done, taxid, name, raw, msg)
 
     def _fetch_done(self, taxid: str, name: str,
@@ -6550,7 +6596,7 @@ class AminoAcidPickerModal(ModalScreen):
     def on_mount(self) -> None:
         try:
             self.query_one("#aa-pick-list", ListView).focus()
-        except Exception:
+        except NoMatches:
             pass
 
     @on(ListView.Selected, "#aa-pick-list")
@@ -7129,7 +7175,10 @@ class MutagenizeModal(ModalScreen):
         import datetime
         today = datetime.date.today().isoformat()
         construct = self._cds_meta.get("name") or self._plasmid_name or "CDS"
-        safe_construct = re.sub(r"[^\w\-]+", "_", construct).strip("_") or "CDS"
+        # Cap length so an unusually long feature label can't produce
+        # primer names that blow past filesystem/name limits.
+        safe_construct = (re.sub(r"[^\w\-]+", "_", construct)
+                          .strip("_")[:32]) or "CDS"
         mutation = self._inner["mutation"]
 
         existing  = _load_primers()
@@ -7520,26 +7569,26 @@ class PrimerDesignScreen(Screen):
         for m, sel in self._MODE_PANELS.items():
             try:
                 self.query_one(sel).display = (m == mode)
-            except Exception:
+            except NoMatches:
                 pass
         if mode == "goldenbraid":
             try:
                 self._update_gb_oh()
             except Exception:
-                pass
+                _log.exception("goldenbraid overhang refresh failed")
 
     def _switch_source(self, src: str) -> None:
         for s, sel in self._SOURCE_PANELS.items():
             try:
                 self.query_one(sel).display = (s == src)
-            except Exception:
+            except NoMatches:
                 pass
         # Hide the plasmid chooser when source=custom (it's irrelevant)
         try:
             for wid in ("pd-plasmid-lbl", "pd-plasmid-name",
                         "btn-pd-pickplasmid"):
                 self.query_one(f"#{wid}").display = (src == "feature")
-        except Exception:
+        except NoMatches:
             pass
 
     @on(Select.Changed, "#pd-source")
@@ -7577,6 +7626,7 @@ class PrimerDesignScreen(Screen):
                     try:
                         new_rec = _gb_text_to_record(gb)
                     except Exception as exc:
+                        _log.exception("Library load for primer-design failed")
                         self.app.notify(f"Failed to load: {exc}",
                                         severity="error")
                         return
@@ -9514,7 +9564,7 @@ SpeciesPickerModal { align: center middle; }
             self.title = f"SpliceCraft — *{self._current_record.name}  ({n:,} bp)"
         try:
             self.query_one("#library", LibraryPanel).set_dirty(True)
-        except Exception:
+        except NoMatches:
             pass
 
     def _mark_clean(self) -> None:
@@ -9524,7 +9574,7 @@ SpeciesPickerModal { align: center middle; }
             self.title = f"SpliceCraft — {self._current_record.name}  ({n:,} bp)"
         try:
             self.query_one("#library", LibraryPanel).set_dirty(False)
-        except Exception:
+        except NoMatches:
             pass
 
     def _do_save(self) -> bool:
@@ -9538,6 +9588,7 @@ SpeciesPickerModal { align: center middle; }
             try:
                 Path(self._source_path).write_text(_record_to_gb_text(self._current_record))
             except Exception as exc:
+                _log.exception("Save to %s failed", self._source_path)
                 self.notify(f"Save failed: {exc}", severity="error")
                 return False
 
@@ -9546,6 +9597,7 @@ SpeciesPickerModal { align: center middle; }
             lib = self.query_one("#library", LibraryPanel)
             lib.add_entry(self._current_record)
         except Exception as exc:
+            _log.exception("Library update failed during save")
             self.notify(f"Library update failed: {exc}", severity="error")
             return False
 
@@ -9660,7 +9712,7 @@ SpeciesPickerModal { align: center middle; }
 
         try:
             self.query_one("#library", LibraryPanel).set_active(record.id)
-        except Exception:
+        except NoMatches:
             pass
         self._mark_clean()
         self.notify(
@@ -9761,6 +9813,8 @@ SpeciesPickerModal { align: center middle; }
             record = _gb_text_to_record(gb_text)
             self._apply_record(record)
         except Exception as exc:
+            _log.exception("Library load failed for entry %r",
+                           event.entry.get("name", "?"))
             self.notify(f"Failed to load from library: {exc}", severity="error")
 
     @on(LibraryPanel.AddCurrentRequested)
@@ -9775,7 +9829,7 @@ SpeciesPickerModal { align: center middle; }
         the map or sidebar to re-select."""
         try:
             pm = self.query_one("#plasmid-map", PlasmidMap)
-        except Exception:
+        except NoMatches:
             return
         if pm.selected_idx < 0:
             return   # nothing to clear
@@ -9783,7 +9837,7 @@ SpeciesPickerModal { align: center middle; }
         pm.refresh()
         try:
             self.query_one("#sidebar", FeatureSidebar).show_detail(None)
-        except Exception:
+        except NoMatches:
             pass
 
     @on(LibraryPanel.RenameRequested)
@@ -9873,13 +9927,14 @@ SpeciesPickerModal { align: center middle; }
             self._current_record.name = new_name
             try:
                 pm = self.query_one("#plasmid-map", PlasmidMap)
+            except NoMatches:
+                pm = None
+            if pm is not None:
                 # record.name is in the cache key, but nuke it explicitly
                 # for belt-and-braces (in case future refactors drop the
                 # name from the key).
                 pm._draw_cache = None
                 pm.refresh()
-            except Exception:
-                pass
             # Refresh the window title via _mark_clean (which rebuilds it
             # from self._current_record.name).
             self._mark_clean()
@@ -10188,7 +10243,7 @@ SpeciesPickerModal { align: center middle; }
         feats = []
         try:
             feats = self.query_one("#plasmid-map", PlasmidMap)._feats
-        except Exception:
+        except NoMatches:
             pass
         self.push_screen(PrimerDesignScreen(seq, feats, name))
 
@@ -10204,7 +10259,7 @@ SpeciesPickerModal { align: center middle; }
         feats: list = []
         try:
             feats = self.query_one("#plasmid-map", PlasmidMap)._feats
-        except Exception:
+        except NoMatches:
             pass
         if not any(f.get("type") in ("CDS", "gene") for f in feats):
             self.notify(
