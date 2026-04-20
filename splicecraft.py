@@ -4404,6 +4404,106 @@ def _save_features(entries: list[dict]) -> None:
     _features_cache = list(entries)
 
 
+def _parse_qualifier_string(raw: str) -> dict[str, list[str]]:
+    """Parse a user-typed qualifier line like ``gene=lacZ; product=LacZ alpha``
+    into the GenBank-style ``{key: [value]}`` dict.
+
+    - Separator between pairs is ``;`` (newlines also accepted).
+    - Separator between key and value is the first ``=``.
+    - Keys and values are stripped; empty keys are skipped silently.
+    - Duplicate keys are merged into a single list (GenBank allows repeated
+      qualifiers — e.g. multiple ``/note=`` lines).
+    """
+    out: dict[str, list[str]] = {}
+    if not raw:
+        return out
+    chunks = re.split(r"[;\n]", raw)
+    for chunk in chunks:
+        if "=" not in chunk:
+            continue
+        key, _, val = chunk.partition("=")
+        key = key.strip()
+        val = val.strip()
+        if not key:
+            continue
+        # Permissive: accept an empty value. GenBank flags (e.g. /pseudo)
+        # are technically value-less, but splicecraft always writes a string
+        # form, so keep them as empty-string qualifiers.
+        out.setdefault(key, []).append(val)
+    return out
+
+
+def _qualifiers_to_string(quals: dict) -> str:
+    """Inverse of `_parse_qualifier_string`. Used to prefill the modal when
+    the user imports an existing feature. Multi-value qualifiers get one
+    `key=value` pair per occurrence."""
+    if not quals:
+        return ""
+    pieces: list[str] = []
+    for key, vals in quals.items():
+        if isinstance(vals, (list, tuple)):
+            for v in vals:
+                pieces.append(f"{key}={v}")
+        else:
+            pieces.append(f"{key}={vals}")
+    return "; ".join(pieces)
+
+
+def _extract_feature_entries_from_record(record) -> list[dict]:
+    """Return one feature-library entry dict per non-source feature.
+
+    Wrap features (origin-spanning CompoundLocations) are flattened into the
+    forward-strand genomic sequence before export, so the entry's ``sequence``
+    is always the 5'→3' DNA that would be re-inserted. Reverse-strand
+    features store the revcomp (i.e. the 5'→3' of the feature as read), which
+    matches how the Add Feature modal expects input.
+    """
+    try:
+        from Bio.SeqFeature import CompoundLocation
+    except ImportError:
+        CompoundLocation = tuple()  # type: ignore[assignment]
+    seq = str(getattr(record, "seq", "") or "").upper()
+    total = len(seq)
+    entries: list[dict] = []
+    for feat in getattr(record, "features", []) or []:
+        if feat.type == "source":
+            continue
+        loc = feat.location
+        strand = getattr(loc, "strand", 1) or 1
+        # Assemble the forward-strand genomic sequence under the feature,
+        # respecting wrap/compound locations.
+        if isinstance(loc, CompoundLocation):
+            parts_seq = []
+            for part in loc.parts:
+                s = int(part.start) % total if total else 0
+                e = int(part.end)   % (total or 1) if total else 0
+                if total and e <= s:
+                    parts_seq.append(seq[s:] + seq[:e])
+                else:
+                    parts_seq.append(seq[s:e])
+            fwd = "".join(parts_seq)
+        else:
+            s = int(loc.start)
+            e = int(loc.end)
+            fwd = seq[s:e]
+        # Store 5'→3' of the feature as read. For reverse-strand CDS that is
+        # the revcomp of the genomic slice.
+        if strand == -1 and fwd:
+            feat_seq = _rc(fwd)
+        else:
+            feat_seq = fwd
+        entries.append({
+            "name":         _feat_label(feat),
+            "feature_type": feat.type,
+            "sequence":     feat_seq,
+            "strand":       1 if strand != -1 else -1,
+            "qualifiers":   {k: list(v) if isinstance(v, (list, tuple)) else [v]
+                             for k, v in (feat.qualifiers or {}).items()},
+            "description":  "",
+        })
+    return entries
+
+
 # ── Codon usage registry + harmonization (shared across modals) ───────────────
 #
 # Persistent JSON library of codon usage tables, plus pure-function harmonizer
@@ -5708,6 +5808,342 @@ def _mut_extract_cds(full_seq: str, start: int, end: int, strand: int) -> str:
     if strand == -1:
         sub = _mut_revcomp(sub)
     return sub
+
+
+# ── Feature picker: pick one feature from a chosen plasmid ────────────────────
+
+class PlasmidFeaturePickerModal(ModalScreen):
+    """Scrollable list of non-source features from a specific library entry.
+
+    Dismisses with a feature-library-style entry dict
+    ``{name, feature_type, sequence, strand, qualifiers, description}``,
+    or None on cancel. No persistence side effects — the caller decides
+    whether to save the picked entry or just use it to prefill a form.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",     "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, entries: list[dict], plasmid_name: str = ""):
+        super().__init__()
+        self._entries = list(entries)
+        self._plasmid_name = plasmid_name or "plasmid"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="featpick-dlg"):
+            yield Static(f" Feature from [{self._plasmid_name}] ",
+                         id="featpick-title")
+            yield DataTable(id="featpick-table", cursor_type="row",
+                            zebra_stripes=True)
+            with Horizontal(id="featpick-btns"):
+                yield Button("Select", id="btn-featpick-ok", variant="primary")
+                yield Button("Cancel", id="btn-featpick-cancel")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#featpick-table", DataTable)
+        t.add_columns("Name", "Type", "Strand", "Length")
+        for i, e in enumerate(self._entries):
+            strand_str = "+" if e.get("strand", 1) == 1 else "−"
+            t.add_row(
+                e.get("name", "?"),
+                e.get("feature_type", "?"),
+                strand_str,
+                f"{len(e.get('sequence', ''))} bp",
+                key=str(i),
+            )
+        if self._entries:
+            t.move_cursor(row=0)
+            t.focus()
+
+    @on(Button.Pressed, "#btn-featpick-ok")
+    def _select(self, _):
+        self._dismiss_cursor()
+
+    @on(DataTable.RowSelected, "#featpick-table")
+    def _row_selected(self, event):
+        if event.row_key and event.row_key.value is not None:
+            try:
+                idx = int(event.row_key.value)
+            except (TypeError, ValueError):
+                return
+            if 0 <= idx < len(self._entries):
+                self.dismiss(dict(self._entries[idx]))
+
+    def _dismiss_cursor(self) -> None:
+        t = self.query_one("#featpick-table", DataTable)
+        if t.row_count == 0:
+            self.dismiss(None)
+            return
+        row_keys = list(t.rows.keys())
+        if 0 <= t.cursor_row < len(row_keys):
+            key = row_keys[t.cursor_row].value
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                self.dismiss(None)
+                return
+            if 0 <= idx < len(self._entries):
+                self.dismiss(dict(self._entries[idx]))
+                return
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-featpick-cancel")
+    def _cancel_btn(self, _):
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── Add-feature modal ──────────────────────────────────────────────────────────
+
+class AddFeatureModal(ModalScreen):
+    """Create or edit a feature-library entry.
+
+    The modal collects: name, feature_type (from `_GENBANK_FEATURE_TYPES`),
+    strand, 5'→3' sequence, and a qualifier line (``key=value; key=value``).
+    Three terminal actions:
+
+      * **Save to Library** — dismisses with ``{"action": "save", "entry": {...}}``.
+      * **Insert at cursor** — dismisses with ``{"action": "insert", "entry": {...}}``.
+      * **Cancel** — dismisses with ``None``.
+
+    An **Import from plasmid** button opens the PlasmidPickerModal
+    → PlasmidFeaturePickerModal chain and prefills the form.
+
+    Validation (non-empty name, ACGT/IUPAC-only sequence, known feature type)
+    lives on the app side; the modal just surfaces the error strings.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",     "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, prefill: "dict | None" = None,
+                 have_cursor: bool = False) -> None:
+        super().__init__()
+        self._prefill = dict(prefill) if prefill else {}
+        self._have_cursor = have_cursor
+
+    def compose(self) -> ComposeResult:
+        p = self._prefill
+        name        = p.get("name", "")
+        feat_type   = p.get("feature_type", "CDS")
+        sequence    = p.get("sequence", "")
+        strand      = p.get("strand", 1)
+        quals_str   = _qualifiers_to_string(p.get("qualifiers") or {})
+        description = p.get("description", "")
+
+        type_options = [(t, t) for t in _GENBANK_FEATURE_TYPES]
+        if feat_type not in _GENBANK_FEATURE_TYPES:
+            type_options.insert(0, (f"{feat_type} (non-standard)", feat_type))
+
+        with Vertical(id="addfeat-dlg"):
+            yield Static(" Add Feature ", id="addfeat-title")
+            yield Label("Name:")
+            yield Input(value=name, placeholder="e.g. lacZ-alpha",
+                        id="addfeat-name")
+
+            with Horizontal(id="addfeat-row1"):
+                with Vertical(id="addfeat-type-col"):
+                    yield Label("Feature type:")
+                    yield Select(type_options, value=feat_type,
+                                 id="addfeat-type", allow_blank=False)
+                with Vertical(id="addfeat-strand-col"):
+                    yield Label("Strand:")
+                    with RadioSet(id="addfeat-strand"):
+                        yield RadioButton("Forward (+)",
+                                          value=(strand != -1),
+                                          id="addfeat-strand-fwd")
+                        yield RadioButton("Reverse (−)",
+                                          value=(strand == -1),
+                                          id="addfeat-strand-rev")
+
+            yield Label("Sequence  (5'→3', ACGT/IUPAC; whitespace ignored):")
+            yield TextArea(sequence, id="addfeat-seq")
+            yield Label("Qualifiers  (e.g.  gene=lacZ; product=LacZ alpha):")
+            yield Input(value=quals_str,
+                        placeholder="key=value; key=value",
+                        id="addfeat-quals")
+            yield Label("Description  (optional):")
+            yield Input(value=description, placeholder="free text",
+                        id="addfeat-desc")
+            yield Static("", id="addfeat-status", markup=True)
+            with Horizontal(id="addfeat-btns"):
+                yield Button("Import from plasmid…",
+                             id="btn-addfeat-import")
+                yield Button("Save to Library",
+                             id="btn-addfeat-save",
+                             variant="primary")
+                yield Button("Insert at cursor",
+                             id="btn-addfeat-insert",
+                             variant="success",
+                             disabled=not self._have_cursor)
+                yield Button("Cancel", id="btn-addfeat-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#addfeat-name", Input).focus()
+        except NoMatches:
+            pass
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _gather(self) -> "dict | None":
+        """Read form → entry dict, or write a red error and return None."""
+        try:
+            name   = self.query_one("#addfeat-name",  Input).value.strip()
+            ftype  = self.query_one("#addfeat-type",  Select).value
+            seqraw = self.query_one("#addfeat-seq",   TextArea).text
+            quals  = self.query_one("#addfeat-quals", Input).value
+            desc   = self.query_one("#addfeat-desc",  Input).value.strip()
+            fwd_rb = self.query_one("#addfeat-strand-fwd", RadioButton)
+        except NoMatches:
+            return None
+        status = self.query_one("#addfeat-status", Static)
+
+        if not name:
+            status.update("[red]Name cannot be empty.[/red]")
+            return None
+        # Normalise + validate sequence
+        seq_clean = "".join(ch for ch in seqraw.upper() if not ch.isspace())
+        if not seq_clean:
+            status.update("[red]Sequence cannot be empty.[/red]")
+            return None
+        allowed = set("ACGTRYWSMKBDHVN")
+        bad = [ch for ch in seq_clean if ch not in allowed]
+        if bad:
+            status.update(
+                f"[red]Sequence has invalid bases: {''.join(sorted(set(bad)))[:10]}[/red]"
+            )
+            return None
+        if ftype is None or ftype == Select.BLANK:
+            status.update("[red]Choose a feature type.[/red]")
+            return None
+        strand = 1 if fwd_rb.value else -1
+        return {
+            "name":         name,
+            "feature_type": str(ftype),
+            "sequence":     seq_clean,
+            "strand":       strand,
+            "qualifiers":   _parse_qualifier_string(quals),
+            "description":  desc,
+        }
+
+    # ── Buttons ──────────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-addfeat-save")
+    def _save(self, _) -> None:
+        entry = self._gather()
+        if entry is None:
+            return
+        self.dismiss({"action": "save", "entry": entry})
+
+    @on(Button.Pressed, "#btn-addfeat-insert")
+    def _insert(self, _) -> None:
+        entry = self._gather()
+        if entry is None:
+            return
+        self.dismiss({"action": "insert", "entry": entry})
+
+    @on(Button.Pressed, "#btn-addfeat-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-addfeat-import")
+    def _import(self, _) -> None:
+        entries = _load_library()
+        if not entries:
+            self.query_one("#addfeat-status", Static).update(
+                "[yellow]Library is empty — save a plasmid first.[/yellow]"
+            )
+            return
+
+        def _on_plasmid(entry_id):
+            if not entry_id:
+                return
+            match = next((e for e in _load_library()
+                          if e.get("id") == entry_id), None)
+            if not match:
+                self.query_one("#addfeat-status", Static).update(
+                    "[red]Entry not found.[/red]"
+                )
+                return
+            gb_text = match.get("gb_text", "")
+            if not gb_text:
+                self.query_one("#addfeat-status", Static).update(
+                    "[red]Library entry has no sequence.[/red]"
+                )
+                return
+            try:
+                rec = _gb_text_to_record(gb_text)
+            except Exception as exc:    # noqa: BLE001
+                _log.exception("Feature import: failed to parse library entry")
+                self.query_one("#addfeat-status", Static).update(
+                    f"[red]Failed to load plasmid: {exc}[/red]"
+                )
+                return
+            feat_entries = _extract_feature_entries_from_record(rec)
+            if not feat_entries:
+                self.query_one("#addfeat-status", Static).update(
+                    "[yellow]Plasmid has no non-source features.[/yellow]"
+                )
+                return
+
+            def _on_feat(picked):
+                if not picked:
+                    return
+                self._apply_prefill(picked)
+
+            self.app.push_screen(
+                PlasmidFeaturePickerModal(feat_entries,
+                                          plasmid_name=match.get("name", "")),
+                callback=_on_feat,
+            )
+
+        self.app.push_screen(PlasmidPickerModal(None), callback=_on_plasmid)
+
+    def _apply_prefill(self, entry: dict) -> None:
+        """Fill the form fields from a picked feature. Leaves user's current
+        name alone if it's non-empty so accidental imports don't clobber
+        typed data."""
+        try:
+            name_inp = self.query_one("#addfeat-name", Input)
+            type_sel = self.query_one("#addfeat-type", Select)
+            seq_ta   = self.query_one("#addfeat-seq", TextArea)
+            quals_in = self.query_one("#addfeat-quals", Input)
+            desc_in  = self.query_one("#addfeat-desc", Input)
+            fwd_rb   = self.query_one("#addfeat-strand-fwd", RadioButton)
+            rev_rb   = self.query_one("#addfeat-strand-rev", RadioButton)
+            status   = self.query_one("#addfeat-status", Static)
+        except NoMatches:
+            return
+        if not name_inp.value.strip():
+            name_inp.value = entry.get("name", "")
+        ftype = entry.get("feature_type", "misc_feature")
+        # Select raises if the value isn't a known option; prepend it if so.
+        current_options = [v for _, v in getattr(type_sel, "_options", [])]
+        if ftype not in current_options:
+            new_opts = [(f"{ftype} (non-standard)", ftype)] + \
+                       [(t, t) for t in _GENBANK_FEATURE_TYPES]
+            type_sel.set_options(new_opts)
+        type_sel.value = ftype
+        seq_ta.text = entry.get("sequence", "")
+        quals_in.value = _qualifiers_to_string(entry.get("qualifiers") or {})
+        desc_in.value = entry.get("description", "") or ""
+        is_rev = entry.get("strand", 1) == -1
+        fwd_rb.value = not is_rev
+        rev_rb.value = is_rev
+        status.update(
+            f"[green]Imported '{entry.get('name', '?')}' — "
+            f"review and Save or Insert.[/green]"
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 # ── Parts bin modal ────────────────────────────────────────────────────────────
@@ -9067,6 +9503,33 @@ PlasmidPickerModal { align: center middle; }
 #pick-btns   { height: 3; margin-top: 1; }
 #pick-btns Button { margin-right: 1; min-width: 14; }
 
+/* ── Feature picker modal ────────────────────────────────── */
+PlasmidFeaturePickerModal { align: center middle; }
+#featpick-dlg {
+    width: 80; height: 26;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#featpick-title { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#featpick-table { height: 1fr; }
+#featpick-btns  { height: 3; margin-top: 1; }
+#featpick-btns Button { margin-right: 1; min-width: 14; }
+
+/* ── Add-feature modal ───────────────────────────────────── */
+AddFeatureModal { align: center middle; }
+#addfeat-dlg {
+    width: 82; height: auto; max-height: 90%;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#addfeat-title { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#addfeat-dlg Label { color: $text-muted; margin-top: 1; }
+#addfeat-row1       { height: auto; }
+#addfeat-type-col   { width: 1fr; margin-right: 2; }
+#addfeat-strand-col { width: 30; }
+#addfeat-seq    { height: 8; margin-top: 0; }
+#addfeat-status { height: 2; margin-top: 1; }
+#addfeat-btns   { height: 3; margin-top: 1; }
+#addfeat-btns Button { margin-right: 1; }
+
 /* ── Rename plasmid dialog ───────────────────────────────── */
 RenamePlasmidModal { align: center middle; }
 #rename-dlg {
@@ -10694,7 +11157,116 @@ SpeciesPickerModal { align: center middle; }
         self.notify("Showing 4+ bp recognition sites")
 
     def action_add_feature(self) -> None:
-        self.notify("Add feature: coming soon", severity="information")
+        """Open the AddFeatureModal. If the sequence panel has an active
+        cursor, the Insert button is enabled; otherwise only Save is."""
+        sp = None
+        cursor_pos = -1
+        try:
+            sp = self.query_one("#seq-panel", SequencePanel)
+            cursor_pos = getattr(sp, "_cursor_pos", -1)
+        except NoMatches:
+            cursor_pos = -1
+        have_cursor = (self._current_record is not None and cursor_pos >= 0)
+        self.push_screen(
+            AddFeatureModal(prefill=None, have_cursor=have_cursor),
+            callback=self._add_feature_result,
+        )
+
+    def _add_feature_result(self, result) -> None:
+        """Callback for AddFeatureModal. `result` is either None (cancel) or
+        ``{"action": "save"|"insert", "entry": {...}}``."""
+        if not result:
+            return
+        action = result.get("action")
+        entry  = result.get("entry") or {}
+        if action == "save":
+            entries = _load_features()
+            # De-dup on (name, feature_type); latest write wins.
+            key = (entry.get("name"), entry.get("feature_type"))
+            entries = [e for e in entries
+                       if (e.get("name"), e.get("feature_type")) != key]
+            entries.append(entry)
+            try:
+                _save_features(entries)
+            except (OSError, ValueError) as exc:
+                _log.exception("Failed to save feature to library")
+                self.notify(f"Save failed: {exc}", severity="error")
+                return
+            self.notify(f"Saved '{entry.get('name')}' to feature library.")
+            return
+        if action == "insert":
+            try:
+                self._insert_feature_at_cursor(entry)
+            except (ValueError, RuntimeError) as exc:
+                _log.exception("Failed to insert feature")
+                self.notify(f"Insert failed: {exc}", severity="error")
+
+    def _insert_feature_at_cursor(self, entry: dict) -> None:
+        """Insert the feature's DNA at the current sequence-panel cursor,
+        shift existing feature coords via `_rebuild_record_with_edit`, and
+        append a new SeqFeature spanning the inserted region.
+
+        Reverse-strand entries have their `sequence` interpreted as the 5'→3'
+        of the feature as read, so the genomic bases inserted are the RC.
+        """
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+
+        if self._current_record is None:
+            raise RuntimeError("Load a plasmid first.")
+        sp = self.query_one("#seq-panel", SequencePanel)
+        pm = self.query_one("#plasmid-map", PlasmidMap)
+        pos = getattr(sp, "_cursor_pos", -1)
+        if pos < 0:
+            raise RuntimeError(
+                "Click on the sequence to place a cursor before inserting.")
+        strand = -1 if entry.get("strand") == -1 else 1
+        feat_seq = (entry.get("sequence") or "").upper()
+        if not feat_seq:
+            raise ValueError("Feature has no sequence.")
+        # Genomic bases inserted are the forward-strand; reverse-strand
+        # entries store the revcomp, so flip them back.
+        if strand == -1:
+            genomic = _rc(feat_seq)
+        else:
+            genomic = feat_seq
+
+        old_seq = str(self._current_record.seq)
+        new_seq = old_seq[:pos] + genomic + old_seq[pos:]
+        self._push_undo()
+        new_record = self._rebuild_record_with_edit(
+            new_seq, "insert", pos, pos, genomic,
+        )
+        new_feat = SeqFeature(
+            FeatureLocation(pos, pos + len(genomic), strand=strand),
+            type=entry.get("feature_type") or "misc_feature",
+            qualifiers={k: list(v) if isinstance(v, (list, tuple)) else [v]
+                        for k, v in (entry.get("qualifiers") or {}).items()},
+        )
+        label = entry.get("name") or ""
+        if label and "label" not in new_feat.qualifiers:
+            new_feat.qualifiers["label"] = [label]
+        new_record.features.append(new_feat)
+
+        self._current_record = new_record
+        pm.load_record(new_record)
+        self._restr_cache = _scan_restriction_sites(
+            new_seq,
+            min_recognition_len=self._restr_min_len,
+            unique_only=self._restr_unique_only,
+        )
+        displayed = self._restr_cache if self._show_restr else []
+        pm._restr_feats = displayed
+        pm.refresh()
+        self.query_one("#sidebar", FeatureSidebar).populate(pm._feats)
+        sp.update_seq(new_seq, pm._feats + displayed)
+        sp._cursor_pos = pos + len(genomic)
+        sp._user_sel   = None
+        sp._refresh_view()
+        self._mark_dirty()
+        self.notify(
+            f"Inserted '{label or entry.get('feature_type')}' "
+            f"({len(genomic)} bp) at {pos + 1}."
+        )
 
     # ── pLannotate annotation ──────────────────────────────────────────────────
 

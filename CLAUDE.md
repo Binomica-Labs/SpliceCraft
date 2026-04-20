@@ -13,7 +13,7 @@ A **terminal-based circular plasmid map viewer, sequence editor, and cloning/mut
 **Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs org, user ATinyGreenCell)
 
 - **Single-file architecture:** the entire app is `splicecraft.py` (~10,620 lines). Intentional — avoids import complexity and keeps the codebase greppable. Sibling project ScriptoScope follows the same convention at ~8,600 lines.
-- **Test suite:** 508 tests across 13 files in `tests/` (last refresh 2026-04-20). Full run ~95 s, biology subset (`test_dna_sanity.py`) < 1 s. `test_invariants_hypothesis.py` adds property-based fuzzing on top of hand-written regression tests.
+- **Test suite:** 570 tests across 14 files in `tests/` (last refresh 2026-04-20). Full run ~170 s, biology subset (`test_dna_sanity.py`) < 1 s. `test_invariants_hypothesis.py` adds property-based fuzzing on top of hand-written regression tests.
 - **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`, plus `pytest>=9.0` / `pytest-asyncio>=1.3` / `hypothesis>=6.100` for tests. Users install via `pipx install splicecraft`. **Optional runtime:** `pLannotate` (conda, GPL-3) for the Shift+A annotation feature.
 - **Published on PyPI** as `splicecraft`. Releases cut via `./release.sh X.Y.Z` (bumps version in both `pyproject.toml` and `splicecraft.py`, runs tests, builds, commits+tags+pushes; GitHub Actions `publish.yml` then publishes via Trusted Publishing / OIDC). Latest published: **v0.3.1**.
 
@@ -220,8 +220,10 @@ python3 -m pytest -x                                # stop on first failure
 | `test_codon.py` | 42 | Codon registry persistence, harmonization, Kazusa parser, NCBI taxid XML safety, CAI/GC math |
 | `test_domesticator.py` | 41 | Golden Braid L0 positions / overhangs, part validation, assembly lanes |
 | `test_circular_math.py` | 38 | Sacred invariant #5 (wrap midpoint); `_bp_in` / `_feat_len` for wrapped / non-wrapped / zero-width |
-| `test_data_safety.py` | 35 | Sacred invariant #7 (atomic saves, `.bak` recovery); **schema-envelope round-trip + legacy bare-list back-compat + future-version warning + shrink-guard counting both formats**; `_protect_user_data` fixture confirmation |
+| `test_data_safety.py` | 37 | Sacred invariant #7 (atomic saves, `.bak` recovery); **schema-envelope round-trip + legacy bare-list back-compat + future-version warning + shrink-guard counting both formats**; `features.json` redirected by `_protect_user_data`; `_protect_user_data` fixture confirmation |
+| `test_add_feature.py` | 24 | **AddFeatureModal + insert pipeline**: qualifier parsing round-trip, `_extract_feature_entries_from_record` strand/wrap handling, modal form validation (empty name / invalid bases / IUPAC), save-to-library dedup, insert-at-cursor (fwd / rev / coord shift / dirty flag) |
 | `test_plannotate.py` | 24 | Availability detection, size-cap preflight, feature merging, subprocess error paths (subprocess never actually invoked) |
+| `test_features_library.py` | 15 | Persistent feature-library JSON round-trip, schema envelope, corruption recovery, cache invalidation, `_GENBANK_FEATURE_TYPES` curation (CDS / gene / promoter present, `source` excluded) |
 | `test_edit_record.py` | 14 | Sacred invariant #9: wrap features survive insert/replace as CompoundLocation; fully-consumed features dropped (no 1-bp stubs) |
 | `test_invariants_hypothesis.py` | 11 | Property-based fuzzing of sacred invariants #3, #5, #8: `_rc` involution + IUPAC closure + Biopython cross-check; `_feat_len` bounds + linear/wrap formulas; `_bp_in` count matches `_feat_len`; wrap midpoint lies on arc |
 | `test_performance.py` | 9 | Budget enforcement (loose, 4–20× headroom): scan pUC19 < 30 ms, scan 10 kb < 150 ms, `_iupac_pattern` warm < 5 ms, `_rc(10 kb)` < 2 ms, `_build_seq_text(20 kb)` < 200 ms, `_BUILD_SEQ_CACHE` populated after first call |
@@ -274,7 +276,6 @@ What was profiled but deliberately **not touched**: Textual compositor (framewor
 Versions live in `pyproject.toml` and `splicecraft.py::__version__`; `release.sh` updates both via sed. See `git log --oneline` for full release history. Recent: v0.3.1 (schema-versioned JSON envelope + crash-recovery autosave + per-plasmid undo stashes + Hypothesis property tests), v0.3.0 (Mutagenize modal with codon registry/harmonization), v0.2.8 (deep-copy record in undo/redo snapshots).
 
 ### Stubs still in menus (not implemented)
-- **Features > Add Feature** — `coming soon`
 - **Build > Simulate Assembly** — `coming soon`
 - **Build > New Part editor** — `coming soon`
 
