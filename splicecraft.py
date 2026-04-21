@@ -248,6 +248,37 @@ def _extract_entries(raw, label: str) -> "tuple[list | None, str | None]":
     return None, f"{label}: unexpected JSON shape ({type(raw).__name__})"
 
 
+def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """Atomically write *text* to *path* via ``tempfile`` + ``os.replace``.
+
+    Guarantees: a concurrent crash leaves either the previous file intact
+    or the new file in place — never a partial write. Callers that need
+    a ``.bak`` should use :func:`_safe_save_json` instead (it layers the
+    envelope, shrink-guard, and schema handling on top of this).
+    """
+    import os
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as fh:
+            fh.write(text)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _safe_save_json(path: Path, entries: list, label: str,
                     schema_version: int = _CURRENT_SCHEMA_VERSION) -> None:
     """Atomically write `entries` as JSON to `path`, backing up first.
@@ -282,7 +313,8 @@ def _safe_save_json(path: Path, entries: list, label: str,
                     prev_entries, _ = _extract_entries(prev, label)
                     if prev_entries is not None:
                         existing_count = len(prev_entries)
-                except Exception:
+                except (json.JSONDecodeError, ValueError):
+                    # Corrupt / unreadable — shrink guard will treat as 0.
                     pass
         except OSError:
             _log.warning("Could not create backup for %s", path)
@@ -1424,7 +1456,7 @@ def _copy_to_clipboard_osc52(text: str) -> bool:
             tty.write(seq)
             tty.flush()
         return True
-    except Exception:
+    except (OSError, UnicodeEncodeError):
         return False
 
 
@@ -1488,7 +1520,7 @@ def _detect_char_aspect() -> float:
                         os.close(fd)
                     except OSError:
                         pass
-    except Exception:
+    except (ImportError, OSError):
         pass
     return 2.0
 
@@ -1749,8 +1781,6 @@ def _export_genbank_to_path(record, path) -> dict:
     The round-trip happens BEFORE the target file is touched, so a failed
     export never leaves a half-written / corrupt .gb at `path`.
     """
-    import os
-    import tempfile
     from pathlib import Path as _Path
 
     p = _Path(path).expanduser()
@@ -1775,26 +1805,7 @@ def _export_genbank_to_path(record, path) -> dict:
             f"({len(parsed.features)} vs {len(normalized.features)})"
         )
 
-    # Atomic write — tempfile in the target's directory, then os.replace.
-    p.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(
-        prefix=f".{p.name}.", suffix=".tmp", dir=str(p.parent)
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            try:
-                os.fsync(fh.fileno())
-            except OSError:
-                pass
-        os.replace(tmp, str(p))
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    _atomic_write_text(p, text)
 
     _log.info(
         "Exported GenBank to %s (%d bp, %d features)",
@@ -1815,8 +1826,6 @@ def _export_fasta_to_path(name: str, sequence: str, path) -> dict:
     that matches what Biopython's default SeqIO writer emits for us
     elsewhere and keeps downstream `grep`/`awk` one-liners simple.
     """
-    import os
-    import tempfile
     from pathlib import Path as _Path
 
     header = (name or "").strip()
@@ -1827,27 +1836,7 @@ def _export_fasta_to_path(name: str, sequence: str, path) -> dict:
         raise ValueError("FASTA export needs a non-empty sequence.")
 
     p = _Path(path).expanduser()
-    text = f">{header}\n{seq}\n"
-
-    p.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(
-        prefix=f".{p.name}.", suffix=".tmp", dir=str(p.parent)
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            try:
-                os.fsync(fh.fileno())
-            except OSError:
-                pass
-        os.replace(tmp, str(p))
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    _atomic_write_text(p, f">{header}\n{seq}\n")
 
     _log.info("Exported FASTA to %s (%s, %d bp)", p, header, len(seq))
     return {"path": str(p), "bp": len(seq), "name": header}
@@ -12760,31 +12749,12 @@ SpeciesPickerModal { align: center middle; }
         if path is None:
             return
         try:
-            import os
-            import tempfile
-            _CRASH_RECOVERY_DIR.mkdir(parents=True, exist_ok=True)
-            text = _record_to_gb_text(self._current_record)
-            fd, tmp = tempfile.mkstemp(
-                prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
+            _atomic_write_text(
+                path, _record_to_gb_text(self._current_record),
             )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(text)
-                    fh.flush()
-                    try:
-                        os.fsync(fh.fileno())
-                    except OSError:
-                        pass
-                os.replace(tmp, str(path))
-                _log.info("Autosaved %s to %s (%d bp)",
-                          self._current_record.name, path,
-                          len(self._current_record.seq))
-            except Exception:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
+            _log.info("Autosaved %s to %s (%d bp)",
+                      self._current_record.name, path,
+                      len(self._current_record.seq))
         except Exception:
             # Autosave is a safety net — never interrupt the user if it fails.
             _log.exception("Autosave to %s failed", path)
@@ -13052,7 +13022,10 @@ SpeciesPickerModal { align: center middle; }
         # Write to source file if one is known
         if self._source_path:
             try:
-                Path(self._source_path).write_text(_record_to_gb_text(self._current_record))
+                _atomic_write_text(
+                    Path(self._source_path),
+                    _record_to_gb_text(self._current_record),
+                )
             except Exception as exc:
                 _log.exception("Save to %s failed", self._source_path)
                 self.notify(f"Save failed: {exc}", severity="error")

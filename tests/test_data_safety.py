@@ -454,3 +454,116 @@ class TestRealFilesNeverTouched:
                 assert entry.get("name") != "SAFETY_TEST", (
                     f"SAFETY_TEST leaked into real {fname}!"
                 )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _atomic_write_text — shared helper for _do_save, _do_autosave, FASTA/GenBank
+#
+# Added 2026-04-21 after the audit caught `_do_save` using plain
+# `Path.write_text`, which leaves a half-written .gb on disk if the process
+# crashes mid-write. The helper is now the sole path by which the app writes
+# non-JSON user data, so regressions here are a real data-loss risk.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestAtomicWriteText:
+    def test_creates_new_file(self, tmp_path):
+        p = tmp_path / "out.txt"
+        sc._atomic_write_text(p, "hello\n")
+        assert p.read_text() == "hello\n"
+
+    def test_overwrites_existing_atomically(self, tmp_path):
+        p = tmp_path / "out.txt"
+        p.write_text("old contents\n")
+        sc._atomic_write_text(p, "new contents\n")
+        assert p.read_text() == "new contents\n"
+
+    def test_no_tmp_file_left_on_success(self, tmp_path):
+        """After a successful write, no `.tmp` file should remain in the
+        target directory. The mkstemp tempfile is renamed into place via
+        os.replace; a lingering tempfile means the cleanup is broken."""
+        p = tmp_path / "out.txt"
+        sc._atomic_write_text(p, "data")
+        # `.out.txt.*.tmp` is the hidden tempfile prefix used by mkstemp
+        leftover = list(tmp_path.glob(f".{p.name}.*.tmp"))
+        assert leftover == [], f"Unexpected tempfile leftovers: {leftover}"
+
+    def test_tmp_file_cleaned_on_error(self, tmp_path, monkeypatch):
+        """Simulate a filesystem failure during os.replace — the tempfile
+        must be cleaned up (not left as dotfile garbage) and the error
+        must propagate so the caller can notify the user."""
+        import os as _os
+        p = tmp_path / "out.txt"
+
+        def _boom(*a, **kw):
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr(_os, "replace", _boom)
+        with pytest.raises(OSError):
+            sc._atomic_write_text(p, "data")
+        # no tempfile left behind
+        leftover = list(tmp_path.glob(f".{p.name}.*.tmp"))
+        assert leftover == []
+        # and the target file was not created / corrupted
+        assert not p.exists()
+
+    def test_existing_file_untouched_on_error(self, tmp_path, monkeypatch):
+        """If the replace step fails, the previous contents of the target
+        must be preserved verbatim — no partial overwrite."""
+        import os as _os
+        p = tmp_path / "out.txt"
+        p.write_text("old contents\n")
+
+        def _boom(*a, **kw):
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr(_os, "replace", _boom)
+        with pytest.raises(OSError):
+            sc._atomic_write_text(p, "new contents\n")
+        assert p.read_text() == "old contents\n"
+
+    def test_creates_parent_dirs(self, tmp_path):
+        """Nested output paths should work — parent dirs created on demand."""
+        p = tmp_path / "nested" / "deeper" / "out.txt"
+        sc._atomic_write_text(p, "x")
+        assert p.read_text() == "x"
+
+    def test_unicode_content(self, tmp_path):
+        p = tmp_path / "out.txt"
+        sc._atomic_write_text(p, "ñáéíóú — GAATTC\n")
+        assert p.read_text(encoding="utf-8") == "ñáéíóú — GAATTC\n"
+
+
+class TestDoSaveUsesAtomicWrite:
+    """Regression guard: `PlasmidApp._do_save` must route through
+    `_atomic_write_text` (not `Path.write_text`). If a future refactor
+    inlines the write again, a process crash mid-save corrupts the
+    user's .gb file silently. This test trips before that ships."""
+
+    async def test_save_survives_mid_write_crash(
+            self, tmp_path, tiny_record, monkeypatch):
+        """Simulate a filesystem failure during os.replace inside
+        `_do_save`. The user's previous .gb content must remain intact,
+        and the app must surface the failure (no silent data loss)."""
+        import os as _os
+        target = tmp_path / "plasmid.gb"
+        target.write_text("ORIGINAL CONTENTS — MUST SURVIVE\n")
+
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app._source_path = str(target)
+            app._unsaved = True
+
+            def _boom(*a, **kw):
+                raise OSError("simulated crash during replace")
+
+            monkeypatch.setattr(_os, "replace", _boom)
+            ok = app._do_save()
+            assert ok is False, "Save must report failure on write error"
+            # Previous contents must be intact — atomic guarantee
+            assert target.read_text() == "ORIGINAL CONTENTS — MUST SURVIVE\n"
+            # No lingering tempfile in the target directory
+            leftover = list(tmp_path.glob(f".{target.name}.*.tmp"))
+            assert leftover == []
