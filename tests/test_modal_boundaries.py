@@ -156,6 +156,12 @@ _MODAL_CASES = [
     ("MutagenizeModal",            lambda: sc.MutagenizeModal("ATG" * 50,
                                                                _make_feats(),
                                                                plasmid_name="test")),
+    ("ColorPickerModal",           lambda: sc.ColorPickerModal("CDS", "#FF0000")),
+    ("FastaFilePickerModal",       lambda: sc.FastaFilePickerModal()),
+    ("FastaExportModal",           lambda: sc.FastaExportModal(
+                                               name="demo",
+                                               sequence="ATGCATGC",
+                                               default_path="/tmp/demo.fa")),
 ]
 
 

@@ -12,9 +12,9 @@ A **terminal-based circular plasmid map viewer, sequence editor, and cloning/mut
 
 **Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs org, user ATinyGreenCell)
 
-- **Single-file architecture:** the entire app is `splicecraft.py` (~10,620 lines). Intentional — avoids import complexity and keeps the codebase greppable. Sibling project ScriptoScope follows the same convention at ~8,600 lines.
-- **Test suite:** 593 tests across 15 files in `tests/` (last refresh 2026-04-20). Full run ~205 s, biology subset (`test_dna_sanity.py`) < 1 s. `test_invariants_hypothesis.py` adds property-based fuzzing on top of hand-written regression tests.
-- **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`, plus `pytest>=9.0` / `pytest-asyncio>=1.3` / `hypothesis>=6.100` for tests. Users install via `pipx install splicecraft`. **Optional runtime:** `pLannotate` (conda, GPL-3) for the Shift+A annotation feature.
+- **Single-file architecture:** the entire app is `splicecraft.py` (~13,200 lines). Intentional — avoids import complexity and keeps the codebase greppable. Sibling project ScriptoScope follows the same convention at ~8,600 lines.
+- **Test suite:** 857 tests across 16 files in `tests/` (last refresh 2026-04-21). Sequential run ~400 s; parallel run (`pytest -n auto`) ~145 s on 8 cores (~2.8× speedup). Biology subset (`test_dna_sanity.py`) < 1 s. `test_invariants_hypothesis.py` adds property-based fuzzing on top of hand-written regression tests.
+- **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`, plus `pytest>=9.0` / `pytest-asyncio>=1.3` / `pytest-xdist>=3.6` / `hypothesis>=6.100` for tests. Users install via `pipx install splicecraft`. **Optional runtime:** `pLannotate` (conda, GPL-3) for the Shift+A annotation feature.
 - **Published on PyPI** as `splicecraft`. Releases cut via `./release.sh X.Y.Z` (bumps version in both `pyproject.toml` and `splicecraft.py`, runs tests, builds, commits+tags+pushes; GitHub Actions `publish.yml` then publishes via Trusted Publishing / OIDC). Latest published: **v0.3.1**.
 
 ## How to run
@@ -24,7 +24,7 @@ cd ~/SpliceCraft
 python3 splicecraft.py              # empty canvas
 python3 splicecraft.py L09137       # fetch pUC19 from NCBI
 python3 splicecraft.py myplasmid.gb # open local GenBank file (.gb/.gbk/.dna)
-python3 -m pytest -q                # full test suite
+python3 -m pytest -n auto -q        # full test suite (parallel, ~2 min on 8 cores)
 
 # End users:
 pipx install splicecraft
@@ -65,19 +65,22 @@ If pLannotate is not on `PATH`, Shift+A notifies the user and returns — nothin
 | 3037–3485 | `SequencePanel` — DNA viewer, click-to-cursor, drag selection |
 | 3486–3825 | Core modals (`EditSeqDialog`, `FetchModal` with in-flight staleness guard, `OpenFileModal`, `DropdownScreen`) |
 | 3826–3867 | `MenuBar` widget |
-| 3868–4076 | Golden Braid L0 position catalog (BsaI overhangs, position constraints) |
+| 3868–4076 | Golden Braid L0 position catalog (Esp3I/BsmBI overhangs, position constraints) |
 | 4077–4130 | Parts-bin + primer-library persistence |
 | 4131–4925 | Codon-usage registry (`_codon_*`), Kazusa parser, NCBI taxid search (`_safe_xml_parse`), harmonization, CAI/GC. Crash-recovery config (`_CRASH_RECOVERY_DIR`) sits at the top of this slab |
 | 4926–5437 | SOE-PCR site-directed mutagenesis primer design (`_mut_*`) |
-| 5438–5598 | `PartsBinModal` |
-| 5599–6147 | `DomesticatorModal` + `ConstructorModal` (Golden Braid L0 UI) |
-| 6148–6485 | `NcbiTaxonPickerModal` + `SpeciesPickerModal` (codon-table picker) |
-| 6486–6716 | Mutagenize helpers (`_MutPreview`, `AminoAcidPickerModal`) |
-| 6717–7361 | `MutagenizeModal` — full mutagenesis workflow |
-| 7362–8460 | `PrimerDesignScreen` — full-screen primer workbench |
-| 8461–8681 | Small modals (`UnsavedQuitModal`, `PlasmidPickerModal`, `RenamePlasmidModal`, `LibraryDeleteConfirmModal`) |
-| 8682–10551 | `PlasmidApp` — main controller, keybindings, per-plasmid undo/redo stashes, crash-recovery autosave, `@work` threads |
-| 10552–end | `main()` entry point |
+| 5953–6394 | `PlasmidFeaturePickerModal`, `AddFeatureModal` |
+| 6395–7162 | **Feature library workbench**: `_normalise_color_input`, `_xterm_index_to_hex`, `ColorPickerModal`, `_FeatureSnippetPanel`, `FeatureLibraryScreen` (full-screen; entered by clicking `Features` in the menu bar) |
+| 7163–7345 | `PartsBinModal` |
+| 7346–7550 | **FASTA file picker** (`_FASTA_EXTS`, `_is_fasta_path`, `_parse_fasta_single` — rejects multi-record, `_FastaAwareDirectoryTree`, `FastaFilePickerModal` — lime-green FASTA highlight, white otherwise) |
+| 7494–8003 | `_feats_for_domesticator` helper + `DomesticatorModal` (4-source part picker: Direct / Feature Library / Feature-from-Plasmid / Open FASTA) |
+| 8004–8322 | `ConstructorModal` (Golden Braid L0 assembly UI) |
+| 8323–8660 | `NcbiTaxonPickerModal` + `SpeciesPickerModal` (codon-table picker) |
+| 8661–8891 | Mutagenize helpers (`_MutPreview`, `AminoAcidPickerModal`) |
+| 8892–9536 | `MutagenizeModal` — full mutagenesis workflow |
+| 9537–10635 | `PrimerDesignScreen` — full-screen primer workbench |
+| 10636–10856 | Small modals (`UnsavedQuitModal`, `PlasmidPickerModal`, `RenamePlasmidModal`, `LibraryDeleteConfirmModal`) |
+| 10857–end | `PlasmidApp` — main controller, keybindings, per-plasmid undo/redo stashes, crash-recovery autosave, `@work` threads; `main()` entry point |
 
 ### Key design patterns
 
@@ -153,7 +156,7 @@ These are the load-bearing pure functions other code depends on. Most are at mod
 
 ## pLannotate integration
 
-Shift+A (or ◈ in the library panel, or `Features > Annotate with pLannotate`) runs pLannotate as a subprocess and merges results into the current record.
+Shift+A (or ◈ in the library panel, or `Edit > Annotate with pLannotate`) runs pLannotate as a subprocess and merges results into the current record.
 
 ### Design principles
 
@@ -168,9 +171,76 @@ Shift+A (or ◈ in the library panel, or `Features > Annotate with pLannotate`) 
 
 Failure modes (`PlannotateNotInstalled`, `PlannotateMissingDb`, `PlannotateTooLarge`, `PlannotateFailed`) map to actionable user notifications. Full traceback always written to `~/.local/share/splicecraft/logs/splicecraft.log`.
 
+## Feature library workbench
+
+Clicking **Features** in the top menu bar pushes `FeatureLibraryScreen` directly — no dropdown. The screen is the sole place to browse, rename, recolor, or delete persistent feature entries. Per-plasmid feature *enumeration* remains on the right-hand `FeatureSidebar` (unchanged).
+
+Entries gained two optional fields in v0.3.2:
+- `color`: per-entry `"#RRGGBB"` override. `None` → fall through to the type default.
+- `strand`: `1` (forward, `▶`) / `-1` (reverse, `◀`) / `0` (arrowless, `▒`) / `2` (double-headed, `◀…▶`). The Cycle-Strand button walks the 4-step loop `1 → -1 → 0 → 2 → 1`. Arrowless is meaningful for `rep_origin`, `misc_feature`, stem-loops; double-headed for inverted repeats / palindromic regulatory elements.
+
+The snippet preview (`_FeatureSnippetPanel`) synthesizes a single full-span feature dict from the selected entry and feeds it through the shared **`_build_seq_text`** pipeline — the exact same renderer the main `SequencePanel` uses. Arrow direction comes from `_render_feature_row_pair`'s strand handling, so the preview always matches what the user sees in the main app after insertion. `_render_feature_row_pair` branches on strand: `0` → solid `▒` bar, `2` → `◀▒…▒▶`, `≥1` → `▒…▒▶`, else → `◀▒…▒`.
+
+Color precedence (implemented in `_resolve_feature_color`): entry's `color` field → user default in `feature_colors.json` → built-in `_DEFAULT_TYPE_COLORS[type]` → `_FEATURE_PALETTE[0]`. Always returns a non-empty string so Rich never barfs.
+
+`feature_colors.json` stores `{feature_type → hex}` as a list of `{"feature_type": ..., "color": ...}` dicts under the standard schema envelope. Missing / empty / corrupt → `{}`, and callers degrade to the built-in defaults.
+
+`Add Feature…` and `Annotate with pLannotate` moved to the **Edit** menu when the Features dropdown was eliminated. Keybindings (`Shift+A` for pLannotate, `Ctrl+F` for Add Feature, `Ctrl+Shift+F` for the capture flow) live there.
+
+**Ctrl+Shift+F capture shortcut.** From the main view, `Ctrl+Shift+F` invokes `PlasmidApp.action_capture_to_features`, which grabs either the Shift+drag DNA selection (`sp._user_sel`, priority 1) or the highlighted feature (`pm.selected_idx`, priority 2) and opens `AddFeatureModal` prefilled with the slice/name/type/strand/color/qualifiers. **If the drag selection's `(start, end)` exactly matches a feature's range, the capture inherits that feature's full metadata** (type, strand, color, qualifiers) via `_prefill_from_feature` — sidebar-click (which sets both `_user_sel` and `selected_idx`) and drag-selecting a feature both produce the same rich prefill. Palette-style colors (`color(N)`) are normalised to hex at capture so stored library entries and Rich markup previews never choke. Insert-at-cursor is disabled in this flow (the bases already live in the record). On Save, the app persists via `_persist_feature_entry` and pushes `FeatureLibraryScreen` so the user lands in the workbench with the new entry visible. Restriction-site overlays (`type == "resite"`) are rejected with a notification — they aren't real features. The shared helper `_persist_feature_entry` is also used by the regular Add-Feature path.
+
+`AddFeatureModal`'s direction row is labelled **Orientation** (not "Strand") and holds four radios (`#addfeat-strand-fwd/rev/none/both`) backed by strand values `1 / -1 / 0 / 2`. The modal also carries a **Color** row (`#addfeat-color-swatch` + `Pick Color…` / `Auto` buttons) so captured or manually-set colors survive through Save. `_gather` and `_apply_prefill` round-trip strand, color, and the standard fields together.
+
+**Expanded color picker.** `ColorPickerModal` grew a full xterm 256-color grid (16 ANSI + 216-cell cube + 24 grayscale) and a free-form custom input that accepts any of `#RGB`, `#RRGGBB`, `0..255` (xterm index), or `color(N)`. The helper `_normalise_color_input` canonicalises these to uppercase `#RRGGBB`, and `_xterm_index_to_hex` converts indices via the canonical `(0, 95, 135, 175, 215, 255)` cube ramp + `8 + 10*k` grayscale. A capability warning (`#colorpick-capability`) surfaces the terminal's `console.color_system` so users on 8/16-color terminals know truecolor picks will be approximated. `_markup_safe_color` (paired with `_resolve_feature_color`) converts any stray `color(N)` palette value to hex before rendering so Rich's markup lexer never trips on the parens. A large preview swatch (`#colorpick-preview-swatch`, 24w × 5h with tall border) dominates the header so the picked color is obvious at a glance, and **drag-to-preview** works across the xterm grid: `on_mouse_down` arms `self._drag_active` if the click lands on a `colorpick-x-*` cell (hit-tested via `get_widget_at`), `on_mouse_move` repaints the swatch every time the cursor enters a new cell, and `on_mouse_up` disarms. Non-left buttons and non-grid mouse-downs are ignored so the regular Save/Cancel/Apply buttons still work normally.
+
+## Parts Bin source picker
+
+The **New Part** flow in `PartsBinModal` opens `DomesticatorModal`, which now offers four mutually-exclusive sources selected via a top-of-modal `RadioSet` (`#dom-src`). The RadioSet uses `layout: horizontal` + `width: 1fr` per button + `overflow: hidden` so all four radios fit on **one row** with no scrollbar; the whole modal uses `width: 110; max-width: 95%; min-width: 80` so it flexes on narrow terminals.
+
+1. **Direct input** (`#dom-panel-direct`) — free-form `TextArea` paste. `_resolve_source` strips anything outside IUPAC before handing a `(cleaned, 0, len(cleaned))` tuple to the Golden Braid validator.
+2. **Feature library** (`#dom-panel-featlib`) — dropdown populated from `_load_features()`. Selection pulls the stored `sequence` and fires the validator as the whole span (`0 → len(seq)`).
+3. **Feature from plasmid** (`#dom-panel-plasmid`) — defaults to the currently-open plasmid (name threaded in as `current_plasmid_name`) but the `Change…` button pushes `PlasmidPickerModal(current_id=...)`. On selection the modal calls `_gb_text_to_record` + `_feats_for_domesticator(rec)` and repopulates the feature `Select` via `sel.set_options(...)`. The picked feature's `start`/`end` are reused verbatim so the Golden Braid coordinate checks run on the real plasmid slice.
+4. **Open FASTA** (`#dom-panel-fasta`) — `Browse…` button pushes `FastaFilePickerModal`, which renders a `DirectoryTree` subclass (`_FastaAwareDirectoryTree`) that paints FASTA files (`.fa / .fasta / .fna / .ffn / .frn / .fas / .mpfa / .faa`, case-insensitive) in **bold lime green** (`#BFFF00`) and every other file in **white** (`#FFFFFF`). On Open the modal dismisses with an absolute path; the domesticator parses it via `_parse_fasta_single(path)` (validates IUPAC + **rejects multi-record FASTAs** — we refuse to silently guess which record the user wanted) and stashes the sequence on `self._fasta_seq`. `_resolve_source` then returns `(self._fasta_seq, 0, len(self._fasta_seq))`. Parse errors surface as `app.notify(..., severity="error")` so the user sees "Multi-sequence FASTA not supported (N records found)", "Non-IUPAC characters…", or "No FASTA records found" rather than a traceback.
+
+Panel visibility is handled by toggling `widget.display` on the four `Vertical` panels — there is still exactly one Save button and one Design button. The helper `_feats_for_domesticator(record)` (module-level, just above `DomesticatorModal`) flattens compound/wrap features to their outer bounds, drops `source`/`resite`/`recut`/zero-width entries, and returns the `{label, type, start, end, strand}` dicts the Golden Braid UI already speaks. Keep that helper in sync with `_feats_in_chunk` / `_extract_feature_entries_from_record` — the three are the canonical ways to translate `SeqFeature`s into dict-shape for UI consumers.
+
+### Silent-mutation repair of internal BsaI / Esp3I sites
+
+`DomesticatorModal` carries a codon-table picker (`#dom-codon-row` → `#dom-codon-label` + `#btn-dom-codon`) mirroring the one in `MutagenizeModal`. `on_mount` seeds `self._codon_entry` via `_codon_tables_get("83333")` (E. coli K12, the shared registry default) and `Change…` pushes `SpeciesPickerModal` with `_codon_picked` as the callback — the picker is shared across both modals so the user can add / reuse codon tables once.
+
+`_design_gb_primers(..., codon_raw=None)` accepts an optional `{codon: (aa, count)}` dict. When the insert contains an internal **BsaI (GGTCTC / GAGACC)** or **Esp3I (CGTCTC / GAGACG)** site:
+- The module-level helper `_gb_find_forbidden_hits(seq)` returns `(enzyme_name, site_found, position)` triples on both strands (module-level constant `_GB_DOMESTICATION_FORBIDDEN = {"BsaI": "GGTCTC", "Esp3I": "CGTCTC"}`).
+- If `part_type ∈ _GB_CODING_PART_TYPES` (CDS / CDS-NS / C-tag) **and** `codon_raw` is truthy **and** `len(insert) % 3 == 0`, the function translates the insert and calls `_codon_fix_sites(insert, protein, codon_raw, sites=_GB_DOMESTICATION_FORBIDDEN)` — reusing the exact helper the MutagenizeModal's harmonizer already uses. On full repair, `insert_seq` in the result is the *mutated* sequence and `mutations` is a list of `"BsaI at nt N: GGT→GGC (codon C aa A, freq=F)"` strings.
+- If the fix is partial (leftover sites overlap codons with no synonymous swap), the function returns an error dict **with the partial `mutations`** so the user sees what was repaired before giving up.
+- Non-coding parts, out-of-frame inserts, and calls without a codon table still reject with an explanatory reason — these can't be fixed synonymously, so the user must pick a different template region or redesign manually.
+
+Why both BsaI and Esp3I are forbidden at L0: Esp3I self-cuts during L0 domestication, but a surviving BsaI site would re-cut during the downstream L1 assembly. Both must be clean for the part to round-trip through Golden Braid cleanly.
+
+The mutated `insert_seq` is what the user should order as a **gBlock / synthetic fragment** — primers only change the amplicon ends, not the middle, so silent mutations inside the insert only apply if the PCR template already carries them.
+
+**Hardening (2026-04-21).** Three failure modes were tightened because "silent pass with a site still in the final insert" = wasted synthesis budget:
+
+1. **All occurrences reported.** `_gb_find_forbidden_hits` walks every match (not just the first per enzyme), so multi-site contamination surfaces completely in error messages and in the pre-fix scan.
+2. **No swap cascades.** `_codon_fix_sites` computes `_forbidden_hit_set(seq, all_forbidden)` before each candidate swap and rejects any swap whose after-set contains an entry not present in the before-set. A BsaI fix can never silently spawn an Esp3I (or the RC of either) anywhere in the sequence.
+3. **Binding-region advisory.** When a mutation lands inside the first 18–25 bp (forward binding) or last 18–25 bp (reverse binding) of the insert, `_design_gb_primers` populates `binding_region_mutations` — a list of `{text, region: "fwd"|"rev", codon_start}` dicts. The Domesticator result panel surfaces this in red so the user knows the original plasmid CANNOT be used as PCR template; they must order the mutated insert as a gBlock and PCR from that.
+
+### Primer naming + pairs list
+
+`_design_gb_primers` returns a dict with a **`pairs`** list — currently exactly one entry, shaped like the top-level result (legacy callers that read `result["fwd_full"]` directly still work since the top-level keys mirror `pairs[0]`). The list is the extensibility hook for a future SOE-PCR splitting path: when an internal Type IIS site can't be silently repaired, the insert will be split at the bad site and each sub-amplicon will contribute its own pair.
+
+`DomesticatorModal`'s **Save Primers** button writes every designed pair to `primers.json` via `_save_primers`, using the project-wide naming convention:
+
+| Primer role | Suffix | Example |
+|---|---|---|
+| Detection (diagnostic PCR) | **DET** | `myGene-DET-F` / `myGene-DET-R` |
+| Cloning (RE tails + GCGC pad) | **CLO** | `myGene-CLO-F` / `myGene-CLO-R` |
+| Golden Braid L0 Domestication | **DOM** | `myPart-DOM-1-F` / `myPart-DOM-1-R` (pair 1), `-DOM-2-F/R` (pair 2), … |
+
+Only domestication primers carry the `#` pair number, since Detection and Cloning always ship as a single pair. Dup-sequence guard: if a primer's sequence already exists in the library, that one entry is skipped (and the user is notified) — the other entries in the batch still save. `PrimerDesignScreen` uses the same suffix table for its auto-fill of the Save-Primer name inputs.
+
 ## On-disk JSON format (schema v1)
 
-All four persisted libraries (`library.json`, `parts_bin.json`, `primers.json`, `codon_tables.json`) use the envelope shape:
+All six persisted libraries (`library.json`, `parts_bin.json`, `primers.json`, `codon_tables.json`, `features.json`, `feature_colors.json`) use the envelope shape:
 
 ```json
 {"_schema_version": 1, "entries": [...]}
@@ -199,14 +269,21 @@ Originally added 2026-04-11 to protect the sacred invariants; expanded each sess
 ### Running
 
 ```bash
-python3 -m pytest -q                                # all 508 tests
+python3 -m pytest -n auto -q                        # full suite, parallel (~2 min on 8 cores)
+python3 -m pytest -q                                # full suite, serial (~7 min) — use when debugging
 python3 -m pytest tests/test_dna_sanity.py          # only biology (< 1 s)
 python3 -m pytest tests/test_invariants_hypothesis.py  # property-based fuzzing
 python3 -m pytest -k "palindrome"                   # filter by name
-python3 -m pytest -x                                # stop on first failure
+python3 -m pytest -x                                # stop on first failure (implies serial)
 ```
 
-`pyproject.toml` sets `asyncio_mode = "auto"` so async tests don't need `@pytest.mark.asyncio`. `tests/conftest.py` defines `tiny_record` / `tiny_gb_path` / `isolated_library` fixtures, and installs the **autouse** `_protect_user_data` fixture that monkeypatches `_LIBRARY_FILE`, `_PARTS_BIN_FILE`, `_PRIMERS_FILE`, `_CODON_TABLES_FILE`, `_CRASH_RECOVERY_DIR`, and their caches to tmp paths. **No test can write to real user files.**
+**Parallel runs** (`-n auto`) rely on `pytest-xdist` and the autouse
+`_protect_user_data` fixture's per-test `tmp_path` isolation. Workers share
+the module-level read-only caches (`_BUILD_SEQ_CACHE`, `_PATTERN_CACHE`,
+`_SCAN_CATALOG`) — nothing writes to them at test time. Use serial mode
+(`-x`, `--pdb`, `-s`) when you need ordered output or debugger attach.
+
+`pyproject.toml` sets `asyncio_mode = "auto"` so async tests don't need `@pytest.mark.asyncio`. `tests/conftest.py` defines `tiny_record` / `tiny_gb_path` / `isolated_library` fixtures, and installs the **autouse** `_protect_user_data` fixture that monkeypatches `_LIBRARY_FILE`, `_PARTS_BIN_FILE`, `_PRIMERS_FILE`, `_CODON_TABLES_FILE`, `_FEATURES_FILE`, `_FEATURE_COLORS_FILE`, `_CRASH_RECOVERY_DIR`, and their caches to tmp paths. **No test can write to real user files.**
 
 ### Files
 
@@ -214,17 +291,18 @@ python3 -m pytest -x                                # stop on first failure
 |------|------:|--------|
 | `test_dna_sanity.py` | 74 | Sacred invariants 1–6; Type IIS cut-outside-recognition; `_translate_cds` forward & reverse |
 | `test_primers.py` | 60 | Detection / cloning / Golden Braid / generic; **wrap-region primer design** (template rotation, modular position mapping) |
-| `test_genbank_io.py` | 59 | `load_genbank` round-trip (GenBank + SnapGene `.dna`); `_save_library` / `_load_library` JSON round-trip + corruption recovery |
+| `test_genbank_io.py` | 68 | `load_genbank` round-trip (GenBank + SnapGene `.dna`); `_save_library` / `_load_library` JSON round-trip + corruption recovery; **`_export_fasta_to_path` atomic-write round-trip + empty-name / empty-seq rejection + overwrite + `.tmp` cleanup** |
 | `test_smoke.py` | 52 | Textual app mounts; panels present; rotation / view-toggle / RE-toggle; pLannotate UI + re-entry guard; `_apply_record` semantics; sidebar wrap-coord display; undo snapshot independence; **per-plasmid undo stashes + LRU eviction**; **crash-recovery autosave** |
 | `test_mutagenize.py` | 49 | SOE-PCR primer design, codon substitution, `_mut_revcomp` / translate / CAI round-trips |
 | `test_codon.py` | 42 | Codon registry persistence, harmonization, Kazusa parser, NCBI taxid XML safety, CAI/GC math |
-| `test_domesticator.py` | 41 | Golden Braid L0 positions / overhangs, part validation, assembly lanes |
+| `test_domesticator.py` | 193 | Golden Braid L0 positions / overhangs, part validation, assembly lanes; **Parts Bin 4-source picker (2026-04-20)**: RadioSet layout + `display`-based panel swap, Direct Input cleaning / Feature Library lookup / Feature-from-Plasmid lookup / **Open-FASTA** paths in `_resolve_source`, `_feats_for_domesticator` flattens compound wraps and drops `source`/resite/recut/zero-width, `PlasmidPickerModal` swap refreshes the feature Select via `set_options`; **horizontal-radio layout regression guards** (same y-coord, no vertical scrollbar, modal fits 90-col terminal); **FASTA picker** (`_is_fasta_path` extension matrix, `_parse_fasta_single` happy / **multi-record reject** / error paths, `_FastaAwareDirectoryTree` paints `.fa/.fasta/.fna/...` lime green and others white); **Parts Bin Export-FASTA button** (present, pushes `FastaExportModal` for user part, warns for built-in catalog rows); **Cloning simulator** (`_PUPD2_BACKBONE_STUB` deterministic + free of BsaI/BsmBI sites on both strands, `_simulate_primed_amplicon` digest-carves back to `oh5+insert+oh3`, `_simulate_cloned_plasmid` yields `oh5+insert+oh3+backbone`); **Parts Bin sequence TextArea + 3 Copy buttons** (Raw / Primed / Cloned via OSC 52, fallback when `primed_seq`/`cloned_seq` missing on legacy parts, warn on built-in catalog rows); **Silent-mutation repair of internal BsaI / Esp3I sites** (coding CDS/CDS-NS/C-tag route through `_codon_fix_sites` via shared codon registry; non-coding parts + out-of-frame inserts + missing codon table still reject; `DomesticatorModal` codon-picker UI defaults to E. coli K12, threads `self._codon_entry['raw']` into `_design_gb_primers`); **Save Primers to Library (2026-04-21)**: `_design_gb_primers` now returns a `pairs` list (1 entry currently, extensible for future SOE-PCR splitting) with top-level keys mirroring `pairs[0]` for back-compat; `DomesticatorModal` "Save Primers" button persists each pair as `{partName}-DOM-{n}-F/R` via `_save_primers` with dup-sequence guard; `PrimerDesignScreen` goldenbraid mode now uses DOM suffix (vs CLO for cloning / DET for detection); **Multi-site / cascade hardening (2026-04-21)**: `_gb_find_forbidden_hits` reports EVERY occurrence (not just first per enzyme) so multi-site contamination can't slip past the error path; `_codon_fix_sites` swap loop rejects any candidate that would introduce a new forbidden pattern anywhere (before/after hit-set cross-check via `_forbidden_hit_set`), preventing cascade failures where fixing BsaI accidentally spawns Esp3I; `binding_region_mutations` flags silent mutations that land inside the 5′ or 3′ primer binding windows so the user knows they must order the mutated insert as a gBlock and cannot PCR from the original template; edge-case coverage includes multi-BsaI, multi-Esp3I, mixed enzymes, reverse-strand (GAGACC / GAGACG), sites at 5′ / 3′ / interior, and cascade-prevention probes |
 | `test_circular_math.py` | 38 | Sacred invariant #5 (wrap midpoint); `_bp_in` / `_feat_len` for wrapped / non-wrapped / zero-width |
 | `test_data_safety.py` | 37 | Sacred invariant #7 (atomic saves, `.bak` recovery); **schema-envelope round-trip + legacy bare-list back-compat + future-version warning + shrink-guard counting both formats**; `features.json` redirected by `_protect_user_data`; `_protect_user_data` fixture confirmation |
 | `test_add_feature.py` | 24 | **AddFeatureModal + insert pipeline**: qualifier parsing round-trip, `_extract_feature_entries_from_record` strand/wrap handling, modal form validation (empty name / invalid bases / IUPAC), save-to-library dedup, insert-at-cursor (fwd / rev / coord shift / dirty flag) |
 | `test_plannotate.py` | 24 | Availability detection, size-cap preflight, feature merging, subprocess error paths (subprocess never actually invoked) |
-| `test_modal_boundaries.py` | 23 | **Every modal stays inside the terminal**: root-container bounds + non-scrollable descendants fit at the baseline 160×48; AddFeatureModal-specific regression guards at 160×48 / 120×40 / 100×30 (regression for 2026-04-20 textbox-offscreen bug) |
-| `test_features_library.py` | 15 | Persistent feature-library JSON round-trip, schema envelope, corruption recovery, cache invalidation, `_GENBANK_FEATURE_TYPES` curation (CDS / gene / promoter present, `source` excluded) |
+| `test_modal_boundaries.py` | 26 | **Every modal stays inside the terminal**: root-container bounds + non-scrollable descendants fit at the baseline 160×48 (covers ColorPickerModal + FastaFilePickerModal + **FastaExportModal**); AddFeatureModal-specific regression guards at 160×48 / 120×40 / 100×30 (regression for 2026-04-20 textbox-offscreen bug) |
+| `test_feature_library_screen.py` | 86 | **Features-tab workbench rework (2026-04-20)**: Menu click routes to FeatureLibraryScreen; CRUD actions (add / duplicate / remove / cycle-strand) persist via `_save_features`; **four-step strand cycle (1 → -1 → 0 → 2 → 1)**; ColorPickerModal returns expected dict shape; snippet DNA panel routes through `_build_seq_text` so `▶` / `◀` / `▒` / `◀…▶` arrows reflect strand 1 / -1 / 0 / 2; **AddFeatureModal 4-way Orientation radios** (Forward/Reverse/Arrowless/Double) with prefill+save round-trip; **Ctrl+Shift+F capture** (drag selection or highlighted feature → prefilled modal → Save → FeatureLibraryScreen); **drag-matches-feature enrichment** (exact-range drag inherits type/strand/color/qualifiers); **AddFeatureModal Color field** (prefill round-trip, Auto clears, capture threads color through); `_normalise_color_input` / `_xterm_index_to_hex` parametrized validation; expanded `ColorPickerModal` xterm-cell click + custom hex/index apply + capability warning; **drag-to-preview** (MouseDown arms `_drag_active`, MouseMove across cells repaints the big `#colorpick-preview-swatch` in real time, MouseUp disarms; non-left buttons ignored, non-grid MouseDown never arms); **Export-FASTA button** (present, pushes `FastaExportModal` threaded with selected entry, warns on empty library + empty-sequence entry) |
+| `test_features_library.py` | 29 | Persistent feature-library JSON round-trip, schema envelope, corruption recovery, cache invalidation, `_GENBANK_FEATURE_TYPES` curation (CDS / gene / promoter present, `source` excluded); **per-entry `color` field + `strand=0` round-trip**; `_load_feature_colors` / `_save_feature_colors` persistence; `_resolve_feature_color` precedence (entry → user default → `_DEFAULT_TYPE_COLORS` → palette) |
 | `test_edit_record.py` | 14 | Sacred invariant #9: wrap features survive insert/replace as CompoundLocation; fully-consumed features dropped (no 1-bp stubs) |
 | `test_invariants_hypothesis.py` | 11 | Property-based fuzzing of sacred invariants #3, #5, #8: `_rc` involution + IUPAC closure + Biopython cross-check; `_feat_len` bounds + linear/wrap formulas; `_bp_in` count matches `_feat_len`; wrap midpoint lies on arc |
 | `test_performance.py` | 9 | Budget enforcement (loose, 4–20× headroom): scan pUC19 < 30 ms, scan 10 kb < 150 ms, `_iupac_pattern` warm < 5 ms, `_rc(10 kb)` < 2 ms, `_build_seq_text(20 kb)` < 200 ms, `_BUILD_SEQ_CACHE` populated after first call |
@@ -375,7 +453,27 @@ Either direction is viable. The single-file convention and shared logging/error 
 ## For future agents
 
 1. **Read this file first.** It gives you architecture without reading 10k lines.
-2. **Run `python3 -m pytest -q`** before and after any change. 508 tests, ~95 s. Biology subset (`tests/test_dna_sanity.py`) runs in < 1 s for a fast inner loop.
+2. **Run `python3 -m pytest -n auto -q`** before and after any change. 857 tests, ~145 s on 8 cores (or ~400 s serial). Biology subset (`tests/test_dna_sanity.py`) runs in < 1 s for a fast inner loop.
+
+## FASTA export (Parts Bin + Feature Library)
+
+Both library screens carry an **Export FASTA…** button alongside the usual CRUD buttons. The button routes through `_export_fasta_to_path(name, sequence, path) -> dict` (atomic `tempfile.mkstemp` + `os.replace`; fsync best-effort; parent dirs created). The user sees `FastaExportModal`, which mirrors `ExportGenBankModal` — Input field for path, Export/Cancel buttons, inline error status. On dismiss the caller gets `{"path", "bp", "name"}` and notifies. Entries without a sequence (built-in Golden Braid catalog parts in `_GB_L0_PARTS`, or library entries with empty `sequence`) warn via `app.notify(..., severity="warning")` instead of pushing an empty modal.
+
+## Parts Bin sequence view + cloning simulator
+
+`PartsBinModal` carries a scrollable **read-only TextArea** (`#parts-seq-view`) that holds the full insert of the highlighted row. Clicking anywhere on the TextArea selects every character (`TextArea.select_all`) so single-click → Ctrl+C is enough. Built-in catalog rows (no sequence) show a placeholder message instead of looking empty.
+
+Three **Copy buttons** sit below the TextArea, all routed through `_copy_to_clipboard_osc52(text)`:
+
+| Button | Sequence copied |
+|---|---|
+| Copy Raw Sequence    | `sequence` — just the insert, no primer tails |
+| Copy Primed Sequence | `_simulate_primed_amplicon(insert, oh5, oh3)` — `pad + Esp3I + spacer + oh5 + insert + oh3 + rc(spacer+Esp3I+pad)` |
+| Copy Cloned Sequence | `_simulate_cloned_plasmid(insert, oh5, oh3)` — `oh5 + insert + oh3 + _PUPD2_BACKBONE_STUB` (circular, linearised at the 5′ overhang) |
+
+**Cloning simulator math** lives next to the `_GB_L0_ENZYME_SITE` / `_GB_SPACER` / `_GB_PAD` constants. Golden Braid splits enzymes across assembly levels: **L0 parts are domesticated with Esp3I (CGTCTC) / BsmBI**, while L1+ transcriptional units are assembled with BsaI (GGTCTC). The two have identical N(1)/N(5) geometry (→ 4-nt 5′ overhangs), so the same simulator math works for both; the constant just picks the recognition sequence. `_PUPD2_BACKBONE_STUB` is a **deterministic 420-bp ACGT placeholder** (seeded via `_build_pupd2_backbone_stub`) scrubbed of every Type IIS site on both strands — `GGTCTC`, `GAGACC` (BsaI), `CGTCTC`, `GAGACG` (Esp3I / BsmBI) — so the simulated cloned plasmid is guaranteed not to re-cut in either L0 or L1 assembly. Replace `_PUPD2_BACKBONE_STUB` with a licensed real pUPD2 sequence and no callers change.
+
+`DomesticatorModal._save` persists `primed_seq` and `cloned_seq` on the part dict alongside the raw insert and primers; the Parts Bin buttons prefer those stored values but fall back to the simulator at read time for parts saved before the simulator existed.
 3. **Check `~/.local/share/splicecraft/logs/splicecraft.log`** (or `$SPLICECRAFT_LOG`) when debugging. Every session has a unique 8-char ID.
 4. **Don't break the sacred invariants.** Each has a test (see mapping table). If you touch `_scan_restriction_sites`, `_rc`, `_iupac_pattern`, `_translate_cds`, `_bp_in`, `_feat_len`, the midpoint formula, or `_rebuild_record_with_edit`, the relevant tests will tell you immediately.
 5. **Follow the error-handling convention**: `_log.exception` for stack traces, `notify()` or `Static.update("[red]...[/]")` for the user. Narrow `except` types. Never let raw tracebacks hit the TUI.

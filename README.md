@@ -83,8 +83,10 @@ Installation section below).
   a selected region, 450-550 bp product by default (configurable)
 - **Cloning primers** — RE-site tails + GCGC padding; 30+ common enzymes or
   type a custom recognition sequence
-- **Golden Braid primers** — BsaI domestication for all L0 positions
-  (Promoter, 5' UTR, CDS, CDS-NS, C-tag, Terminator)
+- **Golden Braid primers** — Esp3I / BsmBI domestication for all L0
+  positions (Promoter, 5' UTR, CDS, CDS-NS, C-tag, Terminator). Splitting
+  L0 (Esp3I) from L1 (BsaI) lets domesticated parts survive the L1
+  Golden Gate reaction without re-cutting.
 - **Generic primers** — simple binding primers, no tails
 - Primers can be added to the plasmid map as `primer_bind` features
 - Scrollable `TextArea` for custom sequence input; highlighted text = target
@@ -215,11 +217,13 @@ you can also still run `python3 splicecraft.py` directly.
 | `l`            | Toggle feature label connector lines   |
 | `r`            | Toggle restriction-site overlay        |
 | `f`            | Fetch a record from NCBI by accession  |
-| `o`            | Open a `.gb` file from disk            |
-| `a`            | Add current plasmid to the library     |
+| `Ctrl+O`       | Open a `.gb` file from disk            |
+| `Ctrl+Shift+A` | Add current plasmid to the library     |
 | `Shift+A`      | Annotate plasmid with pLannotate       |
-| `Shift+E`      | Enter sequence editor mode             |
-| `Shift+S`      | Save edits to file                     |
+| `Ctrl+E`       | Enter sequence editor mode             |
+| `Ctrl+S`       | Save edits to file                     |
+| `Ctrl+F`       | Add a new feature (from cursor or blank) |
+| `Ctrl+Shift+F` | Capture selection / feature → Feature library |
 | `Delete`       | Context-aware delete (feature or library entry) |
 | `Ctrl+Z`       | Undo                                   |
 | `Ctrl+Shift+Z` | Redo                                   |

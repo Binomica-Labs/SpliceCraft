@@ -771,3 +771,64 @@ class TestExportGenBankToPath:
         out = tmp_path / "my plasmids" / "some name.gb"
         sc._export_genbank_to_path(tiny_record, out)
         assert out.exists()
+
+
+class TestExportFastaToPath:
+    """`_export_fasta_to_path(name, sequence, path)` writes a minimal
+    single-record FASTA atomically, validates its inputs, and cleans up
+    after itself. Parts Bin + Feature Library both route through it."""
+
+    def test_writes_expected_fasta_text(self, tmp_path):
+        out = tmp_path / "out.fa"
+        summary = sc._export_fasta_to_path("partA", "ATGCATGC", out)
+        assert out.exists()
+        assert summary == {"path": str(out), "bp": 8, "name": "partA"}
+        assert out.read_text() == ">partA\nATGCATGC\n"
+
+    def test_sequence_is_uppercased(self, tmp_path):
+        out = tmp_path / "lower.fa"
+        sc._export_fasta_to_path("seq", "atgcatgc", out)
+        assert out.read_text().splitlines()[1] == "ATGCATGC"
+
+    def test_roundtrips_through_biopython(self, tmp_path):
+        """Anything we write must also be readable via `_parse_fasta_single`."""
+        out = tmp_path / "rt.fa"
+        sc._export_fasta_to_path("myfeat", "ACGTACGTACGT", out)
+        rid, seq = sc._parse_fasta_single(str(out))
+        assert rid == "myfeat"
+        assert seq == "ACGTACGTACGT"
+
+    def test_empty_name_rejected(self, tmp_path):
+        out = tmp_path / "out.fa"
+        with pytest.raises(ValueError, match="non-empty record name"):
+            sc._export_fasta_to_path("   ", "ATGC", out)
+        assert not out.exists()
+
+    def test_empty_sequence_rejected(self, tmp_path):
+        out = tmp_path / "out.fa"
+        with pytest.raises(ValueError, match="non-empty sequence"):
+            sc._export_fasta_to_path("name", "", out)
+        assert not out.exists()
+
+    def test_parent_dir_created(self, tmp_path):
+        out = tmp_path / "nested" / "deeper" / "out.fa"
+        sc._export_fasta_to_path("seq", "ATGC", out)
+        assert out.exists()
+
+    def test_atomic_no_leftover_tmp(self, tmp_path):
+        """No hidden `.tmp` files must linger after a successful export."""
+        out = tmp_path / "clean.fa"
+        sc._export_fasta_to_path("seq", "ATGC", out)
+        assert list(tmp_path.glob(".*.tmp")) == []
+
+    def test_overwrites_existing_file(self, tmp_path):
+        """Atomic replace — a second call clobbers the old content cleanly."""
+        out = tmp_path / "out.fa"
+        sc._export_fasta_to_path("first", "AAAA", out)
+        sc._export_fasta_to_path("second", "CCCC", out)
+        assert out.read_text() == ">second\nCCCC\n"
+
+    def test_target_path_contains_spaces(self, tmp_path):
+        out = tmp_path / "my parts" / "weird name.fa"
+        sc._export_fasta_to_path("seq", "ATGC", out)
+        assert out.exists()

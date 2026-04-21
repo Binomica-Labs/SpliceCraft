@@ -184,8 +184,8 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
 from textual.widgets import (
-    Button, DataTable, Footer, Header, Input, Label, ListItem, ListView,
-    RadioButton, RadioSet, Select, Static, TextArea,
+    Button, DataTable, DirectoryTree, Footer, Header, Input, Label, ListItem,
+    ListView, RadioButton, RadioSet, Select, Static, TextArea,
 )
 from rich.text import Text
 
@@ -1076,10 +1076,18 @@ def _render_feature_row_pair(
 
         # Dithered feature bar — medium-shade fill + directional arrowhead at
         # the feature end (strand direction preserved). 1 bp features get a
-        # triangle pointing toward the DNA row.
+        # triangle pointing toward the DNA row. strand==0 renders as an
+        # arrowless bar; strand==2 renders as a double-headed bar.
         if bar_len == 1:
             bar_str = "▲" if is_below_dna else "▼"
-        elif strand >= 0:
+        elif strand == 0:
+            bar_str = "▒" * bar_len
+        elif strand == 2:
+            head = "◀" if starts_here else "▒"
+            tail = "▶" if ends_here   else "▒"
+            middle = "▒" * max(0, bar_len - 2)
+            bar_str = head + middle + tail
+        elif strand >= 1:
             bar_str = "▒" * (bar_len - (1 if ends_here   else 0)) + ("▶" if ends_here   else "")
         else:
             bar_str = ("◀" if starts_here else "") + "▒" * (bar_len - (1 if starts_here else 0))
@@ -1794,6 +1802,55 @@ def _export_genbank_to_path(record, path) -> dict:
     )
     return {"path": str(p), "bp": len(normalized.seq),
             "features": len(normalized.features)}
+
+
+def _export_fasta_to_path(name: str, sequence: str, path) -> dict:
+    """Write `sequence` to `path` as a single-record FASTA. Atomic write.
+
+    Returns `{"path", "bp", "name"}` on success. Raises:
+      ValueError  — empty name or empty sequence.
+      OSError     — filesystem failures (write, replace, fsync).
+
+    The sequence is written on a single line (no hard-wrap at 80 chars);
+    that matches what Biopython's default SeqIO writer emits for us
+    elsewhere and keeps downstream `grep`/`awk` one-liners simple.
+    """
+    import os
+    import tempfile
+    from pathlib import Path as _Path
+
+    header = (name or "").strip()
+    seq = (sequence or "").strip().upper()
+    if not header:
+        raise ValueError("FASTA export needs a non-empty record name.")
+    if not seq:
+        raise ValueError("FASTA export needs a non-empty sequence.")
+
+    p = _Path(path).expanduser()
+    text = f">{header}\n{seq}\n"
+
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=f".{p.name}.", suffix=".tmp", dir=str(p.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, str(p))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+    _log.info("Exported FASTA to %s (%s, %d bp)", p, header, len(seq))
+    return {"path": str(p), "bp": len(seq), "name": header}
 
 
 # ── External annotation (pLannotate) ──────────────────────────────────────────
@@ -3181,7 +3238,7 @@ class SequencePanel(Widget):
 
     Click  on the sequence → place cursor + select feature at that position.
     Shift+click           → extend selection for editing.
-    Shift+E               → open insert/replace dialog at cursor / selection.
+    Ctrl+E                → open insert/replace dialog at cursor / selection.
     """
 
     DEFAULT_CSS = """
@@ -3240,7 +3297,7 @@ class SequencePanel(Widget):
 
     def compose(self) -> ComposeResult:
         yield Static(
-            " Sequence  (click: select · Shift+click: select region · Shift+E: edit)",
+            " Sequence  (click: select · Shift+click: select region · Ctrl+E: edit)",
             id="seq-hdr",
         )
         with ScrollableContainer(id="seq-scroll"):
@@ -3925,6 +3982,84 @@ class ExportGenBankModal(ModalScreen):
         self.dismiss(None)
 
 
+class FastaExportModal(ModalScreen):
+    """Prompt for a target path and write `(name, sequence)` as FASTA.
+
+    Dismisses with the summary dict from `_export_fasta_to_path`
+    (`path`, `bp`, `name`) or `None` if cancelled. Caller handles
+    the success notification.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",     "Cancel"),
+        Binding("tab",    "focus_next", "Next",   show=False),
+    ]
+
+    def __init__(self, name: str, sequence: str,
+                 default_path: str = "", subtitle: str = "") -> None:
+        super().__init__()
+        self._name = name
+        self._sequence = sequence
+        self._default_path = default_path
+        self._subtitle = subtitle
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="fasta-export-box"):
+            yield Static(" Export as FASTA ", id="fasta-export-title")
+            bp = len(self._sequence or "")
+            sub = self._subtitle or f"[{self._name}]  {bp} bp"
+            yield Label(sub)
+            yield Label("Output path (.fa / .fasta):")
+            yield Input(
+                value=self._default_path,
+                placeholder="/path/to/sequence.fa",
+                id="fasta-export-path",
+            )
+            with Horizontal(id="fasta-export-btns"):
+                yield Button("Export", id="btn-fasta-export-ok", variant="primary")
+                yield Button("Cancel", id="btn-fasta-export-cancel")
+            yield Static("", id="fasta-export-status", markup=True)
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#fasta-export-path", Input).focus()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-fasta-export-ok")
+    def _do_export(self) -> None:
+        try:
+            inp = self.query_one("#fasta-export-path", Input)
+            status = self.query_one("#fasta-export-status", Static)
+        except NoMatches:
+            return
+        path = inp.value.strip()
+        if not path:
+            status.update("[red]Enter an output path.[/red]")
+            return
+        try:
+            summary = _export_fasta_to_path(self._name, self._sequence, path)
+        except (OSError, ValueError) as exc:
+            _log.exception("FASTA export to %s failed", path)
+            status.update(f"[red]Export failed: {exc}[/red]")
+            return
+        self.dismiss(summary)
+
+    @on(Input.Submitted)
+    def _submitted(self) -> None:
+        try:
+            self.query_one("#btn-fasta-export-ok", Button).press()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-fasta-export-cancel")
+    def _cancel_btn(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ── Dropdown menu modal ────────────────────────────────────────────────────────
 
 class DropdownScreen(ModalScreen):
@@ -4076,6 +4211,11 @@ class MenuBar(Widget):
             region = item.region
             if (region.x <= event.screen_x < region.x + region.width and
                     region.y <= event.screen_y < region.y + region.height):
+                # "Features" is a direct-open workbench (no dropdown).
+                # Every other menu surfaces items via DropdownScreen.
+                if name == "Features":
+                    self.app.push_screen(FeatureLibraryScreen())
+                    break
                 x = region.x
                 y = region.y + 1
                 self.app.open_menu(name, x, y)
@@ -4143,11 +4283,107 @@ _GB_POSITIONS: dict[str, tuple[str, str, str]] = {
     "Terminator":  ("Pos 5",   "GCTT", "CGCT"),
 }
 
-# BsaI recognition + tail used for all Golden Braid domestication primers.
-# Padding bases improve BsaI digestion efficiency near DNA ends.
-_GB_BSAI_SITE = "GGTCTC"
-_GB_SPACER    = "A"           # 1 nt between recognition and the overhang
-_GB_PAD       = "GCGC"        # 4 nt of extra bases for efficient end-cutting
+# Coding-DNA part types: these are the only types where silent (synonymous)
+# codon substitution can be used to remove an internal Type IIS site during
+# domestication. Non-coding parts (promoters, UTRs, terminators) have no
+# reading frame, so internal sites must be fixed manually or by picking a
+# different template region.
+_GB_CODING_PART_TYPES: frozenset[str] = frozenset({"CDS", "CDS-NS", "C-tag"})
+
+# Type IIS recognition + tail used for all Golden Braid L0 domestication
+# primers. Golden Braid splits assembly across two enzymes: **L0 parts use
+# Esp3I / BsmBI (CGTCTC(1/5))**, while downstream L1+ transcriptional units
+# use BsaI (GGTCTC(1/5)). The two have identical N(1)/N(5) geometry (→ 4-nt
+# 5' overhangs) but different recognition sequences, so a domesticated L0
+# part survives a second round of Golden Gate in L1 without re-cutting.
+# Padding bases improve Type IIS digestion efficiency near DNA ends.
+_GB_L0_ENZYME_NAME = "Esp3I"       # Esp3I is the isoschizomer of BsmBI
+_GB_L0_ENZYME_SITE = "CGTCTC"      # recognition; rc = "GAGACG"
+_GB_SPACER         = "A"           # 1 nt between recognition and the overhang
+_GB_PAD            = "GCGC"        # 4 nt of extra bases for efficient end-cutting
+
+
+# ── Cloning simulation (Parts Bin preview) ─────────────────────────────────────
+#
+# The three "Copy …" buttons in the Parts Bin let the user grab the insert,
+# the full PCR amplicon (insert + primer tails), or the simulated cloned
+# plasmid (insert slotted into a pUPD2-shaped backbone) as plain text.
+#
+# The backbone here is a **placeholder** — not a real pUPD2 sequence. It is
+# a deterministic pseudo-random ACGT string, scrubbed of every Type IIS site
+# SpliceCraft touches (BsaI GGTCTC/GAGACC, Esp3I/BsmBI CGTCTC/GAGACG) so the
+# simulated plasmid never contains a stray recognition site that would
+# re-cut during a real assembly. Once we gain a licensed / verified pUPD2
+# sequence we can drop it in here without changing any callers.
+
+def _build_pupd2_backbone_stub(seed: int = 0xBACDBAC0, length: int = 420) -> str:
+    """Return a deterministic ACGT string, free of BsaI/Esp3I/BsmBI sites on
+    both strands, for use as a pUPD2-shaped placeholder backbone.
+
+    Deterministic because the same insert must produce the same cloned
+    sequence across sessions (otherwise the "Copy Cloned Sequence" output
+    would silently drift). Seeded with a fixed constant.
+    """
+    import random as _random_mod
+    rng = _random_mod.Random(seed)
+    bases = [rng.choice("ACGT") for _ in range(length)]
+    # Scrub both strands — the linear backbone becomes part of a circular
+    # product, so a top-strand CGTCTC (Esp3I/BsmBI) and a bottom-strand
+    # GAGACG are biologically equivalent and both must be absent.
+    forbidden = ("GGTCTC", "GAGACC", "CGTCTC", "GAGACG")
+    i = 0
+    while i <= length - 6:
+        window = "".join(bases[i:i + 6])
+        if window in forbidden:
+            # Flip the middle base to something that can't re-hit any
+            # forbidden site; ACGT minus the current base leaves 3 choices.
+            middle = i + 3
+            current = bases[middle]
+            for replacement in "ACGT":
+                if replacement != current:
+                    bases[middle] = replacement
+                    break
+            # Rewind a bit to catch any new site created at the boundary.
+            i = max(0, i - 5)
+            continue
+        i += 1
+    return "".join(bases)
+
+
+_PUPD2_BACKBONE_STUB: str = _build_pupd2_backbone_stub()
+
+
+def _simulate_primed_amplicon(insert: str, oh5: str, oh3: str) -> str:
+    """PCR amplicon top strand (5'→3'), as it would run on a pre-digest gel.
+
+    Structure:  [pad] [Esp3I] [spacer] [oh5] [insert] [oh3] [rc(spacer)]
+                [rc(Esp3I)] [rc(pad)]
+
+    Matches the primer geometry in `_design_gb_primers`: the forward primer
+    is ``pad + Esp3I + spacer + oh5 + binding`` and the reverse primer is
+    ``pad + Esp3I + spacer + rc(oh3) + rc(binding)``. The amplicon is the
+    fusion of forward primer + interior + rev-complement of reverse primer.
+    """
+    left_tail  = _GB_PAD + _GB_L0_ENZYME_SITE + _GB_SPACER
+    right_tail = _rc(_GB_SPACER) + _rc(_GB_L0_ENZYME_SITE) + _rc(_GB_PAD)
+    return left_tail + oh5 + insert + oh3 + right_tail
+
+
+def _simulate_cloned_plasmid(insert: str, oh5: str, oh3: str) -> str:
+    """Simulated cloned circular plasmid, linearised at the 5' overhang.
+
+    After Esp3I / BsmBI (identical N(1)/N(5) geometry to BsaI) digests
+    both the amplicon and the pUPD2 backbone, the insert fragment carries
+    `oh5…oh3` on its 4-nt sticky ends and ligates into the backbone in a
+    single orientation. The circular product, read starting at `oh5`, is:
+
+        [oh5] [insert] [oh3] [backbone_body]
+
+    The backbone here is `_PUPD2_BACKBONE_STUB` — a scrubbed placeholder
+    that contains no BsaI/Esp3I sites on either strand, so the simulated
+    plasmid is guaranteed not to re-cut in either L0 or L1 assembly.
+    """
+    return oh5 + insert + oh3 + _PUPD2_BACKBONE_STUB
 
 
 def _pick_binding_region(seq: str, target_tm: float = 60.0,
@@ -4185,27 +4421,136 @@ def _pick_binding_region(seq: str, target_tm: float = 60.0,
     return best_seq, best_tm
 
 
+_GB_DOMESTICATION_FORBIDDEN: dict[str, str] = {
+    # Esp3I self-cuts during L0 domestication; BsaI would re-cut during any
+    # downstream L1 assembly — both must be absent from the final part.
+    "BsaI":  "GGTCTC",
+    "Esp3I": "CGTCTC",
+}
+
+
+def _gb_find_forbidden_hits(seq: str) -> list[tuple[str, str, int]]:
+    """Return ``(enzyme_name, site_found, position)`` for **every** internal
+    BsaI / Esp3I recognition in *seq*, on both forward and reverse strands.
+
+    Returns every occurrence — not just the first per enzyme. Critical for
+    accurate reporting when an insert contains multiple sites: the user
+    must know about all of them before paying for a gBlock synthesis.
+    Results are sorted by position to aid downstream reporting.
+    """
+    out: list[tuple[str, str, int]] = []
+    for name, site in _GB_DOMESTICATION_FORBIDDEN.items():
+        rc = _rc(site)
+        needles = [site] if rc == site else [site, rc]
+        for needle in needles:
+            start = 0
+            while True:
+                pos = seq.find(needle, start)
+                if pos == -1:
+                    break
+                out.append((name, needle, pos))
+                start = pos + 1
+    out.sort(key=lambda t: (t[2], t[0], t[1]))
+    return out
+
+
+_CODON_FIX_POS_RE = re.compile(r"codon (\d+)")
+
+
+def _codon_fix_mutation_positions(mutations: list[str]) -> list[int]:
+    """Given the string list returned by :func:`_codon_fix_sites`, return
+    each mutation's 0-based codon-start nucleotide position in the insert.
+
+    The mutation format is fixed by ``_codon_fix_sites`` — ``(codon N …)``
+    where ``N`` is 1-based. A missing / malformed entry gets ``-1`` so
+    callers can filter without raising.
+    """
+    out: list[int] = []
+    for m in mutations:
+        match = _CODON_FIX_POS_RE.search(m) if isinstance(m, str) else None
+        if match:
+            out.append((int(match.group(1)) - 1) * 3)
+        else:
+            out.append(-1)
+    return out
+
+
+def _gb_binding_region_advisory(
+    mutations: list[str],
+    insert_len: int,
+    fwd_bind_len: int,
+    rev_bind_len: int,
+) -> list[dict]:
+    """Return one entry per mutation that lands inside a primer binding
+    window. Each entry is ``{"text", "region", "codon_start"}`` where
+    ``region`` is ``"fwd"`` or ``"rev"``. Empty list when every mutation
+    is safely inside the amplicon's interior.
+
+    Why this matters: if a mutation falls inside the 5′ or 3′ binding
+    window, the PCR primer won't bind perfectly to the user's original
+    plasmid template — they must order the *mutated* insert as a gBlock
+    and use that as the PCR template (or redesign around the site).
+    """
+    if not mutations or insert_len <= 0:
+        return []
+    positions = _codon_fix_mutation_positions(mutations)
+    fwd_hi = max(0, fwd_bind_len)             # [0, fwd_hi) covers fwd binding
+    rev_lo = insert_len - max(0, rev_bind_len)  # [rev_lo, insert_len) covers rev binding
+    out: list[dict] = []
+    for text, codon_start in zip(mutations, positions):
+        if codon_start < 0:
+            continue
+        codon_end = codon_start + 3
+        # A 3-nt codon overlaps the fwd window if any nt is in [0, fwd_hi).
+        in_fwd = codon_start < fwd_hi
+        # Overlaps the rev window if any nt is in [rev_lo, insert_len).
+        in_rev = codon_end > rev_lo
+        if in_fwd:
+            out.append({"text": text, "region": "fwd",
+                        "codon_start": codon_start})
+        if in_rev:
+            out.append({"text": text, "region": "rev",
+                        "codon_start": codon_start})
+    return out
+
+
 def _design_gb_primers(
     template_seq: str,
     start: int,
     end: int,
     part_type: str,
     target_tm: float = 60.0,
+    codon_raw: "dict | None" = None,
 ) -> dict:
     """Design Golden Braid L0 domestication primers for a template region.
 
-    The amplified product, after BsaI digestion, will carry the correct 4-nt
-    overhangs for the chosen `part_type` and slot directly into a GB L0
-    assembly.
+    The amplified product, after Esp3I / BsmBI digestion, will carry the
+    correct 4-nt overhangs for the chosen `part_type` and slot directly
+    into a GB L0 assembly. L0 uses Esp3I (CGTCTC) so the domesticated part
+    survives a downstream L1+ BsaI (GGTCTC) assembly without re-cutting.
 
     Primer structure (5'→3'):
 
-        Forward: [pad] [BsaI] [spacer] [5' overhang]    [binding →]
-        Reverse: [pad] [BsaI] [spacer] [RC 3' overhang] [← binding RC]
+        Forward: [pad] [Esp3I] [spacer] [5' overhang]    [binding →]
+        Reverse: [pad] [Esp3I] [spacer] [RC 3' overhang] [← binding RC]
+
+    When *codon_raw* (a ``{codon: (aa, count)}`` dict from the codon-table
+    registry) is supplied and *part_type* is a coding type (CDS / CDS-NS /
+    C-tag), internal BsaI or Esp3I sites are silently repaired by
+    substituting synonymous codons before the primers are designed — the
+    returned ``insert_seq`` is then the *mutated* sequence (which is what
+    the user should order as a gBlock / synthetic fragment for PCR).
+    The list of substitutions made is returned under ``mutations``.
 
     Returns a dict with keys: part_type, position, oh5, oh3, insert_seq,
     fwd_binding, rev_binding, fwd_full, rev_full, fwd_tm, rev_tm,
-    amplicon_len.
+    amplicon_len, mutations, and a ``pairs`` list. ``pairs`` holds one
+    dict per amplicon — each with ``fwd_full``, ``rev_full``, ``fwd_tm``,
+    ``rev_tm``, ``fwd_pos``, ``rev_pos``, ``fwd_binding``, ``rev_binding``,
+    ``amplicon_len``. Callers that only need the first pair can continue
+    to read the legacy top-level keys; multi-pair savers should iterate
+    ``pairs`` (future SOE-PCR splitting for non-repairable internal sites
+    will extend this list beyond one pair).
     """
     pos_label, oh5, oh3 = _GB_POSITIONS[part_type]
     total  = len(template_seq)
@@ -4219,26 +4564,74 @@ def _design_gb_primers(
             "error": f"Golden Braid region is too short ({len(insert)} bp). "
                      f"Select at least 18 bp (recommended 25+ bp for a "
                      f"robust binding region).",
+            "mutations": [],
         }
 
-    # Internal BsaI site check — a GGTCTC (or GAGACC on the bottom strand)
-    # inside the insert will be cut during domestication and fragment the
-    # part. GB L0 parts must be domesticated to remove these; catching it
-    # here lets the user pick another region or redesign their template.
-    bsai_rc  = _rc(_GB_BSAI_SITE)
-    bad_fwd  = insert.find(_GB_BSAI_SITE)
-    bad_rev  = insert.find(bsai_rc)
-    if bad_fwd != -1 or bad_rev != -1:
-        hits = []
-        if bad_fwd != -1:
-            hits.append(f"{_GB_BSAI_SITE} at +{bad_fwd + 1}")
-        if bad_rev != -1:
-            hits.append(f"{bsai_rc} at +{bad_rev + 1}")
-        return {
-            "error": f"Internal BsaI site found ({'; '.join(hits)}). "
-                     f"The part would self-digest during domestication — "
-                     f"pick a different region or silently mutate the site first.",
-        }
+    # Internal BsaI / Esp3I check. An internal Esp3I site would self-cut
+    # during L0 domestication; an internal BsaI site would survive
+    # domestication but re-cut when the part is used in a downstream L1
+    # assembly. Both must be absent from the final part. For coding parts
+    # with a codon table available, we try to repair them via synonymous
+    # codon substitution before giving up.
+    mutations: list[str] = []
+    initial_hits = _gb_find_forbidden_hits(insert)
+    if initial_hits:
+        hit_str = ", ".join(
+            f"{name} {site} at +{pos + 1}"
+            for name, site, pos in initial_hits
+        )
+        can_attempt_fix = (
+            part_type in _GB_CODING_PART_TYPES
+            and bool(codon_raw)
+            and len(insert) % 3 == 0
+        )
+        if can_attempt_fix:
+            protein = _mut_translate(insert)
+            if protein:
+                fixed_insert, mutations = _codon_fix_sites(
+                    insert, protein, codon_raw,
+                    sites=_GB_DOMESTICATION_FORBIDDEN,
+                )
+                remaining = _gb_find_forbidden_hits(fixed_insert)
+                if remaining:
+                    remain_str = ", ".join(
+                        f"{name} {site} at +{pos + 1}"
+                        for name, site, pos in remaining
+                    )
+                    return {
+                        "error": f"Internal Type IIS site(s) remain after "
+                                 f"silent-mutation attempt ({remain_str}). "
+                                 f"The sites overlap codons with no "
+                                 f"synonymous alternative in this codon "
+                                 f"table — pick a different region or "
+                                 f"redesign.",
+                        "mutations": mutations,
+                    }
+                insert = fixed_insert
+            else:
+                return {
+                    "error": f"Internal Type IIS site(s) found ({hit_str}) "
+                             f"but the insert could not be translated for "
+                             f"silent mutation — pick a different region.",
+                    "mutations": [],
+                }
+        else:
+            reasons: list[str] = []
+            if part_type not in _GB_CODING_PART_TYPES:
+                reasons.append(f"{part_type} is non-coding")
+            else:
+                if not codon_raw:
+                    reasons.append("no codon table selected")
+                if len(insert) % 3 != 0:
+                    reasons.append(f"insert length {len(insert)} bp is "
+                                   f"not a multiple of 3")
+            extra = f" ({'; '.join(reasons)})" if reasons else ""
+            return {
+                "error": f"Internal Type IIS site(s) found: {hit_str}. "
+                         f"Silent-mutation repair unavailable{extra}. "
+                         f"Pick a different region or redesign.",
+                "mutations": [],
+            }
 
     # Forward binding: first 18-25 bp of the insert
     fwd_bind, fwd_tm = _pick_binding_region(insert, target_tm)
@@ -4248,15 +4641,14 @@ def _design_gb_primers(
     rev_bind, rev_tm = _pick_binding_region(_rc(insert), target_tm)
 
     # Assemble full primers
-    fwd_tail = _GB_PAD + _GB_BSAI_SITE + _GB_SPACER + oh5
-    rev_tail = _GB_PAD + _GB_BSAI_SITE + _GB_SPACER + _rc(oh3)
+    fwd_tail = _GB_PAD + _GB_L0_ENZYME_SITE + _GB_SPACER + oh5
+    rev_tail = _GB_PAD + _GB_L0_ENZYME_SITE + _GB_SPACER + _rc(oh3)
 
     fwd_full = fwd_tail + fwd_bind
     rev_full = rev_tail + rev_bind
 
-    # Amplicon = full fwd + insert body + full rev (minus double-counted bindings)
-    amplicon_len = len(fwd_full) + (len(insert) - len(fwd_bind)) + len(rev_full) - len(rev_bind) + len(rev_bind)
-    # Simpler: amplicon = pad+bsai+spacer+oh + insert + oh_rc+spacer+bsai_rc+pad
+    # Amplicon = pad + Esp3I + spacer + oh + insert + oh_rc + spacer_rc
+    #          + Esp3I_rc + pad_rc
     amplicon_len = len(fwd_tail) + len(insert) + len(rev_tail)
 
     # Positions of the primer binding regions on the TEMPLATE (not the
@@ -4273,21 +4665,36 @@ def _design_gb_primers(
         fwd_pos = (start, start + len(fwd_bind))
         rev_pos = (end - len(rev_bind), end)
 
+    pair = {
+        "fwd_full":     fwd_full,
+        "rev_full":     rev_full,
+        "fwd_binding":  fwd_bind,
+        "rev_binding":  rev_bind,
+        "fwd_tm":       round(fwd_tm, 1),
+        "rev_tm":       round(rev_tm, 1),
+        "fwd_pos":      fwd_pos,
+        "rev_pos":      rev_pos,
+        "amplicon_len": amplicon_len,
+    }
+    # Binding-region advisory: flag any silent mutation that lands inside
+    # the forward or reverse primer binding window. When non-empty, the
+    # user must order the mutated insert as a gBlock and use that — not
+    # the original template — as the PCR template.
+    binding_region_mutations = _gb_binding_region_advisory(
+        mutations, len(insert), len(fwd_bind), len(rev_bind),
+    )
     return {
         "part_type":    part_type,
         "position":     pos_label,
         "oh5":          oh5,
         "oh3":          oh3,
         "insert_seq":   insert,
-        "fwd_binding":  fwd_bind,
-        "rev_binding":  rev_bind,
-        "fwd_full":     fwd_full,
-        "rev_full":     rev_full,
-        "fwd_tm":       round(fwd_tm, 1),
-        "rev_tm":       round(rev_tm, 1),
-        "fwd_pos":      fwd_pos,
-        "rev_pos":      rev_pos,
-        "amplicon_len": amplicon_len,
+        "mutations":    mutations,
+        "binding_region_mutations": binding_region_mutations,
+        "pairs":        [pair],
+        # Legacy top-level mirror of pairs[0] for callers (cloning simulator,
+        # PrimerDesignScreen) that don't iterate the list yet.
+        **pair,
     }
 
 
@@ -4355,7 +4762,8 @@ def _save_primers(entries: list[dict]) -> None:
 #       "name":         "lacZ-alpha",           # label for the sidebar
 #       "feature_type": "CDS",                  # INSDC feature-table type
 #       "sequence":     "ATG...TAA",            # 5'→3' forward-strand DNA
-#       "strand":       1 | -1,                 # direction when inserted
+#       "strand":       1 | -1 | 0,             # +1 forward, -1 reverse, 0 arrowless
+#       "color":        "#RRGGBB" | None,       # optional per-entry override
 #       "qualifiers":   {"gene": ["lacZ"], ...}, # GenBank-compatible qualifiers
 #       "description":  "(free text)"           # optional
 #     }
@@ -4364,9 +4772,22 @@ def _save_primers(entries: list[dict]) -> None:
 # types (see `_GENBANK_FEATURE_TYPES`). Unknown types are accepted with a
 # warning — some in-house projects use non-standard types and we shouldn't
 # block them, but the warning flags risk of downstream tool incompatibility.
+#
+# Visual styling precedence when rendering a library entry:
+#   1. entry["color"] if set (per-entry user override)
+#   2. user-edited type default from feature_colors.json
+#   3. built-in _DEFAULT_TYPE_COLORS for the feature_type
+#   4. _FEATURE_PALETTE[0] as a last-resort fallback
+# Use `_resolve_feature_color(entry)` rather than reading the field directly.
 
 _FEATURES_FILE = _DATA_DIR / "features.json"
 _features_cache: "list | None" = None
+
+# User-edited type → default color map persisted as entries of
+# {"feature_type": "<type>", "color": "#RRGGBB"}. Kept separate from the
+# entry file so the defaults survive even when the library is empty.
+_FEATURE_COLORS_FILE = _DATA_DIR / "feature_colors.json"
+_feature_colors_cache: "dict[str, str] | None" = None
 
 # Curated INSDC / GenBank feature-table types relevant to plasmid work.
 # Full spec: https://www.insdc.org/submitting-standards/feature-table/
@@ -4385,6 +4806,45 @@ _GENBANK_FEATURE_TYPES: tuple = (
     "misc_feature", "misc_recomb", "stem_loop", "variation",
 )
 
+# Built-in default color per feature type. Used when the user has not
+# customised a default in feature_colors.json. Hex strings so they render
+# identically in Rich (which accepts "#RRGGBB").
+_DEFAULT_TYPE_COLORS: dict[str, str] = {
+    "CDS":             "#FFA500",
+    "gene":            "#FFD700",
+    "mRNA":            "#FFA07A",
+    "tRNA":            "#FF69B4",
+    "rRNA":            "#FF1493",
+    "ncRNA":           "#DA70D6",
+    "misc_RNA":        "#BA55D3",
+    "promoter":        "#00CED1",
+    "terminator":      "#DC143C",
+    "RBS":             "#00FF7F",
+    "polyA_signal":    "#FF6347",
+    "regulatory":      "#7FFFD4",
+    "5'UTR":           "#87CEEB",
+    "3'UTR":           "#4682B4",
+    "intron":          "#A9A9A9",
+    "exon":            "#90EE90",
+    "operon":          "#DDA0DD",
+    "primer_bind":     "#00BFFF",
+    "protein_bind":    "#F08080",
+    "misc_binding":    "#FF8C00",
+    "repeat_region":   "#CD853F",
+    "LTR":             "#8B4513",
+    "mobile_element":  "#8B008B",
+    "rep_origin":      "#9370DB",
+    "oriT":            "#BA55D3",
+    "sig_peptide":     "#ADFF2F",
+    "mat_peptide":     "#9ACD32",
+    "transit_peptide": "#7CFC00",
+    "propeptide":      "#6B8E23",
+    "misc_feature":    "#20B2AA",
+    "misc_recomb":     "#48D1CC",
+    "stem_loop":       "#FF4500",
+    "variation":       "#800080",
+}
+
 
 def _load_features() -> list[dict]:
     global _features_cache
@@ -4402,6 +4862,78 @@ def _save_features(entries: list[dict]) -> None:
     global _features_cache
     _safe_save_json(_FEATURES_FILE, entries, "Feature library")
     _features_cache = list(entries)
+
+
+def _load_feature_colors() -> dict[str, str]:
+    """Return the user's customised type → color map. Missing file / empty
+    entries → empty dict. Callers should combine this with
+    ``_DEFAULT_TYPE_COLORS`` — that precedence is handled by
+    ``_resolve_feature_color``."""
+    global _feature_colors_cache
+    if _feature_colors_cache is not None:
+        return dict(_feature_colors_cache)
+    entries, warning = _safe_load_json(_FEATURE_COLORS_FILE, "Feature colors")
+    if warning:
+        _log.warning(warning)
+    result: dict[str, str] = {}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        ft  = e.get("feature_type")
+        col = e.get("color")
+        if isinstance(ft, str) and ft and isinstance(col, str) and col:
+            result[ft] = col
+    _feature_colors_cache = dict(result)
+    return dict(_feature_colors_cache)
+
+
+def _save_feature_colors(mapping: dict[str, str]) -> None:
+    """Persist the type → color map. Written as a list of ``{"feature_type":
+    ..., "color": ...}`` dicts so it shares the schema-envelope shape with
+    the other libraries (sacred invariant #7)."""
+    global _feature_colors_cache
+    entries = [{"feature_type": ft, "color": col}
+               for ft, col in mapping.items()]
+    _safe_save_json(_FEATURE_COLORS_FILE, entries, "Feature colors")
+    _feature_colors_cache = dict(mapping)
+
+
+def _resolve_feature_color(entry: dict) -> str:
+    """Effective render color for a library entry. Never returns an empty
+    string — falls back through entry override → user default → built-in
+    default → palette[0]. Always produces something Rich will parse.
+
+    Palette values that use ``color(N)`` syntax are safe inside Rich
+    Style.parse but blow up Rich's markup lexer when rewrapped as
+    ``[color(N)]...[/]``. Normalise them to their hex equivalent before
+    returning so every downstream caller can use plain markup templating.
+    """
+    col = entry.get("color") if isinstance(entry, dict) else None
+    if isinstance(col, str) and col:
+        return _markup_safe_color(col)
+    ft = entry.get("feature_type", "") if isinstance(entry, dict) else ""
+    user_defaults = _load_feature_colors()
+    if ft in user_defaults:
+        return _markup_safe_color(user_defaults[ft])
+    if ft in _DEFAULT_TYPE_COLORS:
+        return _markup_safe_color(_DEFAULT_TYPE_COLORS[ft])
+    return _markup_safe_color(_FEATURE_PALETTE[0])
+
+
+def _markup_safe_color(col: str) -> str:
+    """Return ``col`` unchanged if it's already safe for Rich markup (hex,
+    named color, or ``rgb(r,g,b)``). Palette-style ``color(N)`` values
+    are converted to hex via :func:`_normalise_color_input` because the
+    parens collide with Rich's ``[...]`` lexer. Falls back to returning
+    the raw string if normalisation fails — better to render something
+    than to crash the preview."""
+    if not isinstance(col, str) or not col:
+        return col
+    if col.startswith("color("):
+        canon = _normalise_color_input(col)
+        if canon:
+            return canon
+    return col
 
 
 def _parse_qualifier_string(raw: str) -> dict[str, list[str]]:
@@ -4972,11 +5504,43 @@ def _codon_harmonize(protein: str, raw: dict) -> str:
     return "".join(codon_at) + "TAA"
 
 
+def _forbidden_hit_set(seq: str, patterns) -> set[tuple[str, int]]:
+    """Return ``{(pattern, position)}`` for every occurrence of every
+    pattern in *seq*. Codon swaps are 3→3 bases so positions are stable
+    under the swap, which lets us compare before/after hit sets directly."""
+    out: set[tuple[str, int]] = set()
+    for p in patterns:
+        start = 0
+        while True:
+            i = seq.find(p, start)
+            if i == -1:
+                break
+            out.add((p, i))
+            start = i + 1
+    return out
+
+
 def _codon_fix_sites(dna: str, protein: str, raw: dict,
                      sites: "dict | None" = None) -> tuple:
     """Substitute synonymous codons to remove internal restriction sites.
-    `sites` is a forward-strand {name: site} dict; reverse complements are
-    added automatically for non-palindromic sites. Returns (new_dna, fixes)."""
+
+    ``sites`` is a forward-strand ``{name: site}`` dict; reverse complements
+    are added automatically for non-palindromic sites. Returns
+    ``(new_dna, fixes)``.
+
+    Hardening (2026-04-21) — a candidate swap is accepted only if it:
+      1. Actually removes the target site at the current position, AND
+      2. Introduces **no new** forbidden site (forward or RC) anywhere
+         in the full sequence — counted against the full input site set,
+         not just the enzyme currently being iterated. This guards
+         against the classic failure mode of fixing BsaI by accidentally
+         spawning an Esp3I (or the RC of either) a few bases away.
+
+    Multiple occurrences of the same site are processed left-to-right;
+    each swap only needs to remove its own position, so repeated sites
+    of the same enzyme are handled correctly (pre-2026-04-21 the check
+    was ``site not in test`` which failed when two copies were present).
+    """
     if sites is None:
         sites = _CODON_DEFAULT_FORBIDDEN
     expanded: dict = {}
@@ -4986,6 +5550,11 @@ def _codon_fix_sites(dna: str, protein: str, raw: dict,
         rc = _mut_revcomp(site)
         if rc != site:
             expanded[f"{name}_rc"] = rc
+    # Flat tuple of every forbidden pattern (forward + RC). Used by the
+    # per-swap cross-check to veto swaps that would introduce a NEW
+    # pattern anywhere (different enzyme, different strand, different
+    # position — the check is global).
+    all_forbidden = tuple(expanded.values())
     aa_codons, _ = _codon_build_aa_map(raw)
     dna_list = list(dna)
     fixes: list[str] = []
@@ -4999,6 +5568,7 @@ def _codon_fix_sites(dna: str, protein: str, raw: dict,
             fixed = False
             lo_codon = max(0, (idx // 3) - 1)
             hi_codon = (idx + len(site)) // 3 + 2
+            before_hits = _forbidden_hit_set(seq, all_forbidden)
             for codon_idx in range(lo_codon, hi_codon):
                 codon_start = codon_idx * 3
                 if codon_start + 3 > len(dna_list) - 3:  # skip stop codon
@@ -5012,16 +5582,25 @@ def _codon_fix_sites(dna: str, protein: str, raw: dict,
                         continue
                     test = dna_list[:]
                     test[codon_start:codon_start + 3] = list(alt)
-                    if site not in "".join(test):
-                        dna_list = test
-                        strand = " (rc)" if enzyme.endswith("_rc") else ""
-                        fixes.append(
-                            f"{enzyme.replace('_rc', '')}{strand} at nt {idx+1}: "
-                            f"{current}→{alt} (codon {codon_idx+1} {aa}, "
-                            f"freq={frac:.3f})"
-                        )
-                        fixed = True
-                        break
+                    test_seq = "".join(test)
+                    after_hits = _forbidden_hit_set(test_seq, all_forbidden)
+                    # (1) Target site at idx must be gone.
+                    if (site, idx) in after_hits:
+                        continue
+                    # (2) No new forbidden hit appears anywhere.
+                    #     (Existing hits elsewhere are fine — later
+                    #     iterations of this loop will process them.)
+                    if after_hits - before_hits:
+                        continue
+                    dna_list = test
+                    strand = " (rc)" if enzyme.endswith("_rc") else ""
+                    fixes.append(
+                        f"{enzyme.replace('_rc', '')}{strand} at nt {idx+1}: "
+                        f"{current}→{alt} (codon {codon_idx+1} {aa}, "
+                        f"freq={frac:.3f})"
+                    )
+                    fixed = True
+                    break
                 if fixed:
                     break
             if not fixed:
@@ -5927,6 +6506,8 @@ class AddFeatureModal(ModalScreen):
         super().__init__()
         self._prefill = dict(prefill) if prefill else {}
         self._have_cursor = have_cursor
+        # Current color override for this entry. None = Auto (type default).
+        self._color: "str | None" = self._prefill.get("color") or None
 
     def compose(self) -> ComposeResult:
         p = self._prefill
@@ -5954,14 +6535,26 @@ class AddFeatureModal(ModalScreen):
                         yield Select(type_options, value=feat_type,
                                      id="addfeat-type", allow_blank=False)
                     with Vertical(id="addfeat-strand-col"):
-                        yield Label("Strand:")
+                        yield Label("Orientation:")
                         with RadioSet(id="addfeat-strand"):
-                            yield RadioButton("Forward (+)",
-                                              value=(strand != -1),
+                            yield RadioButton("Forward (▶)",
+                                              value=(strand == 1),
                                               id="addfeat-strand-fwd")
-                            yield RadioButton("Reverse (−)",
+                            yield RadioButton("Reverse (◀)",
                                               value=(strand == -1),
                                               id="addfeat-strand-rev")
+                            yield RadioButton("Arrowless (▒)",
+                                              value=(strand == 0),
+                                              id="addfeat-strand-none")
+                            yield RadioButton("Double (◀▶)",
+                                              value=(strand == 2),
+                                              id="addfeat-strand-both")
+
+                with Horizontal(id="addfeat-color-row"):
+                    yield Label("Color:", id="addfeat-color-label")
+                    yield Static("", id="addfeat-color-swatch", markup=True)
+                    yield Button("Pick Color…", id="btn-addfeat-color")
+                    yield Button("Auto",        id="btn-addfeat-color-clear")
 
                 yield Label("Sequence  (5'→3', ACGT/IUPAC; whitespace ignored):")
                 yield TextArea(sequence, id="addfeat-seq")
@@ -5990,8 +6583,46 @@ class AddFeatureModal(ModalScreen):
             self.query_one("#addfeat-name", Input).focus()
         except NoMatches:
             pass
+        self._refresh_color_swatch()
 
     # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _current_feature_type(self) -> str:
+        """Read the feature-type Select, falling back to the prefill's type
+        (or 'misc_feature') if the Select isn't mounted yet. Used so the
+        ColorPicker knows which type's default color to show in the preview."""
+        try:
+            val = self.query_one("#addfeat-type", Select).value
+            if isinstance(val, str) and val and val != Select.BLANK:
+                return val
+        except NoMatches:
+            pass
+        return self._prefill.get("feature_type", "misc_feature") or "misc_feature"
+
+    def _refresh_color_swatch(self) -> None:
+        """Repaint the color preview after _color changes. Always resolves
+        through the same precedence chain used at render time, so Auto shows
+        the effective default (not an empty box).
+
+        Uses ``Text.append`` rather than markup-string interpolation so
+        palette colors like ``color(39)`` render safely — Rich's Style
+        parser accepts them, but its markup lexer chokes on the parens
+        inside ``[color(39)]...[/]``.
+        """
+        try:
+            swatch = self.query_one("#addfeat-color-swatch", Static)
+        except NoMatches:
+            return
+        ftype = self._current_feature_type()
+        synth = {"feature_type": ftype, "color": self._color}
+        resolved = _resolve_feature_color(synth)
+        t = Text()
+        t.append("███ ", style=resolved)
+        if self._color:
+            t.append(resolved)
+        else:
+            t.append(f"Auto → {resolved}", style="dim")
+        swatch.update(t)
 
     def _gather(self) -> "dict | None":
         """Read form → entry dict, or write a red error and return None."""
@@ -6001,7 +6632,10 @@ class AddFeatureModal(ModalScreen):
             seqraw = self.query_one("#addfeat-seq",   TextArea).text
             quals  = self.query_one("#addfeat-quals", Input).value
             desc   = self.query_one("#addfeat-desc",  Input).value.strip()
-            fwd_rb = self.query_one("#addfeat-strand-fwd", RadioButton)
+            fwd_rb  = self.query_one("#addfeat-strand-fwd",  RadioButton)
+            rev_rb  = self.query_one("#addfeat-strand-rev",  RadioButton)
+            none_rb = self.query_one("#addfeat-strand-none", RadioButton)
+            both_rb = self.query_one("#addfeat-strand-both", RadioButton)
         except NoMatches:
             return None
         status = self.query_one("#addfeat-status", Static)
@@ -6024,12 +6658,16 @@ class AddFeatureModal(ModalScreen):
         if ftype is None or ftype == Select.BLANK:
             status.update("[red]Choose a feature type.[/red]")
             return None
-        strand = 1 if fwd_rb.value else -1
+        if   rev_rb.value:  strand = -1
+        elif none_rb.value: strand = 0
+        elif both_rb.value: strand = 2
+        else:               strand = 1   # forward (default)
         return {
             "name":         name,
             "feature_type": str(ftype),
             "sequence":     seq_clean,
             "strand":       strand,
+            "color":        self._color,
             "qualifiers":   _parse_qualifier_string(quals),
             "description":  desc,
         }
@@ -6053,6 +6691,40 @@ class AddFeatureModal(ModalScreen):
     @on(Button.Pressed, "#btn-addfeat-cancel")
     def _cancel_btn(self, _) -> None:
         self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-addfeat-color")
+    def _open_color_picker(self, _) -> None:
+        """Push ColorPickerModal; the dismiss payload updates self._color."""
+        ftype = self._current_feature_type()
+
+        def _on_color(result) -> None:
+            if not isinstance(result, dict):
+                return
+            new_col = result.get("color")
+            self._color = new_col if isinstance(new_col, str) and new_col else None
+            if result.get("set_default") and isinstance(new_col, str) and new_col:
+                defaults = _load_feature_colors()
+                defaults[ftype] = new_col
+                try:
+                    _save_feature_colors(defaults)
+                except (OSError, ValueError) as exc:
+                    _log.exception("Saving type-default color failed")
+                    self.notify(f"Saving default failed: {exc}",
+                                severity="error")
+            self._refresh_color_swatch()
+
+        self.app.push_screen(ColorPickerModal(ftype, self._color),
+                             callback=_on_color)
+
+    @on(Button.Pressed, "#btn-addfeat-color-clear")
+    def _clear_color(self, _) -> None:
+        self._color = None
+        self._refresh_color_swatch()
+
+    @on(Select.Changed, "#addfeat-type")
+    def _type_changed(self, _) -> None:
+        # Auto-mode swatch tracks the effective default for the chosen type.
+        self._refresh_color_swatch()
 
     @on(Button.Pressed, "#btn-addfeat-import")
     def _import(self, _) -> None:
@@ -6117,8 +6789,10 @@ class AddFeatureModal(ModalScreen):
             seq_ta   = self.query_one("#addfeat-seq", TextArea)
             quals_in = self.query_one("#addfeat-quals", Input)
             desc_in  = self.query_one("#addfeat-desc", Input)
-            fwd_rb   = self.query_one("#addfeat-strand-fwd", RadioButton)
-            rev_rb   = self.query_one("#addfeat-strand-rev", RadioButton)
+            fwd_rb   = self.query_one("#addfeat-strand-fwd",  RadioButton)
+            rev_rb   = self.query_one("#addfeat-strand-rev",  RadioButton)
+            none_rb  = self.query_one("#addfeat-strand-none", RadioButton)
+            both_rb  = self.query_one("#addfeat-strand-both", RadioButton)
             status   = self.query_one("#addfeat-status", Static)
         except NoMatches:
             return
@@ -6135,9 +6809,14 @@ class AddFeatureModal(ModalScreen):
         seq_ta.text = entry.get("sequence", "")
         quals_in.value = _qualifiers_to_string(entry.get("qualifiers") or {})
         desc_in.value = entry.get("description", "") or ""
-        is_rev = entry.get("strand", 1) == -1
-        fwd_rb.value = not is_rev
-        rev_rb.value = is_rev
+        strand = entry.get("strand", 1)
+        fwd_rb.value  = (strand == 1)
+        rev_rb.value  = (strand == -1)
+        none_rb.value = (strand == 0)
+        both_rb.value = (strand == 2)
+        col = entry.get("color")
+        self._color = col if isinstance(col, str) and col else None
+        self._refresh_color_swatch()
         status.update(
             f"[green]Imported '{entry.get('name', '?')}' — "
             f"review and Save or Insert.[/green]"
@@ -6145,6 +6824,819 @@ class AddFeatureModal(ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+# ── Color picker modal ────────────────────────────────────────────────────────
+
+_HEX3_RE = re.compile(r"^#[0-9A-Fa-f]{3}$")
+_HEX6_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+_XTERM_RE = re.compile(r"^(?:color\()?(\d{1,3})\)?$")
+
+
+def _normalise_color_input(raw: str) -> "str | None":
+    """Accept any of ``#RGB`` / ``#RRGGBB`` / ``0..255`` / ``color(N)`` and
+    return a canonical hex string. Returns ``None`` if the input isn't
+    parseable — callers surface a validation error.
+
+    Hex is preferred over ``color(N)`` on save because hex survives round-
+    trip through JSON unambiguously and renders identically on every
+    terminal that supports truecolor. xterm indices are converted to their
+    24-bit RGB equivalent via the standard 6×6×6 cube / grayscale ramp.
+    """
+    if not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    if _HEX6_RE.match(raw):
+        return "#" + raw[1:].upper()
+    if _HEX3_RE.match(raw):
+        r, g, b = raw[1], raw[2], raw[3]
+        return f"#{r}{r}{g}{g}{b}{b}".upper()
+    m = _XTERM_RE.match(raw)
+    if m:
+        try:
+            idx = int(m.group(1))
+        except ValueError:
+            return None
+        if 0 <= idx <= 255:
+            return _xterm_index_to_hex(idx)
+    return None
+
+
+# Standard 16 ANSI colors as rendered by most terminals. These are the only
+# colors guaranteed on an 8/16-color terminal; truecolor hex will be
+# approximated to the nearest ANSI on such terminals by Rich.
+_ANSI16_HEX: list[str] = [
+    "#000000", "#800000", "#008000", "#808000",
+    "#000080", "#800080", "#008080", "#C0C0C0",
+    "#808080", "#FF0000", "#00FF00", "#FFFF00",
+    "#0000FF", "#FF00FF", "#00FFFF", "#FFFFFF",
+]
+
+
+def _xterm_index_to_hex(idx: int) -> str:
+    """Convert an xterm-256 color index (0..255) to the closest 24-bit RGB
+    hex. Matches the xterm default palette — terminals may remap these but
+    the vast majority follow the spec. Cube levels use the canonical
+    ``[0, 95, 135, 175, 215, 255]`` ramp; grayscale uses
+    ``8 + 10 * k`` for k in 0..23."""
+    idx = max(0, min(255, int(idx)))
+    if idx < 16:
+        return _ANSI16_HEX[idx]
+    if idx < 232:
+        n = idx - 16
+        levels = (0, 95, 135, 175, 215, 255)
+        r = levels[(n // 36) % 6]
+        g = levels[(n // 6)  % 6]
+        b = levels[ n        % 6]
+        return f"#{r:02X}{g:02X}{b:02X}"
+    v = 8 + 10 * (idx - 232)
+    return f"#{v:02X}{v:02X}{v:02X}"
+
+
+class ColorPickerModal(ModalScreen):
+    """Pick a display color for a feature-library entry.
+
+    Returns via ``dismiss``:
+      * ``None`` — user cancelled.
+      * ``{"color": "#RRGGBB", "set_default": False}`` — set entry color.
+      * ``{"color": "#RRGGBB", "set_default": True}`` — also save as the
+        default for this feature type.
+      * ``{"color": None, "set_default": False}`` — clear the override and
+        fall back to the type default.
+
+    Three ways to pick a color:
+
+      1. **Curated quick-picks** — the 20-color ``_SWATCHES`` that reuse
+         the main map palette.
+      2. **xterm 256-color grid** — full 256-cell grid (16 ANSI + 216 cube
+         + 24 grayscale). Renders as tiny colored buttons; click one to
+         load into the preview.
+      3. **Custom hex / index input** — free-form ``#RGB`` / ``#RRGGBB`` /
+         ``0..255`` / ``color(N)``. Validated via ``_normalise_color_input``
+         which also converts xterm indices to their RGB equivalent so the
+         stored value is always a canonical uppercase hex string.
+
+    If the terminal only supports 8/16 colors (``console.color_system`` is
+    ``"standard"`` or ``None``), a yellow warning explains that truecolor
+    choices will be approximated. The picker still works — you just can't
+    visually distinguish similar hex colors on that terminal.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    # Curated quick-picks — hex-encoded so they round-trip through JSON.
+    _SWATCHES: list[str] = [
+        "#FF6347", "#FFA500", "#FFD700", "#FFFF00", "#ADFF2F",
+        "#7CFC00", "#00FF7F", "#00CED1", "#1E90FF", "#4169E1",
+        "#9370DB", "#BA55D3", "#FF69B4", "#FF1493", "#DC143C",
+        "#A0522D", "#CD853F", "#20B2AA", "#708090", "#2F4F4F",
+    ]
+
+    def __init__(self, feature_type: str, current_color: "str | None") -> None:
+        super().__init__()
+        self._feature_type = feature_type
+        self._current      = current_color or ""
+        self._pending:  "str | None" = current_color or None
+        self._drag_active: bool = False
+
+    def compose(self) -> ComposeResult:
+        type_default = _DEFAULT_TYPE_COLORS.get(self._feature_type, "")
+        user_default = _load_feature_colors().get(self._feature_type, "")
+        effective_default = _markup_safe_color(
+            user_default or type_default or "#808080")
+
+        with Vertical(id="colorpick-dlg"):
+            yield Static(f" Pick color for {self._feature_type} ",
+                         id="colorpick-title")
+            yield Label(
+                f"Current: {self._current or '[dim](auto — using type default)[/]'}   "
+                f"Type default: [{effective_default}]███[/]",
+                markup=True, id="colorpick-current",
+            )
+            yield Static("", id="colorpick-capability", markup=True)
+
+            with Horizontal(id="colorpick-preview-row"):
+                yield Static("", id="colorpick-preview-swatch")
+                yield Static("", id="colorpick-preview-label", markup=True)
+
+            with ScrollableContainer(id="colorpick-scroll"):
+                yield Label("Curated", classes="colorpick-section-hdr")
+                with Horizontal(id="colorpick-row"):
+                    for i, hex_col in enumerate(self._SWATCHES):
+                        yield Button("  ", id=f"colorpick-swatch-{i}",
+                                     classes="colorpick-swatch")
+
+                yield Label("xterm 256  (click any cell)",
+                            classes="colorpick-section-hdr")
+                with Vertical(id="colorpick-xterm-grid"):
+                    # 16 ANSI colors — one row
+                    with Horizontal(classes="colorpick-xterm-row"):
+                        for i in range(16):
+                            yield Button(" ", id=f"colorpick-x-{i}",
+                                         classes="colorpick-xterm-cell")
+                    # 216-color cube — 6 rows × 36 cols
+                    for row in range(6):
+                        with Horizontal(classes="colorpick-xterm-row"):
+                            for col in range(36):
+                                idx = 16 + row * 36 + col
+                                yield Button(" ", id=f"colorpick-x-{idx}",
+                                             classes="colorpick-xterm-cell")
+                    # 24-color grayscale — one row
+                    with Horizontal(classes="colorpick-xterm-row"):
+                        for i in range(232, 256):
+                            yield Button(" ", id=f"colorpick-x-{i}",
+                                         classes="colorpick-xterm-cell")
+
+                yield Label("Custom", classes="colorpick-section-hdr")
+                with Horizontal(id="colorpick-custom-row"):
+                    yield Label("Hex / xterm idx:",
+                                id="colorpick-custom-label")
+                    yield Input(
+                        value=(self._current if _HEX6_RE.match(self._current)
+                               else ""),
+                        placeholder="#FF6347, F63, 208, or color(208)",
+                        id="colorpick-hex-input",
+                    )
+                    yield Button("Apply", id="btn-colorpick-apply",
+                                 variant="primary")
+
+            yield Static("", id="colorpick-status", markup=True)
+            with Horizontal(id="colorpick-btns"):
+                yield Button("Auto (clear override)",
+                             id="btn-colorpick-auto")
+                yield Button("Save",
+                             id="btn-colorpick-save",
+                             variant="primary")
+                yield Button("Save + set as type default",
+                             id="btn-colorpick-default",
+                             variant="success")
+                yield Button("Cancel", id="btn-colorpick-cancel")
+
+    def on_mount(self) -> None:
+        # Paint curated swatches with their own background so the palette
+        # is visible at a glance.
+        for i, hex_col in enumerate(self._SWATCHES):
+            try:
+                btn = self.query_one(f"#colorpick-swatch-{i}", Button)
+            except NoMatches:
+                continue
+            btn.styles.background = hex_col
+        # Paint each xterm cell with its index's RGB value. If the terminal
+        # is 8/16-color, Rich will downsample — that's expected, and the
+        # capability warning already explains it.
+        for idx in range(256):
+            try:
+                btn = self.query_one(f"#colorpick-x-{idx}", Button)
+            except NoMatches:
+                continue
+            btn.styles.background = _xterm_index_to_hex(idx)
+        self._refresh_capability_warning()
+        self._refresh_status()
+
+    def _refresh_capability_warning(self) -> None:
+        """Warn the user if the terminal is 8/16-color — they can still
+        pick truecolor hex, it'll just be approximated to the nearest
+        ANSI when rendered."""
+        try:
+            cap = self.query_one("#colorpick-capability", Static)
+        except NoMatches:
+            return
+        try:
+            sys_name = (self.app.console.color_system or "").lower()
+        except Exception:       # noqa: BLE001
+            sys_name = ""
+        if sys_name in ("truecolor", "256"):
+            cap.update(
+                f"[dim]Terminal palette: {sys_name} — full range available.[/]"
+            )
+        else:
+            label = sys_name or "unknown / 8-color"
+            cap.update(
+                f"[yellow]Terminal palette: {label}. Truecolor choices "
+                f"will be approximated to the nearest ANSI color.[/]"
+            )
+
+    def _refresh_status(self) -> None:
+        """Repaint the big preview swatch + hex label. Called whenever
+        ``self._pending`` changes — including during a live drag across
+        xterm cells."""
+        try:
+            swatch = self.query_one("#colorpick-preview-swatch", Static)
+            label  = self.query_one("#colorpick-preview-label",  Static)
+        except NoMatches:
+            return
+        if self._pending:
+            swatch.styles.background = self._pending
+            t = Text()
+            t.append("Selected: ", style="bold")
+            t.append(self._pending, style=self._pending)
+            label.update(t)
+        else:
+            swatch.styles.background = "transparent"
+            label.update("[dim]Selected: Auto (use type default)[/]")
+
+    def _set_pending(self, value: "str | None") -> None:
+        """Central entry point for any source that changes the pending
+        color — keeps the preview swatch in lock-step and clears any
+        stale error message in #colorpick-status."""
+        if value == self._pending:
+            return
+        self._pending = value
+        self._refresh_status()
+        try:
+            self.query_one("#colorpick-status", Static).update("")
+        except NoMatches:
+            pass
+
+    def _cell_index_at(self, sx: int, sy: int) -> "int | None":
+        """Hit-test screen coords against the xterm grid. Returns the
+        xterm index (0..255) under the cursor, or ``None`` if the point
+        is outside any cell. Used by the live-drag preview so the user
+        can sweep across the grid with a held click."""
+        try:
+            widget, _ = self.get_widget_at(sx, sy)
+        except Exception:  # noqa: BLE001 — NoWidget + anything defensive
+            return None
+        btn_id = getattr(widget, "id", None) or ""
+        if not btn_id.startswith("colorpick-x-"):
+            return None
+        try:
+            idx = int(btn_id.rsplit("-", 1)[1])
+        except ValueError:
+            return None
+        if 0 <= idx <= 255:
+            return idx
+        return None
+
+    def on_mouse_down(self, event: MouseDown) -> None:
+        """Entering a drag: if the mouse-down lands on an xterm cell,
+        arm drag-mode and load that cell's color into the preview
+        immediately. Other targets are left alone so regular button
+        clicks (Save, Cancel, Apply) still work."""
+        if event.button != 1:
+            return
+        idx = self._cell_index_at(event.screen_x, event.screen_y)
+        if idx is not None:
+            self._drag_active = True
+            self._set_pending(_xterm_index_to_hex(idx))
+
+    def on_mouse_move(self, event: MouseMove) -> None:
+        """During a drag, follow the cursor across xterm cells and keep
+        the preview in sync. No effect outside of drag-mode."""
+        if not self._drag_active:
+            return
+        idx = self._cell_index_at(event.screen_x, event.screen_y)
+        if idx is not None:
+            self._set_pending(_xterm_index_to_hex(idx))
+
+    def on_mouse_up(self, event: MouseUp) -> None:
+        self._drag_active = False
+
+    @on(Button.Pressed, ".colorpick-swatch")
+    def _swatch(self, event: Button.Pressed) -> None:
+        btn_id = event.button.id or ""
+        if not btn_id.startswith("colorpick-swatch-"):
+            return
+        try:
+            idx = int(btn_id.rsplit("-", 1)[1])
+        except ValueError:
+            return
+        if 0 <= idx < len(self._SWATCHES):
+            self._set_pending(self._SWATCHES[idx])
+
+    @on(Button.Pressed, ".colorpick-xterm-cell")
+    def _xterm_cell(self, event: Button.Pressed) -> None:
+        btn_id = event.button.id or ""
+        if not btn_id.startswith("colorpick-x-"):
+            return
+        try:
+            idx = int(btn_id.rsplit("-", 1)[1])
+        except ValueError:
+            return
+        if 0 <= idx <= 255:
+            self._set_pending(_xterm_index_to_hex(idx))
+
+    @on(Button.Pressed, "#btn-colorpick-apply")
+    def _apply_custom(self, _) -> None:
+        try:
+            inp = self.query_one("#colorpick-hex-input", Input)
+            status = self.query_one("#colorpick-status", Static)
+        except NoMatches:
+            return
+        raw = inp.value.strip()
+        canonical = _normalise_color_input(raw)
+        if canonical is None:
+            status.update(
+                f"[red]Invalid color '{raw}' — use #RGB, #RRGGBB, or 0..255.[/]"
+            )
+            return
+        self._set_pending(canonical)
+
+    @on(Input.Submitted, "#colorpick-hex-input")
+    def _hex_submitted(self, _) -> None:
+        self._apply_custom(None)
+
+    @on(Button.Pressed, "#btn-colorpick-auto")
+    def _auto(self, _) -> None:
+        self._set_pending(None)
+
+    @on(Button.Pressed, "#btn-colorpick-save")
+    def _save(self, _) -> None:
+        self.dismiss({"color": self._pending, "set_default": False})
+
+    @on(Button.Pressed, "#btn-colorpick-default")
+    def _save_default(self, _) -> None:
+        if not self._pending:
+            self.query_one("#colorpick-status", Static).update(
+                "[yellow]Pick a specific color before setting as default.[/]"
+            )
+            return
+        self.dismiss({"color": self._pending, "set_default": True})
+
+    @on(Button.Pressed, "#btn-colorpick-cancel")
+    def _cancel(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── Feature library workbench (full-screen) ───────────────────────────────────
+
+class _FeatureSnippetPanel(Widget):
+    """Visualization of a single library entry: header line (name/type/
+    strand/length/color swatch), a double-stranded DNA block rendered via
+    the shared ``_build_seq_text`` pipeline (so the preview exactly matches
+    the main SequencePanel — dithered ▒ bar + directional arrowhead), and
+    a qualifiers list.
+
+    Not interactive — re-render by calling ``show(entry)``.
+    """
+
+    DEFAULT_CSS = """
+    _FeatureSnippetPanel {
+        height: 1fr;
+        overflow-y: auto;
+        padding: 1 2;
+    }
+    _FeatureSnippetPanel > #snippet-header,
+    _FeatureSnippetPanel > #snippet-quals {
+        width: 100%;
+        height: auto;
+    }
+    _FeatureSnippetPanel > #snippet-dna {
+        width: 100%;
+        height: auto;
+        margin: 1 0;
+    }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._entry: "dict | None" = None
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="snippet-header", markup=True)
+        yield Static("", id="snippet-dna", markup=False)
+        yield Static("", id="snippet-quals", markup=True)
+
+    def show(self, entry: "dict | None") -> None:
+        self._entry = entry
+        try:
+            hdr  = self.query_one("#snippet-header", Static)
+            dna  = self.query_one("#snippet-dna",    Static)
+            qual = self.query_one("#snippet-quals",  Static)
+        except NoMatches:
+            return
+        if entry is None:
+            hdr.update("[dim]Select a feature on the left to view it.[/]")
+            dna.update("")
+            qual.update("")
+            return
+        hdr.update(self._format_header(entry))
+        dna.update(self._render_dna(entry))
+        qual.update(self._format_qualifiers(entry))
+
+    @staticmethod
+    def _format_header(entry: dict) -> str:
+        name   = entry.get("name", "?") or "?"
+        ftype  = entry.get("feature_type", "?") or "?"
+        seq    = (entry.get("sequence", "") or "").upper()
+        strand = entry.get("strand", 1)
+        desc   = entry.get("description", "") or ""
+        color  = _resolve_feature_color(entry)
+        length = len(seq)
+        strand_tag = {1: "→ forward", -1: "← reverse",
+                      0: "· arrowless", 2: "↔ double"}.get(strand, "→ forward")
+        lines: list[str] = [
+            f"[bold {color}]{name}[/]   "
+            f"[dim]type:[/] [{color}]{ftype}[/]   "
+            f"[dim]strand:[/] {strand_tag}   "
+            f"[dim]length:[/] {length} bp   "
+            f"[dim]color:[/] [{color}]███[/] {color}",
+        ]
+        if desc:
+            lines.append(f"[dim]{desc}[/]")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_dna(entry: "dict") -> "Text":
+        """Build a full double-stranded DNA visualization by synthesizing a
+        single full-span feature and running it through ``_build_seq_text`` —
+        the exact same pipeline the main SequencePanel uses. The feature's
+        ``strand`` decides which arrowhead (if any) is drawn."""
+        seq = (entry.get("sequence", "") or "").upper()
+        if not seq:
+            return Text("(no sequence)", style="dim")
+        name   = entry.get("name", "") or ""
+        ftype  = entry.get("feature_type", "misc_feature") or "misc_feature"
+        strand = entry.get("strand", 1)
+        color  = _resolve_feature_color(entry)
+        synth = [{
+            "type":   ftype,
+            "start":  0,
+            "end":    len(seq),
+            "strand": strand,
+            "color":  color,
+            "label":  name,
+        }]
+        return _build_seq_text(seq, synth, line_width=60)
+
+    @staticmethod
+    def _format_qualifiers(entry: dict) -> str:
+        quals = entry.get("qualifiers") or {}
+        if not quals:
+            return "[dim]No qualifiers.[/]"
+        lines = ["[bold]Qualifiers[/]"]
+        for k in sorted(quals.keys()):
+            vals = quals.get(k) or []
+            if isinstance(vals, list):
+                val_s = "; ".join(str(v) for v in vals)
+            else:
+                val_s = str(vals)
+            lines.append(f"  [cyan]{k}[/] = {val_s}")
+        return "\n".join(lines)
+
+
+class FeatureLibraryScreen(Screen):
+    """Full-screen library browser for persistent feature entries.
+
+    Left column: DataTable listing every entry (Name / Type / Strand / bp
+    / Color swatch). Right column: ``_FeatureSnippetPanel`` visualizing the
+    selected entry. Bottom buttons handle CRUD + styling.
+
+    CRUD routes through ``_load_features`` / ``_save_features`` which
+    enforce the schema envelope (sacred invariant #7). The screen keeps a
+    live copy of the entries list (``self._entries``) and writes back on
+    every mutation; no diff tracking, no undo — adding a feature, renaming
+    it, or deleting it is a single atomic persistence write.
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("a",      "add",     "Add"),
+        Binding("r",      "rename",  "Rename"),
+        Binding("d",      "duplicate", "Duplicate"),
+        Binding("delete", "remove",  "Remove"),
+        Binding("c",      "color",   "Color"),
+        Binding("s",      "strand",  "Cycle Strand"),
+    ]
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        return True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._entries: list[dict] = list(_load_features())
+        self._selected_index: int = 0 if self._entries else -1
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="flib-box"):
+            yield Static(" Feature Library ", id="flib-title")
+            with Horizontal(id="flib-main"):
+                with Vertical(id="flib-left"):
+                    yield Static("Entries", classes="flib-section-hdr")
+                    yield DataTable(id="flib-table",
+                                    cursor_type="row", zebra_stripes=True)
+                with Vertical(id="flib-right"):
+                    yield Static("Preview", classes="flib-section-hdr")
+                    yield _FeatureSnippetPanel()
+            with Horizontal(id="flib-btns"):
+                yield Button("Add…",            id="btn-flib-add")
+                yield Button("Rename…",         id="btn-flib-rename")
+                yield Button("Duplicate",       id="btn-flib-dup")
+                yield Button("Remove",          id="btn-flib-remove",
+                             variant="error")
+                yield Button("Color…",          id="btn-flib-color")
+                yield Button("Cycle Strand",    id="btn-flib-strand")
+                yield Button("Export FASTA…",   id="btn-flib-export-fasta")
+                yield Button("Close  [Esc]",    id="btn-flib-close")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        tbl = self.query_one("#flib-table", DataTable)
+        tbl.add_columns("Name", "Type", "±", "bp", "Color")
+        self._repopulate_table()
+
+    # ── rendering ────────────────────────────────────────────────────────────
+
+    def _repopulate_table(self) -> None:
+        try:
+            tbl = self.query_one("#flib-table", DataTable)
+        except NoMatches:
+            return
+        tbl.clear(columns=False)
+        for entry in self._entries:
+            color = _resolve_feature_color(entry)
+            strand = entry.get("strand", 1)
+            strand_tag = {1: "+", -1: "−", 0: "·", 2: "↔"}.get(strand, "+")
+            bp = len((entry.get("sequence") or ""))
+            # Use Rich Text for the Color cell so the swatch actually tints
+            swatch = Text("███ ", style=color)
+            swatch.append(color, style="dim")
+            tbl.add_row(
+                entry.get("name", "?"),
+                entry.get("feature_type", "?"),
+                strand_tag,
+                str(bp),
+                swatch,
+            )
+        # Keep the selection in range.
+        if self._entries:
+            if self._selected_index < 0 or self._selected_index >= len(self._entries):
+                self._selected_index = 0
+            tbl.move_cursor(row=self._selected_index)
+        else:
+            self._selected_index = -1
+        self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        try:
+            snip = self.query_one(_FeatureSnippetPanel)
+        except NoMatches:
+            return
+        if 0 <= self._selected_index < len(self._entries):
+            snip.show(self._entries[self._selected_index])
+        else:
+            snip.show(None)
+
+    # ── events ───────────────────────────────────────────────────────────────
+
+    @on(DataTable.RowHighlighted, "#flib-table")
+    def _row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        try:
+            tbl = self.query_one("#flib-table", DataTable)
+        except NoMatches:
+            return
+        self._selected_index = tbl.cursor_row
+        self._refresh_preview()
+
+    @on(Button.Pressed, "#btn-flib-export-fasta")
+    def _export_fasta_btn(self, _) -> None: self.action_export_fasta()
+
+    def action_export_fasta(self) -> None:
+        """Export the highlighted library entry as single-record FASTA."""
+        entry = self._current()
+        if entry is None:
+            self.app.notify("Select a feature first.", severity="warning")
+            return
+        seq = entry.get("sequence") or ""
+        if not seq:
+            self.app.notify(
+                "This entry has no sequence to export.",
+                severity="warning",
+            )
+            return
+        name = entry.get("name") or "feature"
+        ftype = entry.get("feature_type") or "?"
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", name) or "feature"
+        default_path = str(Path.home() / f"{safe}.fa")
+
+        def _on_done(summary):
+            if not summary:
+                return
+            self.app.notify(
+                f"Exported '{summary['name']}' to {summary['path']} "
+                f"({summary['bp']} bp).",
+            )
+
+        self.app.push_screen(
+            FastaExportModal(
+                name=name,
+                sequence=seq,
+                default_path=default_path,
+                subtitle=f"[{name}]  [{ftype}]  {len(seq)} bp",
+            ),
+            callback=_on_done,
+        )
+
+    @on(Button.Pressed, "#btn-flib-close")
+    def _close_btn(self, _) -> None:
+        self.app.pop_screen()
+
+    def action_close(self) -> None:
+        self.app.pop_screen()
+
+    # ── persistence helpers ──────────────────────────────────────────────────
+
+    def _persist(self) -> bool:
+        """Write self._entries → features.json. Returns True on success."""
+        try:
+            _save_features(self._entries)
+        except (OSError, ValueError) as exc:
+            _log.exception("Feature library save failed")
+            self.app.notify(f"Save failed: {exc}", severity="error")
+            return False
+        return True
+
+    def _current(self) -> "dict | None":
+        if 0 <= self._selected_index < len(self._entries):
+            return self._entries[self._selected_index]
+        return None
+
+    # ── actions ──────────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-flib-add")
+    def _add_btn(self, _) -> None: self.action_add()
+
+    def action_add(self) -> None:
+        def _cb(result):
+            if not result:
+                return
+            entry = result.get("entry") if isinstance(result, dict) else None
+            if not entry:
+                return
+            # De-dup on (name, feature_type); latest write wins.
+            key = (entry.get("name"), entry.get("feature_type"))
+            self._entries = [e for e in self._entries
+                             if (e.get("name"), e.get("feature_type")) != key]
+            self._entries.append(entry)
+            if self._persist():
+                self._selected_index = len(self._entries) - 1
+                self._repopulate_table()
+                self.app.notify(f"Added '{entry.get('name')}'.")
+        self.app.push_screen(AddFeatureModal(have_cursor=False), callback=_cb)
+
+    @on(Button.Pressed, "#btn-flib-rename")
+    def _rename_btn(self, _) -> None: self.action_rename()
+
+    def action_rename(self) -> None:
+        entry = self._current()
+        if entry is None:
+            self.app.notify("Select a feature first.", severity="warning")
+            return
+        old = entry.get("name", "")
+
+        def _cb(new_name):
+            if not new_name:
+                return
+            if new_name == old:
+                return
+            entry["name"] = str(new_name)
+            if self._persist():
+                self._repopulate_table()
+                self.app.notify(f"Renamed '{old}' → '{new_name}'.")
+
+        self.app.push_screen(RenamePlasmidModal(old, ""), callback=_cb)
+
+    @on(Button.Pressed, "#btn-flib-dup")
+    def _dup_btn(self, _) -> None: self.action_duplicate()
+
+    def action_duplicate(self) -> None:
+        entry = self._current()
+        if entry is None:
+            self.app.notify("Select a feature first.", severity="warning")
+            return
+        import copy as _copy
+        dup = _copy.deepcopy(entry)
+        # Suffix a unique "(copy)" / "(copy N)" name so we don't dedup it out.
+        base = dup.get("name", "feature")
+        existing_names = {e.get("name") for e in self._entries}
+        cand = f"{base} (copy)"
+        n = 2
+        while cand in existing_names:
+            cand = f"{base} (copy {n})"
+            n += 1
+        dup["name"] = cand
+        self._entries.append(dup)
+        if self._persist():
+            self._selected_index = len(self._entries) - 1
+            self._repopulate_table()
+            self.app.notify(f"Duplicated as '{cand}'.")
+
+    @on(Button.Pressed, "#btn-flib-remove")
+    def _remove_btn(self, _) -> None: self.action_remove()
+
+    def action_remove(self) -> None:
+        entry = self._current()
+        if entry is None:
+            return
+        name = entry.get("name", "?")
+        del self._entries[self._selected_index]
+        if self._persist():
+            if self._selected_index >= len(self._entries):
+                self._selected_index = len(self._entries) - 1
+            self._repopulate_table()
+            self.app.notify(f"Removed '{name}'.")
+
+    @on(Button.Pressed, "#btn-flib-color")
+    def _color_btn(self, _) -> None: self.action_color()
+
+    def action_color(self) -> None:
+        entry = self._current()
+        if entry is None:
+            self.app.notify("Select a feature first.", severity="warning")
+            return
+        ftype = entry.get("feature_type", "")
+        current = entry.get("color")
+
+        def _cb(result):
+            if not result:
+                return
+            new_color = result.get("color")
+            set_default = bool(result.get("set_default"))
+            entry["color"] = new_color   # None → auto
+            if set_default and isinstance(new_color, str) and new_color:
+                defaults = _load_feature_colors()
+                defaults[ftype] = new_color
+                try:
+                    _save_feature_colors(defaults)
+                except (OSError, ValueError) as exc:
+                    _log.exception("Feature color default save failed")
+                    self.app.notify(f"Save default failed: {exc}",
+                                    severity="error")
+            if self._persist():
+                self._repopulate_table()
+                shown = new_color if new_color else "auto"
+                self.app.notify(f"Color set to {shown}.")
+
+        self.app.push_screen(ColorPickerModal(ftype, current), callback=_cb)
+
+    @on(Button.Pressed, "#btn-flib-strand")
+    def _strand_btn(self, _) -> None: self.action_strand()
+
+    def action_strand(self) -> None:
+        """Cycle strand direction: +1 (▶) → -1 (◀) → 0 (arrowless ▒) →
+        2 (double ◀▒▶) → +1."""
+        entry = self._current()
+        if entry is None:
+            self.app.notify("Select a feature first.", severity="warning")
+            return
+        cur = entry.get("strand", 1)
+        nxt = {1: -1, -1: 0, 0: 2, 2: 1}.get(cur, 1)
+        entry["strand"] = nxt
+        if self._persist():
+            self._repopulate_table()
+            tag = {1:  "forward (→)",
+                   -1: "reverse (←)",
+                   0:  "arrowless (·)",
+                   2:  "double (↔)"}.get(nxt, "+")
+            self.app.notify(f"Strand → {tag}.")
 
 
 # ── Parts bin modal ────────────────────────────────────────────────────────────
@@ -6172,9 +7664,23 @@ class PartsBinModal(Screen):
             yield Static(" Parts Bin  —  Golden Braid L0 Parts ", id="parts-title")
             yield DataTable(id="parts-table", cursor_type="row", zebra_stripes=True)
             yield Static("", id="parts-detail")
+            # Read-only TextArea so the full sequence is visible with a
+            # scrollbar and selectable/copyable with the standard terminal
+            # gestures (click inside to focus → Ctrl+A → Ctrl+C). Click
+            # anywhere in the area auto-selects the whole sequence so
+            # single-click → Ctrl+C is enough.
+            yield TextArea(
+                "", id="parts-seq-view",
+                read_only=True, soft_wrap=True, show_line_numbers=False,
+            )
+            with Horizontal(id="parts-copy-btns"):
+                yield Button("Copy Raw Sequence",    id="btn-parts-copy-raw")
+                yield Button("Copy Primed Sequence", id="btn-parts-copy-primed")
+                yield Button("Copy Cloned Sequence", id="btn-parts-copy-cloned")
             with Horizontal(id="parts-btns"):
-                yield Button("New Part", id="btn-new-part", variant="primary")
-                yield Button("Close",    id="btn-parts-close")
+                yield Button("New Part",       id="btn-new-part",    variant="primary")
+                yield Button("Export FASTA…",  id="btn-parts-export-fasta")
+                yield Button("Close",          id="btn-parts-close")
         yield Footer()
 
     def _all_rows(self) -> list[dict]:
@@ -6253,12 +7759,6 @@ class PartsBinModal(Screen):
         detail.append("   3′ OH: ", style="dim")
         detail.append(r["oh3"], style="bold cyan")
         detail.append(f"   Backbone: {r['backbone']}   Sel: {r['marker']}", style="dim")
-        if r["sequence"]:
-            detail.append("\n")
-            detail.append(f"Sequence ({len(r['sequence'])} bp): ", style="dim")
-            detail.append(r["sequence"][:60], style="color(252)")
-            if len(r["sequence"]) > 60:
-                detail.append("…", style="dim")
         if r["fwd_primer"]:
             detail.append("\n")
             detail.append("Fwd: ", style="dim green")
@@ -6270,10 +7770,139 @@ class PartsBinModal(Screen):
             detail.append(f"  Tm {r['rev_tm']:.1f}°C", style="dim")
         self.query_one("#parts-detail", Static).update(detail)
 
+        # Full sequence drops into the TextArea below. Built-in catalog
+        # parts have no sequence; show a friendly placeholder so the
+        # scroll area doesn't look broken.
+        seq_view = self.query_one("#parts-seq-view", TextArea)
+        if r["sequence"]:
+            header = (
+                f"> {r['name']} | {r['type']} | pos {r['position']} | "
+                f"{r['oh5']}…{r['oh3']} | {len(r['sequence'])} bp\n"
+            )
+            seq_view.text = header + r["sequence"]
+        else:
+            seq_view.text = (
+                "(Built-in catalog entry — no sequence attached. "
+                "Create a new part to see the insert, primed amplicon, "
+                "and cloned plasmid here.)"
+            )
+
+    # Clicking the sequence area primes it for copy-all: first focus it,
+    # then select every character so the user can Ctrl+C immediately.
+    @on(TextArea.SelectionChanged, "#parts-seq-view")
+    def _seq_selection_changed(self, event) -> None:
+        # No-op — Textual wants the handler registered but we drive
+        # selection explicitly via _select_sequence below. Kept to suppress
+        # "unhandled message" noise on terminals that emit it.
+        pass
+
+    def on_click(self, event) -> None:
+        """Clicking inside the read-only sequence TextArea selects the
+        entire sequence (ready for Ctrl+C). Any other click bubbles up to
+        Textual's default handlers so buttons and the table still work."""
+        try:
+            seq_view = self.query_one("#parts-seq-view", TextArea)
+        except NoMatches:
+            return
+        widget = getattr(event, "widget", None)
+        if widget is seq_view or (widget is not None and seq_view in widget.ancestors):
+            self._select_sequence_in_view(seq_view)
+
+    def _select_sequence_in_view(self, seq_view: TextArea) -> None:
+        """Select the entire TextArea content so Ctrl+C in the terminal
+        copies everything. TextArea.select_all is the supported API."""
+        try:
+            seq_view.focus()
+            seq_view.select_all()
+        except Exception:
+            _log.exception("parts-bin: failed to select sequence text")
+
+    # ── Copy helpers ──────────────────────────────────────────────────────
+
+    def _selected_user_row(self) -> dict | None:
+        """Return the currently-highlighted row IF it's a user part with a
+        sequence, else notify and return None. Built-in catalog rows
+        don't carry sequence/primer data, so every Copy action needs the
+        same guard."""
+        try:
+            t = self.query_one("#parts-table", DataTable)
+        except NoMatches:
+            return None
+        idx = t.cursor_row
+        if (idx is None or idx < 0
+                or not hasattr(self, "_rows") or idx >= len(self._rows)):
+            self.app.notify("Select a part first.", severity="warning")
+            return None
+        r = self._rows[idx]
+        if not r.get("sequence"):
+            self.app.notify(
+                "Built-in catalog parts have no sequence to copy. "
+                "Create a new part first.",
+                severity="warning",
+            )
+            return None
+        return r
+
+    def _copy_and_notify(self, text: str, label: str, bp_note: str) -> None:
+        """Push `text` to the terminal clipboard via OSC 52 and notify the
+        user. Falls back to a notification-only path if the terminal
+        refused the escape sequence."""
+        ok = _copy_to_clipboard_osc52(text)
+        if ok:
+            self.app.notify(f"Copied {label} to clipboard ({bp_note}).")
+        else:
+            self.app.notify(
+                f"Could not access clipboard — select the sequence "
+                f"panel and press Ctrl+C instead ({label}, {bp_note}).",
+                severity="warning",
+            )
+
+    @on(Button.Pressed, "#btn-parts-copy-raw")
+    def _copy_raw(self, _) -> None:
+        """Copy just the insert (raw part sequence, no primer tails)."""
+        r = self._selected_user_row()
+        if r is None:
+            return
+        seq = r["sequence"]
+        self._copy_and_notify(seq, "raw sequence", f"{len(seq)} bp")
+
+    @on(Button.Pressed, "#btn-parts-copy-primed")
+    def _copy_primed(self, _) -> None:
+        """Copy the full PCR amplicon (insert + primer tails = pad + Esp3I
+        + spacer + oh5 + insert + oh3 + rc(spacer+Esp3I+pad)).
+
+        Older saved parts may predate the simulator, so recompute on the
+        fly if `primed_seq` is missing. Parts created before the Esp3I
+        switch (v0.3.2) still carry their original BsaI-primed sequence
+        in `primed_seq` — the fallback only fires when that field is
+        absent, at which point the current L0 enzyme (Esp3I) is used."""
+        r = self._selected_user_row()
+        if r is None:
+            return
+        seq = r.get("primed_seq") or _simulate_primed_amplicon(
+            r["sequence"], r.get("oh5", ""), r.get("oh3", ""),
+        )
+        self._copy_and_notify(seq, "primed amplicon", f"{len(seq)} bp")
+
+    @on(Button.Pressed, "#btn-parts-copy-cloned")
+    def _copy_cloned(self, _) -> None:
+        """Copy the simulated cloned plasmid (insert ligated into pUPD2
+        backbone stub, linearised at the 5' overhang)."""
+        r = self._selected_user_row()
+        if r is None:
+            return
+        seq = r.get("cloned_seq") or _simulate_cloned_plasmid(
+            r["sequence"], r.get("oh5", ""), r.get("oh3", ""),
+        )
+        self._copy_and_notify(
+            seq, "cloned plasmid", f"{len(seq)} bp circular (linearised at 5′ OH)",
+        )
+
     @on(Button.Pressed, "#btn-new-part")
     def _new_part(self, _) -> None:
-        # Opens the domesticator modal. The current record's sequence is
-        # passed so the domesticator can use it as template.
+        # Opens the domesticator modal. The current record's sequence + name
+        # are passed so the "Feature from plasmid" source can default to the
+        # plasmid the user already has open.
         rec = getattr(self.app, "_current_record", None)
         seq = str(rec.seq) if rec else ""
         feats = []
@@ -6282,6 +7911,7 @@ class PartsBinModal(Screen):
             feats = pm._feats
         except NoMatches:
             pass
+        current_name = (getattr(rec, "name", "") or getattr(rec, "id", "") or "") if rec else ""
 
         def _on_result(part_dict):
             if part_dict is None:
@@ -6296,8 +7926,54 @@ class PartsBinModal(Screen):
             )
 
         self.app.push_screen(
-            DomesticatorModal(seq, feats),
+            DomesticatorModal(seq, feats, current_plasmid_name=current_name),
             callback=_on_result,
+        )
+
+    @on(Button.Pressed, "#btn-parts-export-fasta")
+    def _export_fasta(self, _) -> None:
+        """Export the highlighted row's sequence as single-record FASTA.
+
+        Built-in catalog parts have no sequence attached, so we bail
+        with a friendly notify rather than pushing an empty modal."""
+        try:
+            t = self.query_one("#parts-table", DataTable)
+        except NoMatches:
+            return
+        idx = t.cursor_row
+        if (idx is None or idx < 0
+                or not hasattr(self, "_rows") or idx >= len(self._rows)):
+            self.app.notify("Select a part first.", severity="warning")
+            return
+        r = self._rows[idx]
+        seq = r.get("sequence", "") or ""
+        if not seq:
+            self.app.notify(
+                "Built-in catalog parts have no sequence to export. "
+                "Create a new part first.",
+                severity="warning",
+            )
+            return
+        name = r.get("name", "part")
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", name) or "part"
+        default_path = str(Path.home() / f"{safe}.fa")
+
+        def _on_done(summary):
+            if not summary:
+                return
+            self.app.notify(
+                f"Exported '{summary['name']}' to {summary['path']} "
+                f"({summary['bp']} bp).",
+            )
+
+        self.app.push_screen(
+            FastaExportModal(
+                name=name,
+                sequence=seq,
+                default_path=default_path,
+                subtitle=f"[{name}]  [{r.get('type', '?')}]  {len(seq)} bp",
+            ),
+            callback=_on_done,
         )
 
     @on(Button.Pressed, "#btn-parts-close")
@@ -6308,21 +7984,236 @@ class PartsBinModal(Screen):
         self.dismiss(None)
 
 
+# ── FASTA file picker ──────────────────────────────────────────────────────────
+#
+# Used by DomesticatorModal's "Open FASTA" source. The picker is a standard
+# DirectoryTree wrapped in a modal, but with custom label rendering that
+# paints FASTA files lime green and everything else white so the user can
+# scan a mixed directory quickly. Returns an absolute path string on
+# dismiss, or None on cancel.
+
+# Lowercased extensions (including the leading dot) that count as FASTA
+# for the picker's highlight rule. Kept broad so GenBank-style FASTA
+# dumps (.fna for nucleotide, .faa for amino acid, .ffn for coding,
+# etc.) all light up.
+_FASTA_EXTS: frozenset[str] = frozenset({
+    ".fa", ".fasta", ".fna", ".ffn", ".frn", ".fas", ".mpfa", ".faa",
+})
+
+# Lime green and plain white — deliberately high contrast so the eye
+# finds FASTA files immediately in a mixed directory listing.
+_FASTA_PICKER_FASTA_STYLE = "bold #BFFF00"
+_FASTA_PICKER_OTHER_STYLE = "#FFFFFF"
+
+
+def _is_fasta_path(path) -> bool:
+    """True if ``path`` looks like a FASTA file by extension. Accepts
+    anything with a ``suffix`` attribute (``pathlib.Path`` or ``DirEntry``)
+    or a plain string."""
+    try:
+        suffix = getattr(path, "suffix", None)
+        if suffix is None:
+            suffix = Path(str(path)).suffix
+    except Exception:
+        return False
+    return suffix.lower() in _FASTA_EXTS
+
+
+def _parse_fasta_single(path: str) -> tuple[str, str]:
+    """Parse a FASTA file that must contain **exactly one** record and
+    return ``(record_id, sequence)``.
+
+    Multi-record FASTA files are rejected: the domesticator / parts bin
+    flow only makes sense for a single part, so we surface a helpful
+    error rather than silently picking the first record.
+
+    Raises ``ValueError`` with a user-friendly message on any failure
+    (read errors, zero records, multiple records, empty or non-IUPAC
+    sequence). The sequence is upper-cased on success and validated
+    against the IUPAC alphabet plus ``-``/``*``/``X`` for gap / stop /
+    unknown."""
+    from Bio import SeqIO
+    try:
+        records = list(SeqIO.parse(path, "fasta"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Failed to read FASTA: {exc}") from exc
+    if not records:
+        raise ValueError("No FASTA records found in file.")
+    if len(records) > 1:
+        raise ValueError(
+            f"Multi-sequence FASTA not supported ({len(records)} records "
+            "found). Please provide a single-record FASTA."
+        )
+    rec = records[0]
+    seq = str(rec.seq).upper()
+    if not seq:
+        raise ValueError("FASTA record has empty sequence.")
+    valid = set("ACGTURYMKSWBDHVN-X*")
+    bad = sorted(set(seq) - valid)
+    if bad:
+        raise ValueError(
+            f"Non-IUPAC characters in sequence: {''.join(bad[:8])}"
+        )
+    return (rec.id or "fasta", seq)
+
+
+class _FastaAwareDirectoryTree(DirectoryTree):
+    """DirectoryTree variant that colours FASTA files lime green and
+    every other file white. Directories are left alone so Textual's
+    default folder styling still applies."""
+
+    def render_label(self, node, base_style, style):
+        label = super().render_label(node, base_style, style)
+        data = node.data
+        if data is None:
+            return label
+        p = getattr(data, "path", None)
+        if p is None:
+            return label
+        try:
+            if not p.is_file():
+                return label
+        except OSError:
+            return label
+        styled = label.copy()
+        if _is_fasta_path(p):
+            styled.stylize(_FASTA_PICKER_FASTA_STYLE)
+        else:
+            styled.stylize(_FASTA_PICKER_OTHER_STYLE)
+        return styled
+
+
+class FastaFilePickerModal(ModalScreen):
+    """Modal file browser that returns the path to a selected FASTA file.
+
+    Dismisses with ``str`` (absolute path) on Open, or ``None`` on Cancel /
+    Escape. FASTA files are painted lime green in the tree; other files
+    are white so the user can scan a mixed directory quickly. The tree
+    starts in ``start_path`` when given (and readable), else ``$HOME``."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, start_path: "str | None" = None) -> None:
+        super().__init__()
+        start = Path(start_path).expanduser() if start_path else Path.home()
+        try:
+            if not start.is_dir():
+                start = Path.home()
+        except OSError:
+            start = Path.home()
+        self._start = str(start)
+        self._selected: "str | None" = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="fasta-box"):
+            yield Static(" Open FASTA File ", id="fasta-title")
+            yield Static(
+                f"[dim]{self._start}[/dim]", id="fasta-header", markup=True
+            )
+            yield _FastaAwareDirectoryTree(self._start, id="fasta-tree")
+            yield Static(
+                "[dim]FASTA files are highlighted in lime green. "
+                "Click a file, then Open.[/dim]",
+                id="fasta-hint", markup=True,
+            )
+            yield Static("", id="fasta-status", markup=True)
+            with Horizontal(id="fasta-btns"):
+                yield Button("Open", id="btn-fasta-open",
+                             variant="primary", disabled=True)
+                yield Button("Cancel", id="btn-fasta-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#fasta-tree", _FastaAwareDirectoryTree).focus()
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.FileSelected)
+    def _on_file_selected(self, event) -> None:
+        self._selected = str(event.path)
+        try:
+            self.query_one("#fasta-header", Static).update(
+                f"[dim]{self._selected}[/dim]"
+            )
+            self.query_one("#btn-fasta-open", Button).disabled = False
+            self.query_one("#fasta-status", Static).update("")
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-fasta-open")
+    def _open(self) -> None:
+        if self._selected:
+            self.dismiss(self._selected)
+            return
+        try:
+            self.query_one("#fasta-status", Static).update(
+                "[red]Pick a file first.[/red]"
+            )
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-fasta-cancel")
+    def _cancel_btn(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ── Constructor modal ──────────────────────────────────────────────────────────
+
+def _feats_for_domesticator(record) -> list[dict]:
+    """Parse a SeqRecord into the shape the DomesticatorModal feature picker
+    expects: ``{label, type, start, end, strand}`` per non-source feature.
+
+    Kept deliberately simpler than ``PlasmidMap._parse`` — compound/wrap
+    features are flattened to their outer bounds (the domesticator only
+    needs slice coordinates, not rendering geometry), and restriction-site
+    overlays are skipped. Features with non-integer coords or zero width
+    are dropped rather than raising."""
+    out: list[dict] = []
+    total = len(getattr(record, "seq", "") or "")
+    for feat in getattr(record, "features", []) or []:
+        if feat.type in ("source", "resite", "recut"):
+            continue
+        try:
+            start = int(feat.location.start)
+            end   = int(feat.location.end)
+        except (TypeError, ValueError):
+            continue
+        if total > 0:
+            start = max(0, min(start, total))
+            end   = max(0, min(end,   total))
+        if start == end:
+            continue
+        out.append({
+            "label":  _feat_label(feat),
+            "type":   feat.type,
+            "start":  start,
+            "end":    end,
+            "strand": getattr(feat.location, "strand", 1) or 1,
+        })
+    return out
+
 
 class DomesticatorModal(ModalScreen):
     """Golden Braid L0 Parts Domesticator.
 
     Takes a template sequence + region, designs domestication primers with
-    the correct BsaI sites + positional overhangs, and returns a part dict
-    ready for saving to the Parts Bin.
+    the correct Esp3I / BsmBI sites + positional overhangs, and returns a
+    part dict ready for saving to the Parts Bin.
 
     Primer structure (5'→3'):
-        Forward: GCGC GGTCTC A [5' overhang] [binding region →]
-        Reverse: GCGC GGTCTC A [RC 3' OH]    [← binding region RC]
+        Forward: GCGC CGTCTC A [5' overhang] [binding region →]
+        Reverse: GCGC CGTCTC A [RC 3' OH]    [← binding region RC]
 
-    After BsaI digestion the amplicon carries the correct 4-nt sticky ends
-    for Golden Braid L0 assembly.
+    After Esp3I digestion the amplicon carries the correct 4-nt sticky
+    ends for Golden Braid L0 assembly. L0 uses Esp3I (CGTCTC) so the
+    domesticated part survives the downstream L1+ BsaI (GGTCTC) assembly
+    without re-cutting.
     """
 
     BINDINGS = [
@@ -6330,22 +8221,66 @@ class DomesticatorModal(ModalScreen):
         Binding("tab",    "focus_next", "Next", show=False),
     ]
 
-    def __init__(self, template_seq: str, feats: list[dict]):
+    def __init__(self, template_seq: str, feats: list[dict],
+                 current_plasmid_name: str = ""):
         super().__init__()
         self._template = template_seq.upper()
-        self._feats    = feats   # from PlasmidMap._feats, for the feature picker
+        self._feats    = feats   # from PlasmidMap._feats (the *current* plasmid)
         self._design:  "dict | None" = None   # result of _design_gb_primers
+        # ── Source-picker state ────────────────────────────────────────────
+        # Four sources for the part's DNA:
+        #   "direct"  : user types/pastes into a TextArea
+        #   "featlib" : pick from persistent features.json (feature library)
+        #   "plasmid" : pick a plasmid, then a feature from it
+        #   "fasta"   : browse the filesystem for a FASTA file, parse first record
+        # The "plasmid" source defaults to the plasmid the user has open —
+        # swapped via the picker button if they want a library entry instead.
+        self._source: str = "direct"
+        # Plasmid-source state. `_plasmid_pick_id = None` means "use the
+        # current in-app plasmid (seq+feats passed to __init__)".
+        self._plasmid_pick_id:    "str | None"  = None
+        self._plasmid_pick_name:  str           = (
+            current_plasmid_name or ("— current plasmid —" if self._template else "")
+        )
+        self._plasmid_pick_seq:   str           = self._template
+        self._plasmid_pick_feats: list[dict]    = [
+            f for f in self._feats if f.get("type") not in ("resite", "recut")
+        ]
+        # FASTA-source state. Populated by `_on_fasta_picked` after the user
+        # picks a file in `FastaFilePickerModal`.
+        self._fasta_path: "str | None" = None
+        self._fasta_name: str           = ""
+        self._fasta_seq:  str           = ""
+        # Codon table for silent-mutation repair of internal BsaI / Esp3I
+        # sites in coding parts. Seeded to E. coli K12 in on_mount; the user
+        # can swap via the "Change…" button.
+        self._codon_entry: "dict | None" = None
+
+    # ── Option builders (used by compose + on re-pick) ─────────────────────
+
+    def _featlib_options(self) -> list[tuple[str, str]]:
+        """Build Select options for the Feature Library source. Value is the
+        integer index into ``_load_features()`` (as a str, since Select values
+        must be strings) so the design step can look the entry back up."""
+        opts: list[tuple[str, str]] = []
+        for i, e in enumerate(_load_features()):
+            name = e.get("name", "?") or "?"
+            ft   = e.get("feature_type", "misc")
+            blen = len(e.get("sequence", "") or "")
+            opts.append((f"{name}  [{ft}, {blen} bp]", str(i)))
+        return opts
+
+    def _plasmid_feat_options(self) -> list[tuple[str, str]]:
+        """Build Select options for the currently-picked plasmid's features.
+        Value is the index (as str) into ``self._plasmid_pick_feats``."""
+        opts: list[tuple[str, str]] = []
+        for i, f in enumerate(self._plasmid_pick_feats):
+            label = f.get("label") or f.get("type", "?")
+            s, e  = f.get("start", 0), f.get("end", 0)
+            opts.append((f"{label}  ({s+1}‥{e})", str(i)))
+        return opts
 
     def compose(self) -> ComposeResult:
-        # Build the feature dropdown: "(start-end) label" for each non-RE feature
-        feat_options: list[tuple[str, str]] = []
-        for f in self._feats:
-            if f.get("type") in ("resite", "recut"):
-                continue
-            label = f.get("label", f.get("type", "?"))
-            val   = f"{f['start']}-{f['end']}"
-            feat_options.append((f"{label}  ({f['start']+1}‥{f['end']})", val))
-
         # Part-type dropdown options
         type_options = [
             (f"{k}  ({v[0]}: {v[1]}→{v[2]})", k) for k, v in _GB_POSITIONS.items()
@@ -6356,38 +8291,74 @@ class DomesticatorModal(ModalScreen):
                 " Domesticate Part  —  Golden Braid L0 ",
                 id="dom-title",
             )
-            # ── Row 1: Part name + type ──
-            with Horizontal(id="dom-row1"):
-                with Vertical(id="dom-name-col"):
-                    yield Label("Part name")
-                    yield Input(placeholder="e.g. my-promoter", id="dom-name")
-                with Vertical(id="dom-type-col"):
-                    yield Label("Part type")
-                    yield Select(type_options, id="dom-type", value="CDS")
-            # ── Row 2: overhang info (auto-updated from type) ──
-            yield Static("", id="dom-oh-info", markup=True)
-            # ── Row 3: template region ──
-            with Horizontal(id="dom-region-row"):
-                with Vertical(id="dom-feat-col"):
-                    yield Label("From feature")
+            # Scrollable body — everything between title and buttons. Primer
+            # design results expand vertically, so the body needs to scroll
+            # on narrow terminals rather than overflow off-screen.
+            with ScrollableContainer(id="dom-body"):
+                # ── Row 1: Part name + type ──
+                with Horizontal(id="dom-row1"):
+                    with Vertical(id="dom-name-col"):
+                        yield Label("Part name")
+                        yield Input(placeholder="e.g. my-promoter", id="dom-name")
+                    with Vertical(id="dom-type-col"):
+                        yield Label("Part type")
+                        yield Select(type_options, id="dom-type", value="CDS")
+                # ── Row 2: overhang info (auto-updated from type) ──
+                yield Static("", id="dom-oh-info", markup=True)
+                # ── Codon table picker (for silent-mutation repair) ──
+                with Horizontal(id="dom-codon-row"):
+                    yield Static(
+                        "Codon table: [bold]E. coli K12[/bold] (taxid 83333)",
+                        id="dom-codon-label", markup=True,
+                    )
+                    yield Button("Change…", id="btn-dom-codon",
+                                 variant="default")
+                # ── Row 3: Source picker ──
+                yield Label("Source")
+                with RadioSet(id="dom-src"):
+                    yield RadioButton("Direct input",         id="dom-src-direct",  value=True)
+                    yield RadioButton("Feature library",      id="dom-src-featlib")
+                    yield RadioButton("Feature from plasmid", id="dom-src-plasmid")
+                    yield RadioButton("Open FASTA",           id="dom-src-fasta")
+                # ── Direct-input panel ──
+                with Vertical(id="dom-panel-direct", classes="dom-src-panel"):
+                    yield Label("Paste or type the part sequence (5'→3'):")
+                    yield TextArea("", id="dom-direct-seq")
+                # ── Feature-library panel ──
+                with Vertical(id="dom-panel-featlib", classes="dom-src-panel"):
+                    yield Label("Pick a feature from the feature library:")
                     yield Select(
-                        feat_options,
-                        id="dom-feat",
-                        prompt="(select feature or enter manually)",
+                        self._featlib_options(),
+                        id="dom-featlib-select",
+                        prompt="(select feature)",
                     )
-                with Vertical(id="dom-start-col"):
-                    yield Label("Start (bp)")
-                    yield Input(placeholder="1", id="dom-start", type="integer")
-                with Vertical(id="dom-end-col"):
-                    yield Label("End (bp)")
-                    yield Input(
-                        placeholder=str(len(self._template)) if self._template else "100",
-                        id="dom-end",
-                        type="integer",
+                    yield Static("", id="dom-featlib-preview", markup=True)
+                # ── Feature-from-plasmid panel ──
+                with Vertical(id="dom-panel-plasmid", classes="dom-src-panel"):
+                    with Horizontal(id="dom-plasmid-hdr"):
+                        yield Label("Plasmid:")
+                        yield Static(
+                            self._plasmid_pick_name or "(none loaded)",
+                            id="dom-plasmid-name",
+                        )
+                        yield Button("Change…", id="btn-dom-pick-plasmid")
+                    yield Label("Pick feature:")
+                    yield Select(
+                        self._plasmid_feat_options(),
+                        id="dom-plasmid-feat-select",
+                        prompt="(select feature)",
                     )
-            # ── Primer results ──
-            yield Static("", id="dom-primer-results", markup=True)
-            # ── Buttons ──
+                    yield Static("", id="dom-plasmid-feat-preview", markup=True)
+                # ── Open-FASTA panel ──
+                with Vertical(id="dom-panel-fasta", classes="dom-src-panel"):
+                    with Horizontal(id="dom-fasta-hdr"):
+                        yield Label("File:")
+                        yield Static("(no file selected)", id="dom-fasta-name")
+                        yield Button("Browse…", id="btn-dom-pick-fasta")
+                    yield Static("", id="dom-fasta-preview", markup=True)
+                # ── Primer results ──
+                yield Static("", id="dom-primer-results", markup=True)
+            # ── Buttons (pinned below scroll body so they're always reachable) ──
             with Horizontal(id="dom-btns"):
                 yield Button(
                     "Design Primers", id="btn-dom-design", variant="primary",
@@ -6396,27 +8367,207 @@ class DomesticatorModal(ModalScreen):
                     "Save to Parts Bin", id="btn-dom-save", variant="primary",
                     disabled=True,
                 )
+                yield Button(
+                    "Save Primers", id="btn-dom-save-primers",
+                    variant="primary", disabled=True,
+                )
                 yield Button("Cancel", id="btn-dom-cancel")
 
     def on_mount(self) -> None:
         self._update_oh_display()
+        self._refresh_source_panels()
+        # Seed codon table registry with the built-in E. coli K12 entry
+        # (shared with Mutagenize — registry caches across modals).
+        try:
+            _codon_tables_load()
+            self._codon_entry = _codon_tables_get("83333")
+        except Exception:
+            _log.exception("Domesticator: codon registry load failed")
+            self._codon_entry = None
+        self._update_codon_label()
         # Focus the name input
         self.query_one("#dom-name", Input).focus()
 
-    # ── Feature selection fills start/end ──────────────────────────────────
-
-    @on(Select.Changed, "#dom-feat")
-    def _feat_selected(self, event: Select.Changed) -> None:
-        val = event.value
-        if not isinstance(val, str):
+    def _update_codon_label(self) -> None:
+        try:
+            lbl = self.query_one("#dom-codon-label", Static)
+        except NoMatches:
             return
-        if "-" in val:
-            parts = val.split("-", 1)
+        entry = self._codon_entry
+        if not entry:
+            lbl.update("[red]Codon table: none selected[/red]")
+            return
+        tax = f" (taxid {entry['taxid']})" if entry.get("taxid") else ""
+        lbl.update(f"Codon table: [bold]{entry['name']}[/bold]{tax}")
+
+    @on(Button.Pressed, "#btn-dom-codon")
+    def _pick_codon_table(self, _) -> None:
+        self.app.push_screen(SpeciesPickerModal(),
+                             callback=self._codon_picked)
+
+    def _codon_picked(self, entry: "dict | None") -> None:
+        if not entry:
+            return
+        self._codon_entry = entry
+        self._update_codon_label()
+
+    # ── Source-panel visibility ────────────────────────────────────────────
+
+    def _refresh_source_panels(self) -> None:
+        """Show the panel matching ``self._source``; hide the others."""
+        panels = {
+            "direct":  "#dom-panel-direct",
+            "featlib": "#dom-panel-featlib",
+            "plasmid": "#dom-panel-plasmid",
+            "fasta":   "#dom-panel-fasta",
+        }
+        for key, sel in panels.items():
             try:
-                self.query_one("#dom-start", Input).value = str(int(parts[0]) + 1)
-                self.query_one("#dom-end",   Input).value = parts[1]
-            except ValueError:
+                self.query_one(sel).display = (key == self._source)
+            except NoMatches:
                 pass
+
+    @on(RadioSet.Changed, "#dom-src")
+    def _source_changed(self, event: RadioSet.Changed) -> None:
+        rb_id = getattr(event.pressed, "id", "") or ""
+        mapping = {
+            "dom-src-direct":  "direct",
+            "dom-src-featlib": "featlib",
+            "dom-src-plasmid": "plasmid",
+            "dom-src-fasta":   "fasta",
+        }
+        self._source = mapping.get(rb_id, "direct")
+        self._refresh_source_panels()
+        # Wipe stale primer results when the user changes source — the
+        # previously-designed primers no longer reflect what's on screen.
+        try:
+            self.query_one("#dom-primer-results", Static).update("")
+            self.query_one("#btn-dom-save", Button).disabled = True
+            self.query_one("#btn-dom-save-primers", Button).disabled = True
+        except NoMatches:
+            pass
+
+    # ── Feature-library preview ────────────────────────────────────────────
+
+    @on(Select.Changed, "#dom-featlib-select")
+    def _featlib_preview(self, event: Select.Changed) -> None:
+        val = event.value
+        preview = self.query_one("#dom-featlib-preview", Static)
+        if not isinstance(val, str) or not val.isdigit():
+            preview.update("")
+            return
+        entries = _load_features()
+        idx = int(val)
+        if idx < 0 or idx >= len(entries):
+            preview.update("")
+            return
+        e = entries[idx]
+        seq = (e.get("sequence") or "").upper()
+        strand = e.get("strand", 1)
+        head = seq[:40] + ("…" if len(seq) > 40 else "")
+        preview.update(
+            f"  [dim]{len(seq)} bp · strand {strand}[/dim]   {head}"
+        )
+
+    # ── Plasmid-source handlers ────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-dom-pick-plasmid")
+    def _pick_plasmid(self, _) -> None:
+        """Open the plasmid picker; on selection, load that plasmid's record
+        from the library, rebuild the feature dropdown, and refresh the label."""
+        def _on_picked(pid):
+            if not pid:
+                return
+            entries = _load_library()
+            match = next((e for e in entries if e.get("id") == pid), None)
+            if match is None:
+                self.app.notify(f"Plasmid '{pid}' not in library.",
+                                severity="warning")
+                return
+            try:
+                rec = _gb_text_to_record(match.get("gb_text", "") or "")
+            except Exception as exc:
+                _log.exception("Failed to parse library entry %s", pid)
+                self.app.notify(f"Failed to load '{pid}': {exc}",
+                                severity="error")
+                return
+            self._plasmid_pick_id    = pid
+            self._plasmid_pick_name  = match.get("name") or pid
+            self._plasmid_pick_seq   = str(getattr(rec, "seq", "") or "").upper()
+            self._plasmid_pick_feats = _feats_for_domesticator(rec)
+            try:
+                self.query_one("#dom-plasmid-name", Static).update(
+                    self._plasmid_pick_name
+                )
+                sel = self.query_one("#dom-plasmid-feat-select", Select)
+                sel.set_options(self._plasmid_feat_options())
+                self.query_one("#dom-plasmid-feat-preview", Static).update("")
+            except NoMatches:
+                pass
+
+        self.app.push_screen(
+            PlasmidPickerModal(current_id=self._plasmid_pick_id),
+            callback=_on_picked,
+        )
+
+    # ── FASTA-source handlers ──────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-dom-pick-fasta")
+    def _pick_fasta(self, _) -> None:
+        """Open the FASTA file picker; on selection, parse the file and
+        display a preview. The picker starts in ``$HOME`` when first opened,
+        then remembers the last picked directory via `self._fasta_path`."""
+        def _on_picked(path: "str | None") -> None:
+            if not path:
+                return
+            try:
+                name, seq = _parse_fasta_single(path)
+            except ValueError as exc:
+                self.app.notify(str(exc), severity="error")
+                return
+            self._fasta_path = path
+            self._fasta_name = name
+            self._fasta_seq  = seq
+            try:
+                display = Path(path).name or path
+                self.query_one("#dom-fasta-name", Static).update(display)
+                head = seq[:40] + ("…" if len(seq) > 40 else "")
+                self.query_one("#dom-fasta-preview", Static).update(
+                    f"  [dim]{name} · {len(seq)} bp[/dim]   {head}"
+                )
+                self.query_one("#dom-primer-results", Static).update("")
+                self.query_one("#btn-dom-save", Button).disabled = True
+            except NoMatches:
+                pass
+
+        start_dir = (
+            str(Path(self._fasta_path).parent)
+            if self._fasta_path else None
+        )
+        self.app.push_screen(
+            FastaFilePickerModal(start_path=start_dir),
+            callback=_on_picked,
+        )
+
+    @on(Select.Changed, "#dom-plasmid-feat-select")
+    def _plasmid_feat_preview(self, event: Select.Changed) -> None:
+        val = event.value
+        preview = self.query_one("#dom-plasmid-feat-preview", Static)
+        if not isinstance(val, str) or not val.isdigit():
+            preview.update("")
+            return
+        idx = int(val)
+        if idx < 0 or idx >= len(self._plasmid_pick_feats):
+            preview.update("")
+            return
+        f = self._plasmid_pick_feats[idx]
+        s, e = f.get("start", 0), f.get("end", 0)
+        total = len(self._plasmid_pick_seq)
+        blen  = _feat_len(s, e, total) if total else 0
+        preview.update(
+            f"  [dim]{f.get('type','?')} · {s+1}‥{e} · {blen} bp · "
+            f"strand {f.get('strand', 1)}[/dim]"
+        )
 
     # ── Part type changes update the overhang info ─────────────────────────
 
@@ -6435,33 +8586,72 @@ class DomesticatorModal(ModalScreen):
             f"  [dim]{pos}[/dim]   "
             f"5′ overhang: [bold cyan]{oh5}[/bold cyan]   →   "
             f"3′ overhang: [bold cyan]{oh3}[/bold cyan]   "
-            f"[dim](BsaI domestication)[/dim]"
+            f"[dim]({_GB_L0_ENZYME_NAME} domestication)[/dim]"
         )
 
     # ── Design primers ─────────────────────────────────────────────────────
 
+    def _resolve_source(self) -> "tuple[str, int, int] | str":
+        """Return ``(template, start, end)`` for the active source, or a
+        short error string describing why it can't be resolved."""
+        if self._source == "direct":
+            raw = self.query_one("#dom-direct-seq", TextArea).text
+            # Strip whitespace and common paste artefacts (line breaks, FASTA
+            # headers, numbers). Anything non-ACGTU-or-IUPAC is dropped with
+            # a warning so a raw paste "works".
+            cleaned = "".join(
+                c for c in raw.upper()
+                if c in "ACGTURYSWKMBDHVN"
+            )
+            if not cleaned:
+                return "Paste a sequence first."
+            return cleaned, 0, len(cleaned)
+        if self._source == "featlib":
+            val = self.query_one("#dom-featlib-select", Select).value
+            if not isinstance(val, str) or not val.isdigit():
+                return "Pick a feature from the library."
+            entries = _load_features()
+            idx = int(val)
+            if idx < 0 or idx >= len(entries):
+                return "Selected feature is no longer in the library."
+            seq = (entries[idx].get("sequence") or "").upper()
+            if not seq:
+                return "Selected feature has no sequence."
+            return seq, 0, len(seq)
+        if self._source == "plasmid":
+            if not self._plasmid_pick_seq:
+                return "Pick a plasmid from the library first."
+            val = self.query_one("#dom-plasmid-feat-select", Select).value
+            if not isinstance(val, str) or not val.isdigit():
+                return "Pick a feature from the plasmid."
+            idx = int(val)
+            if idx < 0 or idx >= len(self._plasmid_pick_feats):
+                return "Selected feature is no longer available."
+            f = self._plasmid_pick_feats[idx]
+            return self._plasmid_pick_seq, f.get("start", 0), f.get("end", 0)
+        if self._source == "fasta":
+            if not self._fasta_seq:
+                return "Pick a FASTA file first."
+            return self._fasta_seq, 0, len(self._fasta_seq)
+        return "Unknown source."
+
     @on(Button.Pressed, "#btn-dom-design")
     def _design(self, _) -> None:
         status = self.query_one("#dom-primer-results", Static)
-        # Validate inputs
         part_type = self.query_one("#dom-type", Select).value
         if not isinstance(part_type, str) or part_type not in _GB_POSITIONS:
             status.update("[red]Select a part type.[/red]")
             return
-        if not self._template:
-            status.update("[red]No template sequence loaded.[/red]")
+        resolved = self._resolve_source()
+        if isinstance(resolved, str):
+            status.update(f"[red]{resolved}[/red]")
             return
-        try:
-            start = int(self.query_one("#dom-start", Input).value) - 1  # 1-based → 0-based
-            end   = int(self.query_one("#dom-end",   Input).value)
-        except ValueError:
-            status.update("[red]Enter valid start and end positions.[/red]")
-            return
-        total = len(self._template)
-        if start < 0 or end < 0 or start >= total or end > total:
+        template, start, end = resolved
+        total = len(template)
+        if start < 0 or end < 0 or start > total or end > total:
             status.update(
                 f"[red]Invalid region: {start+1}–{end} "
-                f"(plasmid is {total} bp)[/red]"
+                f"(sequence is {total} bp)[/red]"
             )
             return
         if start == end:
@@ -6469,39 +8659,102 @@ class DomesticatorModal(ModalScreen):
             return
         region_len = _feat_len(start, end, total)
         if region_len < 20:
-            status.update("[red]Region too short (< 20 bp).[/red]")
+            status.update(f"[red]Region too short ({region_len} bp, need ≥ 20).[/red]")
             return
 
+        codon_raw = (self._codon_entry or {}).get("raw")
         try:
-            self._design = _design_gb_primers(self._template, start, end, part_type)
+            self._design = _design_gb_primers(
+                template, start, end, part_type, codon_raw=codon_raw,
+            )
         except Exception as exc:
             _log.exception("Primer design failed")
             status.update(f"[red]Primer design failed: {exc}[/red]")
             return
 
+        if "error" in self._design:
+            msg = self._design["error"]
+            muts = self._design.get("mutations") or []
+            body = f"[red]{msg}[/red]"
+            if muts:
+                body += "\n\n[dim]Silent mutations that were applied before "
+                body += "giving up:[/dim]\n"
+                for m in muts:
+                    body += f"  · {m}\n"
+            status.update(body)
+            return
+
         d = self._design
+        pairs = d.get("pairs") or []
         t = Text()
         t.append("── Primers designed ─────────────────────────────────\n",
                  style="dim")
-        t.append("\nForward (5'→3'):\n", style="bold green")
-        # Show with structure annotation
-        tail_len = len(_GB_PAD + _GB_BSAI_SITE + _GB_SPACER) + 4  # pad+bsai+spacer+oh
-        t.append(f"  {d['fwd_full'][:tail_len]}", style="dim green")
-        t.append(d["fwd_full"][tail_len:], style="bold green")
-        t.append(f"   Tm {d['fwd_tm']:.1f}°C\n", style="dim")
-        t.append(f"  {'─'*4}{'BsaI──':>7}{'─OH':>3}{'─── binding region':>20}\n",
-                 style="dim")
-        t.append("\nReverse (5'→3'):\n", style="bold red")
-        t.append(f"  {d['rev_full'][:tail_len]}", style="dim red")
-        t.append(d["rev_full"][tail_len:], style="bold red")
-        t.append(f"   Tm {d['rev_tm']:.1f}°C\n", style="dim")
-        t.append(f"  {'─'*4}{'BsaI──':>7}{'─OH':>3}{'─── binding region':>20}\n",
-                 style="dim")
+        # If silent mutations were applied to remove internal sites, call
+        # them out so the user knows to order the (mutated) insert as a
+        # gBlock rather than PCR from the raw template.
+        muts = d.get("mutations") or []
+        if muts:
+            t.append(
+                f"\n[{len(muts)}] silent mutation(s) applied to remove "
+                f"internal BsaI / Esp3I sites:\n",
+                style="bold yellow",
+            )
+            for m in muts:
+                t.append(f"  · {m}\n", style="yellow")
+            t.append(
+                "  [dim]The insert shown below (and the saved part) reflects "
+                "these changes.\n  Order as a gBlock — the primers will not "
+                "introduce these mutations during PCR.[/dim]\n",
+                style="dim",
+            )
+        # Flag mutations landing inside primer binding windows. The primers
+        # are designed against the mutated insert, so they won't bind the
+        # user's original template there — a gBlock is mandatory.
+        br_muts = d.get("binding_region_mutations") or []
+        if br_muts:
+            t.append(
+                f"\n⚠ [{len(br_muts)}] mutation(s) land inside primer "
+                f"binding region(s):\n",
+                style="bold red",
+            )
+            for entry in br_muts:
+                region = "5′ (forward)" if entry["region"] == "fwd" else "3′ (reverse)"
+                t.append(f"  · {region}: {entry['text']}\n", style="red")
+            t.append(
+                "  [dim]The original plasmid CANNOT be used as the PCR "
+                "template — the primers would\n  mismatch at the mutated "
+                "bases. Order the mutated insert as a gBlock and PCR\n  "
+                "from that, or redesign to avoid silent mutations inside "
+                "the binding windows.[/dim]\n",
+                style="dim",
+            )
+        # Show every designed primer pair. For the current single-amplicon
+        # design this is one; when SOE-PCR splitting is added later, pairs
+        # will contain N+1 entries (one per sub-amplicon).
+        tail_len = len(_GB_PAD + _GB_L0_ENZYME_SITE + _GB_SPACER) + 4
+        n_pairs = len(pairs)
+        for i, p in enumerate(pairs, start=1):
+            if n_pairs > 1:
+                t.append(f"\n── Pair {i} of {n_pairs} ──\n", style="bold cyan")
+            t.append(f"\nPair {i} Forward (5'→3'):\n", style="bold green")
+            t.append(f"  {p['fwd_full'][:tail_len]}", style="dim green")
+            t.append(p["fwd_full"][tail_len:], style="bold green")
+            t.append(f"   Tm {p['fwd_tm']:.1f}°C\n", style="dim")
+            t.append(f"  {'─'*4}{'Esp3I─':>7}{'─OH':>3}{'─── binding region':>20}\n",
+                     style="dim")
+            t.append(f"\nPair {i} Reverse (5'→3'):\n", style="bold red")
+            t.append(f"  {p['rev_full'][:tail_len]}", style="dim red")
+            t.append(p["rev_full"][tail_len:], style="bold red")
+            t.append(f"   Tm {p['rev_tm']:.1f}°C\n", style="dim")
+            t.append(f"  {'─'*4}{'Esp3I─':>7}{'─OH':>3}{'─── binding region':>20}\n",
+                     style="dim")
+            t.append(f"\nAmplicon: {p['amplicon_len']} bp\n", style="white")
         t.append(f"\nInsert: {len(d['insert_seq'])} bp   "
-                 f"Amplicon: {d['amplicon_len']} bp\n",
+                 f"{n_pairs} primer pair(s) total\n",
                  style="white")
         status.update(t)
         self.query_one("#btn-dom-save", Button).disabled = False
+        self.query_one("#btn-dom-save-primers", Button).disabled = False
 
     # ── Save to parts bin ──────────────────────────────────────────────────
 
@@ -6516,21 +8769,116 @@ class DomesticatorModal(ModalScreen):
             )
             return
         d = self._design
+        insert = d["insert_seq"]
+        oh5    = d["oh5"]
+        oh3    = d["oh3"]
         part = {
             "name":        name,
             "type":        d["part_type"],
             "position":    d["position"],
-            "oh5":         d["oh5"],
-            "oh3":         d["oh3"],
+            "oh5":         oh5,
+            "oh3":         oh3,
             "backbone":    "pUPD2",
             "marker":      "Spectinomycin",
-            "sequence":    d["insert_seq"],
+            "sequence":    insert,
             "fwd_primer":  d["fwd_full"],
             "rev_primer":  d["rev_full"],
             "fwd_tm":      d["fwd_tm"],
             "rev_tm":      d["rev_tm"],
+            "primed_seq":  _simulate_primed_amplicon(insert, oh5, oh3),
+            "cloned_seq":  _simulate_cloned_plasmid(insert, oh5, oh3),
         }
         self.dismiss(part)
+
+    # ── Save primers to library ────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-dom-save-primers")
+    def _save_primers_to_library(self, _) -> None:
+        """Persist every designed primer pair to primers.json.
+
+        Naming follows the project-wide convention:
+            {partName}-DOM-{n}-F / {partName}-DOM-{n}-R
+        where DOM tags the primer type (domestication, vs CLO cloning /
+        DET detection) and {n} is the 1-indexed pair number within this
+        domestication run.
+        """
+        status = self.query_one("#dom-primer-results", Static)
+        if self._design is None:
+            status.update("[red]Design primers first.[/red]")
+            return
+        part_name = self.query_one("#dom-name", Input).value.strip()
+        if not part_name:
+            status.update("[red]Enter a part name before saving primers.[/red]")
+            return
+        pairs = self._design.get("pairs") or []
+        if not pairs:
+            status.update("[red]No primer pairs to save.[/red]")
+            return
+
+        source = part_name  # domesticator parts don't carry a plasmid context
+        import datetime
+        today = datetime.date.today().isoformat()
+        entries = _load_primers()
+        existing_seqs = {e.get("sequence", "").upper() for e in entries}
+
+        new_rows: list[dict] = []
+        dupes: list[str] = []
+        for idx, p in enumerate(pairs, start=1):
+            fwd_name = f"{part_name}-DOM-{idx}-F"
+            rev_name = f"{part_name}-DOM-{idx}-R"
+            fwd_seq = p["fwd_full"]
+            rev_seq = p["rev_full"]
+            if fwd_seq.upper() in existing_seqs:
+                dupes.append(fwd_name)
+            else:
+                existing_seqs.add(fwd_seq.upper())
+                new_rows.append({
+                    "name":        fwd_name,
+                    "sequence":    fwd_seq,
+                    "tm":          p["fwd_tm"],
+                    "primer_type": "goldenbraid",
+                    "source":      source,
+                    "pos_start":   p["fwd_pos"][0],
+                    "pos_end":     p["fwd_pos"][1],
+                    "strand":      1,
+                    "date":        today,
+                    "status":      "Designed",
+                })
+            if rev_seq.upper() in existing_seqs:
+                dupes.append(rev_name)
+            else:
+                existing_seqs.add(rev_seq.upper())
+                new_rows.append({
+                    "name":        rev_name,
+                    "sequence":    rev_seq,
+                    "tm":          p["rev_tm"],
+                    "primer_type": "goldenbraid",
+                    "source":      source,
+                    "pos_start":   p["rev_pos"][0],
+                    "pos_end":     p["rev_pos"][1],
+                    "strand":      -1,
+                    "date":        today,
+                    "status":      "Designed",
+                })
+
+        if not new_rows:
+            self.app.notify(
+                f"All {len(pairs) * 2} primer sequences already exist in the "
+                f"library — nothing saved.",
+                severity="warning", timeout=8,
+            )
+            return
+
+        # Prepend new rows so the library table surfaces them first.
+        by_name = {r["name"] for r in new_rows}
+        entries = [e for e in entries if e.get("name") not in by_name]
+        entries = new_rows + entries
+        _save_primers(entries)
+        msg = f"Saved {len(new_rows)} primer(s) to library."
+        if dupes:
+            msg += f" Skipped {len(dupes)} duplicate(s): {', '.join(dupes)}"
+        self.app.notify(msg, timeout=8)
+        self.query_one("#btn-dom-save-primers", Button).disabled = True
 
     @on(Button.Pressed, "#btn-dom-cancel")
     def _cancel_btn(self, _) -> None:
@@ -8787,7 +11135,14 @@ class PrimerDesignScreen(Screen):
         status.update(t)
 
         name = self.query_one("#pd-part-name", Input).value.strip() or "primer"
-        suffix = "DET" if primer_type == "detection" else "CLO"
+        # Suffix tags the primer role: DET = detection (diagnostic PCR),
+        # CLO = cloning (with RE tails), DOM = Golden Braid L0 domestication.
+        if primer_type == "detection":
+            suffix = "DET"
+        elif primer_type == "goldenbraid":
+            suffix = "DOM"
+        else:
+            suffix = "CLO"
         self.query_one("#pd-fwd-name", Input).value = f"{name}-{suffix}-F"
         self.query_one("#pd-rev-name", Input).value = f"{name}-{suffix}-R"
         self.query_one("#btn-pd-save", Button).disabled = False
@@ -9446,6 +11801,21 @@ OpenFileModal { align: center middle; }
 #open-btns Button { margin-right: 1; }
 #open-status { height: 1; margin-top: 1; }
 
+/* ── FASTA file picker modal ─────────────────────────────── */
+FastaFilePickerModal { align: center middle; }
+#fasta-box {
+    width: 90; max-width: 95%; min-width: 60;
+    height: 32; max-height: 90%;
+    background: $surface; border: solid $accent; padding: 1 2;
+}
+#fasta-title  { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#fasta-header { height: 1; margin-bottom: 1; color: $text-muted; }
+#fasta-tree   { height: 1fr; border: solid $primary-darken-2; }
+#fasta-hint   { height: 1; margin-top: 1; color: $text-muted; }
+#fasta-status { height: 1; margin-top: 1; }
+#fasta-btns   { height: 3; margin-top: 1; }
+#fasta-btns Button { margin-right: 1; }
+
 /* ── Export-GenBank modal ────────────────────────────────── */
 ExportGenBankModal { align: center middle; }
 #export-box {
@@ -9457,6 +11827,18 @@ ExportGenBankModal { align: center middle; }
 #export-btns { height: 3; margin-top: 1; }
 #export-btns Button { margin-right: 1; }
 #export-status { height: 2; margin-top: 1; }
+
+/* ── Export-FASTA modal ──────────────────────────────────── */
+FastaExportModal { align: center middle; }
+#fasta-export-box {
+    width: 72; height: auto;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#fasta-export-title { background: $primary; padding: 0 1; margin-bottom: 1; }
+#fasta-export-box Label { color: $text-muted; margin-top: 1; }
+#fasta-export-btns { height: 3; margin-top: 1; }
+#fasta-export-btns Button { margin-right: 1; }
+#fasta-export-status { height: 2; margin-top: 1; }
 
 /* ── Edit-sequence dialog ────────────────────────────────── */
 EditSeqDialog { align: center middle; }
@@ -9528,10 +11910,55 @@ AddFeatureModal { align: center middle; }
 #addfeat-type-col   { width: 1fr; height: 6; margin-right: 2; }
 #addfeat-strand-col { width: 30; height: 6; }
 #addfeat-type-col Label, #addfeat-strand-col Label { margin-top: 0; height: 1; }
+#addfeat-color-row       { height: 3; margin-top: 1; }
+#addfeat-color-label     { width: 8; margin-top: 1; }
+#addfeat-color-swatch    { width: 1fr; margin-top: 1; }
+#addfeat-color-row Button { margin-right: 1; min-width: 14; }
 #addfeat-seq    { height: 6; min-height: 4; margin-top: 0; }
 #addfeat-status { height: 2; margin-top: 1; }
 #addfeat-btns   { height: 3; margin-top: 1; }
 #addfeat-btns Button { margin-right: 1; }
+
+/* ── Color picker modal ──────────────────────────────────── */
+ColorPickerModal { align: center middle; }
+#colorpick-dlg {
+    width: 120; height: 90%; max-height: 40;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#colorpick-title   { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#colorpick-current { height: 1; margin-bottom: 0; }
+#colorpick-capability { height: 1; margin-bottom: 1; }
+#colorpick-preview-row    { height: 5; margin-bottom: 1; align: left middle; }
+#colorpick-preview-swatch { width: 24; height: 5; border: tall $primary; margin-right: 2; }
+#colorpick-preview-label  { width: 1fr; height: 5; content-align: left middle; }
+#colorpick-scroll  { height: 1fr; overflow-y: auto; }
+.colorpick-section-hdr { background: $primary-darken-2; padding: 0 1; margin-top: 1; height: 1; color: $text; }
+#colorpick-row     { height: 3; margin-bottom: 0; }
+.colorpick-swatch  { min-width: 4; width: 4; height: 3; margin: 0 0 0 0; border: none; }
+#colorpick-xterm-grid { height: auto; margin-bottom: 1; }
+.colorpick-xterm-row { height: 1; }
+.colorpick-xterm-cell { min-width: 3; width: 3; height: 1; margin: 0 0 0 0; border: none; padding: 0; }
+#colorpick-custom-row { height: 3; margin-bottom: 1; }
+#colorpick-custom-label { width: 18; margin-top: 1; }
+#colorpick-hex-input { width: 1fr; margin-right: 1; }
+#colorpick-custom-row Button { margin-right: 1; min-width: 10; }
+#colorpick-status  { height: 1; margin: 0 0 1 0; }
+#colorpick-btns    { height: 3; }
+#colorpick-btns Button { margin-right: 1; }
+
+/* ── Feature library full-screen ─────────────────────────── */
+#flib-box {
+    width: 100%; height: 1fr;
+    background: $surface; padding: 0 2;
+}
+#flib-title        { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#flib-main         { height: 1fr; }
+#flib-left         { width: 1fr; padding-right: 1; border-right: solid $primary-darken-2; }
+#flib-right        { width: 2fr; padding-left: 1; }
+.flib-section-hdr  { background: $primary-darken-2; padding: 0 1; }
+#flib-table        { height: 1fr; }
+#flib-btns         { height: 3; margin-top: 1; }
+#flib-btns Button  { margin-right: 1; }
 
 /* ── Rename plasmid dialog ───────────────────────────────── */
 RenamePlasmidModal { align: center middle; }
@@ -9579,25 +12006,58 @@ ConstructorModal { align: center middle; }
 }
 #parts-title  { background: $success-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #parts-table  { height: 1fr; }
-#parts-detail { height: 7; border-top: solid $accent; padding: 0 1; color: $text-muted; }
+#parts-detail { height: 5; border-top: solid $accent; padding: 0 1; color: $text-muted; }
+#parts-seq-view {
+    height: 10; border: solid $accent; padding: 0 1;
+    background: $surface-darken-1;
+}
+#parts-copy-btns  { height: 3; margin-top: 1; }
+#parts-copy-btns Button { margin-right: 1; }
 #parts-btns   { height: 3; margin-top: 1; }
 #parts-btns Button { margin-right: 1; }
 
 /* ── Domesticator modal ─────────────────────────────────── */
 DomesticatorModal { align: center middle; }
 #dom-box {
-    width: 100; height: auto; max-height: 42;
+    width: 110; max-width: 95%; min-width: 80;
+    height: 90%; max-height: 46;
     background: $surface; border: solid $accent; padding: 1 2;
 }
 #dom-title  { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#dom-body   { height: 1fr; overflow-y: auto; }
 #dom-row1   { height: 5; }
 #dom-name-col { width: 1fr; padding-right: 1; }
 #dom-type-col { width: 1fr; }
 #dom-oh-info  { height: 1; margin-bottom: 1; }
-#dom-region-row { height: 5; }
-#dom-feat-col  { width: 2fr; padding-right: 1; }
-#dom-start-col { width: 1fr; padding-right: 1; }
-#dom-end-col   { width: 1fr; }
+#dom-codon-row { height: 3; margin-bottom: 1; }
+#dom-codon-label { width: 4fr; padding: 1 1 0 1; }
+#dom-codon-row Button { width: 1fr; }
+/* Source picker: four radios on ONE row, no scrollbar, flex with modal width */
+#dom-src    {
+    layout: horizontal;
+    height: 3; width: 100%;
+    margin-bottom: 1;
+    overflow: hidden;
+}
+#dom-src > RadioButton {
+    width: 1fr; height: 1;
+    margin: 0 1 0 0; padding: 0;
+    background: transparent; border: none;
+}
+.dom-src-panel { width: 100%; height: auto; margin-bottom: 1; }
+#dom-direct-seq { width: 100%; height: 6; }
+#dom-plasmid-hdr, #dom-fasta-hdr { height: 3; width: 100%; }
+#dom-plasmid-hdr Label, #dom-fasta-hdr Label {
+    width: auto; padding-right: 1; content-align: left middle;
+}
+#dom-plasmid-name, #dom-fasta-name {
+    width: 1fr; content-align: left middle; color: $text;
+}
+#dom-plasmid-hdr Button, #dom-fasta-hdr Button { margin-left: 1; }
+#dom-featlib-select, #dom-plasmid-feat-select { width: 100%; }
+#dom-featlib-preview, #dom-plasmid-feat-preview, #dom-fasta-preview {
+    height: 1; width: 100%;
+}
 #dom-primer-results {
     height: auto; max-height: 14;
     border: solid $primary-darken-2; padding: 0 1; margin-top: 1;
@@ -9830,11 +12290,13 @@ SpeciesPickerModal { align: center middle; }
 
     BINDINGS = [
         Binding("f",           "fetch",            "Fetch GenBank", show=True),
-        Binding("o",           "open_file",        "Open file",     show=True),
-        Binding("a",           "add_to_library",   "Add to lib",    show=True),
+        Binding("ctrl+o",      "open_file",        "Open file",     show=True),
+        Binding("ctrl+shift+a","add_to_library",   "Add to lib",    show=True),
         Binding("A",           "annotate_plasmid", "Annotate",      show=True,  key_display="A"),
-        Binding("E",           "edit_seq",         "Edit seq",      show=True,  key_display="E"),
-        Binding("S",           "save",             "Save",          show=True,  key_display="S"),
+        Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=True),
+        Binding("ctrl+s",      "save",             "Save",          show=True),
+        Binding("ctrl+f",      "add_feature",      "Add feature",   show=True),
+        Binding("ctrl+shift+f","capture_to_features", "→ Feat lib", show=True,  priority=True),
         Binding("[",           "rotate_cw",        "Rotate ←",      show=True,  priority=True),
         Binding("]",           "rotate_ccw",       "Rotate →",      show=True,  priority=True),
         Binding("shift+[",     "rotate_cw_lg",     "Rotate ←←",     show=False, priority=True),
@@ -9855,8 +12317,8 @@ SpeciesPickerModal { align: center middle; }
     # Actions that are always allowed — even on non-default screens.
     # These include Screen-level actions that every screen needs (cancel,
     # focus_next, noop placeholders). The critical guard below checks
-    # self.screen.id; only app-level (main-screen) shortcuts like f, o, a,
-    # A, E, r, v, etc. get blocked.
+    # self.screen.id; only app-level (main-screen) shortcuts like f,
+    # Ctrl+O, Ctrl+Shift+A, A, Ctrl+E, r, v, etc. get blocked.
     _ALWAYS_ALLOWED_ACTIONS: set[str] = {
         "cancel", "focus_next", "noop",
     }
@@ -9889,7 +12351,7 @@ SpeciesPickerModal { align: center middle; }
         yield Static(
             Text(
                 "  [ ] rotate   ← → cursor/map   Shift coarse   Home reset"
-                "   f fetch   o open   a add-to-lib   A annotate   E edit seq   S save   , / . circle",
+                "   f fetch   ^O open   ^S save   ^E edit   ^F add-feat   ^⇧F →feat-lib   ^⇧A add-to-lib   A annotate",
                 style="color(245)",
                 no_wrap=True,
             ),
@@ -11085,22 +13547,25 @@ SpeciesPickerModal { align: center middle; }
 
         menus = {
             "File": [
-                ("Open file (.gb / .dna)", "open_file"),
-                ("Fetch from NCBI", "fetch"),
-                ("---",             None),
-                ("Add to Library",  "add_to_library"),
-                ("Save",            "save"),
-                ("Export as GenBank (.gb)...", "export_genbank"),
-                ("---",             None),
-                ("Quit",            "quit"),
+                ("Open file (.gb / .dna)  [^O]", "open_file"),
+                ("Fetch from NCBI  [f]",         "fetch"),
+                ("---",                          None),
+                ("Add to Library  [^⇧A]",        "add_to_library"),
+                ("Save  [^S]",                   "save"),
+                ("Export as GenBank (.gb)...",   "export_genbank"),
+                ("---",                          None),
+                ("Quit  [q]",                    "quit"),
             ],
             "Edit": [
-                ("Edit Sequence",   "edit_seq"),
-                ("---",             None),
-                ("Undo",            "undo"),
-                ("Redo",            "redo"),
-                ("---",             None),
-                ("Delete Feature",  "delete_feature"),
+                ("Edit Sequence  [^E]",            "edit_seq"),
+                ("---",                             None),
+                ("Undo",                            "undo"),
+                ("Redo",                            "redo"),
+                ("---",                             None),
+                ("Add Feature...  [^F]",            "add_feature"),
+                ("Capture selection → feat-lib  [^⇧F]", "capture_to_features"),
+                ("Delete Feature",                  "delete_feature"),
+                ("Annotate with pLannotate  [⇧A]",  "annotate_plasmid"),
             ],
             "Enzymes": [
                 (f"[{rs}] Show RE sites  [r]",   "toggle_restr"),
@@ -11110,14 +13575,6 @@ SpeciesPickerModal { align: center middle; }
                 (f"[{m4}] 4+ bp sites",           "toggle_restr_min4"),
                 ("---",                            None),
                 ("Toggle connectors",              "toggle_connectors"),
-            ],
-            "Features": [
-                ("Add Feature...",              "add_feature"),
-                ("Delete Feature",              "delete_feature"),
-                ("---",                         None),
-                ("Annotate with pLannotate",    "annotate_plasmid"),
-                ("---",                         None),
-                ("Toggle connectors",           "toggle_connectors"),
             ],
         }
         items = menus.get(name, [])
@@ -11159,6 +13616,134 @@ SpeciesPickerModal { align: center middle; }
         self._rescan_restrictions()
         self.notify("Showing 4+ bp recognition sites")
 
+    def action_capture_to_features(self) -> None:
+        """Ctrl+Shift+F: grab the drag-selected DNA *or* the highlighted feature
+        from the main view, open the AddFeatureModal prefilled, and after
+        Save transport the user to the FeatureLibraryScreen so they see the
+        new entry in context.
+
+        Priority:
+          1. ``sp._user_sel`` (Shift+drag / Shift+arrow region / sidebar-click
+             selection). If the range exactly matches one of ``pm._feats``,
+             the prefill carries that feature's metadata (type, strand,
+             color, qualifiers). Otherwise it's a raw DNA capture with
+             generic ``misc_feature`` / strand=1 defaults.
+          2. ``pm.selected_idx`` (feature clicked on map / sidebar with no
+             active selection) — always full metadata.
+
+        Insert-at-cursor is intentionally disabled for the capture workflow
+        because the bases are already in the record."""
+        try:
+            sp = self.query_one("#seq-panel",   SequencePanel)
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+        except NoMatches:
+            return
+        seq = sp._seq or ""
+        if not seq:
+            self.notify("No sequence loaded.", severity="warning")
+            return
+
+        prefill: "dict | None" = None
+
+        if sp._user_sel is not None:
+            s, e = sp._user_sel
+            sub = seq[s:e].upper()
+            if not sub:
+                self.notify("Selection is empty.", severity="warning")
+                return
+            matched = -1
+            for i, f in enumerate(pm._feats):
+                if f.get("type") in ("resite", "recut"):
+                    continue
+                if (f.get("start"), f.get("end")) == (s, e):
+                    matched = i
+                    break
+            if matched >= 0:
+                prefill = self._prefill_from_feature(pm._feats[matched], seq)
+            else:
+                prefill = {
+                    "name":         "",
+                    "feature_type": "misc_feature",
+                    "sequence":     sub,
+                    "strand":       1,
+                    "color":        None,
+                    "qualifiers":   {},
+                    "description":  f"Captured from bases {s + 1}..{e}",
+                }
+        elif 0 <= pm.selected_idx < len(pm._feats):
+            feat = pm._feats[pm.selected_idx]
+            if feat.get("type") in ("resite", "recut"):
+                self.notify(
+                    "Select a real feature (not a restriction site).",
+                    severity="warning",
+                )
+                return
+            prefill = self._prefill_from_feature(feat, seq)
+        else:
+            self.notify(
+                "Select a feature (click the map) or Shift+drag a DNA region first.",
+                severity="information",
+            )
+            return
+
+        self.push_screen(
+            AddFeatureModal(prefill=prefill, have_cursor=False),
+            callback=self._capture_feature_result,
+        )
+
+    def _prefill_from_feature(self, feat: dict, seq: str) -> dict:
+        """Build an AddFeatureModal prefill from a ``pm._feats`` entry. Pulls
+        qualifiers from the matching SeqFeature on the current record so
+        gene/product/note values ride along with the capture."""
+        s, e = feat["start"], feat["end"]
+        fwd_slice = (seq[s:] + seq[:e]) if (e < s) else seq[s:e]
+        strand = feat.get("strand", 1)
+        feat_seq = _rc(fwd_slice) if strand == -1 else fwd_slice
+        quals: dict = {}
+        if self._current_record is not None:
+            for bf in getattr(self._current_record, "features", []) or []:
+                if bf.type != feat.get("type"):
+                    continue
+                try:
+                    bs = int(bf.location.start)
+                    be = int(bf.location.end)
+                except (TypeError, ValueError):
+                    continue
+                if (bs, be) in ((s, e), (e, s)):
+                    quals = {k: list(v) if isinstance(v, (list, tuple)) else [v]
+                             for k, v in (bf.qualifiers or {}).items()}
+                    break
+        # The map palette uses Rich's ``color(N)`` syntax which round-trips
+        # through Style.parse fine, but chokes Rich's markup lexer when
+        # rewrapped as ``[color(N)]...[/]``. Convert to canonical hex on
+        # capture so the stored library entry and every downstream preview
+        # can use simple markup without escaping gymnastics.
+        raw_color = feat.get("color")
+        if isinstance(raw_color, str) and raw_color.startswith("color("):
+            raw_color = _normalise_color_input(raw_color) or raw_color
+        return {
+            "name":         feat.get("label") or feat.get("type", ""),
+            "feature_type": feat.get("type", "misc_feature"),
+            "sequence":     feat_seq.upper(),
+            "strand":       strand,
+            "color":        raw_color,
+            "qualifiers":   quals,
+            "description":  "",
+        }
+
+    def _capture_feature_result(self, result) -> None:
+        """Callback for the Ctrl+Shift+F capture flow. On Save, persist and push
+        FeatureLibraryScreen. Insert is unreachable (have_cursor=False)."""
+        if not result:
+            return
+        action = result.get("action")
+        entry  = result.get("entry") or {}
+        if action != "save":
+            return
+        if self._persist_feature_entry(entry):
+            self.notify(f"Added '{entry.get('name')}' to feature library.")
+            self.push_screen(FeatureLibraryScreen())
+
     def action_add_feature(self) -> None:
         """Open the AddFeatureModal. If the sequence panel has an active
         cursor, the Insert button is enabled; otherwise only Save is."""
@@ -11175,6 +13760,23 @@ SpeciesPickerModal { align: center middle; }
             callback=self._add_feature_result,
         )
 
+    def _persist_feature_entry(self, entry: dict) -> bool:
+        """Append `entry` to features.json, de-duping on (name, feature_type)
+        so the latest write wins. Returns True on success; on failure, logs
+        and notifies the user so callers can bail cleanly."""
+        entries = _load_features()
+        key = (entry.get("name"), entry.get("feature_type"))
+        entries = [e for e in entries
+                   if (e.get("name"), e.get("feature_type")) != key]
+        entries.append(entry)
+        try:
+            _save_features(entries)
+        except (OSError, ValueError) as exc:
+            _log.exception("Failed to save feature to library")
+            self.notify(f"Save failed: {exc}", severity="error")
+            return False
+        return True
+
     def _add_feature_result(self, result) -> None:
         """Callback for AddFeatureModal. `result` is either None (cancel) or
         ``{"action": "save"|"insert", "entry": {...}}``."""
@@ -11183,19 +13785,8 @@ SpeciesPickerModal { align: center middle; }
         action = result.get("action")
         entry  = result.get("entry") or {}
         if action == "save":
-            entries = _load_features()
-            # De-dup on (name, feature_type); latest write wins.
-            key = (entry.get("name"), entry.get("feature_type"))
-            entries = [e for e in entries
-                       if (e.get("name"), e.get("feature_type")) != key]
-            entries.append(entry)
-            try:
-                _save_features(entries)
-            except (OSError, ValueError) as exc:
-                _log.exception("Failed to save feature to library")
-                self.notify(f"Save failed: {exc}", severity="error")
-                return
-            self.notify(f"Saved '{entry.get('name')}' to feature library.")
+            if self._persist_feature_entry(entry):
+                self.notify(f"Saved '{entry.get('name')}' to feature library.")
             return
         if action == "insert":
             try:

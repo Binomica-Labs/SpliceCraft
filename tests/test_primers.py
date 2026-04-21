@@ -251,8 +251,18 @@ class TestDesignerUniformShape:
     _REQUIRED_KEYS = {"fwd_pos", "rev_pos", "fwd_tm", "rev_tm"}
 
     def _valid_template(self):
-        # Long enough for GB (>= 18 bp) and Detection (>= product_min = 450).
-        return ("A" * 50 + "ATGAAACGTGATTTAGCCGTTAA" * 40 + "T" * 50)
+        """Diverse ~1000 bp template, long enough for GB (>= 18 bp) and
+        Detection (>= product_min = 450). Previously a highly repetitive
+        string (``ATGAAACGTGATTTAGCCGTTAA`` × 40) that made Primer3 grind
+        through ~8 s of self-hybridizing candidates for one test.
+
+        We scrub Esp3I (CGTCTC / GAGACG) from the 0xBEEF output so the
+        Golden-Braid L0 internal-site check doesn't reject the template.
+        Detection / cloning / generic primer designs don't care either
+        way, but share the same fixture."""
+        rng = random.Random(0xBEEF)
+        seq = "".join(rng.choice("ACGT") for _ in range(1000))
+        return seq.replace("CGTCTC", "CGACTC").replace("GAGACG", "GAGACT")
 
     def test_detection_has_required_keys(self):
         seq = self._valid_template()
@@ -282,22 +292,26 @@ class TestDesignerUniformShape:
         # but positions are reported in forward coords)
         assert r["rev_pos"] == (300 - len(r["rev_binding"]), 300)
 
-    def test_goldenbraid_flags_internal_bsai(self):
-        """Regression guard: a GGTCTC inside the insert is self-domesticating
-        and must be flagged, not silently passed through."""
-        core = "ATGAAACGTGATTTAGCC" * 5   # 90 bp, no BsaI
-        with_fwd_bsai = core + "GGTCTC" + core
-        r = sc._design_gb_primers(with_fwd_bsai, 0, len(with_fwd_bsai), "CDS")
+    def test_goldenbraid_flags_internal_esp3i(self):
+        """Regression guard: a CGTCTC inside the insert is self-domesticating
+        for L0 Esp3I / BsmBI and must be flagged, not silently passed through.
+        L0 parts are cut with Esp3I (CGTCTC) so only that recognition site
+        causes a problem at this stage — BsaI sites in an L0 part are fine
+        because L0 domestication never sees BsaI."""
+        core = "ATGAAACGTGATTTAGCC" * 5   # 90 bp, no Esp3I
+        with_fwd_esp3i = core + "CGTCTC" + core
+        r = sc._design_gb_primers(with_fwd_esp3i, 0, len(with_fwd_esp3i), "CDS")
         assert "error" in r
-        assert "BsaI" in r["error"]
+        assert "Esp3I" in r["error"]
 
-    def test_goldenbraid_flags_reverse_bsai(self):
-        """GAGACC (RC of GGTCTC) on the top strand also fragments the part."""
+    def test_goldenbraid_flags_reverse_esp3i(self):
+        """GAGACG (RC of CGTCTC) on the top strand also fragments the part
+        during the L0 Esp3I digest."""
         core = "ATGAAACGTGATTTAGCC" * 5
-        with_rev_bsai = core + "GAGACC" + core
-        r = sc._design_gb_primers(with_rev_bsai, 0, len(with_rev_bsai), "CDS")
+        with_rev_esp3i = core + "GAGACG" + core
+        r = sc._design_gb_primers(with_rev_esp3i, 0, len(with_rev_esp3i), "CDS")
         assert "error" in r
-        assert "BsaI" in r["error"]
+        assert "Esp3I" in r["error"]
 
     def test_generic_has_required_keys(self):
         seq = self._valid_template()
@@ -583,14 +597,14 @@ class TestWrapRegionCloning:
 
 class TestWrapRegionGoldenBraid:
     def test_wrap_region_produces_primers(self):
-        # Need a wrap region free of internal BsaI sites. Build a
-        # deterministic sequence and avoid GGTCTC / GAGACC.
+        # Need a wrap region free of internal Esp3I sites (L0 domestication
+        # now uses CGTCTC, not GGTCTC). Build a deterministic sequence and
+        # scrub both strands.
         import random
         rng = random.Random(0xCAFE)
         seq = "".join(rng.choice("ACGT") for _ in range(3000))
-        # Ensure no BsaI sites by scanning
-        if "GGTCTC" in seq or "GAGACC" in seq:
-            seq = seq.replace("GGTCTC", "GCTGTC").replace("GAGACC", "GACCGA")
+        seq = (seq.replace("CGTCTC", "CGACTC")
+                  .replace("GAGACG", "GAGACT"))
         r = sc._design_gb_primers(seq, 2900, 200, "CDS")
         assert "error" not in r
         assert r["fwd_binding"]

@@ -704,8 +704,14 @@ class TestPlannotateUIEntryPoints:
     async def test_shift_a_binding_registered(self):
         keys = [b.key for b in sc.PlasmidApp.BINDINGS]
         assert "A" in keys, "shift+A (key='A') binding is missing"
-        # And it's distinct from lowercase a
-        assert "a" in keys
+        # And it's distinct from ctrl+shift+a (Add to Library) — these must
+        # not collide. Shift+A (uppercase 'A') fires annotate_plasmid; Add
+        # to Library moved to Ctrl+Shift+A in the 2026-04-20 rename to align
+        # global shortcuts with their action names.
+        assert "ctrl+shift+a" in keys
+        actions = {b.key: b.action for b in sc.PlasmidApp.BINDINGS}
+        assert actions["A"] == "annotate_plasmid"
+        assert actions["ctrl+shift+a"] == "add_to_library"
 
     async def test_shift_a_with_no_record_notifies_not_crashes(
         self, isolated_library, monkeypatch

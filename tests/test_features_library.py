@@ -181,3 +181,136 @@ class TestGenbankFeatureTypes:
 
     def test_no_duplicates(self):
         assert len(set(sc._GENBANK_FEATURE_TYPES)) == len(sc._GENBANK_FEATURE_TYPES)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Color + strand extensions (v0.3.2)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFeatureEntryColorField:
+    """Entries gained an optional ``color`` field and accept ``strand=0``
+    for arrowless features. Round-trip must preserve both verbatim."""
+
+    def test_color_field_roundtrip(self):
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATG", "strand": 1, "color": "#FF6347",
+        }])
+        sc._features_cache = None
+        loaded = sc._load_features()
+        assert loaded[0]["color"] == "#FF6347"
+
+    def test_strand_zero_roundtrip(self):
+        """strand=0 means "arrowless" — meaningful for rep_origin,
+        misc_feature, and similar non-directional annotations."""
+        sc._save_features([{
+            "name": "pMB1", "feature_type": "rep_origin",
+            "sequence": "GCA", "strand": 0,
+        }])
+        sc._features_cache = None
+        loaded = sc._load_features()
+        assert loaded[0]["strand"] == 0
+
+    def test_missing_color_survives(self):
+        """Legacy entries without a color field must still load."""
+        sc._save_features([{
+            "name": "legacy", "feature_type": "CDS",
+            "sequence": "ATG", "strand": 1,
+        }])
+        sc._features_cache = None
+        loaded = sc._load_features()
+        assert "color" not in loaded[0] or loaded[0].get("color") is None
+
+
+class TestFeatureColorsPersistence:
+    """``_load_feature_colors`` / ``_save_feature_colors`` manage the user-
+    editable type → default color map. Empty, missing, and corrupt files
+    all degrade to {}."""
+
+    def test_missing_file_returns_empty(self):
+        sc._feature_colors_cache = None
+        assert sc._load_feature_colors() == {}
+
+    def test_save_and_reload(self):
+        sc._save_feature_colors({"CDS": "#FF0000", "promoter": "#00FF00"})
+        sc._feature_colors_cache = None
+        loaded = sc._load_feature_colors()
+        assert loaded == {"CDS": "#FF0000", "promoter": "#00FF00"}
+
+    def test_envelope_schema_version(self):
+        sc._save_feature_colors({"CDS": "#FF0000"})
+        raw = json.loads(sc._FEATURE_COLORS_FILE.read_text())
+        assert raw["_schema_version"] == sc._CURRENT_SCHEMA_VERSION
+        assert isinstance(raw["entries"], list)
+        assert raw["entries"][0] == {"feature_type": "CDS", "color": "#FF0000"}
+
+    def test_non_dict_entries_filtered(self):
+        sc._FEATURE_COLORS_FILE.write_text(json.dumps({
+            "_schema_version": 1,
+            "entries": [
+                {"feature_type": "CDS",      "color": "#FF0000"},
+                "garbage", 42, None,
+                {"feature_type": "",         "color": "#FF0000"},  # empty key
+                {"feature_type": "promoter", "color":  ""},        # empty color
+                {"feature_type": "gene",     "color": "#00FF00"},
+            ],
+        }))
+        sc._feature_colors_cache = None
+        loaded = sc._load_feature_colors()
+        assert loaded == {"CDS": "#FF0000", "gene": "#00FF00"}
+
+
+class TestResolveFeatureColor:
+    """``_resolve_feature_color`` enforces the precedence:
+    entry color > user default > built-in default > palette fallback."""
+
+    def test_entry_color_wins(self):
+        sc._save_feature_colors({"CDS": "#000000"})
+        sc._feature_colors_cache = None
+        col = sc._resolve_feature_color(
+            {"feature_type": "CDS", "color": "#AAAAAA"}
+        )
+        assert col == "#AAAAAA"
+
+    def test_user_default_over_builtin(self):
+        sc._save_feature_colors({"CDS": "#000000"})
+        sc._feature_colors_cache = None
+        col = sc._resolve_feature_color({"feature_type": "CDS"})
+        assert col == "#000000"
+
+    def test_builtin_default_when_no_user_override(self):
+        sc._feature_colors_cache = None
+        col = sc._resolve_feature_color({"feature_type": "CDS"})
+        assert col == sc._DEFAULT_TYPE_COLORS["CDS"]
+
+    def test_unknown_type_falls_back_to_palette(self):
+        """Palette fallback returns the hex equivalent of
+        ``_FEATURE_PALETTE[0]``. The 2026-04-20 ColorPicker rework
+        normalises ``color(N)`` palette syntax to hex so downstream Rich
+        markup never trips on the parens — the *color* is still the same
+        palette entry, just expressed in a markup-safe form."""
+        sc._feature_colors_cache = None
+        col = sc._resolve_feature_color({"feature_type": "my_custom_type"})
+        assert col == sc._normalise_color_input(sc._FEATURE_PALETTE[0])
+
+    def test_empty_color_treated_as_missing(self):
+        """Empty string color → treat as not set, fall through to type default."""
+        sc._feature_colors_cache = None
+        col = sc._resolve_feature_color(
+            {"feature_type": "CDS", "color": ""}
+        )
+        assert col == sc._DEFAULT_TYPE_COLORS["CDS"]
+
+    def test_all_default_types_have_hex_colors(self):
+        """Every built-in default is a valid hex string so Rich can render it."""
+        for ftype, col in sc._DEFAULT_TYPE_COLORS.items():
+            assert isinstance(col, str)
+            assert col.startswith("#")
+            assert len(col) == 7  # "#RRGGBB"
+
+    def test_all_insdc_types_have_builtin_color(self):
+        """Every curated _GENBANK_FEATURE_TYPES entry has a built-in default
+        so the UI never falls back to the palette for standard types."""
+        missing = [t for t in sc._GENBANK_FEATURE_TYPES
+                   if t not in sc._DEFAULT_TYPE_COLORS]
+        assert not missing, f"No default color for: {missing}"
