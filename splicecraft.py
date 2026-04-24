@@ -173,21 +173,21 @@ def _log_startup_banner() -> None:
     _log.info("log path  : %s", _LOG_PATH)
     _log.info("=" * 60)
 
-from textual import on, work
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, ScrollableContainer
-from textual.css.query import NoMatches
-from textual.events import Click, MouseDown, MouseMove, MouseUp, MouseScrollDown, MouseScrollUp
-from textual.message import Message
-from textual.reactive import reactive
-from textual.screen import ModalScreen, Screen
-from textual.widget import Widget
-from textual.widgets import (
+from textual import on, work  # noqa: E402
+from textual.app import App, ComposeResult  # noqa: E402
+from textual.binding import Binding  # noqa: E402
+from textual.containers import Horizontal, Vertical, ScrollableContainer  # noqa: E402
+from textual.css.query import NoMatches  # noqa: E402
+from textual.events import Click, MouseDown, MouseMove, MouseUp, MouseScrollDown, MouseScrollUp  # noqa: E402
+from textual.message import Message  # noqa: E402
+from textual.reactive import reactive  # noqa: E402
+from textual.screen import ModalScreen, Screen  # noqa: E402
+from textual.widget import Widget  # noqa: E402
+from textual.widgets import (  # noqa: E402
     Button, DataTable, DirectoryTree, Footer, Header, Input, Label, ListItem,
     ListView, RadioButton, RadioSet, Select, Static, TextArea,
 )
-from rich.text import Text
+from rich.text import Text  # noqa: E402
 
 # ── Feature appearance ─────────────────────────────────────────────────────────
 
@@ -1320,8 +1320,6 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     # RE highlight ranges
     reh_s       = re_highlight["start"]      if re_highlight else -1
     reh_e       = re_highlight["end"]        if re_highlight else -1
-    reh_fwd_cut = re_highlight["fwd_cut_bp"] if re_highlight else -1
-    reh_rev_cut = re_highlight["rev_cut_bp"] if re_highlight else -1
     reh_color   = re_highlight["color"]      if re_highlight else ""
 
     seq_upper = seq.upper()
@@ -1494,7 +1492,10 @@ def _detect_char_aspect() -> float:
     pixel dimensions via TIOCGWINSZ.  Falls back to 2.0 if unavailable.
     """
     try:
-        import fcntl, os, struct, termios
+        import fcntl
+        import os
+        import struct
+        import termios
         fds: list[tuple[int, bool]] = []
         try:
             fds.append((os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY), True))
@@ -1867,10 +1868,20 @@ class PlannotateError(Exception):
         self.user_msg = user_msg
         self.detail   = detail
 
-class PlannotateNotInstalled(PlannotateError): pass
-class PlannotateMissingDb(PlannotateError):   pass
-class PlannotateTooLarge(PlannotateError):    pass
-class PlannotateFailed(PlannotateError):      pass
+class PlannotateNotInstalled(PlannotateError):
+    pass
+
+
+class PlannotateMissingDb(PlannotateError):
+    pass
+
+
+class PlannotateTooLarge(PlannotateError):
+    pass
+
+
+class PlannotateFailed(PlannotateError):
+    pass
 
 # pLannotate's hard-coded maximum plasmid size (MAX_PLAS_SIZE in its resources).
 _PLANNOTATE_MAX_BP = 50_000
@@ -1920,8 +1931,10 @@ def _run_plannotate(record, timeout: int = 180):
         )
     if not status["blast"] or not status["diamond"]:
         missing = []
-        if not status["blast"]:   missing.append("blastn")
-        if not status["diamond"]: missing.append("diamond")
+        if not status["blast"]:
+            missing.append("blastn")
+        if not status["diamond"]:
+            missing.append("diamond")
         raise PlannotateNotInstalled(
             f"pLannotate requires {' + '.join(missing)} on PATH",
             _plannotate_install_hint(),
@@ -3799,24 +3812,25 @@ class FetchModal(ModalScreen):
         try:
             record = fetch_genbank(acc, email)
         except Exception as exc:
+            err_msg = str(exc)
             _log.exception("NCBI fetch failed for %s", acc)
             def _err():
                 # Modal may have been dismissed while the fetch was in flight;
                 # query_one would then raise NoMatches. Fall back to a toast.
                 if not self.is_mounted:
                     try:
-                        self.app.notify(f"NCBI fetch failed: {exc}",
+                        self.app.notify(f"NCBI fetch failed: {err_msg}",
                                         severity="error", timeout=8)
                     except Exception:
                         _log.exception("notify fallback for fetch error failed")
                     return
                 try:
                     self.query_one("#fetch-status", Static).update(
-                        f"[red]Error: {exc}[/red]"
+                        f"[red]Error: {err_msg}[/red]"
                     )
                 except NoMatches:
                     try:
-                        self.app.notify(f"NCBI fetch failed: {exc}",
+                        self.app.notify(f"NCBI fetch failed: {err_msg}",
                                         severity="error", timeout=8)
                     except Exception:
                         _log.exception("notify fallback for fetch error failed")
@@ -5337,7 +5351,8 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
     {'taxid': str, 'name': str}. Names come from a batched esummary call
     (one round-trip for up to `retmax` ids). Partial queries are auto-
     wildcarded via `_ncbi_prep_term`. Pure network — run from a worker."""
-    import urllib.request, urllib.parse
+    import urllib.parse
+    import urllib.request
     import xml.etree.ElementTree as ET
     q = (query or "").strip()
     if not q:
@@ -6086,11 +6101,16 @@ def _mut_next_cursor(current: int, protein_len: int, line_width: int,
     if current < 0:
         return 0
     step = max(1, (line_width // 3) if dna_mode else line_width)
-    if   direction == "left":  new_idx = current - 1
-    elif direction == "right": new_idx = current + 1
-    elif direction == "up":    new_idx = current - step
-    elif direction == "down":  new_idx = current + step
-    else:                      return current
+    if direction == "left":
+        new_idx = current - 1
+    elif direction == "right":
+        new_idx = current + 1
+    elif direction == "up":
+        new_idx = current - step
+    elif direction == "down":
+        new_idx = current + step
+    else:
+        return current
     return max(0, min(protein_len - 1, new_idx))
 
 
@@ -6621,7 +6641,6 @@ class AddFeatureModal(ModalScreen):
             seqraw = self.query_one("#addfeat-seq",   TextArea).text
             quals  = self.query_one("#addfeat-quals", Input).value
             desc   = self.query_one("#addfeat-desc",  Input).value.strip()
-            fwd_rb  = self.query_one("#addfeat-strand-fwd",  RadioButton)
             rev_rb  = self.query_one("#addfeat-strand-rev",  RadioButton)
             none_rb = self.query_one("#addfeat-strand-none", RadioButton)
             both_rb = self.query_one("#addfeat-strand-both", RadioButton)
@@ -6647,10 +6666,14 @@ class AddFeatureModal(ModalScreen):
         if ftype is None or ftype == Select.BLANK:
             status.update("[red]Choose a feature type.[/red]")
             return None
-        if   rev_rb.value:  strand = -1
-        elif none_rb.value: strand = 0
-        elif both_rb.value: strand = 2
-        else:               strand = 1   # forward (default)
+        if rev_rb.value:
+            strand = -1
+        elif none_rb.value:
+            strand = 0
+        elif both_rb.value:
+            strand = 2
+        else:
+            strand = 1   # forward (default)
         return {
             "name":         name,
             "feature_type": str(ftype),
@@ -9595,7 +9618,6 @@ class _MutPreview(Static):
 
     def _recompute_display(self) -> None:
         if self._cds_dna_src:
-            lw  = max(3, (self._line_width // 3) * 3)
             dna = self._cds_dna_src.upper()
             if self._mutation_src:
                 mut_c  = (self._mutation_src.get("mut_codon") or "").upper()
@@ -12546,7 +12568,7 @@ SpeciesPickerModal { align: center middle; }
         """Create a new SeqRecord with the feat_idx-th non-source feature removed."""
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
-        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.SeqFeature import SeqFeature
 
         new_record = SeqRecord(
             Seq(str(self._current_record.seq)),
@@ -13289,7 +13311,7 @@ SpeciesPickerModal { align: center middle; }
     def _library_load(self, event: LibraryPanel.PlasmidLoad):
         gb_text = event.entry.get("gb_text", "")
         if not gb_text:
-            self.notify(f"Library entry has no stored sequence.", severity="warning")
+            self.notify("Library entry has no stored sequence.", severity="warning")
             return
         try:
             record = _gb_text_to_record(gb_text)
