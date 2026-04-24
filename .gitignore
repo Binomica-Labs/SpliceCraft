@@ -25,3 +25,4 @@ primers.json
 
 # Claude Code local settings / cache
 .claude/
+uv.lock
