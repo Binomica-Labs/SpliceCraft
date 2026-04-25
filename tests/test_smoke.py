@@ -31,6 +31,16 @@ def _build_app(tiny_record, isolated_library) -> sc.PlasmidApp:
     return app
 
 
+class _MouseEvent:
+    def __init__(self, screen_y: int, button: int = 1):
+        self.screen_y = screen_y
+        self.button = button
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Bootstrap
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -54,6 +64,7 @@ class TestAppBootstrap:
             # Every one of these must exist; query_one raises if not.
             app.query_one("#plasmid-map", sc.PlasmidMap)
             app.query_one("#sidebar", sc.FeatureSidebar)
+            app.query_one("#map-seq-resize", sc.MapSequenceResizeHandle)
             app.query_one("#seq-panel", sc.SequencePanel)
             app.query_one("#library", sc.LibraryPanel)
 
@@ -150,6 +161,89 @@ class TestBasicKeybindings:
             await pilot.press("r")
             await pilot.pause(0.1)
             assert app._show_restr != before
+
+
+class TestMapSequenceResize:
+    async def test_handle_uses_vertical_resize_pointer(self, tiny_record,
+                                                       isolated_library):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            handle = app.query_one("#map-seq-resize",
+                                   sc.MapSequenceResizeHandle)
+            assert str(handle.styles.pointer) == "ns-resize"
+
+    async def test_drag_up_expands_sequence_and_shrinks_map(
+        self, tiny_record, isolated_library
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            handle = app.query_one("#map-seq-resize",
+                                   sc.MapSequenceResizeHandle)
+            seq = app.query_one("#seq-panel", sc.SequencePanel)
+            map_row = app.query_one("#map-row", sc.Horizontal)
+            seq_before = seq.size.height
+            map_before = map_row.size.height
+
+            down = _MouseEvent(screen_y=30)
+            handle.on_mouse_down(down)
+            handle.on_mouse_move(_MouseEvent(screen_y=26))
+            handle.on_mouse_up(_MouseEvent(screen_y=26))
+            await pilot.pause()
+            await pilot.pause(0.05)
+
+            assert down.stopped is True
+            assert seq.size.height > seq_before
+            assert map_row.size.height < map_before
+
+    async def test_drag_down_shrinks_sequence_and_expands_map(
+        self, tiny_record, isolated_library
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            handle = app.query_one("#map-seq-resize",
+                                   sc.MapSequenceResizeHandle)
+            seq = app.query_one("#seq-panel", sc.SequencePanel)
+            map_row = app.query_one("#map-row", sc.Horizontal)
+            seq_before = seq.size.height
+            map_before = map_row.size.height
+
+            handle.on_mouse_down(_MouseEvent(screen_y=30))
+            handle.on_mouse_move(_MouseEvent(screen_y=34))
+            handle.on_mouse_up(_MouseEvent(screen_y=34))
+            await pilot.pause()
+            await pilot.pause(0.05)
+
+            assert seq.size.height < seq_before
+            assert map_row.size.height > map_before
+
+    async def test_drag_clamps_sequence_and_preserves_sidebar_height(
+        self, tiny_record, isolated_library
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            handle = app.query_one("#map-seq-resize",
+                                   sc.MapSequenceResizeHandle)
+            seq = app.query_one("#seq-panel", sc.SequencePanel)
+            map_row = app.query_one("#map-row", sc.Horizontal)
+            sidebar = app.query_one("#sidebar", sc.FeatureSidebar)
+
+            handle.on_mouse_down(_MouseEvent(screen_y=30))
+            handle.on_mouse_move(_MouseEvent(screen_y=-100))
+            handle.on_mouse_up(_MouseEvent(screen_y=-100))
+            await pilot.pause()
+            await pilot.pause(0.05)
+
+            assert seq.size.height >= handle._MIN_SEQ_HEIGHT
+            assert map_row.size.height >= handle._MIN_MAP_HEIGHT
+            assert sidebar.size.height == map_row.size.height
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

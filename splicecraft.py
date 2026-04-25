@@ -3234,6 +3234,89 @@ class LibraryPanel(Widget):
 
 # ── Sequence panel ─────────────────────────────────────────────────────────────
 
+class MapSequenceResizeHandle(Widget):
+    """Drag handle between the plasmid map/sidebar row and sequence panel."""
+
+    DEFAULT_CSS = """
+    MapSequenceResizeHandle {
+        height: 1;
+        background: $primary-darken-2;
+        color: $text-muted;
+        content-align: center middle;
+        pointer: ns-resize;
+    }
+    MapSequenceResizeHandle.dragging {
+        background: $accent;
+        color: $text;
+        pointer: ns-resize;
+    }
+    """
+
+    can_focus = False
+
+    _MIN_SEQ_HEIGHT = 6
+    _MIN_MAP_HEIGHT = 14
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._dragging = False
+        self._drag_start_y = 0
+        self._drag_start_seq_height = 0
+
+    def render(self) -> Text:
+        width = max(1, self.size.width)
+        return Text("─" * width, style="dim")
+
+    def _clamp_sequence_height(self, height: int) -> int:
+        try:
+            center_h = self.app.query_one("#center-col", Vertical).size.height
+        except Exception:
+            return max(self._MIN_SEQ_HEIGHT, height)
+        handle_h = max(1, self.size.height)
+        max_seq_h = max(
+            self._MIN_SEQ_HEIGHT,
+            center_h - handle_h - self._MIN_MAP_HEIGHT,
+        )
+        return max(self._MIN_SEQ_HEIGHT, min(max_seq_h, height))
+
+    def _apply_sequence_height(self, height: int) -> None:
+        seq_panel = self.app.query_one("#seq-panel", SequencePanel)
+        seq_panel.styles.height = self._clamp_sequence_height(height)
+        seq_panel.refresh(layout=True)
+        try:
+            self.app.query_one("#plasmid-map", PlasmidMap).refresh(layout=True)
+            self.app.query_one("#sidebar", FeatureSidebar).refresh(layout=True)
+        except Exception:
+            pass
+        self.app.refresh(layout=True)
+
+    def on_mouse_down(self, event: MouseDown) -> None:
+        if event.button != 1:
+            return
+        seq_panel = self.app.query_one("#seq-panel", SequencePanel)
+        self._dragging = True
+        self._drag_start_y = int(event.screen_y or 0)
+        self._drag_start_seq_height = seq_panel.size.height
+        self.add_class("dragging")
+        self.capture_mouse()
+        event.stop()
+
+    def on_mouse_move(self, event: MouseMove) -> None:
+        if not self._dragging:
+            return
+        delta_y = int(event.screen_y or 0) - self._drag_start_y
+        self._apply_sequence_height(self._drag_start_seq_height - delta_y)
+        event.stop()
+
+    def on_mouse_up(self, event: MouseUp) -> None:
+        if event.button != 1 or not self._dragging:
+            return
+        self._dragging = False
+        self.remove_class("dragging")
+        self.release_mouse()
+        event.stop()
+
+
 class SequencePanel(Widget):
     """
     Bottom DNA sequence viewer.
@@ -12358,6 +12441,7 @@ SpeciesPickerModal { align: center middle; }
                 with Horizontal(id="map-row"):
                     yield PlasmidMap(id="plasmid-map")
                     yield FeatureSidebar(id="sidebar")
+                yield MapSequenceResizeHandle(id="map-seq-resize")
                 yield SequencePanel(id="seq-panel")
         yield Static(
             Text(
