@@ -966,6 +966,30 @@ class TestCrashRecoveryAutosave:
             assert "/" not in path.name
             assert ":" not in path.name
 
+    async def test_autosave_path_disambiguates_sanitised_collisions(
+        self, tiny_record, isolated_library,
+    ):
+        """Regression guard for 2026-04-25: pre-fix, two records with ids
+        like 'foo/bar' and 'foo_bar' both sanitised to 'foo_bar.gb' and
+        stomped each other on autosave. The fix appends a 6-char hash of
+        the original id so collisions resolve to distinct filenames."""
+        from copy import deepcopy
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            a = deepcopy(tiny_record); a.id = "foo/bar"
+            b = deepcopy(tiny_record); b.id = "foo_bar"
+            path_a = app._autosave_path(a)
+            path_b = app._autosave_path(b)
+            assert path_a is not None and path_b is not None
+            assert path_a != path_b, (
+                f"'{a.id}' and '{b.id}' must produce distinct autosave "
+                f"paths after sanitisation; both got {path_a.name}"
+            )
+            # And reproducibility — the same id always maps to the same path.
+            assert app._autosave_path(deepcopy(a)) == path_a
+
 
 class TestPlannotateReentryGuard:
     """Re-entry guard: pressing Shift+A while pLannotate is already running
@@ -1067,6 +1091,157 @@ class TestSidebarDetailWrapFeature:
             rendered = str(box.render())
             # One hyphen-separator only, no comma.
             assert "," not in rendered.split("(")[0]
+
+
+class TestCursorReachesEndOfSequence:
+    """Regression guard for the 2026-04-25 cursor cap fix.
+
+    Pre-fix the Right/Down arrow handlers clamped to `min(n - 1, …)` so the
+    cursor could never land on position `n` (one past the last base) — the
+    Edit Sequence dialog at `_edit_dialog_result` builds
+    `old_seq[:s] + new_bases + old_seq[s:]`, so an end-of-sequence cursor is
+    needed for an arrow-driven 'append' to work. Cap is now `min(n, …)`.
+    """
+
+    async def test_right_arrow_at_end_advances_cursor_to_n(
+        self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            n  = len(sp._seq)
+            # Position cursor on the last base, focus the panel, then press
+            # Right. Pre-fix the cursor stayed at n-1; post-fix it reaches n.
+            sp._cursor_pos = n - 1
+            sp.focus()
+            await pilot.pause(0.05)
+            await pilot.press("right")
+            await pilot.pause(0.05)
+            assert sp._cursor_pos == n, (
+                f"Right arrow at last base should advance cursor to n={n} "
+                f"(insert-at-end); got {sp._cursor_pos}"
+            )
+
+            # And one more Right keypress must NOT push cursor past n.
+            await pilot.press("right")
+            await pilot.pause(0.05)
+            assert sp._cursor_pos == n
+
+
+class TestSeqClickWrapFeature:
+    """Regression guard for the 2026-04-25 fix to `_seq_click`.
+
+    Pre-fix the handler used `s <= bp < e and (e - s) < best_span` which
+    (a) failed every wrap feature (where `e < s`, so the comparison is
+    always False) and (b) used a negative `e - s` span for any wrap that
+    *did* somehow leak through. Clicking inside a wrap feature on the
+    sequence panel silently selected nothing.
+    """
+
+    async def test_click_inside_wrap_feature_selects_it(
+        self, isolated_library,
+    ):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        rec = SeqRecord(Seq("A" * 100), id="wrap_click_test",
+                        annotations={"molecule_type": "DNA"})
+        # Wrap feature spanning 95..100 + 0..5 (10 bp around origin).
+        wrap_loc = CompoundLocation([
+            FeatureLocation(95, 100, strand=1),
+            FeatureLocation(0, 5, strand=1),
+        ])
+        rec.features.append(SeqFeature(wrap_loc, type="CDS",
+                                       qualifiers={"label": ["wrapCDS"]}))
+        # And a normal linear feature far from the wrap so the test isn't
+        # ambiguous about which feature should match.
+        rec.features.append(SeqFeature(
+            FeatureLocation(40, 60, strand=1), type="CDS",
+            qualifiers={"label": ["linearCDS"]}
+        ))
+
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+
+            pm      = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sp      = app.query_one("#seq-panel",   sc.SequencePanel)
+
+            # Sanity: wrap feature exists in pm._feats.
+            wrap_idx = next(
+                (i for i, f in enumerate(pm._feats)
+                 if f.get("label") == "wrapCDS"),
+                None,
+            )
+            assert wrap_idx is not None
+
+            # Click at bp=2 — inside the wrap's head [0, 5).
+            sp.post_message(sc.SequencePanel.SequenceClick(bp=2))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert pm.selected_idx == wrap_idx, (
+                "Clicking bp=2 (inside wrap head) should select the "
+                f"wrap feature; got selected_idx={pm.selected_idx}"
+            )
+
+            # Click at bp=97 — inside the wrap's tail [95, 100).
+            sp.post_message(sc.SequencePanel.SequenceClick(bp=97))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert pm.selected_idx == wrap_idx, (
+                "Clicking bp=97 (inside wrap tail) should select the "
+                f"wrap feature; got selected_idx={pm.selected_idx}"
+            )
+
+    async def test_click_outside_wrap_does_not_falsely_select(
+        self, isolated_library,
+    ):
+        """Negative control: clicking far from the wrap feature must NOT
+        pick it up. The fix uses `_feat_len(s, e, total)` which is positive
+        for wraps; a regression that compared raw `e - s` (negative) would
+        always pick the wrap feature as 'smallest' and break this case."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        rec = SeqRecord(Seq("A" * 100), id="wrap_neg_test",
+                        annotations={"molecule_type": "DNA"})
+        rec.features.append(SeqFeature(
+            CompoundLocation([
+                FeatureLocation(95, 100, strand=1),
+                FeatureLocation(0, 5, strand=1),
+            ]),
+            type="CDS", qualifiers={"label": ["wrapCDS"]},
+        ))
+        rec.features.append(SeqFeature(
+            FeatureLocation(40, 60, strand=1), type="CDS",
+            qualifiers={"label": ["linearCDS"]}
+        ))
+
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sp = app.query_one("#seq-panel",   sc.SequencePanel)
+
+            linear_idx = next(
+                i for i, f in enumerate(pm._feats)
+                if f.get("label") == "linearCDS"
+            )
+
+            # Click at bp=50 — inside the linear feature, far from wrap.
+            sp.post_message(sc.SequencePanel.SequenceClick(bp=50))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert pm.selected_idx == linear_idx, (
+                f"Should pick linear feature at bp=50, "
+                f"got selected_idx={pm.selected_idx}"
+            )
 
 
 class TestUndoSnapshotIndependence:

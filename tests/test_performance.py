@@ -254,3 +254,114 @@ class TestBuildSeqTextPerformance:
         for cursor in [100, 200, 300]:
             sc._build_seq_text(seq_str, feats, line_width=127, cursor_pos=cursor)
         assert key in sc._BUILD_SEQ_CACHE
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Cursor scrolling on large plasmids — guards against regressing the chunk
+# layout cache (`_chunk_layout`) and the per-chunk static render cache
+# (`_CHUNK_STATIC_CACHE`). These were added 2026-04-25 so users editing
+# cosmid (~30-50 kb) and BAC (~100-300 kb) records don't see jerky cursor
+# movement when holding an arrow key. Pre-fix baselines on the same WSL2
+# machine: 50 kb cursor ~67 ms/call, 150 kb ~200+ ms/call. Post-fix budgets
+# below sit well above current numbers (~5× headroom) but trip hard on a
+# real regression.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BUDGET_CURSOR_50KB_MS  = 30.0    # ~10× headroom over 2.7 ms baseline
+BUDGET_CURSOR_150KB_MS = 60.0    # ~6× headroom over 9 ms baseline
+BUDGET_BP_TO_ROW_US    = 200.0   # ~40× headroom over 5 µs baseline
+
+
+class TestLargePlasmidCursorScrolling:
+    """Cursor scrolling on cosmid/BAC-scale records must stay smooth (≥30 fps).
+
+    Holding the Right arrow key fires `_build_seq_text` once per move on a
+    new cursor position. Without the static-render cache, every keystroke
+    re-runs `_render_feature_row_pair` for ~1500 chunks on a 200 kb plasmid
+    (~120 ms = 8 fps, visibly jerky). With the cache, only the chunk
+    containing the cursor re-renders.
+    """
+
+    def test_50kb_warm_cursor_under_30ms(self):
+        rec = _synth_record(50000, 200)
+        pm = sc.PlasmidMap()
+        pm.load_record(rec)
+        seq_str, feats = str(rec.seq), pm._feats
+
+        # Fully warm both caches: chunk_layout + chunk_static
+        sc._build_seq_text(seq_str, feats, line_width=127, cursor_pos=0)
+
+        # Move cursor across 50 positions and time the average per-move cost.
+        t0 = time.perf_counter()
+        for cur in range(0, 50000, 1000):
+            sc._build_seq_text(seq_str, feats, line_width=127, cursor_pos=cur)
+        dt_ms = (time.perf_counter() - t0) / 50 * 1000
+        assert dt_ms < BUDGET_CURSOR_50KB_MS, (
+            f"50 kb warm cursor move took {dt_ms:.1f} ms/call, "
+            f"budget {BUDGET_CURSOR_50KB_MS} ms — possible chunk-static "
+            f"cache regression"
+        )
+
+    def test_150kb_warm_cursor_under_60ms(self):
+        rec = _synth_record(150000, 600)
+        pm = sc.PlasmidMap()
+        pm.load_record(rec)
+        seq_str, feats = str(rec.seq), pm._feats
+        sc._build_seq_text(seq_str, feats, line_width=127, cursor_pos=0)
+
+        t0 = time.perf_counter()
+        for cur in range(0, 150000, 3000):
+            sc._build_seq_text(seq_str, feats, line_width=127, cursor_pos=cur)
+        dt_ms = (time.perf_counter() - t0) / 50 * 1000
+        assert dt_ms < BUDGET_CURSOR_150KB_MS, (
+            f"150 kb (BAC) warm cursor move took {dt_ms:.1f} ms/call, "
+            f"budget {BUDGET_CURSOR_150KB_MS} ms"
+        )
+
+    def test_bp_to_content_row_is_O1(self):
+        """`_bp_to_content_row` must use chunk_layout prefix sums — direct
+        indexing, not a per-chunk re-scan. Pre-fix this was O(chunks ×
+        features), ~50 ms at 50 kb."""
+        from splicecraft import SequencePanel
+        rec = _synth_record(50000, 200)
+        pm = sc.PlasmidMap()
+        pm.load_record(rec)
+        sp = SequencePanel()
+        sp._seq = str(rec.seq)
+        sp._feats = pm._feats
+        sp._show_connectors = False
+        sp._bp_to_content_row(0)  # warm chunk_layout cache
+
+        t0 = time.perf_counter()
+        for _ in range(500):
+            sp._bp_to_content_row(49999)   # worst-case bp at end
+        dt_us = (time.perf_counter() - t0) / 500 * 1e6
+        assert dt_us < BUDGET_BP_TO_ROW_US, (
+            f"_bp_to_content_row(50 kb, end) took {dt_us:.1f} µs/call, "
+            f"budget {BUDGET_BP_TO_ROW_US} µs — chunk_layout cache regression"
+        )
+
+    def test_chunk_static_cache_invalidates_on_feats_change(self):
+        """Two different feature lists must produce two different renders.
+        Caching by `id(feats)` means a feats reassignment misses the cache;
+        a buggy refactor that mutated `feats` in place would alias the two
+        renders and silently leak stale lane art."""
+        rec_a = _synth_record(5000, 20)
+        rec_b = _synth_record(5000, 20)
+        rec_b.features.clear()  # different feats list, same seq length
+        pm_a = sc.PlasmidMap(); pm_a.load_record(rec_a)
+        pm_b = sc.PlasmidMap(); pm_b.load_record(rec_b)
+        seq_a = str(rec_a.seq)
+        seq_b = str(rec_b.seq)
+
+        text_a = sc._build_seq_text(seq_a, pm_a._feats, line_width=80)
+        text_b = sc._build_seq_text(seq_b, pm_b._feats, line_width=80)
+
+        # rec_a has 20 features (annotation rows), rec_b has none — line
+        # counts must differ.
+        rows_a = text_a.plain.count("\n")
+        rows_b = text_b.plain.count("\n")
+        assert rows_a > rows_b, (
+            f"feats=20 produced {rows_a} rows, feats=0 produced {rows_b} — "
+            f"static cache may be aliasing two records"
+        )

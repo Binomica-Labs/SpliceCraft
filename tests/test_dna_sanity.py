@@ -352,6 +352,46 @@ class TestRestrictionScan:
         # Buggy formula would give len(seq) - 2 - 6 = 20 — explicitly reject it:
         assert r["start"] != len(seq) - 2 - 6
 
+    def test_non_palindrome_reverse_strand_recut_position(self):
+        """Pre-2026-04-25, line 922's `(p + site_len - 1 - fwd_cut) % n`
+        formula was off by one: for BsaI (GGTCTC, fwd_cut=7, rev_cut=11) the
+        bottom-strand cut on a reverse-bound site landed one base too far to
+        the LEFT.
+
+        Derivation: BsaI's enzyme-local inter-base cut is at position 7 (=
+        fwd_cut). On a reverse binding the enzyme's local 0 sits at top
+        position p+site_len-1, so local-7 maps to top p+site_len-1-7 and the
+        cut splits between local-6 (top p+site_len-1-6) and local-7. In top
+        5'→3' order the base immediately right of the cut is at position
+        `p + site_len - fwd_cut`, NOT `p + site_len - 1 - fwd_cut`.
+        """
+        # Place GAGACC (= rc of GGTCTC) at position 10. Sequence padded so
+        # all rev-strand cuts land in-bounds for a clean linear test.
+        seq = ("A" * 10) + "GAGACC" + ("A" * 10)        # 26 bp
+        feats = sc._scan_restriction_sites(seq, min_recognition_len=6,
+                                           unique_only=False, circular=False)
+        cuts = [f for f in feats
+                if f.get("label") == "BsaI" and f.get("type") == "recut"]
+        assert len(cuts) == 1
+        c = cuts[0]
+        assert c["strand"] == -1
+        # Correct: p + site_len - fwd_cut = 10 + 6 - 7 = 9.
+        # Buggy:   p + site_len - 1 - fwd_cut = 10 + 6 - 1 - 7 = 8.
+        assert c["start"] == 9, (
+            f"Reverse-strand BsaI bottom-strand cut landed at "
+            f"{c['start']} (expected 9 — off-by-one regression?)"
+        )
+
+        # And the top-strand `ext_cut_bp` (rev_cut path, line 916) should
+        # land at p + site_len - rev_cut = 10 + 6 - 11 = 5, NOT 4 (buggy).
+        resites = [f for f in feats
+                   if f.get("label") == "BsaI" and f.get("type") == "resite"]
+        assert len(resites) == 1
+        assert resites[0]["ext_cut_bp"] == 5, (
+            f"Reverse-strand BsaI top-strand ext_cut_bp at "
+            f"{resites[0]['ext_cut_bp']} (expected 5 — off-by-one regression?)"
+        )
+
     def test_unique_only_filter_excludes_multi_cutters(self):
         # Two EcoRI sites: unique_only=True should drop EcoRI entirely.
         seq = "AA" + "GAATTC" + "AAA" + "GAATTC" + "AA"

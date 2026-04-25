@@ -911,15 +911,18 @@ def _scan_restriction_sites(
                     continue
                 seen.add(key)
                 # Cut column within the bar: enzyme's fwd_cut mapped to
-                # the reversed orientation displayed on the forward strand
-                rev_cut_col = site_len - 1 - fwd_cut
-                _top_cut_bp = (p + site_len - 1 - rev_cut) % n   # top-strand cut in fwd coords
+                # the reversed orientation displayed on the forward strand.
+                # Symmetry: a forward-strand cut at offset `c` from the
+                # recognition's 5' end appears on a reverse-bound site at
+                # offset `site_len - c` from the bar's left edge.
+                rev_cut_col = site_len - fwd_cut
+                _top_cut_bp = (p + site_len - rev_cut) % n   # top-strand cut in fwd coords
                 _top_cut_outside = ((_top_cut_bp - p) % n) >= site_len
                 _cc  = rev_cut_col if 0 <= rev_cut_col < site_len else None
                 _ext = _top_cut_bp if _top_cut_outside else None
                 _emit_resite(hits, p, site_len, -1, color, name, _cc, _ext)
                 # Bottom-strand cut (enzyme's fwd_cut mapped to fwd coords)
-                cut_bp = (p + site_len - 1 - fwd_cut) % n if n > 0 else 0
+                cut_bp = (p + site_len - fwd_cut) % n if n > 0 else 0
                 hits.append({
                     "type":   "recut",
                     "start":  cut_bp,
@@ -1230,6 +1233,32 @@ def _chunk_lane_groups(
 _BUILD_SEQ_CACHE: dict = {}
 
 
+# Per-(seq_id, feats_id, line_width) cache for chunk decomposition. Keyed
+# identically to _BUILD_SEQ_CACHE plus line_width (which only changes on
+# terminal resize). Independent of cursor/selection/show_connectors —
+# show_connectors only changes the row-multiplier rpg, applied at lookup
+# time via prefix-sum arithmetic. Holds:
+#   chunks       — list of (chunk_start, chunk_end, lane_groups, above, below)
+#                  where above/below are lane-pair counts (NOT row counts).
+#   prefix_dna2  — list[int]: total rows up to chunk i with rpg=2 (so cursor
+#                  moves on a 200 kb plasmid don't re-run _feats_in_chunk
+#                  for 1500 chunks every keystroke).
+#   prefix_lanes — list[int]: total lane pairs (above+below) up to chunk i.
+# Total rows before chunk i for arbitrary rpg:
+#   prefix_dna2[i] + (rpg - 2) * prefix_lanes[i]
+_CHUNK_LAYOUT_CACHE: dict = {}
+
+
+# Per-(seq_id, feats_id, line_width, show_connectors) cache of pre-rendered
+# Rich Text per chunk, ASSUMING NO OVERLAYS (no cursor / selection / RE
+# highlight). Cursor moves only re-render the chunk under the cursor; the
+# other ~1500 chunks of a 200 kb BAC are reused from this cache. Profile-
+# driven: `_render_feature_row_pair` was 78% of cursor-move time on a 150 kb
+# plasmid; lane art is fully deterministic per chunk so caching it
+# eliminates that hot path. Stored as `dict[key, list[Text|None]]`.
+_CHUNK_STATIC_CACHE: dict = {}
+
+
 def _feats_in_chunk(
     feats: list[dict], chunk_start: int, chunk_end: int, total: int
 ) -> list[dict]:
@@ -1257,7 +1286,7 @@ def _feats_in_chunk(
     return out
 
 
-def _build_seq_inputs(seq: str, feats: list[tuple]) -> tuple:
+def _build_seq_inputs(seq: str, feats: list[dict]) -> tuple[list[str], list[dict]]:
     """Return (styles, annot_feats) for a given sequence/feature pair,
     memoised by identity. Both outputs are expensive on large plasmids and
     independent of cursor/selection state."""
@@ -1288,6 +1317,61 @@ def _build_seq_inputs(seq: str, feats: list[tuple]) -> tuple:
         _BUILD_SEQ_CACHE.clear()
     _BUILD_SEQ_CACHE[key] = (styles, annot_feats)
     return styles, annot_feats
+
+
+def _chunk_layout(seq: str, feats: list[dict], line_width: int):
+    """Return per-chunk lane decomposition + prefix sums, cached by id.
+
+    Used by both `_bp_to_content_row` (cursor → row index) and
+    `_build_seq_text` (chunk-by-chunk render). Computing this once per
+    (seq, feats, line_width) instead of per cursor move turns BAC/cosmid
+    cursor scrolling from ~120 ms/keystroke into low single digits — the
+    `_feats_in_chunk` + `_chunk_lane_groups` calls per chunk dominate
+    otherwise (200 kb / line_width 127 = ~1.5k chunks × N features).
+
+    Returns ``(chunks, prefix_dna2, prefix_lanes)`` where:
+      - ``chunks[i] = (chunk_start, chunk_end, lane_groups, above_pairs, below_pairs)``
+      - ``prefix_dna2[i]`` = total rows from row 0 up to (not including) chunk i
+        assuming rpg = 2 (no connector row).
+      - ``prefix_lanes[i]`` = total lane pairs (above+below) up to chunk i.
+    Total rows before chunk i for any rpg:
+      ``prefix_dna2[i] + (rpg - 2) * prefix_lanes[i]``
+    """
+    n = len(seq)
+    key = (id(seq), id(feats), line_width, n, len(feats))
+    hit = _CHUNK_LAYOUT_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    # Reuse _build_seq_inputs' filtered+sorted annot_feats so cache hits
+    # there propagate here (and so the two paths see identical lane order).
+    _, annot_feats = _build_seq_inputs(seq, feats)
+
+    chunks: list = []
+    prefix_dna2  = [0]   # rows with rpg=2; index 0 = before chunk 0
+    prefix_lanes = [0]
+    if n == 0 or line_width <= 0:
+        layout = (chunks, prefix_dna2, prefix_lanes)
+        _CHUNK_LAYOUT_CACHE[key] = layout
+        return layout
+
+    for chunk_start in range(0, n, line_width):
+        chunk_end   = min(chunk_start + line_width, n)
+        chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
+        groups      = _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
+        re_above, onebp_above, reg_above, reg_below, onebp_below, re_below = groups
+        above_pairs = len(re_above) + len(onebp_above) + len(reg_above)
+        below_pairs = len(re_below) + len(onebp_below) + len(reg_below)
+        chunks.append((chunk_start, chunk_end, groups, above_pairs, below_pairs))
+        # Per-chunk rows with rpg=2: above*2 + 2 (DNA pair) + below*2
+        prefix_dna2.append(prefix_dna2[-1] + above_pairs * 2 + 2 + below_pairs * 2)
+        prefix_lanes.append(prefix_lanes[-1] + above_pairs + below_pairs)
+
+    layout = (chunks, prefix_dna2, prefix_lanes)
+    if len(_CHUNK_LAYOUT_CACHE) >= 4:
+        _CHUNK_LAYOUT_CACHE.clear()
+    _CHUNK_LAYOUT_CACHE[key] = layout
+    return layout
 
 
 def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
@@ -1327,35 +1411,118 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     seq_upper = seq.upper()
     result    = Text(no_wrap=True, overflow="crop")
 
-    for chunk_start in range(0, n, line_width):
-        chunk_end = min(chunk_start + line_width, n)
+    # Cached chunk decomposition — eliminates per-chunk _feats_in_chunk +
+    # _chunk_lane_groups recomputation on every cursor-move re-render. On a
+    # 200 kb plasmid that's ~1500 chunks × N features → milliseconds saved
+    # per keystroke when scrolling through cosmid/BAC-scale records.
+    chunks_layout, _pf_dna2, _pf_lanes = _chunk_layout(seq, feats, line_width)
 
-        # ── Assign features to lane groups ──
-        # _feats_in_chunk handles wrap features (end < start) by splitting
-        # into tail + head virtual pieces before the overlap test.
-        chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
-        re_above, onebp_above, reg_above, reg_below, onebp_below, re_below = (
-            _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
+    # Per-chunk static-render cache. The first render fills it; subsequent
+    # cursor moves only re-render the chunk under the cursor and reuse the
+    # other ~N pre-rendered Text objects. Without this, the BAC-scale
+    # `_render_feature_row_pair` cost (~78 % of render time) recurs every
+    # keystroke. Cache stays valid for cursor/selection changes; it
+    # invalidates only on (seq, feats, line_width, show_connectors) change.
+    static_key   = (id(seq), id(feats), line_width, show_connectors)
+    static_cache = _CHUNK_STATIC_CACHE.get(static_key)
+    if static_cache is None or len(static_cache) != len(chunks_layout):
+        static_cache = [None] * len(chunks_layout)
+        _CHUNK_STATIC_CACHE[static_key] = static_cache
+        if len(_CHUNK_STATIC_CACHE) > 4:
+            _CHUNK_STATIC_CACHE.pop(next(iter(_CHUNK_STATIC_CACHE)))
+
+    for i, (chunk_start, chunk_end, groups, _ab_pairs, _be_pairs) in enumerate(chunks_layout):
+        # If any overlay touches this chunk, render fresh. Otherwise reuse
+        # (or first-time-populate) the static cache.
+        chunk_has_overlay = (
+            (usr_s < chunk_end and usr_e > chunk_start)
+            or (sel_s < chunk_end and sel_e > chunk_start)
+            or (reh_s < chunk_end and reh_e > chunk_start)
+            or (chunk_start <= cursor_pos < chunk_end)
         )
 
-        # ── Rows ABOVE DNA (far → close): RE → 1bp → multi-bp ──
-        for lane in re_above:
-            _render_feature_row_pair(result, lane, chunk_start, chunk_end,
-                                     num_w + 2, False, show_connectors,
-                                     flip_label_bar=True)
-        for lane in onebp_above:
-            _render_feature_row_pair(result, lane, chunk_start, chunk_end,
-                                     num_w + 2, False, show_connectors)
-        for lane in reg_above:
-            _render_feature_row_pair(result, lane, chunk_start, chunk_end,
-                                     num_w + 2, False, show_connectors)
+        if chunk_has_overlay:
+            _render_chunk(result, chunk_start, chunk_end, groups, styles,
+                          num_w, seq_upper, show_connectors,
+                          sel_s, sel_e, usr_s, usr_e,
+                          reh_s, reh_e, reh_color, cursor_pos)
+        else:
+            cached = static_cache[i]
+            if cached is None:
+                cached = Text(no_wrap=True, overflow="crop")
+                _render_chunk(cached, chunk_start, chunk_end, groups, styles,
+                              num_w, seq_upper, show_connectors,
+                              -1, -1, -1, -1, -1, -1, "", -1)
+                static_cache[i] = cached
+            result.append(cached)
 
-        # ── Double-stranded DNA block ─────────────────────────────────────
-        # The cursor is shown as a reverse-video highlight on the base IN
-        # PLACE rather than as an inserted glyph, so column counts match.
+    return result
 
-        def _strand_chars(bases: "list[str]") -> None:
-            """Append base chars with RLE styling into result."""
+
+def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
+                   groups: tuple, styles: list[str], num_w: int,
+                   seq_upper: str, show_connectors: bool,
+                   sel_s: int, sel_e: int, usr_s: int, usr_e: int,
+                   reh_s: int, reh_e: int, reh_color: str,
+                   cursor_pos: int) -> None:
+    """Render one chunk into `result`. The DNA pair takes a fast RLE path
+    when no overlay (cursor / selection / RE highlight) intersects the
+    chunk; otherwise the per-base path applies overlay styles. Lane rows
+    above/below the DNA pair are independent of overlay so they always
+    render the same way — which is what makes the static-cache reuse safe.
+    """
+    re_above, onebp_above, reg_above, reg_below, onebp_below, re_below = groups
+
+    # ── Rows ABOVE DNA (far → close): RE → 1bp → multi-bp ──
+    for lane in re_above:
+        _render_feature_row_pair(result, lane, chunk_start, chunk_end,
+                                 num_w + 2, False, show_connectors,
+                                 flip_label_bar=True)
+    for lane in onebp_above:
+        _render_feature_row_pair(result, lane, chunk_start, chunk_end,
+                                 num_w + 2, False, show_connectors)
+    for lane in reg_above:
+        _render_feature_row_pair(result, lane, chunk_start, chunk_end,
+                                 num_w + 2, False, show_connectors)
+
+    # ── Double-stranded DNA block ─────────────────────────────────────
+    chunk_fwd = seq_upper[chunk_start:chunk_end]
+    chunk_rev = chunk_fwd.translate(_DNA_COMP_PRESERVE_CASE)
+    chunk_len = chunk_end - chunk_start
+
+    chunk_has_overlay = (
+        (usr_s < chunk_end and usr_e > chunk_start)
+        or (sel_s < chunk_end and sel_e > chunk_start)
+        or (reh_s < chunk_end and reh_e > chunk_start)
+        or (chunk_start <= cursor_pos < chunk_end)
+    )
+
+    if not chunk_has_overlay:
+        # RLE the styles slice. Long runs are common because most bases
+        # outside features carry the default `color(252)`.
+        runs: list[tuple[int, int, str]] = []
+        if chunk_len > 0:
+            cur_sty = styles[chunk_start]
+            rs = 0
+            for j in range(1, chunk_len):
+                s_j = styles[chunk_start + j]
+                if s_j != cur_sty:
+                    runs.append((rs, j, cur_sty))
+                    rs = j
+                    cur_sty = s_j
+            runs.append((rs, chunk_len, cur_sty))
+
+        result.append(f"{chunk_start + 1:>{num_w}}  ", style="color(245)")
+        for rs, re_end, sty in runs:
+            result.append(chunk_fwd[rs:re_end], style=sty)
+        result.append("\n")
+
+        result.append(" " * (num_w + 2), style="color(245)")
+        for rs, re_end, sty in runs:
+            result.append(chunk_rev[rs:re_end], style=sty)
+        result.append("\n")
+    else:
+        def _strand_chars(bases: "list[tuple[str, str]]") -> None:
             run: list[str] = []
             sty = ""
             for ch, s in bases:
@@ -1368,10 +1535,6 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
             if run:
                 result.append("".join(run), style=sty)
 
-        # Perf: translate the whole chunk once instead of per-base.
-        chunk_fwd = seq_upper[chunk_start:chunk_end]
-        chunk_rev = chunk_fwd.translate(_DNA_COMP_PRESERVE_CASE)
-        chunk_len = chunk_end - chunk_start
         fwd_bases: list[tuple[str, str]] = []
         rc_bases:  list[tuple[str, str]] = []
         for j in range(chunk_len):
@@ -1386,7 +1549,6 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                 fwd_sty = "reverse bold white"
                 rev_sty = fwd_sty
             elif in_re:
-                # Entire recognition region: white background, black text
                 fwd_sty = f"reverse bold {reh_color}"
                 rev_sty = f"reverse bold {reh_color}"
             elif in_usr:
@@ -1401,29 +1563,25 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
             fwd_bases.append((chunk_fwd[j], fwd_sty))
             rc_bases.append( (chunk_rev[j], rev_sty))
 
-        # Forward strand
         result.append(f"{chunk_start + 1:>{num_w}}  ", style="color(245)")
         _strand_chars(fwd_bases)
         result.append("\n")
 
-        # Reverse-complement strand (aligned column-for-column)
         result.append(" " * (num_w + 2), style="color(245)")
         _strand_chars(rc_bases)
         result.append("\n")
 
-        # ── Rows BELOW DNA (close → far): multi-bp → 1bp → RE ──
-        for lane in reg_below:
-            _render_feature_row_pair(result, lane, chunk_start, chunk_end,
-                                     num_w + 2, True, show_connectors)
-        for lane in onebp_below:
-            _render_feature_row_pair(result, lane, chunk_start, chunk_end,
-                                     num_w + 2, True, show_connectors)
-        for lane in re_below:
-            _render_feature_row_pair(result, lane, chunk_start, chunk_end,
-                                     num_w + 2, True, show_connectors,
-                                     flip_label_bar=True)
-
-    return result
+    # ── Rows BELOW DNA (close → far): multi-bp → 1bp → RE ──
+    for lane in reg_below:
+        _render_feature_row_pair(result, lane, chunk_start, chunk_end,
+                                 num_w + 2, True, show_connectors)
+    for lane in onebp_below:
+        _render_feature_row_pair(result, lane, chunk_start, chunk_end,
+                                 num_w + 2, True, show_connectors)
+    for lane in re_below:
+        _render_feature_row_pair(result, lane, chunk_start, chunk_end,
+                                 num_w + 2, True, show_connectors,
+                                 flip_label_bar=True)
 
 
 # Standard genetic code for CDS translation (no biopython dependency)
@@ -3564,25 +3722,30 @@ class SequencePanel(Widget):
         return self._sorted_feats_cache
 
     def _bp_to_content_row(self, bp: int) -> int:
-        """Return the content row index (0-based) of the DNA line containing bp."""
-        n           = len(self._seq)
-        num_w       = len(str(n)) if n else 1
-        line_width  = max(20, self._seq_render_width() - (num_w + 2))
-        annot_feats = self._annot_feats_sorted()
+        """Return the content row index (0-based) of the DNA line containing bp.
+
+        O(1) via `_chunk_layout` prefix sums — direct index by `bp //
+        line_width` plus arithmetic on cached above/below pair counts. The
+        previous chunk-by-chunk re-scan was the bottleneck for cursor
+        scrolling on cosmid/BAC-scale records (~50 ms/keystroke at 50 kb).
+        """
+        n = len(self._seq)
+        if n == 0:
+            return 0
+        line_width = self._line_width()
+        if line_width <= 0:
+            return 0
+        chunks_layout, prefix_dna2, prefix_lanes = _chunk_layout(
+            self._seq, self._feats, line_width
+        )
+        if not chunks_layout:
+            return 0
         rpg = 2 + (1 if self._show_connectors else 0)
-        row = 0
-        for chunk_start in range(0, n, line_width):
-            chunk_end   = min(chunk_start + line_width, n)
-            chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
-            re_above, onebp_above, reg_above, reg_below, onebp_below, re_below = (
-                _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
-            )
-            above_rows = (len(re_above) + len(onebp_above) + len(reg_above)) * rpg
-            if bp < chunk_end:
-                return row + above_rows   # forward-strand DNA row within this chunk
-            below_rows = (len(reg_below) + len(onebp_below) + len(re_below)) * rpg
-            row += above_rows + 2 + below_rows
-        return row
+        chunk_idx = min(bp // line_width, len(chunks_layout) - 1)
+        # Total rows up to (not including) chunk_idx, scaled for current rpg.
+        rows_before = prefix_dna2[chunk_idx] + (rpg - 2) * prefix_lanes[chunk_idx]
+        above_rows  = chunks_layout[chunk_idx][3] * rpg
+        return rows_before + above_rows
 
     def _line_width(self) -> int:
         """Number of bp per displayed line."""
@@ -12717,14 +12880,22 @@ SpeciesPickerModal { align: center middle; }
     # ── Crash-recovery autosave ────────────────────────────────────────────────
 
     def _autosave_path(self, record) -> "Path | None":
-        """Return the autosave file path for `record`, or None if no id."""
+        """Return the autosave file path for `record`, or None if no id.
+
+        The filename is `{safe}-{hash6}.gb` where `safe` is the sanitised
+        record.id and `hash6` is a 6-char hex of sha256(record.id). Two
+        records with `id` like 'foo/bar' and 'foo_bar' both sanitise to
+        'foo_bar' but get distinct hashes, so they no longer overwrite each
+        other in the crash-recovery directory.
+        """
         if record is None or not getattr(record, "id", ""):
             return None
-        import re
+        import hashlib
         safe = re.sub(r'[^A-Za-z0-9._-]', '_', record.id)[:80]
         if not safe:
             return None
-        return _CRASH_RECOVERY_DIR / f"{safe}.gb"
+        h = hashlib.sha256(record.id.encode("utf-8")).hexdigest()[:6]
+        return _CRASH_RECOVERY_DIR / f"{safe}-{h}.gb"
 
     def _schedule_autosave(self) -> None:
         """Debounce: restart the countdown to the next autosave write."""
@@ -12860,11 +13031,14 @@ SpeciesPickerModal { align: center middle; }
         if k in ("left", "shift+left"):
             new_pos = max(0, sp._cursor_pos - 1)
         elif k in ("right", "shift+right"):
-            new_pos = min(n - 1, sp._cursor_pos + 1)
+            # Cap at n (one past last base) so the dialog's "insert at cursor"
+            # path can append. cursor_pos in [0, n] inclusive matches Python's
+            # half-open slicing convention used by `_edit_dialog_result`.
+            new_pos = min(n, sp._cursor_pos + 1)
         elif k in ("up", "shift+up"):
             new_pos = max(0, sp._cursor_pos - lw)
         elif k in ("down", "shift+down"):
-            new_pos = min(n - 1, sp._cursor_pos + lw)
+            new_pos = min(n, sp._cursor_pos + lw)
         else:
             return
         event.stop()
@@ -13244,12 +13418,18 @@ SpeciesPickerModal { align: center middle; }
         sidebar = self.query_one("#sidebar",     FeatureSidebar)
         seq_pnl = self.query_one("#seq-panel",   SequencePanel)
         bp      = event.bp
+        # Route through PlasmidMap._bp_in + _feat_len so wrap features
+        # (end < start) are honoured. A naive `s <= bp < e` misses every
+        # origin-spanning feature; `e - s` is also negative for them.
+        total = len(seq_pnl._seq)
         best_idx  = -1
         best_span = float("inf")
         for i, f in enumerate(pm._feats):
-            s, e = f["start"], f["end"]
-            if s <= bp < e and (e - s) < best_span:
-                best_span = e - s
+            if not pm._bp_in(bp, f):
+                continue
+            span = _feat_len(f["start"], f["end"], total) if total else 0
+            if span < best_span:
+                best_span = span
                 best_idx  = i
         if best_idx >= 0:
             f = pm._feats[best_idx]
