@@ -11,7 +11,7 @@ A **terminal-based circular plasmid map viewer, sequence editor, and cloning/mut
 **Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs, user ATinyGreenCell). **PyPI:** `splicecraft`. Latest: **v0.3.3**.
 
 - **Single-file architecture:** entire app is `splicecraft.py` (~14,300 lines). Intentional — keeps the codebase greppable. Sibling project ScriptoScope (~8,600 lines) follows the same convention.
-- **Test suite:** 874 tests across 16 files in `tests/`. `pytest -n auto` ~125 s on 8 cores; sequential ~400 s. Biology subset (`test_dna_sanity.py`) < 1 s. `test_invariants_hypothesis.py` adds property-based fuzzing.
+- **Test suite:** 879 tests across 16 files in `tests/`. `pytest -n auto` ~125 s on 8 cores; sequential ~400 s. Biology subset (`test_dna_sanity.py`) < 1 s. `test_invariants_hypothesis.py` adds property-based fuzzing.
 - **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`. Tests: `pytest`, `pytest-asyncio`, `pytest-xdist`, `hypothesis`. **Optional runtime:** `pLannotate` (conda, GPL-3) for Shift+A annotation.
 - Releases via `./release.sh X.Y.Z` (bumps version, runs tests, builds, tags, pushes; `publish.yml` uploads to PyPI via OIDC).
 

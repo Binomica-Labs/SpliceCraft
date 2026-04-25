@@ -3486,9 +3486,8 @@ class SequencePanel(Widget):
         self._sel_anchor = -1
         if cursor_bp >= 0:
             self._cursor_pos = cursor_bp
+            self._ensure_cursor_visible()   # scroll BEFORE refresh
         self._refresh_view()
-        if cursor_bp >= 0:
-            self._ensure_cursor_visible()
 
         trans_box = self.query_one("#seq-trans", Static)
         if feat.get("type") == "CDS":
@@ -3525,8 +3524,9 @@ class SequencePanel(Widget):
             # Map/sidebar/double-click: cursor at feature end, anchor at start
             self._cursor_pos = max(start, end - 1)
             self._sel_anchor = start
-        self._refresh_view()
+        # Scroll BEFORE refresh — see _ensure_cursor_visible docstring.
         self._ensure_cursor_visible()
+        self._refresh_view()
 
         # Show CDS translation when applicable
         trans_box = self.query_one("#seq-trans", Static)
@@ -3568,8 +3568,9 @@ class SequencePanel(Widget):
             self._cursor_pos = bp
             self._user_sel   = None
             self._sel_anchor = -1
-        self._refresh_view()
+        # Scroll BEFORE refresh — see _ensure_cursor_visible docstring.
         self._ensure_cursor_visible()
+        self._refresh_view()
 
     def on_mouse_move(self, event: MouseMove) -> None:
         if not self._mouse_button_held or self._drag_start_bp < 0:
@@ -3761,31 +3762,92 @@ class SequencePanel(Widget):
         except NoMatches:
             pass
 
-    def _ensure_cursor_visible(self) -> None:
-        """Scroll just enough so the cursor's DNA line is fully visible.
+    def center_on_bp(self, bp: int) -> None:
+        """Scroll the sequence panel so `bp` lands at the vertical centre of
+        the viewport. Used by sidebar/map click handlers — the user has
+        deliberately clicked, so don't make them hunt for the result.
 
-        Deferred to run after the next refresh so that the scroll container
-        has already processed any content update (which can reset scroll_y).
+        Sets `scroll_y` directly (not via `scroll_to`) because Textual's
+        `scroll_to(animate=False)` still defers the position change to the
+        next refresh tick — which is exactly the one-frame lag that makes
+        line-to-line cursor scrolling feel jerky. Direct attribute set
+        applies in the same refresh cycle as the cursor render.
+        """
+        if not self._seq or bp < 0:
+            return
+        row = self._bp_to_content_row(bp)
+        try:
+            scroll = self.query_one("#seq-scroll", ScrollableContainer)
+        except NoMatches:
+            return
+        vp_h = scroll.size.height
+        if vp_h <= 0:
+            return
+        target_top = max(0, row - vp_h // 2)
+        scroll.scroll_y = target_top
+
+    def _ensure_cursor_visible(self) -> None:
+        """Scroll just enough so the cursor's chunk is fully visible.
+
+        "Chunk" here = the cursor's DNA pair plus the feature lanes above
+        and below it. Scrolling only to the DNA row (the previous behaviour)
+        left the above-lanes off the top of the viewport whenever the
+        cursor reached the topmost visible row, so users couldn't see which
+        feature their cursor was on without an extra Up keypress.
+
+        Applied synchronously rather than via `call_after_refresh` because
+        the deferral introduced a one-frame lag between the cursor advance
+        and the scroll catch-up — that's what users perceive as "jerky"
+        line-to-line scrolling. Arrow-key paths don't change content size,
+        so scroll_y bounds stay stable; the synchronous scroll batches into
+        the same refresh cycle as the cursor render.
         """
         if self._cursor_pos < 0 or not self._seq:
             return
-        row = self._bp_to_content_row(self._cursor_pos)
-        row_bottom = row + 1   # fwd + rc strand = 2 rows
+        line_width = self._line_width()
+        if line_width <= 0:
+            return
+        chunks_layout, prefix_dna2, prefix_lanes = _chunk_layout(
+            self._seq, self._feats, line_width
+        )
+        if not chunks_layout:
+            return
 
-        def _do_scroll():
-            try:
-                scroll = self.query_one("#seq-scroll", ScrollableContainer)
-            except NoMatches:
-                return
-            vp_top = int(scroll.scroll_y)
-            vp_h   = scroll.size.height
-            vp_bottom = vp_top + vp_h - 1
-            if row < vp_top:
-                scroll.scroll_to(0, row, animate=False)
-            elif row_bottom > vp_bottom:
-                scroll.scroll_to(0, row_bottom - vp_h + 1, animate=False)
+        rpg = 2 + (1 if self._show_connectors else 0)
+        chunk_idx = min(self._cursor_pos // line_width, len(chunks_layout) - 1)
+        above_pairs = chunks_layout[chunk_idx][3]
+        below_pairs = chunks_layout[chunk_idx][4]
 
-        self.call_after_refresh(_do_scroll)
+        chunk_top    = prefix_dna2[chunk_idx] + (rpg - 2) * prefix_lanes[chunk_idx]
+        chunk_bottom = chunk_top + (above_pairs + below_pairs) * rpg + 1  # last row of chunk
+
+        try:
+            scroll = self.query_one("#seq-scroll", ScrollableContainer)
+        except NoMatches:
+            return
+        vp_top = int(scroll.scroll_y)
+        vp_h   = scroll.size.height
+        if vp_h <= 0:
+            return
+        vp_bottom = vp_top + vp_h - 1
+
+        # Direct attribute set: `scroll_to(animate=False)` is still deferred
+        # by one refresh tick in Textual. That deferral is the source of the
+        # visible jerk between cursor advance and viewport catch-up.
+        if chunk_top < vp_top:
+            # Scrolling up — bring the chunk's above-lanes into view at the
+            # top of the viewport.
+            scroll.scroll_y = chunk_top
+        elif chunk_bottom > vp_bottom:
+            # Scrolling down — bring below-lanes into view at the bottom.
+            # If the chunk is taller than the viewport (very dense feature
+            # stacking), prefer pinning above-lanes + DNA at the top so the
+            # cursor stays visible.
+            chunk_height = chunk_bottom - chunk_top + 1
+            if chunk_height > vp_h:
+                scroll.scroll_y = chunk_top
+            else:
+                scroll.scroll_y = chunk_bottom - vp_h + 1
 
     def _refresh_view(self) -> None:
         view = self.query_one("#seq-view", Static)
@@ -13038,7 +13100,12 @@ SpeciesPickerModal { align: center middle; }
         elif k in ("up", "shift+up"):
             new_pos = max(0, sp._cursor_pos - lw)
         elif k in ("down", "shift+down"):
-            new_pos = min(n, sp._cursor_pos + lw)
+            # Cap at n - 1 (last base). Down is meant to navigate visually
+            # row-to-row; on the last row it should land on the last
+            # basepair, not on n (which has no base to highlight and looks
+            # like the cursor disappeared off-screen). Insert-at-end is
+            # still reachable via Right arrow.
+            new_pos = min(max(0, n - 1), sp._cursor_pos + lw)
         else:
             return
         event.stop()
@@ -13055,8 +13122,12 @@ SpeciesPickerModal { align: center middle; }
             sp._cursor_pos = new_pos
             sp._user_sel   = None
             sp._sel_anchor = -1
-        sp._refresh_view()
+        # Order matters: scroll BEFORE refresh. Textual's `view.update()`
+        # tick resets `scroll_y` when content changes, so a sync set
+        # afterwards gets clobbered. Setting scroll_y before the refresh
+        # means the new content paints at the already-correct viewport.
         sp._ensure_cursor_visible()
+        sp._refresh_view()
 
     # ── Undo / redo ────────────────────────────────────────────────────────────
 
@@ -13452,6 +13523,12 @@ SpeciesPickerModal { align: center middle; }
             seq_pnl.select_feature_range(event.feat_dict, cursor_bp=event.bp)
         else:
             seq_pnl.highlight_feature(event.feat_dict)
+        # Centre the sequence panel on the click point regardless of whether
+        # a feature was hit. Backbone clicks (event.feat_dict is None) get the
+        # raw bp; feature clicks get the bp inside the feature. Both make the
+        # user's intent — "show me this region" — match what they actually see.
+        if event.bp >= 0:
+            seq_pnl.center_on_bp(event.bp)
 
     @on(FeatureSidebar.RowActivated)
     def _sidebar_row_activated(self, event: FeatureSidebar.RowActivated):
@@ -13462,6 +13539,16 @@ SpeciesPickerModal { align: center middle; }
         f = pm._feats[event.idx] if 0 <= event.idx < len(pm._feats) else None
         sidebar.show_detail(f)
         seq_pnl.highlight_feature(f)
+        # Centre the sequence panel on the feature so a sidebar click is
+        # never silent. Wrap features (end < start) need the circular-arc
+        # midpoint, not the naive `(start + end) // 2`.
+        if f is not None:
+            n = len(seq_pnl._seq)
+            if n:
+                s, e = f["start"], f["end"]
+                arc_len = (e - s) % n
+                mid = (s + arc_len // 2) % n
+                seq_pnl.center_on_bp(mid)
 
     # ── Library events ─────────────────────────────────────────────────────────
 

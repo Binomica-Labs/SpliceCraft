@@ -1101,6 +1101,10 @@ class TestCursorReachesEndOfSequence:
     Edit Sequence dialog at `_edit_dialog_result` builds
     `old_seq[:s] + new_bases + old_seq[s:]`, so an end-of-sequence cursor is
     needed for an arrow-driven 'append' to work. Cap is now `min(n, …)`.
+
+    Note (2026-04-25 amendment): Down arrow keeps the n-1 cap because pressing
+    Down on the last row should land on the last visible base, not past it.
+    Insert-at-end is reachable via Right arrow only.
     """
 
     async def test_right_arrow_at_end_advances_cursor_to_n(
@@ -1128,6 +1132,232 @@ class TestCursorReachesEndOfSequence:
             await pilot.press("right")
             await pilot.pause(0.05)
             assert sp._cursor_pos == n
+
+    async def test_down_arrow_on_last_row_caps_at_last_basepair(
+        self, tiny_record, isolated_library,
+    ):
+        """Pressing Down on the last visible row should land on the last
+        basepair (n-1), not on n. Position n has no base to highlight, so
+        the cursor would visually disappear. Reported 2026-04-25."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            n  = len(sp._seq)
+            lw = sp._line_width()
+            assert n > 0 and lw > 0
+            # Place cursor a few bases into what should be the last row.
+            # (`n - 5` is on the last row for any sequence with at least
+            # one full row; tiny_record is ~120 bp so this holds.)
+            sp._cursor_pos = max(0, n - 5)
+            sp.focus()
+            await pilot.pause(0.05)
+            await pilot.press("down")
+            await pilot.pause(0.05)
+            assert sp._cursor_pos == n - 1, (
+                f"Down on last row should clamp cursor to n-1={n-1} "
+                f"(last visible base); got {sp._cursor_pos}"
+            )
+
+            # Pressing Down again must keep cursor at n-1 (no overshoot).
+            await pilot.press("down")
+            await pilot.pause(0.05)
+            assert sp._cursor_pos == n - 1
+
+
+class TestSidebarClickCentersSeqPanel:
+    """Regression guard for the 2026-04-25 sidebar-click centering fix.
+
+    Clicking a feature in the sidebar previously highlighted it but did not
+    scroll the sequence panel. Users with a 50 kb plasmid had to manually
+    scroll through hundreds of rows to find the feature they just clicked.
+    Now the seq panel jumps to the feature's wrap-aware midpoint."""
+
+    async def test_sidebar_click_scrolls_seq_panel_to_feature(
+        self, isolated_library,
+    ):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # 5 kb plasmid with a feature far past the initial viewport so
+        # centering must scroll meaningfully (not stay at scroll_y=0).
+        rec = SeqRecord(Seq("A" * 5000), id="centerTest",
+                        annotations={"molecule_type": "DNA"})
+        rec.features.append(SeqFeature(
+            FeatureLocation(4000, 4200, strand=1), type="CDS",
+            qualifiers={"label": ["targetFeat"]},
+        ))
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sidebar = app.query_one("#sidebar", sc.FeatureSidebar)
+
+            target_idx = next(
+                i for i, f in enumerate(pm._feats)
+                if f.get("label") == "targetFeat"
+            )
+            # Post the sidebar's RowActivated message — this is what fires
+            # when the user actually clicks a feature row.
+            sidebar.post_message(sc.FeatureSidebar.RowActivated(target_idx))
+            await pilot.pause()
+            await pilot.pause(0.1)  # let call_after_refresh do its scroll
+            scroll = app.query_one("#seq-scroll")
+            # Pre-fix: scroll_y stayed at 0. Post-fix: scrolls toward the
+            # feature at bp 4100 (far row).
+            assert scroll.scroll_y > 5, (
+                f"Sidebar click on feature at bp 4100 should scroll seq "
+                f"panel meaningfully; scroll_y={scroll.scroll_y}"
+            )
+
+
+class TestEnsureCursorVisibleShowsLanes:
+    """Regression guard for the 2026-04-25 chunk-aware scroll fix.
+
+    `_ensure_cursor_visible` previously scrolled to put the cursor's DNA
+    forward-strand row at the top of the viewport when the user scrolled
+    up. That left the feature lanes ABOVE the DNA off-screen, so the user
+    had to press Up again just to see which feature their cursor was on.
+    The fix targets `chunk_top` (DNA row minus above-lane rows) instead.
+    """
+
+    async def test_scroll_up_brings_above_lanes_into_view(
+        self, isolated_library,
+    ):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # Build a record where every chunk has a feature so above_pairs > 0.
+        rec = SeqRecord(Seq("A" * 2000), id="laneScrollTest",
+                        annotations={"molecule_type": "DNA"})
+        for i in range(0, 2000, 100):
+            rec.features.append(SeqFeature(
+                FeatureLocation(i, i + 80, strand=1), type="CDS",
+                qualifiers={"label": [f"f{i}"]},
+            ))
+
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+
+            # Park the cursor deep into the sequence so scrolling up to a
+            # mid-chunk has somewhere to go.
+            sp._cursor_pos = 1500
+            sp.focus()
+            await pilot.pause(0.05)
+            sp._ensure_cursor_visible()
+            await pilot.pause(0.05)
+
+            scroll = app.query_one("#seq-scroll")
+            scroll_y_before = scroll.scroll_y
+
+            # Scroll up via Up arrow until cursor is at the top of viewport.
+            for _ in range(40):
+                await pilot.press("up")
+                await pilot.pause(0.02)
+
+            # The cursor's DNA row must be at least `above_pairs * rpg`
+            # below the top of the viewport — i.e., the feature lanes
+            # above the DNA must fit in the viewport above the cursor.
+            line_width = sp._line_width()
+            chunks_layout, prefix_dna2, prefix_lanes = sc._chunk_layout(
+                sp._seq, sp._feats, line_width
+            )
+            rpg = 2 + (1 if sp._show_connectors else 0)
+            chunk_idx = sp._cursor_pos // line_width
+            above_pairs = chunks_layout[chunk_idx][3]
+            chunk_top = (prefix_dna2[chunk_idx]
+                         + (rpg - 2) * prefix_lanes[chunk_idx])
+            dna_row = chunk_top + above_pairs * rpg
+
+            scroll = app.query_one("#seq-scroll")
+            vp_top = int(scroll.scroll_y)
+
+            # Pre-fix: vp_top would equal dna_row (lanes clipped above viewport).
+            # Post-fix: vp_top <= chunk_top, so the above-lanes are visible.
+            assert vp_top <= chunk_top, (
+                f"vp_top={vp_top} should be at or above chunk_top={chunk_top} "
+                f"so the {above_pairs} feature-lane row(s) above the cursor's "
+                f"DNA stay visible. dna_row={dna_row}"
+            )
+
+
+class TestMapClickCentersSeqPanel:
+    """Regression guard for the 2026-04-25 map-click centering fix.
+
+    Clicking on the plasmid map (feature or backbone) now centres the
+    sequence panel on the clicked bp."""
+
+    async def test_map_feature_click_centers_seq_panel(
+        self, isolated_library,
+    ):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 5000), id="mapClickTest",
+                        annotations={"molecule_type": "DNA"})
+        rec.features.append(SeqFeature(
+            FeatureLocation(4000, 4200, strand=1), type="CDS",
+            qualifiers={"label": ["targetFeat"]},
+        ))
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+
+            target_idx = next(
+                i for i, f in enumerate(pm._feats)
+                if f.get("label") == "targetFeat"
+            )
+            target_feat = pm._feats[target_idx]
+            # Simulate the FeatureSelected event the map fires on click.
+            pm.post_message(sc.PlasmidMap.FeatureSelected(
+                target_idx, target_feat, bp=4100
+            ))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            scroll = app.query_one("#seq-scroll")
+            assert scroll.scroll_y > 5, (
+                f"Map click at bp 4100 should scroll seq panel; "
+                f"scroll_y={scroll.scroll_y}"
+            )
+
+    async def test_map_backbone_click_centers_seq_panel(
+        self, tiny_record, isolated_library,
+    ):
+        """Clicking on the bare backbone (no feature) must still scroll the
+        sequence panel — backbone clicks send `feat_dict=None, bp=clicked`
+        and the handler now centres on bp regardless of feature presence."""
+        # Use a longer record so backbone scrolling has somewhere to go.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 5000), id="backboneClickTest",
+                        annotations={"molecule_type": "DNA"})
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            # idx=-1, feat=None — the backbone-click signature.
+            pm.post_message(sc.PlasmidMap.FeatureSelected(
+                -1, None, bp=4500
+            ))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            scroll = app.query_one("#seq-scroll")
+            assert scroll.scroll_y > 5, (
+                f"Backbone click at bp 4500 should still scroll seq panel; "
+                f"scroll_y={scroll.scroll_y}"
+            )
 
 
 class TestSeqClickWrapFeature:
