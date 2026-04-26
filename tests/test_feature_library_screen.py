@@ -6,8 +6,10 @@ Scope:
   * Clicking the `Features` menu bar item pushes FeatureLibraryScreen
     (direct open, no dropdown).
   * Screen mounts cleanly with zero / one / many entries.
-  * Add / Duplicate / Remove / Color / Cycle-Strand actions mutate the
-    on-disk library via _save_features.
+  * Add / Edit / Duplicate / Remove / Color / Cycle-Strand actions
+    mutate the in-memory list and mark dirty; persistence happens only
+    on Save (action_save) or via the unsaved-quit prompt.
+  * Closing with pending edits pushes UnsavedQuitModal.
   * ColorPickerModal returns the expected dict shape for each button path.
 
 All tests use the `_protect_user_data` autouse fixture, so the real
@@ -117,10 +119,11 @@ class TestFeatureLibraryScreenMount:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestFeatureLibraryCrud:
-    """The Remove / Duplicate / Cycle-Strand actions must write through
-    `_save_features` so the change survives a reload."""
+    """Remove / Duplicate / Cycle-Strand mutate the in-memory list and
+    set the dirty flags. Persistence only happens via action_save.
+    """
 
-    async def test_remove_persists(self, tiny_record):
+    async def test_remove_buffers_until_save(self, tiny_record):
         sc._save_features([{
             "name": "lacZ", "feature_type": "CDS",
             "sequence": "ATG", "strand": 1,
@@ -135,8 +138,17 @@ class TestFeatureLibraryCrud:
             await pilot.pause(0.1)
             app.screen.action_remove()
             await pilot.pause()
+            # In-memory list shows the removal; disk does not.
+            assert app.screen._entries == []
+            assert app.screen._has_pending_changes is True
+            sc._features_cache = None
+            assert len(sc._load_features()) == 1
+            # action_save persists.
+            app.screen.action_save()
+            await pilot.pause()
             sc._features_cache = None
             assert sc._load_features() == []
+            assert app.screen._has_pending_changes is False
 
     async def test_duplicate_adds_copy_suffix(self, tiny_record):
         sc._save_features([{
@@ -153,12 +165,20 @@ class TestFeatureLibraryCrud:
             await pilot.pause(0.1)
             app.screen.action_duplicate()
             await pilot.pause()
+            # Buffered: in-memory has the dup, disk still has just the
+            # original until action_save runs.
+            assert len(app.screen._entries) == 2
+            assert "(copy)" in app.screen._entries[1]["name"]
+            sc._features_cache = None
+            assert len(sc._load_features()) == 1
+            app.screen.action_save()
+            await pilot.pause()
             sc._features_cache = None
             loaded = sc._load_features()
             assert len(loaded) == 2
             assert "(copy)" in loaded[1]["name"]
 
-    async def test_cycle_strand_persists(self, tiny_record):
+    async def test_cycle_strand_buffers_until_save(self, tiny_record):
         sc._save_features([{
             "name": "lacZ", "feature_type": "CDS",
             "sequence": "ATG", "strand": 1,
@@ -175,11 +195,18 @@ class TestFeatureLibraryCrud:
             for expected in (-1, 0, 2, 1):
                 app.screen.action_strand()
                 await pilot.pause()
+                # Disk still untouched until save.
                 sc._features_cache = None
-                assert sc._load_features()[0]["strand"] == expected, (
-                    f"after action_strand expected {expected}, got "
-                    f"{sc._load_features()[0]['strand']}"
-                )
+                assert sc._load_features()[0]["strand"] == 1
+                # In-memory entry reflects the cycle step.
+                assert app.screen._entries[0]["strand"] == expected
+                # Edited entry is dirty.
+                assert 0 in app.screen._dirty_indices
+            app.screen.action_save()
+            await pilot.pause()
+            sc._features_cache = None
+            assert sc._load_features()[0]["strand"] == 1
+            assert app.screen._dirty_indices == set()
 
     async def test_close_pops_back_to_main(self, tiny_record):
         app = sc.PlasmidApp()
@@ -195,6 +222,340 @@ class TestFeatureLibraryCrud:
             await pilot.pause()
             await pilot.pause(0.05)
             assert not isinstance(app.screen, sc.FeatureLibraryScreen)
+
+
+class TestFeatureLibraryUnsavedFlow:
+    """The deferred-save model: dirty flags, asterisk prefix in the
+    table, and the UnsavedQuitModal-on-close gate.
+    """
+
+    async def test_dirty_entry_gets_asterisk_prefix(self, tiny_record):
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATG", "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.FeatureLibraryScreen())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app.screen.action_strand()
+            await pilot.pause()
+            tbl = app.screen.query_one("#flib-table", DataTable)
+            row_keys = list(tbl.rows.keys())
+            cell = tbl.get_cell(row_keys[0], list(tbl.columns.keys())[0])
+            assert str(cell).startswith("*"), (
+                f"Dirty entry name should be prefixed with '*', got {cell!r}"
+            )
+
+    async def test_title_marks_pending_changes(self, tiny_record):
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATG", "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.FeatureLibraryScreen())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            title = app.screen.query_one("#flib-title", Static)
+            assert "*" not in str(title.render()), (
+                f"Clean title should not contain '*': {title.render()!r}"
+            )
+            app.screen.action_strand()
+            await pilot.pause()
+            assert "*" in str(title.render()), (
+                f"Dirty title should contain '*': {title.render()!r}"
+            )
+
+    async def test_close_with_dirty_pushes_unsaved_quit_modal(
+        self, tiny_record,
+    ):
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATG", "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.FeatureLibraryScreen())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app.screen.action_strand()
+            await pilot.pause()
+            app.screen.action_close()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Modal pushed on top — library screen is still in the stack.
+            assert isinstance(app.screen, sc.UnsavedQuitModal)
+
+    async def test_unsaved_quit_save_persists_then_pops(self, tiny_record):
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATG", "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.FeatureLibraryScreen())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app.screen.action_strand()  # cycle 1 → -1
+            await pilot.pause()
+            app.screen.action_close()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.UnsavedQuitModal)
+            # Click "Save & Quit".
+            app.screen.query_one("#btn-save-quit", Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Both modals popped → back to main app.
+            assert not isinstance(app.screen, sc.UnsavedQuitModal)
+            assert not isinstance(app.screen, sc.FeatureLibraryScreen)
+            sc._features_cache = None
+            assert sc._load_features()[0]["strand"] == -1
+
+    async def test_unsaved_quit_abandon_pops_without_persisting(
+        self, tiny_record,
+    ):
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATG", "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.FeatureLibraryScreen())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app.screen.action_strand()  # cycle 1 → -1 in memory
+            await pilot.pause()
+            app.screen.action_close()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.UnsavedQuitModal)
+            app.screen.query_one("#btn-abandon", Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert not isinstance(app.screen, sc.FeatureLibraryScreen)
+            sc._features_cache = None
+            # Disk still shows original strand=1.
+            assert sc._load_features()[0]["strand"] == 1
+
+    async def test_unsaved_quit_cancel_keeps_screen_open(self, tiny_record):
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATG", "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.FeatureLibraryScreen())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app.screen.action_strand()
+            await pilot.pause()
+            app.screen.action_close()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.UnsavedQuitModal)
+            app.screen.query_one("#btn-cancel-quit", Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Modal popped, library screen still open with dirty state.
+            assert isinstance(app.screen, sc.FeatureLibraryScreen)
+            assert app.screen._has_pending_changes is True
+
+    async def test_remove_shifts_dirty_indices(self, tiny_record):
+        sc._save_features([
+            {"name": "a", "feature_type": "CDS", "sequence": "ATG", "strand": 1},
+            {"name": "b", "feature_type": "CDS", "sequence": "ATG", "strand": 1},
+            {"name": "c", "feature_type": "CDS", "sequence": "ATG", "strand": 1},
+        ])
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.FeatureLibraryScreen())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            screen = app.screen
+            # Mark indices 0 and 2 dirty.
+            screen._mark_dirty(0)
+            screen._mark_dirty(2)
+            assert screen._dirty_indices == {0, 2}
+            # Remove middle entry (index 1).
+            screen._selected_index = 1
+            screen.action_remove()
+            await pilot.pause()
+            # Index 0 still dirty, former index 2 is now index 1.
+            assert screen._dirty_indices == {0, 1}, (
+                f"After removing idx=1 from {{0,2}}, expected {{0,1}}; "
+                f"got {screen._dirty_indices}"
+            )
+
+    async def test_save_without_changes_is_noop(self, tiny_record):
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATG", "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.FeatureLibraryScreen())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app.screen.action_save()  # nothing to save
+            await pilot.pause()
+            assert app.screen._has_pending_changes is False
+
+    async def test_abandon_does_not_poison_cache(self, tiny_record):
+        """Regression guard: in-place mutations of feature dicts during
+        a deferred-save session must not leak into ``_features_cache``.
+
+        Pre-fix, ``_load_features()`` returned a shallow ``list(...)``
+        of the cache, so dict refs were shared. FeatureLibraryScreen
+        mutated entries in place (rename/strand/color), and even after
+        the user picked Abandon those mutations stuck in the cache —
+        next consumer of ``_load_features()`` (a fresh
+        FeatureLibraryScreen, the DomesticatorModal feature picker,
+        etc.) would see the abandoned edit as if it had been saved.
+        Fix: deepcopy on read and on write into the cache.
+
+        This test deliberately does NOT clear ``_features_cache``
+        before reloading — that's the whole point. The cache must
+        stay clean on its own.
+        """
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATG", "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.FeatureLibraryScreen())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app.screen.action_strand()  # cycle 1 → -1 in memory
+            await pilot.pause()
+            app.screen.action_close()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.UnsavedQuitModal)
+            app.screen.query_one("#btn-abandon", Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Note: NO sc._features_cache = None reset.
+            cached = sc._load_features()
+            assert cached[0]["strand"] == 1, (
+                f"After Abandon, _features_cache still carried the "
+                f"in-memory mutation; expected strand=1, got "
+                f"strand={cached[0]['strand']}. Cache leaked via "
+                f"shared dict refs."
+            )
+
+    async def test_post_save_mutation_does_not_poison_cache(self, tiny_record):
+        """A trickier variant: user saves once, then makes more edits,
+        then abandons. The post-save edits must NOT survive in the
+        cache. Pre-fix, ``_save_features`` did
+        ``_features_cache = list(entries)`` which shared dict refs
+        with the caller's list — so any mutation of the caller's list
+        after the save also mutated the cache. Fix: deepcopy on save.
+        """
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATG", "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.FeatureLibraryScreen())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # First mutation, save it.
+            app.screen.action_strand()  # 1 → -1
+            await pilot.pause()
+            app.screen.action_save()
+            await pilot.pause()
+            # Disk + cache should both be -1 now.
+            assert sc._load_features()[0]["strand"] == -1
+            # Second mutation, abandon it.
+            app.screen.action_strand()  # -1 → 0 (in memory only)
+            await pilot.pause()
+            app.screen.action_close()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.UnsavedQuitModal)
+            app.screen.query_one("#btn-abandon", Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # NO cache reset — the cache must already be clean.
+            cached = sc._load_features()
+            assert cached[0]["strand"] == -1, (
+                f"Post-save mutation leaked into cache through shared "
+                f"dict refs from _save_features; expected the saved "
+                f"value (-1), got {cached[0]['strand']}."
+            )
+
+    async def test_edit_replaces_entry_and_marks_dirty(self, tiny_record):
+        """The Edit button pre-fills AddFeatureModal with the current
+        entry; saving from the modal replaces the entry at its current
+        index and tags it dirty (no asterisk on disk until save).
+        """
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATG", "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.FeatureLibraryScreen())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app.screen.action_edit()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.AddFeatureModal)
+            # Modal should be pre-filled with lacZ.
+            name_input = app.screen.query_one("#addfeat-name", Input)
+            assert name_input.value == "lacZ"
+            # Change the name and save.
+            name_input.value = "lacZ-edited"
+            app.screen.query_one("#btn-addfeat-save", Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Back on the library screen.
+            assert isinstance(app.screen, sc.FeatureLibraryScreen)
+            assert app.screen._entries[0]["name"] == "lacZ-edited"
+            assert 0 in app.screen._dirty_indices
+            assert app.screen._has_pending_changes is True
+            # Disk untouched.
+            sc._features_cache = None
+            assert sc._load_features()[0]["name"] == "lacZ"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

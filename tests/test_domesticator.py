@@ -1336,6 +1336,756 @@ class TestPartsBinExportFasta:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Parts Bin: Save As Feature button
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestGbPartTypeToInsdcMap:
+    """Pure mapping: GB part type (TitleCase + spaces) → INSDC
+    feature_type. CDS-NS / C-tag are GB-specific shapes that have no
+    INSDC equivalent; they collapse to plain "CDS" with the original
+    type preserved in the description."""
+
+    @pytest.mark.parametrize("gb_type, insdc", [
+        ("Promoter",   "promoter"),
+        ("5' UTR",     "5'UTR"),
+        ("CDS",        "CDS"),
+        ("CDS-NS",     "CDS"),
+        ("C-tag",      "CDS"),
+        ("Terminator", "terminator"),
+    ])
+    def test_known_types_map_to_insdc(self, gb_type, insdc):
+        assert sc._GB_PART_TYPE_TO_INSDC[gb_type] == insdc
+
+    def test_every_gb_position_has_a_mapping(self):
+        # Every TitleCase part type listed in _GB_POSITIONS must have a
+        # corresponding INSDC mapping; otherwise Save As Feature would
+        # silently fall through to "misc_feature" for that shape.
+        for gb_type in sc._GB_POSITIONS:
+            assert gb_type in sc._GB_PART_TYPE_TO_INSDC, (
+                f"Missing INSDC mapping for GB part type {gb_type!r}"
+            )
+
+
+class TestPartsBinSaveAsFeature:
+    """`PartsBinModal` grew a "Save As Feature" button that takes the
+    highlighted user part and registers it in the persistent feature
+    library via `AddFeatureModal` → `_persist_feature_entry`."""
+
+    async def test_button_present(self, isolated_parts_bin, isolated_library):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert app.screen.query_one(
+                "#btn-parts-save-as-feature", sc.Button,
+            ) is not None
+
+    async def test_user_part_pushes_prefilled_modal(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        sc._save_parts_bin([{
+            "name":      "myCDS",
+            "type":      "CDS",
+            "position":  "Pos 3-4",
+            "oh5":       "AATG", "oh3": "GCTT",
+            "backbone":  "pUPD2",
+            "marker":    "Spectinomycin",
+            "sequence":  "ATGCATGCATGC",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            parts_modal.query_one("#parts-table",
+                                  sc.DataTable).move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-save-as-feature",
+                                  sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.AddFeatureModal)
+            # Pre-fill carries the part's name + sequence; type is the
+            # INSDC mapping (CDS → CDS in this case).
+            from textual.widgets import Input, Select, TextArea
+            assert app.screen.query_one("#addfeat-name", Input).value == "myCDS"
+            assert app.screen.query_one("#addfeat-type", Select).value == "CDS"
+            assert (
+                app.screen.query_one("#addfeat-seq", TextArea).text
+                == "ATGCATGCATGC"
+            )
+            # GB metadata rides along in the description.
+            desc = app.screen.query_one("#addfeat-desc", Input).value
+            assert "Pos 3-4" in desc
+            assert "AATG" in desc and "GCTT" in desc
+
+    async def test_builtin_part_is_rejected(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        """Built-in catalog rows have no sequence — Save As Feature
+        must surface a warning rather than open an empty AddFeatureModal."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            # No user parts — first row is built-in (no sequence).
+            parts_modal.query_one("#parts-table",
+                                  sc.DataTable).move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-save-as-feature",
+                                  sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Still on the parts screen — no AddFeatureModal pushed.
+            assert isinstance(app.screen, sc.PartsBinModal)
+
+    async def test_save_persists_to_feature_library(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        sc._save_parts_bin([{
+            "name":      "myProm",
+            "type":      "Promoter",
+            "position":  "Pos 1",
+            "oh5":       "GGAG", "oh3": "TGAC",
+            "backbone":  "pUPD2",
+            "marker":    "Spectinomycin",
+            "sequence":  "TATAAATATA",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            parts_modal.query_one("#parts-table",
+                                  sc.DataTable).move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-save-as-feature",
+                                  sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Now in AddFeatureModal — press Save.
+            app.screen.query_one("#btn-addfeat-save", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Back on the parts screen, with the entry now in features.json.
+            assert isinstance(app.screen, sc.PartsBinModal)
+            sc._features_cache = None
+            entries = sc._load_features()
+            assert len(entries) == 1
+            entry = entries[0]
+            assert entry["name"] == "myProm"
+            # Promoter (TitleCase) → promoter (INSDC).
+            assert entry["feature_type"] == "promoter"
+            assert entry["sequence"] == "TATAAATATA"
+            assert entry["strand"] == 1
+
+    async def test_cds_ns_collapses_to_cds_with_note(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        """CDS-NS is a GB-specific coding shape (no stop codon). INSDC
+        has no equivalent so the entry is saved as plain "CDS"; the
+        original GB type rides along in the description so the
+        distinction is recoverable from the library."""
+        sc._save_parts_bin([{
+            "name":      "myNS",
+            "type":      "CDS-NS",
+            "position":  "Pos 3",
+            "oh5":       "AATG", "oh3": "TTCG",
+            "backbone":  "pUPD2",
+            "marker":    "Spectinomycin",
+            "sequence":  "ATGAAATTT",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            parts_modal.query_one("#parts-table",
+                                  sc.DataTable).move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-save-as-feature",
+                                  sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            from textual.widgets import Select, Input
+            assert app.screen.query_one("#addfeat-type", Select).value == "CDS"
+            desc = app.screen.query_one("#addfeat-desc", Input).value
+            assert "GB type: CDS-NS" in desc, (
+                f"Expected GB-type note in description; got {desc!r}"
+            )
+
+
+class TestFeatureLibraryMatchHelper:
+    """Pure helper: classify a (name, feature_type, sequence) triple
+    against the on-disk feature library."""
+
+    def test_no_match_returns_empty(self, isolated_library):
+        sc._save_features([])
+        assert sc._feature_library_match("foo", "CDS", "ATG") == ""
+
+    def test_exact_match(self, isolated_library):
+        sc._save_features([{
+            "name": "foo", "feature_type": "CDS",
+            "sequence": "ATGCAT", "strand": 1,
+        }])
+        assert sc._feature_library_match("foo", "CDS", "ATGCAT") == "exact"
+
+    def test_exact_match_is_case_insensitive_on_sequence(self, isolated_library):
+        # Stored sequence is upper-cased by AddFeatureModal._gather, but
+        # be defensive — the helper canonicalises both sides.
+        sc._save_features([{
+            "name": "foo", "feature_type": "CDS",
+            "sequence": "atgcat", "strand": 1,
+        }])
+        assert sc._feature_library_match("foo", "CDS", "ATGCAT") == "exact"
+
+    def test_name_match_with_different_sequence(self, isolated_library):
+        sc._save_features([{
+            "name": "foo", "feature_type": "CDS",
+            "sequence": "ATGCAT", "strand": 1,
+        }])
+        assert sc._feature_library_match("foo", "CDS", "AAATTT") == "name"
+
+    def test_different_type_is_not_a_match(self, isolated_library):
+        # Same name but different feature_type → treat as a separate
+        # entry. promoter and CDS with the same label are independent.
+        sc._save_features([{
+            "name": "foo", "feature_type": "promoter",
+            "sequence": "ATGCAT", "strand": 1,
+        }])
+        assert sc._feature_library_match("foo", "CDS", "ATGCAT") == ""
+
+
+class TestFeatureLibraryGenerationCounter:
+    """The `_features_generation` counter must bump on every change to
+    the feature library so consumers (PartsBinModal index cache, etc.)
+    can detect "the library has changed since I last looked" without
+    re-scanning the entries list. Strict bump-on-change — never
+    decremented or reset by ordinary code paths."""
+
+    def test_save_features_bumps_generation(self, isolated_library):
+        sc._save_features([])
+        before = sc._features_generation
+        sc._save_features([{
+            "name": "foo", "feature_type": "CDS",
+            "sequence": "ATG", "strand": 1,
+        }])
+        assert sc._features_generation > before
+
+    def test_disk_reload_bumps_generation(self, isolated_library):
+        sc._save_features([])
+        before = sc._features_generation
+        # Simulate an external invalidation (test harness, hand-edit of
+        # features.json, etc.). _load_features re-reads from disk and
+        # bumps the counter so any cached index is treated as stale.
+        sc._features_cache = None
+        sc._load_features()
+        assert sc._features_generation > before
+
+
+class TestBuildFeatureLibraryIndex:
+    """`_build_feature_library_index` must produce a dict keyed by
+    (name, feature_type) with case-folded sequences, single sweep over
+    the library — used by PartsBinModal for O(1) per-row lookups."""
+
+    def test_empty_library_returns_empty_dict(self, isolated_library):
+        sc._save_features([])
+        assert sc._build_feature_library_index() == {}
+
+    def test_index_keys_are_name_type_tuples(self, isolated_library):
+        sc._save_features([
+            {"name": "p1", "feature_type": "promoter",
+             "sequence": "ATG", "strand": 1},
+            {"name": "c1", "feature_type": "CDS",
+             "sequence": "TTT", "strand": 1},
+        ])
+        index = sc._build_feature_library_index()
+        assert ("p1", "promoter") in index
+        assert ("c1", "CDS") in index
+
+    def test_index_sequences_are_case_folded(self, isolated_library):
+        sc._save_features([
+            {"name": "x", "feature_type": "CDS",
+             "sequence": "atgcAT", "strand": 1},
+        ])
+        index = sc._build_feature_library_index()
+        assert index[("x", "CDS")] == "ATGCAT"
+
+    def test_classify_uses_index(self, isolated_library):
+        sc._save_features([
+            {"name": "x", "feature_type": "CDS",
+             "sequence": "ATG", "strand": 1},
+        ])
+        index = sc._build_feature_library_index()
+        assert sc._classify_feature_library_match(index, "x", "CDS", "ATG") == "exact"
+        assert sc._classify_feature_library_match(index, "x", "CDS", "AAA") == "name"
+        assert sc._classify_feature_library_match(index, "y", "CDS", "ATG") == ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Parts Bin: "Feat Lib" column + already-saved warning
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPartsBinFeatLibColumn:
+    """The Parts Bin grew a "Feat Lib" column flagging parts that are
+    already registered as features. Green ✓ = exact match, yellow ✓ =
+    same (name, type) but different sequence (Save would replace).
+    Built-in catalog rows always render empty."""
+
+    async def test_exact_match_renders_green_check(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        sc._save_parts_bin([{
+            "name": "lacZ", "type": "CDS",
+            "position": "Pos 3-4", "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2", "marker": "Spectinomycin",
+            "sequence": "ATGCATGCATGC",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+        }])
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATGCATGCATGC", "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            row_keys = list(t.rows.keys())
+            col_keys = list(t.columns.keys())
+            cell = t.get_cell(row_keys[0], col_keys[-1])  # last column = Feat Lib
+            assert "✓" in str(cell), (
+                f"Expected ✓ in Feat Lib column for exact match; got {cell!r}"
+            )
+            # Style on the whole cell carries "green".
+            assert "green" in str(cell.style).lower()
+
+    async def test_name_match_different_sequence_renders_yellow(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        sc._save_parts_bin([{
+            "name": "lacZ", "type": "CDS",
+            "position": "Pos 3-4", "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2", "marker": "Spectinomycin",
+            "sequence": "ATGCATGCATGC",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+        }])
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "AAATTTAAATTT", "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            row_keys = list(t.rows.keys())
+            col_keys = list(t.columns.keys())
+            cell = t.get_cell(row_keys[0], col_keys[-1])
+            assert "✓" in str(cell)
+            assert "yellow" in str(cell.style).lower()
+
+    async def test_no_match_renders_empty(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        sc._save_parts_bin([{
+            "name": "newPart", "type": "CDS",
+            "position": "Pos 3-4", "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2", "marker": "Spectinomycin",
+            "sequence": "ATGCATGCATGC",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+        }])
+        sc._save_features([])  # empty library
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            row_keys = list(t.rows.keys())
+            col_keys = list(t.columns.keys())
+            cell = t.get_cell(row_keys[0], col_keys[-1])
+            assert str(cell) == "", (
+                f"Expected empty Feat Lib cell for unmatched part; got {cell!r}"
+            )
+
+    async def test_builtin_catalog_row_is_always_empty(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        """Built-in catalog parts have no sequence; even if the user
+        coincidentally has a feature with the same name as a catalog
+        entry, the column should render empty (no false positive)."""
+        sc._save_features([{
+            "name": "Nos", "feature_type": "promoter",
+            "sequence": "ATGCATGCATGC", "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            # First built-in row that's a Promoter named "Nos".
+            for r in parts_modal._rows:
+                if r["name"] == "Nos" and not r["user"]:
+                    target_row_idx = parts_modal._rows.index(r)
+                    break
+            else:
+                pytest.skip("Catalog has no 'Nos' promoter — fixture drift")
+            row_keys = list(t.rows.keys())
+            col_keys = list(t.columns.keys())
+            cell = t.get_cell(row_keys[target_row_idx], col_keys[-1])
+            assert str(cell) == "", (
+                f"Built-in catalog rows must always render empty in "
+                f"Feat Lib column; got {cell!r}"
+            )
+
+    async def test_column_refreshes_after_save_as_feature(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        """After saving a part as a feature, the column should flip
+        from empty to ✓ without the user having to re-open the modal.
+        Regression guard against the callback forgetting to repopulate."""
+        sc._save_parts_bin([{
+            "name": "myPart", "type": "CDS",
+            "position": "Pos 3-4", "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2", "marker": "Spectinomycin",
+            "sequence": "ATGCATGCATGC",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+        }])
+        sc._save_features([])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            t = parts_modal.query_one("#parts-table", sc.DataTable)
+            row_keys = list(t.rows.keys())
+            col_keys = list(t.columns.keys())
+            assert str(t.get_cell(row_keys[0], col_keys[-1])) == ""
+            # Move cursor to the user part and trigger Save As Feature.
+            t.move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-save-as-feature",
+                                  sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # AddFeatureModal pops up — accept the prefill.
+            app.screen.query_one("#btn-addfeat-save", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Back on the parts screen; column should now show ✓.
+            assert isinstance(app.screen, sc.PartsBinModal)
+            t = app.screen.query_one("#parts-table", sc.DataTable)
+            row_keys = list(t.rows.keys())
+            col_keys = list(t.columns.keys())
+            cell = t.get_cell(row_keys[0], col_keys[-1])
+            assert "✓" in str(cell), (
+                f"Feat Lib column should show ✓ after save; got {cell!r}"
+            )
+
+
+class TestPartsBinFeatLibIndexCache:
+    """The PartsBinModal builds a feature-library lookup index once on
+    mount and reuses it across populates. Re-derived only when
+    `_features_generation` advances — so opening Save As Feature, then
+    re-rendering the parts table, doesn't re-scan the entire feature
+    library."""
+
+    async def test_index_built_on_mount(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATGCATGCATGC", "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert modal._feat_lib_index == {("lacZ", "CDS"): "ATGCATGCATGC"}
+            # Generation snapshot recorded so subsequent populates skip
+            # the rebuild.
+            assert modal._feat_lib_gen_seen == sc._features_generation
+
+    async def test_index_not_rebuilt_when_generation_unchanged(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        """_populate must NOT call `_build_feature_library_index` when
+        the feature library hasn't changed. Spy on the helper to count
+        invocations across two sequential populates."""
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATG", "strand": 1,
+        }])
+        calls: list[int] = []
+        orig = sc._build_feature_library_index
+        def spy():
+            calls.append(1)
+            return orig()
+        sc._build_feature_library_index = spy
+        try:
+            app = sc.PlasmidApp()
+            async with app.run_test(size=_BASELINE) as pilot:
+                await pilot.pause()
+                app.push_screen(sc.PartsBinModal())
+                await pilot.pause()
+                await pilot.pause(0.1)
+                first_count = len(calls)
+                # Trigger a second populate without changing the lib.
+                app.screen._populate()
+                await pilot.pause()
+                second_count = len(calls)
+            assert second_count == first_count, (
+                f"Index was rebuilt unnecessarily — first populate: "
+                f"{first_count}, second: {second_count} (expected equal)"
+            )
+        finally:
+            sc._build_feature_library_index = orig
+
+    async def test_index_rebuilt_when_generation_advances(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        """When `_features_generation` advances (e.g., after a save),
+        the next populate must rebuild the index — otherwise the Feat
+        Lib column would lag behind reality."""
+        sc._save_features([])
+        calls: list[int] = []
+        orig = sc._build_feature_library_index
+        def spy():
+            calls.append(1)
+            return orig()
+        sc._build_feature_library_index = spy
+        try:
+            app = sc.PlasmidApp()
+            async with app.run_test(size=_BASELINE) as pilot:
+                await pilot.pause()
+                app.push_screen(sc.PartsBinModal())
+                await pilot.pause()
+                await pilot.pause(0.1)
+                first = len(calls)
+                # Mutate the feature library — gen counter bumps.
+                sc._save_features([{
+                    "name": "lacZ", "feature_type": "CDS",
+                    "sequence": "ATG", "strand": 1,
+                }])
+                app.screen._populate()
+                await pilot.pause()
+                second = len(calls)
+            assert second > first, (
+                f"Index should rebuild after _save_features bumped the "
+                f"generation counter; calls: {first} → {second}"
+            )
+        finally:
+            sc._build_feature_library_index = orig
+
+    async def test_save_as_feature_refreshes_index(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        """After Save As Feature → modal save, the index should reflect
+        the new entry on the very next render (no manual reopen). Same
+        guarantee as `test_column_refreshes_after_save_as_feature` but
+        asserted at the index level, not the rendered cell."""
+        sc._save_parts_bin([{
+            "name": "myPart", "type": "CDS",
+            "position": "Pos 3-4", "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2", "marker": "Spectinomycin",
+            "sequence": "ATGCATGCATGC",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+        }])
+        sc._save_features([])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert ("myPart", "CDS") not in modal._feat_lib_index
+            modal.query_one("#parts-table",
+                            sc.DataTable).move_cursor(row=0)
+            await pilot.pause()
+            modal.query_one("#btn-parts-save-as-feature",
+                            sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app.screen.query_one("#btn-addfeat-save", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Back on parts bin; index now contains the new entry.
+            assert ("myPart", "CDS") in app.screen._feat_lib_index
+            assert (
+                app.screen._feat_lib_index[("myPart", "CDS")]
+                == "ATGCATGCATGC"
+            )
+
+
+class TestPartsBinSaveAsFeatureWarning:
+    """Save As Feature must warn (notify with severity=warning) before
+    silently replacing an existing library entry. Two cases: exact
+    match (no-op save) and name match (sequence will change)."""
+
+    async def test_warns_on_exact_match(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        sc._save_parts_bin([{
+            "name": "lacZ", "type": "CDS",
+            "position": "Pos 3-4", "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2", "marker": "Spectinomycin",
+            "sequence": "ATGCATGCATGC",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+        }])
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATGCATGCATGC", "strand": 1,
+        }])
+        notes: list[tuple] = []
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            # Spy on app.notify to capture the warning text + severity.
+            orig_notify = app.notify
+            def spy(msg, *args, severity="information", **kw):
+                notes.append((str(msg), severity))
+                return orig_notify(msg, *args, severity=severity, **kw)
+            app.notify = spy  # type: ignore[assignment]
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            parts_modal.query_one("#parts-table",
+                                  sc.DataTable).move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-save-as-feature",
+                                  sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+        warnings = [m for (m, sev) in notes if sev == "warning"]
+        assert any("already in the feature library" in m for m in warnings), (
+            f"Expected an 'already in feature library' warning; "
+            f"got warnings={warnings}"
+        )
+
+    async def test_warns_on_name_match_different_sequence(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        sc._save_parts_bin([{
+            "name": "lacZ", "type": "CDS",
+            "position": "Pos 3-4", "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2", "marker": "Spectinomycin",
+            "sequence": "ATGCATGCATGC",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+        }])
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "AAATTTAAATTT", "strand": 1,
+        }])
+        notes: list[tuple] = []
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            orig_notify = app.notify
+            def spy(msg, *args, severity="information", **kw):
+                notes.append((str(msg), severity))
+                return orig_notify(msg, *args, severity=severity, **kw)
+            app.notify = spy  # type: ignore[assignment]
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            parts_modal.query_one("#parts-table",
+                                  sc.DataTable).move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-save-as-feature",
+                                  sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+        warnings = [m for (m, sev) in notes if sev == "warning"]
+        assert any("Saving will replace" in m for m in warnings), (
+            f"Expected a 'will replace' warning; got warnings={warnings}"
+        )
+
+    async def test_no_warning_when_part_is_new(
+        self, isolated_parts_bin, isolated_library,
+    ):
+        sc._save_parts_bin([{
+            "name": "brandNew", "type": "CDS",
+            "position": "Pos 3-4", "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2", "marker": "Spectinomycin",
+            "sequence": "ATGCATGCATGC",
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+        }])
+        sc._save_features([])
+        notes: list[tuple] = []
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            orig_notify = app.notify
+            def spy(msg, *args, severity="information", **kw):
+                notes.append((str(msg), severity))
+                return orig_notify(msg, *args, severity=severity, **kw)
+            app.notify = spy  # type: ignore[assignment]
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            parts_modal.query_one("#parts-table",
+                                  sc.DataTable).move_cursor(row=0)
+            await pilot.pause()
+            parts_modal.query_one("#btn-parts-save-as-feature",
+                                  sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+        warnings = [m for (m, sev) in notes if sev == "warning"]
+        assert not any("already in the feature library" in m
+                       or "will replace" in m
+                       for m in warnings), (
+            f"Did not expect any 'already in library' warning for a "
+            f"brand-new part; got warnings={warnings}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Cloning simulator — primed amplicon + cloned plasmid math
 # ═══════════════════════════════════════════════════════════════════════════════
 

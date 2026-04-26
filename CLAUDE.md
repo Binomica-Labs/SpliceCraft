@@ -11,7 +11,7 @@ A **terminal-based circular plasmid map viewer, sequence editor, and cloning/mut
 **Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs, user ATinyGreenCell). **PyPI:** `splicecraft`. Latest: **v0.3.3**.
 
 - **Single-file architecture:** entire app is `splicecraft.py` (~14,500 lines). Intentional — keeps the codebase greppable. Sibling project ScriptoScope (~8,600 lines) follows the same convention.
-- **Test suite:** 881 tests across 16 files in `tests/`. `pytest -n auto` ~125 s on 8 cores; sequential ~400 s. Biology subset (`test_dna_sanity.py`) < 1 s. `test_invariants_hypothesis.py` adds property-based fuzzing.
+- **Test suite:** 925 tests across 16 files in `tests/`. `pytest -n auto` ~125 s on 8 cores; sequential ~400 s. Biology subset (`test_dna_sanity.py`) < 1 s. `test_invariants_hypothesis.py` adds property-based fuzzing.
 - **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`. Tests: `pytest`, `pytest-asyncio`, `pytest-xdist`, `hypothesis`. **Optional runtime:** `pLannotate` (conda, GPL-3) for Shift+A annotation.
 - Releases via `./release.sh X.Y.Z` (bumps version, runs tests, builds, tags, pushes; `publish.yml` uploads to PyPI via OIDC).
 
@@ -164,19 +164,21 @@ Failures (`PlannotateNotInstalled`, `PlannotateMissingDb`, `PlannotateTooLarge`,
 
 ## Feature library workbench
 
-Clicking **Features** in the menu bar pushes `FeatureLibraryScreen` (no dropdown). It's the sole place to browse, rename, recolor, or delete persistent feature entries. Per-plasmid feature *enumeration* stays on `FeatureSidebar`.
+Clicking **Features** in the menu bar pushes `FeatureLibraryScreen` (no dropdown). It's the sole place to browse, edit, rename, recolor, or delete persistent feature entries. Per-plasmid feature *enumeration* stays on `FeatureSidebar`.
 
 Entries carry optional `color` (`#RRGGBB`; `None` falls through to type default) and `strand` (`1`/`-1`/`0`/`2` = forward/reverse/arrowless/double-headed; Cycle-Strand walks `1 → -1 → 0 → 2 → 1`). Arrowless suits `rep_origin`, `misc_feature`, stem-loops; double-headed suits inverted repeats.
+
+**Deferred save.** All CRUD (Add / Edit / Rename / Duplicate / Remove / Color / Cycle Strand) mutates `self._entries` in memory and tags `self._dirty_indices` / `self._has_pending_changes`. Persistence to `features.json` happens **only** on Save (button or Ctrl+S), or via the "Save & Quit" arm of `UnsavedQuitModal` when closing with pending changes. Dirty entries get an `*` prefix in the table; the title bar shows `*` when anything's pending (covers deletions that leave no row to flag). `_shift_dirty_after_remove` keeps the asterisks pointing at the right rows after a delete shifts indices. `feature_colors.json` (user type-defaults) saves immediately — it's a separate file from `features.json`.
 
 Snippet preview (`_FeatureSnippetPanel`) feeds a synthesized full-span feature dict through `_build_seq_text` — the same renderer the main `SequencePanel` uses, so previews match post-insertion display. `_render_feature_row_pair` branches on strand: `0`→solid `▒`, `2`→`◀▒…▒▶`, `≥1`→`▒…▒▶`, else→`◀▒…▒`.
 
 Color precedence (`_resolve_feature_color`): entry's `color` → user default in `feature_colors.json` → `_DEFAULT_TYPE_COLORS[type]` → `_FEATURE_PALETTE[0]`. Always returns non-empty so Rich never barfs.
 
-`Add Feature…` and `Annotate with pLannotate` live under the **Edit** menu. Keybindings: `Shift+A` pLannotate, `Ctrl+F` Add Feature, `Ctrl+Shift+F` capture flow.
+`Add Feature` and `Annotate with pLannotate` live under the **Edit** menu. Keybindings: `Shift+A` pLannotate, `Ctrl+F` Add Feature, `Ctrl+Shift+F` capture flow. Inside `FeatureLibraryScreen`: `a` Add, `e` Edit, `r` Rename, `d` Duplicate, `c` Color, `s` Cycle Strand, `Delete` Remove, `Ctrl+S` Save, `Esc` Close.
 
 **Ctrl+Shift+F capture.** Grabs Shift+drag selection (`sp._user_sel`, priority 1) or highlighted feature (`pm.selected_idx`, priority 2), opens `AddFeatureModal` prefilled with slice/name/type/strand/color/qualifiers. **If a drag selection's `(start, end)` matches a feature exactly, capture inherits that feature's full metadata** via `_prefill_from_feature`. Palette colors (`color(N)`) normalised to hex. Insert-at-cursor disabled (bases already in record). Restriction-site overlays (`type == "resite"`) rejected. Save → `_persist_feature_entry` then push `FeatureLibraryScreen`.
 
-`AddFeatureModal` Orientation row: four radios (`#addfeat-strand-fwd/rev/none/both`) → strand `1 / -1 / 0 / 2`. Color row (`#addfeat-color-swatch` + Pick Color… / Auto buttons). `_gather` and `_apply_prefill` round-trip together.
+`AddFeatureModal` Orientation row: four radios (`#addfeat-strand-fwd/rev/none/both`) → strand `1 / -1 / 0 / 2`. Color row (`#addfeat-color-swatch` + Pick Color / Auto buttons). `_gather` and `_apply_prefill` round-trip together — same modal serves both Add (`prefill=None`) and Edit (`prefill=current_entry`).
 
 `ColorPickerModal` carries the full xterm 256-color grid (16 ANSI + 216-cube + 24 grayscale) + free-form custom input (accepts `#RGB`, `#RRGGBB`, `0..255`, `color(N)`). `_normalise_color_input` canonicalises to uppercase `#RRGGBB`; `_xterm_index_to_hex` uses canonical `(0, 95, 135, 175, 215, 255)` cube ramp + `8 + 10*k` grayscale. Capability warning surfaces `console.color_system`. `_markup_safe_color` converts stray `color(N)` to hex before render. **Drag-to-preview:** `on_mouse_down` arms `_drag_active` on a `colorpick-x-*` cell (hit-test via `get_widget_at`), `on_mouse_move` repaints the big `#colorpick-preview-swatch`, `on_mouse_up` disarms. Non-left buttons + non-grid mouse-downs ignored.
 
@@ -262,6 +264,12 @@ Cloning simulator math sits next to `_GB_L0_ENZYME_SITE` / `_GB_SPACER` / `_GB_P
 
 `DomesticatorModal._save` persists `primed_seq` and `cloned_seq` on the part dict; Parts Bin buttons prefer stored values, fall back to simulator at read time for legacy parts.
 
+**Save As Feature.** Bottom-row button takes the highlighted user part and pushes `AddFeatureModal` prefilled with name / sequence / strand=1 / GB-position-aware description. Type round-trips through `_GB_PART_TYPE_TO_INSDC` (Promoter→promoter, Terminator→terminator, "5' UTR"→"5'UTR", CDS→CDS; `CDS-NS` and `C-tag` collapse to plain `CDS` with the original GB shape preserved as `GB type: …` in the description). Built-in catalog rows have no sequence and are rejected with a notify. On modal save the entry routes through `app._persist_feature_entry` — same atomic-write helper used by Ctrl+Shift+F capture — and the parts table repaints so the "Feat Lib" column flips to ✓.
+
+Before opening the modal, `_feature_library_match(name, type, seq)` is consulted; an `"exact"` match (same name+type+sequence) emits a "no-op" warning notify and a `"name"` match (same name+type, different sequence) emits a "Saving will replace it" warning. The user keeps the choice — modal opens either way — but doesn't get blindsided by a silent overwrite. The same classification drives the Parts Bin "Feat Lib" column: green ✓ for exact, yellow ✓ for name-only, empty otherwise. Built-in catalog rows always render empty (no sequence to compare; would surface false positives if a user happened to give a feature library entry the same name as a catalog row).
+
+**Index cache + generation counter.** Per-row scans of the feature library would be O(parts × features) every populate. Instead `_build_feature_library_index()` returns a `{(name, feature_type): sequence_upper}` dict in one sweep, and PartsBinModal stores it as `self._feat_lib_index` alongside a snapshot of `_features_generation` (a module-level int bumped by every `_save_features` write and every disk-reload of `_features_cache`). `_refresh_feat_lib_index` runs at the top of `_populate` but is a no-op when the gen counter hasn't advanced — so reopening the parts bin from a session where the feature library hasn't changed skips the scan entirely. The save-as-feature callback triggers a `_populate` so the column flips to ✓ on the very next render. This is the load-bearing piece for "robust interplay between tabs": any code path that mutates the feature library (Ctrl+Shift+F capture, FeatureLibraryScreen Save, Save As Feature itself) bumps the counter, so the parts bin's view is automatically consistent without any explicit cross-screen wiring.
+
 ## Test suite
 
 ```bash
@@ -285,13 +293,13 @@ Parallel runs rely on `pytest-xdist` + the autouse `_protect_user_data` fixture 
 | `test_smoke.py` | 52 | Textual mounts; rotation / view / RE toggles; pLannotate UI + re-entry guard; per-plasmid undo stashes; crash-recovery autosave |
 | `test_mutagenize.py` | 49 | SOE-PCR primers, codon substitution, CAI round-trips |
 | `test_codon.py` | 42 | Codon registry, harmonization, Kazusa parser, NCBI XML safety, CAI/GC math |
-| `test_domesticator.py` | 193 | Golden Braid L0 positions; 4-source picker; `_feats_for_domesticator`; FASTA picker; cloning simulator; codon-fix repair (multi-site, cascade-prevention, binding-region advisory); Save Primers (`pairs` list, DOM suffix) |
+| `test_domesticator.py` | 228 | Golden Braid L0 positions; 4-source picker; `_feats_for_domesticator`; FASTA picker; cloning simulator; codon-fix repair (multi-site, cascade-prevention, binding-region advisory); Save Primers (`pairs` list, DOM suffix); Save As Feature button (GB→INSDC type map, builtin reject, persist round-trip); `_feature_library_match` helper + `_features_generation` counter + `_build_feature_library_index`; "Feat Lib" column (exact-green / name-yellow / empty) with index-cached lookups (rebuilt only on gen advance); Save-As-Feature warnings on collision |
 | `test_circular_math.py` | 38 | Sacred invariant #5; `_bp_in` / `_feat_len` |
 | `test_data_safety.py` | 45 | Sacred invariant #7; envelope round-trip + legacy back-compat + future-version warning; `_atomic_write_text`; `_do_save` atomicity |
 | `test_add_feature.py` | 24 | AddFeatureModal: qualifier round-trip, validation, save-to-library dedup, insert-at-cursor |
 | `test_plannotate.py` | 24 | Availability, size cap, feature merging, error paths (no real subprocess) |
 | `test_modal_boundaries.py` | 26 | Every modal fits in 160×48 (and AddFeatureModal at 100×30) |
-| `test_feature_library_screen.py` | 86 | Workbench CRUD + 4-step strand cycle; AddFeatureModal Orientation + Color; Ctrl+Shift+F capture (drag-matches-feature enrichment); ColorPickerModal xterm grid + drag-to-preview; Export-FASTA |
+| `test_feature_library_screen.py` | 95 | Workbench CRUD + 4-step strand cycle; deferred-save / dirty-tracking / UnsavedQuitModal-on-close; Edit-button prefill round-trip; AddFeatureModal Orientation + Color; Ctrl+Shift+F capture (drag-matches-feature enrichment); ColorPickerModal xterm grid + drag-to-preview; Export-FASTA |
 | `test_features_library.py` | 29 | JSON round-trip; `_GENBANK_FEATURE_TYPES`; per-entry `color` + `strand=0`; `_resolve_feature_color` precedence |
 | `test_edit_record.py` | 14 | Sacred invariant #9: wrap features survive insert/replace as CompoundLocation |
 | `test_invariants_hypothesis.py` | 11 | Property-based fuzzing of invariants #3, #5, #8 |

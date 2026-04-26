@@ -4596,6 +4596,21 @@ _GB_POSITIONS: dict[str, tuple[str, str, str]] = {
 # different template region.
 _GB_CODING_PART_TYPES: frozenset[str] = frozenset({"CDS", "CDS-NS", "C-tag"})
 
+# Parts-bin TitleCase type → INSDC feature_type. Used by
+# `PartsBinModal._save_as_feature` to round-trip a Golden Braid part into
+# the feature library, where types follow the INSDC vocabulary.
+# CDS-NS / C-tag have no INSDC equivalent — they're GB-specific
+# coding-DNA shapes — so they collapse to plain CDS; the GB position
+# survives in the feature's description string instead.
+_GB_PART_TYPE_TO_INSDC: dict[str, str] = {
+    "Promoter":   "promoter",
+    "5' UTR":     "5'UTR",
+    "CDS":        "CDS",
+    "CDS-NS":     "CDS",
+    "C-tag":      "CDS",
+    "Terminator": "terminator",
+}
+
 # Type IIS recognition + tail used for all Golden Braid L0 domestication
 # primers. Golden Braid splits assembly across two enzymes: **L0 parts use
 # Esp3I / BsmBI (CGTCTC(1/5))**, while downstream L1+ transcriptional units
@@ -5089,6 +5104,13 @@ def _save_primers(entries: list[dict]) -> None:
 _FEATURES_FILE = _DATA_DIR / "features.json"
 _features_cache: "list | None" = None
 
+# Monotonic counter bumped on every change to the feature library cache
+# (writes via `_save_features`, plus first-load / cache-miss reads via
+# `_load_features`). Lets long-lived screens (PartsBinModal, etc.) cache
+# derived indices and detect stale state without scanning the whole
+# library every populate. Strict bump-on-change — never decremented.
+_features_generation: int = 0
+
 # User-edited type → default color map persisted as entries of
 # {"feature_type": "<type>", "color": "#RRGGBB"}. Kept separate from the
 # entry file so the defaults survive even when the library is empty.
@@ -5153,21 +5175,108 @@ _DEFAULT_TYPE_COLORS: dict[str, str] = {
 
 
 def _load_features() -> list[dict]:
-    global _features_cache
+    """Return an independent (deep-copied) list of feature library
+    entries. Callers can mutate the returned dicts freely without
+    poisoning the cache — important for ``FeatureLibraryScreen``
+    which buffers in-place edits (rename / color / strand / etc.) and
+    then either persists or abandons. A shallow ``list(_features_cache)``
+    used to share dict refs with the cache, so an abandoned mutation
+    would survive in the cache and leak into the next ``_load_features``
+    consumer (a freshly opened FeatureLibraryScreen, the
+    DomesticatorModal feature picker, etc.) as if it had been saved.
+    """
+    global _features_cache, _features_generation
+    from copy import deepcopy
     if _features_cache is not None:
-        return list(_features_cache)
+        return deepcopy(_features_cache)
     entries, warning = _safe_load_json(_FEATURES_FILE, "Feature library")
     if warning:
         _log.warning(warning)
     entries = [e for e in entries if isinstance(e, dict)]
     _features_cache = entries
-    return list(_features_cache)
+    # A fresh disk read is the result of either first-load or an
+    # external invalidation (test harness setting `_features_cache =
+    # None`, or a hand-edit of features.json). Either way the contents
+    # may have changed since the last write, so bump the generation so
+    # consumers know to rebuild any derived indices.
+    _features_generation += 1
+    return deepcopy(_features_cache)
 
 
 def _save_features(entries: list[dict]) -> None:
-    global _features_cache
+    """Persist `entries` and seed the in-memory cache with a deepcopy
+    so subsequent caller-side mutations of `entries` (or any dict
+    inside it) cannot leak into the cache after the save returns.
+    Without the deepcopy, the dicts in `_features_cache` would alias
+    the dicts in the caller's list — so e.g. a FeatureLibraryScreen
+    that saved, then made another change, then abandoned, would leave
+    the post-save mutations stuck in the cache.
+    """
+    global _features_cache, _features_generation
+    from copy import deepcopy
     _safe_save_json(_FEATURES_FILE, entries, "Feature library")
-    _features_cache = list(entries)
+    _features_cache = deepcopy(entries)
+    _features_generation += 1
+
+
+def _build_feature_library_index() -> dict[tuple[str, str], str]:
+    """Return ``{(name, feature_type): sequence_upper}`` for the entire
+    feature library — single sweep, used for O(1) part-vs-feature
+    lookups in the Parts Bin "Feat Lib" column. Doing this per row
+    inside ``_populate`` would be O(parts × features); building once
+    and looking up is O(parts + features) and reusable across the
+    entire populate.
+    """
+    index: dict[tuple[str, str], str] = {}
+    for e in _load_features():
+        name = e.get("name", "")
+        ftype = e.get("feature_type", "")
+        if not isinstance(name, str) or not isinstance(ftype, str):
+            continue
+        index[(name, ftype)] = (e.get("sequence", "") or "").upper()
+    return index
+
+
+def _classify_feature_library_match(
+    index: dict[tuple[str, str], str],
+    name: str, feature_type: str, sequence: str,
+) -> str:
+    """Look up ``(name, feature_type)`` in a pre-built feature-library
+    ``index`` and return ``"exact"`` / ``"name"`` / ``""``.
+
+    Same semantics as :func:`_feature_library_match`, but takes a
+    pre-built index so callers iterating over many parts pay the
+    library-scan cost once instead of once per part. Sequences are
+    compared case-insensitively (case-folded on both sides).
+    """
+    key = (name, feature_type)
+    if key not in index:
+        return ""
+    existing = index[key]
+    return "exact" if existing == (sequence or "").upper() else "name"
+
+
+def _feature_library_match(name: str, feature_type: str,
+                           sequence: str) -> str:
+    """Classify whether ``(name, feature_type, sequence)`` is already in the
+    feature library. Returns one of:
+
+      - ``"exact"`` — entry with same name + type + sequence exists.
+        Saving would be a no-op modulo qualifier/description tweaks.
+      - ``"name"``  — entry with same name + type exists but sequence
+        differs. Saving will replace the stored sequence.
+      - ``""``       — no entry with this (name, type) pair.
+
+    Convenience wrapper around :func:`_build_feature_library_index` +
+    :func:`_classify_feature_library_match` for one-off lookups (e.g.
+    the warning notify in ``PartsBinModal._save_as_feature``). Loops
+    that scan many parts should build the index once and call
+    :func:`_classify_feature_library_match` directly to avoid
+    rebuilding the index on every part.
+    """
+    return _classify_feature_library_match(
+        _build_feature_library_index(), name, feature_type, sequence,
+    )
 
 
 def _load_feature_colors() -> dict[str, str]:
@@ -6859,7 +6968,7 @@ class AddFeatureModal(ModalScreen):
                 with Horizontal(id="addfeat-color-row"):
                     yield Label("Color:", id="addfeat-color-label")
                     yield Static("", id="addfeat-color-swatch", markup=True)
-                    yield Button("Pick Color…", id="btn-addfeat-color")
+                    yield Button("Pick Color", id="btn-addfeat-color")
                     yield Button("Auto",        id="btn-addfeat-color-clear")
 
                 yield Label("Sequence  (5'→3', ACGT/IUPAC; whitespace ignored):")
@@ -6873,7 +6982,7 @@ class AddFeatureModal(ModalScreen):
                             id="addfeat-desc")
             yield Static("", id="addfeat-status", markup=True)
             with Horizontal(id="addfeat-btns"):
-                yield Button("Import from plasmid…",
+                yield Button("Import from plasmid",
                              id="btn-addfeat-import")
                 yield Button("Save to Library",
                              id="btn-addfeat-save",
@@ -7635,21 +7744,26 @@ class FeatureLibraryScreen(Screen):
     / Color swatch). Right column: ``_FeatureSnippetPanel`` visualizing the
     selected entry. Bottom buttons handle CRUD + styling.
 
-    CRUD routes through ``_load_features`` / ``_save_features`` which
-    enforce the schema envelope (sacred invariant #7). The screen keeps a
-    live copy of the entries list (``self._entries``) and writes back on
-    every mutation; no diff tracking, no undo — adding a feature, renaming
-    it, or deleting it is a single atomic persistence write.
+    Edits are buffered in ``self._entries`` and only written to disk by
+    ``action_save`` (Save button or Ctrl+S). Dirty entries get an
+    ``*`` prefix in the table; the title bar shows ``*`` when there's
+    anything pending (covers deletions that leave no row to flag).
+    Closing with pending changes triggers ``UnsavedQuitModal`` so the
+    user can choose Save/Abandon/Cancel rather than silently losing
+    work. Routes through ``_load_features`` / ``_save_features`` which
+    enforce the schema envelope (sacred invariant #7).
     """
 
     BINDINGS = [
-        Binding("escape", "close", "Close"),
-        Binding("a",      "add",     "Add"),
-        Binding("r",      "rename",  "Rename"),
+        Binding("escape", "close",     "Close"),
+        Binding("a",      "add",       "Add"),
+        Binding("e",      "edit",      "Edit"),
+        Binding("r",      "rename",    "Rename"),
         Binding("d",      "duplicate", "Duplicate"),
-        Binding("delete", "remove",  "Remove"),
-        Binding("c",      "color",   "Color"),
-        Binding("s",      "strand",  "Cycle Strand"),
+        Binding("delete", "remove",    "Remove"),
+        Binding("c",      "color",     "Color"),
+        Binding("s",      "strand",    "Cycle Strand"),
+        Binding("ctrl+s", "save",      "Save"),
     ]
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
@@ -7659,6 +7773,13 @@ class FeatureLibraryScreen(Screen):
         super().__init__()
         self._entries: list[dict] = list(_load_features())
         self._selected_index: int = 0 if self._entries else -1
+        # Dirty tracking. `_dirty_indices` flags entries with unsaved
+        # field changes (asterisk prefix in the table). It can't cover
+        # deletions because the row no longer exists, so
+        # `_has_pending_changes` is the umbrella signal used by
+        # `action_close` to decide whether to prompt.
+        self._dirty_indices: set[int] = set()
+        self._has_pending_changes: bool = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -7673,14 +7794,17 @@ class FeatureLibraryScreen(Screen):
                     yield Static("Preview", classes="flib-section-hdr")
                     yield _FeatureSnippetPanel()
             with Horizontal(id="flib-btns"):
-                yield Button("Add…",            id="btn-flib-add")
-                yield Button("Rename…",         id="btn-flib-rename")
+                yield Button("Add",             id="btn-flib-add")
+                yield Button("Edit",            id="btn-flib-edit")
+                yield Button("Rename",          id="btn-flib-rename")
                 yield Button("Duplicate",       id="btn-flib-dup")
                 yield Button("Remove",          id="btn-flib-remove",
                              variant="error")
-                yield Button("Color…",          id="btn-flib-color")
+                yield Button("Color",           id="btn-flib-color")
                 yield Button("Cycle Strand",    id="btn-flib-strand")
-                yield Button("Export FASTA…",   id="btn-flib-export-fasta")
+                yield Button("Export FASTA",    id="btn-flib-export-fasta")
+                yield Button("Save",            id="btn-flib-save",
+                             variant="primary")
                 yield Button("Close  [Esc]",    id="btn-flib-close")
         yield Footer()
 
@@ -7697,7 +7821,7 @@ class FeatureLibraryScreen(Screen):
         except NoMatches:
             return
         tbl.clear(columns=False)
-        for entry in self._entries:
+        for i, entry in enumerate(self._entries):
             color = _resolve_feature_color(entry)
             strand = entry.get("strand", 1)
             strand_tag = {1: "+", -1: "−", 0: "·", 2: "↔"}.get(strand, "+")
@@ -7705,8 +7829,10 @@ class FeatureLibraryScreen(Screen):
             # Use Rich Text for the Color cell so the swatch actually tints
             swatch = Text("███ ", style=color)
             swatch.append(color, style="dim")
+            base_name = entry.get("name", "?")
+            name_cell = ("*" + base_name) if i in self._dirty_indices else base_name
             tbl.add_row(
-                entry.get("name", "?"),
+                name_cell,
                 entry.get("feature_type", "?"),
                 strand_tag,
                 str(bp),
@@ -7719,7 +7845,18 @@ class FeatureLibraryScreen(Screen):
             tbl.move_cursor(row=self._selected_index)
         else:
             self._selected_index = -1
+        self._refresh_title()
         self._refresh_preview()
+
+    def _refresh_title(self) -> None:
+        try:
+            title = self.query_one("#flib-title", Static)
+        except NoMatches:
+            return
+        title.update(
+            " Feature Library *" if self._has_pending_changes
+            else " Feature Library "
+        )
 
     def _refresh_preview(self) -> None:
         try:
@@ -7783,22 +7920,82 @@ class FeatureLibraryScreen(Screen):
 
     @on(Button.Pressed, "#btn-flib-close")
     def _close_btn(self, _) -> None:
-        self.app.pop_screen()
+        self.action_close()
 
     def action_close(self) -> None:
-        self.app.pop_screen()
+        """Pop back to the main app, prompting on unsaved changes.
+
+        With pending edits, push ``UnsavedQuitModal`` (the same dialog
+        the main quit path uses) and wait for the user's choice:
+        ``"save"`` → persist + pop, ``"abandon"`` → pop without saving,
+        ``None`` → stay open. Without changes, pop immediately.
+        """
+        if not self._has_pending_changes:
+            self.app.pop_screen()
+            return
+
+        def _cb(result):
+            if result == "save":
+                if self._persist_all():
+                    self.app.pop_screen()
+                # On save failure stay open so the user can retry.
+            elif result == "abandon":
+                self.app.pop_screen()
+            # None → cancel; do nothing.
+
+        self.app.push_screen(UnsavedQuitModal(), callback=_cb)
+
+    @on(Button.Pressed, "#btn-flib-save")
+    def _save_btn(self, _) -> None: self.action_save()
+
+    def action_save(self) -> None:
+        """Persist self._entries → features.json. No-op if nothing pending."""
+        if not self._has_pending_changes:
+            self.app.notify("No changes to save.", severity="information")
+            return
+        if self._persist_all():
+            self.app.notify(
+                f"Saved {len(self._entries)} feature(s) to library."
+            )
 
     # ── persistence helpers ──────────────────────────────────────────────────
 
-    def _persist(self) -> bool:
-        """Write self._entries → features.json. Returns True on success."""
+    def _persist_all(self) -> bool:
+        """Write self._entries → features.json and clear the dirty marks.
+        Returns True on success."""
         try:
             _save_features(self._entries)
         except (OSError, ValueError) as exc:
             _log.exception("Feature library save failed")
             self.app.notify(f"Save failed: {exc}", severity="error")
             return False
+        self._dirty_indices.clear()
+        self._has_pending_changes = False
+        self._repopulate_table()
         return True
+
+    def _mark_dirty(self, idx: int) -> None:
+        """Tag an entry as having unsaved field changes (asterisk in the
+        table) and set the umbrella pending-changes flag.
+        """
+        if 0 <= idx < len(self._entries):
+            self._dirty_indices.add(idx)
+        self._has_pending_changes = True
+
+    def _shift_dirty_after_remove(self, removed_idx: int) -> None:
+        """Rewrite ``_dirty_indices`` after deleting entry ``removed_idx``.
+
+        Drops ``removed_idx`` itself, shifts every higher index down by
+        one. Without this, asterisks would stick to the wrong row after
+        a delete (or, worse, point past the end of the list).
+        """
+        new_dirty: set[int] = set()
+        for i in self._dirty_indices:
+            if i < removed_idx:
+                new_dirty.add(i)
+            elif i > removed_idx:
+                new_dirty.add(i - 1)
+        self._dirty_indices = new_dirty
 
     def _current(self) -> "dict | None":
         if 0 <= self._selected_index < len(self._entries):
@@ -7817,16 +8014,86 @@ class FeatureLibraryScreen(Screen):
             entry = result.get("entry") if isinstance(result, dict) else None
             if not entry:
                 return
-            # De-dup on (name, feature_type); latest write wins.
-            key = (entry.get("name"), entry.get("feature_type"))
-            self._entries = [e for e in self._entries
-                             if (e.get("name"), e.get("feature_type")) != key]
-            self._entries.append(entry)
-            if self._persist():
-                self._selected_index = len(self._entries) - 1
-                self._repopulate_table()
-                self.app.notify(f"Added '{entry.get('name')}'.")
+            self._upsert_entry(entry, notice="Added")
         self.app.push_screen(AddFeatureModal(have_cursor=False), callback=_cb)
+
+    @on(Button.Pressed, "#btn-flib-edit")
+    def _edit_btn(self, _) -> None: self.action_edit()
+
+    def action_edit(self) -> None:
+        """Open AddFeatureModal pre-filled with the current entry. The
+        modal already round-trips its prefill (`_apply_prefill` mirrors
+        `_gather`) so editing is just "Add with the existing dict."
+        Replaces the entry at the current index on save and marks it
+        dirty; doesn't write to disk until Save.
+        """
+        entry = self._current()
+        if entry is None:
+            self.app.notify("Select a feature first.", severity="warning")
+            return
+        target_idx = self._selected_index
+
+        def _cb(result):
+            if not result:
+                return
+            new_entry = result.get("entry") if isinstance(result, dict) else None
+            if not new_entry:
+                return
+            # If the user kept the same (name, feature_type), this is a
+            # plain edit-in-place. If they changed the name/type to one
+            # that already exists at a different index, dedup that one
+            # too (Add-style "latest write wins").
+            self._replace_entry(target_idx, new_entry)
+
+        self.app.push_screen(
+            AddFeatureModal(prefill=entry, have_cursor=False),
+            callback=_cb,
+        )
+
+    def _upsert_entry(self, entry: dict, notice: str) -> None:
+        """Append ``entry`` (or replace the entry with the same
+        (name, feature_type) key — "latest write wins"). Marks the new
+        index dirty and updates the selection.
+        """
+        key = (entry.get("name"), entry.get("feature_type"))
+        existing_idx = next(
+            (i for i, e in enumerate(self._entries)
+             if (e.get("name"), e.get("feature_type")) == key),
+            -1,
+        )
+        if existing_idx >= 0:
+            self._entries[existing_idx] = entry
+            self._selected_index = existing_idx
+            self._mark_dirty(existing_idx)
+        else:
+            self._entries.append(entry)
+            self._selected_index = len(self._entries) - 1
+            self._mark_dirty(self._selected_index)
+        self._repopulate_table()
+        self.app.notify(f"{notice} '{entry.get('name')}' (unsaved).")
+
+    def _replace_entry(self, target_idx: int, new_entry: dict) -> None:
+        """Replace entry at ``target_idx``, deduping any other entry that
+        ends up sharing the new (name, feature_type) key.
+        """
+        if not (0 <= target_idx < len(self._entries)):
+            return
+        new_key = (new_entry.get("name"), new_entry.get("feature_type"))
+        # Drop any OTHER entry that now collides with the new key.
+        for i in range(len(self._entries) - 1, -1, -1):
+            if i == target_idx:
+                continue
+            e = self._entries[i]
+            if (e.get("name"), e.get("feature_type")) == new_key:
+                del self._entries[i]
+                self._shift_dirty_after_remove(i)
+                if i < target_idx:
+                    target_idx -= 1
+        self._entries[target_idx] = new_entry
+        self._selected_index = target_idx
+        self._mark_dirty(target_idx)
+        self._repopulate_table()
+        self.app.notify(f"Edited '{new_entry.get('name')}' (unsaved).")
 
     @on(Button.Pressed, "#btn-flib-rename")
     def _rename_btn(self, _) -> None: self.action_rename()
@@ -7837,6 +8104,7 @@ class FeatureLibraryScreen(Screen):
             self.app.notify("Select a feature first.", severity="warning")
             return
         old = entry.get("name", "")
+        idx = self._selected_index
 
         def _cb(new_name):
             if not new_name:
@@ -7844,9 +8112,9 @@ class FeatureLibraryScreen(Screen):
             if new_name == old:
                 return
             entry["name"] = str(new_name)
-            if self._persist():
-                self._repopulate_table()
-                self.app.notify(f"Renamed '{old}' → '{new_name}'.")
+            self._mark_dirty(idx)
+            self._repopulate_table()
+            self.app.notify(f"Renamed '{old}' → '{new_name}' (unsaved).")
 
         self.app.push_screen(RenamePlasmidModal(old, ""), callback=_cb)
 
@@ -7870,10 +8138,10 @@ class FeatureLibraryScreen(Screen):
             n += 1
         dup["name"] = cand
         self._entries.append(dup)
-        if self._persist():
-            self._selected_index = len(self._entries) - 1
-            self._repopulate_table()
-            self.app.notify(f"Duplicated as '{cand}'.")
+        self._selected_index = len(self._entries) - 1
+        self._mark_dirty(self._selected_index)
+        self._repopulate_table()
+        self.app.notify(f"Duplicated as '{cand}' (unsaved).")
 
     @on(Button.Pressed, "#btn-flib-remove")
     def _remove_btn(self, _) -> None: self.action_remove()
@@ -7883,12 +8151,14 @@ class FeatureLibraryScreen(Screen):
         if entry is None:
             return
         name = entry.get("name", "?")
-        del self._entries[self._selected_index]
-        if self._persist():
-            if self._selected_index >= len(self._entries):
-                self._selected_index = len(self._entries) - 1
-            self._repopulate_table()
-            self.app.notify(f"Removed '{name}'.")
+        removed_idx = self._selected_index
+        del self._entries[removed_idx]
+        self._shift_dirty_after_remove(removed_idx)
+        self._has_pending_changes = True
+        if self._selected_index >= len(self._entries):
+            self._selected_index = len(self._entries) - 1
+        self._repopulate_table()
+        self.app.notify(f"Removed '{name}' (unsaved).")
 
     @on(Button.Pressed, "#btn-flib-color")
     def _color_btn(self, _) -> None: self.action_color()
@@ -7900,6 +8170,7 @@ class FeatureLibraryScreen(Screen):
             return
         ftype = entry.get("feature_type", "")
         current = entry.get("color")
+        idx = self._selected_index
 
         def _cb(result):
             if not result:
@@ -7907,6 +8178,10 @@ class FeatureLibraryScreen(Screen):
             new_color = result.get("color")
             set_default = bool(result.get("set_default"))
             entry["color"] = new_color   # None → auto
+            # User-defaults map (feature_colors.json) is a separate
+            # file from the per-entry feature library — saving it
+            # immediately is correct; the deferred-save model only
+            # applies to features.json itself.
             if set_default and isinstance(new_color, str) and new_color:
                 defaults = _load_feature_colors()
                 defaults[ftype] = new_color
@@ -7916,10 +8191,10 @@ class FeatureLibraryScreen(Screen):
                     _log.exception("Feature color default save failed")
                     self.app.notify(f"Save default failed: {exc}",
                                     severity="error")
-            if self._persist():
-                self._repopulate_table()
-                shown = new_color if new_color else "auto"
-                self.app.notify(f"Color set to {shown}.")
+            self._mark_dirty(idx)
+            self._repopulate_table()
+            shown = new_color if new_color else "auto"
+            self.app.notify(f"Color set to {shown} (unsaved).")
 
         self.app.push_screen(ColorPickerModal(ftype, current), callback=_cb)
 
@@ -7936,13 +8211,13 @@ class FeatureLibraryScreen(Screen):
         cur = entry.get("strand", 1)
         nxt = {1: -1, -1: 0, 0: 2, 2: 1}.get(cur, 1)
         entry["strand"] = nxt
-        if self._persist():
-            self._repopulate_table()
-            tag = {1:  "forward (→)",
-                   -1: "reverse (←)",
-                   0:  "arrowless (·)",
-                   2:  "double (↔)"}.get(nxt, "+")
-            self.app.notify(f"Strand → {tag}.")
+        self._mark_dirty(self._selected_index)
+        self._repopulate_table()
+        tag = {1:  "forward (→)",
+               -1: "reverse (←)",
+               0:  "arrowless (·)",
+               2:  "double (↔)"}.get(nxt, "+")
+        self.app.notify(f"Strand → {tag} (unsaved).")
 
 
 # ── Parts bin modal ────────────────────────────────────────────────────────────
@@ -7957,12 +8232,31 @@ class PartsBinModal(Screen):
     Shows both the built-in reference catalog (_GB_L0_PARTS) and user-created
     parts from parts_bin.json. User parts appear first and include sequence
     + primer data; built-in parts have no sequence (shown as "—").
+
+    The "Feat Lib" column flags parts already registered in the
+    persistent feature library. We build a single
+    ``{(name, feature_type): sequence_upper}`` index on first
+    populate and reuse it across renders. The cache is gated on
+    ``_features_generation`` — bumped by every ``_save_features``
+    call — so the column stays in sync with edits made by Save As
+    Feature, Ctrl+Shift+F capture, or the Feature Library workbench
+    without paying the scan cost on every populate.
     """
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "focus_next", "Next", show=False),
     ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Pre-built feature-library index for the "Feat Lib" column.
+        # Re-derived only when `_features_generation` differs from the
+        # snapshot we last saw, so opening the parts bin from a
+        # session where the feature library hasn't changed avoids the
+        # whole scan.
+        self._feat_lib_index: dict[tuple[str, str], str] = {}
+        self._feat_lib_gen_seen: int = -1
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -7985,7 +8279,8 @@ class PartsBinModal(Screen):
                 yield Button("Copy Cloned Sequence", id="btn-parts-copy-cloned")
             with Horizontal(id="parts-btns"):
                 yield Button("New Part",       id="btn-new-part",    variant="primary")
-                yield Button("Export FASTA…",  id="btn-parts-export-fasta")
+                yield Button("Save As Feature", id="btn-parts-save-as-feature")
+                yield Button("Export FASTA",   id="btn-parts-export-fasta")
                 yield Button("Close",          id="btn-parts-close")
         yield Footer()
 
@@ -8023,7 +8318,7 @@ class PartsBinModal(Screen):
     def on_mount(self) -> None:
         t = self.query_one("#parts-table", DataTable)
         t.add_columns(
-            "Name", "Type", "Pos", "5'OH", "3'OH", "Sequence",
+            "Name", "Type", "Pos", "5'OH", "3'OH", "Sequence", "Feat Lib",
         )
         self._populate()
 
@@ -8031,20 +8326,70 @@ class PartsBinModal(Screen):
         t = self.query_one("#parts-table", DataTable)
         t.clear()
         self._rows = self._all_rows()
+        # Refresh the feature-library index up-front so every row's
+        # cell render is an O(1) dict lookup. Without this each row
+        # would call `_feature_library_match`, which itself calls
+        # `_load_features()` and walks the entire library list — O(N×M)
+        # per populate.
+        self._refresh_feat_lib_index()
         for r in self._rows:
             color = _GB_TYPE_COLORS.get(r["type"], "white")
             seq_preview = r["sequence"][:28] + "…" if len(r["sequence"]) > 28 else r["sequence"]
             if not seq_preview:
                 seq_preview = "—"
-            usr_mark = "★ " if r["user"] else ""
             t.add_row(
-                Text(usr_mark + r["name"], style=color),
+                Text(r["name"], style=color),
                 Text(r["type"], style=f"dim {color}"),
                 r["position"],
                 Text(r["oh5"], style="bold cyan"),
                 Text(r["oh3"], style="bold cyan"),
                 Text(seq_preview, style="dim color(252)"),
+                self._lib_status_cell(r),
             )
+
+    def _refresh_feat_lib_index(self) -> None:
+        """Rebuild the feature-library index iff the global
+        ``_features_generation`` advanced since the last build. Reused
+        across every ``_populate`` so a no-op repaint (e.g., the
+        parts table re-rendering for an unrelated reason) doesn't
+        re-scan the whole feature library. The first call after mount
+        always rebuilds since `_feat_lib_gen_seen` defaults to -1.
+        """
+        current = _features_generation
+        if current == self._feat_lib_gen_seen:
+            return
+        self._feat_lib_index = _build_feature_library_index()
+        self._feat_lib_gen_seen = current
+
+    def _lib_status_cell(self, row: dict) -> Text:
+        """Render the "Feat Lib" column cell for a parts-bin row.
+
+        - User part with exact match in feature library → green ✓.
+        - User part with same (name, type) but a different sequence
+          (so a Save would replace) → yellow ✓ as a "stale" marker.
+        - Anything else (built-in catalog, unsaved part) → empty.
+
+        Built-in rows have no `sequence`, so they always render empty;
+        comparing their type/name to library entries would surface
+        false positives if a user happened to give a feature library
+        entry the same name as a catalog row.
+
+        Lookup goes through the pre-built `_feat_lib_index` (refreshed
+        in `_populate` only when `_features_generation` advances), so
+        this method is O(1) per row.
+        """
+        if not row.get("user") or not row.get("sequence"):
+            return Text("")
+        insdc = _GB_PART_TYPE_TO_INSDC.get(row["type"], "misc_feature")
+        match = _classify_feature_library_match(
+            self._feat_lib_index,
+            row.get("name", ""), insdc, row.get("sequence", ""),
+        )
+        if match == "exact":
+            return Text("✓", style="bold green")
+        if match == "name":
+            return Text("✓", style="bold yellow")
+        return Text("")
 
     @on(DataTable.RowHighlighted, "#parts-table")
     def _row_highlighted(self, event: DataTable.RowHighlighted) -> None:
@@ -8056,8 +8401,6 @@ class PartsBinModal(Screen):
         detail = Text()
         detail.append(r["name"], style=f"bold {color}")
         detail.append(f"  [{r['type']}]", style=f"dim {color}")
-        if r["user"]:
-            detail.append("  ★ user part", style="dim green")
         detail.append("\n")
         detail.append(f"Position: {r['position']}   ", style="white")
         detail.append("5′ OH: ", style="dim")
@@ -8279,6 +8622,108 @@ class PartsBinModal(Screen):
                 default_path=default_path,
                 subtitle=f"[{name}]  [{r.get('type', '?')}]  {len(seq)} bp",
             ),
+            callback=_on_done,
+        )
+
+    @on(Button.Pressed, "#btn-parts-save-as-feature")
+    def _save_as_feature(self, _) -> None:
+        """Register the highlighted user part as a feature-library entry.
+
+        Built-in catalog rows have no sequence — they're descriptive
+        position/overhang bookkeeping with no insert — so they're
+        rejected. For real user parts, build a prefill dict mapping
+        the GB part shape onto INSDC feature vocabulary
+        (`_GB_PART_TYPE_TO_INSDC`) and open `AddFeatureModal` so the
+        user can adjust the name / qualifiers before committing.
+        Saving routes through ``app._persist_feature_entry`` (the same
+        helper Ctrl+Shift+F capture uses) so the latest write wins on
+        (name, feature_type) collisions.
+
+        Before opening the modal, ``_feature_library_match`` is
+        consulted: if the (name, INSDC type) pair is already in the
+        library the user gets a yellow warning notify so a silent
+        replace doesn't surprise them. The modal opens in either case
+        — the user retains the option to cancel.
+
+        Insert-at-cursor is disabled here even when a record is open —
+        the parts bin is a different mental model (registering the
+        part's *idea* into the library), and inserting from a modal
+        layered on top of another modal would leave the parts bin
+        stranded over the freshly-edited record.
+        """
+        r = self._selected_user_row()
+        if r is None:
+            return
+
+        ftype = _GB_PART_TYPE_TO_INSDC.get(r["type"], "misc_feature")
+        sequence = r.get("sequence", "")
+        oh5, oh3 = r.get("oh5", ""), r.get("oh3", "")
+        pos = r.get("position", "")
+        backbone = r.get("backbone", "")
+        bits: list[str] = ["Golden Braid L0 part"]
+        if pos:
+            bits.append(f"Position {pos}")
+        if oh5 or oh3:
+            bits.append(f"5' OH {oh5} / 3' OH {oh3}")
+        if backbone:
+            bits.append(f"backbone {backbone}")
+        # CDS-NS / C-tag both collapse to plain "CDS" in INSDC. The
+        # NS / C-tag distinction is meaningful (NS = no stop codon,
+        # C-tag = C-terminal fusion fragment), so preserve it in the
+        # description rather than losing it on the round-trip.
+        if r["type"] in {"CDS-NS", "C-tag"}:
+            bits.append(f"GB type: {r['type']}")
+        description = "; ".join(bits)
+
+        # Warn before opening so the user can spot a collision they
+        # didn't intend. `_feature_library_match` distinguishes exact
+        # (no-op save) from name-only (Save will replace the stored
+        # sequence) — the wording differs because the consequences do.
+        name = r.get("name", "")
+        match = _feature_library_match(name, ftype, sequence)
+        if match == "exact":
+            self.app.notify(
+                f"'{name}' is already in the feature library "
+                f"(exact match). Saving again is a no-op.",
+                severity="warning",
+            )
+        elif match == "name":
+            self.app.notify(
+                f"A feature named '{name}' (type {ftype}) is already "
+                f"in the feature library with a different sequence. "
+                f"Saving will replace it.",
+                severity="warning",
+            )
+
+        prefill = {
+            "name":         name,
+            "feature_type": ftype,
+            "sequence":     sequence,
+            "strand":       1,
+            "color":        None,
+            "qualifiers":   {},
+            "description":  description,
+        }
+
+        def _on_done(result):
+            if not result:
+                return
+            entry = result.get("entry") if isinstance(result, dict) else None
+            if not entry or result.get("action") != "save":
+                return
+            persist = getattr(self.app, "_persist_feature_entry", None)
+            if persist is None or not persist(entry):
+                return
+            self.app.notify(
+                f"Saved '{entry.get('name')}' as a "
+                f"{entry.get('feature_type')} feature."
+            )
+            # Refresh so the "Feat Lib" column flips to ✓ for the row
+            # we just registered.
+            self._populate()
+
+        self.app.push_screen(
+            AddFeatureModal(prefill=prefill, have_cursor=False),
             callback=_on_done,
         )
 
@@ -8617,7 +9062,7 @@ class DomesticatorModal(ModalScreen):
                         "Codon table: [bold]E. coli K12[/bold] (taxid 83333)",
                         id="dom-codon-label", markup=True,
                     )
-                    yield Button("Change…", id="btn-dom-codon",
+                    yield Button("Change", id="btn-dom-codon",
                                  variant="default")
                 # ── Row 3: Source picker ──
                 yield Label("Source")
@@ -8647,7 +9092,7 @@ class DomesticatorModal(ModalScreen):
                             self._plasmid_pick_name or "(none loaded)",
                             id="dom-plasmid-name",
                         )
-                        yield Button("Change…", id="btn-dom-pick-plasmid")
+                        yield Button("Change", id="btn-dom-pick-plasmid")
                     yield Label("Pick feature:")
                     yield Select(
                         self._plasmid_feat_options(),
@@ -8660,7 +9105,7 @@ class DomesticatorModal(ModalScreen):
                     with Horizontal(id="dom-fasta-hdr"):
                         yield Label("File:")
                         yield Static("(no file selected)", id="dom-fasta-name")
-                        yield Button("Browse…", id="btn-dom-pick-fasta")
+                        yield Button("Browse", id="btn-dom-pick-fasta")
                     yield Static("", id="dom-fasta-preview", markup=True)
                 # ── Primer results ──
                 yield Static("", id="dom-primer-results", markup=True)
@@ -10161,7 +10606,7 @@ class MutagenizeModal(ModalScreen):
             with Horizontal(id="mut-codon-row"):
                 yield Static("Codon table: [bold]E. coli K12[/bold] (taxid 83333)",
                              id="mut-codon-label", markup=True)
-                yield Button("Change…", id="btn-mut-codon", variant="default")
+                yield Button("Change", id="btn-mut-codon", variant="default")
 
             # ── CDS preview  (DNA + AA, or AA only for the protein source) ──
             # Click-aware: clicking an AA opens AminoAcidPickerModal and
