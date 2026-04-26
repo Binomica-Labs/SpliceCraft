@@ -3833,34 +3833,49 @@ class SequencePanel(Widget):
         self.call_after_refresh(_do_scroll)
 
     def _ensure_cursor_visible(self) -> None:
-        """Scroll only as much as needed to fit the cursor's chunk fully in view.
+        """Follow the cursor: scroll the minimum necessary, no recentering.
 
         "Chunk" = the cursor's DNA pair plus the feature lanes (with
         labels) above and below it. Behaviour:
 
-          - **First chunk** (no DNA rows above the cursor's): snap
-            `scroll_y` to 0 so any padding / topmost lane art is exposed.
-          - **Last chunk** (no DNA rows below the cursor's): snap
-            `scroll_y` to `max_scroll_y` for the same reason at the bottom.
-          - If the entire chunk is already visible, do nothing. Most
-            arrow presses within a viewport-sized run of feature-free
-            chunks don't scroll at all.
-          - If the chunk extends above the viewport, scroll up so
-            `chunk_top` (= the topmost label row of the above-lanes)
-            sits at the viewport top.
-          - If the chunk extends below, scroll down so `chunk_bottom`
-            (= the bottommost label row of the below-lanes) sits at the
-            viewport bottom.
-          - If the chunk is taller than the viewport (very dense feature
-            stacking), prefer pinning `chunk_top` so labels + DNA stay
-            visible; below-lanes get clipped.
+          - Chunk already fully in view → do nothing. The scroll bar
+            stays put for every arrow press whose cursor lands in a
+            row already on screen — no "pull back to recenter".
+          - Chunk extends above the viewport → scroll up by exactly
+            `vp_top - chunk_top` so `chunk_top` (the topmost label row
+            of the above-lanes) lands at the viewport top.
+          - Chunk extends below → scroll down by exactly
+            `chunk_bottom - vp_bottom` so `chunk_bottom` (the bottommost
+            below-lane row) lands at the viewport bottom.
+          - Chunk taller than the viewport (very dense lane stacking) →
+            track the cursor's DNA row only; whichever side the chunk
+            spills off-screen on gets clipped. Direction-aware: if the
+            DNA is above the viewport we pin it to vp_top (Up arrow
+            into a tall chunk), if below we pin it to vp_bottom.
 
-        Sets `scroll_y` directly and synchronously — this MUST be called
-        BEFORE any `_refresh_view()` queues a `view.update()` tick.
-        Textual's refresh re-applies the scroll target derived from the
-        prior state, so a sync set AFTER the refresh queue (or via
-        `call_after_refresh`) gets silently reverted. Sync set BEFORE the
-        queue is preserved by the tick.
+        No snap-to-extreme on first/last chunks. The user arrow nav
+        wants the scroll bar to track row-by-row, not jump to either
+        end of the document — and `chunk_top == 0` for chunk 0 (so
+        target_top naturally lands at 0 when scrolling up into it),
+        `chunk_bottom - vp_h + 1 == max_scroll_y` for the final chunk.
+        The earlier explicit-snap branches always fired regardless of
+        whether scrolling was needed, which read as a sudden jump.
+
+        Uses `scroll_to(animate=False, immediate=True)` rather than the
+        reactive-bypass `set_scroll`. `set_scroll` sets `scroll_y` via
+        `set_reactive`, which skips the `watch_scroll_y` watcher — and
+        that watcher is what propagates the new position to
+        `vertical_scrollbar.position`. The scrollbar widget therefore
+        renders one tick stale: content scrolls, the bar doesn't, the
+        next event jolts the bar to where it should have been. That
+        was the visible "borked tracking". `scroll_to` runs the full
+        reactive pipeline (validators + watchers) so the bar repaints
+        in lock-step with the content. `immediate=True` skips the
+        default `call_after_refresh` defer; `animate=False` skips the
+        smooth-scroll path entirely.
+
+        Must be called BEFORE `_refresh_view()` so the new content
+        paints with the new scroll position in the same tick.
         """
         if self._cursor_pos < 0 or not self._seq:
             return
@@ -3896,42 +3911,32 @@ class SequencePanel(Widget):
         dna_row      = chunk_top + above_pairs * rpg
 
         if chunk_height > vp_h:
-            # Chunk taller than the viewport — cursor visibility wins.
-            # Anchor the DNA row near the bottom so above-lanes fill the
-            # viewport above the cursor; the topmost lanes get clipped.
-            # This applies to first/last chunks too: snapping to the
-            # extreme would put the DNA row off-screen and Textual would
-            # auto-scroll to bring it back, visible as a "bounce" past
-            # the target.
-            if dna_row < vp_top or dna_row > vp_bottom:
+            # Chunk doesn't fit — track the DNA row, lanes get clipped.
+            # Direction-aware so an Up arrow into a tall chunk pins the
+            # DNA at vp_top (above-lanes fill the viewport, below
+            # clipped) and a Down arrow pins it at vp_bottom (below
+            # clipped, above-lanes still as visible as they fit).
+            if dna_row < vp_top:
+                target_top = dna_row
+            elif dna_row + 1 > vp_bottom:
                 target_top = dna_row - vp_h + 2  # DNA pair at viewport bottom
             else:
                 return
-        elif chunk_idx == 0:
-            # First chunk fits — snap to scroll_y=0 so all topmost lane
-            # art and feature labels are exposed.
-            target_top = 0
-        elif chunk_idx == len(chunks_layout) - 1:
-            # Last chunk fits — snap to max so all bottommost lane art is
-            # exposed.
-            target_top = max_y
-        elif chunk_top < vp_top:
-            # Above the viewport — scroll up so labels + DNA come into view.
-            target_top = chunk_top
-        elif chunk_bottom > vp_bottom:
-            # Below the viewport — scroll down to fit below-lanes too.
-            target_top = chunk_bottom - vp_h + 1
-        else:
-            # Chunk already fully in view — do not scroll.
+        elif chunk_top >= vp_top and chunk_bottom <= vp_bottom:
+            # Already fully in view — do not scroll.
             return
+        elif chunk_top < vp_top:
+            # Scroll up just enough to expose the above-lanes + DNA.
+            target_top = chunk_top
+        else:
+            # chunk_bottom > vp_bottom: scroll down just enough to fit
+            # below-lanes.
+            target_top = chunk_bottom - vp_h + 1
 
         target_top = max(0, min(target_top, max_y))
-        # `set_scroll` sets both axes atomically and updates the smooth-
-        # scroll target in one go; setting `scroll_y` alone leaves
-        # `scroll_target_y` pointing at the prior value, which Textual's
-        # watcher then animates toward — visible as a "bounce" past the
-        # intended destination.
-        scroll.set_scroll(0, target_top)
+        if int(vp_top) == int(target_top):
+            return
+        scroll.scroll_to(0, target_top, animate=False, immediate=True)
 
     def _refresh_view(self) -> None:
         view = self.query_one("#seq-view", Static)
@@ -3964,14 +3969,17 @@ class SequencePanel(Widget):
             )
             self._view_cache_key = key
 
-        # Preserve scroll position across content update
-        saved_y = scroll.scroll_y if scroll is not None else None
+        # Don't try to "preserve scroll across content update" here. An
+        # earlier version captured `scroll.scroll_y` before `view.update`
+        # and re-applied it via `call_after_refresh`. That fought with
+        # `_ensure_cursor_visible`, which sets a NEW scroll target right
+        # before `_refresh_view`: Textual hadn't propagated the new
+        # `scroll_y` yet, so we'd capture the OLD value, then the
+        # deferred would restore the OLD position — visible as a quick
+        # scroll up followed by a snap back. Callers that change content
+        # should set scroll before calling `_refresh_view`; the sync set
+        # survives the refresh tick on its own.
         view.update(self._view_cache_txt)
-        if saved_y is not None and saved_y > 0:
-            def _restore():
-                if scroll is not None:
-                    scroll.scroll_to(0, saved_y, animate=False)
-            self.call_after_refresh(_restore)
 
     def on_resize(self, _) -> None:
         self._refresh_view()
