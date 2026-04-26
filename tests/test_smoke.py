@@ -1119,7 +1119,11 @@ class TestCursorReachesEndOfSequence:
             # Position cursor on the last base, focus the panel, then press
             # Right. Pre-fix the cursor stayed at n-1; post-fix it reaches n.
             sp._cursor_pos = n - 1
-            sp.focus()
+            # Move focus off the default DataTable — the App-level on_key
+            # arrow handler skips when a DataTable owns the keystroke,
+            # because the sidebar/library tables have their own arrow nav.
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            app.set_focus(pm)
             await pilot.pause(0.05)
             await pilot.press("right")
             await pilot.pause(0.05)
@@ -1151,7 +1155,8 @@ class TestCursorReachesEndOfSequence:
             # (`n - 5` is on the last row for any sequence with at least
             # one full row; tiny_record is ~120 bp so this holds.)
             sp._cursor_pos = max(0, n - 5)
-            sp.focus()
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            app.set_focus(pm)
             await pilot.pause(0.05)
             await pilot.press("down")
             await pilot.pause(0.05)
@@ -1212,6 +1217,165 @@ class TestSidebarClickCentersSeqPanel:
                 f"Sidebar click on feature at bp 4100 should scroll seq "
                 f"panel meaningfully; scroll_y={scroll.scroll_y}"
             )
+
+
+class TestClickConsistencyAcrossPanels:
+    """All three "I clicked a feature" entry points — sidebar row, plasmid map
+    feature, sequence-panel lane art — must produce the same outcome:
+    `user_sel` set to the feature span (the copyable highlight), cursor on
+    the click bp / feature midpoint, and the seq-panel viewport centred on
+    that bp. Map worked before but sidebar only set `sel_range` (bold +
+    underline, NOT the copyable selection) and never centred reliably; the
+    seq-panel click never centred at all. Reported 2026-04-25."""
+
+    async def test_all_three_click_paths_are_consistent(
+        self, isolated_library,
+    ):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 5000), id="clickConsistency",
+                        annotations={"molecule_type": "DNA"})
+        # A handful of features so the table cursor actually moves on click.
+        for i in range(3):
+            rec.features.append(SeqFeature(
+                FeatureLocation(i * 1500 + 100, i * 1500 + 200, strand=1),
+                type="CDS", qualifiers={"label": [f"f{i}"]},
+            ))
+        rec.features.append(SeqFeature(
+            FeatureLocation(4000, 4200, strand=1), type="CDS",
+            qualifiers={"label": ["targetFeat"]},
+        ))
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            scroll = app.query_one("#seq-scroll")
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sidebar = app.query_one("#sidebar", sc.FeatureSidebar)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+
+            target_idx = next(i for i, f in enumerate(pm._feats)
+                              if f.get("label") == "targetFeat")
+            target = pm._feats[target_idx]
+            target_bp = (target["start"] + target["end"]) // 2  # 4100
+
+            async def reset_state():
+                scroll.scroll_y = 0
+                sidebar._prog_row = -1
+                sp._user_sel = None
+                sp._sel_range = None
+                sp._cursor_pos = -1
+                await pilot.pause(0.05)
+
+            async def expect_focused_target():
+                # All three paths land on these post-click invariants:
+                assert sp._user_sel == (4000, 4200), (
+                    f"user_sel must be the feature span; got {sp._user_sel}"
+                )
+                assert sp._cursor_pos == target_bp, (
+                    f"cursor must land on bp={target_bp}; got {sp._cursor_pos}"
+                )
+                assert scroll.scroll_y > 30, (
+                    f"viewport must scroll (centre on bp 4100); "
+                    f"got scroll_y={scroll.scroll_y}"
+                )
+
+            # 1. Plasmid-map click.
+            await reset_state()
+            pm.post_message(sc.PlasmidMap.FeatureSelected(
+                target_idx, target, bp=target_bp
+            ))
+            await pilot.pause(0.5)
+            await expect_focused_target()
+
+            # 2. Sequence-panel lane click.
+            await reset_state()
+            sp.post_message(sc.SequencePanel.SequenceClick(bp=target_bp))
+            await pilot.pause(0.5)
+            await expect_focused_target()
+
+            # 3. Sidebar row click — actual mouse click, not a synthesized
+            # RowActivated message (the message bypasses the RowHighlighted
+            # cascade that real clicks go through).
+            await reset_state()
+            await pilot.click("#feat-table", offset=(5, target_idx + 1))
+            await pilot.pause(0.5)
+            await expect_focused_target()
+
+
+class TestSidebarArrowNavSingleScroll:
+    """Regression guard for the 2026-04-25 sidebar-arrow-key jitter fix.
+
+    Pressing Up/Down in the sidebar's feature list cascades into
+    `_focus_feature`, which used to call `select_feature_range` (which
+    triggered `_ensure_cursor_visible` — partial scroll just-into-view)
+    AND THEN `center_on_bp` (full scroll to centre). The two scrolls
+    happened in quick succession and were perceptible as a jitter / snap
+    on every arrow press. Fix: pass `scroll=False` to the highlight
+    helpers when `_focus_feature` will issue its own centred scroll.
+    """
+
+    async def test_only_center_scroll_runs_per_arrow_press(
+        self, isolated_library,
+    ):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 5000), id="arrowJitter",
+                        annotations={"molecule_type": "DNA"})
+        for i in range(4):
+            rec.features.append(SeqFeature(
+                FeatureLocation(i * 1200 + 100, i * 1200 + 200, strand=1),
+                type="CDS", qualifiers={"label": [f"f{i}"]},
+            ))
+
+        # Spy on _ensure_cursor_visible — it must NOT fire from the
+        # `_focus_feature` path (which would cause the double-scroll). It
+        # MAY fire from arrow-key text navigation (in the seq panel), but
+        # arrowing through the sidebar should hit center_on_bp only.
+        ensure_calls = []
+        orig_ensure = sc.SequencePanel._ensure_cursor_visible
+        def spy_ensure(self):
+            ensure_calls.append(self._cursor_pos)
+            orig_ensure(self)
+        sc.SequencePanel._ensure_cursor_visible = spy_ensure
+
+        try:
+            app = sc.PlasmidApp()
+            app._preload_record = rec
+            async with app.run_test(size=TERMINAL_SIZE) as pilot:
+                await pilot.pause()
+                await pilot.pause(0.05)
+                sp = app.query_one("#seq-panel", sc.SequencePanel)
+                scroll = app.query_one("#seq-scroll")
+
+                # Click row 0 to land focus inside the sidebar table.
+                await pilot.click("#feat-table", offset=(5, 1))
+                await pilot.pause(0.3)
+                ensure_calls.clear()
+
+                # Arrow through the rest. Each press triggers
+                # _focus_feature → highlight + centring scroll. With the
+                # fix, _ensure_cursor_visible does NOT fire from this
+                # path.
+                for _ in range(3):
+                    await pilot.press("down")
+                    await pilot.pause(0.3)
+
+                assert ensure_calls == [], (
+                    f"_focus_feature path must NOT call _ensure_cursor_visible "
+                    f"(would cause double-scroll jitter). Got "
+                    f"{len(ensure_calls)} call(s): {ensure_calls}"
+                )
+                # Sanity: the centring scroll did happen.
+                assert scroll.scroll_y > 30, (
+                    f"sidebar arrow nav should still scroll to centre; "
+                    f"scroll_y={scroll.scroll_y}"
+                )
+        finally:
+            sc.SequencePanel._ensure_cursor_visible = orig_ensure
 
 
 class TestEnsureCursorVisibleShowsLanes:

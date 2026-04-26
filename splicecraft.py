@@ -3208,6 +3208,31 @@ class FeatureSidebar(Widget):
             return
         self.post_message(self.RowActivated(event.cursor_row))
 
+    @on(DataTable.RowSelected, "#feat-table")
+    def _row_selected(self, event: DataTable.RowSelected):
+        """Click on a row whose cursor is already on it doesn't fire
+        RowHighlighted (the cursor didn't move), so a user clicking the same
+        sidebar row twice — or clicking a row that was already
+        highlight-driven by a map/seq-panel click — would otherwise be
+        silent. RowSelected fires on every click; combine with
+        RowHighlighted's `_prog_row` gate to avoid double-firing on
+        first-time clicks (which fire both events).
+        """
+        if self._populating:
+            return
+        # `_row_highlighted` will already have fired when the cursor moved,
+        # so skip the duplicate. Only emit when the click landed on the
+        # already-current cursor row (no preceding RowHighlighted).
+        try:
+            t = self.query_one("#feat-table", DataTable)
+        except NoMatches:
+            return
+        if event.cursor_row != t.cursor_row:
+            return
+        # No `_prog_row` check here — programmatic moves don't trigger
+        # RowSelected, only real clicks/Enter do, so we always want to react.
+        self.post_message(self.RowActivated(event.cursor_row))
+
 
 # ── Library panel ──────────────────────────────────────────────────────────────
 
@@ -3466,12 +3491,17 @@ class SequencePanel(Widget):
         self.remove_class("has-trans")
         self._refresh_view()
 
-    def highlight_feature(self, feat: "dict | None", cursor_bp: int = -1) -> None:
+    def highlight_feature(self, feat: "dict | None", cursor_bp: int = -1,
+                            scroll: bool = True) -> None:
         """Highlight a feature's region in the sequence; show CDS translation.
 
         cursor_bp: if >= 0, anchor the cursor (and scroll) at this bp position.
                    Use this for sequence-panel clicks so scroll stays at the
                    clicked position rather than jumping to the feature start.
+        scroll:    when True (default), call `_ensure_cursor_visible` so the
+                   cursor is on screen. Pass False when the caller will
+                   issue its own `center_on_bp` afterwards — otherwise two
+                   sequential scrolls become a visible jitter.
         """
         self._re_highlight = None
         if feat is None or not self._seq:
@@ -3486,7 +3516,8 @@ class SequencePanel(Widget):
         self._sel_anchor = -1
         if cursor_bp >= 0:
             self._cursor_pos = cursor_bp
-            self._ensure_cursor_visible()   # scroll BEFORE refresh
+            if scroll:
+                self._ensure_cursor_visible()   # scroll BEFORE refresh
         self._refresh_view()
 
         trans_box = self.query_one("#seq-trans", Static)
@@ -3502,12 +3533,19 @@ class SequencePanel(Widget):
         else:
             self.remove_class("has-trans")
 
-    def select_feature_range(self, feat: dict, cursor_bp: int = -1) -> None:
+    def select_feature_range(self, feat: dict, cursor_bp: int = -1,
+                              scroll: bool = True) -> None:
         """Highlight the entire feature span as a copyable selection.
 
         cursor_bp: if >= 0 (sequence-panel click), keep cursor at that bp and
                    anchor the Shift+arrow selection there. Otherwise cursor goes
                    to the feature end so Shift+arrow naturally extends outward.
+        scroll:    when True, also adjust the viewport so the cursor is on
+                   screen. Pass False when the caller will issue its own
+                   `center_on_bp` immediately after — otherwise the user
+                   sees a partial scroll (just-visible) followed by a
+                   centring scroll, which reads as a perceptible jitter on
+                   sidebar arrow-key navigation.
         """
         if not self._seq or feat is None:
             return
@@ -3525,7 +3563,8 @@ class SequencePanel(Widget):
             self._cursor_pos = max(start, end - 1)
             self._sel_anchor = start
         # Scroll BEFORE refresh — see _ensure_cursor_visible docstring.
-        self._ensure_cursor_visible()
+        if scroll:
+            self._ensure_cursor_visible()
         self._refresh_view()
 
         # Show CDS translation when applicable
@@ -3767,40 +3806,61 @@ class SequencePanel(Widget):
         the viewport. Used by sidebar/map click handlers — the user has
         deliberately clicked, so don't make them hunt for the result.
 
-        Sets `scroll_y` directly (not via `scroll_to`) because Textual's
-        `scroll_to(animate=False)` still defers the position change to the
-        next refresh tick — which is exactly the one-frame lag that makes
-        line-to-line cursor scrolling feel jerky. Direct attribute set
-        applies in the same refresh cycle as the cursor render.
+        Defers via `call_after_refresh` so the scroll runs after the queued
+        `view.update()` tick from the preceding highlight call. Uses
+        `scroll_to(force=True)` rather than `scroll_y = ...`: a direct
+        attribute set on a Reactive can be silently reverted by Textual's
+        scroll-target watcher when it fires next, but `scroll_to` goes
+        through the proper code path and `force=True` skips clamping.
+        Symptom of the broken assignment: scroll moves to centre, then
+        reverts on the next event — visible as a "snap back" jitter.
         """
         if not self._seq or bp < 0:
             return
         row = self._bp_to_content_row(bp)
-        try:
-            scroll = self.query_one("#seq-scroll", ScrollableContainer)
-        except NoMatches:
-            return
-        vp_h = scroll.size.height
-        if vp_h <= 0:
-            return
-        target_top = max(0, row - vp_h // 2)
-        scroll.scroll_y = target_top
+
+        def _do_scroll():
+            try:
+                scroll = self.query_one("#seq-scroll", ScrollableContainer)
+            except NoMatches:
+                return
+            vp_h = scroll.size.height
+            if vp_h <= 0:
+                return
+            target_top = max(0, row - vp_h // 2)
+            scroll.scroll_to(0, target_top, animate=False, force=True)
+
+        self.call_after_refresh(_do_scroll)
 
     def _ensure_cursor_visible(self) -> None:
-        """Scroll just enough so the cursor's chunk is fully visible.
+        """Scroll only as much as needed to fit the cursor's chunk fully in view.
 
-        "Chunk" here = the cursor's DNA pair plus the feature lanes above
-        and below it. Scrolling only to the DNA row (the previous behaviour)
-        left the above-lanes off the top of the viewport whenever the
-        cursor reached the topmost visible row, so users couldn't see which
-        feature their cursor was on without an extra Up keypress.
+        "Chunk" = the cursor's DNA pair plus the feature lanes (with
+        labels) above and below it. Behaviour:
 
-        Applied synchronously rather than via `call_after_refresh` because
-        the deferral introduced a one-frame lag between the cursor advance
-        and the scroll catch-up — that's what users perceive as "jerky"
-        line-to-line scrolling. Arrow-key paths don't change content size,
-        so scroll_y bounds stay stable; the synchronous scroll batches into
-        the same refresh cycle as the cursor render.
+          - **First chunk** (no DNA rows above the cursor's): snap
+            `scroll_y` to 0 so any padding / topmost lane art is exposed.
+          - **Last chunk** (no DNA rows below the cursor's): snap
+            `scroll_y` to `max_scroll_y` for the same reason at the bottom.
+          - If the entire chunk is already visible, do nothing. Most
+            arrow presses within a viewport-sized run of feature-free
+            chunks don't scroll at all.
+          - If the chunk extends above the viewport, scroll up so
+            `chunk_top` (= the topmost label row of the above-lanes)
+            sits at the viewport top.
+          - If the chunk extends below, scroll down so `chunk_bottom`
+            (= the bottommost label row of the below-lanes) sits at the
+            viewport bottom.
+          - If the chunk is taller than the viewport (very dense feature
+            stacking), prefer pinning `chunk_top` so labels + DNA stay
+            visible; below-lanes get clipped.
+
+        Sets `scroll_y` directly and synchronously — this MUST be called
+        BEFORE any `_refresh_view()` queues a `view.update()` tick.
+        Textual's refresh re-applies the scroll target derived from the
+        prior state, so a sync set AFTER the refresh queue (or via
+        `call_after_refresh`) gets silently reverted. Sync set BEFORE the
+        queue is preserved by the tick.
         """
         if self._cursor_pos < 0 or not self._seq:
             return
@@ -3819,7 +3879,7 @@ class SequencePanel(Widget):
         below_pairs = chunks_layout[chunk_idx][4]
 
         chunk_top    = prefix_dna2[chunk_idx] + (rpg - 2) * prefix_lanes[chunk_idx]
-        chunk_bottom = chunk_top + (above_pairs + below_pairs) * rpg + 1  # last row of chunk
+        chunk_bottom = chunk_top + (above_pairs + below_pairs) * rpg + 1
 
         try:
             scroll = self.query_one("#seq-scroll", ScrollableContainer)
@@ -3830,24 +3890,45 @@ class SequencePanel(Widget):
         if vp_h <= 0:
             return
         vp_bottom = vp_top + vp_h - 1
+        max_y    = scroll.max_scroll_y
 
-        # Direct attribute set: `scroll_to(animate=False)` is still deferred
-        # by one refresh tick in Textual. That deferral is the source of the
-        # visible jerk between cursor advance and viewport catch-up.
-        if chunk_top < vp_top:
-            # Scrolling up — bring the chunk's above-lanes into view at the
-            # top of the viewport.
-            scroll.scroll_y = chunk_top
-        elif chunk_bottom > vp_bottom:
-            # Scrolling down — bring below-lanes into view at the bottom.
-            # If the chunk is taller than the viewport (very dense feature
-            # stacking), prefer pinning above-lanes + DNA at the top so the
-            # cursor stays visible.
-            chunk_height = chunk_bottom - chunk_top + 1
-            if chunk_height > vp_h:
-                scroll.scroll_y = chunk_top
+        chunk_height = chunk_bottom - chunk_top + 1
+        dna_row      = chunk_top + above_pairs * rpg
+
+        if chunk_height > vp_h:
+            # Chunk taller than viewport — can't show everything. Prefer
+            # cursor visibility over lane-art visibility: anchor the DNA
+            # row near the bottom so above-lanes fill the viewport above
+            # the cursor (the topmost lanes get clipped). Pinning
+            # `chunk_top` instead would put the cursor off-screen and
+            # Textual would auto-scroll to bring it back — visible as a
+            # "bounce" past the target.
+            if dna_row < vp_top or dna_row > vp_bottom:
+                target_top = dna_row - vp_h + 2  # DNA pair at viewport bottom
             else:
-                scroll.scroll_y = chunk_bottom - vp_h + 1
+                # Cursor already visible — don't scroll.
+                return
+        elif chunk_top < vp_top:
+            # Above the viewport — scroll up so labels + DNA come into view.
+            target_top = chunk_top
+        elif chunk_bottom > vp_bottom:
+            # Below the viewport — scroll down to fit below-lanes too.
+            target_top = chunk_bottom - vp_h + 1
+        else:
+            # Chunk already fully in view — do not scroll. Edge cases:
+            # the first chunk's `chunk_top` is 0, and the last chunk's
+            # `chunk_bottom - vp_h + 1` equals `max_scroll_y`, so the
+            # branches above naturally land at the extremes when entering
+            # those chunks from below/above respectively.
+            return
+
+        target_top = max(0, min(target_top, max_y))
+        # `set_scroll` sets both axes atomically and updates the smooth-
+        # scroll target in one go; setting `scroll_y` alone leaves
+        # `scroll_target_y` pointing at the prior value, which Textual's
+        # watcher then animates toward — visible as a "bounce" past the
+        # intended destination.
+        scroll.set_scroll(0, target_top)
 
     def _refresh_view(self) -> None:
         view = self.query_one("#seq-view", Static)
@@ -13085,6 +13166,20 @@ SpeciesPickerModal { align: center middle; }
             return
 
         # ── Arrow keys: move cursor; Shift+arrow extends selection ───────────
+        # Skip if the user is arrowing through one of the navigable
+        # DataTables (feature sidebar, plasmid library, etc.). Otherwise
+        # this handler races with the table's own arrow handler — every
+        # Down keystroke would BOTH advance the seq cursor here AND fire
+        # the table's row-highlight cascade, scrolling the sequence panel
+        # twice (visible jitter on sidebar-feature browsing). The
+        # SequencePanel itself is not focusable, so we can't use
+        # `sp.has_focus`; instead, check whether some OTHER focused
+        # widget owns the keystroke.
+        focused = self.focused
+        if focused is not None:
+            from textual.widgets import DataTable
+            if isinstance(focused, DataTable):
+                return
         if sp._cursor_pos < 0 or not sp._seq:
             return
         n  = len(sp._seq)
@@ -13482,6 +13577,40 @@ SpeciesPickerModal { align: center middle; }
 
     # ── Feature selection: map ↔ sidebar ↔ sequence panel ─────────────────────
 
+    def _wrap_aware_midpoint(self, f: dict, n: int) -> int:
+        """Return the bp at the visual midpoint of a feature, honouring the
+        circular `end < start` wrap convention. A naive `(start + end) // 2`
+        puts the midpoint on the OPPOSITE side of the plasmid for wrap features."""
+        s, e = f["start"], f["end"]
+        if not n:
+            return 0
+        arc_len = (e - s) % n
+        return (s + arc_len // 2) % n
+
+    def _focus_feature(self, f: "dict | None", bp: int) -> None:
+        """Single-source UX for "user picked a feature": highlight it as a
+        copyable user_sel range, place the cursor on `bp`, and centre the
+        sequence panel on `bp`. Called from every feature-pick entry point
+        (sequence-panel lane click, plasmid-map click, sidebar row click)
+        so the three feel identical.
+
+        Backbone clicks pass `f=None` — only the centring + clearing of
+        prior highlights applies in that case.
+
+        Both highlight calls go in with `scroll=False`: their own
+        `_ensure_cursor_visible` would scroll the cursor "just into view"
+        first, then `center_on_bp` would scroll again to centre. The two
+        scrolls in sequence read as a perceptible jitter when arrowing
+        through the sidebar feature list.
+        """
+        seq_pnl = self.query_one("#seq-panel", SequencePanel)
+        if f is not None and bp >= 0:
+            seq_pnl.select_feature_range(f, cursor_bp=bp, scroll=False)
+        else:
+            seq_pnl.highlight_feature(f, scroll=False)
+        if bp >= 0:
+            seq_pnl.center_on_bp(bp)
+
     @on(SequencePanel.SequenceClick)
     def _seq_click(self, event: SequencePanel.SequenceClick) -> None:
         """Single or double click on the sequence — select the smallest feature at bp."""
@@ -13507,28 +13636,15 @@ SpeciesPickerModal { align: center middle; }
             pm.select_feature(best_idx)
             sidebar.show_detail(f)
             sidebar.highlight_row(best_idx)
-            # Single or double click: select full feature range (copyable highlight)
-            seq_pnl.select_feature_range(f, cursor_bp=bp)
+            self._focus_feature(f, bp)
 
     @on(PlasmidMap.FeatureSelected)
     def _map_feat_selected(self, event: PlasmidMap.FeatureSelected):
         sidebar = self.query_one("#sidebar",   FeatureSidebar)
-        seq_pnl = self.query_one("#seq-panel", SequencePanel)
         sidebar.show_detail(event.feat_dict)
         if event.idx >= 0:
             sidebar.highlight_row(event.idx)
-        if event.feat_dict is not None and event.bp >= 0:
-            # Cursor lands on the clicked base (already inside the feature via
-            # _bp_in); feature span becomes the copyable selection.
-            seq_pnl.select_feature_range(event.feat_dict, cursor_bp=event.bp)
-        else:
-            seq_pnl.highlight_feature(event.feat_dict)
-        # Centre the sequence panel on the click point regardless of whether
-        # a feature was hit. Backbone clicks (event.feat_dict is None) get the
-        # raw bp; feature clicks get the bp inside the feature. Both make the
-        # user's intent — "show me this region" — match what they actually see.
-        if event.bp >= 0:
-            seq_pnl.center_on_bp(event.bp)
+        self._focus_feature(event.feat_dict, event.bp)
 
     @on(FeatureSidebar.RowActivated)
     def _sidebar_row_activated(self, event: FeatureSidebar.RowActivated):
@@ -13538,17 +13654,11 @@ SpeciesPickerModal { align: center middle; }
         pm.select_feature(event.idx)
         f = pm._feats[event.idx] if 0 <= event.idx < len(pm._feats) else None
         sidebar.show_detail(f)
-        seq_pnl.highlight_feature(f)
-        # Centre the sequence panel on the feature so a sidebar click is
-        # never silent. Wrap features (end < start) need the circular-arc
-        # midpoint, not the naive `(start + end) // 2`.
-        if f is not None:
-            n = len(seq_pnl._seq)
-            if n:
-                s, e = f["start"], f["end"]
-                arc_len = (e - s) % n
-                mid = (s + arc_len // 2) % n
-                seq_pnl.center_on_bp(mid)
+        # Sidebar has no click-bp of its own — anchor at the feature's
+        # wrap-aware midpoint so the cursor lands inside the feature and
+        # the centred view shows it symmetrically.
+        bp = self._wrap_aware_midpoint(f, len(seq_pnl._seq)) if f is not None else -1
+        self._focus_feature(f, bp)
 
     # ── Library events ─────────────────────────────────────────────────────────
 
