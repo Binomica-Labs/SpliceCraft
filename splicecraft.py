@@ -3895,29 +3895,26 @@ class SequencePanel(Widget):
         chunk_height = chunk_bottom - chunk_top + 1
         dna_row      = chunk_top + above_pairs * rpg
 
-        # Edge chunks: snap scroll to the extreme so all topmost / bottommost
-        # lane art and feature labels are exposed. There's nothing further
-        # in that direction, so revealing extra padding / clipped lane art
-        # is the user-visible improvement. The cursor's DNA row may scroll
-        # off-screen at the extreme when the chunk is taller than the
-        # viewport — that's acceptable here because the user explicitly
-        # asked for the scroll bar to reach the end on the first/last row.
-        if chunk_idx == 0:
-            target_top = 0
-        elif chunk_idx == len(chunks_layout) - 1:
-            target_top = max_y
-        elif chunk_height > vp_h:
-            # Middle chunk taller than the viewport — can't show
-            # everything. Prefer cursor visibility over lane-art
-            # visibility: anchor the DNA row near the bottom so above-
-            # lanes fill the viewport above the cursor (topmost lanes
-            # get clipped). Pinning `chunk_top` instead would put the
-            # cursor off-screen and Textual would auto-scroll to bring
-            # it back — visible as a "bounce" past the target.
+        if chunk_height > vp_h:
+            # Chunk taller than the viewport — cursor visibility wins.
+            # Anchor the DNA row near the bottom so above-lanes fill the
+            # viewport above the cursor; the topmost lanes get clipped.
+            # This applies to first/last chunks too: snapping to the
+            # extreme would put the DNA row off-screen and Textual would
+            # auto-scroll to bring it back, visible as a "bounce" past
+            # the target.
             if dna_row < vp_top or dna_row > vp_bottom:
                 target_top = dna_row - vp_h + 2  # DNA pair at viewport bottom
             else:
                 return
+        elif chunk_idx == 0:
+            # First chunk fits — snap to scroll_y=0 so all topmost lane
+            # art and feature labels are exposed.
+            target_top = 0
+        elif chunk_idx == len(chunks_layout) - 1:
+            # Last chunk fits — snap to max so all bottommost lane art is
+            # exposed.
+            target_top = max_y
         elif chunk_top < vp_top:
             # Above the viewport — scroll up so labels + DNA come into view.
             target_top = chunk_top
