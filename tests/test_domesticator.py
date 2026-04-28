@@ -1674,7 +1674,7 @@ class TestPartsBinFeatLibColumn:
             t = parts_modal.query_one("#parts-table", sc.DataTable)
             row_keys = list(t.rows.keys())
             col_keys = list(t.columns.keys())
-            cell = t.get_cell(row_keys[0], col_keys[-1])  # last column = Feat Lib
+            cell = t.get_cell(row_keys[0], col_keys[-2])  # Feat Lib column (Grammar is now last)
             assert "✓" in str(cell), (
                 f"Expected ✓ in Feat Lib column for exact match; got {cell!r}"
             )
@@ -1706,7 +1706,7 @@ class TestPartsBinFeatLibColumn:
             t = parts_modal.query_one("#parts-table", sc.DataTable)
             row_keys = list(t.rows.keys())
             col_keys = list(t.columns.keys())
-            cell = t.get_cell(row_keys[0], col_keys[-1])
+            cell = t.get_cell(row_keys[0], col_keys[-2])  # Feat Lib column
             assert "✓" in str(cell)
             assert "yellow" in str(cell.style).lower()
 
@@ -1732,7 +1732,7 @@ class TestPartsBinFeatLibColumn:
             t = parts_modal.query_one("#parts-table", sc.DataTable)
             row_keys = list(t.rows.keys())
             col_keys = list(t.columns.keys())
-            cell = t.get_cell(row_keys[0], col_keys[-1])
+            cell = t.get_cell(row_keys[0], col_keys[-2])  # Feat Lib column
             assert str(cell) == "", (
                 f"Expected empty Feat Lib cell for unmatched part; got {cell!r}"
             )
@@ -1764,7 +1764,7 @@ class TestPartsBinFeatLibColumn:
                 pytest.skip("Catalog has no 'Nos' promoter — fixture drift")
             row_keys = list(t.rows.keys())
             col_keys = list(t.columns.keys())
-            cell = t.get_cell(row_keys[target_row_idx], col_keys[-1])
+            cell = t.get_cell(row_keys[target_row_idx], col_keys[-2])  # Feat Lib column
             assert str(cell) == "", (
                 f"Built-in catalog rows must always render empty in "
                 f"Feat Lib column; got {cell!r}"
@@ -1795,7 +1795,7 @@ class TestPartsBinFeatLibColumn:
             t = parts_modal.query_one("#parts-table", sc.DataTable)
             row_keys = list(t.rows.keys())
             col_keys = list(t.columns.keys())
-            assert str(t.get_cell(row_keys[0], col_keys[-1])) == ""
+            assert str(t.get_cell(row_keys[0], col_keys[-2])) == ""  # Feat Lib column
             # Move cursor to the user part and trigger Save As Feature.
             t.move_cursor(row=0)
             await pilot.pause()
@@ -1812,7 +1812,7 @@ class TestPartsBinFeatLibColumn:
             t = app.screen.query_one("#parts-table", sc.DataTable)
             row_keys = list(t.rows.keys())
             col_keys = list(t.columns.keys())
-            cell = t.get_cell(row_keys[0], col_keys[-1])
+            cell = t.get_cell(row_keys[0], col_keys[-2])  # Feat Lib column
             assert "✓" in str(cell), (
                 f"Feat Lib column should show ✓ after save; got {cell!r}"
             )
@@ -3285,3 +3285,476 @@ class TestDesignResultExposesBindingAdvisory:
         entry = r["binding_region_mutations"][0]
         assert set(entry.keys()) == {"text", "region", "codon_start"}
         assert entry["region"] in ("fwd", "rev")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Grammar abstraction (built-in registry, persistence, helpers)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBuiltinGrammars:
+    """The two shipped grammars (``gb_l0`` and ``moclo_plant``) need to
+    expose a stable schema — every consumer (PartsBinModal,
+    DomesticatorModal, GrammarEditorModal) reads these fields and any
+    drift would manifest as a downstream KeyError in the UI."""
+
+    REQUIRED_KEYS = {
+        "id", "name", "enzyme", "site", "spacer", "pad",
+        "forbidden_sites", "positions", "coding_types",
+        "type_to_insdc", "catalog", "editable",
+    }
+
+    @pytest.mark.parametrize("gid", ["gb_l0", "moclo_plant"])
+    def test_required_keys_present(self, gid):
+        g = sc._BUILTIN_GRAMMARS[gid]
+        missing = self.REQUIRED_KEYS - set(g.keys())
+        assert not missing, (
+            f"Built-in grammar {gid!r} is missing keys: {missing}. "
+            f"Every consumer assumes the full schema is present."
+        )
+
+    @pytest.mark.parametrize("gid", ["gb_l0", "moclo_plant"])
+    def test_positions_have_full_overhang_metadata(self, gid):
+        g = sc._BUILTIN_GRAMMARS[gid]
+        for pos in g["positions"]:
+            assert {"name", "type", "oh5", "oh3"} <= set(pos.keys()), (
+                f"{gid} position {pos!r} missing required fields."
+            )
+            valid = set("ACGTRYWSMKBDHV")
+            for label in ("oh5", "oh3"):
+                bad = [c for c in pos[label] if c not in valid]
+                assert not bad, (
+                    f"{gid} position {pos['name']} has non-IUPAC base "
+                    f"in {label}: {pos[label]!r}"
+                )
+
+    @pytest.mark.parametrize("gid", ["gb_l0", "moclo_plant"])
+    def test_builtins_marked_not_editable(self, gid):
+        # The editor honours `editable=False` to lock down built-in
+        # grammars. Drifting this would let users corrupt the canonical
+        # references, which is the whole point of having "Duplicate as
+        # Custom" in the parts bin.
+        assert sc._BUILTIN_GRAMMARS[gid].get("editable") is False
+
+    def test_gb_l0_matches_legacy_constants(self):
+        """The GB L0 grammar is derived from the existing _GB_*
+        constants. Tests still reference those constants directly, so
+        the derived view must agree with the source of truth."""
+        g = sc._BUILTIN_GRAMMARS["gb_l0"]
+        assert g["enzyme"] == sc._GB_L0_ENZYME_NAME
+        assert g["site"]   == sc._GB_L0_ENZYME_SITE
+        assert g["spacer"] == sc._GB_SPACER
+        assert g["pad"]    == sc._GB_PAD
+        assert dict(g["forbidden_sites"]) == dict(sc._GB_DOMESTICATION_FORBIDDEN)
+        assert sorted(g["coding_types"]) == sorted(sc._GB_CODING_PART_TYPES)
+        assert dict(g["type_to_insdc"]) == dict(sc._GB_PART_TYPE_TO_INSDC)
+        # Every position in _GB_POSITIONS shows up in the grammar's
+        # positions list with matching overhangs.
+        derived = {p["type"]: (p["name"], p["oh5"], p["oh3"]) for p in g["positions"]}
+        for ptype, (pos_name, oh5, oh3) in sc._GB_POSITIONS.items():
+            assert derived[ptype] == (pos_name, oh5, oh3)
+
+    def test_moclo_plant_uses_bsai(self):
+        g = sc._BUILTIN_GRAMMARS["moclo_plant"]
+        assert g["enzyme"] == "BsaI"
+        assert g["site"]   == "GGTCTC"
+        # MoClo L0 (BsaI) → L1 (BpiI/BbsI). Both must be on the
+        # forbidden list so domestication scrubs them before the user
+        # commits a synthesis order.
+        assert "BsaI" in g["forbidden_sites"]
+        assert "BpiI" in g["forbidden_sites"]
+
+
+class TestGrammarHelpers:
+    """The lookup helpers (``_all_grammars``, ``_get_active_grammar``,
+    ``_grammar_position_by_type``) are the seam every consumer goes
+    through; cover their happy paths + fallback semantics."""
+
+    def test_all_grammars_returns_builtins(self, tmp_path, monkeypatch):
+        # Empty custom grammars file — only built-ins are returned.
+        monkeypatch.setattr(sc, "_grammars_cache", [])
+        out = sc._all_grammars()
+        assert "gb_l0" in out
+        assert "moclo_plant" in out
+
+    def test_all_grammars_includes_custom(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sc, "_grammars_cache", [
+            {"id": "custom_a", "name": "Custom A",
+             "enzyme": "BsaI", "site": "GGTCTC",
+             "spacer": "A", "pad": "GCGC",
+             "forbidden_sites": {"BsaI": "GGTCTC"},
+             "positions": [
+                 {"name": "Pos 1", "type": "Promoter",
+                  "oh5": "GGAG", "oh3": "AATG"},
+             ],
+             "coding_types": [], "type_to_insdc": {}, "catalog": []},
+        ])
+        out = sc._all_grammars()
+        assert "custom_a" in out
+        # Custom grammars are always editable in the editor regardless
+        # of how the JSON was hand-written — guards against a
+        # mis-flagged file locking the user out.
+        assert out["custom_a"]["editable"] is True
+
+    def test_get_active_grammar_defaults_to_gb_l0(
+        self, tmp_path, monkeypatch,
+    ):
+        # No setting written → default = gb_l0.
+        monkeypatch.setattr(sc, "_settings_cache", {})
+        active = sc._get_active_grammar()
+        assert active["id"] == "gb_l0"
+
+    def test_get_active_grammar_resolves_setting(
+        self, tmp_path, monkeypatch,
+    ):
+        monkeypatch.setattr(sc, "_settings_cache", {"active_grammar": "moclo_plant"})
+        active = sc._get_active_grammar()
+        assert active["id"] == "moclo_plant"
+
+    def test_get_active_grammar_recovers_from_missing_id(self):
+        """If the persisted active id no longer resolves (e.g., the
+        custom grammar that was selected got deleted), the helper
+        flips the setting back to gb_l0 instead of crashing."""
+        sc._save_settings({"active_grammar": "nonexistent_grammar"})
+        active = sc._get_active_grammar()
+        assert active["id"] == "gb_l0"
+        # The helper writes the recovery back to settings so we don't
+        # keep falling back forever.
+        assert sc._get_setting("active_grammar") == "gb_l0"
+
+    def test_grammar_position_by_type(self):
+        g = sc._BUILTIN_GRAMMARS["gb_l0"]
+        pos = sc._grammar_position_by_type(g, "CDS")
+        assert pos is not None
+        assert pos["oh5"] == "AATG"
+        assert pos["oh3"] == "GCTT"
+        # Type not in this grammar → None (not KeyError).
+        assert sc._grammar_position_by_type(g, "BogusType") is None
+
+
+class TestSettingsPersistence:
+    """``settings.json`` round-trip through the envelope schema —
+    ``_load_setting`` / ``_save_setting`` are how every preference is
+    persisted now (active grammar today, more later)."""
+
+    def test_set_then_get(self):
+        sc._set_setting("active_grammar", "moclo_plant")
+        assert sc._get_setting("active_grammar") == "moclo_plant"
+
+    def test_get_default_when_missing(self):
+        sc._save_settings({})
+        assert sc._get_setting("missing_key", "fallback") == "fallback"
+
+    def test_round_trip_through_disk(self):
+        sc._set_setting("active_grammar", "moclo_plant")
+        # Force a re-read from disk — the cache must agree with what
+        # was written.
+        sc._settings_cache = None
+        assert sc._load_settings()["active_grammar"] == "moclo_plant"
+
+
+class TestCustomGrammarPersistence:
+    """``cloning_grammars.json`` round-trip + the deepcopy-on-load
+    contract that protects the cache from caller-side mutation."""
+
+    def test_round_trip(self):
+        entries = [{
+            "id": "custom_x", "name": "Custom X",
+            "enzyme": "BsaI", "site": "GGTCTC",
+            "spacer": "A", "pad": "GCGC",
+            "forbidden_sites": {"BsaI": "GGTCTC"},
+            "positions": [
+                {"name": "Pos 1", "type": "Promoter",
+                 "oh5": "GGAG", "oh3": "AATG"},
+            ],
+            "coding_types": [], "type_to_insdc": {}, "catalog": [],
+        }]
+        sc._save_custom_grammars(entries)
+        sc._grammars_cache = None
+        loaded = sc._load_custom_grammars()
+        assert len(loaded) == 1
+        assert loaded[0]["id"] == "custom_x"
+        assert loaded[0]["positions"][0]["oh5"] == "GGAG"
+
+    def test_load_returns_independent_dicts(self):
+        sc._save_custom_grammars([{
+            "id": "c1", "name": "C1", "enzyme": "X", "site": "AAAAAA",
+            "spacer": "A", "pad": "AAAA",
+            "forbidden_sites": {}, "positions": [],
+            "coding_types": [], "type_to_insdc": {}, "catalog": [],
+        }])
+        a = sc._load_custom_grammars()
+        b = sc._load_custom_grammars()
+        # Same content but different dict identity — mutating one must
+        # not affect the other (or the cache).
+        a[0]["name"] = "MUTATED"
+        assert b[0]["name"] == "C1"
+        c = sc._load_custom_grammars()
+        assert c[0]["name"] == "C1"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Parts Bin grammar dropdown + filter
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPartsBinGrammarFilter:
+    """The Parts Bin filters its catalog and user parts to the active
+    grammar. Switching grammars repopulates the table with that
+    grammar's parts. Legacy parts (no ``grammar`` field) treat as
+    ``gb_l0`` so existing v0.3.x data migrates intact."""
+
+    async def test_default_active_is_gb_l0(self, isolated_parts_bin):
+        # Fresh app — settings.json doesn't exist yet, default kicks in.
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert modal._active_grammar_id() == "gb_l0"
+
+    def test_gb_l0_is_first_in_dropdown(self):
+        """Golden Braid L0 must be position 1 of the grammar dropdown
+        regardless of how many built-in or custom grammars exist.
+        Order contract is enforced by `_grammar_dropdown_options`
+        rather than relying on Python's dict-insertion ordering
+        accidentally getting it right (a user-defined grammar
+        id-sorted before ``gb_l0`` would otherwise show up first)."""
+        # Seed a custom grammar whose id alphabetises BEFORE "gb_l0",
+        # so any naive sort would put it at position 1 instead.
+        sc._save_custom_grammars([{
+            "id": "aaa_pinned_first", "name": "Aardvark",
+            "enzyme": "BsaI", "site": "GGTCTC",
+            "spacer": "A", "pad": "GCGC",
+            "forbidden_sites": {"BsaI": "GGTCTC"},
+            "positions": [
+                {"name": "Pos 1", "type": "Promoter",
+                 "oh5": "GGAG", "oh3": "AATG"},
+            ],
+            "coding_types": [], "type_to_insdc": {}, "catalog": [],
+        }])
+        options = sc._grammar_dropdown_options()
+        assert options, "Grammar dropdown should never be empty."
+        first_label, first_id = options[0]
+        assert first_id == "gb_l0", (
+            f"GB L0 must be position 1 of the dropdown; got "
+            f"{first_id!r} ({first_label!r}) instead. "
+            f"Full order: {[gid for _label, gid in options]}"
+        )
+
+    def test_dropdown_order_builtins_then_custom(self):
+        """Built-ins (gb_l0 first, then moclo_plant) precede every
+        custom grammar in the dropdown. The (custom) suffix is the
+        signal that tells the user where the boundary is."""
+        sc._save_custom_grammars([{
+            "id": "custom_z", "name": "Z Custom",
+            "enzyme": "BsaI", "site": "GGTCTC",
+            "spacer": "A", "pad": "GCGC",
+            "forbidden_sites": {"BsaI": "GGTCTC"},
+            "positions": [
+                {"name": "Pos 1", "type": "Promoter",
+                 "oh5": "GGAG", "oh3": "AATG"},
+            ],
+            "coding_types": [], "type_to_insdc": {}, "catalog": [],
+        }])
+        opts = sc._grammar_dropdown_options()
+        ids_in_order = [gid for _label, gid in opts]
+        # First two slots are the built-ins, in declared order.
+        assert ids_in_order[:2] == ["gb_l0", "moclo_plant"]
+        # Custom grammars come after and carry the (custom) tag.
+        custom_labels = [
+            label for label, gid in opts if gid not in sc._BUILTIN_GRAMMARS
+        ]
+        assert all("(custom)" in label for label in custom_labels)
+
+    async def test_legacy_parts_default_to_gb_l0(self, isolated_parts_bin):
+        # A v0.3.x part with no `grammar` field shows up under GB L0.
+        sc._save_parts_bin([{
+            "name": "legacy_x", "type": "CDS",
+            "position": "Pos 3-4", "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2", "marker": "Spectinomycin",
+            "sequence": "ATG" * 10,
+            "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            user_rows = [r for r in modal._rows if r.get("user")]
+            assert any(r["name"] == "legacy_x" for r in user_rows)
+
+    async def test_all_parts_visible_regardless_of_grammar(
+        self, isolated_parts_bin,
+    ):
+        """The Parts Bin no longer filters by an active grammar — every
+        user-saved part is visible at all times, with the Grammar
+        column indicating which assembly standard each row belongs to.
+        Grammar selection moved into the New Part modal."""
+        sc._save_parts_bin([
+            {"name": "gb_part",    "type": "CDS",
+             "position": "Pos 3-4", "oh5": "AATG", "oh3": "GCTT",
+             "backbone": "pUPD2",  "marker": "Spectinomycin",
+             "sequence": "ATG" * 10, "fwd_primer": "", "rev_primer": "",
+             "fwd_tm": 0.0, "rev_tm": 0.0,
+             "grammar": "gb_l0"},
+            {"name": "moclo_part", "type": "CDS",
+             "position": "Pos 3", "oh5": "AGGT", "oh3": "GCTT",
+             "backbone": "pUPD2",  "marker": "Spectinomycin",
+             "sequence": "ATG" * 10, "fwd_primer": "", "rev_primer": "",
+             "fwd_tm": 0.0, "rev_tm": 0.0,
+             "grammar": "moclo_plant"},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            user_names = {r["name"] for r in modal._rows if r.get("user")}
+            assert user_names == {"gb_part", "moclo_part"}, (
+                f"Both user parts should be listed; got {user_names}"
+            )
+            # Each user row carries its source grammar id so the
+            # Grammar column can render the right label.
+            grammars = {
+                r["name"]: r.get("grammar")
+                for r in modal._rows if r.get("user")
+            }
+            assert grammars == {
+                "gb_part": "gb_l0", "moclo_part": "moclo_plant",
+            }
+
+    async def test_grammar_column_shows_human_name(
+        self, isolated_parts_bin,
+    ):
+        sc._save_parts_bin([{
+            "name": "x", "type": "CDS",
+            "position": "Pos 3-4", "oh5": "AATG", "oh3": "GCTT",
+            "backbone": "pUPD2",  "marker": "Spectinomycin",
+            "sequence": "ATG" * 10, "fwd_primer": "", "rev_primer": "",
+            "fwd_tm": 0.0, "rev_tm": 0.0,
+            "grammar": "moclo_plant",
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            t = app.screen.query_one("#parts-table", sc.DataTable)
+            row_keys = list(t.rows.keys())
+            col_keys = list(t.columns.keys())
+            # Last column is the new Grammar column; show the
+            # built-in's human name, not the raw id.
+            cell = t.get_cell(row_keys[0], col_keys[-1])
+            assert "MoClo" in str(cell), (
+                f"Grammar column should show human-readable name; "
+                f"got {cell!r}"
+            )
+
+    async def test_new_part_inherits_active_grammar(self, isolated_parts_bin):
+        sc._set_setting("active_grammar", "moclo_plant")
+        sc._save_parts_bin([])
+        # Simulate the DomesticatorModal save callback: the part dict
+        # arrives with no `grammar` field; PartsBinModal._new_part
+        # patches the active grammar id in.
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            # Manually invoke the inner _on_result by calling the
+            # `_new_part` callback path — we don't push the full
+            # DomesticatorModal because that would need a full record.
+            # Instead, directly emulate the persistence step.
+            new_part = {
+                "name": "fresh", "type": "Promoter",
+                "position": "Pos 1", "oh5": "GGAG", "oh3": "AATG",
+                "backbone": "pUPD2", "marker": "Spectinomycin",
+                "sequence": "ATGCATGCATGC",
+                "fwd_primer": "", "rev_primer": "",
+                "fwd_tm": 0.0, "rev_tm": 0.0,
+            }
+            # This mirrors the body of the _on_result closure in _new_part.
+            new_part.setdefault("grammar", modal._active_grammar_id())
+            entries = sc._load_parts_bin()
+            entries.insert(0, new_part)
+            sc._save_parts_bin(entries)
+            sc._parts_bin_cache = None
+            assert sc._load_parts_bin()[0]["grammar"] == "moclo_plant"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DomesticatorModal honors the active grammar
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDomesticatorUsesActiveGrammar:
+    """Primer design parameters (positions, enzyme, spacer, pad,
+    forbidden sites) all flow from the active grammar — switching
+    grammar in the parts bin should change what the Domesticator
+    designs without the user having to flip anything else."""
+
+    def test_design_uses_grammar_overhangs(self):
+        moclo = sc._BUILTIN_GRAMMARS["moclo_plant"]
+        # Long enough for a binding region; ATG-aligned for codon-fix
+        # repair if needed.
+        seq = "ATG" + "GCG" * 30 + "TAA"
+        r = sc._design_gb_primers(
+            seq, 0, len(seq), "Promoter", grammar=moclo,
+        )
+        assert "error" not in r, r
+        # Forward primer should carry the MoClo Promoter overhang
+        # (GGAG → AATG), not the GB one (GGAG → TGAC).
+        assert r["oh5"] == "GGAG"
+        assert r["oh3"] == "AATG"
+        # Tail uses BsaI, not Esp3I.
+        assert "GGTCTC" in r["fwd_full"][:15]
+        assert "CGTCTC" not in r["fwd_full"][:15]
+
+    def test_design_rejects_type_not_in_grammar(self):
+        moclo = sc._BUILTIN_GRAMMARS["moclo_plant"]
+        # MoClo Plant doesn't define CDS-NS — design should refuse
+        # rather than silently fall back to a GB position.
+        seq = "ATG" + "GCG" * 30 + "TAA"
+        r = sc._design_gb_primers(
+            seq, 0, len(seq), "CDS-NS", grammar=moclo,
+        )
+        assert "error" in r
+        assert "CDS-NS" in r["error"]
+
+    def test_forbidden_sites_scan_uses_grammar(self):
+        # MoClo Plant scrubs BsaI + BpiI; Esp3I would be allowed.
+        moclo = sc._BUILTIN_GRAMMARS["moclo_plant"]
+        # Seq with an internal Esp3I (CGTCTC). Under MoClo it should
+        # NOT be flagged as forbidden — this is the contract that
+        # makes per-grammar Type IIS scrubbing meaningful.
+        seq_with_esp3i = "ATG" + "CGTCTC" + "GCG" * 25 + "TAA"
+        hits = sc._gb_find_forbidden_hits(
+            seq_with_esp3i, sites=moclo["forbidden_sites"],
+        )
+        assert all(h[0] != "Esp3I" for h in hits), (
+            f"MoClo grammar should not flag Esp3I sites; got {hits!r}"
+        )
+
+    async def test_modal_title_shows_active_grammar(
+        self, isolated_parts_bin, tiny_record,
+    ):
+        sc._set_setting("active_grammar", "moclo_plant")
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.DomesticatorModal(str(tiny_record.seq), [],
+                                                 current_plasmid_name="x"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            title = app.screen.query_one("#dom-title", sc.Static)
+            assert "MoClo" in str(title.render())

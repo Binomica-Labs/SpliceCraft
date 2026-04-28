@@ -404,6 +404,12 @@ class TestRealFilesNeverTouched:
             f"expected a tmp dir!"
         )
 
+    def test_collections_file_is_redirected(self):
+        assert "/tmp" in str(sc._COLLECTIONS_FILE) or "pytest" in str(sc._COLLECTIONS_FILE), (
+            f"_COLLECTIONS_FILE points to {sc._COLLECTIONS_FILE} — "
+            f"expected a tmp dir!"
+        )
+
     def test_save_library_writes_to_tmp(self):
         """Actually call _save_library and verify the write landed in /tmp,
         not in the repo directory."""
@@ -431,13 +437,18 @@ class TestRealFilesNeverTouched:
         assert sc._FEATURES_FILE.exists()
         assert "/tmp" in str(sc._FEATURES_FILE) or "pytest" in str(sc._FEATURES_FILE)
 
+    def test_save_collections_writes_to_tmp(self):
+        sc._save_collections([{"name": "SAFETY_TEST", "plasmids": []}])
+        assert sc._COLLECTIONS_FILE.exists()
+        assert "/tmp" in str(sc._COLLECTIONS_FILE) or "pytest" in str(sc._COLLECTIONS_FILE)
+
     def test_real_repo_files_untouched(self):
         """The actual files in the repo root must NOT contain SAFETY_TEST
         entries — if they do, the autouse fixture failed."""
         import json
         repo_root = Path(__file__).resolve().parent.parent
         for fname in ["plasmid_library.json", "parts_bin.json",
-                      "primers.json", "features.json"]:
+                      "primers.json", "features.json", "collections.json"]:
             p = repo_root / fname
             if not p.exists():
                 continue

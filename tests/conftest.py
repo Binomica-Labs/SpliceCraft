@@ -46,13 +46,12 @@ def _protect_user_data(tmp_path, monkeypatch):
         ("_CODON_TABLES_FILE",    "_codon_tables_cache"),
         ("_FEATURES_FILE",        "_features_cache"),
         ("_FEATURE_COLORS_FILE",  "_feature_colors_cache"),
-        ("_PLANNOTATE_CHECK_CACHE", None),  # not a file, but reset for isolation
+        ("_GRAMMARS_FILE",        "_grammars_cache"),
+        ("_SETTINGS_FILE",        "_settings_cache"),
+        ("_COLLECTIONS_FILE",     "_collections_cache"),
     ]
 
     for file_attr, cache_attr in _DATA_FILES:
-        if file_attr == "_PLANNOTATE_CHECK_CACHE":
-            monkeypatch.setattr(sc, file_attr, None)
-            continue
         # Redirect the file path to a temp location
         real_path = getattr(sc, file_attr)
         tmp_file = tmp_path / real_path.name

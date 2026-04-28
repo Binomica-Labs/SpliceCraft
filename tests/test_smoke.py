@@ -176,10 +176,6 @@ class TestNoNetworkAccess:
             assert not calls, f"fetch_genbank was called {len(calls)} time(s)"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# pLannotate UI entry points (button + shortcut, pLannotate itself mocked)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class TestLibraryRename:
     """Library panel rename (✎ button). Verifies the button exists, the
     modal opens with the current name, saving persists the new name to
@@ -580,8 +576,8 @@ class TestDeleteFocusRouting:
 
 class TestImportAutoPersist:
     """Every 'user imports a plasmid' entry point should auto-save the
-    record to the library. Library loads, pLannotate merges, and undo/redo
-    should NOT re-save."""
+    record to the library. Library loads and undo/redo should NOT
+    re-save."""
 
     async def test_preload_record_is_auto_added_to_library(
         self, tiny_record, isolated_library
@@ -691,76 +687,14 @@ class TestImportAutoPersist:
             assert len(sc._load_library()) == before
 
 
-class TestPlannotateUIEntryPoints:
-    async def test_annotate_button_exists_in_library(self, tiny_record,
-                                                      isolated_library):
-        app = _build_app(tiny_record, isolated_library)
-        async with app.run_test(size=TERMINAL_SIZE) as pilot:
-            await pilot.pause()
-            await pilot.pause(0.05)
-            btn = app.query_one("#btn-lib-annot", sc.Button)
-            assert btn is not None
-
-    async def test_shift_a_binding_registered(self):
-        keys = [b.key for b in sc.PlasmidApp.BINDINGS]
-        assert "A" in keys, "shift+A (key='A') binding is missing"
-        # And it's distinct from ctrl+shift+a (Add to Library) — these must
-        # not collide. Shift+A (uppercase 'A') fires annotate_plasmid; Add
-        # to Library moved to Ctrl+Shift+A in the 2026-04-20 rename to align
-        # global shortcuts with their action names.
-        assert "ctrl+shift+a" in keys
-        actions = {b.key: b.action for b in sc.PlasmidApp.BINDINGS}
-        assert actions["A"] == "annotate_plasmid"
-        assert actions["ctrl+shift+a"] == "add_to_library"
-
-    async def test_shift_a_with_no_record_notifies_not_crashes(
-        self, isolated_library, monkeypatch
-    ):
-        """With no record loaded, Shift+A must notify a warning and return
-        without touching pLannotate."""
-        app = sc.PlasmidApp()
-        async with app.run_test(size=TERMINAL_SIZE) as pilot:
-            await pilot.pause()
-            await pilot.pause(0.05)
-            # No record loaded; invoke the action directly (avoids key
-            # routing which may target a different widget)
-            app.action_annotate_plasmid()
-            await pilot.pause(0.05)
-            # The app should still be alive — assertion is "didn't crash"
-
-    async def test_annotate_action_with_plannotate_missing_notifies_install(
-        self, tiny_record, isolated_library, monkeypatch
-    ):
-        """With pLannotate absent from PATH, the action notifies instead of
-        attempting to run anything. Verify by counting subprocess.run calls."""
-        import shutil, subprocess
-        monkeypatch.setattr(sc, "_PLANNOTATE_CHECK_CACHE", None)
-        monkeypatch.setattr(shutil, "which", lambda *a, **k: None)
-        calls = []
-        monkeypatch.setattr(
-            subprocess, "run",
-            lambda *a, **k: calls.append((a, k)) or None,
-        )
-        app = _build_app(tiny_record, isolated_library)
-        async with app.run_test(size=TERMINAL_SIZE) as pilot:
-            await pilot.pause()
-            await pilot.pause(0.05)
-            app.action_annotate_plasmid()
-            await pilot.pause(0.05)
-            assert not calls, (
-                "subprocess.run should NOT be invoked when pLannotate "
-                "is not on PATH"
-            )
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # _apply_record source_path + dirty-flag handling (regression guard 2026-04-13)
 # ═══════════════════════════════════════════════════════════════════════════════
 #
 # Before today's fix, _apply_record always cleared _source_path — even when
-# called with clear_undo=False for an in-place update (pLannotate merge,
-# primer-add). That meant after annotating, Ctrl+S no longer targeted the
-# user's original .gb file. Also, pLannotate used lib.set_dirty(True) alone,
+# called with clear_undo=False for an in-place update (e.g. primer-add).
+# That meant after the in-place merge, Ctrl+S no longer targeted the user's
+# original .gb file. Also, the merge path used lib.set_dirty(True) alone,
 # which only updated the library panel's marker but left self._unsaved=False,
 # so the user could quit without being prompted to save.
 
@@ -785,7 +719,7 @@ class TestApplyRecordInPlaceSemantics:
     async def test_clear_undo_false_preserves_source_path(
         self, tiny_record, isolated_library
     ):
-        """In-place-update semantics: after pLannotate merge or primer-add,
+        """In-place-update semantics: after primer-add or feature-merge,
         the user's original source file should still be the Ctrl+S target."""
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
@@ -989,51 +923,6 @@ class TestCrashRecoveryAutosave:
             )
             # And reproducibility — the same id always maps to the same path.
             assert app._autosave_path(deepcopy(a)) == path_a
-
-
-class TestPlannotateReentryGuard:
-    """Re-entry guard: pressing Shift+A while pLannotate is already running
-    must not spawn a second subprocess. Regression guard for 2026-04-13."""
-
-    async def test_action_noop_when_plannotate_running(
-        self, tiny_record, isolated_library, monkeypatch
-    ):
-        """Set the running flag, call action_annotate_plasmid, confirm
-        no subprocess was invoked."""
-        import shutil, subprocess
-        # Pretend pLannotate is fully installed so the code reaches the
-        # re-entry guard (otherwise it short-circuits on "not installed").
-        monkeypatch.setattr(sc, "_PLANNOTATE_CHECK_CACHE", None)
-        monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
-        calls = []
-        monkeypatch.setattr(
-            subprocess, "run",
-            lambda *a, **k: calls.append((a, k)) or None,
-        )
-        app = _build_app(tiny_record, isolated_library)
-        async with app.run_test(size=TERMINAL_SIZE) as pilot:
-            await pilot.pause()
-            await pilot.pause(0.05)
-            # Simulate a pLannotate run already in flight
-            app._plannotate_running = True
-            app.action_annotate_plasmid()
-            await pilot.pause(0.05)
-            assert not calls, (
-                "subprocess.run should NOT be invoked while "
-                "_plannotate_running is True"
-            )
-
-    async def test_flag_exists_after_mount(
-        self, tiny_record, isolated_library
-    ):
-        """The flag is initialized in on_mount — regression guard for
-        future refactors that might forget to set it up."""
-        app = _build_app(tiny_record, isolated_library)
-        async with app.run_test(size=TERMINAL_SIZE) as pilot:
-            await pilot.pause()
-            await pilot.pause(0.05)
-            assert hasattr(app, "_plannotate_running")
-            assert app._plannotate_running is False
 
 
 class TestSidebarDetailWrapFeature:

@@ -29,6 +29,7 @@ import platform
 import re
 import sys
 import uuid as _uuid
+from datetime import date as _date
 from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -437,6 +438,146 @@ def _save_library(entries: list[dict]) -> None:
     global _library_cache
     _safe_save_json(_LIBRARY_FILE, entries, "Plasmid library")
     _library_cache = list(entries)
+    # Keep the active collection's plasmids in sync with the library — every
+    # add / remove / rename on the panel feeds through here, so a single
+    # mirror call covers all CRUD without changing call sites.
+    _sync_active_collection_plasmids(entries)
+
+
+# ── Plasmid collections ────────────────────────────────────────────────────────
+#
+# A "collection" is a named snapshot of a plasmid library — the user can keep
+# several themed sets (e.g. "yeast project", "E. coli toolkit", "MoClo plant")
+# and switch between them. Switching loads the snapshot into `plasmid_library.json`
+# wholesale, so the rest of the app keeps working off the single live library.
+#
+# On-disk shape (envelope schema v1):
+#   {"_schema_version": 1, "entries": [
+#       {"name": "...", "description": "...", "plasmids": [<library entry>, ...]},
+#       ...
+#   ]}
+# Each `plasmids` entry mirrors a library row exactly (id, name, gb_text, ...),
+# so saving = `_load_library()`; loading = `_save_library(plasmids)`.
+
+_COLLECTIONS_FILE = _DATA_DIR / "collections.json"
+_collections_cache: "list | None" = None
+
+def _load_collections() -> list[dict]:
+    """Return a deepcopy of the collections list so callers can mutate
+    entries (rename, edit plasmids list) without poisoning the in-memory
+    cache. Matches the `_load_features` contract documented in CLAUDE.md.
+    """
+    global _collections_cache
+    if _collections_cache is None:
+        entries, warning = _safe_load_json(_COLLECTIONS_FILE, "Plasmid collections")
+        if warning:
+            _log.warning(warning)
+        _collections_cache = [e for e in entries if isinstance(e, dict)]
+    from copy import deepcopy
+    return deepcopy(_collections_cache)
+
+def _save_collections(entries: list[dict]) -> None:
+    global _collections_cache
+    _safe_save_json(_COLLECTIONS_FILE, entries, "Plasmid collections")
+    from copy import deepcopy
+    _collections_cache = deepcopy(entries)
+
+
+# Active collection — which named collection is the panel currently showing.
+# Stored in settings.json (key: "active_collection") so it persists across
+# launches. Collection identity is the user-facing name; names are unique
+# per the modal's dup-name guard.
+
+_DEFAULT_COLLECTION_NAME = "Main Collection"
+
+
+def _get_active_collection_name() -> "str | None":
+    val = _get_setting("active_collection", None)
+    return val if isinstance(val, str) and val else None
+
+
+def _set_active_collection_name(name: "str | None") -> None:
+    """Persist (or clear) the active-collection pointer."""
+    _set_setting("active_collection", name or "")
+
+
+def _find_collection(name: str) -> "dict | None":
+    for c in _load_collections():
+        if c.get("name") == name:
+            return c
+    return None
+
+
+def _collection_name_taken(name: str) -> bool:
+    """Dup-name guard for create / rename. Pure check, no side effects."""
+    return _find_collection(name) is not None
+
+
+def _ensure_default_collection() -> None:
+    """Idempotent: guarantee at least one collection exists.
+
+    First-run users have a non-empty `plasmid_library.json` but no
+    `collections.json` — migrate by wrapping their existing plasmids in a
+    "Main Collection" and marking it active. Empty-library first-runs just
+    get an empty Main Collection so the panel always has something to show.
+    """
+    colls = _load_collections()
+    if colls:
+        if not _get_active_collection_name():
+            first = colls[0].get("name")
+            if first:
+                _set_active_collection_name(first)
+        return
+    plasmids = _load_library()
+    _save_collections([{
+        "name":        _DEFAULT_COLLECTION_NAME,
+        "description": "Default collection",
+        "plasmids":    plasmids,
+        "saved":       _date.today().isoformat(),
+    }])
+    _set_active_collection_name(_DEFAULT_COLLECTION_NAME)
+
+
+def _sync_active_collection_plasmids(entries: list[dict]) -> None:
+    """Mirror the live library's contents into the active collection so the
+    on-disk collection record never drifts from the panel's view.
+
+    Silent no-op if no collection is active, or if the active name has
+    been deleted (e.g. user removed it via the manager) — the next
+    explicit Load/Save will re-establish a target.
+    """
+    name = _get_active_collection_name()
+    if not name:
+        return
+    colls = _load_collections()
+    for c in colls:
+        if c.get("name") == name:
+            c["plasmids"] = [dict(e) for e in entries if isinstance(e, dict)]
+            _save_collections(colls)
+            return
+
+
+def _restore_library_from_active_collection() -> None:
+    """Refresh `plasmid_library.json` with the active collection's plasmids
+    so the panel renders what the user expects after a restart or after
+    edits made in another session.
+
+    Called once during app startup (after `_ensure_default_collection`).
+    Silent no-op if no collection is active or the active one was deleted.
+    Bypasses `_save_library`'s mirror — the collection is the source.
+    """
+    global _library_cache
+    name = _get_active_collection_name()
+    if not name:
+        return
+    coll = _find_collection(name)
+    if coll is None:
+        return
+    plasmids = [dict(p) for p in (coll.get("plasmids") or [])
+                if isinstance(p, dict)]
+    _safe_save_json(_LIBRARY_FILE, plasmids, "Plasmid library")
+    _library_cache = list(plasmids)
+
 
 # ── Restriction sites ──────────────────────────────────────────────────────────
 
@@ -1694,6 +1835,24 @@ def _format_bp(bp: int) -> str:
     return f"{bp / 1000:.2f}k"
 
 
+def _cursor_row_key(table) -> "str | None":
+    """Return the value of a DataTable's cursor row key, or None when
+    the table is empty or the cursor is out of bounds.
+
+    Centralises the boilerplate `list(t.rows.keys())` + bounds-check
+    that was open-coded at ~10 sites (library panel buttons, picker
+    modals, primer table). Always pair with the empty-table branch in
+    the caller — this helper is read-only.
+    """
+    if table.row_count == 0:
+        return None
+    row_keys = list(table.rows.keys())
+    if not (0 <= table.cursor_row < len(row_keys)):
+        return None
+    rk = row_keys[table.cursor_row]
+    return rk.value if rk else None
+
+
 def _feat_label(feat) -> str:
     for q in ("label", "gene", "product", "standard_name", "note", "bound_moiety"):
         if q in feat.qualifiers:
@@ -2000,220 +2159,10 @@ def _export_fasta_to_path(name: str, sequence: str, path) -> dict:
     return {"path": str(p), "bp": len(seq), "name": header}
 
 
-# ── External annotation (pLannotate) ──────────────────────────────────────────
-#
-# Integration with pLannotate (https://github.com/mmcguffi/pLannotate) as an
-# OPTIONAL runtime dependency. pLannotate is GPL-3 so we only call its CLI
-# as a subprocess — we never `import plannotate` (which would arguably create
-# a combined work under GPL).
-#
-# If pLannotate is not installed (shutil.which returns None), the UI entry
-# points notify the user with install instructions and no error propagates.
-#
-# Install path (from the pLannotate README):
-#     conda create -n plannotate -c conda-forge -c bioconda plannotate
-#     conda activate plannotate
-#     plannotate setupdb        # ~500 MB database, one-time
-#
-# pLannotate refuses inputs larger than 50 kb (its MAX_PLAS_SIZE constant),
-# so we preflight that too and give a specific error.
-
-class PlannotateError(Exception):
-    """Base class for pLannotate errors carrying a user-facing message."""
-    def __init__(self, user_msg: str, detail: str = ""):
-        super().__init__(user_msg if not detail else f"{user_msg}: {detail}")
-        self.user_msg = user_msg
-        self.detail   = detail
-
-class PlannotateNotInstalled(PlannotateError): pass
-class PlannotateMissingDb(PlannotateError):   pass
-class PlannotateTooLarge(PlannotateError):    pass
-class PlannotateFailed(PlannotateError):      pass
-
-# pLannotate's hard-coded maximum plasmid size (MAX_PLAS_SIZE in its resources).
-_PLANNOTATE_MAX_BP = 50_000
-
-# Cached availability probe — cleared by setting to None.
-_PLANNOTATE_CHECK_CACHE: "dict | None" = None
-
-def _plannotate_status() -> dict:
-    """Check whether pLannotate + BLAST+ + diamond are on PATH. Cached."""
-    global _PLANNOTATE_CHECK_CACHE
-    if _PLANNOTATE_CHECK_CACHE is not None:
-        return _PLANNOTATE_CHECK_CACHE
-    import shutil
-    status = {
-        "installed": shutil.which("plannotate") is not None,
-        "blast":     shutil.which("blastn")     is not None,
-        "diamond":   shutil.which("diamond")    is not None,
-    }
-    status["ready"] = all((status["installed"], status["blast"], status["diamond"]))
-    _PLANNOTATE_CHECK_CACHE = status
-    return status
-
-def _plannotate_install_hint() -> str:
-    """User-friendly install instructions for notifications."""
-    return (
-        "Install via conda:  conda create -n plannotate "
-        "-c conda-forge -c bioconda plannotate && "
-        "conda activate plannotate && plannotate setupdb"
-    )
-
-def _run_plannotate(record, timeout: int = 180):
-    """Run `plannotate batch` on a temporary copy of `record` and return the
-    parsed output as a Biopython SeqRecord. Raises a PlannotateError subclass
-    on any failure; callers are expected to catch and surface `err.user_msg`.
-
-    Never imports `plannotate` — invokes the CLI as a subprocess so the GPL
-    boundary stays clean.
-    """
-    import os
-    import subprocess
-    import tempfile
-
-    status = _plannotate_status()
-    if not status["installed"]:
-        raise PlannotateNotInstalled(
-            "pLannotate is not installed", _plannotate_install_hint()
-        )
-    if not status["blast"] or not status["diamond"]:
-        missing = []
-        if not status["blast"]:   missing.append("blastn")
-        if not status["diamond"]: missing.append("diamond")
-        raise PlannotateNotInstalled(
-            f"pLannotate requires {' + '.join(missing)} on PATH",
-            _plannotate_install_hint(),
-        )
-
-    n = len(record.seq)
-    if n > _PLANNOTATE_MAX_BP:
-        raise PlannotateTooLarge(
-            f"pLannotate max input is {_PLANNOTATE_MAX_BP:,} bp "
-            f"(this record: {n:,} bp)"
-        )
-
-    with tempfile.TemporaryDirectory(prefix="splicecraft_plan_") as tmp:
-        in_path = os.path.join(tmp, "input.gb")
-        with open(in_path, "w", encoding="utf-8") as fh:
-            fh.write(_record_to_gb_text(record))
-
-        try:
-            result = subprocess.run(
-                [
-                    "plannotate", "batch",
-                    "-i", in_path,
-                    "-o", tmp,
-                    "-f", "annotated",
-                    "-s", "",           # no "_pLann" suffix
-                ],
-                capture_output=True, text=True, timeout=timeout,
-            )
-        except FileNotFoundError:
-            # PATH said plannotate existed, but the binary disappeared between
-            # the `which` check and the subprocess. Rare; report as not-installed.
-            raise PlannotateNotInstalled(
-                "pLannotate not found on PATH", _plannotate_install_hint()
-            )
-        except subprocess.TimeoutExpired:
-            raise PlannotateFailed(
-                f"pLannotate timed out after {timeout}s",
-                f"input was {n:,} bp",
-            )
-
-        combined_out = (result.stdout or "") + (result.stderr or "")
-        if "Databases not downloaded" in combined_out:
-            raise PlannotateMissingDb(
-                "pLannotate databases not installed",
-                "Run: plannotate setupdb",
-            )
-
-        if result.returncode != 0:
-            # Strip control chars so ANSI/escape sequences from pLannotate's
-            # stderr can't corrupt the Textual rendering when surfaced via
-            # notify(). Keep tabs/newlines for readability.
-            raw_tail = combined_out[-500:]
-            err_tail = "".join(
-                ch for ch in raw_tail
-                if ch in "\t\n" or (ch.isprintable() and ord(ch) >= 0x20)
-            ).strip() or "(no output)"
-            raise PlannotateFailed("pLannotate failed", err_tail)
-
-        # Locate output GenBank. `plannotate batch` writes <file_name>.gbk; we
-        # passed `-f annotated` so look for annotated.gbk first, then any .gbk
-        # that isn't our input.
-        out_gb = os.path.join(tmp, "annotated.gbk")
-        if not os.path.exists(out_gb):
-            candidates = [
-                f for f in os.listdir(tmp)
-                if f.endswith(".gbk") and f != "input.gb"
-            ]
-            if not candidates:
-                raise PlannotateFailed("pLannotate produced no .gbk output")
-            out_gb = os.path.join(tmp, candidates[0])
-
-        try:
-            annotated = load_genbank(out_gb)
-        except Exception as exc:
-            raise PlannotateFailed("could not parse pLannotate output", str(exc))
-
-    return annotated
-
-
-def _merge_plannotate_features(original, annotated):
-    """Return a NEW SeqRecord with `original`'s sequence and features, plus
-    any non-duplicate features from `annotated` tagged with a "pLannotate"
-    note qualifier.
-
-    - Preserves the original sequence (annotated may round-trip differently).
-    - Skips feature type "source" (GenBank boilerplate).
-    - Skips a pLannotate feature if (type, start, end, strand) matches an
-      existing feature — avoids duplicating features the user already has.
-    """
-    from copy import deepcopy
-    from Bio.Seq import Seq
-    from Bio.SeqRecord import SeqRecord
-
-    merged = SeqRecord(
-        Seq(str(original.seq)),
-        id=original.id,
-        name=original.name,
-        description=original.description,
-        annotations=dict(original.annotations),
-    )
-    for feat in original.features:
-        merged.features.append(deepcopy(feat))
-
-    existing_keys = {
-        (f.type, int(f.location.start), int(f.location.end), f.location.strand)
-        for f in original.features if f.type != "source"
-    }
-    n_added = 0
-    for feat in annotated.features:
-        if feat.type == "source":
-            continue
-        key = (
-            feat.type,
-            int(feat.location.start),
-            int(feat.location.end),
-            feat.location.strand,
-        )
-        if key in existing_keys:
-            continue
-        new_feat = deepcopy(feat)
-        # Tag with a "pLannotate" note so users (and future loads) can tell
-        # where each feature came from.
-        notes = new_feat.qualifiers.get("note", [])
-        if isinstance(notes, str):
-            notes = [notes]
-        if not any("pLannotate" in n for n in notes):
-            notes = ["pLannotate"] + list(notes)
-        new_feat.qualifiers["note"] = notes
-        merged.features.append(new_feat)
-        n_added += 1
-
-    # Stash the count so the UI caller can surface it in a notification.
-    merged._plannotate_added = n_added
-    return merged
+# pLannotate integration removed — the panel's annotate button became a
+# back-to-collections button, and the Shift+A keybinding + Edit menu entry
+# are gone. Users who want auto-annotation can still run pLannotate
+# externally and import the resulting GenBank file via File > Open.
 
 
 # ── Core drawing ───────────────────────────────────────────────────────────────
@@ -3237,17 +3186,35 @@ class FeatureSidebar(Widget):
 # ── Library panel ──────────────────────────────────────────────────────────────
 
 class LibraryPanel(Widget):
-    """Left-hand plasmid library — persistent SnapGene-style collection."""
+    """Left-hand plasmid panel — toggles between a *collections* list and
+    the active collection's *plasmids* view.
+
+    Two modes:
+      * ``"collections"`` — a list of named collections. ``+ / − / ✎``
+        buttons add / remove / rename collections in-place; clicking a
+        row enters that collection's plasmid view.
+      * ``"plasmids"`` — the existing per-plasmid view (the SnapGene-
+        style library list). ``←`` returns to the collections view;
+        ``+`` saves the currently-loaded record into the active
+        collection (via ``_save_library`` → ``_sync_active_collection_plasmids``).
+
+    The two on-disk files (``plasmid_library.json`` + ``collections.json``)
+    stay in sync because every mutation routes through ``_save_library``,
+    which mirrors entries into the active collection.
+    """
 
     DEFAULT_CSS = """
     LibraryPanel {
         width: 26;
         border-right: solid $primary;
     }
-    #lib-hdr   { background: $primary; padding: 0 1; }
-    #lib-table { height: 1fr; }
-    #lib-btns  { height: 3; }
-    #lib-btns Button { min-width: 5; margin: 0 0 0 1; }
+    #lib-hdr        { background: $primary; padding: 0 1; }
+    #lib-table      { height: 1fr; }
+    #lib-coll-table { height: 1fr; }
+    #lib-btns       { height: 3; }
+    #lib-btns Button       { min-width: 5; margin: 0 0 0 1; }
+    #lib-coll-btns         { height: 3; }
+    #lib-coll-btns Button  { min-width: 5; margin: 0 0 0 1; }
     """
 
     class PlasmidLoad(Message):
@@ -3259,13 +3226,6 @@ class LibraryPanel(Widget):
     class AddCurrentRequested(Message):
         """User pressed '+' to add the currently-loaded record."""
         pass
-
-    class AnnotateRequested(Message):
-        """User pressed the annotate button on a selected library row.
-        entry_id is the library key of the row with the cursor."""
-        def __init__(self, entry_id: "str | None"):
-            self.entry_id = entry_id
-            super().__init__()
 
     class RenameRequested(Message):
         """User pressed the rename (✎) button with a library row focused.
@@ -3281,6 +3241,13 @@ class LibraryPanel(Widget):
         that's no longer visually in focus."""
         pass
 
+    class CollectionSwitched(Message):
+        """User picked a different collection — library has been swapped.
+        The app refreshes its caches in response (no record changes)."""
+        def __init__(self, name: str):
+            self.name = name
+            super().__init__()
+
     def on_descendant_focus(self, _event):
         # DataTable inside the library panel is what actually gets focus;
         # Textual reports it to us via a DescendantFocus event. Propagate
@@ -3288,26 +3255,93 @@ class LibraryPanel(Widget):
         self.post_message(self.GainedFocus())
 
     def compose(self) -> ComposeResult:
-        yield Static(" Library", id="lib-hdr")
-        yield DataTable(id="lib-table", cursor_type="row", zebra_stripes=True)
+        yield Static(" Collections", id="lib-hdr")
+        # Collections-view widgets ────────────────────────────────────
+        yield DataTable(id="lib-coll-table", cursor_type="row",
+                        zebra_stripes=True)
+        with Horizontal(id="lib-coll-btns"):
+            yield Button("+", id="btn-coll-add", variant="primary",
+                         tooltip="New collection")
+            yield Button("−", id="btn-coll-del", variant="error",
+                         tooltip="Remove selected collection")
+            yield Button("✎", id="btn-coll-rename", variant="default",
+                         tooltip="Rename selected collection")
+        # Plasmids-view widgets ────────────────────────────────────
+        yield DataTable(id="lib-table", cursor_type="row",
+                        zebra_stripes=True)
         with Horizontal(id="lib-btns"):
             yield Button("+", id="btn-lib-add", variant="primary",
-                         tooltip="Add current plasmid")
+                         tooltip="Save loaded plasmid to this collection")
             yield Button("−", id="btn-lib-del", variant="error",
-                         tooltip="Remove selected")
-            yield Button("◈", id="btn-lib-annot", variant="primary",
-                         tooltip="Annotate selected (pLannotate)  —  shortcut: Shift+A")
+                         tooltip="Remove selected plasmid")
+            yield Button("←", id="btn-lib-back", variant="primary",
+                         tooltip="Back to collections")
             yield Button("✎", id="btn-lib-rename", variant="default",
                          tooltip="Rename selected plasmid")
 
     def on_mount(self):
         self._active_id:    "str | None" = None
         self._active_dirty: bool         = False
-        t = self.query_one("#lib-table", DataTable)
-        t.add_columns("Name", "bp")
+        # Start in plasmids view if the user already has an active
+        # collection (returning user picks up where they left off);
+        # else show the collections list so they can pick.
+        self._view_mode: str = (
+            "plasmids" if _get_active_collection_name() else "collections"
+        )
+        coll = self.query_one("#lib-coll-table", DataTable)
+        coll.add_columns("Name", "Plasmids")
+        plas = self.query_one("#lib-table", DataTable)
+        plas.add_columns("Name", "bp")
+        self._apply_view_mode()
         self._repopulate()
 
-    def _repopulate(self):
+    # ── View-mode toggle ────────────────────────────────────────────────────
+
+    def _apply_view_mode(self) -> None:
+        is_coll = (self._view_mode == "collections")
+        try:
+            self.query_one("#lib-coll-table").display = is_coll
+            self.query_one("#lib-coll-btns").display  = is_coll
+            self.query_one("#lib-table").display      = not is_coll
+            self.query_one("#lib-btns").display       = not is_coll
+        except NoMatches:
+            return
+        self._update_header()
+
+    def _update_header(self) -> None:
+        try:
+            hdr = self.query_one("#lib-hdr", Static)
+        except NoMatches:
+            return
+        # Dirty marker shows in BOTH views — even in collections view
+        # the user should see at a glance that there are unsaved edits
+        # somewhere in the active collection.
+        prefix = "* " if self._active_dirty else " "
+        if self._view_mode == "collections":
+            hdr.update(f"{prefix}Collections")
+            return
+        active = _get_active_collection_name() or "Library"
+        # Cap to keep the 26-cell-wide panel from overflowing; reserve
+        # 2 cells for the dirty marker.
+        hdr.update(f"{prefix}{active[:22]}")
+
+    # ── Repopulate dispatch ────────────────────────────────────────────────
+
+    def _repopulate(self) -> None:
+        if self._view_mode == "collections":
+            self._repopulate_collections()
+        else:
+            self._repopulate_plasmids()
+
+    def _repopulate_collections(self) -> None:
+        t = self.query_one("#lib-coll-table", DataTable)
+        t.clear()
+        for c in _load_collections():
+            name = c.get("name") or "?"
+            n_plas = len(c.get("plasmids", []) or [])
+            t.add_row(name[:14], str(n_plas), key=name)
+
+    def _repopulate_plasmids(self) -> None:
         t = self.query_one("#lib-table", DataTable)
         t.clear()
         for entry in _load_library():
@@ -3319,26 +3353,30 @@ class LibraryPanel(Widget):
                 key=entry["id"],
             )
 
+    # ── Plasmid view: existing flow + back button ──────────────────────────
+
     def add_entry(self, record) -> None:
-        """Serialize record and persist to library JSON."""
+        """Serialize record and persist into the active collection."""
         gb_text = _record_to_gb_text(record)
         entries = _load_library()
         entries = [e for e in entries if e.get("id") != record.id]
-        import datetime
         entries.insert(0, {
             "name":    record.name or record.id,
             "id":      record.id,
             "size":    len(record.seq),
             "n_feats": len([f for f in record.features if f.type != "source"]),
             "source":  getattr(record, "_tui_source", f"id:{record.id}"),
-            "added":   datetime.date.today().isoformat(),
+            "added":   _date.today().isoformat(),
             "gb_text": gb_text,
         })
         _save_library(entries)
-        self._repopulate()
+        if self._view_mode == "plasmids":
+            self._repopulate_plasmids()
 
     @on(DataTable.RowSelected, "#lib-table")
     def _row_selected(self, event: DataTable.RowSelected):
+        if self._view_mode != "plasmids":
+            return
         key = event.row_key.value if event.row_key else None
         if key is None:
             return
@@ -3347,32 +3385,52 @@ class LibraryPanel(Widget):
                 self.post_message(self.PlasmidLoad(entry))
                 return
 
+    @on(Button.Pressed, "#btn-lib-back")
+    def _btn_back(self):
+        # If the loaded plasmid has unsaved edits, prompt before
+        # navigating away. Without this, the asterisks in the table /
+        # header are a heads-up but it's still easy to forget; the
+        # modal forces the user to make a deliberate choice.
+        app = self.app
+        if not getattr(app, "_unsaved", False):
+            self._do_back()
+            return
+
+        def _on_response(result: "str | None") -> None:
+            if result == "save":
+                # _do_save marks clean on success and notifies. If the
+                # save fails (e.g. write error), stay in plasmids view
+                # so the user can retry.
+                if hasattr(app, "_do_save") and app._do_save():
+                    self._do_back()
+            elif result == "discard":
+                if hasattr(app, "_discard_changes"):
+                    app._discard_changes()
+                self._do_back()
+            # None → cancel; user stays in plasmids view.
+
+        app.push_screen(
+            UnsavedNavigateModal("go back to collections"),
+            callback=_on_response,
+        )
+
+    def _do_back(self) -> None:
+        """Switch to collections view. Called either directly (no
+        unsaved edits) or after the user resolves the unsaved-prompt."""
+        self._view_mode = "collections"
+        self._apply_view_mode()
+        self._repopulate_collections()
+
     @on(Button.Pressed, "#btn-lib-add")
     def _btn_add(self):
         self.post_message(self.AddCurrentRequested())
-
-    @on(Button.Pressed, "#btn-lib-annot")
-    def _btn_annotate(self):
-        # Annotate the currently-focused row if any, else the active record.
-        t = self.query_one("#lib-table", DataTable)
-        entry_id: "str | None" = None
-        if t.row_count > 0 and 0 <= t.cursor_row < t.row_count:
-            row_keys = list(t.rows.keys())
-            if 0 <= t.cursor_row < len(row_keys):
-                entry_id = row_keys[t.cursor_row].value
-        self.post_message(self.AnnotateRequested(entry_id))
 
     @on(Button.Pressed, "#btn-lib-rename")
     def _btn_rename(self):
         # Rename only works on the row with the DataTable cursor — if the
         # library is empty or no row is focused, we send None and the app
         # will notify the user.
-        t = self.query_one("#lib-table", DataTable)
-        entry_id: "str | None" = None
-        if t.row_count > 0 and 0 <= t.cursor_row < t.row_count:
-            row_keys = list(t.rows.keys())
-            if 0 <= t.cursor_row < len(row_keys):
-                entry_id = row_keys[t.cursor_row].value
+        entry_id = _cursor_row_key(self.query_one("#lib-table", DataTable))
         self.post_message(self.RenameRequested(entry_id))
 
     def set_active(self, entry_id: "str | None") -> None:
@@ -3381,25 +3439,163 @@ class LibraryPanel(Widget):
         self._active_dirty = False
 
     def set_dirty(self, dirty: bool) -> None:
-        """Show unsaved-changes marker on the active row and in the panel header."""
+        """Show unsaved-changes marker on the active row and in the panel header.
+
+        Called from `_mark_dirty`/`_mark_clean` on EVERY keystroke that
+        flips `_unsaved`, so we early-return when the state is unchanged
+        and skip the table refresh in collections-view mode (where the
+        plasmid table isn't visible anyway).
+        """
+        if self._active_dirty == dirty:
+            return
         self._active_dirty = dirty
-        self._repopulate()
-        self.query_one("#lib-hdr", Static).update(
-            " * Library" if dirty else " Library"
+        if self._view_mode == "plasmids":
+            self._refresh_active_row()
+        self._update_header()
+
+    def _refresh_active_row(self) -> None:
+        """Update just the active plasmid's Name cell, not the whole table.
+
+        Falls back to a full repopulate if the DataTable's incremental
+        API isn't available (older Textual) or the active row can't be
+        located. The fallback is correctness-preserving but defeats the
+        keystroke-hot-path optimisation; it should never fire under
+        Textual ≥ 8.2.3 (our pinned floor).
+        """
+        if not self._active_id:
+            return
+        try:
+            t = self.query_one("#lib-table", DataTable)
+        except NoMatches:
+            return
+        active_entry = next(
+            (e for e in _load_library() if e.get("id") == self._active_id),
+            None,
         )
+        if active_entry is None:
+            return
+        nm = active_entry.get("name", "?")
+        display = ("*" + nm)[:14] if self._active_dirty else nm[:14]
+        try:
+            from textual.coordinate import Coordinate
+            for i, row_key in enumerate(t.rows.keys()):
+                if row_key.value == self._active_id:
+                    t.update_cell_at(Coordinate(i, 0), display)
+                    return
+        except Exception:
+            self._repopulate_plasmids()
 
     @on(Button.Pressed, "#btn-lib-del")
     def _btn_del(self):
-        t = self.query_one("#lib-table", DataTable)
-        if t.row_count == 0:
+        entry_id = _cursor_row_key(self.query_one("#lib-table", DataTable))
+        if entry_id is None:
             return
-        row_keys = list(t.rows.keys())
-        if not (0 <= t.cursor_row < len(row_keys)):
-            return
-        rk = row_keys[t.cursor_row]
-        entries = [e for e in _load_library() if e.get("id") != rk.value]
+        entries = [e for e in _load_library() if e.get("id") != entry_id]
         _save_library(entries)
-        self._repopulate()
+        self._repopulate_plasmids()
+
+    # ── Collections view: enter / + / − / ✎ ────────────────────────────────
+
+    @on(DataTable.RowSelected, "#lib-coll-table")
+    def _coll_row_selected(self, event: DataTable.RowSelected):
+        if self._view_mode != "collections":
+            return
+        rk = event.row_key
+        name = rk.value if rk else None
+        if not name:
+            return
+        coll = _find_collection(name)
+        if coll is None:
+            return
+        # Set active BEFORE writing the library so _save_library's mirror
+        # writes back to the correct collection.
+        _set_active_collection_name(name)
+        plasmids = [dict(p) for p in (coll.get("plasmids") or [])
+                    if isinstance(p, dict)]
+        _save_library(plasmids)
+        self._view_mode = "plasmids"
+        self._apply_view_mode()
+        self._repopulate_plasmids()
+        self.post_message(self.CollectionSwitched(name))
+
+    @on(Button.Pressed, "#btn-coll-add")
+    def _btn_coll_add(self):
+        def _picked(name: "str | None") -> None:
+            if not name:
+                return
+            if _collection_name_taken(name):
+                self.app.notify(
+                    f"Collection '{name}' already exists.",
+                    severity="warning",
+                )
+                return
+            existing = _load_collections()
+            existing.append({
+                "name":        name,
+                "description": "",
+                "plasmids":    [],
+                "saved":       _date.today().isoformat(),
+            })
+            _save_collections(existing)
+            self._repopulate_collections()
+        self.app.push_screen(
+            CollectionNameModal("New collection", "", "Collection name"),
+            callback=_picked,
+        )
+
+    @on(Button.Pressed, "#btn-coll-del")
+    def _btn_coll_del(self):
+        name = _cursor_row_key(self.query_one("#lib-coll-table", DataTable))
+        if not name:
+            return
+        coll = _find_collection(name)
+        n_plas = len((coll or {}).get("plasmids", []) or [])
+
+        def _on_confirm(yes: bool) -> None:
+            if not yes:
+                return
+            remaining = [c for c in _load_collections()
+                         if c.get("name") != name]
+            _save_collections(remaining)
+            if _get_active_collection_name() == name:
+                _set_active_collection_name(None)
+            self._repopulate_collections()
+
+        self.app.push_screen(
+            CollectionDeleteConfirmModal(name, n_plas),
+            callback=_on_confirm,
+        )
+
+    @on(Button.Pressed, "#btn-coll-rename")
+    def _btn_coll_rename(self):
+        old = _cursor_row_key(self.query_one("#lib-coll-table", DataTable))
+        if not old:
+            return
+
+        def _picked(new_name: "str | None") -> None:
+            if not new_name or new_name == old:
+                return
+            if _collection_name_taken(new_name):
+                self.app.notify(
+                    f"Collection '{new_name}' already exists.",
+                    severity="warning",
+                )
+                return
+            existing = _load_collections()
+            for c in existing:
+                if c.get("name") == old:
+                    c["name"] = new_name
+                    break
+            _save_collections(existing)
+            if _get_active_collection_name() == old:
+                _set_active_collection_name(new_name)
+            self._repopulate_collections()
+            self._update_header()
+
+        self.app.push_screen(
+            CollectionNameModal("Rename collection", old, "Collection name"),
+            callback=_picked,
+        )
 
 
 # ── Sequence panel ─────────────────────────────────────────────────────────────
@@ -4674,29 +4870,37 @@ def _build_pupd2_backbone_stub(seed: int = 0xBACDBAC0, length: int = 420) -> str
 _PUPD2_BACKBONE_STUB: str = _build_pupd2_backbone_stub()
 
 
-def _simulate_primed_amplicon(insert: str, oh5: str, oh3: str) -> str:
+def _simulate_primed_amplicon(
+    insert: str, oh5: str, oh3: str,
+    grammar: "dict | None" = None,
+) -> str:
     """PCR amplicon top strand (5'→3'), as it would run on a pre-digest gel.
 
-    Structure:  [pad] [Esp3I] [spacer] [oh5] [insert] [oh3] [rc(spacer)]
-                [rc(Esp3I)] [rc(pad)]
+    Structure:  [pad] [enzyme site] [spacer] [oh5] [insert] [oh3]
+                [rc(spacer)] [rc(enzyme site)] [rc(pad)]
 
-    Matches the primer geometry in `_design_gb_primers`: the forward primer
-    is ``pad + Esp3I + spacer + oh5 + binding`` and the reverse primer is
-    ``pad + Esp3I + spacer + rc(oh3) + rc(binding)``. The amplicon is the
-    fusion of forward primer + interior + rev-complement of reverse primer.
+    Matches the primer geometry in :func:`_design_gb_primers`. Defaults to
+    Golden Braid L0 (Esp3I); pass ``grammar`` to use a different cloning
+    grammar's enzyme/pad/spacer (e.g., MoClo Plant uses BsaI). Used by
+    both DomesticatorModal (active grammar at design time) and
+    PartsBinModal "Copy Primed Sequence" (the part's stored grammar).
     """
-    left_tail  = _GB_PAD + _GB_L0_ENZYME_SITE + _GB_SPACER
-    right_tail = _rc(_GB_SPACER) + _rc(_GB_L0_ENZYME_SITE) + _rc(_GB_PAD)
+    g = grammar if isinstance(grammar, dict) else _BUILTIN_GRAMMARS["gb_l0"]
+    pad    = g.get("pad",    _GB_PAD)
+    site   = g.get("site",   _GB_L0_ENZYME_SITE)
+    spacer = g.get("spacer", _GB_SPACER)
+    left_tail  = pad + site + spacer
+    right_tail = _rc(spacer) + _rc(site) + _rc(pad)
     return left_tail + oh5 + insert + oh3 + right_tail
 
 
 def _simulate_cloned_plasmid(insert: str, oh5: str, oh3: str) -> str:
     """Simulated cloned circular plasmid, linearised at the 5' overhang.
 
-    After Esp3I / BsmBI (identical N(1)/N(5) geometry to BsaI) digests
-    both the amplicon and the pUPD2 backbone, the insert fragment carries
-    `oh5…oh3` on its 4-nt sticky ends and ligates into the backbone in a
-    single orientation. The circular product, read starting at `oh5`, is:
+    After the cloning grammar's enzyme cuts both the amplicon and the
+    backbone, the insert fragment carries `oh5…oh3` on its 4-nt sticky
+    ends and ligates into the backbone in a single orientation. The
+    circular product, read starting at `oh5`, is:
 
         [oh5] [insert] [oh3] [backbone_body]
 
@@ -4750,17 +4954,268 @@ _GB_DOMESTICATION_FORBIDDEN: dict[str, str] = {
 }
 
 
-def _gb_find_forbidden_hits(seq: str) -> list[tuple[str, str, int]]:
-    """Return ``(enzyme_name, site_found, position)`` for **every** internal
-    BsaI / Esp3I recognition in *seq*, on both forward and reverse strands.
+# ── Modular cloning grammars (Golden Braid, MoClo, custom) ─────────────────────
+#
+# A "grammar" parameterises every Type IIS-aware tool in the app: the
+# Parts Bin (which catalog + which user parts are visible), the
+# Domesticator (which positions/overhangs/enzyme/forbidden-sites apply
+# to primer design), and downstream constructors. Each grammar carries:
+#
+#   - **enzyme + site + spacer + pad** — the Type IIS recognition + the
+#     primer-tail bookkeeping bytes (`pad + site + spacer + oh5 + …`).
+#   - **forbidden_sites** — every Type IIS recognition that must be
+#     scrubbed from a domesticated part. For Golden Braid L0 that's
+#     Esp3I (current step) + BsaI (next step); for MoClo Plant it's
+#     BsaI (current) + BpiI (next). The codon-fix repair pipeline
+#     iterates over this dict.
+#   - **positions** — ordered list of `{name, type, oh5, oh3, color}`
+#     dicts. The `type` is the user-facing part-shape label (e.g.
+#     "Promoter", "CDS-NS"), shared across catalog rows so a single
+#     position lookup powers the Domesticator's position dropdown,
+#     the parts table coloring, and the overhang-table display.
+#   - **coding_types** — subset of position types that have a reading
+#     frame (so the codon-fix repair pipeline can swap synonymous
+#     codons to remove an internal forbidden site).
+#   - **type_to_insdc** — Title-cased part type → INSDC feature_type
+#     for the Save-As-Feature flow. Lossy mappings (CDS-NS → CDS) are
+#     covered in the description string.
+#   - **catalog** — built-in reference parts as
+#     ``(name, type, position_label, oh5, oh3, backbone, marker)``
+#     tuples. Empty for grammars that ship without a reference set.
+#   - **editable** — built-ins are read-only; user-defined grammars
+#     are loaded from `cloning_grammars.json` and can be edited in
+#     `GrammarEditorModal`.
+#
+# The ID space is flat: built-in IDs start with their grammar family
+# (``gb_l0``, ``moclo_plant``); custom-grammar IDs are slugged from
+# user-supplied names (``custom_my_assembly``, etc.) at creation.
 
-    Returns every occurrence — not just the first per enzyme. Critical for
-    accurate reporting when an insert contains multiple sites: the user
-    must know about all of them before paying for a gBlock synthesis.
+_BUILTIN_GRAMMARS: dict[str, dict] = {
+    "gb_l0": {
+        "id":              "gb_l0",
+        "name":            "Golden Braid L0",
+        "enzyme":          _GB_L0_ENZYME_NAME,
+        "site":            _GB_L0_ENZYME_SITE,
+        "spacer":          _GB_SPACER,
+        "pad":             _GB_PAD,
+        "forbidden_sites": dict(_GB_DOMESTICATION_FORBIDDEN),
+        "positions": [
+            {"name": pos, "type": ptype, "oh5": oh5, "oh3": oh3,
+             "color": _GB_TYPE_COLORS.get(ptype, "white")}
+            for ptype, (pos, oh5, oh3) in _GB_POSITIONS.items()
+        ],
+        "coding_types":    sorted(_GB_CODING_PART_TYPES),
+        "type_to_insdc":   dict(_GB_PART_TYPE_TO_INSDC),
+        "catalog":         list(_GB_L0_PARTS),
+        "editable":        False,
+    },
+    # Plant MoClo (Weber et al. 2011, Engler et al. 2014). BsaI at L0,
+    # BpiI/BbsI at L1 — both scrubbed during domestication. Ships
+    # without a built-in catalog because Plant MoClo's reference parts
+    # depend heavily on the user's host system; users seed via "New
+    # Part" or by duplicating into a custom grammar.
+    "moclo_plant": {
+        "id":              "moclo_plant",
+        "name":            "MoClo Plant (Weber 2011)",
+        "enzyme":          "BsaI",
+        "site":            "GGTCTC",
+        "spacer":          "A",
+        "pad":             "GCGC",
+        # BsaI for the current L0 cut; BpiI (= BbsI) for the next-level
+        # MoClo assembly, which uses a different Type IIS site so the
+        # L0 part survives the L1 reaction without re-cutting.
+        "forbidden_sites": {"BsaI": "GGTCTC", "BpiI": "GAAGAC"},
+        "positions": [
+            {"name": "Pos 1", "type": "Promoter",   "oh5": "GGAG", "oh3": "AATG", "color": "green"},
+            {"name": "Pos 2", "type": "5' UTR",     "oh5": "AATG", "oh3": "AGGT", "color": "cyan"},
+            {"name": "Pos 3", "type": "CDS",        "oh5": "AGGT", "oh3": "GCTT", "color": "yellow"},
+            {"name": "Pos 4", "type": "C-tag",      "oh5": "GCTT", "oh3": "GGTA", "color": "magenta"},
+            {"name": "Pos 5", "type": "Terminator", "oh5": "GGTA", "oh3": "CGCT", "color": "blue"},
+        ],
+        "coding_types":    ["CDS", "C-tag"],
+        "type_to_insdc": {
+            "Promoter":   "promoter",
+            "5' UTR":     "5'UTR",
+            "CDS":        "CDS",
+            "C-tag":      "CDS",
+            "Terminator": "terminator",
+        },
+        "catalog":         [],
+        "editable":        False,
+    },
+}
+
+
+# Custom grammars persist to `cloning_grammars.json` (envelope schema,
+# sacred invariant #7). Schema per entry mirrors the built-in dict
+# above; ``editable`` is implicitly True for everything in this file.
+_GRAMMARS_FILE = _DATA_DIR / "cloning_grammars.json"
+_grammars_cache: "list | None" = None
+
+
+def _load_custom_grammars() -> list[dict]:
+    global _grammars_cache
+    from copy import deepcopy
+    if _grammars_cache is not None:
+        return deepcopy(_grammars_cache)
+    entries, warning = _safe_load_json(_GRAMMARS_FILE, "Cloning grammars")
+    if warning:
+        _log.warning(warning)
+    entries = [e for e in entries if isinstance(e, dict) and isinstance(e.get("id"), str)]
+    _grammars_cache = entries
+    return deepcopy(_grammars_cache)
+
+
+def _save_custom_grammars(entries: list[dict]) -> None:
+    global _grammars_cache
+    from copy import deepcopy
+    _safe_save_json(_GRAMMARS_FILE, entries, "Cloning grammars")
+    _grammars_cache = deepcopy(entries)
+
+
+def _all_grammars() -> dict[str, dict]:
+    """Return all grammars (built-in + user-defined) keyed by id.
+
+    Built-ins come first; user-defined grammars override builtin IDs
+    if they ever collide (defensive — UI prevents this on save). The
+    returned dicts are independent copies, so callers may mutate them
+    without poisoning the cache.
+    """
+    from copy import deepcopy
+    out: dict[str, dict] = {gid: deepcopy(g) for gid, g in _BUILTIN_GRAMMARS.items()}
+    for g in _load_custom_grammars():
+        gid = g.get("id")
+        if isinstance(gid, str):
+            # Custom grammars are always editable regardless of what
+            # the JSON file says — stops a mis-flagged file from
+            # locking the user out of their own definitions.
+            g = dict(g)
+            g["editable"] = True
+            out[gid] = g
+    return out
+
+
+def _get_active_grammar() -> dict:
+    """Return the currently-active grammar dict. Falls back to GB L0
+    if the persisted ``active_grammar`` id no longer resolves (e.g.,
+    a custom grammar was deleted while still selected)."""
+    grammars = _all_grammars()
+    gid = _get_setting("active_grammar", "gb_l0")
+    if gid in grammars:
+        return grammars[gid]
+    # Recover gracefully — flip the setting back to gb_l0 so we don't
+    # keep falling back forever.
+    _set_setting("active_grammar", "gb_l0")
+    return grammars["gb_l0"]
+
+
+def _grammar_position_by_type(grammar: dict, ptype: str) -> "dict | None":
+    """Helper: find the position spec for a given part type within a
+    grammar. ``None`` if the grammar doesn't define that type — which
+    e.g. means CDS-NS isn't a valid pick under MoClo Plant."""
+    for pos in grammar.get("positions", []):
+        if pos.get("type") == ptype:
+            return pos
+    return None
+
+
+def _grammar_dropdown_options() -> list[tuple[str, str]]:
+    """Return ``[(display_name, id), …]`` for every grammar, in the
+    canonical order used wherever a Select dropdown lists grammars
+    (DomesticatorModal "Grammar" picker today; future menus likely):
+
+      1. **Golden Braid L0 first** — the default reference grammar.
+         Pinned at position 1 regardless of any other ordering
+         shenanigans (e.g., a custom grammar id-sorted before
+         ``gb_l0``).
+      2. Other built-in grammars (MoClo Plant, etc.) in
+         ``_BUILTIN_GRAMMARS`` insertion order.
+      3. Custom grammars from ``cloning_grammars.json`` last, tagged
+         ``(custom)`` for visual disambiguation.
+    """
+    grammars = _all_grammars()
+    out: list[tuple[str, str]] = []
+    if "gb_l0" in grammars:
+        g = grammars["gb_l0"]
+        out.append((f"{g.get('name', 'Golden Braid L0')}", "gb_l0"))
+    for gid in _BUILTIN_GRAMMARS:
+        if gid == "gb_l0" or gid not in grammars:
+            continue
+        g = grammars[gid]
+        out.append((f"{g.get('name', gid)}", gid))
+    for gid, g in grammars.items():
+        if gid in _BUILTIN_GRAMMARS:
+            continue
+        out.append((f"{g.get('name', gid)}  (custom)", gid))
+    return out
+
+
+# ── App-wide settings (active grammar, future preferences) ─────────────────────
+
+_SETTINGS_FILE = _DATA_DIR / "settings.json"
+_settings_cache: "dict | None" = None
+
+
+def _load_settings() -> dict:
+    """Return the persistent settings dict. Stored on disk as a list of
+    ``{"key": ..., "value": ...}`` envelope entries so it shares the
+    schema layout (sacred invariant #7) with every other JSON file."""
+    global _settings_cache
+    if _settings_cache is not None:
+        return dict(_settings_cache)
+    entries, warning = _safe_load_json(_SETTINGS_FILE, "Settings")
+    if warning:
+        _log.warning(warning)
+    settings: dict = {}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        k, v = e.get("key"), e.get("value")
+        if isinstance(k, str):
+            settings[k] = v
+    _settings_cache = settings
+    return dict(_settings_cache)
+
+
+def _save_settings(settings: dict) -> None:
+    global _settings_cache
+    entries = [{"key": k, "value": v} for k, v in settings.items()]
+    _safe_save_json(_SETTINGS_FILE, entries, "Settings")
+    _settings_cache = dict(settings)
+
+
+def _get_setting(key: str, default=None):
+    return _load_settings().get(key, default)
+
+
+def _set_setting(key: str, value) -> None:
+    settings = _load_settings()
+    settings[key] = value
+    _save_settings(settings)
+
+
+def _gb_find_forbidden_hits(
+    seq: str,
+    sites: "dict[str, str] | None" = None,
+) -> list[tuple[str, str, int]]:
+    """Return ``(enzyme_name, site_found, position)`` for **every** internal
+    Type IIS recognition in *seq*, on both forward and reverse strands.
+
+    The ``sites`` map (``{enzyme_name: recognition}``) defaults to the
+    Golden Braid L0 forbidden set (Esp3I + BsaI). Pass a different
+    grammar's ``forbidden_sites`` to scan against MoClo (BsaI + BpiI),
+    a custom grammar, or any other Type IIS combination. Returns every
+    occurrence — not just the first per enzyme. Critical for accurate
+    reporting when an insert contains multiple sites: the user must
+    know about all of them before paying for a gBlock synthesis.
     Results are sorted by position to aid downstream reporting.
     """
+    if sites is None:
+        sites = _GB_DOMESTICATION_FORBIDDEN
     out: list[tuple[str, str, int]] = []
-    for name, site in _GB_DOMESTICATION_FORBIDDEN.items():
+    for name, site in sites.items():
+        if not isinstance(site, str) or not site:
+            continue
         rc = _rc(site)
         needles = [site] if rc == site else [site, rc]
         for needle in needles:
@@ -4842,18 +5297,20 @@ def _design_gb_primers(
     part_type: str,
     target_tm: float = 60.0,
     codon_raw: "dict | None" = None,
+    grammar: "dict | None" = None,
 ) -> dict:
-    """Design Golden Braid L0 domestication primers for a template region.
+    """Design modular cloning domestication primers for a template region.
 
-    The amplified product, after Esp3I / BsmBI digestion, will carry the
-    correct 4-nt overhangs for the chosen `part_type` and slot directly
-    into a GB L0 assembly. L0 uses Esp3I (CGTCTC) so the domesticated part
-    survives a downstream L1+ BsaI (GGTCTC) assembly without re-cutting.
+    Defaults to Golden Braid L0 (Esp3I, GGAG/TGAC/AATG/GCTT/CGCT
+    overhangs); pass ``grammar`` to use a different cloning grammar
+    (MoClo Plant, custom user-defined). The amplified product, after
+    digestion with the grammar's enzyme, carries the 4-nt overhangs
+    associated with ``part_type`` in that grammar's position table.
 
     Primer structure (5'→3'):
 
-        Forward: [pad] [Esp3I] [spacer] [5' overhang]    [binding →]
-        Reverse: [pad] [Esp3I] [spacer] [RC 3' overhang] [← binding RC]
+        Forward: [pad] [enzyme site] [spacer] [5' overhang]    [binding →]
+        Reverse: [pad] [enzyme site] [spacer] [RC 3' overhang] [← binding RC]
 
     When *codon_raw* (a ``{codon: (aa, count)}`` dict from the codon-table
     registry) is supplied and *part_type* is a coding type (CDS / CDS-NS /
@@ -4873,7 +5330,22 @@ def _design_gb_primers(
     ``pairs`` (future SOE-PCR splitting for non-repairable internal sites
     will extend this list beyond one pair).
     """
-    pos_label, oh5, oh3 = _GB_POSITIONS[part_type]
+    g = grammar if isinstance(grammar, dict) else _BUILTIN_GRAMMARS["gb_l0"]
+    pos_spec = _grammar_position_by_type(g, part_type)
+    if pos_spec is None:
+        return {
+            "error": f"Part type {part_type!r} is not defined in grammar "
+                     f"{g.get('name', '?')}. Available types: "
+                     f"{', '.join(p.get('type', '?') for p in g.get('positions', []))}.",
+            "mutations": [],
+        }
+    pos_label, oh5, oh3 = pos_spec.get("name", "?"), pos_spec.get("oh5", ""), pos_spec.get("oh3", "")
+    forbidden_sites = g.get("forbidden_sites", _GB_DOMESTICATION_FORBIDDEN) or _GB_DOMESTICATION_FORBIDDEN
+    coding_types = set(g.get("coding_types", []) or _GB_CODING_PART_TYPES)
+    enzyme_pad = g.get("pad", _GB_PAD)
+    enzyme_site = g.get("site", _GB_L0_ENZYME_SITE)
+    enzyme_spacer = g.get("spacer", _GB_SPACER)
+
     total  = len(template_seq)
     insert = _slice_circular(template_seq.upper(), start, end)
     wraps  = end < start
@@ -4882,27 +5354,27 @@ def _design_gb_primers(
     # _pick_binding_region returns the whole (too-short) insert with Tm=0.
     if len(insert) < 18:
         return {
-            "error": f"Golden Braid region is too short ({len(insert)} bp). "
+            "error": f"Cloning region is too short ({len(insert)} bp). "
                      f"Select at least 18 bp (recommended 25+ bp for a "
                      f"robust binding region).",
             "mutations": [],
         }
 
-    # Internal BsaI / Esp3I check. An internal Esp3I site would self-cut
-    # during L0 domestication; an internal BsaI site would survive
-    # domestication but re-cut when the part is used in a downstream L1
-    # assembly. Both must be absent from the final part. For coding parts
-    # with a codon table available, we try to repair them via synonymous
-    # codon substitution before giving up.
+    # Internal Type IIS check. The grammar's `forbidden_sites` lists
+    # every recognition that must be absent from the final part — for
+    # GB L0 that's Esp3I (current cut) + BsaI (next-level reuse); for
+    # MoClo Plant, BsaI + BpiI. Coding parts can be repaired via
+    # synonymous codon substitution; non-coding parts have no reading
+    # frame so internal sites must be fixed manually.
     mutations: list[str] = []
-    initial_hits = _gb_find_forbidden_hits(insert)
+    initial_hits = _gb_find_forbidden_hits(insert, sites=forbidden_sites)
     if initial_hits:
         hit_str = ", ".join(
             f"{name} {site} at +{pos + 1}"
             for name, site, pos in initial_hits
         )
         can_attempt_fix = (
-            part_type in _GB_CODING_PART_TYPES
+            part_type in coding_types
             and bool(codon_raw)
             and len(insert) % 3 == 0
         )
@@ -4911,9 +5383,11 @@ def _design_gb_primers(
             if protein:
                 fixed_insert, mutations = _codon_fix_sites(
                     insert, protein, codon_raw,
-                    sites=_GB_DOMESTICATION_FORBIDDEN,
+                    sites=forbidden_sites,
                 )
-                remaining = _gb_find_forbidden_hits(fixed_insert)
+                remaining = _gb_find_forbidden_hits(
+                    fixed_insert, sites=forbidden_sites,
+                )
                 if remaining:
                     remain_str = ", ".join(
                         f"{name} {site} at +{pos + 1}"
@@ -4938,7 +5412,7 @@ def _design_gb_primers(
                 }
         else:
             reasons: list[str] = []
-            if part_type not in _GB_CODING_PART_TYPES:
+            if part_type not in coding_types:
                 reasons.append(f"{part_type} is non-coding")
             else:
                 if not codon_raw:
@@ -4961,9 +5435,9 @@ def _design_gb_primers(
     # (i.e. the last 18-25 bp of the insert, reverse-complemented)
     rev_bind, rev_tm = _pick_binding_region(_rc(insert), target_tm)
 
-    # Assemble full primers
-    fwd_tail = _GB_PAD + _GB_L0_ENZYME_SITE + _GB_SPACER + oh5
-    rev_tail = _GB_PAD + _GB_L0_ENZYME_SITE + _GB_SPACER + _rc(oh3)
+    # Assemble full primers using the grammar's enzyme/pad/spacer.
+    fwd_tail = enzyme_pad + enzyme_site + enzyme_spacer + oh5
+    rev_tail = enzyme_pad + enzyme_site + enzyme_spacer + _rc(oh3)
 
     fwd_full = fwd_tail + fwd_bind
     rev_full = rev_tail + rev_bind
@@ -5571,12 +6045,11 @@ def _codon_tables_load() -> list[dict]:
         })
     # Seed built-in K12 if not present
     if not any(e.get("taxid") == "83333" for e in fixed):
-        import datetime
         fixed.insert(0, {
             "name":   "E. coli K12",
             "taxid":  "83333",
             "source": "builtin",
-            "added":  datetime.date.today().isoformat(),
+            "added":  _date.today().isoformat(),
             "raw":    dict(_CODON_BUILTIN_K12),
         })
         _codon_tables_cache = fixed
@@ -5604,7 +6077,6 @@ def _codon_tables_add(name: str, taxid: str, raw: dict,
                       source: str = "user") -> dict:
     """Insert or replace a table in the registry. Dedup key is taxid when
     non-empty, else name. Returns the stored entry."""
-    import datetime
     entries = _codon_tables_load()
     taxid = str(taxid or "").strip()
     name  = (name or "?").strip() or "?"
@@ -5612,7 +6084,7 @@ def _codon_tables_add(name: str, taxid: str, raw: dict,
         "name":   name,
         "taxid":  taxid,
         "source": source,
-        "added":  datetime.date.today().isoformat(),
+        "added":  _date.today().isoformat(),
         "raw":    dict(raw),
     }
     def _same(e):
@@ -8220,18 +8692,342 @@ class FeatureLibraryScreen(Screen):
         self.app.notify(f"Strand → {tag} (unsaved).")
 
 
+# ── Cloning grammar editor ─────────────────────────────────────────────────────
+
+class GrammarEditorModal(ModalScreen):
+    """View or edit a cloning grammar (overhang table + enzyme + tail).
+
+    Built-in grammars (``gb_l0``, ``moclo_plant``) open here in
+    read-only mode — every input is disabled and Save/Delete are
+    greyed out so the canonical references can't be corrupted. To
+    modify a built-in, use Duplicate in the Parts Bin to fork it
+    into an editable custom grammar first.
+
+    Custom grammars open editable. Save validates IUPAC bases on
+    every overhang field, requires at least one position, and writes
+    the result to ``cloning_grammars.json``. Delete (only enabled
+    for custom grammars) drops the entry permanently.
+
+    Dismisses with:
+      - ``"saved"`` — grammar persisted (caller should refresh).
+      - ``"deleted"`` — grammar removed (caller should flip active
+        back to ``gb_l0`` if this was the active one).
+      - ``None`` — user cancelled, no changes.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, grammar_id: str) -> None:
+        super().__init__()
+        self._grammar_id = grammar_id
+        self._is_builtin = grammar_id in _BUILTIN_GRAMMARS
+        # Snapshot the grammar dict so cancel discards in-flight edits.
+        from copy import deepcopy
+        grammars = _all_grammars()
+        self._grammar = deepcopy(
+            grammars.get(grammar_id, _BUILTIN_GRAMMARS["gb_l0"])
+        )
+
+    def compose(self) -> ComposeResult:
+        g = self._grammar
+        editable = not self._is_builtin
+        with Vertical(id="ged-dlg"):
+            title = f" Grammar: {g.get('name', '?')}"
+            if self._is_builtin:
+                title += "   [built-in, read-only]"
+            yield Static(title, id="ged-title")
+
+            if self._is_builtin:
+                yield Static(
+                    "  Built-in grammars are read-only. "
+                    "Duplicate from the Parts Bin to fork an editable copy.",
+                    id="ged-builtin-banner",
+                )
+
+            with ScrollableContainer(id="ged-body"):
+                yield Label("Name:")
+                yield Input(value=g.get("name", ""),
+                            id="ged-name", disabled=not editable)
+
+                with Horizontal(id="ged-enzyme-row"):
+                    yield Label("Enzyme:", classes="ged-inline-label")
+                    yield Input(value=g.get("enzyme", ""),
+                                id="ged-enzyme", disabled=not editable)
+                    yield Label("Recognition:", classes="ged-inline-label")
+                    yield Input(value=g.get("site", ""),
+                                id="ged-site", disabled=not editable)
+
+                with Horizontal(id="ged-tail-row"):
+                    yield Label("Spacer:", classes="ged-inline-label")
+                    yield Input(value=g.get("spacer", ""),
+                                id="ged-spacer", disabled=not editable)
+                    yield Label("Pad:", classes="ged-inline-label")
+                    yield Input(value=g.get("pad", ""),
+                                id="ged-pad", disabled=not editable)
+
+                yield Label("Forbidden sites (one per line, NAME=SITE):")
+                forbidden = g.get("forbidden_sites", {}) or {}
+                if isinstance(forbidden, dict):
+                    forb_text = "\n".join(
+                        f"{k}={v}" for k, v in forbidden.items()
+                    )
+                else:
+                    forb_text = ""
+                yield TextArea(forb_text, id="ged-forbidden",
+                               read_only=not editable, soft_wrap=False,
+                               show_line_numbers=False)
+
+                yield Label(
+                    "Positions (one per line: name | type | 5'OH | 3'OH | color):"
+                )
+                pos_lines = []
+                for p in g.get("positions", []) or []:
+                    if not isinstance(p, dict):
+                        continue
+                    color_field = p.get("color") or ""
+                    pos_lines.append(
+                        f"{p.get('name','')} | {p.get('type','')} | "
+                        f"{p.get('oh5','')} | {p.get('oh3','')} | {color_field}"
+                    )
+                yield TextArea("\n".join(pos_lines), id="ged-positions",
+                               read_only=not editable, soft_wrap=False,
+                               show_line_numbers=False)
+
+                yield Label("Coding types (comma-separated, eligible for codon repair):")
+                coding = g.get("coding_types", []) or []
+                yield Input(value=", ".join(coding),
+                            id="ged-coding", disabled=not editable)
+
+            yield Static("", id="ged-status", markup=True)
+
+            with Horizontal(id="ged-btns"):
+                yield Button("Save",   id="btn-ged-save",
+                             variant="primary", disabled=not editable)
+                yield Button("Cancel", id="btn-ged-cancel")
+                yield Button("Delete", id="btn-ged-delete",
+                             variant="error", disabled=not editable)
+
+    @on(Button.Pressed, "#btn-ged-cancel")
+    def _cancel(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-ged-save")
+    def _save(self, _) -> None:
+        if self._is_builtin:
+            return
+        parsed = self._gather()
+        if parsed is None:
+            return
+        entries = _load_custom_grammars()
+        for i, e in enumerate(entries):
+            if e.get("id") == self._grammar_id:
+                entries[i] = parsed
+                break
+        else:
+            entries.append(parsed)
+        try:
+            _save_custom_grammars(entries)
+        except (OSError, ValueError) as exc:
+            _log.exception("Grammar save failed")
+            self.app.notify(f"Save failed: {exc}", severity="error")
+            return
+        self.app.notify(f"Saved grammar '{parsed.get('name')}'.")
+        self.dismiss("saved")
+
+    @on(Button.Pressed, "#btn-ged-delete")
+    def _delete(self, _) -> None:
+        if self._is_builtin:
+            return
+        entries = _load_custom_grammars()
+        new_entries = [e for e in entries if e.get("id") != self._grammar_id]
+        if len(new_entries) == len(entries):
+            self.app.notify(
+                "Grammar not found in custom grammars file.",
+                severity="warning",
+            )
+            return
+        try:
+            _save_custom_grammars(new_entries)
+        except (OSError, ValueError) as exc:
+            _log.exception("Grammar delete failed")
+            self.app.notify(f"Delete failed: {exc}", severity="error")
+            return
+        self.app.notify(
+            f"Deleted grammar '{self._grammar.get('name', self._grammar_id)}'."
+        )
+        self.dismiss("deleted")
+
+    # ── Parsing ──────────────────────────────────────────────────────────────
+
+    def _gather(self) -> "dict | None":
+        """Form → grammar dict. Returns None and writes a red status
+        line on validation failure; never raises."""
+        try:
+            name      = self.query_one("#ged-name",      Input).value.strip()
+            enzyme    = self.query_one("#ged-enzyme",    Input).value.strip()
+            site      = self.query_one("#ged-site",      Input).value.strip().upper()
+            spacer    = self.query_one("#ged-spacer",    Input).value.strip().upper()
+            pad       = self.query_one("#ged-pad",       Input).value.strip().upper()
+            forb_text = self.query_one("#ged-forbidden", TextArea).text
+            pos_text  = self.query_one("#ged-positions", TextArea).text
+            coding    = self.query_one("#ged-coding",    Input).value
+        except NoMatches:
+            return None
+        status = self.query_one("#ged-status", Static)
+        valid_iupac = set("ACGTRYWSMKBDHVN")
+
+        if not name:
+            status.update("[red]Name cannot be empty.[/red]")
+            return None
+        for label, val in (("Enzyme", enzyme),):
+            if not val:
+                status.update(f"[red]{label} cannot be empty.[/red]")
+                return None
+        for label, val in (
+            ("Recognition site", site),
+            ("Spacer", spacer),
+            ("Pad",   pad),
+        ):
+            if not val:
+                status.update(f"[red]{label} cannot be empty.[/red]")
+                return None
+            bad = [c for c in val if c not in valid_iupac]
+            if bad:
+                status.update(
+                    f"[red]{label} contains invalid bases: "
+                    f"{''.join(sorted(set(bad)))[:10]}[/red]"
+                )
+                return None
+
+        # Forbidden sites: NAME=SITE per line.
+        forbidden: dict[str, str] = {}
+        for raw in forb_text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if "=" not in line:
+                status.update(
+                    f"[red]Forbidden line must be NAME=SITE: {line!r}[/red]"
+                )
+                return None
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().upper()
+            if not k or not v:
+                continue
+            bad = [c for c in v if c not in valid_iupac]
+            if bad:
+                status.update(
+                    f"[red]Forbidden site {k!r} has invalid bases: "
+                    f"{''.join(sorted(set(bad)))[:10]}[/red]"
+                )
+                return None
+            forbidden[k] = v
+
+        # Positions: name | type | oh5 | oh3 [| color]
+        positions: list[dict] = []
+        for raw in pos_text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) < 4:
+                status.update(
+                    f"[red]Position line needs ≥4 fields "
+                    f"(name | type | 5'OH | 3'OH): {line!r}[/red]"
+                )
+                return None
+            pname, ptype = parts[0], parts[1]
+            poh5, poh3 = parts[2].upper(), parts[3].upper()
+            if not pname or not ptype:
+                status.update(
+                    f"[red]Position name and type cannot be empty: {line!r}[/red]"
+                )
+                return None
+            for label, val in (("5'OH", poh5), ("3'OH", poh3)):
+                bad = [c for c in val if c not in valid_iupac]
+                if bad:
+                    status.update(
+                        f"[red]Position {pname!r} {label} has invalid bases: "
+                        f"{''.join(sorted(set(bad)))[:10]}[/red]"
+                    )
+                    return None
+            color = parts[4] if len(parts) >= 5 and parts[4] else None
+            entry: dict = {
+                "name": pname, "type": ptype, "oh5": poh5, "oh3": poh3,
+            }
+            if color:
+                entry["color"] = color
+            positions.append(entry)
+
+        if not positions:
+            status.update("[red]Need at least one position.[/red]")
+            return None
+
+        coding_types = [t.strip() for t in coding.split(",") if t.strip()]
+
+        # Auto-derive type_to_insdc — best-effort heuristic so Save As
+        # Feature works without forcing the user to hand-edit JSON.
+        # Coding types collapse to "CDS"; obvious labels (Promoter,
+        # Terminator, 5'UTR/3'UTR) get their INSDC analogue; everything
+        # else falls back to "misc_feature".
+        type_to_insdc: dict[str, str] = {}
+        for pos in positions:
+            ptype = pos["type"]
+            lower = ptype.lower()
+            if ptype in coding_types:
+                type_to_insdc[ptype] = "CDS"
+            elif lower == "promoter":
+                type_to_insdc[ptype] = "promoter"
+            elif "terminator" in lower:
+                type_to_insdc[ptype] = "terminator"
+            elif lower.startswith("5") and "utr" in lower:
+                type_to_insdc[ptype] = "5'UTR"
+            elif lower.startswith("3") and "utr" in lower:
+                type_to_insdc[ptype] = "3'UTR"
+            else:
+                type_to_insdc[ptype] = "misc_feature"
+
+        return {
+            "id":              self._grammar_id,
+            "name":            name,
+            "enzyme":          enzyme,
+            "site":            site,
+            "spacer":          spacer,
+            "pad":             pad,
+            "forbidden_sites": forbidden,
+            "positions":       positions,
+            "coding_types":    coding_types,
+            "type_to_insdc":   type_to_insdc,
+            "catalog":         self._grammar.get("catalog", []) or [],
+            "editable":        True,
+        }
+
+
 # ── Parts bin modal ────────────────────────────────────────────────────────────
 
 class PartsBinModal(Screen):
-    """Golden Braid-compatible L0 parts library — full-screen view.
+    """Modular cloning parts library — full-screen view.
 
     Uses Screen (not ModalScreen) so it fills the terminal cleanly instead
     of floating a fixed-size box on a dark overlay. Escape or the Close
     button pops back to the main app.
 
-    Shows both the built-in reference catalog (_GB_L0_PARTS) and user-created
-    parts from parts_bin.json. User parts appear first and include sequence
-    + primer data; built-in parts have no sequence (shown as "—").
+    The active **grammar** (Golden Braid L0, MoClo Plant, or any
+    user-defined custom) gates what's visible: only catalog and
+    user-saved parts tagged with the active grammar's id show up.
+    The Grammar dropdown at the top of the modal switches grammars
+    (persisted in `settings.json` as ``active_grammar``); the
+    overhang table beneath it is the canonical Position / Type / 5'OH
+    / 3'OH map for the active grammar so the user always knows which
+    sticky ends apply. ``Edit`` and ``Duplicate`` open the grammar
+    editor; built-in grammars are read-only there, but
+    "Duplicate as Custom" forks them into a new editable grammar.
 
     The "Feat Lib" column flags parts already registered in the
     persistent feature library. We build a single
@@ -8259,9 +9055,15 @@ class PartsBinModal(Screen):
         self._feat_lib_gen_seen: int = -1
 
     def compose(self) -> ComposeResult:
+        """Single-pane loadout: parts table dominates, detail + sequence
+        peek out at the bottom, all buttons live on a single bottom row.
+        Grammar selection happens inside the New Part modal — every part
+        in the table carries its own ``grammar`` id, surfaced as a
+        column rather than a top-of-modal filter.
+        """
         yield Header()
         with Vertical(id="parts-box"):
-            yield Static(" Parts Bin  —  Golden Braid L0 Parts ", id="parts-title")
+            yield Static(" Parts Bin ", id="parts-title")
             yield DataTable(id="parts-table", cursor_type="row", zebra_stripes=True)
             yield Static("", id="parts-detail")
             # Read-only TextArea so the full sequence is visible with a
@@ -8273,20 +9075,31 @@ class PartsBinModal(Screen):
                 "", id="parts-seq-view",
                 read_only=True, soft_wrap=True, show_line_numbers=False,
             )
-            with Horizontal(id="parts-copy-btns"):
-                yield Button("Copy Raw Sequence",    id="btn-parts-copy-raw")
-                yield Button("Copy Primed Sequence", id="btn-parts-copy-primed")
-                yield Button("Copy Cloned Sequence", id="btn-parts-copy-cloned")
             with Horizontal(id="parts-btns"):
-                yield Button("New Part",       id="btn-new-part",    variant="primary")
+                yield Button("Copy Raw",        id="btn-parts-copy-raw")
+                yield Button("Copy Primed",     id="btn-parts-copy-primed")
+                yield Button("Copy Cloned",     id="btn-parts-copy-cloned")
+                yield Button("New Part",        id="btn-new-part",    variant="primary")
                 yield Button("Save As Feature", id="btn-parts-save-as-feature")
-                yield Button("Export FASTA",   id="btn-parts-export-fasta")
-                yield Button("Close",          id="btn-parts-close")
+                yield Button("Export FASTA",    id="btn-parts-export-fasta")
+                yield Button("Close",           id="btn-parts-close")
         yield Footer()
 
+    def _active_grammar_id(self) -> str:
+        """Currently-active grammar id, defaulting to gb_l0 when the
+        setting hasn't been written yet. Used by ``_new_part`` to tag
+        freshly-saved parts with whichever grammar the New Part modal
+        was set to."""
+        return _get_setting("active_grammar", "gb_l0")
+
+    # ── Row data ─────────────────────────────────────────────────────────────
+
     def _all_rows(self) -> list[dict]:
-        """Combine user-created parts (first) + built-in catalog into a
-        uniform list of dicts for the table and detail panel."""
+        """Every part in the bin, regardless of grammar — the table now
+        shows them all and tags each with a Grammar column. User parts
+        first, then every built-in grammar's catalog appended in
+        registry order. Legacy user parts (no ``grammar`` field, from
+        pre-grammar versions of SpliceCraft) default to ``gb_l0``."""
         rows: list[dict] = []
         for p in _load_parts_bin():
             rows.append({
@@ -8303,22 +9116,46 @@ class PartsBinModal(Screen):
                 "fwd_tm":   p.get("fwd_tm", 0.0),
                 "rev_tm":   p.get("rev_tm", 0.0),
                 "user":     True,
+                "grammar":  p.get("grammar", "gb_l0"),
             })
-        for row in _GB_L0_PARTS:
-            name, ptype, pos, oh5, oh3, backbone, marker = row
-            rows.append({
-                "name": name, "type": ptype, "position": pos,
-                "oh5": oh5, "oh3": oh3, "backbone": backbone,
-                "marker": marker, "sequence": "", "fwd_primer": "",
-                "rev_primer": "", "fwd_tm": 0.0, "rev_tm": 0.0,
-                "user": False,
-            })
+        # Built-in catalogs from every grammar — concatenated, with each
+        # row tagged so the Grammar column makes it clear which assembly
+        # standard the row belongs to.
+        for gid, grammar in _all_grammars().items():
+            for row in grammar.get("catalog", []):
+                try:
+                    name, ptype, pos, oh5, oh3, backbone, marker = row
+                except (TypeError, ValueError):
+                    continue
+                rows.append({
+                    "name": name, "type": ptype, "position": pos,
+                    "oh5": oh5, "oh3": oh3, "backbone": backbone,
+                    "marker": marker, "sequence": "", "fwd_primer": "",
+                    "rev_primer": "", "fwd_tm": 0.0, "rev_tm": 0.0,
+                    "user": False,
+                    "grammar": gid,
+                })
         return rows
+
+    def _type_color_map(self) -> dict[str, str]:
+        """Return ``{type_name: rich_color}`` merged across every
+        grammar's positions. Used by ``_populate`` to colour the Type
+        cell for any row regardless of which grammar it belongs to —
+        legacy GB types fall through to ``_GB_TYPE_COLORS``."""
+        out = dict(_GB_TYPE_COLORS)
+        for grammar in _all_grammars().values():
+            for pos in grammar.get("positions", []):
+                ptype = pos.get("type")
+                color = pos.get("color")
+                if isinstance(ptype, str) and ptype and isinstance(color, str) and color:
+                    out[ptype] = color
+        return out
 
     def on_mount(self) -> None:
         t = self.query_one("#parts-table", DataTable)
         t.add_columns(
-            "Name", "Type", "Pos", "5'OH", "3'OH", "Sequence", "Feat Lib",
+            "Name", "Type", "Pos", "5'OH", "3'OH", "Sequence",
+            "Feat Lib", "Grammar",
         )
         self._populate()
 
@@ -8332,11 +9169,23 @@ class PartsBinModal(Screen):
         # `_load_features()` and walks the entire library list — O(N×M)
         # per populate.
         self._refresh_feat_lib_index()
+        type_colors = self._type_color_map()
+        # Pre-resolve grammar display names so the Grammar column
+        # shows human-readable labels instead of raw ids.
+        grammars = _all_grammars()
+        grammar_label = {
+            gid: g.get("name", gid) for gid, g in grammars.items()
+        }
         for r in self._rows:
-            color = _GB_TYPE_COLORS.get(r["type"], "white")
+            color = type_colors.get(r["type"], "white")
             seq_preview = r["sequence"][:28] + "…" if len(r["sequence"]) > 28 else r["sequence"]
             if not seq_preview:
                 seq_preview = "—"
+            gid = r.get("grammar", "gb_l0")
+            grammar_cell = Text(
+                grammar_label.get(gid, gid),
+                style="dim",
+            )
             t.add_row(
                 Text(r["name"], style=color),
                 Text(r["type"], style=f"dim {color}"),
@@ -8345,6 +9194,7 @@ class PartsBinModal(Screen):
                 Text(r["oh3"], style="bold cyan"),
                 Text(seq_preview, style="dim color(252)"),
                 self._lib_status_cell(r),
+                grammar_cell,
             )
 
     def _refresh_feat_lib_index(self) -> None:
@@ -8528,8 +9378,16 @@ class PartsBinModal(Screen):
         r = self._selected_user_row()
         if r is None:
             return
+        # Use the part's stored grammar so a copy of an old MoClo part
+        # uses BsaI tails even after the user has flipped the active
+        # grammar to GB; legacy parts (no grammar field) fall back to
+        # gb_l0 which preserves v0.3.x behaviour.
+        part_grammar = _all_grammars().get(
+            r.get("grammar", "gb_l0"), _BUILTIN_GRAMMARS["gb_l0"],
+        )
         seq = r.get("primed_seq") or _simulate_primed_amplicon(
             r["sequence"], r.get("oh5", ""), r.get("oh3", ""),
+            grammar=part_grammar,
         )
         self._copy_and_notify(seq, "primed amplicon", f"{len(seq)} bp")
 
@@ -8565,6 +9423,11 @@ class PartsBinModal(Screen):
         def _on_result(part_dict):
             if part_dict is None:
                 return
+            # Tag the part with the active grammar so the parts bin
+            # filter can route it to the right tab next time. Legacy
+            # parts (saved before grammars existed) default to gb_l0
+            # in `_all_rows`.
+            part_dict.setdefault("grammar", self._active_grammar_id())
             entries = _load_parts_bin()
             entries.insert(0, part_dict)
             _save_parts_bin(entries)
@@ -9021,6 +9884,34 @@ class DomesticatorModal(ModalScreen):
             opts.append((f"{name}  [{ft}, {blen} bp]", str(i)))
         return opts
 
+    def _type_options_for(self, grammar: dict) -> tuple[list[tuple[str, str]], str]:
+        """Build ``(type_options, default_value)`` for the Part Type
+        Select based on a given grammar. Each option is
+        ``"{type}  ({position}: 5'OH→3'OH)"`` so the user picks a
+        type and immediately sees what overhangs they'll get. Default
+        prefers the first coding type (codon-fix repair only works on
+        coding parts), falling back to the first listed type."""
+        type_options: list[tuple[str, str]] = []
+        for pos in grammar.get("positions", []):
+            ptype = pos.get("type")
+            if not isinstance(ptype, str) or not ptype:
+                continue
+            label = (
+                f"{ptype}  ({pos.get('name','?')}: "
+                f"{pos.get('oh5','')}→{pos.get('oh3','')})"
+            )
+            type_options.append((label, ptype))
+        if not type_options:
+            # Pathological grammar with no positions — surface
+            # something rather than crashing the Select widget.
+            type_options = [("(no positions defined)", "")]
+        coding_types = grammar.get("coding_types", []) or []
+        default_type = next(
+            (t for _label, t in type_options if t in coding_types),
+            type_options[0][1] if type_options else "",
+        )
+        return type_options, default_type
+
     def _plasmid_feat_options(self) -> list[tuple[str, str]]:
         """Build Select options for the currently-picked plasmid's features.
         Value is the index (as str) into ``self._plasmid_pick_feats``."""
@@ -9032,20 +9923,32 @@ class DomesticatorModal(ModalScreen):
         return opts
 
     def compose(self) -> ComposeResult:
-        # Part-type dropdown options
-        type_options = [
-            (f"{k}  ({v[0]}: {v[1]}→{v[2]})", k) for k, v in _GB_POSITIONS.items()
-        ]
+        # Grammar selection lives inside this modal now (formerly on
+        # the Parts Bin). Picking a different grammar from the
+        # dropdown re-persists the active-grammar setting and rebuilds
+        # the Type Select with that grammar's positions.
+        active_grammar = _get_active_grammar()
+        active_gid = active_grammar.get("id", "gb_l0")
+        type_options, default_type = self._type_options_for(active_grammar)
 
         with Vertical(id="dom-box"):
             yield Static(
-                " Domesticate Part  —  Golden Braid L0 ",
+                f" Domesticate Part  —  {active_grammar.get('name', '?')} ",
                 id="dom-title",
             )
             # Scrollable body — everything between title and buttons. Primer
             # design results expand vertically, so the body needs to scroll
             # on narrow terminals rather than overflow off-screen.
             with ScrollableContainer(id="dom-body"):
+                # ── Row 0: Cloning grammar picker ──
+                with Horizontal(id="dom-grammar-row"):
+                    yield Label("Cloning grammar")
+                    yield Select(
+                        _grammar_dropdown_options(),
+                        value=active_gid,
+                        id="dom-grammar-select",
+                        allow_blank=False,
+                    )
                 # ── Row 1: Part name + type ──
                 with Horizontal(id="dom-row1"):
                     with Vertical(id="dom-name-col"):
@@ -9053,7 +9956,8 @@ class DomesticatorModal(ModalScreen):
                         yield Input(placeholder="e.g. my-promoter", id="dom-name")
                     with Vertical(id="dom-type-col"):
                         yield Label("Part type")
-                        yield Select(type_options, id="dom-type", value="CDS")
+                        yield Select(type_options, id="dom-type",
+                                     value=default_type)
                 # ── Row 2: overhang info (auto-updated from type) ──
                 yield Static("", id="dom-oh-info", markup=True)
                 # ── Codon table picker (for silent-mutation repair) ──
@@ -9320,7 +10224,37 @@ class DomesticatorModal(ModalScreen):
             f"strand {f.get('strand', 1)}[/dim]"
         )
 
-    # ── Part type changes update the overhang info ─────────────────────────
+    # ── Grammar / part-type changes update the overhang info ──────────────
+
+    @on(Select.Changed, "#dom-grammar-select")
+    def _grammar_changed(self, event: Select.Changed) -> None:
+        """Switching the cloning grammar from this modal persists the
+        choice (so the next New Part / Save As Feature flow defaults
+        to it) and rebuilds the Type Select with that grammar's
+        positions. The title bar and overhang info reflect the new
+        grammar immediately."""
+        if event.value == Select.BLANK:
+            return
+        new_gid = str(event.value)
+        if new_gid == _get_setting("active_grammar", "gb_l0"):
+            return
+        _set_setting("active_grammar", new_gid)
+        new_grammar = _get_active_grammar()
+        type_options, default_type = self._type_options_for(new_grammar)
+        try:
+            type_sel = self.query_one("#dom-type", Select)
+            type_sel.set_options(type_options)
+            type_sel.value = default_type
+        except NoMatches:
+            pass
+        try:
+            title = self.query_one("#dom-title", Static)
+            title.update(
+                f" Domesticate Part  —  {new_grammar.get('name', '?')} "
+            )
+        except NoMatches:
+            pass
+        self._update_oh_display()
 
     @on(Select.Changed, "#dom-type")
     def _type_changed(self, _event) -> None:
@@ -9329,15 +10263,19 @@ class DomesticatorModal(ModalScreen):
     def _update_oh_display(self) -> None:
         sel = self.query_one("#dom-type", Select)
         val = sel.value
-        if not isinstance(val, str) or val not in _GB_POSITIONS:
+        grammar = _get_active_grammar()
+        pos_spec = (
+            _grammar_position_by_type(grammar, val)
+            if isinstance(val, str) else None
+        )
+        if pos_spec is None:
             self.query_one("#dom-oh-info", Static).update("")
             return
-        pos, oh5, oh3 = _GB_POSITIONS[val]
         self.query_one("#dom-oh-info", Static).update(
-            f"  [dim]{pos}[/dim]   "
-            f"5′ overhang: [bold cyan]{oh5}[/bold cyan]   →   "
-            f"3′ overhang: [bold cyan]{oh3}[/bold cyan]   "
-            f"[dim]({_GB_L0_ENZYME_NAME} domestication)[/dim]"
+            f"  [dim]{pos_spec.get('name','?')}[/dim]   "
+            f"5′ overhang: [bold cyan]{pos_spec.get('oh5','')}[/bold cyan]   →   "
+            f"3′ overhang: [bold cyan]{pos_spec.get('oh3','')}[/bold cyan]   "
+            f"[dim]({grammar.get('enzyme','?')} domestication)[/dim]"
         )
 
     # ── Design primers ─────────────────────────────────────────────────────
@@ -9390,7 +10328,9 @@ class DomesticatorModal(ModalScreen):
     def _design(self, _) -> None:
         status = self.query_one("#dom-primer-results", Static)
         part_type = self.query_one("#dom-type", Select).value
-        if not isinstance(part_type, str) or part_type not in _GB_POSITIONS:
+        grammar = _get_active_grammar()
+        if (not isinstance(part_type, str)
+                or _grammar_position_by_type(grammar, part_type) is None):
             status.update("[red]Select a part type.[/red]")
             return
         resolved = self._resolve_source()
@@ -9417,6 +10357,7 @@ class DomesticatorModal(ModalScreen):
         try:
             self._design = _design_gb_primers(
                 template, start, end, part_type, codon_raw=codon_raw,
+                grammar=grammar,
             )
         except Exception as exc:
             _log.exception("Primer design failed")
@@ -9482,7 +10423,17 @@ class DomesticatorModal(ModalScreen):
         # Show every designed primer pair. For the current single-amplicon
         # design this is one; when SOE-PCR splitting is added later, pairs
         # will contain N+1 entries (one per sub-amplicon).
-        tail_len = len(_GB_PAD + _GB_L0_ENZYME_SITE + _GB_SPACER) + 4
+        gtail = (
+            grammar.get("pad", _GB_PAD)
+            + grammar.get("site", _GB_L0_ENZYME_SITE)
+            + grammar.get("spacer", _GB_SPACER)
+        )
+        tail_len = len(gtail) + 4
+        enzyme_label = (grammar.get("enzyme", "?") or "?")[:5]
+        legend = (
+            f"  {'─'*4}{enzyme_label + '─':>7}{'─OH':>3}"
+            f"{'─── binding region':>20}\n"
+        )
         n_pairs = len(pairs)
         for i, p in enumerate(pairs, start=1):
             if n_pairs > 1:
@@ -9491,14 +10442,12 @@ class DomesticatorModal(ModalScreen):
             t.append(f"  {p['fwd_full'][:tail_len]}", style="dim green")
             t.append(p["fwd_full"][tail_len:], style="bold green")
             t.append(f"   Tm {p['fwd_tm']:.1f}°C\n", style="dim")
-            t.append(f"  {'─'*4}{'Esp3I─':>7}{'─OH':>3}{'─── binding region':>20}\n",
-                     style="dim")
+            t.append(legend, style="dim")
             t.append(f"\nPair {i} Reverse (5'→3'):\n", style="bold red")
             t.append(f"  {p['rev_full'][:tail_len]}", style="dim red")
             t.append(p["rev_full"][tail_len:], style="bold red")
             t.append(f"   Tm {p['rev_tm']:.1f}°C\n", style="dim")
-            t.append(f"  {'─'*4}{'Esp3I─':>7}{'─OH':>3}{'─── binding region':>20}\n",
-                     style="dim")
+            t.append(legend, style="dim")
             t.append(f"\nAmplicon: {p['amplicon_len']} bp\n", style="white")
         t.append(f"\nInsert: {len(d['insert_seq'])} bp   "
                  f"{n_pairs} primer pair(s) total\n",
@@ -9523,6 +10472,7 @@ class DomesticatorModal(ModalScreen):
         insert = d["insert_seq"]
         oh5    = d["oh5"]
         oh3    = d["oh3"]
+        grammar = _get_active_grammar()
         part = {
             "name":        name,
             "type":        d["part_type"],
@@ -9536,8 +10486,11 @@ class DomesticatorModal(ModalScreen):
             "rev_primer":  d["rev_full"],
             "fwd_tm":      d["fwd_tm"],
             "rev_tm":      d["rev_tm"],
-            "primed_seq":  _simulate_primed_amplicon(insert, oh5, oh3),
+            "primed_seq":  _simulate_primed_amplicon(
+                insert, oh5, oh3, grammar=grammar,
+            ),
             "cloned_seq":  _simulate_cloned_plasmid(insert, oh5, oh3),
+            "grammar":     grammar.get("id", "gb_l0"),
         }
         self.dismiss(part)
 
@@ -9567,8 +10520,7 @@ class DomesticatorModal(ModalScreen):
             return
 
         source = part_name  # domesticator parts don't carry a plasmid context
-        import datetime
-        today = datetime.date.today().isoformat()
+        today = _date.today().isoformat()
         entries = _load_primers()
         existing_seqs = {e.get("sequence", "").upper() for e in entries}
 
@@ -10560,6 +11512,20 @@ class MutagenizeModal(ModalScreen):
         # For library source — current plasmid's features + template
         self._lib_template: str = ""
         self._lib_feats:    list = []
+        # Source-dropdown options computed once here so on_mount can read
+        # the same default the Select was rendered with. The "Current map
+        # features" option only appears when a plasmid is actually loaded;
+        # otherwise the modal is launchable from a blank canvas (lib /
+        # parts / prot still produce a CDS).
+        self._src_options: list[tuple[str, str]] = []
+        if self._template:
+            self._src_options.append(("Current map features", "map"))
+        self._src_options.extend([
+            ("Plasmid library",              "lib"),
+            ("Parts bin",                    "parts"),
+            ("Protein sequence (harmonize)", "prot"),
+        ])
+        self._initial_source = self._src_options[0][1]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="mut-box"):
@@ -10567,15 +11533,10 @@ class MutagenizeModal(ModalScreen):
                 " Mutagenize  —  Golden Braid SOE-PCR Site-Directed Mutagenesis ",
                 id="mut-title",
             )
-            # ── Source selector ──
             yield Label("CDS source")
             yield Select(
-                [
-                    ("Current map features", "map"),
-                    ("Plasmid library",       "lib"),
-                    ("Protein sequence (harmonize)", "prot"),
-                ],
-                id="mut-source", value="map", allow_blank=False,
+                self._src_options,
+                id="mut-source", value=self._initial_source, allow_blank=False,
             )
 
             # ── Source-specific bodies (toggled via .display) ──
@@ -10591,6 +11552,11 @@ class MutagenizeModal(ModalScreen):
                 yield Label("CDS feature")
                 yield Select([("(load a plasmid first)", "_none")],
                              id="mut-lib-cds", prompt="(select a CDS feature)")
+
+            with Vertical(id="mut-src-parts"):
+                yield Label("Part  (from your Parts Bin)")
+                yield Select(self._build_parts_options(),
+                             id="mut-parts", prompt="(select a part)")
 
             with Vertical(id="mut-src-prot"):
                 yield Label("Protein sequence  (AA, 1-letter; stops optional)")
@@ -10671,6 +11637,28 @@ class MutagenizeModal(ModalScreen):
             opts = [("(plasmid library is empty)", "_none")]
         return opts
 
+    def _build_parts_options(self) -> list:
+        """Build Select options for the Parts Bin source. Filters to parts
+        whose stored insert sequence is a valid CDS shape (≥ 30 bp, length
+        a multiple of 3) — same gate the map/library sources apply. The
+        value is the integer index into ``_load_parts_bin()`` (as a str)."""
+        try:
+            entries = _load_parts_bin()
+        except Exception:
+            _log.exception("Mutagenize: failed to load parts bin")
+            entries = []
+        opts: list = []
+        for i, e in enumerate(entries):
+            seq = (e.get("sequence") or "").upper()
+            if len(seq) < 30 or len(seq) % 3 != 0:
+                continue
+            nm = e.get("name", f"part_{i}")
+            ptype = e.get("type", "?")
+            opts.append((f"{nm}  [{ptype}, {len(seq)} bp]", str(i)))
+        if not opts:
+            opts = [("(no eligible parts in bin)", "_none")]
+        return opts
+
     def on_mount(self) -> None:
         # Seed built-in K12 via registry load
         try:
@@ -10679,7 +11667,9 @@ class MutagenizeModal(ModalScreen):
         except Exception:
             _log.exception("Mutagenize: codon registry load failed")
             self._codon_entry = None
-        self._apply_source("map")
+        # Falls back to lib/parts/prot if no plasmid is loaded — the source
+        # dropdown excludes "map" in that case (see compose).
+        self._apply_source(self._initial_source)
         info = self.query_one("#mut-cds-info", Static)
         info.update("[dim]Pick a source and CDS, then enter a mutation like "
                     "[bold]W140F[/bold] and press Design.[/dim]")
@@ -10693,18 +11683,27 @@ class MutagenizeModal(ModalScreen):
             self._apply_source(event.value)
 
     def _apply_source(self, src: str) -> None:
-        self.query_one("#mut-src-map", Vertical).display  = (src == "map")
-        self.query_one("#mut-src-lib", Vertical).display  = (src == "lib")
-        self.query_one("#mut-src-prot", Vertical).display = (src == "prot")
-        # Clear any previously-loaded CDS so the user knows they need to re-pick.
-        # Also drop the last designed primers so the preview doesn't keep
-        # highlighting a stale mutation from the previous source.
+        self.query_one("#mut-src-map", Vertical).display   = (src == "map")
+        self.query_one("#mut-src-lib", Vertical).display   = (src == "lib")
+        self.query_one("#mut-src-parts", Vertical).display = (src == "parts")
+        self.query_one("#mut-src-prot", Vertical).display  = (src == "prot")
+        # Switching source invalidates any previously-loaded CDS and the
+        # last designed primers — otherwise the preview keeps showing a
+        # stale mutation from the previous source.
+        self._reset_cds_state()
+
+    def _reset_cds_state(self, info_msg: str = "") -> None:
+        """Clear CDS + primer state and refresh the preview. Used by
+        source-switch and by a deselect on any of the CDS dropdowns."""
         self._cds_dna  = ""
         self._cds_meta = None
         self._outer    = None
         self._inner    = None
-        self.query_one("#mut-cds-info", Static).update("")
-        self.query_one("#btn-mut-save", Button).disabled = True
+        try:
+            self.query_one("#mut-cds-info", Static).update(info_msg)
+            self.query_one("#btn-mut-save", Button).disabled = True
+        except NoMatches:
+            return
         self._update_preview()
 
     # ── Map source ────────────────────────────────────────────────────────
@@ -10772,6 +11771,42 @@ class MutagenizeModal(ModalScreen):
     def _lib_cds_changed(self, event: Select.Changed) -> None:
         self._load_cds_from_feature(event.value, self._lib_template,
                                     self._lib_feats, origin="lib")
+
+    # ── Parts-bin source ──────────────────────────────────────────────────
+
+    @on(Select.Changed, "#mut-parts")
+    def _parts_changed(self, event: Select.Changed) -> None:
+        val = event.value
+        info = self.query_one("#mut-cds-info", Static)
+        if not isinstance(val, str) or val == "_none" or not val.isdigit():
+            self._reset_cds_state()
+            return
+        try:
+            entries = _load_parts_bin()
+        except Exception:
+            _log.exception("Mutagenize: failed to load parts bin")
+            info.update("[red]Could not load Parts Bin.[/red]")
+            return
+        try:
+            entry = entries[int(val)]
+        except (IndexError, ValueError):
+            info.update("[red]Parts bin entry not found.[/red]")
+            return
+        seq = (entry.get("sequence") or "").upper()
+        if len(seq) < 30 or len(seq) % 3 != 0:
+            info.update("[red]Part sequence is too short or not a multiple "
+                        "of 3.[/red]")
+            return
+        name = entry.get("name") or f"part_{val}"
+        self._plasmid_name = name
+        # A part's insert is already in 5'→3' biological orientation, so
+        # treat it as a single-CDS pseudo-plasmid spanning [0, len(seq)).
+        synthetic_feat = {
+            "type": "CDS", "label": name, "strand": 1,
+            "start": 0, "end": len(seq),
+        }
+        self._load_cds_from_feature(f"0:{len(seq)}:1", seq, [synthetic_feat],
+                                    origin="parts")
 
     def _load_cds_from_feature(self, val, template: str, feats: list,
                                origin: str) -> None:
@@ -11083,8 +12118,7 @@ class MutagenizeModal(ModalScreen):
     def _save(self, _) -> None:
         if not (self._outer and self._inner and self._cds_meta):
             return
-        import datetime
-        today = datetime.date.today().isoformat()
+        today = _date.today().isoformat()
         construct = self._cds_meta.get("name") or self._plasmid_name or "CDS"
         # Cap length so an unusually long feature label can't produce
         # primer names that blow past filesystem/name limits.
@@ -12093,8 +13127,7 @@ class PrimerDesignScreen(Screen):
             )
             return
 
-        import datetime
-        today = datetime.date.today().isoformat()
+        today = _date.today().isoformat()
 
         for pname, seq, tm, pos in [
             (fwd_name, fwd_seq, result["fwd_tm"], result["fwd_pos"]),
@@ -12310,6 +13343,53 @@ class UnsavedQuitModal(ModalScreen):
     def action_cancel(self): self.dismiss(None)
 
 
+class UnsavedNavigateModal(ModalScreen):
+    """Shown when the user tries to navigate (e.g. Back to Collections)
+    with unsaved edits. Sibling of `UnsavedQuitModal` — kept separate
+    because the button labels and verb differ ("go back" vs "quit"),
+    and the wording matters for users to understand the consequence.
+
+    Dismisses with ``"save"`` (caller saves then proceeds), ``"discard"``
+    (caller reverts the in-memory record from the library copy then
+    proceeds), or ``None`` (cancel — stay).
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",     "Cancel"),
+        Binding("tab",    "focus_next", "Next button", show=False),
+    ]
+
+    def __init__(self, action_phrase: str = "leave"):
+        super().__init__()
+        self._action_phrase = action_phrase
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="navunsv-dlg"):
+            yield Static(" Unsaved Changes ", id="navunsv-title")
+            yield Static(
+                f"  The loaded plasmid has unsaved edits.\n"
+                f"  Save before you {self._action_phrase}?",
+                id="navunsv-msg",
+            )
+            with Horizontal(id="navunsv-btns"):
+                yield Button("Save",            id="btn-navunsv-save",
+                             variant="primary")
+                yield Button("Discard Changes", id="btn-navunsv-discard",
+                             variant="error")
+                yield Button("Cancel",          id="btn-navunsv-cancel")
+
+    @on(Button.Pressed, "#btn-navunsv-save")
+    def _save(self, _):     self.dismiss("save")
+
+    @on(Button.Pressed, "#btn-navunsv-discard")
+    def _discard(self, _):  self.dismiss("discard")
+
+    @on(Button.Pressed, "#btn-navunsv-cancel")
+    def _cancel_btn(self, _): self.dismiss(None)
+
+    def action_cancel(self): self.dismiss(None)
+
+
 class PlasmidPickerModal(ModalScreen):
     """Scrollable plasmid-picker modal. Shows all entries from the library.
     Dismisses with the selected entry's id, or None on cancel.
@@ -12354,15 +13434,7 @@ class PlasmidPickerModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-pick-ok")
     def _select(self, _):
-        t = self.query_one("#pick-table", DataTable)
-        if t.row_count == 0:
-            self.dismiss(None)
-            return
-        row_keys = list(t.rows.keys())
-        if 0 <= t.cursor_row < len(row_keys):
-            self.dismiss(row_keys[t.cursor_row].value)
-        else:
-            self.dismiss(None)
+        self.dismiss(_cursor_row_key(self.query_one("#pick-table", DataTable)))
 
     @on(DataTable.RowSelected, "#pick-table")
     def _row_selected(self, event):
@@ -12376,6 +13448,237 @@ class PlasmidPickerModal(ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class CollectionsModal(ModalScreen):
+    """Browse, save, and load named collections of plasmids.
+
+    A collection is a saved snapshot of the plasmid library — the user
+    can keep several themed sets (e.g. yeast project, E. coli toolkit,
+    MoClo plant) and switch between them. Loading a collection replaces
+    the current library wholesale; ``_save_library`` writes a `.bak`
+    via the same atomic-save invariant the rest of the app uses, so the
+    previous library can be recovered manually if the swap was a mistake.
+
+    Dismisses with ``{"loaded": name, "n_plasmids": int}`` when a
+    collection was loaded, else None.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",     "Close"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="coll-dlg"):
+            yield Static(" Plasmid Collections ", id="coll-title")
+            yield Label("Save the current library as a new collection:")
+            with Horizontal(id="coll-save-row"):
+                yield Input(placeholder="Collection name",
+                            id="coll-save-name")
+                yield Button("Save", id="btn-coll-save", variant="primary")
+            yield Static("", id="coll-status", markup=True)
+            yield Label("Existing collections:")
+            yield DataTable(id="coll-table", cursor_type="row",
+                            zebra_stripes=True)
+            with Horizontal(id="coll-btns"):
+                yield Button("Load Selected", id="btn-coll-load",
+                             variant="warning")
+                yield Button("Delete", id="btn-coll-del", variant="error")
+                yield Button("Close", id="btn-coll-close")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#coll-table", DataTable)
+        t.add_columns("Name", "# Plasmids", "Description")
+        self._repopulate()
+        self.query_one("#coll-save-name", Input).focus()
+
+    def _repopulate(self) -> None:
+        t = self.query_one("#coll-table", DataTable)
+        t.clear()
+        for c in _load_collections():
+            name = c.get("name") or "?"
+            n_plas = len(c.get("plasmids", []) or [])
+            desc = (c.get("description") or "")[:40]
+            t.add_row(name, str(n_plas), desc, key=name)
+
+    @on(Button.Pressed, "#btn-coll-save")
+    def _save(self, _) -> None:
+        name = self.query_one("#coll-save-name", Input).value.strip()
+        status = self.query_one("#coll-status", Static)
+        if not name:
+            status.update("[red]Enter a collection name.[/red]")
+            return
+        if _collection_name_taken(name):
+            status.update(
+                f"[red]A collection named '{name}' already exists.[/red]"
+            )
+            return
+        plasmids = _load_library()
+        existing = _load_collections()
+        existing.append({
+            "name":        name,
+            "description": f"Saved {len(plasmids)} plasmid(s)",
+            "plasmids":    plasmids,
+            "saved":       _date.today().isoformat(),
+        })
+        _save_collections(existing)
+        self.query_one("#coll-save-name", Input).value = ""
+        status.update(
+            f"[green]Saved '{name}' ({len(plasmids)} plasmid(s)).[/green]"
+        )
+        self._repopulate()
+
+    @on(Input.Submitted, "#coll-save-name")
+    def _save_submitted(self, _) -> None:
+        self._save(None)
+
+    @on(Button.Pressed, "#btn-coll-load")
+    def _load(self, _) -> None:
+        status = self.query_one("#coll-status", Static)
+        name = _cursor_row_key(self.query_one("#coll-table", DataTable))
+        if not name:
+            status.update("[red]No collection selected.[/red]")
+            return
+        coll = _find_collection(name)
+        if coll is None:
+            status.update(f"[red]Collection '{name}' not found.[/red]")
+            return
+        plasmids = [p for p in (coll.get("plasmids") or [])
+                    if isinstance(p, dict)]
+        # Set active BEFORE the library write so the upcoming sync mirror
+        # targets the newly-selected collection. Since `plasmids` came
+        # from `coll`, the mirror writes the same content back — a true
+        # no-op only because we read `plasmids` before the mirror runs.
+        _set_active_collection_name(name)
+        _save_library(plasmids)
+        self.dismiss({"loaded": name, "n_plasmids": len(plasmids)})
+
+    @on(Button.Pressed, "#btn-coll-del")
+    def _delete(self, _) -> None:
+        status = self.query_one("#coll-status", Static)
+        name = _cursor_row_key(self.query_one("#coll-table", DataTable))
+        if not name:
+            status.update("[red]No collection selected.[/red]")
+            return
+        existing = [c for c in _load_collections() if c.get("name") != name]
+        _save_collections(existing)
+        self._repopulate()
+        status.update(f"[dim]Deleted collection '{name}'.[/dim]")
+
+    @on(Button.Pressed, "#btn-coll-close")
+    def _close_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class CollectionNameModal(ModalScreen):
+    """Tiny prompt modal for creating or renaming a collection.
+
+    Dismisses with the trimmed name string, or None on cancel.
+    Caller is responsible for collision-checking before persisting.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",     "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, title: str, current: str = "",
+                 placeholder: str = "Collection name") -> None:
+        super().__init__()
+        self.title_text = title
+        self.current = current
+        self.placeholder_text = placeholder
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="collname-dlg"):
+            yield Static(f" {self.title_text} ", id="collname-title")
+            yield Label("Name:")
+            yield Input(value=self.current,
+                        placeholder=self.placeholder_text,
+                        id="collname-input")
+            yield Static("", id="collname-status", markup=True)
+            with Horizontal(id="collname-btns"):
+                yield Button("OK",     id="btn-collname-ok",     variant="primary")
+                yield Button("Cancel", id="btn-collname-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#collname-input", Input).focus()
+
+    @on(Button.Pressed, "#btn-collname-ok")
+    def _ok(self, _) -> None:
+        self._submit()
+
+    @on(Input.Submitted, "#collname-input")
+    def _submitted(self, _) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        name = self.query_one("#collname-input", Input).value.strip()
+        if not name:
+            self.query_one("#collname-status", Static).update(
+                "[red]Name cannot be empty.[/red]"
+            )
+            return
+        self.dismiss(name)
+
+    @on(Button.Pressed, "#btn-collname-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class CollectionDeleteConfirmModal(ModalScreen):
+    """Confirm-on-delete modal for collections — different copy from
+    LibraryDeleteConfirmModal (which talks about library entries).
+
+    Default focus on [No] to protect against handslip-deletes.
+    Dismisses True (delete) or False (keep)."""
+
+    BINDINGS = [
+        Binding("escape", "cancel",     "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, name: str, n_plasmids: int) -> None:
+        super().__init__()
+        self.coll_name = name
+        self.n_plas = n_plasmids
+
+    def compose(self) -> ComposeResult:
+        plural = "" if self.n_plas == 1 else "s"
+        with Vertical(id="colldel-dlg"):
+            yield Static(" Delete collection ", id="colldel-title")
+            yield Static(
+                f"  Delete collection [bold]{self.coll_name}[/bold] "
+                f"({self.n_plas} plasmid{plural})?\n\n"
+                f"  [dim]The plasmids stay in your library file; only the\n"
+                f"  collection grouping is removed. A backup (.bak) of\n"
+                f"  collections.json is kept.[/dim]",
+                id="colldel-msg", markup=True,
+            )
+            with Horizontal(id="colldel-btns"):
+                yield Button("No",          id="btn-colldel-no",  variant="default")
+                yield Button("Yes, delete", id="btn-colldel-yes", variant="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#btn-colldel-no", Button).focus()
+
+    @on(Button.Pressed, "#btn-colldel-no")
+    def _no(self, _) -> None:
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-colldel-yes")
+    def _yes(self, _) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 class RenamePlasmidModal(ModalScreen):
@@ -12615,6 +13918,17 @@ UnsavedQuitModal { align: center middle; }
 #quit-btns  { height: 3; margin-top: 1; }
 #quit-btns Button { margin-right: 1; }
 
+/* ── Unsaved-navigate dialog (back to collections, switch tab, ...) ── */
+UnsavedNavigateModal { align: center middle; }
+#navunsv-dlg {
+    width: 60; height: auto;
+    background: $surface; border: solid $warning; padding: 1 2;
+}
+#navunsv-title { background: $warning-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#navunsv-msg   { color: $text-muted; margin-bottom: 1; }
+#navunsv-btns  { height: 3; margin-top: 1; }
+#navunsv-btns Button { margin-right: 1; }
+
 /* ── Library-delete confirmation ─────────────────────────── */
 LibraryDeleteConfirmModal { align: center middle; }
 #libdel-dlg {
@@ -12636,6 +13950,45 @@ PlasmidPickerModal { align: center middle; }
 #pick-table  { height: 1fr; }
 #pick-btns   { height: 3; margin-top: 1; }
 #pick-btns Button { margin-right: 1; min-width: 14; }
+
+/* ── Plasmid collections modal ───────────────────────────── */
+CollectionsModal { align: center middle; }
+#coll-dlg {
+    width: 100; height: 32;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#coll-title    { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#coll-dlg Label { color: $text-muted; margin-top: 1; }
+#coll-save-row { height: 3; margin-top: 1; }
+#coll-save-row Input  { width: 1fr; margin-right: 1; }
+#coll-save-row Button { width: 14; }
+#coll-status   { height: 1; margin: 0 0 1 0; }
+#coll-table    { height: 1fr; }
+#coll-btns     { height: 3; margin-top: 1; }
+#coll-btns Button { margin-right: 1; min-width: 12; }
+
+/* ── Collection name prompt + delete confirm ───────────────── */
+CollectionNameModal { align: center middle; }
+#collname-dlg {
+    width: 60; height: 14;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#collname-title  { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#collname-dlg Label { color: $text-muted; margin-top: 1; }
+#collname-input  { margin-top: 1; }
+#collname-status { height: 1; margin-top: 1; }
+#collname-btns   { height: 3; margin-top: 1; }
+#collname-btns Button { margin-right: 1; min-width: 10; }
+
+CollectionDeleteConfirmModal { align: center middle; }
+#colldel-dlg {
+    width: 60; height: 14;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#colldel-title { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#colldel-msg   { height: 1fr; }
+#colldel-btns  { height: 3; margin-top: 1; }
+#colldel-btns Button { margin-right: 1; min-width: 12; }
 
 /* ── Feature picker modal ────────────────────────────────── */
 PlasmidFeaturePickerModal { align: center middle; }
@@ -12750,6 +14103,28 @@ ConstructorModal { align: center middle; }
 #ctor-btns        { height: 3; margin-top: 1; }
 #ctor-btns Button { margin-right: 1; }
 
+/* ── Grammar editor modal ────────────────────────────────── */
+GrammarEditorModal { align: center middle; }
+#ged-dlg {
+    width: 110; max-width: 95%; min-width: 80;
+    height: 90%; max-height: 44;
+    background: $surface; border: solid $accent; padding: 1 2;
+}
+#ged-title { background: $primary-darken-1; color: $text; padding: 0 1; }
+#ged-builtin-banner {
+    background: $warning-darken-2; color: $text;
+    padding: 0 1; margin-top: 1;
+}
+#ged-body { height: 1fr; padding: 0 1; }
+#ged-enzyme-row, #ged-tail-row { height: 3; margin-top: 1; }
+#ged-enzyme-row Input, #ged-tail-row Input { width: 22; margin-right: 2; }
+.ged-inline-label { padding: 1 1 0 0; width: 14; }
+#ged-forbidden { height: 5; border: solid $primary-darken-2; }
+#ged-positions { height: 9; border: solid $primary-darken-2; }
+#ged-status { height: auto; min-height: 1; padding: 0 1; }
+#ged-btns { height: 3; margin-top: 1; }
+#ged-btns Button { margin-right: 1; }
+
 /* ── Parts bin (full-screen) ─────────────────────────────── */
 #parts-box {
     width: 100%; height: 1fr;
@@ -12757,13 +14132,12 @@ ConstructorModal { align: center middle; }
 }
 #parts-title  { background: $success-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #parts-table  { height: 1fr; }
-#parts-detail { height: 5; border-top: solid $accent; padding: 0 1; color: $text-muted; }
+#parts-detail { height: 3; border-top: solid $accent; padding: 0 1; color: $text-muted; }
 #parts-seq-view {
     height: 10; border: solid $accent; padding: 0 1;
     background: $surface-darken-1;
 }
-#parts-copy-btns  { height: 3; margin-top: 1; }
-#parts-copy-btns Button { margin-right: 1; }
+/* Single bottom button row holds Copy + action buttons together. */
 #parts-btns   { height: 3; margin-top: 1; }
 #parts-btns Button { margin-right: 1; }
 
@@ -12776,6 +14150,9 @@ DomesticatorModal { align: center middle; }
 }
 #dom-title  { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #dom-body   { height: 1fr; overflow-y: auto; }
+#dom-grammar-row { height: 3; margin-bottom: 1; }
+#dom-grammar-row Label { padding: 1 1 0 0; width: 18; }
+#dom-grammar-row Select { width: 1fr; }
 #dom-row1   { height: 5; }
 #dom-name-col { width: 1fr; padding-right: 1; }
 #dom-type-col { width: 1fr; }
@@ -12825,7 +14202,7 @@ MutagenizeModal { align: center middle; }
 }
 #mut-title    { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #mut-box Label { color: $text-muted; margin-top: 1; }
-#mut-src-map, #mut-src-lib, #mut-src-prot { height: auto; }
+#mut-src-map, #mut-src-lib, #mut-src-parts, #mut-src-prot { height: auto; }
 #mut-prot-aa  { height: 6; border: solid $primary-darken-2; }
 #mut-prot-row { height: 3; margin-top: 1; }
 #mut-prot-row Input { width: 2fr; margin-right: 1; }
@@ -13043,7 +14420,6 @@ SpeciesPickerModal { align: center middle; }
         Binding("f",           "fetch",            "Fetch GenBank", show=True),
         Binding("ctrl+o",      "open_file",        "Open file",     show=True),
         Binding("ctrl+shift+a","add_to_library",   "Add to lib",    show=True),
-        Binding("A",           "annotate_plasmid", "Annotate",      show=True,  key_display="A"),
         Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=True),
         Binding("ctrl+s",      "save",             "Save",          show=True),
         Binding("ctrl+f",      "add_feature",      "Add feature",   show=True),
@@ -13090,6 +14466,13 @@ SpeciesPickerModal { align: center middle; }
         return True
 
     def compose(self) -> ComposeResult:
+        # Migration must run BEFORE children compose+mount — Textual fires
+        # mount events leaves→root, so anything in App.on_mount runs AFTER
+        # LibraryPanel.on_mount, by which point the panel has already read
+        # `active_collection` (None) and locked into the wrong view mode.
+        # Both helpers are idempotent.
+        _ensure_default_collection()
+        _restore_library_from_active_collection()
         yield Header()
         yield MenuBar()
         with Horizontal(id="main-row"):
@@ -13102,7 +14485,7 @@ SpeciesPickerModal { align: center middle; }
         yield Static(
             Text(
                 "  [ ] rotate   ← → cursor/map   Shift coarse   Home reset"
-                "   f fetch   ^O open   ^S save   ^E edit   ^F add-feat   ^⇧F →feat-lib   ^⇧A add-to-lib   A annotate",
+                "   f fetch   ^O open   ^S save   ^E edit   ^F add-feat   ^⇧F →feat-lib   ^⇧A add-to-lib",
                 style="color(245)",
                 no_wrap=True,
             ),
@@ -13430,10 +14813,6 @@ SpeciesPickerModal { align: center middle; }
         self._stash_order: list[str] = []  # LRU
         self._MAX_PLASMIDS_WITH_UNDO = 10
         self._current_undo_key: "str | None" = None
-        # Re-entrancy guard for pLannotate: spawning a second subprocess
-        # while the first is still running wastes 5-30 s of CPU and risks
-        # the stale-check discarding the newer result. See action_annotate_plasmid.
-        self._plannotate_running: bool = False
         # Crash-recovery autosave: debounced so rapid edits coalesce into one
         # write. Cleared whenever the record is saved / marked clean.
         self._autosave_timer = None
@@ -13443,12 +14822,34 @@ SpeciesPickerModal { align: center middle; }
         # either way so they know the state of their data.
         self._check_data_files()
         self._check_crash_recovery()
+        # Migration to the collection-driven model already ran in compose
+        # (so child panels see the correct active collection on mount).
         if self._preload_record is not None:
             def _load_preload():
                 self._import_and_persist(self._preload_record)
             self.call_after_refresh(_load_preload)
-        elif not _load_library():
-            self._seed_default_library()
+        else:
+            lib = _load_library()
+            if lib:
+                # User has at least one library entry — auto-load the first
+                # so the canvas isn't blank on startup. Falls through silently
+                # if the entry's gb_text is missing or unparsable; the user
+                # can still pick another row from the panel.
+                first = lib[0]
+                gb_text = first.get("gb_text", "")
+                if gb_text:
+                    try:
+                        record = _gb_text_to_record(gb_text)
+                        def _load_first(r=record):
+                            self._apply_record(r)
+                        self.call_after_refresh(_load_first)
+                    except Exception:
+                        _log.exception(
+                            "Auto-load of first library entry %r failed",
+                            first.get("name", "?"),
+                        )
+            else:
+                self._seed_default_library()
 
     def _check_data_files(self) -> None:
         """Validate plasmid library, parts bin, and primer library on startup.
@@ -13464,17 +14865,23 @@ SpeciesPickerModal { align: center middle; }
         _safe_load_json actually reads the files.
         """
         global _library_cache, _parts_bin_cache, _primers_cache
+        global _collections_cache, _settings_cache
+        # Force a cold read on every JSON registry so a corrupt file is
+        # detected NOW (with .bak recovery + a user notify) rather than at
+        # the first lazy-load when something breaks downstream.
         for path, label, cache_attr in [
-            (_LIBRARY_FILE,    "Plasmid library", "_library_cache"),
-            (_PARTS_BIN_FILE,  "Parts bin",       "_parts_bin_cache"),
-            (_PRIMERS_FILE,    "Primer library",  "_primers_cache"),
+            (_LIBRARY_FILE,     "Plasmid library",     "_library_cache"),
+            (_PARTS_BIN_FILE,   "Parts bin",           "_parts_bin_cache"),
+            (_PRIMERS_FILE,     "Primer library",      "_primers_cache"),
+            (_COLLECTIONS_FILE, "Plasmid collections", "_collections_cache"),
+            (_SETTINGS_FILE,    "Settings",            "_settings_cache"),
         ]:
-            # Force a cold read (bypass cache) so we actually check the file
             globals()[cache_attr] = None
-            entries, warning = _safe_load_json(path, label)
-            globals()[cache_attr] = entries
+            _, warning = _safe_load_json(path, label)
             if warning:
                 self.notify(warning, severity="warning", timeout=12)
+        # Caches stay None so the next typed loader (e.g. _load_settings)
+        # rebuilds them through its own filter/shape logic.
 
     # ── Crash-recovery autosave ────────────────────────────────────────────────
 
@@ -13809,6 +15216,43 @@ SpeciesPickerModal { align: center middle; }
         # Successful save / explicit clean → delete the recovery file
         self._clear_autosave(self._current_record)
 
+    def _discard_changes(self) -> None:
+        """Revert the in-memory record to whatever the library has stored.
+
+        Used by `UnsavedNavigateModal` when the user picks "Discard
+        Changes" — reloads the saved copy and clears the undo stack so
+        the discarded edits cannot be revived via Ctrl+Z. If the record
+        was never saved (no library entry), just marks clean.
+        """
+        if self._current_record is None:
+            return
+        record_id = getattr(self._current_record, "id", None)
+        match = next(
+            (e for e in _load_library() if e.get("id") == record_id),
+            None,
+        ) if record_id else None
+        if match is None or not match.get("gb_text"):
+            self._mark_clean()
+            return
+        try:
+            record = _gb_text_to_record(match["gb_text"])
+        except Exception:
+            _log.exception("Discard reload failed for %r", record_id)
+            self.notify("Failed to revert from library; marking clean.",
+                        severity="warning")
+            self._mark_clean()
+            return
+        # Wipe undo so the discarded edits can't be reapplied.
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        # _apply_record(clear_undo=True) would null _source_path — preserve
+        # the file path so a subsequent Ctrl+S still targets the original
+        # .gb file. The undo-stack clear above already covers the discard
+        # semantics; we just need an in-place record swap here.
+        saved_source = self._source_path
+        self._apply_record(record, clear_undo=False)
+        self._source_path = saved_source
+
     def _do_save(self) -> bool:
         """Save current record to its source file and/or library. Returns True on success."""
         if self._current_record is None:
@@ -13917,9 +15361,8 @@ SpeciesPickerModal { align: center middle; }
         """Apply a freshly-imported record to the UI AND save it to the library.
 
         Used by the three "user imported a plasmid" entry points — NCBI fetch,
-        open local file, and CLI preload. Library loads, pLannotate merges,
-        and undo/redo go through `_apply_record` directly so they don't
-        re-save the same record.
+        open local file, and CLI preload. Library loads and undo/redo go
+        through `_apply_record` directly so they don't re-save the same record.
 
         `add_entry` dedupes by `record.id`, so re-importing an existing entry
         updates it in place rather than creating a duplicate.
@@ -13957,8 +15400,8 @@ SpeciesPickerModal { align: center middle; }
         a previously-edited plasmid resurrects its history. Also clears
         `_source_path` so Ctrl+S can't accidentally overwrite the old file.
 
-        `clear_undo=False` is for in-place record changes (pLannotate merge,
-        primer-add) — the stacks stay intact and the edit remains undo-able.
+        `clear_undo=False` is for in-place record changes (primer-add,
+        feature-merge) — the stacks stay intact and the edit remains undo-able.
         """
         if record is None:
             return
@@ -14256,37 +15699,6 @@ SpeciesPickerModal { align: center middle; }
 
         self.notify(f"Renamed to {new_name}.")
 
-    @on(LibraryPanel.AnnotateRequested)
-    def _library_annotate_requested(self, event: LibraryPanel.AnnotateRequested):
-        """Library's ◈ button was clicked. If the focused row isn't the
-        currently-loaded record, load it first, then run annotation."""
-        if event.entry_id is None:
-            # No row focused — fall back to annotating the current record.
-            self.action_annotate_plasmid()
-            return
-        need_load = (
-            self._current_record is None
-            or self._current_record.id != event.entry_id
-        )
-        if need_load:
-            for entry in _load_library():
-                if entry.get("id") == event.entry_id:
-                    try:
-                        record = _gb_text_to_record(entry.get("gb_text", ""))
-                        self._apply_record(record)
-                    except Exception as exc:
-                        _log.exception("library load for annotation failed")
-                        self.notify(
-                            f"Failed to load library entry: {exc}",
-                            severity="error",
-                        )
-                        return
-                    break
-            else:
-                self.notify("Library entry not found.", severity="warning")
-                return
-        self.action_annotate_plasmid()
-
     # ── Menu bar ───────────────────────────────────────────────────────────────
 
     def _rescan_restrictions(self) -> None:
@@ -14360,6 +15772,8 @@ SpeciesPickerModal { align: center middle; }
                 ("Save  [^S]",                   "save"),
                 ("Export as GenBank (.gb)...",   "export_genbank"),
                 ("---",                          None),
+                ("Collections...",               "open_collections"),
+                ("---",                          None),
                 ("Quit  [q]",                    "quit"),
             ],
             "Edit": [
@@ -14371,7 +15785,6 @@ SpeciesPickerModal { align: center middle; }
                 ("Add Feature...  [^F]",            "add_feature"),
                 ("Capture selection → feat-lib  [^⇧F]", "capture_to_features"),
                 ("Delete Feature",                  "delete_feature"),
-                ("Annotate with pLannotate  [⇧A]",  "annotate_plasmid"),
             ],
             "Enzymes": [
                 (f"[{rs}] Show RE sites  [r]",   "toggle_restr"),
@@ -14668,122 +16081,34 @@ SpeciesPickerModal { align: center middle; }
             f"({len(genomic)} bp) at {pos + 1}."
         )
 
-    # ── pLannotate annotation ──────────────────────────────────────────────────
-
-    def action_annotate_plasmid(self) -> None:
-        """Run pLannotate on the currently-loaded record (shortcut: Shift+A)."""
-        if getattr(self, "_plannotate_running", False):
-            self.notify(
-                "pLannotate is already running — wait for the current run "
-                "to finish.",
-                severity="information",
-            )
-            return
-        if self._current_record is None:
-            self.notify(
-                "Load a plasmid first (press 'f' to fetch or 'o' to open).",
-                severity="warning",
-            )
-            return
-        status = _plannotate_status()
-        if not status["ready"]:
-            # Specific, actionable error. Detect which piece is missing so the
-            # user knows what to install.
-            if not status["installed"]:
-                self.notify(
-                    "pLannotate not installed. " + _plannotate_install_hint(),
-                    severity="error", timeout=10,
-                )
-            else:
-                missing = [k for k in ("blast", "diamond") if not status[k]]
-                self.notify(
-                    f"pLannotate needs {' + '.join(missing)} on PATH. "
-                    + _plannotate_install_hint(),
-                    severity="error", timeout=10,
-                )
-            return
-        # Preflight the size cap so the user gets the error instantly instead
-        # of waiting for pLannotate to reject it.
-        n = len(self._current_record.seq)
-        if n > _PLANNOTATE_MAX_BP:
-            self.notify(
-                f"pLannotate caps inputs at {_PLANNOTATE_MAX_BP:,} bp "
-                f"(this plasmid: {n:,} bp).",
-                severity="warning",
-            )
-            return
-        self.notify(
-            f"Running pLannotate on {self._current_record.name} "
-            f"({n:,} bp)… this takes 5-30 s.",
-            timeout=15,
-        )
-        self._plannotate_running = True
-        self._run_plannotate_worker(self._current_record)
-
-    @work(thread=True)
-    def _run_plannotate_worker(self, record) -> None:
-        """Background worker: runs pLannotate subprocess, merges, applies.
-        Errors are logged and surfaced to the UI via notify(); nothing raw
-        reaches the user. The `_plannotate_running` re-entry flag is
-        cleared unconditionally in `_finally` so a crashed run does not
-        lock the user out of future annotation attempts."""
-        merged = None
-        err = None
-        try:
-            try:
-                annotated = _run_plannotate(record)
-                merged    = _merge_plannotate_features(record, annotated)
-            except PlannotateError as exc:
-                _log.info("pLannotate: %s", exc)
-                err = ("error", exc.user_msg)
-            except Exception as exc:
-                _log.exception("pLannotate worker crashed")
-                err = ("crash", str(exc))
-        finally:
-            def _finally():
-                self._plannotate_running = False
-                if err is not None:
-                    kind, msg = err
-                    if kind == "error":
-                        self.notify(msg, severity="error", timeout=10)
-                    else:
-                        self.notify(f"pLannotate crashed: {msg}",
-                                    severity="error", timeout=10)
-                    return
-                # Guard against races: if the user loaded a different plasmid
-                # while pLannotate was running, silently applying the merged
-                # OLD record would clobber their newer work.
-                if self._current_record is not record:
-                    self.notify(
-                        "pLannotate finished, but you've loaded a different "
-                        "plasmid in the meantime — discarding annotation result.",
-                        severity="warning", timeout=8,
-                    )
-                    return
-                n_added = getattr(merged, "_plannotate_added", 0)
-                if n_added == 0:
-                    self.notify(
-                        "pLannotate found no new features (all hits duplicated "
-                        "existing annotations).",
-                        severity="information",
-                    )
-                    return
-                self._push_undo()          # annotation is undo-able
-                self._apply_record(merged, clear_undo=False)
-                # Mark dirty AFTER _apply_record (which calls _mark_clean
-                # internally) so the user gets prompted on quit and sees the
-                # * in the title.
-                self._mark_dirty()
-                self.notify(
-                    f"Added {n_added} pLannotate feature"
-                    f"{'s' if n_added != 1 else ''}. "
-                    "Press 'a' to save to library.",
-                    timeout=6,
-                )
-            self.call_from_thread(_finally)
-
     def action_open_parts_bin(self) -> None:
         self.push_screen(PartsBinModal())
+
+    def action_open_collections(self) -> None:
+        """Open the plasmid-collections manager."""
+        self.push_screen(CollectionsModal(),
+                         callback=self._on_collections_dismissed)
+
+    def _on_collections_dismissed(self, result) -> None:
+        """If a collection was loaded, replace the current library wholesale
+        and refresh the panel into the plasmids view of the new collection.
+        Keep the active record (the user might be editing) — they can
+        switch via the panel if needed."""
+        if not isinstance(result, dict) or not result.get("loaded"):
+            return
+        try:
+            panel = self.query_one("#library", LibraryPanel)
+            panel._view_mode = "plasmids"
+            panel._apply_view_mode()
+            panel._repopulate()
+        except NoMatches:
+            pass
+        self.notify(
+            f"Loaded collection '{result['loaded']}' "
+            f"({result['n_plasmids']} plasmid(s)). "
+            f"Previous library backed up to plasmid_library.json.bak.",
+            timeout=10,
+        )
 
     def action_open_constructor(self) -> None:
         self.push_screen(ConstructorModal())
@@ -14803,25 +16128,20 @@ SpeciesPickerModal { align: center middle; }
 
     def action_open_mutagenize(self) -> None:
         """Open the SOE-PCR site-directed mutagenesis primer designer.
-        Requires a loaded plasmid with at least one CDS feature."""
+
+        Always opens — the modal supports plasmid library, parts bin, and
+        protein-input sources, so a CDS source is reachable even with no
+        plasmid loaded. The 'Current map features' option just shows
+        '(no CDS features on this plasmid)' if the canvas is empty."""
         rec = self._current_record
-        if rec is None:
-            self.notify("Load a plasmid first (press 'f' or 'o').",
-                        severity="warning")
-            return
-        seq = str(rec.seq)
+        seq = str(rec.seq) if rec is not None else ""
+        name = (rec.name or "") if rec is not None else ""
         feats: list = []
         try:
             feats = self.query_one("#plasmid-map", PlasmidMap)._feats
         except NoMatches:
             pass
-        if not any(f.get("type") in ("CDS", "gene") for f in feats):
-            self.notify(
-                "No CDS features on this plasmid — nothing to mutagenize.",
-                severity="warning",
-            )
-            return
-        self.push_screen(MutagenizeModal(seq, feats, rec.name or ""))
+        self.push_screen(MutagenizeModal(seq, feats, name))
 
     def action_undo(self) -> None:
         self._action_undo()

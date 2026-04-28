@@ -6,14 +6,14 @@ The project is developed by a human bioinformatician with an AI agent (Claude Op
 
 ## What is SpliceCraft?
 
-A **terminal-based circular plasmid map viewer, sequence editor, and cloning/mutagenesis workbench** built with Python 3.10+ / Textual / Biopython. Renders Unicode braille-dot plasmid maps in the terminal, with a per-base sequence panel, restriction-site overlays, a plasmid library, Golden Braid L0 assembly tooling, Primer3-backed primer design, and SOE-PCR site-directed mutagenesis.
+A **terminal-based circular plasmid map viewer, sequence editor, and cloning/mutagenesis workbench** built with Python 3.10+ / Textual / Biopython. Renders Unicode braille-dot plasmid maps in the terminal, with a per-base sequence panel, restriction-site overlays, a **collection-driven plasmid library**, Golden Braid L0 assembly tooling, Primer3-backed primer design, and SOE-PCR site-directed mutagenesis.
 
-**Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs, user ATinyGreenCell). **PyPI:** `splicecraft`. Latest: **v0.3.3**.
+**Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs, user ATinyGreenCell). **PyPI:** `splicecraft`. Latest: **v0.4.0**.
 
-- **Single-file architecture:** entire app is `splicecraft.py` (~14,500 lines). Intentional — keeps the codebase greppable. Sibling project ScriptoScope (~8,600 lines) follows the same convention.
-- **Test suite:** 925 tests across 16 files in `tests/`. `pytest -n auto` ~125 s on 8 cores; sequential ~400 s. Biology subset (`test_dna_sanity.py`) < 1 s. `test_invariants_hypothesis.py` adds property-based fuzzing.
-- **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`. Tests: `pytest`, `pytest-asyncio`, `pytest-xdist`, `hypothesis`. **Optional runtime:** `pLannotate` (conda, GPL-3) for Shift+A annotation.
-- Releases via `./release.sh X.Y.Z` (bumps version, runs tests, builds, tags, pushes; `publish.yml` uploads to PyPI via OIDC).
+- **Single-file architecture:** entire app is `splicecraft.py` (~16,200 lines). Intentional — keeps the codebase greppable. Sibling project ScriptoScope (~8,600 lines) follows the same convention.
+- **Test suite:** 977 tests across 17 files in `tests/`. `pytest -n auto` ~3 min on 8 cores; sequential ~7 min. Biology subset (`test_dna_sanity.py`) < 1 s. `test_invariants_hypothesis.py` adds property-based fuzzing.
+- **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`. Tests: `pytest`, `pytest-asyncio`, `pytest-xdist`, `hypothesis`. No optional runtime deps — pLannotate integration was removed in 0.4.0.
+- Releases via `./release.py X.Y.Z` (bumps version, runs tests, builds, tags, pushes; `publish.yml` uploads to PyPI via OIDC). Pure-Python — no bash/sed/grep dependencies.
 
 ## How to run
 
@@ -22,61 +22,41 @@ cd ~/SpliceCraft
 python3 splicecraft.py              # empty canvas
 python3 splicecraft.py L09137       # fetch pUC19 from NCBI
 python3 splicecraft.py myplasmid.gb # open local GenBank file (.gb/.gbk/.dna)
-python3 -m pytest -n auto -q        # full test suite (~2 min on 8 cores)
+python3 -m pytest -n auto -q        # full test suite (~3 min on 8 cores)
 ```
 
 End users: `pipx install splicecraft && splicecraft`.
 
 Logs: `~/.local/share/splicecraft/logs/splicecraft.log` (override with `$SPLICECRAFT_LOG`). Every line prefixed with an 8-char session ID for multi-run grepping.
 
-### pLannotate (optional)
-
-Press **Shift+A** (or click ◈ in the library panel) to annotate via pLannotate. SpliceCraft calls it as a subprocess only — never imports it (GPL-3 license isolation).
-
-```bash
-conda create -n plannotate -c conda-forge -c bioconda plannotate
-conda activate plannotate
-plannotate setupdb          # downloads ~500 MB of BLAST/diamond DBs
-```
-
-If pLannotate is not on PATH, Shift+A notifies the user — nothing crashes.
-
 ## Architecture (single file: `splicecraft.py`)
 
-### Top-level structure (line numbers ±30)
+### Top-level structure (line numbers ±50)
 
 | Lines | Section |
 |-------|---------|
-| 1–200 | Docstring, imports, user data dir, dep check, rotating session-tagged logger, feature-colour palette |
-| 201–385 | Atomic JSON persistence (`_safe_save_json` / `_safe_load_json` / `_extract_entries`; envelope schema `{"_schema_version":1,"entries":[...]}` + legacy bare-list back-compat) |
-| 386–408 | Library cache loaders |
-| 409–1448 | NEB enzyme catalog (~204), IUPAC tables + cached regex, `_rc`, `_scan_restriction_sites`, `_assign_chunk_features`, `_render_feature_row_pair`, memoized `_build_seq_inputs`/`_build_seq_text`, OSC-52 clipboard, `_translate_cds` |
-| 1449–1521 | Char-aspect detection + label helpers |
-| 1522–1659 | GenBank I/O (`fetch_genbank`, `load_genbank` auto-detect `.gb`/`.dna`, `_record_to_gb_text`, `_gb_text_to_record`) |
-| 1660–1875 | pLannotate subprocess integration |
-| 1876–1985 | `_Canvas` + `_BrailleCanvas` (sub-cell braille resolution) |
-| 1986–2753 | `PlasmidMap` widget — circular/linear draw, label placement, `_draw_cache` |
-| 2754–2868 | `FeatureSidebar` |
-| 2869–3036 | `LibraryPanel` |
-| 3037–3485 | `SequencePanel` |
-| 3486–3825 | Core modals (`EditSeqDialog`, `FetchModal`, `OpenFileModal`, `DropdownScreen`) |
-| 3826–3867 | `MenuBar` |
-| 3868–4076 | Golden Braid L0 position catalog (Esp3I/BsmBI overhangs) |
-| 4077–4130 | Parts-bin + primer-library persistence |
-| 4131–4925 | Codon-usage registry, Kazusa parser, NCBI taxid search (`_safe_xml_parse`), CAI/GC. Crash-recovery config sits at top of slab |
-| 4926–5437 | SOE-PCR mutagenesis primer design (`_mut_*`) |
-| 5953–6394 | `PlasmidFeaturePickerModal`, `AddFeatureModal` |
-| 6395–7162 | Feature library workbench (`ColorPickerModal`, `_FeatureSnippetPanel`, `FeatureLibraryScreen`) |
-| 7163–7345 | `PartsBinModal` |
-| 7346–7550 | FASTA file picker (`_FastaAwareDirectoryTree`, `FastaFilePickerModal`) |
-| 7494–8003 | `_feats_for_domesticator` + `DomesticatorModal` (4-source part picker) |
-| 8004–8322 | `ConstructorModal` (Golden Braid L0 assembly UI) |
-| 8323–8660 | `NcbiTaxonPickerModal`, `SpeciesPickerModal` |
-| 8661–8891 | Mutagenize helpers (`_MutPreview`, `AminoAcidPickerModal`) |
-| 8892–9536 | `MutagenizeModal` |
-| 9537–10635 | `PrimerDesignScreen` |
-| 10636–10856 | Small modals (`UnsavedQuitModal`, `PlasmidPickerModal`, `RenamePlasmidModal`, `LibraryDeleteConfirmModal`) |
-| 10857–end | `PlasmidApp` — main controller, keybindings, undo/redo stashes, autosave, `@work` threads; `main()` |
+| 1–200 | Docstring, imports (incl. module-level `from datetime import date as _date`), user data dir, dep check, rotating session-tagged logger, feature-colour palette |
+| 201–460 | Atomic JSON persistence (`_safe_save_json` / `_safe_load_json` / `_extract_entries`; envelope schema `{"_schema_version":1,"entries":[...]}` + legacy bare-list back-compat) + library cache loaders |
+| 461–575 | **Collections persistence** — `_load_collections` / `_save_collections` (deepcopy-on-read), `_get/_set_active_collection_name`, `_find_collection`, `_collection_name_taken`, `_ensure_default_collection` (Main Collection migration), `_sync_active_collection_plasmids`, `_restore_library_from_active_collection` |
+| 576–1820 | NEB enzyme catalog (~204), IUPAC tables + cached regex, `_rc`, `_scan_restriction_sites`, `_assign_chunk_features`, `_render_feature_row_pair`, memoized `_build_seq_inputs`/`_build_seq_text`, OSC-52 clipboard, `_translate_cds` |
+| 1821–1870 | Char-aspect detection + label helpers + `_cursor_row_key` DataTable utility |
+| 1871–2110 | GenBank I/O (`fetch_genbank`, `load_genbank` auto-detect `.gb`/`.dna`, `_record_to_gb_text`, `_gb_text_to_record`, `_normalize_for_genbank`, `_export_genbank_to_path`, `_export_fasta_to_path`) |
+| 2111–2200 | _(pLannotate slot — removed in 0.4.0; placeholder comment only)_ |
+| 2201–2350 | `_Canvas` + `_BrailleCanvas` (sub-cell braille resolution) + `PlasmidMap` start |
+| 2200–3160 | `PlasmidMap` widget — circular/linear draw, label placement, `_draw_cache`; `FeatureSidebar` |
+| 3160–3730 | **`LibraryPanel`** — two-mode panel (collections list ↔ active-collection plasmids). Click a collection → enter plasmids view; back button (`←` in plasmids-button row) → return to collections. Per-mode `+ − ✎` CRUD; `set_dirty` does single-cell `update_cell_at` instead of full repopulate. |
+| 3730–3990 | `SequencePanel` |
+| 3990–4400 | Core modals (`EditSeqDialog`, `FetchModal`, `OpenFileModal`, `ExportGenBankModal`, `FastaExportModal`, `DropdownScreen`, `MenuBar`) |
+| 4400–4900 | Golden Braid L0 position catalog (Esp3I/BsmBI overhangs); cloning grammar registry (`_BUILTIN_GRAMMARS`, `_load_custom_grammars`, `_get_active_grammar`); settings.json key/value persistence |
+| 4900–5800 | Codon-usage registry, Kazusa parser, NCBI taxid search (`_safe_xml_parse`), CAI/GC. SOE-PCR mutagenesis primer design (`_mut_*`) |
+| 5800–7100 | Feature-library workbench, `PlasmidFeaturePickerModal`, `AddFeatureModal`, `ColorPickerModal`, `_FeatureSnippetPanel`, `FeatureLibraryScreen` |
+| 7100–7600 | `PartsBinModal`, FASTA file picker (`_FastaAwareDirectoryTree`, `FastaFilePickerModal`) |
+| 7600–8400 | `_feats_for_domesticator` + `DomesticatorModal` (4-source part picker), `ConstructorModal` (Golden Braid L0 assembly UI) |
+| 8400–8900 | `NcbiTaxonPickerModal`, `SpeciesPickerModal`, Mutagenize helpers (`_MutPreview`, `AminoAcidPickerModal`) |
+| 8900–11800 | **`MutagenizeModal`** — 4-source CDS picker (map / library / parts bin / protein-harmonize); excludes "map" when no plasmid loaded |
+| 11800–12750 | `PrimerDesignScreen` |
+| 12750–13700 | Small modals (`UnsavedQuitModal`, `UnsavedNavigateModal`, `PlasmidPickerModal`, `RenamePlasmidModal`, `LibraryDeleteConfirmModal`, **`CollectionsModal`** for snapshot save, **`CollectionNameModal`** for create/rename, **`CollectionDeleteConfirmModal`**) |
+| 13700–end | `PlasmidApp` — main controller, keybindings, undo/redo stashes (per-plasmid LRU), autosave, `@work` threads (NCBI fetch, library seed, Kazusa); `_discard_changes` (preserves `_source_path`); migration call site in `compose()`; `main()` |
 
 ### Key design patterns
 
@@ -85,8 +65,8 @@ If pLannotate is not on PATH, Shift+A notifies the user — nothing crashes.
 - **Feature coordination:** map click → sidebar highlight → sequence scroll (and back via Textual messages).
 - **Undo/redo:** snapshot-based (full seq + cursor + `deepcopy` of SeqRecord), max 50. **Per-plasmid stashes** — switching plasmids stashes outgoing history under the old `record.id`, restores incoming. LRU-capped at 10 plasmids.
 - **Crash-recovery autosave:** dirty edits debounce a 3 s write to `_DATA_DIR/crash_recovery/{safe_id}.gb`. Cleared on save/abandon. Startup notifies on survivors.
-- **Caching:** `PlasmidMap._draw_cache`, `_BUILD_SEQ_CACHE`, `_PATTERN_CACHE`, `_SCAN_CATALOG` — keyed on inputs (using `id(self._feats)` since lists are reassigned, not mutated, on load).
-- **Workers:** `@work(thread=True)` for NCBI fetch, library seed, pLannotate, Kazusa codon fetch. Results pushed back via `call_from_thread` with stale-record guards.
+- **Caching:** `PlasmidMap._draw_cache`, `_BUILD_SEQ_CACHE`, `_PATTERN_CACHE`, `_SCAN_CATALOG` — keyed on inputs (using `id(self._feats)` since lists are reassigned, not mutated, on load). `_collections_cache` deepcopies on read so callers can mutate entries safely.
+- **Workers:** `@work(thread=True)` for NCBI fetch, library seed, Kazusa codon fetch. Results pushed back via `call_from_thread` with stale-record guards.
 
 ## Logging & error handling
 
@@ -123,107 +103,55 @@ Each has at least one test. Mapping at end of file.
 
 10. **Undo snapshots must be deepcopied.** `_push_undo`, `_action_undo`, `_action_redo` all `deepcopy(self._current_record)`.
 
-## Core helper catalog
+## Plasmid collections (the new top-level organizational unit, 0.4.0+)
 
-Load-bearing pure functions. Read these first before touching rendering, primer design, or the record pipeline.
+A **collection** is a named bucket of plasmids. Users create one on demand from the LibraryPanel; the active collection's plasmids are what shows in the panel's plasmids view.
 
-| Helper | Line | Purpose |
-|---|---:|---|
-| `_safe_save_json` / `_safe_load_json` / `_extract_entries` | 282 / 362 / 228 | Atomic JSON I/O with `.bak` recovery + schema envelope. All six libraries route through these. |
-| `_atomic_write_text` | 251 | Module-level atomic write (tempfile + fsync + os.replace + cleanup). `_do_save`, `_do_autosave`, `_export_genbank_to_path`, `_export_fasta_to_path` use it. |
-| `_iupac_pattern` | 680 | IUPAC→regex compiler, cached in `_PATTERN_CACHE`. |
-| `_IUPAC_COMP`, `_DNA_COMP_PRESERVE_CASE` | ~690 | `str.maketrans` tables (hot-path complement). |
-| `_rc` | 697 | IUPAC-aware reverse complement. |
-| `_feat_len`, `_slice_circular`, `_bp_in` | 701 / 707 / — | Wrap-aware geometry. |
-| `_scan_restriction_sites` | 749 | Palindrome- and wrap-aware. Returns `(resites, recuts)`. |
-| `_build_seq_inputs` / `_build_seq_text` | 1220 / 1253 | Sequence-panel renderer, memoized via `_BUILD_SEQ_CACHE`. |
-| `_translate_cds` | 1423 | Forward + reverse CDS → protein. Cross-validated against Biopython. |
-| `fetch_genbank` / `load_genbank` | 1545 / 1587 | NCBI Entrez fetch + local `.gb`/`.dna` load. |
-| `_record_to_gb_text` / `_gb_text_to_record` | 1634 / 1654 | Round-trip SeqRecords as GenBank text. Caller's record never mutated. |
-| `_run_plannotate`, `_merge_plannotate_features` | 1719 / 1819 | pLannotate subprocess + merge. |
-| `_pick_binding_region` | 3936 | Primer3-compatible region selection. |
-| `_design_*_primers` | 3971+ | Detection / cloning / Golden Braid / generic primer design. |
-| `_codon_*` | 4212+ | Codon registry, harmonization, NCBI taxid search via `_safe_xml_parse`. |
-| `_mut_*` | 4965+ | SOE-PCR mutagenesis primers. |
-| `_rebuild_record_with_edit` | in `PlasmidApp` | Edit pipeline preserving wrap features. Sacred invariant #9. |
-| `_autosave_*` / `_stash_current_undo_and_load` | in `PlasmidApp` | Crash-recovery autosave + per-plasmid undo stack stashing. |
+**On-disk model:**
+- `collections.json` is the single source of truth for collection identity + their plasmid contents.
+- `plasmid_library.json` is a **live mirror** of the active collection — every `_save_library` call also calls `_sync_active_collection_plasmids`, which writes the same entries back into the active collection in `collections.json`.
+- The active-collection name lives in `settings.json` as `{"key": "active_collection", "value": "Main Collection"}`.
 
-## pLannotate integration
+**Migration / first-run** (`_ensure_default_collection`): runs in `App.compose()` (BEFORE children mount, since Textual fires mount events leaves→root). On first launch with no `collections.json`, wraps whatever's in `plasmid_library.json` in a "Main Collection" and points active at it. On subsequent launches, sets active to the first collection if it's missing (orphaned from a delete-active-collection flow).
 
-Shift+A (or ◈ in library panel, or `Edit > Annotate with pLannotate`) runs pLannotate as a subprocess and merges results.
+**Restore** (`_restore_library_from_active_collection`): also runs in `compose()`. Writes the active collection's plasmids into `plasmid_library.json` so the panel renders the user's stored data even if they edited collections.json externally. Bypasses `_save_library`'s mirror — collection is the source.
 
-- **Subprocess only, never import.** pLannotate is GPL-3. Never `import plannotate`.
-- **Optional runtime dependency.** UI shows install hint when missing.
-- **Size cap preflighted** at 50 kb (matches pLannotate's `MAX_PLAS_SIZE`).
-- **Merge, don't replace.** Existing features preserved; pLannotate hits get `note="pLannotate"`. Hits matching `(type, start, end, strand)` are skipped.
-- **Background worker** with stale-record guard (`self._current_record is captured_record`).
-- **Re-entry guard** via `_plannotate_running` flag with `finally` cleanup.
-- **Undo-able + dirty-flagged.** `_push_undo()` before merge; `_mark_dirty()` after.
+**LibraryPanel two-mode UI:**
+- *Collections view*: DataTable with `Name | Plasmids`. `+` (new collection prompt), `−` (delete with confirm), `✎` (rename). Click a row → enter that collection's plasmids view + set active.
+- *Plasmids view*: existing per-plasmid table. `+` (save loaded record), `−` (remove), `←` (back to collections; prompts via `UnsavedNavigateModal` if `app._unsaved` is true), `✎` (rename plasmid).
+- Mode persists in `_view_mode`. Returning user starts in plasmids view if active is set; first-runs / no-active start in collections view.
+- The dirty marker `*` shows in both view headers — even from collections view, the user knows there are unsaved edits.
 
-Failures (`PlannotateNotInstalled`, `PlannotateMissingDb`, `PlannotateTooLarge`, `PlannotateFailed`) map to user notifications. Tracebacks → log file only.
+**Cache contract:** `_load_collections` and `_save_collections` `deepcopy` so a caller mutating a returned dict (e.g. `_btn_coll_rename` editing `c["name"]` in place before save) cannot poison `_collections_cache`. Same contract as `_load_features` per the existing convention.
 
-## Feature library workbench
+**`UnsavedNavigateModal`** is the sibling of `UnsavedQuitModal` — same Save/Discard/Cancel structure but the verbs say "go back to collections" instead of "quit". `App._discard_changes` reloads the record from the library copy, clears undo/redo, and **preserves `_source_path`** (calls `_apply_record(record, clear_undo=False)` then restores source_path) so post-discard Ctrl+S still targets the user's original .gb file.
 
-Clicking **Features** in the menu bar pushes `FeatureLibraryScreen` (no dropdown). It's the sole place to browse, edit, rename, recolor, or delete persistent feature entries. Per-plasmid feature *enumeration* stays on `FeatureSidebar`.
+## Mutagenize source picker (0.3.10+)
 
-Entries carry optional `color` (`#RRGGBB`; `None` falls through to type default) and `strand` (`1`/`-1`/`0`/`2` = forward/reverse/arrowless/double-headed; Cycle-Strand walks `1 → -1 → 0 → 2 → 1`). Arrowless suits `rep_origin`, `misc_feature`, stem-loops; double-headed suits inverted repeats.
+`MutagenizeModal` accepts CDS DNA from any of four sources via a top-of-modal `Select`:
 
-**Deferred save.** All CRUD (Add / Edit / Rename / Duplicate / Remove / Color / Cycle Strand) mutates `self._entries` in memory and tags `self._dirty_indices` / `self._has_pending_changes`. Persistence to `features.json` happens **only** on Save (button or Ctrl+S), or via the "Save & Quit" arm of `UnsavedQuitModal` when closing with pending changes. Dirty entries get an `*` prefix in the table; the title bar shows `*` when anything's pending (covers deletions that leave no row to flag). `_shift_dirty_after_remove` keeps the asterisks pointing at the right rows after a delete shifts indices. `feature_colors.json` (user type-defaults) saves immediately — it's a separate file from `features.json`.
+1. **Current map features** — only shown when `template_seq` is non-empty (modal launchable from blank canvas).
+2. **Plasmid library** — pick a library entry, then pick a CDS feature on it.
+3. **Parts bin** — pick a domesticated GB part directly. Filtered to `len % 3 == 0 && >= 30 bp` (same gate as map/library sources). The part's stored `sequence` is treated as a single-CDS pseudo-plasmid spanning `[0, len)`.
+4. **Protein sequence (harmonize)** — paste 1-letter AA, harmonize via the active codon table (`_codon_harmonize` + `_codon_fix_sites` for BsaI scrubbing).
 
-Snippet preview (`_FeatureSnippetPanel`) feeds a synthesized full-span feature dict through `_build_seq_text` — the same renderer the main `SequencePanel` uses, so previews match post-insertion display. `_render_feature_row_pair` branches on strand: `0`→solid `▒`, `2`→`◀▒…▒▶`, `≥1`→`▒…▒▶`, else→`◀▒…▒`.
+`_initial_source` and `_src_options` are computed in `__init__` (was previously set in compose, read in on_mount via `getattr` fallback — refactored 0.4.0). `_reset_cds_state(info_msg="")` consolidates the "clear CDS + primer state + refresh preview" block used by source-switch and parts-deselect.
 
-Color precedence (`_resolve_feature_color`): entry's `color` → user default in `feature_colors.json` → `_DEFAULT_TYPE_COLORS[type]` → `_FEATURE_PALETTE[0]`. Always returns non-empty so Rich never barfs.
+## Cloning grammars (Golden Braid, MoClo, custom)
 
-`Add Feature` and `Annotate with pLannotate` live under the **Edit** menu. Keybindings: `Shift+A` pLannotate, `Ctrl+F` Add Feature, `Ctrl+Shift+F` capture flow. Inside `FeatureLibraryScreen`: `a` Add, `e` Edit, `r` Rename, `d` Duplicate, `c` Color, `s` Cycle Strand, `Delete` Remove, `Ctrl+S` Save, `Esc` Close.
+Every Type IIS-aware tool reads its overhangs / enzyme / forbidden-sites / coding-types / type→INSDC map from a **grammar dict**. Two ship as built-ins (`_BUILTIN_GRAMMARS["gb_l0"]`, `_BUILTIN_GRAMMARS["moclo_plant"]`); user-defined grammars persist to `cloning_grammars.json` and become editable in `GrammarEditorModal`. The active grammar id lives in `settings.json` (`{"key": "active_grammar", "value": "gb_l0"}`); `_get_active_grammar()` resolves the id to a dict and falls back to gb_l0 if the persisted id no longer exists (e.g., a custom grammar was deleted while still selected) — and writes the recovery back to settings so we don't keep falling back forever.
 
-**Ctrl+Shift+F capture.** Grabs Shift+drag selection (`sp._user_sel`, priority 1) or highlighted feature (`pm.selected_idx`, priority 2), opens `AddFeatureModal` prefilled with slice/name/type/strand/color/qualifiers. **If a drag selection's `(start, end)` matches a feature exactly, capture inherits that feature's full metadata** via `_prefill_from_feature`. Palette colors (`color(N)`) normalised to hex. Insert-at-cursor disabled (bases already in record). Restriction-site overlays (`type == "resite"`) rejected. Save → `_persist_feature_entry` then push `FeatureLibraryScreen`.
+**Grammar schema:** `id`, `name`, `enzyme`, `site`, `spacer`, `pad`, `forbidden_sites: {enzyme: site}`, `positions: [{name, type, oh5, oh3, color}]`, `coding_types: [str]` (eligible for codon-fix repair), `type_to_insdc: {gb_type: insdc_type}`, `catalog: [(name, type, position, oh5, oh3, backbone, marker)]`, `editable: bool`. Built-ins set `editable=False` so the editor refuses to save over them — fork via "Duplicate as Custom" in the Parts Bin first.
 
-`AddFeatureModal` Orientation row: four radios (`#addfeat-strand-fwd/rev/none/both`) → strand `1 / -1 / 0 / 2`. Color row (`#addfeat-color-swatch` + Pick Color / Auto buttons). `_gather` and `_apply_prefill` round-trip together — same modal serves both Add (`prefill=None`) and Edit (`prefill=current_entry`).
+**PartsBinModal integration.** Top-of-modal Select widget (`#parts-grammar-select`) flips the active grammar; the overhang table (`#parts-overhangs`) shows the active grammar's positions; `_all_rows` filters catalog + user parts to the active grammar's id. New parts saved via DomesticatorModal pick up `grammar=active_id` automatically; **legacy parts without a `grammar` field default to `gb_l0`** so existing v0.3.x data migrates intact. The Edit button opens `GrammarEditorModal` (read-only on built-ins); Duplicate forks the active grammar with a user-supplied name.
 
-`ColorPickerModal` carries the full xterm 256-color grid (16 ANSI + 216-cube + 24 grayscale) + free-form custom input (accepts `#RGB`, `#RRGGBB`, `0..255`, `color(N)`). `_normalise_color_input` canonicalises to uppercase `#RRGGBB`; `_xterm_index_to_hex` uses canonical `(0, 95, 135, 175, 215, 255)` cube ramp + `8 + 10*k` grayscale. Capability warning surfaces `console.color_system`. `_markup_safe_color` converts stray `color(N)` to hex before render. **Drag-to-preview:** `on_mouse_down` arms `_drag_active` on a `colorpick-x-*` cell (hit-test via `get_widget_at`), `on_mouse_move` repaints the big `#colorpick-preview-swatch`, `on_mouse_up` disarms. Non-left buttons + non-grid mouse-downs ignored.
+**DomesticatorModal integration.** The Position dropdown is built from `active_grammar["positions"]`; `_design_gb_primers` accepts a `grammar=` kwarg threaded through from the modal so the primer tail uses the active grammar's `pad + site + spacer + oh5` and the codon-fix repair scans `forbidden_sites` (which differs per grammar — GB L0 forbids Esp3I + BsaI; MoClo Plant forbids BsaI + BpiI). `_simulate_primed_amplicon` likewise accepts a `grammar=` kwarg; the Parts Bin "Copy Primed Sequence" button looks up the part's stored grammar so an old MoClo part still gets BsaI tails even after the user has flipped the active grammar to GB.
 
-## Parts Bin source picker
-
-`PartsBinModal` "New Part" opens `DomesticatorModal` with four sources via top-of-modal `RadioSet` (`#dom-src`, `layout: horizontal` + `width: 1fr` + `overflow: hidden` so all four fit on one row). Modal sized `width: 110; max-width: 95%; min-width: 80`.
-
-1. **Direct input** — free-form `TextArea`. `_resolve_source` strips non-IUPAC.
-2. **Feature library** — dropdown from `_load_features()`; uses stored `sequence`.
-3. **Feature from plasmid** — defaults to current plasmid; `Change…` pushes `PlasmidPickerModal`. On select, `_gb_text_to_record` + `_feats_for_domesticator(rec)` repopulates feature `Select` via `set_options(...)`.
-4. **Open FASTA** — `Browse…` pushes `FastaFilePickerModal` (`_FastaAwareDirectoryTree` paints `.fa/.fasta/.fna/.ffn/.frn/.fas/.mpfa/.faa` lime green `#BFFF00`, others white). Parses via `_parse_fasta_single(path)` — validates IUPAC + **rejects multi-record FASTAs**. Errors notify with severity="error".
-
-Panel visibility via `widget.display` toggle. `_feats_for_domesticator(record)` flattens compound/wrap features to outer bounds, drops `source`/`resite`/`recut`/zero-width. Keep in sync with `_feats_in_chunk` / `_extract_feature_entries_from_record`.
-
-### Silent-mutation repair of internal BsaI / Esp3I sites
-
-`DomesticatorModal` carries a codon-table picker (`#dom-codon-row`) seeded with `_codon_tables_get("83333")` (E. coli K12; shared with `MutagenizeModal`). `_design_gb_primers(..., codon_raw=None)` accepts a `{codon: (aa, count)}` dict.
-
-- `_gb_find_forbidden_hits(seq)` returns `(enzyme, site, position)` triples on **both strands**, every occurrence (multi-site contamination must surface fully). `_GB_DOMESTICATION_FORBIDDEN = {"BsaI": "GGTCTC", "Esp3I": "CGTCTC"}`.
-- For coding part types (`_GB_CODING_PART_TYPES = CDS / CDS-NS / C-tag`) with truthy `codon_raw` and `len(insert) % 3 == 0`, `_codon_fix_sites` swaps synonymous codons. Reuses the MutagenizeModal harmonizer.
-- `_codon_fix_sites` cross-checks before/after hit-sets via `_forbidden_hit_set` — rejects any swap that introduces a new forbidden pattern (no cascade where fixing BsaI spawns Esp3I).
-- Partial repair returns an error dict with the partial `mutations` list.
-- Non-coding parts, out-of-frame inserts, missing codon table → reject with explanatory reason.
-
-Why both BsaI and Esp3I are forbidden at L0: Esp3I self-cuts during L0 domestication; surviving BsaI re-cuts at L1 assembly. Both must be clean.
-
-The mutated `insert_seq` is what to order as a **gBlock** — primers only change amplicon ends. **Binding-region advisory:** when a mutation lands in the first 18–25 bp (forward binding) or last 18–25 bp (reverse binding), `binding_region_mutations` flags it so the user knows the original plasmid CANNOT be PCR template — they must order the mutated insert and PCR from that.
-
-### Primer naming + pairs list
-
-`_design_gb_primers` returns a **`pairs`** list (1 entry currently; extensibility hook for future SOE-PCR splitting on un-repairable internal sites). Top-level keys mirror `pairs[0]` for back-compat.
-
-`DomesticatorModal`'s **Save Primers** persists each pair to `primers.json` via `_save_primers`:
-
-| Role | Suffix | Example |
-|---|---|---|
-| Detection (diagnostic PCR) | DET | `myGene-DET-F` / `myGene-DET-R` |
-| Cloning (RE tails + GCGC pad) | CLO | `myGene-CLO-F` / `myGene-CLO-R` |
-| Golden Braid L0 Domestication | DOM | `myPart-DOM-1-F` / `myPart-DOM-1-R` |
-
-Only domestication primers carry `#` pair number. Dup-sequence guard: existing primer skipped (user notified); other entries in the batch still save. `PrimerDesignScreen` uses the same suffix table.
+**Cache + deepcopy.** `_load_custom_grammars` and `_load_collections` both deepcopy on read so caller-side mutations of returned dicts don't poison the cache.
 
 ## On-disk JSON format (schema v1)
 
-All six libraries (`library.json`, `parts_bin.json`, `primers.json`, `codon_tables.json`, `features.json`, `feature_colors.json`) use:
+All seven libraries (`plasmid_library.json`, `parts_bin.json`, `primers.json`, `codon_tables.json`, `features.json`, `feature_colors.json`, `collections.json`) plus `settings.json` and `cloning_grammars.json` use:
 
 ```json
 {"_schema_version": 1, "entries": [...]}
@@ -235,45 +163,19 @@ All six libraries (`library.json`, `parts_bin.json`, `primers.json`, `codon_tabl
 
 Dirty edits trigger a 3 s debounced write to `_CRASH_RECOVERY_DIR/{safe_id}.gb` (default `~/.local/share/splicecraft/crash_recovery/`). Deleted on `_mark_clean` or abandon. `_check_crash_recovery()` at startup notifies on survivors; user recovers via File > Open.
 
-- `_autosave_path(record)` sanitises `record.id` with `re.sub(r'[^A-Za-z0-9._-]', '_', ...)`, caps at 80 chars.
+- `_autosave_path(record)` sanitises `record.id` with `re.sub(r'[^A-Za-z0-9._-]', '_', ...)`, caps at 80 chars, and appends a 6-char sha256 to disambiguate IDs that collide after sanitisation.
 - Atomic write — `tempfile.mkstemp` + `os.replace`.
 - Best-effort — `except Exception: _log.exception(...)`. Autosave is a safety net, not source of truth.
 - Debounced via `self.set_timer`. `_mark_dirty` restarts countdown; `_mark_clean` cancels by deleting target.
 
 ## Per-plasmid undo/redo stashes
 
-`_apply_record(clear_undo=True)` (switch-plasmid path) stashes outgoing stacks under `record.id` in `_stashed_undo_stacks` / `_stashed_redo_stacks`, restores incoming history if previously edited. LRU-capped at `_MAX_PLASMIDS_WITH_UNDO = 10`. `_current_undo_key` tracks the live stack. `clear_undo=False` (in-place edits — pLannotate, primer-add) leaves stacks intact.
-
-## FASTA export (Parts Bin + Feature Library)
-
-Both screens carry **Export FASTA…** alongside CRUD. Routes through `_export_fasta_to_path(name, sequence, path) -> dict` (atomic; parent dirs created). User sees `FastaExportModal` (mirrors `ExportGenBankModal`). Returns `{"path", "bp", "name"}`. Empty-sequence entries warn instead of opening the modal.
-
-## Parts Bin sequence view + cloning simulator
-
-`PartsBinModal` carries a read-only `TextArea` (`#parts-seq-view`) for the highlighted insert. Click selects all (Ctrl+C-ready). Built-in catalog rows show a placeholder.
-
-Three Copy buttons (all via `_copy_to_clipboard_osc52`):
-
-| Button | Sequence |
-|---|---|
-| Copy Raw Sequence | `sequence` — insert only, no tails |
-| Copy Primed Sequence | `_simulate_primed_amplicon(insert, oh5, oh3)` — `pad + Esp3I + spacer + oh5 + insert + oh3 + rc(spacer+Esp3I+pad)` |
-| Copy Cloned Sequence | `_simulate_cloned_plasmid(insert, oh5, oh3)` — `oh5 + insert + oh3 + _PUPD2_BACKBONE_STUB` |
-
-Cloning simulator math sits next to `_GB_L0_ENZYME_SITE` / `_GB_SPACER` / `_GB_PAD`. Golden Braid uses Esp3I/BsmBI at L0, BsaI at L1+ — same N(1)/N(5) geometry, same simulator math. `_PUPD2_BACKBONE_STUB` is a deterministic 420-bp ACGT placeholder scrubbed of every Type IIS site (`GGTCTC`, `GAGACC`, `CGTCTC`, `GAGACG`) on both strands. Replace with licensed pUPD2 and no callers change.
-
-`DomesticatorModal._save` persists `primed_seq` and `cloned_seq` on the part dict; Parts Bin buttons prefer stored values, fall back to simulator at read time for legacy parts.
-
-**Save As Feature.** Bottom-row button takes the highlighted user part and pushes `AddFeatureModal` prefilled with name / sequence / strand=1 / GB-position-aware description. Type round-trips through `_GB_PART_TYPE_TO_INSDC` (Promoter→promoter, Terminator→terminator, "5' UTR"→"5'UTR", CDS→CDS; `CDS-NS` and `C-tag` collapse to plain `CDS` with the original GB shape preserved as `GB type: …` in the description). Built-in catalog rows have no sequence and are rejected with a notify. On modal save the entry routes through `app._persist_feature_entry` — same atomic-write helper used by Ctrl+Shift+F capture — and the parts table repaints so the "Feat Lib" column flips to ✓.
-
-Before opening the modal, `_feature_library_match(name, type, seq)` is consulted; an `"exact"` match (same name+type+sequence) emits a "no-op" warning notify and a `"name"` match (same name+type, different sequence) emits a "Saving will replace it" warning. The user keeps the choice — modal opens either way — but doesn't get blindsided by a silent overwrite. The same classification drives the Parts Bin "Feat Lib" column: green ✓ for exact, yellow ✓ for name-only, empty otherwise. Built-in catalog rows always render empty (no sequence to compare; would surface false positives if a user happened to give a feature library entry the same name as a catalog row).
-
-**Index cache + generation counter.** Per-row scans of the feature library would be O(parts × features) every populate. Instead `_build_feature_library_index()` returns a `{(name, feature_type): sequence_upper}` dict in one sweep, and PartsBinModal stores it as `self._feat_lib_index` alongside a snapshot of `_features_generation` (a module-level int bumped by every `_save_features` write and every disk-reload of `_features_cache`). `_refresh_feat_lib_index` runs at the top of `_populate` but is a no-op when the gen counter hasn't advanced — so reopening the parts bin from a session where the feature library hasn't changed skips the scan entirely. The save-as-feature callback triggers a `_populate` so the column flips to ✓ on the very next render. This is the load-bearing piece for "robust interplay between tabs": any code path that mutates the feature library (Ctrl+Shift+F capture, FeatureLibraryScreen Save, Save As Feature itself) bumps the counter, so the parts bin's view is automatically consistent without any explicit cross-screen wiring.
+`_apply_record(clear_undo=True)` (switch-plasmid path) stashes outgoing stacks under `record.id` in `_stashed_undo_stacks` / `_stashed_redo_stacks`, restores incoming history if previously edited. LRU-capped at `_MAX_PLASMIDS_WITH_UNDO = 10`. `_current_undo_key` tracks the live stack. `clear_undo=False` (in-place edits — primer-add, feature merge, **discard-from-library**) leaves stacks intact.
 
 ## Test suite
 
 ```bash
-python3 -m pytest -n auto -q                          # full, parallel (~2 min)
+python3 -m pytest -n auto -q                          # full, parallel (~3 min)
 python3 -m pytest -q                                  # serial (~7 min) — debugging
 python3 -m pytest tests/test_dna_sanity.py            # biology only (< 1 s)
 python3 -m pytest tests/test_invariants_hypothesis.py # property-based fuzzing
@@ -281,7 +183,7 @@ python3 -m pytest -k "palindrome"                     # filter
 python3 -m pytest -x                                  # stop on first failure
 ```
 
-Parallel runs rely on `pytest-xdist` + the autouse `_protect_user_data` fixture (per-test `tmp_path` isolation; monkeypatches `_LIBRARY_FILE`, `_PARTS_BIN_FILE`, `_PRIMERS_FILE`, `_CODON_TABLES_FILE`, `_FEATURES_FILE`, `_FEATURE_COLORS_FILE`, `_CRASH_RECOVERY_DIR` and caches). **No test can write to real user files.** Module-level read-only caches (`_BUILD_SEQ_CACHE`, `_PATTERN_CACHE`, `_SCAN_CATALOG`) are safe — nothing writes them at test time.
+Parallel runs rely on `pytest-xdist` + the autouse `_protect_user_data` fixture (per-test `tmp_path` isolation; monkeypatches `_LIBRARY_FILE`, `_PARTS_BIN_FILE`, `_PRIMERS_FILE`, `_CODON_TABLES_FILE`, `_FEATURES_FILE`, `_FEATURE_COLORS_FILE`, `_GRAMMARS_FILE`, `_SETTINGS_FILE`, `_COLLECTIONS_FILE`, `_CRASH_RECOVERY_DIR` and caches). **No test can write to real user files.** Module-level read-only caches (`_BUILD_SEQ_CACHE`, `_PATTERN_CACHE`, `_SCAN_CATALOG`) are safe — nothing writes them at test time.
 
 `pyproject.toml` sets `asyncio_mode = "auto"` so async tests don't need `@pytest.mark.asyncio`. `tests/conftest.py` provides `tiny_record` / `tiny_gb_path` / `isolated_library` fixtures.
 
@@ -290,15 +192,15 @@ Parallel runs rely on `pytest-xdist` + the autouse `_protect_user_data` fixture 
 | `test_dna_sanity.py` | 74 | Sacred invariants 1–6; Type IIS cut-outside-recognition; `_translate_cds` |
 | `test_primers.py` | 60 | Detection / cloning / Golden Braid / generic; wrap-region template rotation |
 | `test_genbank_io.py` | 68 | `load_genbank` round-trip (GenBank + SnapGene `.dna`); JSON corruption recovery; `_export_fasta_to_path` |
-| `test_smoke.py` | 52 | Textual mounts; rotation / view / RE toggles; pLannotate UI + re-entry guard; per-plasmid undo stashes; crash-recovery autosave |
+| `test_smoke.py` | ~50 | Textual mounts; rotation / view / RE toggles; per-plasmid undo stashes; crash-recovery autosave |
 | `test_mutagenize.py` | 49 | SOE-PCR primers, codon substitution, CAI round-trips |
-| `test_codon.py` | 42 | Codon registry, harmonization, Kazusa parser, NCBI XML safety, CAI/GC math |
-| `test_domesticator.py` | 228 | Golden Braid L0 positions; 4-source picker; `_feats_for_domesticator`; FASTA picker; cloning simulator; codon-fix repair (multi-site, cascade-prevention, binding-region advisory); Save Primers (`pairs` list, DOM suffix); Save As Feature button (GB→INSDC type map, builtin reject, persist round-trip); `_feature_library_match` helper + `_features_generation` counter + `_build_feature_library_index`; "Feat Lib" column (exact-green / name-yellow / empty) with index-cached lookups (rebuilt only on gen advance); Save-As-Feature warnings on collision |
+| `test_codon.py` | 50+ | Codon registry, harmonization, Kazusa parser, NCBI XML safety, CAI/GC math; Mutagenize 4-source flow (incl. Parts Bin source); Mutagenize-without-plasmid |
+| `test_domesticator.py` | 258 | Golden Braid L0 positions; 4-source picker; `_feats_for_domesticator`; FASTA picker; cloning simulator; codon-fix repair (multi-site, cascade-prevention, binding-region advisory); Save Primers (`pairs` list, DOM suffix); Save As Feature button (GB→INSDC type map, builtin reject, persist round-trip); `_feature_library_match` helper + `_features_generation` counter + `_build_feature_library_index`; "Feat Lib" column (exact-green / name-yellow / empty) with index-cached lookups (rebuilt only on gen advance); Save-As-Feature warnings on collision; **grammar abstraction** (`_BUILTIN_GRAMMARS`, `_all_grammars`, `_get_active_grammar` fallback, `_grammar_position_by_type`); settings.json + cloning_grammars.json round-trips with deepcopy isolation; Parts Bin grammar dropdown filters by active grammar (legacy parts → gb_l0); DomesticatorModal honours active grammar (overhangs / enzyme / forbidden-site scrub) |
+| `test_collections.py` | 47 | Collections persistence + envelope schema + legacy bare-list back-compat; Main Collection migration (first-run, idempotent, fallback active); `_save_library` mirrors to active; `_sync_active_collection_plasmids` no-op when no active; LibraryPanel two-mode toggle; collection CRUD via panel (add/remove/rename); Save-loaded-plasmid-to-active-collection; Back-button unsaved-prompt (Save/Discard/Cancel); CollectionsModal Save/Load/Delete |
 | `test_circular_math.py` | 38 | Sacred invariant #5; `_bp_in` / `_feat_len` |
-| `test_data_safety.py` | 45 | Sacred invariant #7; envelope round-trip + legacy back-compat + future-version warning; `_atomic_write_text`; `_do_save` atomicity |
+| `test_data_safety.py` | 47 | Sacred invariant #7; envelope round-trip + legacy back-compat + future-version warning; `_atomic_write_text`; `_do_save` atomicity; collections.json isolation |
 | `test_add_feature.py` | 24 | AddFeatureModal: qualifier round-trip, validation, save-to-library dedup, insert-at-cursor |
-| `test_plannotate.py` | 24 | Availability, size cap, feature merging, error paths (no real subprocess) |
-| `test_modal_boundaries.py` | 26 | Every modal fits in 160×48 (and AddFeatureModal at 100×30) |
+| `test_modal_boundaries.py` | 29 | Every modal fits in 160×48 (and AddFeatureModal at 100×30); CollectionsModal, CollectionNameModal, CollectionDeleteConfirmModal, UnsavedNavigateModal included |
 | `test_feature_library_screen.py` | 95 | Workbench CRUD + 4-step strand cycle; deferred-save / dirty-tracking / UnsavedQuitModal-on-close; Edit-button prefill round-trip; AddFeatureModal Orientation + Color; Ctrl+Shift+F capture (drag-matches-feature enrichment); ColorPickerModal xterm grid + drag-to-preview; Export-FASTA |
 | `test_features_library.py` | 29 | JSON round-trip; `_GENBANK_FEATURE_TYPES`; per-entry `color` + `strand=0`; `_resolve_feature_color` precedence |
 | `test_edit_record.py` | 14 | Sacred invariant #9: wrap features survive insert/replace as CompoundLocation |
@@ -336,12 +238,13 @@ Parallel runs rely on `pytest-xdist` + the autouse `_protect_user_data` fixture 
 3. Per-chunk `str.translate` for reverse strand (module-level `_DNA_COMP_PRESERVE_CASE`).
 4. `_SCAN_CATALOG` precomputed at import — eliminates per-scan `_rc` / `_iupac_pattern`.
 5. `PlasmidMap._draw_cache` — only recomputed on size / mode / feature / RE-state change.
+6. **`LibraryPanel.set_dirty`** — early-returns when dirty state didn't change; updates only the active row's Name cell via `update_cell_at(Coordinate(row, 0))` instead of rebuilding the whole DataTable on every keystroke. Falls back to `_repopulate_plasmids` if the incremental API isn't available.
 
 Profiled but **not touched**: Textual compositor, Rich `Text.append`, import time.
 
 ## Release + versioning
 
-Versions in `pyproject.toml` and `splicecraft.py::__version__`; `release.sh` updates both. See `git log --oneline` for full release history.
+Versions in `pyproject.toml` and `splicecraft.py::__version__`; `release.py` rewrites both via in-file regex (one match each — refuses to bump if the file's formatting drifted enough that zero or >1 lines match). See `git log --oneline` for full release history.
 
 **Stubs in menus (not implemented):**
 - Build > Simulate Assembly — `coming soon`
@@ -355,8 +258,10 @@ Versions in `pyproject.toml` and `splicecraft.py::__version__`; `release.sh` upd
 4. **Textual reactive auto-invalidation requires assignment, not mutation.** `self._feats = new_list` triggers refresh; `self._feats.append(x)` does not.
 5. **Single-file means giant diffs are normal.** Rendering-layer refactors touch 100+ lines.
 6. **Primer3 is linear-only.** For wrap regions, rotate template to `seq[start:] + seq[:start]` then unrotate via `(coord + rotation) % total`. See `_design_detection_primers`.
-7. **`_source_path` survives in-place edits.** Cleared only when `clear_undo=True` (fresh loads). Otherwise Ctrl+S after pLannotate or primer-add forgets the original file.
+7. **`_source_path` survives in-place edits.** Cleared only when `clear_undo=True` (fresh loads). Otherwise Ctrl+S after primer-add or **Discard-from-library** still targets the original .gb file. `_discard_changes` explicitly stashes/restores `_source_path` around its `_apply_record(clear_undo=False)` call to honor this.
 8. **NCBI responses go through `_safe_xml_parse`.** It rejects DOCTYPE/ENTITY before `ET.fromstring`. Don't add a new NCBI endpoint without it.
+9. **Migration runs in `App.compose()`, not `on_mount`.** Mount events fire leaves→root, so anything in `App.on_mount` runs AFTER `LibraryPanel.on_mount`. Collections + active-collection setup must be done before children mount or the panel reads stale state.
+10. **`_save_library` mirrors to the active collection.** Every panel CRUD writes BOTH `plasmid_library.json` and `collections.json` (each with its own `.bak`). This is intentional — the two files are kept in sync. Routing a write around `_save_library` (e.g. `_restore_library_from_active_collection`) bypasses the mirror; do that only when the collection IS the source.
 
 ## How to extend — modular recipes
 
@@ -366,19 +271,19 @@ Place in nearest section per Top-level structure. Snake-case with leading unders
 
 ### B. New persisted JSON library
 
-Define `_MYTHING_FILE = _USER_DATA_DIR / "mything.json"`. Route load/save through `_safe_load_json` / `_safe_save_json` — never bypass (invariant #7). Filter `isinstance(entry, dict)` after load. Add the file + its cache to `_protect_user_data` in `tests/conftest.py`. Cover corruption recovery in `test_data_safety.py`.
+Define `_MYTHING_FILE = _USER_DATA_DIR / "mything.json"`. Route load/save through `_safe_load_json` / `_safe_save_json` — never bypass (invariant #7). Filter `isinstance(entry, dict)` after load. Add the file + its cache to `_protect_user_data` in `tests/conftest.py` and to `_check_data_files` in `PlasmidApp`. Cover corruption recovery in `test_data_safety.py`. If callers will mutate returned entries (rename in place, etc.), `deepcopy` on read like `_load_collections` / `_load_features`.
 
 ### C. New modal
 
-Subclass `ModalScreen[ReturnType]` (templates: `FetchModal`, `OpenFileModal`). `query_one("#widget-id", WidgetType)` reads, `self.dismiss(result)` returns. Push via `self.push_screen(MyModal(args), callback=on_result)`. Cover happy path in `test_smoke.py`.
+Subclass `ModalScreen[ReturnType]` (templates: `FetchModal`, `OpenFileModal`, `CollectionNameModal`). `query_one("#widget-id", WidgetType)` reads, `self.dismiss(result)` returns. Push via `self.push_screen(MyModal(args), callback=on_result)`. Use `_cursor_row_key(table)` for DataTable cursor reads. Cover happy path in `test_smoke.py` or a topic-specific test file. Add a row to `test_modal_boundaries.py::_MODAL_CASES`.
 
 ### D. New background worker
 
-`@work(thread=True)` on `PlasmidApp` or owning modal. Wrap body in `try / except Exception as exc`, `_log.exception`, push friendly message via `call_from_thread`. **Stale-record guard:** capture `self._current_record` identity at entry; `if self._current_record is captured_record:` in callback. **Re-entry guard:** `self._myop_running` flag with `finally`. Template: `PlasmidApp._run_plannotate_worker`.
+`@work(thread=True)` on `PlasmidApp` or owning modal. Wrap body in `try / except Exception as exc`, `_log.exception`, push friendly message via `call_from_thread`. **Stale-record guard:** capture `self._current_record` identity at entry; `if self._current_record is captured_record:` in callback. **Re-entry guard:** `self._myop_running` flag with `finally`. Template: `PlasmidApp._seed_default_library` (background NCBI fetch with stale-record guard).
 
 ### E. New menu action / keybinding
 
-Add `action_my_thing(self)` on `PlasmidApp`. Add `Binding("key", "my_thing", "desc")` to `BINDINGS`. Add menu item to `MenuBar.compose()`. Modal → recipe C; worker → recipe D.
+Add `action_my_thing(self)` on `PlasmidApp`. Add `Binding("key", "my_thing", "desc")` to `BINDINGS`. Add menu item to `MenuBar.compose()` (or to the dropdown dict in `open_menu`). Modal → recipe C; worker → recipe D.
 
 ### F. New full-screen workbench
 
@@ -390,7 +295,7 @@ Subclass `Screen` (or `ModalScreen` if dismissable). Push from menu action with 
 
 - Thread-local `Console` for `_text_to_content` (if seq-panel render blows the 33 ms/frame budget).
 - Two-level render cache (`_seq_render_cache` + `_content_cache`, LRU via `OrderedDict.move_to_end`).
-- `@lru_cache(1)` availability probes for optional CLI tools (BLAST, Prodigal beyond pLannotate).
+- `@lru_cache(1)` availability probes for optional CLI tools (BLAST, Prodigal).
 
 User is undecided whether to merge SpliceCraft / ScriptoScope / MitoShift / RefHunter / molCalc into one Textual app with modes, or keep them separate. Either is viable — the single-file convention keeps the option open.
 

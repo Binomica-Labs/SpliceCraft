@@ -33,9 +33,10 @@
 
 A terminal-based circular plasmid map viewer, sequence editor, **primer design
 workbench**, and **Golden Braid parts domesticator** — rendered entirely in your
-shell. Fetch any GenBank record by accession, load local files, annotate features
-with pLannotate, design diagnostic / cloning / Golden Braid primers with Primer3,
-and edit sequences — without ever leaving the terminal.
+shell. Fetch any GenBank record by accession, load local files, organize plasmids
+into named **collections**, design diagnostic / cloning / Golden Braid primers
+with Primer3, run **SOE-PCR site-directed mutagenesis** on any CDS, and edit
+sequences — without ever leaving the terminal.
 
 ## Quick start
 
@@ -71,12 +72,19 @@ Installation section below).
   (BsaI, BsmBI, BbsI, SapI) with visible recognition arcs + cut markers
 
 ### Libraries (all persist to JSON)
-- **Plasmid library** — SnapGene-style collection, auto-saves on import, survives
-  restarts, supports rename and handslip-protected delete
+- **Plasmid collections** — organize plasmids into named buckets (e.g. "yeast
+  project", "E. coli toolkit"). Library panel toggles between a collection list
+  and the active collection's plasmids; a default "Main Collection" is created
+  on first run, with full add / remove / rename CRUD from the panel
+- **Plasmid library** — auto-saves on import, mirrors live into the active
+  collection, survives restarts, rename + handslip-protected delete; unsaved
+  edits prompt Save / Discard / Cancel before navigating away
 - **Parts Bin** — Golden Braid L0 parts catalog with user-domesticated parts
   including sequences and primer pairs
 - **Primer library** — all designed primers with Tm, length, date, status
   (Designed / Ordered / Validated), multi-select for batch operations
+- **Feature library** — reusable feature snippets with per-entry color and strand,
+  centralized workbench for browse / edit / rename / recolor / delete
 
 ### Primer design (Primer3)
 - **Detection primers** — diagnostic PCR; Primer3 picks the ideal pair within
@@ -91,10 +99,12 @@ Installation section below).
 - Primers can be added to the plasmid map as `primer_bind` features
 - Scrollable `TextArea` for custom sequence input; highlighted text = target
 
-### Annotation
-- **pLannotate integration** — press `Shift+A` (or use the `◈` library button)
-  to auto-annotate a plasmid against pLannotate's curated feature database.
-  Optional — see install notes below
+### Mutagenesis
+- **SOE-PCR site-directed mutagenesis** — design 4-primer SOE sets for any
+  W140F-style mutation. CDS source can be the loaded plasmid, a library entry,
+  a domesticated part from the Parts Bin, or a free-form protein sequence
+  (auto-harmonized to the active codon table). Edge cases (mutation within
+  60 nt of a CDS end) auto-fall back to a 2-primer modified-outer PCR.
 
 ### Feature operations
 - **Feature sidebar** — click a row to highlight on map; click the map to
@@ -172,20 +182,6 @@ cd SpliceCraft
 pip install -e .        # inside a venv, or pass --break-system-packages
 ```
 
-### Optional dependencies
-
-**pLannotate** (for automatic plasmid annotation via `Shift+A`) — requires conda:
-
-```bash
-conda create -n plannotate -c conda-forge -c bioconda plannotate
-conda activate plannotate
-plannotate setupdb          # one-time ~500 MB BLAST database download
-# then run SpliceCraft from the same conda env
-```
-
-SpliceCraft runs fine without pLannotate — the annotation feature just
-notifies the user how to install it if pressed.
-
 ---
 
 ## Usage
@@ -219,7 +215,6 @@ you can also still run `python3 splicecraft.py` directly.
 | `f`            | Fetch a record from NCBI by accession  |
 | `Ctrl+O`       | Open a `.gb` file from disk            |
 | `Ctrl+Shift+A` | Add current plasmid to the library     |
-| `Shift+A`      | Annotate plasmid with pLannotate       |
 | `Ctrl+E`       | Enter sequence editor mode             |
 | `Ctrl+S`       | Save edits to file                     |
 | `Ctrl+F`       | Add a new feature (from cursor or blank) |
@@ -253,15 +248,16 @@ you can also still run `python3 splicecraft.py` directly.
 
 ## Menus
 
-| Menu       | Items                                                              |
-|------------|--------------------------------------------------------------------|
-| File       | Open .gb file · Fetch from NCBI · Add to Library · Save · Quit     |
-| Edit       | Edit Sequence · Undo · Redo · Delete Feature                       |
-| Enzymes    | Show RE sites · Unique cutters · 6+/4+ bp sites · Connectors       |
-| Features   | Add Feature · Delete Feature · Annotate with pLannotate            |
-| Primers    | Opens the full-screen Primer Design workbench                      |
-| Parts      | Opens the Parts Bin (Golden Braid L0 parts catalog)                |
-| Constructor| Opens the Assembly Constructor for TU building                     |
+| Menu       | Items                                                                                  |
+|------------|----------------------------------------------------------------------------------------|
+| File       | Open .gb file · Fetch from NCBI · Add to Library · Save · Export GenBank · Collections · Quit |
+| Edit       | Edit Sequence · Undo · Redo · Add Feature · Capture → feat-lib · Delete Feature        |
+| Enzymes    | Show RE sites · Unique cutters · 6+/4+ bp sites · Connectors                           |
+| Features   | Opens the Feature Library workbench                                                    |
+| Primers    | Opens the full-screen Primer Design workbench                                          |
+| Mutagenize | Opens the SOE-PCR site-directed mutagenesis designer (4-source CDS picker)             |
+| Parts      | Opens the Parts Bin (Golden Braid L0 parts catalog)                                    |
+| Constructor| Opens the Assembly Constructor for TU building                                         |
 
 ---
 
@@ -274,26 +270,30 @@ you can also still run `python3 splicecraft.py` directly.
 | Rich              | ≥ 14.0            | Terminal rendering (Textual dependency)      |
 | Biopython         | ≥ 1.87            | GenBank parsing and NCBI Entrez fetch        |
 | primer3-py        | ≥ 2.3.0           | Primer design (Tm, thermodynamic screening)  |
+| platformdirs      | ≥ 4.2             | Cross-platform user-data directory           |
 | pytest            | ≥ 9.0             | Test suite (dev only)                        |
 | pytest-asyncio    | ≥ 1.3             | Async test support (dev only)                |
-| **pLannotate**    | optional, conda   | Automatic plasmid annotation (`Shift+A`)     |
-| **BLAST+**        | optional, conda   | Required by pLannotate                       |
-| **Primer3 CLI**   | optional, `apt`   | Not used directly — primer3-py bundles it    |
 
 ---
 
 ## Data files
 
-All user data persists as human-readable JSON in the repo directory:
+All user data persists as human-readable JSON in the platform-appropriate user
+data directory:
 
-| File                  | Purpose                                     |
-|-----------------------|---------------------------------------------|
-| `plasmid_library.json`| Saved plasmid collection (GenBank + metadata) |
-| `parts_bin.json`      | User-domesticated Golden Braid parts        |
-| `primers.json`        | Designed primer library                     |
-| `*.json.bak`          | Automatic backup — written before each save |
+| File                       | Purpose                                                  |
+|----------------------------|----------------------------------------------------------|
+| `collections.json`         | Named collections of plasmids; source of truth           |
+| `plasmid_library.json`     | Live mirror of the active collection's plasmids          |
+| `parts_bin.json`           | User-domesticated Golden Braid parts                     |
+| `primers.json`             | Designed primer library                                  |
+| `features.json`            | Reusable feature snippets                                |
+| `feature_colors.json`      | Per-type feature color overrides                         |
+| `codon_tables.json`        | Cached codon-usage tables fetched from Kazusa            |
+| `cloning_grammars.json`    | User-defined cloning grammars (Golden Braid / MoClo)     |
+| `settings.json`            | App preferences (active collection, active grammar, ...) |
+| `*.json.bak`               | Automatic backup — written before each save              |
 
-These files are in `.gitignore` — they're user-local data, not repo content.
 A manual backup rotation happens on every save so accidental data loss is
 always recoverable via the `.bak` file.
 
@@ -302,7 +302,7 @@ always recoverable via the `.bak` file.
 ## Tests
 
 ```bash
-python3 -m pytest -q          # full suite (483 tests, ~75 s)
+python3 -m pytest -n auto -q                  # full suite (977 tests, ~3 min on 8 cores)
 python3 -m pytest tests/test_dna_sanity.py    # biology correctness only (< 1s)
 ```
 
@@ -310,7 +310,7 @@ python3 -m pytest tests/test_dna_sanity.py    # biology correctness only (< 1s)
 
 ## Codebase tour
 
-SpliceCraft is a single-file Python app (`splicecraft.py`, ~10,360 lines) built on
+SpliceCraft is a single-file Python app (`splicecraft.py`, ~16,200 lines) built on
 Textual + Biopython. The single-file layout is intentional — no import puzzles,
 and everything is greppable from one place.
 
@@ -319,12 +319,13 @@ and everything is greppable from one place.
 | Region | Contents |
 |--------|----------|
 | Top of file | imports, user data dir (`platformdirs`), rotating session-tagged logger, `_safe_save_json` / `_safe_load_json` (atomic writes + `.bak` recovery) |
+| Persistence | Library + parts-bin + primers + features + feature-colors + codon-tables + cloning-grammars + settings + **collections** (collection-driven model with active-pointer in settings.json + library mirror sync) |
 | Biology core | NEB enzyme catalog, IUPAC-aware `_rc`, `_scan_restriction_sites` (palindrome- and wrap-aware), sequence panel renderer, `_translate_cds` |
-| I/O | `fetch_genbank` (NCBI Entrez), `load_genbank` (`.gb` / `.gbk` / `.dna`), pLannotate subprocess integration |
-| Rendering | `_Canvas` + `_BrailleCanvas` (sub-cell dot matrix), `PlasmidMap`, `SequencePanel`, `FeatureSidebar`, `LibraryPanel`, `MenuBar` |
-| Workbenches | `PrimerDesignScreen` (detection / cloning / Golden Braid / generic), `MutagenizeModal` (SOE-PCR mutagenesis), `DomesticatorModal` + `ConstructorModal` (Golden Braid L0) |
-| Registries | codon-usage tables, parts bin, primer library — all persisted as JSON with automatic `.bak` backups |
-| Controller | `PlasmidApp` — keybindings, undo/redo (50-deep snapshot stack), `@work` threads for NCBI / pLannotate / Kazusa |
+| I/O | `fetch_genbank` (NCBI Entrez), `load_genbank` (`.gb` / `.gbk` / `.dna`), GenBank/FASTA export |
+| Rendering | `_Canvas` + `_BrailleCanvas` (sub-cell dot matrix), `PlasmidMap`, `SequencePanel`, `FeatureSidebar`, `LibraryPanel` (two-mode: collections list ↔ active-collection plasmids), `MenuBar` |
+| Workbenches | `PrimerDesignScreen` (detection / cloning / Golden Braid / generic), `MutagenizeModal` (SOE-PCR; 4-source CDS picker), `DomesticatorModal` + `ConstructorModal` (Golden Braid L0), `FeatureLibraryScreen` |
+| Registries | codon-usage tables, parts bin, primer library, feature library, cloning grammars, plasmid collections — all persisted as JSON with automatic `.bak` backups |
+| Controller | `PlasmidApp` — keybindings, undo/redo (50-deep snapshot stack), `@work` threads for NCBI / Kazusa, collection-driven startup migration in `compose()` |
 
 ### Contributor docs
 
@@ -337,7 +338,7 @@ Read it before touching the rendering layer, record pipeline, or primer design.
 ### Running the suite
 
 ```bash
-python3 -m pytest -q                   # full suite (~75 s)
+python3 -m pytest -n auto -q                  # full suite (~3 min)
 python3 -m pytest tests/test_dna_sanity.py    # biology only (< 1 s)
 ```
 

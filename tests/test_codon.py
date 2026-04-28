@@ -471,7 +471,7 @@ class TestMutInnerWithTable:
 
 class TestMutagenizeModalSources:
     async def test_source_switching(self):
-        """The three source panels must toggle visibility as the Select
+        """The four source panels must toggle visibility as the Select
         changes, without any widget-lookup errors."""
         app = sc.PlasmidApp()
         async with app.run_test(size=(140, 50)) as pilot:
@@ -482,13 +482,14 @@ class TestMutagenizeModalSources:
             await app.push_screen(sc.MutagenizeModal(cds, feats, "TEST"))
             await pilot.pause(0.3)
             src = app.screen.query_one("#mut-source")
-            for val in ("prot", "lib", "map"):
+            for val in ("prot", "lib", "parts", "map"):
                 src.value = val
                 await pilot.pause(0.1)
                 visible = {
-                    "map":  app.screen.query_one("#mut-src-map").display,
-                    "lib":  app.screen.query_one("#mut-src-lib").display,
-                    "prot": app.screen.query_one("#mut-src-prot").display,
+                    "map":   app.screen.query_one("#mut-src-map").display,
+                    "lib":   app.screen.query_one("#mut-src-lib").display,
+                    "parts": app.screen.query_one("#mut-src-parts").display,
+                    "prot":  app.screen.query_one("#mut-src-prot").display,
                 }
                 assert visible[val] is True
                 assert sum(visible.values()) == 1
@@ -581,6 +582,195 @@ class TestMutagenizeModalSources:
             modal.query_one("#btn-mut-harmonize").action_press()
             await pilot.pause(0.1)
             assert modal._cds_dna == ""
+
+
+class TestMutagenizeNoPlasmid:
+    """Mutagenize must launch with no loaded plasmid. The 'Current map
+    features' option is excluded from the source dropdown in that case
+    so the user only sees sources that can actually produce a CDS."""
+
+    async def test_modal_opens_with_empty_template(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.MutagenizeModal("", [], ""))
+            await pilot.pause(0.3)
+            modal = app.screen
+            src = modal.query_one("#mut-source")
+            values = [v for (_label, v) in src._options]  # type: ignore[attr-defined]
+            assert "map" not in values
+            # The other three sources must all be present.
+            assert "lib" in values and "parts" in values and "prot" in values
+            # Default starts at the first remaining source — "lib" — and
+            # the lib panel is the visible one.
+            assert src.value == "lib"
+            assert modal.query_one("#mut-src-lib").display is True
+            assert modal.query_one("#mut-src-map").display is False
+            app.exit()
+
+    async def test_action_open_mutagenize_no_record(self, monkeypatch):
+        """PlasmidApp.action_open_mutagenize must push the modal even when
+        _current_record is None (regression: previously errored out with a
+        notify-and-return). Suppress the default-seed worker so it can't
+        load pACYC184 in the background and mask the no-record state."""
+        monkeypatch.setattr(sc.PlasmidApp, "_seed_default_library",
+                            lambda self: None)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            assert app._current_record is None
+            app.action_open_mutagenize()
+            await pilot.pause(0.3)
+            assert type(app.screen).__name__ == "MutagenizeModal"
+            app.exit()
+
+    async def test_modal_includes_map_when_template_present(self):
+        cds = "ATG" + ("GCT" * 30) + "TAA"
+        feats = [{"type": "CDS", "label": "x",
+                  "start": 0, "end": len(cds), "strand": 1}]
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.MutagenizeModal(cds, feats, "x"))
+            await pilot.pause(0.3)
+            modal = app.screen
+            src = modal.query_one("#mut-source")
+            values = [v for (_label, v) in src._options]  # type: ignore[attr-defined]
+            assert "map" in values
+            assert src.value == "map"
+            app.exit()
+
+
+class TestPartsBinSource:
+    """The Parts Bin source feeds a stored part's `sequence` (5'→3' insert,
+    no tails) into Mutagenize as a single-CDS pseudo-plasmid.
+
+    Eligibility filter mirrors the map/library sources: ≥ 30 bp and a
+    multiple of 3."""
+
+    def _ok_part(self, name: str = "myCds") -> dict:
+        cds = "ATG" + ("GCT" * 30) + "TAA"   # 96 nt = 32 codons
+        return {
+            "name": name, "type": "CDS", "position": "Pos 3",
+            "oh5": "AGGT", "oh3": "GCTT", "sequence": cds,
+            "grammar": "gb_l0",
+        }
+
+    async def test_options_filter_short_and_offgrid(self, monkeypatch):
+        bin_entries = [
+            self._ok_part("good_cds"),
+            {"name": "tooShort", "type": "CDS", "sequence": "ATGAAATAA"},  # 9 bp
+            {"name": "offgrid",  "type": "CDS",
+             "sequence": "ATG" + ("GCT" * 30) + "T"},                      # 94 bp, %3!=0
+            {"name": "empty",    "type": "Promoter", "sequence": ""},
+        ]
+        monkeypatch.setattr(sc, "_load_parts_bin", lambda: list(bin_entries))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.MutagenizeModal("", [], ""))
+            await pilot.pause(0.3)
+            modal = app.screen
+            opts = modal._build_parts_options()
+            # Only the one good part passes.
+            assert len(opts) == 1
+            label, val = opts[0]
+            assert "good_cds" in label
+            assert val == "0"
+            app.exit()
+
+    async def test_options_empty_bin(self, monkeypatch):
+        monkeypatch.setattr(sc, "_load_parts_bin", lambda: [])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.MutagenizeModal("", [], ""))
+            await pilot.pause(0.3)
+            modal = app.screen
+            opts = modal._build_parts_options()
+            assert len(opts) == 1
+            assert opts[0][1] == "_none"
+            app.exit()
+
+    async def test_select_loads_cds(self, monkeypatch):
+        """Picking a part from the dropdown loads its `sequence` as the
+        CDS, sets meta with origin='parts', and enables the preview."""
+        part = self._ok_part("aeBlue")
+        monkeypatch.setattr(sc, "_load_parts_bin", lambda: [part])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.MutagenizeModal("", [], ""))
+            await pilot.pause(0.3)
+            modal = app.screen
+            modal.query_one("#mut-source").value = "parts"
+            await pilot.pause(0.1)
+            # Re-build options against the patched parts bin: compose ran
+            # before our monkeypatch took effect, so the dropdown was seeded
+            # with the (empty) real bin. set_options refreshes from the patch.
+            modal.query_one("#mut-parts").set_options(modal._build_parts_options())
+            await pilot.pause(0.1)
+            modal.query_one("#mut-parts").value = "0"
+            await pilot.pause(0.2)
+            assert modal._cds_dna == part["sequence"].upper()
+            assert modal._cds_meta is not None
+            assert modal._cds_meta["origin"] == "parts"
+            assert modal._cds_meta["name"] == "aeBlue"
+            assert modal._cds_meta["start"] == 0
+            assert modal._cds_meta["end"] == len(part["sequence"])
+            assert modal._cds_meta["strand"] == 1
+            # Translation should be valid (starts with M, ends with stop).
+            protein = sc._mut_translate(modal._cds_dna)
+            assert protein.startswith("M")
+            app.exit()
+
+    async def test_select_then_design_primers(self, monkeypatch):
+        """End-to-end: pick part → enter mutation → design enables Save."""
+        part = self._ok_part("partA")
+        monkeypatch.setattr(sc, "_load_parts_bin", lambda: [part])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.MutagenizeModal("", [], ""))
+            await pilot.pause(0.3)
+            modal = app.screen
+            modal.query_one("#mut-source").value = "parts"
+            await pilot.pause(0.1)
+            modal.query_one("#mut-parts").set_options(modal._build_parts_options())
+            await pilot.pause(0.1)
+            modal.query_one("#mut-parts").value = "0"
+            await pilot.pause(0.2)
+            # Protein is M + 30×A + (stop) → mutate position 5 (A) → V.
+            modal.query_one("#mut-input").value = "A5V"
+            modal.query_one("#btn-mut-design").action_press()
+            await pilot.pause(0.2)
+            assert modal._inner is not None
+            assert modal._outer is not None
+            assert modal.query_one("#btn-mut-save").disabled is False
+            app.exit()
+
+    async def test_source_switch_clears_parts_cds(self, monkeypatch):
+        """Switching off 'parts' must clear the CDS so the user re-picks."""
+        part = self._ok_part("partB")
+        monkeypatch.setattr(sc, "_load_parts_bin", lambda: [part])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.MutagenizeModal("", [], ""))
+            await pilot.pause(0.3)
+            modal = app.screen
+            modal.query_one("#mut-source").value = "parts"
+            await pilot.pause(0.1)
+            modal.query_one("#mut-parts").set_options(modal._build_parts_options())
+            await pilot.pause(0.1)
+            modal.query_one("#mut-parts").value = "0"
+            await pilot.pause(0.2)
+            assert modal._cds_dna != ""
+            modal.query_one("#mut-source").value = "prot"
+            await pilot.pause(0.1)
+            assert modal._cds_dna == ""
+            assert modal._cds_meta is None
+            app.exit()
 
 
 class TestLibrarySourceWrapFeature:

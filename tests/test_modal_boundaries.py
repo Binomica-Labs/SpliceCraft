@@ -138,6 +138,8 @@ _MODAL_CASES = [
     ("EditSeqDialog.insert",       lambda: sc.EditSeqDialog("insert",   "",  5, 5)),
     ("EditSeqDialog.replace",      lambda: sc.EditSeqDialog("replace", "ATCG", 5, 9)),
     ("UnsavedQuitModal",           lambda: sc.UnsavedQuitModal()),
+    ("UnsavedNavigateModal",       lambda: sc.UnsavedNavigateModal(
+                                               "go back to collections")),
     ("RenamePlasmidModal",         lambda: sc.RenamePlasmidModal("my_plasmid", "abc123")),
     ("LibraryDeleteConfirmModal",  lambda: sc.LibraryDeleteConfirmModal(
                                                "test", 3000, "abc123")),
@@ -162,6 +164,11 @@ _MODAL_CASES = [
                                                name="demo",
                                                sequence="ATGCATGC",
                                                default_path="/tmp/demo.fa")),
+    ("CollectionsModal",           lambda: sc.CollectionsModal()),
+    ("CollectionNameModal",        lambda: sc.CollectionNameModal(
+                                               "New collection", "")),
+    ("CollectionDeleteConfirmModal", lambda: sc.CollectionDeleteConfirmModal(
+                                                  "MyCollection", 5)),
 ]
 
 
