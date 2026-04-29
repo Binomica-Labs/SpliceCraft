@@ -169,6 +169,8 @@ _MODAL_CASES = [
                                                "New collection", "")),
     ("CollectionDeleteConfirmModal", lambda: sc.CollectionDeleteConfirmModal(
                                                   "MyCollection", 5)),
+    ("ScaryDeleteConfirmModal",      lambda: sc.ScaryDeleteConfirmModal(
+                                                  "MyCollection", 12)),
 ]
 
 

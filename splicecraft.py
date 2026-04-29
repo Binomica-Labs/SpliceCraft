@@ -1687,16 +1687,23 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
             is_cur = (cursor_pos == i)
 
             if is_cur:
-                fwd_sty = "reverse bold white"
+                # All overlays use the same high-contrast palette
+                # (white background, black foreground) so the user's
+                # selection / cursor never blends into a feature tint.
+                # Cursor is bold to distinguish it from a passive selection.
+                fwd_sty = "black on white bold"
                 rev_sty = fwd_sty
             elif in_re:
+                # RE highlight stays color-tinted — the colour carries
+                # enzyme identity, which is information we'd lose by
+                # collapsing every overlay to white-on-black.
                 fwd_sty = f"reverse bold {reh_color}"
-                rev_sty = f"reverse bold {reh_color}"
+                rev_sty = fwd_sty
             elif in_usr:
-                fwd_sty = base + " on color(237)"
+                fwd_sty = "black on white"
                 rev_sty = fwd_sty
             elif in_sel:
-                fwd_sty = "bold underline " + base
+                fwd_sty = "black on white bold underline"
                 rev_sty = fwd_sty
             else:
                 fwd_sty = base
@@ -3288,6 +3295,11 @@ class LibraryPanel(Widget):
         self._view_mode: str = (
             "plasmids" if _get_active_collection_name() else "collections"
         )
+        # Two-click activation guard for collection rows — armed by the
+        # first RowSelected, disarmed by a 1.5 s timer or by switching
+        # rows. See `_coll_row_selected`.
+        self._coll_armed_name: "str | None" = None
+        self._coll_arm_timer = None
         coll = self.query_one("#lib-coll-table", DataTable)
         coll.add_columns("Name", "Plasmids")
         plas = self.query_one("#lib-table", DataTable)
@@ -3487,23 +3499,103 @@ class LibraryPanel(Widget):
 
     @on(Button.Pressed, "#btn-lib-del")
     def _btn_del(self):
+        self.request_delete_under_cursor()
+
+    def request_delete_under_cursor(self) -> None:
+        """Single entry point for both the `−` button and the keyboard
+        Delete key — dispatches to the right confirm flow based on
+        view mode. Plasmid view → one confirm; collections view → two
+        confirms (the second one is the loud red warning) so a single
+        keypress can never wipe out a whole library.
+        """
+        if self._view_mode == "plasmids":
+            self._request_plasmid_delete()
+        else:
+            self._request_collection_delete()
+
+    def _request_plasmid_delete(self) -> None:
         entry_id = _cursor_row_key(self.query_one("#lib-table", DataTable))
         if entry_id is None:
             return
-        entries = [e for e in _load_library() if e.get("id") != entry_id]
-        _save_library(entries)
-        self._repopulate_plasmids()
+        entry = next(
+            (e for e in _load_library() if e.get("id") == entry_id),
+            None,
+        )
+        if entry is None:
+            return
+        name = entry.get("name") or entry_id
+        size = entry.get("size", 0) or 0
+
+        def _on_confirm(yes: "bool | None") -> None:
+            if not yes:
+                return
+            entries = [e for e in _load_library() if e.get("id") != entry_id]
+            _save_library(entries)
+            self._repopulate_plasmids()
+            # If we just deleted the loaded record's library entry, drop
+            # the panel's active-row binding so the dirty asterisk doesn't
+            # point at a row that no longer exists.
+            app = self.app
+            cur = getattr(app, "_current_record", None)
+            if cur is not None and cur.id == entry_id:
+                self.set_active(None)
+
+        self.app.push_screen(
+            LibraryDeleteConfirmModal(name, size, entry_id),
+            callback=_on_confirm,
+        )
 
     # ── Collections view: enter / + / − / ✎ ────────────────────────────────
 
     @on(DataTable.RowSelected, "#lib-coll-table")
     def _coll_row_selected(self, event: DataTable.RowSelected):
+        """Loading a collection swaps the entire library + active pointer,
+        so we require an explicit double-activation: the first
+        RowSelected on a row arms a confirmation hint, and only a second
+        activation on the same row inside the timeout actually loads.
+        Mirrors the "click twice to commit" pattern users get on the
+        plasmid table (where the first click moves the cursor and the
+        second activates).
+        """
         if self._view_mode != "collections":
             return
         rk = event.row_key
         name = rk.value if rk else None
         if not name:
             return
+
+        # Cancel any prior arm-timer; only the most recent click matters.
+        prior_timer = getattr(self, "_coll_arm_timer", None)
+        if prior_timer is not None:
+            try:
+                prior_timer.stop()
+            except Exception:
+                pass
+            self._coll_arm_timer = None
+
+        if getattr(self, "_coll_armed_name", None) != name:
+            # First activation on this row — arm a 1.5 s window during
+            # which a second activation will actually load.
+            self._coll_armed_name = name
+            self.app.notify(
+                f"Click '{name}' again to load it.",
+                timeout=2,
+            )
+
+            def _disarm() -> None:
+                self._coll_armed_name = None
+                self._coll_arm_timer = None
+
+            try:
+                self._coll_arm_timer = self.set_timer(1.5, _disarm)
+            except Exception:
+                # Timer setup can fail during teardown; fall back to a
+                # single-shot arm with no auto-disarm.
+                self._coll_arm_timer = None
+            return
+
+        # Second activation within the window — load it.
+        self._coll_armed_name = None
         coll = _find_collection(name)
         if coll is None:
             return
@@ -3545,25 +3637,45 @@ class LibraryPanel(Widget):
 
     @on(Button.Pressed, "#btn-coll-del")
     def _btn_coll_del(self):
+        self._request_collection_delete()
+
+    def _request_collection_delete(self) -> None:
+        """Two-stage confirm. First modal asks "delete this collection?"
+        with default-No focus; only on Yes does the second loud-red
+        modal fire ("ARE YOU ABSOLUTELY SURE?", also default-No).
+        Either No (or Esc) keeps the collection. Bound to both the
+        `−` button and the keyboard Delete key when the panel is in
+        collections view.
+        """
         name = _cursor_row_key(self.query_one("#lib-coll-table", DataTable))
         if not name:
             return
         coll = _find_collection(name)
         n_plas = len((coll or {}).get("plasmids", []) or [])
 
-        def _on_confirm(yes: bool) -> None:
+        def _on_first(yes: "bool | None") -> None:
             if not yes:
                 return
-            remaining = [c for c in _load_collections()
-                         if c.get("name") != name]
-            _save_collections(remaining)
-            if _get_active_collection_name() == name:
-                _set_active_collection_name(None)
-            self._repopulate_collections()
+
+            def _on_second(yes2: "bool | None") -> None:
+                if not yes2:
+                    return
+                remaining = [c for c in _load_collections()
+                             if c.get("name") != name]
+                _save_collections(remaining)
+                if _get_active_collection_name() == name:
+                    _set_active_collection_name(None)
+                self._repopulate_collections()
+                self.app.notify(f"Deleted collection '{name}'.")
+
+            self.app.push_screen(
+                ScaryDeleteConfirmModal(name, n_plas),
+                callback=_on_second,
+            )
 
         self.app.push_screen(
             CollectionDeleteConfirmModal(name, n_plas),
-            callback=_on_confirm,
+            callback=_on_first,
         )
 
     @on(Button.Pressed, "#btn-coll-rename")
@@ -3633,10 +3745,17 @@ class SequencePanel(Widget):
             super().__init__()
 
     class SequenceClick(Message):
-        """User clicked on a base; app should select feature there."""
-        def __init__(self, bp: int, double: bool = False):
-            self.bp     = bp
-            self.double = double
+        """User clicked on a base or a feature lane; app routes the
+        outcome based on `from_lane`. Lane clicks → highlight the
+        whole feature. DNA-row clicks → just place the cursor on `bp`,
+        no feature-wide highlight even if `bp` happens to fall inside
+        a feature's range.
+        """
+        def __init__(self, bp: int, double: bool = False,
+                     from_lane: bool = False):
+            self.bp        = bp
+            self.double    = double
+            self.from_lane = from_lane
             super().__init__()
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -3837,6 +3956,11 @@ class SequencePanel(Widget):
             return
         self._last_was_drag = False
         self._last_resite_click = None
+        # `_last_lane_click` is set as a side-effect of `_click_to_bp` when
+        # the click lands on a feature lane (the bar/arrow art) rather
+        # than the DNA strand. Sequence-row clicks intentionally do NOT
+        # trigger a whole-feature highlight — only the lane art does.
+        self._last_lane_click = False
         bp = self._click_to_bp(event.screen_x, event.screen_y)
         if bp < 0:
             return
@@ -3870,7 +3994,9 @@ class SequencePanel(Widget):
         # Regular click: clear any RE highlight
         self._re_highlight = None
         double = event.chain >= 2
-        self.post_message(self.SequenceClick(bp, double=double))
+        self.post_message(self.SequenceClick(
+            bp, double=double, from_lane=self._last_lane_click,
+        ))
 
     def _seq_render_width(self) -> int:
         """Character width of the render area, minus the 2-col vertical scrollbar."""
@@ -3903,13 +4029,18 @@ class SequencePanel(Widget):
         seq_col = vp_x - (num_w + 2)   # offset past the num+2-space prefix
 
         def _check_lane(lane):
-            """Check if click hit a feature in this lane; return bp or None."""
+            """Check if click hit a feature in this lane; return bp or None.
+            Sets `_last_lane_click=True` so on_click can route a lane hit
+            to a whole-feature highlight while a DNA-row hit just places
+            the cursor."""
             for f in lane:
                 bar_s = max(f["start"], chunk_start) - chunk_start
                 bar_e = min(f["end"],   chunk_end)   - chunk_start
                 if bar_s <= seq_col < bar_e:
                     if f.get("type") == "resite":
                         self._last_resite_click = f
+                    else:
+                        self._last_lane_click = True
                     return (f["start"] + f["end"]) // 2
             return -1
 
@@ -13655,11 +13786,10 @@ class CollectionDeleteConfirmModal(ModalScreen):
         with Vertical(id="colldel-dlg"):
             yield Static(" Delete collection ", id="colldel-title")
             yield Static(
-                f"  Delete collection [bold]{self.coll_name}[/bold] "
-                f"({self.n_plas} plasmid{plural})?\n\n"
-                f"  [dim]The plasmids stay in your library file; only the\n"
-                f"  collection grouping is removed. A backup (.bak) of\n"
-                f"  collections.json is kept.[/dim]",
+                f"  Delete collection [bold]{self.coll_name}[/bold]?\n"
+                f"  ({self.n_plas} plasmid{plural})\n\n"
+                f"  [dim]A backup is written to\n"
+                f"  collections.json.bak before the change.[/dim]",
                 id="colldel-msg", markup=True,
             )
             with Horizontal(id="colldel-btns"):
@@ -13674,6 +13804,64 @@ class CollectionDeleteConfirmModal(ModalScreen):
         self.dismiss(False)
 
     @on(Button.Pressed, "#btn-colldel-yes")
+    def _yes(self, _) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class ScaryDeleteConfirmModal(ModalScreen):
+    """Second-stage confirmation for collection delete — deliberately
+    visually loud (red border + warning banner + emphatic copy) to make
+    the user pause. Default focus on [No] like every confirm modal in
+    the app. Dismisses True (delete) or False (keep)."""
+
+    BINDINGS = [
+        Binding("escape", "cancel",     "Cancel"),
+        Binding("tab",    "focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, name: str, n_plasmids: int) -> None:
+        super().__init__()
+        self.coll_name = name
+        self.n_plas = n_plasmids
+
+    def compose(self) -> ComposeResult:
+        plural = "" if self.n_plas == 1 else "s"
+        with Vertical(id="scarydel-dlg"):
+            yield Static(
+                "  ⚠   ARE YOU ABSOLUTELY SURE?   ⚠  ",
+                id="scarydel-title", markup=False,
+            )
+            yield Static(
+                f"\n  This will [bold red]permanently delete[/bold red] the "
+                f"collection\n"
+                f"  [bold]{self.coll_name}[/bold] and its "
+                f"[bold red]{self.n_plas} plasmid{plural}[/bold red].\n\n"
+                f"  [yellow]The plasmids inside will also be removed from\n"
+                f"  the library mirror.[/yellow]\n\n"
+                f"  A backup of [italic]collections.json[/italic] is written "
+                f"to\n"
+                f"  [italic]collections.json.bak[/italic] in your data "
+                f"directory —\n"
+                f"  recover from it manually if you change your mind.\n",
+                id="scarydel-msg", markup=True,
+            )
+            with Horizontal(id="scarydel-btns"):
+                yield Button("No, keep it", id="btn-scarydel-no",
+                             variant="default")
+                yield Button("Yes, delete forever", id="btn-scarydel-yes",
+                             variant="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#btn-scarydel-no", Button).focus()
+
+    @on(Button.Pressed, "#btn-scarydel-no")
+    def _no(self, _) -> None:
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-scarydel-yes")
     def _yes(self, _) -> None:
         self.dismiss(True)
 
@@ -13982,13 +14170,33 @@ CollectionNameModal { align: center middle; }
 
 CollectionDeleteConfirmModal { align: center middle; }
 #colldel-dlg {
-    width: 60; height: 14;
+    width: 60; height: 16;
     background: $surface; border: solid $primary; padding: 1 2;
 }
 #colldel-title { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #colldel-msg   { height: 1fr; }
 #colldel-btns  { height: 3; margin-top: 1; }
 #colldel-btns Button { margin-right: 1; min-width: 12; }
+
+/* ── Scary second-confirm: deliberately loud, can't miss it ──── */
+ScaryDeleteConfirmModal { align: center middle; }
+#scarydel-dlg {
+    width: 70; height: 20;
+    background: $surface;
+    border: thick $error;
+    padding: 1 2;
+}
+#scarydel-title {
+    background: $error;
+    color: $text;
+    text-style: bold;
+    text-align: center;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+#scarydel-msg  { height: 1fr; }
+#scarydel-btns { height: 3; margin-top: 1; }
+#scarydel-btns Button { margin-right: 1; min-width: 18; }
 
 /* ── Feature picker modal ────────────────────────────────── */
 PlasmidFeaturePickerModal { align: center middle; }
@@ -14728,13 +14936,14 @@ SpeciesPickerModal { align: center middle; }
         return False
 
     def action_delete_feature(self):
-        # Focus-aware routing: when the keyboard focus is inside the library,
-        # Delete targets the highlighted library row (with a confirmation
-        # dialog defaulting to No), NOT the currently-selected feature. This
-        # prevents a handslip after tabbing into the library from silently
-        # deleting a feature the user forgot they had selected.
+        # Focus-aware routing: when the keyboard focus is inside the
+        # library, Delete targets whatever's under the cursor in the
+        # current view — a plasmid (one-stage confirm) or a collection
+        # (two-stage confirm with a loud red second modal). The same
+        # entry point is used by the panel's `−` button so button and
+        # keyboard behave identically.
         if self._focus_is_in_library():
-            self._request_library_delete()
+            self.query_one("#library", LibraryPanel).request_delete_under_cursor()
             return
         pm = self.query_one("#plasmid-map", PlasmidMap)
         if pm.selected_idx < 0 or not pm._feats:
@@ -14747,50 +14956,6 @@ SpeciesPickerModal { align: center middle; }
         sp = self.query_one("#seq-panel", SequencePanel)
         self._apply_snapshot(str(new_record.seq), sp._cursor_pos, new_record)
         self.notify(f"Deleted '{label}'  (Ctrl+Z to undo)")
-
-    def _request_library_delete(self) -> None:
-        """Called from action_delete_feature when the library has focus.
-        Pops LibraryDeleteConfirmModal on the currently-highlighted row;
-        on confirmation, removes the entry from plasmid_library.json."""
-        lib = self.query_one("#library", LibraryPanel)
-        t = lib.query_one("#lib-table", DataTable)
-        if t.row_count == 0:
-            self.notify("Library is empty.", severity="warning")
-            return
-        if not (0 <= t.cursor_row < t.row_count):
-            self.notify("No library row highlighted.", severity="warning")
-            return
-        row_keys = list(t.rows.keys())
-        if t.cursor_row >= len(row_keys):
-            return
-        entry_id = row_keys[t.cursor_row].value
-
-        # Look up name and size for a user-friendly dialog message
-        name, size = "?", 0
-        for e in _load_library():
-            if e.get("id") == entry_id:
-                name = e.get("name") or e.get("id") or "?"
-                size = e.get("size", 0)
-                break
-
-        def _on_confirm(result: "bool | None") -> None:
-            if result is not True:
-                return
-            entries = [e for e in _load_library() if e.get("id") != entry_id]
-            _save_library(entries)
-            lib._repopulate()
-            # If we just deleted the currently-loaded record's entry, mark
-            # the header so the user knows they no longer have an active
-            # library binding for it.
-            if (self._current_record is not None
-                    and self._current_record.id == entry_id):
-                lib.set_active(None)
-            self.notify(f"Removed '{name}' from library.")
-
-        self.push_screen(
-            LibraryDeleteConfirmModal(name, size, entry_id),
-            callback=_on_confirm,
-        )
 
     def action_add_to_library(self):
         if self._current_record is None:
@@ -15512,11 +15677,32 @@ SpeciesPickerModal { align: center middle; }
 
     @on(SequencePanel.SequenceClick)
     def _seq_click(self, event: SequencePanel.SequenceClick) -> None:
-        """Single or double click on the sequence — select the smallest feature at bp."""
+        """Click on the sequence panel.
+
+        - **Lane art click** (`from_lane=True`): the user clicked a feature
+          bar / arrow / label, so we highlight the whole feature's DNA
+          and surface it in the sidebar / map.
+        - **DNA-row click** (`from_lane=False`): the user clicked a base —
+          just move the cursor there and clear any whole-feature
+          highlight. The base may live inside a feature, but the user
+          asked for a single-base operation, not a feature pick.
+        """
         pm      = self.query_one("#plasmid-map", PlasmidMap)
         sidebar = self.query_one("#sidebar",     FeatureSidebar)
         seq_pnl = self.query_one("#seq-panel",   SequencePanel)
         bp      = event.bp
+
+        if not event.from_lane:
+            # Plain DNA-row click. The cursor is already at `bp` (set
+            # during mouse_down before this click event fired); we just
+            # clear any lingering whole-feature highlight from a prior
+            # lane click, leave map/sidebar selection alone, and let the
+            # caller's mouse-down refresh stand.
+            if seq_pnl._sel_range is not None:
+                seq_pnl._sel_range = None
+                seq_pnl._refresh_view()
+            return
+
         # Route through PlasmidMap._bp_in + _feat_len so wrap features
         # (end < start) are honoured. A naive `s <= bp < e` misses every
         # origin-spanning feature; `e - s` is also negative for them.

@@ -364,31 +364,71 @@ class TestLibraryPanelModes:
             assert lib.query_one("#lib-table").display is False
             app.exit()
 
-    async def test_clicking_collection_switches_to_plasmids_view(self):
-        # Two collections; user is in collections view; clicking row picks one.
+    async def test_clicking_collection_requires_double_activation(self):
+        """Loading a collection swaps the entire library, so a stray
+        RowSelected must NOT fire the load. The first activation arms
+        the collection and a second activation on the same row commits.
+        """
         sc._save_collections([
             {"name": "A", "plasmids": [
                 {"id": "p1", "name": "p1", "size": 1, "gb_text": "GB"}]},
             {"name": "B", "plasmids": []},
         ])
-        sc._set_active_collection_name(None)  # force start in collections view
+        sc._set_active_collection_name(None)
         app = sc.PlasmidApp()
         async with app.run_test(size=(160, 48)) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
             lib = app.query_one("#library", sc.LibraryPanel)
-            # Migration ran; active was set automatically. Force back.
             lib._view_mode = "collections"
             lib._apply_view_mode()
             lib._repopulate_collections()
             t = lib.query_one("#lib-coll-table")
             t.move_cursor(row=0)  # "A"
-            from textual.widgets._data_table import RowKey
-            t.action_select_cursor()  # fires RowSelected
+            t.action_select_cursor()  # arm
+            await pilot.pause(0.1)
+            # Still in collections view — first click only armed.
+            assert lib._view_mode == "collections"
+            assert lib._coll_armed_name == "A"
+            # Second activation on the same row commits.
+            t.action_select_cursor()
             await pilot.pause(0.2)
             assert lib._view_mode == "plasmids"
             assert sc._get_active_collection_name() == "A"
             assert [e["id"] for e in sc._load_library()] == ["p1"]
+            app.exit()
+
+    async def test_switching_row_disarms_previous_collection(self):
+        """Arming row A then activating row B should NOT load either —
+        the arm transfers to B and one more activation on B is needed."""
+        sc._save_collections([
+            {"name": "A", "plasmids": [
+                {"id": "pA", "name": "pA", "size": 1, "gb_text": "GB"}]},
+            {"name": "B", "plasmids": [
+                {"id": "pB", "name": "pB", "size": 1, "gb_text": "GB"}]},
+        ])
+        sc._set_active_collection_name(None)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib._view_mode = "collections"
+            lib._apply_view_mode()
+            lib._repopulate_collections()
+            t = lib.query_one("#lib-coll-table")
+            t.move_cursor(row=0)
+            t.action_select_cursor()  # arm A
+            await pilot.pause(0.1)
+            t.move_cursor(row=1)
+            t.action_select_cursor()  # arm B (disarms A)
+            await pilot.pause(0.1)
+            # Still in collections view; B is now armed.
+            assert lib._view_mode == "collections"
+            assert lib._coll_armed_name == "B"
+            t.action_select_cursor()  # commit B
+            await pilot.pause(0.2)
+            assert sc._get_active_collection_name() == "B"
             app.exit()
 
 
@@ -486,12 +526,61 @@ class TestPanelCollectionCRUD:
             t.move_cursor(row=1)  # "Drop"
             lib.query_one("#btn-coll-del").action_press()
             await pilot.pause(0.2)
-            modal = app.screen
-            assert isinstance(modal, sc.CollectionDeleteConfirmModal)
-            modal.query_one("#btn-colldel-yes").action_press()
+            # Stage 1: friendly confirm
+            assert isinstance(app.screen, sc.CollectionDeleteConfirmModal)
+            app.screen.query_one("#btn-colldel-yes").action_press()
+            await pilot.pause(0.2)
+            # Stage 2: scary red second confirm
+            assert isinstance(app.screen, sc.ScaryDeleteConfirmModal)
+            app.screen.query_one("#btn-scarydel-yes").action_press()
             await pilot.pause(0.2)
             names = [c["name"] for c in sc._load_collections()]
             assert names == ["Keep"]
+            app.exit()
+
+    async def test_collection_delete_first_no_keeps_collection(self):
+        """Cancel at the friendly stage — collection stays."""
+        sc._save_collections([{"name": "Stay", "plasmids": []}])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib._view_mode = "collections"
+            lib._apply_view_mode()
+            lib._repopulate_collections()
+            t = lib.query_one("#lib-coll-table")
+            t.move_cursor(row=0)
+            lib.query_one("#btn-coll-del").action_press()
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, sc.CollectionDeleteConfirmModal)
+            app.screen.query_one("#btn-colldel-no").action_press()
+            await pilot.pause(0.2)
+            assert [c["name"] for c in sc._load_collections()] == ["Stay"]
+            app.exit()
+
+    async def test_collection_delete_second_no_keeps_collection(self):
+        """Yes through the friendly stage but No on the scary stage —
+        the collection still survives. Belt + suspenders confirm pattern."""
+        sc._save_collections([{"name": "Saved", "plasmids": []}])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib._view_mode = "collections"
+            lib._apply_view_mode()
+            lib._repopulate_collections()
+            t = lib.query_one("#lib-coll-table")
+            t.move_cursor(row=0)
+            lib.query_one("#btn-coll-del").action_press()
+            await pilot.pause(0.2)
+            app.screen.query_one("#btn-colldel-yes").action_press()
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, sc.ScaryDeleteConfirmModal)
+            app.screen.query_one("#btn-scarydel-no").action_press()
+            await pilot.pause(0.2)
+            assert [c["name"] for c in sc._load_collections()] == ["Saved"]
             app.exit()
 
     async def test_delete_active_collection_clears_active(self):
@@ -509,8 +598,9 @@ class TestPanelCollectionCRUD:
             t.move_cursor(row=0)
             lib.query_one("#btn-coll-del").action_press()
             await pilot.pause(0.2)
-            modal = app.screen
-            modal.query_one("#btn-colldel-yes").action_press()
+            app.screen.query_one("#btn-colldel-yes").action_press()
+            await pilot.pause(0.2)
+            app.screen.query_one("#btn-scarydel-yes").action_press()
             await pilot.pause(0.2)
             assert sc._load_collections() == []
             assert sc._get_active_collection_name() is None
@@ -654,6 +744,128 @@ class TestBackButtonUnsavedPrompt:
             # Saved → marked clean → switched to collections view.
             assert app._unsaved is False
             assert lib._view_mode == "collections"
+            app.exit()
+
+
+class TestPlasmidDeleteConfirmFlow:
+    """The plasmid `−` button and the Delete key both go through
+    LibraryDeleteConfirmModal (default focus on No) so a stray click
+    or keypress can't silently nuke a saved plasmid."""
+
+    @pytest.fixture(autouse=True)
+    def _no_seed(self, monkeypatch):
+        monkeypatch.setattr(sc.PlasmidApp, "_seed_default_library",
+                            lambda self: None)
+
+    async def test_button_pushes_confirm_modal(self, tiny_record):
+        sc._save_collections([{"name": "C", "plasmids": []}])
+        sc._set_active_collection_name("C")
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.2)  # let preload save
+            lib = app.query_one("#library", sc.LibraryPanel)
+            t = lib.query_one("#lib-table")
+            t.move_cursor(row=0)
+            lib.query_one("#btn-lib-del").action_press()
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, sc.LibraryDeleteConfirmModal)
+            # Default focus is on No; cancel dismisses without deleting.
+            app.screen.query_one("#btn-libdel-no").action_press()
+            await pilot.pause(0.2)
+            assert any(e.get("id") == tiny_record.id
+                       for e in sc._load_library())
+            app.exit()
+
+    async def test_button_yes_deletes(self, tiny_record):
+        sc._save_collections([{"name": "C", "plasmids": []}])
+        sc._set_active_collection_name("C")
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.2)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib.query_one("#lib-table").move_cursor(row=0)
+            lib.query_one("#btn-lib-del").action_press()
+            await pilot.pause(0.2)
+            app.screen.query_one("#btn-libdel-yes").action_press()
+            await pilot.pause(0.2)
+            assert all(e.get("id") != tiny_record.id
+                       for e in sc._load_library())
+            app.exit()
+
+    async def test_delete_key_routes_through_same_confirm(self, tiny_record):
+        sc._save_collections([{"name": "C", "plasmids": []}])
+        sc._set_active_collection_name("C")
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.2)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib.query_one("#lib-table").focus()
+            lib.query_one("#lib-table").move_cursor(row=0)
+            await pilot.pause(0.05)
+            app.action_delete_feature()
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, sc.LibraryDeleteConfirmModal)
+            app.exit()
+
+
+class TestCollectionDeleteKeyFlow:
+    """The Delete key in collections view triggers the same two-stage
+    confirm as the `−` button — friendly modal then loud red modal."""
+
+    @pytest.fixture(autouse=True)
+    def _no_seed(self, monkeypatch):
+        monkeypatch.setattr(sc.PlasmidApp, "_seed_default_library",
+                            lambda self: None)
+
+    async def test_delete_key_in_collections_view_pushes_first_confirm(self):
+        sc._save_collections([{"name": "Doomed", "plasmids": []}])
+        sc._set_active_collection_name(None)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib._view_mode = "collections"
+            lib._apply_view_mode()
+            lib._repopulate_collections()
+            t = lib.query_one("#lib-coll-table")
+            t.focus()
+            t.move_cursor(row=0)
+            await pilot.pause(0.05)
+            app.action_delete_feature()
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, sc.CollectionDeleteConfirmModal)
+            app.exit()
+
+    async def test_delete_key_full_two_stage_flow(self):
+        sc._save_collections([{"name": "Doomed", "plasmids": []}])
+        sc._set_active_collection_name(None)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib._view_mode = "collections"
+            lib._apply_view_mode()
+            lib._repopulate_collections()
+            t = lib.query_one("#lib-coll-table")
+            t.focus()
+            t.move_cursor(row=0)
+            await pilot.pause(0.05)
+            app.action_delete_feature()
+            await pilot.pause(0.2)
+            app.screen.query_one("#btn-colldel-yes").action_press()
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, sc.ScaryDeleteConfirmModal)
+            app.screen.query_one("#btn-scarydel-yes").action_press()
+            await pilot.pause(0.2)
+            assert sc._load_collections() == []
             app.exit()
 
 

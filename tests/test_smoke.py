@@ -1179,9 +1179,13 @@ class TestClickConsistencyAcrossPanels:
             await pilot.pause(0.5)
             await expect_focused_target()
 
-            # 2. Sequence-panel lane click.
+            # 2. Sequence-panel lane click — `from_lane=True` mirrors a
+            # real click on the feature bar/arrow art (the only seq-panel
+            # click path that should fire a whole-feature highlight).
             await reset_state()
-            sp.post_message(sc.SequencePanel.SequenceClick(bp=target_bp))
+            sp.post_message(
+                sc.SequencePanel.SequenceClick(bp=target_bp, from_lane=True)
+            )
             await pilot.pause(0.5)
             await expect_focused_target()
 
@@ -1419,11 +1423,15 @@ class TestSeqClickWrapFeature:
     Pre-fix the handler used `s <= bp < e and (e - s) < best_span` which
     (a) failed every wrap feature (where `e < s`, so the comparison is
     always False) and (b) used a negative `e - s` span for any wrap that
-    *did* somehow leak through. Clicking inside a wrap feature on the
-    sequence panel silently selected nothing.
+    *did* somehow leak through. Clicking the lane art of a wrap feature
+    on the sequence panel silently selected nothing.
+
+    Updated 2026-04-28: `_seq_click` now distinguishes lane clicks
+    (`from_lane=True`) from DNA-row clicks. Only lane clicks pick a
+    feature; DNA-row clicks just place the cursor.
     """
 
-    async def test_click_inside_wrap_feature_selects_it(
+    async def test_lane_click_inside_wrap_feature_selects_it(
         self, isolated_library,
     ):
         from Bio.Seq import Seq
@@ -1438,8 +1446,6 @@ class TestSeqClickWrapFeature:
         ])
         rec.features.append(SeqFeature(wrap_loc, type="CDS",
                                        qualifiers={"label": ["wrapCDS"]}))
-        # And a normal linear feature far from the wrap so the test isn't
-        # ambiguous about which feature should match.
         rec.features.append(SeqFeature(
             FeatureLocation(40, 60, strand=1), type="CDS",
             qualifiers={"label": ["linearCDS"]}
@@ -1451,10 +1457,9 @@ class TestSeqClickWrapFeature:
             await pilot.pause()
             await pilot.pause(0.05)
 
-            pm      = app.query_one("#plasmid-map", sc.PlasmidMap)
-            sp      = app.query_one("#seq-panel",   sc.SequencePanel)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sp = app.query_one("#seq-panel",   sc.SequencePanel)
 
-            # Sanity: wrap feature exists in pm._feats.
             wrap_idx = next(
                 (i for i, f in enumerate(pm._feats)
                  if f.get("label") == "wrapCDS"),
@@ -1462,22 +1467,64 @@ class TestSeqClickWrapFeature:
             )
             assert wrap_idx is not None
 
-            # Click at bp=2 — inside the wrap's head [0, 5).
-            sp.post_message(sc.SequencePanel.SequenceClick(bp=2))
+            # Lane click at bp=2 — inside the wrap's head [0, 5).
+            sp.post_message(
+                sc.SequencePanel.SequenceClick(bp=2, from_lane=True)
+            )
             await pilot.pause()
             await pilot.pause(0.05)
             assert pm.selected_idx == wrap_idx, (
-                "Clicking bp=2 (inside wrap head) should select the "
-                f"wrap feature; got selected_idx={pm.selected_idx}"
+                "Lane-click at bp=2 (wrap head) should select the wrap "
+                f"feature; got selected_idx={pm.selected_idx}"
             )
 
-            # Click at bp=97 — inside the wrap's tail [95, 100).
-            sp.post_message(sc.SequencePanel.SequenceClick(bp=97))
+            # Lane click at bp=97 — inside the wrap's tail [95, 100).
+            sp.post_message(
+                sc.SequencePanel.SequenceClick(bp=97, from_lane=True)
+            )
             await pilot.pause()
             await pilot.pause(0.05)
             assert pm.selected_idx == wrap_idx, (
-                "Clicking bp=97 (inside wrap tail) should select the "
-                f"wrap feature; got selected_idx={pm.selected_idx}"
+                "Lane-click at bp=97 (wrap tail) should select the wrap "
+                f"feature; got selected_idx={pm.selected_idx}"
+            )
+
+    async def test_base_click_does_not_select_feature(
+        self, isolated_library,
+    ):
+        """A click on the DNA strand row (not the lane art) must NOT
+        trigger a whole-feature selection, even if `bp` is inside one
+        — the user asked for a single-base operation, not a feature
+        pick. Regression guard for the 2026-04-28 lane-click rule."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 100), id="base_click_test",
+                        annotations={"molecule_type": "DNA"})
+        rec.features.append(SeqFeature(
+            FeatureLocation(40, 60, strand=1), type="CDS",
+            qualifiers={"label": ["linearCDS"]}
+        ))
+
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sp = app.query_one("#seq-panel",   sc.SequencePanel)
+
+            assert pm.selected_idx == -1
+            # Base click at bp=50 (inside the CDS feature) must NOT
+            # select it — only lane art clicks do.
+            sp.post_message(
+                sc.SequencePanel.SequenceClick(bp=50, from_lane=False)
+            )
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert pm.selected_idx == -1, (
+                "Base-row click should not pick a feature; got "
+                f"selected_idx={pm.selected_idx}"
             )
 
     async def test_click_outside_wrap_does_not_falsely_select(
@@ -1517,8 +1564,10 @@ class TestSeqClickWrapFeature:
                 if f.get("label") == "linearCDS"
             )
 
-            # Click at bp=50 — inside the linear feature, far from wrap.
-            sp.post_message(sc.SequencePanel.SequenceClick(bp=50))
+            # Lane click at bp=50 — inside the linear feature, far from wrap.
+            sp.post_message(
+                sc.SequencePanel.SequenceClick(bp=50, from_lane=True)
+            )
             await pilot.pause()
             await pilot.pause(0.05)
             assert pm.selected_idx == linear_idx, (
