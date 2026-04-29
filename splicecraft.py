@@ -4141,18 +4141,27 @@ class SequencePanel(Widget):
         through the proper code path and `force=True` skips clamping.
         Symptom of the broken assignment: scroll moves to centre, then
         reverts on the next event — visible as a "snap back" jitter.
+
+        If the viewport hasn't been laid out yet on the first refresh
+        (`vp_h == 0`), retry once on the next refresh. Without the retry
+        the centring silently no-ops under suite load — release.py's
+        serial test path was hitting this ~30 % of the time.
         """
         if not self._seq or bp < 0:
             return
         row = self._bp_to_content_row(bp)
 
-        def _do_scroll():
+        def _do_scroll(remaining_retries: int = 1) -> None:
             try:
                 scroll = self.query_one("#seq-scroll", ScrollableContainer)
             except NoMatches:
                 return
             vp_h = scroll.size.height
             if vp_h <= 0:
+                if remaining_retries > 0:
+                    self.call_after_refresh(
+                        lambda: _do_scroll(remaining_retries - 1)
+                    )
                 return
             target_top = max(0, row - vp_h // 2)
             scroll.scroll_to(0, target_top, animate=False, force=True)

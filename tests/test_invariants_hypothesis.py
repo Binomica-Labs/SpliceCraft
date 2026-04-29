@@ -148,16 +148,21 @@ class TestBpInProperties:
 # ── Property: circular midpoint (sacred invariant #5) ─────────────────────────
 
 class TestWrapMidpointProperties:
-    @given(start=st.integers(min_value=0, max_value=9999),
-           end=st.integers(min_value=0, max_value=9999),
-           total=small_total)
+    @given(data=st.data(), total=small_total)
     @settings(max_examples=300, deadline=None)
-    def test_midpoint_lies_on_arc(self, start, end, total):
+    def test_midpoint_lies_on_arc(self, data, total):
         """Sacred invariant #5: label-placement midpoint must lie on the
         feature's arc. For wrap features, the naive `(start+end)//2` sits
         on the wrong side of the plasmid; the modular formula must not.
-        Covers both wrap and non-wrap cases."""
-        assume(start < total and end < total)
+        Covers both wrap and non-wrap cases.
+
+        Drawing start/end from `[0, total)` directly (rather than the
+        old `assume(start < total and end < total)`) avoids hypothesis'
+        `filter_too_much` health-check failures when `total` is small
+        and ~99 % of fixed-range inputs would be rejected.
+        """
+        start = data.draw(st.integers(min_value=0, max_value=total - 1))
+        end   = data.draw(st.integers(min_value=0, max_value=total - 1))
         assume(start != end)  # zero-width has no midpoint semantics
         arc_len = (end - start) % total
         mid = (start + arc_len // 2) % total
@@ -167,15 +172,14 @@ class TestWrapMidpointProperties:
             f"total={total} (arc_len={arc_len})"
         )
 
-    @given(start=st.integers(min_value=0, max_value=9999),
-           end=st.integers(min_value=0, max_value=9999),
-           total=small_total)
+    @given(data=st.data(), total=small_total)
     @settings(max_examples=200, deadline=None)
-    def test_midpoint_is_within_feat_len(self, start, end, total):
+    def test_midpoint_is_within_feat_len(self, data, total):
         """The distance from start to midpoint (along the arc, modular)
         must be less than `_feat_len`. Catches off-by-one mistakes that
         place the midpoint just outside the arc."""
-        assume(start < total and end < total)
+        start = data.draw(st.integers(min_value=0, max_value=total - 1))
+        end   = data.draw(st.integers(min_value=0, max_value=total - 1))
         assume(start != end)
         arc_len = (end - start) % total
         mid = (start + arc_len // 2) % total
