@@ -13566,11 +13566,29 @@ class SplashScreen(ModalScreen):
         "       |_|"
     )
 
-    # Pre-baked rainbow palette — 24 hues spanning HSV(0..1) at S=0.85,
-    # V=1.0. Hand-rolling 24 hex strings keeps Rich's style cache small
-    # (otherwise every braille pixel could spawn a unique style and the
-    # final Text object balloons).
+    # Pre-baked rainbow palette — 24 hues spanning HSV(0..1).
+    # `_RAINBOW` is full saturation/value (V=1.0) for the FRONT strand;
+    # `_RAINBOW_DIM` is the same hues at V=0.40 for the BACK strand. The
+    # two-palette setup gives the visual depth cue that distinguishes
+    # major and minor grooves at a glance — the back strand reads as
+    # "behind" because it's literally darker. Hand-rolling 24+24 hex
+    # strings keeps Rich's style cache small.
     _RAINBOW: "tuple[str, ...]" = ()
+    _RAINBOW_DIM: "tuple[str, ...]" = ()
+
+    # ── Animation knobs ───────────────────────────────────────────────
+    # Toggle to revert to the static splash (the version locked in at
+    # v0.4.3 — guaranteed-cheap, no per-frame redraw). Set to False to
+    # disable the rotation tick entirely; everything else still works,
+    # `_phase_offset` just stays at 0.
+    _HELIX_ANIMATE: bool = True
+    # Decouple "how fast the helix rotates" from "how smoothly it
+    # animates". `_HELIX_TURNS_PER_SECOND` is the rotation speed; tuning
+    # `_HELIX_TICK_S` only changes the frame cadence (more ticks = same
+    # rotation but smoother). Per-tick phase delta is derived as
+    # `2π · turns_per_sec · tick_s`.
+    _HELIX_TURNS_PER_SECOND: float = 0.55  # one full revolution / ~1.8 s
+    _HELIX_TICK_S:           float = 0.04  # 25 FPS frame cadence
 
     def compose(self) -> ComposeResult:
         # Single full-screen Static; we paint the entire splash (DNA
@@ -13579,19 +13597,47 @@ class SplashScreen(ModalScreen):
 
     def on_mount(self) -> None:
         if not type(self)._RAINBOW:
-            type(self)._RAINBOW = self._build_rainbow()
+            bright, dim = self._build_rainbow()
+            type(self)._RAINBOW = bright
+            type(self)._RAINBOW_DIM = dim
+        # Per-instance rotation phase; _draw_helix adds this to every
+        # strand sample so the visual axis rotates over time.
+        self._phase_offset: float = 0.0
+        self._refresh()
+        if self._HELIX_ANIMATE:
+            self.set_interval(self._HELIX_TICK_S, self._tick_rotation)
+
+    def _tick_rotation(self) -> None:
+        # Advance the phase a hair on each tick. `% (2π)` keeps the
+        # accumulator bounded so it never grows large enough for
+        # float-precision wobble to be visible.
+        import math
+        delta = 2.0 * math.pi * self._HELIX_TURNS_PER_SECOND * self._HELIX_TICK_S
+        self._phase_offset = (self._phase_offset + delta) % (2.0 * math.pi)
         self._refresh()
 
     def on_resize(self, _event) -> None:
         self._refresh()
 
-    def _build_rainbow(self) -> "tuple[str, ...]":
+    def _build_rainbow(
+        self,
+    ) -> "tuple[tuple[str, ...], tuple[str, ...]]":
+        """Return (bright, dim) palettes — same hues, different V.
+        Bright is for the strand that's currently in front of the
+        helical axis (z >= 0); dim is for the back strand."""
         import colorsys
-        out: list[str] = []
+        bright: list[str] = []
+        dim:    list[str] = []
         for i in range(24):
             r, g, b = colorsys.hsv_to_rgb(i / 24, 0.85, 1.0)
-            out.append(f"#{int(r * 255):02X}{int(g * 255):02X}{int(b * 255):02X}")
-        return tuple(out)
+            bright.append(
+                f"#{int(r * 255):02X}{int(g * 255):02X}{int(b * 255):02X}"
+            )
+            rd, gd, bd = colorsys.hsv_to_rgb(i / 24, 0.85, 0.40)
+            dim.append(
+                f"#{int(rd * 255):02X}{int(gd * 255):02X}{int(bd * 255):02X}"
+            )
+        return tuple(bright), tuple(dim)
 
     def _refresh(self) -> None:
         try:
@@ -13655,10 +13701,12 @@ class SplashScreen(ModalScreen):
         pitch_diameter_ratio = 1.78
         period = max(60.0, 2.0 * amp * pitch_diameter_ratio)
 
-        # 150° offset between the two strands → ratiometric major/minor
-        # groove asymmetry. Try `+5π/6` for one handedness; flipping the
-        # sign gives left-handed Z-DNA. We want right-handed B-DNA.
-        DELTA_PHI = 5.0 * math.pi / 6.0
+        # 127° offset (= 0.706π) between strands. This gives the
+        # canonical B-DNA major:minor groove ratio of 22 Å : 12 Å along
+        # the axis: minor = Δφ / 2π = 0.353 of one pitch ≈ 12 Å of a
+        # 34 Å turn; major = (2π - Δφ) / 2π = 0.647 of pitch ≈ 22 Å.
+        # Flipping the sign of Δφ would give left-handed Z-DNA.
+        DELTA_PHI = 0.706 * math.pi
         # Crossings happen when the two strands' projected x match.
         # Solving sin(θ) = sin(θ + Δφ) gives crossings every π in θ
         # but offset; depth (cos) at the crossing tells us which is in
@@ -13667,22 +13715,42 @@ class SplashScreen(ModalScreen):
         gap_px = 6  # strand-to-strand pixel distance at which we treat as crossing
 
         rainbow = type(self)._RAINBOW
+        rainbow_dim = type(self)._RAINBOW_DIM
         n_hues = len(rainbow)
-        # Sample at 0.5-px resolution so disks overlap into a smooth
-        # ribbon. Also gives enough samples that the front-strand
-        # transition at each crossing reads cleanly.
-        n_samples = int(d_len * 2)
+        # 1 sample per pixel of axis length — with the 5-px disk that's
+        # a 4-px overlap between consecutive disks, plenty for an
+        # unbroken ribbon. Halved from `2*d_len` to claw back render
+        # budget for higher animation FPS.
+        n_samples = int(d_len)
 
         # 5-pixel disk (Manhattan radius 2) for the chunky stroke.
         disk = [(dx, dy) for dx in range(-2, 3) for dy in range(-2, 3)
                 if dx * dx + dy * dy <= 4]
 
+        # Hot-path bindings — the strand loop runs n_samples * 13 ≈ 5k
+        # iterations per frame, so cutting attribute lookups and method
+        # dispatch is worth the verbosity. We bypass `_BrailleCanvas.set_pixel`
+        # entirely and poke the underlying arrays.
+        bc_bits   = bc._bits
+        bc_colors = bc._colors
+        bc_prio   = bc._prio
+        DOT_BITS  = bc._DOT_BITS
+        n_cols    = bc.cols
+        n_rows    = bc.rows
+
         # Bottom-left start of the axis.
         sx, sy = 0.0, float(px_h - 1)
 
+        # Per-instance rotation; 0 when animation is disabled, advances
+        # in `_tick_rotation` otherwise. Adding it to `phase` rotates
+        # the helix around its own axis without changing pitch / amp /
+        # major-minor groove ratio (those are baked into `period` and
+        # `DELTA_PHI`, both unchanged).
+        phase_anim = getattr(self, "_phase_offset", 0.0)
+
         for i in range(n_samples + 1):
             t = i * d_len / n_samples
-            phase = 2.0 * math.pi * t / period
+            phase = 2.0 * math.pi * t / period + phase_anim
             cx_axis = sx + t * ux
             cy_axis = sy + t * uy
             # Strand A at phase, strand B at phase + 150°.
@@ -13692,32 +13760,59 @@ class SplashScreen(ModalScreen):
             bx = cx_axis + amp * sb * vx
             by = cy_axis + amp * sb * vy
             # Depth (out of screen) — used to pick which strand is in
-            # front near each crossing for the right-handed look.
-            za = amp * math.cos(phase)
-            zb = amp * math.cos(phase + DELTA_PHI)
-            color = rainbow[int(t * n_hues / d_len) % n_hues]
+            # front and to choose between the bright and dim palettes.
+            za = math.cos(phase)
+            zb = math.cos(phase + DELTA_PHI)
+            hue = int(t * n_hues / d_len) % n_hues
+            # Front strand: bright; back strand: dim. Two-palette depth
+            # cue makes the major/minor groove asymmetry obvious without
+            # needing the viewer to count crossings.
+            a_color = rainbow[hue] if za >= zb else rainbow_dim[hue]
+            b_color = rainbow[hue] if zb >  za else rainbow_dim[hue]
             near_crossing = math.hypot(ax - bx, ay - by) < gap_px
             # Right-handed B-DNA: at each crossing the strand with
             # GREATER z is in front. Suppress the other inside the
-            # crossing window so it visibly passes behind.
+            # crossing window so it visibly passes BEHIND, not through.
             skip_a = near_crossing and za < zb
             skip_b = near_crossing and zb < za
+            iax, iay = int(ax), int(ay)
+            ibx, iby = int(bx), int(by)
             if not skip_a:
+                # Inlined set_pixel — saves ~10 ms/frame at 160×48 by
+                # dropping the method-dispatch overhead on the hottest
+                # loop.
                 for dx, dy in disk:
-                    bc.set_pixel(int(ax) + dx, int(ay) + dy, color)
+                    px_p = iax + dx
+                    py_p = iay + dy
+                    col = px_p >> 1
+                    row = py_p >> 2
+                    if 0 <= col < n_cols and 0 <= row < n_rows:
+                        bc_bits[row][col] |= 1 << DOT_BITS[py_p & 3][px_p & 1]
+                        bc_colors[row][col] = a_color
+                        bc_prio[row][col] = 1
             if not skip_b:
                 for dx, dy in disk:
-                    bc.set_pixel(int(bx) + dx, int(by) + dy, color)
+                    px_p = ibx + dx
+                    py_p = iby + dy
+                    col = px_p >> 1
+                    row = py_p >> 2
+                    if 0 <= col < n_cols and 0 <= row < n_rows:
+                        bc_bits[row][col] |= 1 << DOT_BITS[py_p & 3][px_p & 1]
+                        bc_colors[row][col] = b_color
+                        bc_prio[row][col] = 1
 
         # Base-pair rungs — 10.5 bp per B-DNA turn (we use 10 for an
         # even number that visibly subdivides the period). Skip rungs
         # where the strands cross.
+        # Note: rungs use the same `phase_anim` offset as the strands so
+        # they rotate in lock-step. Without this, rungs would slide along
+        # a fixed grid while the strands rotate around them — visibly wrong.
         rungs_per_turn = 10
         rung_dt = period / rungs_per_turn
         n_rungs = int(d_len / rung_dt)
         for j in range(n_rungs + 1):
             t = j * rung_dt
-            phase = 2.0 * math.pi * t / period
+            phase = 2.0 * math.pi * t / period + phase_anim
             cx_axis = sx + t * ux
             cy_axis = sy + t * uy
             sa = math.sin(phase)
