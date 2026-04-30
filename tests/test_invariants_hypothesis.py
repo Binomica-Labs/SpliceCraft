@@ -109,15 +109,21 @@ class TestFeatLenProperties:
         start = data.draw(st.integers(min_value=end + 1, max_value=total - 1))
         assert sc._feat_len(start, end, total) == (total - start) + end
 
-    @given(start=st.integers(min_value=0, max_value=9999),
-           end=st.integers(min_value=0, max_value=9999),
-           total=small_total)
+    @given(total=small_total, data=st.data())
     @settings(max_examples=300, deadline=None)
-    def test_feat_len_nonneg_and_bounded(self, start, end, total):
+    def test_feat_len_nonneg_and_bounded(self, total, data):
         """Sacred invariant #8: `_feat_len` must be non-negative and
         never exceed the total plasmid length. Breakages here corrupt
-        sort orders and primer-design math."""
-        assume(start < total and end < total)
+        sort orders and primer-design math.
+
+        Draws `start` / `end` conditional on `total` instead of
+        filtering via `assume(start < total)` — when `total` is small
+        (4-10), independent draws from [0, 9999] hit the
+        `filter_too_much` health check in serial mode (~0.1 % pass
+        rate). Conditional draws keep the test intent and remove the
+        flake."""
+        start = data.draw(st.integers(min_value=0, max_value=total - 1))
+        end = data.draw(st.integers(min_value=0, max_value=total - 1))
         L = sc._feat_len(start, end, total)
         assert 0 <= L <= total
 
