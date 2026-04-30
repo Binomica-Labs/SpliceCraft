@@ -7,15 +7,6 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Status: Beta](https://img.shields.io/badge/status-beta-orange.svg)](https://github.com/Binomica-Labs/SpliceCraft)
 
-![SpliceCraft screenshot](https://raw.githubusercontent.com/Binomica-Labs/SpliceCraft/master/splicecraftScreenshot.png)
-
-> ⚠️ **Beta software.** SpliceCraft is under active development and the API,
-> UI, and on-disk file formats may change between releases. Your data files
-> (`plasmid_library.json`, `parts_bin.json`, `primers.json`) are auto-backed
-> up to `*.bak` on every save, but please keep your own off-disk copies of
-> anything critical. **Do not use SpliceCraft as your sole system of record
-> for cloning work until it exits beta.**
-
 A terminal-based circular plasmid map viewer, sequence editor, **primer design
 workbench**, and **Golden Braid parts domesticator** — rendered entirely in your
 shell. Fetch any GenBank record by accession, load local files, organize plasmids
@@ -23,7 +14,16 @@ into named **collections**, design diagnostic / cloning / Golden Braid primers
 with Primer3, run **SOE-PCR site-directed mutagenesis** on any CDS, and edit
 sequences — without ever leaving the terminal.
 
+![SpliceCraft screenshot](https://raw.githubusercontent.com/Binomica-Labs/SpliceCraft/master/splicecraftScreenshot.png)
+
 ## Quick start
+
+> ⚠️ **Beta software.** SpliceCraft is under active development and the API,
+> UI, and on-disk file formats may change between releases. Your data files
+> (`plasmid_library.json`, `parts_bin.json`, `primers.json`) are auto-backed
+> up to `*.bak` on every save, but please keep your own off-disk copies of
+> anything critical. **Do not use SpliceCraft as your sole system of record
+> for cloning work until it exits beta.**
 
 ```bash
 pipx install splicecraft
