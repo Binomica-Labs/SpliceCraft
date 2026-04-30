@@ -4151,7 +4151,7 @@ class SequencePanel(Widget):
             return
         row = self._bp_to_content_row(bp)
 
-        def _do_scroll(remaining_retries: int = 1) -> None:
+        def _do_scroll(remaining_retries: int = 3) -> None:
             try:
                 scroll = self.query_one("#seq-scroll", ScrollableContainer)
             except NoMatches:
@@ -4159,8 +4159,13 @@ class SequencePanel(Widget):
             vp_h = scroll.size.height
             if vp_h <= 0:
                 if remaining_retries > 0:
-                    self.call_after_refresh(
-                        lambda: _do_scroll(remaining_retries - 1)
+                    # Switch to set_timer for the deeper retries — under
+                    # suite load `call_after_refresh` can fire BEFORE the
+                    # next layout pass actually completes, so a tiny
+                    # wall-clock delay is more reliable than another
+                    # refresh-edge poll.
+                    self.set_timer(
+                        0.05, lambda: _do_scroll(remaining_retries - 1),
                     )
                 return
             target_top = max(0, row - vp_h // 2)
