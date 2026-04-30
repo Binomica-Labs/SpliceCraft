@@ -183,6 +183,7 @@ from textual.events import Click, MouseDown, MouseMove, MouseUp, MouseScrollDown
 from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
+from textual.theme import Theme
 from textual.widget import Widget
 from textual.widgets import (
     Button, DataTable, DirectoryTree, Footer, Header, Input, Label, ListItem,
@@ -957,12 +958,23 @@ def _scan_restriction_sites(
     scan_seq = (seq_u + seq_u[: max_site_len - 1]) if (circular and n > 0) else seq_u
 
     def _emit_resite(hits, p, site_len, strand, color, name,
-                     cut_col, ext_cut_bp):
+                     cut_col, ext_cut_bp,
+                     top_cut_bp=-1, bottom_cut_bp=-1):
         """Emit one or two resite dicts depending on wrap. Labels only on the
         first piece so the map doesn't double-print. For wrapped sites, the
         cut_col / ext_cut_bp fields are only meaningful on the piece that
         actually contains the cut; we attach them to the tail piece by default
-        and clear them on the head piece."""
+        and clear them on the head piece.
+
+        `top_cut_bp` / `bottom_cut_bp` are absolute top-strand-coordinate
+        positions where the enzyme cleaves each strand. They're stored on
+        every piece (including wrap continuations) so a click anywhere on
+        the bar can render the per-strand cut split.
+        """
+        common = {
+            "top_cut_bp":    top_cut_bp,
+            "bottom_cut_bp": bottom_cut_bp,
+        }
         if p + site_len <= n:
             hits.append({
                 "type":       "resite",
@@ -973,6 +985,7 @@ def _scan_restriction_sites(
                 "label":      name,
                 "cut_col":    cut_col,
                 "ext_cut_bp": ext_cut_bp,
+                **common,
             })
             return
         # Wraps origin: tail [p, n) + head [0, (p + site_len) - n).
@@ -997,6 +1010,7 @@ def _scan_restriction_sites(
             "label":      name,
             "cut_col":    tail_cut_col,
             "ext_cut_bp": ext_cut_bp,
+            **common,
         })
         hits.append({
             "type":       "resite",
@@ -1007,6 +1021,7 @@ def _scan_restriction_sites(
             "label":      "",     # unlabeled continuation
             "cut_col":    head_cut_col,
             "ext_cut_bp": ext_cut_bp,
+            **common,
         })
 
     for entry in _SCAN_CATALOG:
@@ -1027,12 +1042,22 @@ def _scan_restriction_sites(
             # ext_cut_bp: absolute cut position when cut falls outside recognition
             _ext = ((p + fwd_cut) % n) if (fwd_cut <= 0 or fwd_cut >= site_len) else None
             _cc  = fwd_cut if 0 < fwd_cut < site_len else None
-            _emit_resite(hits, p, site_len, 1, color, name, _cc, _ext)
-            cut_bp = (p + fwd_cut) % n if n > 0 else 0
+            # For forward-strand binding (whether palindromic or Type IIS),
+            # fwd_cut counts from the recognition's 5' end on the top strand
+            # and rev_cut counts from the recognition's 3' end on the bottom
+            # strand (= 5' end of bottom strand reading right-to-left). Both
+            # measured in top-strand coordinates: top cut at p+fwd_cut,
+            # bottom cut at p+rev_cut. For palindromes these are mirror
+            # images (rev_cut == site_len - fwd_cut); for Type IIS like BsaI
+            # both fall outside the recognition.
+            _top_cut = (p + fwd_cut) % n if n > 0 else 0
+            _bot_cut = (p + rev_cut) % n if n > 0 else 0
+            _emit_resite(hits, p, site_len, 1, color, name, _cc, _ext,
+                         top_cut_bp=_top_cut, bottom_cut_bp=_bot_cut)
             hits.append({
                 "type":   "recut",
-                "start":  cut_bp,
-                "end":    cut_bp + 1,
+                "start":  _top_cut,
+                "end":    _top_cut + 1,
                 "strand": 1,
                 "color":  color,
                 "label":  name,
@@ -1058,16 +1083,17 @@ def _scan_restriction_sites(
                 # offset `site_len - c` from the bar's left edge.
                 rev_cut_col = site_len - fwd_cut
                 _top_cut_bp = (p + site_len - rev_cut) % n   # top-strand cut in fwd coords
+                _bot_cut_bp = (p + site_len - fwd_cut) % n if n > 0 else 0
                 _top_cut_outside = ((_top_cut_bp - p) % n) >= site_len
                 _cc  = rev_cut_col if 0 <= rev_cut_col < site_len else None
                 _ext = _top_cut_bp if _top_cut_outside else None
-                _emit_resite(hits, p, site_len, -1, color, name, _cc, _ext)
-                # Bottom-strand cut (enzyme's fwd_cut mapped to fwd coords)
-                cut_bp = (p + site_len - fwd_cut) % n if n > 0 else 0
+                _emit_resite(hits, p, site_len, -1, color, name, _cc, _ext,
+                             top_cut_bp=_top_cut_bp,
+                             bottom_cut_bp=_bot_cut_bp)
                 hits.append({
                     "type":   "recut",
-                    "start":  cut_bp,
-                    "end":    cut_bp + 1,
+                    "start":  _bot_cut_bp,
+                    "end":    _bot_cut_bp + 1,
                     "strand": -1,
                     "color":  color,
                     "label":  name,
@@ -1105,10 +1131,26 @@ def _assign_chunk_features(
     """
     Forward-strand features always go above DNA; reverse-strand always below.
     Within each group, overlapping features are stacked into greedy lanes
-    (each lane is a list of non-overlapping features).  Capped at 3 lanes/side.
+    (each lane is a list of non-overlapping features). Lane[0] is the lane
+    closest to the DNA; new features try lane[0] first and only spill into
+    lane[1+] when there's a collision in this chunk.
+
+    No cap on lane count — features pile up as deep as the data demands.
+    A future "feature priority" knob will reorder placement; until then
+    sort by (start ascending, length descending) so longer features win
+    the lower lanes when starts tie.
     """
     def _greedy_lanes(feats: list[dict]) -> list[list[dict]]:
-        sorted_f = sorted(feats, key=lambda f: max(f["start"], chunk_start))
+        # Plain greedy packing — sort by start (with longer features
+        # first as a tie-breaker so a long CDS doesn't get bumped by
+        # a tiny one starting at the same bp). Type-based priority
+        # is now handled by `_chunk_lane_groups` segregating CDS
+        # and non-CDS into separate per-side lane stacks.
+        sorted_f = sorted(
+            feats,
+            key=lambda f: (max(f["start"], chunk_start),
+                           -(f["end"] - f["start"])),
+        )
         lanes: list[list[dict]] = []
         lane_ends: list[int]    = []
         for f in sorted_f:
@@ -1126,11 +1168,264 @@ def _assign_chunk_features(
             if not placed:
                 lanes.append([f])
                 lane_ends.append(bar_e)
-        return lanes[:3]
+        return lanes
 
     fwd = [f for f in chunk_feats if f["strand"] >= 0]
     rev = [f for f in chunk_feats if f["strand"] <  0]
     return _greedy_lanes(fwd), _greedy_lanes(rev)
+
+
+def _emit_packed_row(result: "Text", row_arr: list[tuple[str, str]],
+                      prefix_w: int) -> None:
+    """Append a packed row (per-column (char, style) tuples) to `result`
+    with line-number gutter. Run-length-merges adjacent same-style
+    cells to keep `Text.append` calls cheap."""
+    result.append(" " * prefix_w, style="color(245)")
+    run: list[str] = []
+    cur_sty = ""
+    for ch, sty in row_arr:
+        if sty == cur_sty:
+            run.append(ch)
+        else:
+            if run:
+                result.append("".join(run), style=cur_sty)
+            run = [ch]
+            cur_sty = sty
+    if run:
+        result.append("".join(run), style=cur_sty)
+    result.append("\n")
+
+
+def _paint_feature_label(arr: list[tuple[str, str]], f: dict,
+                          chunk_start: int, chunk_end: int,
+                          re_highlight_se: "tuple[int, int] | None" = None,
+                          ) -> None:
+    """Top-of-feature row painter. For resites this is the parens row
+    (`( EnzymeName )` with a Type-IIS dashed bridge); for everything
+    else it's the centered label text."""
+    s, e = f["start"], f["end"]
+    bar_s = max(s, chunk_start) - chunk_start
+    bar_e = min(e, chunk_end)   - chunk_start
+    bar_len = bar_e - bar_s
+    if bar_len <= 0:
+        return
+    color = f.get("color", "white")
+    feat_type = f.get("type", "")
+    starts_here = s >= chunk_start
+    ends_here   = e <= chunk_end
+    content_w = chunk_end - chunk_start
+
+    if feat_type == "resite":
+        if starts_here and bar_len >= 1:
+            arr[bar_s] = ("(", color)
+        if ends_here and bar_len >= 1:
+            arr[bar_s + bar_len - 1] = (")", color)
+        interior_start = (1 if starts_here else 0)
+        interior_end   = (bar_len - 1 if ends_here else bar_len)
+        interior_len   = interior_end - interior_start
+        label = f.get("label", "")
+        is_active_re = (re_highlight_se is not None
+                        and f["start"] == re_highlight_se[0]
+                        and f["end"]   == re_highlight_se[1])
+        name_sty = "bold green" if is_active_re else "bold white"
+        if interior_len > 0 and label:
+            name_str  = label[:interior_len]
+            name_pad  = interior_len - len(name_str)
+            name_lpad = name_pad // 2
+            for j, ch in enumerate(name_str):
+                pos = bar_s + interior_start + name_lpad + j
+                if 0 <= pos < content_w:
+                    arr[pos] = (ch, name_sty)
+        # Type-IIS dashed bridge in the parens row, between the
+        # recognition and the cut column. Mirrors the original
+        # `_render_feature_row_pair` resite block.
+        ext_cut_bp = f.get("ext_cut_bp")
+        if ext_cut_bp is not None and chunk_start <= ext_cut_bp < chunk_end:
+            cut_abs = ext_cut_bp - chunk_start
+            if cut_abs >= bar_s + bar_len:
+                for j in range(bar_s + bar_len, cut_abs):
+                    if 0 <= j < content_w and arr[j][0] == " ":
+                        arr[j] = ("╌", color)
+            elif cut_abs < bar_s:
+                for j in range(cut_abs + 1, bar_s):
+                    if 0 <= j < content_w and arr[j][0] == " ":
+                        arr[j] = ("╌", color)
+        return
+
+    label = f.get("label") or f.get("type", "")
+    lbl = label[:bar_len]
+    pad = bar_len - len(lbl)
+    pl  = pad // 2
+    lbl_str = " " * pl + lbl + " " * (pad - pl)
+    for i, ch in enumerate(lbl_str):
+        col = bar_s + i
+        if 0 <= col < content_w and ch != " ":
+            arr[col] = (ch, color)
+
+
+def _paint_feature_bar(arr: list[tuple[str, str]], f: dict,
+                        chunk_start: int, chunk_end: int,
+                        is_below_dna: bool = False) -> None:
+    """Bottom-of-feature row painter (close to DNA). For resites this
+    is the cut-arrow row; for other features it's the dither bar."""
+    s, e = f["start"], f["end"]
+    starts_here = s >= chunk_start
+    ends_here   = e <= chunk_end
+    bar_s = max(s, chunk_start) - chunk_start
+    bar_e = min(e, chunk_end)   - chunk_start
+    bar_len = bar_e - bar_s
+    if bar_len <= 0:
+        return
+    strand = f.get("strand", 1)
+    color  = f.get("color", "white")
+    feat_type = f.get("type", "")
+    content_w = chunk_end - chunk_start
+
+    if feat_type == "resite":
+        # Cut arrow at the in-recognition cut column or the external
+        # cut bp (Type IIS). Glyph points toward the DNA strand.
+        cut_ch = "↑" if is_below_dna else "↓"
+        cut_col = f.get("cut_col")
+        if cut_col is not None:
+            visible_offset = cut_col - max(0, chunk_start - f["start"])
+            cut_pos = bar_s + visible_offset
+            if 0 <= cut_pos < content_w:
+                arr[cut_pos] = (cut_ch, "bold " + color)
+        ext_cut_bp = f.get("ext_cut_bp")
+        if ext_cut_bp is not None and chunk_start <= ext_cut_bp < chunk_end:
+            cut_abs = ext_cut_bp - chunk_start
+            if 0 <= cut_abs < content_w:
+                arr[cut_abs] = (cut_ch, "bold " + color)
+        return
+
+    if strand == 0:
+        bar_str = "▒" * bar_len
+    elif strand == 2:
+        head = "◀" if starts_here else "▒"
+        tail = "▶" if ends_here   else "▒"
+        bar_str = head + "▒" * max(0, bar_len - 2) + tail
+    elif strand >= 1:
+        bar_str = "▒" * (bar_len - (1 if ends_here else 0)) + ("▶" if ends_here else "")
+    else:
+        bar_str = ("◀" if starts_here else "") + "▒" * (bar_len - (1 if starts_here else 0))
+    for i, ch in enumerate(bar_str):
+        col = bar_s + i
+        if 0 <= col < content_w:
+            arr[col] = (ch, color)
+
+
+def _paint_cds_aa(arr: list[tuple[str, str]], f: dict,
+                   chunk_start: int, chunk_end: int,
+                   seq_upper: str,
+                   aa_highlight: "dict | None") -> None:
+    """Paint AA letters at codon midpoints inside this chunk's bp range.
+
+    For wrap-CDS halves (split by `_feats_in_chunk`), `f["start"]`/
+    `f["end"]` are the half's linear bounds — useless for codon math.
+    The original CDS coords live in `_orig_start` / `_orig_end`; we
+    use those for both the cache lookup (so each half shares the full
+    translation) and the codon-midpoint formula.
+    """
+    if not seq_upper:
+        return
+    aa_letters, cds_len, virt_e = _cds_aa_list(seq_upper, f)
+    n_codons = len(aa_letters)
+    if n_codons == 0:
+        return
+    # Original CDS bounds — fall back to the half's bounds for non-wrap.
+    orig_s = f.get("_orig_start", f["start"])
+    orig_e = f.get("_orig_end",   f["end"])
+    n = len(seq_upper)
+    strand = f.get("strand", 1)
+    color  = f.get("color", "white")
+    is_aa_active = (aa_highlight is not None and f is aa_highlight)
+    sty = (f"reverse bold {color}" if is_aa_active
+           else f"bold {color}")
+    if orig_e >= orig_s:
+        # Non-wrap: narrow the codon range whose midpoint can land in
+        # this chunk so a 10 kb CDS doesn't iterate every codon per
+        # chunk it spans.
+        if strand == -1:
+            lo = (orig_e - 2 - chunk_end) // 3 + 1
+            hi = (orig_e - 2 - chunk_start) // 3 + 1
+        else:
+            lo = (chunk_start - orig_s - 1 + 2) // 3
+            hi = (chunk_end - orig_s - 1 + 2) // 3
+        lo = max(0, lo)
+        hi = min(n_codons, hi + 1)
+        i_range = range(lo, hi) if lo < hi else range(0)
+    else:
+        # Wrap-CDS half: codon midpoints don't fall in a contiguous i
+        # range, so scan all codons and let the per-bp filter below
+        # drop the ones outside this chunk. Each call only sees the
+        # chunk-local arr so the cost is bounded by codons-in-CDS.
+        i_range = range(n_codons)
+    content_w = chunk_end - chunk_start
+    for ci in i_range:
+        if strand == -1:
+            aa_bp = (virt_e - 3*ci - 2) % n if n else 0
+        else:
+            aa_bp = (orig_s + 3*ci + 1) % n if n else 0
+        if chunk_start <= aa_bp < chunk_end:
+            col = aa_bp - chunk_start
+            if 0 <= col < content_w:
+                arr[col] = (aa_letters[ci], sty)
+
+
+def _render_packed_strand(result: "Text",
+                           placements: list[tuple[dict, int]],
+                           total_rows: int,
+                           chunk_start: int, chunk_end: int,
+                           prefix_w: int,
+                           seq_upper: str,
+                           is_below_dna: bool,
+                           aa_highlight: "dict | None",
+                           re_highlight_se: "tuple[int, int] | None" = None,
+                           ) -> None:
+    """Render the per-strand packed lane art for one chunk.
+
+    Above-DNA: rows iterate from row=total_rows-1 (top, far from DNA)
+    down to row=0 (bottom, just above DNA). Each row is painted from
+    every feature whose footprint covers it.
+
+    Below-DNA: order flips so row=0 (closest to DNA) prints first.
+
+    Per-feature sub-row mapping (sub = row - bottom_row):
+      non-CDS height 2: sub=0 → bar, sub=1 → label
+      CDS    height 3: sub=0 → AA letters, sub=1 → bar, sub=2 → label
+    """
+    if total_rows <= 0:
+        return
+    content_w = chunk_end - chunk_start
+    if is_below_dna:
+        row_iter = range(total_rows)
+    else:
+        row_iter = range(total_rows - 1, -1, -1)
+    for row in row_iter:
+        arr: list[tuple[str, str]] = [(" ", "")] * content_w
+        for f, bottom_row in placements:
+            height = _feat_stack_height(f)
+            if not (bottom_row <= row < bottom_row + height):
+                continue
+            sub = row - bottom_row
+            if f.get("type") == "CDS":
+                if sub == 0:
+                    _paint_cds_aa(arr, f, chunk_start, chunk_end,
+                                  seq_upper, aa_highlight)
+                elif sub == 1:
+                    _paint_feature_bar(arr, f, chunk_start, chunk_end,
+                                       is_below_dna=is_below_dna)
+                else:   # sub == 2
+                    _paint_feature_label(arr, f, chunk_start, chunk_end,
+                                         re_highlight_se=re_highlight_se)
+            else:
+                if sub == 0:
+                    _paint_feature_bar(arr, f, chunk_start, chunk_end,
+                                       is_below_dna=is_below_dna)
+                else:   # sub == 1
+                    _paint_feature_label(arr, f, chunk_start, chunk_end,
+                                         re_highlight_se=re_highlight_se)
+        _emit_packed_row(result, arr, prefix_w)
 
 
 def _render_feature_row_pair(
@@ -1143,6 +1438,9 @@ def _render_feature_row_pair(
     show_connectors: bool,
     flip_label_bar: bool = False,
     single_row: bool = False,
+    re_highlight_se: "tuple[int, int] | None" = None,
+    seq_upper: str = "",
+    aa_highlight: "dict | None" = None,
 ) -> None:
     """
     Append one label row + optional connector row + one feature-bar row to result.
@@ -1181,18 +1479,32 @@ def _render_feature_row_pair(
 
         if feat_type == "resite":
             # ── Parenthesis-style RE site: ( EnzymeName ) ─────────────────
-            # Bar row:   ( EnzymeName )  — bold white name, colored parens
-            # Label row: ↓ or ↑ at the intra-site cut column (if cut is
-            #            within the recognition site; Type IIS cuts elsewhere)
+            # Layout convention (post-2026-04-30):
+            #   * label_arr (the "far from DNA" row) carries `( EnzymeName )`
+            #     and the Type-IIS dashed bridge.
+            #   * bar_arr (the "close to DNA" row) carries the cut arrow.
+            # Putting the cut close to DNA keeps it pointing at the actual
+            # bp on the strand. Critically, this matches the convention
+            # used by regular features (label far, bar close) so a
+            # resite can share a unified lane with a CDS / promoter etc.
+            # without a per-feature flip.
             cut_col = f.get("cut_col")   # 0-based offset from f["start"], or None
 
-            # Opening / closing parens
+            # Opening / closing parens — go in label_arr (the "name" row).
             if starts_here and bar_len >= 1:
-                bar_arr[bar_s] = ("(", color)
+                label_arr[bar_s] = ("(", color)
             if ends_here and bar_len >= 1:
-                bar_arr[bar_s + bar_len - 1] = (")", color)
+                label_arr[bar_s + bar_len - 1] = (")", color)
 
-            # Enzyme name: bold white, centered in the interior
+            # Enzyme name: bold white normally, bold green when this is
+            # the resite the user just clicked (matched on start/end so
+            # repeated sites of the same enzyme stay independent). The
+            # green flips back to white as soon as the highlight clears
+            # — see PlasmidApp.on_click and on_key for the revert paths.
+            is_active_re = (re_highlight_se is not None
+                            and f["start"] == re_highlight_se[0]
+                            and f["end"]   == re_highlight_se[1])
+            name_sty = "bold green" if is_active_re else "bold white"
             interior_start = (1 if starts_here else 0)
             interior_end   = (bar_len - 1 if ends_here else bar_len)
             interior_len   = interior_end - interior_start
@@ -1203,32 +1515,35 @@ def _render_feature_row_pair(
                 for j, ch in enumerate(name_str):
                     pos = bar_s + interior_start + name_lpad + j
                     if 0 <= pos < content_w:
-                        bar_arr[pos] = (ch, "bold white")
+                        label_arr[pos] = (ch, name_sty)
 
-            # Cut marker in the label row so it doesn't obscure the name
+            # Cut arrow in bar_arr (close-to-DNA row).
             cut_ch = "↑" if is_below_dna else "↓"
             if cut_col is not None:
                 visible_offset = cut_col - max(0, chunk_start - f["start"])
                 cut_pos = bar_s + visible_offset
                 if 0 <= cut_pos < content_w:
-                    label_arr[cut_pos] = (cut_ch, "bold " + color)
+                    bar_arr[cut_pos] = (cut_ch, "bold " + color)
 
-            # Type IIS: dashed bridge from recognition bar to cut site
+            # Type IIS: dashed bridge in label_arr (with the parens) +
+            # cut arrow in bar_arr at the external cut position.
             ext_cut_bp = f.get("ext_cut_bp")
             if ext_cut_bp is not None and chunk_start <= ext_cut_bp < chunk_end:
                 cut_abs = ext_cut_bp - chunk_start
                 if 0 <= cut_abs < content_w:
-                    label_arr[cut_abs] = (cut_ch, "bold " + color)
-                # Bridge in bar_arr: from recognition end rightward, or from
-                # cut leftward to recognition start (upstream cutters)
+                    bar_arr[cut_abs] = (cut_ch, "bold " + color)
+                # Bridge in label_arr — the dashed line lives on the
+                # parens row, visually connecting `(name)` to the cut
+                # column above (which in turn aligns with the arrow on
+                # the bar row below).
                 if cut_abs >= bar_s + bar_len:       # downstream cut
                     for j in range(bar_s + bar_len, cut_abs):
-                        if 0 <= j < content_w and bar_arr[j][0] == " ":
-                            bar_arr[j] = ("╌", color)
+                        if 0 <= j < content_w and label_arr[j][0] == " ":
+                            label_arr[j] = ("╌", color)
                 elif cut_abs < bar_s:                # upstream cut
                     for j in range(cut_abs + 1, bar_s):
-                        if 0 <= j < content_w and bar_arr[j][0] == " ":
-                            bar_arr[j] = ("╌", color)
+                        if 0 <= j < content_w and label_arr[j][0] == " ":
+                            label_arr[j] = ("╌", color)
 
             # Connector tick at midpoint
             mid = bar_s + bar_len // 2
@@ -1343,28 +1658,83 @@ def _render_feature_row_pair(
         _write_arr(first_arr)
 
 
+def _feat_stack_height(f: dict) -> int:
+    """Vertical row count for a single feature's lane art:
+    non-CDS = 2 (bar + label); CDS = 3 (AA + bar + label)."""
+    return 3 if f.get("type") == "CDS" else 2
+
+
+def _pack_features_2d(feats: list[dict], chunk_start: int,
+                      chunk_end: int) -> list[tuple[dict, int]]:
+    """Greedy 2D packing: each feature occupies a (bp range × height)
+    rectangle starting from `bottom_row` (0 = closest to DNA). Returns
+    a list of (feat, bottom_row) pairs.
+
+    Sort order picks placement priority on collision: CDS comes first
+    so a CDS that overlaps a non-CDS gets the lower (closer-to-DNA)
+    slot. Within the same type, longer features sort first so they
+    win lane[0] when starts tie.
+
+    Algorithm: track per-column the highest occupied row index
+    (`col_top`). The new feature's bottom_row is one above the max
+    of its column range — the smallest legal y where all needed
+    rows are free. If nothing overlaps the feature, max_top is -1
+    and the feature lands at row 0 (bar adjacent to DNA).
+    """
+    sorted_f = sorted(
+        feats,
+        key=lambda f: (
+            0 if f.get("type") == "CDS" else 1,
+            max(f["start"], chunk_start),
+            -(f["end"] - f["start"]),
+        ),
+    )
+    placements: list[tuple[dict, int]] = []
+    col_top: dict[int, int] = {}
+    for f in sorted_f:
+        bar_s = max(f["start"], chunk_start)
+        bar_e = min(f["end"],   chunk_end)
+        if bar_e <= bar_s:
+            continue
+        height = _feat_stack_height(f)
+        max_top = -1
+        for col in range(bar_s, bar_e):
+            t = col_top.get(col, -1)
+            if t > max_top:
+                max_top = t
+        bottom_row = max_top + 1
+        top_row = bottom_row + height - 1
+        for col in range(bar_s, bar_e):
+            col_top[col] = top_row
+        placements.append((f, bottom_row))
+    return placements
+
+
 def _chunk_lane_groups(
     chunk_feats: list[dict], chunk_start: int, chunk_end: int,
-) -> "tuple[list, list, list, list, list, list]":
-    """Split chunk features into separate lane groups for rendering order.
+) -> "tuple[list, list, int, int]":
+    """Returns (above_placements, below_placements, above_rows, below_rows).
 
-    Returns (re_above, onebp_above, reg_above, reg_below, onebp_below, re_below).
-    Rendering order top→bottom:
-      re_above → onebp_above → reg_above → DNA → reg_below → onebp_below → re_below
-    Multi-bp regular features are closest to DNA; 1bp features next; RE sites farthest.
+    `*_placements` is `[(feat, bottom_row), ...]` from `_pack_features_2d`.
+    `*_rows` is the total stack height on that strand for this chunk
+    (0 if no features). Each feature occupies a contiguous block of
+    rows starting at `bottom_row`:
+      * non-CDS: 2 rows (row 0 = bar adjacent to DNA, row 1 = label)
+      * CDS:     3 rows (row 0 = AA, row 1 = bar, row 2 = label)
+    Greedy placement keeps every feature's bar/label as close to DNA
+    as possible; only collisions cause stacking.
     """
-    resites, onebp, multibp = [], [], []
-    for f in chunk_feats:
-        if f.get("type") == "resite":
-            resites.append(f)
-        elif f["end"] - f["start"] == 1:
-            onebp.append(f)
-        else:
-            multibp.append(f)
-    reg_above,   reg_below   = _assign_chunk_features(multibp, chunk_start, chunk_end)
-    onebp_above, onebp_below = _assign_chunk_features(onebp,   chunk_start, chunk_end)
-    re_above,    re_below    = _assign_chunk_features(resites, chunk_start, chunk_end)
-    return re_above, onebp_above, reg_above, reg_below, onebp_below, re_below
+    fwd = [f for f in chunk_feats if f.get("strand", 0) >= 0]
+    rev = [f for f in chunk_feats if f.get("strand", 0) <  0]
+    above_p = _pack_features_2d(fwd, chunk_start, chunk_end)
+    below_p = _pack_features_2d(rev, chunk_start, chunk_end)
+    above_rows = max(
+        (p[1] + _feat_stack_height(p[0]) for p in above_p), default=0
+    )
+    below_rows = max(
+        (p[1] + _feat_stack_height(p[0]) for p in below_p), default=0
+    )
+    return above_p, below_p, above_rows, below_rows
 
 
 # Per-(seq_id, feats_id) cache for expensive inputs of _build_seq_text that
@@ -1419,11 +1789,19 @@ def _feats_in_chunk(
             if s < chunk_end and e > chunk_start:
                 out.append(f)
             continue
-        # Wrap feature: split into tail + head.
+        # Wrap feature: split into tail + head. Stamp the original
+        # (start, end) on each half so renderers that need the full
+        # CDS reading frame (`_paint_cds_aa`, the AA-click handler
+        # in `_check_packed`) can recover it. Without these, codon
+        # midpoints would be computed off the half's local start
+        # and the AA letters would land on the wrong bp with the
+        # wrong translation. Non-CDS features ignore these keys.
         if s < chunk_end and total > chunk_start:
-            out.append({**f, "end": total})
+            out.append({**f, "end": total,
+                        "_orig_start": s, "_orig_end": e})
         if 0 < chunk_end and e > chunk_start:
-            out.append({**f, "start": 0, "label": ""})
+            out.append({**f, "start": 0, "label": "",
+                        "_orig_start": s, "_orig_end": e})
     return out
 
 
@@ -1500,13 +1878,20 @@ def _chunk_layout(seq: str, feats: list[dict], line_width: int):
         chunk_end   = min(chunk_start + line_width, n)
         chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
         groups      = _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
-        re_above, onebp_above, reg_above, reg_below, onebp_below, re_below = groups
-        above_pairs = len(re_above) + len(onebp_above) + len(reg_above)
-        below_pairs = len(re_below) + len(onebp_below) + len(reg_below)
-        chunks.append((chunk_start, chunk_end, groups, above_pairs, below_pairs))
-        # Per-chunk rows with rpg=2: above*2 + 2 (DNA pair) + below*2
-        prefix_dna2.append(prefix_dna2[-1] + above_pairs * 2 + 2 + below_pairs * 2)
-        prefix_lanes.append(prefix_lanes[-1] + above_pairs + below_pairs)
+        above_p, below_p, above_rows, below_rows = groups
+        # `above_pairs` / `below_pairs` are stored as lane *pair counts*
+        # for backward compat with `_bp_to_content_row` arithmetic; on
+        # a 2D-packed chunk we just halve the row count (both feature
+        # types divide into 2-row label/bar pairs except CDS which has
+        # an extra AA row — bookkeeping uses the literal row count via
+        # the dedicated `*_rows` fields).
+        chunks.append((chunk_start, chunk_end, groups,
+                       above_rows, below_rows))
+        # Per-chunk rows: above_rows + 2 (DNA pair) + below_rows + 1 (gap).
+        prefix_dna2.append(
+            prefix_dna2[-1] + above_rows + 2 + below_rows + 1
+        )
+        prefix_lanes.append(prefix_lanes[-1] + above_rows + below_rows)
 
     layout = (chunks, prefix_dna2, prefix_lanes)
     if len(_CHUNK_LAYOUT_CACHE) >= 4:
@@ -1520,13 +1905,14 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                     user_sel:  "tuple[int,int] | None" = None,
                     cursor_pos: int = -1,
                     show_connectors: bool = False,
-                    re_highlight: "dict | None" = None) -> Text:
+                    re_highlight: "dict | None" = None,
+                    aa_highlight: "dict | None" = None) -> Text:
     """Rich Text of the sequence with per-position feature coloring.
 
     sel_range    — feature highlight: bold + underline on feature bases
     user_sel     — shift-click selection: subtle background, used by edit dialog
     cursor_pos   — click cursor: reverse-video highlight on base at cursor_pos
-    re_highlight — dict with keys: start, end, fwd_cut_bp, rev_cut_bp, color, name
+    re_highlight — dict with keys: start, end, top_cut_bp, bottom_cut_bp, color, name
                    When set, highlights the recognition bases on both strands
                    and marks cut positions with reverse-video.
 
@@ -1543,11 +1929,11 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     usr_e  = user_sel[1]  if user_sel  else -1
 
     # RE highlight ranges
-    reh_s       = re_highlight["start"]      if re_highlight else -1
-    reh_e       = re_highlight["end"]        if re_highlight else -1
-    reh_fwd_cut = re_highlight["fwd_cut_bp"] if re_highlight else -1
-    reh_rev_cut = re_highlight["rev_cut_bp"] if re_highlight else -1
-    reh_color   = re_highlight["color"]      if re_highlight else ""
+    reh_s       = re_highlight["start"]         if re_highlight else -1
+    reh_e       = re_highlight["end"]           if re_highlight else -1
+    reh_top_cut = re_highlight["top_cut_bp"]    if re_highlight else -1
+    reh_bot_cut = re_highlight["bottom_cut_bp"] if re_highlight else -1
+    reh_color   = re_highlight["color"]         if re_highlight else ""
 
     seq_upper = seq.upper()
     result    = Text(no_wrap=True, overflow="crop")
@@ -1572,7 +1958,8 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
         if len(_CHUNK_STATIC_CACHE) > 4:
             _CHUNK_STATIC_CACHE.pop(next(iter(_CHUNK_STATIC_CACHE)))
 
-    for i, (chunk_start, chunk_end, groups, _ab_pairs, _be_pairs) in enumerate(chunks_layout):
+    for i, (chunk_start, chunk_end, groups, _ab_pairs, _be_pairs,
+            *_extra) in enumerate(chunks_layout):
         # If any overlay touches this chunk, render fresh. Otherwise reuse
         # (or first-time-populate) the static cache.
         chunk_has_overlay = (
@@ -1581,19 +1968,32 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
             or (reh_s < chunk_end and reh_e > chunk_start)
             or (chunk_start <= cursor_pos < chunk_end)
         )
+        # Active AA highlight on a CDS that overlaps this chunk →
+        # bypass the static cache so the reverse-video AA letters
+        # render fresh. Wrap-aware overlap test mirrors `_bp_in`.
+        if aa_highlight is not None:
+            aa_s, aa_e = aa_highlight["start"], aa_highlight["end"]
+            if aa_e >= aa_s:
+                if aa_s < chunk_end and aa_e > chunk_start:
+                    chunk_has_overlay = True
+            else:
+                if chunk_start < aa_e or chunk_end > aa_s:
+                    chunk_has_overlay = True
 
         if chunk_has_overlay:
             _render_chunk(result, chunk_start, chunk_end, groups, styles,
                           num_w, seq_upper, show_connectors,
                           sel_s, sel_e, usr_s, usr_e,
-                          reh_s, reh_e, reh_color, cursor_pos)
+                          reh_s, reh_e, reh_top_cut, reh_bot_cut,
+                          cursor_pos, aa_highlight)
         else:
             cached = static_cache[i]
             if cached is None:
                 cached = Text(no_wrap=True, overflow="crop")
                 _render_chunk(cached, chunk_start, chunk_end, groups, styles,
                               num_w, seq_upper, show_connectors,
-                              -1, -1, -1, -1, -1, -1, "", -1)
+                              -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                              aa_highlight)
                 static_cache[i] = cached
             result.append(cached)
 
@@ -1604,27 +2004,30 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
                    groups: tuple, styles: list[str], num_w: int,
                    seq_upper: str, show_connectors: bool,
                    sel_s: int, sel_e: int, usr_s: int, usr_e: int,
-                   reh_s: int, reh_e: int, reh_color: str,
-                   cursor_pos: int) -> None:
+                   reh_s: int, reh_e: int,
+                   reh_top_cut: int, reh_bot_cut: int,
+                   cursor_pos: int,
+                   aa_highlight: "dict | None" = None) -> None:
     """Render one chunk into `result`. The DNA pair takes a fast RLE path
     when no overlay (cursor / selection / RE highlight) intersects the
     chunk; otherwise the per-base path applies overlay styles. Lane rows
     above/below the DNA pair are independent of overlay so they always
     render the same way — which is what makes the static-cache reuse safe.
     """
-    re_above, onebp_above, reg_above, reg_below, onebp_below, re_below = groups
+    above_p, below_p, above_rows, below_rows = groups
+    re_se = (reh_s, reh_e) if reh_s >= 0 and reh_e > reh_s else None
 
-    # ── Rows ABOVE DNA (far → close): RE → 1bp → multi-bp ──
-    for lane in re_above:
-        _render_feature_row_pair(result, lane, chunk_start, chunk_end,
-                                 num_w + 2, False, show_connectors,
-                                 flip_label_bar=True)
-    for lane in onebp_above:
-        _render_feature_row_pair(result, lane, chunk_start, chunk_end,
-                                 num_w + 2, False, show_connectors)
-    for lane in reg_above:
-        _render_feature_row_pair(result, lane, chunk_start, chunk_end,
-                                 num_w + 2, False, show_connectors)
+    # Rows ABOVE DNA — render top (far) → bottom (close to DNA).
+    # Per-feature 2D packing: each feature's bar is at row 0
+    # (adjacent to DNA) when nothing overlaps; CDS adds an AA row
+    # at sub-row 0, pushing its own bar to sub-row 1. Stacking only
+    # happens on bp-range collisions, so unrelated features stay
+    # tight against DNA.
+    _render_packed_strand(result, above_p, above_rows,
+                          chunk_start, chunk_end, num_w + 2,
+                          seq_upper, is_below_dna=False,
+                          aa_highlight=aa_highlight,
+                          re_highlight_se=re_se)
 
     # ── Double-stranded DNA block ─────────────────────────────────────
     chunk_fwd = seq_upper[chunk_start:chunk_end]
@@ -1694,11 +2097,25 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
                 fwd_sty = "black on white bold"
                 rev_sty = fwd_sty
             elif in_re:
-                # RE highlight stays color-tinted — the colour carries
-                # enzyme identity, which is information we'd lose by
-                # collapsing every overlay to white-on-black.
-                fwd_sty = f"reverse bold {reh_color}"
-                rev_sty = fwd_sty
+                # RE highlight: black letters on a side-of-cut tinted
+                # background. Blue background = upstream of cut (left
+                # fragment); red background = at/after cut (right
+                # fragment). Per-strand because sticky-end enzymes
+                # cleave at offset positions on top vs bottom (e.g.
+                # EcoRI: top at p+1, bottom at p+5), so the staggered
+                # overhang bases show two different bg colors above
+                # vs below the DNA pair. Legacy resites without baked
+                # cut bps fall back to plain white-bg.
+                if reh_top_cut >= 0:
+                    fwd_sty = ("black on blue bold" if i < reh_top_cut
+                               else "black on red bold")
+                else:
+                    fwd_sty = "black on white bold"
+                if reh_bot_cut >= 0:
+                    rev_sty = ("black on blue bold" if i < reh_bot_cut
+                               else "black on red bold")
+                else:
+                    rev_sty = "black on white bold"
             elif in_usr:
                 fwd_sty = "black on white"
                 rev_sty = fwd_sty
@@ -1719,17 +2136,21 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
         _strand_chars(rc_bases)
         result.append("\n")
 
-    # ── Rows BELOW DNA (close → far): multi-bp → 1bp → RE ──
-    for lane in reg_below:
-        _render_feature_row_pair(result, lane, chunk_start, chunk_end,
-                                 num_w + 2, True, show_connectors)
-    for lane in onebp_below:
-        _render_feature_row_pair(result, lane, chunk_start, chunk_end,
-                                 num_w + 2, True, show_connectors)
-    for lane in re_below:
-        _render_feature_row_pair(result, lane, chunk_start, chunk_end,
-                                 num_w + 2, True, show_connectors,
-                                 flip_label_bar=True)
+    # Rows BELOW DNA: mirror of above. Sub-row 0 (bar / AA-for-CDS)
+    # prints first → adjacent to DNA. Sub-row 1 (label / bar-for-CDS)
+    # next, etc.
+    _render_packed_strand(result, below_p, below_rows,
+                          chunk_start, chunk_end, num_w + 2,
+                          seq_upper, is_below_dna=True,
+                          aa_highlight=aa_highlight,
+                          re_highlight_se=re_se)
+    # One empty row after the chunk's full stack (lane art + DNA pair
+    # + lane art) so consecutive chunks have uniform breathing room.
+    # Without this, a chunk with no below-lane-art butts directly
+    # against the next chunk's above-lane-art and the eye can't tell
+    # where one chunk ends. Counted in `_chunk_layout` and traversed
+    # in `_click_to_bp` so click-row-to-bp math stays consistent.
+    result.append("\n")
 
 
 # Standard genetic code for CDS translation (no biopython dependency)
@@ -1764,6 +2185,58 @@ def _copy_to_clipboard_osc52(text: str) -> bool:
         return True
     except (OSError, UnicodeEncodeError):
         return False
+
+
+# Per-CDS AA cache. Key: (id(seq), feature start, feature end, strand)
+# Value: a list of decoded one-letter AA codes, indexed by codon i.
+# Computed once per CDS; reused across all chunks that overlap that
+# CDS so we don't re-translate the same protein N times for an N-row
+# feature. Capped at 64 entries — enough for typical plasmids without
+# letting the cache balloon on a long-running session.
+_CDS_AA_CACHE: dict = {}
+
+
+def _cds_aa_list(seq: str, f: dict) -> tuple[list[str], int, int]:
+    """Return (aa_letters, cds_len, virt_e) for `f`, cached on (seq id,
+    start, end, strand). `aa_letters[i]` is the one-letter AA for the
+    i-th codon read in the CDS's natural direction (5'→3' on the
+    feature's own strand). `virt_e` is the linear end coordinate
+    (= `e` for non-wrap features, `s + cds_len` for wrap).
+
+    For wrap-CDS halves split by `_feats_in_chunk`, the half's
+    `f["start"]` / `f["end"]` are linear chunk-relative bounds and
+    don't carry the original reading frame. `_orig_start` /
+    `_orig_end` (stamped by the splitter) hold the CDS's true
+    coords; we key the cache and translate against those so all
+    halves of the same wrap-CDS share one translation.
+    """
+    s = f.get("_orig_start", f["start"])
+    e = f.get("_orig_end",   f["end"])
+    strand = f.get("strand", 1)
+    key = (id(seq), s, e, strand)
+    cached = _CDS_AA_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if e < s:
+        cds_seq = (seq[s:] + seq[:e]).upper()
+        cds_len = len(cds_seq)
+        virt_e  = s + cds_len
+    else:
+        cds_seq = seq[s:e].upper()
+        cds_len = e - s
+        virt_e  = e
+    if strand == -1:
+        cds_seq = cds_seq.translate(_IUPAC_COMP)[::-1]
+    n_codons = cds_len // 3
+    aa_letters = [
+        _CODON_TABLE.get(cds_seq[3*i:3*i+3], "?")
+        for i in range(n_codons)
+    ]
+    if len(_CDS_AA_CACHE) >= 64:
+        _CDS_AA_CACHE.pop(next(iter(_CDS_AA_CACHE)))
+    result = (aa_letters, cds_len, virt_e)
+    _CDS_AA_CACHE[key] = result
+    return result
 
 
 def _translate_cds(full_seq: str, start: int, end: int, strand: int) -> str:
@@ -2304,10 +2777,20 @@ class PlasmidMap(Widget):
     can_focus = True
 
     BINDINGS = [
-        Binding("left",        "rotate_cw",        "Rotate ←",      show=True),
-        Binding("right",       "rotate_ccw",        "Rotate →",      show=True),
-        Binding("shift+left",  "rotate_cw_lg",     "Rotate ←←",     show=False),
-        Binding("shift+right", "rotate_ccw_lg",    "Rotate →→",     show=False),
+        # Rotation direction: ← = counterclockwise, → = clockwise.
+        # `[` and `]` are alternate keys that don't conflict with text
+        # editing in the seq panel; both are focus-gated to the map (no
+        # `priority=True`), so rotation only happens when the user has
+        # actually clicked into the map panel.
+        Binding("left",        "rotate_ccw",       "Rotate ←",      show=True),
+        Binding("right",       "rotate_cw",        "Rotate →",      show=True),
+        Binding("up",          "reset_origin",     "Reset origin",  show=True),
+        Binding("shift+left",  "rotate_ccw_lg",    "Rotate ←←",     show=False),
+        Binding("shift+right", "rotate_cw_lg",     "Rotate →→",     show=False),
+        Binding("[",           "rotate_ccw",       "Rotate ←",      show=False),
+        Binding("]",           "rotate_cw",        "Rotate →",      show=False),
+        Binding("shift+[",     "rotate_ccw_lg",    "Rotate ←←",     show=False),
+        Binding("shift+]",     "rotate_cw_lg",     "Rotate →→",     show=False),
         Binding("home",        "reset_origin",     "Reset",         show=False),
         Binding("comma",       "aspect_dec",       "Circle wider",   show=False),
         Binding("full_stop",   "aspect_inc",       "Circle taller",  show=False),
@@ -3059,7 +3542,6 @@ class FeatureSidebar(Widget):
         border-left: solid $primary;
     }
     #feat-table  { height: 1fr; }
-    #detail-box  { height: 8; border-top: solid $accent; padding: 0 1; }
     #sidebar-hdr { background: $primary; padding: 0 1; }
     """
 
@@ -3071,7 +3553,6 @@ class FeatureSidebar(Widget):
     def compose(self) -> ComposeResult:
         yield Static(" Features", id="sidebar-hdr")
         yield DataTable(id="feat-table", cursor_type="row", zebra_stripes=True)
-        yield Static("", id="detail-box")
 
     def on_mount(self):
         t = self.query_one("#feat-table", DataTable)
@@ -3116,29 +3597,11 @@ class FeatureSidebar(Widget):
         self.call_after_refresh(_clear_populating)
 
     def show_detail(self, f: dict | None) -> None:
-        box = self.query_one("#detail-box", Static)
-        if f is None:
-            box.update(Text(""))
-            return
-        strand_sym = "+" if f["strand"] == 1 else ("−" if f["strand"] == -1 else "·")
-        # Wrap features need modular length (end < start means the feature
-        # crosses the origin); naive end-start is negative and misleading.
-        rec = getattr(self.app, "_current_record", None)
-        total = len(rec.seq) if rec else max(f["end"], f["start"]) + 1
-        span = _feat_len(f["start"], f["end"], total)
-        if f["end"] < f["start"]:
-            coord_str = f"{f['start']+1}‥{total},1‥{f['end']}"
-        else:
-            coord_str = f"{f['start']+1}‥{f['end']}"
-        t = Text()
-        t.append(f["type"],  style=f"bold {f['color']}")
-        t.append("\n")
-        t.append(f["label"], style="white")
-        t.append("\n")
-        t.append(f"{coord_str} ({span:,} bp)", style="dim")
-        t.append("\n")
-        t.append(f"Strand: {strand_sym}", style="dim")
-        box.update(t)
+        """No-op kept so existing call sites don't need to be guarded.
+        The detail-box widget was removed when the sidebar was simplified
+        to a single full-height table; feature info is still surfaced
+        via the table row + map highlight."""
+        return
 
     _prog_row: int = -1   # cursor moves driven by highlight_row, not the user
     _populating: bool = False   # suppress RowActivated cascade during populate()
@@ -3192,6 +3655,36 @@ class FeatureSidebar(Widget):
 
 # ── Library panel ──────────────────────────────────────────────────────────────
 
+def _fuzzy_match(query: str, name: str) -> bool:
+    """Case-insensitive subsequence match: True if every char of `query`
+    appears in `name` in order (not necessarily contiguous). Empty query
+    matches everything. Used by LibraryPanel's search filter."""
+    if not query:
+        return True
+    q, n = query.lower(), name.lower()
+    i = 0
+    for ch in q:
+        i = n.find(ch, i)
+        if i < 0:
+            return False
+        i += 1
+    return True
+
+
+class _SearchInput(Input):
+    """Input that clears its display when focus is gained, so the user
+    sees a fresh cursor regardless of whether the field had the
+    'Search' prefill or an active filter shown. The parent panel
+    (LibraryPanel) handles Submitted to apply / clear the filter and
+    restores PREFILL on submit-empty."""
+    PREFILL = "Search"
+
+    def on_focus(self, _event) -> None:
+        # Always blank the field on focus gain — matches the spec
+        # "clicking into … the textbox clears and a cursor appears".
+        self.value = ""
+
+
 class LibraryPanel(Widget):
     """Left-hand plasmid panel — toggles between a *collections* list and
     the active collection's *plasmids* view.
@@ -3216,6 +3709,9 @@ class LibraryPanel(Widget):
         border-right: solid $primary;
     }
     #lib-hdr        { background: $primary; padding: 0 1; }
+    /* Search input lives directly under the header; height 3 is the
+       Textual Input default (1 content row + 2 border rows). */
+    #lib-search     { height: 3; margin: 0; }
     #lib-table      { height: 1fr; }
     #lib-coll-table { height: 1fr; }
     #lib-btns       { height: 3; }
@@ -3266,6 +3762,16 @@ class LibraryPanel(Widget):
         # Collections-view widgets ────────────────────────────────────
         yield DataTable(id="lib-coll-table", cursor_type="row",
                         zebra_stripes=True)
+        # Plasmids-view widgets ────────────────────────────────────
+        yield DataTable(id="lib-table", cursor_type="row",
+                        zebra_stripes=True)
+        # One shared search input sits between the tables and the
+        # button row so it lives just above whichever button bar is
+        # currently visible. Pre-filled with "Search"; on focus the
+        # value is cleared (see `_SearchInput`). Submitted handler
+        # applies a fuzzy filter (or clears it on empty submit and
+        # restores the prefill).
+        yield _SearchInput(value=_SearchInput.PREFILL, id="lib-search")
         with Horizontal(id="lib-coll-btns"):
             yield Button("+", id="btn-coll-add", variant="primary",
                          tooltip="New collection")
@@ -3273,9 +3779,6 @@ class LibraryPanel(Widget):
                          tooltip="Remove selected collection")
             yield Button("✎", id="btn-coll-rename", variant="default",
                          tooltip="Rename selected collection")
-        # Plasmids-view widgets ────────────────────────────────────
-        yield DataTable(id="lib-table", cursor_type="row",
-                        zebra_stripes=True)
         with Horizontal(id="lib-btns"):
             yield Button("+", id="btn-lib-add", variant="primary",
                          tooltip="Save loaded plasmid to this collection")
@@ -3289,6 +3792,10 @@ class LibraryPanel(Widget):
     def on_mount(self):
         self._active_id:    "str | None" = None
         self._active_dirty: bool         = False
+        # Active fuzzy filter text. Empty string = no filter (show all
+        # rows). Set/cleared by `_on_search_submitted`; consulted in
+        # `_repopulate_*`.
+        self._filter_text:  str          = ""
         # Start in plasmids view if the user already has an active
         # collection (returning user picks up where they left off);
         # else show the collections list so they can pick.
@@ -3305,6 +3812,23 @@ class LibraryPanel(Widget):
         plas = self.query_one("#lib-table", DataTable)
         plas.add_columns("Name", "bp")
         self._apply_view_mode()
+        self._repopulate()
+
+    @on(Input.Submitted, "#lib-search")
+    def _on_search_submitted(self, event: Input.Submitted) -> None:
+        """Enter on the search field: empty value clears the filter and
+        restores 'Search' prefill; non-empty value applies a fuzzy
+        filter to whichever table is currently visible. The literal
+        prefill string also counts as 'empty' so a user mashing Enter
+        without first clicking through doesn't search for 'Search'."""
+        text = event.value.strip()
+        if not text or text == _SearchInput.PREFILL:
+            self._filter_text = ""
+            event.input.value = _SearchInput.PREFILL
+        else:
+            self._filter_text = text
+            # Leave value as the user typed it so they can see what's
+            # filtering; click+Enter clears it back to PREFILL.
         self._repopulate()
 
     # ── View-mode toggle ────────────────────────────────────────────────────
@@ -3348,17 +3872,24 @@ class LibraryPanel(Widget):
     def _repopulate_collections(self) -> None:
         t = self.query_one("#lib-coll-table", DataTable)
         t.clear()
+        flt = self._filter_text
         for c in _load_collections():
             name = c.get("name") or "?"
+            if not _fuzzy_match(flt, name):
+                continue
             n_plas = len(c.get("plasmids", []) or [])
             t.add_row(name[:14], str(n_plas), key=name)
 
     def _repopulate_plasmids(self) -> None:
         t = self.query_one("#lib-table", DataTable)
         t.clear()
+        flt = self._filter_text
         for entry in _load_library():
+            name = entry.get("name") or entry.get("id") or "?"
+            if not _fuzzy_match(flt, name):
+                continue
             is_dirty = (entry["id"] == self._active_id and self._active_dirty)
-            name_disp = ("*" + entry["name"])[:14] if is_dirty else entry["name"][:14]
+            name_disp = ("*" + name)[:14] if is_dirty else name[:14]
             t.add_row(
                 name_disp,
                 f"{entry['size']:,}",
@@ -3599,6 +4130,15 @@ class LibraryPanel(Widget):
         coll = _find_collection(name)
         if coll is None:
             return
+        # If this collection is already the active one, just switch the
+        # panel into plasmids view — re-writing plasmid_library.json with
+        # identical content would churn the .bak file and trigger a
+        # cascade of LibraryPanel reloads for no user-visible change.
+        if name == _get_active_collection_name():
+            self._view_mode = "plasmids"
+            self._apply_view_mode()
+            self._repopulate_plasmids()
+            return
         # Set active BEFORE writing the library so _save_library's mirror
         # writes back to the correct collection.
         _set_active_collection_name(name)
@@ -3726,13 +4266,7 @@ class SequencePanel(Widget):
         height: 14;
         border-top: solid $primary;
     }
-    #seq-hdr    { background: $primary; padding: 0 1; height: 1; }
     #seq-scroll { height: 1fr; }
-    #seq-trans  {
-        height: 3; border-top: solid $primary-darken-2;
-        padding: 0 1; display: none;
-    }
-    SequencePanel.has-trans #seq-trans { display: block; }
     """
 
     # ── Messages ───────────────────────────────────────────────────────────────
@@ -3771,6 +4305,12 @@ class SequencePanel(Widget):
         self._view_cache_txt: "Text | None"         = None
         self._show_connectors:  bool = False
         self._re_highlight: "dict | None" = None  # RE cut visualization
+        # Active AA-translation highlight. Set when the user clicks
+        # the bar of a CDS feature (the AA letters). Renders the
+        # AA glyphs reversed so the protein sequence reads as
+        # "highlighted ready to copy"; Ctrl+C in this state copies
+        # the AA string instead of the DNA bases.
+        self._aa_highlight: "dict | None" = None
         self._sel_anchor:   int         = -1    # anchor for Shift+arrow extension
         # Drag-to-select state
         self._drag_start_bp:    int  = -1
@@ -3780,16 +4320,22 @@ class SequencePanel(Widget):
         self._last_was_drag:    bool = False
         # Set by _click_to_bp when the click lands on a resite bar row
         self._last_resite_click: "dict | None" = None
+        # Set by `_click_to_bp` when the click lands on the AA-letter
+        # sub-row of a CDS feature. Holds the underlying codon's
+        # (start, end) bp range so `on_click` can park `_user_sel`
+        # on those 3 bases — Ctrl+C copies the codon, the user sees
+        # a high-contrast highlight on the DNA cells beneath.
+        self._last_aa_codon_click: "tuple[int, int] | None" = None
+        # Set by `_click_to_bp` to True when the click lands on a
+        # feature lane (bar/arrow art) rather than the DNA strand.
+        # Reset before every `_click_to_bp` call (see on_mouse_down /
+        # on_click) since the setter is asymmetric — never clears.
+        self._last_lane_click: bool = False
         self._sorted_feats_cache: "list | None" = None
 
     def compose(self) -> ComposeResult:
-        yield Static(
-            " Sequence  (click: select · Shift+click: select region · Ctrl+E: edit)",
-            id="seq-hdr",
-        )
         with ScrollableContainer(id="seq-scroll"):
             yield Static("", id="seq-view")
-        yield Static("", id="seq-trans")
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -3802,8 +4348,8 @@ class SequencePanel(Widget):
         self._user_sel     = None
         self._cursor_pos   = -1
         self._re_highlight = None
+        self._aa_highlight = None
         self._sel_anchor   = -1
-        self.remove_class("has-trans")
         self._refresh_view()
 
     def highlight_feature(self, feat: "dict | None", cursor_bp: int = -1,
@@ -3821,7 +4367,6 @@ class SequencePanel(Widget):
         self._re_highlight = None
         if feat is None or not self._seq:
             self._sel_range = None
-            self.remove_class("has-trans")
             self._refresh_view()
             return
 
@@ -3834,19 +4379,6 @@ class SequencePanel(Widget):
             if scroll:
                 self._ensure_cursor_visible()   # scroll BEFORE refresh
         self._refresh_view()
-
-        trans_box = self.query_one("#seq-trans", Static)
-        if feat.get("type") == "CDS":
-            aa   = _translate_cds(self._seq, start, end, feat.get("strand", 1))
-            n_aa = len(aa.rstrip("*"))
-            t    = Text()
-            t.append(f" {feat['label']}  ", style=f"bold {feat['color']}")
-            t.append(f"({n_aa} aa)  ", style="dim")
-            t.append(aa[:self.size.width - 4], style=feat["color"])
-            trans_box.update(t)
-            self.add_class("has-trans")
-        else:
-            self.remove_class("has-trans")
 
     def select_feature_range(self, feat: dict, cursor_bp: int = -1,
                               scroll: bool = True) -> None:
@@ -3882,28 +4414,31 @@ class SequencePanel(Widget):
             self._ensure_cursor_visible()
         self._refresh_view()
 
-        # Show CDS translation when applicable
-        trans_box = self.query_one("#seq-trans", Static)
-        if feat.get("type") == "CDS":
-            aa   = _translate_cds(self._seq, start, end, feat.get("strand", 1))
-            n_aa = len(aa.rstrip("*"))
-            t    = Text()
-            t.append(f" {feat['label']}  ", style=f"bold {feat['color']}")
-            t.append(f"({n_aa} aa)  ", style="dim")
-            t.append(aa[:self.size.width - 4], style=feat["color"])
-            trans_box.update(t)
-            self.add_class("has-trans")
-        else:
-            self.remove_class("has-trans")
-
     # ── Mouse / click ──────────────────────────────────────────────────────────
 
     def on_mouse_down(self, event: MouseDown) -> None:
         if event.button != 1:
             return
+        # Reset side-effect flags before `_click_to_bp` — it sets these
+        # only on lane / AA-letter hits and never clears, so a stale
+        # value from the previous click would otherwise leak through
+        # (e.g. lane→DNA-row sequence wrongly skipping auto-scroll, or
+        # mid-drag mouse_up bypassing on_click and leaving them set).
+        self._last_lane_click     = False
+        self._last_aa_codon_click = None
         bp = self._click_to_bp(event.screen_x, event.screen_y)
         if bp < 0:
             return
+        # AA-letter click → land the cursor at the CENTER bp of the
+        # codon (= where the AA letter was rendered), not the feature
+        # midpoint that `_check_packed` returns for lane hits.
+        # Without this override the cursor would briefly flash at the
+        # CDS midpoint between mouse_down and the on_click handler
+        # that re-parks it. Codon range is `[cs, ce)` with cs = mid-1,
+        # ce = mid+2 — so the centre bp is `cs + 1`.
+        aa_codon = self._last_aa_codon_click
+        if aa_codon is not None:
+            bp = aa_codon[0] + 1
         self._mouse_button_held = True
         self._drag_start_bp     = bp
         self._has_dragged       = False
@@ -3922,8 +4457,16 @@ class SequencePanel(Widget):
             self._cursor_pos = bp
             self._user_sel   = None
             self._sel_anchor = -1
-        # Scroll BEFORE refresh — see _ensure_cursor_visible docstring.
-        self._ensure_cursor_visible()
+        # Skip the auto-scroll for lane-art / AA-letter clicks: the
+        # user clicked something already on screen, so jumping the
+        # viewport to the feature midpoint (or the codon centre)
+        # would yank them away from what they were looking at. Plain
+        # DNA-row clicks still scroll if the cursor lands off-screen,
+        # since those clicks set cursor at the literal click bp.
+        skip_scroll = (self._last_lane_click
+                       or self._last_aa_codon_click is not None)
+        if not skip_scroll:
+            self._ensure_cursor_visible()
         self._refresh_view()
 
     def on_mouse_move(self, event: MouseMove) -> None:
@@ -3978,21 +4521,61 @@ class SequencePanel(Widget):
                 elif ext_cut < hi_start:
                     hi_start = ext_cut
             self._re_highlight = {
-                "start":      hi_start,
-                "end":        hi_end,
-                "fwd_cut_bp": -1,
-                "rev_cut_bp": -1,
-                "color":      resite["color"],
-                "name":       resite["label"],
+                "start":         hi_start,
+                "end":           hi_end,
+                # Absolute top-strand-coord cut positions, baked into
+                # the resite at scan time. -1 means unknown (e.g. an
+                # older custom-built resite without these fields).
+                "top_cut_bp":    resite.get("top_cut_bp", -1),
+                "bottom_cut_bp": resite.get("bottom_cut_bp", -1),
+                "color":         resite["color"],
+                "name":          resite["label"],
             }
             self._sel_range  = None
             self._user_sel   = None
             self._cursor_pos = -1
+            # Drop any sibling-panel highlight the user had set before
+            # — they're focusing on this restriction site now, so a
+            # prior feature selection on the map shouldn't linger.
+            try:
+                pm = self.app.query_one("#plasmid-map", PlasmidMap)
+                if pm.selected_idx != -1:
+                    pm.selected_idx = -1
+                    pm.refresh()
+            except (NoMatches, AttributeError):
+                pass
             self._refresh_view()
             return
 
-        # Regular click: clear any RE highlight
+        # AA-letter click → highlight just that one codon (3 bp) on
+        # the DNA strand as a copyable selection, with the cursor
+        # parked at the codon's centre bp (where the AA letter was
+        # rendered). The `_check_packed` walker stashed the codon's
+        # `[start, end)` range in `_last_aa_codon_click`.
+        codon = self._last_aa_codon_click
+        self._last_aa_codon_click = None
+        if codon is not None:
+            self._user_sel    = codon
+            self._sel_range   = None
+            self._sel_anchor  = codon[0]
+            # Cursor at codon centre — the AA letter's column.
+            self._cursor_pos  = codon[0] + 1
+            self._re_highlight = None
+            self._aa_highlight = None
+            try:
+                pm = self.app.query_one("#plasmid-map", PlasmidMap)
+                if pm.selected_idx != -1:
+                    pm.selected_idx = -1
+                    pm.refresh()
+            except (NoMatches, AttributeError):
+                pass
+            self._refresh_view()
+            return
+
+        # Regular click: clear any RE highlight + drop any whole-CDS
+        # AA highlight (the new spec is single-codon only — see above).
         self._re_highlight = None
+        self._aa_highlight = None
         double = event.chain >= 2
         self.post_message(self.SequenceClick(
             bp, double=double, from_lane=self._last_lane_click,
@@ -4047,16 +4630,102 @@ class SequencePanel(Widget):
         for chunk_start in range(0, n, line_width):
             chunk_end   = min(chunk_start + line_width, n)
             chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
-            re_above, onebp_above, reg_above, reg_below, onebp_below, re_below = (
+            above_p, below_p, above_rows, below_rows = (
                 _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
             )
 
-            # Above: RE (far) → 1bp → multi-bp (close to DNA)
-            for lane in (*re_above, *onebp_above, *reg_above):
-                for _ in range(rpg):
-                    if row == content_row:
-                        return _check_lane(lane)
-                    row += 1
+            def _check_packed(placements, screen_row_idx_from_top: int,
+                              total_rows: int, is_below: bool):
+                """Map a screen-row offset within the strand stack to a
+                feature lane click. `screen_row_idx_from_top=0` is the
+                first row drawn for that strand; below-DNA flips the
+                packed-row index to account for the close→far order."""
+                if is_below:
+                    packed_row = screen_row_idx_from_top
+                else:
+                    packed_row = total_rows - 1 - screen_row_idx_from_top
+                # Find the feature whose footprint covers (col, packed_row)
+                # at the click column; mirrors `_check_lane` in spirit.
+                for f, bottom_row in placements:
+                    if not (bottom_row <= packed_row
+                            < bottom_row + _feat_stack_height(f)):
+                        continue
+                    bar_s = max(f["start"], chunk_start) - chunk_start
+                    bar_e = min(f["end"],   chunk_end)   - chunk_start
+                    if bar_s <= seq_col < bar_e:
+                        if f.get("type") == "resite":
+                            self._last_resite_click = f
+                        elif (f.get("type") == "CDS"
+                                and packed_row - bottom_row == 0):
+                            # AA sub-row click. Only count it as a
+                            # codon click if the column actually
+                            # carries an AA letter (= a codon midpoint
+                            # of THIS CDS). Empty cells between
+                            # letters are no-ops — the user explicitly
+                            # asked that clicking the gap between
+                            # amino acids do nothing.
+                            click_bp = chunk_start + seq_col
+                            # Original CDS bounds — wrap halves
+                            # carry these in `_orig_*`; non-wrap
+                            # falls back to the half's own coords.
+                            orig_s = f.get("_orig_start", f["start"])
+                            orig_e = f.get("_orig_end",   f["end"])
+                            strand = f.get("strand", 1)
+                            n = len(self._seq)
+                            if orig_e >= orig_s:
+                                cds_len = orig_e - orig_s
+                                virt_e  = orig_e
+                            else:
+                                cds_len = (n - orig_s) + orig_e if n else 0
+                                virt_e  = orig_s + cds_len
+                            n_codons = cds_len // 3
+                            # Virtual click bp: for wrap CDS clicks
+                            # in the head, shift by `n` so the codon
+                            # math works in linear coordinates.
+                            if orig_e < orig_s and click_bp < orig_s and n:
+                                virt_click = click_bp + n
+                            else:
+                                virt_click = click_bp
+                            on_letter = False
+                            codon_idx = -1
+                            if strand == -1:
+                                # midpoint bp = virt_e - 3*i - 2
+                                delta = virt_e - virt_click - 2
+                                if delta >= 0 and delta % 3 == 0:
+                                    codon_idx = delta // 3
+                                    on_letter = 0 <= codon_idx < n_codons
+                            else:
+                                # midpoint bp = orig_s + 3*i + 1
+                                delta = virt_click - orig_s - 1
+                                if delta >= 0 and delta % 3 == 0:
+                                    codon_idx = delta // 3
+                                    on_letter = 0 <= codon_idx < n_codons
+                            if on_letter:
+                                # Codon spans 3 bp centred on click_bp;
+                                # clamp at the seq ends but allow the
+                                # codon range itself to wrap (cs > ce
+                                # only happens at the very edges of a
+                                # wrap CDS — `_user_sel` consumers
+                                # already tolerate the linear case).
+                                cs = click_bp - 1
+                                ce = click_bp + 2
+                                if 0 <= cs and ce <= n:
+                                    self._last_aa_codon_click = (cs, ce)
+                                self._last_lane_click = True
+                                return click_bp
+                            # Click landed in an empty cell of the AA
+                            # row — do nothing.
+                            return -1
+                        else:
+                            self._last_lane_click = True
+                        return (f["start"] + f["end"]) // 2
+                return -1
+
+            # Above traversal: top of stack first (row index from top = 0).
+            for k in range(above_rows):
+                if row == content_row:
+                    return _check_packed(above_p, k, above_rows, False)
+                row += 1
 
             # DNA rows: fwd strand + RC strand (2 rows)
             for _ in range(2):
@@ -4066,12 +4735,17 @@ class SequencePanel(Widget):
                     return -1
                 row += 1
 
-            # Below: multi-bp (close) → 1bp → RE (far)
-            for lane in (*reg_below, *onebp_below, *re_below):
-                for _ in range(rpg):
-                    if row == content_row:
-                        return _check_lane(lane)
-                    row += 1
+            # Below traversal: closest to DNA first (row index from top = 0).
+            for k in range(below_rows):
+                if row == content_row:
+                    return _check_packed(below_p, k, below_rows, True)
+                row += 1
+
+            # Trailing blank row appended in `_render_chunk` for
+            # inter-chunk spacing — clicks here are no-ops.
+            if row == content_row:
+                return -1
+            row += 1
 
             if row > content_row:
                 break
@@ -4107,11 +4781,14 @@ class SequencePanel(Widget):
         )
         if not chunks_layout:
             return 0
-        rpg = 2 + (1 if self._show_connectors else 0)
+        # rpg is no longer meaningful in the 2D-packed renderer (each
+        # chunk reports literal row counts directly); ignore connectors
+        # for now — the show_connectors path is unused after the
+        # 2026-04-30 packing refactor.
         chunk_idx = min(bp // line_width, len(chunks_layout) - 1)
-        # Total rows up to (not including) chunk_idx, scaled for current rpg.
-        rows_before = prefix_dna2[chunk_idx] + (rpg - 2) * prefix_lanes[chunk_idx]
-        above_rows  = chunks_layout[chunk_idx][3] * rpg
+        chunk_info  = chunks_layout[chunk_idx]
+        above_rows  = chunk_info[3]
+        rows_before = prefix_dna2[chunk_idx]
         return rows_before + above_rows
 
     def _line_width(self) -> int:
@@ -4229,13 +4906,18 @@ class SequencePanel(Widget):
         if not chunks_layout:
             return
 
-        rpg = 2 + (1 if self._show_connectors else 0)
         chunk_idx = min(self._cursor_pos // line_width, len(chunks_layout) - 1)
-        above_pairs = chunks_layout[chunk_idx][3]
-        below_pairs = chunks_layout[chunk_idx][4]
+        # Post-2026-04-30: chunks_layout stores literal row counts
+        # (above_rows / below_rows) instead of pair counts × rpg.
+        above_rows = chunks_layout[chunk_idx][3]
+        below_rows = chunks_layout[chunk_idx][4]
 
-        chunk_top    = prefix_dna2[chunk_idx] + (rpg - 2) * prefix_lanes[chunk_idx]
-        chunk_bottom = chunk_top + (above_pairs + below_pairs) * rpg + 1
+        chunk_top    = prefix_dna2[chunk_idx]
+        # `chunk_bottom` is the last row of the below-lane art for
+        # this chunk (we exclude the trailing inter-chunk gap from
+        # the "visible" footprint so a snap-into-view doesn't pull
+        # the next chunk's lane art onto the bottom edge).
+        chunk_bottom = chunk_top + above_rows + 2 + below_rows - 1
 
         try:
             scroll = self.query_one("#seq-scroll", ScrollableContainer)
@@ -4249,7 +4931,7 @@ class SequencePanel(Widget):
         max_y    = scroll.max_scroll_y
 
         chunk_height = chunk_bottom - chunk_top + 1
-        dna_row      = chunk_top + above_pairs * rpg
+        dna_row      = chunk_top + above_rows
 
         if chunk_height > vp_h:
             # Chunk doesn't fit — track the DNA row, lanes get clipped.
@@ -4295,9 +4977,10 @@ class SequencePanel(Widget):
         reh_key = (
             self._re_highlight["start"], self._re_highlight["end"]
         ) if self._re_highlight else None
+        aa_key = id(self._aa_highlight) if self._aa_highlight is not None else None
         key = (id(self._seq), id(self._feats), line_width,
                self._sel_range, self._user_sel, self._cursor_pos,
-               self._show_connectors, reh_key)
+               self._show_connectors, reh_key, aa_key)
         if key != self._view_cache_key:
             self._view_cache_txt = _build_seq_text(
                 self._seq, self._feats,
@@ -4307,6 +4990,7 @@ class SequencePanel(Widget):
                 cursor_pos      = self._cursor_pos,
                 show_connectors = self._show_connectors,
                 re_highlight    = self._re_highlight,
+                aa_highlight    = self._aa_highlight,
             )
             self._view_cache_key = key
 
@@ -8982,7 +9666,8 @@ class GrammarEditorModal(ModalScreen):
             _log.exception("Grammar save failed")
             self.app.notify(f"Save failed: {exc}", severity="error")
             return
-        self.app.notify(f"Saved grammar '{parsed.get('name')}'.")
+        self.app.notify(f"Saved grammar '{parsed.get('name')}'.",
+                        severity="success")
         self.dismiss("saved")
 
     @on(Button.Pressed, "#btn-ged-delete")
@@ -9493,7 +10178,8 @@ class PartsBinModal(Screen):
         refused the escape sequence."""
         ok = _copy_to_clipboard_osc52(text)
         if ok:
-            self.app.notify(f"Copied {label} to clipboard ({bp_note}).")
+            self.app.notify(f"Copied {label} to clipboard ({bp_note}).",
+                            severity="success")
         else:
             self.app.notify(
                 f"Could not access clipboard — select the sequence "
@@ -12726,7 +13412,8 @@ class PrimerDesignScreen(Screen):
                     self.query_one("#pd-plasmid-name", Static).update(
                         new_rec.name)
                     self._update_feature_dropdown()
-                    self.app.notify(f"Loaded {new_rec.name} as primer template.")
+                    self.app.notify(f"Loaded {new_rec.name} as primer template.",
+                                    severity="success")
                     return
             self.app.notify("Entry not found.", severity="warning")
 
@@ -13293,7 +13980,8 @@ class PrimerDesignScreen(Screen):
             })
         _save_primers(entries)
         self._refresh_library_table()
-        self.app.notify(f"Saved {fwd_name} + {rev_name} to primer library.")
+        self.app.notify(f"Saved {fwd_name} + {rev_name} to primer library.",
+                        severity="success")
         self._reset_for_new_design()
 
     # ── Add selected library primers as features ──────────────────────────
@@ -14420,6 +15108,11 @@ class LibraryDeleteConfirmModal(ModalScreen):
 class PlasmidApp(App):
     TITLE       = "SpliceCraft"
     TRANSITIONS = {}          # instant screen open/close — no slide animations
+    # Auto-focus the plasmid library table on startup, NOT the search
+    # Input (which would otherwise capture `r`, `f`, `v`, etc. as text
+    # before the App's priority bindings could fire). The search input
+    # still focuses on click via Textual's default click-to-focus.
+    AUTO_FOCUS = "#lib-coll-table, #lib-table"
     _preload_record = None
     _current_record = None   # last-loaded SeqRecord
     _source_path:   "str | None" = None   # file the current record was loaded from
@@ -14438,11 +15131,45 @@ class PlasmidApp(App):
     CSS = """
 Screen { background: $background; }
 
+/* ── Toast notifications — semantic colour tinting ────── */
+/* Textual ships three severities (information / warning / error); we
+   also accept "success" (custom — see `_notify_success`). Red is
+   reserved for the error tier; warnings use amber so users don't
+   confuse a soft "hey, FYI" with a hard failure:
+     - information (default neutral)  → subtle blue
+     - success     (custom severity)  → muted green
+     - warning                         → amber
+     - error                           → red */
+Toast.-information {
+    background: $primary-darken-3;
+    border-left: outer $primary;
+}
+Toast.-information .toast--title { color: $text-primary; }
+
+Toast.-success {
+    background: $success-darken-3;
+    border-left: outer $success;
+}
+Toast.-success .toast--title { color: $text-success; }
+
+Toast.-warning {
+    background: $warning-darken-3;
+    border-left: outer $warning;
+}
+Toast.-warning .toast--title { color: $text-warning; }
+
+Toast.-error {
+    background: $error-darken-2;
+    border-left: outer $error;
+}
+Toast.-error .toast--title { color: $text-error; }
+
 /* ── Layout ─────────────────────────────────────────────── */
 MenuBar { height: 1; dock: top; }
-#main-row   { height: 1fr; }
-#center-col { width: 1fr; height: 1fr; }
-#map-row    { height: 1fr; }
+/* Top row shares height between Library / PlasmidMap / Sidebar; the
+   SequencePanel sits beneath it and uses its own fixed height, giving
+   the DNA strip the full window width. */
+#top-row { height: 1fr; }
 
 #status-bar {
     height: 1;
@@ -14528,10 +15255,14 @@ EditSeqDialog { align: center middle; }
 #edit-btns Button { margin-right: 1; }
 
 /* ── Unsaved-quit dialog ─────────────────────────────────── */
+/* The cool dim-indigo `#1a1f3a` lifts the confirmation modals off
+   the pure-black panels so they read as a raised surface. All six
+   confirm modals share it; tweak in one place if you want a
+   different shade. */
 UnsavedQuitModal { align: center middle; }
 #quit-dlg {
     width: 60; height: auto;
-    background: $surface; border: solid $error; padding: 1 2;
+    background: #1a1f3a; border: solid $error; padding: 1 2;
 }
 #quit-title { background: $error-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #quit-msg   { color: $text-muted; margin-bottom: 1; }
@@ -14542,7 +15273,7 @@ UnsavedQuitModal { align: center middle; }
 UnsavedNavigateModal { align: center middle; }
 #navunsv-dlg {
     width: 60; height: auto;
-    background: $surface; border: solid $warning; padding: 1 2;
+    background: #1a1f3a; border: solid $warning; padding: 1 2;
 }
 #navunsv-title { background: $warning-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #navunsv-msg   { color: $text-muted; margin-bottom: 1; }
@@ -14553,7 +15284,7 @@ UnsavedNavigateModal { align: center middle; }
 QuitConfirmModal { align: center middle; }
 #quitcon-dlg {
     width: 50; height: auto;
-    background: $surface; border: solid $primary; padding: 1 2;
+    background: #1a1f3a; border: solid $primary; padding: 1 2;
 }
 #quitcon-title { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #quitcon-msg   { color: $text-muted; margin-bottom: 1; }
@@ -14572,7 +15303,7 @@ SplashScreen { background: black; }
 LibraryDeleteConfirmModal { align: center middle; }
 #libdel-dlg {
     width: 64; height: auto;
-    background: $surface; border: solid $error; padding: 1 2;
+    background: #1a1f3a; border: solid $error; padding: 1 2;
 }
 #libdel-title { background: $error-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #libdel-msg   { color: $text-muted; margin-bottom: 1; }
@@ -14622,7 +15353,7 @@ CollectionNameModal { align: center middle; }
 CollectionDeleteConfirmModal { align: center middle; }
 #colldel-dlg {
     width: 60; height: 16;
-    background: $surface; border: solid $primary; padding: 1 2;
+    background: #1a1f3a; border: solid $primary; padding: 1 2;
 }
 #colldel-title { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #colldel-msg   { height: 1fr; }
@@ -14633,7 +15364,7 @@ CollectionDeleteConfirmModal { align: center middle; }
 ScaryDeleteConfirmModal { align: center middle; }
 #scarydel-dlg {
     width: 70; height: 20;
-    background: $surface;
+    background: #1a1f3a;
     border: thick $error;
     padding: 1 2;
 }
@@ -15083,17 +15814,28 @@ SpeciesPickerModal { align: center middle; }
         Binding("ctrl+s",      "save",             "Save",          show=True),
         Binding("ctrl+f",      "add_feature",      "Add feature",   show=True),
         Binding("ctrl+shift+f","capture_to_features", "→ Feat lib", show=True,  priority=True),
-        Binding("[",           "rotate_cw",        "Rotate ←",      show=True,  priority=True),
-        Binding("]",           "rotate_ccw",       "Rotate →",      show=True,  priority=True),
-        Binding("shift+[",     "rotate_cw_lg",     "Rotate ←←",     show=False, priority=True),
-        Binding("shift+]",     "rotate_ccw_lg",    "Rotate →→",     show=False, priority=True),
+        # Rotation keys (arrows + [/]) live on PlasmidMap.BINDINGS so they
+        # only rotate when the map has focus. Pre-2026-04-29 the `[`/`]`
+        # keys were App-level with priority=True, which fired even on
+        # modal screens — moving them to the map removes that surprise.
         Binding("home",        "reset_origin",     "Reset origin",  show=True,  priority=True),
         Binding("v",           "toggle_map_view",  "⊙/─ View",      show=True,  priority=True),
         Binding("l",           "toggle_connectors","Connectors",    show=True,  priority=True),
         Binding("r",           "toggle_restr",     "RE sites",      show=True,  priority=True),
         Binding("delete",      "delete_feature",   "Del feature",   show=True,  priority=True),
         Binding("q",           "quit",             "Quit",          show=True),
-        Binding("ctrl+c",      "copy_selection",   "",              show=False, priority=True),
+        # Ctrl+C copies the top strand (5'→3'). Reverse-complement
+        # (bottom strand) is on Alt+C: most terminal emulators
+        # collapse Ctrl+Shift+C to plain Ctrl+C at the byte level
+        # (both send ETX, 0x03), so the original `ctrl+shift+c`
+        # binding never fired and Ctrl+Shift+C silently invoked the
+        # top-strand action. Alt+C arrives as ESC-c which is always
+        # distinct from ETX. Keeping `ctrl+shift+c` as an alias for
+        # terminals that DO honour modifier keys (kitty, Windows
+        # Terminal w/ modifyOtherKeys, etc.).
+        Binding("ctrl+c",       "copy_selection",        "",         show=False, priority=True),
+        Binding("alt+c",        "copy_selection_bottom", "",         show=False, priority=True),
+        Binding("ctrl+shift+c", "copy_selection_bottom", "",         show=False, priority=True),
     ]
 
     # Actions that remain available even when a screen is pushed on top.
@@ -15134,13 +15876,14 @@ SpeciesPickerModal { align: center middle; }
         _restore_library_from_active_collection()
         yield Header()
         yield MenuBar()
-        with Horizontal(id="main-row"):
+        # Three side-by-side panels share the top row; the sequence
+        # panel sits below them and spans the full window width so the
+        # DNA strip is the broadest, easiest-to-scan element on screen.
+        with Horizontal(id="top-row"):
             yield LibraryPanel(id="library")
-            with Vertical(id="center-col"):
-                with Horizontal(id="map-row"):
-                    yield PlasmidMap(id="plasmid-map")
-                    yield FeatureSidebar(id="sidebar")
-                yield SequencePanel(id="seq-panel")
+            yield PlasmidMap(id="plasmid-map")
+            yield FeatureSidebar(id="sidebar")
+        yield SequencePanel(id="seq-panel")
         yield Static(
             Text(
                 "  [ ] rotate   ← → cursor/map   Shift coarse   Home reset"
@@ -15152,19 +15895,12 @@ SpeciesPickerModal { align: center middle; }
         )
         yield Footer()
 
-    # ── Delegate rotation keys to PlasmidMap ───────────────────────────────────
-
-    def action_rotate_cw(self):
-        self.query_one("#plasmid-map", PlasmidMap).action_rotate_cw()
-
-    def action_rotate_ccw(self):
-        self.query_one("#plasmid-map", PlasmidMap).action_rotate_ccw()
-
-    def action_rotate_cw_lg(self):
-        self.query_one("#plasmid-map", PlasmidMap).action_rotate_cw_lg()
-
-    def action_rotate_ccw_lg(self):
-        self.query_one("#plasmid-map", PlasmidMap).action_rotate_ccw_lg()
+    # ── Delegate map-level keys to PlasmidMap ──────────────────────────────────
+    # Rotation actions used to live here as App-level wrappers so `[`/`]`
+    # could rotate from any focus context. They've been moved onto the
+    # map widget itself so rotation is strictly focus-gated; only Home /
+    # `v` remain at the App level because they should still work when
+    # the user is editing the seq panel or browsing the sidebar.
 
     def action_reset_origin(self):
         self.query_one("#plasmid-map", PlasmidMap).action_reset_origin()
@@ -15198,12 +15934,27 @@ SpeciesPickerModal { align: center middle; }
                 callback=self._edit_dialog_result,
             )
         elif sp._cursor_pos >= 0:
-            # Insert at cursor position
+            # No selection: replace the single base under the cursor.
+            # The cursor sits at one bp; pre-2026-04-30 this opened
+            # the dialog in "insert" mode (insert before cursor) which
+            # was rarely what the user wanted. The new default is to
+            # replace [cursor, cursor+1). Insert mode will get its own
+            # entry point later.
             pos = sp._cursor_pos
-            self.push_screen(
-                EditSeqDialog("insert", start=pos, end=pos),
-                callback=self._edit_dialog_result,
-            )
+            n = len(sp._seq)
+            if pos >= n:
+                # Cursor parked one-past-the-end (e.g. via Right at
+                # last base) — fall back to plain insert there.
+                self.push_screen(
+                    EditSeqDialog("insert", start=pos, end=pos),
+                    callback=self._edit_dialog_result,
+                )
+            else:
+                existing = sp._seq[pos:pos + 1]
+                self.push_screen(
+                    EditSeqDialog("replace", existing, pos, pos + 1),
+                    callback=self._edit_dialog_result,
+                )
         else:
             self.notify(
                 "Click on the sequence to place a cursor, "
@@ -15239,7 +15990,7 @@ SpeciesPickerModal { align: center middle; }
             pm._restr_feats = displayed
             pm.refresh()
             sp.update_seq(new_seq, pm._feats + displayed)
-            self.notify(f"Sequence updated  ({len(new_seq):,} bp)")
+            self._notify_success(f"Sequence updated  ({len(new_seq):,} bp)")
         else:
             pm._restr_feats = displayed
             pm.refresh()
@@ -15414,17 +16165,41 @@ SpeciesPickerModal { align: center middle; }
             return
         lib = self.query_one("#library", LibraryPanel)
         lib.add_entry(self._current_record)
-        self.notify(f"Added {self._current_record.name} to library.")
+        self._notify_success(f"Added {self._current_record.name} to library.")
 
     # ── Mount: auto-load preloaded record ──────────────────────────────────────
 
     def on_mount(self) -> None:
+        # Pin every panel/screen background to true black to match the
+        # logo. textual-dark's defaults are near-black greys; we register
+        # a fork that pins background/surface/panel to #000000 and keep
+        # the rest of textual-dark's palette. Done before push_screen so
+        # the splash inherits the black backdrop.
+        self.register_theme(Theme(
+            name="splicecraft-black",
+            primary="#0178D4",
+            secondary="#004578",
+            warning="#ffa62b",
+            error="#ba3c5b",
+            success="#4EBF71",
+            accent="#ffa62b",
+            foreground="#e0e0e0",
+            background="#000000",
+            surface="#000000",
+            panel="#000000",
+            dark=True,
+        ))
+        self.theme = "splicecraft-black"
         # Show the splash on top first; the rest of init runs underneath
         # while the user reads it. Skipped under `--no-splash` (and during
         # tests by default — splash blocks input which interferes with
-        # `pilot.click` and friends).
+        # `pilot.click` and friends). Notifications fired while the splash
+        # is up are queued (see `notify`) and replayed on dismiss so the
+        # user still sees crash-recovery / corruption warnings.
+        self._splash_notify_queue: list = []
         if not getattr(self, "_skip_splash", False):
-            self.push_screen(SplashScreen())
+            self.push_screen(SplashScreen(),
+                             callback=self._on_splash_dismissed)
         # Per-plasmid undo: switching plasmids stashes the old stacks under
         # the old record.id and restores this plasmid's own history if it
         # was edited before. See _stash_current_undo_and_load.
@@ -15616,24 +16391,141 @@ SpeciesPickerModal { align: center middle; }
     # ── Keyboard: cursor movement, copy, undo/redo ─────────────────────────────
 
     def action_copy_selection(self) -> None:
+        """Ctrl+C — copy the top strand (5'→3') of the selection."""
+        self._copy_strand(bottom=False)
+
+    def action_copy_selection_bottom(self) -> None:
+        """Ctrl+Shift+C — copy the bottom strand (5'→3' on the
+        reverse-complement) of the selection."""
+        self._copy_strand(bottom=True)
+
+    def _copy_strand(self, *, bottom: bool) -> None:
         sp  = self.query_one("#seq-panel", SequencePanel)
         seq = sp._seq
         if not seq:
             return
-        sel = sp._user_sel or sp._sel_range
-        if sel:
-            text = seq[sel[0]:sel[1]].upper()
+        # AA-highlight short-circuit: when a CDS is highlighted as a
+        # protein sequence (clicked the bar / AA letters), Ctrl+C
+        # copies the AA string instead of DNA. Alt+C / Ctrl+Shift+C
+        # (`bottom=True`) still copies DNA reverse-complement so the
+        # user has both options once a CDS is selected.
+        aa_feat = sp._aa_highlight
+        if aa_feat is not None and not bottom:
+            f_s, f_e = aa_feat["start"], aa_feat["end"]
+            strand = aa_feat.get("strand", 1)
+            aa_str = _translate_cds(seq, f_s, f_e, strand).rstrip("*")
             try:
-                self.copy_to_clipboard(text)
-                self.notify(f"Copied {len(text)} bp to clipboard")
+                self.copy_to_clipboard(aa_str)
+                self._notify_success(
+                    f"Copied {len(aa_str)} aa ({aa_feat.get('label', 'CDS')}) "
+                    f"to clipboard"
+                )
             except Exception:
-                if _copy_to_clipboard_osc52(text):
-                    self.notify(f"Copied {len(text)} bp to clipboard")
+                if _copy_to_clipboard_osc52(aa_str):
+                    self._notify_success(
+                        f"Copied {len(aa_str)} aa "
+                        f"({aa_feat.get('label', 'CDS')}) to clipboard"
+                    )
                 else:
                     self.notify("Clipboard unavailable", severity="warning")
-        else:
+            return
+        sel = sp._user_sel or sp._sel_range
+        if not sel:
             self.notify("No selection — click a feature or drag to select",
                         severity="information")
+            return
+        top = seq[sel[0]:sel[1]].upper()
+        if bottom:
+            # `_rc` handles full IUPAC, not just ACGT — sacred invariant #3.
+            text = _rc(top)
+            label = "bottom strand"
+        else:
+            text = top
+            label = "top strand"
+        try:
+            self.copy_to_clipboard(text)
+            self._notify_success(f"Copied {len(text)} bp ({label}) to clipboard")
+        except Exception:
+            if _copy_to_clipboard_osc52(text):
+                self._notify_success(f"Copied {len(text)} bp ({label}) to clipboard")
+            else:
+                self.notify("Clipboard unavailable", severity="warning")
+
+    def _clear_all_highlights(self) -> None:
+        """Comprehensive 'fresh state' reset — clears every panel's
+        visible highlight in one go. Click handlers that land on a
+        neutral spot (map backbone, blank sidebar area, anywhere
+        outside a selectable widget) call this so prior selections
+        don't linger across panels.
+
+        Cleared:
+          - SequencePanel: RE highlight, feature highlight, user
+            selection, selection anchor, cursor, translation strip.
+          - PlasmidMap: selected feature index.
+
+        Selecting a new feature (lane click, map feature click, sidebar
+        row activation) doesn't go through here — those paths replace
+        the previous selection directly via `select_feature_range` /
+        `pm.select_feature`, which already does the right thing.
+
+        Optimization: only refresh widgets whose state actually
+        changed. A click on an already-clear screen would otherwise
+        repaint both panels for no visible change."""
+        try:
+            sp = self.query_one("#seq-panel", SequencePanel)
+            seq_changed = (sp._re_highlight is not None
+                           or sp._sel_range is not None
+                           or sp._user_sel is not None
+                           or sp._sel_anchor != -1
+                           or sp._cursor_pos >= 0
+                           or sp._aa_highlight is not None)
+            if seq_changed:
+                sp._re_highlight = None
+                sp._sel_range = None
+                sp._user_sel = None
+                sp._sel_anchor = -1
+                sp._cursor_pos = -1
+                sp._aa_highlight = None
+                sp._refresh_view()
+        except NoMatches:
+            pass
+        try:
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+            if pm.selected_idx != -1:
+                pm.selected_idx = -1
+                pm.refresh()
+        except NoMatches:
+            pass
+
+    def on_click(self, event) -> None:
+        """Clicks landing OUTSIDE every interactive panel (seq, map,
+        sidebar, library) are 'neutral clicks' and should reset every
+        panel's highlight state. Clicks INSIDE a panel are owned by
+        that panel's own handler — the panel already replaces or
+        clears its highlight as part of handling the click, and events
+        bubble bottom-up so the panel runs first.
+
+        We walk the widget chain upward from `event.widget`; if any
+        ancestor is one of the four panels, the click is in-panel and
+        we leave it alone."""
+        node = getattr(event, "widget", None)
+        if node is None:
+            return
+        try:
+            panels = (
+                self.query_one("#seq-panel",   SequencePanel),
+                self.query_one("#plasmid-map", PlasmidMap),
+                self.query_one("#sidebar",     FeatureSidebar),
+                self.query_one("#library",     LibraryPanel),
+            )
+        except NoMatches:
+            return
+        cur = node
+        while cur is not None:
+            if cur in panels:
+                return   # click landed in a panel; let it decide
+            cur = cur.parent
+        self._clear_all_highlights()
 
     def on_key(self, event) -> None:
         sp = self.query_one("#seq-panel", SequencePanel)
@@ -15650,21 +16542,117 @@ SpeciesPickerModal { align: center middle; }
             event.stop()
             return
 
-        # ── Arrow keys: move cursor; Shift+arrow extends selection ───────────
-        # Skip if the user is arrowing through one of the navigable
-        # DataTables (feature sidebar, plasmid library, etc.). Otherwise
-        # this handler races with the table's own arrow handler — every
-        # Down keystroke would BOTH advance the seq cursor here AND fire
-        # the table's row-highlight cascade, scrolling the sequence panel
-        # twice (visible jitter on sidebar-feature browsing). The
-        # SequencePanel itself is not focusable, so we can't use
-        # `sp.has_focus`; instead, check whether some OTHER focused
-        # widget owns the keystroke.
+        # ── Arrow keys + Enter: seq-panel cursor navigation ─────────────────
+        # Skip if the focused widget already binds these keys for its own
+        # purpose. Otherwise this handler races with the focused widget's
+        # binding — every Left keystroke would BOTH rotate the plasmid
+        # AND advance the seq cursor. Cases:
+        #   - DataTable — arrows move row cursor, Enter activates row.
+        #   - PlasmidMap — arrows rotate origin, Up resets origin.
+        #   - Input — Enter submits, arrows move text cursor.
+        # The SequencePanel itself is not focusable, so a "no widget
+        # focused" branch is the normal seq-cursor path.
         focused = self.focused
         if focused is not None:
-            from textual.widgets import DataTable
-            if isinstance(focused, DataTable):
+            from textual.widgets import DataTable, Input
+            if isinstance(focused, (DataTable, PlasmidMap, Input)):
                 return
+
+        # ── RE-highlight + arrow: revert the highlight, park the cursor ─
+        # Any arrow press clears the RE highlight and the staggered-
+        # overhang coloring. Left/right park the cursor immediately
+        # upstream/downstream of the top-strand cut so the user can
+        # keep editing from there; up/down park at the cut (downstream
+        # side) so the next keystroke navigates rows from a sensible
+        # anchor instead of a stale -1 cursor position. Top strand is
+        # the reference because its cut is what's drawn on the recut
+        # marker; the bottom-strand cut differs only on sticky cutters.
+        if (sp._re_highlight is not None
+                and event.key in ("left", "right", "up", "down")):
+            cut = sp._re_highlight.get("top_cut_bp", -1)
+            if cut < 0:
+                # Legacy resite without baked cut bp — fall back to the
+                # recognition-site boundary so arrow keys still navigate
+                # somewhere sensible.
+                cut = sp._re_highlight.get("end", -1)
+            if cut >= 0 and sp._seq:
+                if event.key == "left":
+                    sp._cursor_pos = max(0, cut - 1)
+                else:   # right / up / down → downstream side of cut
+                    sp._cursor_pos = min(len(sp._seq) - 1, cut)
+                sp._re_highlight = None
+                sp._sel_anchor = -1
+                sp._user_sel = None
+                sp._sel_range = None
+                sp._ensure_cursor_visible()
+                sp._refresh_view()
+                event.stop()
+                return
+
+        # ── Whole-feature highlight + arrow: jump out at the matching end ──
+        # When `_user_sel` (drag- / shift-selection / lane-click feature
+        # range) or `_sel_range` (programmatic feature highlight) is
+        # active, the next arrow press snaps the cursor to the relevant
+        # end of the selection and steps one base in the arrow's
+        # direction. This is the keyboard equivalent of "click out of
+        # the selection". Up/Down jump to start/end then move one
+        # display row in the arrow's direction.
+        hl_range = sp._user_sel or sp._sel_range
+        if (hl_range is not None
+                and event.key in ("left", "right", "up", "down")
+                and sp._seq):
+            sel_s, sel_e = hl_range
+            n = len(sp._seq)
+            lw = sp._line_width()
+            if event.key == "left":
+                sp._cursor_pos = max(0, sel_s - 1)
+            elif event.key == "right":
+                sp._cursor_pos = min(n - 1, sel_e)
+            elif event.key == "up":
+                # Land at start, then step one display row up.
+                sp._cursor_pos = max(0, sel_s - lw)
+            else:   # down
+                sp._cursor_pos = min(n - 1, max(sel_e - 1, 0) + lw)
+                if sp._cursor_pos >= n:
+                    sp._cursor_pos = n - 1
+            sp._user_sel = None
+            sp._sel_range = None
+            sp._sel_anchor = -1
+            sp._ensure_cursor_visible()
+            sp._refresh_view()
+            event.stop()
+            return
+
+        # Enter on the seq cursor highlights the feature containing that
+        # bp — same chain as a lane click in the seq panel, so the map
+        # selection / sidebar highlight / feature focus all come along.
+        # Smallest enclosing feature wins (matches the lane-click rule
+        # in `_seq_click`).
+        if event.key == "enter":
+            if sp._cursor_pos < 0 or not sp._seq:
+                return
+            bp = sp._cursor_pos
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+            sidebar = self.query_one("#sidebar", FeatureSidebar)
+            total = len(sp._seq)
+            best_idx  = -1
+            best_span = float("inf")
+            for i, f in enumerate(pm._feats):
+                if not pm._bp_in(bp, f):
+                    continue
+                span = _feat_len(f["start"], f["end"], total) if total else 0
+                if span < best_span:
+                    best_span = span
+                    best_idx  = i
+            if best_idx < 0:
+                return
+            f = pm._feats[best_idx]
+            pm.select_feature(best_idx)
+            sidebar.show_detail(f)
+            sidebar.highlight_row(best_idx)
+            self._focus_feature(f, bp)
+            event.stop()
+            return
         if sp._cursor_pos < 0 or not sp._seq:
             return
         n  = len(sp._seq)
@@ -15875,6 +16863,33 @@ SpeciesPickerModal { align: center middle; }
         self._apply_record(record, clear_undo=False)
         self._source_path = saved_source
 
+    def _notify_success(self, message: str, **kwargs) -> None:
+        """Toast with the green success tint — for save/load/copy
+        confirmations. `severity="success"` is not in Textual's typed
+        Literal but slips through at runtime, attaching a `.-success`
+        CSS class that PlasmidApp.CSS styles to a muted green."""
+        kwargs.setdefault("severity", "success")
+        self.notify(message, **kwargs)
+
+    def notify(self, message, **kwargs) -> None:
+        """Suppress toast notifications while the splash is up so they
+        don't render on top of the helix; queue them (capped at 16) and
+        replay on splash dismiss in `_on_splash_dismissed`. Errors and
+        warnings are still logged via the call sites' `_log.exception`,
+        so nothing is silently lost even if the queue overflows."""
+        if isinstance(self.screen, SplashScreen):
+            if len(getattr(self, "_splash_notify_queue", [])) < 16:
+                self._splash_notify_queue.append((message, kwargs))
+            return
+        super().notify(message, **kwargs)
+
+    def _on_splash_dismissed(self, _result) -> None:
+        """Flush any notifications queued during the splash. Replays in
+        order so a startup corruption-recovery message still surfaces."""
+        queue, self._splash_notify_queue = self._splash_notify_queue, []
+        for msg, kwargs in queue:
+            super().notify(msg, **kwargs)
+
     def _do_save(self) -> bool:
         """Save current record to its source file and/or library. Returns True on success."""
         if self._current_record is None:
@@ -15904,9 +16919,9 @@ SpeciesPickerModal { align: center middle; }
 
         self._mark_clean()
         if self._source_path:
-            self.notify(f"Saved → {self._source_path}")
+            self._notify_success(f"Saved → {self._source_path}")
         else:
-            self.notify(f"Saved {self._current_record.name} to library")
+            self._notify_success(f"Saved {self._current_record.name} to library")
         return True
 
     def action_save(self) -> None:
@@ -15977,7 +16992,7 @@ SpeciesPickerModal { align: center middle; }
             path = result.get("path", "?")
             bp = result.get("bp", 0)
             feats = result.get("features", 0)
-            self.notify(
+            self._notify_success(
                 f"Exported {feats} features / {bp} bp → {path}",
                 timeout=8,
             )
@@ -16011,7 +17026,15 @@ SpeciesPickerModal { align: center middle; }
         try:
             lib = self.query_one("#library", LibraryPanel)
             lib.add_entry(record)
-            self.notify(f"Saved {record.name} to library.", timeout=4)
+            # Lead with "Loaded" so the user sees this as a file-open
+            # confirmation; library auto-save is the side effect, not
+            # the headline. Keeps the toast green via _notify_success.
+            if source_path:
+                self._notify_success(
+                    f"Loaded {record.name} from {source_path}", timeout=4)
+            else:
+                self._notify_success(
+                    f"Loaded {record.name} → library", timeout=4)
         except Exception:
             # UI already loaded the record; log and warn but don't hide it.
             _log.exception("auto-persist on import failed")
@@ -16118,29 +17141,49 @@ SpeciesPickerModal { align: center middle; }
         arc_len = (e - s) % n
         return (s + arc_len // 2) % n
 
-    def _focus_feature(self, f: "dict | None", bp: int) -> None:
-        """Single-source UX for "user picked a feature": highlight it as a
-        copyable user_sel range, place the cursor on `bp`, and centre the
-        sequence panel on `bp`. Called from every feature-pick entry point
-        (sequence-panel lane click, plasmid-map click, sidebar row click)
-        so the three feel identical.
+    def _feature_spans_multiple_rows(self, f: dict,
+                                      seq_pnl: "SequencePanel") -> bool:
+        """True when the feature wraps the origin OR its bp range
+        crosses more than one display row at the seq panel's current
+        line_width. Used to decide whether `_focus_feature` should
+        snap-centre (single-row case) or do a gentler minimum-scroll
+        (multi-row case)."""
+        n = len(seq_pnl._seq)
+        if n == 0:
+            return False
+        line_width = seq_pnl._line_width()
+        if line_width <= 0:
+            return False
+        s, e = f["start"], f["end"]
+        if e < s:
+            return True   # wrap features always span the origin row
+        e = min(e, n)
+        if e - s <= 0:
+            return False
+        return (e - 1) // line_width != s // line_width
 
-        Backbone clicks pass `f=None` — only the centring + clearing of
-        prior highlights applies in that case.
+    def _focus_feature(self, f: "dict | None", bp: int,
+                       *, scroll: bool = True) -> None:
+        """Single-source UX for "user picked a feature": highlight the
+        feature span as a copyable user_sel and place the cursor on
+        `bp`. Called from every feature-pick entry point (sequence-
+        panel lane click, plasmid-map click, sidebar row click).
 
-        Both highlight calls go in with `scroll=False`: their own
-        `_ensure_cursor_visible` would scroll the cursor "just into view"
-        first, then `center_on_bp` would scroll again to centre. The two
-        scrolls in sequence read as a perceptible jitter when arrowing
-        through the sidebar feature list.
+        `scroll=True` (default) calls `_ensure_cursor_visible` so the
+        cursor lands on screen — appropriate for map / sidebar
+        clicks, where the user is in a different panel than the seq
+        viewer. `scroll=False` is used by seq-panel lane clicks: the
+        user clicked something they were already looking at, so
+        moving the viewport would feel jarring.
         """
         seq_pnl = self.query_one("#seq-panel", SequencePanel)
         if f is not None and bp >= 0:
             seq_pnl.select_feature_range(f, cursor_bp=bp, scroll=False)
         else:
             seq_pnl.highlight_feature(f, scroll=False)
-        if bp >= 0:
-            seq_pnl.center_on_bp(bp)
+        if bp < 0 or not scroll:
+            return
+        seq_pnl._ensure_cursor_visible()
 
     @on(SequencePanel.SequenceClick)
     def _seq_click(self, event: SequencePanel.SequenceClick) -> None:
@@ -16161,12 +17204,18 @@ SpeciesPickerModal { align: center middle; }
 
         if not event.from_lane:
             # Plain DNA-row click. The cursor is already at `bp` (set
-            # during mouse_down before this click event fired); we just
-            # clear any lingering whole-feature highlight from a prior
-            # lane click, leave map/sidebar selection alone, and let the
-            # caller's mouse-down refresh stand.
+            # during mouse_down before this click event fired); we
+            # also reset any lingering feature highlight (sel_range)
+            # and the map's selected feature so the click reads as a
+            # fresh single-base operation across all panels.
+            changed = False
             if seq_pnl._sel_range is not None:
                 seq_pnl._sel_range = None
+                changed = True
+            if pm.selected_idx != -1:
+                pm.selected_idx = -1
+                pm.refresh()
+            if changed:
                 seq_pnl._refresh_view()
             return
 
@@ -16188,28 +17237,57 @@ SpeciesPickerModal { align: center middle; }
             pm.select_feature(best_idx)
             sidebar.show_detail(f)
             sidebar.highlight_row(best_idx)
-            self._focus_feature(f, bp)
+            # Lane click — user is already looking at this feature
+            # in the seq panel, so don't scroll the viewport. The
+            # whole-feature highlight (`_user_sel = (start, end)`) is
+            # set by `select_feature_range` below; Ctrl+C copies it.
+            self._focus_feature(f, bp, scroll=False)
+            # Drop any prior whole-CDS AA highlight — single-codon
+            # highlights on AA-letter clicks are handled directly in
+            # `SequencePanel.on_click` and don't go through this
+            # whole-feature path.
+            if seq_pnl._aa_highlight is not None:
+                seq_pnl._aa_highlight = None
+                seq_pnl._refresh_view()
 
     @on(PlasmidMap.FeatureSelected)
     def _map_feat_selected(self, event: PlasmidMap.FeatureSelected):
-        sidebar = self.query_one("#sidebar",   FeatureSidebar)
+        sidebar = self.query_one("#sidebar", FeatureSidebar)
+        # Backbone click (idx == -1, feat_dict is None): treat as a
+        # neutral click and wipe every panel's highlight, including
+        # the seq panel's selection / cursor and the map's own
+        # selected_idx (which the panel already nulled in on_click).
+        # The seq panel still scrolls to the clicked bp so the user
+        # sees where in the plasmid they pointed at — useful when
+        # navigating a long plasmid.
+        if event.idx < 0 or event.feat_dict is None:
+            self._clear_all_highlights()
+            if event.bp >= 0:
+                self.query_one("#seq-panel", SequencePanel).center_on_bp(event.bp)
+            return
         sidebar.show_detail(event.feat_dict)
-        if event.idx >= 0:
-            sidebar.highlight_row(event.idx)
-        self._focus_feature(event.feat_dict, event.bp)
+        sidebar.highlight_row(event.idx)
+        # Scroll to the feature's START rather than where the user
+        # clicked on the arc — clicking anywhere on a feature should
+        # land the seq cursor at its 5' end so the user can read the
+        # feature top-to-bottom from the beginning. The whole-feature
+        # highlight (`_user_sel = (start, end)`) still spans the full
+        # range; we just anchor the cursor and viewport at start.
+        self._focus_feature(event.feat_dict, event.feat_dict["start"])
 
     @on(FeatureSidebar.RowActivated)
     def _sidebar_row_activated(self, event: FeatureSidebar.RowActivated):
         pm      = self.query_one("#plasmid-map", PlasmidMap)
         sidebar = self.query_one("#sidebar",     FeatureSidebar)
-        seq_pnl = self.query_one("#seq-panel",   SequencePanel)
         pm.select_feature(event.idx)
         f = pm._feats[event.idx] if 0 <= event.idx < len(pm._feats) else None
         sidebar.show_detail(f)
-        # Sidebar has no click-bp of its own — anchor at the feature's
-        # wrap-aware midpoint so the cursor lands inside the feature and
-        # the centred view shows it symmetrically.
-        bp = self._wrap_aware_midpoint(f, len(seq_pnl._seq)) if f is not None else -1
+        # Anchor at the feature's START (5' end) rather than its
+        # midpoint so the seq panel scrolls to where the feature
+        # begins. Pre-2026-04-30 we used `_wrap_aware_midpoint` which
+        # parked the viewport on the middle of long features; users
+        # found it disorienting on multi-kb CDS rows.
+        bp = f["start"] if f is not None else -1
         self._focus_feature(f, bp)
 
     # ── Library events ─────────────────────────────────────────────────────────
@@ -16219,6 +17297,14 @@ SpeciesPickerModal { align: center middle; }
         gb_text = event.entry.get("gb_text", "")
         if not gb_text:
             self.notify(f"Library entry has no stored sequence.", severity="warning")
+            return
+        # If this entry is already loaded (matched on record.id), skip the
+        # reload — it would clobber undo/redo and any unsaved edits for no
+        # gain. record.id is the LOCUS identifier; library entries dedupe
+        # on the same key so a match here means literal identity.
+        entry_id = event.entry.get("id")
+        if (entry_id and self._current_record is not None
+                and getattr(self._current_record, "id", None) == entry_id):
             return
         try:
             record = _gb_text_to_record(gb_text)
@@ -16613,7 +17699,7 @@ SpeciesPickerModal { align: center middle; }
         if action != "save":
             return
         if self._persist_feature_entry(entry):
-            self.notify(f"Added '{entry.get('name')}' to feature library.")
+            self._notify_success(f"Added '{entry.get('name')}' to feature library.")
             self.push_screen(FeatureLibraryScreen())
 
     def action_add_feature(self) -> None:
@@ -16658,7 +17744,7 @@ SpeciesPickerModal { align: center middle; }
         entry  = result.get("entry") or {}
         if action == "save":
             if self._persist_feature_entry(entry):
-                self.notify(f"Saved '{entry.get('name')}' to feature library.")
+                self._notify_success(f"Saved '{entry.get('name')}' to feature library.")
             return
         if action == "insert":
             try:

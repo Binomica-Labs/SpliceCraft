@@ -50,9 +50,17 @@ Installation section below).
 - **Linear map view** — toggle with `v` for a horizontal strip layout
 - **Dithered sequence panel** — per-base DNA viewer with feature bars, restriction
   site overlays, and double-stranded display
+- **Inline amino-acid translation** — every CDS shows its protein right above
+  (forward) or below (reverse) its DNA bar, one letter per codon midpoint, in
+  the feature's colour. Wrap-around CDSes translate correctly across the origin.
+  Click an AA letter to highlight that codon's three bases on the strand —
+  `Ctrl+C` copies the codon
+- **Per-strand restriction-cut visualization** — clicking a sticky cutter
+  (EcoRI, HindIII, …) tints the upstream bases blue and downstream bases red,
+  with the staggered overhang shown as different colours on the two strands
 - **Live NCBI fetch** — pull any GenBank record by accession number on demand
 - **Local file support** — open `.gb` / `.gbk` (GenBank) or `.dna` (SnapGene native) files directly from disk
-- **Free rotation** — spin the origin left or right with `[` / `]`
+- **Free rotation** — spin the origin with `[` / `]` or arrow keys (when the map has focus)
 - **Restriction enzyme overlay** — 200+ NEB enzymes including Type IIS
   (BsaI, BsmBI, BbsI, SapI) with visible recognition arcs + cut markers
 
@@ -64,6 +72,9 @@ Installation section below).
 - **Plasmid library** — auto-saves on import, mirrors live into the active
   collection, survives restarts, rename + handslip-protected delete; unsaved
   edits prompt Save / Discard / Cancel before navigating away
+- **Library fuzzy search** — type into the search box at the top of the
+  library panel to filter the visible table by subsequence match (case-insensitive,
+  not necessarily contiguous). Empty submit restores the full list.
 - **Parts Bin** — Golden Braid L0 parts catalog with user-domesticated parts
   including sequences and primer pairs
 - **Primer library** — all designed primers with Tm, length, date, status
@@ -190,7 +201,9 @@ you can also still run `python3 splicecraft.py` directly.
 
 | Key            | Description                            |
 |----------------|----------------------------------------|
-| `[` / `]`      | Rotate map origin left / right         |
+| `[` / `]`      | Rotate map origin left / right (when map focused) |
+| `← / →`        | Same as `[` / `]` (when map focused)   |
+| `↑`            | Reset origin to 0 (when map focused)   |
 | `Shift+[/]`    | Rotate coarse (10× step)               |
 | `Home`         | Reset origin to 0                      |
 | `,` / `.`      | Circular map aspect wider / taller     |
@@ -204,10 +217,12 @@ you can also still run `python3 splicecraft.py` directly.
 | `Ctrl+S`       | Save edits to file                     |
 | `Ctrl+F`       | Add a new feature (from cursor or blank) |
 | `Ctrl+Shift+F` | Capture selection / feature → Feature library |
+| `Enter`        | Highlight the feature enclosing the seq cursor |
 | `Delete`       | Context-aware delete (feature or library entry) |
 | `Ctrl+Z`       | Undo                                   |
 | `Ctrl+Shift+Z` | Redo                                   |
-| `Ctrl+C`       | Copy selection to clipboard            |
+| `Ctrl+C`       | Copy selection (top strand 5'→3', or AA when CDS highlighted) |
+| `Alt+C`        | Copy selection (bottom strand, reverse-complement) |
 | `q`            | Quit                                   |
 
 ### Primer Design screen
@@ -224,10 +239,14 @@ you can also still run `python3 splicecraft.py` directly.
 
 | Action         | Description                                 |
 |----------------|---------------------------------------------|
-| Click          | Place cursor / select feature under pointer |
+| Click DNA row  | Place cursor at that base                   |
+| Click feature bar | Highlight the feature, set cursor at its 5' end |
+| Click AA letter | Highlight that codon's three bases on the strand |
+| Click restriction site | Highlight recognition span; tint upstream blue / downstream red per strand |
 | Double-click   | Select full feature span                    |
 | Drag           | Select a sequence range                     |
 | Scroll wheel   | Rotate map (when over map panel)            |
+| Click backbone | Clear all panel highlights                  |
 
 ---
 
@@ -287,15 +306,15 @@ always recoverable via the `.bak` file.
 ## Tests
 
 ```bash
-python3 -m pytest -n auto -q                  # full suite (977 tests, ~3 min on 8 cores)
-python3 -m pytest tests/test_dna_sanity.py    # biology correctness only (< 1s)
+python3 -m pytest -n auto -q                  # full suite (1,009 tests, ~2 min on 8 cores)
+python3 -m pytest tests/test_dna_sanity.py    # biology correctness only (< 2s)
 ```
 
 ---
 
 ## Codebase tour
 
-SpliceCraft is a single-file Python app (`splicecraft.py`, ~16,200 lines) built on
+SpliceCraft is a single-file Python app (`splicecraft.py`, ~17,900 lines) built on
 Textual + Biopython. The single-file layout is intentional — no import puzzles,
 and everything is greppable from one place.
 
@@ -323,8 +342,8 @@ Read it before touching the rendering layer, record pipeline, or primer design.
 ### Running the suite
 
 ```bash
-python3 -m pytest -n auto -q                  # full suite (~3 min)
-python3 -m pytest tests/test_dna_sanity.py    # biology only (< 1 s)
+python3 -m pytest -n auto -q                  # full suite (~2 min)
+python3 -m pytest tests/test_dna_sanity.py    # biology only (< 2 s)
 ```
 
 All tests run offline against synthetic `SeqRecord`s and monkeypatched data paths;

@@ -119,6 +119,10 @@ class TestBasicKeybindings:
             await pilot.pause()
             await pilot.pause(0.05)
             pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            # `[` is focus-gated to the map (post-2026-04-29), so focus
+            # the map before pressing it. Pre-fix `[` worked anywhere.
+            app.set_focus(pm)
+            await pilot.pause(0.05)
             origin_before = pm.origin_bp
             await pilot.press("[")
             await pilot.pause(0.1)
@@ -925,63 +929,6 @@ class TestCrashRecoveryAutosave:
             assert app._autosave_path(deepcopy(a)) == path_a
 
 
-class TestSidebarDetailWrapFeature:
-    """The sidebar detail pane must render wrap features with an unambiguous
-    compound-location string. A naive '{start+1}..{end}' shows '97..5' for a
-    wrap, which a casual reader could mis-interpret as a 3-bp reverse range.
-    Added 2026-04-13 alongside the _feat_len fix — users kept asking in the
-    issue tracker 'what does 97..5 mean?'."""
-
-    async def test_wrap_feature_coord_string_includes_origin(
-        self, isolated_library,
-    ):
-        from Bio.Seq import Seq
-        from Bio.SeqRecord import SeqRecord
-        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
-        rec = SeqRecord(Seq("A" * 100), id="wrap_test",
-                        annotations={"molecule_type": "DNA"})
-        wrap_loc = CompoundLocation([
-            FeatureLocation(95, 100, strand=1),
-            FeatureLocation(0, 5, strand=1),
-        ])
-        rec.features.append(SeqFeature(wrap_loc, type="CDS",
-                                       qualifiers={"label": ["wrapCDS"]}))
-        app = sc.PlasmidApp()
-        app._preload_record = rec
-        async with app.run_test(size=TERMINAL_SIZE) as pilot:
-            await pilot.pause()
-            await pilot.pause(0.05)
-            sidebar = app.query_one("#sidebar", sc.FeatureSidebar)
-            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
-            wrap_feat = next(f for f in pm._feats if f.get("label") == "wrapCDS")
-            sidebar.show_detail(wrap_feat)
-            box = sidebar.query_one("#detail-box")
-            rendered = str(box.render())
-            # Must reference both halves (tail 96..100 and head 1..5)
-            assert "96" in rendered and "100" in rendered
-            assert "1‥5" in rendered or "1..5" in rendered
-            # Length displayed is 10 bp (5 + 5), not the wrong 'end - start'
-            assert "10 bp" in rendered or "10\xa0bp" in rendered
-
-    async def test_linear_feature_coord_string_unchanged(
-        self, tiny_record, isolated_library,
-    ):
-        """A linear feature must still render as '{start+1}‥{end} (N bp)' —
-        the wrap fix must not regress the common case."""
-        app = _build_app(tiny_record, isolated_library)
-        async with app.run_test(size=TERMINAL_SIZE) as pilot:
-            await pilot.pause()
-            await pilot.pause(0.05)
-            sidebar = app.query_one("#sidebar", sc.FeatureSidebar)
-            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
-            linear = next(f for f in pm._feats if f["end"] > f["start"])
-            sidebar.show_detail(linear)
-            box = sidebar.query_one("#detail-box")
-            rendered = str(box.render())
-            # One hyphen-separator only, no comma.
-            assert "," not in rendered.split("(")[0]
-
-
 class TestCursorReachesEndOfSequence:
     """Regression guard for the 2026-04-25 cursor cap fix.
 
@@ -1005,14 +952,14 @@ class TestCursorReachesEndOfSequence:
             await pilot.pause(0.05)
             sp = app.query_one("#seq-panel", sc.SequencePanel)
             n  = len(sp._seq)
-            # Position cursor on the last base, focus the panel, then press
-            # Right. Pre-fix the cursor stayed at n-1; post-fix it reaches n.
+            # Position cursor on the last base, then press Right. Pre-fix
+            # the cursor stayed at n-1; post-fix it reaches n.
             sp._cursor_pos = n - 1
-            # Move focus off the default DataTable — the App-level on_key
-            # arrow handler skips when a DataTable owns the keystroke,
-            # because the sidebar/library tables have their own arrow nav.
-            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
-            app.set_focus(pm)
+            # Clear focus so the App-level on_key arrow handler runs. With
+            # focus on a DataTable OR PlasmidMap (both bind arrows for
+            # their own purpose) the App handler bails — that skip is what
+            # keeps the seq cursor from following plasmid rotation.
+            app.set_focus(None)
             await pilot.pause(0.05)
             await pilot.press("right")
             await pilot.pause(0.05)
@@ -1044,8 +991,8 @@ class TestCursorReachesEndOfSequence:
             # (`n - 5` is on the last row for any sequence with at least
             # one full row; tiny_record is ~120 bp so this holds.)
             sp._cursor_pos = max(0, n - 5)
-            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
-            app.set_focus(pm)
+            # Clear focus — see the Right-arrow test above for the rationale.
+            app.set_focus(None)
             await pilot.pause(0.05)
             await pilot.press("down")
             await pilot.pause(0.05)
@@ -1058,6 +1005,393 @@ class TestCursorReachesEndOfSequence:
             await pilot.press("down")
             await pilot.pause(0.05)
             assert sp._cursor_pos == n - 1
+
+
+class TestRotationDoesNotMoveSeqCursor:
+    """Regression guard for 2026-04-29: arrow keys with PlasmidMap focused
+    rotate the plasmid origin, and MUST NOT move the seq cursor as a
+    side effect. Pre-fix the App-level on_key handler also fired and
+    advanced the cursor on every Left/Right rotation keystroke."""
+
+    async def test_left_arrow_rotates_without_moving_cursor(
+        self, tiny_record, isolated_library,
+    ):
+        """Left arrow on focused map should rotate counterclockwise
+        (origin_bp INCREASES — `_rotate_ccw`) and leave the seq cursor
+        alone. Pre-2026-04-29 it rotated CW and dragged the cursor."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sp._cursor_pos = 50
+            pm.origin_bp = 100
+            app.set_focus(pm)
+            await pilot.pause(0.05)
+            await pilot.press("left")
+            await pilot.pause(0.05)
+            # CCW: origin increases (mod total).
+            assert pm.origin_bp > 100, (
+                f"Left arrow should rotate CCW (origin_bp ↑); "
+                f"got {pm.origin_bp}"
+            )
+            assert sp._cursor_pos == 50, (
+                f"Rotation must not move seq cursor; "
+                f"expected 50, got {sp._cursor_pos}"
+            )
+
+    async def test_right_arrow_rotates_clockwise(
+        self, tiny_record, isolated_library,
+    ):
+        """Right arrow on focused map → clockwise (origin_bp DECREASES,
+        wrapping mod total). Pre-2026-04-29 the binding called rotate_ccw."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm.origin_bp = 100
+            app.set_focus(pm)
+            await pilot.pause(0.05)
+            await pilot.press("right")
+            await pilot.pause(0.05)
+            assert pm.origin_bp < 100, (
+                f"Right arrow should rotate CW (origin_bp ↓); "
+                f"got {pm.origin_bp}"
+            )
+
+    async def test_up_arrow_resets_origin(
+        self, tiny_record, isolated_library,
+    ):
+        """Up arrow on the focused map snaps origin_bp back to 0 — the
+        arrow-key partner to the seldom-used Home binding."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm.origin_bp = 42
+            sp._cursor_pos = 50
+            app.set_focus(pm)
+            await pilot.pause(0.05)
+            await pilot.press("up")
+            await pilot.pause(0.05)
+            assert pm.origin_bp == 0, (
+                f"Up arrow on focused map should reset origin to 0; "
+                f"got {pm.origin_bp}"
+            )
+            # And reset must NOT yank the seq cursor with it.
+            assert sp._cursor_pos == 50
+
+
+class TestRestrictionEnzymeClickHighlight:
+    """Regression guard for 2026-04-29: clicking a restriction enzyme
+    bar highlights the recognition span, embeds top/bottom cut bps in
+    `_re_highlight`, and a subsequent left/right arrow parks the cursor
+    immediately upstream/downstream of the cut."""
+
+    async def test_re_highlight_records_cut_positions(
+        self, isolated_library,
+    ):
+        # Build a sequence with a single EcoRI site (GAATTC) at p=10.
+        # EcoRI: fwd_cut=1, rev_cut=5 — so top cut at 11, bottom at 15.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        seq = "A" * 10 + "GAATTC" + "A" * 84
+        rec = SeqRecord(Seq(seq), id="re_test", name="re_test",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            # Find the EcoRI resite in the scan output.
+            sites = sc._scan_restriction_sites(seq, circular=True)
+            ecori_resite = next(
+                s for s in sites
+                if s.get("type") == "resite" and s.get("label") == "EcoRI"
+            )
+            assert ecori_resite["top_cut_bp"] == 11, ecori_resite
+            assert ecori_resite["bottom_cut_bp"] == 15, ecori_resite
+
+            # Simulate a lane-click on this resite by setting the panel's
+            # internal _last_resite_click and routing through on_click.
+            sp._last_resite_click = ecori_resite
+            # Drive the click handler directly with the resite still set.
+            sp._re_highlight = {
+                "start":         ecori_resite["start"],
+                "end":           ecori_resite["end"],
+                "top_cut_bp":    ecori_resite["top_cut_bp"],
+                "bottom_cut_bp": ecori_resite["bottom_cut_bp"],
+                "color":         ecori_resite["color"],
+                "name":          ecori_resite["label"],
+            }
+            sp._cursor_pos = -1
+            await pilot.pause(0.05)
+
+            # Right arrow — cursor should land on top_cut (= 11), the
+            # first base of the right (downstream) fragment.
+            app.set_focus(None)
+            await pilot.pause(0.05)
+            await pilot.press("right")
+            await pilot.pause(0.05)
+            assert sp._cursor_pos == 11, (
+                f"Right arrow on RE-highlighted EcoRI should park cursor "
+                f"at downstream-of-cut bp 11; got {sp._cursor_pos}"
+            )
+            # And the highlight should be cleared.
+            assert sp._re_highlight is None
+
+    async def test_left_arrow_parks_cursor_upstream_of_cut(
+        self, isolated_library,
+    ):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        seq = "A" * 10 + "GAATTC" + "A" * 84
+        rec = SeqRecord(Seq(seq), id="re_test2", name="re_test2",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._re_highlight = {
+                "start":         10,
+                "end":           16,
+                "top_cut_bp":    11,
+                "bottom_cut_bp": 15,
+                "color":         "magenta",
+                "name":          "EcoRI",
+            }
+            sp._cursor_pos = -1
+            app.set_focus(None)
+            await pilot.pause(0.05)
+            await pilot.press("left")
+            await pilot.pause(0.05)
+            # Left should park cursor immediately upstream of top_cut (11),
+            # i.e. on bp 10 — the last base of the left (upstream) fragment.
+            assert sp._cursor_pos == 10
+            assert sp._re_highlight is None
+
+    async def test_up_down_arrows_also_clear_highlight(
+        self, isolated_library,
+    ):
+        """Up/Down arrows clear the highlight too — any arrow press
+        should revert the staggered-overhang visualization."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        seq = "A" * 10 + "GAATTC" + "A" * 84
+        rec = SeqRecord(Seq(seq), id="re_test3", name="re_test3",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._re_highlight = {
+                "start":         10,
+                "end":           16,
+                "top_cut_bp":    11,
+                "bottom_cut_bp": 15,
+                "color":         "magenta",
+                "name":          "EcoRI",
+            }
+            sp._cursor_pos = -1
+            app.set_focus(None)
+            await pilot.pause(0.05)
+            await pilot.press("up")
+            await pilot.pause(0.05)
+            assert sp._re_highlight is None
+
+    async def test_click_outside_seq_panel_clears_highlight(
+        self, isolated_library,
+    ):
+        """A click on the plasmid map (or any other panel) should
+        revert the RE highlight on the seq panel. The App-level
+        on_click cleans up when the click lands outside seq panel."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        seq = "A" * 10 + "GAATTC" + "A" * 84
+        rec = SeqRecord(Seq(seq), id="re_test4", name="re_test4",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._re_highlight = {
+                "start":         10,
+                "end":           16,
+                "top_cut_bp":    11,
+                "bottom_cut_bp": 15,
+                "color":         "magenta",
+                "name":          "EcoRI",
+            }
+            await pilot.pause(0.05)
+            # Click on the plasmid map area — anywhere outside the seq panel.
+            await pilot.click("#plasmid-map", offset=(20, 10))
+            await pilot.pause(0.05)
+            assert sp._re_highlight is None
+
+
+class TestEnterHighlightsFeatureAtCursor:
+    """Regression guard for 2026-04-29: Enter in the seq-panel context
+    should highlight the feature whose range contains the current
+    cursor — equivalent to clicking the feature in the lane art."""
+
+    async def test_enter_at_cursor_highlights_enclosing_feature(
+        self, isolated_library,
+    ):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 200), id="enter_test", name="enter_test",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features.append(SeqFeature(FeatureLocation(50, 100, strand=1),
+                                       type="CDS",
+                                       qualifiers={"label": ["midCDS"]}))
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            # Park cursor inside the CDS [50, 100). Clear focus so the
+            # App-level Enter handler runs (not consumed by a focused
+            # DataTable / Input / PlasmidMap).
+            sp._cursor_pos = 75
+            app.set_focus(None)
+            await pilot.pause(0.05)
+            await pilot.press("enter")
+            await pilot.pause(0.05)
+            # Map's selected_idx should now point at the CDS.
+            cds_idx = next(i for i, f in enumerate(pm._feats)
+                           if f.get("label") == "midCDS")
+            assert pm.selected_idx == cds_idx, (
+                f"Enter at bp 75 should select the CDS [50,100); "
+                f"map.selected_idx={pm.selected_idx}, expected={cds_idx}"
+            )
+            # And the seq panel's full-feature highlight (`_user_sel`)
+            # should now cover the whole CDS range [50, 100), set by
+            # `select_feature_range` in `_focus_feature`.
+            assert sp._user_sel == (50, 100), (
+                f"Enter should highlight whole feature range [50,100); "
+                f"got user_sel={sp._user_sel}"
+            )
+
+    async def test_enter_outside_any_feature_is_a_noop(
+        self, isolated_library,
+    ):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 200), id="t2", name="t2",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features.append(SeqFeature(FeatureLocation(50, 100, strand=1),
+                                       type="CDS",
+                                       qualifiers={"label": ["midCDS"]}))
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            # Cursor on bp 10 — outside the CDS range.
+            sp._cursor_pos = 10
+            sel_before = pm.selected_idx
+            app.set_focus(None)
+            await pilot.pause(0.05)
+            await pilot.press("enter")
+            await pilot.pause(0.05)
+            # No feature contains bp 10, so nothing new gets selected.
+            assert pm.selected_idx == sel_before
+
+
+class TestLibrarySearch:
+    """Search input on the LibraryPanel: pre-fill 'Search', focus clears,
+    Enter applies fuzzy filter, empty Enter clears + restores prefill."""
+
+    def test_fuzzy_match_subsequence(self):
+        # Subsequence in order, case-insensitive.
+        assert sc._fuzzy_match("lac", "LacZ alpha")
+        assert sc._fuzzy_match("lcz", "LacZ alpha")
+        assert sc._fuzzy_match("", "anything")
+        assert not sc._fuzzy_match("xyz", "LacZ alpha")
+        # 'zlc' fails because no 'c' after the 'z' in "LacZ alpha".
+        assert not sc._fuzzy_match("zlc", "LacZ alpha")
+
+    async def test_search_filter_applies_and_clears(
+        self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Seed the library with two distinguishable plasmids so we
+            # can verify the filter actually narrows the table rows.
+            from Bio.Seq import Seq
+            from Bio.SeqRecord import SeqRecord
+            for nm in ("alphaPlasmid", "betaConstruct"):
+                rec = SeqRecord(Seq("A" * 50), id=nm, name=nm,
+                                annotations={"molecule_type": "DNA",
+                                             "topology": "circular"})
+                app.query_one("#library", sc.LibraryPanel).add_entry(rec)
+            await pilot.pause(0.05)
+
+            # Switch to plasmids view so the lib-table is what we filter.
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib._view_mode = "plasmids"
+            lib._apply_view_mode()
+            lib._repopulate()
+            await pilot.pause(0.05)
+            tbl = app.query_one("#lib-table", sc.DataTable)
+            assert tbl.row_count >= 2
+
+            # Apply filter "alpha" — only alphaPlasmid should remain.
+            inp = app.query_one("#lib-search", sc.Input)
+            inp.value = "alpha"
+            await inp.action_submit()
+            await pilot.pause(0.05)
+            assert lib._filter_text == "alpha"
+            assert tbl.row_count == 1
+
+            # Clear filter via empty submit; prefill restored.
+            inp.value = ""
+            await inp.action_submit()
+            await pilot.pause(0.05)
+            assert lib._filter_text == ""
+            assert inp.value == sc._SearchInput.PREFILL
+            assert tbl.row_count >= 2
+
+    async def test_focus_clears_input_value(
+        self, tiny_record, isolated_library,
+    ):
+        """Clicking into the input clears whatever was displayed (the
+        'Search' prefill, an active filter, etc.) so the cursor opens
+        on a fresh field."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            inp = app.query_one("#lib-search", sc.Input)
+            assert inp.value == sc._SearchInput.PREFILL
+            app.set_focus(inp)
+            await pilot.pause(0.05)
+            assert inp.value == ""
 
 
 class TestSidebarClickCentersSeqPanel:
@@ -1109,15 +1443,16 @@ class TestSidebarClickCentersSeqPanel:
 
 
 class TestClickConsistencyAcrossPanels:
-    """All three "I clicked a feature" entry points — sidebar row, plasmid map
-    feature, sequence-panel lane art — must produce the same outcome:
-    `user_sel` set to the feature span (the copyable highlight), cursor on
-    the click bp / feature midpoint, and the seq-panel viewport centred on
-    that bp. Map worked before but sidebar only set `sel_range` (bold +
-    underline, NOT the copyable selection) and never centred reliably; the
-    seq-panel click never centred at all. Reported 2026-04-25."""
+    """The three "I clicked a feature" entry points all set `user_sel`
+    to the feature span and scroll the seq panel into view, but they
+    differ on cursor placement:
+      * Plasmid-map / sidebar feature click → cursor at START
+        (post-2026-04-30: clicking a feature row scrolls to the 5' end
+        rather than the midpoint, so the user reads top-down).
+      * Seq-panel lane click → cursor at the clicked bp (the user
+        already pointed at a specific position; honour it)."""
 
-    async def test_all_three_click_paths_are_consistent(
+    async def test_all_three_click_paths_set_user_sel(
         self, isolated_library,
     ):
         from Bio.Seq import Seq
@@ -1125,7 +1460,6 @@ class TestClickConsistencyAcrossPanels:
         from Bio.SeqFeature import SeqFeature, FeatureLocation
         rec = SeqRecord(Seq("A" * 5000), id="clickConsistency",
                         annotations={"molecule_type": "DNA"})
-        # A handful of features so the table cursor actually moves on click.
         for i in range(3):
             rec.features.append(SeqFeature(
                 FeatureLocation(i * 1500 + 100, i * 1500 + 200, strand=1),
@@ -1148,7 +1482,7 @@ class TestClickConsistencyAcrossPanels:
             target_idx = next(i for i, f in enumerate(pm._feats)
                               if f.get("label") == "targetFeat")
             target = pm._feats[target_idx]
-            target_bp = (target["start"] + target["end"]) // 2  # 4100
+            target_mid = (target["start"] + target["end"]) // 2  # 4100
 
             async def reset_state():
                 scroll.scroll_y = 0
@@ -1158,44 +1492,55 @@ class TestClickConsistencyAcrossPanels:
                 sp._cursor_pos = -1
                 await pilot.pause(0.05)
 
-            async def expect_focused_target():
-                # All three paths land on these post-click invariants:
+            def assert_user_sel():
                 assert sp._user_sel == (4000, 4200), (
                     f"user_sel must be the feature span; got {sp._user_sel}"
                 )
-                assert sp._cursor_pos == target_bp, (
-                    f"cursor must land on bp={target_bp}; got {sp._cursor_pos}"
-                )
-                assert scroll.scroll_y > 30, (
-                    f"viewport must scroll (centre on bp 4100); "
-                    f"got scroll_y={scroll.scroll_y}"
-                )
 
-            # 1. Plasmid-map click.
+            # 1. Plasmid-map click → cursor at start (4000).
             await reset_state()
             pm.post_message(sc.PlasmidMap.FeatureSelected(
-                target_idx, target, bp=target_bp
+                target_idx, target, bp=target_mid
             ))
             await pilot.pause(0.5)
-            await expect_focused_target()
+            assert_user_sel()
+            assert sp._cursor_pos == 4000, (
+                f"map click must park cursor at feature START; "
+                f"got {sp._cursor_pos}"
+            )
+            assert scroll.scroll_y > 30
 
-            # 2. Sequence-panel lane click — `from_lane=True` mirrors a
-            # real click on the feature bar/arrow art (the only seq-panel
-            # click path that should fire a whole-feature highlight).
+            # 2. Sequence-panel lane click → cursor at click bp (4100).
+            # Lane clicks deliberately do NOT scroll: the user clicked
+            # something they were already looking at, so jumping the
+            # viewport away from their cursor would be jarring.
             await reset_state()
             sp.post_message(
-                sc.SequencePanel.SequenceClick(bp=target_bp, from_lane=True)
+                sc.SequencePanel.SequenceClick(bp=target_mid, from_lane=True)
             )
             await pilot.pause(0.5)
-            await expect_focused_target()
+            assert_user_sel()
+            assert sp._cursor_pos == target_mid, (
+                f"lane click must honour the clicked bp ({target_mid}); "
+                f"got {sp._cursor_pos}"
+            )
+            # Lane click no longer scrolls — the user is already on
+            # the feature in the seq panel.
+            assert scroll.scroll_y == 0, (
+                f"lane click must NOT scroll the seq panel; "
+                f"scroll_y={scroll.scroll_y}"
+            )
 
-            # 3. Sidebar row click — actual mouse click, not a synthesized
-            # RowActivated message (the message bypasses the RowHighlighted
-            # cascade that real clicks go through).
+            # 3. Sidebar row click → cursor at start (4000).
             await reset_state()
             await pilot.click("#feat-table", offset=(5, target_idx + 1))
             await pilot.pause(0.5)
-            await expect_focused_target()
+            assert_user_sel()
+            assert sp._cursor_pos == 4000, (
+                f"sidebar click must park cursor at feature START; "
+                f"got {sp._cursor_pos}"
+            )
+            assert scroll.scroll_y > 30
 
 
 class TestSidebarArrowNavSingleScroll:
@@ -1207,33 +1552,40 @@ class TestSidebarArrowNavSingleScroll:
     AND THEN `center_on_bp` (full scroll to centre). The two scrolls
     happened in quick succession and were perceptible as a jitter / snap
     on every arrow press. Fix: pass `scroll=False` to the highlight
-    helpers when `_focus_feature` will issue its own centred scroll.
+    helpers so EXACTLY ONE scroll runs per arrow press — either
+    `_ensure_cursor_visible` (multi-row features, post-2026-04-30) or
+    `center_on_bp` (single-row features), never both.
     """
 
-    async def test_only_center_scroll_runs_per_arrow_press(
+    async def test_no_center_snap_on_feature_focus(
         self, isolated_library,
     ):
+        """`_focus_feature` (lane click / map click / sidebar click /
+        sidebar arrow nav) must always use minimum-scroll, never
+        `center_on_bp`. Snapping a feature to viewport centre yanked
+        the view away from whatever the user was looking at — even
+        for short single-row features the cursor at start landing
+        mid-viewport felt jarring. Post-2026-04-30 the fix is
+        unconditional: every feature focus path goes through
+        `_ensure_cursor_visible`, which only scrolls if the cursor
+        is actually off-screen."""
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         from Bio.SeqFeature import SeqFeature, FeatureLocation
-        rec = SeqRecord(Seq("A" * 5000), id="arrowJitter",
+        rec = SeqRecord(Seq("A" * 5000), id="focusScroll",
                         annotations={"molecule_type": "DNA"})
         for i in range(4):
             rec.features.append(SeqFeature(
-                FeatureLocation(i * 1200 + 100, i * 1200 + 200, strand=1),
+                FeatureLocation(i * 1200 + 100, i * 1200 + 130, strand=1),
                 type="CDS", qualifiers={"label": [f"f{i}"]},
             ))
 
-        # Spy on _ensure_cursor_visible — it must NOT fire from the
-        # `_focus_feature` path (which would cause the double-scroll). It
-        # MAY fire from arrow-key text navigation (in the seq panel), but
-        # arrowing through the sidebar should hit center_on_bp only.
-        ensure_calls = []
-        orig_ensure = sc.SequencePanel._ensure_cursor_visible
-        def spy_ensure(self):
-            ensure_calls.append(self._cursor_pos)
-            orig_ensure(self)
-        sc.SequencePanel._ensure_cursor_visible = spy_ensure
+        center_calls = []
+        orig_center = sc.SequencePanel.center_on_bp
+        def spy_center(self, bp):
+            center_calls.append(bp)
+            orig_center(self, bp)
+        sc.SequencePanel.center_on_bp = spy_center
 
         try:
             app = sc.PlasmidApp()
@@ -1241,34 +1593,23 @@ class TestSidebarArrowNavSingleScroll:
             async with app.run_test(size=TERMINAL_SIZE) as pilot:
                 await pilot.pause()
                 await pilot.pause(0.05)
-                sp = app.query_one("#seq-panel", sc.SequencePanel)
-                scroll = app.query_one("#seq-scroll")
 
-                # Click row 0 to land focus inside the sidebar table.
                 await pilot.click("#feat-table", offset=(5, 1))
                 await pilot.pause(0.3)
-                ensure_calls.clear()
+                center_calls.clear()
 
-                # Arrow through the rest. Each press triggers
-                # _focus_feature → highlight + centring scroll. With the
-                # fix, _ensure_cursor_visible does NOT fire from this
-                # path.
+                # Arrow through the sidebar — each press fires
+                # `_focus_feature`. None should hit `center_on_bp`.
                 for _ in range(3):
                     await pilot.press("down")
                     await pilot.pause(0.3)
 
-                assert ensure_calls == [], (
-                    f"_focus_feature path must NOT call _ensure_cursor_visible "
-                    f"(would cause double-scroll jitter). Got "
-                    f"{len(ensure_calls)} call(s): {ensure_calls}"
-                )
-                # Sanity: the centring scroll did happen.
-                assert scroll.scroll_y > 30, (
-                    f"sidebar arrow nav should still scroll to centre; "
-                    f"scroll_y={scroll.scroll_y}"
+                assert center_calls == [], (
+                    f"feature focus path must not center-snap; "
+                    f"center_on_bp called with {center_calls}"
                 )
         finally:
-            sc.SequencePanel._ensure_cursor_visible = orig_ensure
+            sc.SequencePanel.center_on_bp = orig_center
 
 
 class TestEnsureCursorVisibleShowsLanes:

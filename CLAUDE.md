@@ -8,10 +8,10 @@ The project is developed by a human bioinformatician with an AI agent (Claude Op
 
 A **terminal-based circular plasmid map viewer, sequence editor, and cloning/mutagenesis workbench** built with Python 3.10+ / Textual / Biopython. Renders Unicode braille-dot plasmid maps in the terminal, with a per-base sequence panel, restriction-site overlays, a **collection-driven plasmid library**, Golden Braid L0 assembly tooling, Primer3-backed primer design, and SOE-PCR site-directed mutagenesis.
 
-**Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs, user ATinyGreenCell). **PyPI:** `splicecraft`. Latest: **v0.4.0**.
+**Repo:** `github.com/Binomica-Labs/SpliceCraft` (Binomica Labs, user ATinyGreenCell). **PyPI:** `splicecraft`. Latest: **v0.4.5**.
 
-- **Single-file architecture:** entire app is `splicecraft.py` (~16,200 lines). Intentional — keeps the codebase greppable. Sibling project ScriptoScope (~8,600 lines) follows the same convention.
-- **Test suite:** 977 tests across 17 files in `tests/`. `pytest -n auto` ~3 min on 8 cores; sequential ~7 min. Biology subset (`test_dna_sanity.py`) < 1 s. `test_invariants_hypothesis.py` adds property-based fuzzing.
+- **Single-file architecture:** entire app is `splicecraft.py` (~17,900 lines). Intentional — keeps the codebase greppable. Sibling project ScriptoScope (~8,600 lines) follows the same convention.
+- **Test suite:** 1,009 tests across 17 files in `tests/`. `pytest -n auto` ~2 min on 8 cores; sequential ~11 min. Biology subset (`test_dna_sanity.py`) < 2 s. `test_invariants_hypothesis.py` adds property-based fuzzing.
 - **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`. Tests: `pytest`, `pytest-asyncio`, `pytest-xdist`, `hypothesis`. No optional runtime deps — pLannotate integration was removed in 0.4.0.
 - Releases via `./release.py X.Y.Z` (bumps version, runs tests, builds, tags, pushes; `publish.yml` uploads to PyPI via OIDC). Pure-Python — no bash/sed/grep dependencies.
 
@@ -38,7 +38,7 @@ Logs: `~/.local/share/splicecraft/logs/splicecraft.log` (override with `$SPLICEC
 | 1–200 | Docstring, imports (incl. module-level `from datetime import date as _date`), user data dir, dep check, rotating session-tagged logger, feature-colour palette |
 | 201–460 | Atomic JSON persistence (`_safe_save_json` / `_safe_load_json` / `_extract_entries`; envelope schema `{"_schema_version":1,"entries":[...]}` + legacy bare-list back-compat) + library cache loaders |
 | 461–575 | **Collections persistence** — `_load_collections` / `_save_collections` (deepcopy-on-read), `_get/_set_active_collection_name`, `_find_collection`, `_collection_name_taken`, `_ensure_default_collection` (Main Collection migration), `_sync_active_collection_plasmids`, `_restore_library_from_active_collection` |
-| 576–1820 | NEB enzyme catalog (~204), IUPAC tables + cached regex, `_rc`, `_scan_restriction_sites`, `_assign_chunk_features`, `_render_feature_row_pair`, memoized `_build_seq_inputs`/`_build_seq_text`, OSC-52 clipboard, `_translate_cds` |
+| 576–2400 | NEB enzyme catalog (~204), IUPAC tables + cached regex, `_rc`, `_scan_restriction_sites`, **2D feature packer** (`_pack_features_2d`, `_chunk_lane_groups`, `_render_packed_strand`, `_paint_feature_label`, `_paint_feature_bar`, `_paint_cds_aa`), `_feats_in_chunk` (wrap-CDS halves carry `_orig_start`/`_orig_end`), memoized `_build_seq_inputs`/`_build_seq_text` (per-strand cut bg colours), `_cds_aa_list` (per-CDS LRU translation cache), OSC-52 clipboard, `_translate_cds` |
 | 1821–1870 | Char-aspect detection + label helpers + `_cursor_row_key` DataTable utility |
 | 1871–2110 | GenBank I/O (`fetch_genbank`, `load_genbank` auto-detect `.gb`/`.dna`, `_record_to_gb_text`, `_gb_text_to_record`, `_normalize_for_genbank`, `_export_genbank_to_path`, `_export_fasta_to_path`) |
 | 2111–2200 | _(pLannotate slot — removed in 0.4.0; placeholder comment only)_ |
@@ -126,6 +126,42 @@ A **collection** is a named bucket of plasmids. Users create one on demand from 
 
 **`UnsavedNavigateModal`** is the sibling of `UnsavedQuitModal` — same Save/Discard/Cancel structure but the verbs say "go back to collections" instead of "quit". `App._discard_changes` reloads the record from the library copy, clears undo/redo, and **preserves `_source_path`** (calls `_apply_record(record, clear_undo=False)` then restores source_path) so post-discard Ctrl+S still targets the user's original .gb file.
 
+## Sequence-panel rendering (2D lanes + inline AA, 0.4.5+)
+
+Rewritten in 0.4.5. The earlier three-tier stack (`re_above` → `onebp_above` → `reg_above` → DNA → mirrored below) was replaced with a single greedy 2D packer.
+
+**`_pack_features_2d(feats, chunk_start, chunk_end)`** returns `[(feat, bottom_row), …]`. CDS features get height 3 (AA + bar + label); everything else height 2 (bar + label). Sort order: CDSes first, then start ascending, then length descending. The packer tracks per-column `col_top` and slots each feature one row above the highest occupied column in its bp range. No cap on lane depth — features pile up as deep as the data demands.
+
+**Layout convention:** every feature's bar lives at `bottom_row=0` (adjacent to DNA) when nothing else competes; only collisions push it up. Resites participate in the same packed lane as ordinary features — their parens row prints far from DNA, cut-arrow row close to DNA, so a resite and a CDS can share a single bp range without a per-feature row flip.
+
+**Inline AA row (`_paint_cds_aa`).** Each forward CDS gets an extra "AA letters at codon midpoints" row directly above its bar; reverse CDS gets one directly below its bar. Letters are styled `bold {color}`. Translation goes through `_cds_aa_list` (LRU-capped at 64 entries) so a CDS is translated at most once per render.
+
+**Wrap-CDS halves carry `_orig_start` / `_orig_end`.** `_feats_in_chunk` splits a wrap feature `(s=900, e=10)` into a tail half `{start: s, end: total}` and a head half `{start: 0, end: e, label: ""}`. CDS halves additionally stamp `_orig_start=s, _orig_end=e` on each piece. `_paint_cds_aa` and `_cds_aa_list` use those to recover the original reading frame; `_check_packed`'s AA-letter click block does the same. Without this, codon midpoints would be computed off the half's local start and the head half would translate the wrong reading frame. **Pitfall:** any new helper that does codon-midpoint math on a feature dict must read `f.get("_orig_start", f["start"])` / `f.get("_orig_end", f["end"])` — never the half-local `f["start"]`/`f["end"]`.
+
+**AA-letter click → single-codon highlight.** Clicking on a rendered AA letter (in the AA sub-row of a CDS) sets `_user_sel` to the codon's 3 bp DNA range and parks the cursor at the codon centre. Empty cells between AA letters are no-ops. Detection is in `_check_packed` and gated on `packed_row - bottom_row == 0` for CDS features.
+
+**Per-strand RE highlight.** Resites bake `top_cut_bp` and `bottom_cut_bp` into every emitted piece (including wrap continuations). `_re_highlight` dict keys: `start, end, top_cut_bp, bottom_cut_bp, color, name`. The render path tints DNA bps with `black on blue` upstream of the cut and `black on red` at/after — per strand, so EcoRI-style sticky cutters render the staggered overhang as two different bg colours above vs below.
+
+**Layout (top row):** post-0.4.5 the App composes `Horizontal#top-row` containing `LibraryPanel` + `PlasmidMap` + `FeatureSidebar`, with `SequencePanel` below it spanning the full window width. `#main-row` / `#center-col` / `#map-row` containers are gone. `FeatureSidebar.show_detail` is now a no-op kept for caller compatibility — the detail box widget was removed when the sidebar collapsed to a single full-height table.
+
+**Theme:** `on_mount` registers a `splicecraft-black` Theme that pins `background`/`surface`/`panel` to `#000000` (textual-dark defaults to near-black greys); registered + activated before the splash so the splash inherits the black backdrop.
+
+**Toasts:** four severities, each with its own CSS class — `information` (blue), `success` (custom; green via `_notify_success`), `warning` (amber), `error` (red). Notifications fired while the splash is up are queued (cap 16) and replayed in `_on_splash_dismissed` so startup corruption-recovery messages still surface.
+
+**Library search.** `_SearchInput` (subclass of `Input`) sits between the table and button rows; pre-fills the literal "Search", clears on focus. Submitted handler `_on_search_submitted` applies a fuzzy subsequence filter (`_fuzzy_match`) to whichever table is visible (collections or plasmids). Empty submit clears the filter and restores the prefill. `AUTO_FOCUS = "#lib-coll-table, #lib-table"` keeps startup focus on the table — focusing the Input would otherwise capture single-char priority bindings (`r`, `f`, `v`, etc.) as text.
+
+**Map rotation keys are focus-gated.** Pre-0.4.5 `[`/`]` were App-level with `priority=True` so they fired even on modal screens. In 0.4.5 they live on `PlasmidMap.BINDINGS` (no `priority`) — rotation only happens when the map has focus. Arrow keys also live there: Left/Right rotate, Up resets origin. The App-level `on_key` handler skips arrow / Enter when a `DataTable`, `Input`, or `PlasmidMap` is focused so rotations don't double-fire as seq-cursor moves.
+
+**Other on_key behaviours.** With an active `_re_highlight`, any arrow press clears it and parks the cursor on the upstream / downstream side of the top-strand cut. With a `_user_sel` / `_sel_range` highlight active, arrow press jumps out at the matching end (Left → start-1, Right → end, Up/Down → ± one display row). Enter in seq-panel context highlights the smallest feature enclosing the cursor (keyboard equivalent of a lane click).
+
+**Copy-bottom-strand binding (Alt+C, Ctrl+Shift+C alias).** Most terminals collapse Ctrl+Shift+C to the same bytes as Ctrl+C (both ETX, 0x03), so the original `ctrl+shift+c` binding never fired. Alt+C arrives as ESC-c — always distinct. Ctrl+Shift+C is kept as an alias for terminals that DO honour modifier keys (kitty, Windows Terminal w/ modifyOtherKeys). `_copy_strand(bottom=True)` reverse-complements the selection via `_rc` (sacred invariant #3).
+
+**Click-to-clear.** Backbone clicks on the map (`event.idx < 0`) and clicks landing outside any of the four main panels (`PlasmidApp.on_click` walks the widget chain) call `_clear_all_highlights()` — wipes RE highlight, sel ranges, cursor, and `pm.selected_idx`. Selection-replacing clicks (lane / map feature / sidebar row) take their own short path and don't go through the global clear.
+
+**Cursor-at-feature-start.** Map and sidebar feature picks now park the cursor at the feature's 5' end (`f["start"]`), not the wrap-aware midpoint — long CDS rows used to land cursor mid-feature and the user lost the "where does this start" anchor. Lane clicks honour the clicked bp.
+
+**Lane click → no scroll.** `_focus_feature(scroll=False)` for seq-panel lane clicks — the user clicked something they were already looking at, so jumping the viewport away from their cursor would feel jarring. Map / sidebar clicks scroll via `_ensure_cursor_visible` (minimum-scroll, never `center_on_bp`).
+
 ## Mutagenize source picker (0.3.10+)
 
 `MutagenizeModal` accepts CDS DNA from any of four sources via a top-of-modal `Select`:
@@ -189,10 +225,10 @@ Parallel runs rely on `pytest-xdist` + the autouse `_protect_user_data` fixture 
 
 | File | Tests | Covers |
 |------|------:|--------|
-| `test_dna_sanity.py` | 74 | Sacred invariants 1–6; Type IIS cut-outside-recognition; `_translate_cds` |
+| `test_dna_sanity.py` | 77 | Sacred invariants 1–6; Type IIS cut-outside-recognition; `_translate_cds`; **wrap-CDS inline AA painting** (`TestWrapCDSInlineTranslation` — `_orig_*` round-trip + cache-key sharing) |
 | `test_primers.py` | 60 | Detection / cloning / Golden Braid / generic; wrap-region template rotation |
 | `test_genbank_io.py` | 68 | `load_genbank` round-trip (GenBank + SnapGene `.dna`); JSON corruption recovery; `_export_fasta_to_path` |
-| `test_smoke.py` | ~50 | Textual mounts; rotation / view / RE toggles; per-plasmid undo stashes; crash-recovery autosave |
+| `test_smoke.py` | ~70 | Textual mounts; rotation / view / RE toggles; per-plasmid undo stashes; crash-recovery autosave; **rotation-doesn't-move-cursor** (focus-gating); **arrow clears RE highlight** (top-cut anchoring); **Enter highlights enclosing feature**; **library search** (fuzzy filter, focus-clears, prefill restore); cursor-at-feature-start for map / sidebar picks |
 | `test_mutagenize.py` | 49 | SOE-PCR primers, codon substitution, CAI round-trips |
 | `test_codon.py` | 50+ | Codon registry, harmonization, Kazusa parser, NCBI XML safety, CAI/GC math; Mutagenize 4-source flow (incl. Parts Bin source); Mutagenize-without-plasmid |
 | `test_domesticator.py` | 258 | Golden Braid L0 positions; 4-source picker; `_feats_for_domesticator`; FASTA picker; cloning simulator; codon-fix repair (multi-site, cascade-prevention, binding-region advisory); Save Primers (`pairs` list, DOM suffix); Save As Feature button (GB→INSDC type map, builtin reject, persist round-trip); `_feature_library_match` helper + `_features_generation` counter + `_build_feature_library_index`; "Feat Lib" column (exact-green / name-yellow / empty) with index-cached lookups (rebuilt only on gen advance); Save-As-Feature warnings on collision; **grammar abstraction** (`_BUILTIN_GRAMMARS`, `_all_grammars`, `_get_active_grammar` fallback, `_grammar_position_by_type`); settings.json + cloning_grammars.json round-trips with deepcopy isolation; Parts Bin grammar dropdown filters by active grammar (legacy parts → gb_l0); DomesticatorModal honours active grammar (overhangs / enzyme / forbidden-site scrub) |
@@ -205,7 +241,7 @@ Parallel runs rely on `pytest-xdist` + the autouse `_protect_user_data` fixture 
 | `test_features_library.py` | 29 | JSON round-trip; `_GENBANK_FEATURE_TYPES`; per-entry `color` + `strand=0`; `_resolve_feature_color` precedence |
 | `test_edit_record.py` | 14 | Sacred invariant #9: wrap features survive insert/replace as CompoundLocation |
 | `test_invariants_hypothesis.py` | 11 | Property-based fuzzing of invariants #3, #5, #8 |
-| `test_performance.py` | 9 | Loose budgets (4–20× headroom): pUC19 scan < 30 ms, 10 kb scan < 150 ms, etc. |
+| `test_performance.py` | 9 | Loose budgets (4–20× headroom): pUC19 scan < 30 ms, 10 kb scan < 150 ms; cursor 50 KB < 50 ms / 150 KB < 120 ms (bumped 0.4.5 for inline AA + inter-chunk gap rows). |
 
 ### Sacred invariant → test mapping
 
@@ -239,6 +275,9 @@ Parallel runs rely on `pytest-xdist` + the autouse `_protect_user_data` fixture 
 4. `_SCAN_CATALOG` precomputed at import — eliminates per-scan `_rc` / `_iupac_pattern`.
 5. `PlasmidMap._draw_cache` — only recomputed on size / mode / feature / RE-state change.
 6. **`LibraryPanel.set_dirty`** — early-returns when dirty state didn't change; updates only the active row's Name cell via `update_cell_at(Coordinate(row, 0))` instead of rebuilding the whole DataTable on every keystroke. Falls back to `_repopulate_plasmids` if the incremental API isn't available.
+7. **`_CDS_AA_CACHE`** — per-CDS translation cache, keyed on `(id(seq), orig_start, orig_end, strand)`, capped 64. Prevents re-translation across chunk renders for a single CDS, and lets wrap-CDS halves share one entry.
+8. **Per-chunk static cache** in `_build_seq_text` — chunks without overlapping cursor / selection / RE / AA highlights skip per-base style work and replay a cached `Text` body. AA highlight is wrap-aware so reverse-video letters render fresh on the active CDS even when the chunk is otherwise static.
+9. **`_CHUNK_LAYOUT_CACHE`** (4 entries, identity-keyed) memoises the per-chunk lane decomposition + prefix sums so cursor moves on a 200 kb cosmid stay in low single-digit ms. Bypassed only on (seq, feats, line_width) change.
 
 Profiled but **not touched**: Textual compositor, Rich `Text.append`, import time.
 
@@ -262,6 +301,14 @@ Versions in `pyproject.toml` and `splicecraft.py::__version__`; `release.py` rew
 8. **NCBI responses go through `_safe_xml_parse`.** It rejects DOCTYPE/ENTITY before `ET.fromstring`. Don't add a new NCBI endpoint without it.
 9. **Migration runs in `App.compose()`, not `on_mount`.** Mount events fire leaves→root, so anything in `App.on_mount` runs AFTER `LibraryPanel.on_mount`. Collections + active-collection setup must be done before children mount or the panel reads stale state.
 10. **`_save_library` mirrors to the active collection.** Every panel CRUD writes BOTH `plasmid_library.json` and `collections.json` (each with its own `.bak`). This is intentional — the two files are kept in sync. Routing a write around `_save_library` (e.g. `_restore_library_from_active_collection`) bypasses the mirror; do that only when the collection IS the source.
+
+11. **Wrap-CDS rendering uses `_orig_start`/`_orig_end`, not `f["start"]`/`f["end"]`.** `_feats_in_chunk` splits wrap features into linear half-features for chunk rendering; CDS halves carry the original coords as `_orig_start` / `_orig_end`. Any helper doing codon-midpoint math, AA translation, or "is this click on a letter" must read those keys via `f.get("_orig_start", f["start"])`. Reading the half's local `f["start"]` (= 0 for head halves) gives the wrong reading frame and paints AA letters at the wrong bp with the wrong codes. Affects `_paint_cds_aa`, `_cds_aa_list`, `_check_packed`'s AA-click block. Regression test: `TestWrapCDSInlineTranslation` in `test_dna_sanity.py`.
+
+12. **`_re_highlight` schema (0.4.5+):** keys are `start, end, top_cut_bp, bottom_cut_bp, color, name`. The legacy `fwd_cut_bp` / `rev_cut_bp` keys are gone; resites carry baked `top_cut_bp` / `bottom_cut_bp` from `_emit_resite`. Legacy resites without these keys (i.e. `cut == -1`) fall back to plain `black on white` highlight so the panel doesn't crash.
+
+13. **Map rotation keys live on `PlasmidMap.BINDINGS`, not `App.BINDINGS`.** Don't add `priority=True` to rotation keys at the App level — rotations would fire from modal screens. App-level `on_key` skips arrow / Enter when focus is on a `DataTable`, `Input`, or `PlasmidMap` so the seq cursor doesn't double-step.
+
+14. **Ctrl+Shift+C is functionally an alias for Ctrl+C in most terminals.** The Alt+C binding (`copy_selection_bottom`) is the actual reverse-complement trigger. Don't rely on Ctrl+Shift+C to be distinct unless the user is on kitty / Windows Terminal w/ modifyOtherKeys.
 
 ## How to extend — modular recipes
 

@@ -764,3 +764,99 @@ class TestTranslateCds:
         if not expected.endswith("*"):
             expected += "*"
         assert aa == expected
+
+
+class TestWrapCDSInlineTranslation:
+    """Regression guard for 2026-04-30: the inline AA-translation row
+    drawn into the seq panel's lane art must place AA letters at the
+    correct codon midpoints AND with the correct one-letter codes for
+    wrap-CDS features. Pre-fix `_paint_cds_aa` ran codon math against
+    the SPLIT virtual half (start=0 for the head), which both painted
+    at the wrong bp and translated the wrong reading frame.
+
+    The fix: `_feats_in_chunk` stamps `_orig_start` / `_orig_end` on
+    each split half, and `_paint_cds_aa` / `_cds_aa_list` use those
+    for the codon-midpoint formula and translation source so every
+    half of a wrap-CDS shares one canonical translation.
+    """
+
+    def test_wrap_cds_paints_correct_letters_and_positions(self):
+        import random
+        random.seed(42)
+        n = 1000
+        seq = "".join(random.choice("ACGT") for _ in range(n))
+        # Wrap CDS: tail [900, 1000) + head [0, 30); 130 bp = 43 codons.
+        feats = [{"start": 900, "end": 30, "type": "CDS", "strand": 1,
+                  "label": "wrapCDS", "color": "cyan"}]
+
+        # Head chunk [0, 60) — should host codons 33..52 (codon 33's
+        # midpoint at bp 0, codon 52's at bp 57).
+        chunk_start, chunk_end = 0, 60
+        in_chunk = sc._feats_in_chunk(feats, chunk_start, chunk_end, n)
+        # Head half should carry the original wrap coords.
+        head = next(f for f in in_chunk if f.get("type") == "CDS")
+        assert head["_orig_start"] == 900
+        assert head["_orig_end"] == 30
+
+        arr = [(" ", "")] * (chunk_end - chunk_start)
+        sc._paint_cds_aa(arr, head, chunk_start, chunk_end,
+                          seq.upper(), None)
+        painted = [(i, ch) for i, (ch, _sty) in enumerate(arr) if ch != " "]
+
+        # Compute the canonical answer from the joined CDS sequence.
+        cds_seq = (seq[900:] + seq[:30]).upper()
+        expected = []
+        for i in range(len(cds_seq) // 3):
+            mid = (900 + 3 * i + 1) % n
+            if 0 <= mid < 60:
+                aa = sc._CODON_TABLE.get(cds_seq[3 * i:3 * i + 3], "?")
+                expected.append((mid, aa))
+        assert painted == expected, (
+            f"Wrap-CDS AA letters mis-painted in head half.\n"
+            f"painted={painted}\nexpected={expected}"
+        )
+
+    def test_wrap_cds_aa_cache_keys_on_orig_coords(self):
+        """Both halves of a wrap-CDS should share one cached translation
+        — keyed on `(_orig_start, _orig_end)` — so we don't translate
+        the same protein twice per render. Pre-fix the cache keyed on
+        the half's local `(start, end)` and produced two stale entries
+        per wrap-CDS."""
+        seq = "ATGAAATGCAAAAAAAAAACCCTAA" + "G" * 75   # 100 bp
+        n = len(seq)
+        # Wrap CDS [80, 25); covers tail [80, 100) + head [0, 25).
+        feats = [{"start": 80, "end": 25, "type": "CDS", "strand": 1,
+                  "label": "f", "color": "white"}]
+        head = sc._feats_in_chunk(feats, 0, 30, n)[0]
+        tail = sc._feats_in_chunk(feats, 80, 100, n)[0]
+        sc._CDS_AA_CACHE.clear()
+        aa_head, _, _ = sc._cds_aa_list(seq, head)
+        aa_tail, _, _ = sc._cds_aa_list(seq, tail)
+        assert aa_head is aa_tail   # same cached list
+        assert len(sc._CDS_AA_CACHE) == 1
+
+    def test_non_wrap_cds_unchanged(self):
+        """Sanity: non-wrap CDS features (the common case) must paint
+        identically with or without the `_orig_*` keys — i.e. the
+        fallback `f.get("_orig_start", f["start"])` path is correct."""
+        seq = "ATGAAATGCCCCAAATGCAAA" + "G" * 79   # 100 bp
+        feats = [{"start": 0, "end": 21, "type": "CDS", "strand": 1,
+                  "label": "f", "color": "white"}]
+        n = len(seq)
+        chunk_start, chunk_end = 0, 30
+        in_chunk = sc._feats_in_chunk(feats, chunk_start, chunk_end, n)
+        cds = next(f for f in in_chunk if f.get("type") == "CDS")
+        # Non-wrap: no `_orig_*` keys stamped.
+        assert "_orig_start" not in cds
+
+        arr = [(" ", "")] * (chunk_end - chunk_start)
+        sc._paint_cds_aa(arr, cds, chunk_start, chunk_end,
+                          seq.upper(), None)
+        painted = [(i, ch) for i, (ch, _sty) in enumerate(arr) if ch != " "]
+        # Codon midpoints at bp 1, 4, 7, ..., 19 (7 codons in 21 bp).
+        cds_seq = seq[0:21].upper()
+        expected = [
+            (3 * i + 1, sc._CODON_TABLE.get(cds_seq[3 * i:3 * i + 3], "?"))
+            for i in range(7)
+        ]
+        assert painted == expected

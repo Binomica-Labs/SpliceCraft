@@ -267,8 +267,14 @@ class TestBuildSeqTextPerformance:
 # real regression.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-BUDGET_CURSOR_50KB_MS  = 30.0    # ~10× headroom over 2.7 ms baseline
-BUDGET_CURSOR_150KB_MS = 60.0    # ~6× headroom over 9 ms baseline
+BUDGET_CURSOR_50KB_MS  = 50.0    # ~10× headroom over 5 ms baseline
+BUDGET_CURSOR_150KB_MS = 120.0   # ~10× headroom over 12 ms baseline
+# Bumped 2026-04-30 after the inline AA translation row + trailing
+# inter-chunk gap row landed. Both add spans to the pre-cached chunk
+# Text, so `result.append(cached)` (the dominant cost in the timed
+# loop, per cProfile) does proportionally more work. The added cost
+# is one-row-per-chunk for the gap and one-row-per-CDS-chunk for the
+# AA translation — bounded, not algorithmic.
 BUDGET_BP_TO_ROW_US    = 200.0   # ~40× headroom over 5 µs baseline
 
 

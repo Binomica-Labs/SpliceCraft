@@ -2,6 +2,109 @@
 
 ---
 
+## [0.4.5] — 2026-04-30
+
+### Added
+
+- **Inline amino-acid translation in the sequence panel.** Each CDS
+  feature now has an extra row of one-letter AA codes drawn at codon
+  midpoints, directly above (forward) or below (reverse) its bar. No
+  more popping the translation strip in/out — the protein is always
+  visible alongside the bases. Wrap-around CDS features (those that
+  span the origin) translate correctly across the join.
+- **Click an AA letter → highlight that codon's three bases on the
+  DNA strand.** Cursor parks at the codon centre; Ctrl+C copies the
+  3 bp. Empty cells between AA letters are no-ops by design.
+- **Per-strand restriction-cut visualization.** Clicking a sticky
+  cutter (EcoRI, HindIII, …) in the lane art now tints the upstream
+  bases on each strand blue and the downstream bases red, showing
+  the staggered overhang correctly — top and bottom strands carry
+  different bg colours over the offset bps.
+- **Library search input.** Pre-fills "Search"; clears on focus;
+  Enter applies a fuzzy subsequence filter to the visible table
+  (collections or plasmids); empty Enter clears the filter and
+  restores the prefill.
+- **Bottom-strand copy** — Alt+C (and Ctrl+Shift+C as an alias for
+  terminals that distinguish it from Ctrl+C) reverse-complements
+  the current selection before copying.
+- **Enter on the seq cursor** highlights the smallest feature
+  enclosing that bp — keyboard equivalent of clicking a feature.
+- **Up arrow on the focused map** resets the origin to bp 1
+  (keyboard partner to Home).
+- **Pure-black UI theme** (`splicecraft-black`) — pinned at startup
+  so panels and modals match the logo's true-black backdrop instead
+  of textual-dark's near-black greys.
+- **Toast notifications carry semantic colour.** Saves/loads/copies
+  flash green ("success"); information stays neutral; warnings amber;
+  errors red. Notifications fired while the splash is up are queued
+  and replayed on dismiss so startup messages aren't lost.
+
+### Changed
+
+- **2D feature-lane packer** replaces the three-tier RE / 1bp /
+  multi-bp lane stack. Every feature now sits in lane 0 (adjacent
+  to the DNA strand) by default; only bp-range collisions push a
+  feature up. Restriction sites participate in the same lanes as
+  ordinary features — the parens row prints far from DNA, the cut
+  arrow close. Lane depth is uncapped — features pile up as deep
+  as the data demands.
+- **Layout rework.** The library, plasmid map, and feature sidebar
+  share one horizontal top row; the sequence panel sits beneath
+  them and spans the full window width. The old per-feature detail
+  box in the sidebar was removed (info still surfaces via the row
+  + map highlight); the redundant `Sequence` header strip in the
+  seq panel is gone too.
+- **Map / sidebar feature picks now park the cursor at the feature's
+  5' end** rather than its midpoint. Long CDS rows used to land the
+  cursor mid-feature; the new behaviour anchors at the feature's
+  start so users read top-down.
+- **Lane clicks no longer scroll the seq panel.** The user clicked
+  something they were already looking at, so jumping the viewport
+  away from their cursor would be jarring.
+- **Map rotation keys are focus-gated.** `[` / `]` and arrow keys
+  rotate only when the plasmid map has focus — they no longer
+  fire from modal screens or the seq panel.
+- **Arrow keys clear the active RE highlight** and park the cursor
+  immediately upstream (Left) or downstream (Right / Up / Down) of
+  the top-strand cut.
+- **Arrow keys exit a feature highlight** at the matching end and
+  step one base in the arrow's direction, instead of being absorbed
+  by the highlight.
+- **Backbone clicks on the map** (or anywhere outside the four main
+  panels) now clear every panel's highlight in one go.
+- **Loading a library entry that's already loaded is now a no-op,**
+  instead of clobbering undo/redo and any unsaved edits.
+- **Performance budgets bumped** for the inline AA row + inter-chunk
+  gap (`50 KB cursor ≤ 50 ms`, `150 KB cursor ≤ 120 ms`).
+
+### Fixed
+
+- **Wrap-CDS inline AA painting.** The new AA row was placing letters
+  at the wrong bps with the wrong reading frame for any CDS that
+  crosses the origin (head halves were translated as if they were
+  fresh 0-indexed CDS fragments). `_feats_in_chunk` now stamps the
+  original `(start, end)` on each split half as `_orig_start` /
+  `_orig_end`, and `_paint_cds_aa` / `_cds_aa_list` / the AA-letter
+  click handler all use those for codon math. Regression test in
+  `TestWrapCDSInlineTranslation`.
+- **`SequencePanel.on_mouse_down` AttributeError on first click.**
+  The new lane-click skip-scroll logic read `self._last_lane_click`
+  before any prior `on_click` had a chance to initialise it. Now
+  set in `__init__` and reset before every `_click_to_bp` call so
+  the flag reflects only the current click.
+
+### Removed
+
+- Three vestigial helpers (`_build_chunk_translation`, `_emit_aa_row`,
+  `_chunk_has_cds`, ~125 lines) from an earlier AA-row prototype that
+  was superseded by `_paint_cds_aa`. No callers, no tests.
+- Sequence-panel header strip and translation footer (`#seq-hdr`,
+  `#seq-trans`).
+- Feature-sidebar detail box (`#detail-box`); `show_detail` is now
+  a no-op kept for caller compatibility.
+
+---
+
 ## [Unreleased]
 
 ### Added
