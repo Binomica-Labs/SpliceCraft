@@ -4335,7 +4335,7 @@ class EditSeqDialog(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self, mode: str, existing: str = "",
@@ -4420,7 +4420,7 @@ class EditSeqDialog(ModalScreen):
 class FetchModal(ModalScreen):
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def compose(self) -> ComposeResult:
@@ -4508,7 +4508,7 @@ class FetchModal(ModalScreen):
 class OpenFileModal(ModalScreen):
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def compose(self) -> ComposeResult:
@@ -4558,7 +4558,7 @@ class ExportGenBankModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel",      "Cancel"),
-        Binding("tab",    "focus_next",  "Next",   show=False),
+        Binding("tab",    "app.focus_next",  "Next",   show=False),
     ]
 
     def __init__(self, record, default_path: str = "") -> None:
@@ -4634,7 +4634,7 @@ class FastaExportModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
-        Binding("tab",    "focus_next", "Next",   show=False),
+        Binding("tab",    "app.focus_next", "Next",   show=False),
     ]
 
     def __init__(self, name: str, sequence: str,
@@ -7429,7 +7429,7 @@ class PlasmidFeaturePickerModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self, entries: list[dict], plasmid_name: str = ""):
@@ -7525,7 +7525,7 @@ class AddFeatureModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self, prefill: "dict | None" = None,
@@ -8857,7 +8857,7 @@ class GrammarEditorModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self, grammar_id: str) -> None:
@@ -9181,7 +9181,7 @@ class PartsBinModal(Screen):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self) -> None:
@@ -9847,7 +9847,7 @@ class FastaFilePickerModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self, start_path: "str | None" = None) -> None:
@@ -9972,7 +9972,7 @@ class DomesticatorModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self, template_seq: str, feats: list[dict],
@@ -10736,7 +10736,7 @@ class ConstructorModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     # L1 destination backbone info
@@ -11635,7 +11635,7 @@ class MutagenizeModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self, template_seq: str, feats: list, plasmid_name: str = ""):
@@ -12362,7 +12362,7 @@ class PrimerDesignScreen(Screen):
         Binding("m",       "noop",       "Mark (★)",      show=True, key_display="m"),
         Binding("shift+m", "noop",       "Mark All",      show=True, key_display="M"),
         Binding("shift+s", "noop",       "Change Status", show=True, key_display="S"),
-        Binding("tab",     "focus_next", "",               show=False),
+        Binding("tab",     "app.focus_next", "",               show=False),
     ]
 
     def action_noop(self) -> None:
@@ -13456,7 +13456,7 @@ class UnsavedQuitModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("tab",    "focus_next", "Next button", show=False),
+        Binding("tab",    "app.focus_next", "Next button", show=False),
     ]
 
     def compose(self) -> ComposeResult:
@@ -13471,6 +13471,11 @@ class UnsavedQuitModal(ModalScreen):
                 yield Button("Abandon Changes",  id="btn-abandon",   variant="error")
                 yield Button("Cancel",           id="btn-cancel-quit")
 
+    def on_mount(self) -> None:
+        # Default focus on Cancel — match the "default No / safe" pattern
+        # of every other confirm modal so a hammered Enter can't quit.
+        self.query_one("#btn-cancel-quit", Button).focus()
+
     @on(Button.Pressed, "#btn-save-quit")
     def _save_quit(self, _): self.dismiss("save")
 
@@ -13481,6 +13486,319 @@ class UnsavedQuitModal(ModalScreen):
     def _cancel_btn(self, _): self.dismiss(None)
 
     def action_cancel(self): self.dismiss(None)
+
+
+class QuitConfirmModal(ModalScreen):
+    """Confirm-quit modal for the no-unsaved-changes case. The unsaved
+    branch goes through `UnsavedQuitModal` (with Save / Abandon / Cancel)
+    instead. Default focus on `No`.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="quitcon-dlg"):
+            yield Static(" Quit SpliceCraft? ", id="quitcon-title")
+            yield Static(
+                "  Are you sure you want to quit?",
+                id="quitcon-msg",
+            )
+            with Horizontal(id="quitcon-btns"):
+                yield Button("No",  id="btn-quitcon-no",  variant="default")
+                yield Button("Yes", id="btn-quitcon-yes", variant="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#btn-quitcon-no", Button).focus()
+
+    @on(Button.Pressed, "#btn-quitcon-no")
+    def _no(self, _): self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-quitcon-yes")
+    def _yes(self, _): self.dismiss(True)
+
+    def action_cancel(self): self.dismiss(False)
+
+
+class SplashScreen(ModalScreen):
+    """Pre-app splash — branded loader showing the SpliceCraft banner,
+    Binomica Labs credit, and the running version. Dismisses on any
+    keystroke; the main UI mounts in the background while the splash
+    is up so dismissal feels instant.
+
+    Pushed at the top of `PlasmidApp.on_mount`. Skip via the
+    `--no-splash` CLI flag (mostly for tests + scripted runs).
+    """
+
+    BINDINGS = [
+        # Bound keys fire their action; everything else routes through
+        # `on_key` (any key dismisses). Both paths call dismiss().
+        Binding("escape", "dismiss_splash", "Continue", show=False),
+        Binding("enter",  "dismiss_splash", "Continue", show=False),
+        Binding("space",  "dismiss_splash", "Continue", show=False),
+        Binding("q",      "dismiss_splash", "Continue", show=False),
+    ]
+
+    # Cosmic-font logo, letter-by-letter rendering joined with a 2-col
+    # gap so the word reads as contiguous "SpliceCraft" rather than as
+    # individual letterforms. 131 cols × 6 rows. Falls back to the
+    # narrower "big" font on terminals < 135 cols (see `_LOGO_FALLBACK`).
+    _LOGO_COSMIC = (
+        " .::::::.   ::::::::::.    :::       :::    .,-:::::    .,::::::      .,-:::::    :::::::..       :::.       .-:::::'  ::::::::::::\n"
+        ";;;`    `    `;;;```.;;;   ;;;       ;;;  ,;;;'````'    ;;;;''''    ,;;;'````'    ;;;;``;;;;      ;;`;;      ;;;''''   ;;;;;;;;''''\n"
+        "'[==/[[[[,    `]]nnn]]'    [[[       [[[  [[[            [[cccc     [[[            [[[,/[[['     ,[[ '[[,    [[[,,==        [[     \n"
+        "  '''    $     $$$\"\"       $$'       $$$  $$$            $$\"\"\"\"     $$$            $$$$$$c      c$$$cc$$$c   `$$$\"``        $$     \n"
+        " 88b    dP     888o       o88oo,.__  888  `88bo,__,o,    888oo,__   `88bo,__,o,    888b \"88bo,   888   888,   888           88,    \n"
+        "  \"YMmMY\"      YMMMb      \"\"\"\"YUMMM  MMM    \"YUMMMMMP\"   \"\"\"\"YUMMM    \"YUMMMMMP\"   MMMM   \"W\"    YMM   \"\"`    \"MM,          MMM    "
+    )
+
+    # Fallback for narrow terminals — "big" figlet font, 52 cols × 8 rows.
+    _LOGO_FALLBACK = (
+        "  _____       _ _           _____            __ _\n"
+        " / ____|     | (_)         / ____|          / _| |\n"
+        "| (___  _ __ | |_  ___ ___| |     _ __ __ _| |_| |_\n"
+        " \\___ \\| '_ \\| | |/ __/ _ \\ |    | '__/ _` |  _| __|\n"
+        " ____) | |_) | | | (_|  __/ |____| | | (_| | | | |_\n"
+        "|_____/| .__/|_|_|\\___\\___|\\_____|_|  \\__,_|_|  \\__|\n"
+        "       | |\n"
+        "       |_|"
+    )
+
+    # Pre-baked rainbow palette — 24 hues spanning HSV(0..1) at S=0.85,
+    # V=1.0. Hand-rolling 24 hex strings keeps Rich's style cache small
+    # (otherwise every braille pixel could spawn a unique style and the
+    # final Text object balloons).
+    _RAINBOW: "tuple[str, ...]" = ()
+
+    def compose(self) -> ComposeResult:
+        # Single full-screen Static; we paint the entire splash (DNA
+        # helix + logo + tagline + version + prompt) into one Rich Text.
+        yield Static("", id="splash-canvas", markup=False)
+
+    def on_mount(self) -> None:
+        if not type(self)._RAINBOW:
+            type(self)._RAINBOW = self._build_rainbow()
+        self._refresh()
+
+    def on_resize(self, _event) -> None:
+        self._refresh()
+
+    def _build_rainbow(self) -> "tuple[str, ...]":
+        import colorsys
+        out: list[str] = []
+        for i in range(24):
+            r, g, b = colorsys.hsv_to_rgb(i / 24, 0.85, 1.0)
+            out.append(f"#{int(r * 255):02X}{int(g * 255):02X}{int(b * 255):02X}")
+        return tuple(out)
+
+    def _refresh(self) -> None:
+        try:
+            canvas = self.query_one("#splash-canvas", Static)
+        except NoMatches:
+            return
+        size = self.size
+        if size.width <= 4 or size.height <= 4:
+            return
+        canvas.update(self._compose_splash(size.width, size.height))
+
+    def _compose_splash(self, w: int, h: int) -> Text:
+        bc = _BrailleCanvas(w, h)
+        tc = _Canvas(w, h)
+        self._draw_helix(bc, w, h)
+        self._draw_logo(tc, w, h)
+        return bc.combine(tc)
+
+    def _draw_helix(self, bc: "_BrailleCanvas", w: int, h: int) -> None:
+        """Right-handed B-DNA helix in braille — diagonal axis, rainbow.
+
+        Biologically calibrated to B-DNA:
+          * **Right-handed.** Strand A leads strand B by +150°
+            (= +5π/6); the front strand at each crossing is the one
+            with the more positive depth coordinate, computed via
+            cosine of the helical phase. The back strand is suppressed
+            within ~6 px of each crossing so it visibly passes BEHIND
+            the front strand instead of merging into it.
+          * **Major/minor groove ratio ≈ 7 : 5.** Strands are offset by
+            150° rather than the symmetric 180°, which puts adjacent
+            crossings at 150° and 210° apart in helical phase. The
+            wider 210° gap on one side reads as the major groove; the
+            narrower 150° gap as the minor.
+          * **Pitch : diameter ≈ 1.78.** B-DNA's 34 Å rise per turn
+            divided by its ~19 Å diameter. We solve `period = 2 · amp ·
+            1.78` so the helix proportions stay correct regardless of
+            terminal size. ``amp`` is the strand radius from the axis;
+            ``period`` is the rise along the axis per turn.
+
+        Axis runs bottom-left → top-right (corner to corner). Strands
+        oscillate perpendicular to that axis. Each sample paints a
+        5-pixel disk so the helix reads as a chunky ribbon rather than
+        a thin line.
+        """
+        import math
+        px_w = w * 2
+        px_h = h * 4
+
+        # Axis: bottom-left → top-right. In braille pixel coords (y
+        # grows downward), bottom-left = (0, px_h-1) and top-right =
+        # (px_w-1, 0). Normalise to a unit direction `u` and a
+        # perpendicular `v`.
+        d_len = math.hypot(px_w, px_h)
+        ux, uy = px_w / d_len, -px_h / d_len
+        vx, vy = -uy, ux  # 90° CCW perpendicular
+
+        # B-DNA proportions — pitch / diameter = 34 / 19 ≈ 1.78.
+        # `amp` is the helix radius (half the diameter), `period` is the
+        # axial rise per full turn.
+        amp = max(20, int(min(px_w, px_h) * 0.22))
+        pitch_diameter_ratio = 1.78
+        period = max(60.0, 2.0 * amp * pitch_diameter_ratio)
+
+        # 150° offset between the two strands → ratiometric major/minor
+        # groove asymmetry. Try `+5π/6` for one handedness; flipping the
+        # sign gives left-handed Z-DNA. We want right-handed B-DNA.
+        DELTA_PHI = 5.0 * math.pi / 6.0
+        # Crossings happen when the two strands' projected x match.
+        # Solving sin(θ) = sin(θ + Δφ) gives crossings every π in θ
+        # but offset; depth (cos) at the crossing tells us which is in
+        # front. We use a small "near-crossing" window around each
+        # crossing to suppress the back strand for visible occlusion.
+        gap_px = 6  # strand-to-strand pixel distance at which we treat as crossing
+
+        rainbow = type(self)._RAINBOW
+        n_hues = len(rainbow)
+        # Sample at 0.5-px resolution so disks overlap into a smooth
+        # ribbon. Also gives enough samples that the front-strand
+        # transition at each crossing reads cleanly.
+        n_samples = int(d_len * 2)
+
+        # 5-pixel disk (Manhattan radius 2) for the chunky stroke.
+        disk = [(dx, dy) for dx in range(-2, 3) for dy in range(-2, 3)
+                if dx * dx + dy * dy <= 4]
+
+        # Bottom-left start of the axis.
+        sx, sy = 0.0, float(px_h - 1)
+
+        for i in range(n_samples + 1):
+            t = i * d_len / n_samples
+            phase = 2.0 * math.pi * t / period
+            cx_axis = sx + t * ux
+            cy_axis = sy + t * uy
+            # Strand A at phase, strand B at phase + 150°.
+            sa, sb = math.sin(phase), math.sin(phase + DELTA_PHI)
+            ax = cx_axis + amp * sa * vx
+            ay = cy_axis + amp * sa * vy
+            bx = cx_axis + amp * sb * vx
+            by = cy_axis + amp * sb * vy
+            # Depth (out of screen) — used to pick which strand is in
+            # front near each crossing for the right-handed look.
+            za = amp * math.cos(phase)
+            zb = amp * math.cos(phase + DELTA_PHI)
+            color = rainbow[int(t * n_hues / d_len) % n_hues]
+            near_crossing = math.hypot(ax - bx, ay - by) < gap_px
+            # Right-handed B-DNA: at each crossing the strand with
+            # GREATER z is in front. Suppress the other inside the
+            # crossing window so it visibly passes behind.
+            skip_a = near_crossing and za < zb
+            skip_b = near_crossing and zb < za
+            if not skip_a:
+                for dx, dy in disk:
+                    bc.set_pixel(int(ax) + dx, int(ay) + dy, color)
+            if not skip_b:
+                for dx, dy in disk:
+                    bc.set_pixel(int(bx) + dx, int(by) + dy, color)
+
+        # Base-pair rungs — 10.5 bp per B-DNA turn (we use 10 for an
+        # even number that visibly subdivides the period). Skip rungs
+        # where the strands cross.
+        rungs_per_turn = 10
+        rung_dt = period / rungs_per_turn
+        n_rungs = int(d_len / rung_dt)
+        for j in range(n_rungs + 1):
+            t = j * rung_dt
+            phase = 2.0 * math.pi * t / period
+            cx_axis = sx + t * ux
+            cy_axis = sy + t * uy
+            sa = math.sin(phase)
+            sb = math.sin(phase + DELTA_PHI)
+            ax = cx_axis + amp * sa * vx
+            ay = cy_axis + amp * sa * vy
+            bx = cx_axis + amp * sb * vx
+            by = cy_axis + amp * sb * vy
+            dist = math.hypot(ax - bx, ay - by)
+            if dist <= 10:
+                continue
+            color = rainbow[int(t * n_hues / d_len) % n_hues]
+            n_steps = int(dist) + 1
+            for k in range(n_steps + 1):
+                f = k / n_steps
+                px = ax + (bx - ax) * f
+                py = ay + (by - ay) * f
+                # 2-px stroke for the rung.
+                bc.set_pixel(int(px), int(py), color)
+                bc.set_pixel(int(px), int(py) + 1, color)
+
+    def _draw_logo(self, tc: "_Canvas", w: int, h: int) -> None:
+        """Centre-align the logo + tagline + version + prompt onto the
+        text canvas. The text canvas wins over braille pixels in
+        `combine()`, so each non-space char punches through the helix
+        with a bright bold style. Spaces inside the cosmic letterforms
+        intentionally let the helix bleed through — gives the logo a
+        woven-into-the-DNA feel."""
+        logo = self._LOGO_COSMIC if w >= 135 else self._LOGO_FALLBACK
+        lines = logo.split("\n")
+        logo_w = max(len(ln) for ln in lines)
+        logo_h = len(lines)
+        col_off = max(0, (w - logo_w) // 2)
+        row_off = max(0, (h - logo_h) // 2 - 4)
+
+        logo_style = "bold #FFFFFF on #000000"
+        for i, ln in enumerate(lines):
+            row = row_off + i
+            if row >= h:
+                break
+            for j, ch in enumerate(ln):
+                if ch != " ":
+                    tc.put(col_off + j, row, ch, style=logo_style)
+
+        info_lines = [
+            "·  I n - T e r m i n a l   P l a s m i d   W o r k b e n c h  ·",
+            "",
+            f"Binomica Labs   ·   v{__version__}",
+            "",
+            "press any key to begin",
+        ]
+        info_row = row_off + logo_h + 2
+        info_styles = [
+            "italic #FFFFFF on #000000",
+            "",
+            "bold #FFFFFF on #000000",
+            "",
+            "italic #FFD700 on #000000",  # gold prompt — eye-catching
+        ]
+        for i, line in enumerate(info_lines):
+            row = info_row + i
+            if row >= h:
+                break
+            col = max(0, (w - len(line)) // 2)
+            style = info_styles[i] if i < len(info_styles) else ""
+            for j, ch in enumerate(line):
+                if ch != " ":
+                    tc.put(col + j, row, ch, style=style)
+
+    def on_key(self, event) -> None:
+        # Catch-all: any keystroke dismisses, including keys not in BINDINGS.
+        # `event.stop()` keeps the app from also processing the key.
+        self.dismiss(None)
+        event.stop()
+
+    def on_click(self, _event) -> None:
+        # Mouse click dismisses too — same affordance as "press any key".
+        self.dismiss(None)
+
+    def action_dismiss_splash(self) -> None:
+        self.dismiss(None)
 
 
 class UnsavedNavigateModal(ModalScreen):
@@ -13496,7 +13814,7 @@ class UnsavedNavigateModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
-        Binding("tab",    "focus_next", "Next button", show=False),
+        Binding("tab",    "app.focus_next", "Next button", show=False),
     ]
 
     def __init__(self, action_phrase: str = "leave"):
@@ -13537,7 +13855,7 @@ class PlasmidPickerModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self, current_id: "str | None" = None):
@@ -13606,7 +13924,7 @@ class CollectionsModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel",     "Close"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def compose(self) -> ComposeResult:
@@ -13723,7 +14041,7 @@ class CollectionNameModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self, title: str, current: str = "",
@@ -13782,7 +14100,7 @@ class CollectionDeleteConfirmModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self, name: str, n_plasmids: int) -> None:
@@ -13828,7 +14146,7 @@ class ScaryDeleteConfirmModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self, name: str, n_plasmids: int) -> None:
@@ -13889,7 +14207,7 @@ class RenamePlasmidModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("tab",    "focus_next", "Next", show=False),
+        Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self, current_name: str, entry_id: str):
@@ -13957,7 +14275,7 @@ class LibraryDeleteConfirmModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("tab",    "focus_next", "Next button", show=False),
+        Binding("tab",    "app.focus_next", "Next button", show=False),
     ]
 
     def __init__(self, name: str, size: int, entry_id: str):
@@ -14011,6 +14329,11 @@ class PlasmidApp(App):
     _restr_min_len: int = 6
     _show_restr: bool = False
     _restr_cache: "list" = []
+    # Splash screen on launch — skip via CLI `--no-splash` or by setting
+    # `app._skip_splash = True` before run() (the test conftest sets this
+    # because the splash modal blocks pilot.click before the suite drives
+    # the actual UI).
+    _skip_splash:    bool         = False
 
     CSS = """
 Screen { background: $background; }
@@ -14125,6 +14448,25 @@ UnsavedNavigateModal { align: center middle; }
 #navunsv-msg   { color: $text-muted; margin-bottom: 1; }
 #navunsv-btns  { height: 3; margin-top: 1; }
 #navunsv-btns Button { margin-right: 1; }
+
+/* ── Quit confirm (clean-exit branch, default No) ────────── */
+QuitConfirmModal { align: center middle; }
+#quitcon-dlg {
+    width: 50; height: auto;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#quitcon-title { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#quitcon-msg   { color: $text-muted; margin-bottom: 1; }
+#quitcon-btns  { height: 3; margin-top: 1; }
+#quitcon-btns Button { margin-right: 1; min-width: 10; }
+
+/* ── Splash screen — full-window DNA helix + cosmic logo overlay ─── */
+SplashScreen { background: black; }
+#splash-canvas {
+    width: 100%; height: 100%;
+    background: black;
+    color: $accent;
+}
 
 /* ── Library-delete confirmation ─────────────────────────── */
 LibraryDeleteConfirmModal { align: center middle; }
@@ -14977,6 +15319,12 @@ SpeciesPickerModal { align: center middle; }
     # ── Mount: auto-load preloaded record ──────────────────────────────────────
 
     def on_mount(self) -> None:
+        # Show the splash on top first; the rest of init runs underneath
+        # while the user reads it. Skipped under `--no-splash` (and during
+        # tests by default — splash blocks input which interferes with
+        # `pilot.click` and friends).
+        if not getattr(self, "_skip_splash", False):
+            self.push_screen(SplashScreen())
         # Per-plasmid undo: switching plasmids stashes the old stacks under
         # the old record.id and restores this plasmid's own history if it
         # was edited before. See _stash_current_undo_and_load.
@@ -15465,9 +15813,19 @@ SpeciesPickerModal { align: center middle; }
         self._do_save()
 
     def action_quit(self) -> None:
+        # Two paths: with unsaved edits → Save / Abandon / Cancel modal;
+        # clean state → simple Yes / No confirm modal (default No). The
+        # second path is new — we used to exit() outright, which could
+        # nuke a hammered-q keypress with no chance to back out.
         if self._unsaved:
-            self.push_screen(UnsavedQuitModal(), callback=self._on_quit_response)
+            self.push_screen(UnsavedQuitModal(),
+                             callback=self._on_quit_response)
         else:
+            self.push_screen(QuitConfirmModal(),
+                             callback=self._on_quit_confirm)
+
+    def _on_quit_confirm(self, result) -> None:
+        if result is True:
             self.exit()
 
     def _on_quit_response(self, result) -> None:
@@ -16363,7 +16721,15 @@ SpeciesPickerModal { align: center middle; }
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
-    arg = sys.argv[1] if len(sys.argv) > 1 else None
+    # Pluck `--no-splash` out of argv before the positional-argument
+    # parsing so it composes with any other flag in any position.
+    args = list(sys.argv[1:])
+    skip_splash = False
+    for flag in ("--no-splash", "-Q"):
+        if flag in args:
+            args.remove(flag)
+            skip_splash = True
+    arg = args[0] if args else None
     # Handle --version / -V without loading the TUI
     if arg in ("--version", "-V"):
         print(f"splicecraft {__version__}")
@@ -16371,24 +16737,26 @@ def main():
     if arg in ("--help", "-h"):
         print(
             f"splicecraft {__version__}\n"
-            "Usage: splicecraft [ACCESSION | FILE.gb]\n\n"
+            "Usage: splicecraft [ACCESSION | FILE.gb] [--no-splash]\n\n"
             "  splicecraft             # empty canvas\n"
             "  splicecraft L09137      # fetch pUC19 from NCBI\n"
-            "  splicecraft my.gb       # open a local GenBank file\n\n"
+            "  splicecraft my.gb       # open a local GenBank file\n"
+            "  splicecraft --no-splash # skip the launcher splash\n\n"
             "Data files (library, parts, primers) live in:\n"
             f"  {_DATA_DIR}\n"
             "Override with $SPLICECRAFT_DATA_DIR."
         )
         return
-    if len(sys.argv) > 2:
+    if len(args) > 1:
         print(
-            f"splicecraft takes at most one argument (got {len(sys.argv) - 1}: "
-            f"{' '.join(sys.argv[1:])}). Pass a single accession or file.",
+            f"splicecraft takes at most one positional argument (got "
+            f"{len(args)}: {' '.join(args)}). Pass a single accession or file.",
             file=sys.stderr,
         )
         sys.exit(2)
     _log_startup_banner()
     app = PlasmidApp()
+    app._skip_splash = skip_splash
 
     if arg:
         looks_like_file = arg.lower().endswith((".gb", ".gbk", ".genbank", ".dna"))

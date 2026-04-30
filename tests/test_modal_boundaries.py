@@ -171,6 +171,8 @@ _MODAL_CASES = [
                                                   "MyCollection", 5)),
     ("ScaryDeleteConfirmModal",      lambda: sc.ScaryDeleteConfirmModal(
                                                   "MyCollection", 12)),
+    ("QuitConfirmModal",             lambda: sc.QuitConfirmModal()),
+    ("SplashScreen",                 lambda: sc.SplashScreen()),
 ]
 
 

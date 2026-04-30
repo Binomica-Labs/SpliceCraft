@@ -1576,6 +1576,122 @@ class TestSeqClickWrapFeature:
             )
 
 
+class TestSplashScreen:
+    """Splash modal mounts on launch and dismisses on any keystroke; the
+    test conftest sets `_skip_splash = True` for everything else, so any
+    test that wants to drive the splash has to opt back in."""
+
+    async def test_splash_mounts_when_enabled(self, isolated_library):
+        app = sc.PlasmidApp()
+        app._skip_splash = False
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, sc.SplashScreen)
+            # The new splash paints DNA helix + logo + tagline + version
+            # all into one canvas Static. Probe the rendered Text for
+            # the Binomica + version string to verify the composition
+            # actually included them.
+            canvas = app.screen.query_one("#splash-canvas")
+            content = str(canvas.render())
+            assert "Binomica" in content
+            assert sc.__version__ in content
+            app.exit()
+
+    async def test_splash_dismisses_on_key(self, isolated_library):
+        app = sc.PlasmidApp()
+        app._skip_splash = False
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.SplashScreen)
+            await pilot.press("a")
+            await pilot.pause(0.1)
+            assert not isinstance(app.screen, sc.SplashScreen)
+            app.exit()
+
+    async def test_splash_skipped_under_default_test_config(self, isolated_library):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # conftest set _skip_splash = True; no splash on screen.
+            assert not isinstance(app.screen, sc.SplashScreen)
+            app.exit()
+
+
+class TestQuitConfirm:
+    """Pressing q opens QuitConfirmModal (default No) when there are no
+    unsaved edits. With unsaved edits the existing UnsavedQuitModal still
+    fires instead. Tab cycles between buttons; Enter on the focused
+    button presses it (Textual default — no extra wiring needed)."""
+
+    async def test_clean_quit_pushes_confirm_modal(self, isolated_library):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert app._unsaved is False
+            app.action_quit()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.QuitConfirmModal)
+            # Default focus is on No.
+            assert app.screen.focused.id == "btn-quitcon-no"
+            app.exit()
+
+    async def test_clean_quit_no_keeps_app_running(self, isolated_library):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app.action_quit()
+            await pilot.pause(0.1)
+            app.screen.query_one("#btn-quitcon-no").action_press()
+            await pilot.pause(0.1)
+            # Still running — return to default screen, not exited.
+            assert not isinstance(app.screen, sc.QuitConfirmModal)
+            app.exit()
+
+    async def test_unsaved_quit_routes_through_unsaved_modal(
+        self, tiny_record, isolated_library
+    ):
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.2)
+            app._mark_dirty()
+            await pilot.pause(0.05)
+            app.action_quit()
+            await pilot.pause(0.1)
+            # With unsaved edits, the unsaved modal fires (3 buttons),
+            # not the simple QuitConfirmModal.
+            assert isinstance(app.screen, sc.UnsavedQuitModal)
+            app.screen.query_one("#btn-cancel-quit").action_press()
+            await pilot.pause(0.1)
+            app.exit()
+
+    async def test_tab_cycles_focus_between_no_and_yes(self, isolated_library):
+        """Tab + Enter end-to-end on a confirm modal — the only modal
+        contract that matters for keyboard-only quit confirmation."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app.action_quit()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert modal.focused.id == "btn-quitcon-no"
+            await pilot.press("tab")
+            await pilot.pause(0.05)
+            assert modal.focused.id == "btn-quitcon-yes"
+            await pilot.press("tab")
+            await pilot.pause(0.05)
+            # Wraps back round to No.
+            assert modal.focused.id == "btn-quitcon-no"
+            app.exit()
+
+
 class TestUndoSnapshotIndependence:
     """Defensive guard for an invariant that's currently easy to break by
     accident: undo/redo snapshots must be INDEPENDENT of the live record,

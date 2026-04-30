@@ -64,6 +64,12 @@ def _protect_user_data(tmp_path, monkeypatch):
     # the user's real _DATA_DIR/crash_recovery on disk.
     monkeypatch.setattr(sc, "_CRASH_RECOVERY_DIR", tmp_path / "crash_recovery")
 
+    # Skip the launch splash for every test by default — the splash modal
+    # blocks input until dismissed, which would break every `pilot.click`
+    # / `app.action_*` call. Tests that exercise the splash explicitly
+    # set `_skip_splash = False` on their app instance before run_test.
+    monkeypatch.setattr(sc.PlasmidApp, "_skip_splash", True)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Session-scoped module import
