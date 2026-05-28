@@ -381,3 +381,89 @@ def test_delete_enzyme_collection_clears_active_pointer(mock_app):
     assert sc._get_active_enzyme_collection_name() == "WillDelete"
     sc._h_delete_enzyme_collection(mock_app, {"name": "WillDelete"})
     assert sc._get_active_enzyme_collection_name() is None
+
+
+# ── Parts-bin collection endpoints ────────────────────────────────────────────
+
+
+def test_list_parts_bins():
+    sc._save_parts_bin_collections([
+        {"name": "Bin A", "parts": [], "description": "d"},
+    ])
+    res = sc._h_list_parts_bins(None, {})
+    assert res["ok"]
+    names = {b["name"] for b in res["parts_bins"]}
+    assert "Bin A" in names
+
+
+def test_set_active_parts_bin_roundtrip():
+    sc._save_parts_bin_collections([
+        {"name": "Bin A", "parts": [], "description": ""},
+        {"name": "Bin B",
+         "parts": [{"name": "p1", "sequence": "ATGC"}],
+         "description": ""},
+    ])
+    res = sc._h_set_active_parts_bin(None, {"name": "Bin B"})
+    assert res["ok"] and res["active"] == "Bin B"
+    assert res["n_parts"] == 1
+    assert sc._get_active_parts_bin_name() == "Bin B"
+
+
+def test_set_active_parts_bin_unknown_404():
+    res = sc._h_set_active_parts_bin(None, {"name": "no-such-bin-xyz"})
+    assert isinstance(res, tuple) and res[1] == 404
+
+
+def test_set_active_parts_bin_missing_name_400():
+    res = sc._h_set_active_parts_bin(None, {})
+    assert isinstance(res, tuple) and res[1] == 400
+
+
+# ── HMM-database endpoints ─────────────────────────────────────────────────────
+
+
+def test_list_hmm_databases_has_builtins():
+    res = sc._h_list_hmm_databases(None, {})
+    assert res["ok"]
+    ids = {d["id"] for d in res["hmm_databases"]}
+    assert ids   # built-ins always present
+
+
+def test_get_hmm_database_roundtrip():
+    listed = sc._h_list_hmm_databases(None, {})["hmm_databases"]
+    assert listed
+    some_id = listed[0]["id"]
+    res = sc._h_get_hmm_database(None, {"id": some_id})
+    assert res["ok"] and res["id"] == some_id
+
+
+def test_get_hmm_database_unknown_404():
+    res = sc._h_get_hmm_database(None, {"id": "no-such-db"})
+    assert isinstance(res, tuple) and res[1] == 404
+
+
+def test_set_active_hmm_database_roundtrip():
+    listed = sc._h_list_hmm_databases(None, {})["hmm_databases"]
+    assert listed
+    some_id = listed[0]["id"]
+    res = sc._h_set_active_hmm_database(None, {"id": some_id})
+    assert res["ok"] and res["active"] == some_id
+    assert (sc._get_setting("hmm_db_active_id", "") or "") == some_id
+
+
+def test_set_active_hmm_database_unknown_404():
+    res = sc._h_set_active_hmm_database(None, {"id": "no-such-db"})
+    assert isinstance(res, tuple) and res[1] == 404
+
+
+def test_delete_hmm_database_unknown_404():
+    res = sc._h_delete_hmm_database(None, {"id": "no-such-db"})
+    assert isinstance(res, tuple) and res[1] == 404
+
+
+def test_delete_hmm_database_not_downloaded_ok():
+    listed = sc._h_list_hmm_databases(None, {})["hmm_databases"]
+    assert listed
+    some_id = listed[0]["id"]
+    res = sc._h_delete_hmm_database(None, {"id": some_id})
+    assert res["ok"] and res["files_removed"] == 0

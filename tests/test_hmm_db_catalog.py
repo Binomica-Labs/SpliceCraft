@@ -323,7 +323,7 @@ class TestDownloadMagicBytes:
                         content_type="application/octet-stream",
                     )
             return _O()
-        monkeypatch.setattr(sc, "_hmm_db_build_url_opener", _opener)
+        monkeypatch.setattr(sc, "_build_hardened_url_opener", _opener)
         with pytest.raises(ValueError, match="gzip magic"):
             sc._stream_download_to_path(
                 "https://example.com/x.gz",
@@ -340,7 +340,7 @@ class TestDownloadMagicBytes:
                         html, content_type="text/html",
                     )
             return _O()
-        monkeypatch.setattr(sc, "_hmm_db_build_url_opener", _opener)
+        monkeypatch.setattr(sc, "_build_hardened_url_opener", _opener)
         with pytest.raises(ValueError, match="Content-Type"):
             sc._stream_download_to_path(
                 "https://example.com/x.gz",
@@ -355,7 +355,7 @@ class TestDownloadMagicBytes:
                 def open(self, _req, timeout=None):
                     return TestDownloadMagicBytes._stub_urlopen(gz)
             return _O()
-        monkeypatch.setattr(sc, "_hmm_db_build_url_opener", _opener)
+        monkeypatch.setattr(sc, "_build_hardened_url_opener", _opener)
         dest = tmp_path / "db.hmm.gz"
         sha = sc._stream_download_to_path(
             "https://example.com/x.gz", dest,
@@ -630,7 +630,7 @@ class TestNetworkRetry:
                 if calls[0] == 1:
                     raise urllib.error.URLError("transient")
                 return _StubResp()
-        monkeypatch.setattr(sc, "_hmm_db_build_url_opener",
+        monkeypatch.setattr(sc, "_build_hardened_url_opener",
                               lambda: _Opener())
         v, src = sc._fetch_hmm_db_remote_version({
             "id":          "pfam-a",
@@ -650,7 +650,7 @@ class TestNetworkRetry:
         class _Opener:
             def open(self, _req, timeout=None):
                 raise urllib.error.URLError("persistent")
-        monkeypatch.setattr(sc, "_hmm_db_build_url_opener",
+        monkeypatch.setattr(sc, "_build_hardened_url_opener",
                               lambda: _Opener())
         v, src = sc._fetch_hmm_db_remote_version({
             "id":          "pfam-a",

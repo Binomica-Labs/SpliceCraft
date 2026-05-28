@@ -14,6 +14,43 @@
 
 ---
 
+## [Unreleased]
+
+### Final pre-1.0 hardening sweep + completeness
+
+#### New features
+
+- **Add, edit, and delete protein motifs in the Synthesis editor.** The protein-motif library pane (Synthesis → Protein tab) gains **New…** and **Delete** buttons alongside Insert / Edit — build your own custom tags / linkers / signals and remove ones you don't use. Built-in motifs are protected: deleting your edit of a built-in restores the original.
+- **Import a custom codon-usage table.** The codon-table picker (used by Synthesis and Mutagenize) gains an **Import TSV** button — paste a tab / space / comma-delimited table (codon, optional amino acid, count) and it's validated and added to your library. Header lines, blank lines, and `#` comments are ignored; `U` is accepted.
+- **Group features from the editor.** The Edit Feature dialog gains **Group with…** (merge this feature into a shared group with others on the canvas) and **Ungroup** (drop the group from just this feature, or the whole group).
+- **Find ORFs from the menu.** The ORF finder is now reachable via **File → Find ORFs in this sequence…** (previously only via the agent API).
+- **More automation reach (agent API).** New endpoints to list and switch parts bins, and to list / inspect / switch / delete HMM databases.
+
+#### Bug fixes
+
+- **Mutagenesis no longer designs a primer that silently omits the mutation.** For a point mutation a moderate distance from a CDS end, the "fold the change into one outer primer" shortcut could produce a primer that didn't actually carry the change — amplifying wild-type. The shortcut is now only offered when the primer genuinely spans the mutation; otherwise it falls back to standard SOE.
+- **The Verification report jumps to the right base for diff alignments.** For an `Alt+\` "diff with another plasmid" alignment, clicking a row now lands on the correct position in your plasmid (it previously used the other plasmid's coordinate frame).
+- **A read can no longer show ✓ verified on a bad alignment.** A corrupted / over-100 % coverage value could let a divergent read read as verified; coverage is now clamped consistently.
+- **Traditional-cloning products keep features that cross the origin.** A feature spanning the ligation join on a circular product is no longer dropped on save.
+- **A corrupt custom-enzyme entry can't stop the app from starting.** A bad recognition site in `custom_enzymes.json` is skipped with a warning instead of crashing launch.
+- **Restriction maps on linear molecules no longer show phantom cut marks** for far-reaching enzymes (e.g. BaeI / BsaXI) matching near the 5′ end.
+- **`--no-splash` users now see "What's New"** after an upgrade (and aren't re-prompted for it on the next normal launch).
+
+#### Hardening
+
+- **Online BLAST / HMM-scan results can't smuggle terminal escapes.** Remote hit text from NCBI / EBI — and agent-supplied names across gels, experiments, grammars, parts, primers, and features — is stripped of control bytes before it reaches the screen.
+- **The update check and HMM-database downloads refuse an HTTPS→HTTP downgrade** on redirect.
+- **NCBI BLAST tolerates a transient server hiccup** while polling instead of aborting (and leaking the server-side job).
+- **Concurrency-safe data writes.** Closed two remaining read-modify-write gaps (agent project-delete, agent folder-import) so simultaneous operations can't drop an entry, and extended the data-safety delete guard to two more cleanup paths.
+- **Several dialogs open instantly on large libraries** (BLAST, alignment picker, move/copy, mutagenize, add-feature) — they no longer deep-copy the whole library / collections just to fill a list, and the bulk move/copy commit now runs off the UI thread.
+- A settings-save failure now notifies you instead of silently leaving the on-disk copy stale.
+
+#### Tests
+
+- New coverage for the codon-TSV parser, the protein-motif editor, the new agent endpoints, and the mutagenesis / alignment / cloning / biology fixes. Full suite green.
+
+---
+
 ## [0.9.40] — 2026-05-28
 
 ### Online BLAST / HMMscan, choose-your-collection saves, and a BLAST menu

@@ -969,3 +969,74 @@ class TestMutagenizeClickAlignment:
             await pilot.pause(0.05)
             assert preview._cursor_aa == 2   # 'S'
             app.exit()
+
+
+# ── TSV import parser ─────────────────────────────────────────────────────────
+
+class TestParseCodonTsv:
+    def test_codon_count_two_col(self):
+        raw = sc._parse_codon_tsv("ATG\t127\nGCT\t120\n")
+        assert raw["ATG"] == ("M", 127)
+        assert raw["GCT"] == ("A", 120)
+
+    def test_codon_aa_count_three_col(self):
+        raw = sc._parse_codon_tsv("ATG\tM\t100\nTAA\t*\t5\n")
+        assert raw["ATG"] == ("M", 100)
+        assert raw["TAA"] == ("*", 5)
+
+    def test_three_letter_aa(self):
+        raw = sc._parse_codon_tsv("ATG Met 9\nTAA Stop 1\n")
+        assert raw["ATG"] == ("M", 9)
+        assert raw["TAA"] == ("*", 1)
+
+    def test_skips_header_comment_blank(self):
+        raw = sc._parse_codon_tsv(
+            "# my table\ncodon\taa\tcount\n\nATG\tM\t12\n")
+        assert set(raw) == {"ATG"}
+
+    def test_u_folded_to_t(self):
+        raw = sc._parse_codon_tsv("AUG 5\n")
+        assert "ATG" in raw
+
+    def test_fraction_only_scaled(self):
+        raw = sc._parse_codon_tsv("GCT\t0.5\nATG\t0.25\n")
+        assert raw["GCT"][1] == 500
+        assert raw["ATG"][1] == 250
+
+    def test_fraction_and_count_prefers_count(self):
+        raw = sc._parse_codon_tsv("ATG\tM\t0.9\t127\n")
+        assert raw["ATG"] == ("M", 127)
+
+    def test_comma_delimited(self):
+        raw = sc._parse_codon_tsv("ATG,M,12\nGCT,A,4\n")
+        assert raw["ATG"] == ("M", 12)
+
+    def test_aa_mismatch_raises(self):
+        with pytest.raises(ValueError):
+            sc._parse_codon_tsv("ATG\tA\t5\n")   # ATG is Met, not Ala
+
+    def test_missing_count_raises(self):
+        with pytest.raises(ValueError):
+            sc._parse_codon_tsv("ATG\tM\n")
+
+    def test_negative_count_raises(self):
+        with pytest.raises(ValueError):
+            sc._parse_codon_tsv("ATG\tM\t-5\n")
+
+    def test_duplicate_codon_raises(self):
+        with pytest.raises(ValueError):
+            sc._parse_codon_tsv("ATG 5\nATG 6\n")
+
+    def test_no_rows_raises(self):
+        with pytest.raises(ValueError):
+            sc._parse_codon_tsv("# just a comment\n\n")
+
+    def test_non_str_raises(self):
+        with pytest.raises(ValueError):
+            sc._parse_codon_tsv(None)   # type: ignore[arg-type]
+
+    def test_import_modal_and_handler_exist(self):
+        # The paste-import feature is reachable: the modal class exists and
+        # SpeciesPickerModal wires an Import-TSV handler.
+        assert hasattr(sc, "CodonTsvImportModal")
+        assert hasattr(sc.SpeciesPickerModal, "_import_tsv")

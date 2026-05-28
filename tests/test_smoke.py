@@ -11994,7 +11994,14 @@ class TestFutureProofingFeatures:
                               "https://test.example/pypi.json")
         # Patch urllib.request.urlopen at the call site.
         import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+        # The PyPI fetch routes through the hardened opener (shared with the
+        # HMM-DB downloader; refuses https→http redirect downgrade), so stub
+        # that instead of `urlopen`.
+        class _StubOpener:
+            def open(self, req, timeout=None):
+                return _fake_urlopen(req, timeout)
+        monkeypatch.setattr(sc, "_build_hardened_url_opener",
+                            lambda: _StubOpener())
         result = sc._fetch_latest_pypi_version()
         assert result == "9.9.9"
         assert captured["url"] == "https://test.example/pypi.json"
@@ -12949,7 +12956,11 @@ class TestRobustnessHardening:
                 raise urllib.error.URLError("temporarily unreachable")
             return _OkResp()
 
-        monkeypatch.setattr(urllib.request, "urlopen", _flaky_urlopen)
+        class _StubOpener:
+            def open(self, req, timeout=None):
+                return _flaky_urlopen(req, timeout)
+        monkeypatch.setattr(sc, "_build_hardened_url_opener",
+                            lambda: _StubOpener())
         result = sc._fetch_latest_pypi_version()
         assert result == "9.9.9"
         assert len(attempts) == 2  # one failure + one retry
@@ -12965,7 +12976,11 @@ class TestRobustnessHardening:
             attempts.append(1)
             raise urllib.error.URLError("permanently unreachable")
 
-        monkeypatch.setattr(urllib.request, "urlopen", _always_fails)
+        class _StubOpener:
+            def open(self, req, timeout=None):
+                return _always_fails(req, timeout)
+        monkeypatch.setattr(sc, "_build_hardened_url_opener",
+                            lambda: _StubOpener())
         result = sc._fetch_latest_pypi_version()
         assert result is None
         assert len(attempts) == 2

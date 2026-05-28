@@ -45,10 +45,12 @@ What you can do without leaving the terminal.
   forbidden Type IIS sites against the active cloning grammar.
   In-editor protein-motif highlighting (signal peptide, NLS, mito
   targeting, tags) flags regions of biological interest as you type.
-- **Codon-table picker** (`Synthesis → Codon table…`) — browse the
-  Kazusa usage-table catalog by organism / taxid, persist a preferred
-  table via `set-active-codon-table`. Custom tables are loadable from
-  TSV.
+- **Codon-table picker** — the **Codon table** dropdown in the Synthesis
+  (and Mutagenize) protein tools opens a picker to browse the Kazusa
+  usage-table catalog by organism / taxid and persist a preferred table
+  (also via `set-active-codon-table`). **Import TSV** pastes a custom
+  usage table (codon, optional amino acid, count) straight into your
+  library.
 
 ## Cloning
 
@@ -252,10 +254,12 @@ and folder-import all accept the same set.
   mitochondrial targeting sequence, common tags, phosphorylation
   sites). Surfaced in the Synthesis protein composer as you type,
   and in the AA lane on the main sequence panel under loaded CDSs.
-- **User-overrides** — add / edit / remove motifs persistently via
-  the protein-motifs editor; overrides round-trip through
-  `protein_motifs.json` with the same atomic-save + backup discipline
-  as every other persisted file.
+- **User-overrides** — add (**New…**), edit, and remove (**Delete**)
+  motifs persistently from the Synthesis protein tab's motif pane;
+  overrides round-trip through `protein_motifs.json` with the same
+  atomic-save + backup discipline as every other persisted file.
+  Built-in motifs are protected — deleting your edit of one restores
+  the original.
 
 ## Recovery + data safety
 

@@ -147,7 +147,11 @@ installs and the user-data directory location.
       EAAAK), protease sites (TEV, PreScission, Thrombin),
       self-cleaving 2A peptides (P2A, T2A, E2A, F2A), and
       localisation signals (NLS, NES). Insert splices the motif's
-      AA sequence at the cursor. Saves as a linear DNA library
+      AA sequence at the cursor; **New** / **Edit** / **Delete**
+      manage your persistent motif library (add custom motifs or
+      remove your own — built-ins are protected, and **Import TSV**
+      on the codon-table picker loads a custom usage table). Saves
+      as a linear DNA library
       entry with a CDS feature carrying the `translation=`
       qualifier so round-trip back into the protein tab recovers
       the exact AA sequence (no codon-table-drift on reload).

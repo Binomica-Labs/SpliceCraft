@@ -3747,3 +3747,52 @@ class TestProteinLoadFilterStrict:
         assert feats[0]["end"]   == 6
         assert feats[0]["label"] == "His3"
         assert feats[0]["type"]  == "Tag"
+
+
+class TestProteinMotifEditor:
+    """The GUI motif-library editor (New / Edit / Delete in the Synthesis
+    protein tab) goes through `_protein_motif_upsert` / `_protein_motif_delete`,
+    which mirror the agent-endpoint override semantics."""
+
+    def test_upsert_new_motif_round_trip(self):
+        assert sc._protein_motif_upsert(
+            "MyTag", "hhhkkk", feature_type="Tag",
+            color="#123456", description="custom") is None
+        by_name = {m["name"]: m for m in sc._load_protein_motifs()}
+        assert "MyTag" in by_name
+        assert by_name["MyTag"]["sequence"] == "HHHKKK"   # upper-cased
+        assert by_name["MyTag"]["feature_type"] == "Tag"
+
+    def test_upsert_override_then_delete_restores_builtin(self):
+        builtins = {m["name"]: m for m in sc._load_protein_motifs()}
+        assert "His6" in builtins
+        orig_desc = builtins["His6"].get("description")
+        assert sc._protein_motif_upsert(
+            "His6", "HHHHHH", feature_type="Tag",
+            description="OVERRIDDEN") is None
+        after = {m["name"]: m for m in sc._load_protein_motifs()}["His6"]
+        assert after["description"] == "OVERRIDDEN"
+        # Deleting the user override restores the built-in.
+        assert sc._protein_motif_delete("His6") is None
+        restored = {m["name"]: m for m in sc._load_protein_motifs()}["His6"]
+        assert restored.get("description") == orig_desc
+
+    def test_upsert_rejects_invalid(self):
+        assert sc._protein_motif_upsert("", "HHHH") is not None      # no name
+        assert sc._protein_motif_upsert("X", "") is not None         # no seq
+        assert sc._protein_motif_upsert("X", "HHJ123") is not None   # non-AA
+
+    def test_delete_builtin_without_override_rejected(self):
+        # Fresh sandbox → no user override for His6 → can't delete a built-in.
+        assert sc._protein_motif_delete("His6") is not None
+
+    def test_delete_user_novel_motif(self):
+        assert sc._protein_motif_upsert("Zztag", "WWWW") is None
+        assert sc._protein_motif_delete("Zztag") is None
+        names = {m["name"] for m in sc._load_protein_motifs()}
+        assert "Zztag" not in names
+
+    def test_editor_modal_and_handlers_exist(self):
+        assert hasattr(sc, "NewMotifModal")
+        assert hasattr(sc.SynthesisScreen, "_on_motif_new")
+        assert hasattr(sc.SynthesisScreen, "_on_motif_delete")

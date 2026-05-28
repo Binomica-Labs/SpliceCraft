@@ -36,7 +36,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-~120 endpoints across:
+~130 endpoints across:
 
 - **Records** — get / set sequence, add / update / delete features,
   list features, find ORFs, transfer annotations, apply GFF3 features
@@ -51,10 +51,13 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   delete entries, create / rename / delete collections, set the
   active collection, list / set plasmid statuses.
 - **Parts** — list-parts, get-part, delete-part, classify-part
-  (overhang-pair lookup against every grammar).
+  (overhang-pair lookup against every grammar); list-parts-bins,
+  set-active-parts-bin (switch the active named bin; mirrors the bin
+  into the live parts file).
 - **Design** — gibson-assemble, simulate-gibson, design-mutagenesis,
   design-gb-part (Golden Braid / MoClo), design-primers (generic
-  Primer3 detection or restriction cloning).
+  Primer3 detection or restriction cloning), optimize-protein
+  (codon-optimise an AA sequence to the active table).
 - **Simulate** — simulate-pcr (exact-match in-silico amplification,
   wrap-aware on circular templates) and simulate-gel (per-lane band
   positions + optional rendered ASCII gel image; ladder / plasmid /
@@ -65,6 +68,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   lineage as nested JSON.
 - **Codon tables** — list, add (Kazusa fetch or raw dict), delete.
 - **Search** — blast, hmmscan.
+- **HMM databases** — list / get / set-active / delete-hmm-database
+  (the registry that backs hmmscan; delete un-downloads the files,
+  leaving the catalog entry so it can be re-fetched).
+- **Custom enzymes + enzyme collections** — list / get / create /
+  update / delete-custom-enzyme; list / get / create / update /
+  delete-enzyme-collection; get / set-active-enzyme-collection.
+- **Feature library** — list / get / create / update /
+  delete-feature-library (reusable annotation snippets).
+- **Primer collections** — list-primer-collections,
+  set-active-primer-collection (plus per-primer CRUD).
 - **Data safety** — list-backups, restore-backup,
   list-pre-update-snapshots, restore-pre-update-snapshot.
 - **Settings** — get-settings, set-setting (allowlisted toggles).

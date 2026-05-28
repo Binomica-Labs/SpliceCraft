@@ -65,7 +65,7 @@ The long-form rules and subsystem deep-dives live in split files. **Each entry h
 Each has at least one test in `tests/`. Touching `_scan_restriction_sites`, `_rc`, `_iupac_pattern`, `_translate_cds`, `_bp_in`, `_feat_len`, the wrap-midpoint formula, or `_rebuild_record_with_edit` trips tests immediately.
 
 1. **Palindromic enzymes scanned forward only.** Bottom-strand hit emitted as `recut`. Scanning both strands double-counts.
-2. **Reverse-strand resite positions use forward coordinate.** Reverse hit at `p` (after RC) stored as `p`, not `n - p - site_len`. Cut maps via `site_len - 1 - fwd_cut`.
+2. **Reverse-strand resite positions use forward coordinate.** Reverse hit at `p` (after RC) stored as `p`, not `n - p - site_len`. Cut column maps via `rev_cut_col = site_len - fwd_cut`.
 3. **`_rc()` handles full IUPAC** via `_IUPAC_COMP`, not just ACGT.
 4. **IUPAC regex patterns cached** in `_PATTERN_CACHE`.
 5. **Circular wrap midpoint:** `arc_len = (end - start) % total; mid = (start + arc_len // 2) % total`. Naive form puts label opposite actual arc.

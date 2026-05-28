@@ -6210,13 +6210,26 @@ def _rebuild_scan_catalog() -> None:
     catalog_fn = globals().get("_all_enzymes")
     catalog = catalog_fn() if catalog_fn is not None else dict(_NEB_ENZYMES)
     for name, (site, fwd_cut, rev_cut) in catalog.items():
-        site_u  = site.upper()
-        pat     = _iupac_pattern(site_u)
-        rc_site = _rc(site_u)
-        is_pal  = (rc_site == site_u)
-        rc_pat  = None if is_pal else _iupac_pattern(rc_site)
+        try:
+            site_u    = str(site).upper()
+            fwd_cut_i = int(fwd_cut)
+            rev_cut_i = int(rev_cut)
+            pat     = _iupac_pattern(site_u)
+            rc_site = _rc(site_u)
+            is_pal  = (rc_site == site_u)
+            rc_pat  = None if is_pal else _iupac_pattern(rc_site)
+        except (ValueError, TypeError, AttributeError) as exc:
+            # A corrupt/legacy custom enzyme (non-IUPAC site, non-int cut,
+            # non-str, …) must NOT crash import at this module-level call —
+            # the JSON-backup net can't recover a file that parses fine but
+            # is semantically bad. Skip the entry; the rest still loads.
+            _log.warning(
+                "Skipping enzyme %r with invalid site/cuts %r: %s",
+                name, (site, fwd_cut, rev_cut), exc,
+            )
+            continue
         new_catalog.append((
-            name, site_u, len(site_u), fwd_cut, rev_cut,
+            name, site_u, len(site_u), fwd_cut_i, rev_cut_i,
             _RESTR_COLOR.get(name, _DEFAULT_RESTR_COLOR),
             pat, is_pal, rc_pat,
         ))
@@ -6413,6 +6426,15 @@ def _scan_restriction_sites_impl(
             if key in seen:
                 continue
             seen.add(key)
+            # On LINEAR molecules a negative-cut enzyme (e.g. BaeI fwd_cut=-10)
+            # matching within |cut| bp of the 5' end makes (p+fwd_cut)%n wrap
+            # to a phantom cut near the 3' end that doesn't biologically exist.
+            # Mirror the reverse-strand guard below: drop the hit when a raw cut
+            # falls outside the molecule. Circular molecules wrap correctly.
+            if not circular and (
+                    (p + fwd_cut) < 0 or (p + fwd_cut) > n
+                    or (p + rev_cut) < 0 or (p + rev_cut) > n):
+                continue
             # ext_cut_bp: absolute cut position when cut falls outside recognition
             _ext = ((p + fwd_cut) % n) if (fwd_cut <= 0 or fwd_cut >= site_len) else None
             _cc  = fwd_cut if 0 < fwd_cut < site_len else None
@@ -6672,6 +6694,13 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
         for m in pat.finditer(scan_seq):
             p = m.start()
             if p >= n:
+                continue
+            # Linear molecules: skip a negative-cut enzyme whose cut would wrap
+            # past the 5' end into a phantom 3'-end fragment boundary (mirrors
+            # the restriction-overlay scan guard). Circular wraps correctly.
+            if not circular and (
+                    (p + fwd_cut) < 0 or (p + fwd_cut) > n
+                    or (p + rev_cut) < 0 or (p + rev_cut) > n):
                 continue
             _emit(p + fwd_cut, p + rev_cut)
         if not is_pal:
@@ -7697,6 +7726,19 @@ def _gibson_validate_body_lengths(
                     f"Fragment {norm_fragments[-1]['name']!r} is fully "
                     f"consumed by its homology arms ({last_lead} + "
                     f"{last_trail} ≥ {last_len} bp). Pick a longer "
+                    f"fragment or shorter overlaps."
+                )
+            # Fragment 0 also carries BOTH arms in a circular assembly: a
+            # leading wrap arm (junction (n-1)->0) and a trailing arm
+            # (junction 0->1). The i>0 loop above never validates it.
+            first_lead  = overlap_lens[n - 1]
+            first_trail = overlap_lens[0]
+            first_len = len(norm_fragments[0]["sequence"])
+            if first_lead + first_trail >= first_len:
+                errors.append(
+                    f"Fragment {norm_fragments[0]['name']!r} is fully "
+                    f"consumed by its homology arms ({first_lead} + "
+                    f"{first_trail} ≥ {first_len} bp). Pick a longer "
                     f"fragment or shorter overlaps."
                 )
     return errors
@@ -15114,10 +15156,10 @@ def _alignment_quality_status(
     # status fire on garbage. Treat any negative as divergent.
     if n_match < 0 or n_mismatch < 0 or n_gaps < 0 or ungapped < 0:
         return ("divergent", "✗", "red")
-    aligned_bp = n_match + n_mismatch
-    coverage_pct = (
-        100.0 * aligned_bp / target_len if target_len else 0.0
-    )
+    # Clamp via the shared helper so this classifier can't diverge from the
+    # toast / report coverage display — an unclamped >100% (corrupted result
+    # or local self-overlap) would otherwise make `verified` EASIER to reach.
+    coverage_pct = _coverage_pct_from_result(result, target_len)
     if (ungapped >= _SEQ_STATUS_VERIFIED_UNGAPPED_PCT
             and coverage_pct >= _SEQ_STATUS_VERIFIED_COVERAGE_PCT
             and n_gaps <= _SEQ_STATUS_VERIFIED_MAX_GAPS
@@ -25491,7 +25533,12 @@ def _fetch_latest_pypi_version(timeout: float = _UPDATE_CHECK_TIMEOUT_S
     last_exc: "BaseException | None" = None
     for attempt in range(2):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            # Hardened opener: explicit SSL context + bounded redirects +
+            # refusal of an https->http downgrade, so a redirect to plaintext
+            # can't feed the version-compare an attacker-chosen value over an
+            # unencrypted channel.
+            opener = _build_hardened_url_opener()
+            with opener.open(req, timeout=timeout) as resp:
                 raw = resp.read(_PYPI_MAX_RESPONSE_BYTES + 1)
             break
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
@@ -35944,11 +35991,17 @@ def _settings_flush_worker() -> None:
                 # that the user thinks "took" can't silently revert
                 # at next launch.
                 _bg_notify_save_failure("Settings", exc)
-            except Exception:
+            except Exception as exc:
                 _log.exception(
                     "settings flush: unexpected error while writing %s",
                     _SETTINGS_FILE,
                 )
+                # Same UI-surface contract as the narrow branch above: an
+                # unexpected error (e.g. a non-serialisable value that slipped
+                # past the validator) must not silently break the "your toggle
+                # took" promise — notify so the user knows the on-disk mirror
+                # is stale until the next successful flush.
+                _bg_notify_save_failure("Settings", exc)
     finally:
         with _settings_flush_lock:
             _settings_flush_running = False
@@ -38422,6 +38475,63 @@ def _save_protein_motifs(entries: list[dict]) -> None:
         _protein_motifs_cache = None
 
 
+def _protein_motif_upsert(name: str, sequence: str, *,
+                          feature_type: str = "Motif",
+                          color: str = "", description: str = "",
+                          ) -> "str | None":
+    """Create or override a USER protein motif (built-ins re-merge on
+    read; a same-name user entry shadows the built-in). RMW under
+    `_cache_lock`. Returns None on success or a validation error string;
+    a save failure propagates (OSError / RuntimeError) for the caller to
+    surface. Shared by the GUI motif editor and mirrors the
+    `set-protein-motif` agent endpoint's semantics."""
+    name = _sanitize_label((name or "").strip(), max_len=200)
+    if not name:
+        return "motif name is required"
+    seq = (sequence or "").strip().upper()
+    if not seq:
+        return "motif amino-acid sequence is required"
+    bad = sorted({c for c in seq if c not in "ACDEFGHIKLMNPQRSTVWY*"})
+    if bad:
+        return f"non-canonical amino acids in sequence: {''.join(bad)!r}"
+    ftype = _sanitize_label(feature_type or "Motif", max_len=200) or "Motif"
+    color = _sanitize_label(color or "", max_len=64)
+    desc  = _sanitize_label(description or "", max_len=2000)
+    with _cache_lock:
+        user_entries, _w = _safe_load_json(
+            _PROTEIN_MOTIFS_FILE, "Protein motifs")
+        user_entries = [
+            e for e in user_entries
+            if isinstance(e, dict) and e.get("name") != name
+        ]
+        user_entries.append({
+            "name": name, "feature_type": ftype,
+            "sequence": seq, "color": color, "description": desc,
+        })
+        _save_protein_motifs(user_entries)
+    return None
+
+
+def _protein_motif_delete(name: str) -> "str | None":
+    """Delete a USER motif override (built-ins can't be deleted; deleting
+    an override restores the built-in on next read). RMW under
+    `_cache_lock`. Returns None on success or an error string; a save
+    failure propagates. Mirrors the `delete-protein-motif` endpoint."""
+    name = (name or "").strip()
+    if not name:
+        return "missing motif name"
+    with _cache_lock:
+        user_entries, _w = _safe_load_json(
+            _PROTEIN_MOTIFS_FILE, "Protein motifs")
+        user_entries = [e for e in user_entries if isinstance(e, dict)]
+        kept = [e for e in user_entries if e.get("name") != name]
+        if len(kept) == len(user_entries):
+            return (f"'{name}' is a built-in motif (or has no user "
+                    "override) — built-ins can't be deleted")
+        _save_protein_motifs(kept)
+    return None
+
+
 # Generation-keyed cache of the (name, feature_type) → sequence index.
 # Invalidated automatically by `_save_features` bumping
 # `_features_generation`, so callers don't need to manage staleness —
@@ -38903,6 +39013,94 @@ def _codon_tables_get(key: str) -> "dict | None":
         if str(e.get("name", "")).lower() == key:
             return e
     return None
+
+
+_CODON_TSV_MAX_CHARS = 1_000_000   # 64 codons; even a verbose export is KB
+
+
+# Three-letter (and stop-alias) → one-letter for TSV amino-acid columns.
+_CODON_TSV_AA3 = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+    "STOP": "*", "TER": "*", "END": "*",
+}
+
+
+def _parse_codon_tsv(text: str) -> dict:
+    """Parse a tab/whitespace/comma-delimited codon-usage table into the
+    in-memory ``{codon: (aa, count)}`` registry shape. Pure — no I/O.
+
+    Each data row needs a 3-base codon and a usage count. An optional
+    amino-acid column (1-letter, 3-letter, or ``*`` / ``Stop``) is
+    validated against the standard code and otherwise derived from
+    ``_CODON_GENETIC_CODE``. Rows whose first token isn't an ACGT/U codon
+    (headers), blank lines, and ``#`` comments are skipped. Counts may be
+    ints or floats (rounded); a fraction-only row (0..1) is scaled by
+    1000 so relative preference survives. ``U`` is accepted and folded to
+    ``T``.
+
+    Raises ``ValueError`` with a readable message on a bad codon, a
+    non-numeric / negative count, an AA/codon mismatch, a duplicate
+    codon, or a file with zero usable rows — callers surface it in a
+    status line rather than crashing.
+    """
+    if not isinstance(text, str):
+        raise ValueError("codon table must be text")
+    if len(text) > _CODON_TSV_MAX_CHARS:
+        raise ValueError("codon table is too large (1 MB cap)")
+    raw: "dict[str, tuple[str, int]]" = {}
+    for lineno, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        toks = [t for t in re.split(r"[\s,]+", s) if t]
+        if not toks:
+            continue
+        codon = toks[0].upper().replace("U", "T")
+        if len(codon) != 3 or any(b not in "ACGT" for b in codon):
+            continue   # header / non-codon row — skip silently
+        if codon not in _CODON_GENETIC_CODE:
+            raise ValueError(f"line {lineno}: {codon!r} is not a valid codon")
+        if codon in raw:
+            raise ValueError(f"line {lineno}: duplicate codon {codon!r}")
+        expected_aa = _CODON_GENETIC_CODE[codon]
+        aa_given: "str | None" = None
+        numeric: list[str] = []
+        for t in toks[1:]:
+            tu = t.upper()
+            if len(tu) == 1 and (tu in "ACDEFGHIKLMNPQRSTVWY" or tu in "*.X"):
+                aa_given = "*" if tu in "*.X" else tu
+            elif tu in _CODON_TSV_AA3:
+                aa_given = _CODON_TSV_AA3[tu]
+            else:
+                try:
+                    float(t)
+                    numeric.append(t)
+                except ValueError:
+                    pass   # stray non-numeric, non-AA token — ignore
+        if aa_given is not None and aa_given != expected_aa:
+            raise ValueError(
+                f"line {lineno}: codon {codon!r} encodes {expected_aa!r} "
+                f"but the file says {aa_given!r}"
+            )
+        if not numeric:
+            raise ValueError(
+                f"line {lineno}: no count/frequency column for {codon!r}"
+            )
+        ints = [t for t in numeric if float(t) == int(float(t))]
+        count = (int(round(float(ints[-1]))) if ints
+                 else int(round(float(numeric[-1]) * 1000)))
+        if count < 0:
+            raise ValueError(f"line {lineno}: negative count for {codon!r}")
+        raw[codon] = (expected_aa, count)
+    if not raw:
+        raise ValueError(
+            "no codon rows found — expected lines like 'GCT A 120' or "
+            "'GCT 120' (codon then count)"
+        )
+    return raw
 
 
 def _codon_name_parts(name: str) -> tuple[str, str]:
@@ -39979,24 +40177,81 @@ def _mut_design_outer(dna: str) -> dict:
     }
 
 
-def _mut_design_modified_outer(dna_mut: str, near_start: bool) -> dict:
-    """Edge-case: mutation < 60 nt from a CDS end → fold mutant codon into a
-    single outer primer. PCR becomes a 2-primer direct reaction, no SOE."""
+# A folded "modified outer" primer (2-primer direct PCR, no SOE) MUST span
+# the mutant codon, otherwise it amplifies wild-type — a silent wrong product.
+# Cap its length and require a matched extension anchor past the mutation; when
+# no spanning primer fits, the caller falls back to the regular SOE design.
+_MUT_OUTER_MAX_LEN = 45    # nt; mutation farther than this from the end → SOE
+_MUT_OUTER_ANCHOR  = 8     # matched template bases required past the mutation
+
+
+def _mut_design_modified_outer(dna_mut: str, near_start: bool,
+                               nt_start: int) -> "dict | None":
+    """Edge-case: mutation < _MUT_MIN_SOE_FRAG nt from a CDS end → fold the
+    mutant codon into a single outer primer so the PCR is a 2-primer direct
+    reaction (no SOE).
+
+    The folded primer MUST span the mutant codon at `nt_start` (with a matched
+    anchor for clean extension), else it would carry wild-type sequence and
+    silently amplify a WT product. Returns None when no spanning primer fits
+    within `_MUT_OUTER_MAX_LEN`, so the caller falls back to the regular
+    (always-correct) SOE inner+outer design."""
+    mut_end = nt_start + 3                      # exclusive end of mutant codon
+    if nt_start < 0 or mut_end > len(dna_mut):
+        return None
     if near_start:
-        p = _mut_design_fwd_anneal(dna_mut)
-        if p is None:
-            raise RuntimeError("Modified FWD outer design failed.")
-        p["label"]    = "modified_FWD_outer"
-        p["partner"]  = "REV_outer (unchanged)"
-        p["replaces"] = "FWD_outer"
-    else:
-        p = _mut_design_rev_anneal(dna_mut)
-        if p is None:
-            raise RuntimeError("Modified REV outer design failed.")
-        p["label"]    = "modified_REV_outer"
-        p["partner"]  = "FWD_outer (unchanged)"
-        p["replaces"] = "REV_outer"
-    return p
+        # FWD outer anneals from base 3 (after the BsaI tail) toward 3'; it
+        # must start at/before the codon and reach mut_end + anchor.
+        anneal_start = 3
+        if nt_start < anneal_start:
+            return None
+        end_hi = min(len(dna_mut), anneal_start + _MUT_OUTER_MAX_LEN)
+        best = None
+        for end in range(mut_end + _MUT_OUTER_ANCHOR, end_hi + 1):
+            anneal = dna_mut[anneal_start:end]
+            if len(anneal) < 18:
+                continue
+            s = _mut_score_outer(anneal)
+            if best is None or s < best["score"]:
+                best = {
+                    "anneal":    anneal,
+                    "full":      _MUT_BSAI_FWD_TAIL + anneal,
+                    "tm_anneal": _mut_tm(anneal),
+                    "gc":        _mut_gc_pct(anneal),
+                    "score":     s,
+                }
+        if best is None:
+            return None
+        best["label"]    = "modified_FWD_outer"
+        best["partner"]  = "REV_outer (unchanged)"
+        best["replaces"] = "FWD_outer"
+        return best
+    # near_end: REV outer anneals to the bottom strand at the 3' end; the
+    # top-strand window [start, len) must reach back past the mutant codon.
+    seq_len  = len(dna_mut)
+    lo_start = max(0, seq_len - _MUT_OUTER_MAX_LEN)
+    hi_start = nt_start - _MUT_OUTER_ANCHOR
+    best = None
+    for start in range(lo_start, hi_start + 1):
+        tail = dna_mut[start:]
+        if len(tail) < 18:
+            continue
+        anneal = _mut_revcomp(tail)
+        s = _mut_score_outer(anneal)
+        if best is None or s < best["score"]:
+            best = {
+                "anneal":    anneal,
+                "full":      _MUT_BSAI_REV_TAIL + anneal,
+                "tm_anneal": _mut_tm(anneal),
+                "gc":        _mut_gc_pct(anneal),
+                "score":     s,
+            }
+    if best is None:
+        return None
+    best["label"]    = "modified_REV_outer"
+    best["partner"]  = "FWD_outer (unchanged)"
+    best["replaces"] = "REV_outer"
+    return best
 
 
 def _mut_design_inner(dna: str, mut_pos_1: int, mut_aa: str, wt_aa: str,
@@ -40026,7 +40281,22 @@ def _mut_design_inner(dna: str, mut_pos_1: int, mut_aa: str, wt_aa: str,
         aa_map = _MUT_AA_TO_CODONS
 
     if mut_aa == "*":
-        mut_codon = "TAA"
+        # Prefer the selected table's most-frequent stop codon (TAA fallback)
+        # so the suggestion respects the organism instead of always TAA.
+        # _codon_build_aa_map excludes stops, so read them from the raw table.
+        stops = [
+            (str(c).upper(), v)
+            for c, v in (codon_table or {}).items()
+            if isinstance(v, (list, tuple)) and len(v) >= 2 and v[0] == "*"
+        ]
+
+        def _stop_count(item) -> float:
+            try:
+                return float(item[1][1])
+            except (TypeError, ValueError, IndexError):
+                return 0.0
+
+        mut_codon = max(stops, key=_stop_count)[0] if stops else "TAA"
     else:
         mut_codon = next(
             (c for c, _f in aa_map.get(mut_aa, []) if c != wt_codon),
@@ -40098,14 +40368,21 @@ def _mut_design_inner(dna: str, mut_pos_1: int, mut_aa: str, wt_aa: str,
 
     edge_case = None
     if near_start or near_end:
-        modified_outer = _mut_design_modified_outer(mut_dna, near_start=near_start)
-        edge_case = {
-            "near_start":     near_start,
-            "near_end":       near_end,
-            "frag_a":         frag_a,
-            "frag_b":         frag_b,
-            "modified_outer": modified_outer,
-        }
+        modified_outer = _mut_design_modified_outer(
+            mut_dna, near_start=near_start, nt_start=nt_start)
+        # Only offer the 2-primer direct shortcut when the folded primer
+        # actually spans the mutation; otherwise edge_case stays None and the
+        # regular SOE inner+outer design (always correct) is shown/saved.
+        # Pre-fix the modified outer used a fixed start-anchored window and
+        # could omit the mutation for codons ~11-19 → silent WT product.
+        if modified_outer is not None:
+            edge_case = {
+                "near_start":     near_start,
+                "near_end":       near_end,
+                "frag_a":         frag_a,
+                "frag_b":         frag_b,
+                "modified_outer": modified_outer,
+            }
 
     return {
         "mutation":    f"{wt_aa}{mut_pos_1}{mut_aa}",
@@ -42354,6 +42631,21 @@ class FeatureEditModal(ModalScreen):
                         "entry."
                     ),
                 )
+                yield Button(
+                    "Group with…", id="btn-featedit-group",
+                    tooltip=(
+                        "Merge this feature into a shared group with "
+                        "other features on the canvas (they move / "
+                        "delete / save as a unit)."
+                    ),
+                )
+                yield Button(
+                    "Ungroup", id="btn-featedit-ungroup",
+                    tooltip=(
+                        "Drop this feature's group qualifier — just "
+                        "this feature, or the whole group."
+                    ),
+                )
                 yield Button("Cancel", id="btn-featedit-cancel")
 
     def on_mount(self) -> None:
@@ -43256,6 +43548,70 @@ class FeatureEditModal(ModalScreen):
         self.app.push_screen(
             GroupNamePromptModal(default_name=str(default_name)),
             callback=_on_name,
+        )
+
+    @on(Button.Pressed, "#btn-featedit-group")
+    def _on_group_with(self) -> None:
+        """Push the multi-select picker; on confirm, dismiss with
+        action="group" so the app stamps a shared feature_group on this
+        feature + the picked others (groups merge — see
+        `_apply_feature_group_with`)."""
+        if self._editing:
+            self._set_status(
+                "[yellow]Press Save (or Cancel) before grouping.[/yellow]"
+            )
+            return
+
+        def _on_picked(result) -> None:
+            if not isinstance(result, dict):
+                return
+            other_idxs = result.get("other_idxs") or []
+            if not other_idxs:
+                return
+            self.dismiss({
+                "action":     "group",
+                "idx":        self._idx,
+                "other_idxs": other_idxs,
+            })
+
+        self.app.push_screen(
+            GroupFeaturePickerModal(self._idx),
+            callback=_on_picked,
+        )
+
+    @on(Button.Pressed, "#btn-featedit-ungroup")
+    def _on_ungroup(self) -> None:
+        """If this feature is in a group, ask the scope (just this vs the
+        whole group) via UngroupScopeModal, then dismiss with
+        action="ungroup" for `_apply_feature_ungroup`."""
+        if self._editing:
+            self._set_status(
+                "[yellow]Press Save (or Cancel) before ungrouping.[/yellow]"
+            )
+            return
+        gid = str(self._feat.get("feature_group") or "")
+        if not gid:
+            self._set_status(
+                "[yellow]This feature isn't in a group.[/yellow]"
+            )
+            return
+
+        def _on_scope(result) -> None:
+            if not isinstance(result, dict):
+                return
+            scope = result.get("scope")
+            if scope not in ("this", "whole"):
+                return
+            self.dismiss({
+                "action":   "ungroup",
+                "idx":      self._idx,
+                "scope":    scope,
+                "group_id": gid,
+            })
+
+        self.app.push_screen(
+            UngroupScopeModal(gid),
+            callback=_on_scope,
         )
 
     def _editing_disabled_for_ops(self) -> bool:
@@ -47470,20 +47826,38 @@ def _redact_url_credentials(url: str) -> str:
     return url
 
 
-def _hmm_db_build_url_opener():
+def _build_hardened_url_opener():
     """Return a urllib `OpenerDirector` with hardened settings:
       * explicit SSL context (system trust store via
         `ssl.create_default_context`)
       * redirect cap (`_HMM_DB_MAX_REDIRECTS`)
-    Use via `opener.open(req, timeout=...)`. Returned opener is
-    stateless — safe to share across threads."""
+      * refusal of https→http redirect downgrades — the HTTPS-only policy
+        must hold across the whole redirect chain, not just the initial
+        URL. Without this a hostile/misconfigured mirror could 30x a
+        validated https URL to plaintext and strip TLS mid-transfer.
+    Use via `opener.open(req, timeout=...)`. Returned opener is stateless
+    — safe to share across threads. Shared by the HMM-DB downloader and
+    the PyPI update-check fetch."""
     import ssl
     import urllib.request
+    import urllib.error
 
     ctx = ssl.create_default_context()
 
     class _BoundedRedirectHandler(urllib.request.HTTPRedirectHandler):
         max_redirections = _HMM_DB_MAX_REDIRECTS
+
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if (req.get_full_url().lower().startswith("https://")
+                    and not str(newurl).lower().startswith("https://")):
+                raise urllib.error.HTTPError(
+                    newurl, code,
+                    "refusing https->http redirect downgrade",
+                    headers, fp,
+                )
+            return super().redirect_request(
+                req, fp, code, msg, headers, newurl,
+            )
 
     return urllib.request.build_opener(
         urllib.request.HTTPSHandler(context=ctx),
@@ -47616,7 +47990,7 @@ def _fetch_hmm_db_remote_version(entry: dict) -> "tuple[str, str]":
     import time as _time
     import urllib.error
 
-    opener = _hmm_db_build_url_opener()
+    opener = _build_hardened_url_opener()
     entry_id = entry.get("id") or "?"
     version_url = (entry.get("version_url") or "").strip()
 
@@ -47645,8 +48019,13 @@ def _fetch_hmm_db_remote_version(entry: dict) -> "tuple[str, str]":
                 with opener.open(
                     req, timeout=_HMM_DB_NETWORK_TIMEOUT_S,
                 ) as resp:
-                    # No Content-Type guard on the version URL or HEAD —
-                    # version files are tiny and HEAD has no body.
+                    # Refuse an HTML / JSON / XML error page served with a 200
+                    # at the version URL — pre-fix a CDN interstitial flowed
+                    # into gzip.decompress / the version parser and surfaced
+                    # its first line as the "remote version", mislabelling the
+                    # DB as out-of-date. HEAD has no body to check.
+                    if method == "GET":
+                        _hmm_db_assert_content_type_ok(resp, url)
                     raw = resp.read(max_bytes + 1) if method == "GET" else b""
                     if method == "GET" and len(raw) > max_bytes:
                         _log.warning(
@@ -47811,7 +48190,7 @@ def _stream_download_to_path(url: str, dest: Path,
     except FileNotFoundError:
         pass
 
-    opener = _hmm_db_build_url_opener()
+    opener = _build_hardened_url_opener()
     from urllib.request import Request as _Req
 
     def _open_with_retry():
@@ -48044,6 +48423,7 @@ def _cleanup_pressed_files(hmm_path: Path) -> None:
     doesn't get treated as "ready" by `_hmm_db_pressed`."""
     for ext in ("h3i", "h3m", "h3p", "h3f"):
         sibling = hmm_path.parent / f"{hmm_path.name}.{ext}"
+        _refuse_unauthorized_delete(sibling, "HMM DB pressed index")
         try:
             sibling.unlink()
         except FileNotFoundError:
@@ -49180,6 +49560,7 @@ def _ncbi_blast_online(query: str, program: str, database: str,
     try:
         elapsed = 0
         checks = 0
+        consecutive_fail = 0
         while elapsed < _ONLINE_MAX_WAIT_S:
             if cancel.wait(timeout=_ONLINE_POLL_INTERVAL_S):
                 raise _OnlineSearchCancelled()
@@ -49189,14 +49570,30 @@ def _ncbi_blast_online(query: str, program: str, database: str,
                 progress_cb(
                     f"Waiting for NCBI {program} results "
                     f"(checked {checks}×)…")
-            status_text = _online_http(
-                _NCBI_BLAST_URL,
-                data=urlencode({
-                    "CMD": "Get",
-                    "FORMAT_OBJECT": "SearchInfo",
-                    "RID": rid,
-                }).encode(),
-                max_bytes=_NCBI_BLAST_MAX_RESPONSE_BYTES)
+            try:
+                status_text = _online_http(
+                    _NCBI_BLAST_URL,
+                    data=urlencode({
+                        "CMD": "Get",
+                        "FORMAT_OBJECT": "SearchInfo",
+                        "RID": rid,
+                    }).encode(),
+                    max_bytes=_NCBI_BLAST_MAX_RESPONSE_BYTES)
+                consecutive_fail = 0
+            except (RuntimeError, OSError) as exc:
+                # Transient NCBI 5xx / network blip while the job is still
+                # queued server-side: tolerate a few in a row before giving
+                # up (mirrors the EBI HMMER poll loop). Pre-fix a single 502
+                # aborted the search AND leaked the RID — the delete only ran
+                # on the cancel path.
+                consecutive_fail += 1
+                if consecutive_fail >= 5:
+                    raise RuntimeError(
+                        f"NCBI BLAST polling failed {consecutive_fail}× in a "
+                        f"row: {exc}") from exc
+                _log.debug("NCBI poll transient failure %d/5: %s",
+                            consecutive_fail, exc)
+                continue
             if "Status=WAITING" in status_text:
                 continue
             if "Status=FAILED" in status_text:
@@ -49212,7 +49609,12 @@ def _ncbi_blast_online(query: str, program: str, database: str,
             raise RuntimeError(
                 f"NCBI BLAST timed out after {_ONLINE_MAX_WAIT_S}s — the "
                 f"query may be too large; try a shorter region.")
-    except _OnlineSearchCancelled:
+    except BaseException:
+        # Any abort after the RID was issued (cancel, timeout, FAILED /
+        # UNKNOWN, repeated poll failures) must delete the server-side job —
+        # pre-fix only cancel did, leaking RIDs on every other error path.
+        # Success (READY) breaks WITHOUT raising, so the RID survives for the
+        # result fetch below.
         _ncbi_blast_delete_rid(rid)
         raise
     if progress_cb:
@@ -49240,9 +49642,15 @@ def _ncbi_blast_parse_xml(xml_text: str, max_hits: int) -> "list[dict]":
             f"NCBI returned XML SpliceCraft couldn't parse: {exc}") from exc
     hits: "list[dict]" = []
     for hit in root.iter("Hit"):
-        hit_def = (hit.findtext("Hit_def") or "").strip()
-        acc = ((hit.findtext("Hit_accession") or "").strip()
-               or (hit.findtext("Hit_id") or "").strip() or "?")
+        # Strip terminal control bytes (\x1b / OSC etc.) from server-supplied
+        # text: the detail pane escapes Rich markup but NOT raw ESC, so a
+        # hostile Hit_def could otherwise inject terminal escape sequences.
+        hit_def = _CONTROL_CHARS_RE.sub(
+            "", hit.findtext("Hit_def") or "").strip()
+        acc = (_CONTROL_CHARS_RE.sub(
+                   "", hit.findtext("Hit_accession") or "").strip()
+               or _CONTROL_CHARS_RE.sub(
+                   "", hit.findtext("Hit_id") or "").strip() or "?")
         hsp = hit.find(".//Hsp")
         if hsp is None:
             continue
@@ -49299,15 +49707,20 @@ def _hmmer_web_parse_json(obj: "_Any", max_hits: int) -> "list[dict]":
         md = h.get("metadata")
         if not isinstance(md, dict):
             md = {}
-        acc = str(h.get("acc") or md.get("accession")
-                  or h.get("accession") or "?")
+        # Strip terminal control bytes from server-supplied strings (the
+        # detail pane escapes Rich markup but NOT raw ESC / OSC sequences).
+        acc = _CONTROL_CHARS_RE.sub("", str(
+            h.get("acc") or md.get("accession")
+            or h.get("accession") or "?"))
         # `metadata.identifier` is the Pfam family name (e.g. "Pkinase");
         # the top-level `name` is an internal numeric id — avoid it unless
         # nothing better exists.
-        name = str(md.get("identifier") or md.get("id")
-                   or h.get("name") or acc)
-        desc = str(md.get("description") or h.get("desc")
-                   or h.get("description") or "")
+        name = _CONTROL_CHARS_RE.sub("", str(
+            md.get("identifier") or md.get("id")
+            or h.get("name") or acc))
+        desc = _CONTROL_CHARS_RE.sub("", str(
+            md.get("description") or h.get("desc")
+            or h.get("description") or ""))
         ndom = _online_safe_int(
             h.get("ndom") if h.get("ndom") is not None
             else h.get("nincluded") if h.get("nincluded") is not None
@@ -49455,7 +49868,7 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
         # tells the database builder to merge every collection.
         coll_opts: list[tuple[str, str]] = [("(all collections)", "")]
         try:
-            for c in _load_collections():
+            for c in _iter_collections_readonly():
                 nm = str(c.get("name", "")).strip()
                 if nm:
                     coll_opts.append((nm, nm))
@@ -50755,7 +51168,9 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
             self._safe_online_status("[yellow]Search cancelled.[/yellow]")
             return
         if err is not None:
-            self._safe_online_status(f"[red]{err}[/red]")
+            from rich.markup import escape as _esc
+            safe_err = _esc(_CONTROL_CHARS_RE.sub("", err))
+            self._safe_online_status(f"[red]{safe_err}[/red]")
             return
         self._online_render_blast(hits or [])
         n = len(hits or [])
@@ -50772,7 +51187,9 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
             self._safe_online_status("[yellow]Search cancelled.[/yellow]")
             return
         if err is not None:
-            self._safe_online_status(f"[red]{err}[/red]")
+            from rich.markup import escape as _esc
+            safe_err = _esc(_CONTROL_CHARS_RE.sub("", err))
+            self._safe_online_status(f"[red]{safe_err}[/red]")
             return
         self._online_render_hmm(hits or [])
         n = len(hits or [])
@@ -58232,6 +58649,7 @@ def _delete_experiment_attach_dir(entry_id: str) -> None:
     d = _experiment_attach_dir(entry_id, create=False)
     if d is None or not d.exists():
         return
+    _refuse_unauthorized_delete(d, "experiment attach dir")
     try:
         for p in d.iterdir():
             if p.is_file() and not p.is_symlink():
@@ -58511,8 +58929,10 @@ def _normalise_gel_entry(entry: dict, *, fresh: bool = False) -> dict:
     out["id"] = gid
     raw_name = out.get("name")
     name = raw_name if isinstance(raw_name, str) else ""
-    name = name.strip() or "Untitled gel"
-    out["name"] = name[:_GEL_NAME_MAX_LEN]
+    # Strip control bytes (terminal-escape defence) on top of the length
+    # cap — gel + lane names render in the gel-picker DataTable.
+    out["name"] = (_sanitize_label(name, max_len=_GEL_NAME_MAX_LEN)
+                   or "Untitled gel")
     raw_notes = out.get("notes")
     notes = raw_notes if isinstance(raw_notes, str) else ""
     out["notes"] = notes[:_GEL_NOTES_MAX_LEN]
@@ -58539,9 +58959,10 @@ def _normalise_gel_entry(entry: dict, *, fresh: bool = False) -> dict:
         src = raw_src if isinstance(raw_src, str) else "empty"
         det = raw_det if isinstance(raw_det, str) else ""
         lanes.append({
-            "name":   nm[:_GEL_LANE_NAME_MAX_LEN],
-            "source": src[:_GEL_LANE_SOURCE_MAX_LEN],
-            "detail": det[:_GEL_LANE_DETAIL_MAX_LEN],
+            "name":   _sanitize_label(nm,  max_len=_GEL_LANE_NAME_MAX_LEN),
+            "source": (_sanitize_label(src, max_len=_GEL_LANE_SOURCE_MAX_LEN)
+                       or "empty"),
+            "detail": _sanitize_label(det, max_len=_GEL_LANE_DETAIL_MAX_LEN),
         })
     out["lanes"] = lanes
     now = _now_iso()
@@ -58700,7 +59121,9 @@ def _normalise_experiment_entry(entry: dict, *, fresh: bool = False
     title = out.get("title")
     if not isinstance(title, str):
         title = ""
-    out["title"] = title[:_EXPERIMENT_TITLE_MAX_LEN]
+    # Strip control bytes (terminal-escape defence) + length cap — the
+    # title renders in the experiments-list DataTable.
+    out["title"] = _sanitize_label(title, max_len=_EXPERIMENT_TITLE_MAX_LEN)
     body = out.get("body_md")
     if not isinstance(body, str):
         body = ""
@@ -67276,12 +67699,22 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                                  "sequence at the cursor.",
                     )
                     yield Button(
+                        "New…", id="btn-syn-motif-new",
+                        tooltip="Add a new custom motif to your "
+                                "persistent library.",
+                    )
+                    yield Button(
                         "Edit", id="btn-syn-motif-edit",
                         tooltip=(
                             "Edit the selected motif. Built-in motifs "
                             "are copied to your local library on first "
                             "edit so changes persist."
                         ),
+                    )
+                    yield Button(
+                        "Delete", id="btn-syn-motif-delete",
+                        tooltip="Delete the selected user motif "
+                                "(built-ins can't be deleted).",
                     )
                 yield Static(
                     "[dim]Tags, linkers, protease sites, NLS, 2A "
@@ -68228,6 +68661,65 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         self.app.push_screen(
             AddFeatureModal(prefill=motif),
             callback=_cb,
+        )
+
+    @on(Button.Pressed, "#btn-syn-motif-new")
+    def _on_motif_new(self) -> None:
+        """Add a NEW custom motif via NewMotifModal, persisted with
+        `_protein_motif_upsert` (built-ins re-merge on read)."""
+        def _cb(result):
+            if not isinstance(result, dict):
+                return
+            try:
+                err = _protein_motif_upsert(
+                    result.get("name", ""), result.get("sequence", ""),
+                    feature_type=result.get("feature_type", "Motif"),
+                    color=result.get("color", ""),
+                    description=result.get("description", ""),
+                )
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Protein motifs", exc)
+                return
+            if err:
+                self.app.notify(err, severity="warning")
+                return
+            self._refresh_motif_table()
+            nm = _sanitize_label(str(result.get("name") or ""))
+            _log_event("synthesis.protein.motif_edit",
+                       name=nm, action="new")
+            self.app.notify(
+                f"Added '{nm}' to your motif library.",
+                severity="information",
+            )
+        self.app.push_screen(NewMotifModal(), callback=_cb)
+
+    @on(Button.Pressed, "#btn-syn-motif-delete")
+    def _on_motif_delete(self) -> None:
+        """Delete the selected USER motif (built-ins protected) via
+        `_protein_motif_delete`, then refresh the table."""
+        motif = self._motif_selected_entry()
+        if motif is None:
+            self.app.notify(
+                "Pick a motif from the library list first.",
+                severity="information",
+            )
+            return
+        name = str(motif.get("name") or "")
+        try:
+            err = _protein_motif_delete(name)
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Protein motifs", exc)
+            return
+        if err:
+            self.app.notify(err, severity="warning")
+            return
+        self._refresh_motif_table()
+        _log_event("synthesis.protein.motif_edit",
+                   name=name, action="delete")
+        self.app.notify(
+            f"Removed '{name}' from your motif library "
+            "(built-in restored if one exists).",
+            severity="information",
         )
 
     def _motif_selected_entry(self) -> "dict | None":
@@ -69935,7 +70427,7 @@ class MultiAlignPickerModal(_OneShotDismissScreen, ModalScreen):
         # filtered out so the picker never offers self-self alignment.
         entries = sorted(
             (
-                e for e in _load_library()
+                e for e in _iter_library_readonly()
                 if e.get("id") and e.get("id") != self._current_id
             ),
             key=lambda e: _natural_sort_key(
@@ -70416,7 +70908,17 @@ class VerificationReportModal(_OneShotDismissScreen, ModalScreen):
                 )
                 aq = result.get("aligned_q") or ""
                 at = result.get("aligned_t") or ""
-                variants = _extract_variants_from_alignment(aq, at)
+                # For axis="query" alignments (Alt+\ diff) the alignment is
+                # stored on the QUERY plasmid's entry, so variant positions —
+                # and thus the click-to-jump target — must be in the QUERY
+                # frame. _extract_variants_from_alignment numbers positions in
+                # its 2nd arg's frame, so pass the query string second when the
+                # canvas axis is the query. SNP / indel COUNTS are axis-
+                # symmetric; only the position frame differs.
+                if align.get("axis", "target") == "query":
+                    variants = _extract_variants_from_alignment(at, aq)
+                else:
+                    variants = _extract_variants_from_alignment(aq, at)
                 n_snps = sum(1 for v in variants if v["type"] == "snp")
                 n_indels = sum(
                     1 for v in variants
@@ -74860,7 +75362,9 @@ class TraditionalCloningPane(Vertical):
             return
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
-        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.SeqFeature import (
+            SeqFeature, FeatureLocation, CompoundLocation,
+        )
         from datetime import date as _date_mod
         # ``NamePlasmidModal`` already rejected blanks + exact-name
         # duplicates; re-run the sanitiser defensively in case a
@@ -74895,20 +75399,36 @@ class TraditionalCloningPane(Vertical):
             annotations={"molecule_type": "DNA",
                           "topology":      "circular"},
         )
+        n_top = len(product["top_seq"])
         for f in product["features"]:
             try:
                 s = int(f.get("start", 0))
                 e = int(f.get("end", 0))
             except (TypeError, ValueError):
                 continue
-            if e <= s or e > len(product["top_seq"]):
+            if s == e or n_top == 0:
+                continue
+            if not (0 <= s <= n_top and 0 <= e <= n_top):
                 continue
             strand = int(f.get("strand", 1) or 0) or 1
             qualifiers = {
                 "label": [str(f.get("label") or f.get("type") or "feat")],
             }
+            if e > s:
+                loc = FeatureLocation(s, e, strand=strand)
+            elif e <= 0:
+                loc = FeatureLocation(s, n_top, strand=strand)
+            else:
+                # Origin-spanning (wrap) feature on the circular product:
+                # (s, n) + (0, e), mirroring _gibson_record_from_result so a
+                # backbone feature straddling the ligation join survives
+                # instead of being silently dropped ([INV-44]).
+                loc = CompoundLocation([
+                    FeatureLocation(s, n_top, strand=strand),
+                    FeatureLocation(0, e, strand=strand),
+                ])
             rec.features.append(SeqFeature(
-                FeatureLocation(s, e, strand=strand),
+                loc,
                 type=str(f.get("type", "misc_feature")),
                 qualifiers=qualifiers,
             ))
@@ -78294,6 +78814,156 @@ class NcbiTaxonPickerModal(_OneShotDismissScreen, ModalScreen):
         self.dismiss(None)
 
 
+# ── New protein motif (custom library entry) ───────────────────────────────────
+
+class NewMotifModal(_OneShotDismissScreen, ModalScreen):
+    """Add a new custom protein motif. Dismisses with
+    ``{name, sequence, feature_type, color, description}`` on Save (the
+    caller persists via `_protein_motif_upsert`), or None on Cancel."""
+
+    _blocks_undo: bool = True
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    NewMotifModal { align: center middle; }
+    #nm-dlg { width: 72; height: auto; max-height: 90%;
+              background: $surface; border: solid $primary; padding: 1 2; }
+    #nm-title { background: $primary-darken-2; color: $text; padding: 0 1;
+                margin-bottom: 1; text-align: center; text-style: bold; }
+    #nm-dlg Static.nm-label { color: $text-muted; margin-top: 1; }
+    #nm-desc { height: 5; border: solid $primary-darken-2; }
+    #nm-status { height: auto; margin-top: 1; color: $text-muted; }
+    #nm-btns { height: 3; margin-top: 1; align-horizontal: right; }
+    #nm-btns Button { margin-right: 1; min-width: 12; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="nm-dlg"):
+            yield Static(" New protein motif ", id="nm-title")
+            yield Static("Name", classes="nm-label")
+            yield Input(placeholder="e.g. My tag", id="nm-name")
+            yield Static("Amino-acid sequence", classes="nm-label")
+            yield Input(placeholder="e.g. HHHHHH", id="nm-seq")
+            yield Static("Type", classes="nm-label")
+            yield Input(value="Motif", id="nm-type")
+            yield Static("Color (hex, optional)", classes="nm-label")
+            yield Input(placeholder="#1E40AF", id="nm-color")
+            yield Static("Description (optional)", classes="nm-label")
+            yield TextArea(id="nm-desc")
+            yield Static("", id="nm-status", markup=True)
+            with Horizontal(id="nm-btns"):
+                yield Button("Save", id="btn-nm-save", variant="primary")
+                yield Button("Cancel", id="btn-nm-cancel")
+
+    def _status(self, msg: str) -> None:
+        try:
+            self.query_one("#nm-status", Static).update(msg)
+        except NoMatches:
+            pass
+
+    def _val(self, wid: str) -> str:
+        try:
+            return self.query_one(wid, Input).value.strip()
+        except NoMatches:
+            return ""
+
+    @on(Button.Pressed, "#btn-nm-save")
+    def _save(self, _) -> None:
+        name = self._val("#nm-name")
+        seq = self._val("#nm-seq").upper()
+        if not name:
+            self._status("[red]Name is required.[/red]")
+            return
+        if not seq:
+            self._status("[red]Amino-acid sequence is required.[/red]")
+            return
+        bad = sorted({c for c in seq if c not in "ACDEFGHIKLMNPQRSTVWY*"})
+        if bad:
+            self._status(
+                f"[red]Non-canonical amino acids: {''.join(bad)}[/red]")
+            return
+        try:
+            desc = self.query_one("#nm-desc", TextArea).text.strip()
+        except NoMatches:
+            desc = ""
+        self.dismiss({
+            "name":         name,
+            "sequence":     seq,
+            "feature_type": self._val("#nm-type") or "Motif",
+            "color":        self._val("#nm-color"),
+            "description":  desc,
+        })
+
+    @on(Button.Pressed, "#btn-nm-cancel")
+    def _cancel(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ── Codon-table TSV import (paste a custom usage table) ────────────────────────
+
+class CodonTsvImportModal(_OneShotDismissScreen, ModalScreen):
+    """Paste a tab / space / comma-delimited codon-usage table. Dismisses
+    with the pasted text (str) on Import, or None on Cancel — parsing
+    happens in the caller via `_parse_codon_tsv`."""
+
+    _blocks_undo: bool = True
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    CodonTsvImportModal { align: center middle; }
+    #ctsv-dlg { width: 84; height: auto; max-height: 90%;
+                background: $surface; border: solid $primary; padding: 1 2; }
+    #ctsv-title { background: $primary-darken-2; color: $text;
+                  padding: 0 1; margin-bottom: 1; text-align: center;
+                  text-style: bold; }
+    #ctsv-help { color: $text-muted; height: auto; padding: 0 1; }
+    #ctsv-text { height: 14; min-height: 6; margin-top: 1;
+                 border: solid $primary-darken-2; }
+    #ctsv-status { height: auto; margin-top: 1; color: $text-muted; }
+    #ctsv-btns { height: 3; margin-top: 1; align-horizontal: right; }
+    #ctsv-btns Button { margin-right: 1; min-width: 12; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ctsv-dlg"):
+            yield Static(" Import codon table (TSV) ", id="ctsv-title")
+            yield Static(
+                "[dim]Paste a tab / space / comma-delimited table — one row "
+                "per codon: [b]codon  [amino acid]  count[/b]. Header lines, "
+                "blank lines, and `#` comments are ignored; the amino-acid "
+                "column is optional.[/dim]",
+                id="ctsv-help", markup=True,
+            )
+            yield TextArea(id="ctsv-text")
+            yield Static("", id="ctsv-status", markup=True)
+            with Horizontal(id="ctsv-btns"):
+                yield Button("Import", id="btn-ctsv-go", variant="primary")
+                yield Button("Cancel", id="btn-ctsv-cancel")
+
+    @on(Button.Pressed, "#btn-ctsv-go")
+    def _go(self, _) -> None:
+        try:
+            text = self.query_one("#ctsv-text", TextArea).text
+        except NoMatches:
+            text = ""
+        if not text.strip():
+            try:
+                self.query_one("#ctsv-status", Static).update(
+                    "[red]Paste a TSV codon table first.[/red]")
+            except NoMatches:
+                pass
+            return
+        self.dismiss(text)
+
+    @on(Button.Pressed, "#btn-ctsv-cancel")
+    def _cancel(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ── Species picker (shared modal for codon-table selection) ────────────────────
 
 class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
@@ -78338,6 +79008,9 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
             with Horizontal(id="sp-btns"):
                 yield Button("Use Selected", id="btn-sp-use", variant="primary",
                              disabled=True)
+                yield Button("Import TSV", id="btn-sp-import",
+                             tooltip="Paste a custom codon-usage table "
+                                     "(TSV: codon, [amino acid], count).")
                 yield Button("Delete", id="btn-sp-delete", disabled=True)
                 yield Button("Cancel  [Esc]", id="btn-sp-cancel")
 
@@ -78438,6 +79111,51 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
             _notify_save_failure(self.app, "Codon tables", exc)
             return
         self._refresh_list(self.query_one("#sp-filter", Input).value)
+
+    @on(Button.Pressed, "#btn-sp-import")
+    def _import_tsv(self, _) -> None:
+        """Paste-import a custom codon table from TSV (parsed by
+        `_parse_codon_tsv`, persisted via `_codon_tables_add`). The display
+        name comes from the Display-name Input, else 'Custom codon table'."""
+        name_hint = ""
+        try:
+            name_hint = self.query_one("#sp-name", Input).value.strip()
+        except NoMatches:
+            pass
+
+        def _on_text(text) -> None:
+            if not isinstance(text, str) or not text.strip():
+                return
+            try:
+                info = self.query_one("#sp-info", Static)
+            except NoMatches:
+                info = None
+            try:
+                raw = _parse_codon_tsv(text)
+            except ValueError as exc:
+                if info:
+                    info.update(f"[red]Import failed — {exc}[/red]")
+                return
+            display = (_sanitize_label(name_hint, max_len=200)
+                       or "Custom codon table")
+            try:
+                _codon_tables_add(display, "", raw, source="user")
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Codon tables", exc)
+                return
+            _log_event("codon_table.import_tsv",
+                       name=display, n_codons=len(raw))
+            try:
+                self._refresh_list(
+                    self.query_one("#sp-filter", Input).value)
+                if info:
+                    info.update(
+                        f"[green]Imported '{display}' "
+                        f"({len(raw)} codons).[/green]")
+            except NoMatches:
+                pass
+
+        self.app.push_screen(CodonTsvImportModal(), callback=_on_text)
 
     @on(Button.Pressed, "#btn-sp-fetch")
     def _fetch(self, _) -> None:
@@ -79155,7 +79873,10 @@ class MutagenizeModal(ModalScreen):
 
     def _build_library_options(self) -> list:
         try:
-            entries = _load_library()
+            # Readonly view (no full-library deepcopy) — option values are the
+            # disk-order index, and `_lib_changed` reads the same view, so the
+            # index mapping stays consistent.
+            entries = list(_iter_library_readonly())
         except Exception:
             _log.exception("Mutagenize: failed to load plasmid library")
             entries = []
@@ -79265,7 +79986,7 @@ class MutagenizeModal(ModalScreen):
             self._lib_template = ""
             self._lib_feats    = []
             return
-        entries = _load_library()
+        entries = list(_iter_library_readonly())
         try:
             entry = entries[int(val)]
         except (IndexError, ValueError):
@@ -79486,7 +80207,8 @@ class MutagenizeModal(ModalScreen):
             f"[red]Codon optimization failed: {msg}. "
             f"The selected codon table may be missing entries for this "
             f"protein's residues — try a different organism or "
-            f"add codon-table entries via File > Codon tables.[/red]"
+            f"add a table via the Codon table picker (Fetch from Kazusa "
+            f"or Import TSV).[/red]"
         )
 
     def _apply_optimized_cds(self, aa: str, cds: str, fixes,
@@ -89630,7 +90352,7 @@ class MoveCopyToCollectionModal(ModalScreen):
         table.add_columns("Collection", "Plasmids")
         self._row_to_name = []
         try:
-            colls = _load_collections()
+            colls = list(_iter_collections_readonly())
         except (OSError, RuntimeError) as exc:
             self._set_status(
                 f"[red]Couldn't load collections: {_scrub_path(str(exc))}"
@@ -92560,20 +93282,31 @@ def _h_bulk_import_folder(app, payload):
     name = _normalize_collection_name(payload.get("collection"))
     if name is None:
         return ({"error": "missing or invalid 'collection'"}, 400)
+    # Advisory fast-fail so we don't parse a whole folder for a name
+    # that's already taken; the authoritative re-check is in-lock below.
     if _collection_name_taken(name):
         return ({"error": f"collection {name!r} already exists; "
                           f"delete it first or pick a unique name"}, 409)
+    # Parse files OUTSIDE the lock (slow I/O, touches no cache).
     entries, failures = _bulk_import_folder(folder)
-    colls = _load_collections()
-    colls.append({
-        "name":        name,
-        "description": f"Bulk imported from {folder}",
-        "plasmids":    entries,
-        "saved":       _date.today().isoformat(),
-    })
-    if (err := _agent_save_or_500(
-            lambda: _save_collections(colls), "collections")) is not None:
-        return err
+    # RMW under _cache_lock with the collision re-check INSIDE so two
+    # concurrent imports (or a racing create-collection) can't both pass
+    # the check and silently drop one collection — mirrors the
+    # _h_create_collection fix (sweep #11).
+    with _cache_lock:
+        if _collection_name_taken(name):
+            return ({"error": f"collection {name!r} already exists; "
+                              f"delete it first or pick a unique name"}, 409)
+        colls = _load_collections()
+        colls.append({
+            "name":        name,
+            "description": f"Bulk imported from {folder}",
+            "plasmids":    entries,
+            "saved":       _date.today().isoformat(),
+        })
+        if (err := _agent_save_or_500(
+                lambda: _save_collections(colls), "collections")) is not None:
+            return err
     app.call_from_thread(_agent_refresh_library_panel, app)
     return {
         "ok":         True,
@@ -92943,9 +93676,10 @@ def _agent_grammar_dict(payload: dict) -> "dict | str":
             if not isinstance(pos.get(k), str):
                 return f"positions[{i}] missing string field {k!r}"
         cleaned_positions.append({
-            "name": pos["name"], "type": pos["type"],
+            "name": _sanitize_label(pos["name"]),
+            "type": _sanitize_label(pos["type"]),
             "oh5":  pos["oh5"].upper(), "oh3": pos["oh3"].upper(),
-            "color": pos.get("color") or "white",
+            "color": _sanitize_label(pos.get("color")) or "white",
         })
     coding_types = payload.get("coding_types") or []
     if not isinstance(coding_types, list) or not all(
@@ -92958,8 +93692,8 @@ def _agent_grammar_dict(payload: dict) -> "dict | str":
         return "'type_to_insdc' must be {part_type: insdc_type} strings"
     return {
         "id":              gid.strip(),
-        "name":            name.strip()[:200],
-        "enzyme":          enzyme.strip(),
+        "name":            _sanitize_label(name),
+        "enzyme":          _sanitize_label(enzyme),
         "level_up_enzyme": (payload.get("level_up_enzyme")
                               if isinstance(payload.get("level_up_enzyme"), str)
                               else ""),
@@ -93278,9 +94012,9 @@ def _agent_primer_dict(payload: dict) -> "dict | str":
     return {
         "name":     name,
         "sequence": seq,
-        "source":   (source or "")[:300],
+        "source":   _sanitize_label(source, max_len=300),
         "status":   status or "Designed",
-        "type":     ptype or "",
+        "type":     _sanitize_label(ptype),
         "tm":       tm,
         "notes":    notes or "",
         "date":     _datetime.now().strftime("%Y-%m-%d"),
@@ -93389,6 +94123,135 @@ def _h_set_active_primer_collection(app, payload):
             "primer_collections")) is not None:
         return err
     return {"ok": True, "active": name}
+
+
+# ── Parts-bin collections (named bins) ─────────────────────────────────────────
+
+
+@_agent_endpoint("list-parts-bins")
+def _h_list_parts_bins(app, payload):
+    """Every named parts bin. Each item: ``{name, n_parts, description}``;
+    `active` is the currently-selected bin name (empty if none)."""
+    out = []
+    for b in _load_parts_bin_collections():
+        out.append({
+            "name":        b.get("name", "?"),
+            "n_parts":     len(b.get("parts", []) or []),
+            "description": str(b.get("description") or "")[:200],
+        })
+    return {"ok": True, "parts_bins": out,
+            "active": _get_active_parts_bin_name() or ""}
+
+
+@_agent_endpoint("set-active-parts-bin", write=True)
+def _h_set_active_parts_bin(app, payload):
+    """Switch the active parts bin. Body: ``{name}`` (one of
+    `list-parts-bins`). The named bin in `parts_bin_collections.json` is
+    the source of truth; its parts are mirrored into the live
+    `parts_bin.json` via `_safe_save_json_mirror` so the switch may
+    legitimately shrink the mirror without tripping the L3 guard
+    ([INV-83]). RMW under `_cache_lock`, matching `PartsBinPickerModal`."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing 'name'"}, 400)
+    name = name.strip()
+    with _cache_lock:
+        target = _find_parts_bin(name)
+        if target is None:
+            valid = [b.get("name") for b in _load_parts_bin_collections()]
+            return ({"error":
+                      f"unknown parts bin {name!r}; "
+                      f"valid: {sorted(v for v in valid if v)}"}, 404)
+        _set_active_parts_bin_name(name)
+        _settings_flush_sync()
+        raw_parts = target.get("parts", [])
+        if not isinstance(raw_parts, list):
+            raw_parts = []
+        target_parts = [p for p in raw_parts if isinstance(p, dict)]
+        err = _agent_save_or_500(
+            lambda: _safe_save_json_mirror(
+                _PARTS_BIN_FILE, target_parts, "Parts bin"),
+            "Parts bin")
+        if err:
+            return err
+        globals()["_parts_bin_cache"] = None
+        _clear_assembly_fragment_cache()
+    _log_event("parts_bin.switch", name=name, via="agent")
+    return {"ok": True, "active": name, "n_parts": len(target_parts)}
+
+
+# ── HMM databases (hmmscan registry) ───────────────────────────────────────────
+
+
+@_agent_endpoint("list-hmm-databases")
+def _h_list_hmm_databases(app, payload):
+    """Every registered HMM database. Each item: ``{id, name, ready,
+    builtin}`` (`ready` = pressed/usable on disk). `active` is the
+    picked id used by hmmscan."""
+    out = []
+    for e in _load_hmm_db_catalog():
+        eid = e.get("id", "")
+        out.append({
+            "id":      eid,
+            "name":    e.get("name", eid),
+            "ready":   _hmm_db_pressed(eid),
+            "builtin": bool(e.get("builtin")),
+        })
+    return {"ok": True, "hmm_databases": out,
+            "active": (_get_setting("hmm_db_active_id", "") or "")}
+
+
+@_agent_endpoint("get-hmm-database")
+def _h_get_hmm_database(app, payload):
+    """Detail for one HMM database by `id`."""
+    eid = payload.get("id")
+    if not isinstance(eid, str) or not eid.strip():
+        return ({"error": "missing 'id'"}, 400)
+    eid = eid.strip()
+    for e in _load_hmm_db_catalog():
+        if e.get("id") == eid:
+            return {"ok": True, "id": eid, "name": e.get("name", eid),
+                    "ready": _hmm_db_pressed(eid),
+                    "builtin": bool(e.get("builtin")),
+                    "url": e.get("url", ""),
+                    "version": e.get("version", "")}
+    return ({"error": "hmm database not found"}, 404)
+
+
+@_agent_endpoint("set-active-hmm-database", write=True)
+def _h_set_active_hmm_database(app, payload):
+    """Pick the active HMM database. Body: ``{id}`` (one of
+    `list-hmm-databases`). Persists the `hmm_db_active_id` setting."""
+    eid = payload.get("id")
+    if not isinstance(eid, str) or not eid.strip():
+        return ({"error": "missing 'id'"}, 400)
+    eid = eid.strip()
+    if eid not in {e.get("id") for e in _load_hmm_db_catalog()}:
+        return ({"error": "hmm database not found"}, 404)
+    _set_setting("hmm_db_active_id", eid)
+    _settings_flush_sync()
+    _log_event("hmm_db.set_active", id=eid, via="agent")
+    return {"ok": True, "active": eid}
+
+
+@_agent_endpoint("delete-hmm-database", write=True)
+def _h_delete_hmm_database(app, payload):
+    """Delete the DOWNLOADED files for an HMM database by `id`
+    (un-downloads it; the catalog entry stays so it can be re-fetched).
+    Files removal is L2-gated via `_delete_hmm_db_files`."""
+    eid = payload.get("id")
+    if not isinstance(eid, str) or not eid.strip():
+        return ({"error": "missing 'id'"}, 400)
+    eid = eid.strip()
+    if eid not in {e.get("id") for e in _load_hmm_db_catalog()}:
+        return ({"error": "hmm database not found"}, 404)
+    try:
+        removed = _delete_hmm_db_files(eid)
+    except (OSError, RuntimeError) as exc:
+        _log.exception("agent delete-hmm-database failed")
+        return ({"error": f"delete failed: {exc}"}, 500)
+    _log_event("hmm_db.delete", id=eid, files_removed=removed, via="agent")
+    return {"ok": True, "id": eid, "files_removed": removed}
 
 
 # ── User settings (allowlisted toggles) ───────────────────────────────────────
@@ -93713,10 +94576,10 @@ def _agent_part_dict(payload: dict) -> "dict | str":
     notes = _sanitize_note(payload.get("notes", ""))
     return {
         "name":      name,
-        "grammar":   (grammar or ""),
-        "type":      (ptype or ""),
+        "grammar":   _sanitize_label(grammar),
+        "type":      _sanitize_label(ptype),
         "level":     int(level),
-        "position":  (position or ""),
+        "position":  _sanitize_label(position),
         "oh5":       (oh5 or "").upper(),
         "oh3":       (oh3 or "").upper(),
         "sequence":  clean_seq,
@@ -93821,9 +94684,9 @@ def _agent_feature_dict(payload: dict) -> "dict | str":
     return {
         "name":         name,
         "sequence":     seq,
-        "feature_type": ftype or "misc_feature",
+        "feature_type": _sanitize_feat_type(ftype),
         "strand":       int(strand),
-        "color":        color or "",
+        "color":        _sanitize_label(color),
         "notes":        notes or "",
     }
 
@@ -95535,26 +96398,32 @@ def _h_delete_experiment_project(app, payload):
         )
         if err:
             return err
-    promoted = ""
-    if was_active and new_projs:
-        promoted = new_projs[0].get("name") or ""
-        _set_active_project_name(promoted)
-        _settings_flush_sync()
-        raw_entries = new_projs[0].get("experiments") or []
-        if not isinstance(raw_entries, list):
-            raw_entries = []
-        target_entries = [
-            e for e in raw_entries if isinstance(e, dict)
-        ]
-        try:
-            # [INV-83, sweep #27] Agent project-delete auto-promotes;
-            # mirror-swap to the promoted project's entries.
-            _safe_save_json_mirror(
-                _EXPERIMENTS_FILE, target_entries, "Experiments",
-            )
-        except (OSError, RuntimeError):
-            pass
-        globals()["_experiments_cache"] = None
+        # The auto-promote + mirror-swap must stay under the same
+        # _cache_lock hold (RLock, so the inner load/save re-enter
+        # safely) — otherwise a concurrent _save_experiments can
+        # reseat the cache between our save and the cache-null below,
+        # desyncing cache from disk. Matches the locked UI sibling
+        # ExperimentProjectsPickerModal._do_delete.
+        promoted = ""
+        if was_active and new_projs:
+            promoted = new_projs[0].get("name") or ""
+            _set_active_project_name(promoted)
+            _settings_flush_sync()
+            raw_entries = new_projs[0].get("experiments") or []
+            if not isinstance(raw_entries, list):
+                raw_entries = []
+            target_entries = [
+                e for e in raw_entries if isinstance(e, dict)
+            ]
+            try:
+                # [INV-83, sweep #27] Agent project-delete auto-promotes;
+                # mirror-swap to the promoted project's entries.
+                _safe_save_json_mirror(
+                    _EXPERIMENTS_FILE, target_entries, "Experiments",
+                )
+            except (OSError, RuntimeError):
+                pass
+            globals()["_experiments_cache"] = None
     _log_event("project.deleted", name=name, via="agent",
                 promoted=promoted)
     return {"ok": True, "name": name, "promoted": promoted}
@@ -96955,6 +97824,11 @@ class PlasmidApp(App):
     # because the splash modal blocks pilot.click before the suite drives
     # the actual UI).
     _skip_splash:    bool         = False
+    # When the splash is skipped (--no-splash / -Q), the post-splash gate
+    # (What's New on upgrade + last_seen_version bump) still needs to run.
+    # main() sets this True; the test conftest leaves it False so the suite
+    # — which also sets _skip_splash — doesn't fire the gate / push the modal.
+    _run_post_splash_when_skipped: bool = False
     # PyPI update check on launch. Default-True for tests so the suite
     # never hits the network; `main()` flips it to False so the
     # production launch runs the background worker.
@@ -99559,6 +100433,12 @@ SpeciesPickerModal { align: center middle; }
         if not getattr(self, "_skip_splash", False):
             self.push_screen(SplashScreen(),
                              callback=self._on_splash_dismissed)
+        elif getattr(self, "_run_post_splash_when_skipped", False):
+            # --no-splash / -Q: no splash to dismiss, but the post-splash gate
+            # (What's New on upgrade + last_seen_version bump + any deferred
+            # update notice) must still run — else these users never see
+            # release notes and get re-prompted on the next normal launch.
+            self.call_after_refresh(self._on_splash_dismissed, None)
         # Background PyPI update check. Threaded + 24h-cached + 3s-
         # timeout-bounded so it can never slow down startup or block
         # the UI thread. Skipped under tests (`_skip_update_check`
@@ -106664,6 +107544,7 @@ SpeciesPickerModal { align: center middle; }
                 ("Add to Library  [^⇧A]",        "add_to_library"),
                 ("Find plasmid (all collections)…", "find_plasmid"),
                 ("Diff with another plasmid…",   "diff_plasmid"),
+                ("Find ORFs in this sequence…",  "find_orfs"),
                 ("Save  [^S]",                   "save"),
                 ("Export as GenBank (.gb)...",   "export_genbank"),
                 ("Export as FASTA (.fa)...",     "export_fasta"),
@@ -106684,7 +107565,7 @@ SpeciesPickerModal { align: center middle; }
                 ("⚠ Master Delete (wipe all user data)…",
                                                   "master_delete"),
                 ("---",                          None),
-                ("Quit  [q]",                    "quit"),
+                ("Quit  [^Q]",                   "quit"),
             ],
             # "Settings" is a direct-open menubar entry — see
             # `MenuBar.on_click` and `action_open_named_menu` for the
@@ -107090,29 +107971,6 @@ SpeciesPickerModal { align: center middle; }
         self.notify("Showing 4+ bp recognition sites")
 
     @_action_log("app.edit.custom_enzyme_list")
-    def action_edit_custom_enzyme_list(self) -> None:
-        """Open the custom-enzyme-list modal (GH #13). Save commits
-        the parsed CSV + active toggle to settings and re-scans the
-        restriction overlay so the change is visible immediately."""
-        self.push_screen(CustomEnzymeListModal())
-
-    @_action_log("app.toggle.custom_enzyme_list")
-    def action_toggle_custom_enzyme_list(self) -> None:
-        """Flip `restr_use_custom_list`. If the list is empty, the
-        toggle still saves but the scan falls back to the default
-        filters (the dispatch guards on a non-empty parsed set)."""
-        self._restr_use_custom_list = not self._restr_use_custom_list
-        _set_setting(
-            "restr_use_custom_list", self._restr_use_custom_list,
-        )
-        self._rescan_restrictions()
-        state = "on" if self._restr_use_custom_list else "off"
-        names = self._restr_custom_enzymes or "(empty)"
-        self.notify(
-            f"Custom enzyme list {state} — {names}",
-            markup=False,
-        )
-
     @_action_log("app.capture.to_features")
     def action_capture_to_features(self) -> None:
         """Ctrl+Shift+F: grab the drag-selected DNA *or* the highlighted feature
@@ -108811,6 +109669,10 @@ def main():
         _log.warning(_data_version_warning)
     app = PlasmidApp()
     app._skip_splash = skip_splash
+    # Production launch: run the post-splash gate even under --no-splash so
+    # What's New + the last_seen_version bump aren't lost (the test harness
+    # leaves this False).
+    app._run_post_splash_when_skipped = True
     # Production launch opts in to the background PyPI update check
     # (test conftest leaves this True so the suite never hits the
     # network). The worker is also gated by the user's persisted
