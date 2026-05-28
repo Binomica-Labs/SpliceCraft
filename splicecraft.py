@@ -82338,13 +82338,23 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
         the module-level cache. Mirrors the stale-record-counter
         pattern (CLAUDE.md invariant #28) but for the collection axis.
         """
+        # Sweep #30 follow-up (2026-05-28): capture `self.app` ONCE at
+        # thread entry, while the widget's app-context is still valid.
+        # Pre-fix the worker re-resolved `self.app` ~3 s later to dispatch
+        # its result, and if the user navigated (e.g. opened the align
+        # picker) during the scan the `.app` property raised
+        # NoActiveAppError — the result was then dropped (caught + logged
+        # at the bottom). `App.call_from_thread` on a captured reference
+        # doesn't depend on the per-thread active-app context, so the late
+        # callback can't fail. Smoke-found 2026-05-28 (session 3a963157).
+        app = self.app
         # Check cache state BEFORE the call so we know whether this
         # is a fresh scan worth toasting about. Cache-hit returns
         # instantly and a toast would be noise.
         fresh = (globals().get("_primer_usage_cache") is None)
         if fresh:
-            self.app.call_from_thread(
-                self.app.notify,
+            app.call_from_thread(
+                app.notify,
                 "Indexing primer usage across collections…",
                 timeout=4,
             )
@@ -82360,7 +82370,7 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             usage = {}
         _log.info("primer-usage worker: scan done, %d sequences", len(usage))
         try:
-            self.app.call_from_thread(
+            app.call_from_thread(
                 self._on_primer_usage_indexed, usage, coll_at_entry,
             )
         except Exception:
