@@ -46,7 +46,7 @@ What you can do without leaving the terminal.
   In-editor protein-motif highlighting (signal peptide, NLS, mito
   targeting, tags) flags regions of biological interest as you type.
 - **Codon-table picker** — the **Codon table** dropdown in the Synthesis
-  (and Mutagenize) protein tools opens a picker to browse the Kazusa
+  (and Mutato) protein tools opens a picker to browse the Kazusa
   usage-table catalog by organism / taxid and persist a preferred table
   (also via `set-active-codon-table`). **Import TSV** pastes a custom
   usage table (codon, optional amino acid, count) straight into your

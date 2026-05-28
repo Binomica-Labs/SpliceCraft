@@ -1631,3 +1631,50 @@ class TestCustomEnzymeListFilter:
         result, err = v_fn(42)
         assert result is None
         assert err is not None
+
+
+class TestTranslTableNonStandard:
+    """Sweep #30 (2026-05-28): a CDS carrying /transl_table must translate
+    with the named NCBI genetic code, not the hardcoded standard table —
+    otherwise a mito / Mycoplasma CDS renders the wrong protein AND a
+    reassigned stop (TGA→Trp) trips a false premature-stop ⚠."""
+
+    def test_standard_table_is_canonical_object(self):
+        assert sc._codon_table_for(1) is sc._CODON_TABLE
+        assert sc._codon_table_for(None) is sc._CODON_TABLE
+        assert sc._codon_table_for(0) is sc._CODON_TABLE   # falsy → standard
+
+    def test_table4_reassigns_tga_to_trp(self):
+        m = sc._codon_table_for(4)   # mold/protozoan mito + Mycoplasma
+        assert m["TGA"] == "W"       # the reassignment that matters
+        assert m["TAA"] == "*"       # other stops unchanged
+        assert m["TAG"] == "*"
+        assert m["ATG"] == "M"
+
+    def test_vertebrate_mito_table2(self):
+        m = sc._codon_table_for(2)
+        assert m["TGA"] == "W"       # Trp
+        assert m["AGA"] == "*"       # AGR = stop in vertebrate mito
+        assert m["AGG"] == "*"
+        assert m["ATA"] == "M"       # Met (sense in table 2)
+
+    def test_unknown_table_falls_back_to_standard(self):
+        # A hand-edited /transl_table=99 must not crash — fall back to std.
+        m = sc._codon_table_for(99)
+        assert m["TGA"] == "*"
+
+    def test_translate_cds_honours_table4(self):
+        seq = "ATGTGATAA"            # ATG TGA TAA
+        assert sc._translate_cds(seq, 0, 9, 1) == "M**"
+        assert sc._translate_cds(seq, 0, 9, 1, transl_table=4) == "MW*"
+
+    def test_cds_aa_list_internal_tga_not_stop_under_table4(self):
+        # ATG TGA AAA TAA — the internal TGA is a real premature stop under
+        # the standard code but a Trp under table 4 (so no false ⚠).
+        seq = "ATGTGAAAATAA"
+        aa_std, _len, _ve = sc._cds_aa_list(
+            seq, {"start": 0, "end": 12, "strand": 1})
+        assert aa_std == ["M", "*", "K", "*"]
+        aa_t4, _len, _ve = sc._cds_aa_list(
+            seq, {"start": 0, "end": 12, "strand": 1, "transl_table": 4})
+        assert aa_t4 == ["M", "W", "K", "*"]

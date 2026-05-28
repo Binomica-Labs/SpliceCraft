@@ -81,7 +81,7 @@ maintainer runs before each release.
 | Enzymes     | Show RE sites · Unique cutters · 6+/4+ bp sites · Connectors · Edit custom enzyme list… |
 | Features    | Feature Library workbench                                                        |
 | Primers     | Full-screen Primer Design workbench                                              |
-| Mutagenize  | SOE-PCR site-directed mutagenesis designer (4-source CDS picker)                 |
+| Mutato      | SOE-PCR site-directed mutagenesis designer (4-source CDS picker)                 |
 | Parts       | Parts Bin (per-grammar; multi-bin via Parts Bin collections)                     |
 | Constructor | Traditional cloning · Gibson assembly · Golden Braid / MoClo / custom grammar assembly |
 | Simulator   | In-silico PCR (exact-match binding) + agarose gel rendering (0.5–4.0%, ladder / uncut / digest / amplicon lanes) |

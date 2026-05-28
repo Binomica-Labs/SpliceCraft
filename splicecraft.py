@@ -152,8 +152,33 @@ def _user_data_dir() -> Path:
             from platformdirs import user_data_dir
             p = Path(user_data_dir("splicecraft", appauthor=False, roaming=False))
         except ImportError:
-            p = Path.home() / ".local" / "share" / "splicecraft"
-    p.mkdir(parents=True, exist_ok=True)
+            try:
+                p = Path.home() / ".local" / "share" / "splicecraft"
+            except (RuntimeError, OSError):
+                # $HOME unset AND no platformdirs → Path.home() raises
+                # RuntimeError. Fall back to temp so import doesn't crash.
+                import tempfile
+                p = Path(tempfile.gettempdir()) / "splicecraft-data"
+    # Sweep #30 (2026-05-28): never let a data-dir creation failure crash
+    # at IMPORT time. A misconfigured $SPLICECRAFT_DATA_DIR (a path that's
+    # a FILE → FileExistsError; a file mid-path → NotADirectoryError; an
+    # unwritable parent → PermissionError) used to surface a raw traceback
+    # before main() could even handle --version/--help. Fall back to a
+    # fresh temp dir so launch survives; the user's real data (wherever it
+    # is) is untouched, and the loud stderr line — printed before the TUI
+    # takes the screen — tells them their configured location is broken.
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        import tempfile
+        fallback = Path(tempfile.mkdtemp(prefix="splicecraft-data-"))
+        sys.stderr.write(
+            f"SpliceCraft: could not create data dir at {p} ({exc}); "
+            f"using a temporary dir at {fallback} for this session. "
+            f"Set $SPLICECRAFT_DATA_DIR to a writable path to keep your "
+            f"library across launches.\n"
+        )
+        return fallback
     return p
 
 _DATA_DIR = _user_data_dir()
@@ -914,6 +939,7 @@ from textual.screen import ModalScreen, Screen  # noqa: E402
 from textual.theme import Theme  # noqa: E402
 from textual.widget import Widget  # noqa: E402
 from textual.await_complete import AwaitComplete  # noqa: E402
+from textual.worker import Worker, WorkerState  # noqa: E402
 
 
 class _OneShotDismissScreen(Screen):
@@ -2070,8 +2096,26 @@ def _safe_save_json(path: Path, entries: list, label: str,
                     )
                     _spill_raw_bytes(path, existing, label,
                                       reason="invalid-json")
-        except OSError:
-            _log.warning("Could not read prior content for %s", path)
+        except OSError as exc:
+            # 2026-05-28 (sweep #30): the file EXISTS (we're inside
+            # `if path.exists()`) but could not be read to back it up.
+            # Falling through to Step 3 would overwrite real,
+            # un-backed-up data with the in-memory state — and if that
+            # state is empty/short because the SAME I/O fault made the
+            # cache load `[]`, the good file is destroyed with no
+            # recovery copy AND the shrink guard can't fire
+            # (existing_count stayed 0). A save we cannot back up is not
+            # safe: refuse so the caller surfaces it. (A legitimately
+            # ABSENT file never reaches here — only the present-but-
+            # unreadable case does.)
+            msg = (
+                f"Refusing to save {label}: prior file at {path} exists "
+                f"but could not be read to back it up ({exc}). "
+                f"Overwriting would destroy un-backed-up data. Resolve "
+                f"the read error (permissions / disk) and retry."
+            )
+            _log.error(msg)
+            raise OSError(msg) from exc
 
     # Step 2: shrink guard with spillover + L3 catastrophic-shrink
     # refusal (2026-05-22).
@@ -2135,10 +2179,16 @@ def _safe_save_json(path: Path, entries: list, label: str,
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, indent=2)
                 fh.flush()
-                try:
-                    os.fsync(fh.fileno())
-                except OSError:
-                    pass
+                # 2026-05-28 (sweep #30): re-raise fsync failures here
+                # too — mirrors the H2 hardening in `_atomic_write_text`
+                # / `_atomic_write_bytes`. This inline writer was the
+                # last save path that still swallowed `os.fsync` errors:
+                # on EIO / ENOSPC at fsync the data never reached stable
+                # storage, yet `os.replace` proceeded and the function
+                # returned success — the UI showed "saved" over a write
+                # a power-loss would lose. The surrounding handler unlinks
+                # the temp file and the error propagates (sacred #7).
+                os.fsync(fh.fileno())
             os.replace(tmp_name, str(path))
             # Fsync the parent directory so the rename's directory entry
             # update is journalled — see `_fsync_parent_dir`. Pre-fix
@@ -3446,6 +3496,20 @@ def _extract_recent_events(log_path: "Path | None" = None,
             )
             if lvl_m:
                 level = lvl_m.group(1)
+            # 2026-05-28 (sweep #30): belt-and-suspenders privacy. The
+            # bundle scrubs its copies of the raw log via `_scrub_path`,
+            # but `events_summary.json` is built from these `fields`
+            # verbatim — so a raw home/data-dir path in ANY event field
+            # (`save.ok` source_path, `save.failed` error, snapshot path,
+            # future fields) would ride into the shareable bundle
+            # unredacted. Scrub every top-level string value here so the
+            # leak is closed at the single chokepoint, not per call site.
+            # [INV-38 path-privacy invariant]
+            if isinstance(fields, dict):
+                fields = {
+                    k: (_scrub_path(v) if isinstance(v, str) else v)
+                    for k, v in fields.items()
+                }
             events.append({
                 "ts": ts, "session": sid, "level": level,
                 "event": event_name, "fields": fields,
@@ -4881,6 +4945,30 @@ def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
     # includes the gb_text hash so stale entries would simply miss
     # — but blowing the whole map keeps the invariant simple.
     _invalidate_library_kmer_cache()
+
+
+def _authoritative_library_snapshot(fallback: "list[dict]") -> "list[dict]":
+    """Return the live ``_library_cache`` if populated, else ``fallback``.
+
+    The LibraryPanel disk-writer workers (``_add_save_to_disk`` /
+    ``_delete_save_to_disk`` / ``_rename_save_to_disk``) run in DIFFERENT
+    ``@work`` groups. ``_cache_lock`` serialises their ``_safe_save_json``
+    calls but does NOT order them across groups, so a slow worker could
+    land its dispatch-time payload AFTER a newer worker's and resurrect a
+    just-deleted / just-renamed entry on disk. The in-memory cache stays
+    correct, so the divergence is disk-only and self-heals on the next
+    library mutation — but it is real (a delete-then-quit could un-delete
+    on disk). Pre-sweep-#30 this was a documented deferred race.
+
+    Every dispatch site reseats ``_library_cache`` to the latest
+    committed state synchronously BEFORE dispatch (on the single UI
+    thread), so the cache is always >= any in-flight payload. Persisting
+    the cache (not the captured payload) makes whichever worker writes
+    LAST write the freshest state, closing the race. Call this UNDER
+    ``_cache_lock``. Falls back to the payload only if the cache is
+    somehow unset (defensive — never happens in a running app, where
+    add/delete/rename can't fire before the cache populates)."""
+    return _library_cache if isinstance(_library_cache, list) else fallback
 
 
 # ── Plasmid collections ────────────────────────────────────────────────────────
@@ -6654,8 +6742,23 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
         site, fwd_cut, rev_cut = catalog[ename]
         site_u   = site.upper()
         site_len = len(site_u)
-        pat      = _iupac_pattern(site_u)
-        rc_site  = _rc(site_u)
+        try:
+            pat      = _iupac_pattern(site_u)
+            rc_site  = _rc(site_u)
+        except ValueError:
+            # Sweep #30 (2026-05-28): a corrupt custom-enzyme site (e.g. a
+            # hand-edited custom_enzymes.json with a non-IUPAC char) makes
+            # _iupac_pattern raise. Skip the bad enzyme rather than
+            # crashing the whole digest — mirrors the per-enzyme guard
+            # INV-85 added to _rebuild_scan_catalog. Pre-fix one bad site
+            # silently killed the trad-cloning Simulate / MoClo workers.
+            # (A valid site's reverse complement is always valid IUPAC, so
+            # the rc_pat compile below can't raise once this passed.)
+            _log.warning(
+                "enzyme_cuts: skipping %r — bad recognition site %r",
+                ename, site,
+            )
+            continue
         is_pal   = (rc_site == site_u)
         scan_seq = (seq_u + seq_u[: site_len - 1]) if (circular and n > 0) else seq_u
 
@@ -6714,7 +6817,18 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
                 # site (= bottom strand of unbound) is `site_len - rev_cut`
                 # bases from the recognition's 5' end on the unbound
                 # forward strand; bottom cut is `site_len - fwd_cut`.
-                _emit(p + site_len - rev_cut, p + site_len - fwd_cut)
+                _rev_top_raw = p + site_len - rev_cut
+                _rev_bot_raw = p + site_len - fwd_cut
+                # Linear molecules: a reverse-strand Type IIS cut that falls
+                # past the 5' end would wrap via _emit's `% n` into a phantom
+                # 3'-end fragment boundary. Mirror the forward-path guard above
+                # (and the restriction-overlay reverse-strand guard) and drop
+                # it; circular molecules wrap correctly.
+                if not circular and (
+                        _rev_top_raw < 0 or _rev_top_raw > n
+                        or _rev_bot_raw < 0 or _rev_bot_raw > n):
+                    continue
+                _emit(_rev_top_raw, _rev_bot_raw)
     return sorted(out.values(), key=lambda c: (c["top"], c["enzyme"]))
 
 
@@ -7598,7 +7712,14 @@ def _gibson_normalize_fragments(
         if not isinstance(f, dict):
             return None, "Each fragment must be a dict."
         raw = str(f.get("sequence") or "")
-        cleaned = "".join(ch for ch in raw.upper() if not ch.isspace())
+        # Sweep #30 (2026-05-28): map RNA U->T to match the rest of the
+        # app's normalisation. A fragment pasted in RNA notation would
+        # otherwise fail overlap detection against a T-notation neighbour
+        # (and a downstream _rc would mangle the U, which has no entry in
+        # the complement table). Main sequence-load paths already do this.
+        cleaned = "".join(
+            ch for ch in raw.upper().replace("U", "T") if not ch.isspace()
+        )
         norm_fragments.append({
             "name":     str(f.get("name") or "?"),
             "sequence": cleaned,
@@ -9584,6 +9705,50 @@ _CODON_TABLE: dict[str, str] = {
     "GGT": "G", "GGC": "G", "GGA": "G", "GGG": "G",
 }
 
+# NCBI genetic-code tables other than the standard (table 1) are resolved
+# lazily from Biopython and cached. Table 1 returns the hand-rolled
+# `_CODON_TABLE` above (fast path + identical behaviour for the
+# overwhelmingly-common case).
+_CODON_TABLE_BY_ID: "dict[int, dict[str, str]]" = {1: _CODON_TABLE}
+
+
+def _codon_table_for(table_id: "int | None") -> "dict[str, str]":
+    """Return the codon→AA map for an NCBI genetic-code id (the GenBank
+    ``/transl_table`` qualifier).
+
+    Table 1 (or None / falsy) is the standard code. Other ids — 2
+    (vertebrate mito), 4 (Mycoplasma / Spiroplasma + mold/protozoan
+    mito), 5 (invertebrate mito), 11 (bacterial/plastid), … — are built
+    once from Biopython's ``CodonTable`` and cached. Reassigned codons
+    (e.g. ``TGA`` = Trp in tables 2/4/5, ``AGR`` = stop in table 2) then
+    translate CORRECTLY instead of rendering a wrong residue + a false
+    premature-stop ⚠ on the map. An unknown / invalid id falls back to
+    the standard code with a warning rather than crashing — a hand-edited
+    ``/transl_table=99`` must not break the map. Stops map to ``"*"`` to
+    match ``_CODON_TABLE`` exactly."""
+    try:
+        tid = int(table_id) if table_id else 1
+    except (TypeError, ValueError):
+        tid = 1
+    cached = _CODON_TABLE_BY_ID.get(tid)
+    if cached is not None:
+        return cached
+    try:
+        from Bio.Data import CodonTable as _BioCodonTable
+        ct = _BioCodonTable.unambiguous_dna_by_id[tid]
+        m = dict(ct.forward_table)          # sense codons (ACGT only)
+        for stop in ct.stop_codons:
+            m[stop] = "*"
+    except Exception:  # noqa: BLE001  (KeyError for bad id, ImportError, …)
+        _log.warning(
+            "Unknown genetic-code table %r; falling back to the standard "
+            "code (table 1).", table_id,
+        )
+        m = _CODON_TABLE
+    _CODON_TABLE_BY_ID[tid] = m
+    return m
+
+
 def _copy_to_clipboard_osc52(text: str) -> bool:
     """Copy text via OSC 52 escape sequence — works in iTerm2, Windows
     Terminal, most modern Linux terminals.
@@ -9753,9 +9918,18 @@ def _cds_aa_list(seq: str, f: dict) -> tuple[list[str], int, int]:
     # feature dict by the GenBank parser. Off-by-one would frame-shift
     # every AA past the leading partial codon.
     cs_offset = max(0, min(2, int(f.get("codon_start", 1)) - 1))
+    # /transl_table: honour a non-standard NCBI genetic code so a mito /
+    # Mycoplasma CDS translates correctly. The premature-stop ⚠ count is
+    # derived from this list (see PlasmidMap._parse), so a reassigned
+    # stop (e.g. TGA→Trp in table 4) no longer false-flags as broken.
+    try:
+        tid = int(f.get("transl_table", 1) or 1)
+    except (TypeError, ValueError):
+        tid = 1
+    table_map = _codon_table_for(tid)
     exon_key = tuple(exons) if exons else None
     # hash(seq) instead of id(seq) — see `_build_seq_inputs`.
-    key = (hash(seq), s, e, strand, exon_key, cs_offset)
+    key = (hash(seq), s, e, strand, exon_key, cs_offset, tid)
     cached = _CDS_AA_CACHE.get(key)
     if cached is not None:
         return cached
@@ -9783,7 +9957,7 @@ def _cds_aa_list(seq: str, f: dict) -> tuple[list[str], int, int]:
     cds_seq = cds_seq[cs_offset:]
     n_codons = (cds_len - cs_offset) // 3
     aa_letters = [
-        _CODON_TABLE.get(cds_seq[3*i:3*i+3], "?")
+        table_map.get(cds_seq[3*i:3*i+3], "?")
         for i in range(n_codons)
     ]
     if len(_CDS_AA_CACHE) >= 64:
@@ -9795,7 +9969,7 @@ def _cds_aa_list(seq: str, f: dict) -> tuple[list[str], int, int]:
 
 def _translate_cds(full_seq: str, start: int, end: int, strand: int,
                     exons: "list[tuple[int, int]] | None" = None,
-                    codon_start: int = 1) -> str:
+                    codon_start: int = 1, transl_table: int = 1) -> str:
     """Translate a CDS region to single-letter AA string (stop codon → *).
 
     Uses _IUPAC_COMP for the reverse-complement step so IUPAC ambiguity codes
@@ -9831,7 +10005,10 @@ def _translate_cds(full_seq: str, start: int, end: int, strand: int,
         sub = sub.translate(_IUPAC_COMP)[::-1]
     offset = max(0, min(2, int(codon_start) - 1))
     sub = sub[offset:]
-    aa = [_CODON_TABLE.get(sub[i:i+3], "?") for i in range(0, len(sub) - 2, 3)]
+    # `transl_table` (GenBank /transl_table) selects a non-standard NCBI
+    # genetic code; defaults to 1 (standard). See `_codon_table_for`.
+    table_map = _codon_table_for(transl_table)
+    aa = [table_map.get(sub[i:i+3], "?") for i in range(0, len(sub) - 2, 3)]
     result = "".join(aa)
     if result and not result.endswith("*"):
         result += "*"
@@ -16794,6 +16971,22 @@ class PlasmidMap(Widget):
                     cs_raw = 1
                 if cs_raw in (2, 3):
                     new_feat["codon_start"] = cs_raw
+                # /transl_table (sweep #30, 2026-05-28): stamp a
+                # non-standard NCBI genetic-code id so `_cds_aa_list`
+                # (seq-panel display + the premature-stop count below) and
+                # the protein-copy `_translate_cds` honour it. Only stored
+                # when present and != 1 — keep feature dicts lean, mirror
+                # the codon_start handling above. Must run BEFORE the
+                # premature-stop count so a reassigned stop isn't flagged.
+                try:
+                    tt_raw = int(
+                        (feat.qualifiers.get("transl_table", ["1"])
+                         or ["1"])[0]
+                    )
+                except (TypeError, ValueError, IndexError):
+                    tt_raw = 1
+                if tt_raw and tt_raw != 1:
+                    new_feat["transl_table"] = tt_raw
                 # Sweep #41 (2026-05-27): count stops in the
                 # translation. >1 stop = the CDS has at least one
                 # premature stop (the most common signature of a
@@ -18997,7 +19190,8 @@ def _search_collections_library(query: str, *,
     everything" affordance for agents).
 
     Used by the cross-collection search modal (`LibrarySearchModal`,
-    Edit → Find plasmid…) and the `search-library` agent endpoint.
+    File → Find plasmid (all collections)…) and the `search-library`
+    agent endpoint.
     Results are natural-sorted by ``(collection_name, plasmid_name)``
     so ``Backbones 2`` lands before ``Backbones 10`` and within a
     collection ``pBin2`` lands before ``pBin10``.
@@ -20245,9 +20439,16 @@ class LibraryPanel(Widget):
         # the new one at the top, same contract as before.
         has_id_match = any(e.get("id") == record.id for e in entries)
         if has_id_match:
-            entries = [e for e in entries if e.get("id") != record.id]
-            entries.insert(0, new_entry)
-            self._commit_library_entries(entries)
+            # Sweep #30 (2026-05-28): re-derive + commit under _cache_lock
+            # so a concurrent worker-thread library writer (e.g. agent
+            # gibson-assemble) can't be clobbered. The collision read
+            # above is advisory; only the COMMIT must be atomic. RLock
+            # re-enters through _commit_library_entries. [INV-74]
+            with _cache_lock:
+                entries = [e for e in _load_library()
+                           if e.get("id") != record.id]
+                entries.insert(0, new_entry)
+                self._commit_library_entries(entries)
             return True
         # No id match: check for name collisions against entries whose
         # id differs. ``_resolve_load_collisions`` handles the modal
@@ -20258,8 +20459,10 @@ class LibraryPanel(Widget):
             and e.get("id") != record.id
         ]
         if not same_name_entries:
-            entries.insert(0, new_entry)
-            self._commit_library_entries(entries)
+            with _cache_lock:  # Sweep #30: atomic commit — see above [INV-74]
+                entries = _load_library()
+                entries.insert(0, new_entry)
+                self._commit_library_entries(entries)
             return True
 
         def _content_fn(e: dict) -> str:
@@ -20287,25 +20490,30 @@ class LibraryPanel(Widget):
                     name=display_name, id=record.id,
                 )
                 return
-            current = _load_library()
-            if replace_names:
-                current = [
-                    e for e in current
-                    if (e.get("name") or "") not in replace_names
-                ]
-            # ``items_to_save`` may have a renamed entry (COPY suffix
-            # added during exact-copy resolution); mutate the original
-            # record's display name to match so re-saves stay coherent.
-            for it in items_to_save:
-                if it is new_entry:
-                    final_name = it.get("name") or display_name
-                    if final_name != display_name:
-                        try:
-                            record._tui_display_name = final_name  # type: ignore[attr-defined]
-                        except Exception:
-                            pass
-            current = list(items_to_save) + current
-            self._commit_library_entries(current)
+            # Sweep #30 (2026-05-28): the deferred collision-resolution
+            # save re-derives + commits under _cache_lock too, so it can't
+            # clobber a concurrent worker-thread library write that landed
+            # while the modal was open. [INV-74]
+            with _cache_lock:
+                current = _load_library()
+                if replace_names:
+                    current = [
+                        e for e in current
+                        if (e.get("name") or "") not in replace_names
+                    ]
+                # ``items_to_save`` may have a renamed entry (COPY suffix
+                # added during exact-copy resolution); mutate the original
+                # record's display name to match so re-saves stay coherent.
+                for it in items_to_save:
+                    if it is new_entry:
+                        final_name = it.get("name") or display_name
+                        if final_name != display_name:
+                            try:
+                                record._tui_display_name = final_name  # type: ignore[attr-defined]
+                            except Exception:
+                                pass
+                current = list(items_to_save) + current
+                self._commit_library_entries(current)
             _log_event(
                 "library.add.ok",
                 name=display_name, id=record.id,
@@ -20570,10 +20778,15 @@ class LibraryPanel(Widget):
         their disk writes raced. RLock allows nested
         ``_sync_active_collection_plasmids`` -> ``_save_collections``.
         """
+        # Sweep #30 (2026-05-28): persist the AUTHORITATIVE cache, not
+        # the dispatch-time payload — see `_authoritative_library_snapshot`
+        # for the cross-group out-of-order-write race this closes.
+        to_write = entries
         try:
             with _cache_lock:
+                to_write = _authoritative_library_snapshot(entries)
                 _safe_save_json(
-                    _LIBRARY_FILE, entries, "Plasmid library",
+                    _LIBRARY_FILE, to_write, "Plasmid library",
                 )
         except (OSError, RuntimeError) as exc:
             _log.exception("Plasmid add: library save failed")
@@ -20583,7 +20796,7 @@ class LibraryPanel(Widget):
             )
             return
         try:
-            _sync_active_collection_plasmids(entries, async_write=True)
+            _sync_active_collection_plasmids(to_write, async_write=True)
         except Exception:
             _log.exception(
                 "Plasmid add: active-collection mirror dispatch failed",
@@ -21082,10 +21295,14 @@ class LibraryPanel(Widget):
         Sweep #25 (2026-05-23): disk writes under ``_cache_lock``
         (see ``_add_save_to_disk`` rationale).
         """
+        # Sweep #30 (2026-05-28): persist the AUTHORITATIVE cache, not
+        # the dispatch-time payload (see `_authoritative_library_snapshot`).
+        to_write = entries
         try:
             with _cache_lock:
+                to_write = _authoritative_library_snapshot(entries)
                 _safe_save_json(
-                    _LIBRARY_FILE, entries, "Plasmid library",
+                    _LIBRARY_FILE, to_write, "Plasmid library",
                 )
         except (OSError, RuntimeError) as exc:
             _log.exception("Plasmid delete: library save failed")
@@ -21095,7 +21312,7 @@ class LibraryPanel(Widget):
             )
             return
         try:
-            _sync_active_collection_plasmids(entries, async_write=True)
+            _sync_active_collection_plasmids(to_write, async_write=True)
         except Exception:
             _log.exception(
                 "Plasmid delete: active-collection mirror dispatch failed",
@@ -24790,7 +25007,12 @@ def _load_whats_new_body(current_version: str) -> str:
             and _WHATS_NEW_CACHE[1] == mtime):
         return _WHATS_NEW_CACHE[2]
     try:
-        text = cl_path.read_text(encoding="utf-8", errors="replace")
+        # Sweep #30 (2026-05-28): utf-8-sig strips an optional leading
+        # BOM. A CHANGELOG.md saved with a BOM (common from Windows
+        # editors / a contributor PR) would otherwise leave the first
+        # "## [X.Y.Z]" heading as "﻿## …", failing the ^## regex and
+        # silently dropping the newest release from the What's New modal.
+        text = cl_path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         _log.warning("Could not read CHANGELOG: %s", cl_path)
         return (f"# What's New in SpliceCraft\n\n"
@@ -25415,7 +25637,7 @@ def _resolve_pypi_url() -> str:
     if not (lower.startswith("https://") or lower.startswith("http://")):
         _log.warning(
             "$SPLICECRAFT_PYPI_URL=%r ignored: must be http(s)://",
-            override,
+            _redact_url_credentials(override),
         )
         return _PYPI_JSON_URL
     # Sweep #26 (2026-05-23): refuse plain http:// unless the user
@@ -25430,7 +25652,7 @@ def _resolve_pypi_url() -> str:
         _log.warning(
             "$SPLICECRAFT_PYPI_URL=%r refused: http:// strips TLS. "
             "Set SPLICECRAFT_PYPI_INSECURE=1 to override.",
-            override,
+            _redact_url_credentials(override),
         )
         return _PYPI_JSON_URL
     # Bound length too — a 10 MB env var would be silly but
@@ -25475,10 +25697,15 @@ def _parse_pypi_version(v: str) -> "tuple[int, ...] | None":
     parts = s.split(".")
     out: list[int] = []
     for p in parts:
-        try:
-            out.append(int(p))
-        except ValueError:
+        # Sweep #30 (2026-05-28): int() is too permissive — it accepts
+        # "+5", "-5", "1_0" (PEP 515 underscores), and Unicode digits
+        # ("٥" -> 5). A crafted / garbled PyPI metadata value must
+        # not parse to a misleading version tuple, so require pure ASCII
+        # digits (str.isdigit() alone still passes superscripts/Unicode;
+        # the empty segment from "1..2" also fails this and returns None).
+        if not (p.isascii() and p.isdigit()):
             return None
+        out.append(int(p))
     return tuple(out)
 
 
@@ -27873,7 +28100,7 @@ def _update_take_snapshot(pin_version: "str | None"
             file=sys.stderr,
         )
         return None, 1
-    _log_event("update.snapshot.ok", path=str(snap_path))
+    _log_event("update.snapshot.ok", path=_scrub_path(str(snap_path)))
     print(f"  ✓ Snapshot saved: {snap_path}")
     return snap_path, None
 
@@ -31658,8 +31885,10 @@ class MenuBar(Widget):
     }
     """
 
+    # "Mutato" is the (whimsical) display label for the mutagenesis tool;
+    # the action/modal/worker names stay `mutagenize` internally.
     MENUS = ["File", "Settings", "BLAST", "Enzymes", "Features", "Primers",
-             "Mutagenize", "Synthesis", "Parts", "Constructor", "Simulator",
+             "Mutato", "Synthesis", "Parts", "Constructor", "Simulator",
              "Sequencing", "Experiments", "History"]
 
     def compose(self) -> ComposeResult:
@@ -48066,12 +48295,29 @@ def _fetch_hmm_db_remote_version(entry: dict) -> "tuple[str, str]":
             raw, _hdrs = out
             try:
                 if version_url.endswith(".gz"):
-                    text = gzip.decompress(raw).decode(
-                        "utf-8", errors="replace",
-                    )
+                    # Sweep #30 (2026-05-28): bound the DECOMPRESSED size.
+                    # `raw` is 64 KB-capped, but gzip can expand ~1000x, so
+                    # a crafted bomb would balloon to tens of MB in RAM on
+                    # every (24h-gated) modal mount. The real version file
+                    # is ~150 bytes; stream-decompress with the same cap and
+                    # bail on overflow rather than one-shot gzip.decompress
+                    # (which would inflate the whole bomb). [INV-84]
+                    import io as _io
+                    with gzip.GzipFile(fileobj=_io.BytesIO(raw)) as _gz:
+                        _dec = _gz.read(_HMM_DB_VERSION_MAX_BYTES + 1)
+                    if len(_dec) > _HMM_DB_VERSION_MAX_BYTES:
+                        _log.warning(
+                            "HMM DB version file at %s decompresses past the "
+                            "%d-byte cap; ignoring (possible gzip bomb).",
+                            _redacted(version_url),
+                            _HMM_DB_VERSION_MAX_BYTES,
+                        )
+                        text = ""
+                    else:
+                        text = _dec.decode("utf-8", errors="replace")
                 else:
                     text = raw.decode("utf-8", errors="replace")
-            except (OSError, ValueError):
+            except (OSError, ValueError, EOFError):
                 text = raw.decode("utf-8", errors="replace")
             parsed = _parse_pfam_version_text(text)
             if parsed:
@@ -49483,8 +49729,16 @@ def _online_http(url: str, *, data: "bytes | None" = None,
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, data=data, headers=hdrs)
+    # Sweep #30 (2026-05-28): route through the hardened opener so the
+    # online BLAST/HMMER path gets the same network discipline as the
+    # HMM-DB downloader + PyPI check — explicit verifying SSL context,
+    # bounded redirects, and refusal of an https->http downgrade on
+    # redirect. Pre-fix this used the default global opener, which would
+    # follow a MITM/compromised-CDN redirect to plaintext and read the
+    # RID/XML over a tamperable channel (feeding the result table). [INV-85]
+    opener = _build_hardened_url_opener()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             raw = resp.read(max_bytes + 1)
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"HTTP {exc.code} from {url}") from exc
@@ -49739,9 +49993,14 @@ def _hmmer_web_parse_json(obj: "_Any", max_hits: int) -> "list[dict]":
                 h.get("score") if h.get("score") is not None
                 else h.get("bitscore")),
             "n_dom": ndom,
-            "clan": str(md.get("clan") or ""),
-            "type": str(md.get("type") or ""),
-            "link": str(md.get("external_link") or ""),
+            # Sweep #30 (2026-05-28): strip control bytes here too — these
+            # three EBI-supplied fields also reach the markup=True detail
+            # pane (clan/type/link) and were the gap the acc/name/desc
+            # strips above left open. [INV-85]
+            "clan": _CONTROL_CHARS_RE.sub("", str(md.get("clan") or "")),
+            "type": _CONTROL_CHARS_RE.sub("", str(md.get("type") or "")),
+            "link": _CONTROL_CHARS_RE.sub(
+                "", str(md.get("external_link") or "")),
             "included": bool(h.get("is_included", True)),
         })
         if len(out) >= max_hits:
@@ -51211,9 +51470,16 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
             pid = h.get("identity_pct")
             aln = h.get("aln_len")
             bs = h.get("bit_score")
+            # Sweep #30 (2026-05-28): wrap the remote-controlled text
+            # cells in `Text(...)` so DataTable renders them LITERALLY.
+            # Control bytes are stripped at parse, but a bare string cell
+            # is still interpreted as Rich markup (`[red]`, `[link=...]`),
+            # so a hostile/MITM Hit_def could spoof styling or smuggle an
+            # OSC-8 link. Mirrors the Text(...) pattern the app's other
+            # untrusted tables use. [INV-85]
             t.add_row(
-                self._online_trunc(h.get("accession", "?"), 24),
-                self._online_trunc(h.get("description", ""), 56),
+                Text(self._online_trunc(h.get("accession", "?"), 24)),
+                Text(self._online_trunc(h.get("description", ""), 56)),
                 "—" if pid is None else f"{pid}",
                 "—" if aln is None else f"{aln}",
                 self._online_fmt_eval(h.get("evalue")),
@@ -51233,10 +51499,12 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
         for i, h in enumerate(hits):
             key = str(i)
             bs = h.get("bit_score")
+            # Sweep #30: literal-render remote text cells — see
+            # _online_render_blast. [INV-85]
             t.add_row(
-                self._online_trunc(h.get("acc", "?"), 14),
-                self._online_trunc(h.get("name", ""), 20),
-                self._online_trunc(h.get("description", ""), 50),
+                Text(self._online_trunc(h.get("acc", "?"), 14)),
+                Text(self._online_trunc(h.get("name", ""), 20)),
+                Text(self._online_trunc(h.get("description", ""), 50)),
                 self._online_fmt_eval(h.get("evalue")),
                 "—" if bs is None else f"{bs:.0f}",
                 f"{h.get('n_dom', 0)}",
@@ -58935,7 +59203,11 @@ def _normalise_gel_entry(entry: dict, *, fresh: bool = False) -> dict:
                    or "Untitled gel")
     raw_notes = out.get("notes")
     notes = raw_notes if isinstance(raw_notes, str) else ""
-    out["notes"] = notes[:_GEL_NOTES_MAX_LEN]
+    # Sweep #30 (2026-05-28): strip control bytes (preserving \t/\n for
+    # multi-line notes) — gel name + lane fields already go through
+    # _sanitize_label; notes was a raw slice, so an agent could persist a
+    # terminal-escape that renders when the gel is opened. [INV-85]
+    out["notes"] = _sanitize_note(notes, max_len=_GEL_NOTES_MAX_LEN)
     try:
         agar = float(out.get("agarose_pct", 1.0))
     except (TypeError, ValueError):
@@ -59127,6 +59399,12 @@ def _normalise_experiment_entry(entry: dict, *, fresh: bool = False
     body = out.get("body_md")
     if not isinstance(body, str):
         body = ""
+    # Sweep #30 (2026-05-28): strip terminal-control bytes (preserving
+    # \t / \n so multi-paragraph Markdown survives) — body_md renders in
+    # the Compose TextArea + Markdown view; pre-fix an agent create/update
+    # could persist an ESC/OSC escape that fired when the note opened.
+    # [INV-85]
+    body = _NOTE_CTRL_RE.sub("", body)
     # Sweep #9 (2026-05-19): re-apply legacy `@plasmid:` / `@actions:`
     # tag migration on every save, not only on load. Without this,
     # a body that arrived into in-memory state via paste / import
@@ -59156,10 +59434,13 @@ def _normalise_experiment_entry(entry: dict, *, fresh: bool = False
         for t in raw_tags:
             if not isinstance(t, str):
                 continue
-            t = t.strip()
+            # Sweep #30 (2026-05-28): strip control bytes + cap via
+            # _sanitize_label — tags render in the #exp-tags-input Input;
+            # the prior strip()+slice let an agent smuggle an escape. [INV-85]
+            t = _sanitize_label(t, max_len=_EXPERIMENT_TAG_MAX_LEN)
             if not t:
                 continue
-            tags.append(t[:_EXPERIMENT_TAG_MAX_LEN])
+            tags.append(t)
             if len(tags) >= _EXPERIMENT_TAGS_MAX:
                 break
     out["tags"] = tags
@@ -92321,17 +92602,26 @@ def _h_delete_from_library(app, payload):
         guard = _agent_dirty_guard(app, payload)
         if guard is not None:
             return guard
-        entries = _load_library()
-        # Capture the deleted entry's id BEFORE filtering so we can
-        # compare against the currently-loaded record below.
-        deleted_ids = {e.get("id") for e in entries
-                       if e.get("name") == name and e.get("id")}
-        kept = [e for e in entries if e.get("name") != name]
-        if len(kept) == len(entries):
-            return ({"error": f"no entry named {name!r}"}, 404)
-        if (err := _agent_save_or_500(
-                lambda: _save_library(kept), "library")) is not None:
-            return err
+        # Sweep #30 (2026-05-28): hold _cache_lock across the full
+        # load -> filter -> save RMW. UI-thread serialisation does NOT
+        # exclude worker-thread handlers that hold _cache_lock (e.g.
+        # gibson-assemble), so a lockless _load_library() here could read
+        # a snapshot a concurrent worker then grows; our _save_library
+        # would then write the stale-derived list back, dropping the
+        # worker's entry (or resurrecting this delete). RLock re-enters
+        # through _save_library. [INV-74]
+        with _cache_lock:
+            entries = _load_library()
+            # Capture the deleted entry's id BEFORE filtering so we can
+            # compare against the currently-loaded record below.
+            deleted_ids = {e.get("id") for e in entries
+                           if e.get("name") == name and e.get("id")}
+            kept = [e for e in entries if e.get("name") != name]
+            if len(kept) == len(entries):
+                return ({"error": f"no entry named {name!r}"}, 404)
+            if (err := _agent_save_or_500(
+                    lambda: _save_library(kept), "library")) is not None:
+                return err
         # If the deleted entry is the loaded record, clear the canvas
         # + drop the panel's active pointer so subsequent saves can't
         # re-resurrect it from the stale in-memory state.
@@ -93508,17 +93798,22 @@ def _h_set_plasmid_status(app, payload):
         guard = _agent_dirty_guard(app, payload)
         if guard is not None:
             return guard
-        entries = _load_library()
-        for e in entries:
-            if e.get("name") == key or e.get("id") == key:
-                e["status"] = new_status
-                if (err := _agent_save_or_500(
-                        lambda: _save_library(entries),
-                        "library")) is not None:
-                    return err
-                _agent_refresh_library_panel(app)
-                return new_status
-        return None
+        # Sweep #30 (2026-05-28): full load -> mutate -> save RMW under
+        # _cache_lock so a concurrent worker-thread library writer can't
+        # interleave (see _h_delete_from_library). RLock re-enters through
+        # _save_library. [INV-74]
+        with _cache_lock:
+            entries = _load_library()
+            for e in entries:
+                if e.get("name") == key or e.get("id") == key:
+                    e["status"] = new_status
+                    if (err := _agent_save_or_500(
+                            lambda: _save_library(entries),
+                            "library")) is not None:
+                        return err
+                    _agent_refresh_library_panel(app)
+                    return new_status
+            return None
 
     result = app.call_from_thread(_apply)
     if isinstance(result, tuple):
@@ -99590,6 +99885,47 @@ SpeciesPickerModal { align: center middle; }
             return False
         return True
 
+    @on(Worker.StateChanged)
+    def _on_worker_state_changed(
+            self, event: Worker.StateChanged) -> None:
+        """Sweep #30 (2026-05-28): app-wide safety net for worker
+        exceptions that ESCAPE a worker body. SpliceCraft runs ~60
+        `@work(thread=True)` workers; each is supposed to catch its own
+        errors, but Textual does NOT surface a thread-worker exception to
+        the user by default (it logs only to its internal devtools
+        logger), and `threading.excepthook` ([INV-37]) does NOT cover them
+        (the pool thread survives). Pre-fix a single missed try/except
+        left the user with a frozen/blank UI and zero feedback. This turns
+        any unhandled worker ERROR into a logged + toasted failure that's
+        visible in the diagnostic bundle. Workers that handle their own
+        errors complete SUCCESS and never reach here, so this is low-noise
+        — it fires only for genuinely-unhandled escapes."""
+        if event.state is not WorkerState.ERROR:
+            return
+        worker = event.worker
+        try:
+            _log.error(
+                "worker %r failed (group=%s): %r",
+                worker.name, worker.group, worker.error,
+                exc_info=worker.error,
+            )
+            _log_event(
+                "worker.error",
+                name=str(worker.name or ""),
+                group=str(worker.group or ""),
+                error=_scrub_path(str(worker.error or "")),
+            )
+        except Exception:
+            _log.debug("worker-error net: logging failed", exc_info=True)
+        try:
+            self.notify(
+                "A background task failed — see the log "
+                "(F9 saves a diagnostic bundle).",
+                severity="error", timeout=8,
+            )
+        except Exception:
+            pass
+
     def compose(self) -> ComposeResult:
         # Migration must run BEFORE children compose+mount — Textual fires
         # mount events leaves→root, so anything in App.on_mount runs AFTER
@@ -101293,8 +101629,13 @@ SpeciesPickerModal { align: center middle; }
             # letters rendered above the DNA.
             exons = aa_feat.get("_exons")
             cs    = int(aa_feat.get("codon_start", 1))
+            try:
+                tt = int(aa_feat.get("transl_table", 1) or 1)
+            except (TypeError, ValueError):
+                tt = 1
             aa_str = _translate_cds(
                 seq, f_s, f_e, strand, exons=exons, codon_start=cs,
+                transl_table=tt,
             ).rstrip("*")
             # Route through the 4-tier helper so a clipboard-broken
             # SSH session still gets the AA string via the disk-fallback
@@ -102100,7 +102441,8 @@ SpeciesPickerModal { align: center middle; }
 
         self._mark_clean()
         self._last_save_error = ""
-        _log_event("save.ok", source_path=self._source_path)
+        _log_event("save.ok",
+                   source_path=_scrub_path(str(self._source_path or "")))
         if self._source_path:
             self._notify_success(f"Saved → {self._source_path}")
         else:
@@ -102226,7 +102568,7 @@ SpeciesPickerModal { align: center middle; }
             except NoMatches:
                 pass
             self._mark_clean()
-            _log_event("save.ok", source_path=source_path)
+            _log_event("save.ok", source_path=_scrub_path(source_path or ""))
             if source_path:
                 self._notify_success(f"Saved → {source_path}")
             else:
@@ -107392,10 +107734,14 @@ SpeciesPickerModal { align: center middle; }
         Sweep #25 (2026-05-23): disk write under ``_cache_lock``
         (see ``_add_save_to_disk`` rationale).
         """
+        # Sweep #30 (2026-05-28): persist the AUTHORITATIVE cache, not
+        # the dispatch-time payload (see `_authoritative_library_snapshot`).
+        to_write = entries
         try:
             with _cache_lock:
+                to_write = _authoritative_library_snapshot(entries)
                 _safe_save_json(
-                    _LIBRARY_FILE, entries, "Plasmid library",
+                    _LIBRARY_FILE, to_write, "Plasmid library",
                 )
         except (OSError, RuntimeError) as exc:
             _log.exception("rename: disk save failed")
@@ -107415,7 +107761,7 @@ SpeciesPickerModal { align: center middle; }
         # also gets the async coalescing treatment so a burst of
         # renames doesn't queue up 5 sequential 150 MB writes.
         try:
-            _sync_active_collection_plasmids(entries, async_write=True)
+            _sync_active_collection_plasmids(to_write, async_write=True)
         except Exception:
             _log.exception(
                 "rename: active-collection mirror dispatch failed",
@@ -107507,7 +107853,7 @@ SpeciesPickerModal { align: center middle; }
             # for Ctrl+P with a seq-panel selection).
             self._open_primer_design_impl(show_picker=False)
             return
-        if name == "Mutagenize":
+        if name == "Mutato":
             self.action_open_mutagenize()
             return
         if name == "Synthesis":
@@ -107545,6 +107891,7 @@ SpeciesPickerModal { align: center middle; }
                 ("Find plasmid (all collections)…", "find_plasmid"),
                 ("Diff with another plasmid…",   "diff_plasmid"),
                 ("Find ORFs in this sequence…",  "find_orfs"),
+                ("Transfer annotations from…",   "transfer_annotations"),
                 ("Save  [^S]",                   "save"),
                 ("Export as GenBank (.gb)...",   "export_genbank"),
                 ("Export as FASTA (.fa)...",     "export_fasta"),
@@ -109729,6 +110076,15 @@ def main():
             # to fetch a file-looking string from NCBI.
             print(f"File not found: {arg}", file=sys.stderr)
             sys.exit(1)
+        elif arg.startswith("-"):
+            # Sweep #30 (2026-05-28): a leading-dash token that survived
+            # arg parsing is a mistyped / unknown flag, not an NCBI
+            # accession (accessions never start with "-"). Pre-fix it was
+            # handed to fetch_genbank and surfaced a confusing "Fetch
+            # failed" from NCBI; give a clear usage error instead.
+            print(f"Unknown option: {arg}\n"
+                  f"Run 'splicecraft --help' for usage.", file=sys.stderr)
+            sys.exit(2)
         else:
             print(f"Fetching {arg!r} from NCBI…", flush=True)
             try:

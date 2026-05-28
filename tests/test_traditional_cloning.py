@@ -116,13 +116,47 @@ class TestEnzymeCuts:
         assert len(cuts) == 1
 
     def test_non_palindromic_finds_reverse_strand_match(self):
-        # NdeI: CA^TATG — palindrome (RC is also CATATG)
-        # Use a non-palindromic enzyme: BsaI (GGTCTC, type IIS, fwd=7, rev=11)
-        # On the reverse strand this RC's to GAGACC.
-        seq = "AAAGAGACCAAAAAA"  # GAGACC on top = BsaI binding on reverse
+        # BsaI (GGTCTC, type IIS, fwd=7, rev=11) is non-palindromic; its RC
+        # is GAGACC, so GAGACC on the top strand = BsaI bound on the reverse
+        # strand. With the site placed far enough from the 5' end that the
+        # downstream-of-recognition cut still lands INSIDE the molecule, the
+        # scanner must report that real cut at its forward-strand coords.
+        #   top cut = p + site_len - rev_cut = 8 + 6 - 11 = 3
+        #   bot cut = p + site_len - fwd_cut = 8 + 6 -  7 = 7
+        seq = "A" * 8 + "GAGACC" + "A" * 8   # n=22, GAGACC at p=8
         cuts = sc._enzyme_cuts(seq, ["BsaI"], circular=False)
         assert len(cuts) == 1
-        assert cuts[0]["enzyme"] == "BsaI"
+        c = cuts[0]
+        assert c["enzyme"] == "BsaI"
+        assert c["top"] == 3
+        assert c["bot"] == 7
+        assert c["kind"] == "5'"
+        assert c["overhang_seq"] == "AAAA"
+
+    def test_reverse_strand_cut_off_5prime_end_dropped_on_linear(self):
+        """A reverse-strand Type IIS enzyme whose cut would fall PAST the
+        5' end produces no real cut on a LINEAR molecule — the enzyme binds
+        but its scissile bond is off the end. Pre-fix the cut wrapped via
+        `% n` into a phantom boundary near the 3' end (here top=-2 → 13)."""
+        # GAGACC at p=3: top cut = 3 + 6 - 11 = -2 (off the 5' end).
+        seq = "AAAGAGACCAAAAAA"   # n=15
+        cuts = sc._enzyme_cuts(seq, ["BsaI"], circular=False)
+        assert cuts == [], (
+            f"expected no in-bounds cut on the linear molecule, got {cuts}"
+        )
+
+    def test_reverse_strand_cut_off_origin_wraps_on_circular(self):
+        """The SAME off-the-end site IS a real cut on a CIRCULAR molecule:
+        the scissile bond wraps around the origin. The guard that drops the
+        linear phantom must NOT touch the circular wrap."""
+        seq = "AAAGAGACCAAAAAA"   # n=15, GAGACC at p=3
+        cuts = sc._enzyme_cuts(seq, ["BsaI"], circular=True)
+        assert len(cuts) == 1
+        c = cuts[0]
+        assert c["enzyme"] == "BsaI"
+        # top = (3 + 6 - 11) % 15 = 13 ; bot = (3 + 6 - 7) % 15 = 2
+        assert c["top"] == 13
+        assert c["bot"] == 2
 
 
 # ──────────────────────────────────────────────────────────────────────────────

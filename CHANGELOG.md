@@ -16,7 +16,24 @@
 
 ## [Unreleased]
 
-### Final pre-1.0 hardening sweep + completeness
+_Nothing yet — `1.0.0` is the current head._
+
+---
+
+## [1.0.0] — 2026-05-28
+
+### SpliceCraft 1.0 — the beta grows up
+
+After a long `0.x` beta of weekly-to-daily releases driven by real bench
+use, **1.0 is the stability commitment**: semantic versioning, a
+two-version support window, and frozen on-disk / agent-API / CLI
+contracts (see [`V1_GATE.md`](V1_GATE.md)) — drop a `0.x` data directory
+into a `1.x` install and it upgrades in place without losing an entry.
+
+It also lands the deepest hardening pass the project has had: the data
+layer, the molecular-biology engine, and the network/security surface
+were each swept end to end (10 independent review passes), every finding
+verified against the real code before it was touched. The full list:
 
 #### New features
 
@@ -25,6 +42,8 @@
 - **Group features from the editor.** The Edit Feature dialog gains **Group with…** (merge this feature into a shared group with others on the canvas) and **Ungroup** (drop the group from just this feature, or the whole group).
 - **Find ORFs from the menu.** The ORF finder is now reachable via **File → Find ORFs in this sequence…** (previously only via the agent API).
 - **More automation reach (agent API).** New endpoints to list and switch parts bins, and to list / inspect / switch / delete HMM databases.
+- **"Transfer annotations from…" is back in the File menu.** Copy features from one plasmid onto another straight from the menu — the entry had gone missing.
+- **A dash of whimsy: the "Mutagenize" menu is now "Mutato".** Same SOE-PCR site-directed mutagenesis designer, friendlier name.
 
 #### Bug fixes
 
@@ -33,8 +52,12 @@
 - **A read can no longer show ✓ verified on a bad alignment.** A corrupted / over-100 % coverage value could let a divergent read read as verified; coverage is now clamped consistently.
 - **Traditional-cloning products keep features that cross the origin.** A feature spanning the ligation join on a circular product is no longer dropped on save.
 - **A corrupt custom-enzyme entry can't stop the app from starting.** A bad recognition site in `custom_enzymes.json` is skipped with a warning instead of crashing launch.
+- **CDS features with a non-standard genetic code now translate correctly.** A CDS carrying a GenBank `/transl_table` (e.g. vertebrate mitochondrial, Mycoplasma / Spiroplasma, invertebrate mito) is translated with that NCBI code instead of the standard one — so the protein readout and the copied AA string are right, and a reassigned stop (e.g. `TGA`→Trp) no longer shows a false premature-stop ⚠ on the map.
 - **Restriction maps on linear molecules no longer show phantom cut marks** for far-reaching enzymes (e.g. BaeI / BsaXI) matching near the 5′ end.
 - **`--no-splash` users now see "What's New"** after an upgrade (and aren't re-prompted for it on the next normal launch).
+- **"What's New" no longer drops the newest release** when `CHANGELOG.md` was saved with a byte-order mark (a common Windows-editor artifact).
+- **A mistyped command-line flag now shows a clear error** (e.g. `splicecraft --bogus`) instead of being sent to NCBI as a search term.
+- **SpliceCraft no longer crashes on launch when its data directory can't be created** (a misconfigured `$SPLICECRAFT_DATA_DIR` pointing at a file, or an unset `$HOME`); it falls back to a temporary directory for the session and tells you on stderr.
 
 #### Hardening
 
@@ -44,10 +67,24 @@
 - **Concurrency-safe data writes.** Closed two remaining read-modify-write gaps (agent project-delete, agent folder-import) so simultaneous operations can't drop an entry, and extended the data-safety delete guard to two more cleanup paths.
 - **Several dialogs open instantly on large libraries** (BLAST, alignment picker, move/copy, mutagenize, add-feature) — they no longer deep-copy the whole library / collections just to fill a list, and the bulk move/copy commit now runs off the UI thread.
 - A settings-save failure now notifies you instead of silently leaving the on-disk copy stale.
+- **Background-task failures are now surfaced.** If any background job (save, alignment, import, network) hits an unexpected error that its own handler didn't catch, you get a toast and a log entry instead of a silently frozen panel.
+- **Stronger data-integrity guarantees when saving:**
+  - A storage-flush (`fsync`) failure during a save is now reported instead of silently returning "saved" over a write a power-loss could lose.
+  - If the previous library / collections file can't be read to back it up, the save is **refused** rather than overwriting un-backed-up data.
+  - Rapid add / delete / rename of plasmids can no longer let a slower background write land stale state on disk (e.g. resurrecting a just-deleted entry) — the on-disk copy always reflects the latest state.
+  - The automation API's `delete-from-library`, `set-plasmid-status`, and `add-current-to-library` calls are now fully serialized with the rest of the app, so a concurrent assembly / save can't drop an entry.
+- **The diagnostic bundle no longer embeds your home-directory paths** in its machine-readable event summary (they were already redacted from the human-readable log copies).
+- **Online BLAST / HMM results are fully sanitized.** The remaining Pfam clan / type / link fields — and the result-table cells from NCBI / EBI — can no longer smuggle terminal escapes or display markup into the UI.
+- **Online BLAST / HMM searches refuse an HTTPS→HTTP downgrade** on redirect, matching the update-check and database-download paths.
+- **The HMM-database version check is hardened against a "gzip bomb"** — a malicious version file can't balloon memory on the (24 h-gated) check.
+- **Agent-supplied experiment notes / tags and gel notes are stripped of control bytes** before they're stored and rendered.
+- **A corrupt custom-enzyme entry can no longer crash a cloning digest** — it's skipped with a warning (matching launch behavior).
+- **Gibson assembly accepts fragments written in RNA notation** (`U` is treated as `T`, matching the rest of the app).
+- **The update check ignores garbled version metadata** (non-ASCII-digit version strings) and redacts any credentials in a custom `$SPLICECRAFT_PYPI_URL` mirror from the logs.
 
 #### Tests
 
-- New coverage for the codon-TSV parser, the protein-motif editor, the new agent endpoints, and the mutagenesis / alignment / cloning / biology fixes. Full suite green.
+- New coverage for the codon-TSV parser, the protein-motif editor, the new agent endpoints, and the mutagenesis / alignment / cloning / biology fixes. Plus regression tests for the save `fsync`-failure / unreadable-prior-file refusal and the authoritative-cache write. Full suite green.
 
 ---
 

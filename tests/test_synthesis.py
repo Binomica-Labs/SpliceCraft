@@ -179,7 +179,7 @@ class TestMenubarWiring:
         # Per the workflow the user picked at design time:
         # Mutagenize → Synthesize new → Parts → Constructor.
         menus = sc.MenuBar.MENUS
-        i_mut = menus.index("Mutagenize")
+        i_mut = menus.index("Mutato")  # whimsical label for the mutagenesis tool
         i_syn = menus.index("Synthesis")
         i_parts = menus.index("Parts")
         assert i_mut < i_syn < i_parts

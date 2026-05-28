@@ -1194,3 +1194,75 @@ class TestTypedClone:
         reread = sc._load_library()
         assert reread[0]["name"] == "foo"
         assert reread[0]["tags"] == ["a"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sweep #30 (2026-05-28) — final pre-1.0 data-integrity hardening
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSweep30SafeSaveJson:
+    def test_primary_write_fsync_failure_raises_and_leaves_no_file(
+            self, tmp_path, monkeypatch):
+        """A failed `os.fsync` on the PRIMARY write must PROPAGATE — the
+        data never reached stable storage. Pre-fix the inline Step-3
+        fsync was wrapped in `except OSError: pass`, so `os.replace`
+        proceeded and the function returned success over a write a
+        power-loss would lose. A first write (no prior file → no backup
+        fsync) isolates the primary-write fsync as the only one called."""
+        import os as _os
+        p = tmp_path / "lib.json"
+
+        def boom(_fd):
+            raise OSError("simulated EIO on fsync")
+        monkeypatch.setattr(_os, "fsync", boom)
+
+        with pytest.raises(OSError):
+            sc._safe_save_json(p, [{"id": "A"}], "test")
+        # os.replace never ran → no target file; the handler unlinked the
+        # temp file so nothing is left behind.
+        assert not p.exists()
+        leftover = list(tmp_path.glob(".lib.json.*.tmp"))
+        assert leftover == [], f"temp file not cleaned up: {leftover}"
+
+    def test_unreadable_existing_file_refuses_overwrite(
+            self, tmp_path, monkeypatch):
+        """If an existing, non-empty file cannot be read to back it up,
+        the save must REFUSE: overwriting would destroy un-backed-up data
+        AND the shrink guard can't fire (existing_count stays 0). Pre-fix
+        the read error was swallowed with a warning and the overwrite
+        proceeded."""
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [{"id": "keep1"}, {"id": "keep2"}], "test")
+        original = p.read_bytes()
+
+        real_read = type(p).read_bytes
+
+        def unreadable(self, *a, **k):
+            if self == p:  # only fault the target's prior-content read
+                raise OSError("simulated EIO on read")
+            return real_read(self, *a, **k)
+        monkeypatch.setattr(type(p), "read_bytes", unreadable)
+
+        with pytest.raises(OSError):
+            sc._safe_save_json(p, [], "test")  # a would-be nuke-to-empty
+        monkeypatch.undo()
+        # The original file survived intact — the refusal preserved it.
+        assert p.read_bytes() == original
+        assert json.loads(p.read_text())["entries"] == [
+            {"id": "keep1"}, {"id": "keep2"}]
+
+
+class TestAuthoritativeLibrarySnapshot:
+    """Sweep #30: the disk-writer workers persist the live cache (always
+    >= any in-flight dispatch-time payload) so cross-group out-of-order
+    writes can't resurrect a just-deleted/renamed entry on disk."""
+
+    def test_returns_cache_when_populated(self, monkeypatch):
+        cache = [{"id": "live"}]
+        monkeypatch.setattr(sc, "_library_cache", cache)
+        assert sc._authoritative_library_snapshot([{"id": "stale"}]) is cache
+
+    def test_falls_back_when_cache_unset(self, monkeypatch):
+        monkeypatch.setattr(sc, "_library_cache", None)
+        fb = [{"id": "fallback"}]
+        assert sc._authoritative_library_snapshot(fb) is fb
