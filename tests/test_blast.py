@@ -999,6 +999,11 @@ class TestBlastModalHmmscanIntegration:
             await pilot.pause()
             modal = app.screen
             modal.query_one("#blast-program", sc.Select).value = "hmmscan"
+            # Let the program-change reset settle BEFORE typing the query —
+            # switching alphabet (blastn→hmmscan) clears the query box, so
+            # the query must be entered after that fires (the natural
+            # pick-program-then-type order).
+            await pilot.pause()
             modal.query_one("#blast-query", sc.TextArea).text = (
                 "MAKVTPGGRSEKAAAAAAAAA"
             )
@@ -1024,6 +1029,7 @@ class TestBlastModalHmmscanIntegration:
             await pilot.pause()
             modal = app.screen
             modal.query_one("#blast-program", sc.Select).value = "hmmscan"
+            await pilot.pause()  # let the program-change reset settle
             modal.query_one("#blast-query", sc.TextArea).text = "MAKVT"
             # Leave the hmm-path Input empty.
             await pilot.pause()
@@ -1049,6 +1055,7 @@ class TestBlastModalHmmscanIntegration:
             await pilot.pause()
             modal = app.screen
             modal.query_one("#blast-program", sc.Select).value = "hmmscan"
+            await pilot.pause()  # let the program-change reset settle
             modal.query_one("#blast-query", sc.TextArea).text = (
                 "MAKVTPGGRSEKAAAAAAAAA"
             )

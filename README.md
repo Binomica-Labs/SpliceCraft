@@ -173,11 +173,21 @@ installs and the user-data directory location.
   main sequence panel's feature lanes — strand arrowheads,
   centred labels, multi-lane stacking on overlap). Round-trips
   through save as CDS sub-features.
-- **Search** your library with in-process BLASTN / BLASTP / HMMscan
-  (via `pyhmmer` — no external `blast+` install). The HMMscan tab
-  ships a one-click downloader for Pfam-A and NCBIfam (or any
-  custom HMMER3 `.hmm.gz` URL) with auto update-detection — no
-  manual `wget` + `hmmpress` ritual.
+- **Search** (`Ctrl+B`) on two tabs:
+  - **Local** — your own library with the in-process BLASTN /
+    BLASTP / HMMscan engine (via `pyhmmer` — no external `blast+`
+    install). The HMMscan side ships a one-click downloader for
+    Pfam-A and NCBIfam (or any custom HMMER3 `.hmm.gz` URL) with
+    auto update-detection — no manual `wget` + `hmmpress` ritual.
+  - **Online** — paste DNA / RNA / protein (or load a whole plasmid
+    or a single feature from your library) and run it against NCBI
+    with any program (blastn / blastp / blastx / tblastn / tblastx),
+    or run `hmmscan` against Pfam at EMBL-EBI — results land in a
+    scrollable hit table, just like a GenBank web BLAST. A live
+    keep-alive spinner + poll counter shows the search is really
+    running (not frozen), and Cancel stops it. Oversize queries are
+    refused client-side at NCBI's limits (1,000,000 nt / 100,000 aa)
+    so the server never rejects the job.
 - **Drive from outside** via a 100+ endpoint localhost JSON API
   (`splicecraft --agent`) and a stdlib-only CLI sidecar
   (`splicecraft-cli`). Custom enzymes + enzyme collections expose

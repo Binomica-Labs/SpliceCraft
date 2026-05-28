@@ -3543,9 +3543,18 @@ def _collect_ui_snapshot(app=None) -> dict:
         except Exception:  # noqa: BLE001 — broken-app survival
             pass
         try:
-            xy = getattr(app, "_last_mouse_xy", None)
-            if xy is not None and len(xy) == 2:
-                snap["mouse_position"] = {"x": int(xy[0]), "y": int(xy[1])}
+            # Textual's App tracks the live cursor in `mouse_position`
+            # (an Offset, updated on every MouseMove — even over modals).
+            # Prefer it; fall back to the seq-panel's `_last_mouse_xy`
+            # for stubs / pre-move state. Screen-relative col,row.
+            mp = getattr(app, "mouse_position", None)
+            if mp is not None and hasattr(mp, "x") and hasattr(mp, "y"):
+                snap["mouse_position"] = {"x": int(mp.x), "y": int(mp.y)}
+            else:
+                xy = getattr(app, "_last_mouse_xy", None)
+                if xy is not None and len(xy) == 2:
+                    snap["mouse_position"] = {"x": int(xy[0]),
+                                              "y": int(xy[1])}
         except Exception:  # noqa: BLE001 — broken-app survival
             pass
         try:
@@ -3587,53 +3596,65 @@ def _collect_ui_snapshot(app=None) -> dict:
             snap["active_grammar"] = getattr(app, "_active_grammar", None)
         except Exception:  # noqa: BLE001 — broken-app survival
             pass
-        # Widget tree of the TOP screen — class + id + region (x,y,w,h)
-        # so a reader can reconstruct the visual layout without a
-        # screenshot. Capped at 200 widgets to keep the snapshot
-        # bounded; deeply-nested layouts are rare.
+        # Widget tree of EVERY screen on the stack (base screen +
+        # whatever modals are open on top) — class + id + region
+        # (x,y,w,h) so a reader can reconstruct the visual layout of all
+        # open elements without a screenshot. Capped at 200 widgets TOTAL
+        # across screens to keep the snapshot bounded.
         try:
-            top_screen = None
-            try:
-                top_screen = app.screen
-            except Exception:  # noqa: BLE001
-                stack = list(getattr(app, "screen_stack", []) or [])
-                top_screen = stack[-1] if stack else None
-            if top_screen is not None:
-                widget_tree: list[dict] = []
-                seen = 0
+            stack = list(getattr(app, "screen_stack", []) or [])
+            if not stack:
+                try:
+                    cur = app.screen
+                except Exception:  # noqa: BLE001
+                    cur = None
+                if cur is not None:
+                    stack = [cur]
+            seen = 0
 
-                def _walk(node, depth: int) -> None:
-                    nonlocal seen
-                    if seen >= 200:
-                        return
-                    try:
-                        region = getattr(node, "region", None)
-                        info = {
-                            "depth":   depth,
-                            "class":   type(node).__name__,
-                            "id":      getattr(node, "id", None),
-                            "classes": list(getattr(node, "classes", []) or []),
+            def _walk(node, depth: int, out: list) -> None:
+                nonlocal seen
+                if seen >= 200:
+                    return
+                try:
+                    region = getattr(node, "region", None)
+                    info = {
+                        "depth":   depth,
+                        "class":   type(node).__name__,
+                        "id":      getattr(node, "id", None),
+                        "classes": list(getattr(node, "classes", []) or []),
+                    }
+                    if region is not None:
+                        info["region"] = {
+                            "x": int(getattr(region, "x", 0)),
+                            "y": int(getattr(region, "y", 0)),
+                            "w": int(getattr(region, "width", 0)),
+                            "h": int(getattr(region, "height", 0)),
                         }
-                        if region is not None:
-                            info["region"] = {
-                                "x": int(getattr(region, "x", 0)),
-                                "y": int(getattr(region, "y", 0)),
-                                "w": int(getattr(region, "width", 0)),
-                                "h": int(getattr(region, "height", 0)),
-                            }
-                        widget_tree.append(info)
-                        seen += 1
-                    except Exception:  # noqa: BLE001
-                        return
-                    try:
-                        kids = list(getattr(node, "children", []) or [])
-                    except Exception:  # noqa: BLE001
-                        kids = []
-                    for child in kids:
-                        _walk(child, depth + 1)
-                _walk(top_screen, 0)
-                snap["widget_tree"] = widget_tree
-                snap["widget_tree_screen"] = type(top_screen).__name__
+                    out.append(info)
+                    seen += 1
+                except Exception:  # noqa: BLE001
+                    return
+                try:
+                    kids = list(getattr(node, "children", []) or [])
+                except Exception:  # noqa: BLE001
+                    kids = []
+                for child in kids:
+                    _walk(child, depth + 1, out)
+
+            trees: list[dict] = []
+            for scr in stack:        # bottom (base screen) → top (modal)
+                if seen >= 200:
+                    break
+                widgets: list[dict] = []
+                _walk(scr, 0, widgets)
+                trees.append({"screen": type(scr).__name__,
+                              "widgets": widgets})
+            if trees:
+                snap["widget_trees"] = trees
+                # Back-compat: the top screen alone under the old keys.
+                snap["widget_tree"] = trees[-1]["widgets"]
+                snap["widget_tree_screen"] = trees[-1]["screen"]
         except Exception:  # noqa: BLE001 — broken-app survival
             pass
     # Settings from disk — same view a fresh launch would see.
@@ -3696,9 +3717,9 @@ def _format_ui_snapshot(snap: dict) -> str:
         lines.append("- **Focused widget**: (none)")
     mp = snap.get("mouse_position")
     if mp:
-        lines.append(f"- **Last mouse position**: col={mp['x']}, row={mp['y']}")
+        lines.append(f"- **Mouse position**: col={mp['x']}, row={mp['y']}")
     else:
-        lines.append("- **Last mouse position**: (unknown)")
+        lines.append("- **Mouse position**: (unknown)")
     ts = snap.get("terminal_size")
     if ts:
         lines.append(f"- **Terminal size**: {ts['cols']}×{ts['rows']}")
@@ -3717,29 +3738,35 @@ def _format_ui_snapshot(snap: dict) -> str:
     lines.append("")
     lines.append("## Persisted settings")
     lines.append(_kv_block(snap.get("settings") or {}))
-    # Widget tree of the top screen — class, id, classes, and
-    # rendered region (x,y,w,h) so a reader can reconstruct the
-    # visual layout without a screenshot. Tree is depth-indented.
-    wt = snap.get("widget_tree") or []
-    if wt:
-        lines.append("## Widget tree (top screen: %s)" %
-                      snap.get("widget_tree_screen", "?"))
-        lines.append("```")
-        for w in wt:
-            indent = "  " * int(w.get("depth", 0))
-            ident = ""
-            if w.get("id"):
-                ident = f"#{w['id']}"
-            cls_list = w.get("classes") or []
-            cls = ("." + ".".join(cls_list)) if cls_list else ""
-            r = w.get("region") or {}
-            region = ""
-            if r:
-                region = (f"  [x={r.get('x', '?')}, y={r.get('y', '?')}, "
-                          f"w={r.get('w', '?')}, h={r.get('h', '?')}]")
-            lines.append(f"{indent}{w.get('class', '?')}{ident}{cls}{region}")
-        lines.append("```")
+    # Widget tree of every open element (base screen + each open modal),
+    # depth-indented with class, id, classes, and rendered region — so a
+    # reader can reconstruct the visual layout without a screenshot.
+    trees = snap.get("widget_trees")
+    if not trees and snap.get("widget_tree"):
+        # Back-compat with an older snapshot dict that only carried the
+        # top screen.
+        trees = [{"screen": snap.get("widget_tree_screen", "?"),
+                  "widgets": snap.get("widget_tree") or []}]
+    if trees:
+        lines.append("## Open elements — widget trees")
         lines.append("")
+        for t in trees:
+            lines.append(f"### {t.get('screen', '?')}")
+            lines.append("```")
+            for w in t.get("widgets") or []:
+                indent = "  " * int(w.get("depth", 0))
+                ident = f"#{w['id']}" if w.get("id") else ""
+                cls_list = w.get("classes") or []
+                cls = ("." + ".".join(cls_list)) if cls_list else ""
+                r = w.get("region") or {}
+                region = ""
+                if r:
+                    region = (f"  [x={r.get('x', '?')}, y={r.get('y', '?')}, "
+                              f"w={r.get('w', '?')}, h={r.get('h', '?')}]")
+                lines.append(
+                    f"{indent}{w.get('class', '?')}{ident}{cls}{region}")
+            lines.append("```")
+            lines.append("")
     lines.append("## Log tail (last %d lines, paths scrubbed)" %
                   _UI_SNAPSHOT_LOG_TAIL_LINES)
     lines.append("```")
@@ -5035,6 +5062,101 @@ def _collection_name_taken(name: str) -> bool:
             if isinstance(c, dict) and c.get("name") == name:
                 return True
     return False
+
+
+def _commit_library_entry_to_collection(entry: dict, collection: str) -> str:
+    """Append a library entry (linear OR circular — topology is the
+    producer's choice) to the named collection, name- and id-collision-
+    renaming so existing entries are never clobbered, and re-mirror the
+    active-library file when the target IS the active collection. Returns
+    the entry's final (post-rename) display name.
+
+    Universal save helper shared by the PCR amplicon save and every
+    assembly save (Constructor GB/MoClo, Gibson, Traditional) so "save
+    into collection X" behaves identically everywhere:
+      * Whole load→mutate→save runs under `_cache_lock` ([INV-50]) so a
+        concurrent worker / agent write can't interleave.
+      * Atomic `_save_collections` (.bak chain) — on failure the disk is
+        unchanged and the error propagates to the caller.
+      * A target collection deleted in another window is recreated.
+      * Name collisions get " COPY" / " COPY N" (spaces, never `_`); id
+        collisions get `_N` (ids are sanitised by design).
+
+    Raises `OSError` / `RuntimeError` on save failure.
+    """
+    from copy import deepcopy as _deepcopy
+    collection = (collection or "").strip() or "Default"
+    with _cache_lock:
+        colls = _load_collections()
+        idx = next(
+            (i for i, c in enumerate(colls)
+             if isinstance(c, dict) and (c.get("name") or "") == collection),
+            -1,
+        )
+        if idx < 0:
+            colls.append({"name": collection, "plasmids": []})
+            idx = len(colls) - 1
+        plasmids = [e for e in (colls[idx].get("plasmids") or [])
+                    if isinstance(e, dict)]
+        names = {(e.get("name") or "") for e in plasmids}
+        ids = {(e.get("id") or "") for e in plasmids}
+
+        landing = _deepcopy(entry)
+        base_name = (landing.get("name") or "").strip() or "plasmid"
+        new_name = base_name
+        if new_name in names:
+            new_name = f"{base_name} COPY"
+            n = 2
+            while new_name in names:
+                new_name = f"{base_name} COPY {n}"
+                n += 1
+        landing["name"] = new_name
+
+        base_id = (landing.get("id") or "").strip() or "plasmid"
+        new_id = base_id
+        if new_id in ids:
+            n = 2
+            new_id = f"{base_id}_{n}"
+            while new_id in ids:
+                n += 1
+                new_id = f"{base_id}_{n}"
+        landing["id"] = new_id
+
+        plasmids.append(landing)
+        colls[idx]["plasmids"] = plasmids
+        _save_collections(colls)
+
+        # Keep the active-library mirror in lockstep when we wrote into
+        # the active collection (otherwise the running library panel
+        # shows stale rows).
+        if _get_active_collection_name() == collection:
+            _safe_save_json_mirror(
+                _LIBRARY_FILE, plasmids, "Plasmid library",
+            )
+            globals()["_library_cache"] = None
+    return landing["name"]
+
+
+def _name_modal_result(result: "_Any",
+                       default_collection: str) -> "tuple[str, str] | None":
+    """Normalise a `NamePlasmidModal` dismiss payload into
+    ``(name, collection)`` — or ``None`` for cancel / empty.
+
+    Accepts BOTH the collection-mode dict ``{"name", "collection"}`` and a
+    bare name ``str`` (legacy callers + direct-dismiss tests), so the
+    universal save callbacks stay robust regardless of how the modal was
+    dismissed. ``collection`` defaults to ``default_collection`` when the
+    payload doesn't carry one."""
+    if isinstance(result, dict):
+        nm = (result.get("name") or "").strip()
+        if not nm:
+            return None
+        coll = (result.get("collection") or "").strip() or default_collection
+        return (nm, coll)
+    if isinstance(result, str):
+        nm = result.strip()
+        return (nm, default_collection) if nm else None
+    return None
 
 
 def _ensure_default_collection() -> None:
@@ -24284,94 +24406,121 @@ class HelpModal(_OneShotDismissScreen, ModalScreen):
 # Markdown table format is selectable: users can drag a row to copy
 # the key combo.
 _HELP_BODY_MD = """\
-### File / Record
+## Navigation
+
+*Moving around the app. Start here.*
+
+### Focus a single panel (viewport)
+
+| Key | Panel |
+|---|---|
+| `F1` · `Ctrl+1` | Library only |
+| `F2` | Plasmid map only |
+| `F3` · `Ctrl+3` | Feature list only |
+| `F4` · `Ctrl+2` | Sequence panel only |
+| `F5` · `Ctrl+0` | Restore all panels |
+
+### Move around the map & sequence
 
 | Key | Action |
 |---|---|
-| `f` | Fetch GenBank from NCBI |
-| `Ctrl+O` | Open file (`.gb` / `.gbk` / `.dna`) |
+| `←` `→` | Rotate (circular map) · pan (linear map) · move cursor (sequence) |
+| `Shift+←` `Shift+→` | Coarse rotate / pan — or extend the selection |
+| `[` `]` | Rotate (alternate keys; safe while a text box has focus) |
+| `Home` | Reset map origin · jump to start of row (sequence) |
+| `End` | Jump to end of row (sequence) |
+| `Alt+O` | Set the highlighted feature as the new origin (works from any panel) |
+| `v` | Toggle linear ↔ circular map |
+| `+` · `=` | Zoom in (linear map) |
+| `-` | Zoom out (linear map) |
+| `0` | Reset zoom + pan to the whole record (linear map) |
+
+### Find & inspect
+
+| Key | Action |
+|---|---|
+| `Ctrl+/` | Find a feature by name / type and jump the cursor to it |
+| `F6` · `Ctrl+H` | Construction-history viewer for the loaded plasmid |
+| `l` | Toggle feature connector lines |
+| `r` | Toggle the restriction-site overlay |
+
+## Edit the loaded plasmid
+
+### Sequence & features
+
+| Key | Action |
+|---|---|
+| `Ctrl+A` | Select the entire sequence |
+| `Ctrl+E` | Edit sequence (insert / replace bases) |
+| `Ctrl+F` | Add a feature from the current selection |
+| `Ctrl+Shift+F` | Capture the current selection into the feature library |
+| `Enter` (on a feature) | Open the feature editor (read-only; press **Edit** to modify) |
+| `Delete` | Delete the selected feature |
+| `Ctrl+Z` · `Ctrl+Shift+Z` | Undo · redo |
+
+### Select & copy
+
+| Action | Effect |
+|---|---|
+| Click a feature bar | Highlight that feature's DNA span |
+| Click a base | Place the cursor (no feature pick) |
+| **`Ctrl+click` a base** | Extend a base-level selection from the cursor |
+| **`Ctrl+click` a feature** | Extend the selection from the anchor feature to this one (map · sequence lanes · sidebar) |
+| `Shift+click` | Same as `Ctrl+click` — but many terminals (xterm, macOS Terminal, GNOME Terminal) intercept Shift+click for their own text selection, so `Ctrl+click` is the reliable default |
+| `Ctrl+C` | Copy the selection (top strand, 5'→3') |
+| `Alt+C` | Copy the selection (bottom strand, reverse-complement) |
+
+## Files & library
+
+| Key | Action |
+|---|---|
+| `f` | Fetch a GenBank record from NCBI by accession |
+| `Ctrl+O` | Open a local file (`.gb` · `.gbk` · `.dna`) |
 | `Ctrl+S` | Save |
-| `Ctrl+N` | New plasmid (paste DNA + annotate) |
-| `Ctrl+Shift+A` | Add current record to library |
+| `Ctrl+N` | New plasmid — paste DNA, then auto-annotate |
+| `Ctrl+Shift+A` | Add the current record to your library |
 | `Ctrl+Q` | Quit |
 
-### Editing
+## Cloning & analysis tools
 
-| Key | Action |
-|---|---|
-| `Ctrl+A` | Select entire sequence |
-| `Ctrl+E` | Edit sequence (insert / replace) |
-| `Ctrl+F` | Add feature (uses current selection) |
-| `Ctrl+Shift+F` | Capture selection → feature library |
-| `Enter` (on a feature) | Open feature editor (read-only; press `Edit` to modify) |
-| `Delete` | Delete selected feature |
-| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
-
-### Cloning + analysis
-
-| Key | Action |
+| Key | Tool |
 |---|---|
 | `Ctrl+P` | Primer design |
-| `Ctrl+B` | BLAST (BLASTN / BLASTP / HMMscan) |
-| `Alt+A` | Align current plasmid against one or more library plasmids — each pick adds a row to the linear-map alignment overlay (blue match · red mismatch · gray gap, with a coverage histogram above). Click a read lane to drill into AlignmentScreen. |
-| `Alt+Shift+A` | Clear every alignment row from the overlay. |
+| `Ctrl+B` | BLAST / HMMscan — **Local** (your library) + **Online** (NCBI BLAST · Pfam) |
+| `Ctrl+G` | Cloning-grammar editor (Golden Braid · MoClo · …) |
+| `Alt+A` | Align the current plasmid against library plasmids — each pick adds a row to the linear-map overlay (blue match · red mismatch · gray gap, with a coverage histogram). Click a lane to drill into the alignment. |
+| `Alt+Shift+A` | Clear every alignment row from the overlay |
+| `Alt+L` | Manage alignments |
 
-### Menu workbenches (no keyboard shortcut — open from the menu bar)
+## Toolbar menus
 
-| Menu | What it does |
-|---|---|
-| `Parts` | Parts bin: browse / classify / edit Type IIS-cloning parts. |
-| `Constructor` | Multi-grammar assembler: Golden Braid · MoClo · Gibson. |
-| `Mutagenize` | SOE-PCR primer design for single-site mutations. |
-| `Simulator` | In-silico PCR (exact-match binding model) + agarose gel rendering. Run a virtual amplification on the loaded template; preview band migration at user-selectable agarose %. |
+Open from the menu bar with the mouse — or jump straight to one with `Alt`+letter:
 
-### Map / view
+| Menu | Shortcut | Holds |
+|---|---|---|
+| File | `Alt+F` | Open · Save · Fetch · What's New |
+| Edit | `Alt+E` | Edit-related actions |
+| Settings | `Alt+S` | Preferences · cloning grammars |
+| Enzymes | `Alt+N` | Restriction enzymes + custom collections |
+| Primers | `Alt+P` | Primer library + design |
+| Synthesis | `Alt+Y` | Gene synthesis + protein tools |
+| Parts | `Alt+R` | Parts bin — browse / classify / edit Type IIS parts |
+| Simulator | `Alt+I` | In-silico PCR + agarose-gel rendering |
+| Sequencing | `Alt+Q` | Plasmidsaurus / sequencing import |
+| Experiments | `Alt+X` | Lab-notebook experiments |
+| History | `Alt+H` | Construction history |
+| Features | *(mouse)* | Annotation tools |
+| Mutagenize | *(mouse)* | SOE-PCR site-directed mutagenesis |
+| Constructor | *(mouse)* | Multi-grammar assembler (Golden Braid · MoClo · Gibson) |
 
-| Key | Action |
-|---|---|
-| `←` `→` | Rotate (circular map) · pan (linear map) · move cursor (seq focus) |
-| `Shift+←/→` | Coarse rotate / pan, or extend selection |
-| `[` `]` | Rotate (alternate keys, no-conflict with text edit) |
-| `Home` | Reset map origin / jump to row start (seq) |
-| `Alt+O` | Set highlighted feature as new origin (rotates map · re-sorts sidebar · shifts seq panel — works from any panel) |
-| `End` | Jump to row end (seq panel) |
-| `v` | Toggle linear / circular map |
-| `+` / `=` | Zoom IN (linear map only) |
-| `-` | Zoom OUT (linear map only) |
-| `0` | Reset zoom + pan to whole-record view (linear map only) |
-| `l` | Toggle feature connectors |
-| `r` | Toggle restriction sites |
-
-### Layout (focus one panel full-screen)
+## Diagnostics & help
 
 | Key | Action |
 |---|---|
-| `F1` | Library only |
-| `F2` | Plasmid map only |
-| `F3` | Feature list only |
-| `F4` | Sequence panel only |
-| `F5` | Restore all panels |
-
-### Selection / clipboard
-
-| Key / action | Effect |
-|---|---|
-| Click bar | Highlight feature DNA span |
-| Click base | Place cursor (no feature pick) |
-| **Ctrl+click base** | Extend bp-level selection from cursor |
-| **Ctrl+click feature** | Extend selection from anchor feature to this one (works on map, sequence-panel lanes, sidebar rows) |
-| Shift+click | Same as Ctrl+click — but many terminals (xterm, macOS Terminal, GNOME Terminal) intercept Shift+click for their own text-selection so the click never reaches the app. Ctrl+click is the reliable default. |
-| `Ctrl+C` | Copy selection (top strand) |
-| `Alt+C` | Copy selection (bottom strand, reverse-complement) |
-| `Alt+M` | Toggle click-debug — each click echoes modifier state in a toast. Diagnoses terminals that swallow Shift+click: no toast on Shift+click means the terminal ate it; use Ctrl+click instead. |
-
-### Seq-panel debug
-
-| Key | Action |
-|---|---|
-| `Alt+D` | Toggle hover-status diagnostic row |
-| `H` | Copy hover info to clipboard (debug only) |
-| `D` | Dump rendered chunk to clipboard (debug only) |
+| `?` | This help |
+| `Alt+D` · `Ctrl+U` · `F9` | Capture a UI snapshot — open elements + mouse position + log tail — for a bug report. Saved to `ui_snapshots/` and copied to the clipboard. |
+| `Alt+M` | Toggle click-debug — each click echoes its modifier state in a toast (diagnoses terminals that swallow Shift+click) |
+| `Alt+Shift+D` | Toggle the sequence-panel debug row, then: `H` copies hover info · `D` dumps the rendered chunk |
 """
 
 
@@ -38851,7 +39000,7 @@ def _codon_parse_kazusa_html(html: str) -> "dict | None":
     return raw
 
 
-def _safe_xml_parse(xml_data: str):
+def _safe_xml_parse(xml_data: str, *, allow_dtd: bool = False):
     """Parse XML with defense against billion-laughs / XXE tricks.
 
     Python's stdlib ET (expat) already refuses to fetch external entities
@@ -38865,6 +39014,15 @@ def _safe_xml_parse(xml_data: str):
     declaration. If it's a DOCTYPE / ENTITY, refuse before handing to
     expat. NCBI / Kazusa / .dna history XML have no legitimate DTD, so
     this never false-positives.
+
+    ``allow_dtd=True`` opts a caller into permitting an **external** DTD
+    reference — e.g. NCBI BLAST's ``FORMAT_TYPE=XML`` output, which opens
+    with ``<!DOCTYPE BlastOutput PUBLIC ... NCBI_BlastOutput.dtd>``. A
+    standalone ``<!ENTITY>`` and any DOCTYPE carrying an internal subset
+    (``[ … ]`` — where billion-laughs entity definitions live) are still
+    refused. expat never fetches the external DTD (no network since
+    3.7.1) and there are no entities to expand, so this stays XXE-safe.
+    Default ``False`` keeps every existing caller's strict behaviour.
     """
     import io
     import xml.etree.ElementTree as ET
@@ -38893,14 +39051,33 @@ def _safe_xml_parse(xml_data: str):
                 break
             i = end + 2
             continue
-        # DOCTYPE / ENTITY declaration — refuse.
-        # Case-insensitive check on the next ~16 chars (case-folding
-        # the WHOLE document is expensive on multi-MB inputs).
+        # DOCTYPE / ENTITY declaration — refuse (or, with allow_dtd, permit
+        # only an external-DTD reference). Case-insensitive check on the
+        # next ~16 chars (case-folding the WHOLE document is expensive on
+        # multi-MB inputs).
         head = xml_data[i:i + 16].lower()
-        if head.startswith("<!doctype") or head.startswith("<!entity"):
+        if head.startswith("<!entity"):
             raise ET.ParseError(
-                "XML contains DTD/ENTITY — refusing to parse"
+                "XML contains a standalone ENTITY declaration — refusing"
             )
+        if head.startswith("<!doctype"):
+            if not allow_dtd:
+                raise ET.ParseError(
+                    "XML contains DTD/ENTITY — refusing to parse"
+                )
+            # Permit an external-DTD reference but refuse any internal
+            # subset (`[ … ]`), which is where entity-expansion attacks
+            # live. The DOCTYPE without a subset ends at the first `>`.
+            close = xml_data.find(">", i)
+            bracket = xml_data.find("[", i)
+            if close == -1:
+                break  # malformed — let expat surface the parse error
+            if bracket != -1 and bracket < close:
+                raise ET.ParseError(
+                    "XML DOCTYPE has an internal subset — refusing to parse"
+                )
+            i = close + 1
+            continue
         # Reached a normal start tag — safe to hand off to expat.
         break
     # 2026-05-27 (audit-3 M6): cap nesting depth via iterparse so a
@@ -48738,6 +48915,498 @@ class HmmDbCatalogModal(ModalScreen):
         self._dismiss_once(None)
 
 
+# ── Online search engines (NCBI BLAST URL API + EBI HMMER web) ───────────────
+#
+# Borrowed + generalised from the sister project ScriptoScope
+# (`/home/seb/proteoscope/scriptoscope.py::ncbi_blastp`) per the
+# "[RECIPE] borrow before respinning" playbook. Both engines follow the
+# same submit → poll → fetch → parse shape and run inside BlastModal's
+# `@work(thread=True)` workers so the UI keeps redrawing during the
+# (potentially multi-minute) round trip. A `threading.Event` per engine
+# lets the user cancel mid-flight; the NCBI side also releases the
+# server-side RID so an abandoned job doesn't keep running unattended.
+#
+# Hardening (per the new-feature sweep convention):
+#   * resp.read(MAX + 1) + bail-if-exceeded — never raw .read() ([PIT-20]).
+#   * NCBI XML routed through _safe_xml_parse ([PIT-19], defangs DOCTYPE /
+#     billion-laughs / unbounded nesting).
+#   * HMMER JSON parsed defensively (.get() chains, several shapes) since
+#     the P7Hit object is `additionalProperties: true` in the EBI schema.
+#   * Friendly RuntimeErrors for timeout / unreachable host — never a raw
+#     traceback to the user.
+#   * Never logs sequence content ([INV-38]) — lengths / program only.
+
+_NCBI_BLAST_URL = "https://blast.ncbi.nlm.nih.gov/Blast.cgi"
+_HMMER_WEB_SUBMIT_URL = "https://www.ebi.ac.uk/Tools/hmmer/api/v1/search/hmmscan"
+_HMMER_WEB_RESULT_URL = "https://www.ebi.ac.uk/Tools/hmmer/api/v1/result/"
+
+# Response caps ([PIT-20]). BLAST XML for a 50-hit list runs into the
+# megabytes; Pfam hmmscan JSON is smaller. Both refuse a pathological
+# multi-hundred-MB body (compromised / misconfigured server / MITM).
+_NCBI_BLAST_MAX_RESPONSE_BYTES = 48 * 1024 * 1024
+_HMMER_WEB_MAX_RESPONSE_BYTES = 24 * 1024 * 1024
+
+# Poll cadence + overall ceiling shared by both engines. 10 s honours
+# NCBI's URL-API politeness floor (don't poll a single RID more than
+# ~once / 10 s); ScriptoScope used 5 s but we err polite. 300 s overall
+# matches the crib.
+_ONLINE_POLL_INTERVAL_S = 10
+_ONLINE_MAX_WAIT_S = 300
+
+# Programs offered by the Online tab's dropdown. The trailing "hmmscan"
+# routes to the EBI HMMER engine; every other value hits NCBI BLAST.
+_ONLINE_BLAST_PROGRAMS: "tuple[tuple[str, str], ...]" = (
+    ("blastn   (DNA/RNA → nucleotide nt)",        "blastn"),
+    ("blastp   (protein → protein nr)",           "blastp"),
+    ("blastx   (translated DNA → protein nr)",    "blastx"),
+    ("tblastn  (protein → translated nt)",        "tblastn"),
+    ("tblastx  (translated DNA → translated nt)", "tblastx"),
+    ("hmmscan  (protein → Pfam, online)",         "hmmscan"),
+)
+
+# Programs that take a nucleotide query (so a pasted RNA can be U→T
+# normalised before submit) vs a protein query.
+_ONLINE_NUCLEOTIDE_QUERY = frozenset({"blastn", "blastx", "tblastx"})
+_ONLINE_PROTEIN_QUERY = frozenset({"blastp", "tblastn", "hmmscan"})
+
+
+def _program_query_kind(program: str) -> str:
+    """"nt" if the program takes a nucleotide query, else "protein".
+    Spans both tabs (local blastn/blastp/hmmscan + online's five BLAST
+    programs). Used to decide whether switching program invalidates the
+    current query (nt↔protein) and should clear it."""
+    return "nt" if program in _ONLINE_NUCLEOTIDE_QUERY else "protein"
+
+# NCBI's hard query-length limits (chars). Submitting past these makes
+# the server reject the job ("query too long"), so we refuse the search
+# client-side with a clear message rather than truncate (a silently
+# trimmed BLAST query returns misleading hits). Per NCBI's published
+# limits: 1,000,000 for nucleotide queries; 100,000 for protein. The
+# EBI HMMER hmmscan service takes a single protein — 100,000 aa is far
+# beyond any real Pfam query but still caps a pathological paste.
+_NCBI_BLAST_MAX_QUERY = {
+    "blastn": 1_000_000, "blastx": 1_000_000, "tblastx": 1_000_000,
+    "blastp": 100_000, "tblastn": 100_000,
+    "hmmscan": 100_000,
+}
+
+
+def _online_max_query_len(program: str) -> int:
+    return _NCBI_BLAST_MAX_QUERY.get(program, 100_000)
+
+# EBI HMMER job-status buckets (case-folded). Anything non-empty that
+# isn't a terminal-success / terminal-error state counts as "still
+# running" and keeps the poll loop going.
+_HMMER_DONE_STATUS = frozenset(
+    {"SUCCESS", "DONE", "COMPLETE", "COMPLETED", "FINISHED", "OK"})
+_HMMER_ERROR_STATUS = frozenset(
+    {"ERROR", "ERR", "FAILURE", "FAILED", "FAIL"})
+
+
+class _OnlineSearchCancelled(Exception):
+    """Raised inside an online-search worker when the user cancels."""
+
+
+# One cancel flag per engine. Set by the UI thread (Cancel button),
+# polled by the worker via `Event.wait(timeout=…)` so cancellation is
+# near-instant even mid-sleep between polls.
+_ncbi_blast_cancel = threading.Event()
+_hmmer_web_cancel = threading.Event()
+
+
+def _ncbi_blast_db_for(program: str) -> str:
+    """Default NCBI database for a BLAST program: a protein DB (`nr`) when
+    the *subject* is protein (blastp / blastx), a nucleotide DB (`nt`)
+    otherwise (blastn / tblastn / tblastx)."""
+    return "nr" if program in ("blastp", "blastx") else "nt"
+
+
+def _online_safe_float(val: "_Any") -> "float | None":
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _online_safe_int(val: "_Any") -> "int | None":
+    try:
+        return int(str(val).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _online_clean_query(raw: str, program: str) -> str:
+    """Strip FASTA headers + whitespace, upper-case, and (for nucleotide-
+    query programs) normalise RNA U→T. Does NOT truncate — the caller
+    enforces `_online_max_query_len(program)` and refuses oversize input
+    so a trimmed query can't return misleading hits."""
+    seq = _strip_fasta_headers(raw or "")
+    seq = re.sub(r"\s+", "", seq).upper()
+    if program in _ONLINE_NUCLEOTIDE_QUERY:
+        seq = seq.replace("U", "T")
+    return seq
+
+
+def _feature_protein(entry: dict) -> str:
+    """Protein sequence for a CDS feature entry (as produced by
+    `_extract_feature_entries_from_record`). Used to feed protein-query
+    searches (hmmscan / blastp / tblastn) a translated CDS rather than its
+    raw nucleotides.
+
+    Prefers the authoritative ``/translation`` qualifier (handles alt start
+    codons, codon_start, selenocysteine, etc.); falls back to translating
+    the strand-correct coding sequence honouring ``/codon_start`` and
+    stopping at the first stop codon. Returns "" if the entry yields no
+    protein."""
+    quals = entry.get("qualifiers") or {}
+
+    def _first(key):
+        v = quals.get(key)
+        if isinstance(v, (list, tuple)):
+            return v[0] if v else None
+        return v
+
+    tr = _first("translation")
+    if tr:
+        prot = re.sub(r"[^A-Za-z*]", "", str(tr)).upper().rstrip("*")
+        if prot:
+            return prot
+    nt = re.sub(r"\s+", "", str(entry.get("sequence") or "")).upper()
+    if not nt:
+        return ""
+    phase = _online_safe_int(_first("codon_start")) or 1
+    if phase not in (1, 2, 3):
+        phase = 1
+    nt = nt[phase - 1:]
+    aas: list[str] = []
+    for i in range(0, len(nt) - 2, 3):
+        aa = _CODON_GENETIC_CODE.get(nt[i:i + 3], "X")
+        if aa == "*":
+            break
+        aas.append(aa)
+    return "".join(aas)
+
+
+def _online_http(url: str, *, data: "bytes | None" = None,
+                 headers: "dict | None" = None,
+                 timeout: int = _NCBI_TIMEOUT_S,
+                 max_bytes: int = _NCBI_BLAST_MAX_RESPONSE_BYTES) -> str:
+    """POST (``data`` given) / GET (``data`` None) ``url`` and return the
+    decoded body. Translates network failures into friendly RuntimeErrors
+    and enforces the response-size cap ([PIT-20]). HTTP error statuses
+    surface as ``RuntimeError`` carrying the code so the poll loop can tell
+    a transient 404-not-ready from a fatal 400."""
+    import socket
+    import urllib.error
+    import urllib.request
+    hdrs = {"User-Agent": f"SpliceCraft/{__version__}"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, data=data, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(max_bytes + 1)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code} from {url}") from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, socket.timeout):
+            raise RuntimeError(
+                "Connection timed out — check your internet connection."
+            ) from exc
+        raise RuntimeError(f"Cannot reach server: {reason}") from exc
+    except socket.timeout as exc:
+        raise RuntimeError(
+            "Connection timed out — check your internet connection."
+        ) from exc
+    if len(raw) > max_bytes:
+        raise RuntimeError(
+            f"Response exceeded the {max_bytes // (1024 * 1024)} MB cap — "
+            f"refusing to load it. Narrow the query or hit list."
+        )
+    return raw.decode("utf-8", "replace")
+
+
+def _ncbi_blast_delete_rid(rid: str) -> None:
+    """Best-effort release of a server-side BLAST job so an abandoned /
+    cancelled search doesn't keep running. Failures are swallowed — the
+    job times out on NCBI's side anyway."""
+    from urllib.parse import urlencode
+    try:
+        _online_http(
+            _NCBI_BLAST_URL,
+            data=urlencode({"CMD": "Delete", "RID": rid}).encode(),
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def _ncbi_blast_online(query: str, program: str, database: str,
+                       max_hits: int,
+                       progress_cb: "_Callable[[str], None] | None" = None,
+                       cancel_event: "threading.Event | None" = None
+                       ) -> "list[dict]":
+    """Run a remote NCBI BLAST via the public URL API (CMD=Put → RID →
+    poll SearchInfo → CMD=Get XML → parse). Returns hit dicts shaped for
+    ``BlastModal._online_render_blast``. Raises ``_OnlineSearchCancelled``
+    if ``cancel_event`` fires, ``RuntimeError`` on network / server error.
+    Borrowed from ScriptoScope's ``ncbi_blastp`` ([RECIPE])."""
+    from urllib.parse import urlencode
+    cancel = cancel_event or threading.Event()
+    if progress_cb:
+        progress_cb(f"Submitting {program} to NCBI…")
+    put = urlencode({
+        "CMD": "Put",
+        "PROGRAM": program,
+        "DATABASE": database,
+        "QUERY": query,
+        "HITLIST_SIZE": str(max_hits),
+        "FORMAT_TYPE": "XML",
+    }).encode()
+    put_text = _online_http(
+        _NCBI_BLAST_URL, data=put,
+        max_bytes=_NCBI_BLAST_MAX_RESPONSE_BYTES)
+    rid = ""
+    for line in put_text.splitlines():
+        s = line.strip()
+        if s.startswith("RID = "):
+            rid = s.split("=", 1)[1].strip()
+            break
+    if not rid:
+        raise RuntimeError(
+            "NCBI did not return a job id (RID) — the query may be invalid "
+            "for this program, or NCBI is rejecting traffic right now.")
+    try:
+        elapsed = 0
+        checks = 0
+        while elapsed < _ONLINE_MAX_WAIT_S:
+            if cancel.wait(timeout=_ONLINE_POLL_INTERVAL_S):
+                raise _OnlineSearchCancelled()
+            elapsed += _ONLINE_POLL_INTERVAL_S
+            checks += 1
+            if progress_cb:
+                progress_cb(
+                    f"Waiting for NCBI {program} results "
+                    f"(checked {checks}×)…")
+            status_text = _online_http(
+                _NCBI_BLAST_URL,
+                data=urlencode({
+                    "CMD": "Get",
+                    "FORMAT_OBJECT": "SearchInfo",
+                    "RID": rid,
+                }).encode(),
+                max_bytes=_NCBI_BLAST_MAX_RESPONSE_BYTES)
+            if "Status=WAITING" in status_text:
+                continue
+            if "Status=FAILED" in status_text:
+                raise RuntimeError(
+                    "NCBI BLAST job failed — the server errored on the "
+                    "query (check the sequence matches the program).")
+            if "Status=UNKNOWN" in status_text:
+                raise RuntimeError(
+                    "NCBI BLAST job expired or is unknown — please retry.")
+            if "Status=READY" in status_text:
+                break
+        else:
+            raise RuntimeError(
+                f"NCBI BLAST timed out after {_ONLINE_MAX_WAIT_S}s — the "
+                f"query may be too large; try a shorter region.")
+    except _OnlineSearchCancelled:
+        _ncbi_blast_delete_rid(rid)
+        raise
+    if progress_cb:
+        progress_cb("Downloading NCBI results…")
+    xml_text = _online_http(
+        _NCBI_BLAST_URL,
+        data=urlencode({
+            "CMD": "Get", "FORMAT_TYPE": "XML", "RID": rid,
+        }).encode(),
+        timeout=60, max_bytes=_NCBI_BLAST_MAX_RESPONSE_BYTES)
+    return _ncbi_blast_parse_xml(xml_text, max_hits)
+
+
+def _ncbi_blast_parse_xml(xml_text: str, max_hits: int) -> "list[dict]":
+    """Parse NCBI BLAST XML into hit dicts. Routes through _safe_xml_parse
+    ([PIT-19]); one row per hit (first/best HSP, mirroring the crib)."""
+    import xml.etree.ElementTree as ET
+    try:
+        # NCBI BLAST XML opens with an external <!DOCTYPE … BlastOutput.dtd>
+        # — allowed here (expat never fetches it); internal subsets remain
+        # refused so this stays XXE / billion-laughs safe.
+        root = _safe_xml_parse(xml_text, allow_dtd=True)
+    except ET.ParseError as exc:
+        raise RuntimeError(
+            f"NCBI returned XML SpliceCraft couldn't parse: {exc}") from exc
+    hits: "list[dict]" = []
+    for hit in root.iter("Hit"):
+        hit_def = (hit.findtext("Hit_def") or "").strip()
+        acc = ((hit.findtext("Hit_accession") or "").strip()
+               or (hit.findtext("Hit_id") or "").strip() or "?")
+        hsp = hit.find(".//Hsp")
+        if hsp is None:
+            continue
+        identity = _online_safe_int(hsp.findtext("Hsp_identity"))
+        align_len = _online_safe_int(hsp.findtext("Hsp_align-len"))
+        pct = (round(identity / align_len * 100, 1)
+               if identity is not None and align_len else None)
+        hits.append({
+            "accession": acc,
+            "description": hit_def,
+            "identity_pct": pct,
+            "aln_len": align_len,
+            "evalue": _online_safe_float(hsp.findtext("Hsp_evalue")),
+            "bit_score": _online_safe_float(hsp.findtext("Hsp_bit-score")),
+            "q_start": _online_safe_int(hsp.findtext("Hsp_query-from")),
+            "q_end": _online_safe_int(hsp.findtext("Hsp_query-to")),
+            "s_start": _online_safe_int(hsp.findtext("Hsp_hit-from")),
+            "s_end": _online_safe_int(hsp.findtext("Hsp_hit-to")),
+        })
+        if len(hits) >= max_hits:
+            break
+    return hits
+
+
+def _hmmer_web_parse_json(obj: "_Any", max_hits: int) -> "list[dict]":
+    """Pull Pfam hits out of an EBI HMMER result body. Defensive across
+    `result.hits`, `results.hits`, and top-level `hits`.
+
+    The human-readable family name + description live in the hit's
+    ``metadata`` sub-object (``identifier`` / ``description``), NOT in the
+    top-level ``name`` (an internal numeric id) or ``desc`` (always null in
+    the live v1 API). We read metadata first and fall back to the
+    top-level / legacy keys so canned fixtures without metadata still
+    parse. ``clan`` / ``type`` / ``external_link`` enrich the detail pane;
+    ``included`` flags whether the hit cleared Pfam's inclusion (gathering)
+    threshold vs. merely the reporting threshold."""
+    if not isinstance(obj, dict):
+        return []
+    hits = None
+    for container_key in ("result", "results"):
+        container = obj.get(container_key)
+        if isinstance(container, dict) and isinstance(
+                container.get("hits"), list):
+            hits = container["hits"]
+            break
+    if hits is None and isinstance(obj.get("hits"), list):
+        hits = obj["hits"]
+    if not isinstance(hits, list):
+        return []
+    out: "list[dict]" = []
+    for h in hits:
+        if not isinstance(h, dict):
+            continue
+        md = h.get("metadata")
+        if not isinstance(md, dict):
+            md = {}
+        acc = str(h.get("acc") or md.get("accession")
+                  or h.get("accession") or "?")
+        # `metadata.identifier` is the Pfam family name (e.g. "Pkinase");
+        # the top-level `name` is an internal numeric id — avoid it unless
+        # nothing better exists.
+        name = str(md.get("identifier") or md.get("id")
+                   or h.get("name") or acc)
+        desc = str(md.get("description") or h.get("desc")
+                   or h.get("description") or "")
+        ndom = _online_safe_int(
+            h.get("ndom") if h.get("ndom") is not None
+            else h.get("nincluded") if h.get("nincluded") is not None
+            else h.get("nreported"))
+        if ndom is None:
+            doms = h.get("domains")
+            ndom = len(doms) if isinstance(doms, list) else 0
+        out.append({
+            "acc": acc,
+            "name": name,
+            "description": desc,
+            "evalue": _online_safe_float(
+                h.get("evalue") if h.get("evalue") is not None
+                else h.get("eval")),
+            "bit_score": _online_safe_float(
+                h.get("score") if h.get("score") is not None
+                else h.get("bitscore")),
+            "n_dom": ndom,
+            "clan": str(md.get("clan") or ""),
+            "type": str(md.get("type") or ""),
+            "link": str(md.get("external_link") or ""),
+            "included": bool(h.get("is_included", True)),
+        })
+        if len(out) >= max_hits:
+            break
+    return out
+
+
+def _hmmer_web_hmmscan(protein: str, max_hits: int,
+                       progress_cb: "_Callable[[str], None] | None" = None,
+                       cancel_event: "threading.Event | None" = None
+                       ) -> "list[dict]":
+    """Run a remote hmmscan vs Pfam via the EBI HMMER web API (POST search
+    → poll result/{id} until SUCCESS → parse). Returns Pfam hit dicts.
+    Raises ``_OnlineSearchCancelled`` on cancel, ``RuntimeError`` on
+    network / server error."""
+    cancel = cancel_event or threading.Event()
+    if progress_cb:
+        progress_cb("Submitting hmmscan to EBI HMMER…")
+    body = json.dumps({"input": protein, "database": "pfam"}).encode()
+    submit_text = _online_http(
+        _HMMER_WEB_SUBMIT_URL, data=body,
+        headers={"Content-Type": "application/json",
+                 "Accept": "application/json"},
+        max_bytes=_HMMER_WEB_MAX_RESPONSE_BYTES)
+    try:
+        submit = json.loads(submit_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "EBI HMMER returned an unparseable submit response.") from exc
+    # Some deployments return hits inline on submit — short-circuit.
+    inline = _hmmer_web_parse_json(submit, max_hits)
+    if inline:
+        return inline
+    job_id = ""
+    if isinstance(submit, dict):
+        job_id = str(submit.get("id") or submit.get("uuid") or "").strip()
+    if not job_id:
+        raise RuntimeError("EBI HMMER did not return a job id.")
+    result_url = _HMMER_WEB_RESULT_URL + job_id
+    elapsed = 0
+    checks = 0
+    consecutive_fail = 0
+    while elapsed < _ONLINE_MAX_WAIT_S:
+        if cancel.wait(timeout=_ONLINE_POLL_INTERVAL_S):
+            raise _OnlineSearchCancelled()
+        elapsed += _ONLINE_POLL_INTERVAL_S
+        checks += 1
+        if progress_cb:
+            progress_cb(
+                f"Waiting for Pfam hmmscan results (checked {checks}×)…")
+        try:
+            rtext = _online_http(
+                result_url,
+                headers={"Accept": "application/json"},
+                max_bytes=_HMMER_WEB_MAX_RESPONSE_BYTES)
+            obj = json.loads(rtext)
+            consecutive_fail = 0
+        except (RuntimeError, json.JSONDecodeError):
+            # 404-not-ready / transient flake — keep polling, but don't
+            # spin forever against a persistent failure.
+            consecutive_fail += 1
+            if consecutive_fail >= 5:
+                raise RuntimeError(
+                    "EBI HMMER kept returning errors — try again later.")
+            continue
+        status = str(
+            (obj.get("status") if isinstance(obj, dict) else "") or ""
+        ).upper()
+        if status in _HMMER_ERROR_STATUS:
+            raise RuntimeError("EBI HMMER reported the job failed.")
+        if status and status not in _HMMER_DONE_STATUS:
+            continue  # PENDING / RUNNING / QUEUED — still cooking
+        return _hmmer_web_parse_json(obj, max_hits)
+    raise RuntimeError(
+        f"EBI HMMER timed out after {_ONLINE_MAX_WAIT_S}s — try again "
+        f"or use the Local tab with a downloaded Pfam database.")
+
+
 # ── BLAST modal ───────────────────────────────────────────────────────────────
 
 class BlastModal(_OneShotDismissScreen, ModalScreen):
@@ -48805,7 +49474,7 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
             # line is the unified "what just happened" surface.
             with TabbedContent(initial="tab-blast-hmm",
                                  id="blast-tabs"):
-                with TabPane("BLAST / HMMscan",
+                with TabPane("Local BLAST / HMM",
                               id="tab-blast-hmm"):
                     with ScrollableContainer(id="blast-body"):
                         yield Label(
@@ -48905,6 +49574,69 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
                         yield Static("[dim]No query run yet.[/dim]",
                                      id="blast-results",
                                      markup=True)
+                # ── Online tab ─────────────────────────────────────
+                # NCBI BLAST (all programs) + EBI HMMER hmmscan, run
+                # over the network. Self-contained: own query box,
+                # source loaders, program/DB controls, Search/Cancel
+                # button, status line, and results DataTable (mirrors
+                # the parts-bin list). The footer Run/Build buttons
+                # only drive the Local tab — they're disabled while
+                # this tab is active (see _on_blast_tab_activated).
+                with TabPane("Online BLAST / HMM",
+                              id="tab-blast-online"):
+                    with ScrollableContainer(id="online-body"):
+                        yield Label(
+                            "Query  (paste DNA / RNA / protein, or "
+                            "load from a library plasmid / feature):"
+                        )
+                        yield TextArea("", id="online-query")
+                        with Horizontal(id="online-src-row"):
+                            yield Button(
+                                "From plasmid…",
+                                id="btn-online-from-plasmid",
+                                tooltip=("Fill the query with a whole "
+                                         "plasmid's sequence from your "
+                                         "library."))
+                            yield Button(
+                                "From feature…",
+                                id="btn-online-from-feature",
+                                tooltip=("Fill the query with one "
+                                         "feature's sequence from a "
+                                         "library plasmid."))
+                        with Horizontal(id="online-prog-row"):
+                            with Vertical(id="online-prog-col"):
+                                yield Label("Program:")
+                                yield Select(
+                                    _ONLINE_BLAST_PROGRAMS,
+                                    value="blastn",
+                                    id="online-program",
+                                    allow_blank=False)
+                            with Vertical(id="online-db-col"):
+                                yield Label("Database:")
+                                yield Input(value="nt", id="online-db")
+                            with Vertical(id="online-hits-col"):
+                                yield Label("Max hits:")
+                                yield Input(value="50",
+                                            id="online-maxhits",
+                                            type="integer")
+                        yield Static(
+                            "[dim]BLAST searches NCBI's public nt / nr "
+                            "databases; hmmscan searches Pfam at "
+                            "EMBL-EBI. A search can take a minute or "
+                            "two — Cancel to stop.[/dim]",
+                            id="online-help", markup=True)
+                        with Horizontal(id="online-search-row"):
+                            yield Button("Search NCBI",
+                                         id="btn-online-search",
+                                         variant="primary")
+                            yield Static("", id="online-status",
+                                         markup=True)
+                        yield Label("Results:")
+                        yield DataTable(id="online-table",
+                                        cursor_type="row",
+                                        zebra_stripes=True)
+                        yield Static("", id="online-detail",
+                                     markup=True)
             yield Static("", id="blast-status", markup=True)
             with Horizontal(id="blast-btns"):
                 yield Button("Build database",
@@ -48923,6 +49655,13 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
             self.query_one("#blast-query", TextArea).focus()
         except NoMatches:
             pass
+        # Online tab: seed the results table with the BLAST column set
+        # (program defaults to blastn). Columns are rebuilt on the fly
+        # when the user switches to / from hmmscan.
+        try:
+            self._online_set_columns("blast")
+        except Exception:
+            _log.exception("BlastModal: online table init failed")
         # Sweep #28: auto version-check for the currently-active DB
         # if its 24h cache has expired. Best-effort, non-blocking,
         # background-only — the banner updates when the worker
@@ -49139,26 +49878,48 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
         except NoMatches:
             pass
 
-    def _safe_results(self, msg: str) -> None:
+    def _safe_results(self, msg: str, *, no_wrap: bool = False) -> None:
         if not self.is_mounted:
             return
         try:
-            self.query_one("#blast-results", Static).update(msg)
+            widget = self.query_one("#blast-results", Static)
         except NoMatches:
-            pass
+            return
+        if no_wrap:
+            # Keep each hit on exactly one line — a wrapped fixed-width
+            # results table is unreadable. Overflow is clipped (the modal
+            # is wide; the detail isn't lost since every column is short).
+            from rich.text import Text as _Text
+            r = _Text.from_markup(msg)
+            r.no_wrap = True
+            r.overflow = "ellipsis"
+            widget.update(r)
+        else:
+            widget.update(msg)
+
+    _local_prev_program: str = "blastn"
 
     @on(Select.Changed, "#blast-program")
     @on(Select.Changed, "#blast-source")
-    def _on_program_or_source_changed(self, _: Select.Changed) -> None:
-        """Clear the results / status panes when the user switches
-        program (BLASTN ↔ BLASTP ↔ HMMscan) or source collection so the
-        previous run's table doesn't claim to describe whatever's now
-        selected. Pre-fix the user could swap BLASTN→BLASTP and still
-        see the BLASTN results table + "17 HSPs found" status."""
+    def _on_program_or_source_changed(self, event: Select.Changed) -> None:
+        """Reset the results / status panes when the user switches program
+        (BLASTN ↔ BLASTP ↔ HMMscan) or source collection so the previous
+        run's table doesn't claim to describe whatever's now selected.
+        A program switch that flips the query alphabet (nt↔protein) also
+        clears the now-invalid query."""
         if not self.is_mounted:
             return
         self._safe_status("[dim]Run to see results.[/dim]")
         self._safe_results("")
+        if getattr(getattr(event, "select", None), "id", "") == "blast-program":
+            new = self._selected_program()
+            if (_program_query_kind(new)
+                    != _program_query_kind(self._local_prev_program)):
+                try:
+                    self.query_one("#blast-query", TextArea).clear()
+                except NoMatches:
+                    pass
+            self._local_prev_program = new
 
     @on(Button.Pressed, "#btn-blast-run")
     def _run(self) -> None:
@@ -49346,7 +50107,8 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
             self._safe_status("")
             return
         assert db is not None
-        self._safe_results(self._format_hits(prog, query, hits or [], db))
+        self._safe_results(self._format_hits(prog, query, hits or [], db),
+                           no_wrap=True)
         trunc_note = (
             f"  [yellow](query truncated to {_MAX_BLAST_QUERY_LEN:,} "
             f"letters)[/yellow]" if truncated else ""
@@ -49543,11 +50305,592 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
             lines.append(row)
         return "\n".join(lines)
 
+    # ── Online tab (NCBI BLAST + EBI HMMER hmmscan) ──────────────────
+    #
+    # Self-contained: the footer Run/Build buttons stay wired to the
+    # Local tab and are disabled while this tab is active. Network ops
+    # run in `@work(thread=True)` workers sharing the "online_search"
+    # group so only one is ever in flight; a per-engine threading.Event
+    # cancels mid-run.
+
+    _online_busy: bool = False
+    _online_prev_program: str = "blastn"
+    _ONLINE_BLAST_COLS = ("Accession", "Description", "% ID", "Aln",
+                          "E-value", "Bits", "Q-range", "S-range")
+    _ONLINE_HMM_COLS = ("Pfam Acc", "Name", "Description",
+                        "E-value", "Bits", "#Dom")
+
+    @staticmethod
+    def _online_trunc(s: str, n: int) -> str:
+        s = str(s or "")
+        return s if len(s) <= n else s[:n - 1] + "…"
+
+    @staticmethod
+    def _online_fmt_eval(ev: "float | None") -> str:
+        return "—" if ev is None else f"{ev:.1e}"
+
+    @staticmethod
+    def _online_fmt_range(a: "int | None", b: "int | None") -> str:
+        return "—" if a is None or b is None else f"{a}-{b}"
+
+    def _safe_online_status(self, msg: str) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            self.query_one("#online-status", Static).update(msg)
+        except NoMatches:
+            pass
+
+    def _safe_online_detail(self, msg: str) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            self.query_one("#online-detail", Static).update(msg)
+        except NoMatches:
+            pass
+
+    # ── Keep-alive heartbeat ─────────────────────────────────────────
+    #
+    # Network searches poll only every 10 s, so the status line would
+    # sit unchanged between polls and look frozen. A 1 s UI-thread timer
+    # animates a braille spinner + a live "Ns elapsed" so the user can
+    # see the app is alive, while the worker posts a phase + poll-count
+    # ("checked 3×") that proves the *search* is progressing. If no phase
+    # update arrives for >25 s (longer than two poll intervals), a
+    # "server slow" note flags a possible stall before the 30 s socket
+    # timeout fires.
+
+    _ONLINE_SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    _online_timer = None
+    _online_phase: str = ""
+    _online_started: float = 0.0
+    _online_last_progress: float = 0.0
+    _online_spin: int = 0
+
+    def _online_set_phase(self, text: str) -> None:
+        """Record the worker's current phase + mark forward progress.
+        Called from the worker thread via ``call_from_thread``."""
+        self._online_phase = text
+        self._online_last_progress = _time_mod.monotonic()
+
+    def _online_start_heartbeat(self) -> None:
+        now = _time_mod.monotonic()
+        self._online_started = now
+        self._online_last_progress = now
+        self._online_spin = 0
+        self._online_phase = "Contacting server…"
+        self._online_tick()   # paint frame 0 immediately
+        try:
+            self._online_timer = self.set_interval(1.0, self._online_tick)
+        except Exception:
+            self._online_timer = None
+
+    def _online_stop_heartbeat(self) -> None:
+        timer = self._online_timer
+        self._online_timer = None
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+
+    def _online_tick(self) -> None:
+        if not self.is_mounted or not self._online_busy:
+            return
+        frames = self._ONLINE_SPIN_FRAMES
+        self._online_spin = (self._online_spin + 1) % len(frames)
+        frame = frames[self._online_spin]
+        now = _time_mod.monotonic()
+        elapsed = int(now - self._online_started)
+        stalled = (now - self._online_last_progress) > 25
+        note = ("  [yellow]· server slow — still waiting[/yellow]"
+                if stalled else "")
+        self._safe_online_status(
+            f"[cyan]{frame}[/cyan] {self._online_phase}  "
+            f"·  {elapsed}s{note}")
+
+    def _online_query_text(self) -> str:
+        try:
+            return self.query_one("#online-query", TextArea).text
+        except NoMatches:
+            return ""
+
+    def _online_selected_program(self) -> str:
+        try:
+            v = self.query_one("#online-program", Select).value
+            return v if isinstance(v, str) else "blastn"
+        except NoMatches:
+            return "blastn"
+
+    def _online_database(self) -> str:
+        try:
+            return (self.query_one("#online-db", Input).value or "").strip()
+        except NoMatches:
+            return ""
+
+    def _online_max_hits(self) -> int:
+        try:
+            raw = self.query_one("#online-maxhits", Input).value
+        except NoMatches:
+            return 50
+        n = _online_safe_int(raw)
+        if n is None or n < 1:
+            return 50
+        return min(n, 500)   # cap protects response size + the server
+
+    def _online_set_columns(self, kind: str) -> None:
+        """Reset the online results table to the BLAST or HMM column set
+        and drop any cached row→hit map."""
+        try:
+            t = self.query_one("#online-table", DataTable)
+        except NoMatches:
+            return
+        t.clear(columns=True)
+        t.add_columns(*(self._ONLINE_HMM_COLS if kind == "hmm"
+                        else self._ONLINE_BLAST_COLS))
+        self._online_rows: "dict[str, dict]" = {}
+
+    def _online_set_searching(self, on: bool) -> None:
+        self._online_busy = on
+        try:
+            btn = self.query_one("#btn-online-search", Button)
+            if on:
+                btn.label = "Cancel"
+                btn.variant = "error"
+            else:
+                is_hmm = self._online_selected_program() == "hmmscan"
+                btn.label = "Search Pfam" if is_hmm else "Search NCBI"
+                btn.variant = "primary"
+        except NoMatches:
+            pass
+        # Lock the inputs while a search is in flight so the user can't
+        # change the program / query out from under the running worker.
+        for wid in ("#online-program", "#online-db", "#online-maxhits",
+                    "#btn-online-from-plasmid", "#btn-online-from-feature"):
+            try:
+                self.query_one(wid).disabled = on
+            except NoMatches:
+                pass
+        # Heartbeat: animate while running, stop (leaving the final
+        # status message) when done.
+        if on:
+            self._online_start_heartbeat()
+        else:
+            self._online_stop_heartbeat()
+
+    @on(Select.Changed, "#online-program")
+    def _on_online_program_changed(self, event: Select.Changed) -> None:
+        if not self.is_mounted:
+            return
+        prog = event.value if isinstance(event.value, str) else "blastn"
+        is_hmm = (prog == "hmmscan")
+        # hmmscan ignores the BLAST nt/nr database — hide that control.
+        try:
+            self.query_one("#online-db-col").display = not is_hmm
+        except NoMatches:
+            pass
+        if not is_hmm:
+            try:
+                self.query_one("#online-db", Input).value = \
+                    _ncbi_blast_db_for(prog)
+            except NoMatches:
+                pass
+        if not self._online_busy:
+            try:
+                self.query_one("#btn-online-search", Button).label = \
+                    "Search Pfam" if is_hmm else "Search NCBI"
+            except NoMatches:
+                pass
+        # The previous run's table described a different program — clear it.
+        self._online_set_columns("hmm" if is_hmm else "blast")
+        self._safe_online_status("")
+        self._safe_online_detail("")
+        # A program switch that flips the query alphabet (nt↔protein) also
+        # clears the now-invalid query; staying within an alphabet
+        # (e.g. blastn→blastx) keeps it.
+        if (_program_query_kind(prog)
+                != _program_query_kind(self._online_prev_program)):
+            try:
+                self.query_one("#online-query", TextArea).clear()
+            except NoMatches:
+                pass
+        self._online_prev_program = prog
+
+    @on(TabbedContent.TabActivated, "#blast-tabs")
+    def _on_blast_tab_activated(self, _: "object" = None) -> None:
+        """The footer Build / Run buttons only drive the Local tab — gray
+        them out while the Online tab is active so it's clear the Online
+        tab has its own Search button."""
+        try:
+            active = self.query_one("#blast-tabs", TabbedContent).active
+        except NoMatches:
+            return
+        online = (active == "tab-blast-online")
+        for wid in ("#btn-blast-run", "#btn-blast-build"):
+            try:
+                self.query_one(wid, Button).disabled = online
+            except NoMatches:
+                pass
+
+    # ── Query-source loaders (type / whole plasmid / feature) ────────
+
+    @on(Button.Pressed, "#btn-online-from-plasmid")
+    def _online_from_plasmid(self, _) -> None:
+        if self._online_busy:
+            return
+        self.app.push_screen(PlasmidPickerModal(None),
+                             callback=self._on_pick_plasmid_whole)
+
+    def _on_pick_plasmid_whole(self, plasmid_id) -> None:
+        if not plasmid_id:
+            return
+        entry = _find_library_entry_by_id(plasmid_id)
+        if not entry:
+            self._safe_online_status("[red]Plasmid not found in library.[/red]")
+            return
+        gb = entry.get("gb_text", "")
+        if not gb:
+            self._safe_online_status(
+                "[yellow]That library entry has no stored sequence.[/yellow]")
+            return
+        try:
+            rec = _gb_text_to_record(gb)
+        except Exception:
+            _log.exception("Online tab: failed to parse library plasmid")
+            self._safe_online_status(
+                "[red]Couldn't parse that plasmid — it may be corrupt.[/red]")
+            return
+        seq = str(rec.seq)
+        try:
+            self.query_one("#online-query", TextArea).text = seq
+        except NoMatches:
+            return
+        self._safe_online_status(
+            f"[green]Loaded {entry.get('name', 'plasmid')} "
+            f"({len(seq):,} bp).[/green]")
+
+    # When the selected program takes a protein query (hmmscan / blastp /
+    # tblastn), loading "from feature" must restrict the picker to CDS
+    # features and feed the *translated* protein — a CDS's raw nucleotides
+    # are meaningless to a protein search. Captured at click time so it
+    # can't shift while the picker modals are stacked.
+    _online_feature_protein_mode: bool = False
+
+    @on(Button.Pressed, "#btn-online-from-feature")
+    def _online_from_feature(self, _) -> None:
+        if self._online_busy:
+            return
+        self._online_feature_protein_mode = (
+            self._online_selected_program() in _ONLINE_PROTEIN_QUERY)
+        self.app.push_screen(PlasmidPickerModal(None),
+                             callback=self._on_pick_plasmid_for_feature)
+
+    def _on_pick_plasmid_for_feature(self, plasmid_id) -> None:
+        if not plasmid_id:
+            return
+        entry = _find_library_entry_by_id(plasmid_id)
+        if not entry or not entry.get("gb_text"):
+            self._safe_online_status(
+                "[yellow]That library entry has no stored sequence.[/yellow]")
+            return
+        try:
+            rec = _gb_text_to_record(entry["gb_text"])
+        except Exception:
+            _log.exception("Online tab: failed to parse library plasmid")
+            self._safe_online_status(
+                "[red]Couldn't parse that plasmid — it may be corrupt.[/red]")
+            return
+        feat_entries = _extract_feature_entries_from_record(rec)
+        if self._online_feature_protein_mode:
+            # Protein search: only CDS features can be translated.
+            feat_entries = [e for e in feat_entries
+                            if e.get("feature_type") == "CDS"]
+            if not feat_entries:
+                self._safe_online_status(
+                    "[yellow]That plasmid has no CDS features to "
+                    "translate for a protein search.[/yellow]")
+                return
+        elif not feat_entries:
+            self._safe_online_status(
+                "[yellow]That plasmid has no non-source features.[/yellow]")
+            return
+        self.app.push_screen(
+            PlasmidFeaturePickerModal(feat_entries,
+                                      plasmid_name=entry.get("name", "")),
+            callback=self._on_pick_feature)
+
+    def _on_pick_feature(self, picked) -> None:
+        if not picked:
+            return
+        if self._online_feature_protein_mode:
+            prot = _feature_protein(picked)
+            if not prot:
+                self._safe_online_status(
+                    "[yellow]Couldn't translate that CDS (no /translation "
+                    "and an empty coding sequence).[/yellow]")
+                return
+            try:
+                self.query_one("#online-query", TextArea).text = prot
+            except NoMatches:
+                return
+            self._safe_online_status(
+                f"[green]Loaded translated CDS {picked.get('name', '?')} "
+                f"({len(prot):,} aa).[/green]")
+            return
+        seq = picked.get("sequence", "") or ""
+        if not seq:
+            self._safe_online_status(
+                "[yellow]That feature has no sequence.[/yellow]")
+            return
+        try:
+            self.query_one("#online-query", TextArea).text = seq
+        except NoMatches:
+            return
+        self._safe_online_status(
+            f"[green]Loaded feature {picked.get('name', '?')} "
+            f"({len(seq):,} bp).[/green]")
+
+    # ── Search ───────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-online-search")
+    def _online_search(self, _) -> None:
+        if self._online_busy:
+            # Acts as Cancel while a search is in flight.
+            _ncbi_blast_cancel.set()
+            _hmmer_web_cancel.set()
+            self._safe_online_status("[yellow]Cancelling…[/yellow]")
+            return
+        program = self._online_selected_program()
+        raw = self._online_query_text()
+        if not raw.strip():
+            self._safe_online_status(
+                "[red]Paste or load a query sequence first.[/red]")
+            return
+        query = _online_clean_query(raw, program)
+        if not query:
+            self._safe_online_status(
+                "[red]Query is empty after cleaning — check it contains "
+                "sequence letters.[/red]")
+            return
+        limit = _online_max_query_len(program)
+        if len(query) > limit:
+            label = "hmmscan" if program == "hmmscan" else program
+            self._safe_online_status(
+                f"[red]Query is {len(query):,} letters; {label} accepts at "
+                f"most {limit:,}. Trim it or search a shorter region so the "
+                f"server doesn't reject the job.[/red]")
+            return
+        max_hits = self._online_max_hits()
+        _log_event("online_search.run", program=program,
+                   query_len=len(query), max_hits=max_hits)
+        if program == "hmmscan":
+            self._online_set_columns("hmm")
+            _hmmer_web_cancel.clear()
+            self._online_set_searching(True)
+            self._safe_online_status("[dim]Starting Pfam hmmscan…[/dim]")
+            self._safe_online_detail("")
+            self._do_online_hmmscan(query, max_hits)
+            return
+        database = self._online_database() or _ncbi_blast_db_for(program)
+        self._online_set_columns("blast")
+        _ncbi_blast_cancel.clear()
+        self._online_set_searching(True)
+        self._safe_online_status(f"[dim]Starting {program}…[/dim]")
+        self._safe_online_detail("")
+        self._do_online_blast(query, program, database, max_hits)
+
+    @work(thread=True, exclusive=True, group="online_search")
+    def _do_online_blast(self, query: str, program: str, database: str,
+                         max_hits: int) -> None:
+        def _progress(msg: str) -> None:
+            if self.is_mounted:
+                self.app.call_from_thread(self._online_set_phase, msg)
+        try:
+            hits = _ncbi_blast_online(query, program, database, max_hits,
+                                      _progress, _ncbi_blast_cancel)
+        except _OnlineSearchCancelled:
+            self.app.call_from_thread(self._online_blast_done, program,
+                                      None, "__cancelled__")
+            return
+        except RuntimeError as exc:
+            self.app.call_from_thread(self._online_blast_done, program,
+                                      None, str(exc))
+            return
+        except Exception as exc:
+            _log.exception("NCBI BLAST worker failed")
+            self.app.call_from_thread(self._online_blast_done, program,
+                                      None, f"NCBI BLAST failed: {exc}")
+            return
+        self.app.call_from_thread(self._online_blast_done, program,
+                                  hits, None)
+
+    @work(thread=True, exclusive=True, group="online_search")
+    def _do_online_hmmscan(self, protein: str, max_hits: int) -> None:
+        def _progress(msg: str) -> None:
+            if self.is_mounted:
+                self.app.call_from_thread(self._online_set_phase, msg)
+        try:
+            hits = _hmmer_web_hmmscan(protein, max_hits,
+                                      _progress, _hmmer_web_cancel)
+        except _OnlineSearchCancelled:
+            self.app.call_from_thread(self._online_hmm_done,
+                                      None, "__cancelled__")
+            return
+        except RuntimeError as exc:
+            self.app.call_from_thread(self._online_hmm_done, None, str(exc))
+            return
+        except Exception as exc:
+            _log.exception("EBI HMMER worker failed")
+            self.app.call_from_thread(self._online_hmm_done, None,
+                                      f"hmmscan failed: {exc}")
+            return
+        self.app.call_from_thread(self._online_hmm_done, hits, None)
+
+    def _online_blast_done(self, program: str, hits: "list[dict] | None",
+                           err: "str | None") -> None:
+        self._online_set_searching(False)
+        if not self.is_mounted:
+            return
+        if err == "__cancelled__":
+            self._safe_online_status("[yellow]Search cancelled.[/yellow]")
+            return
+        if err is not None:
+            self._safe_online_status(f"[red]{err}[/red]")
+            return
+        self._online_render_blast(hits or [])
+        n = len(hits or [])
+        self._safe_online_status(
+            f"[green]{program} done — {n} hit{'' if n == 1 else 's'} "
+            f"from NCBI.[/green]")
+
+    def _online_hmm_done(self, hits: "list[dict] | None",
+                         err: "str | None") -> None:
+        self._online_set_searching(False)
+        if not self.is_mounted:
+            return
+        if err == "__cancelled__":
+            self._safe_online_status("[yellow]Search cancelled.[/yellow]")
+            return
+        if err is not None:
+            self._safe_online_status(f"[red]{err}[/red]")
+            return
+        self._online_render_hmm(hits or [])
+        n = len(hits or [])
+        inc = sum(1 for h in (hits or []) if h.get("included", True))
+        extra = (f" ({inc} above the inclusion threshold)"
+                 if n and inc != n else "")
+        self._safe_online_status(
+            f"[green]hmmscan done — {n} Pfam "
+            f"hit{'' if n == 1 else 's'}{extra}.[/green]")
+
+    def _online_render_blast(self, hits: "list[dict]") -> None:
+        self._online_set_columns("blast")
+        try:
+            t = self.query_one("#online-table", DataTable)
+        except NoMatches:
+            return
+        for i, h in enumerate(hits):
+            key = str(i)
+            pid = h.get("identity_pct")
+            aln = h.get("aln_len")
+            bs = h.get("bit_score")
+            t.add_row(
+                self._online_trunc(h.get("accession", "?"), 24),
+                self._online_trunc(h.get("description", ""), 56),
+                "—" if pid is None else f"{pid}",
+                "—" if aln is None else f"{aln}",
+                self._online_fmt_eval(h.get("evalue")),
+                "—" if bs is None else f"{bs:.0f}",
+                self._online_fmt_range(h.get("q_start"), h.get("q_end")),
+                self._online_fmt_range(h.get("s_start"), h.get("s_end")),
+                key=key,
+            )
+            self._online_rows[key] = h
+
+    def _online_render_hmm(self, hits: "list[dict]") -> None:
+        self._online_set_columns("hmm")
+        try:
+            t = self.query_one("#online-table", DataTable)
+        except NoMatches:
+            return
+        for i, h in enumerate(hits):
+            key = str(i)
+            bs = h.get("bit_score")
+            t.add_row(
+                self._online_trunc(h.get("acc", "?"), 14),
+                self._online_trunc(h.get("name", ""), 20),
+                self._online_trunc(h.get("description", ""), 50),
+                self._online_fmt_eval(h.get("evalue")),
+                "—" if bs is None else f"{bs:.0f}",
+                f"{h.get('n_dom', 0)}",
+                key=key,
+            )
+            self._online_rows[key] = h
+
+    @on(DataTable.RowHighlighted, "#online-table")
+    def _online_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        rows = getattr(self, "_online_rows", {})
+        key = event.row_key.value if event.row_key else None
+        h = rows.get(key) if key is not None else None
+        if not h:
+            return
+        from rich.markup import escape as _esc
+        if "acc" in h:   # Pfam hit
+            head = (f"[b]{_esc(str(h.get('acc', '')))}[/b]  "
+                    f"{_esc(str(h.get('name', '')))}")
+            tags = []
+            if h.get("type"):
+                tags.append(str(h["type"]))
+            if h.get("clan"):
+                tags.append(f"clan {h['clan']}")
+            if not h.get("included", True):
+                tags.append("below inclusion threshold")
+            if tags:
+                head += "  [dim]·  " + _esc("  ·  ".join(tags)) + "[/dim]"
+            lines = [head]
+            if h.get("description"):
+                lines.append(_esc(str(h["description"])))
+            if h.get("link"):
+                lines.append(f"[dim]{_esc(str(h['link']))}[/dim]")
+            self._safe_online_detail("\n".join(lines))
+        else:            # BLAST hit
+            acc = str(h.get("accession", ""))
+            stats = []
+            if h.get("identity_pct") is not None:
+                stats.append(f"{h['identity_pct']}% id")
+            if h.get("aln_len") is not None:
+                stats.append(f"aln {h['aln_len']}")
+            if h.get("evalue") is not None:
+                stats.append(f"E {self._online_fmt_eval(h['evalue'])}")
+            if h.get("bit_score") is not None:
+                stats.append(f"{h['bit_score']:.0f} bits")
+            head = f"[b]{_esc(acc)}[/b]"
+            if stats:
+                head += "  [dim]·  " + _esc("  ·  ".join(stats)) + "[/dim]"
+            lines = [head]
+            if h.get("description"):
+                lines.append(_esc(str(h["description"])))
+            if acc and acc != "?":
+                # Generic NCBI lookup — resolves whether the accession is
+                # nucleotide (nt) or protein (nr).
+                lines.append(
+                    "[dim]https://www.ncbi.nlm.nih.gov/search/all/?term="
+                    f"{_esc(acc)}[/dim]")
+            self._safe_online_detail("\n".join(lines))
+
     @on(Button.Pressed, "#btn-blast-close")
     def _close_btn(self) -> None:
+        # Release any in-flight online search so an abandoned NCBI RID is
+        # freed and the worker doesn't keep polling after the modal closes.
+        _ncbi_blast_cancel.set()
+        _hmmer_web_cancel.set()
+        self._online_stop_heartbeat()
         self.dismiss(None)
 
     def action_cancel(self) -> None:
+        _ncbi_blast_cancel.set()
+        _hmmer_web_cancel.set()
+        self._online_stop_heartbeat()
         self.dismiss(None)
 
 
@@ -54373,14 +55716,18 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
                     )
                     return
                 try:
-                    entries = _load_parts_bin()
-                    if replace_names:
-                        entries = [
-                            e for e in entries
-                            if (e.get("name") or "") not in replace_names
-                        ]
-                    entries = items_to_save + entries
-                    _save_parts_bin(entries)
+                    # RMW under `_cache_lock` so a concurrent parts-bin
+                    # writer (agent create/delete-part, constructor save)
+                    # can't read the same pre-state and drop this row.
+                    with _cache_lock:
+                        entries = _load_parts_bin()
+                        if replace_names:
+                            entries = [
+                                e for e in entries
+                                if (e.get("name") or "") not in replace_names
+                            ]
+                        entries = items_to_save + entries
+                        _save_parts_bin(entries)
                 except (OSError, RuntimeError) as exc:
                     _notify_save_failure(self.app, "Parts bin", exc)
                     return
@@ -54767,18 +56114,22 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
                 return
             n_overwritten = 0
             try:
-                entries = _load_parts_bin()
-                if replace_names:
-                    before = len(entries)
-                    entries = [
-                        e for e in entries
-                        if (e.get("name") or "") not in replace_names
-                    ]
-                    n_overwritten = before - len(entries)
-                # Insert newest-first at the top so the user sees them
-                # at the head of the table after the modal refreshes.
-                entries = items_to_save + entries
-                _save_parts_bin(entries)
+                # RMW under `_cache_lock` so a concurrent parts-bin writer
+                # (agent create/delete-part, constructor save) can't read
+                # the same pre-state and drop these rows.
+                with _cache_lock:
+                    entries = _load_parts_bin()
+                    if replace_names:
+                        before = len(entries)
+                        entries = [
+                            e for e in entries
+                            if (e.get("name") or "") not in replace_names
+                        ]
+                        n_overwritten = before - len(entries)
+                    # Insert newest-first at the top so the user sees them
+                    # at the head of the table after the modal refreshes.
+                    entries = items_to_save + entries
+                    _save_parts_bin(entries)
             except (OSError, RuntimeError) as exc:
                 _log.exception("Load Parts: parts bin save failed")
                 _notify_save_failure(self.app, "Parts bin", exc)
@@ -73441,17 +74792,22 @@ class TraditionalCloningPane(Vertical):
         if product is None or not product.get("top_seq"):
             return
         default_name = self._compose_default_name(suffix)
+        active_coll = _get_active_collection_name() or "Default"
 
-        def _on_named(user_name: "str | None") -> None:
-            if user_name is None:
-                # User cancelled — don't write anything.
+        def _on_named(result: "object") -> None:
+            # Accepts dict OR bare str; None / empty = cancel.
+            parsed = _name_modal_result(result, active_coll)
+            if parsed is None:
                 return
+            user_name, collection = parsed
             self._commit_product_to_library(
                 product, suffix=suffix, name=user_name,
+                collection=collection,
             )
 
         self.app.push_screen(
-            NamePlasmidModal(default_name, target_label="plasmid"),
+            NamePlasmidModal(default_name, target_label="plasmid",
+                             default_collection=active_coll),
             callback=_on_named,
         )
 
@@ -73483,7 +74839,9 @@ class TraditionalCloningPane(Vertical):
         return full[:60].rstrip()
 
     def _commit_product_to_library(self, product: "dict | None", *,
-                                      suffix: str, name: str) -> None:
+                                      suffix: str, name: str,
+                                      collection: "str | None" = None
+                                      ) -> None:
         """Persist a simulated ligation product to the library under
         ``name`` (already sanitised + dup-checked by
         ``NamePlasmidModal``). Builds a SeqRecord with the product's
@@ -73593,6 +74951,35 @@ class TraditionalCloningPane(Vertical):
             # History recording is best-effort — never block the save.
             _log.exception("trad-cloning: failed to record history "
                               "for %s", name)
+        # Route into a NON-active collection via the universal commit
+        # helper (lock-protected RMW + collision-rename; no active-library
+        # mirror since the product isn't in the active set). The common
+        # default — saving into the active collection — keeps the
+        # cache-first + async-disk path below.
+        active_coll = _get_active_collection_name()
+        tc = (collection or "").strip()
+        if tc and tc != (active_coll or ""):
+            try:
+                final_name = _commit_library_entry_to_collection(entry, tc)
+            except (OSError, RuntimeError) as exc:
+                _log_event("traditional.save.failed", name=name,
+                           suffix=suffix, stage="commit",
+                           error=str(exc)[:120])
+                _notify_save_failure(self.app, "Plasmid library", exc)
+                return
+            _log_event("traditional.save.ok", name=final_name, suffix=suffix,
+                       bp=_seq_len(rec), n_feats=len(rec.features or []),
+                       collection=tc)
+            self.app.notify(
+                f"Saved {final_name} ({_seq_len(rec):,} bp) to "
+                f"collection '{tc}'.", timeout=6)
+            self._populate_library_tables()
+            try:
+                _agent_refresh_library_panel(self.app)
+            except Exception:
+                _log.exception("trad save: LibraryPanel refresh failed")
+            self._invalidate_results()
+            return
         # Sweep #11 (2026-05-20): RMW under `_cache_lock` so a
         # concurrent worker save from a different group (Constructor,
         # Gibson, Domesticator mirror) can't read the same pre-state
@@ -74473,6 +75860,19 @@ class GibsonAssemblyPane(Vertical):
 
     # ── Save ─────────────────────────────────────────────────────────────────
 
+    def _default_gibson_name(self, lane: list[dict]) -> str:
+        """Default name for a Gibson product — the joined fragment names
+        (spaces, no underscores) so the library row reads cleanly. Caps
+        at 60 chars to keep the row single-line."""
+        labels: list[str] = []
+        for f in lane:
+            nm = str((f or {}).get("name") or "").strip()
+            if nm and nm not in labels:
+                labels.append(nm)
+        joined = " + ".join(labels)
+        base = f"Gibson {joined}" if joined else "Gibson assembly"
+        return base[:60].rstrip()
+
     @on(Button.Pressed, "#btn-gib-save")
     def _on_save(self, _: Button.Pressed) -> None:
         product = self._product
@@ -74482,59 +75882,85 @@ class GibsonAssemblyPane(Vertical):
                 severity="warning",
             )
             return
-        # Capture inputs on the UI thread, then dispatch to the worker.
-        # The lane is deepcopied so a concurrent lane mutation can't
-        # mutate the worker's view; product is already a fresh dict
-        # returned by `_simulate_gibson_assembly`.
+        # Capture inputs on the UI thread, then prompt for name +
+        # collection before dispatching to the worker. The lane is
+        # deepcopied so a concurrent lane mutation can't mutate the
+        # worker's view; product is already a fresh dict returned by
+        # `_simulate_gibson_assembly`.
         import copy as _copy
         lane_snapshot = _copy.deepcopy(self._lane)
         product_snapshot = _copy.deepcopy(product)
         circ = bool(product_snapshot.get("circular", True))
         entry_counter = getattr(self.app, "_record_load_counter", 0)
-        # Disable Save immediately so a second click can't race the
-        # worker into a duplicate insert.
-        self._invalidate_product()
-        self._gibson_save_worker(
-            product=product_snapshot,
-            lane=lane_snapshot,
-            circular=circ,
-            entry_counter=entry_counter,
+        default_name = self._default_gibson_name(lane_snapshot)
+        active_coll = _get_active_collection_name() or "Default"
+
+        def _on_named(result: "object") -> None:
+            # Accepts dict OR bare str; None / empty = cancel (keep the
+            # product so the user can retry).
+            parsed = _name_modal_result(result, active_coll)
+            if parsed is None:
+                return
+            nm, coll = parsed
+            # Commit is going ahead — disable Save now so a second click
+            # can't race the worker into a duplicate insert.
+            self._invalidate_product()
+            self._gibson_save_worker(
+                product=product_snapshot,
+                lane=lane_snapshot,
+                circular=circ,
+                entry_counter=entry_counter,
+                name=_sanitize_plasmid_name(nm, fallback=default_name),
+                collection=coll,
+            )
+
+        self.app.push_screen(
+            NamePlasmidModal(default_name, target_label="plasmid",
+                             default_collection=active_coll),
+            callback=_on_named,
         )
 
     @work(thread=True, exclusive=True, group="gibson_save")
     def _gibson_save_worker(self, *, product: dict, lane: list[dict],
                               circular: bool,
-                              entry_counter: int) -> None:
+                              entry_counter: int,
+                              name: "str | None" = None,
+                              collection: "str | None" = None) -> None:
         """Worker: build the GenBank text + history XML and persist the
-        Gibson product to the library. Heavy serialisation runs
-        off-thread; UI updates (notify / panel reveal / re-populate)
-        bounce back via ``call_from_thread``.
-        """
-        # Sweep #11 (2026-05-20): Gibson load-modify-save runs under
-        # `_cache_lock` to keep id-uniqueness honest against
-        # concurrent Constructor / Traditional / Domesticator mirror
-        # saves. Without this, two workers could both pick the same
-        # "gibson-N" name and the second save would silently drop
-        # the first save's entry. Lock is held across the
-        # disambiguation + insert + save so the gap is closed.
-        try:
-            entries = _load_library()
-        except Exception as exc:
-            _log.exception("gibson: library load failed")
-            self.app.call_from_thread(
-                _notify_save_failure,
-                self.app, "Plasmid library", exc,
-            )
-            return
-        existing = {e.get("name") for e in entries
-                     if isinstance(e, dict)}
-        base = "gibson"
-        n = 1
-        name = base
-        while name in existing:
-            n += 1
-            name = f"{base}-{n}"
-        rec = _gibson_record_from_result(product, name=name)
+        Gibson product into the chosen collection via the universal
+        `_commit_library_entry_to_collection` helper (lock-protected RMW
+        + name/id collision-rename + active-library mirror — Sweep #11's
+        cross-group race protection now lives in that shared helper).
+        Heavy serialisation runs off-thread; UI updates bounce back via
+        ``call_from_thread``.
+
+        ``name`` is the user's chosen display name (spaces preserved; the
+        GenBank LOCUS id is sanitised separately). ``collection`` is the
+        chosen destination. Both fall back to a legacy auto-name +
+        active collection when omitted (back-compat for direct callers /
+        older tests). The product can be linear or circular — both save
+        fine."""
+        active_coll = _get_active_collection_name() or "Default"
+        target_coll = (collection or "").strip() or active_coll
+        display_name = _sanitize_plasmid_name((name or "").strip(),
+                                                fallback="") if name else ""
+        if not display_name:
+            # Legacy auto-name fallback (no prompt) — keep "gibson-N"
+            # disambiguated against existing library names.
+            try:
+                existing = {e.get("name") for e in _iter_library_readonly()
+                            if isinstance(e, dict)}
+            except Exception:
+                existing = set()
+            base, nn, display_name = "gibson", 1, "gibson"
+            while display_name in existing:
+                nn += 1
+                display_name = f"{base}-{nn}"
+        # GenBank LOCUS can't carry whitespace — sanitise the id; the
+        # display name keeps spaces (no underscores forced on the row).
+        locus_id = (re.sub(r"[^A-Za-z0-9_-]+", "_", display_name).strip("_")
+                    or "gibson")[:16]
+        rec = _gibson_record_from_result(product, name=locus_id)
         if rec is None:
             self.app.call_from_thread(
                 self._on_gibson_save_failed,
@@ -74551,59 +75977,41 @@ class GibsonAssemblyPane(Vertical):
             )
             return
         from datetime import date as _date_mod
+        # Stale-record guard (invariant #28). If the canvas record
+        # changed between Simulate and Save, the lane is still valid
+        # (lane fragments are self-contained) — proceed but flag the
+        # entry's `source` for diagnostic clarity.
+        source = "constructor:gibson"
+        if entry_counter != getattr(self.app, "_record_load_counter",
+                                       entry_counter):
+            source = "constructor:gibson:stale-canvas"
         entry = {
-            "id":      name,
-            "name":    name,
+            "id":      locus_id,
+            "name":    display_name,
             "size":    _seq_len(rec),
             "n_feats": len(rec.features or []),
-            "source":  "constructor:gibson",
+            "source":  source,
             "added":   _date_mod.today().isoformat(),
             "gb_text": gb_text,
         }
         try:
             entry["history_xml"] = self._build_history_for_gibson(
-                name=name, product_seq_len=_seq_len(rec),
+                name=display_name, product_seq_len=_seq_len(rec),
                 lane=lane, circular=circular,
-                library_entries=entries,
+                library_entries=_load_library(),
             )
         except Exception:
             _log.exception(
-                "gibson: history recording failed for %s", name,
+                "gibson: history recording failed for %s", display_name,
             )
-        # Stale-record guard (invariant #28). If the canvas record
-        # changed between Simulate and Save (e.g. the user opened a
-        # different plasmid mid-flight), the lane is still valid
-        # (lane fragments are self-contained, not pinned to the canvas)
-        # — so we proceed but bump the entry's `source` to flag it
-        # for diagnostic clarity.
-        if entry_counter != getattr(self.app, "_record_load_counter",
-                                       entry_counter):
-            entry["source"] = "constructor:gibson:stale-canvas"
         try:
-            # Re-disambiguate inside the lock to defend against a
-            # racing worker that landed a "gibson-N" between our
-            # check above and this point.
-            with _cache_lock:
-                fresh = _load_library()
-                fresh_names = {
-                    e.get("name") for e in fresh if isinstance(e, dict)
-                }
-                if name in fresh_names:
-                    bump = n + 1
-                    while True:
-                        candidate = f"{base}-{bump}"
-                        if candidate not in fresh_names:
-                            name = candidate
-                            entry["id"] = candidate
-                            entry["name"] = candidate
-                            break
-                        bump += 1
-                fresh.insert(0, entry)
-                _save_library(fresh)
+            final_name = _commit_library_entry_to_collection(
+                entry, target_coll,
+            )
         except (OSError, RuntimeError) as exc:
             _log_event(
                 "gibson.save.failed",
-                name=name, error=str(exc)[:120],
+                name=display_name, error=str(exc)[:120],
                 fragments=len(lane), circular=circular,
             )
             self.app.call_from_thread(
@@ -74613,30 +76021,39 @@ class GibsonAssemblyPane(Vertical):
             return
         _log_event(
             "gibson.save.ok",
-            name=name, bp=_seq_len(rec),
+            name=final_name, bp=_seq_len(rec),
             n_feats=len(rec.features or []),
             fragments=len(lane), circular=circular,
+            collection=target_coll,
         )
         self.app.call_from_thread(
             self._on_gibson_save_success,
-            name, _seq_len(rec), len(rec.features or []),
+            final_name, _seq_len(rec), len(rec.features or []),
+            target_coll,
         )
 
     def _on_gibson_save_failed(self, msg: str) -> None:
         self.app.notify(msg, severity="error", markup=False)
 
     def _on_gibson_save_success(self, name: str, seq_len: int,
-                                  n_feats: int) -> None:
+                                  n_feats: int,
+                                  collection: "str | None" = None) -> None:
+        coll_part = (f"collection '{collection}'"
+                     if collection else "library")
         self.app.notify(
             f"Saved {name} ({seq_len:,} bp, "
-            f"{n_feats} features) to library.",
+            f"{n_feats} features) to {coll_part}.",
             timeout=6,
         )
-        try:
-            lib = self.app.query_one("#library", LibraryPanel)
-            lib.reveal_entry_id(name)
-        except (NoMatches, AttributeError):
-            pass
+        # The LibraryPanel shows the active collection — only reveal when
+        # the save landed there.
+        active_coll = _get_active_collection_name()
+        if (not collection) or collection == (active_coll or ""):
+            try:
+                lib = self.app.query_one("#library", LibraryPanel)
+                lib.reveal_entry_id(name)
+            except (NoMatches, AttributeError):
+                pass
         # Re-populate so the new entry is immediately pickable as a
         # source for the next Gibson lane.
         self._populate_library_table()
@@ -75878,12 +77295,16 @@ class ConstructorModal(ModalScreen):
         target_level_for_label = source_level + 1
         target_label_for_modal = _part_level_label(target_level_for_label)
 
-        def _on_named(user_name: "str | None") -> None:
-            if user_name is None:
-                # User cancelled the naming prompt — abort the whole
-                # save flow so we don't write a half-named assembly
-                # under the auto-generated default.
+        active_coll = _get_active_collection_name() or "Default"
+
+        def _on_named(result: "object") -> None:
+            # Accepts the collection-mode dict OR a bare name str;
+            # None / empty = cancel → abort so we don't write a
+            # half-named assembly under the auto-generated default.
+            parsed = _name_modal_result(result, active_coll)
+            if parsed is None:
                 return
+            user_name, collection = parsed
             # `NamePlasmidModal` already sanitises, but re-run the
             # filter defensively in case a future code path bypasses
             # the modal (e.g. an agent endpoint).
@@ -75898,12 +77319,14 @@ class ConstructorModal(ModalScreen):
                 source_level=source_level,
                 bb_key=bb_key,
                 name=chosen,
+                collection=collection,
             )
 
         self.app.push_screen(
             NamePlasmidModal(
                 default_name,
                 target_label=target_label_for_modal,
+                default_collection=active_coll,
             ),
             callback=_on_named,
         )
@@ -75911,19 +77334,24 @@ class ConstructorModal(ModalScreen):
     def _do_save_with_name(self, *, gid: str, grammar: dict,
                            entry_vector: dict, parts: list[dict],
                            source_level: int, bb_key: str,
-                           name: str) -> None:
+                           name: str, collection: "str | None" = None
+                           ) -> None:
         """Dispatch the assembly simulation + library / parts-bin
         persist to a worker so the UI stays responsive during a
         multi-second flow on heavy libraries. Pre-fix the whole flow
         ran sync on the name-modal callback — a 10-part L2 MOD
         assembly into a 100 MB library could freeze for 5–15 s.
+
+        ``collection`` is the user's chosen destination (from the
+        name+collection modal); None falls back to the active
+        collection inside `_persist_assembly`.
         """
         self.app.notify("Assembling and saving", timeout=4, markup=False)
         entry_counter = getattr(self.app, "_record_load_counter", 0)
         self._save_to_library_worker(
             gid=gid, grammar=grammar, entry_vector=entry_vector,
             parts=parts, source_level=source_level,
-            bb_key=bb_key, name=name,
+            bb_key=bb_key, name=name, collection=collection,
             entry_counter=entry_counter,
         )
 
@@ -75933,6 +77361,7 @@ class ConstructorModal(ModalScreen):
                                   parts: list[dict],
                                   source_level: int, bb_key: str,
                                   name: str,
+                                  collection: "str | None" = None,
                                   entry_counter: int = 0) -> None:
         """Worker body for `_do_save_with_name`. Runs
         `_clone_assembly_into_entry_vector` (heavy assembly simulation)
@@ -75990,6 +77419,7 @@ class ConstructorModal(ModalScreen):
                 entry_vector=entry_vector, parts=parts,
                 backbone_role=bb_key,
                 display_name=name,
+                target_collection=collection,
             )
         except Exception as exc:
             _log.exception("Save To Library: persist failed")
@@ -76020,7 +77450,7 @@ class ConstructorModal(ModalScreen):
         self.app.call_from_thread(
             self._on_constructor_save_success,
             new_id, _seq_len(new_rec), source_level, name,
-            canvas_stale,
+            canvas_stale, collection,
         )
 
     def _on_constructor_save_failed(self, msg: str) -> None:
@@ -76030,6 +77460,7 @@ class ConstructorModal(ModalScreen):
                                        source_level: int,
                                        name: str,
                                        canvas_stale: bool = False,
+                                       collection: "str | None" = None,
                                        ) -> None:
         # Repopulate the LibraryPanel + focus the new row so the user
         # sees the assembly land in-list. Best-effort — the panel
@@ -76045,7 +77476,14 @@ class ConstructorModal(ModalScreen):
         # — only the auto-reveal is skipped. We refresh the panel via
         # `_repopulate` instead so the new row is visible without
         # stealing the cursor.
-        if new_id:
+        active_coll = _get_active_collection_name()
+        target_coll = (collection or active_coll or "").strip()
+        # The LibraryPanel shows the ACTIVE collection — only reveal the
+        # new row when the save landed there. A save into a different
+        # collection still committed; it just isn't in the active view.
+        saved_to_active = (not target_coll
+                           or target_coll == (active_coll or ""))
+        if new_id and saved_to_active:
             try:
                 lib = self.app.query_one("#library", LibraryPanel)
             except (NoMatches, AttributeError):
@@ -76060,15 +77498,10 @@ class ConstructorModal(ModalScreen):
                     lib.reveal_entry_id(new_id)
         target_level = source_level + 1
         level_label = _part_level_label(target_level)
-        # Mention the active collection in the notify so the user
-        # knows the assembly automatically mirrored there (via
-        # `_save_library` → `_sync_active_collection_plasmids`).
-        # Falls back to the "main" library wording when no collection
-        # is active.
-        active_coll = _get_active_collection_name()
+        # Name the destination collection the user actually chose.
         coll_part = (
-            f"collection '{active_coll}'"
-            if active_coll else "library"
+            f"collection '{target_coll}'"
+            if target_coll else "library"
         )
         self.app.notify(
             f"Saved '{name}' to {coll_part} "
@@ -76208,7 +77641,8 @@ class ConstructorModal(ModalScreen):
                             entry_vector: dict,
                             parts: list[dict],
                             backbone_role: str,
-                            display_name: "str | None" = None) -> str:
+                            display_name: "str | None" = None,
+                            target_collection: "str | None" = None) -> str:
         """Add the newly-cloned plasmid to plasmid_library.json AND
         mirror a parts-bin entry so the result can be picked from the
         L1+ assembly palette in subsequent cycles. Both go through
@@ -76297,33 +77731,50 @@ class ConstructorModal(ModalScreen):
         except Exception:
             _log.exception("constructor: failed to record history "
                             "for %s", unique_id)
+        active_coll = _get_active_collection_name()
+        tc = (target_collection or "").strip()
+        route_to_other = bool(tc and tc != (active_coll or ""))
         try:
-            # Sweep #11 (2026-05-20): RMW under `_cache_lock` so a
-            # concurrent worker save from a different group (Gibson,
-            # Traditional, Domesticator mirror) can't read the same
-            # pre-state and then have its save overwrite this one
-            # (or vice versa). The check above for `unique_id`
-            # collision against `existing` is also covered — we
-            # re-read inside the lock to defend against a race that
-            # added an entry between the disambiguation loop and the
-            # save. RLock allows the nested `_save_library` lock.
-            with _cache_lock:
-                lib_entries = _load_library()
-                # Re-disambiguate inside the lock so a concurrent
-                # save that took our originally-unique id is
-                # detected and we pick the next free slot.
-                existing_now = {e.get("id") or "" for e in lib_entries}
-                if unique_id in existing_now:
-                    bump = suffix
-                    while True:
-                        candidate = f"{plasmid_id}_{bump}"
-                        if candidate not in existing_now:
-                            unique_id = candidate
-                            lib_entry["id"] = unique_id
-                            break
-                        bump += 1
-                lib_entries.insert(0, lib_entry)
-                _save_library(lib_entries)
+            if route_to_other:
+                # Save into a NON-active collection: the universal commit
+                # helper appends to collections.json + collision-renames
+                # against THAT collection's entries (under `_cache_lock`).
+                # It deliberately does NOT mirror into the active library
+                # (the plasmid isn't in the active set), so the
+                # LibraryPanel won't show it until the user switches to
+                # the chosen collection. Reflect the final disambiguated
+                # name back so the success toast is accurate.
+                final_nm = _commit_library_entry_to_collection(
+                    lib_entry, tc,
+                )
+                lib_entry["name"] = final_nm
+            else:
+                # Sweep #11 (2026-05-20): RMW under `_cache_lock` so a
+                # concurrent worker save from a different group (Gibson,
+                # Traditional, Domesticator mirror) can't read the same
+                # pre-state and then have its save overwrite this one
+                # (or vice versa). The check above for `unique_id`
+                # collision against `existing` is also covered — we
+                # re-read inside the lock to defend against a race that
+                # added an entry between the disambiguation loop and the
+                # save. RLock allows the nested `_save_library` lock.
+                with _cache_lock:
+                    lib_entries = _load_library()
+                    # Re-disambiguate inside the lock so a concurrent
+                    # save that took our originally-unique id is
+                    # detected and we pick the next free slot.
+                    existing_now = {e.get("id") or "" for e in lib_entries}
+                    if unique_id in existing_now:
+                        bump = suffix
+                        while True:
+                            candidate = f"{plasmid_id}_{bump}"
+                            if candidate not in existing_now:
+                                unique_id = candidate
+                                lib_entry["id"] = unique_id
+                                break
+                            bump += 1
+                    lib_entries.insert(0, lib_entry)
+                    _save_library(lib_entries)
         except (OSError, RuntimeError) as exc:
             # Library save is the first commit. Re-raise — nothing
             # has landed on disk yet, so the outer worker's failure
@@ -76430,27 +77881,35 @@ class ConstructorModal(ModalScreen):
             "source_parts": [str(p.get("name") or "") for p in parts],
             "source_role":  backbone_role,
         }
-        bin_entries = _load_parts_bin()
-        bin_entries.insert(0, deepcopy(bin_entry))
-        try:
-            _save_parts_bin(bin_entries)
-        except (OSError, RuntimeError) as exc:
-            # Partial commit: the library write at line ~40319 already
-            # succeeded, so the new plasmid IS in the library — only
-            # the parts-bin row that the next-cycle palette depends
-            # on is missing. Surface this distinct state so the user
-            # doesn't see a misleading "Save failed" toast and
-            # re-trigger the whole assembly (which would create a
-            # duplicate library row). The unique_id below lets the
-            # user find the partially-saved entry; they can then
-            # manually re-add it to the parts bin via the New Part
-            # flow.
-            raise RuntimeError(
-                f"library saved as {unique_id!r} but parts-bin "
-                f"write failed: {exc}. The assembled plasmid is in "
-                f"your library; re-add it to the parts bin manually "
-                f"via the New Part button."
-            ) from exc
+        # Sweep (2026-05-28): the parts-bin RMW runs under `_cache_lock`
+        # too — the library half above is already locked (Sweep #11), but
+        # this half read+inserted outside the lock, so a concurrent
+        # parts-bin writer from a different group (agent create/delete-
+        # part, a PartsBin/Load-Parts modal, the L0 Domesticator) could
+        # read the same pre-state and drop this row on its save. RLock
+        # allows the nested `_save_parts_bin` lock.
+        with _cache_lock:
+            bin_entries = _load_parts_bin()
+            bin_entries.insert(0, deepcopy(bin_entry))
+            try:
+                _save_parts_bin(bin_entries)
+            except (OSError, RuntimeError) as exc:
+                # Partial commit: the library write at line ~40319 already
+                # succeeded, so the new plasmid IS in the library — only
+                # the parts-bin row that the next-cycle palette depends
+                # on is missing. Surface this distinct state so the user
+                # doesn't see a misleading "Save failed" toast and
+                # re-trigger the whole assembly (which would create a
+                # duplicate library row). The unique_id below lets the
+                # user find the partially-saved entry; they can then
+                # manually re-add it to the parts bin via the New Part
+                # flow.
+                raise RuntimeError(
+                    f"library saved as {unique_id!r} but parts-bin "
+                    f"write failed: {exc}. The assembled plasmid is in "
+                    f"your library; re-add it to the parts bin manually "
+                    f"via the New Part button."
+                ) from exc
         _log.info(
             "constructor: saved assembly %r (level %d, gid %s) — "
             "%d bp, %d parts, vector %r",
@@ -81415,7 +82874,11 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
 
 _PCR_MIN_PRIMER_LEN     = 10       # primers shorter than this can't anneal
 _PCR_MAX_PRIMER_LEN     = 80       # absurdly long primer = user error
-_PCR_DEFAULT_MAX_AMPLICON = 20_000   # bp — beyond this is wishful long-PCR
+_PCR_DEFAULT_MAX_AMPLICON = 20_000   # bp — function / agent default ceiling
+# UI default for the Simulator's "Max amplicon" box: 500 bp is a common
+# amplicon size, a friendlier starting point than the 20 kb long-PCR
+# ceiling. UI-only — the function / agent default above is unchanged.
+_PCR_UI_DEFAULT_MAX_AMPLICON = 500
 _PCR_AMPLICON_HARD_CAP  = 100_000  # bp — safety cap regardless of UI input
 _PCR_MAX_AMPLICONS      = 50       # cap on result count (a mispriming primer
                                    # on a repetitive template can yield 1000s)
@@ -82336,19 +83799,22 @@ class SimulatorScreen(Screen):
         width: 1fr; color: $text-muted; padding: 0 1;
         content-align: left middle;
     }
-    /* Template picker — a plasmid dropdown. Label + Select widths match
-       the Source row below so the two dropdowns line up in one column. */
+    /* Template + primer-source pickers share one row. The Template
+       dropdown is widened to fit full plasmid names; the Source toggle
+       sits beside it and the picked-plasmid meta (bp / topology) trails
+       in the residual width. */
     #sim-pcr-template-row {
         height: 3; margin: 0 0 1 0;
         align: left middle;
     }
     #sim-pcr-template-row Label {
-        width: 10; padding: 0 1 0 0;
+        width: 10; height: 3; padding: 0 1 0 0;
         content-align: right middle;
     }
-    #sim-pcr-template-select { width: 32; }
+    #sim-pcr-template-select { width: 44; }
+    #sim-pcr-source { width: 32; }
     #sim-pcr-template-meta {
-        width: 1fr; color: $text-muted; padding: 0 1;
+        width: 1fr; height: 3; color: $text-muted; padding: 0 1;
         content-align: left middle;
     }
 
@@ -82362,7 +83828,7 @@ class SimulatorScreen(Screen):
         align: left middle;
     }
     .sim-pcr-primer-row Label {
-        width: 10; padding: 0 1 0 0;
+        width: 10; height: 3; padding: 0 1 0 0;
         content-align: right middle;
     }
     .sim-pcr-primer-row Input { width: 1fr; min-width: 24; }
@@ -82374,25 +83840,8 @@ class SimulatorScreen(Screen):
         width: 1fr; min-width: 24;
     }
     .sim-pcr-primer-row .sim-tm {
-        width: 14; padding: 0 1;
+        width: 14; height: 3; padding: 0 1;
         content-align: center middle; color: $text-muted;
-    }
-
-    /* Primer-source toggle row sits right above the primer rows.
-       Label gets the same 10-col gutter so it visually nests with
-       the Forward / Reverse labels below it; Select flexes. */
-    #sim-pcr-source-row {
-        height: 3; margin: 0 0 1 0;
-        align: left middle;
-    }
-    #sim-pcr-source-row Label {
-        width: 10; padding: 0 1 0 0;
-        content-align: right middle;
-    }
-    #sim-pcr-source-row Select { width: 32; }
-    #sim-pcr-source-row .sim-pcr-source-hint {
-        width: 1fr; color: $text-muted; padding: 0 1;
-        content-align: left middle;
     }
 
     /* Params row: same height: 3 treatment so the Max-amplicon Input
@@ -82402,15 +83851,20 @@ class SimulatorScreen(Screen):
         height: 3; margin: 0 0 1 0;
         align: left middle;
     }
+    /* Label is auto-width so it sizes to its text and the Max-amplicon
+       Input packs right after it; height: 3 vertically centres it on
+       the Input. NOTE: no `#sim-pcr-params-row Static` rule — Label
+       subclasses Static, so a `Static { width: 1fr }` here would match
+       the Label (equal specificity, later rule) and stretch it to fill
+       the row, shoving the Input to the far edge. */
     #sim-pcr-params-row Label {
-        width: auto; padding: 0 1 0 0;
-        content-align: right middle;
-    }
-    #sim-pcr-params-row Input { width: 12; }
-    #sim-pcr-params-row Static {
-        width: 1fr; color: $text-muted; padding: 0 1;
+        width: auto; height: 3; padding: 0 1 0 0;
         content-align: left middle;
     }
+    /* Width sized to fit a 7-figure entry: Textual Input chrome is
+       6 cols (border 2 + padding 0 2 = 4), so width 15 leaves a 9-col
+       content area — 7 digits + cursor with slack. */
+    #sim-pcr-params-row Input { width: 15; }
 
     #sim-pcr-btns { height: 3; margin: 0 0 1 0; align: left middle; }
     #sim-pcr-btns Button { margin-right: 1; }
@@ -82445,7 +83899,7 @@ class SimulatorScreen(Screen):
         align: left middle;
     }
     #sim-gel-name-row Label {
-        width: 11; padding: 0 1 0 0;
+        width: 11; height: 3; padding: 0 1 0 0;
         content-align: right middle;
     }
     #sim-gel-name { width: 1fr; max-width: 40; }
@@ -82454,7 +83908,7 @@ class SimulatorScreen(Screen):
         align: left middle;
     }
     #sim-gel-top-row Label {
-        width: 11; padding: 0 1 0 0;
+        width: 11; height: 3; padding: 0 1 0 0;
         content-align: right middle;
     }
     #sim-gel-top-row Select { width: 14; }
@@ -82490,7 +83944,7 @@ class SimulatorScreen(Screen):
         align: left middle;
     }
     .sim-gel-lane-num {
-        width: 3; padding: 0 1 0 0;
+        width: 3; height: 3; padding: 0 1 0 0;
         color: $text-muted; content-align: center middle;
     }
     .sim-gel-lane-name   { width: 14; min-width: 10; }
@@ -82903,11 +84357,13 @@ class SimulatorScreen(Screen):
                 # Hint moved up to the Template label's old spot.
                 yield Static("· primers must match template exactly",
                               id="sim-pcr-hint")
-                # Template picker — pick the PCR template from the
-                # plasmid library. Pre-selects the plasmid that was
-                # active when the Simulator opened (or the first library
-                # plasmid when none was active). Aligned with the Source
-                # dropdown below.
+                # Template + primer-source pickers on one row. Template:
+                # pick the PCR template from the plasmid library (pre-
+                # selects the plasmid active when the Simulator opened,
+                # else the first library plasmid) — widened to fit full
+                # names. Source: flip the primer-entry widgets below
+                # between free-text Inputs and library Selects (sweep
+                # #37). The picked-plasmid meta (bp / topology) trails.
                 with Horizontal(id="sim-pcr-template-row"):
                     yield Label("Template:")
                     yield Select(
@@ -82916,13 +84372,6 @@ class SimulatorScreen(Screen):
                         allow_blank=False,
                         id="sim-pcr-template-select",
                     )
-                    yield Static(self._template_meta_text(),
-                                  id="sim-pcr-template-meta")
-                # Sweep #37 (2026-05-27): primer source toggle. Pick
-                # Library to swap the Input widgets below for Selects
-                # populated from the saved primer library; pick Custom
-                # to type primers free-form (original behaviour).
-                with Horizontal(id="sim-pcr-source-row"):
                     yield Label("Source:")
                     yield Select(
                         [("Custom (free text)", "custom"),
@@ -82931,11 +84380,8 @@ class SimulatorScreen(Screen):
                         allow_blank=False,
                         id="sim-pcr-source",
                     )
-                    yield Static(
-                        "· Library pulls from your saved primers; "
-                        "Custom lets you type primer sequences.",
-                        classes="sim-pcr-source-hint",
-                    )
+                    yield Static(self._template_meta_text(),
+                                  id="sim-pcr-template-meta")
                 # Forward primer row: Input + Select share the slot;
                 # exactly one is visible at a time per the source mode.
                 with Horizontal(classes="sim-pcr-primer-row"):
@@ -82965,7 +84411,7 @@ class SimulatorScreen(Screen):
                     yield Static("Tm —", classes="sim-tm", id="sim-pcr-rev-tm")
                 with Horizontal(id="sim-pcr-params-row"):
                     yield Label("Max amplicon (bp):")
-                    yield Input(str(_PCR_DEFAULT_MAX_AMPLICON),
+                    yield Input(str(_PCR_UI_DEFAULT_MAX_AMPLICON),
                                   id="sim-pcr-maxamp")
                 with Horizontal(id="sim-pcr-btns"):
                     yield Button("Run PCR", id="btn-sim-pcr-run",
@@ -83504,18 +84950,24 @@ class SimulatorScreen(Screen):
 
     def _default_amplicon_name(self, amp: dict) -> str:
         """The auto-generated amplicon name (also the AmpliconSaveModal
-        default). Mirrors the legacy in-line naming so existing saves
-        keep the same shape when the user accepts the default."""
-        base_name = (self._plasmid_name or "amplicon").split()[0]
-        base_name = re.sub(r"[^A-Za-z0-9_-]+", "_", base_name).strip("_") \
-                    or "amplicon"
+        default). Reads as a clean display label — **spaces, not
+        underscores** — so accepting the default never plants underscores
+        in the library row (the bug the user hit saving PCR amplicons
+        into the Phase Genomics collection). The GenBank LOCUS `id` is
+        sanitised separately in `_build_amplicon_library_entry`; the
+        display `name` keeps spaces."""
+        base_name = (self._plasmid_name or "").strip() or "amplicon"
+        # Cap so the library / modal row stays single-line. Display names
+        # may carry spaces, so NO underscore substitution here.
+        if len(base_name) > 32:
+            base_name = base_name[:32].rstrip()
         try:
             length = int(amp.get("length", 0) or 0)
             start = int(amp.get("start", 0) or 0)
             end = int(amp.get("end", 0) or 0)
         except (TypeError, ValueError):
             length, start, end = 0, 0, 0
-        return f"{base_name}_PCR_{length}bp_{start + 1}-{end}"
+        return f"{base_name} PCR {length} bp ({start + 1}-{end})"
 
     def _build_amplicon_library_entry(
         self, amp: dict, *, name: "str | None" = None,
@@ -83602,75 +85054,12 @@ class SimulatorScreen(Screen):
     def _commit_amplicon_to_collection(
         self, entry: dict, collection: str,
     ) -> str:
-        """Append `entry` to the named collection, name- and id-
-        collision-renaming so existing entries are never clobbered, and
-        re-mirror the active-library file when the target IS the active
-        collection. Returns the entry's final (post-rename) name.
-
-        Follows the `_move_copy_commit` transactional pattern:
-          * Whole load→mutate→save runs under `_cache_lock` so a
-            concurrent worker / agent write can't interleave.
-          * Atomic `_save_collections` (atomic write + .bak chain) — on
-            any failure the disk is unchanged and the error propagates
-            to the caller (which surfaces a save-failed toast).
-          * A target collection that no longer exists (deleted in
-            another window) is recreated rather than silently dropping
-            the save.
-          * `deepcopy` of the entry on the way in so a later mutation of
-            the caller's dict can't leak into the persisted list.
-
-        Raises `OSError` / `RuntimeError` on save failure."""
-        collection = (collection or "").strip() or "Default"
-        with _cache_lock:
-            colls = _load_collections()
-            idx = next(
-                (i for i, c in enumerate(colls)
-                 if isinstance(c, dict)
-                 and (c.get("name") or "") == collection),
-                -1,
-            )
-            if idx < 0:
-                colls.append({"name": collection, "plasmids": []})
-                idx = len(colls) - 1
-            plasmids = [e for e in (colls[idx].get("plasmids") or [])
-                        if isinstance(e, dict)]
-            names = {(e.get("name") or "") for e in plasmids}
-            ids   = {(e.get("id") or "")   for e in plasmids}
-
-            landing = deepcopy(entry)
-            base_name = (landing.get("name") or "").strip() or "PCR amplicon"
-            new_name = base_name
-            if new_name in names:
-                new_name = f"{base_name} COPY"
-                n = 2
-                while new_name in names:
-                    new_name = f"{base_name} COPY {n}"
-                    n += 1
-            landing["name"] = new_name
-
-            base_id = (landing.get("id") or "").strip() or "amplicon"
-            new_id = base_id
-            if new_id in ids:
-                n = 2
-                new_id = f"{base_id}_{n}"
-                while new_id in ids:
-                    n += 1
-                    new_id = f"{base_id}_{n}"
-            landing["id"] = new_id
-
-            plasmids.append(landing)
-            colls[idx]["plasmids"] = plasmids
-            _save_collections(colls)
-
-            # Keep the active-library mirror in lockstep when we just
-            # wrote into the active collection (otherwise the running
-            # library panel would show stale rows).
-            if _get_active_collection_name() == collection:
-                _safe_save_json_mirror(
-                    _LIBRARY_FILE, plasmids, "Plasmid library",
-                )
-                globals()["_library_cache"] = None
-        return landing["name"]
+        """Thin wrapper over the universal
+        `_commit_library_entry_to_collection` (kept as a method so the
+        Simulator's call sites + tests read naturally). Appends the
+        amplicon to the chosen collection, collision-renaming + mirroring
+        the active library, and returns the final display name."""
+        return _commit_library_entry_to_collection(entry, collection)
 
     # ── Gel handlers ───────────────────────────────────────────────────────────
 
@@ -87102,7 +88491,8 @@ class NamePlasmidModal(_OneShotDismissScreen, ModalScreen):
     ]
 
     def __init__(self, default_name: str,
-                 *, target_label: str = "plasmid") -> None:
+                 *, target_label: str = "plasmid",
+                 default_collection: "str | None" = None) -> None:
         super().__init__()
         self._default_name = _sanitize_plasmid_name(
             default_name or "", fallback="assembly",
@@ -87110,6 +88500,37 @@ class NamePlasmidModal(_OneShotDismissScreen, ModalScreen):
         # ``target_label`` ("TU", "MOD", or just "plasmid") shows up
         # in the title so the user knows which level they're naming.
         self._target_label = target_label or "plasmid"
+        # Opt-in collection picker: when ``default_collection`` is given
+        # the modal shows a "Save to collection" Select and dismisses
+        # with ``{"name": str, "collection": str}``; when it's None the
+        # modal keeps its legacy contract (dismiss with a bare ``str``)
+        # so existing callers are unaffected. The universal save flow
+        # (Constructor / Gibson / Traditional / amplicon) passes the
+        # active collection here so the user can redirect the save.
+        self._collection_mode = default_collection is not None
+        self._collections: list[str] = []
+        self._default_collection = ""
+        if self._collection_mode:
+            names: list[str] = []
+            try:
+                for c in _iter_collections_readonly():
+                    if not isinstance(c, dict):
+                        continue
+                    nm = (c.get("name") or "").strip()
+                    if nm and nm not in names:
+                        names.append(nm)
+            except Exception:
+                _log.exception("NamePlasmidModal: collection enum failed")
+            active = (default_collection or "").strip()
+            # Active collection first + guaranteed present so the Select
+            # (allow_blank=False) always mounts with a valid value.
+            ordered = ([active] if active else []) + [
+                n for n in names if n != active
+            ]
+            if not ordered:
+                ordered = [active or "Default"]
+            self._collections = ordered
+            self._default_collection = ordered[0]
         # Snapshot existing names / ids at modal-construct time —
         # the library doesn't mutate while the modal is open so a
         # one-shot read is enough and keeps the dup-check O(1) on
@@ -87169,6 +88590,14 @@ class NamePlasmidModal(_OneShotDismissScreen, ModalScreen):
                 id="nameplasmid-input",
             )
             yield Static("", id="nameplasmid-status", markup=True)
+            if self._collection_mode:
+                yield Label("Save to collection:")
+                yield Select(
+                    [(c, c) for c in self._collections],
+                    value=self._default_collection,
+                    allow_blank=False,
+                    id="nameplasmid-collection",
+                )
             # Reference table of existing plasmids in the active
             # collection — read-only, sorted alphabetically (natural-
             # sort) so the user can scan for collisions at a glance.
@@ -87406,7 +88835,21 @@ class NamePlasmidModal(_OneShotDismissScreen, ModalScreen):
                 inp.value = cleaned
         except Exception:
             pass
-        self.dismiss(cleaned)
+        if self._collection_mode:
+            self.dismiss({"name": cleaned,
+                          "collection": self._selected_collection()})
+        else:
+            self.dismiss(cleaned)
+
+    def _selected_collection(self) -> str:
+        """Currently-picked collection (collection mode only). Falls back
+        to the default if the Select is missing / blank."""
+        try:
+            v = self.query_one("#nameplasmid-collection", Select).value
+        except NoMatches:
+            return self._default_collection
+        return v if isinstance(v, str) and v.strip() else \
+            self._default_collection
 
     @on(Button.Pressed, "#btn-nameplasmid-cancel")
     def _cancel_btn(self, _) -> None:
@@ -96154,6 +97597,24 @@ BlastModal { align: center middle; }
 #blast-status { height: 2; margin-top: 1; }
 #blast-btns   { height: 3; margin-top: 1; align-horizontal: right; }
 #blast-btns Button { margin-right: 1; min-width: 16; }
+/* ── Online BLAST / HMM tab ──────────────────────────────── */
+#online-body  { height: 1fr; overflow-y: auto; }
+#online-query { height: 6; min-height: 4; margin-top: 0; }
+#online-src-row { height: 3; margin-top: 0; }
+#online-src-row Button { margin-right: 1; min-width: 16; }
+#online-prog-row { height: 5; }
+#online-prog-col { width: 2fr; height: 5; margin-right: 2; }
+#online-db-col   { width: 1fr; height: 5; margin-right: 2; }
+#online-hits-col { width: 1fr; height: 5; }
+#online-prog-col Label, #online-db-col Label,
+#online-hits-col Label { margin-top: 0; height: 1; }
+#online-help { height: auto; min-height: 1; margin-top: 0;
+               color: $text-muted; padding: 0 1; }
+#online-search-row { height: 3; margin-top: 1; align: left middle; }
+#online-status { width: 1fr; margin-left: 2; }
+#online-table  { height: 1fr; min-height: 8; margin-top: 0; }
+#online-detail { height: auto; min-height: 3; margin-top: 0;
+                 color: $text-muted; padding: 0 1; }
 
 /* ── Color picker modal ──────────────────────────────────── */
 ColorPickerModal { align: center middle; }
@@ -96217,6 +97678,7 @@ NamePlasmidModal { align: center middle; }
 #nameplasmid-title  { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #nameplasmid-input  { margin-top: 1; margin-bottom: 1; }
 #nameplasmid-status { height: 2; color: $text-muted; }
+#nameplasmid-collection { margin-bottom: 1; }
 #nameplasmid-list-label { color: $text-muted; margin-top: 1; }
 #nameplasmid-list   { height: 1fr; margin-top: 1; border: solid $primary-darken-2; }
 #nameplasmid-btns   { height: 3; margin-top: 1; }

@@ -874,10 +874,10 @@ class TestGibsonHardening:
     @pytest.mark.asyncio
     async def test_save_dispatches_worker(self, tiny_record,
                                               isolated_library):
-        """B1 regression: clicking Save dispatches a background worker
-        instead of writing synchronously on the UI thread. We confirm
-        by patching ``_gibson_save_worker`` and verifying it's called
-        once with the captured snapshot."""
+        """Clicking Save opens the name+collection prompt; confirming it
+        dispatches the background worker with the captured snapshot +
+        the chosen name/collection (instead of writing synchronously on
+        the UI thread). We confirm by patching ``_gibson_save_worker``."""
         app = sc.PlasmidApp()
         app._preload_record = tiny_record
         async with app.run_test(size=(160, 48)) as pilot:
@@ -907,21 +907,35 @@ class TestGibsonHardening:
             # Intercept the worker — assert it's the dispatch point.
             calls: list[dict] = []
 
-            def fake_worker(*, product, lane, circular, entry_counter):
+            def fake_worker(*, product, lane, circular, entry_counter,
+                            name=None, collection=None):
                 calls.append({
                     "product_success": product.get("success"),
                     "lane_len": len(lane),
                     "circular": circular,
                     "entry_counter": entry_counter,
+                    "name": name,
+                    "collection": collection,
                 })
 
             pane._gibson_save_worker = fake_worker  # type: ignore[assignment]
             pane._on_save(None)
             await pilot.pause()
+            # Save now opens the name+collection prompt; the worker is NOT
+            # dispatched until the user confirms.
+            name_modal = app.screen
+            assert isinstance(name_modal, sc.NamePlasmidModal)
+            name_modal.query_one("#nameplasmid-input", sc.Input).value = \
+                "My Gibson Build"
+            await pilot.pause()
+            name_modal._try_submit()
+            await pilot.pause()
             assert len(calls) == 1
             assert calls[0]["product_success"] is True
             assert calls[0]["lane_len"] == 1
-            # Save button must be disabled immediately to prevent
-            # double-click duplicate inserts (the worker hasn't finished).
+            assert calls[0]["name"] == "My Gibson Build"
+            assert isinstance(calls[0]["collection"], str)
+            # Save button disabled on confirm to prevent double-click
+            # duplicate inserts (the worker hasn't finished).
             save_btn = pane.query_one("#btn-gib-save", sc.Button)
             assert save_btn.disabled is True

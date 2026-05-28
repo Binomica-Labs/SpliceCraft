@@ -107,8 +107,13 @@ class TestCrossGroupWriteRMW:
             if not hasattr(obj, "_gibson_save_worker"):
                 continue
             src = inspect.getsource(obj._gibson_save_worker)
-            assert "with _cache_lock" in src, (
-                f"{name}._gibson_save_worker missing _cache_lock"
+            # The cross-group RMW race protection now lives in the shared
+            # `_commit_library_entry_to_collection` helper (which holds
+            # `_cache_lock`); accept either the inline lock or delegation
+            # to that locked helper.
+            assert ("with _cache_lock" in src
+                    or "_commit_library_entry_to_collection" in src), (
+                f"{name}._gibson_save_worker missing lock-protected commit"
             )
 
     def test_domesticator_mirror_holds_lock(self):

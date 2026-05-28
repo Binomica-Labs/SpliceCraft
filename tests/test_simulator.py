@@ -1380,6 +1380,50 @@ class TestPcrTemplatePickerWiring:
             assert screen._pcr_amplicons == []
             assert screen._selected_pcr_idx == -1
 
+    async def test_template_and_source_share_one_row(self):
+        from textual.widgets import Select, Static
+        _seed_collections(active="Default", seed_entries=[
+            _lib_entry_with_seq("plasmidA", "pa"),
+        ])
+        app = self._host(seq="ATGC" * 100, name="pUC19")
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            tpl = screen.query_one("#sim-pcr-template-select", Select)
+            src = screen.query_one("#sim-pcr-source", Select)
+            meta = screen.query_one("#sim-pcr-template-meta", Static)
+            # All three on the same row.
+            assert tpl.region.y == src.region.y == meta.region.y
+            # Source picker sits to the RIGHT of the template picker.
+            assert src.region.x >= tpl.region.x + tpl.region.width
+            # Template picker is widened to fit full plasmid names.
+            assert tpl.region.width >= 40
+
+    async def test_amplicon_input_packs_after_label_and_labels_centered(self):
+        from textual.widgets import Input, Label
+        app = self._host()
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            screen = app.screen
+            row = screen.query_one("#sim-pcr-params-row")
+            label = row.query_one(Label)
+            inp = screen.query_one("#sim-pcr-maxamp", Input)
+            # Input packs immediately after the label — not shoved to
+            # the far right edge as it was when the label expanded.
+            assert inp.region.x <= label.region.x + label.region.width + 1
+            assert inp.region.x < 40
+            # Labels span the full 3-tall row so their text vertically
+            # centres on the input (was top-aligned before).
+            assert label.region.height == 3
+            tpl_label = screen.query_one(
+                "#sim-pcr-template-row").query_one(Label)
+            assert tpl_label.region.height == 3
+            # Default is the common 500 bp, and the box is wide enough
+            # for a 7-figure entry (Textual Input chrome is 6 cols, so a
+            # 7-digit value + cursor needs total width >= 14).
+            assert inp.value == "500"
+            assert inp.region.width >= 14
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Simulator button double-fire hardening
