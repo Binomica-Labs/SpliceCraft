@@ -1081,3 +1081,27 @@ class TestBlastModalHmmscanIntegration:
             modal2 = app2.screen
             inp = modal2.query_one("#blast-hmm-path", sc.Input)
             assert inp.value == path
+
+
+class TestBlastMenuEntry:
+    """The menubar "BLAST" entry (which replaced "Edit") is a direct-open
+    item that pops the same modal as Ctrl+B — no dropdown."""
+
+    def test_blast_in_menus_edit_gone(self):
+        assert "BLAST" in sc.MenuBar.MENUS
+        assert "Edit" not in sc.MenuBar.MENUS
+        # Replaced in place — Settings stays at its pinned index.
+        assert sc.MenuBar.MENUS.index("Settings") == 1
+
+    async def test_menu_opens_blast_modal(self, tiny_record,
+                                          isolated_library):
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # `open_menu` direct-dispatches the BLAST action (no dropdown).
+            app.open_menu("BLAST", 0, 0)
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, sc.BlastModal)

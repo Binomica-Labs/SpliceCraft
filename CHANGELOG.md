@@ -14,6 +14,32 @@
 
 ---
 
+## [0.9.40] — 2026-05-28
+
+### Online BLAST / HMMscan, choose-your-collection saves, and a BLAST menu
+
+#### New features
+
+- **Search NCBI and Pfam without leaving SpliceCraft.** The BLAST window (`Ctrl+B`) gains an **Online** tab: paste DNA / RNA / protein — or load a whole plasmid or a single feature straight from your library — pick any program (blastn, blastp, blastx, tblastn, tblastx, or `hmmscan` against Pfam), and get hits in a scrollable table just like a web BLAST. Highlight a hit to see its full description, Pfam clan + InterPro link, or an NCBI lookup link. A live spinner + "checked N×" counter shows the search is really running (not frozen), and Cancel stops it.
+- **Choose the collection when you save.** Saving an assembly (Golden Braid / MoClo, Gibson, or traditional cloning) or a PCR amplicon now lets you both **name it and pick which collection it lands in** — not just the active one. Gibson products are named by you instead of an automatic "gibson-N".
+- **BLAST is now a toolbar menu.** The menu bar's **Edit** entry became **BLAST** — clicking it (or `Alt+B`) opens the same BLAST window as `Ctrl+B`. The former Edit actions stay on their keyboard shortcuts (Edit Sequence `^E`, Undo / Redo `^Z` / `^⇧Z`, Add Feature `^F`, Delete Feature `Delete`).
+- **Clearer `?` help screen.** Reorganised so Navigation (panel / viewport keys) comes first, then editing, files, tools, the toolbar menus, and diagnostics — and stale entries were corrected.
+
+#### Bug fixes
+
+- **PCR amplicon names no longer get mangled with underscores.** Accepting the default name when saving an amplicon used to write something like `MAV_PCR_1200bp_1-1200` into the library row; it now reads cleanly (e.g. `MAV PCR 1200 bp (1-1200)`).
+
+#### Hardening
+
+- **The bug-report snapshot (`Alt+D`) is more complete** — it now captures the live mouse position and every open dialog, not just the frontmost one.
+- **Parts Bin saves are race-safe.** Saving a part from an assembly, from the New Part dialog, or via Load Parts can no longer drop a row when another save runs at the same moment.
+
+#### Tests
+
+- New coverage for the online BLAST / HMMscan parsers + tab wiring, the universal name + collection save flow, and the BLAST menu entry. Full suite green; ruff + pyright clean.
+
+---
+
 ## [0.9.39] — 2026-05-28
 
 ### Simulator workflow overhaul + app-wide double-click hardening

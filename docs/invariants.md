@@ -566,7 +566,7 @@ Pitfalls discovered during regular development and codified as rules. Each has a
 1. Class-level annotation on `PlasmidApp` with default (e.g. `_my_setting: bool = True`).
 2. Hydrate in `PlasmidApp.compose()` — `self._my_setting = bool(_get_setting("my_setting", True))`. **`compose()` not `on_mount`** (mount fires leaves→root, so by `on_mount` children read stale defaults).
 3. `action_toggle_my_setting` calls `_set_setting("my_setting", self._my_setting)` after flipping.
-4. Surface in Settings menu (`MenuBar.MENUS` between File and Edit; `Settings` entry in `PlasmidApp.open_menu`'s `menus` dict).
+4. Surface in Settings menu (`MenuBar.MENUS` between File and BLAST; `Settings` entry in `PlasmidApp.open_menu`'s `menus` dict).
 
 **Persisted toggles:** `show_feature_tooltips`, `click_debug`, `check_updates`, `show_restr`, `restr_unique_only`, `restr_min_len`, `min_primer_binding`, `show_connectors`, `linear_layout`, `active_collection`, `active_grammar`. `map_mode` is **per-plasmid** on each library entry's `map_mode` field. `_library_load` stashes as `_tui_map_mode`; `pm.load_record` honours over topology default; `action_toggle_map_view` + `_register_alignment` write through `_persist_map_mode_for_active`. Sequencing-aligned plasmids auto-tag `linear`. `show_connectors`/`linear_layout` need deferred apply via `_pending_show_connectors`/`_pending_linear_layout` (targets not composed yet in `compose()`).
 

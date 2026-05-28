@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.9.39"
+__version__ = "0.9.40"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -24499,7 +24499,7 @@ Open from the menu bar with the mouse — or jump straight to one with `Alt`+let
 | Menu | Shortcut | Holds |
 |---|---|---|
 | File | `Alt+F` | Open · Save · Fetch · What's New |
-| Edit | `Alt+E` | Edit-related actions |
+| BLAST | `Alt+B` | Opens the BLAST / HMMscan modal (same as `Ctrl+B`) |
 | Settings | `Alt+S` | Preferences · cloning grammars |
 | Enzymes | `Alt+N` | Restriction enzymes + custom collections |
 | Primers | `Alt+P` | Primer library + design |
@@ -31611,7 +31611,7 @@ class MenuBar(Widget):
     }
     """
 
-    MENUS = ["File", "Settings", "Edit", "Enzymes", "Features", "Primers",
+    MENUS = ["File", "Settings", "BLAST", "Enzymes", "Features", "Primers",
              "Mutagenize", "Synthesis", "Parts", "Constructor", "Simulator",
              "Sequencing", "Experiments", "History"]
 
@@ -98577,7 +98577,7 @@ SpeciesPickerModal { align: center middle; }
         # before adding the menu shortcut here.
         Binding("alt+f", "open_named_menu('File')",         "File menu",     show=False),
         Binding("alt+s", "open_named_menu('Settings')",     "Settings menu", show=False),
-        Binding("alt+e", "open_named_menu('Edit')",         "Edit menu",     show=False),
+        Binding("alt+b", "open_named_menu('BLAST')",        "BLAST menu",    show=False),
         Binding("alt+n", "open_named_menu('Enzymes')",      "Enzymes menu",  show=False),
         Binding("alt+p", "open_named_menu('Primers')",      "Primers",       show=False),
         Binding("alt+y", "open_named_menu('Synthesis')",    "Synthesis",     show=False),
@@ -106642,6 +106642,11 @@ SpeciesPickerModal { align: center middle; }
         if name == "Experiments":
             self.action_open_experiments()
             return
+        if name == "BLAST":
+            # Direct-open: the menubar "BLAST" entry pops the same modal
+            # as Ctrl+B (no dropdown). Replaced the old "Edit" menu.
+            self.action_open_blast()
+            return
 
         # ── Multi-action menus (dropdown) ──────────────────────────────────
         # Settings + Enzymes are direct-open menubar entries — see
@@ -106684,19 +106689,12 @@ SpeciesPickerModal { align: center middle; }
             # "Settings" is a direct-open menubar entry — see
             # `MenuBar.on_click` and `action_open_named_menu` for the
             # dispatch. No dropdown rows needed.
-            "Edit": [
-                ("Edit Sequence  [^E]",            "edit_seq"),
-                ("---",                             None),
-                ("Undo",                            "undo"),
-                ("Redo",                            "redo"),
-                ("---",                             None),
-                ("Add Feature...  [^F]",            "add_feature"),
-                ("Capture selection → feat-lib  [^⇧F]", "capture_to_features"),
-                ("Delete Feature",                  "delete_feature"),
-                ("---",                             None),
-                ("Find ORFs…",                      "find_orfs"),
-                ("Transfer annotations from…",       "transfer_annotations"),
-            ],
+            #
+            # "BLAST" replaced the old "Edit" dropdown (2026-05-28) — it's
+            # a direct-open entry that pops the Ctrl+B BLAST modal. The
+            # former Edit actions remain on their keyboard shortcuts:
+            # Edit Sequence [^E], Undo [^Z] / Redo [^⇧Z], Add Feature
+            # [^F], Capture→feat-lib [^⇧F], Delete Feature [Delete].
             # "Enzymes" is a direct-open menubar entry — clicking the
             # menubar item opens `EnzymeCollectionsModal` straight
             # away. The "Enzyme Settings" tab inside the modal hosts
