@@ -46,6 +46,14 @@ markdown_extensions:
   - toc:
       permalink: true
 
+# Dev-internal references (sweep history + subsystem deep-dives) stay in
+# the repo for contributors but are excluded from the public site —
+# subsystems.md also contains raw regexes whose `<![` trips mkdocs's
+# HTML pass, and invariants.md is a 190 KB agent-facing changelog.
+exclude_docs: |
+  invariants.md
+  subsystems.md
+
 nav:
   - Home: index.md
   - Install: install.md
@@ -58,8 +66,9 @@ nav:
     - Agent API: agent-api.md
     - CLI sidecar: cli.md
   - Architecture: architecture.md
+  - Supported terminals: PLATFORMS.md
   - Project:
-    - Contributing: ../CONTRIBUTING.md
-    - Security policy: ../SECURITY.md
-    - v1.0.0 acceptance gate: ../V1_GATE.md
-    - Changelog: ../CHANGELOG.md
+    - Contributing: https://github.com/Binomica-Labs/SpliceCraft/blob/master/CONTRIBUTING.md
+    - Security policy: https://github.com/Binomica-Labs/SpliceCraft/blob/master/SECURITY.md
+    - v1.0.0 acceptance gate: https://github.com/Binomica-Labs/SpliceCraft/blob/master/V1_GATE.md
+    - Changelog: https://github.com/Binomica-Labs/SpliceCraft/blob/master/CHANGELOG.md

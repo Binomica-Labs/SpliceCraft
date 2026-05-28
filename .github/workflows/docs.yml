@@ -1,0 +1,57 @@
+name: Docs
+
+# Build the mkdocs site and publish it to GitHub Pages.
+#
+# One-time repo setup (maintainer): Settings -> Pages -> Build and
+# deployment -> Source: "GitHub Actions". After that, every push to
+# master that touches docs/, mkdocs.yml, or this workflow rebuilds and
+# republishes https://binomica-labs.github.io/SpliceCraft/.
+# Use the "Run workflow" button (workflow_dispatch) to force a deploy.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+# Least-privilege token: Pages deploy needs pages:write + id-token:write.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never run two Pages deploys at once; let an in-flight deploy finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install mkdocs-material
+        run: python -m pip install --upgrade pip mkdocs-material
+      - name: Build (strict — fail on broken links / bad nav)
+        run: mkdocs build --strict --site-dir _site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
