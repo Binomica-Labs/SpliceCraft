@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -58640,6 +58640,125 @@ class _FastaAwareDirectoryTree(DirectoryTree):
         super()._populate_node(node, sorted_content)
 
 
+# ── Protein / amino-acid sequence file ingest (Synthesis "Open") ──────────────
+#
+# The Synthesis composer's Protein tab loads an amino-acid sequence
+# straight from a file via the "Open" button → `ProteinSeqFilePickerModal`.
+# We accept FASTA (every flavour) plus the common single-sequence
+# amino-acid formats BioPython can read, require EXACTLY one record,
+# strip the header, and validate the residues. The picker paints these
+# formats pink — the same signal FASTA carries in every other picker —
+# so a loadable sequence stands out in a mixed folder.
+
+# Pink, shared with the global FASTA highlight so the "this is a sequence
+# file" colour cue stays consistent across every picker in the app.
+_PICKER_PROTEIN_STYLE = _PICKER_FASTA_STYLE
+
+# Extensions highlighted green in the protein file picker: the FASTA
+# family plus peptide / protein-record formats. Acceptance on Open is
+# broader — any clicked file is parse-attempted — but the highlight only
+# marks the formats we expect to carry an amino-acid sequence.
+_PROTEIN_PICKER_EXTS: frozenset[str] = frozenset(
+    _FASTA_EXTS | {".pep", ".fsa", ".seq", ".gp", ".gpff", ".sp", ".pir"}
+)
+_PROTEIN_PICKER_HIGHLIGHT_MAP: dict[str, str] = {
+    e: _PICKER_PROTEIN_STYLE for e in _PROTEIN_PICKER_EXTS
+}
+
+# Non-FASTA amino-acid formats keyed by extension → BioPython SeqIO
+# format. Everything not listed is read as FASTA (with a raw-text
+# fallback for a headerless single-sequence dump).
+_PROTEIN_SEQ_FORMAT_BY_EXT: dict[str, str] = {
+    ".gp": "genbank", ".gpff": "genbank",
+    ".sp": "swiss",
+    ".pir": "pir",
+}
+
+# Amino-acid alphabet accepted at the FILE boundary: the 20 standard
+# residues + stop (*) + the ambiguity / special codes real protein
+# records carry (B=Asx, Z=Glx, J=Xle, X=any, U=Sec, O=Pyl) + gap (-).
+# Wider than the editor's `_PROTEIN_AA_ALPHABET` (20 + *) on purpose so a
+# genuine UniProt / NCBI protein FASTA isn't rejected as garbage; the
+# editor's `load()` filters down to its own alphabet on the way in
+# (the caller warns when residues are dropped).
+_PROTEIN_FILE_AA_ALPHABET: frozenset[str] = frozenset(
+    "ACDEFGHIKLMNPQRSTVWYBZJXUO*-"
+)
+
+# Cap protein sequence files well below the bulk-import ceiling: a single
+# protein at the editor's ~35 k-AA cap is ~35 KB, so 8 MB is absurd
+# headroom while still bounding the synchronous SeqIO.parse the picker
+# runs on the UI thread.
+_PROTEIN_FILE_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _validate_ingested_protein_seq(seq: str) -> str:
+    """Upper-case, strip whitespace, and validate ``seq`` against the
+    file-ingest amino-acid alphabet. Returns the cleaned sequence. Raises
+    ``ValueError`` (user-facing) on empty / non-amino-acid content."""
+    seq = "".join(str(seq or "").split()).upper()
+    if not seq:
+        raise ValueError("Sequence is empty.")
+    bad = sorted(set(seq) - _PROTEIN_FILE_AA_ALPHABET)
+    if bad:
+        raise ValueError(
+            "Not an amino-acid sequence — unexpected characters: "
+            f"{''.join(bad[:8])}"
+        )
+    return seq
+
+
+def _parse_protein_fasta_single(path: str) -> tuple[str, str]:
+    """Parse a SINGLE-entry amino-acid sequence file and return
+    ``(record_id, aa_seq)`` with the FASTA header line removed.
+
+    Accepts FASTA (every flavour) and the SeqIO formats in
+    `_PROTEIN_SEQ_FORMAT_BY_EXT`, with a raw-text fallback for a
+    headerless single-sequence dump. Requires EXACTLY one record —
+    multi-entry files are rejected rather than silently taking the first.
+    Raises ``ValueError`` with a user-facing message on any failure
+    (read / size / symlink error, zero or multiple records, empty or
+    non-amino-acid sequence).
+    """
+    from Bio import SeqIO
+    ok, reason = _safe_file_size_check(
+        Path(path), _PROTEIN_FILE_MAX_BYTES, "Sequence file",
+    )
+    if not ok:
+        raise ValueError(reason or "Sequence file rejected by size check.")
+    suffix = (Path(path).suffix or "").lower()
+    fmt = _PROTEIN_SEQ_FORMAT_BY_EXT.get(suffix, "fasta")
+    records: list = []
+    try:
+        records = list(SeqIO.parse(path, fmt))
+    except (OSError, ValueError):
+        records = []
+    # A .pep / .seq / non-FASTA file is often really FASTA — retry once.
+    if not records and fmt != "fasta":
+        try:
+            records = list(SeqIO.parse(path, "fasta"))
+        except (OSError, ValueError):
+            records = []
+    if records:
+        if len(records) > 1:
+            raise ValueError(
+                f"Multi-sequence file not supported ({len(records)} "
+                "records found). Please provide a single-entry FASTA."
+            )
+        rec = records[0]
+        rid = (getattr(rec, "id", "") or "").strip() or Path(path).stem
+        return (rid or "sequence",
+                _validate_ingested_protein_seq(str(rec.seq)))
+    # Last resort: a headerless raw-sequence text file. Strip any stray
+    # FASTA header lines, then treat the remainder as one sequence.
+    try:
+        raw = Path(path).read_text(errors="replace")
+    except OSError as exc:
+        raise ValueError(f"Couldn't read sequence file: {exc}") from exc
+    return (Path(path).stem or "sequence",
+            _validate_ingested_protein_seq(_strip_fasta_headers(raw)))
+
+
 class FastaFilePickerModal(_OneShotDismissScreen, ModalScreen):
     """Modal file browser that returns the path to a selected FASTA file.
 
@@ -58713,6 +58832,117 @@ class FastaFilePickerModal(_OneShotDismissScreen, ModalScreen):
             pass
 
     @on(Button.Pressed, "#btn-fasta-cancel")
+    def _cancel_btn(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ProteinSeqFilePickerModal(_OneShotDismissScreen, ModalScreen):
+    """Modal file browser for loading an amino-acid sequence into the
+    Synthesis composer's Protein tab.
+
+    Browse the filesystem (expand any folder to any depth), with
+    amino-acid sequence files — FASTA + .pep / .gp / .pir / … — painted
+    pink (the shared sequence-file colour) so they stand out from the
+    rest of the directory. On Open
+    the selected file is parsed: it must be a SINGLE-entry sequence, the
+    FASTA header is stripped, and the residues are validated; a bad file
+    surfaces an inline error and the picker stays open so the user can
+    pick another. Dismisses with ``(path, record_id, aa_seq)`` on
+    success, or ``None`` on Cancel / Escape.
+    """
+
+    # App-level Ctrl+Z would otherwise pop the canvas underneath while
+    # the picker is open (mirrors OpenFileModal / the synthesis modals).
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, start_path: "str | None" = None) -> None:
+        super().__init__()
+        start = Path(start_path).expanduser() if start_path else Path.home()
+        try:
+            if not start.is_dir():
+                start = Path.home()
+        except OSError:
+            start = Path.home()
+        self._start = str(start)
+        self._selected: "str | None" = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pfa-box"):
+            yield Static(" Open protein sequence ", id="pfa-title")
+            yield Static(
+                f"[dim]{self._start}[/dim]", id="pfa-header", markup=True,
+            )
+            yield _ExtensionAwareDirectoryTree(
+                self._start,
+                highlight_map=_PROTEIN_PICKER_HIGHLIGHT_MAP,
+                id="pfa-tree",
+            )
+            yield Static(
+                "[dim]Amino-acid files (FASTA, .faa, .pep, .gp, …) are "
+                "highlighted in pink. Single-entry only; the FASTA "
+                "header is stripped on load. Click a file, then Open.[/dim]",
+                id="pfa-hint", markup=True,
+            )
+            yield Static("", id="pfa-status", markup=True)
+            with Horizontal(id="pfa-btns"):
+                yield Button("Open", id="btn-pfa-open",
+                             variant="primary", disabled=True)
+                yield Button("Cancel", id="btn-pfa-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one(
+                "#pfa-tree", _ExtensionAwareDirectoryTree,
+            ).focus()
+        except NoMatches:
+            pass
+
+    def _set_status(self, markup: str) -> None:
+        try:
+            self.query_one("#pfa-status", Static).update(markup)
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.FileSelected)
+    def _on_file_selected(self, event) -> None:
+        self._selected = str(event.path)
+        try:
+            self.query_one("#pfa-header", Static).update(
+                f"[dim]{self._selected}[/dim]"
+            )
+            self.query_one("#btn-pfa-open", Button).disabled = False
+            self._set_status("")
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-pfa-open")
+    def _open(self) -> None:
+        if not self._selected:
+            self._set_status("[red]Pick a file first.[/red]")
+            return
+        try:
+            name, seq = _parse_protein_fasta_single(self._selected)
+        except ValueError as exc:
+            self._set_status(f"[red]{exc}[/red]")
+            return
+        except Exception as exc:
+            _log.exception(
+                "ProteinSeqFilePickerModal: parse failed for %s",
+                self._selected,
+            )
+            self._set_status(f"[red]Couldn't read file: {exc}[/red]")
+            return
+        self.dismiss((self._selected, name, seq))
+
+    @on(Button.Pressed, "#btn-pfa-cancel")
     def _cancel_btn(self) -> None:
         self.dismiss(None)
 
@@ -67029,6 +67259,7 @@ class ProteinEditor(Widget):
         if not self._aa_seq:
             placeholder = (
                 "(empty protein — type amino acids, "
+                "Ctrl+V (or your terminal's paste) to paste, "
                 "Alt+T to toggle AA-only mode, "
                 "pick a motif on the right to insert)"
             )
@@ -67718,6 +67949,27 @@ class ProteinEditor(Widget):
         self._cursor_pos = len(self._aa_seq)
         self._refresh_view()
 
+    # ── Paste handler ─────────────────────────────────────────────────────
+    #
+    # Mirrors SynthesisEditor.on_paste (sweep #28). Terminal
+    # native-paste (Ctrl+V / Cmd+V / Ctrl+Shift+V / right-click /
+    # middle-click, terminal-dependent) sends bracketed-paste
+    # sequences that Textual converts into `events.Paste` messages.
+    # We route the payload through `insert_at_cursor`, which AA-filters
+    # (drops non-amino-acid chars with a notify), caps length at
+    # `_PROTEIN_MAX_AA`, and handles the selection-replace case — so a
+    # pasted amino-acid sequence lands at the cursor exactly like the
+    # DNA tab pastes bases.
+
+    def on_paste(self, event: Paste) -> None:
+        """Insert bracketed-paste payload at the cursor. AA filtering +
+        size-cap + selection-replace handled by `insert_at_cursor`."""
+        text = getattr(event, "text", None)
+        if not isinstance(text, str) or not text:
+            return
+        event.stop()
+        self.insert_at_cursor(text)
+
     # ── Key handler ───────────────────────────────────────────────────────
 
     def on_key(self, event) -> None:
@@ -68213,13 +68465,29 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         height: 1fr; min-height: 6;
         border: solid $primary-darken-2;
     }
-    #syn-featlib-btns, #syn-motif-btns { height: 3; margin-top: 1; align: left middle; }
-    #syn-featlib-btns Button, #syn-motif-btns Button {
-        margin-right: 1; min-width: 10; width: 1fr;
+    /* Four action buttons in a narrow (~1fr) side pane don't fit in a
+       single row — at the editor's 4fr / pane 1fr split the pane is
+       only ~30 cols, so a one-row layout pushed buttons 3 + 4 off the
+       right edge (invisible). Lay them out 2x2 so every button stays
+       on-screen regardless of terminal width. */
+    #syn-featlib-btns, #syn-motif-btns {
+        layout: grid;
+        grid-size: 2 2;
+        grid-columns: 1fr 1fr;
+        grid-rows: 3;
+        grid-gutter: 0 1;
+        height: 6; margin-top: 1;
     }
-    #syn-featlib-hint, #syn-motif-hint {
+    #syn-featlib-btns Button, #syn-motif-btns Button {
+        width: 1fr; min-width: 8;
+    }
+    #syn-featlib-hint {
         height: 2; color: $text-muted; padding: 0 1;
     }
+    /* "Open" loads an amino-acid sequence from a file into the protein
+       editor — full-width below the motif buttons (where the catalog
+       hint used to sit). */
+    #btn-syn-protein-open { width: 100%; margin-top: 1; }
     /* Protein-tab top row: codon table + mode toggle. */
     #syn-protein-controls {
         height: 3; margin-top: 1; align: left middle;
@@ -68258,6 +68526,9 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         self._protein_saved_snapshot: "str" = ""
         self._protein_dirty: bool = False
         self._motif_rows: list[tuple[str, dict]] = []
+        # Last directory the protein "Open" file picker landed in, so a
+        # second Open re-opens where the user left off (None → $HOME).
+        self._protein_open_dir: "str | None" = None
         # Active codon table — id ("name|taxid") plus raw dict. Set
         # by `_apply_codon_table_choice` on Select.Changed; defaults
         # to the first available table (built-in E. coli K12 always
@@ -68415,10 +68686,12 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                         tooltip="Delete the selected user motif "
                                 "(built-ins can't be deleted).",
                     )
-                yield Static(
-                    "[dim]Tags, linkers, protease sites, NLS, 2A "
-                    "peptides — built-in catalog.[/]",
-                    id="syn-motif-hint", markup=True,
+                yield Button(
+                    "Open", id="btn-syn-protein-open",
+                    tooltip=(
+                        "Open a single-entry FASTA / amino-acid file and "
+                        "load its sequence into the protein editor."
+                    ),
                 )
 
     def _codon_table_options(self) -> list[tuple[str, str]]:
@@ -70176,6 +70449,75 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 self._load_protein_entry_by_id(eid)
             self.app.push_screen(SynthesisLoadModal(),
                                   callback=_on_picked)
+        if not self._protein_dirty:
+            _do_pick()
+            return
+        def _on_resolved(choice):
+            if choice == "save":
+                self._do_protein_save(after=lambda ok: ok and _do_pick())
+            elif choice == "abandon":
+                _do_pick()
+        self.app.push_screen(SynthesisUnsavedChangesModal(),
+                              callback=_on_resolved)
+
+    @on(Button.Pressed, "#btn-syn-protein-open")
+    def _on_protein_open(self) -> None:
+        self._open_protein_file()
+
+    def _open_protein_file(self) -> None:
+        """Open the protein file picker, then load the selected file's
+        single-entry amino-acid sequence into the protein editor.
+        Prompts via the unsaved-changes modal when the protein tab is
+        dirty — same guard as Load / New."""
+        def _do_pick():
+            def _on_picked(result):
+                if not result:
+                    return
+                path, name, seq = result
+                try:
+                    pe = self.query_one(
+                        "#syn-protein-editor", ProteinEditor,
+                    )
+                except NoMatches:
+                    return
+                requested = len(seq)
+                # `load` filters to the editor's 20-AA + '*' alphabet, so
+                # ambiguity / gap codes accepted at the file boundary get
+                # dropped here — surface the count so the load isn't silent.
+                pe.load(seq, feats=[])
+                kept = len(pe.get_state()[0])
+                self._protein_loaded_id = None
+                self._protein_loaded_name = name
+                self._protein_saved_snapshot = ""
+                self._protein_dirty = True
+                try:
+                    self._protein_open_dir = str(Path(path).parent)
+                except (OSError, ValueError):
+                    self._protein_open_dir = None
+                self._refresh_status()
+                if kept <= 0:
+                    self.app.notify(
+                        f"'{name}' had no residues the editor can store.",
+                        severity="warning",
+                    )
+                elif kept < requested:
+                    self.app.notify(
+                        f"Loaded {kept:,} aa from {name}; dropped "
+                        f"{requested - kept:,} non-standard residue(s) "
+                        "(X / B / Z / gaps the editor can't store).",
+                        severity="information",
+                    )
+                else:
+                    self.app.notify(
+                        f"Loaded {kept:,} aa from {name}.",
+                        severity="information",
+                    )
+                _log_event("synthesis.protein.open_file",
+                           name=name, aa=kept, dropped=requested - kept)
+            self.app.push_screen(
+                ProteinSeqFilePickerModal(start_path=self._protein_open_dir),
+                callback=_on_picked,
+            )
         if not self._protein_dirty:
             _do_pick()
             return
@@ -98774,6 +99116,20 @@ FastaFilePickerModal { align: center middle; }
 #fasta-status { height: 1; margin-top: 1; }
 #fasta-btns   { height: 3; margin-top: 1; }
 #fasta-btns Button { margin-right: 1; }
+
+ProteinSeqFilePickerModal { align: center middle; }
+#pfa-box {
+    width: 90; max-width: 95%; min-width: 60;
+    height: 32; max-height: 90%;
+    background: $surface; border: solid $accent; padding: 1 2;
+}
+#pfa-title  { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#pfa-header { height: 1; margin-bottom: 1; color: $text-muted; }
+#pfa-tree   { height: 1fr; border: solid $primary-darken-2; }
+#pfa-hint   { height: 2; margin-top: 1; color: $text-muted; }
+#pfa-status { height: 1; margin-top: 1; }
+#pfa-btns   { height: 3; margin-top: 1; }
+#pfa-btns Button { margin-right: 1; }
 
 /* ── Export-GenBank modal ────────────────────────────────── */
 ExportGenBankModal { align: center middle; }

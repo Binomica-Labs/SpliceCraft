@@ -3796,3 +3796,423 @@ class TestProteinMotifEditor:
         assert hasattr(sc, "NewMotifModal")
         assert hasattr(sc.SynthesisScreen, "_on_motif_new")
         assert hasattr(sc.SynthesisScreen, "_on_motif_delete")
+
+
+class TestProteinEditorPaste:
+    """ProteinEditor.on_paste mirrors SynthesisEditor.on_paste — a
+    terminal native-paste lands amino acids at the cursor through
+    `insert_at_cursor` (AA-filter + cap + selection-replace)."""
+
+    def test_handler_exists(self):
+        assert hasattr(sc.ProteinEditor, "on_paste")
+
+    async def test_paste_inserts_amino_acids_at_cursor(self):
+        from textual.events import Paste
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
+            pe.load("", [])
+            pe._cursor_pos = 0
+            pe.on_paste(Paste("MKWVT"))
+            await pilot.pause()
+            assert pe._aa_seq == "MKWVT"
+            assert pe._cursor_pos == 5
+
+    async def test_paste_filters_non_aa_chars(self):
+        # Lower-case + whitespace + non-AA letters (B/J/O/U/X/Z) +
+        # digits are dropped; the valid residues + '*' survive.
+        from textual.events import Paste
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
+            pe.load("", [])
+            pe._cursor_pos = 0
+            pe.on_paste(Paste("mhhhhhh* xz123"))
+            await pilot.pause()
+            assert pe._aa_seq == "MHHHHHH*"
+
+    async def test_paste_replaces_active_selection(self):
+        from textual.events import Paste
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
+            pe.load("AAAA", [])
+            pe._user_sel = (1, 3)        # select the middle "AA"
+            pe._cursor_pos = 3
+            pe.on_paste(Paste("WY"))
+            await pilot.pause()
+            assert pe._aa_seq == "AWYA"
+
+    async def test_empty_paste_is_noop(self):
+        from textual.events import Paste
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
+            pe.load("MK", [])
+            pe.on_paste(Paste(""))
+            await pilot.pause()
+            assert pe._aa_seq == "MK"
+
+    async def test_paste_event_bubbles_from_focused_scroll(self):
+        # End-to-end: a Paste delivered to the focused scroll container
+        # (where Textual routes terminal native-paste) must bubble up to
+        # ProteinEditor.on_paste — same wiring as the DNA editor.
+        from textual.events import Paste
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            scr.query_one("#syn-tabs").active = "syn-tab-protein"
+            await pilot.pause()
+            await pilot.pause()
+            pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
+            pe.load("", [])
+            scroll = scr.query_one("#pe-scroll")
+            scroll.post_message(Paste("GSGSG"))
+            await pilot.pause()
+            await pilot.pause()
+            assert pe._aa_seq == "GSGSG"
+
+
+class TestSynthesisSidePaneButtonsFit:
+    """The DNA feature-library and protein-motif side panes each host
+    four action buttons. At the editor's 4fr / pane 1fr split the pane
+    is only ~30 cols — too narrow for a single row of four. Regression
+    guard for the off-screen-button bug: they must lay out 2x2 and stay
+    inside the pane (pre-fix buttons 3 + 4 rendered past the right edge
+    and were invisible)."""
+
+    def _assert_2x2_inside(self, cont, buttons, term_w):
+        # Container is two rows tall (2 x button height 3).
+        assert cont.region.height == 6
+        ys = set()
+        for b in buttons:
+            r = b.region
+            # Every button fully inside the container horizontally...
+            assert r.x >= cont.region.x
+            assert r.right <= cont.region.right
+            # ...vertically, and on-screen.
+            assert r.y >= cont.region.y
+            assert r.bottom <= cont.region.bottom
+            assert r.right <= term_w
+            ys.add(r.y)
+        # Two distinct rows → the four buttons actually wrapped.
+        assert len(ys) == 2
+
+    async def test_motif_buttons_fit(self):
+        from textual.widgets import Button
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            scr.query_one("#syn-tabs").active = "syn-tab-protein"
+            await pilot.pause()
+            await pilot.pause()
+            cont = scr.query_one("#syn-motif-btns")
+            buttons = [
+                scr.query_one("#" + bid, Button) for bid in (
+                    "btn-syn-motif-insert", "btn-syn-motif-new",
+                    "btn-syn-motif-edit", "btn-syn-motif-delete",
+                )
+            ]
+            self._assert_2x2_inside(cont, buttons, _TERM[0])
+
+    async def test_featlib_buttons_fit(self):
+        from textual.widgets import Button
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            # DNA tab is the initial tab — no switch needed.
+            cont = scr.query_one("#syn-featlib-btns")
+            buttons = [
+                scr.query_one("#" + bid, Button) for bid in (
+                    "btn-syn-featlib-insert", "btn-syn-featlib-annotate",
+                    "btn-syn-featlib-edit", "btn-syn-featlib-refresh",
+                )
+            ]
+            self._assert_2x2_inside(cont, buttons, _TERM[0])
+
+
+class TestProteinSeqFileParse:
+    """`_parse_protein_fasta_single` / `_validate_ingested_protein_seq` —
+    single-entry amino-acid file ingest for the Protein-tab Open button."""
+
+    def _write(self, tmp_path, name: str, text: str) -> str:
+        d = tmp_path / "seqs"
+        d.mkdir(exist_ok=True)
+        p = d / name
+        p.write_text(text)
+        return str(p)
+
+    def test_validate_uppercases_and_strips_whitespace(self):
+        assert sc._validate_ingested_protein_seq(" mk wv\tt f\n") == "MKWVTF"
+
+    def test_validate_rejects_empty(self):
+        with pytest.raises(ValueError):
+            sc._validate_ingested_protein_seq("   \n  ")
+
+    def test_validate_rejects_non_aa(self):
+        with pytest.raises(ValueError):
+            sc._validate_ingested_protein_seq("MK123!!")
+
+    def test_validate_accepts_ambiguity_codes(self):
+        # B/Z/J/X/U/O/* are accepted at the file boundary (real records
+        # carry them); the editor's load() filters them later.
+        assert sc._validate_ingested_protein_seq("MKXBZJUO*") == "MKXBZJUO*"
+
+    def test_single_record_fasta_header_stripped(self, tmp_path):
+        p = self._write(
+            tmp_path, "one.fasta",
+            ">sp|P12345|TEST a protein\nMKWVTFISLLFL\nFSSAYSRGVFRR\n",
+        )
+        name, seq = sc._parse_protein_fasta_single(p)
+        assert name == "sp|P12345|TEST"
+        assert seq == "MKWVTFISLLFLFSSAYSRGVFRR"
+
+    def test_lowercase_sequence_uppercased(self, tmp_path):
+        p = self._write(tmp_path, "lc.fasta", ">x\nmkwvtf\n")
+        _name, seq = sc._parse_protein_fasta_single(p)
+        assert seq == "MKWVTF"
+
+    def test_multi_record_rejected(self, tmp_path):
+        p = self._write(tmp_path, "multi.fasta", ">a\nMKMK\n>b\nWYWY\n")
+        with pytest.raises(ValueError, match="[Mm]ulti"):
+            sc._parse_protein_fasta_single(p)
+
+    def test_empty_record_rejected(self, tmp_path):
+        p = self._write(tmp_path, "empty.fasta", ">only-header\n")
+        with pytest.raises(ValueError):
+            sc._parse_protein_fasta_single(p)
+
+    def test_non_aa_content_rejected(self, tmp_path):
+        p = self._write(tmp_path, "junk.fasta", ">j\n12345 %%% !!!\n")
+        with pytest.raises(ValueError):
+            sc._parse_protein_fasta_single(p)
+
+    def test_headerless_raw_sequence_file(self, tmp_path):
+        # No '>' — falls back to raw-text ingest.
+        p = self._write(tmp_path, "raw.seq", "MKWVTF\nISLLFL\n")
+        name, seq = sc._parse_protein_fasta_single(p)
+        assert seq == "MKWVTFISLLFL"
+        assert name == "raw"   # stem when there's no record id
+
+    def test_missing_file_rejected(self, tmp_path):
+        with pytest.raises(ValueError):
+            sc._parse_protein_fasta_single(str(tmp_path / "nope.fasta"))
+
+    def test_directory_path_rejected(self, tmp_path):
+        with pytest.raises(ValueError):
+            sc._parse_protein_fasta_single(str(tmp_path))
+
+
+class TestProteinPickerHighlight:
+    """The protein file picker paints amino-acid formats pink — the same
+    signal FASTA carries in every other picker."""
+
+    def test_fasta_exts_mapped_to_protein_style(self):
+        for ext in (".faa", ".fasta", ".fa", ".pep", ".gp", ".pir"):
+            assert sc._PROTEIN_PICKER_HIGHLIGHT_MAP.get(ext) == \
+                sc._PICKER_PROTEIN_STYLE
+
+    def test_protein_style_matches_global_fasta_pink(self):
+        # Consistency: same pink the rest of the app's pickers use.
+        assert sc._PICKER_PROTEIN_STYLE == sc._PICKER_FASTA_STYLE
+        assert "FF69B4" in sc._PICKER_PROTEIN_STYLE
+
+
+class TestProteinSeqFilePickerModal:
+    def _write_fasta(self, tmp_path, text: str, name: str = "p.fasta") -> str:
+        d = tmp_path / "seqs"
+        d.mkdir(exist_ok=True)
+        p = d / name
+        p.write_text(text)
+        return str(p)
+
+    async def test_open_without_selection_shows_inline_error(self, tmp_path):
+        from textual.widgets import Static
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            captured = []
+            app.push_screen(
+                sc.ProteinSeqFilePickerModal(start_path=str(tmp_path)),
+                callback=captured.append,
+            )
+            await pilot.pause()
+            await pilot.pause()
+            modal = app.screen
+            modal._open()      # no file selected
+            await pilot.pause()
+            status = str(modal.query_one("#pfa-status", Static).render())
+            assert "Pick a file" in status
+            assert not captured     # did NOT dismiss
+
+    async def test_open_valid_file_dismisses_with_seq(self, tmp_path):
+        p = self._write_fasta(tmp_path, ">prot1\nMKWVTFISLL\n")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            captured = []
+            app.push_screen(
+                sc.ProteinSeqFilePickerModal(start_path=str(tmp_path)),
+                callback=captured.append,
+            )
+            await pilot.pause()
+            await pilot.pause()
+            modal = app.screen
+            modal._selected = p
+            modal._open()
+            await pilot.pause()
+            await pilot.pause()
+            assert len(captured) == 1
+            path, name, seq = captured[0]
+            assert path == p
+            assert name == "prot1"
+            assert seq == "MKWVTFISLL"
+
+    async def test_open_multi_entry_stays_open_with_error(self, tmp_path):
+        from textual.widgets import Static
+        p = self._write_fasta(tmp_path, ">a\nMKMK\n>b\nWYWY\n", "multi.fasta")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            captured = []
+            app.push_screen(
+                sc.ProteinSeqFilePickerModal(start_path=str(tmp_path)),
+                callback=captured.append,
+            )
+            await pilot.pause()
+            await pilot.pause()
+            modal = app.screen
+            modal._selected = p
+            modal._open()
+            await pilot.pause()
+            status = str(modal.query_one("#pfa-status", Static).render())
+            assert "Multi" in status or "multi" in status
+            assert not captured             # did NOT dismiss
+            assert app.screen is modal      # still open
+
+
+class TestSynthesisProteinOpenIntegration:
+    def _write_fasta(self, tmp_path, text: str, name: str = "p.fasta") -> str:
+        d = tmp_path / "seqs"
+        d.mkdir(exist_ok=True)
+        p = d / name
+        p.write_text(text)
+        return str(p)
+
+    async def test_open_button_present_and_hint_removed(self):
+        from textual.widgets import Button
+        from textual.css.query import NoMatches
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            with pytest.raises(NoMatches):
+                scr.query_one("#syn-motif-hint")             # removed
+            scr.query_one("#syn-tabs").active = "syn-tab-protein"
+            await pilot.pause()
+            await pilot.pause()
+            btn = scr.query_one("#btn-syn-protein-open", Button)   # exists
+            # On-screen and inside its pane (not clipped off the edge).
+            pane = scr.query_one("#syn-motif-pane")
+            assert btn.region.width > 0 and btn.region.height > 0
+            assert btn.region.right <= _TERM[0]
+            assert btn.region.x >= pane.region.x
+            assert btn.region.right <= pane.region.right
+
+    async def test_open_loads_sequence_into_editor(self, tmp_path):
+        p = self._write_fasta(tmp_path, ">myprot\nMKWVTFISLLFL\n")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            scr.query_one("#syn-tabs").active = "syn-tab-protein"
+            await pilot.pause()
+            scr._open_protein_file()        # protein tab not dirty → picks
+            await pilot.pause()
+            await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, sc.ProteinSeqFilePickerModal)
+            picker._selected = p
+            picker._open()
+            await pilot.pause()
+            await pilot.pause()
+            pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
+            assert pe.get_state()[0] == "MKWVTFISLLFL"
+            assert scr._protein_loaded_name == "myprot"
+            assert scr._protein_loaded_id is None
+            assert scr._protein_dirty is True
+
+    async def test_open_drops_ambiguity_codes(self, tmp_path):
+        # X is accepted by the file parser but the editor can't store it;
+        # it should be filtered out of the loaded buffer.
+        p = self._write_fasta(tmp_path, ">amb\nMKXMK\n", "amb.fasta")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            scr.query_one("#syn-tabs").active = "syn-tab-protein"
+            await pilot.pause()
+            scr._open_protein_file()
+            await pilot.pause()
+            await pilot.pause()
+            picker = app.screen
+            picker._selected = p
+            picker._open()
+            await pilot.pause()
+            await pilot.pause()
+            pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
+            assert pe.get_state()[0] == "MKMK"   # X dropped

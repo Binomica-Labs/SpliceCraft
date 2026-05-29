@@ -142,9 +142,11 @@ A gene-synthesis composer with two tabs. The **DNA tab** is a
 horizontally-scrolling linear editor with anti-parallel strand markers, live
 feature stripes, restriction overlay, and AA translation, plus a feature
 library side-pane (Insert to splice, Annotate to overlay). The **Protein
-tab** lets you type amino acids and watch the codons appear underneath using
-your chosen codon table — and a built-in motif library (His6, FLAG, HA, TEV,
-P2A, NLS, GS linkers, and ~30 more) inserts pre-colored tags. Compose a part,
+tab** lets you type or paste amino acids and watch the codons appear underneath
+using your chosen codon table — and a built-in motif library (His6, FLAG, HA, TEV,
+P2A, NLS, GS linkers, and ~30 more) inserts pre-colored tags. Or hit **Open** to
+load a sequence straight from a single-entry FASTA (or other amino-acid file) — a
+file browser highlights the loadable formats in pink. Compose a part,
 hit **Clone Fragment**, and it's handed straight to the Domesticator as an L0
 building block.
 

@@ -14,6 +14,19 @@
 
 ---
 
+## [1.0.5] — 2026-05-29
+
+### New features
+
+- **Paste amino acids straight into the Synthesis Protein tab.** The DNA tab already accepted your terminal's paste (Ctrl+V / right-click / middle-click); the Protein tab now does too — pasted residues land at the cursor, and anything that isn't an amino acid is filtered out for you.
+- **Open a protein sequence from a file in the Synthesis Protein tab.** A new **Open** button launches a file browser — expand any folder to any depth — that highlights FASTA and other amino-acid sequence files in pink. Pick one and its sequence drops into the editor: single-entry only, with the FASTA header line stripped automatically.
+
+### Bug fixes
+
+- **Synthesis side-panel buttons no longer run off the edge of the screen.** The four action buttons in the Protein-motif and DNA feature-library side panes were packed into a single row too wide for the narrow pane, pushing the last two off-screen where they couldn't be clicked. They now wrap to a tidy 2×2 grid that stays fully visible at any terminal width.
+
+---
+
 ## [1.0.4] — 2026-05-29
 
 ### Bug fixes
