@@ -783,6 +783,68 @@ class TestLibraryRename:
             )
 
 
+class TestSaveKeepsLibraryNameAndFocus:
+    """Saving an EDITED plasmid must keep the spaced library name it had
+    (not fall back to the underscored GenBank LOCUS id), and the library
+    list must stay focused on the just-saved plasmid instead of snapping
+    back to the top."""
+
+    async def test_edited_save_keeps_spaced_library_name(self, isolated_library):
+        """Re-saving a record rebuilt WITHOUT `_tui_display_name` (what
+        an edit / primer-add / rotate produces) keeps the prior spaced
+        library name rather than the underscored LOCUS."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ATGC" * 50), id="My_Plasmid", name="My_Plasmid",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        # As stashed on .dna import: the display name keeps spaces while
+        # the GenBank LOCUS id is space-stripped.
+        rec._tui_display_name = "My Plasmid"
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            lib = app.query_one("#library", sc.LibraryPanel)
+            assert lib.add_entry(rec)                  # first save → spaced name
+            await pilot.pause()
+            e = next(x for x in sc._load_library() if x.get("id") == "My_Plasmid")
+            assert e["name"] == "My Plasmid"
+            # A modify rebuilds the record and drops `_tui_display_name`.
+            edited = SeqRecord(Seq("ATGC" * 50 + "GG"), id="My_Plasmid",
+                               name="My_Plasmid",
+                               annotations={"molecule_type": "DNA",
+                                            "topology": "circular"})
+            assert not hasattr(edited, "_tui_display_name")
+            assert lib.add_entry(edited)
+            await pilot.pause()
+            e2 = next(x for x in sc._load_library() if x.get("id") == "My_Plasmid")
+            assert e2["name"] == "My Plasmid", (
+                f"edited save underscored the name → {e2['name']!r}")
+
+    async def test_save_keeps_focus_on_saved_plasmid(self, isolated_library):
+        """After a save the library cursor sits on the saved plasmid, not
+        row 0 (the table is cleared+repopulated, which resets the cursor)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+
+        def _mk(i):
+            return SeqRecord(Seq("ATGC" * 50), id=f"plas_{i}", name=f"plas_{i}",
+                             annotations={"molecule_type": "DNA",
+                                          "topology": "circular"})
+        app = _build_app(_mk(0), isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            lib = app.query_one("#library", sc.LibraryPanel)
+            for i in range(5):
+                lib.add_entry(_mk(i))
+            await pilot.pause()
+            # Re-save plas_3 (a mid-list row) → cursor should land on it.
+            assert lib.add_entry(_mk(3))
+            await pilot.pause()
+            t = app.query_one("#lib-table", sc.DataTable)
+            assert sc._cursor_row_key(t) == "plas_3"
+
+
 class TestNamePlasmidModalDupWarning:
     """`NamePlasmidModal._existing_ids` previously mapped case-folded
     id → id, so the dup-warning's id-conflict path surfaced the bare
@@ -7889,9 +7951,10 @@ class TestShiftClickFeatureExtend:
                         type="primer_bind",
                         qualifiers={"label": ["P-fwd"],
                                     "primer_seq": ["GAATCGATGAAACG"]}),
-            # Reverse primer at 30..38: top strand is "TAACGTGC" RC =
-            # "GCACGTTA", primer = 5'-GTATGC-GCACGTTA-3', flap = GTATGC
-            # which RC's to GCATAC for top-strand orientation.
+            # Reverse primer at 30..38: top strand is "TAACGTGC", its
+            # RC = "GCACGTTA", primer = 5'-GTATGC-GCACGTTA-3', flap =
+            # GTATGC which REVERSES to CGTATG for the bottom-strand
+            # frame (so the flap reads inline with the bottom strand).
             SeqFeature(FeatureLocation(30, 38, strand=-1),
                         type="primer_bind",
                         qualifiers={"label": ["P-rev"],
@@ -7910,9 +7973,9 @@ class TestShiftClickFeatureExtend:
             assert f_fwd["_bound_len"] == 8
             assert f_fwd["_flap_start"] == 6
             assert f_fwd["_flap_end"]   == 12
-            # Reverse flap = RC of first 6 primer bases (top-strand
-            # orientation), positioned to the RIGHT of the bound region.
-            assert f_rev["_flap_bases"] == "GCATAC"
+            # Reverse flap = plain reverse of the first 6 primer bases
+            # (bottom-strand frame), positioned RIGHT of the bound region.
+            assert f_rev["_flap_bases"] == "CGTATG"
             assert f_rev["_flap_len"] == 6
             assert f_rev["_bound_len"] == 8
             assert f_rev["_flap_start"] == 38
@@ -7986,8 +8049,9 @@ class TestShiftClickFeatureExtend:
         # Layout: top, bottom, bound, flap (reverse-strand mirror).
         assert len(lines) == 4
         assert "◀" in lines[2]
-        # Flap on row 3, top-strand-RC of GTATGC = GCATAC.
-        assert "GCATAC" in lines[3]
+        # Flap on row 3 reads in the bottom-strand frame: plain reverse
+        # of GTATGC = CGTATG (was RC=GCATAC before the bottom-strand fix).
+        assert "CGTATG" in lines[3]
 
     def test_build_primer_preview_wrap_unsupported(self):
         """Wrap primers fall back to a friendly hint instead of
@@ -8309,6 +8373,155 @@ class TestShiftClickFeatureExtend:
         assert rendered == "     ATGAAACG▶", (
             f"full-binding primer should show bases + arrow, got {rendered!r}"
         )
+
+    async def test_reverse_primer_bound_bar_shows_bottom_strand(self):
+        """A reverse primer is drawn against the BOTTOM strand, so its
+        bound bar must show the bottom-strand bases — the per-base
+        complement of the top strand the seq panel prints directly
+        below it — NOT the top strand (which it used to show). Reading
+        the bar right-to-left toward the ◀ still spells the saved
+        5'→3' primer."""
+        # Top strand at the bound region [5,13) = "ATGAAACG"; the
+        # bottom strand (same columns) is its complement "TACTTTGC".
+        # The saved 5'→3' reverse primer = RC(top) = "CGTTTCAT".
+        top    = "ATGAAACG"
+        bottom = top.translate(sc._DNA_COMP_PRESERVE_CASE)   # "TACTTTGC"
+        feat = {
+            "type": "primer_bind", "start": 5, "end": 13, "strand": -1,
+            "color": "magenta", "label": "P-rev",
+            "_primer_seq": sc._rc(top),     # "CGTTTCAT" — saved 5'→3'
+            "_bound_len":  8,
+        }
+        arr: list[tuple[str, str]] = [(" ", "")] * 20
+        sc._paint_primer_bound_bar(arr, feat, 0, 20)
+        rendered = "".join(c for c, _ in arr[5:13])
+        assert rendered == bottom, (
+            f"reverse primer bound bar should show the bottom strand "
+            f"{bottom!r}, got {rendered!r}"
+        )
+        assert rendered != top, "bound bar must NOT show the top strand"
+        # ◀ sits one cell left of the bound region (the primer's 3' end).
+        assert arr[4][0] == "◀"
+        # Right-to-left reading recovers the saved 5'→3' primer.
+        assert rendered[::-1] == sc._rc(top)
+
+    def test_wrap_intervals_helper(self):
+        """`_wrap_intervals` splits an out-of-range span into the
+        in-[0,total) pieces a circular flap occupies."""
+        assert sc._wrap_intervals(10, 20, 100) == [(10, 20)]          # in range
+        assert sc._wrap_intervals(-3, 2, 100) == [(97, 100), (0, 2)]  # off 5' end
+        assert sc._wrap_intervals(98, 103, 100) == [(98, 100), (0, 3)]  # off 3' end
+        assert sc._wrap_intervals(5, 5, 100) == []                    # empty span
+        assert sc._wrap_intervals(0, 250, 100) == [(0, 100)]          # ≥ full circle
+        assert sc._wrap_intervals(10, 20, 0) == [(10, 20)]            # total≤0 → as-is
+
+    def test_flap_overlaps_chunk_row_and_origin(self):
+        """A primer's unbound flap is detected in an adjacent display
+        row AND across the origin, so the feature gets included there."""
+        total = 100
+        rev = {"_flap_start": 78, "_flap_end": 86}        # reverse-primer tail
+        assert sc._flap_overlaps_chunk(rev, 0, 80, total)     # tail starts this row
+        assert sc._flap_overlaps_chunk(rev, 80, 160, total)   # spills to next row
+        fwd = {"_flap_start": -3, "_flap_end": 2}         # wraps the origin
+        assert sc._flap_overlaps_chunk(fwd, 0, 50, total)     # head at [0,2)
+        assert sc._flap_overlaps_chunk(fwd, 50, 100, total)   # wrapped tail [97,100)
+        assert not sc._flap_overlaps_chunk({}, 0, 80, total)  # no flap fields
+
+    def test_primer_flap_wraps_around_origin(self):
+        """A reverse primer whose unbound flap runs off the 3' end wraps
+        around the origin instead of being clipped (regression: a rotate
+        that drops the origin under the primer left the tail behind)."""
+        feat = {"type": "primer_bind", "strand": -1, "color": "magenta",
+                "_flap_start": 98, "_flap_end": 103, "_flap_bases": "WXYZ!"}
+        arr = [(" ", "")] * 100
+        sc._paint_primer_flap_bar(arr, feat, 0, 100, total=100)
+        # W@98 X@99 then wrap: Y@0 Z@1 !@2
+        assert "".join(arr[c][0] for c in (98, 99, 0, 1, 2)) == "WXYZ!"
+
+    def test_primer_flap_wraps_to_next_chunk_row(self):
+        """A flap longer than the columns left on its row continues on
+        the next display chunk at the matching column offset."""
+        feat = {"type": "primer_bind", "strand": -1, "color": "magenta",
+                "_flap_start": 78, "_flap_end": 86, "_flap_bases": "ABCDEFGH"}
+        total = 200
+        row1 = [(" ", "")] * 80          # chunk [0,80): only cols 78,79 fit
+        sc._paint_primer_flap_bar(row1, feat, 0, 80, total=total)
+        assert row1[78][0] == "A" and row1[79][0] == "B"
+        row2 = [(" ", "")] * 80          # chunk [80,160): the rest at cols 0..5
+        sc._paint_primer_flap_bar(row2, feat, 80, 160, total=total)
+        assert "".join(row2[c][0] for c in range(6)) == "CDEFGH"
+
+    def test_feats_in_chunk_includes_primer_by_flap_only(self):
+        """A primer whose bound region misses a chunk but whose flap
+        reaches it is still returned, so the flap row renders there."""
+        total = 200
+        rev = {"type": "primer_bind", "strand": -1, "start": 70, "end": 78,
+               "_flap_start": 78, "_flap_end": 90, "_flap_bases": "A" * 12}
+        # Chunk [80,160): bound [70,78) misses, flap [78,90) reaches [80,90).
+        assert rev in sc._feats_in_chunk([rev], 80, 160, total)
+        # Chunk [120,160): neither bound nor flap reaches → excluded.
+        assert sc._feats_in_chunk([rev], 120, 160, total) == []
+
+    def test_pack_features_2d_reserves_flap_columns(self):
+        """The packer reserves a primer's flap columns so a feature
+        overlapping the flap region stacks above it instead of
+        colliding on the same row."""
+        total = 200
+        primer = {"type": "primer_bind", "strand": 1, "start": 10, "end": 18,
+                  "_flap_start": 18, "_flap_end": 30, "_flap_bases": "A" * 12}
+        other  = {"type": "misc_feature", "strand": 1, "start": 25, "end": 40}
+        rows = {f["type"]: row
+                for f, row in sc._pack_features_2d([primer, other], 0, 60, total)}
+        assert rows["primer_bind"] == 0
+        # `other` overlaps the flap cols 18..29 → must stack above the
+        # primer's footprint instead of landing at row 0 (pre-fix it did).
+        assert rows["misc_feature"] > 0
+
+    def test_rotate_reframes_primer_binding(self):
+        """`_rotate_seq_record` shifts a primer_bind feature (keeping its
+        /primer_seq) when the origin moves, so the primer stays on its
+        target in the rotated sequence."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        seq = "ATGAAACG" * 25                          # 200 bp, circular
+        rec = SeqRecord(Seq(seq), id="R", name="R",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [SeqFeature(
+            FeatureLocation(100, 120, strand=-1), type="primer_bind",
+            qualifiers={"label": ["p"], "primer_seq": [sc._rc(seq[100:120])]})]
+        rot = sc._rotate_seq_record(rec, 30)            # new origin at bp 30
+        p = next(f for f in rot.features if f.type == "primer_bind")
+        assert (int(p.location.start), int(p.location.end)) == (70, 90)
+        assert p.qualifiers["primer_seq"] == [sc._rc(seq[100:120])]
+        assert str(rot.seq)[70:90] == seq[100:120]      # still on target
+
+    async def test_sequence_edit_shifts_primer_feature(self, isolated_library):
+        """Inserting bases upstream of a primer_bind feature shifts the
+        feature's coordinates by the insert length — the edit
+        re-coordination behaviour we set out to verify."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        seq = "ATGC" * 50                               # 200 bp
+        rec = SeqRecord(Seq(seq), id="E", name="E",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [SeqFeature(
+            FeatureLocation(100, 120, strand=1), type="primer_bind",
+            qualifiers={"label": ["p"], "primer_seq": [seq[100:120]]})]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            ins = "G" * 10
+            new_seq = seq[:10] + ins + seq[10:]
+            new_rec = app._rebuild_record_with_edit(
+                new_seq, "insert", 10, 10, ins, source_record=rec)
+            p = next(f for f in new_rec.features if f.type == "primer_bind")
+            # Primer began at 100..120; a 10-bp insert at bp 10 pushes it +10.
+            assert (int(p.location.start), int(p.location.end)) == (110, 130)
+            assert p.qualifiers["primer_seq"] == [seq[100:120]]
 
     async def test_seq_panel_renders_primer_flap_bases(
             self, isolated_library):

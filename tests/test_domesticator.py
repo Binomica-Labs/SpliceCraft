@@ -5297,6 +5297,120 @@ class TestPrimerDesignScreenGBSuffix:
             )
 
 
+class TestPrimerLibraryMarkAndFocus:
+    """After a design-save the new pair is marked + focused (ready for a
+    one-press Add-to-map), and deleting a primer keeps the list parked
+    near where it was instead of snapping back to the top."""
+
+    @staticmethod
+    def _seed(n):
+        sc._save_primers([
+            {"name": f"p{i:02d}", "sequence": f"ACGTACGTACGTACGT{i:04d}",
+             "tm": 60.0, "primer_type": "generic", "source": "seed",
+             "pos_start": 0, "pos_end": 20, "strand": 1,
+             "date": "2026-05-29", "status": "Designed"}
+            for i in range(n)
+        ])
+
+    async def test_design_save_marks_and_focuses_new_pair(self, isolated_library):
+        """Saving designed primers marks the new pair (so a single
+        Add-to-map grabs them) and lands the cursor on one of them."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            screen = sc.PrimerDesignScreen("ACGT" * 200, [], "test")
+            app.push_screen(screen)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            screen._det_result = {
+                "fwd_seq": "AAGCGATCAAAGGATATAT",
+                "rev_seq": "TTCATGCTACAAGGATTTA",
+                "fwd_tm": 58.0, "rev_tm": 58.5,
+                "fwd_pos": (10, 29), "rev_pos": (60, 79),
+                "_type": "detection",
+            }
+            screen._commit_designed_primers_with_names(
+                ["Ztest-DET-F", "Ztest-DET-R"])
+            await pilot.pause()
+            await pilot.pause(0.1)
+            primers = sc._load_primers()
+            names = [p.get("name") for p in primers]
+            assert "Ztest-DET-F" in names and "Ztest-DET-R" in names
+            # Both new primers are marked.
+            marked = {primers[i].get("name") for i in screen._lib_selected
+                      if 0 <= i < len(primers)}
+            assert marked == {"Ztest-DET-F", "Ztest-DET-R"}, marked
+            # Cursor landed on one of the new primers.
+            t = screen.query_one("#pd-lib-table", sc.DataTable)
+            cur = screen._row_to_primer_idx[t.cursor_row]
+            assert primers[cur].get("name") in {"Ztest-DET-F", "Ztest-DET-R"}
+
+    async def test_delete_last_primer_keeps_cursor_in_range(self, isolated_library):
+        """Deleting the bottom primer leaves the cursor on the new last
+        row instead of snapping to row 0 (the old out-of-range behaviour)."""
+        self._seed(6)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            screen = sc.PrimerDesignScreen("ACGT" * 200, [], "test")
+            app.push_screen(screen)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            t = screen.query_one("#pd-lib-table", sc.DataTable)
+            assert t.row_count == 6
+            t.move_cursor(row=5)                 # bottom row
+            await pilot.pause()
+            last = sc._load_primers()[screen._row_to_primer_idx[5]]
+            remaining = [p for p in sc._load_primers()
+                         if p.get("name") != last.get("name")]
+            sc._save_primers(remaining)
+            screen._refresh_library_table()
+            await pilot.pause()
+            await pilot.pause(0.1)          # let the deferred restore run
+            # Clamped to the new last row (4), not bounced to 0.
+            assert t.cursor_row == 4, t.cursor_row
+
+    async def test_delete_maintains_scroll_position(self, isolated_library):
+        """Deleting a primer keeps the EXACT scrollbar position — the user
+        stays parked where they were rather than the list re-scrolling so
+        the deleted row's slot sits at the viewport edge."""
+        self._seed(200)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            screen = sc.PrimerDesignScreen("ACGT" * 200, [], "test")
+            app.push_screen(screen)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            t = screen.query_one("#pd-lib-table", sc.DataTable)
+            assert t.row_count == 200
+            t.scroll_to(y=30, animate=False)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            y_before = t.scroll_offset.y
+            assert y_before > 0, "test setup: the table should be scrolled"
+            # Delete the primer shown at a mid-viewport row and drop its
+            # row in place (the surgical path the delete handler uses).
+            # NB: the modal-confirm path can't be exercised headlessly
+            # here — dismissing the confirm modal hard-resets the table
+            # scroll in the test harness (the real terminal does not),
+            # so we drive `_drop_primer_rows` directly.
+            old_idx = screen._row_to_primer_idx[40]
+            remaining = [p for i, p in enumerate(sc._load_primers())
+                         if i != old_idx]
+            sc._save_primers(remaining)
+            screen._drop_primer_rows({old_idx}, cursor_row=40, scroll_y=y_before)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert t.row_count == 199
+            # Scrollbar held its position; row→idx map stayed in sync;
+            # cursor parked near the deleted row, not bounced to the top.
+            assert t.scroll_offset.y == y_before, (
+                f"scroll moved {y_before} → {t.scroll_offset.y}")
+            assert len(screen._row_to_primer_idx) == 199
+            assert t.cursor_row == 40
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Edge-case hardening: multi-site inserts, end-of-insert sites, swap cascades
 #

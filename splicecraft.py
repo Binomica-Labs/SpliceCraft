@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -8520,13 +8520,19 @@ def _paint_primer_bound_bar(arr: list[tuple[str, str]], f: dict,
     if not primer_seq or bound_len <= 0:
         _paint_feature_bar(arr, f, chunk_start, chunk_end)
         return
-    # Full bound bases in top-strand orientation. Forward primer's
-    # bound region = `primer_seq[flap_len:]`; reverse primer's
-    # bound region in top-strand orientation = RC of the same slice.
+    # Bound bases shown inline with the strand the primer anneals to.
+    # A forward primer sits on the top strand → its bases show as-is.
+    # A reverse primer sits on the BOTTOM strand, so it shows the
+    # bottom-strand bases (the per-base complement of the top strand
+    # the seq panel prints directly below it). That is the plain
+    # REVERSE of the primer's 5'→3' bound slice — reverse(B) ==
+    # complement(_rc(B)) == complement(top strand) — so the bar lines
+    # up base-for-base with the bottom strand; reading it right-to-left
+    # toward the ◀ still spells the saved 5'→3' primer.
     if strand >= 0:
         full_bound_bases = primer_seq[flap_len:flap_len + bound_len]
     else:
-        full_bound_bases = _rc(primer_seq[flap_len:flap_len + bound_len])
+        full_bound_bases = primer_seq[flap_len:flap_len + bound_len][::-1]
 
     # ── Slice the half's portion of the full bound ─────────────────
     orig_start = f.get("_orig_start")
@@ -8600,7 +8606,8 @@ def _paint_primer_bound_bar(arr: list[tuple[str, str]], f: dict,
 
 
 def _paint_primer_flap_bar(arr: list[tuple[str, str]], f: dict,
-                             chunk_start: int, chunk_end: int) -> None:
+                             chunk_start: int, chunk_end: int,
+                             total: int = 0) -> None:
     """Flap-row painter — sits one row farther from the strand than
     the bound bar (`sub == 1` of a primer-with-flap). Renders the
     flap's bases in the column range `[_flap_start, _flap_end)`
@@ -8609,6 +8616,19 @@ def _paint_primer_flap_bar(arr: list[tuple[str, str]], f: dict,
     vertically overlapping it. Background = primer color, fg =
     cell text colour, identical typography to the bound row so the
     eye reads them as one continuous primer.
+
+    Origin-wrap aware: the flap is the primer's UNBOUND 5' tail, so it
+    dangles OUTSIDE the bound region and on a circular plasmid can run
+    off either end — `_flap_start < 0` for a forward primer binding
+    near bp 0, or `_flap_end > total` for a reverse primer near the
+    end. This is also hit when a rotate / set-origin drops the new
+    origin under the primer. Each flap base is placed at its template
+    column **mod `total`** so the tail reappears on the far side
+    instead of being clipped (the pre-fix behaviour silently dropped
+    the wrapped bases — "the tail didn't shift over"). With
+    `total == 0` (no sequence length supplied — e.g. a unit test that
+    only exercises an in-range flap) the modulo is skipped and the
+    flap clips at the linear ends.
     """
     flap_s = int(f.get("_flap_start") or 0)
     flap_e = int(f.get("_flap_end")   or 0)
@@ -8618,18 +8638,15 @@ def _paint_primer_flap_bar(arr: list[tuple[str, str]], f: dict,
     color = f.get("color", "white")
     bg_style = f"black on {color}"
     content_w = chunk_end - chunk_start
-    # Clip flap to the visible chunk.
-    vis_s = max(flap_s, chunk_start)
-    vis_e = min(flap_e, chunk_end)
-    if vis_e <= vis_s:
-        return
-    # Slice the bases to match the visible window.
-    src_start = vis_s - flap_s
-    src_end   = src_start + (vis_e - vis_s)
-    visible = flap_bases[src_start:src_end]
-    bar_s = vis_s - chunk_start
-    for i, ch in enumerate(visible):
-        col = bar_s + i
+    n = total if total > 0 else 0
+    # Per-base placement so the tail can wrap the origin. `flap_bases`
+    # spans `[flap_s, flap_e)` one char per column; base `i` sits at
+    # template column `flap_s + i` (mod total on a circular molecule).
+    for i, ch in enumerate(flap_bases):
+        pos = flap_s + i
+        if n:
+            pos %= n
+        col = pos - chunk_start
         if 0 <= col < content_w:
             arr[col] = (ch if ch else "▒", bg_style)
 
@@ -8919,7 +8936,8 @@ def _render_packed_strand(result: "Text",
                                            is_below_dna=is_below_dna)
                 else:   # sub == 1
                     if has_flap:
-                        _paint_primer_flap_bar(arr, f, chunk_start, chunk_end)
+                        _paint_primer_flap_bar(arr, f, chunk_start, chunk_end,
+                                               total=len(seq_upper))
                     else:
                         _paint_feature_label(arr, f, chunk_start, chunk_end,
                                              re_highlight_se=re_highlight_se)
@@ -8932,8 +8950,44 @@ def _feat_stack_height(f: dict) -> int:
     return 3 if f.get("type") == "CDS" else 2
 
 
+def _wrap_intervals(start: int, end: int, total: int) -> "list[tuple[int, int]]":
+    """Decompose the half-open span ``[start, end)`` — whose endpoints
+    may fall below 0 or above ``total`` — into one or two ``[a, b)``
+    pieces lying within ``[0, total)`` on a circular molecule. Empty
+    span → ``[]``. ``total <= 0`` → the span unchanged (no wrap). Used
+    to place a primer's unbound flap, which dangles outside the bound
+    region and can cross both display-row and origin boundaries."""
+    if end <= start:
+        return []
+    if total <= 0:
+        return [(start, end)]
+    span = end - start
+    if span >= total:
+        return [(0, total)]
+    a = start % total
+    b = a + span
+    if b <= total:
+        return [(a, b)]
+    return [(a, total), (0, b - total)]
+
+
+def _flap_overlaps_chunk(f: dict, chunk_start: int, chunk_end: int,
+                         total: int) -> bool:
+    """True when a primer feature's unbound flap (``_flap_start`` ..
+    ``_flap_end``, possibly negative / past ``total``) overlaps the
+    chunk ``[chunk_start, chunk_end)`` on a circular molecule."""
+    fs = f.get("_flap_start")
+    fe = f.get("_flap_end")
+    if not (isinstance(fs, int) and isinstance(fe, int)) or fe <= fs:
+        return False
+    for a, b in _wrap_intervals(fs, fe, total):
+        if a < chunk_end and b > chunk_start:
+            return True
+    return False
+
+
 def _pack_features_2d(feats: list[dict], chunk_start: int,
-                      chunk_end: int) -> list[tuple[dict, int]]:
+                      chunk_end: int, total: int = 0) -> list[tuple[dict, int]]:
     """Greedy 2D packing: each feature occupies a (bp range × height)
     rectangle starting from `bottom_row` (0 = closest to DNA). Returns
     a list of (feat, bottom_row) pairs.
@@ -8965,21 +9019,40 @@ def _pack_features_2d(feats: list[dict], chunk_start: int,
     placements: list[tuple[dict, int]] = []
     col_top = [-1] * width
     for f in feats:
+        # Chunk-local columns this feature occupies = its bound region
+        # PLUS any unbound primer flap. The flap lives outside
+        # [start, end) and is wrap-aware (it can spill onto the next
+        # display row or cross the origin), so reserving its columns
+        # here keeps a tail that lands on this row from being packed
+        # under an unrelated feature.
+        spans: list[tuple[int, int]] = []
         bar_s = max(f["start"], chunk_start) - chunk_start
         bar_e = min(f["end"],   chunk_end)   - chunk_start
-        if bar_e <= bar_s:
+        if bar_e > bar_s:
+            spans.append((bar_s, bar_e))
+        fs = f.get("_flap_start")
+        fe = f.get("_flap_end")
+        if isinstance(fs, int) and isinstance(fe, int) and fe > fs:
+            for a, b in _wrap_intervals(fs, fe, total):
+                ca = max(a, chunk_start) - chunk_start
+                cb = min(b, chunk_end)   - chunk_start
+                if cb > ca:
+                    spans.append((ca, cb))
+        if not spans:
             continue
         height = _feat_stack_height(f)
-        max_top = max(col_top[bar_s:bar_e])
+        max_top = max(max(col_top[a:b]) for a, b in spans)
         bottom_row = max_top + 1
         top_row = bottom_row + height - 1
-        col_top[bar_s:bar_e] = [top_row] * (bar_e - bar_s)
+        for a, b in spans:
+            col_top[a:b] = [top_row] * (b - a)
         placements.append((f, bottom_row))
     return placements
 
 
 def _chunk_lane_groups(
     chunk_feats: list[dict], chunk_start: int, chunk_end: int,
+    total: int = 0,
 ) -> "tuple[list, list, int, int]":
     """Returns (above_placements, below_placements, above_rows, below_rows).
 
@@ -8994,8 +9067,8 @@ def _chunk_lane_groups(
     """
     fwd = [f for f in chunk_feats if f.get("strand", 0) >= 0]
     rev = [f for f in chunk_feats if f.get("strand", 0) <  0]
-    above_p = _pack_features_2d(fwd, chunk_start, chunk_end)
-    below_p = _pack_features_2d(rev, chunk_start, chunk_end)
+    above_p = _pack_features_2d(fwd, chunk_start, chunk_end, total)
+    below_p = _pack_features_2d(rev, chunk_start, chunk_end, total)
     above_rows = max(
         (p[1] + _feat_stack_height(p[0]) for p in above_p), default=0
     )
@@ -9096,6 +9169,14 @@ def _feats_in_chunk(
         s, e = f["start"], f["end"]
         if e >= s:
             if s < chunk_end and e > chunk_start:
+                out.append(f)
+            elif _flap_overlaps_chunk(f, chunk_start, chunk_end, total):
+                # Bound region misses this chunk, but the primer's
+                # unbound flap (wrap-aware — may spill onto the next
+                # display row or cross the origin) lands here, so
+                # include the feature for the flap row. The bound-bar
+                # painter no-ops when [start, end) doesn't intersect
+                # the chunk, so only the flap renders.
                 out.append(f)
             continue
         # Wrap feature: split into tail + head. Stamp the original
@@ -9222,7 +9303,7 @@ def _chunk_layout(seq: str, feats: list[dict], line_width: int):
     for chunk_start in range(0, n, line_width):
         chunk_end   = min(chunk_start + line_width, n)
         chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
-        groups      = _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
+        groups      = _chunk_lane_groups(chunk_feats, chunk_start, chunk_end, n)
         above_p, below_p, above_rows, below_rows = groups
         # `above_pairs` / `below_pairs` are stored as lane *pair counts*
         # for backward compat with `_bp_to_content_row` arithmetic; on
@@ -17095,19 +17176,21 @@ class PlasmidMap(Widget):
                         new_feat["_weak_primer"] = True
                     if flap_len > 0:
                         new_feat["_flap_len"] = flap_len
-                        # Top-strand-oriented flap bases (so they
-                        # read inline with the strand below):
-                        # forward primer flap = primer_seq[:flap_len];
-                        # reverse primer flap = RC of primer_seq[:flap_len]
-                        # (the 5' end of the rev primer is on the
-                        # right side of the bound region in top-
-                        # strand orientation).
+                        # Flap bases read inline with the strand the
+                        # primer anneals to. Forward primer (top
+                        # strand): flap = primer_seq[:flap_len], drawn
+                        # LEFT of the bound region. Reverse primer
+                        # (bottom strand): flap = the plain REVERSE of
+                        # primer_seq[:flap_len] so it reads in the same
+                        # bottom-strand frame as the bound bar, drawn
+                        # RIGHT of the bound region (the rev primer's
+                        # 5' end is on the high-coordinate side).
                         if strand >= 0:
                             new_feat["_flap_bases"] = primer_seq[:flap_len]
                             new_feat["_flap_start"] = start - flap_len
                             new_feat["_flap_end"]   = start
                         else:
-                            new_feat["_flap_bases"] = _rc(primer_seq[:flap_len])
+                            new_feat["_flap_bases"] = primer_seq[:flap_len][::-1]
                             new_feat["_flap_start"] = end
                             new_feat["_flap_end"]   = end + flap_len
             feats.append(new_feat)
@@ -20417,9 +20500,11 @@ class LibraryPanel(Widget):
         gb_text = _record_to_gb_text(record)
         entries = _load_library()
         prev_status = ""
+        prev_name = ""
         for e in entries:
             if e.get("id") == record.id:
                 prev_status = _sanitize_plasmid_status(e.get("status"))
+                prev_name = str(e.get("name") or "").strip()
                 break
         # Pre-build the new entry dict so collision detection can
         # compare against it directly. `.strip()` on the display name
@@ -20430,8 +20515,17 @@ class LibraryPanel(Widget):
         # row (saved without the space). 2026-05-24: trim at every
         # `e["name"]` and `e["id"]` write site; the backfill in
         # `_load_library` cleans legacy entries.
+        # Re-saving an EDITED plasmid (same id) must keep the display
+        # NAME it already had in the library. A record rebuilt by an
+        # edit / primer-add / rotate loses its `_tui_display_name`, and
+        # `record.name` is the GenBank LOCUS — space-stripped per INSDC
+        # spec — so falling straight back to it turned "My Plasmid" into
+        # "My_Plasmid" on every modify+save. Prefer the prior library
+        # name before the LOCUS so spaces survive (no-add-underscores
+        # rule). `_tui_display_name` still wins first (covers rename).
         display_name = str(
             getattr(record, "_tui_display_name", None)
+            or prev_name
             or record.name or record.id or ""
         ).strip()
         new_entry = {
@@ -20459,7 +20553,7 @@ class LibraryPanel(Widget):
                 entries = [e for e in _load_library()
                            if e.get("id") != record.id]
                 entries.insert(0, new_entry)
-                self._commit_library_entries(entries)
+                self._commit_library_entries(entries, select_id=record.id)
             return True
         # No id match: check for name collisions against entries whose
         # id differs. ``_resolve_load_collisions`` handles the modal
@@ -20473,7 +20567,7 @@ class LibraryPanel(Widget):
             with _cache_lock:  # Sweep #30: atomic commit — see above [INV-74]
                 entries = _load_library()
                 entries.insert(0, new_entry)
-                self._commit_library_entries(entries)
+                self._commit_library_entries(entries, select_id=record.id)
             return True
 
         def _content_fn(e: dict) -> str:
@@ -20524,7 +20618,7 @@ class LibraryPanel(Widget):
                             except Exception:
                                 pass
                 current = list(items_to_save) + current
-                self._commit_library_entries(current)
+                self._commit_library_entries(current, select_id=record.id)
             _log_event(
                 "library.add.ok",
                 name=display_name, id=record.id,
@@ -20540,7 +20634,8 @@ class LibraryPanel(Widget):
         )
         return True
 
-    def _commit_library_entries(self, entries: "list[dict]") -> None:
+    def _commit_library_entries(self, entries: "list[dict]",
+                                *, select_id: "str | None" = None) -> None:
         """Sync cache + repopulate + async disk write. Shared exit
         path for both the id-replace branch and the post-modal
         callback in ``add_entry`` so cache hygiene + dependent-cache
@@ -20562,6 +20657,19 @@ class LibraryPanel(Widget):
         if self._view_mode == "plasmids":
             self._apply_panel_width()
             self._repopulate_plasmids()
+            # Keep the list focused on the just-saved plasmid instead of
+            # snapping back to the top — `_repopulate_plasmids` clears
+            # the table (resetting the cursor), so re-seat it on
+            # `select_id` (the row key is the entry id).
+            if select_id:
+                try:
+                    t = self.query_one("#lib-table", DataTable)
+                    for i, row_key in enumerate(t.rows.keys()):
+                        if getattr(row_key, "value", None) == select_id:
+                            t.move_cursor(row=i)
+                            break
+                except (NoMatches, AttributeError):
+                    pass
         # Disk write off-thread. Failure surfaces via
         # ``_notify_save_failure`` from inside the worker.
         self._add_save_to_disk(entries)
@@ -22085,7 +22193,7 @@ class SequencePanel(Widget):
                        if f.get("type") not in ("site", "recut")]
         chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
         above_p, below_p, above_rows, below_rows = (
-            _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
+            _chunk_lane_groups(chunk_feats, chunk_start, chunk_end, n)
         )
         # Build the chunk's render fresh into a stub Text so we can
         # extract its plain-text lines.
@@ -44213,10 +44321,12 @@ def _build_primer_preview(template: str, primer_seq: str,
       row 0: flap bases (right-justified to bound start, primer bg)
       row 1: bound bases + ► arrow (primer bg)
       row 2: top strand window
-      row 3: bottom strand (RC, dim)
+      row 3: bottom strand (complement, dim)
 
-    Reverse primer mirrors: top/bottom strand on top, bound bar
-    with ◄ on the LEFT, then flap underneath.
+    Reverse primer mirrors: top/bottom strand on top, then the bound
+    bar (◄ on the LEFT) drawn in the BOTTOM-strand frame so its bases
+    line up with the bottom strand row directly above it, then the
+    flap underneath.
 
     `context_bp` extends the strand window past the primer's
     footprint so the user sees flanking bases. Wrap-binding
@@ -44272,8 +44382,11 @@ def _build_primer_preview(template: str, primer_seq: str,
         bound_col   = bound_start - win_start
         arrow_col   = bound_col + len(bound_bases)
     else:
-        flap_bases  = _rc(primer_seq[:flap_len])
-        bound_bases = _rc(primer_seq[flap_len:])
+        # Bottom-strand frame (see `_paint_primer_bound_bar`): the
+        # plain reverse of the primer slices, so the bound bar matches
+        # the bottom strand row and reads 5'→3' right-to-left toward ◄.
+        flap_bases  = primer_seq[:flap_len][::-1]
+        bound_bases = primer_seq[flap_len:][::-1]
         flap_col    = bound_end - win_start
         bound_col   = bound_start - win_start
         arrow_col   = bound_col - 1
@@ -82323,8 +82436,12 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
                 p.get("date", ""),
                 Text(status, style=s_color),
             )
-        if primers and 0 <= saved_cursor < len(primers):
-            t.move_cursor(row=saved_cursor)
+        if primers:
+            # Keep the cursor near where it was — clamp so a refresh that
+            # shrinks the list lands on the new last row rather than
+            # snapping to row 0. (A single delete preserves scroll via
+            # the surgical row-removal path, which doesn't call this.)
+            t.move_cursor(row=min(saved_cursor, len(primers) - 1))
 
     @work(thread=True, exclusive=True, group="primer_usage_index")
     def _index_usage_worker(self) -> None:
@@ -82744,6 +82861,17 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
         """If primers are marked, confirm deletion of all marked. Otherwise
         confirm deletion of the cursor row."""
         primers = _load_primers()
+        # Remember the cursor row so we can re-seat it (within the same
+        # viewport) after a surgical delete — otherwise removing the
+        # cursor's own row resets the cursor to 0 and the modal-dismiss
+        # focus scroll-cursor-into-view jumps the list to the top.
+        try:
+            _pdt = self.query_one("#pd-lib-table", DataTable)
+            pre_cursor_row = _pdt.cursor_row
+            pre_scroll_y = _pdt.scroll_offset.y
+        except NoMatches:
+            pre_cursor_row = 0
+            pre_scroll_y = 0
         if self._lib_selected:
             count = len(self._lib_selected)
             names = [primers[i].get("name", "?") for i in sorted(self._lib_selected)
@@ -82760,23 +82888,31 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
         def _on_confirm(result):
             if result is not True:
                 return
-            entries = _load_primers()
+            old_primers = _load_primers()
             name_set = set(names)
-            n_before = len(entries)
-            entries = [e for e in entries if e.get("name") not in name_set]
+            n_before = len(old_primers)
+            # Indices (in the current list order) being removed.
+            deleted_idx = {i for i, p in enumerate(old_primers)
+                           if p.get("name") in name_set}
+            if not deleted_idx:
+                self.app.notify("Nothing to delete — already removed.",
+                                severity="information")
+                return
+            new_primers = [p for i, p in enumerate(old_primers)
+                           if i not in deleted_idx]
             try:
-                _save_primers(entries)
+                _save_primers(new_primers)
             except (OSError, RuntimeError) as exc:
                 _notify_save_failure(self.app, "Primer library", exc)
                 return
-            self._lib_selected.clear()
-            self._refresh_library_table()
-            # Report the count of entries we actually removed, not the
-            # count the user asked to delete — a stale list (concurrent
-            # rename / delete) could leave fewer to actually go. Pre-fix
-            # used `len(names)`, which over-reported when names were
-            # already gone.
-            n_removed = n_before - len(entries)
+            # Surgically drop the deleted rows in place (no full
+            # clear()+repopulate) so the scrollbar stays exactly where
+            # the user had it — see `_drop_primer_rows`.
+            self._drop_primer_rows(deleted_idx, cursor_row=pre_cursor_row,
+                                   scroll_y=pre_scroll_y)
+            # Report what we actually removed — a stale list (concurrent
+            # rename / delete) could leave fewer to go than asked.
+            n_removed = n_before - len(new_primers)
             self.app.notify(
                 f"Deleted {n_removed} primer"
                 f"{'s' if n_removed != 1 else ''}.")
@@ -82785,6 +82921,46 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             LibraryDeleteConfirmModal(label, 0, ""),
             callback=_on_confirm,
         )
+
+    def _drop_primer_rows(self, deleted_idx: "set[int]", *,
+                          cursor_row: int, scroll_y: int) -> None:
+        """Remove the primer rows at original-indices ``deleted_idx`` from
+        the library table IN PLACE — no full clear()+repopulate — so the
+        scrollbar stays exactly where the user had it (a clear() resets
+        scroll to 0). Caller must have already pruned those primers from
+        ``_load_primers()``. Remaining rows keep their rendered ★ marks;
+        the row→primer-index map and the mark set are remapped to the
+        compacted list, and the cursor + scroll are re-pinned.
+        """
+        try:
+            t = self.query_one("#pd-lib-table", DataTable)
+        except NoMatches:
+            return
+        row_keys = list(t.rows.keys())
+        for row, old_i in enumerate(self._row_to_primer_idx):
+            if old_i in deleted_idx and 0 <= row < len(row_keys):
+                t.remove_row(row_keys[row])
+
+        def _shift(old_i: int) -> int:
+            return old_i - sum(1 for d in deleted_idx if d < old_i)
+        self._row_to_primer_idx = [
+            _shift(old_i) for old_i in self._row_to_primer_idx
+            if old_i not in deleted_idx
+        ]
+        self._lib_selected = {
+            _shift(i) for i in self._lib_selected if i not in deleted_idx
+        }
+        if self._row_to_primer_idx:
+            # Re-seat the cursor near the deleted row and within the
+            # current viewport so a focus-driven scroll-cursor-into-view
+            # is a no-op, then re-pin the exact scroll (remove_row can
+            # recompute the height and nudge it; no clear() happened, so
+            # scroll_to won't clamp to 0).
+            t.move_cursor(
+                row=min(cursor_row, len(self._row_to_primer_idx) - 1),
+                scroll=False,
+            )
+            t.scroll_to(y=scroll_y, animate=False)
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -83428,6 +83604,12 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
                     error=str(exc),
                 )
                 return
+            # Mark the just-saved pair (prepended at indices 0..N-1) so
+            # the refresh renders them ★ and the user can immediately add
+            # the new primers to the map. The prepend shifts every prior
+            # index, so replace (not union) any stale marks. preserve_
+            # scroll=False — the focus jump below scrolls to the new pair.
+            self._lib_selected = set(range(len(items_to_save)))
             self._refresh_library_table()
             saved_names = [p.get("name", "?") for p in items_to_save]
             _log_event(

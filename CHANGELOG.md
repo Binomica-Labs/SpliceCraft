@@ -14,9 +14,19 @@
 
 ---
 
-## [Unreleased]
+## [1.0.1] — 2026-05-29
 
-_Nothing yet — `1.0.0` is the current head._
+### New features
+
+- **Designed primers land marked and in view.** After you save a designed primer pair to the library, the new pair is automatically *marked* and the list jumps to it — so you can send them straight to the map (Add to map) without hunting for where they landed.
+
+### Bug fixes
+
+- **Reverse primers in the sequence panel now read off the bottom strand.** A primer bound to the bottom (reverse) strand was showing the *top*-strand bases in its inline bar — the same letters as the strand printed directly below it. It now shows the bottom-strand bases it actually pairs with; reading the bar right-to-left (toward the ◀) still spells the saved 5′→3′ primer. The in-designer primer preview got the same fix. Primer Library storage is unchanged — primers are still saved 5′→3′.
+- **A primer's unbound 5′ tail now wraps correctly in the sequence panel.** When a primer's unbound tail (the 5′ flap that doesn't pair with the template) runs past the right edge of a sequence row, it now continues on the next row at the matching column offset instead of being clipped at the row boundary. It also wraps around the origin (bp 1) — e.g. when you rotate / re-origin the plasmid so the primer straddles it. Forward and reverse primers, and tails that cross both a row boundary *and* the origin, are all handled, and the tail no longer collides with features stacked on the same row.
+- **Saving an edited plasmid no longer renames it.** Saving changes to a plasmid (the `*`-marked entry) used to replace the library name with the GenBank LOCUS id — turning spaces into underscores (`My Plasmid` → `My_Plasmid`) because an edited record loses its display name. The save now keeps the name the entry already had in the library. (Already-renamed entries can be set straight again from the library ✎ Rename button.)
+- **The plasmid library keeps its selection after a save.** Saving no longer snaps the library list back to the top — the cursor stays on the plasmid you just saved.
+- **Deleting a primer keeps the list exactly where it was.** The primer library now removes just the deleted row in place (instead of rebuilding the whole list), so the scrollbar holds its exact position and the cursor stays on a neighbouring primer — no more scrolling back down after removing a single primer.
 
 ---
 
