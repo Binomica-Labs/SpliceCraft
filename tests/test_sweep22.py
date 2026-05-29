@@ -322,6 +322,15 @@ class TestMigrationCoverageEveryLoadPath:
             "_load_entry_vectors", "_load_settings",
             "_load_experiments", "_load_experiment_projects",
             "_load_gels",
+            # Added 2026-05-29: persisted types that post-date the
+            # original list — custom enzymes + enzyme collections
+            # (INV-85) and codon tables — must route through the
+            # framework too, else a future schema bump silently skips
+            # them. NB `_codon_tables_load` does NOT follow the
+            # `_load_*` prefix; loaders are resolved by name, not by
+            # pattern, so the asymmetry is fine.
+            "_load_custom_enzymes", "_load_enzyme_collections",
+            "_codon_tables_load",
         ]
         # INV-73 (2026-05-25): walk the call graph one level to follow
         # cache-refactor indirections. `_load_library` no longer

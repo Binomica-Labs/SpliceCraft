@@ -14,6 +14,15 @@
 
 ---
 
+## [1.0.3] — 2026-05-29
+
+### New features
+
+- **SpliceCraft now runs on (almost) any terminal.** A terminal that isn't set to UTF-8 used to refuse to launch, because the braille plasmid map needs Unicode. SpliceCraft now first tries to switch the terminal to UTF-8 itself (a `LANG=C` shell often mislabels an otherwise-capable terminal), and only if that's genuinely impossible does it fall back to a 7-bit-ASCII plasmid map — backbone, features, DNA helix, and the search spinner all included — that draws on any ANSI terminal. Force the ASCII map any time with `SPLICECRAFT_ASCII=1`, handy if your terminal *claims* UTF-8 but its font can't draw braille (you'd otherwise see boxes instead of dots). This also makes Raspberry Pi / ARM Linux a first-class target — see the platform guide.
+- **"What's New" highlights each item's summary in purple.** The leading one-line summary of every change is now tinted purple, so you can scan the gist of a release at a glance and read the detail only where you want it.
+
+---
+
 ## [1.0.2] — 2026-05-29
 
 ### New features

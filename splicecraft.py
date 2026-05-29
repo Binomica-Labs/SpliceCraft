@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -592,6 +592,100 @@ def _log_startup_banner() -> None:
     _log.info("=" * 60)
 
 
+# ── Terminal render tier ─────────────────────────────────────────────
+# SpliceCraft's signature view is a Unicode-braille (U+2800–U+28FF)
+# plasmid map. On a terminal that can't emit UTF-8 the braille renders
+# as mojibake — but rather than REFUSE to launch (the pre-1.0.3
+# behaviour), we degrade: `_ASCII_MODE` flips the map + helix renderers
+# to a 7-bit-ASCII density ramp that draws on literally any ANSI
+# terminal. The flag is set once at startup by `_select_render_tier()`
+# and read by the renderers. Forced on with SPLICECRAFT_ASCII=1 (escape
+# hatch for a terminal/font that claims UTF-8 but can't show braille).
+_ASCII_MODE: bool = False
+
+# Codecs whose output the braille map renders correctly. cp65001 is the
+# Windows code page for UTF-8 (`chcp 65001`); utf-16/32 are supersets.
+_UTF8_ENCODINGS = frozenset({
+    "utf-8", "utf8", "utf-16", "utf-32", "cp65001",
+})
+
+
+def _ensure_utf8_stdout() -> bool:
+    """Best-effort: make stdout emit UTF-8 so the braille map renders.
+
+    `sys.stdout.encoding` is a locale-derived guess that is frequently
+    wrong: a `LANG=C` shell reports e.g. ``'ascii'`` / ``'latin-1'``
+    even though the terminal displays UTF-8 fine. Rather than treat
+    that string as gospel and refuse, we reconfigure the stream to
+    UTF-8 (`io.TextIOWrapper.reconfigure`, 3.7+) and carry on.
+    ``PYTHONUTF8=1`` already flips Python's encoding to UTF-8, so this
+    mostly no-ops there.
+
+    Returns True if stdout is UTF-8 (already, or after a successful
+    reconfigure); False if the stream genuinely can't be made UTF-8
+    (→ caller falls back to the ASCII map)."""
+    enc = (getattr(sys.stdout, "encoding", "") or "").lower()
+    if not enc:
+        # Piped / redirected — not an interactive terminal, so the
+        # braille map isn't rendering anywhere; don't force ASCII on
+        # the strength of a missing encoding string.
+        return True
+    if enc in _UTF8_ENCODINGS:
+        return True
+    reconf = getattr(sys.stdout, "reconfigure", None)
+    if not callable(reconf):
+        return False
+    try:
+        # errors="replace" so the rescued (non-native-UTF-8) stream
+        # degrades a stray unencodable char to "?" instead of crashing
+        # the TUI mid-render — belt-and-braces for the "any terminal"
+        # goal. The already-UTF-8 fast path short-circuits above, so the
+        # normal stream is untouched.
+        reconf(encoding="utf-8", errors="replace")
+    except (ValueError, OSError, LookupError, AttributeError):
+        return False
+    new_enc = (getattr(sys.stdout, "encoding", "") or "").lower()
+    return new_enc in _UTF8_ENCODINGS
+
+
+def _select_render_tier() -> "tuple[bool, list[str]]":
+    """Decide the map rendering tier from terminal capability + env
+    override, set the module-level ``_ASCII_MODE``, and return
+    ``(ascii_mode, warnings)``.
+
+    Resolution order:
+      1. ``SPLICECRAFT_ASCII=1`` → force ASCII regardless (escape hatch
+         for a terminal/font that reports UTF-8 but can't actually
+         render braille glyphs).
+      2. else try to make stdout UTF-8 (`_ensure_utf8_stdout`); only if
+         that genuinely fails do we fall back to ASCII.
+
+    Idempotent — reconfiguring an already-UTF-8 stream is a no-op — so
+    calling it more than once is harmless."""
+    global _ASCII_MODE
+    warnings: list[str] = []
+    forced = (os.environ.get("SPLICECRAFT_ASCII", "") or "").strip().lower()
+    if forced in ("1", "true", "yes", "on"):
+        _ASCII_MODE = True
+        warnings.append(
+            "SPLICECRAFT_ASCII set — drawing the plasmid map in ASCII "
+            "fallback mode (braille map disabled)."
+        )
+        return True, warnings
+    if not _ensure_utf8_stdout():
+        _ASCII_MODE = True
+        enc = (getattr(sys.stdout, "encoding", "") or "").lower() or "unknown"
+        warnings.append(
+            f"Terminal encoding is {enc!r} and couldn't be switched to "
+            f"UTF-8 — using the ASCII plasmid-map fallback. For the "
+            f"richer braille map, use a UTF-8 locale (e.g. LANG=C.UTF-8) "
+            f"or set PYTHONIOENCODING=utf-8 / PYTHONUTF8=1."
+        )
+        return True, warnings
+    _ASCII_MODE = False
+    return False, warnings
+
+
 def _check_terminal_capabilities() -> "tuple[list[str], list[str]]":
     """Probe terminal + interpreter for the features SpliceCraft needs.
 
@@ -599,14 +693,15 @@ def _check_terminal_capabilities() -> "tuple[list[str], list[str]]":
     Empty `blocking` means SpliceCraft can launch; any string there
     means the user will hit a hard breakage and the launcher should
     refuse + print the message to stderr. `warning` lists soft
-    degradations (no clipboard image grab, no primer3 Tm, etc.).
+    degradations (ASCII map fallback, no clipboard image grab, etc.).
 
     Checks:
-      * **stdout encoding** must be UTF-8 (or a superset). The braille
-        plasmid map relies on U+2800-U+28FF; on a Latin-1 terminal
-        the entire map renders as gibberish.
-      * **stdout is a TTY** when not running in test mode. A pipe /
-        redirect means Textual can't draw the UI.
+      * **stdout encoding** — the braille map wants UTF-8 (U+2800-
+        U+28FF). A non-UTF-8 terminal NO LONGER blocks launch: we
+        reconfigure the stream to UTF-8 where possible, and only when
+        that genuinely fails do we degrade to the ASCII map fallback
+        (`_select_render_tier`) with a warning. Encoding is therefore
+        never a hard blocker.
       * **Pillow** is importable (needed for clipboard image paste on
         Windows / macOS; soft on Linux/WSL where the button is
         disabled anyway).
@@ -621,19 +716,11 @@ def _check_terminal_capabilities() -> "tuple[list[str], list[str]]":
     """
     blocking: list[str] = []
     warning:  list[str] = []
-    # Encoding probe — the braille map needs UTF-8 (or a wider
-    # codec). `stdout.encoding` is None when piped; treat that as
-    # the caller's problem and skip the warning since they're
-    # presumably scripting, not running interactively.
-    enc = (getattr(sys.stdout, "encoding", "") or "").lower()
-    if enc and enc not in ("utf-8", "utf8", "utf-16", "utf-32",
-                              "cp65001"):
-        blocking.append(
-            f"Terminal encoding is {enc!r}; SpliceCraft requires UTF-8 "
-            f"for the braille plasmid map. Set "
-            f"PYTHONIOENCODING=utf-8 or use a UTF-8 locale "
-            f"(e.g. LANG=C.UTF-8)."
-        )
+    # Encoding → render tier. Reconfigures stdout to UTF-8 where it can;
+    # only falls back to the ASCII map (a warning, never a blocker) when
+    # the terminal genuinely can't do UTF-8.
+    _, tier_warnings = _select_render_tier()
+    warning.extend(tier_warnings)
     # Optional Python deps — soft warnings only.
     for mod_name, purpose in (
         ("PIL",          "clipboard image paste (Experiments)"),
@@ -650,11 +737,15 @@ def _check_terminal_capabilities() -> "tuple[list[str], list[str]]":
 
 def _log_terminal_capabilities() -> None:
     """Fire the capability probe + emit `startup.terminal_capabilities`
-    event. Blocking failures print to stderr AND abort via
-    `SystemExit(1)`; warnings only go to the log.
+    event. Blocking failures (none today — encoding now degrades to the
+    ASCII map rather than refusing) print to stderr AND abort via
+    `SystemExit(1)`. When the probe selected the ASCII map fallback
+    (`_ASCII_MODE`), a single note also prints to stderr so the user
+    knows why the map looks different and how to get the braille map
+    back. Other warnings go to the log only.
 
-    Called from `main()` right after the startup banner so failures
-    surface before the Textual harness initialises (which would
+    Called from `main()` right after the startup banner so this all
+    surfaces before the Textual harness initialises (which would
     swallow stderr).
     """
     blocking, warning = _check_terminal_capabilities()
@@ -663,11 +754,22 @@ def _log_terminal_capabilities() -> None:
         encoding=(getattr(sys.stdout, "encoding", "") or "").lower(),
         is_tty=bool(getattr(sys.stdout, "isatty", lambda: False)()),
         platform=sys.platform,
+        ascii_mode=_ASCII_MODE,
         blocking_count=len(blocking),
         warning_count=len(warning),
     )
     for msg in warning:
         _log.warning("terminal capability: %s", msg)
+    if _ASCII_MODE:
+        # Surface the map fallback once on stderr (before Textual takes
+        # the alternate screen) so the user isn't left wondering why the
+        # plasmid map renders as ASCII rather than braille.
+        print(
+            "splicecraft: drawing the plasmid map in ASCII fallback mode "
+            "(terminal isn't UTF-8, or SPLICECRAFT_ASCII is set). For the "
+            "braille map, use a UTF-8 locale, e.g. LANG=C.UTF-8.",
+            file=sys.stderr,
+        )
     if blocking:
         for msg in blocking:
             _log.error("terminal capability blocked: %s", msg)
@@ -5294,6 +5396,16 @@ _collection_sync_shutdown = threading.Event()
 _collection_sync_pending: "tuple[str, list[dict]] | None" = None
 _collection_sync_thread: "threading.Thread | None" = None
 _collection_sync_event = threading.Event()
+# Test seam: when True, `_sync_active_collection_plasmids` always writes
+# the active-collection mirror SYNCHRONOUSLY, bypassing the background
+# daemon below. That daemon is a persistent module-level thread whose
+# deferred writes otherwise bleed across pytest tests — a mirror queued
+# in one test fires during the next and writes a stale plasmid snapshot
+# into the shared collections cache (the library table is collection-
+# driven), producing flaky row counts. `_protect_user_data` flips this
+# on so collection mirrors are deterministic in tests. Production leaves
+# it False (the async daemon keeps the UI responsive on 100 MB+ files).
+_collection_sync_force_sync: bool = False
 
 
 def _drain_collection_sync_loop() -> None:
@@ -5384,7 +5496,7 @@ def _sync_active_collection_plasmids(
     # state. The pre-0.8.9 shallow `dict(e)` shared nested
     # qualifiers / features / plasmids lists by reference.
     snapshot = [_typed_clone(e) for e in entries if isinstance(e, dict)]
-    if not async_write:
+    if not async_write or _collection_sync_force_sync:
         # Sweep #25 (2026-05-23): readonly iterator + targeted clone.
         # Pre-fix `_load_collections()` deep-cloned the entire ~160 MB
         # collections.json just to mutate one entry. Now we walk the
@@ -16455,6 +16567,39 @@ class _Canvas:
 # into a pre-built list saves ~1–2 ms/frame on the circular-map render.
 _BRAILLE_LUT: list[str] = [chr(0x2800 + i) for i in range(256)]
 
+# ASCII fallback glyphs for the braille canvas, used when `_ASCII_MODE`
+# is on (a terminal that can't emit UTF-8 — see `_select_render_tier`).
+# Each braille cell packs up to 8 dots; we map the dot popcount (0–8)
+# onto a light→dark 7-bit-ASCII density ramp so a dense feature arc
+# reads darker than a thin backbone line. Pure ASCII renders on
+# literally any ANSI terminal, so the map (and the DNA helix, which
+# shares this canvas) degrade legibly instead of turning to mojibake.
+# Same pre-built-LUT trick as `_BRAILLE_LUT` to keep `combine` hot-loop
+# cheap (one index, no per-cell popcount).
+_ASCII_DENSITY_RAMP = " .:-=+*#@"   # 9 levels, indexed by popcount 0..8
+_ASCII_DENSITY_LUT: list[str] = [
+    _ASCII_DENSITY_RAMP[bin(i).count("1")] for i in range(256)
+]
+
+# When `_ASCII_MODE` is on the density LUT above handles the braille dot
+# layer, but the map also OVERLAYS Unicode glyphs on the text canvas —
+# block fills, strand arrowheads, the ⚠ weak-site marker, the centre
+# crosshair / box-drawing, and any accented letters in feature labels.
+# `_BrailleCanvas.combine` transliterates those to 7-bit ASCII via this
+# map (anything unmapped → '?') so the WHOLE map — not just the dots —
+# stays mojibake-free on a non-UTF-8 terminal.
+_ASCII_GLYPH_MAP = {
+    "█": "#", "▓": "#", "▒": "#", "░": ".",   # block fills
+    "▌": "#", "▐": "#", "▏": "|", "▕": "|",
+    "▶": ">", "◀": "<", "▲": "^", "▼": "v",   # strand arrowheads
+    "►": ">", "◄": "<", "→": ">", "←": "<",
+    "⚠": "!", "✓": "v", "✗": "x",             # status marks
+    "·": ".", "•": "*", "◆": "*", "●": "o", "○": "o",
+    "┼": "+", "─": "-", "│": "|", "├": "+", "┤": "+",   # box drawing
+    "┌": "+", "┐": "+", "└": "+", "┘": "+", "┬": "+", "┴": "+",
+    "═": "=", "║": "|", "╫": "+", "╪": "+",
+}
+
 
 class _BrailleCanvas:
     """
@@ -16519,6 +16664,10 @@ class _BrailleCanvas:
         tc_styles = text_canvas._styles
         bc_bits   = self._bits
         bc_colors = self._colors
+        # Pick the glyph table once per render (not per cell): ASCII
+        # density ramp on a non-UTF-8 terminal, braille otherwise.
+        lut = _ASCII_DENSITY_LUT if _ASCII_MODE else _BRAILLE_LUT
+        ascii_overlay = _ASCII_MODE   # also fold overlay glyphs → ASCII
         for row in range(rows):
             blank_run = 0
             tc_row  = tc_chars[row]
@@ -16539,15 +16688,21 @@ class _BrailleCanvas:
                 if tc_ch != " " or tc_st:
                     # Non-space char, OR a styled space — emit from
                     # text_canvas so the style (and any background
-                    # colour it carries) is preserved.
+                    # colour it carries) is preserved. In ASCII mode,
+                    # fold any non-ASCII overlay glyph down to a 7-bit
+                    # equivalent ('?' if unmapped) so the map can't emit
+                    # raw UTF-8 on a terminal that can't render it.
+                    ch_out = tc_ch
+                    if ascii_overlay and tc_ch > "\x7f":
+                        ch_out = _ASCII_GLYPH_MAP.get(tc_ch, "?")
                     if tc_st:
-                        result.append(tc_ch, style=tc_st)
+                        result.append(ch_out, style=tc_st)
                     else:
-                        result.append(tc_ch)
+                        result.append(ch_out)
                 else:
                     # Unstyled space with braille pixels underneath —
                     # render the braille glyph.
-                    ch = _BRAILLE_LUT[bc_bits_row[col]]
+                    ch = lut[bc_bits_row[col]]
                     c  = bc_colors_row[col]
                     if c != " ":
                         result.append(ch, style=c)
@@ -25685,6 +25840,20 @@ class WhatsNewModal(_OneShotDismissScreen, ModalScreen):
     #whatsnew-body MarkdownBlock > .code_inline {
         color: $success;
         background: $success 15%;
+    }
+    /* Leading **bold** summary sentence of each changelog bullet,
+       tinted purple so users get the one-line gist of every item at
+       a glance and read the detail only if they choose. By the
+       CHANGELOG patch-notes convention `**strong**` marks ONLY that
+       opening summary (detail prose uses plain text + `*italic*` →
+       `.em`), so colouring every inline-strong span purple targets
+       exactly the summaries. (The intro's `**version**` tints too —
+       harmless, reads as a nice highlight.) `.strong` is the
+       COMPONENT_CLASS Textual's MarkdownBlock exposes for `**bold**`,
+       the same hook as `.code_inline` above. */
+    #whatsnew-body MarkdownBlock > .strong {
+        color: #C77FFF;
+        text-style: bold;
     }
     #whatsnew-hint {
         margin-top: 1;
@@ -51189,6 +51358,9 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
     # timeout fires.
 
     _ONLINE_SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    # ASCII spinner for `_ASCII_MODE` (non-UTF-8 terminal) — the braille
+    # frames above would render as mojibake there.
+    _ONLINE_SPIN_FRAMES_ASCII = "|/-\\"
     _online_timer = None
     _online_phase: str = ""
     _online_started: float = 0.0
@@ -51225,7 +51397,8 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
     def _online_tick(self) -> None:
         if not self.is_mounted or not self._online_busy:
             return
-        frames = self._ONLINE_SPIN_FRAMES
+        frames = (self._ONLINE_SPIN_FRAMES_ASCII if _ASCII_MODE
+                  else self._ONLINE_SPIN_FRAMES)
         self._online_spin = (self._online_spin + 1) % len(frames)
         frame = frames[self._online_spin]
         now = _time_mod.monotonic()
@@ -110183,11 +110356,11 @@ def main():
 
     _log_startup_banner()
 
-    # Terminal capability probe — refuses to launch on a non-UTF-8
-    # terminal (braille map would render as gibberish), warns on
-    # missing optional Python deps. Fires BEFORE the data-dir lock
-    # so a misconfigured environment surfaces its error before
-    # touching shared state.
+    # Terminal capability probe — reconfigures stdout to UTF-8 where it
+    # can and otherwise selects the ASCII map fallback (never refuses to
+    # launch on encoding any more), and warns on missing optional Python
+    # deps. Fires BEFORE the data-dir lock so the render tier is fixed
+    # and any environment warning surfaces before touching shared state.
     _log_terminal_capabilities()
 
     # Multi-instance lock: refuse to launch a second splicecraft

@@ -19,6 +19,8 @@ Last update: 2026-05-19 (SpliceCraft 0.9.7+).
 | Linux | alacritty | ✅ Fully supported | Same as kitty |
 | Linux | xterm | ⚠ Limited | OSC 52 clipboard needs `allowWindowOps`; mouse drag-select may need `xtermMouseProtocol` set |
 | Linux | tmux / screen | ✅ Works under | Pass `-e` (env), use `tmux`'s `set -g allow-passthrough on` for OSC 52 |
+| **Raspberry Pi / ARM Linux** (64-bit) | LXTerminal / SSH | ✅ Fully supported | All compiled deps ship `aarch64` wheels → clean `pipx install`. Needs 64-bit Pi OS Bookworm+ (Python ≥3.10); Pi 4/5 ideal. See [Raspberry Pi / ARM Linux](#raspberry-pi--arm-linux) |
+| Raspberry Pi / ARM Linux (32-bit) | LXTerminal / SSH | ⚠ Limited | No 32-bit-ARM wheels — `pyhmmer`/`primer3-py`/`biopython`/`Pillow` source-compile (slow). Use the 64-bit OS |
 | **macOS** | Terminal.app | ✅ Fully supported | macOS 11+; older macOS may lack true-color |
 | macOS | iTerm2 | ✅ Fully supported | Preferred for OSC 52 reliability |
 | macOS | tmux on macOS | ✅ Works under | Same OSC 52 caveat as Linux |
@@ -36,10 +38,15 @@ Last update: 2026-05-19 (SpliceCraft 0.9.7+).
 SpliceCraft hard-requires:
 
 * **UTF-8 stdout encoding** — the plasmid map uses U+2800-U+28FF braille
-  dots. Non-UTF-8 terminals will render the map as gibberish. The
-  launcher refuses to start with a clear error message in this case.
-  Fix: `export PYTHONIOENCODING=utf-8` or use a UTF-8 locale
-  (`LANG=C.UTF-8` / `LANG=en_US.UTF-8`).
+  dots. As of 1.0.3 a non-UTF-8 terminal **no longer refuses to launch**:
+  the launcher first tries to reconfigure stdout to UTF-8 (a `LANG=C`
+  shell often mislabels an otherwise-capable terminal), and only if that
+  genuinely fails does it fall back to a **7-bit-ASCII density-ramp map**
+  that renders on any ANSI terminal. For the richer braille map, prefer a
+  UTF-8 locale (`LANG=C.UTF-8` / `LANG=en_US.UTF-8`) or
+  `PYTHONIOENCODING=utf-8` / `PYTHONUTF8=1`. If your terminal *reports*
+  UTF-8 but the font can't draw braille (boxes / blanks), force the ASCII
+  map with `SPLICECRAFT_ASCII=1`.
 * **256-color ANSI** — feature colors degrade visibly without it.
   Every modern terminal supports this; only ancient `vt100` doesn't.
 * **Mouse events** — required for click-to-select, drag-select on
@@ -128,6 +135,38 @@ back to the pure-Python engine; WSL2 reports as Linux and gets pyhmmer
 normally. The runtime checks also cover other edge cases (e.g. `pip
 install --no-deps` for an offline minimal install).
 
+### Raspberry Pi / ARM Linux
+
+SpliceCraft runs well on a Raspberry Pi — it's a Linux TUI, so the
+terminal side is identical to desktop Linux (and a minimal / serial
+console degrades to the ASCII map; see *Required terminal features*).
+Two things decide whether the install is painless:
+
+* **Use a 64-bit OS (`aarch64`).** On 64-bit Raspberry Pi OS / Ubuntu,
+  every compiled dependency — `pyhmmer`, `primer3-py`, `biopython`,
+  `Pillow` — publishes a `manylinux_2_17_aarch64` wheel, so `pipx
+  install splicecraft` pulls prebuilt binaries with no compiler and no
+  wait. HMMscan works too (the `aarch64` `pyhmmer` wheel exists — and
+  note the marker only drops `pyhmmer` on Windows, not on ARM Linux).
+  On a **32-bit** OS (`armv7l` / `armhf`) none of those four have
+  wheels, so all four source-compile — possible (they're POSIX C,
+  unlike `pyhmmer` on Windows) but slow, and it needs `build-essential`
+  + dev headers + RAM. Prefer the 64-bit image.
+* **Python ≥ 3.10.** Raspberry Pi OS **Bookworm** (Debian 12) ships
+  3.11 ✓. Older **Bullseye** ships 3.9, which trips `No matching
+  distribution found for splicecraft (from versions: none)` — upgrade
+  the OS or install a newer Python (e.g. via pyenv).
+
+**Hardware.** A Pi 4 / Pi 5 (quad-core, ≥ 2 GB) is comfortable for
+interactive editing and map rendering; heavy one-off operations
+(building a BLAST DB, HMMscan against Pfam-A, rendering a very large
+plasmid) run slower than desktop but are fine. A Pi 3 is workable; the
+single-core / 512 MB boards (Pi Zero, Pi 1–2) are not recommended.
+SD-card I/O makes saving large `collections.json` / `library.json`
+slower — a fast card or USB-SSD boot helps. The HMM databases are heavy
+to fetch + `hmmpress` (Pfam-A is ~1.5 GB) but work on a Pi 4/5 with
+storage.
+
 ---
 
 ## Known issues
@@ -184,9 +223,12 @@ On every launch, `_log_terminal_capabilities()` runs and emits a
 }
 ```
 
-Blocking failures (non-UTF-8 encoding) print to stderr and abort
-launch with exit 1. Warnings (missing optional deps) log only and
-allow launch to proceed.
+Warnings (a non-UTF-8 terminal that fell back to the ASCII map,
+`SPLICECRAFT_ASCII` forced on, or a missing optional dep) log and —
+for the render-tier ones — surface once on stderr, but launch always
+proceeds. As of 1.0.3 the probe has **no hard-blocking failures**:
+encoding is rescued (reconfigure-to-UTF-8) or degraded (ASCII map)
+rather than aborting, so `blocking_count` is normally `0`.
 
 Grep your log:
 

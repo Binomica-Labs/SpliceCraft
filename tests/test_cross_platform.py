@@ -110,20 +110,24 @@ class TestTerminalCapabilities:
                 f"encoding {variant!r} should not block, got {blocking}"
             )
 
-    def test_latin1_encoding_blocks(self, monkeypatch):
-        """Latin-1 (or other non-Unicode-superset codecs) blocks
-        launch — braille U+2800 would render as gibberish. The
-        blocking message names the variable + suggests the fix
-        (`PYTHONIOENCODING=utf-8` / `LANG=C.UTF-8`)."""
+    def test_latin1_encoding_falls_back_to_ascii_not_block(self, monkeypatch):
+        """Latin-1 (or any non-UTF-8 codec that can't be reconfigured)
+        NO LONGER blocks launch. A FakeStdout with no `reconfigure`
+        can't be switched to UTF-8, so the probe selects the ASCII map
+        fallback (`_ASCII_MODE = True`) and WARNS — it does not refuse.
+        The warning still points at the UTF-8 locale fix. (Pre-1.0.3
+        this raised a hard blocker; the new contract is graceful
+        degradation so SpliceCraft runs on any ANSI terminal.)"""
+        monkeypatch.setattr(sc, "_ASCII_MODE", False)
         class _FakeStdout:
-            encoding = "latin-1"
+            encoding = "latin-1"   # and no `reconfigure` → unfixable
         monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
-        blocking, _ = sc._check_terminal_capabilities()
-        assert len(blocking) == 1
-        assert "encoding" in blocking[0].lower()
-        # Actionable: name the env var fix.
-        assert "PYTHONIOENCODING" in blocking[0]
-        assert "LANG" in blocking[0]
+        blocking, warning = sc._check_terminal_capabilities()
+        assert blocking == [], "non-UTF-8 must no longer block launch"
+        assert sc._ASCII_MODE is True, "should fall back to the ASCII map"
+        blob = " ".join(warning).lower()
+        assert "ascii" in blob
+        assert "utf-8" in blob or "utf8" in blob
 
     def test_no_encoding_is_skipped(self, monkeypatch):
         """When stdout has no encoding (piped to a process), skip
@@ -163,6 +167,244 @@ class TestTerminalCapabilities:
         assert "PIL"          in msg_blob
         assert "primer3"      in msg_blob
         assert "spellchecker" in msg_blob
+
+
+class TestEnsureUtf8Stdout:
+    """`_ensure_utf8_stdout` — the rescue step that converts a locale-
+    mislabelled (LANG=C) terminal to real UTF-8 output instead of
+    refusing. Returns True iff stdout is / became UTF-8. Edge-cased
+    hard because it's the gate that decides whether the braille map
+    or the ASCII fallback renders."""
+
+    def test_already_utf8_short_circuits_no_reconfigure(self, monkeypatch):
+        calls = []
+        class _FakeStdout:
+            encoding = "utf-8"
+            def reconfigure(self, **kw):
+                calls.append(kw)
+        monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
+        assert sc._ensure_utf8_stdout() is True
+        assert calls == [], "must not reconfigure an already-UTF-8 stream"
+
+    def test_utf8_aliases_short_circuit(self, monkeypatch):
+        for enc in ("utf-8", "utf8", "UTF-8", "cp65001", "utf-16", "utf-32"):
+            class _FakeStdout:
+                encoding = enc
+            monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
+            assert sc._ensure_utf8_stdout() is True, enc
+
+    def test_empty_encoding_treated_as_ok(self, monkeypatch):
+        # Piped / redirected — encoding "" → not interactive, don't
+        # force ASCII on the strength of a missing string.
+        class _FakeStdout:
+            encoding = ""
+        monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
+        assert sc._ensure_utf8_stdout() is True
+
+    def test_none_stdout_does_not_crash(self, monkeypatch):
+        # pythonw / daemonised: sys.stdout can be None.
+        monkeypatch.setattr(sc.sys, "stdout", None)
+        assert sc._ensure_utf8_stdout() is True
+
+    def test_latin1_without_reconfigure_returns_false(self, monkeypatch):
+        class _FakeStdout:
+            encoding = "latin-1"   # no `reconfigure` attribute
+        monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
+        assert sc._ensure_utf8_stdout() is False
+
+    def test_reconfigure_success_flips_to_utf8(self, monkeypatch):
+        class _FakeStdout:
+            encoding = "ascii"
+            def reconfigure(self, *, encoding=None, **kw):
+                self.encoding = encoding   # mimic TextIOWrapper
+        monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
+        assert sc._ensure_utf8_stdout() is True
+
+    def test_reconfigure_raises_returns_false(self, monkeypatch):
+        for exc in (OSError("nope"), ValueError("x"), LookupError("x")):
+            class _FakeStdout:
+                encoding = "ascii"
+                def reconfigure(self, **kw):
+                    raise exc
+            monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
+            assert sc._ensure_utf8_stdout() is False
+
+    def test_reconfigure_noop_still_nonutf8_returns_false(self, monkeypatch):
+        # Defensive: reconfigure() returns without error but the codec
+        # didn't actually change → still report False (don't claim UTF-8
+        # we couldn't achieve).
+        class _FakeStdout:
+            encoding = "latin-1"
+            def reconfigure(self, **kw):
+                pass   # pretend success, leave encoding unchanged
+        monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
+        assert sc._ensure_utf8_stdout() is False
+
+
+class TestSelectRenderTier:
+    """`_select_render_tier` — env override + UTF-8 rescue → sets the
+    module-level `_ASCII_MODE`. Every test resets the global via
+    monkeypatch so it can't leak into other suites."""
+
+    def test_utf8_terminal_uses_braille(self, monkeypatch):
+        monkeypatch.setattr(sc, "_ASCII_MODE", True)   # ensure it flips back
+        monkeypatch.delenv("SPLICECRAFT_ASCII", raising=False)
+        class _FakeStdout:
+            encoding = "utf-8"
+        monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
+        ascii_mode, warnings = sc._select_render_tier()
+        assert ascii_mode is False
+        assert sc._ASCII_MODE is False
+        assert warnings == []
+
+    def test_unfixable_nonutf8_selects_ascii(self, monkeypatch):
+        monkeypatch.setattr(sc, "_ASCII_MODE", False)
+        monkeypatch.delenv("SPLICECRAFT_ASCII", raising=False)
+        class _FakeStdout:
+            encoding = "latin-1"   # no reconfigure → unfixable
+        monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
+        ascii_mode, warnings = sc._select_render_tier()
+        assert ascii_mode is True
+        assert sc._ASCII_MODE is True
+        assert warnings and "ascii" in " ".join(warnings).lower()
+
+    def test_env_force_ascii_overrides_capable_utf8(self, monkeypatch):
+        monkeypatch.setattr(sc, "_ASCII_MODE", False)
+        monkeypatch.setenv("SPLICECRAFT_ASCII", "1")
+        class _FakeStdout:
+            encoding = "utf-8"   # capable, but forced to ASCII anyway
+        monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
+        ascii_mode, warnings = sc._select_render_tier()
+        assert ascii_mode is True
+        assert sc._ASCII_MODE is True
+        assert warnings and "splicecraft_ascii" in " ".join(warnings).lower()
+
+    def test_env_force_accepts_truthy_variants(self, monkeypatch):
+        class _FakeStdout:
+            encoding = "utf-8"
+        monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
+        for val in ("1", "true", "TRUE", "Yes", "on", "  on  "):
+            monkeypatch.setattr(sc, "_ASCII_MODE", False)
+            monkeypatch.setenv("SPLICECRAFT_ASCII", val)
+            ascii_mode, _ = sc._select_render_tier()
+            assert ascii_mode is True, f"{val!r} should force ASCII"
+
+    def test_env_force_ignores_falsey_variants(self, monkeypatch):
+        class _FakeStdout:
+            encoding = "utf-8"
+        monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
+        for val in ("0", "false", "no", "off", "", "garbage"):
+            monkeypatch.setattr(sc, "_ASCII_MODE", True)
+            monkeypatch.setenv("SPLICECRAFT_ASCII", val)
+            ascii_mode, _ = sc._select_render_tier()
+            assert ascii_mode is False, f"{val!r} should NOT force ASCII"
+
+
+class TestAsciiDensityLut:
+    """`_ASCII_DENSITY_LUT` — braille bitmask → 7-bit-ASCII density char
+    by dot popcount. The fallback only renders on 'any terminal' if it
+    is genuinely pure ASCII."""
+
+    def test_length_is_256(self):
+        assert len(sc._ASCII_DENSITY_LUT) == 256
+
+    def test_all_entries_are_single_ascii_char(self):
+        for ch in sc._ASCII_DENSITY_LUT:
+            assert len(ch) == 1
+            assert ord(ch) < 128, f"{ch!r} is not 7-bit ASCII"
+
+    def test_endpoints(self):
+        assert sc._ASCII_DENSITY_LUT[0x00] == " "    # 0 dots
+        assert sc._ASCII_DENSITY_LUT[0x01] == "."    # 1 dot, lightest visible
+        assert sc._ASCII_DENSITY_LUT[0xFF] == "@"    # 8 dots, densest
+
+    def test_glyph_tracks_popcount(self):
+        ramp = sc._ASCII_DENSITY_RAMP
+        assert len(ramp) == 9, "ramp must cover popcounts 0..8"
+        for bits in range(256):
+            assert sc._ASCII_DENSITY_LUT[bits] == ramp[bin(bits).count("1")]
+
+
+class TestAsciiMapFallback:
+    """`_BrailleCanvas.combine` swaps braille glyphs for the ASCII
+    density ramp when `_ASCII_MODE` is on — the core "works on any
+    terminal" guarantee. The braille default path must be untouched."""
+
+    @staticmethod
+    def _render(ascii_mode, monkeypatch):
+        monkeypatch.setattr(sc, "_ASCII_MODE", ascii_mode)
+        canvas = sc._Canvas(4, 1)         # all-blank text cells
+        bc = sc._BrailleCanvas(4, 1)
+        bc.set_pixel(0, 0)                # 1 dot in cell 0 (sparse)
+        for px in range(2):               # all 8 dots in cell 1 (dense)
+            for py in range(4):
+                bc.set_pixel(2 + px, py)
+        return bc.combine(canvas).plain
+
+    def test_ascii_mode_emits_pure_ascii_no_braille(self, monkeypatch):
+        out = self._render(True, monkeypatch)
+        assert all(ord(c) < 128 for c in out), f"non-ASCII leaked: {out!r}"
+        assert not any(0x2800 <= ord(c) <= 0x28FF for c in out)
+
+    def test_ascii_mode_density_tracks_dot_count(self, monkeypatch):
+        out = self._render(True, monkeypatch)
+        # Sparse cell → lightest visible glyph; dense cell → densest.
+        assert "." in out and "@" in out
+
+    def test_braille_mode_unchanged(self, monkeypatch):
+        out = self._render(False, monkeypatch)
+        assert any(0x2800 <= ord(c) <= 0x28FF for c in out), (
+            f"default mode must still render braille, got {out!r}"
+        )
+
+    def test_ascii_mode_transliterates_overlay_glyphs(self, monkeypatch):
+        # The map overlays Unicode glyphs on the text canvas (block
+        # fills, arrowheads, ⚠, crosshair). ASCII mode must fold those
+        # to 7-bit equivalents too — not just the braille dot layer.
+        monkeypatch.setattr(sc, "_ASCII_MODE", True)
+        canvas = sc._Canvas(5, 1)
+        bc = sc._BrailleCanvas(5, 1)
+        canvas.put(0, 0, "█", "")    # block fill   → '#'
+        canvas.put(1, 0, "▶", "")    # arrowhead    → '>'
+        canvas.put(2, 0, "⚠", "")    # weak marker  → '!'
+        canvas.put(3, 0, "·", "")    # crosshair    → '.'
+        out = bc.combine(canvas).plain
+        assert all(ord(c) < 128 for c in out), f"non-ASCII leaked: {out!r}"
+        assert "#" in out and ">" in out and "!" in out and "." in out
+
+    def test_ascii_mode_unmapped_glyph_becomes_question(self, monkeypatch):
+        # A glyph not in the map (e.g. an accented label letter) folds
+        # to '?' rather than leaking raw UTF-8.
+        monkeypatch.setattr(sc, "_ASCII_MODE", True)
+        canvas = sc._Canvas(2, 1)
+        bc = sc._BrailleCanvas(2, 1)
+        canvas.put(0, 0, "β", "")    # not in _ASCII_GLYPH_MAP
+        out = bc.combine(canvas).plain
+        assert "?" in out
+        assert all(ord(c) < 128 for c in out)
+
+    def test_braille_mode_preserves_overlay_glyphs(self, monkeypatch):
+        # Default (UTF-8) mode leaves overlay glyphs untouched.
+        monkeypatch.setattr(sc, "_ASCII_MODE", False)
+        canvas = sc._Canvas(3, 1)
+        bc = sc._BrailleCanvas(3, 1)
+        canvas.put(0, 0, "▶", "")
+        assert "▶" in bc.combine(canvas).plain
+
+
+class TestAsciiSpinnerFallback:
+    """The online-search spinner uses braille frames by default and a
+    7-bit-ASCII set under `_ASCII_MODE`, so it doesn't mojibake on a
+    non-UTF-8 terminal."""
+
+    def test_ascii_spinner_frames_are_pure_ascii(self):
+        frames = sc.BlastModal._ONLINE_SPIN_FRAMES_ASCII
+        assert frames, "ASCII spinner frames must be non-empty"
+        assert all(ord(c) < 128 for c in frames)
+
+    def test_default_spinner_frames_are_braille(self):
+        assert any(0x2800 <= ord(c) <= 0x28FF
+                   for c in sc.BlastModal._ONLINE_SPIN_FRAMES)
 
 
 class TestSignalHandlersDegradeWithoutSIGUSR1:

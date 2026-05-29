@@ -73,6 +73,14 @@ def _protect_user_data(tmp_path, monkeypatch):
         if cache_attr:
             monkeypatch.setattr(sc, cache_attr, None)
 
+    # Force the active-collection mirror to write SYNCHRONOUSLY in tests.
+    # Its async path uses a persistent background daemon whose deferred
+    # writes otherwise bleed across tests — a mirror queued in one test
+    # fires during the next, writing a stale snapshot into the shared
+    # collections cache → flaky row counts in delete/save tests
+    # (TestDeleteFocusRouting, 2026-05-29). Synchronous = deterministic.
+    monkeypatch.setattr(sc, "_collection_sync_force_sync", True)
+
     # Crash-recovery autosave dir: redirect so tests can't leave files in
     # the user's real _DATA_DIR/crash_recovery on disk.
     monkeypatch.setattr(sc, "_CRASH_RECOVERY_DIR", tmp_path / "crash_recovery")

@@ -1399,9 +1399,8 @@ class TestDeleteFocusRouting:
             # Move DataTable cursor to the tiny_record row (should already be
             # there since it's the only entry)
             app.action_delete_feature()
-            await pilot.pause(0.05)
             from splicecraft import LibraryDeleteConfirmModal
-            modal = app.screen
+            modal = await self._await_delete_modal(app, pilot)
             assert isinstance(modal, LibraryDeleteConfirmModal)
             modal.dismiss(True)
             await pilot.pause(0.05)
@@ -1473,6 +1472,21 @@ class TestDeleteFocusRouting:
                 return t
         return t  # caller asserts; we just give up polling
 
+    async def _await_delete_modal(self, app, pilot, max_ticks: int = 60):
+        """Poll until the LibraryDeleteConfirmModal is the active screen.
+        `action_delete_feature` pushes the modal on Textual's message
+        bus, which can take more than one fixed pause under pytest-xdist
+        load — dismissing `app.screen` before the modal lands would
+        no-op the delete (the 2026-05-29 `-n auto` flake where the
+        last-remaining row survived). Returns the screen so the caller
+        can dismiss / assert on it."""
+        from splicecraft import LibraryDeleteConfirmModal
+        for _ in range(max_ticks):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, LibraryDeleteConfirmModal):
+                return app.screen
+        return app.screen  # caller dismisses / asserts
+
     async def test_delete_middle_row_cursor_lands_on_row_above(
         self, isolated_library
     ):
@@ -1482,14 +1496,16 @@ class TestDeleteFocusRouting:
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            t = app.query_one("#lib-table", sc.DataTable)
+            # Wait for the seeded rows to finish loading before acting —
+            # under pytest-xdist load the table can still be populating a
+            # tick after mount (Sweep #16 act-before-settle flake).
+            t = await self._await_row_count(app, 5, pilot)
             t.focus()
             t.move_cursor(row=2)  # pA3
             await pilot.pause(0.05)
             app.action_delete_feature()
-            await pilot.pause(0.05)
             from splicecraft import LibraryDeleteConfirmModal
-            modal = app.screen
+            modal = await self._await_delete_modal(app, pilot)
             assert isinstance(modal, LibraryDeleteConfirmModal)
             modal.dismiss(True)
             t = await self._await_row_count(app, 4, pilot)
@@ -1507,13 +1523,13 @@ class TestDeleteFocusRouting:
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            t = app.query_one("#lib-table", sc.DataTable)
+            # Wait for the seed to load before acting (Sweep #16 flake).
+            t = await self._await_row_count(app, 3, pilot)
             t.focus()
             t.move_cursor(row=0)  # pA1
             await pilot.pause(0.05)
             app.action_delete_feature()
-            await pilot.pause(0.05)
-            modal = app.screen
+            modal = await self._await_delete_modal(app, pilot)
             modal.dismiss(True)
             t = await self._await_row_count(app, 2, pilot)
             assert t.row_count == 2
@@ -1530,13 +1546,13 @@ class TestDeleteFocusRouting:
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            t = app.query_one("#lib-table", sc.DataTable)
+            # Wait for the seed to load before acting (Sweep #16 flake).
+            t = await self._await_row_count(app, 3, pilot)
             t.focus()
             t.move_cursor(row=2)  # pA3
             await pilot.pause(0.05)
             app.action_delete_feature()
-            await pilot.pause(0.05)
-            modal = app.screen
+            modal = await self._await_delete_modal(app, pilot)
             modal.dismiss(True)
             t = await self._await_row_count(app, 2, pilot)
             assert t.row_count == 2
@@ -1562,22 +1578,19 @@ class TestDeleteFocusRouting:
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            t = app.query_one("#lib-table", sc.DataTable)
+            # Wait for the seed to load before acting (Sweep #16 flake).
+            t = await self._await_row_count(app, 1, pilot)
             t.focus()
             t.move_cursor(row=0)
             await pilot.pause(0.05)
             app.action_delete_feature()
-            await pilot.pause(0.05)
-            modal = app.screen
+            modal = await self._await_delete_modal(app, pilot)
             modal.dismiss(True)
-            # Poll for up to 1s — usually completes in <100 ms but the
-            # CI runner can lag. Once row_count hits 0 we break out
-            # so the test stays fast on the common path.
-            for _ in range(20):
-                await pilot.pause(0.05)
-                t = app.query_one("#lib-table", sc.DataTable)
-                if t.row_count == 0:
-                    break
+            # The modal-dismiss → delete refresh runs on Textual's
+            # message bus and can take more ticks than a fixed pause
+            # under pytest-xdist load. Use the shared 3 s poll helper —
+            # a 1 s inline loop here flaked under `-n auto` (2026-05-29).
+            t = await self._await_row_count(app, 0, pilot)
             assert t.row_count == 0
 
 
