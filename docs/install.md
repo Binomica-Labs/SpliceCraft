@@ -74,6 +74,26 @@ splicecraft
 The `[dev]` extra pulls in pytest, hypothesis, pytest-xdist, ruff,
 pyright, coverage, and build — the same toolchain CI runs.
 
+## Windows
+
+SpliceCraft installs and runs on **native Windows** (Windows Terminal
+recommended) via `pipx install splicecraft` — the editor, maps, primer
+design, and BLASTN/BLASTP all work. Two Windows-specific notes:
+
+* **Requires Python 3.10+.** If `pipx install splicecraft` fails with
+  `No matching distribution found for splicecraft (from versions:
+  none)`, your interpreter is older than 3.10 and pip has filtered out
+  every release. Check with `python --version` (and `pipx --version`,
+  which shows the interpreter pipx itself runs on), install Python
+  3.10+ (`winget install Python.Python.3.12`), then retry — or pin it
+  for this install with `pipx install --python 3.12 splicecraft`.
+* **Local HMMscan needs WSL2.** HMMscan is powered by `pyhmmer`
+  (HMMER 3), whose C core has no Windows build, so it is omitted from
+  the native-Windows install and the HMMscan button explains this.
+  Everything else works natively; for HMMscan, run SpliceCraft inside
+  [WSL2](https://learn.microsoft.com/windows/wsl/install): `wsl
+  --install`, then `pipx install splicecraft` in the Ubuntu shell.
+
 ## User-data location
 
 User data (collections, library, parts, primers, features, codon

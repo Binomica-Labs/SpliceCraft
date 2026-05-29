@@ -20,7 +20,21 @@ this file owns the **engine** contract.
 """
 from __future__ import annotations
 
+import sys
+
+import pytest
+
 import splicecraft as sc
+
+# pyhmmer ships no Windows wheels and HMMER's C core is POSIX-only, so
+# pyproject.toml omits it on native Windows (`sys_platform != 'win32'`).
+# Tests that need a real pyhmmer (HMMscan, forced-pyhmmer backend) are
+# skipped there; BLASTN/BLASTP auto-dispatch tests still run because they
+# fall back to the pure-Python engine when pyhmmer is absent.
+_REQUIRES_PYHMMER = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="pyhmmer is POSIX-only — omitted from the native-Windows install by design",
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -838,6 +852,7 @@ class TestBlastnEdgeCases:
         hits = sc._blast_search(target, db, backend="pure")
         assert hits and hits[0]["subject_id"] == "PURE01"
 
+    @_REQUIRES_PYHMMER
     def test_pyhmmer_backend_explicit(self):
         # Force the pyhmmer backend; verify it routes there + returns hits.
         target = "AGCTAGCTAGCTAGCTAGCTAGCTAGCTAG"
@@ -902,7 +917,9 @@ class TestBlastnEdgeCases:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HMMscan via pyhmmer — pyhmmer is now a hard dependency (see pyproject.toml)
+# HMMscan via pyhmmer — a hard dependency on POSIX, conditional on Windows
+# (no Windows wheels; see pyproject.toml). The classes below are skipped on
+# native Windows via @_REQUIRES_PYHMMER.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_tiny_hmm(tmp_path, *, name: str = "toy",
@@ -935,11 +952,13 @@ def _build_tiny_hmm(tmp_path, *, name: str = "toy",
     return str(out)
 
 
+@_REQUIRES_PYHMMER
 class TestHmmscanEngine:
 
     def test_pyhmmer_available(self):
-        # pyhmmer is now a hard dependency; the probe should always
-        # return True on a properly-installed test env.
+        # pyhmmer is a hard dependency on POSIX (conditional on Windows,
+        # where it has no wheels). On any non-Windows test env the probe
+        # must report it present; this class is skipped on Windows.
         assert sc._PYHMMER_AVAILABLE is True
 
     def test_hits_a_matching_protein(self, tmp_path):
@@ -983,6 +1002,7 @@ class TestHmmscanEngine:
         assert hits, "alphabet filter should preserve real AA letters"
 
 
+@_REQUIRES_PYHMMER
 class TestBlastModalHmmscanIntegration:
     """Modal-level test: HMMscan path triggers the engine and renders
     real hits when the user supplies a valid .hmm file."""

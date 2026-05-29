@@ -14,6 +14,15 @@
 
 ---
 
+## [1.0.2] — 2026-05-29
+
+### New features
+
+- **SpliceCraft now installs on native Windows.** `pipx install splicecraft` used to fail outright on native Windows: the HMMER engine behind HMMscan (`pyhmmer`) has no Windows build, and it was a required dependency, so pip reported *"No matching distribution found"*. It's now required only on Linux, macOS, and WSL, and optional on Windows — so Windows users get the full app (editor, maps, primer design, and in-process BLASTN/BLASTP) installing and running natively. Linux, macOS, and WSL are unchanged and still include it.
+- **HMMscan on Windows now explains itself instead of looking broken.** Local HMMscan needs that POSIX-only HMMER engine, so on Windows the HMMscan button now shows a notification — local HMMscan isn't available on Windows; run SpliceCraft under WSL2 — rather than a confusing error. Everything else on the BLAST tab works natively.
+
+---
+
 ## [1.0.1] — 2026-05-29
 
 ### New features

@@ -25,7 +25,7 @@ Last update: 2026-05-19 (SpliceCraft 0.9.7+).
 | **WSL** | Windows Terminal | ✅ Fully supported | Pillow clipboard image grab disabled (Linux side) — use file picker |
 | WSL | VS Code integrated | ✅ Works | VS Code's terminal handles OSC 52 |
 | WSL | tmux inside WSL | ✅ Works under | Same OSC 52 caveat |
-| **Windows native** | Windows Terminal | ✅ Supported | Pillow clipboard image grab available |
+| **Windows native** | Windows Terminal | ✅ Supported | Pillow clipboard image grab available. Local HMMscan unavailable (`pyhmmer` is POSIX-only — use WSL2); BLASTN/BLASTP + everything else work natively |
 | Windows native | ConPTY (cmd, PowerShell) | ⚠ Limited | Some Textual mouse modes unreliable; recommend Windows Terminal |
 | Windows native | conhost.exe (legacy) | ❌ Unsupported | No true-color, no mouse — Textual will refuse to launch |
 
@@ -117,10 +117,16 @@ this convention end-to-end.
 | `rich-pixels>=3.0.0` | Image rendering in Experiments | Image renders as placeholder |
 | `pyhmmer` | In-process HMMscan | HMMscan button warns |
 
-All four are declared hard deps in `pyproject.toml` so a normal
-`pip install splicecraft` brings them. The runtime checks exist for
-edge cases (e.g. `pip install --no-deps` for an offline minimal
-install).
+`Pillow`, `pyspellchecker`, `primer3-py`, and `rich-pixels` are
+unconditional hard deps in `pyproject.toml`, so a normal `pip install
+splicecraft` brings them on every platform. **`pyhmmer` is a hard dep
+only on POSIX** (`sys_platform != 'win32'`): it ships no Windows wheels
+and HMMER's C core doesn't build on native Windows, so it is
+intentionally omitted there. On native Windows, HMMscan is unavailable
+(the button toasts + explains the WSL2 path) while BLASTN/BLASTP fall
+back to the pure-Python engine; WSL2 reports as Linux and gets pyhmmer
+normally. The runtime checks also cover other edge cases (e.g. `pip
+install --no-deps` for an offline minimal install).
 
 ---
 

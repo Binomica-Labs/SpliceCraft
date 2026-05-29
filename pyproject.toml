@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.0.1"
+version         = "1.0.2"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -44,7 +44,20 @@ dependencies = [
     # external C-library install required (the wheels ship the HMMER
     # source compiled in). The pure-Python BLAST fallback also runs
     # without pyhmmer for very short queries.
-    "pyhmmer>=0.12.1",
+    #
+    # POSIX-only marker (added 2026-05-29): pyhmmer publishes only
+    # manylinux/macosx wheels and HMMER's C core does NOT build on
+    # native Windows — upstream states "non-UNIX operating systems
+    # (such as Windows) are not supported by HMMER." As an unconditional
+    # hard dep it broke `pipx install splicecraft` for native-Windows
+    # users entirely ("No matching distribution found"). The marker
+    # keeps it a hard dep everywhere it CAN install — Linux, macOS, and
+    # WSL (which reports as sys_platform == 'linux') — so no existing
+    # user loses HMMscan, and omits it ONLY on native Windows. There the
+    # app degrades gracefully: BLASTN/BLASTP fall back to the pure-Python
+    # engine and the HMMscan button shows a "run under WSL2" hint
+    # (gated by `_PYHMMER_AVAILABLE` → `_handle_hmmscan_request`).
+    "pyhmmer>=0.12.1; sys_platform != 'win32'",
     # Experiments lab-notebook deps (added 2026-05-18 with the
     # Experiments toolbar). All three are pure-Python wheels with no
     # external system shell-outs:

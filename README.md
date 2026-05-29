@@ -94,7 +94,9 @@ Search without leaving the app (`Ctrl+B`). The **Local** tab runs BLASTN /
 BLASTP / HMMscan against your own library with an in-process engine — powered
 by `pyhmmer`, so there's no external `blast+` to install — and a one-click
 downloader pulls Pfam-A or NCBIfam (or any HMMER3 `.hmm.gz` URL) with
-automatic update-detection, no `wget` + `hmmpress` ritual. The **Online** tab
+automatic update-detection, no `wget` + `hmmpress` ritual. On native Windows,
+BLASTN/BLASTP run in-process but HMMscan needs WSL2 (`pyhmmer`/HMMER is
+POSIX-only). The **Online** tab
 sends DNA / RNA / protein — or a whole plasmid or a single feature straight
 from your library — to NCBI (blastn / blastp / blastx / tblastn / tblastx) or
 to Pfam at EMBL-EBI, and drops the hits into a scrollable table just like a

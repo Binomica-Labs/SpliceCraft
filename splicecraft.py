@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -50915,14 +50915,46 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
         )
 
     def _handle_hmmscan_request(self) -> None:
-        """Surface a fallback message if pyhmmer isn't importable
-        (which should never happen on a freshly-installed SpliceCraft
-        ≥0.5.1, since pyhmmer is a hard dependency in pyproject.toml).
-        Older installs that pre-date the pyhmmer dep land here.
+        """Surface a fallback when pyhmmer isn't importable, with a
+        platform-aware reason:
+
+        * Native Windows — pyhmmer ships no Windows wheels and HMMER's
+          C core doesn't build there, so it is intentionally omitted
+          from the install (see the `sys_platform != 'win32'` marker in
+          pyproject.toml). Local HMMscan can't run; we toast + point the
+          user at WSL2. BLASTN/BLASTP still work (pure-Python fallback).
+        * Elsewhere (Linux/macOS/WSL) — pyhmmer is a hard dep, so a
+          missing import means an install that predates it (≥0.5.1) or a
+          `--no-deps` install; the fix is an upgrade/reinstall.
 
         Kept as a separate method so `_run`'s HMMscan branch stays
-        readable — early-return into a clear, recoverable error
-        message rather than `_run_done`'s generic red status."""
+        readable — early-return into a clear, recoverable message
+        rather than `_run_done`'s generic red status."""
+        if sys.platform == "win32":
+            self.app.notify(
+                "Local HMMscan isn't available on Windows — HMMER (pyhmmer) "
+                "has no Windows build. Run SpliceCraft under WSL2 for HMMscan; "
+                "BLASTN/BLASTP and everything else work natively.",
+                title="HMMscan unavailable on Windows",
+                severity="warning",
+                timeout=10,
+            )
+            self._safe_results(
+                "[yellow][b]Local HMMscan isn't available on Windows.[/b]\n\n"
+                "HMMscan is powered by [b]pyhmmer[/b] (HMMER 3), which ships no "
+                "Windows build — HMMER's C core is POSIX-only.\n\n"
+                "To run HMMscan, launch SpliceCraft inside [b]WSL2[/b] "
+                "(Windows Subsystem for Linux):\n\n"
+                "  [b]wsl --install[/b]   then, in Ubuntu:  "
+                "[b]pipx install splicecraft[/b]\n\n"
+                "Everything else — BLASTN, BLASTP, the full editor — works "
+                "natively on Windows.[/yellow]"
+            )
+            self._safe_status(
+                "[yellow]HMMscan unavailable on Windows — see results "
+                "panel.[/yellow]"
+            )
+            return
         self._safe_results(
             "[yellow][b]pyhmmer is not importable[/b] — your install of "
             "SpliceCraft predates the pyhmmer dependency (added in 0.5.1).\n\n"
