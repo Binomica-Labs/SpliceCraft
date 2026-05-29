@@ -43,6 +43,11 @@ primers.json
 *_results.zip
 *:Zone.Identifier
 
+# Tech-support scratch: where the maintainer drops user bug-report
+# screenshots to share with Claude. Local-only — never committed.
+# (A v1.0.3 `git add -A` swept two PNGs in here before this rule landed.)
+TechSupport/
+
 # Editor / OS
 .vscode/
 .idea/
