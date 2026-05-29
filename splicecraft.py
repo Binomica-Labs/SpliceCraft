@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -14169,6 +14169,34 @@ def _rotate_aligned_to_original_target_frame(
     return new_q, new_t
 
 
+def _alignment_terminal_tail_bp(aligned_q: str, aligned_t: str) -> int:
+    """Total non-aligning bases at the 5' AND 3' ends of a gapped
+    pairwise alignment — terminal columns where exactly one strand has
+    a base and the other is a gap (`-`).
+
+    On a CIRCULAR molecule these end overhangs are the signature of an
+    origin offset that a rotation can erase, so `_pick_best_rotation`
+    uses this to decide whether to attempt rotation even when overall
+    identity is high: a small origin shift still aligns ~96% but leaves
+    the origin-spanning bases hanging off both ends (the 2026-05-29
+    "non-aligning bases at the ends" report). Pure / no I/O."""
+    if not aligned_q or not aligned_t:
+        return 0
+
+    def _lead_tail(a: str, b: str) -> int:
+        n = 0
+        for ca, cb in zip(a, b):
+            # XOR: exactly one strand is a gap → a non-aligning column.
+            if (ca == "-") != (cb == "-"):
+                n += 1
+            else:
+                break
+        return n
+
+    return (_lead_tail(aligned_q, aligned_t)
+            + _lead_tail(aligned_q[::-1], aligned_t[::-1]))
+
+
 def _pick_best_rotation(query_seq: str, target_seq: str, *,
                          is_circular: bool,
                          mode: str = "global",
@@ -14277,13 +14305,33 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
             )
     plain_id = max((c[3].get("identity_pct", 0.0) for c in candidates),
                     default=0.0)
-    # Only try the rotation candidates when (a) the target is
-    # circular, (b) plain alignment is poor enough that rotation
-    # might rescue it. The 80% threshold is empirical: anything
-    # above ~80% identity is already in the right register and
-    # rotation can only marginally improve it (not worth the 2x
-    # C-loop).
-    if (is_circular and plain_id < _ROTATION_TRY_THRESHOLD_PCT
+    # Terminal-tail trigger (2026-05-29): the 80% identity gate alone
+    # MISSES a small circular origin offset. A read whose origin sits a
+    # few dozen bp off the reference still aligns ~96% (well above 80%),
+    # so rotation was skipped — but the origin-spanning bases hang off
+    # BOTH ends as non-aligning 5'/3' tails (the "non-aligning bases at
+    # the ends" report). Detect those tails on the best plain candidate
+    # and attempt rotation to erase them even when identity is high. The
+    # picker keeps the plain result if rotation doesn't beat it (ranked
+    # by n_matches, INV-76), so trying is always safe.
+    _plain_cands = [c for c in candidates if c[0] == "none"]
+    plain_tail_bp = 0
+    if _plain_cands:
+        _best_plain = max(
+            _plain_cands, key=lambda c: c[3].get("identity_pct", 0.0))
+        plain_tail_bp = _alignment_terminal_tail_bp(
+            _best_plain[3].get("aligned_q", ""),
+            _best_plain[3].get("aligned_t", ""),
+        )
+    # Only try the rotation candidates when the target is circular AND
+    # either (a) plain identity is poor enough that rotation might
+    # rescue it, or (b) the plain alignment leaves terminal tails a
+    # rotation could fold in. The 80% threshold is empirical; the tail
+    # trigger catches the high-identity-but-origin-offset case the
+    # threshold can't see.
+    if (is_circular
+            and (plain_id < _ROTATION_TRY_THRESHOLD_PCT
+                 or plain_tail_bp >= _ROTATION_TAIL_TRIGGER_BP)
             and not _good_enough()):
         # Rotation trials are run for BOTH orientations (fwd + RC)
         # when plain alignment in either orientation was below
@@ -14422,6 +14470,15 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
 # Tunable — empirically ~80% identity covers the same-plasmid case
 # while leaving headroom for partial-homology cases.
 _ROTATION_TRY_THRESHOLD_PCT = 80.0
+# Minimum total terminal non-aligning bp (5'+3') on the best plain
+# alignment that — for a CIRCULAR target — triggers a rotation attempt
+# even when identity is above `_ROTATION_TRY_THRESHOLD_PCT`. A small
+# origin offset still aligns well past 80% but leaves the origin-
+# spanning bases as end tails; rotation folds them in. Small enough to
+# catch a few-dozen-bp offset, large enough to ignore 1-2 bp terminal
+# mismatch-as-gap noise. Added 2026-05-29 ("non-aligning bases at the
+# ends" report).
+_ROTATION_TAIL_TRIGGER_BP = 8
 
 # When any candidate's overall identity_pct crosses this threshold,
 # `_pick_best_rotation` stops attempting further candidates. 99.5%
@@ -15172,8 +15229,12 @@ def _merge_stored_alignments(
       * Entries with a matching ``_stored_id`` (in_memory) →
         ``id`` (existing) are updated in place (preserves list order so
         the AlignmentManagerModal's row order stays stable).
-      * Fresh in_memory entries with no match (and no ``_stored_id``,
-        or whose ``_stored_id`` isn't on disk) are appended.
+      * Fresh in_memory entries whose CONTENT (target / axis / aligned
+        strings) byte-matches a row already on disk are treated as an
+        idempotent re-run (2026-05-29): the existing row is kept and the
+        in-memory entry adopts its id — no duplicate is appended.
+      * Fresh in_memory entries with neither an id- nor a content-match
+        are appended.
       * Existing entries with no in-memory counterpart are kept
         untouched — protects hidden alignments (``visible=False``)
         and entries that failed to hydrate.
@@ -15196,21 +15257,35 @@ def _merge_stored_alignments(
         in_memory = []
     merged = list(existing)
     existing_pos: dict[str, int] = {}
+    # Content-key → position of rows already on disk, for the cross-disk
+    # re-run dedup below. First occurrence wins, so the row a re-run
+    # adopts is the earliest stored copy. Legacy duplicates from before
+    # the 2026-05-29 dedup are left in place — only NEW duplicates are
+    # prevented; old ones can be pruned via the AlignmentManager.
+    existing_content_pos: dict[tuple, int] = {}
     for pos, e in enumerate(merged):
         if not isinstance(e, dict):
             continue
         eid = e.get("id")
         if isinstance(eid, str) and eid:
             existing_pos[eid] = pos
+        eck = _alignment_content_key(e)
+        if eck is not None and eck not in existing_content_pos:
+            existing_content_pos[eck] = pos
     fresh: list[dict] = []
-    # In-batch content-key dedup (2026-05-27). Two concurrent workers
-    # producing the same alignment (same target, same axis, same
-    # aligned_q/aligned_t) BOTH get serialised with fresh uuids and
-    # would both append — silent duplicate. By tracking the keys we
-    # already saw in THIS batch, the second occurrence is dropped.
-    # Dedup is intentionally NOT applied against `existing` (on disk)
-    # so a user who legitimately re-runs the same alignment as a new
-    # event still gets a new stored row.
+    # Content-key dedup, two flavours:
+    #   * In-batch (2026-05-27): two concurrent workers producing the
+    #     same alignment both get fresh uuids and would both append;
+    #     `fresh_content_keys` drops the second.
+    #   * Cross-disk re-run (2026-05-29): a fresh alignment whose
+    #     content (target / axis / aligned_q / aligned_t) byte-matches a
+    #     row already on disk is an idempotent re-run — adopt the
+    #     existing row's id and DON'T append a duplicate. Pre-2026-05-29
+    #     this was intentionally allowed ("I did this again" → a new
+    #     row), but it let benchmarking / repeated verification grow the
+    #     stored list unbounded (bloating library.json + cluttering the
+    #     verification report). A genuinely different alignment has a
+    #     different content key and is still appended.
     fresh_content_keys: set[tuple] = set()
     stamp_pairs: list[tuple[dict, str]] = []
     for align in in_memory:
@@ -15229,6 +15304,20 @@ def _merge_stored_alignments(
             merged[existing_pos[sid]] = stored
             continue
         ckey = _alignment_content_key(stored)
+        if ckey is not None and ckey in existing_content_pos:
+            # Idempotent re-run of an alignment already on disk: don't
+            # append a duplicate. Adopt the existing row's id (so a
+            # later flush updates in place instead of appending) and
+            # leave the existing row UNTOUCHED — preserving its metadata
+            # (e.g. a user-set visible=False). Re-stamp this entry's
+            # pair from the throwaway fresh uuid to the canonical id.
+            eid = merged[existing_content_pos[ckey]].get("id", "")
+            if isinstance(eid, str) and eid:
+                if stamp_pairs and stamp_pairs[-1][0] is align:
+                    stamp_pairs[-1] = (align, eid)
+                else:
+                    stamp_pairs.append((align, eid))
+            continue
         if ckey is not None and ckey in fresh_content_keys:
             # Same alignment already appended earlier in this batch
             # (concurrent workers race). Skip — but leave the stamp

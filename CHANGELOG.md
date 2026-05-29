@@ -14,6 +14,18 @@
 
 ---
 
+## [1.0.4] — 2026-05-29
+
+### Bug fixes
+
+- **Sequencing alignments no longer show stray 5′/3′ overhangs on circular plasmids.** When a read's origin sat a little off the reference's — which is the norm, since assemblers rarely pick the same start base — the aligner left the origin-spanning bases hanging off both ends as non-aligning tails. It now detects those end tails and rotates the circular molecule to fold them back in, so the read aligns cleanly end to end. Spotted by **Joshua Lerman (Angstrom Innovation)** — thanks for the sharp eye and the detailed report.
+
+### Hardening
+
+- **Re-running an alignment no longer stores a duplicate.** Aligning a read against a plasmid you've already aligned it to now refreshes the existing record in place instead of stacking a second identical copy — so benchmarking or re-checking keeps your library lean and the verification report uncluttered.
+
+---
+
 ## [1.0.3] — 2026-05-29
 
 ### New features

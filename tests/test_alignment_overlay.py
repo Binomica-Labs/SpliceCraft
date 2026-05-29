@@ -675,11 +675,14 @@ class TestMergeDedupConcurrentRace:
         assert len(merged) == 1
         assert merged[0]["target_label"] == "t"
 
-    def test_existing_with_same_content_is_NOT_deduped(self):
-        # If an alignment is already on disk with the same content
-        # AND the user runs a NEW alignment with identical content,
-        # that's a legitimate "I did this again" — preserve as a
-        # separate stored row.
+    def test_existing_with_same_content_is_deduped(self):
+        # 2026-05-29: a re-run whose content byte-matches a row already
+        # on disk is now IDEMPOTENT — the existing row is kept (not
+        # duplicated) and the in-memory entry adopts its id. This
+        # REVERSES the prior "I did this again → separate row" design
+        # (`test_existing_with_same_content_is_NOT_deduped`), which let
+        # re-runs / benchmarking grow the stored list unbounded —
+        # bloating library.json and cluttering the verification report.
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         rec = SeqRecord(
@@ -690,11 +693,59 @@ class TestMergeDedupConcurrentRace:
             {**self._in_memory("old"), "target_record": rec},
         )
         assert existing_stored is not None
+        existing_id = existing_stored["id"]
         in_mem = [{**self._in_memory("new"), "target_record": rec}]
-        merged, _ = sc._merge_stored_alignments(
+        merged, stamp_pairs = sc._merge_stored_alignments(
             [existing_stored], in_mem,
         )
-        # Existing + new = 2 rows. New one gets a fresh uuid.
+        assert len(merged) == 1, "identical re-run must not duplicate"
+        assert merged[0]["id"] == existing_id
+        # The in-memory entry adopts the canonical existing id, so a
+        # later flush updates in place rather than re-appending.
+        assert stamp_pairs and stamp_pairs[-1][1] == existing_id
+
+    def test_dedup_leaves_existing_row_untouched(self):
+        # A content-match must NOT overwrite the existing row — its
+        # metadata (e.g. a user-set visible=False) is preserved.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq("ATGCATGC"), id="T", name="T",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        existing_stored = sc._serialize_alignment_for_storage(
+            {**self._in_memory("old"), "target_record": rec},
+        )
+        existing_stored["visible"] = False
+        existing_stored["_user_note"] = "keep me"
+        in_mem = [{**self._in_memory("new"), "target_record": rec}]
+        merged, _ = sc._merge_stored_alignments([existing_stored], in_mem)
+        assert len(merged) == 1
+        assert merged[0]["visible"] is False
+        assert merged[0]["_user_note"] == "keep me"
+
+    def test_different_content_still_appends(self):
+        # A genuinely different alignment (different aligned strings →
+        # different content key) is still stored — the dedup is precise,
+        # not a blanket "one row per target".
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq("ATGCATGC"), id="T", name="T",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        existing_stored = sc._serialize_alignment_for_storage(
+            {**self._in_memory("old"), "target_record": rec},
+        )
+        diff = {
+            **self._in_memory("new"), "target_record": rec,
+            "aligned_q": "TTTTTTTT", "aligned_t": "TTTTTTTT",
+            "result": {
+                "aligned_q": "TTTTTTTT", "aligned_t": "TTTTTTTT",
+                "n_matches": 8, "n_mismatches": 0, "identity_pct": 100.0,
+            },
+        }
+        merged, _ = sc._merge_stored_alignments([existing_stored], [diff])
         assert len(merged) == 2
 
 
@@ -1282,7 +1333,13 @@ class TestAlignmentPersistenceRoundTrip:
                 query_label="q",
                 target_label="t",
                 target_record=rec_b,
-                result={"aligned_q": "A" * 200, "aligned_t": "T" * 200},
+                # Distinct query content from the seeded vis/hidden rows
+                # so this is a genuinely NEW alignment. With identical
+                # content the 2026-05-29 re-run dedup correctly collapses
+                # it into the visible row (no append) — which is a
+                # separate behaviour with its own coverage; here we want
+                # to exercise append-alongside-a-preserved-hidden-row.
+                result={"aligned_q": "C" * 200, "aligned_t": "T" * 200},
                 axis="query",
             )
             app._flush_active_alignments()
@@ -6118,4 +6175,101 @@ class TestFlushAlignmentsLocked:
         # would deadlock against our outer acquire.
         import threading
         assert isinstance(sc._cache_lock, type(threading.RLock()))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Rotation tail-trigger — a SMALL circular origin offset still aligns
+# ~96% (above the 80% identity gate) but leaves the origin-spanning
+# bases as non-aligning 5'/3' end tails. `_pick_best_rotation` must
+# detect the tails and rotate them away. Regression for the 2026-05-29
+# "non-aligning bases at the ends" report (Angstrom consensus vs a
+# reference linearised at a slightly different origin).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _det_seq(n: int, seed: int) -> str:
+    """Deterministic pseudo-random DNA via a private RNG (doesn't
+    perturb the global `random` state other tests may depend on)."""
+    import random as _random
+    rng = _random.Random(seed)
+    return "".join(rng.choice("ACGT") for _ in range(n))
+
+
+class TestAlignmentTerminalTailBp:
+    def test_no_tails(self):
+        assert sc._alignment_terminal_tail_bp("ATGC", "ATGC") == 0
+
+    def test_internal_gap_is_not_a_tail(self):
+        assert sc._alignment_terminal_tail_bp("ATGC", "AT-C") == 0
+
+    def test_five_prime_tail(self):
+        assert sc._alignment_terminal_tail_bp("ATGCGG", "--GCGG") == 2
+
+    def test_three_prime_tail(self):
+        assert sc._alignment_terminal_tail_bp("GCGGAT", "GCGG--") == 2
+
+    def test_both_ends(self):
+        assert sc._alignment_terminal_tail_bp("ATGCGGAT", "--GCGG--") == 4
+
+    def test_empty_inputs(self):
+        assert sc._alignment_terminal_tail_bp("", "") == 0
+
+
+class TestRotationTailTrigger:
+    def test_small_origin_offset_rotates_tails_away(self):
+        # THE regression: 30 bp origin shift → ~96% plain identity (gate
+        # is 80%, so pre-fix rotation was skipped) → 30 bp non-aligning
+        # tail at each end. The tail-trigger must now rotate them away.
+        target = _det_seq(1500, seed=42)
+        query = target[30:] + target[:30]
+        res = sc._pick_best_rotation(
+            query, target, is_circular=True, canvas_axis="target")
+        assert res["picked_rotation"] != "none", (
+            "small origin offset must trigger rotation via the tail-trigger "
+            "(pre-fix it was skipped because identity stayed above 80%)"
+        )
+        assert sc._alignment_terminal_tail_bp(
+            res["aligned_q"], res["aligned_t"]) == 0
+        assert res["identity_pct"] > 99.0
+
+    def test_clean_same_origin_skips_rotation(self):
+        # No offset → no tails → rotation NOT attempted (perf preserved).
+        target = _det_seq(1500, seed=42)
+        res = sc._pick_best_rotation(
+            target, target, is_circular=True, canvas_axis="target")
+        assert res["picked_rotation"] == "none"
+        assert sc._alignment_terminal_tail_bp(
+            res["aligned_q"], res["aligned_t"]) == 0
+
+    def test_large_offset_still_rotates_clean(self):
+        target = _det_seq(1500, seed=42)
+        query = target[600:] + target[:600]
+        res = sc._pick_best_rotation(
+            query, target, is_circular=True, canvas_axis="target")
+        assert res["picked_rotation"] != "none"
+        assert sc._alignment_terminal_tail_bp(
+            res["aligned_q"], res["aligned_t"]) == 0
+
+    def test_linear_target_never_force_rotated(self):
+        # is_circular=False: end tails are legitimate (linear molecule),
+        # so rotation must NOT fire off the back of the tail-trigger.
+        target = _det_seq(1500, seed=42)
+        query = target[30:] + target[:30]
+        res = sc._pick_best_rotation(
+            query, target, is_circular=False, canvas_axis="target")
+        assert res["picked_rotation"] == "none"
+
+
+class TestPastTurnRedundancyFoldsInternally:
+    """Triage candidate #1: a read running past one full turn (origin-
+    spanning redundancy) folds into an INTERNAL gap, not a terminal
+    overhang — the benign case stays benign and can't masquerade as the
+    origin-offset bug above."""
+
+    def test_past_turn_redundancy_is_internal_not_terminal(self):
+        target = _det_seq(1500, seed=42)
+        query = target[600:] + target[:600] + target[600:660]  # +60 bp
+        res = sc._pick_best_rotation(
+            query, target, is_circular=True, canvas_axis="target")
+        assert sc._alignment_terminal_tail_bp(
+            res["aligned_q"], res["aligned_t"]) == 0
 
