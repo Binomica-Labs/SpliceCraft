@@ -128,6 +128,14 @@ class TestIUPACPattern:
         p2 = sc._iupac_pattern("GCCGGC")
         assert p1 is p2
 
+    def test_rejects_non_iupac_site(self):
+        """A site with a non-IUPAC character raises ValueError — the exact
+        contract the corrupt-custom-enzyme guard in _enzyme_cuts_impl
+        (sweep #30) relies on to SKIP a bad recognition site instead of
+        crashing a cloning digest."""
+        with pytest.raises(ValueError):
+            sc._iupac_pattern("GGZCC")    # 'Z' is not an IUPAC code
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Codon table

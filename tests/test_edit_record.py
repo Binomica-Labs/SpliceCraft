@@ -277,3 +277,78 @@ class TestSimpleFeatureShift:
         new_rec = app._rebuild_record_with_edit(new_seq, "insert", 50, 50, "T" * 10)
         f = _first_by_label(new_rec, "spans")
         assert int(f.location.start) == 40 and int(f.location.end) == 80
+
+
+class TestWrapFeatureOriginEdgeInserts:
+    """Sweep #30 coverage: insert exactly at bp 0 and at bp `total` on a
+    canonical wrap feature — the two origin-equivalent positions the
+    existing tests (which insert mid-sequence / inside the tail) never
+    exercised. These hit the wrap-canonical anchor-preservation branches
+    of `_rebuild_record_with_edit` (head stays at 0 / tail extends to the
+    new total), pushing that primitive's line coverage over 80%."""
+
+    def test_insert_at_origin_zero_keeps_head_anchored(self):
+        # Wrap join(95..100, 0..5) + a downstream gene at [50, 70).
+        rec = _wrap_record(extra_feats=[(50, 70, "gene", "downstream")])
+        app = _make_app(rec)
+        new_seq = "T" * 10 + "A" * 100          # insert 10 bp AT bp 0
+        new_rec = app._rebuild_record_with_edit(new_seq, "insert", 0, 0, "T" * 10)
+
+        wrap = _first_by_label(new_rec, "wrapCDS")
+        assert isinstance(wrap.location, CompoundLocation)
+        parts = sorted((int(p.start), int(p.end)) for p in wrap.location.parts)
+        # Head stays anchored at 0 (end 5 -> 15); tail shifts +10.
+        assert parts == [(0, 15), (105, 110)]
+        # Downstream gene sits entirely after the insert → shifts +10.
+        gene = _first_by_label(new_rec, "downstream")
+        assert (int(gene.location.start), int(gene.location.end)) == (60, 80)
+
+    def test_insert_at_origin_total_extends_tail(self):
+        rec = _wrap_record()                     # join(95..100, 0..5), total 100
+        app = _make_app(rec)
+        new_seq = "A" * 100 + "T" * 10           # insert 10 bp AT bp total (100)
+        new_rec = app._rebuild_record_with_edit(
+            new_seq, "insert", 100, 100, "T" * 10)
+
+        wrap = _first_by_label(new_rec, "wrapCDS")
+        assert isinstance(wrap.location, CompoundLocation)
+        parts = sorted((int(p.start), int(p.end)) for p in wrap.location.parts)
+        # Head unchanged; tail end grows to the new total (110).
+        assert parts == [(0, 5), (95, 110)]
+
+
+class TestRebuildEditEdgeCases:
+    """Sweep #30 coverage: the remaining reachable branches of
+    _rebuild_record_with_edit — the no-record guard, a feature that
+    overhangs the START of a replace, and a wrap feature fully consumed
+    by a replace. Real edge cases, not pragma fillers."""
+
+    def test_returns_none_when_no_record(self):
+        # src is None (no plasmid loaded) → documented no-op guard.
+        app = _make_app(None)
+        assert app._rebuild_record_with_edit("ACGT", "insert", 0, 0, "") is None
+
+    def test_replace_trims_feature_overhanging_start(self):
+        # Feature [40, 60); replace [50, 70) with 4 bp. The feature starts
+        # before the edit and ends inside it → head kept, new end is just
+        # past the inserted payload (s + ins_len = 54), NOT the old 60.
+        rec = SeqRecord(Seq("A" * 100), id="T",
+                        annotations={"molecule_type": "DNA"})
+        rec.features.append(SeqFeature(
+            FeatureLocation(40, 60, strand=1),
+            type="gene", qualifiers={"label": ["overhang"]}))
+        app = _make_app(rec)
+        new_seq = "A" * 50 + "C" * 4 + "A" * 30   # replace 20 bp with 4 bp
+        new_rec = app._rebuild_record_with_edit(
+            new_seq, "replace", 50, 70, "C" * 4)
+        f = _first_by_label(new_rec, "overhang")
+        assert (int(f.location.start), int(f.location.end)) == (40, 54)
+
+    def test_replace_consuming_whole_wrap_drops_feature(self):
+        # Replace the entire molecule → both parts of the wrap feature are
+        # consumed → the feature is dropped (no 1-bp ghost stub).
+        rec = _wrap_record()                       # join(95..100, 0..5)
+        app = _make_app(rec)
+        new_rec = app._rebuild_record_with_edit(
+            "C" * 10, "replace", 0, 100, "C" * 10)
+        assert _first_by_label(new_rec, "wrapCDS") is None

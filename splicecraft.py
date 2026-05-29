@@ -390,6 +390,17 @@ if not _log.handlers:
         _handler = RotatingFileHandler(
             _LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=4,
             encoding="utf-8",
+            # 2026-05-28 (sweep #30): backslashreplace so a code point
+            # utf-8 can't encode — e.g. a lone surrogate that os.fsdecode
+            # yields for an undecodable filename under a non-UTF-8 locale
+            # (LANG=C, exotic terminals) — is escaped in the log instead
+            # of crashing the write. Without it, logging's handleError
+            # silently DROPS the record AND prints a traceback to stderr,
+            # which corrupts a live Textual TUI. Covers every path:
+            # `_log_event`'s ensure_ascii=False payloads, and raw
+            # `_log.info`/`.exception` calls carrying OS-derived paths /
+            # error strings / key data from any terminal.
+            errors="backslashreplace",
         )
         _handler.setFormatter(logging.Formatter(
             fmt="%(asctime)s [%(session)s] %(levelname)-5s "

@@ -1266,3 +1266,27 @@ class TestAuthoritativeLibrarySnapshot:
         monkeypatch.setattr(sc, "_library_cache", None)
         fb = [{"id": "fallback"}]
         assert sc._authoritative_library_snapshot(fb) is fb
+
+
+class TestLogEventEncodingRobustness:
+    """Sweep #30: the event logger must survive 'weird OS input' — e.g. a
+    lone surrogate (U+DC80..U+DCFF) that os.fsdecode yields for an
+    undecodable filename under a non-UTF-8 locale, which utf-8 cannot
+    encode. The rotating handler uses errors='backslashreplace' so such a
+    record is escaped in the log instead of being dropped with a stderr
+    traceback that would corrupt the live Textual TUI."""
+
+    def test_rotating_handler_sets_backslashreplace(self):
+        rfhs = [h for h in sc._log.handlers
+                if isinstance(h, sc.RotatingFileHandler)]
+        # NullHandler fallback (read-only log dir) → nothing to assert.
+        for h in rfhs:
+            assert getattr(h, "errors", None) == "backslashreplace"
+
+    def test_log_event_with_surrogate_does_not_raise(self):
+        # A lone surrogate utf-8 can't encode — must not blow up the call
+        # (and with backslashreplace the record actually lands, not drops).
+        sc._log_event("test.weird_input", path="/tmp/\udc80\udcffweird.gb")
+
+    def test_log_info_with_surrogate_does_not_raise(self):
+        sc._log.info("weird OS path: %s", "/x/\udc80\udcff/y.gb")
