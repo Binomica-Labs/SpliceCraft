@@ -57,7 +57,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 - **Design** — gibson-assemble, simulate-gibson, design-mutagenesis,
   design-gb-part (Golden Braid / MoClo), design-primers (generic
   Primer3 detection or restriction cloning), optimize-protein
-  (codon-optimise an AA sequence to the active table).
+  (codon-optimise an AA sequence to a chosen table; optional `stops`
+  0–3 appends that many stop codons, and a trailing `*` run in the
+  protein is honored as-is and overrides it).
 - **Simulate** — simulate-pcr (exact-match in-silico amplification,
   wrap-aware on circular templates) and simulate-gel (per-lane band
   positions + optional rendered ASCII gel image; ladder / plasmid /

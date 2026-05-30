@@ -308,11 +308,12 @@ async def test_settings_modal_renders_every_group():
         # Min primer binding numeric input + apply button.
         assert modal.query_one("#set-min-primer", Input) is not None
         assert modal.query_one("#set-min-primer-apply", Button) is not None
-        # Sub-modal launchers — all four buttons.
+        # Sub-modal launchers — all five buttons.
         for bid in (
             "#set-grammars",
             "#set-entry-vectors",
             "#set-enzyme-collections",
+            "#set-codon-tables",
             "#set-restore",
         ):
             assert modal.query_one(bid, Button) is not None

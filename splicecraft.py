@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -31691,6 +31691,10 @@ class SettingsModal(_OneShotDismissScreen, ModalScreen):
                     "Enzyme collections", id="set-enzyme-collections",
                 )
                 yield Button(
+                    "Codon Tables", id="set-codon-tables",
+                )
+            with Horizontal(classes="set-row"):
+                yield Button(
                     "Restore from backup", id="set-restore",
                 )
             yield Static("", id="set-status", markup=True)
@@ -31811,6 +31815,39 @@ class SettingsModal(_OneShotDismissScreen, ModalScreen):
     @on(Button.Pressed, "#set-enzyme-collections")
     def _on_enzyme_collections(self, _) -> None:
         self.app.push_screen(EnzymeCollectionsModal())
+
+    @on(Button.Pressed, "#set-codon-tables")
+    def _on_codon_tables(self, _) -> None:
+        # Codon-table collections used to be reachable only through the
+        # Domesticator / Synthesis codon picker. This Settings entry opens
+        # the same manager (`SpeciesPickerModal`: browse, fetch from Kazusa,
+        # import a TSV, delete). "Use Selected" sets the LAUNCH DEFAULT — the
+        # persisted `active_codon_table` taxid that SynthesisScreen's
+        # `_init_codon_table` honors on open — which previously had no GUI
+        # entry point (only the `set-active-codon-table` agent endpoint).
+        self.app.push_screen(SpeciesPickerModal(),
+                             callback=self._codon_table_default_picked)
+
+    def _codon_table_default_picked(self, entry: "dict | None") -> None:
+        # Cancel (None) leaves the default untouched; any fetch / import /
+        # delete the user did inside the manager already persisted on its own.
+        if not entry:
+            return
+        taxid = str(entry.get("taxid", "") or "").strip()
+        name = str(entry.get("name", "") or "?")
+        if not taxid:
+            # `active_codon_table` matches by taxid (see `_init_codon_table`),
+            # so a taxid-less table can't be the launch default. It's still
+            # saved in the registry — just not settable as the default here.
+            self._set_status(
+                f"[yellow]'{name}' has no taxid, so it can't be the launch "
+                f"default — it's still saved in your codon tables.[/yellow]")
+            return
+        _set_setting("active_codon_table", taxid)
+        _log_event("settings.active_codon_table_set", taxid=taxid, name=name)
+        self._set_status(
+            f"Launch-default codon table set to [bold]{name}[/bold] "
+            f"(taxid {taxid}). Synthesis uses it on next open.")
 
     @on(Button.Pressed, "#set-restore")
     def _on_restore(self, _) -> None:
@@ -39931,6 +39968,50 @@ def _ncbi_prep_term(query: str) -> str:
     return " ".join(tokens)
 
 
+def _ncbi_taxid_search_terms(query: str) -> list[str]:
+    """Cascading NCBI-taxonomy search terms, strictest first — mirrors the
+    sister project ScriptoScope's `genbank_search` strategy (see
+    `[SISTER]` in docs/invariants.md). The caller tries each term in
+    order and stops at the first that returns hits, so an imprecise or
+    partial species name still surfaces *related* taxa instead of a
+    dead-end "no results".
+
+    * Strategy 1 is `_ncbi_prep_term` — the precise-ish query (genus
+      subtree + prefix wildcard for a single token; trailing wildcard
+      for a multi-word name). The overwhelming majority of real queries
+      resolve here, so this is identical to the pre-cascade behaviour.
+    * For a MULTI-word query that comes back empty, two broader rounds
+      kick in: every token prefix-wildcarded and AND-joined (tolerates a
+      partial genus AS WELL AS a partial species — "Sacchar cerev"),
+      then OR-joined (ANY token matches, so a stray or mistyped word
+      still finds relatives — e.g. a genus typo "Homon sapiens" is
+      rescued by the species epithet).
+
+    A single-token query gets only strategy 1: its broader forms are
+    already subsumed by the `OR {t}*` clause `_ncbi_prep_term` emits, so
+    re-querying would just repeat the same search. A query the user has
+    already steered with a `*` wildcard or a `[Field]` tag passes through
+    verbatim — never second-guess an explicit Entrez query.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    first = _ncbi_prep_term(q)
+    if "*" in q or "[" in q:
+        return [first]
+    tokens = q.split()
+    if len(tokens) < 2:
+        return [first]
+    terms = [first]
+    for broadened in (
+        " AND ".join(f"{tok}*" for tok in tokens),
+        " OR ".join(f"{tok}*" for tok in tokens),
+    ):
+        if broadened not in terms:
+            terms.append(broadened)
+    return terms
+
+
 # Response-size caps for upstream fetches: defends against a compromised /
 # misconfigured / man-in-the-middled upstream that streams gigabytes at us.
 # NCBI esearch / esummary XML for a 200-id batch is ~50 KB in practice;
@@ -39944,8 +40025,16 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
     """Search NCBI taxonomy for candidates matching `query`. Returns
     (hits, total_count, status_message) where each hit is
     {'taxid': str, 'name': str}. Names come from a batched esummary call
-    (one round-trip for up to `retmax` ids). Partial queries are auto-
-    wildcarded via `_ncbi_prep_term`. Pure network — run from a worker."""
+    (one round-trip for up to `retmax` ids).
+
+    Imprecise / partial queries are handled by a cascading search
+    (`_ncbi_taxid_search_terms`, mirroring ScriptoScope's `genbank_search`):
+    a strict query is tried first, and if it comes back EMPTY the search
+    is automatically broadened — every token prefix-wildcarded, then
+    OR-joined — so a related-but-not-exact species name still surfaces
+    candidates. A network / parse / oversize failure aborts the cascade
+    immediately (an empty result, by contrast, just falls through to the
+    next, broader strategy). Pure network — run from a worker."""
     import urllib.parse
     import urllib.request
     import urllib.error as _urllib_error   # sweep #25 — narrow excepts
@@ -39953,40 +40042,61 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
     q = (query or "").strip()
     if not q:
         return [], 0, "Empty query"
-    term = _ncbi_prep_term(q)
     base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-    params = urllib.parse.urlencode({
-        "db": "taxonomy", "term": term,
-        "retmax": str(retmax), "retmode": "xml",
-    })
-    try:
-        req = urllib.request.Request(f"{base}/esearch.fcgi?{params}",
-                                     headers={"User-Agent": "SpliceCraft/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read(_NCBI_MAX_RESPONSE_BYTES + 1)
-        if len(raw) > _NCBI_MAX_RESPONSE_BYTES:
-            _log.warning("NCBI esearch response exceeded %d bytes; truncating",
-                          _NCBI_MAX_RESPONSE_BYTES)
-            return [], 0, "NCBI returned an oversized response"
-        xml_data = raw.decode("utf-8", errors="replace")
-    except (OSError, _urllib_error.URLError) as exc:
-        # Sweep #25 (2026-05-23): narrowed from bare `Exception` —
-        # network failures land as `URLError` (timeout, DNS, refused)
-        # or `OSError` (socket-level). Other exceptions (KeyError,
-        # AttributeError) here would be real bugs and should
-        # propagate to surface in the log + dialog.
-        _log.exception("NCBI esearch failed for %r", q)
-        return [], 0, f"Network error: {exc}"
-    try:
-        root = _safe_xml_parse(xml_data)
-    except ET.ParseError as exc:
-        return [], 0, f"Could not parse NCBI response: {exc}"
-    ids = [e.text for e in root.findall(".//Id") if e.text]
-    count_elem = root.find(".//Count")
-    try:
-        total = int(count_elem.text) if count_elem is not None and count_elem.text else len(ids)
-    except ValueError:
-        total = len(ids)
+    ids: list[str] = []
+    total = 0
+    broadened = False
+    for idx, term in enumerate(_ncbi_taxid_search_terms(q)):
+        params = urllib.parse.urlencode({
+            "db": "taxonomy", "term": term,
+            "retmax": str(retmax), "retmode": "xml",
+        })
+        try:
+            req = urllib.request.Request(
+                f"{base}/esearch.fcgi?{params}",
+                headers={"User-Agent": "SpliceCraft/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read(_NCBI_MAX_RESPONSE_BYTES + 1)
+            if len(raw) > _NCBI_MAX_RESPONSE_BYTES:
+                _log.warning("NCBI esearch response exceeded %d bytes; truncating",
+                              _NCBI_MAX_RESPONSE_BYTES)
+                return [], 0, "NCBI returned an oversized response"
+            xml_data = raw.decode("utf-8", errors="replace")
+        except (OSError, _urllib_error.URLError) as exc:
+            # Sweep #25 (2026-05-23): narrowed from bare `Exception` —
+            # network failures land as `URLError` (timeout, DNS, refused)
+            # or `OSError` (socket-level). Other exceptions (KeyError,
+            # AttributeError) here would be real bugs and should
+            # propagate to surface in the log + dialog. A network error
+            # aborts the cascade (matches ScriptoScope's `?` propagation)
+            # rather than masking an outage behind broader retries.
+            _log.exception("NCBI esearch failed for %r", q)
+            return [], 0, f"Network error: {exc}"
+        try:
+            # allow_dtd=True: NCBI eutils responses open with an EXTERNAL
+            # DTD reference — `<!DOCTYPE eSearchResult PUBLIC "-//NLM//DTD
+            # esearch 20060628//EN" ".../esearch.dtd">` — which has no
+            # internal subset, so it stays XXE / billion-laughs safe (expat
+            # never fetches the external DTD since Py 3.7.1, and there are no
+            # entities to expand). Without this flag the strict parse rejects
+            # EVERY real NCBI response with "XML contains DTD/ENTITY —
+            # refusing to parse", which surfaced as the taxon-search "XML
+            # parser error". Mirrors the BLAST-XML caller. See [PIT-19].
+            root = _safe_xml_parse(xml_data, allow_dtd=True)
+        except ET.ParseError as exc:
+            return [], 0, f"Could not parse NCBI response: {exc}"
+        cur_ids = [e.text for e in root.findall(".//Id") if e.text]
+        if cur_ids:
+            ids = cur_ids
+            count_elem = root.find(".//Count")
+            try:
+                total = (int(count_elem.text)
+                         if count_elem is not None and count_elem.text
+                         else len(ids))
+            except ValueError:
+                total = len(ids)
+            broadened = idx > 0
+            break
     if not ids:
         return [], 0, f"No NCBI taxonomy entry for '{q}'"
     # Batched esummary: one round-trip for all retrieved ids
@@ -40005,7 +40115,10 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
             sxml = ""
         else:
             sxml = sraw.decode("utf-8", errors="replace")
-        sroot = _safe_xml_parse(sxml) if sxml else None
+        # allow_dtd=True — esummary carries the same external-DTD DOCTYPE
+        # as esearch (`<!DOCTYPE eSummaryResult PUBLIC ... esummary-v1.dtd>`);
+        # see the esearch parse above for why this is safe.
+        sroot = _safe_xml_parse(sxml, allow_dtd=True) if sxml else None
         for doc in (sroot.findall(".//DocSum") if sroot is not None else []):
             did_el = doc.find("Id")
             if did_el is None or not did_el.text:
@@ -40024,6 +40137,11 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
     msg = f"{total} hit(s) for '{q}'"
     if total > len(hits):
         msg = f"Showing {len(hits)} of {total} hits for '{q}' (refine to narrow)"
+    if broadened:
+        # No exact match — surfaced related taxa via the broadened
+        # cascade. Tell the user so a loose hit isn't mistaken for a
+        # precise one.
+        msg += " · broadened to related names"
     return hits, total, msg
 
 
@@ -40082,11 +40200,82 @@ def _codon_build_aa_map(raw: dict) -> tuple[dict, dict]:
     return dict(aa_codons), codon_frac
 
 
-def _codon_optimize(protein: str, raw: dict) -> str:
+def _codon_allocate(codons: list, n: int) -> list:
+    """Pick ``n`` codons from ``[(codon, frac), ...]`` so the chosen multiset
+    matches the frequency distribution as closely as possible (largest-
+    remainder apportionment), then interleave them so no single codon
+    clusters at the front. Deterministic: equal remainders break by input
+    order, so the same ``(codons, n)`` always yields the same list.
+
+    Shared by amino-acid positions AND frequency-matched stop codons. The
+    return is GUARANTEED to be exactly length ``n`` (empty when ``n <= 0``):
+    for a normalized table the apportionment already sums to ``n``, but a
+    hand-rolled / truncated table whose fractions don't sum to 1 is padded
+    with (or truncated to) the most-frequent codon so the caller can never
+    receive a short list that would leave a position unfilled — i.e. NO
+    rogue/empty codon ever reaches the output. Every codon in ``codons`` is
+    synonymous (same residue, or all stops), so padding never changes the
+    encoded amino acid."""
+    if n <= 0:
+        return []
+    if len(codons) == 1:
+        return [codons[0][0]] * n
+    targets: list = []
+    remainders: list = []
+    allocated = 0
+    for codon, frac in codons:
+        exact = n * frac
+        floored = int(exact)
+        targets.append(floored)
+        remainders.append((exact - floored, len(targets) - 1))
+        allocated += floored
+    shortage = n - allocated
+    remainders.sort(key=lambda x: -x[0])
+    for k in range(max(0, shortage)):
+        # `% len` guards a malformed table whose rounding leaves a shortage
+        # larger than the codon count; for a normalized table
+        # shortage <= len(remainders), so this is a plain index.
+        targets[remainders[k % len(remainders)][1]] += 1
+    queues = [[codon] * cnt
+              for (codon, _frac), cnt in zip(codons, targets) if cnt > 0]
+    interleaved: list = []
+    i = 0
+    while any(queues):
+        q = queues[i % len(queues)]
+        if q:
+            interleaved.append(q.pop(0))
+        i += 1
+    # Length guarantee (defensive — a no-op for any table whose per-AA
+    # fractions sum to 1): pad short with the most-frequent synonym,
+    # truncate long.
+    if len(interleaved) < n:
+        interleaved += [codons[0][0]] * (n - len(interleaved))
+    return interleaved[:n]
+
+
+def _codon_optimize(protein: str, raw: dict, *, stops: int = 1) -> str:
     """Frequency-matching codon optimization: distribute synonymous codons
     across the protein so each amino acid's codon distribution matches
-    the target organism's overall usage frequencies. Appends a TAA stop.
-    Raises ValueError on unknown amino acids.
+    the target organism's overall usage frequencies. Raises ValueError on
+    unknown amino acids.
+
+    Stop codons (2026-05-30): a run of trailing ``*`` in ``protein`` is
+    honored verbatim — ``"MGK*"`` → one stop, ``"MGK**"`` → two, ``"MGK***"``
+    → three — and ``stops`` is then ignored. A ``*`` anywhere but that
+    trailing run raises ValueError (a premature stop is never silently
+    encoded). When the protein carries no trailing ``*``, ``stops`` (default
+    1, negatives clamped to 0) stop codons are appended. A SINGLE stop is
+    always ``TAA`` (the strongest terminator / lowest readthrough in E. coli,
+    and the historical default that downstream site-scrubbing assumes); 2+
+    stops are frequency-matched to the table's OWN stop-codon usage so the
+    emitted run resists readthrough with organism-appropriate diversity,
+    falling back to ``TAA`` only when the table declares no stop codons.
+
+    The amino-acid body is apportioned by `_codon_allocate`, which excludes
+    stop codons from every residue's synonym pool — so a body position can
+    NEVER be a stop (no premature internal stop) and is always a real codon
+    (no rogue/empty base). Output length is exactly ``3*len(body) +
+    3*n_stops``.
 
     Distinct from Angov-style codon HARMONIZATION (Angov 2011), which
     requires a SOURCE organism's codon usage to preserve relative
@@ -40094,46 +40283,38 @@ def _codon_optimize(protein: str, raw: dict) -> str:
     translation pauses important for cotranslational folding). We only
     consume the target table, so this is pure optimization, not
     harmonization. Renamed 2026-05-01 to stop misleading users."""
-    aa_codons, _ = _codon_build_aa_map(raw)
+    aa_codons, codon_frac = _codon_build_aa_map(raw)
+    # Peel a trailing run of stop requests; a '*' anywhere else is an error.
+    body = protein
+    n_trailing = 0
+    while body and body[-1] == "*":
+        body = body[:-1]
+        n_trailing += 1
+    if "*" in body:
+        raise ValueError(
+            "stop codon '*' is only allowed at the end of the protein")
+    n_stops = n_trailing if n_trailing else max(0, int(stops))
+
     aa_positions: dict = {}
-    for i, aa in enumerate(protein):
-        aa = aa.upper()
-        aa_positions.setdefault(aa, []).append(i)
-    codon_at = [""] * len(protein)
+    for i, aa in enumerate(body):
+        aa_positions.setdefault(aa.upper(), []).append(i)
+    codon_at = [""] * len(body)
     for aa, positions in aa_positions.items():
-        n = len(positions)
         codons_for_aa = aa_codons.get(aa, [])
         if not codons_for_aa:
             raise ValueError(f"No codons for amino acid '{aa}' in this table")
-        if len(codons_for_aa) == 1:
-            for pos in positions:
-                codon_at[pos] = codons_for_aa[0][0]
-            continue
-        targets: list = []
-        remainders: list = []
-        allocated = 0
-        for codon, frac in codons_for_aa:
-            exact   = n * frac
-            floored = int(exact)
-            targets.append(floored)
-            remainders.append((exact - floored, len(targets) - 1))
-            allocated += floored
-        shortage = n - allocated
-        remainders.sort(key=lambda x: -x[0])
-        for k in range(shortage):
-            targets[remainders[k][1]] += 1
-        queues = [[codon] * cnt
-                  for (codon, _), cnt in zip(codons_for_aa, targets) if cnt > 0]
-        interleaved: list = []
-        i = 0
-        while any(queues):
-            q = queues[i % len(queues)]
-            if q:
-                interleaved.append(q.pop(0))
-            i += 1
-        for pos, codon in zip(positions, interleaved):
+        for pos, codon in zip(positions,
+                              _codon_allocate(codons_for_aa, len(positions))):
             codon_at[pos] = codon
-    return "".join(codon_at) + "TAA"
+
+    if n_stops <= 1:
+        tail = "TAA" * n_stops
+    else:
+        stop_codons = sorted(
+            ((c, codon_frac[c]) for c, (a, _ct) in raw.items() if a == "*"),
+            key=lambda x: -x[1])
+        tail = "".join(_codon_allocate(stop_codons or [("TAA", 1.0)], n_stops))
+    return "".join(codon_at) + tail
 
 
 def _forbidden_hit_set(seq: str, patterns) -> set[tuple[str, int]]:
@@ -68494,6 +68675,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
     }
     #syn-codon-table-label { width: auto; padding: 1 1 0 1; color: $text-muted; }
     #syn-codon-table-select { width: 36; }
+    #btn-syn-codon-manage { width: 11; margin-left: 1; }
     #syn-codon-mode-label { width: auto; padding: 1 1 0 2; color: $text-muted; }
     #btn-syn-toggle-codon-mode { width: 22; margin-left: 1; }
     #syn-bottom {
@@ -68639,6 +68821,12 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 id="syn-codon-table-select",
                 allow_blank=False,
             )
+            yield Button(
+                "Manage", id="btn-syn-codon-manage",
+                tooltip="Browse, fetch from Kazusa, import your own (TSV), "
+                        "or delete codon usage tables. Changes show up here "
+                        "immediately.",
+            )
             yield Static("Mode:", id="syn-codon-mode-label")
             yield Button(
                 "Codon-translated", id="btn-syn-toggle-codon-mode",
@@ -68715,6 +68903,50 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
             value = f"{name}|{taxid}"
             opts.append((label, value))
         return opts
+
+    def _refresh_codon_table_options(
+        self, select_choice: "str | None" = None,
+    ) -> None:
+        """Rebuild the codon-table Select from the live registry so a table
+        just fetched / imported / deleted in the manager shows up without
+        reopening Synthesis. Keeps the current selection when it still
+        exists; switches to `select_choice` (a ``name|taxid``) when given and
+        present; otherwise falls back to the first option. Assigning the
+        value drives `_on_codon_table_changed`, which re-applies the table to
+        the ProteinEditor and persists `active_codon_table`."""
+        try:
+            sel = self.query_one("#syn-codon-table-select", Select)
+        except NoMatches:
+            return
+        opts = self._codon_table_options()
+        if not opts:
+            return
+        values = [v for _label, v in opts]
+        target = next(
+            (c for c in (select_choice,
+                          getattr(self, "_codon_table_choice", None))
+              if c and c in values),
+            values[0],
+        )
+        sel.set_options(opts)
+        sel.value = target
+
+    @on(Button.Pressed, "#btn-syn-codon-manage")
+    def _on_manage_codon_tables(self, _) -> None:
+        # Reach the codon-table manager (browse / fetch from Kazusa / import
+        # your own via TSV / delete) without leaving Synthesis. On return the
+        # dropdown is rebuilt so the change is visible immediately; a table
+        # the user "Used" becomes the active selection.
+        self.app.push_screen(SpeciesPickerModal(),
+                             callback=self._codon_manager_closed)
+
+    def _codon_manager_closed(self, entry: "dict | None") -> None:
+        choice = None
+        if entry:
+            name = str(entry.get("name", "") or "?")
+            taxid = str(entry.get("taxid", "") or "")
+            choice = f"{name}|{taxid}"
+        self._refresh_codon_table_options(select_choice=choice)
 
     def on_mount(self) -> None:
         self._refresh_status()
@@ -79746,8 +79978,12 @@ class ConstructorModal(ModalScreen):
 
 class NcbiTaxonPickerModal(_OneShotDismissScreen, ModalScreen):
     """Shown when the user types a non-numeric query in the Kazusa fetch
-    field. Searches NCBI taxonomy (with an auto-wildcard so partial names
-    like 'Escher' match) and lists candidates with their scientific names.
+    field. Searches NCBI taxonomy and lists candidates with their
+    scientific names. The search is lax: partial names auto-wildcard
+    ('Escher' → Escherichia*), and if a precise query finds nothing the
+    cascade in `_ncbi_taxid_search` broadens to related taxa (a genus
+    typo like 'Homon sapiens' is still rescued by the species epithet) —
+    so you rarely need the exact scientific name.
 
     Dismiss: {'taxid': str, 'name': str} when the user picks an entry, or
     None on cancel. The parent (SpeciesPickerModal) then drives the actual
@@ -79769,7 +80005,8 @@ class NcbiTaxonPickerModal(_OneShotDismissScreen, ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="ncbi-box"):
             yield Static(" NCBI Taxonomy  —  Pick a Species ", id="ncbi-title")
-            yield Label("Refine search  (partial names OK — 'Escher' → Escherichia*)")
+            yield Label("Refine search  (partial / imprecise names OK — "
+                        "broadens to related species if there's no exact match)")
             yield Input(value=self._initial_query,
                         placeholder="genus or species (e.g. Escherichia, Homo sapiens)",
                         id="ncbi-query")
@@ -80854,6 +81091,13 @@ class MutagenizeModal(ModalScreen):
                 yield TextArea("", id="mut-prot-aa")
                 with Horizontal(id="mut-prot-row"):
                     yield Input(placeholder="Name (e.g. aeBlue)", id="mut-prot-name")
+                    yield Select(
+                        [("1 stop", "1"), ("2 stops", "2"), ("3 stops", "3")],
+                        value="1", allow_blank=False, id="mut-stops",
+                        tooltip="Stop codons to append when the protein has "
+                                "no trailing '*'. A trailing '*' run in the "
+                                "sequence overrides this; 2–3 stops are "
+                                "frequency-matched to the organism.")
                     yield Button("Optimize → CDS", id="btn-mut-optimize",
                                  variant="primary")
 
@@ -81192,39 +81436,57 @@ class MutagenizeModal(ModalScreen):
             return
         aa_raw = self.query_one("#mut-prot-aa", TextArea).text
         # Strip whitespace, digits, FASTA header markers, and separators —
-        # but NOT '*' (stop): that's a meaningful, invalid-in-middle char
-        # we want to flag explicitly rather than silently drop.
+        # but NOT '*' (stop): a stop is meaningful (a trailing run sets how
+        # many stop codons to emit) and invalid mid-sequence, so we handle
+        # it explicitly rather than silently dropping it.
         aa = re.sub(r"[\s\d>_\-]", "", aa_raw).upper()
         if not aa:
             info.update("[red]Enter a protein sequence.[/red]")
             return
-        # Allow a single trailing stop but reject mid-sequence stops.
-        if "*" in aa[:-1]:
-            info.update("[red]Stop codon '*' not allowed in the middle of the "
+        # Peel a trailing run of stop requests; reject any '*' before it.
+        body = aa
+        n_trailing = 0
+        while body.endswith("*"):
+            body = body[:-1]
+            n_trailing += 1
+        if "*" in body:
+            info.update("[red]Stop codon '*' is only allowed at the END of the "
                         "protein sequence.[/red]")
             return
-        if aa.endswith("*"):
-            aa = aa[:-1]
+        if n_trailing > 3:
+            info.update(f"[red]At most 3 trailing stop codons (you entered "
+                        f"{n_trailing}).[/red]")
+            return
+        if not body:
+            info.update("[red]Enter at least one amino acid.[/red]")
+            return
         valid_aa = set("ACDEFGHIKLMNPQRSTVWY")
-        bad = sorted({c for c in aa if c not in valid_aa})
+        bad = sorted({c for c in body if c not in valid_aa})
         if bad:
             info.update(f"[red]Invalid amino-acid letters: {''.join(bad)}[/red]")
             return
+        # A trailing '*' run wins; otherwise honor the stop-count selector.
+        try:
+            sel_stops = int(str(self.query_one("#mut-stops", Select).value))
+        except (NoMatches, ValueError, TypeError):
+            sel_stops = 1
+        n_stops = n_trailing if n_trailing else sel_stops
         name = self.query_one("#mut-prot-name", Input).value.strip() or "protein"
         info.update("[dim]Optimizing codons…[/dim]")
-        self._optimize_worker(aa, self._codon_entry["raw"], name)
+        self._optimize_worker(body, self._codon_entry["raw"], name, n_stops)
 
     @work(thread=True, exclusive=True, group="mutagenize_optimize")
     def _optimize_worker(self, aa: str, codon_raw: dict,
-                           name: str) -> None:
+                           name: str, stops: int = 1) -> None:
         """Off-thread codon optimisation + IIS-site scrub. Pre-fix this
         ran sync on the button-press handler — a 1 kb CDS hit ~200–400 ms
         in `_codon_optimize` alone, plus the site-scrub pass. Stale-
         record guard (invariant #28) drops the result if the canvas
-        reloaded mid-optimize."""
+        reloaded mid-optimize. ``aa`` is the stop-free body; ``stops`` is
+        how many stop codons to append (1–3)."""
         entry_counter = getattr(self.app, "_record_load_counter", 0)
         try:
-            cds = _codon_optimize(aa, codon_raw)
+            cds = _codon_optimize(aa, codon_raw, stops=stops)
             cds, fixes = _codon_fix_sites(
                 cds, aa, codon_raw,
                 sites={"BsaI": "GGTCTC"},  # only guard the tail enzyme
@@ -94121,9 +94383,13 @@ def _h_set_active_codon_table(app, payload):
 @_agent_endpoint("optimize-protein")
 def _h_optimize_protein(app, payload):
     """Codon-optimize a 1-letter AA sequence to DNA using a codon
-    table from the registry. Body: ``{protein, table?}`` where
-    `table` is a taxid (defaults to E. coli K12 = 83333). Appends a
-    TAA stop. Read-only — doesn't touch the loaded record."""
+    table from the registry. Body: ``{protein, table?, stops?}`` where
+    `table` is a taxid (defaults to E. coli K12 = 83333) and `stops`
+    (0–3, default 1) is how many stop codons to append when `protein`
+    has no trailing '*'. A trailing '*' run in `protein` (1–3) is honored
+    verbatim and overrides `stops`; a single stop is TAA, 2–3 are
+    frequency-matched to the table's stop usage. Read-only — doesn't
+    touch the loaded record."""
     protein = _sanitize_label(payload.get("protein"),
                                 max_len=10_000).upper()
     if not protein:
@@ -94133,13 +94399,20 @@ def _h_optimize_protein(app, payload):
         return ({"error":
                   f"non-canonical amino acids in 'protein': "
                   f"{''.join(sorted(set(invalid_aa)))!r}"}, 400)
+    stops_raw = payload.get("stops", 1)
+    try:
+        stops = int(stops_raw)
+    except (TypeError, ValueError):
+        return ({"error": "'stops' must be an integer between 0 and 3"}, 400)
+    if not 0 <= stops <= 3:
+        return ({"error": "'stops' must be between 0 and 3"}, 400)
     taxid = _sanitize_accession(payload.get("table")) or "83333"
     entry = _codon_tables_get(taxid)
     if entry is None:
         return ({"error": f"no codon table with taxid {taxid!r}; "
                           f"see list-codon-tables"}, 404)
     try:
-        dna = _codon_optimize(protein, entry["raw"])
+        dna = _codon_optimize(protein, entry["raw"], stops=stops)
     except ValueError as exc:
         return ({"error": str(exc)}, 400)
     return {
@@ -100131,6 +100404,7 @@ MutagenizeModal { align: center middle; }
 #mut-prot-row { height: 3; margin-top: 1; }
 #mut-prot-row Input { width: 2fr; margin-right: 1; }
 #mut-prot-row Button { width: 1fr; }
+#mut-stops { width: 14; }
 #mut-cds-info { height: 1; margin: 0 0 1 0; }
 #mut-codon-row { height: 3; margin: 1 0; }
 #mut-codon-label { width: 4fr; padding: 1 1 0 1; }

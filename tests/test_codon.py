@@ -300,6 +300,23 @@ class _FakeResponse:
         return self._body[:amt]
 
 
+# Real NCBI eutils responses open with an EXTERNAL-DTD DOCTYPE (a PUBLIC id +
+# .dtd URL, no internal `[...]` subset). `_safe_xml_parse` refuses ANY DTD
+# unless the caller passes allow_dtd=True, so mocks that OMITTED the DOCTYPE
+# silently diverged from production — which is exactly how the taxon-search
+# "XML parser error" (2026-05-30) shipped despite a green suite. Every NCBI
+# mock below now carries the real preamble so the tests exercise the same
+# parse path the live app hits. See `_ncbi_taxid_search` / [PIT-19].
+_ESEARCH_PREAMBLE = (
+    b'<?xml version="1.0" encoding="UTF-8" ?>\n'
+    b'<!DOCTYPE eSearchResult PUBLIC "-//NLM//DTD esearch 20060628//EN" '
+    b'"https://eutils.ncbi.nlm.nih.gov/eutils/dtd/20060628/esearch.dtd">\n')
+_ESUMMARY_PREAMBLE = (
+    b'<?xml version="1.0" encoding="UTF-8" ?>\n'
+    b'<!DOCTYPE eSummaryResult PUBLIC "-//NLM//DTD esummary v1 20041029//EN" '
+    b'"https://eutils.ncbi.nlm.nih.gov/eutils/dtd/20041029/esummary-v1.dtd">\n')
+
+
 class TestNcbiPrepTerm:
     def test_single_token_uses_subtree_or_wildcard(self):
         """Single-word queries should combine exact-taxon subtree (all species
@@ -337,11 +354,11 @@ class TestNcbiSearch:
     def test_multiple_hits_batched_esummary(self, monkeypatch):
         """Verifies esummary is called once with a comma-joined id list and
         ScientificName is picked up per-DocSum."""
-        esearch_xml = (b"<?xml version=\"1.0\"?><eSearchResult>"
+        esearch_xml = (_ESEARCH_PREAMBLE + b"<eSearchResult>"
                        b"<Count>3</Count><IdList>"
                        b"<Id>561</Id><Id>562</Id><Id>564</Id>"
                        b"</IdList></eSearchResult>")
-        esummary_xml = (b"<?xml version=\"1.0\"?><eSummaryResult>"
+        esummary_xml = (_ESUMMARY_PREAMBLE + b"<eSummaryResult>"
                         b"<DocSum><Id>561</Id>"
                         b"<Item Name=\"ScientificName\" Type=\"String\">"
                         b"Escherichia</Item></DocSum>"
@@ -383,10 +400,10 @@ class TestNcbiSearch:
     def test_total_higher_than_retrieved_mentions_refine(self, monkeypatch):
         """When total hit count exceeds retmax, the status message should
         nudge the user to refine."""
-        esearch_xml = (b"<?xml version=\"1.0\"?><eSearchResult>"
+        esearch_xml = (_ESEARCH_PREAMBLE + b"<eSearchResult>"
                        b"<Count>1200</Count><IdList>"
                        b"<Id>1</Id></IdList></eSearchResult>")
-        esummary_xml = (b"<?xml version=\"1.0\"?><eSummaryResult>"
+        esummary_xml = (_ESUMMARY_PREAMBLE + b"<eSummaryResult>"
                         b"<DocSum><Id>1</Id>"
                         b"<Item Name=\"ScientificName\" Type=\"String\">"
                         b"root</Item></DocSum></eSummaryResult>")
@@ -403,7 +420,7 @@ class TestNcbiSearch:
         assert "refine" in msg.lower()
 
     def test_no_results(self, monkeypatch):
-        xml = (b"<?xml version=\"1.0\"?><eSearchResult>"
+        xml = (_ESEARCH_PREAMBLE + b"<eSearchResult>"
                b"<Count>0</Count><IdList></IdList></eSearchResult>")
 
         def fake_urlopen(req, timeout=None):
@@ -430,7 +447,7 @@ class TestNcbiSearch:
     def test_esummary_failure_still_returns_ids(self, monkeypatch):
         """If esummary fails after esearch succeeds, hits come back with
         fallback '(taxid N)' names so the user can still pick one."""
-        esearch_xml = (b"<?xml version=\"1.0\"?><eSearchResult>"
+        esearch_xml = (_ESEARCH_PREAMBLE + b"<eSearchResult>"
                        b"<Count>1</Count><IdList><Id>4932</Id></IdList>"
                        b"</eSearchResult>")
 
@@ -464,6 +481,184 @@ class TestNcbiSearch:
         assert hits == []
         assert total == 0
         assert "oversized" in msg.lower()
+
+    def test_external_dtd_doctype_response_parses(self, monkeypatch):
+        """Regression (2026-05-30): real NCBI esearch/esummary responses open
+        with an external-DTD DOCTYPE. `_ncbi_taxid_search` must parse them
+        (allow_dtd=True), else every live taxon lookup fails with
+        'Could not parse NCBI response: XML contains DTD/ENTITY — refusing to
+        parse' — the codon-table picker's "XML parser error". The shared
+        mocks above now all carry the DOCTYPE, but assert the happy path here
+        explicitly so the guard can't be lost in a future mock refactor."""
+        esearch = _ESEARCH_PREAMBLE + (
+            b"<eSearchResult><Count>1</Count>"
+            b"<IdList><Id>9606</Id></IdList></eSearchResult>")
+        esummary = _ESUMMARY_PREAMBLE + (
+            b"<eSummaryResult><DocSum><Id>9606</Id>"
+            b"<Item Name=\"ScientificName\" Type=\"String\">"
+            b"Homo sapiens</Item></DocSum></eSummaryResult>")
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            return _FakeResponse(esearch if "esearch" in url else esummary)
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        hits, total, msg = sc._ncbi_taxid_search("Homo sapiens")
+        assert [h["taxid"] for h in hits] == ["9606"]
+        assert hits[0]["name"] == "Homo sapiens"
+        assert total == 1
+        # The defining symptom of the bug was a parse-error status string.
+        assert "parse" not in msg.lower()
+        assert "dtd" not in msg.lower()
+
+
+class TestNcbiTaxidSearchTerms:
+    """Cascading term builder mirrored from ScriptoScope's genbank_search."""
+
+    def test_empty(self):
+        assert sc._ncbi_taxid_search_terms("") == []
+        assert sc._ncbi_taxid_search_terms("   ") == []
+
+    def test_single_token_one_strategy(self):
+        # Single token has no broader form beyond `_ncbi_prep_term`'s
+        # `OR {t}*` clause — so exactly one strategy, no cascade.
+        terms = sc._ncbi_taxid_search_terms("Escherichia")
+        assert terms == [sc._ncbi_prep_term("Escherichia")]
+
+    def test_multi_word_cascade_strict_then_and_then_or(self):
+        terms = sc._ncbi_taxid_search_terms("Homo sapiens")
+        assert terms == [
+            "Homo sapiens*",          # strict (== _ncbi_prep_term)
+            "Homo* AND sapiens*",     # broaden 1: partial genus + species
+            "Homo* OR sapiens*",      # broaden 2: any token → related taxa
+        ]
+
+    def test_strict_strategy_always_equals_prep_term(self):
+        for q in ("Homo sapiens", "Saccharomyces cerevisiae", "Escher", "E"):
+            assert sc._ncbi_taxid_search_terms(q)[0] == sc._ncbi_prep_term(q)
+
+    def test_user_wildcard_or_field_passthrough_no_cascade(self):
+        assert sc._ncbi_taxid_search_terms("Escher*") == ["Escher*"]
+        assert sc._ncbi_taxid_search_terms("coli[Scientific Name]") == \
+            ["coli[Scientific Name]"]
+
+
+class TestNcbiSearchCascade:
+    """Lax/broadening search behaviour: a strict query that returns
+    nothing falls through to broader rounds (AND-wildcard, then
+    OR-wildcard) so a related / imprecise name still surfaces taxa —
+    while a network error aborts immediately."""
+
+    _EMPTY = (_ESEARCH_PREAMBLE + b'<eSearchResult>'
+              b'<Count>0</Count><IdList></IdList></eSearchResult>')
+
+    @staticmethod
+    def _hit(taxid: str) -> bytes:
+        return _ESEARCH_PREAMBLE + (
+            f'<eSearchResult><Count>1</Count>'
+            f'<IdList><Id>{taxid}</Id></IdList></eSearchResult>'
+            ).encode()
+
+    @staticmethod
+    def _summ(taxid: str, name: str) -> bytes:
+        return _ESUMMARY_PREAMBLE + (
+            f'<eSummaryResult><DocSum>'
+            f'<Id>{taxid}</Id><Item Name="ScientificName" '
+            f'Type="String">{name}</Item></DocSum></eSummaryResult>'
+            ).encode()
+
+    @staticmethod
+    def _url(req):
+        return req.full_url if hasattr(req, "full_url") else str(req)
+
+    def test_broadens_to_or_when_stricter_rounds_empty(self, monkeypatch):
+        from urllib.parse import unquote_plus
+        calls: list[str] = []
+
+        def fake(req, timeout=None):
+            url = self._url(req)
+            calls.append(url)
+            if "esummary" in url:
+                return _FakeResponse(self._summ("9606", "Homo sapiens"))
+            # Only the OR-broadened round finds anything.
+            if " OR " in unquote_plus(url):
+                return _FakeResponse(self._hit("9606"))
+            return _FakeResponse(self._EMPTY)
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        # Genus typo — rescued by the species epithet in the OR round.
+        hits, total, msg = sc._ncbi_taxid_search("Homon sapiens")
+        assert [h["taxid"] for h in hits] == ["9606"]
+        assert "broadened" in msg.lower()
+        assert sum("esearch" in u for u in calls) == 3   # strict + AND + OR
+
+    def test_broadens_to_and(self, monkeypatch):
+        from urllib.parse import unquote_plus
+        calls: list[str] = []
+
+        def fake(req, timeout=None):
+            url = self._url(req)
+            calls.append(url)
+            if "esummary" in url:
+                return _FakeResponse(self._summ("4932", "Saccharomyces cerevisiae"))
+            if " AND " in unquote_plus(url):
+                return _FakeResponse(self._hit("4932"))
+            return _FakeResponse(self._EMPTY)
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        hits, total, msg = sc._ncbi_taxid_search("Sacchar cerev")
+        assert [h["taxid"] for h in hits] == ["4932"]
+        assert "broadened" in msg.lower()
+        assert sum("esearch" in u for u in calls) == 2   # strict + AND only
+
+    def test_strict_hit_stops_cascade_and_omits_broadened_hint(self, monkeypatch):
+        calls: list[str] = []
+
+        def fake(req, timeout=None):
+            url = self._url(req)
+            calls.append(url)
+            if "esummary" in url:
+                return _FakeResponse(self._summ("9606", "Homo sapiens"))
+            return _FakeResponse(self._hit("9606"))   # every round would hit
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        hits, total, msg = sc._ncbi_taxid_search("Homo sapiens")
+        assert [h["taxid"] for h in hits] == ["9606"]
+        assert "broadened" not in msg.lower()
+        assert sum("esearch" in u for u in calls) == 1   # stopped at strict
+
+    def test_multi_word_all_empty_exhausts_cascade(self, monkeypatch):
+        calls: list[str] = []
+
+        def fake(req, timeout=None):
+            calls.append(self._url(req))
+            return _FakeResponse(self._EMPTY)
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        hits, total, msg = sc._ncbi_taxid_search("zzz nope")
+        assert hits == []
+        assert total == 0
+        assert "no ncbi" in msg.lower()
+        assert sum("esearch" in u for u in calls) == 3   # tried all 3
+
+    def test_network_error_aborts_cascade_on_first_failure(self, monkeypatch):
+        calls: list[str] = []
+
+        def boom(req, timeout=None):
+            calls.append(self._url(req))
+            raise OSError("connection refused")
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", boom)
+        hits, total, msg = sc._ncbi_taxid_search("Homon sapiens")
+        assert hits == []
+        assert "network error" in msg.lower()
+        assert len(calls) == 1   # did NOT retry broader strategies
 
 
 class TestKazusaSizeCap:
@@ -609,6 +804,59 @@ class TestMutagenizeModalSources:
             await pilot.pause(0.1)
             assert modal._cds_dna != ""
             assert sc._mut_translate(modal._cds_dna) == "MAEVK"
+
+    async def test_protein_stops_selector_appends_triple(self):
+        """The stops selector controls how many stop codons are appended
+        when the protein carries no trailing '*'."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.MutagenizeModal("", [], ""))
+            await pilot.pause(0.3)
+            modal = app.screen
+            modal.query_one("#mut-source").value = "prot"
+            await pilot.pause(0.1)
+            modal.query_one("#mut-prot-aa").text = "MAEV"
+            modal.query_one("#mut-stops").value = "3"
+            await pilot.pause(0.1)
+            modal.query_one("#btn-mut-optimize").action_press()
+            await pilot.pause(0.2)
+            assert len(modal._cds_dna) == 4 * 3 + 3 * 3      # body + 3 stops
+            assert sc._mut_translate(modal._cds_dna) == "MAEV"
+
+    async def test_protein_double_trailing_stop_overrides_selector(self):
+        """A trailing '**' run is honored as two stops even when the
+        selector says 1."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.MutagenizeModal("", [], ""))
+            await pilot.pause(0.3)
+            modal = app.screen
+            modal.query_one("#mut-source").value = "prot"
+            await pilot.pause(0.1)
+            modal.query_one("#mut-prot-aa").text = "MAEV**"
+            modal.query_one("#mut-stops").value = "1"
+            await pilot.pause(0.1)
+            modal.query_one("#btn-mut-optimize").action_press()
+            await pilot.pause(0.2)
+            assert len(modal._cds_dna) == 4 * 3 + 3 * 2      # body + 2 stops
+            assert sc._mut_translate(modal._cds_dna) == "MAEV"
+
+    async def test_protein_rejects_more_than_three_stops(self):
+        """More than three trailing stop codons is rejected, not optimized."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.MutagenizeModal("", [], ""))
+            await pilot.pause(0.3)
+            modal = app.screen
+            modal.query_one("#mut-source").value = "prot"
+            await pilot.pause(0.1)
+            modal.query_one("#mut-prot-aa").text = "MAEV****"
+            modal.query_one("#btn-mut-optimize").action_press()
+            await pilot.pause(0.1)
+            assert modal._cds_dna == ""
 
     async def test_protein_input_rejects_invalid_chars(self):
         app = sc.PlasmidApp()
@@ -1040,3 +1288,471 @@ class TestParseCodonTsv:
         # SpeciesPickerModal wires an Import-TSV handler.
         assert hasattr(sc, "CodonTsvImportModal")
         assert hasattr(sc.SpeciesPickerModal, "_import_tsv")
+
+
+# ── Reachability — Settings entry point + Synthesis live dropdown refresh ────
+
+class TestCodonTableReachability:
+    """Codon-table collections are reachable from Settings (a new launcher)
+    AND from Synthesis (a Manage button next to the dropdown), and the
+    Synthesis dropdown rebuilds from the live registry so a freshly
+    fetched / imported / deleted table shows up without reopening."""
+
+    async def test_settings_codon_tables_opens_manager_and_sets_default(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(170, 50)) as pilot:
+            await pilot.pause()
+            modal = sc.SettingsModal()
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause()
+            from textual.widgets import Button
+            # The launcher opens the codon-table manager (SpeciesPickerModal).
+            modal.query_one("#set-codon-tables", Button).action_press()
+            await pilot.pause()
+            await pilot.pause()
+            assert type(app.screen).__name__ == "SpeciesPickerModal"
+            app.pop_screen()
+            await pilot.pause()
+            # "Use Selected" → callback persists the taxid as the launch
+            # default that SynthesisScreen._init_codon_table honors on open.
+            modal._codon_table_default_picked(
+                {"name": "E. coli K12", "taxid": "83333"})
+            assert sc._get_setting("active_codon_table", "") == "83333"
+            # A taxid-less table can't be the default (no crash, unchanged).
+            modal._codon_table_default_picked({"name": "custom", "taxid": ""})
+            assert sc._get_setting("active_codon_table", "") == "83333"
+            # Cancel (None) leaves the default untouched.
+            modal._codon_table_default_picked(None)
+            assert sc._get_setting("active_codon_table", "") == "83333"
+            app.exit()
+
+    async def test_synthesis_manage_button_and_live_refresh(self, monkeypatch):
+        # Drive the codon registry through a controllable in-memory list so
+        # the test never touches the real codon_tables.json.
+        registry = {"v": [
+            {"name": "E. coli K12", "taxid": "83333",
+             "raw": {"GCT": ("A", 10)}, "source": "builtin"},
+        ]}
+        monkeypatch.setattr(
+            sc, "_codon_tables_load",
+            lambda: [dict(e) for e in registry["v"]])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(170, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(0.3)
+            screen = app.screen
+            from textual.widgets import Button
+            # Manage button sits next to the codon dropdown.
+            assert screen.query_one("#btn-syn-codon-manage", Button) is not None
+            # Simulate the manager adding a user table, then the picker
+            # closing with that table "Used".
+            registry["v"].append(
+                {"name": "My Lab Strain", "taxid": "999999",
+                 "raw": {"GCT": ("A", 7)}, "source": "user"})
+            screen._codon_manager_closed(
+                {"name": "My Lab Strain", "taxid": "999999"})
+            await pilot.pause(0.2)
+            # The rebuilt dropdown now lists the new table …
+            assert ("My Lab Strain|999999"
+                    in [v for _l, v in screen._codon_table_options()])
+            # … and it became the active selection (Select.Changed applied it).
+            assert screen._codon_table_choice == "My Lab Strain|999999"
+            app.exit()
+
+    async def test_synthesis_refresh_falls_back_when_selection_deleted(
+            self, monkeypatch):
+        """If the currently-selected table is deleted in the manager, the
+        refresh falls back to a still-present option instead of a dangling
+        selection."""
+        registry = {"v": [
+            {"name": "E. coli K12", "taxid": "83333",
+             "raw": {"GCT": ("A", 10)}, "source": "builtin"},
+            {"name": "My Lab Strain", "taxid": "999999",
+             "raw": {"GCT": ("A", 7)}, "source": "user"},
+        ]}
+        monkeypatch.setattr(
+            sc, "_codon_tables_load",
+            lambda: [dict(e) for e in registry["v"]])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(170, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(0.3)
+            screen = app.screen
+            # Select the user strain, then "delete" it from the registry.
+            screen._codon_manager_closed(
+                {"name": "My Lab Strain", "taxid": "999999"})
+            await pilot.pause(0.2)
+            assert screen._codon_table_choice == "My Lab Strain|999999"
+            registry["v"] = [registry["v"][0]]    # only K12 remains
+            screen._codon_manager_closed(None)     # cancel after delete
+            await pilot.pause(0.2)
+            # Selection no longer dangles on the deleted table.
+            assert screen._codon_table_choice == "E. coli K12|83333"
+            app.exit()
+
+
+# ── Codon optimization: bulletproofing (zero-tolerance correctness) ──────────
+#
+# The codon optimizer feeds real cloning/synthesis work, so these guard the
+# invariants that "cannot fail": the optimized DNA encodes EXACTLY the input
+# protein, contains only ACGT, is in-frame, carries no premature internal
+# stop, and is deterministic. We assert them as a property sweep over many
+# random proteins plus targeted edge cases. Translation here is done with the
+# raw standard genetic code (`_CODON_GENETIC_CODE`) so the check is
+# independent of the translator used inside the app.
+
+_AA20 = "ACDEFGHIKLMNPQRSTVWY"
+_STOP_CODONS = {"TAA", "TAG", "TGA"}
+
+
+def _translate_std(dna: str) -> str:
+    """3-frame-0 translation via the standard code; '?' for any non-codon.
+    Does NOT stop at stops (so we can see the whole sequence including the
+    appended stop run)."""
+    gc = sc._CODON_GENETIC_CODE
+    return "".join(gc.get(dna[i:i + 3], "?") for i in range(0, len(dna) - 2, 3))
+
+
+def _tail_codons(dna: str, n: int) -> list:
+    return [dna[i:i + 3] for i in range(len(dna) - 3 * n, len(dna), 3)]
+
+
+class TestCodonAllocate:
+    """The shared apportionment helper underpinning both residue and stop
+    placement. Its length guarantee is what makes 'no rogue/empty codon'
+    structurally true."""
+
+    _ALA = [("GCT", 0.40), ("GCC", 0.35), ("GCA", 0.15), ("GCG", 0.10)]
+
+    def test_length_is_exactly_n_for_every_n(self):
+        for n in range(0, 64):
+            out = sc._codon_allocate(self._ALA, n)
+            assert len(out) == n
+            assert all(c in {"GCT", "GCC", "GCA", "GCG"} for c in out)
+
+    def test_zero_and_negative_give_empty(self):
+        assert sc._codon_allocate(self._ALA, 0) == []
+        assert sc._codon_allocate(self._ALA, -7) == []
+
+    def test_single_codon_repeats(self):
+        assert sc._codon_allocate([("ATG", 1.0)], 5) == ["ATG"] * 5
+
+    def test_deterministic(self):
+        assert sc._codon_allocate(self._ALA, 23) == sc._codon_allocate(self._ALA, 23)
+
+    def test_dominant_codon_wins(self):
+        from collections import Counter
+        out = sc._codon_allocate([("GCT", 0.7), ("GCC", 0.2), ("GCA", 0.1)], 100)
+        c = Counter(out)
+        assert c["GCT"] == max(c.values())
+        assert c["GCT"] >= 60
+
+    def test_under_normalized_table_padded_to_n(self):
+        # Fractions sum to 0.5 — apportionment falls short, must still pad.
+        out = sc._codon_allocate([("GCT", 0.25), ("GCC", 0.25)], 8)
+        assert len(out) == 8
+        assert all(c in {"GCT", "GCC"} for c in out)
+
+    def test_over_normalized_table_truncated_to_n(self):
+        # Fractions sum to 2.0 — apportionment overshoots, must not exceed n.
+        out = sc._codon_allocate([("GCT", 1.0), ("GCC", 1.0)], 5)
+        assert len(out) == 5
+
+
+class TestOptimizeProperties:
+    """Core 'optimization actually works / no rogue bases' invariants."""
+
+    def test_property_sweep_2000_proteins(self):
+        import random
+        rng = random.Random(20260530)
+        K12 = sc._CODON_BUILTIN_K12
+        for _ in range(2000):
+            p = "".join(rng.choice(_AA20) for _ in range(rng.randint(0, 60)))
+            dna = sc._codon_optimize(p, K12)
+            assert all(b in "ACGT" for b in dna), (p, dna)     # no rogue base
+            assert len(dna) == 3 * len(p) + 3                  # frame + length
+            assert len(dna) % 3 == 0
+            assert _translate_std(dna) == p + "*"              # exact protein
+            assert dna[-3:] == "TAA"                           # single stop=TAA
+            assert "*" not in _translate_std(dna[:-3])         # no internal stop
+            for i, aa in enumerate(p):                         # every codon right
+                assert K12[dna[3 * i:3 * i + 3]][0] == aa
+            assert sc._codon_optimize(p, K12) == dna           # deterministic
+
+    def test_all_twenty_homopolymers(self):
+        for aa in _AA20:
+            dna = sc._codon_optimize(aa * 17, sc._CODON_BUILTIN_K12)
+            assert _translate_std(dna) == aa * 17 + "*"
+            assert all(b in "ACGT" for b in dna)
+            assert len(dna) == 17 * 3 + 3
+
+    def test_lowercase_input_same_as_upper(self):
+        up = sc._codon_optimize("MAKLEND", sc._CODON_BUILTIN_K12)
+        lo = sc._codon_optimize("maklend", sc._CODON_BUILTIN_K12)
+        assert lo == up
+        assert sc._mut_translate(lo) == "MAKLEND"
+
+    def test_empty_protein_is_lone_stop(self):
+        assert sc._codon_optimize("", sc._CODON_BUILTIN_K12) == "TAA"
+
+    def test_single_residue(self):
+        assert sc._codon_optimize("M", sc._CODON_BUILTIN_K12) == "ATGTAA"
+
+    def test_unknown_aa_raises(self):
+        for bad in ("MAXA", "MZA", "MBK", "MUK", "MOK"):
+            with pytest.raises(ValueError, match="No codons"):
+                sc._codon_optimize(bad, sc._CODON_BUILTIN_K12)
+
+    def test_optimize_then_fix_sites_preserves_protein(self):
+        # Mirrors the Mutagenize worker: optimize → BsaI scrub. The protein
+        # and the stop run must both survive the synonymous swaps.
+        body = "MAKLEDGGRSTVWYFHIQNP" * 3
+        dna = sc._codon_optimize(body, sc._CODON_BUILTIN_K12, stops=2)
+        fixed, _fixes = sc._codon_fix_sites(
+            dna, body, sc._CODON_BUILTIN_K12, {"BsaI": "GGTCTC"})
+        assert len(fixed) == len(dna)
+        assert all(b in "ACGT" for b in fixed)
+        assert sc._mut_translate(fixed) == sc._mut_translate(dna) == body
+
+
+class TestOptimizeStops:
+    """Double / triple stop-codon handling (2026-05-30)."""
+
+    def test_trailing_stops_honored_1_2_3(self):
+        for k in (1, 2, 3):
+            dna = sc._codon_optimize("MGK" + "*" * k, sc._CODON_BUILTIN_K12)
+            assert len(dna) == 3 * 3 + 3 * k
+            assert all(c in _STOP_CODONS for c in _tail_codons(dna, k))
+            assert _translate_std(dna[:9]) == "MGK"          # body intact
+            assert sc._mut_translate(dna) == "MGK"           # truncates at stop
+
+    def test_stops_kwarg_counts(self):
+        for k in (0, 1, 2, 3):
+            dna = sc._codon_optimize("MGK", sc._CODON_BUILTIN_K12, stops=k)
+            assert len(dna) == 9 + 3 * k
+            assert all(c in _STOP_CODONS for c in _tail_codons(dna, k))
+            assert sc._mut_translate(dna) == "MGK"
+
+    def test_trailing_run_overrides_kwarg(self):
+        dna = sc._codon_optimize("MGK***", sc._CODON_BUILTIN_K12, stops=1)
+        assert len(dna) == 9 + 9                              # 3 stops, not 1
+        assert all(c in _STOP_CODONS for c in _tail_codons(dna, 3))
+
+    def test_mid_sequence_stop_raises(self):
+        for bad in ("M*GK", "*MGK", "MG*K", "M**GK", "MG*K*"):
+            with pytest.raises(ValueError, match="only allowed at the end"):
+                sc._codon_optimize(bad, sc._CODON_BUILTIN_K12)
+
+    def test_single_stop_is_always_TAA(self):
+        assert sc._codon_optimize("MGK", sc._CODON_BUILTIN_K12).endswith("TAA")
+        assert sc._codon_optimize("MGK*", sc._CODON_BUILTIN_K12).endswith("TAA")
+        assert sc._codon_optimize(
+            "MGK", sc._CODON_BUILTIN_K12, stops=1).endswith("TAA")
+
+    def test_stops_zero_emits_no_stop(self):
+        dna = sc._codon_optimize("MGK", sc._CODON_BUILTIN_K12, stops=0)
+        assert len(dna) == 9
+        assert sc._mut_translate(dna) == "MGK"
+
+    def test_negative_stops_clamped_to_zero(self):
+        assert (sc._codon_optimize("MGK", sc._CODON_BUILTIN_K12, stops=-5)
+                == sc._codon_optimize("MGK", sc._CODON_BUILTIN_K12, stops=0))
+
+    def test_multi_stops_are_frequency_matched(self):
+        from collections import Counter
+        # E. coli K12: TAA is the most-used stop → it leads the run.
+        tail = _tail_codons(
+            sc._codon_optimize("MGK", sc._CODON_BUILTIN_K12, stops=3), 3)
+        assert all(c in _STOP_CODONS for c in tail)
+        assert Counter(tail).most_common(1)[0][0] == "TAA"
+        # A synthetic TGA-dominant organism → the run is all TGA.
+        tga = dict(sc._CODON_BUILTIN_K12)
+        tga["TGA"] = ("*", 900)
+        tga["TAA"] = ("*", 50)
+        tga["TAG"] = ("*", 50)
+        assert _tail_codons(
+            sc._codon_optimize("MGK", tga, stops=3), 3) == ["TGA", "TGA", "TGA"]
+
+    def test_no_internal_stop_with_multi_stops(self):
+        dna = sc._codon_optimize(
+            "M" + "G" * 30 + "K", sc._CODON_BUILTIN_K12, stops=3)
+        assert "*" not in _translate_std(dna[:-9])           # body has no stop
+
+    def test_table_without_stops_falls_back_to_taa(self):
+        # A custom table that declares no stop codons must still terminate.
+        nostop = {c: v for c, v in sc._CODON_BUILTIN_K12.items()
+                  if v[0] != "*"}
+        dna = sc._codon_optimize("MGK", nostop, stops=2)
+        assert _tail_codons(dna, 2) == ["TAA", "TAA"]
+        assert sc._mut_translate(dna) == "MGK"
+
+
+class TestCodonTableConsistency:
+    """The optimizer trusts the loaded table's codon→AA labels, so every
+    loader MUST pin those labels to the standard genetic code — otherwise an
+    optimized sequence could encode the wrong residue. These cross-checks
+    guard that 'no mismatch' contract for the builtin, Kazusa, and TSV paths.
+    """
+
+    def test_builtin_k12_is_complete_and_standard(self):
+        K12 = sc._CODON_BUILTIN_K12
+        assert len(K12) == 64
+        for codon, (aa, _ct) in K12.items():
+            assert aa == sc._CODON_GENETIC_CODE[codon]
+        aamap, _ = sc._codon_build_aa_map(K12)
+        assert all(aamap.get(a) for a in _AA20)              # all 20 present
+
+    def test_kazusa_table_labels_match_genetic_code(self):
+        raw = sc._codon_parse_kazusa_html(_FAKE_KAZUSA_HTML)
+        assert raw is not None and len(raw) == 64
+        # The parser assigns AAs from _CODON_GENETIC_CODE, never the file —
+        # so no codon can be mislabeled.
+        for codon, (aa, _ct) in raw.items():
+            assert aa == sc._CODON_GENETIC_CODE[codon]
+
+    def test_kazusa_table_optimizes_without_mismatch(self):
+        import random
+        raw = sc._codon_parse_kazusa_html(_FAKE_KAZUSA_HTML)
+        rng = random.Random(11)
+        for _ in range(300):
+            p = "".join(rng.choice(_AA20) for _ in range(rng.randint(1, 40)))
+            dna = sc._codon_optimize(p, raw)
+            assert _translate_std(dna) == p + "*"
+            assert all(b in "ACGT" for b in dna)
+
+    def test_tsv_table_labels_match_and_optimize(self):
+        # A complete TSV built straight from the genetic code.
+        text = "\n".join(f"{c}\t{a}\t10"
+                         for c, a in sc._CODON_GENETIC_CODE.items())
+        raw = sc._parse_codon_tsv(text)
+        assert len(raw) == 64
+        for codon, (aa, _ct) in raw.items():
+            assert aa == sc._CODON_GENETIC_CODE[codon]
+        dna = sc._codon_optimize("MKLAEVNDPQRSTWYF", raw)
+        assert sc._mut_translate(dna) == "MKLAEVNDPQRSTWYF"
+
+    def test_tsv_codon_aa_mismatch_is_rejected(self):
+        # ATG encodes M; a file claiming L must be refused, not silently
+        # loaded (which would later mistranslate the optimized output).
+        with pytest.raises(ValueError, match="encodes"):
+            sc._parse_codon_tsv("ATG\tL\t5\n")
+
+
+class TestKazusaIncompleteDownload:
+    """A Kazusa fetch cut short by a dropped connection / interrupted Wi-Fi
+    must be REJECTED (returns None), never silently accepted as a partial
+    table that would later make the optimizer raise mid-design. The parser
+    requires all 64 codons."""
+
+    @staticmethod
+    def _first_n_codon_rows(n: int) -> str:
+        """The fake table truncated to its first `n` codon rows."""
+        import re
+        kept, out = 0, []
+        for ln in _FAKE_KAZUSA_HTML.splitlines():
+            is_codon = bool(re.search(r"\b[ACGTU]{3}\b\s+\d", ln)) \
+                and "Codon" not in ln
+            if is_codon:
+                if kept >= n:
+                    continue
+                kept += 1
+            out.append(ln)
+        return "\n".join(out)
+
+    def test_complete_table_parses_to_64(self):
+        raw = sc._codon_parse_kazusa_html(_FAKE_KAZUSA_HTML)
+        assert raw is not None and len(raw) == 64
+
+    def test_first_40_codons_rejected(self):
+        assert sc._codon_parse_kazusa_html(self._first_n_codon_rows(40)) is None
+
+    def test_exactly_63_codons_rejected(self):
+        # One missing codon (Gly/GGG row removed) → still rejected.
+        partial = "\n".join(ln for ln in _FAKE_KAZUSA_HTML.splitlines()
+                            if "GGG" not in ln)
+        assert sc._codon_parse_kazusa_html(partial) is None
+
+    def test_midflight_byte_cutoff_rejected(self):
+        # Raw string sliced mid-stream (possibly mid-line), as a dropped
+        # connection would leave it.
+        for cut in (800, 1400, len(_FAKE_KAZUSA_HTML) // 2):
+            assert sc._codon_parse_kazusa_html(_FAKE_KAZUSA_HTML[:cut]) is None
+
+    def test_empty_and_garbage_rejected(self):
+        assert sc._codon_parse_kazusa_html("") is None
+        assert sc._codon_parse_kazusa_html("<html><body></body></html>") is None
+
+    def test_fetch_complete_returns_full_table(self, monkeypatch):
+        import urllib.request
+
+        def fake(req, timeout=None):
+            return _FakeResponse(_FAKE_KAZUSA_HTML.encode())
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        raw, msg = sc._codon_fetch_kazusa("83333")
+        assert raw is not None and len(raw) == 64
+        assert "fetched" in msg.lower()
+
+    def test_fetch_truncated_returns_parse_error(self, monkeypatch):
+        import urllib.request
+
+        def fake(req, timeout=None):
+            return _FakeResponse(_FAKE_KAZUSA_HTML[:1400].encode())
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        raw, msg = sc._codon_fetch_kazusa("83333")
+        assert raw is None
+        assert "parse" in msg.lower()
+
+    def test_fetch_not_found_message(self, monkeypatch):
+        import urllib.request
+
+        def fake(req, timeout=None):
+            return _FakeResponse(b"<html><body>Species not found</body></html>")
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        raw, msg = sc._codon_fetch_kazusa("999999999")
+        assert raw is None
+        assert "not found" in msg.lower()
+
+
+class TestOptimizeProteinEndpoint:
+    """`optimize-protein` agent endpoint. The handler is pure (ignores
+    `app`, reads the codon registry), so we call it directly. The `stops`
+    param is OPTIONAL and backward compatible — omitting it keeps the
+    historical single-TAA behaviour."""
+
+    def test_default_is_single_taa(self):
+        r = sc._h_optimize_protein(None, {"protein": "MGK"})
+        assert r["ok"] is True
+        assert r["dna"].endswith("TAA")
+        assert r["length"] == 12          # 3 residues + 1 stop
+
+    def test_stops_param_appends_that_many(self):
+        r = sc._h_optimize_protein(None, {"protein": "MGK", "stops": 3})
+        assert r["length"] == 9 + 9
+        assert sc._mut_translate(r["dna"]) == "MGK"
+
+    def test_trailing_stars_honored(self):
+        r = sc._h_optimize_protein(None, {"protein": "MGK**"})
+        assert r["length"] == 9 + 6       # two stops
+
+    def test_out_of_range_stops_400(self):
+        _body, code = sc._h_optimize_protein(None, {"protein": "MGK", "stops": 9})
+        assert code == 400
+
+    def test_non_integer_stops_400(self):
+        _body, code = sc._h_optimize_protein(
+            None, {"protein": "MGK", "stops": "lots"})
+        assert code == 400
+
+    def test_mid_sequence_stop_400(self):
+        _body, code = sc._h_optimize_protein(None, {"protein": "M*GK"})
+        assert code == 400
+
+    def test_missing_protein_400(self):
+        _body, code = sc._h_optimize_protein(None, {})
+        assert code == 400

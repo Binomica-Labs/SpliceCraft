@@ -14,6 +14,25 @@
 
 ---
 
+## [1.0.6] — 2026-05-30
+
+### New features
+
+- **Codon Tables are now reachable from Settings.** A new **Codon Tables** button (Settings → Advanced) opens the codon-usage table manager — browse, fetch from Kazusa, import your own (TSV), or delete — and *Use Selected* sets the launch-default table that the Synthesis Protein tab picks up the next time you open it.
+- **Manage codon tables without leaving Synthesis.** A **Manage** button next to the Synthesis codon-table dropdown opens that same manager; anything you fetch, import, or delete appears in the dropdown immediately, and a table you *Use* becomes the active selection.
+- **Append double or triple stop codons when optimizing.** Codon-optimizing a protein in Mutato gains a **stops** selector (1 / 2 / 3) for how many stop codons to append, and a trailing run of `*` in your pasted sequence (e.g. `MGK**`) is honored as-is. Two or three stops are frequency-matched to your organism's own stop-codon usage for robust termination, leading with the strongest terminator.
+
+### Bug fixes
+
+- **Codon-table species search works again.** Searching NCBI for a species or taxon in the codon-table picker (from Synthesis, Mutato, or the Domesticator) failed with an *"XML parser error"* on every query — NCBI's reply opens with a document-type header that the safe XML reader was refusing outright. The reader now accepts NCBI's external header (while still blocking the dangerous kind with internal entity definitions), so species search returns hits as expected.
+
+### Hardening
+
+- **Codon optimization is now covered by an exhaustive correctness sweep.** Thousands of randomized proteins confirm every optimized sequence translates back to exactly your input, contains only A/C/G/T, stays in frame, never introduces a premature internal stop codon, and is reproducible run to run.
+- **Incomplete codon-table downloads are rejected cleanly.** A Kazusa fetch cut short by a dropped connection or interrupted Wi-Fi is now refused up front (a table must contain all 64 codons) instead of loading a partial table that could fail later mid-design. Every loaded table — builtin, Kazusa, or your own TSV — is guaranteed to map codons to amino acids by the standard genetic code, so an optimized sequence can never silently encode the wrong residue.
+
+---
+
 ## [1.0.5] — 2026-05-29
 
 ### New features

@@ -134,7 +134,10 @@ CDS, name the change (say, `L54A`), and SpliceCraft designs the SOE-PCR
 primers for you — with a smart fallback to a 2-primer modified-outer strategy
 when a near-the-end mutation can be folded into a single primer. It checks
 its own work, too: the shortcut is only offered when the primer genuinely
-carries the change, so you never amplify wild-type by accident.
+carries the change, so you never amplify wild-type by accident. It also turns a
+pasted protein into a ready-to-order CDS — frequency-matched codon optimization
+against your chosen table, with a **stops** selector (1–3) that also honors a
+trailing `*` run when you want a double or triple stop codon.
 
 ### Synthesis
 
@@ -143,7 +146,9 @@ horizontally-scrolling linear editor with anti-parallel strand markers, live
 feature stripes, restriction overlay, and AA translation, plus a feature
 library side-pane (Insert to splice, Annotate to overlay). The **Protein
 tab** lets you type or paste amino acids and watch the codons appear underneath
-using your chosen codon table — and a built-in motif library (His6, FLAG, HA, TEV,
+using your chosen codon table — pick a different one or hit **Manage** to fetch
+one from Kazusa, import your own as a TSV, or delete one, all from the dropdown
+and reflected live — and a built-in motif library (His6, FLAG, HA, TEV,
 P2A, NLS, GS linkers, and ~30 more) inserts pre-colored tags. Or hit **Open** to
 load a sequence straight from a single-entry FASTA (or other amino-acid file) — a
 file browser highlights the loadable formats in pink. Compose a part,
@@ -209,7 +214,8 @@ backup — and it's home to **Master Delete**, a triple-gated full wipe for
 when you genuinely want a clean slate (typed `YES`, a default-No confirm, and
 a cool-down on the button; no shortcut, no API). **Settings** collapses every
 toggle (restriction overlay, primer-binding length, and more) into one dialog,
-with launchers for the grammar, entry-vector, and enzyme-collection editors.
+with launchers for the grammar, entry-vector, enzyme-collection, and
+codon-table editors.
 
 Want to drive all of this from a script or an agent? There's a 100+ endpoint
 localhost JSON API (`splicecraft --agent`) and a stdlib-only CLI sidecar
