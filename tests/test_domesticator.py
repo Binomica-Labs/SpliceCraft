@@ -1830,16 +1830,19 @@ class TestPartToClonedSeqRecord:
             "backbone": "pUPD2", "marker": "Spec", "user": True,
         }
         rec = sc._part_to_cloned_seqrecord(part)
-        # Cloned form = oh5 + insert + oh3 + backbone stub.
-        assert str(rec.seq).startswith("AATG" + "ATGAAATAATAA")
+        # Cloned form = oh5 + insert + oh3 + backbone stub. AATG-CDS: the
+        # overhang's ATG IS the start codon, so the body's redundant leading
+        # ATG is collapsed (single start, not the old AATG·ATG double start).
+        assert str(rec.seq).startswith("AATG" + "AAATAATAA")
         # Topology + molecule_type pull through to GenBank serialisation.
         assert rec.annotations["topology"] == "circular"
         assert rec.annotations["molecule_type"] == "DNA"
-        # Single feature spans the insert. Start = len(oh5), len matches.
+        # Single feature spans the insert, extended 3 bp upstream into the
+        # AATG overhang so it still covers the (now-collapsed) start codon.
         assert len(rec.features) == 1
         f = rec.features[0]
-        assert int(f.location.start) == 4
-        assert int(f.location.end) == 4 + len("ATGAAATAATAA")
+        assert int(f.location.start) == 1
+        assert int(f.location.end) == 1 + len("ATGAAATAATAA")
         assert f.type == "CDS"
         assert f.qualifiers.get("label") == ["myCDS"]
 
@@ -4548,7 +4551,9 @@ class TestPartsBinCopyButtons:
             )
             assert len(captured) == 1
             text = captured[0]
-            assert text == "AATG" + "ATGCATGCATGC" + "GCTT" + sc._PUPD2_BACKBONE_STUB
+            # AATG-CDS: the body's redundant leading ATG collapses into the
+            # overhang's start codon (no duplicated start).
+            assert text == "AATG" + "CATGCATGC" + "GCTT" + sc._PUPD2_BACKBONE_STUB
 
     async def test_copy_primed_regenerates_when_field_missing(
             self, isolated_parts_bin, monkeypatch):
@@ -10217,3 +10222,48 @@ class TestReDerivedCdsIncludesStartCodon:
         # Clamp: start can't go negative.
         assert feats[0]["start"] == 0
 
+
+
+class TestCloneAtgFusionNoDoubleStart:
+    """Regression for the 2026-05-30 double-ATG bug: an AATG-CDS part whose
+    stored body still carries the source ATG must NOT produce a duplicated
+    start codon (AATG·ATG…) when assembled / cloned. The designed fwd primer
+    already binds at codon 2, so the simulated assembly must match it.
+    Grammar-agnostic (Golden Braid AND MoClo)."""
+
+    def test_fuse_collapses_aatg_cds(self):
+        # AATG overhang + body that still carries the source ATG -> single ATG.
+        assert sc._fuse_overhang_body("AATG", "ATGGTTAAA", "CDS") == "AATGGTTAAA"
+        # Body already trimmed to codon 2 -> unchanged (idempotent).
+        assert sc._fuse_overhang_body("AATG", "GTTAAA", "CDS") == "AATGGTTAAA"
+
+    def test_fuse_noop_for_moclo_plant_aggt(self):
+        # MoClo Plant CDS oh5 is AGGT (no embedded ATG) -> no collapse.
+        assert sc._fuse_overhang_body("AGGT", "ATGGTT", "CDS") == "AGGTATGGTT"
+
+    def test_fuse_noop_for_noncoding(self):
+        assert sc._fuse_overhang_body("GGAG", "ATGGTT", "Promoter") == "GGAGATGGTT"
+
+    def test_fuse_keeps_met_met_codon2(self):
+        # M-M protein (ATGATG…): drop only the redundant START ATG; the
+        # second ATG (codon 2 Met) stays.
+        assert sc._fuse_overhang_body("AATG", "ATGATGGTT", "CDS") == "AATGATGGTT"
+
+    def test_primed_amplicon_no_double_start(self):
+        amp = sc._simulate_primed_amplicon(
+            "ATGGTTAAACCCGGG", "AATG", "GCTT", part_type="CDS").upper()
+        i = amp.find("AATG")
+        assert amp[i:i + 7] == "AATGGTT"        # overhang ATG, then codon 2
+        assert "AATGATG" not in amp
+
+    def test_cloned_plasmid_no_double_start(self):
+        cl = sc._simulate_cloned_plasmid(
+            "ATGGTTAAACCCGGG", "AATG", "GCTT", part_type="CDS").upper()
+        assert cl.startswith("AATGGTT")
+        assert "AATGATG" not in cl[:10]
+
+    def test_non_cds_part_unaffected(self):
+        # A promoter (no reading frame) keeps its body verbatim behind oh5.
+        amp = sc._simulate_primed_amplicon(
+            "ATGCCCATG", "GGAG", "AATG", part_type="Promoter").upper()
+        assert "GGAGATGCCCATG" in amp

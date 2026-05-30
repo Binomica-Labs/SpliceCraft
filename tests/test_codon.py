@@ -1756,3 +1756,285 @@ class TestOptimizeProteinEndpoint:
     def test_missing_protein_400(self):
         _body, code = sc._h_optimize_protein(None, {})
         assert code == 400
+
+
+class TestNcbiTaxonPickerModalStyle:
+    """The NCBI taxon picker is a centered modal dialog (like the species
+    picker), not a full-screen panel. Empty initial query → no network."""
+
+    async def test_renders_as_centered_dialog(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.NcbiTaxonPickerModal(""))
+            await pilot.pause()
+            box = app.screen.query_one("#ncbi-box")
+            # Centered + bounded box, not the full 171×43 screen.
+            assert box.region.width <= 92        # ~90 + border, not 171
+            assert box.region.x > 0              # inset from the left edge
+            assert box.region.height < 43        # not full height
+            # The list it wraps is present and styled as a bordered list.
+            assert app.screen.query_one("#ncbi-list") is not None
+
+
+class TestPickerDataTables:
+    """The codon-usage list and the NCBI results list are true DataTables
+    (native zebra striping + columns), not ListViews — and selecting a row
+    drives the Use/Fetch button + commit correctly."""
+
+    async def test_codon_list_is_datatable_and_use_commits(self):
+        from textual.widgets import DataTable, Button
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            picked = {}
+            await app.push_screen(
+                sc.SpeciesPickerModal(),
+                callback=lambda e: picked.update(e or {}))
+            await pilot.pause(0.3)
+            modal = app.screen
+            dt = modal.query_one("#sp-list", DataTable)
+            assert dt.zebra_stripes is True
+            assert len(dt.columns) == 3          # Species / Taxid / Source
+            assert len(dt.rows) >= 1             # builtin K12 always present
+            # A row is highlighted → Use is live; Use dismisses with it.
+            dt.move_cursor(row=0)
+            await pilot.pause(0.1)
+            assert modal.query_one("#btn-sp-use", Button).disabled is False
+            expect = dict(modal._entries[0])
+            modal.query_one("#btn-sp-use", Button).action_press()
+            await pilot.pause(0.2)
+            assert picked.get("taxid") == expect["taxid"]
+
+    async def test_ncbi_list_is_datatable_and_populates(self):
+        from textual.widgets import DataTable, Button
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.NcbiTaxonPickerModal(""))
+            await pilot.pause(0.2)
+            modal = app.screen
+            dt = modal.query_one("#ncbi-list", DataTable)
+            assert dt.zebra_stripes is True
+            assert len(dt.columns) == 2          # Species / Taxid
+            # Feed canned hits straight to the result handler (no network).
+            modal._search_done(
+                [{"name": "Homo sapiens", "taxid": "9606"},
+                 {"name": "Mus musculus", "taxid": "10090"}], 2, "2 hits")
+            await pilot.pause(0.1)
+            assert len(dt.rows) == 2
+            assert modal.query_one("#btn-ncbi-use", Button).disabled is False
+            assert modal._hits[0]["taxid"] == "9606"
+
+
+class TestProteinOptimizeToDna:
+    """Synthesis Protein tab → 'Optimize → DNA': codon-optimizes the protein
+    and hands the CDS to the DNA tab as a fresh, editable fragment."""
+
+    async def test_optimizes_and_loads_into_dna_tab(self):
+        from textual.widgets import Select, TabbedContent
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(0.3)
+            screen = app.screen
+            pe = screen.query_one("#syn-protein-editor", sc.ProteinEditor)
+            pe.load("MAEVKLAGHIKQRSTVWY")
+            await pilot.pause(0.1)
+            screen.query_one("#syn-codon-stops", Select).value = "2"
+            await pilot.pause(0.1)
+            screen.query_one("#btn-syn-optimize-dna").action_press()
+            await pilot.pause(0.6)            # threaded worker + apply
+            # The DNA tab is now active and holds the optimized CDS.
+            assert screen.query_one(
+                "#syn-tabs", TabbedContent).active == "syn-tab-dna"
+            ed = screen.query_one("#syn-editor", sc.SynthesisEditor)
+            seq, feats = ed.get_state()
+            assert sc._mut_translate(seq) == "MAEVKLAGHIKQRSTVWY"
+            assert len(seq) == 18 * 3 + 2 * 3       # body + 2 stops
+            assert all(b in "ACGT" for b in seq)
+            assert screen._dirty is True            # fresh unsaved fragment
+            assert screen._loaded_id is None
+            assert any(f.get("type") == "CDS" for f in feats)
+            app.exit()
+
+    async def test_trailing_stops_override_selector(self):
+        from textual.widgets import Select
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(0.3)
+            screen = app.screen
+            screen.query_one("#syn-protein-editor", sc.ProteinEditor).load("MGK***")
+            await pilot.pause(0.1)
+            screen.query_one("#syn-codon-stops", Select).value = "1"
+            await pilot.pause(0.1)
+            screen.query_one("#btn-syn-optimize-dna").action_press()
+            await pilot.pause(0.6)
+            ed = screen.query_one("#syn-editor", sc.SynthesisEditor)
+            seq = ed.get_state()[0]
+            assert len(seq) == 3 * 3 + 3 * 3        # MGK + 3 trailing stops
+            assert sc._mut_translate(seq) == "MGK"
+            app.exit()
+
+    async def test_prompts_before_clobbering_dirty_dna_tab(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(0.3)
+            screen = app.screen
+            screen._dirty = True                    # DNA tab has unsaved edits
+            screen.query_one("#syn-protein-editor", sc.ProteinEditor).load("MAEVK")
+            await pilot.pause(0.1)
+            screen.query_one("#btn-syn-optimize-dna").action_press()
+            await pilot.pause(0.3)
+            assert type(app.screen).__name__ == "SynthesisReplaceDnaConfirmModal"
+            app.screen.query_one("#btn-srd-cancel").action_press()
+            await pilot.pause(0.2)
+            # Cancel returns to Synthesis with the DNA tab untouched.
+            assert type(app.screen).__name__ == "SynthesisScreen"
+            app.exit()
+
+    async def test_staleguard_apply_bails_when_unmounted(self):
+        """If the optimize worker's result lands after the Synthesis screen
+        was torn down, the apply must no-op (is_mounted guard) rather than
+        write into dead widgets. Force the guard deterministically."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(0.3)
+            screen = app.screen
+            ed = screen.query_one("#syn-editor", sc.SynthesisEditor)
+            before = ed.get_state()[0]
+            cls = type(screen)
+            cls.is_mounted = property(lambda self: False)   # simulate teardown
+            try:
+                screen._apply_optimize_to_dna(
+                    "MGK", "ATGGGTAAATAA", [], sc._CODON_BUILTIN_K12, "x", 1)
+                # Guard held — the DNA editor was left untouched.
+                assert ed.get_state()[0] == before
+            finally:
+                del cls.is_mounted                           # restore Widget's
+            app.exit()
+
+
+class TestFixSitesHardening:
+    """The cut-site remover is IUPAC-aware (degenerate sites match real DNA)
+    and robust against odd input (2026-05-30 hardening)."""
+
+    def test_hit_set_matches_degenerate_overlapping(self):
+        # GGWCC = GG[AT]CC → matches GGACC@3 and GGTCC@10 (overlap-safe scan).
+        hits = sc._forbidden_hit_set("AAAGGACCGGGGTCCAA", ("GGWCC",))
+        assert sorted(p for _s, p in hits) == [3, 10]
+
+    def test_hit_set_exact_site_unchanged(self):
+        hits = sc._forbidden_hit_set("GGTCTCAAGGTCTC", ("GGTCTC",))
+        assert sorted(p for _s, p in hits) == [0, 8]
+
+    def test_property_random_forbidden_sets_preserve_protein(self):
+        import random
+        rng = random.Random(99)
+        K12 = sc._CODON_BUILTIN_K12
+        enz = sc._all_enzymes()
+        names = list(enz)
+        for _ in range(300):
+            p = "".join(rng.choice(_AA20) for _ in range(rng.randint(20, 70)))
+            cds = sc._codon_optimize(p, K12)
+            sites = {n: enz[n][0] for n in rng.sample(names, rng.randint(1, 8))}
+            fixed, _f = sc._codon_fix_sites(cds, p, K12, sites)
+            assert sc._mut_translate(fixed) == sc._mut_translate(cds)   # synonymous
+            assert all(b in "ACGT" for b in fixed)                      # no rogue
+            assert len(fixed) == len(cds)                               # 3→3 swaps
+            pats = tuple({s.upper() for s in sites.values()})
+            # Never INTRODUCES a forbidden site (degenerate or exact).
+            assert not (sc._forbidden_hit_set(fixed, pats)
+                        - sc._forbidden_hit_set(cds, pats))
+
+    def test_invalid_site_skipped_not_fatal(self):
+        out, fixes = sc._codon_fix_sites(
+            "ATGGGTAAA", "MG", sc._CODON_BUILTIN_K12, {"Weird": "GGXZ!"})
+        assert out == "ATGGGTAAA" and fixes == []
+
+    def test_empty_sites_is_noop(self):
+        out, fixes = sc._codon_fix_sites(
+            "ATGGGTAAA", "MG", sc._CODON_BUILTIN_K12, {})
+        assert out == "ATGGGTAAA" and fixes == []
+
+    def test_idempotent(self):
+        body = "MAEVKLAGGRSTWND" * 3
+        cds = sc._codon_optimize(body, sc._CODON_BUILTIN_K12)
+        sites = {"BsaI": "GGTCTC", "EcoRI": "GAATTC"}
+        f1, _ = sc._codon_fix_sites(cds, body, sc._CODON_BUILTIN_K12, sites)
+        f2, fx2 = sc._codon_fix_sites(f1, body, sc._CODON_BUILTIN_K12, sites)
+        assert f2 == f1 and fx2 == []
+
+
+class TestForbiddenSitesSetting:
+    """`_codon_forbidden_enzymes` setting → `_codon_fix_sites` site map."""
+
+    @staticmethod
+    def _patch(monkeypatch, names):
+        monkeypatch.setattr(
+            sc, "_get_setting",
+            lambda k, d=None: names if k == "codon_forbidden_enzymes" else d)
+
+    def test_resolves_names_to_sites(self, monkeypatch):
+        self._patch(monkeypatch, ["BsaI", "EcoRI"])
+        sites = sc._codon_forbidden_sites()
+        assert sites.get("BsaI") == "GGTCTC"
+        assert sites.get("EcoRI") == "GAATTC"
+
+    def test_skips_unknown_names(self, monkeypatch):
+        self._patch(monkeypatch, ["BsaI", "NotARealEnzyme"])
+        sites = sc._codon_forbidden_sites()
+        assert "BsaI" in sites and "NotARealEnzyme" not in sites
+
+    def test_empty_list_means_no_scrub(self, monkeypatch):
+        self._patch(monkeypatch, [])
+        assert sc._codon_forbidden_sites() == {}
+
+    def test_label_reflects_count(self, monkeypatch):
+        self._patch(monkeypatch, ["BsaI", "EcoRI", "NdeI"])
+        assert sc._forbidden_sites_label() == "Avoid sites (3)"
+
+
+class TestForbiddenSitesModalAndButtons:
+    """The picker modal + its 'Avoid sites' buttons in Mutato / Synthesis."""
+
+    async def test_modal_toggles_and_returns_selection(self):
+        from textual.widgets import DataTable, Button
+        import types
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            result = {}
+            await app.push_screen(
+                sc.ForbiddenSitesModal(["BsaI"]),
+                callback=lambda r: result.update(picked=r))
+            await pilot.pause(0.2)
+            modal = app.screen
+            assert len(modal.query_one("#fsm-table", DataTable).columns) == 3
+            assert "BsaI" in modal._selected            # pre-selected
+            assert "EcoRI" in modal._rows               # common set listed
+            # Toggle EcoRI on via the row handler.
+            i = modal._rows.index("EcoRI")
+            modal._toggle(types.SimpleNamespace(cursor_row=i))
+            await pilot.pause(0.1)
+            assert "EcoRI" in modal._selected
+            modal.query_one("#btn-fsm-done", Button).action_press()
+            await pilot.pause(0.2)
+            assert set(result["picked"]) == {"BsaI", "EcoRI"}
+
+    async def test_synthesis_has_avoid_sites_button(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(0.3)
+            btn = app.screen.query_one("#btn-syn-forbidden")
+            assert str(btn.label).startswith("Avoid sites")
+            app.exit()

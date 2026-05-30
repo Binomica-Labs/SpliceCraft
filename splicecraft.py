@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -32575,6 +32575,29 @@ def _atg_offset_for_part(part_oh5: str, part_type: str) -> int:
         return 3
     return 0
 
+
+def _fuse_overhang_body(oh5: str, body: str, part_type: str) -> str:
+    """Join a 5' fusion overhang to a coding-part body, COLLAPSING the
+    start-codon overlap.
+
+    When the overhang embeds the start codon (Golden Braid / MoClo ``AATG``
+    = ``A`` spacer + ``ATG`` start; any 4+ nt overhang ending in ATG) AND the
+    stored body still carries that same ATG (the Domesticator-saved
+    convention), drop the body's redundant leading ATG so the fused sequence
+    reads ``AATG[codon2…]`` instead of ``AATG·ATG[codon2…]`` — a duplicated
+    start codon that frameshifts the rest of the ORF (the 2026-05-30 'double
+    ATG' bug). The designed forward primer already binds at codon 2, so this
+    makes the simulated assembly match what the primers produce on the bench.
+
+    Grammar-agnostic via `_atg_offset_for_part` — a no-op for MoClo-Plant
+    ``AGGT``, non-coding parts, or a body already trimmed to codon 2 — so it
+    is safe and idempotent at every site that assembles a part body behind
+    its 5' overhang (Golden Braid AND MoClo)."""
+    off = _atg_offset_for_part(oh5, part_type)
+    if off and str(body)[:3].upper() == "ATG":
+        body = body[off:]
+    return oh5 + body
+
 # Parts-bin TitleCase type → INSDC feature_type. Used by
 # `PartsBinModal._save_as_feature` to round-trip a Golden Braid part into
 # the feature library, where types follow the INSDC vocabulary.
@@ -32671,6 +32694,7 @@ _PUPD2_BACKBONE_STUB: str = _build_pupd2_backbone_stub()
 def _simulate_primed_amplicon(
     insert: str, oh5: str, oh3: str,
     grammar: "dict | None" = None,
+    part_type: str = "",
 ) -> str:
     """PCR amplicon top strand (5'→3'), as it would run on a pre-digest gel.
 
@@ -32689,7 +32713,11 @@ def _simulate_primed_amplicon(
     spacer = g.get("spacer", _GB_SPACER)
     left_tail  = pad + site + spacer
     right_tail = _rc(spacer) + _rc(site) + _rc(pad)
-    return left_tail + oh5 + insert + oh3 + right_tail
+    # `_fuse_overhang_body` collapses the AATG-CDS start-codon overlap so the
+    # amplicon matches the designed primers (which bind at codon 2) — no
+    # duplicated ATG. Grammar-agnostic (GB + MoClo); no-op otherwise.
+    return (left_tail + _fuse_overhang_body(oh5, insert, part_type)
+            + oh3 + right_tail)
 
 
 def _amplicon_from_stored_primers(
@@ -32766,7 +32794,8 @@ def _amplicon_from_stored_primers(
     return fwd + sequence[body_start:body_end] + rev_rc
 
 
-def _simulate_cloned_plasmid(insert: str, oh5: str, oh3: str) -> str:
+def _simulate_cloned_plasmid(insert: str, oh5: str, oh3: str,
+                             part_type: str = "") -> str:
     """Simulated cloned circular plasmid, linearised at the 5' overhang.
 
     After the cloning grammar's enzyme cuts both the amplicon and the
@@ -32780,7 +32809,8 @@ def _simulate_cloned_plasmid(insert: str, oh5: str, oh3: str) -> str:
     that contains no BsaI/Esp3I sites on either strand, so the simulated
     plasmid is guaranteed not to re-cut in either L0 or L1 assembly.
     """
-    return oh5 + insert + oh3 + _PUPD2_BACKBONE_STUB
+    return (_fuse_overhang_body(oh5, insert, part_type)
+            + oh3 + _PUPD2_BACKBONE_STUB)
 
 
 # ── _clone_part_into_entry_vector helpers ─────────────────────────────────
@@ -32886,9 +32916,23 @@ def _clone_part_try_primer_path(
     Returns `(insert_frag, dropout_idx)` on success. `insert_frag`
     carries any pre-built per-source features (multi-source assembly)
     shifted to candidate coordinates."""
-    primed = part.get("primed_seq") or _simulate_primed_amplicon(
-        insert, oh5, oh3, grammar=grammar,
-    )
+    # PCR-faithful: amplify with the part's DESIGNED primers, which bind at
+    # codon 2 for an AATG-CDS so the start codon is supplied only by the
+    # overhang (no duplicated ATG). The pre-baked `primed_seq` is ignored
+    # here — older saves built it via the raw `oh5 + body` formula that
+    # double-counts the AATG start codon. Falls back to the (now
+    # ATG-collapse-aware) synthetic amplicon when primers are absent / don't
+    # bind cleanly.
+    ptype = str(part.get("type") or "")
+    fwd = str(part.get("fwd_primer") or "")
+    rev = str(part.get("rev_primer") or "")
+    primed = ""
+    if fwd and rev:
+        primed = _amplicon_from_stored_primers(fwd, rev, insert, oh5, ptype) or ""
+    if not primed:
+        primed = _simulate_primed_amplicon(
+            insert, oh5, oh3, grammar=grammar, part_type=ptype,
+        )
     insert_frags = _digest_with_enzymes(
         primed, [enzyme], circular=False,
         source_label=part.get("name") or "insert",
@@ -32967,10 +33011,17 @@ def _clone_part_synthesise_insert(
     left_end  = dict(dropout["left"])
     right_end = dict(dropout["right"])
     left_oh   = left_end.get("overhang_seq", "")
-    synth_top = left_oh + oh5 + insert + oh3
+    ptype     = str(part.get("type") or "")
+    # Collapse the AATG-CDS start-codon overlap so the synthesised insert
+    # matches the bench product (the overhang's ATG IS the start codon — the
+    # designed fwd primer binds at codon 2). Grammar-agnostic; no-op for
+    # non-coding / MoClo-Plant AGGT / already-trimmed bodies.
+    fused     = _fuse_overhang_body(oh5, insert, ptype)
+    atg_off   = (len(oh5) + len(insert)) - len(fused)
+    synth_top = left_oh + fused + oh3
     prebuilt = part.get("features")
     if isinstance(prebuilt, list) and prebuilt:
-        shift = len(left_oh) + len(oh5)
+        shift = len(left_oh) + len(oh5) - atg_off
         top_len = len(synth_top)
         built_features: list[dict] = []
         for fr in prebuilt:
@@ -32994,8 +33045,10 @@ def _clone_part_synthesise_insert(
         # the insert annotation covers exactly the user's designed
         # sequence (between oh5 and oh3). The L1-junction overhangs
         # themselves stay untagged.
-        f["start"] = len(left_oh) + len(oh5)
-        f["end"]   = f["start"] + len(insert)
+        # Extend the annotation `atg_off` bases upstream into the overhang
+        # so an AATG-CDS feature still covers the start codon it now supplies.
+        f["start"] = max(0, len(left_oh) + len(oh5) - atg_off)
+        f["end"]   = len(left_oh) + len(fused)
         built_features = [f]
     insert_frag = {
         "top_seq":      synth_top,
@@ -34602,7 +34655,7 @@ def _part_to_cloned_seqrecord(part: dict):
     # Stub backbone fallback — original behaviour pre-2026-05-07.
     oh5 = part.get("oh5", "") or ""
     oh3 = part.get("oh3", "") or ""
-    seq = _simulate_cloned_plasmid(insert, oh5, oh3)
+    seq = _simulate_cloned_plasmid(insert, oh5, oh3, part.get("type", ""))
 
     raw_name = part.get("name") or "part"
     safe_id  = re.sub(r"[^A-Za-z0-9_]", "_", raw_name) or "part"
@@ -34613,8 +34666,14 @@ def _part_to_cloned_seqrecord(part: dict):
     rec.annotations["topology"]      = "circular"
 
     # Insert spans `[len(oh5), len(oh5) + len(insert))` in the linearised
-    # cloned plasmid (oh5 sits at the 5' end of the saved sequence).
-    insert_start = len(oh5)
+    # cloned plasmid (oh5 sits at the 5' end of the saved sequence). For an
+    # AATG-CDS part `_simulate_cloned_plasmid` collapses the body's redundant
+    # start ATG (the overhang supplies the start codon), so the annotation
+    # begins `atg_off` bases earlier — inside the overhang — to still cover
+    # the start codon. `atg_off` is 0 for non-coding / non-ATG overhangs.
+    atg_off = (_atg_offset_for_part(oh5, part.get("type", ""))
+               if str(insert)[:3].upper() == "ATG" else 0)
+    insert_start = max(0, len(oh5) - atg_off)
     insert_end   = insert_start + len(insert)
     ftype = _GB_PART_TYPE_TO_INSDC.get(part.get("type", ""), "misc_feature")
     note_bits = [f"GB part type: {part.get('type', '?')}"]
@@ -36410,6 +36469,11 @@ _SETTINGS_SCHEMA: "dict[str, tuple[tuple, object]]" = {
     # `_init_codon_table`. Agent endpoint
     # `set-active-codon-table` writes this; Synthesis honors on open.
     "active_codon_table":      ((str,),                ""),
+    # Enzyme names whose recognition sites are scrubbed (via synonymous codon
+    # swaps) during codon optimization. Resolved to {name: site} by
+    # `_codon_forbidden_sites`; the picker is `ForbiddenSitesModal`. Default
+    # BsaI (the Golden-Gate tail enzyme) — the historical hardcoded behaviour.
+    "codon_forbidden_enzymes": ((list,),               ["BsaI"]),
     # Crash-recovery dedupe: list of recovery-file basenames already
     # shown to the user so reopened sessions don't repeat the "found
     # unsaved edits from <date>" prompt. Forward-compat passthrough
@@ -40319,17 +40383,25 @@ def _codon_optimize(protein: str, raw: dict, *, stops: int = 1) -> str:
 
 def _forbidden_hit_set(seq: str, patterns) -> set[tuple[str, int]]:
     """Return ``{(pattern, position)}`` for every occurrence of every
-    pattern in *seq*. Codon swaps are 3→3 bases so positions are stable
-    under the swap, which lets us compare before/after hit sets directly."""
+    pattern in *seq*.
+
+    IUPAC-aware (2026-05-30 hardening): a degenerate recognition site
+    (``GGWCC``, ``CCANNNNNNTGG``, ``RGATCY`` …) is matched against concrete
+    A/C/G/T via `_iupac_pattern`, not as a literal substring — so forbidding
+    a degenerate-site enzyme actually finds (and the caller removes) its real
+    sites instead of silently matching nothing. For an exact A/C/G/T site
+    this is identical to the previous `seq.find` scan. Overlapping
+    occurrences are reported via a zero-width lookahead (codon swaps are 3→3
+    bases, so positions stay stable, letting the caller compare before/after
+    hit sets directly). A pattern that isn't valid IUPAC is skipped."""
     out: set[tuple[str, int]] = set()
     for p in patterns:
-        start = 0
-        while True:
-            i = seq.find(p, start)
-            if i == -1:
-                break
-            out.add((p, i))
-            start = i + 1
+        try:
+            pat = _iupac_pattern(p)
+        except ValueError:
+            continue
+        for m in re.finditer(f"(?={pat.pattern})", seq):
+            out.add((p, m.start()))
     return out
 
 
@@ -40370,7 +40442,17 @@ def _codon_fix_sites(dna: str, protein: str, raw: dict,
         sites = _CODON_DEFAULT_FORBIDDEN
     expanded: dict = {}
     for name, site in sites.items():
-        site = site.upper()
+        site = str(site or "").upper()
+        if not site:
+            continue
+        # Validate as an IUPAC recognition site; skip (rather than crash the
+        # whole optimize) an enzyme whose site carries a stray non-IUPAC char.
+        try:
+            _iupac_pattern(site)
+        except ValueError:
+            _log.warning("Codon site-scrub: skipping %r (%s) — not a valid "
+                          "IUPAC recognition site", site, name)
+            continue
         expanded[name] = site
         rc = _mut_revcomp(site)
         if rc != site:
@@ -40380,16 +40462,21 @@ def _codon_fix_sites(dna: str, protein: str, raw: dict,
     # pattern anywhere (different enzyme, different strand, different
     # position — the check is global).
     all_forbidden = tuple(expanded.values())
+    # Precompiled (cached) IUPAC matchers for the per-enzyme outer scan, so
+    # a degenerate site is actually located (not literal-substring searched).
+    site_pats = {nm: _iupac_pattern(st) for nm, st in expanded.items()}
     aa_codons, _ = _codon_build_aa_map(raw)
     dna_list = list(dna)
     fixes: list[str] = []
     for enzyme, site in expanded.items():
+        pat = site_pats[enzyme]
         pos = 0
         while True:
             seq = "".join(dna_list)
-            idx = seq.find(site, pos)
-            if idx == -1:
+            m = pat.search(seq, pos)
+            if m is None:
                 break
+            idx = m.start()
             fixed = False
             lo_codon = max(0, (idx // 3) - 1)
             hi_codon = (idx + len(site)) // 3 + 2
@@ -40441,6 +40528,61 @@ def _codon_fix_sites(dna: str, protein: str, raw: dict,
             if not fixed:
                 pos = idx + 1
     return "".join(dna_list), fixes
+
+
+def _codon_forbidden_sites() -> "dict[str, str]":
+    """Resolve the persisted ``codon_forbidden_enzymes`` name list into the
+    ``{name: recognition_site}`` map that `_codon_fix_sites` consumes, drawing
+    sites from the merged built-in + custom enzyme set. A name that's unknown
+    (e.g. a custom enzyme since deleted) or whose site isn't valid IUPAC is
+    skipped. An empty / missing list means 'scrub nothing'. Default ['BsaI'].
+    """
+    names = _get_setting("codon_forbidden_enzymes", ["BsaI"])
+    if not isinstance(names, list):
+        names = ["BsaI"]
+    enz = _all_enzymes()
+    out: dict[str, str] = {}
+    for n in names:
+        info = enz.get(str(n))
+        if not info:
+            continue
+        site = str(info[0] or "").upper()
+        if not site:
+            continue
+        try:
+            _iupac_pattern(site)
+        except ValueError:
+            continue
+        out[str(n)] = site
+    return out
+
+
+def _forbidden_sites_label() -> str:
+    """Button label showing how many enzyme sites are currently forbidden."""
+    names = _get_setting("codon_forbidden_enzymes", ["BsaI"])
+    n = len(names) if isinstance(names, list) else 0
+    return f"Avoid sites ({n})"
+
+
+def _open_forbidden_sites_picker(screen, button_id: str) -> None:
+    """Open `ForbiddenSitesModal` from `screen`, persist the chosen enzyme
+    list to the shared `codon_forbidden_enzymes` setting, and relabel
+    `button_id` with the new count. Shared by the Mutagenize + Synthesis
+    'Avoid sites' buttons (both surfaces optimize against the same set)."""
+    current = _get_setting("codon_forbidden_enzymes", ["BsaI"])
+    if not isinstance(current, list):
+        current = ["BsaI"]
+
+    def _picked(names: "list | None") -> None:
+        if names is None:
+            return
+        _set_setting("codon_forbidden_enzymes", [str(n) for n in names])
+        try:
+            screen.query_one(button_id, Button).label = _forbidden_sites_label()
+        except NoMatches:
+            pass
+
+    screen.app.push_screen(ForbiddenSitesModal(list(current)), callback=_picked)
 
 
 def _codon_cai(dna: str, raw: dict) -> float:
@@ -55562,9 +55704,10 @@ class PartEditModal(_OneShotDismissScreen, ModalScreen):
             if clean_seq:
                 out["primed_seq"] = _simulate_primed_amplicon(
                     clean_seq, clean_oh5, clean_oh3, grammar=self._grammar,
+                    part_type=clean_ptype,
                 )
                 out["cloned_seq"] = _simulate_cloned_plasmid(
-                    clean_seq, clean_oh5, clean_oh3,
+                    clean_seq, clean_oh5, clean_oh3, clean_ptype,
                 )
             else:
                 out.pop("primed_seq", None)
@@ -56819,7 +56962,7 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
             )
             seq = _simulate_primed_amplicon(
                 r["sequence"], r.get("oh5", ""), r.get("oh3", ""),
-                grammar=part_grammar,
+                grammar=part_grammar, part_type=r.get("type", ""),
             )
         self._copy_and_notify(seq, "primed amplicon", f"{len(seq)} bp")
 
@@ -56855,7 +56998,7 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
             )
             seq = _simulate_cloned_plasmid(
                 r.get("sequence", "") or "",
-                r.get("oh5", ""), r.get("oh3", ""),
+                r.get("oh5", ""), r.get("oh3", ""), r.get("type", ""),
             )
         self._copy_and_notify(
             seq, "cloned plasmid", f"{len(seq)} bp circular",
@@ -68552,6 +68695,70 @@ class SynthesisUnsavedChangesModal(ModalScreen):
         self._dismiss_once(None)
 
 
+class SynthesisReplaceDnaConfirmModal(ModalScreen):
+    """Confirm before an 'Optimize → DNA' hand-off overwrites unsaved
+    DNA-tab edits. Dismisses ``True`` (replace) or ``False`` (cancel)."""
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    DEFAULT_CSS = """
+    SynthesisReplaceDnaConfirmModal { align: center middle; }
+    #srd-dlg {
+        width: 62; height: auto;
+        background: $surface; padding: 1 2;
+        border: solid $warning;
+    }
+    #srd-title { background: $warning; color: black; padding: 0 1; height: 1; }
+    #srd-body { margin: 1 0; }
+    #srd-btns { height: 3; align: right middle; }
+    #srd-btns Button { margin-left: 1; min-width: 12; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="srd-dlg"):
+            yield Static(" Replace DNA fragment? ", id="srd-title")
+            yield Static(
+                "The DNA tab has unsaved edits. Optimizing this protein "
+                "will replace them with the new CDS.",
+                id="srd-body",
+            )
+            with Horizontal(id="srd-btns"):
+                yield Button("Replace", id="btn-srd-replace",
+                              variant="warning")
+                yield Button("Cancel", id="btn-srd-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#btn-srd-cancel", Button).focus()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-srd-replace")
+    def _replace(self, _) -> None:
+        self._dismiss_once(True)
+
+    @on(Button.Pressed, "#btn-srd-cancel")
+    def _cancel_btn(self, _) -> None:
+        self._dismiss_once(False)
+
+    def action_cancel(self) -> None:
+        self._dismiss_once(False)
+
+
 class SynthesisScreen(_OneShotDismissScreen, Screen):
     """Full-screen gene-synthesis composer.
 
@@ -68678,6 +68885,11 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
     #btn-syn-codon-manage { width: 11; margin-left: 1; }
     #syn-codon-mode-label { width: auto; padding: 1 1 0 2; color: $text-muted; }
     #btn-syn-toggle-codon-mode { width: 22; margin-left: 1; }
+    #syn-protein-actions { height: 3; align: left middle; }
+    #syn-codon-stops-label { width: auto; padding: 1 1 0 1; color: $text-muted; }
+    #syn-codon-stops { width: 12; }
+    #btn-syn-forbidden { width: 16; margin-left: 1; }
+    #btn-syn-optimize-dna { width: 18; margin-left: 1; }
     #syn-bottom {
         height: 3; margin-top: 1; align: right middle;
     }
@@ -68832,6 +69044,24 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 "Codon-translated", id="btn-syn-toggle-codon-mode",
                 tooltip="Alt+T — toggle codon display under each AA.",
             )
+        # Optimize-action row: stop count, forbidden sites, hand-off to DNA.
+        with Horizontal(id="syn-protein-actions"):
+            yield Static("Stops:", id="syn-codon-stops-label")
+            yield Select(
+                [("1 stop", "1"), ("2 stops", "2"), ("3 stops", "3")],
+                value="1", allow_blank=False, id="syn-codon-stops",
+                tooltip="Stop codons appended when optimizing. A trailing "
+                        "'*' run in the protein overrides this; 2–3 are "
+                        "frequency-matched to the organism.")
+            yield Button(
+                _forbidden_sites_label(), id="btn-syn-forbidden",
+                variant="default",
+                tooltip="Choose which restriction-enzyme sites to avoid "
+                        "(scrub) during codon optimization.")
+            yield Button(
+                "Optimize → DNA", id="btn-syn-optimize-dna", variant="primary",
+                tooltip="Codon-optimize this protein and open the CDS in the "
+                        "DNA tab as an editable fragment.")
         with Horizontal(id="syn-body-split"):
             with Vertical(id="syn-protein-editor-frame"):
                 yield ProteinEditor(id="syn-protein-editor")
@@ -68947,6 +69177,139 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
             taxid = str(entry.get("taxid", "") or "")
             choice = f"{name}|{taxid}"
         self._refresh_codon_table_options(select_choice=choice)
+
+    # ── Protein → DNA: codon-optimize and hand off to the DNA tab ───────────
+
+    @on(Button.Pressed, "#btn-syn-optimize-dna")
+    def _on_optimize_to_dna(self, _) -> None:
+        """Codon-optimize the protein-tab sequence and open the CDS in the
+        DNA tab as a fresh, editable fragment. Full Mutato parity: the
+        stop-count selector + a trailing-'*' run set the stop count, and the
+        result is BsaI-scrubbed. Prompts before clobbering an unsaved DNA
+        buffer (the DNA tab carries its own dirty flag, `_dirty`)."""
+        try:
+            pe = self.query_one("#syn-protein-editor", ProteinEditor)
+        except NoMatches:
+            return
+        # Sanitize exactly as Mutato does: drop whitespace/digits/separators
+        # but keep '*' so a trailing-stop run is meaningful (and a mid-run
+        # stop is an explicit error rather than a silent drop).
+        aa = re.sub(r"[\s\d>_\-]", "", pe.get_state()[0] or "").upper()
+        if not aa:
+            self.app.notify("Enter a protein sequence first.",
+                             severity="warning")
+            return
+        body = aa
+        n_trailing = 0
+        while body.endswith("*"):
+            body = body[:-1]
+            n_trailing += 1
+        if "*" in body:
+            self.app.notify("Stop codon '*' is only allowed at the END of "
+                            "the protein.", severity="warning")
+            return
+        if n_trailing > 3:
+            self.app.notify(f"At most 3 trailing stop codons (you entered "
+                            f"{n_trailing}).", severity="warning")
+            return
+        if not body:
+            self.app.notify("Enter at least one amino acid.",
+                             severity="warning")
+            return
+        bad = sorted({c for c in body if c not in "ACDEFGHIKLMNPQRSTVWY"})
+        if bad:
+            self.app.notify(f"Invalid amino-acid letters: {''.join(bad)}",
+                             severity="warning")
+            return
+        raw = self._codon_table_raw
+        if not raw:
+            self.app.notify("No codon table selected.", severity="warning")
+            return
+        try:
+            sel_stops = int(str(self.query_one("#syn-codon-stops",
+                                                Select).value))
+        except (NoMatches, ValueError, TypeError):
+            sel_stops = 1
+        n_stops = n_trailing if n_trailing else sel_stops
+        name = self._protein_loaded_name or "optimized protein"
+
+        def _proceed() -> None:
+            # Staleguard: the confirm-modal callback (or any deferred
+            # dispatch) can fire after the Synthesis screen was torn down —
+            # don't kick off a worker against a dead screen. The worker's
+            # apply re-checks `is_mounted` before touching widgets too.
+            if not self.is_mounted:
+                return
+            self.app.notify("Optimizing codons…", timeout=2)
+            self._optimize_to_dna_worker(body, dict(raw), name, n_stops)
+
+        # "Prompt to discard" — only when the DNA tab has unsaved edits.
+        if not self._dirty:
+            _proceed()
+            return
+
+        def _on_confirm(go: "bool | None") -> None:
+            if go:
+                _proceed()
+        self.app.push_screen(SynthesisReplaceDnaConfirmModal(),
+                             callback=_on_confirm)
+
+    @work(thread=True, exclusive=True, group="synthesis_protein_optimize")
+    def _optimize_to_dna_worker(self, body: str, raw: dict,
+                                  name: str, stops: int) -> None:
+        """Off-thread codon-optimize + BsaI site-scrub (mirrors Mutato's
+        `_optimize_worker`)."""
+        try:
+            cds = _codon_optimize(body, raw, stops=stops)
+            cds, fixes = _codon_fix_sites(cds, body, raw,
+                                          sites=_codon_forbidden_sites())
+        except Exception as exc:
+            _log.exception("Synthesis: protein → DNA optimize failed")
+            self.app.call_from_thread(
+                self.app.notify,
+                f"Codon optimization failed: {exc}", severity="error")
+            return
+        self.app.call_from_thread(
+            self._apply_optimize_to_dna, body, cds, fixes, raw, name, stops)
+
+    def _apply_optimize_to_dna(self, body: str, cds: str, fixes: list,
+                                 raw: dict, name: str, stops: int) -> None:
+        if not self.is_mounted:
+            return
+        try:
+            tabs = self.query_one("#syn-tabs", TabbedContent)
+            ed = self.query_one("#syn-editor", SynthesisEditor)
+        except NoMatches:
+            return
+        cds_feat = {
+            "start": 0, "end": len(cds), "label": name, "type": "CDS",
+            "color": _GB_TYPE_COLORS.get("CDS", "white"), "strand": 1,
+            "qualifiers": {"label": [name], "translation": [body]},
+        }
+        # Fresh, unsaved DNA fragment — Save will prompt for a library name.
+        self._loaded_id = None
+        self._loaded_name = name
+        self._saved_snapshot = ("", [])
+        self._dirty = True
+        ed.load(cds, [cds_feat])
+        tabs.active = "syn-tab-dna"
+        self.call_after_refresh(self._focus_dna_editor)
+        self._refresh_status()
+        cai = _codon_cai(cds, raw)
+        gc = _codon_gc(cds)
+        fix_note = f" · {len(fixes)} BsaI fix(es)" if fixes else ""
+        self.app.notify(
+            f"Optimized {len(body)} aa → {len(cds)} nt CDS · "
+            f"CAI {cai:.2f} · GC {gc:.1f}%{fix_note}. "
+            f"Now editable in the DNA tab.",
+            severity="information")
+        _log_event("synthesis.protein.optimize_to_dna",
+                   aa=len(body), nt=len(cds), n_stops=stops,
+                   n_fixes=len(fixes))
+
+    @on(Button.Pressed, "#btn-syn-forbidden")
+    def _on_pick_forbidden_sites(self, _) -> None:
+        _open_forbidden_sites_picker(self, "#btn-syn-forbidden")
 
     def on_mount(self) -> None:
         self._refresh_status()
@@ -73601,9 +73964,10 @@ class DomesticatorModal(ModalScreen):
             "fwd_tm":      d["fwd_tm"],
             "rev_tm":      d["rev_tm"],
             "primed_seq":  _simulate_primed_amplicon(
-                insert, oh5, oh3, grammar=grammar,
+                insert, oh5, oh3, grammar=grammar, part_type=d["part_type"],
             ),
-            "cloned_seq":  _simulate_cloned_plasmid(insert, oh5, oh3),
+            "cloned_seq":  _simulate_cloned_plasmid(
+                insert, oh5, oh3, d["part_type"]),
             "grammar":     grammar_id,
         }
         self.dismiss(part)
@@ -80011,13 +80375,15 @@ class NcbiTaxonPickerModal(_OneShotDismissScreen, ModalScreen):
                         placeholder="genus or species (e.g. Escherichia, Homo sapiens)",
                         id="ncbi-query")
             yield Static("", id="ncbi-info", markup=True)
-            yield ListView(id="ncbi-list")
+            yield DataTable(id="ncbi-list", cursor_type="row",
+                            zebra_stripes=True)
             with Horizontal(id="ncbi-btns"):
                 yield Button("Fetch Selected", id="btn-ncbi-use",
                              variant="primary", disabled=True)
                 yield Button("Cancel  [Esc]", id="btn-ncbi-cancel")
 
     def on_mount(self) -> None:
+        self.query_one("#ncbi-list", DataTable).add_columns("Species", "Taxid")
         if self._initial_query:
             self._start_search(self._initial_query)
         self.query_one("#ncbi-query", Input).focus()
@@ -80046,13 +80412,14 @@ class NcbiTaxonPickerModal(_OneShotDismissScreen, ModalScreen):
         if not self.is_mounted:
             return
         self._hits = hits
-        lv = self.query_one("#ncbi-list", ListView)
-        lv.clear()
+        dt = self.query_one("#ncbi-list", DataTable)
+        dt.clear()
         for h in hits:
-            lv.append(ListItem(Label(
-                f"{h['name']}  [dim](taxid {h['taxid']})[/dim]",
-                markup=True,
-            )))
+            dt.add_row(str(h.get("name", "?") or "?"),
+                       str(h.get("taxid", "") or "—"))
+        # A DataTable auto-highlights row 0 once populated, so Fetch is live
+        # the moment there are hits.
+        self.query_one("#btn-ncbi-use", Button).disabled = not bool(hits)
         info = self.query_one("#ncbi-info", Static)
         if hits:
             info.update(f"[dim]{msg}[/dim]")
@@ -80063,26 +80430,24 @@ class NcbiTaxonPickerModal(_OneShotDismissScreen, ModalScreen):
     def _on_submit(self, _event: Input.Submitted) -> None:
         self._start_search(self.query_one("#ncbi-query", Input).value)
 
-    @on(ListView.Highlighted, "#ncbi-list")
-    def _list_highlighted(self, _) -> None:
-        lv = self.query_one("#ncbi-list", ListView)
-        if lv.index is None:
-            return
-        self.query_one("#btn-ncbi-use", Button).disabled = False
+    @on(DataTable.RowHighlighted, "#ncbi-list")
+    def _list_highlighted(self, event) -> None:
+        if 0 <= getattr(event, "cursor_row", -1) < len(self._hits):
+            self.query_one("#btn-ncbi-use", Button).disabled = False
 
-    @on(ListView.Selected, "#ncbi-list")
-    def _list_selected(self, _) -> None:
-        lv = self.query_one("#ncbi-list", ListView)
-        if lv.index is None:
-            return
-        self.dismiss(self._hits[lv.index])
+    @on(DataTable.RowSelected, "#ncbi-list")
+    def _list_selected(self, event) -> None:
+        # Click / Enter on a row commits it (mirrors the original ListView).
+        row = getattr(event, "cursor_row", -1)
+        if 0 <= row < len(self._hits):
+            self.dismiss(self._hits[row])
 
     @on(Button.Pressed, "#btn-ncbi-use")
     def _use(self, _) -> None:
-        lv = self.query_one("#ncbi-list", ListView)
-        if lv.index is None:
-            return
-        self.dismiss(self._hits[lv.index])
+        dt = self.query_one("#ncbi-list", DataTable)
+        row = dt.cursor_row
+        if isinstance(row, int) and 0 <= row < len(self._hits):
+            self.dismiss(self._hits[row])
 
     @on(Button.Pressed, "#btn-ncbi-cancel")
     def _cancel_btn(self, _) -> None:
@@ -80273,7 +80638,8 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
             yield Input(placeholder="search by genus, species, or taxid "
                                     "(e.g. Escherichia, coli, 9606)",
                         id="sp-filter")
-            yield ListView(id="sp-list")
+            yield DataTable(id="sp-list", cursor_type="row",
+                            zebra_stripes=True)
             yield Static("", id="sp-info", markup=True)
             with Horizontal(id="sp-fetch-row"):
                 yield Input(placeholder="taxid or name (e.g. 9606, Homo sapiens, "
@@ -80293,19 +80659,19 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
                 yield Button("Cancel  [Esc]", id="btn-sp-cancel")
 
     def on_mount(self) -> None:
+        dt = self.query_one("#sp-list", DataTable)
+        dt.add_columns("Species", "Taxid", "Source")
         self._refresh_list("")
         self.query_one("#sp-filter", Input).focus()
 
     def _refresh_list(self, query: str) -> None:
-        lv = self.query_one("#sp-list", ListView)
-        lv.clear()
+        dt = self.query_one("#sp-list", DataTable)
+        dt.clear()
         self._entries: list = _codon_search(query)
         for e in self._entries:
-            tax = f" (taxid {e['taxid']})" if e.get("taxid") else ""
-            src = e.get("source", "user")
-            tag = f"[{src}]"
-            lv.append(ListItem(Label(f"{e['name']}{tax}   [dim]{tag}[/dim]",
-                                     markup=True)))
+            taxid = str(e.get("taxid", "") or "—")
+            src = str(e.get("source", "user") or "user")
+            dt.add_row(str(e.get("name", "?") or "?"), taxid, src)
         info = self.query_one("#sp-info", Static)
         if not self._entries:
             info.update("[dim]No matching entries. Use the fetch row below to "
@@ -80316,8 +80682,22 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
                 info.update(f"[dim]{summary}[/dim]")
             else:
                 info.update(f"[dim]{len(self._entries)} table(s) in library.[/dim]")
-        self.query_one("#btn-sp-use", Button).disabled = True
-        self.query_one("#btn-sp-delete", Button).disabled = True
+        self._sync_row_buttons()
+
+    def _sync_row_buttons(self) -> None:
+        """Use/Delete enablement for the DataTable's currently-highlighted
+        row (a DataTable always has a cursor row when non-empty, so Use is
+        live as soon as the list has entries; Delete respects built-ins)."""
+        has = bool(self._entries)
+        try:
+            row = self.query_one("#sp-list", DataTable).cursor_row
+        except NoMatches:
+            row = 0
+        if not (isinstance(row, int) and 0 <= row < len(self._entries)):
+            row = 0
+        self.query_one("#btn-sp-use", Button).disabled = not has
+        self.query_one("#btn-sp-delete", Button).disabled = (
+            not has or self._entries[row].get("source") == "builtin")
 
     @staticmethod
     def _genus_summary(query: str, entries: list) -> str:
@@ -80342,41 +80722,29 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
     def _filter_changed(self, event: Input.Changed) -> None:
         self._refresh_list(event.value)
 
-    @on(ListView.Selected, "#sp-list")
-    def _list_selected(self, _) -> None:
-        lv = self.query_one("#sp-list", ListView)
-        if lv.index is None:
-            return
-        self.query_one("#btn-sp-use", Button).disabled = False
-        entry = self._entries[lv.index]
-        self.query_one("#btn-sp-delete", Button).disabled = (
-            entry.get("source") == "builtin"
-        )
-
-    @on(ListView.Highlighted, "#sp-list")
-    def _list_highlighted(self, _) -> None:
-        lv = self.query_one("#sp-list", ListView)
-        if lv.index is None:
-            return
-        entry = self._entries[lv.index]
-        self.query_one("#btn-sp-use", Button).disabled = False
-        self.query_one("#btn-sp-delete", Button).disabled = (
-            entry.get("source") == "builtin"
-        )
+    @on(DataTable.RowHighlighted, "#sp-list")
+    @on(DataTable.RowSelected, "#sp-list")
+    def _row_changed(self, _event) -> None:
+        # Selecting a row never dismisses on its own (matches the original
+        # ListView flow) — it just re-syncs the Use/Delete buttons for the
+        # now-current row. "Use Selected" is the explicit commit.
+        self._sync_row_buttons()
 
     @on(Button.Pressed, "#btn-sp-use")
     def _use(self, _) -> None:
-        lv = self.query_one("#sp-list", ListView)
-        if lv.index is None:
+        dt = self.query_one("#sp-list", DataTable)
+        row = dt.cursor_row
+        if not (isinstance(row, int) and 0 <= row < len(self._entries)):
             return
-        self.dismiss(self._entries[lv.index])
+        self.dismiss(self._entries[row])
 
     @on(Button.Pressed, "#btn-sp-delete")
     def _delete(self, _) -> None:
-        lv = self.query_one("#sp-list", ListView)
-        if lv.index is None:
+        dt = self.query_one("#sp-list", DataTable)
+        row = dt.cursor_row
+        if not (isinstance(row, int) and 0 <= row < len(self._entries)):
             return
-        entry = self._entries[lv.index]
+        entry = self._entries[row]
         if entry.get("source") == "builtin":
             return
         all_entries = _codon_tables_load()
@@ -80510,12 +80878,134 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
             self._refresh_list(self.query_one("#sp-filter", Input).value)
             for i, e in enumerate(self._entries):
                 if str(e.get("taxid")) == str(taxid):
-                    self.query_one("#sp-list", ListView).index = i
+                    self.query_one("#sp-list", DataTable).move_cursor(row=i)
+                    self._sync_row_buttons()
                     break
         except Exception:
             _log.exception("SpeciesPickerModal fetch-callback failed")
 
     @on(Button.Pressed, "#btn-sp-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ForbiddenSitesModal(_OneShotDismissScreen, ModalScreen):
+    """Pick the restriction-enzyme recognition sites to AVOID during codon
+    optimization. The common cloning / Type-IIS enzymes are listed by
+    default; the search box reaches the full built-in + custom enzyme set
+    (degenerate sites like ``GGWCC`` are matched correctly by the scrubber).
+    Dismisses with the chosen ``list[str]`` of enzyme names, or None on
+    cancel; the selection round-trips through `_codon_forbidden_sites`."""
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    DEFAULT_CSS = """
+    ForbiddenSitesModal { align: center middle; }
+    #fsm-box {
+        width: 72; height: auto; max-height: 36;
+        background: $surface; border: solid $accent; padding: 1 2;
+    }
+    #fsm-title { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+    #fsm-box Label { color: $text-muted; margin-top: 1; }
+    #fsm-table { height: 16; border: solid $primary-darken-2; }
+    #fsm-info { height: 1; margin: 1 0; }
+    #fsm-btns { height: 3; margin-top: 1; }
+    #fsm-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self, selected: "list[str] | None" = None) -> None:
+        super().__init__()
+        self._selected: set[str] = {str(n) for n in (selected or [])}
+        self._all: dict = {}
+        self._rows: list[str] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="fsm-box"):
+            yield Static(" Forbidden cut sites  —  avoided during optimization ",
+                         id="fsm-title")
+            yield Label("Search enzymes  (blank = common cloning enzymes + "
+                        "your current picks; type to reach the full set)")
+            yield Input(placeholder="e.g. BsaI, EcoRI, Esp3I, AvaII",
+                        id="fsm-search")
+            yield DataTable(id="fsm-table", cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("", id="fsm-info", markup=True)
+            with Horizontal(id="fsm-btns"):
+                yield Button("Done", id="btn-fsm-done", variant="primary")
+                yield Button("Clear all", id="btn-fsm-clear")
+                yield Button("Cancel  [Esc]", id="btn-fsm-cancel")
+
+    def on_mount(self) -> None:
+        self._all = _all_enzymes()
+        dt = self.query_one("#fsm-table", DataTable)
+        dt.add_columns("On", "Enzyme", "Site")
+        self._refresh("")
+        self.query_one("#fsm-search", Input).focus()
+
+    def _visible_names(self, query: str) -> list[str]:
+        q = query.strip().lower()
+        if q:
+            return sorted(n for n in self._all if q in n.lower())
+        # Blank search: the common cloning set, plus any current picks that
+        # aren't already in it (so a fetched/searched pick stays visible).
+        common = [n for n in _CODON_DEFAULT_FORBIDDEN if n in self._all]
+        extras = sorted(n for n in self._selected
+                        if n in self._all and n not in common)
+        return common + extras
+
+    def _refresh(self, query: str) -> None:
+        dt = self.query_one("#fsm-table", DataTable)
+        dt.clear()
+        self._rows = self._visible_names(query)
+        for n in self._rows:
+            mark = "✓" if n in self._selected else " "
+            dt.add_row(mark, n, self._all[n][0])
+        self._update_info()
+
+    def _update_info(self) -> None:
+        try:
+            self.query_one("#fsm-info", Static).update(
+                f"[dim]{len(self._selected)} enzyme(s) forbidden · "
+                f"Enter / click a row to toggle.[/dim]")
+        except NoMatches:
+            pass
+
+    @on(Input.Changed, "#fsm-search")
+    def _on_search(self, event: Input.Changed) -> None:
+        self._refresh(event.value)
+
+    @on(DataTable.RowSelected, "#fsm-table")
+    def _toggle(self, event) -> None:
+        row = getattr(event, "cursor_row", -1)
+        if not (isinstance(row, int) and 0 <= row < len(self._rows)):
+            return
+        name = self._rows[row]
+        if name in self._selected:
+            self._selected.discard(name)
+        else:
+            self._selected.add(name)
+        # Update just the toggle cell so the cursor + scroll stay put.
+        self.query_one("#fsm-table", DataTable).update_cell_at(
+            _Coordinate(row, 0), "✓" if name in self._selected else " ")
+        self._update_info()
+
+    @on(Button.Pressed, "#btn-fsm-clear")
+    def _clear(self, _) -> None:
+        self._selected.clear()
+        self._refresh(self.query_one("#fsm-search", Input).value)
+
+    @on(Button.Pressed, "#btn-fsm-done")
+    def _done(self, _) -> None:
+        self.dismiss(sorted(self._selected))
+
+    @on(Button.Pressed, "#btn-fsm-cancel")
     def _cancel_btn(self, _) -> None:
         self.dismiss(None)
 
@@ -81108,6 +81598,10 @@ class MutagenizeModal(ModalScreen):
                 yield Static("Codon table: [bold]E. coli K12[/bold] (taxid 83333)",
                              id="mut-codon-label", markup=True)
                 yield Button("Change", id="btn-mut-codon", variant="default")
+                yield Button(_forbidden_sites_label(), id="btn-mut-forbidden",
+                             variant="default",
+                             tooltip="Choose which restriction-enzyme sites to "
+                                     "avoid (scrub) during codon optimization.")
 
             # ── CDS preview  (DNA + AA, or AA only for the protein source) ──
             # Click-aware: clicking an AA opens AminoAcidPickerModal and
@@ -81489,7 +81983,7 @@ class MutagenizeModal(ModalScreen):
             cds = _codon_optimize(aa, codon_raw, stops=stops)
             cds, fixes = _codon_fix_sites(
                 cds, aa, codon_raw,
-                sites={"BsaI": "GGTCTC"},  # only guard the tail enzyme
+                sites=_codon_forbidden_sites(),
             )
         except Exception as exc:
             _log.exception("Mutagenize: optimize failed")
@@ -81620,6 +82114,10 @@ class MutagenizeModal(ModalScreen):
         lbl = self.query_one("#mut-codon-label", Static)
         tax = f" (taxid {entry['taxid']})" if entry.get("taxid") else ""
         lbl.update(f"Codon table: [bold]{entry['name']}[/bold]{tax}")
+
+    @on(Button.Pressed, "#btn-mut-forbidden")
+    def _pick_forbidden_sites(self, _) -> None:
+        _open_forbidden_sites_picker(self, "#btn-mut-forbidden")
 
     # ── Design ───────────────────────────────────────────────────────────
 
@@ -100458,6 +100956,20 @@ SpeciesPickerModal { align: center middle; }
 #sp-fetch-row Button { width: 1fr; }
 #sp-btns     { height: 3; margin-top: 1; }
 #sp-btns Button { margin-right: 1; }
+
+/* ── NCBI taxon picker modal (centered dialog — mirrors the species
+      picker above so it matches the rest of the app's modals) ───────── */
+NcbiTaxonPickerModal { align: center middle; }
+#ncbi-box {
+    width: 90; height: auto; max-height: 34;
+    background: $surface; border: solid $accent; padding: 1 2;
+}
+#ncbi-title  { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#ncbi-box Label { color: $text-muted; margin-top: 1; }
+#ncbi-list   { height: 16; border: solid $primary-darken-2; }
+#ncbi-info   { height: 1; margin: 1 0; }
+#ncbi-btns   { height: 3; margin-top: 1; }
+#ncbi-btns Button { margin-right: 1; }
 
 /* ── Primer design screen (full-screen, Option B tabbed layout) ────── */
 #pd-box {

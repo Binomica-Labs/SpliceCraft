@@ -137,7 +137,9 @@ its own work, too: the shortcut is only offered when the primer genuinely
 carries the change, so you never amplify wild-type by accident. It also turns a
 pasted protein into a ready-to-order CDS — frequency-matched codon optimization
 against your chosen table, with a **stops** selector (1–3) that also honors a
-trailing `*` run when you want a double or triple stop codon.
+trailing `*` run when you want a double or triple stop codon, and an **Avoid
+sites** picker that scrubs your chosen restriction-enzyme cut sites out of the
+optimized CDS.
 
 ### Synthesis
 
@@ -149,7 +151,10 @@ tab** lets you type or paste amino acids and watch the codons appear underneath
 using your chosen codon table — pick a different one or hit **Manage** to fetch
 one from Kazusa, import your own as a TSV, or delete one, all from the dropdown
 and reflected live — and a built-in motif library (His6, FLAG, HA, TEV,
-P2A, NLS, GS linkers, and ~30 more) inserts pre-colored tags. Or hit **Open** to
+P2A, NLS, GS linkers, and ~30 more) inserts pre-colored tags. Hit **Optimize →
+DNA** to codon-optimize the protein (with the same stop-count and **Avoid
+sites** controls as Mutato) and hand the CDS straight to the DNA tab as an
+editable fragment. Or hit **Open** to
 load a sequence straight from a single-entry FASTA (or other amino-acid file) — a
 file browser highlights the loadable formats in pink. Compose a part,
 hit **Clone Fragment**, and it's handed straight to the Domesticator as an L0

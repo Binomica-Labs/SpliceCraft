@@ -14,6 +14,24 @@
 
 ---
 
+## [1.0.7] — 2026-05-30
+
+### New features
+
+- **Codon-optimize a protein straight into the DNA tab.** The Synthesis **Protein** tab gains an **Optimize → DNA** button: it codon-optimizes your protein — with a stop-count selector (1–3, plus a trailing `*` run is honored) and restriction-site scrubbing — and drops the resulting CDS into the **DNA** tab as a fresh, editable fragment, ready to tinker with and save. If the DNA tab already holds unsaved edits, it asks before replacing them.
+- **Choose which restriction sites to avoid when optimizing.** A new **Avoid sites** picker — in both Mutato and the Synthesis Protein tab — lets you pick exactly which enzyme cut sites codon optimization should scrub out. The common cloning enzymes are one click away, and a search box reaches the full enzyme set, including your own custom enzymes. Your choice is remembered and shared between both tools. (Still defaults to BsaI.)
+- **Cleaner codon-table pop-ups.** The NCBI species-search dialog now opens as a centered, framed pop-up (it previously filled the whole screen edge to edge), matching the rest of SpliceCraft's modals. The codon-usage table and the species-search results are now proper tables — columns (species · taxid · source) with alternating row shading — so long lists are far easier to scan.
+
+### Bug fixes
+
+- **No duplicated start codon when cloning a CDS part.** Cloning a Golden Braid / MoClo **CDS** part whose body begins with its own `ATG` was prepending the `AATG` fusion overhang in front of it, leaving a double start codon (`AATG·ATG…`) in the simulated cloned plasmid — even though the designed primers correctly bind at codon 2. The clone simulation now amplifies with the actual primers (and the parts-bin amplicon / cloned-plasmid previews and the saved `primed_seq` collapse the same overlap), so the cloned sequence has a single start codon with the CDS annotation still covering it. Grammar-agnostic — Golden Braid *and* MoClo.
+
+### Hardening
+
+- **Codon optimization scrubs degenerate cut sites correctly.** The site remover now recognizes enzymes with ambiguous recognition sequences (e.g. AvaII's `GGWCC`, BstXI's `CCANNNNNNTGG`) by matching them against real A/C/G/T — previously such a site could slip through unscrubbed, giving a false sense of safety. Across thousands of randomized proteins × enzyme combinations, every optimized-and-scrubbed sequence still translates back to exactly your protein, stays in frame with only A/C/G/T, and never introduces a *new* forbidden site; an enzyme whose recognition site can't be parsed is skipped instead of failing the whole optimization.
+
+---
+
 ## [1.0.6] — 2026-05-30
 
 ### New features
