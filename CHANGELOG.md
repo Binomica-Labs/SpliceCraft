@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.10] — 2026-05-31
+
+### New features
+
+- **The bulk-align confirm window now shows the real alignment quality for each read.** Next to the k-mer match score — which only tells you *which* library plasmid a read belongs to — every row that's set to align now shows **Identity**, **Mism** (mismatched bases), and **Gaps**, computed by actually aligning each read against its matched plasmid. The alignment runs once, while you press **Bulk auto-align** (the progress bar counts through it), so the confirm window opens with every read's quality already filled in — and that same alignment is reused when you commit, so nothing is aligned twice. A read that's a single base off now reads `99.99% · 1 · 0` here *before* you commit — where the k-mer score alone rounded to "100%" for both perfect and near-perfect reads (a circular plasmid's k-mer score sits at ~99.8% even for a flawless read, so it can't tell a 1-base mismatch apart from perfect).
+
+---
+
 ## [1.0.9] — 2026-05-31
 
 ### New features

@@ -194,7 +194,11 @@ linear map (green match / red mismatch / gray gap) with its name painted
 right onto the bar so a multi-read pile-up stays readable — and even a
 single-base mismatch shows up red when the whole plasmid is zoomed to fit,
 rather than being swallowed by the surrounding match. **Bulk auto-align**
-matches a whole results folder against your library in one pass, and the
+matches a whole results folder against your library in one pass — and its
+confirm window shows each read's real **identity, mismatched-base, and gap
+counts** (computed by actually aligning, not just the name/k-mer match
+score), ready when the window opens so you can see how clean every read is
+before you commit. The
 **Verification Report** grades every construct (✓ verified / ⚠ near-match /
 ~ partial / ✗ divergent) in one sortable table — click a row to jump to the
 first variant. The **Alignment Manager** lists every stored alignment with

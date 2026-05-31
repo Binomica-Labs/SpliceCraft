@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.9"
+__version__ = "1.0.10"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -62784,10 +62784,79 @@ class SequencingScreen(Screen):
             self.app.call_from_thread(_err)
             return
 
+        # 2026-05-31: align each target-bearing sample NOW, on this same
+        # button-press worker (with progress), so the confirm modal opens
+        # with real Identity/Mism/Gaps already shown AND the commit can
+        # reuse the result. Pre-fix the modal re-aligned on open (slow,
+        # felt like a hang) and the commit aligned a THIRD time — the
+        # same ~18 kb pairwise twice over. Now it runs exactly once here.
+        self._compute_bulk_quality(matches)
+
         def _ok():
             self._reset_bulk_align_button()
             self._push_bulk_confirm_modal(matches)
         self.app.call_from_thread(_ok)
+
+    def _compute_bulk_quality(self, matches: "list[dict]") -> None:
+        """Align each target-bearing sample against its proposed match,
+        on the matcher worker thread, stashing the display summary
+        (`_aln` = ``{ident, mism, gaps}``) AND the full
+        `_pick_best_rotation` result (`_aln_result`, reused verbatim by
+        `_bulk_align_worker` so the commit never re-aligns) on each match
+        dict. Progress ticks the bar the matcher phase already raised.
+        Rows with no target / no consensus member get ``_aln = False``
+        (rendered "?"). Runs the SAME `_pick_best_rotation(...,
+        canvas_axis="target")` call the commit used to run, so the cached
+        result is byte-for-byte what the commit would have computed."""
+        n = len(matches)
+        for i, m in enumerate(matches, 1):
+            target_entry = m.get("target_entry") or {}
+            tgt_gb = target_entry.get("gb_text") or ""
+            sample = m.get("sample") or {}
+            gbk_member = sample.get("gbk")
+            if not tgt_gb or not gbk_member or not self._zip_path:
+                m["_aln"] = False
+                continue
+            sample_name = sample.get("name") or sample.get("base") or "?"
+
+            def _tick(i=i, nm=sample_name):
+                try:
+                    from textual.widgets import ProgressBar
+                    txt = self.query_one("#bulk-align-progress", Static)
+                    bar = self.query_one("#bulk-align-bar", ProgressBar)
+                    txt.update(
+                        f"[b]Aligning {i}/{n}:[/b] {nm}…"
+                    )
+                    bar.update(total=max(1, n), progress=i - 1)
+                except (NoMatches, AttributeError):
+                    pass
+            self.app.call_from_thread(_tick)
+            try:
+                query_rec = _gb_text_to_record(
+                    _extract_gbk_member(self._zip_path, gbk_member))
+                target_rec = _gb_text_to_record(tgt_gb)
+                is_circular = (
+                    (target_rec.annotations or {})
+                    .get("topology", "").lower() == "circular"
+                )
+                result = _pick_best_rotation(
+                    str(query_rec.seq), str(target_rec.seq),
+                    is_circular=is_circular,
+                    mode="global", canvas_axis="target",
+                )
+                m["_aln"] = {
+                    "ident": float(result.get("identity_pct") or 0.0),
+                    "mism":  int(result.get("n_mismatches") or 0),
+                    "gaps":  int(result.get("n_gap_cols",
+                                            result.get("n_gaps", 0)) or 0),
+                }
+                m["_aln_result"] = result
+            except Exception:
+                _log.exception(
+                    "BulkAlign: quality pre-align failed for %r",
+                    gbk_member,
+                )
+                m["_aln"] = False
 
     def _reset_bulk_align_button(self) -> None:
         """Re-enable the Bulk-align button + hide the progress
@@ -63039,19 +63108,31 @@ class SequencingScreen(Screen):
                     (target_rec.annotations or {}).get("topology", "")
                     .lower() == "circular"
                 )
-                try:
-                    result = _pick_best_rotation(
-                        str(query_rec.seq), str(target_rec.seq),
-                        is_circular=target_is_circular,
-                        mode="global", canvas_axis="target",
-                    )
-                except Exception:
-                    _log.exception(
-                        "BulkAlign: alignment failed for %r vs %r",
-                        gbk_member, target_entry.get("id"),
-                    )
-                    n_failed += 1
-                    continue
+                # 2026-05-31: reuse the alignment the matcher-phase
+                # `_compute_bulk_quality` already ran for this row (cached
+                # as `_aln_result`) so the same ~18 kb pairwise isn't run
+                # twice. Fall back to a fresh align only if the cache is
+                # missing (e.g. the pre-align failed, or a row reached
+                # "align" by a path that skipped the pre-pass).
+                cached = m.get("_aln_result")
+                if (isinstance(cached, dict)
+                        and cached.get("aligned_q")
+                        and cached.get("aligned_t")):
+                    result = cached
+                else:
+                    try:
+                        result = _pick_best_rotation(
+                            str(query_rec.seq), str(target_rec.seq),
+                            is_circular=target_is_circular,
+                            mode="global", canvas_axis="target",
+                        )
+                    except Exception:
+                        _log.exception(
+                            "BulkAlign: alignment failed for %r vs %r",
+                            gbk_member, target_entry.get("id"),
+                        )
+                        n_failed += 1
+                        continue
                 # Pre-compute the bulk-align display label off the UI
                 # thread: `<order_num> <basename_no_ext>` matches the
                 # per-sample flow.
@@ -73004,6 +73085,54 @@ class MultiAlignPickerModal(_OneShotDismissScreen, ModalScreen):
 # any row before committing. Dismiss returns the final per-row action
 # list; the caller's worker batches the alignments and adds.
 
+
+def _bulk_quality_cells(
+    aln: "dict | bool | None", *, action: str, has_target: bool,
+) -> "tuple[Text, Text, Text]":
+    """Build the (Identity, Mismatch, Gaps) cells for one
+    BulkAlignConfirmModal row.
+
+    The three quality columns describe the alignment that WILL run on
+    confirm — the honest "how bad is it" the k-mer matching score can't
+    give (a 1-bp mismatch barely dents the k-mer Jaccard, and the
+    circular-origin junction alone drops a *perfect* read to ~99.8%).
+
+    ``aln`` is the cached `_pick_best_rotation`-derived dict
+    ``{ident, mism, gaps}``; ``None`` while the off-thread align is still
+    running; ``False`` when it couldn't run / failed. Display gating:
+
+      * action != "align", or the row has no target  → em-dash (nothing
+        will be aligned).
+      * align pending (``aln is None``)              → "…".
+      * align failed (``aln is False``)              → "?".
+      * else → identity via `_format_identity_pct` (never a false
+        "100%") coloured by `_identity_pct_color`; mismatch yellow /
+        gap red when nonzero, dim "0" otherwise.
+
+    Pure → the suite can pin the gating + formatting without a modal.
+    """
+    if action != "align" or not has_target:
+        return (Text("—", style="dim"),
+                Text("—", style="dim"),
+                Text("—", style="dim"))
+    if aln is None:
+        return (Text("…", style="dim"),
+                Text("…", style="dim"),
+                Text("…", style="dim"))
+    if not isinstance(aln, dict):          # False sentinel — align failed
+        return (Text("?", style="dim"),
+                Text("?", style="dim"),
+                Text("?", style="dim"))
+    ident = float(aln.get("ident") or 0.0)
+    mism = max(0, int(aln.get("mism") or 0))
+    gaps = max(0, int(aln.get("gaps") or 0))
+    return (
+        Text(_format_identity_pct(ident), style=_identity_pct_color(ident)),
+        Text(str(mism), style="yellow" if mism else "dim"),
+        Text(str(gaps), style="red" if gaps else "dim"),
+    )
+
+
 class BulkAlignConfirmModal(_OneShotDismissScreen, ModalScreen):
     """Confirm step for the "align every sample to its library match"
     bulk flow. Shows one row per Plasmidsaurus sample with the
@@ -73061,7 +73190,10 @@ class BulkAlignConfirmModal(_OneShotDismissScreen, ModalScreen):
         super().__init__()
         # Defensive copy so user toggles in the modal don't leak into
         # the caller's matches list (the caller still owns the source
-        # data for retry / diagnostic purposes).
+        # data for retry / diagnostic purposes). Each match already
+        # carries `_aln` (display summary) + `_aln_result` (full
+        # alignment) from `_compute_bulk_quality`, run on the button-
+        # press worker — the modal only RENDERS them, never re-aligns.
         self._matches: list[dict] = [dict(m) for m in matches]
 
     def compose(self) -> ComposeResult:
@@ -73070,7 +73202,10 @@ class BulkAlignConfirmModal(_OneShotDismissScreen, ModalScreen):
                           id="bulk-title")
             yield Static(
                 "Each sample is paired with the best-match library "
-                "entry by name (substring) or by k-mer similarity. "
+                "entry by name (substring) or by k-mer similarity "
+                "([dim]a matching score, not alignment quality[/dim]). "
+                "[b]Identity / Mism / Gaps[/b] show the real alignment "
+                "quality for each align row (already computed). "
                 "Space rotates the cursor row's action: "
                 "[green]→ align[/green] · "
                 "[cyan]+ add as new[/cyan] · "
@@ -73087,9 +73222,15 @@ class BulkAlignConfirmModal(_OneShotDismissScreen, ModalScreen):
 
     def on_mount(self) -> None:
         t = self.query_one("#bulk-table", DataTable)
+        # "k-mer"/"Name" are MATCHING scores (which library entry is
+        # this read?); "Ident"/"Mism"/"Gaps" are the actual ALIGNMENT
+        # quality, computed up front by `_compute_bulk_quality` on the
+        # button-press worker and cached on each match — the modal just
+        # renders them (2026-05-31 user request: align once, not twice).
         t.add_columns("#", "Sample", "Action",
                         "Target / new name",
-                        "k-mer", "Name", "Note")
+                        "k-mer", "Name",
+                        "Ident", "Mism", "Gaps", "Note")
         for i, m in enumerate(self._matches, 1):
             self._add_or_update_row(t, i, m)
         if self._matches:
@@ -73145,11 +73286,21 @@ class BulkAlignConfirmModal(_OneShotDismissScreen, ModalScreen):
             name_cell = Text("—", style="dim")
         note = m.get("note") or m.get("method") or ""
         note_cell = Text(note, style="dim")
+        # Real alignment quality (filled by `_quality_align_worker`).
+        # `_aln` is None until that row's align lands, then a dict (or
+        # False on failure). Gated on action so the columns describe
+        # only the alignments that will actually run on confirm.
+        ident_cell, mism_cell, gaps_cell = _bulk_quality_cells(
+            m.get("_aln"),
+            action=action,
+            has_target=bool((m.get("target_entry") or {}).get("gb_text")),
+        )
         cells = (
             Text(str(idx_1based), style="dim"),
             Text(sample_name),
             action_cell, target_cell,
-            kmer_cell, name_cell, note_cell,
+            kmer_cell, name_cell,
+            ident_cell, mism_cell, gaps_cell, note_cell,
         )
         if update:
             try:
@@ -73210,7 +73361,8 @@ class BulkAlignConfirmModal(_OneShotDismissScreen, ModalScreen):
         # actionable rows. Cancelled (None) is distinct from "run
         # with nothing actionable" (empty list).
         committed = [
-            m for m in self._matches
+            {k: v for k, v in m.items() if k != "_aln"}
+            for m in self._matches
             if m.get("action") in ("align", "add")
         ]
         self.dismiss(committed)

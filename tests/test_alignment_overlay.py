@@ -4920,6 +4920,125 @@ class TestBulkAlignConfirmModalToggle:
             assert modal._matches[0]["action"] == "add"
 
 
+class TestBulkQualityCells:
+    """`_bulk_quality_cells` renders the Identity / Mism / Gaps columns
+    for the bulk-align confirm modal. The k-mer column is a *matching*
+    score (which plasmid is this?); THESE columns describe the real
+    alignment that runs on confirm, so a 1-bp mismatch surfaces here
+    even though it barely dents the k-mer Jaccard."""
+
+    def test_non_align_action_is_dashes(self):
+        for act in ("add", "skip"):
+            cells = sc._bulk_quality_cells(
+                {"ident": 99.99, "mism": 1, "gaps": 0},
+                action=act, has_target=True)
+            assert [c.plain for c in cells] == ["—", "—", "—"]
+
+    def test_no_target_is_dashes(self):
+        cells = sc._bulk_quality_cells(
+            {"ident": 100.0, "mism": 0, "gaps": 0},
+            action="align", has_target=False)
+        assert [c.plain for c in cells] == ["—", "—", "—"]
+
+    def test_pending_is_ellipsis(self):
+        cells = sc._bulk_quality_cells(None, action="align", has_target=True)
+        assert [c.plain for c in cells] == ["…", "…", "…"]
+
+    def test_failed_is_question(self):
+        cells = sc._bulk_quality_cells(False, action="align", has_target=True)
+        assert [c.plain for c in cells] == ["?", "?", "?"]
+
+    def test_one_bp_mismatch_renders_honestly(self):
+        ident, mism, gaps = sc._bulk_quality_cells(
+            {"ident": 100.0 * 18093 / 18094, "mism": 1, "gaps": 0},
+            action="align", has_target=True)
+        assert ident.plain == "99.99%"            # NOT "100%"
+        assert ident.style == "green"             # agrees with the tier
+        assert mism.plain == "1" and mism.style == "yellow"
+        assert gaps.plain == "0" and gaps.style == "dim"
+
+    def test_perfect_match_is_clean_100(self):
+        ident, mism, _g = sc._bulk_quality_cells(
+            {"ident": 100.0, "mism": 0, "gaps": 0},
+            action="align", has_target=True)
+        assert ident.plain == "100%"
+        assert ident.style == "bright_cyan"
+        assert mism.style == "dim"
+
+    def test_gap_nonzero_is_red(self):
+        _i, _m, gaps = sc._bulk_quality_cells(
+            {"ident": 98.0, "mism": 0, "gaps": 5},
+            action="align", has_target=True)
+        assert gaps.plain == "5" and gaps.style == "red"
+
+    def test_negative_counts_clamped(self):
+        _i, mism, gaps = sc._bulk_quality_cells(
+            {"ident": 50.0, "mism": -3, "gaps": -1},
+            action="align", has_target=True)
+        assert mism.plain == "0" and gaps.plain == "0"
+
+
+class TestBulkAlignConfirmModalQualityColumns:
+    """The confirm modal grows Ident / Mism / Gaps columns. The quality
+    alignment runs ONCE up front (in `_compute_bulk_quality` on the
+    Bulk-align button-press worker) and is cached on each match as `_aln`
+    (+ `_aln_result` for the commit to reuse); the modal only RENDERS it,
+    never re-aligns."""
+
+    async def test_columns_present_and_render_cached_aln(
+            self, tiny_record, isolated_library):
+        from textual.widgets import DataTable
+        from textual.coordinate import Coordinate
+        matches = [{
+            "sample": {"name": "CAM4", "gbk": "cam4.gbk"},
+            "action": "align",
+            "target_entry": {"id": "T", "name": "MAV40", "gb_text": "x"},
+            "score": 1.0, "method": "kmer-strong", "note": "",
+            "_aln": {"ident": 100.0 * 18093 / 18094, "mism": 1, "gaps": 0},
+        }]
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            await app.push_screen(sc.BulkAlignConfirmModal(matches))
+            await pilot.pause(0.1)
+            modal = app.screen
+            t = modal.query_one("#bulk-table", DataTable)
+            headers = [c.label.plain for c in t.columns.values()]
+            assert "Ident" in headers
+            assert "Mism" in headers
+            assert "Gaps" in headers
+            assert t.get_cell_at(Coordinate(0, 6)).plain == "99.99%"
+            assert t.get_cell_at(Coordinate(0, 7)).plain == "1"
+            assert t.get_cell_at(Coordinate(0, 8)).plain == "0"
+
+    async def test_failed_prealign_renders_question(
+            self, tiny_record, isolated_library):
+        from textual.widgets import DataTable
+        from textual.coordinate import Coordinate
+        # `_compute_bulk_quality` sets `_aln = False` when a row can't be
+        # aligned (no target / no consensus member / align failure); the
+        # modal renders that as "?".
+        matches = [{
+            "sample": {"name": "CAM4", "gbk": "cam4.gbk"},
+            "action": "align",
+            "target_entry": {"id": "T", "name": "MAV40", "gb_text": "x"},
+            "score": 1.0, "method": "kmer-strong", "note": "",
+            "_aln": False,
+        }]
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            await app.push_screen(sc.BulkAlignConfirmModal(matches))
+            await pilot.pause(0.1)
+            modal = app.screen
+            t = modal.query_one("#bulk-table", DataTable)
+            assert t.get_cell_at(Coordinate(0, 6)).plain == "?"
+            assert t.get_cell_at(Coordinate(0, 7)).plain == "?"
+            assert t.get_cell_at(Coordinate(0, 8)).plain == "?"
+
+
 class TestLibraryPanelSeqColumn:
     """LibraryPanel's "Seq" column shows per-entry sequencing-status
     badges driven by `_library_entry_alignment_summary`. The cell
