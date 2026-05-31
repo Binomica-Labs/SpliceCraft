@@ -670,6 +670,43 @@ class TestRestrictionScan:
         assert len(heads) == 1
         assert heads[0]["ext_cut_bp"] == 4
 
+    def test_circular_wrap_stamps_full_recognition_bounds(self):
+        """Regression for the 2026-05-30 'too few purple bases' fix. A
+        recognition site that wraps the origin must stamp the FULL
+        wrap-encoded recognition span (`rec_start=p`, `rec_end=head_len`,
+        with `rec_end < rec_start`) on BOTH the labeled tail and the
+        unlabeled head, so a click-highlight can colour every
+        recognition base — not just the pre-origin tail."""
+        n = 30
+        seq = "CTC" + "X" * (n - 6) + "GGT"   # GGTCTC at [27,30)+[0,3)
+        feats = sc._scan_restriction_sites(seq, min_recognition_len=6,
+                                           unique_only=True, circular=True)
+        resites = [f for f in feats if f.get("label") == "BsaI"
+                   and f.get("type") == "resite"]
+        assert len(resites) == 1
+        tail = resites[0]
+        assert tail["start"] == 27 and tail["end"] == 30
+        assert tail["rec_start"] == 27 and tail["rec_end"] == 3
+        assert tail["rec_end"] < tail["rec_start"], "recognition must wrap-encode"
+        heads = [f for f in feats if f.get("type") == "resite"
+                 and not f.get("label") and f["start"] == 0
+                 and f.get("color") == tail["color"]]
+        assert len(heads) == 1
+        assert heads[0]["rec_start"] == 27 and heads[0]["rec_end"] == 3
+
+    def test_non_wrap_recognition_bounds_equal_span(self):
+        """A non-wrapping site stamps rec_start/rec_end == its own span
+        (no wrap encoding) so the highlight behaves exactly as before."""
+        seq = "AAAA" + "GGTCTC" + "A" * 20   # BsaI at [4,10), no wrap
+        feats = sc._scan_restriction_sites(seq, min_recognition_len=6,
+                                           unique_only=True, circular=True)
+        bsai = [f for f in feats if f.get("label") == "BsaI"
+                and f.get("type") == "resite"]
+        assert len(bsai) == 1
+        r = bsai[0]
+        assert r["rec_start"] == r["start"] and r["rec_end"] == r["end"]
+        assert r["rec_end"] >= r["rec_start"]
+
     def test_circular_wrap_type_iis_cut_arrow_renders(self):
         """End-to-end render check: the cut-arrow glyph (↑ or ↓) must appear
         in the rendered sequence panel output for a wrap Type IIS site.
@@ -906,6 +943,162 @@ class TestResiteHighlightWrap:
         hi = self._highlight("X" * 30, resite)
         assert hi["start"] == 4
         assert hi["end"] == 10
+
+    def test_wrapped_recognition_colours_full_site(self):
+        """Regression for the 2026-05-30 'too few purple bases' fix. A
+        Type IIS recognition straddling the origin is emitted as a
+        labeled tail `[p, n)` + an unlabeled head `[0, head_len)`.
+        Clicking the tail must still highlight the FULL recognition:
+        the dict carries the wrap-encoded recognition span
+        (`rec_end < rec_start`) so the renderer's wrap-aware
+        `in_recognition` test paints tail AND head bases — not just the
+        2-3 pre-origin tail bases."""
+        # GGTCTC at [27,30) + [0,3) on n=30, as the scanner stamps it.
+        resite = {
+            "start": 27, "end": 30, "strand": 1, "color": "red",
+            "label": "BsaI", "top_cut_bp": 4, "bottom_cut_bp": 8,
+            "ext_cut_bp": 4, "rec_start": 27, "rec_end": 3,
+        }
+        hi = self._highlight("X" * 30, resite)
+        assert hi["rec_start"] == 27
+        assert hi["rec_end"] == 3
+        assert hi["rec_end"] < hi["rec_start"], "recognition must wrap-encode"
+        # Wrap-aware recognition membership covers all 6 GGTCTC bases.
+        rec_s, rec_e = hi["rec_start"], hi["rec_end"]
+
+        def _in_rec(i):
+            return ((i >= rec_s or i < rec_e) if rec_e < rec_s
+                    else (rec_s <= i < rec_e))
+        covered = [i for i in range(30) if _in_rec(i)]
+        assert covered == [0, 1, 2, 27, 28, 29], covered
+
+    def test_non_wrap_highlight_recognition_bounds_unchanged(self):
+        """A resite with no stamped `rec_start`/`rec_end` (legacy /
+        non-wrap) falls back to its own span — the fix must not perturb
+        the ordinary linear case."""
+        resite = {
+            "start": 10, "end": 16, "strand": 1, "color": "red",
+            "label": "BsaI", "top_cut_bp": 17, "bottom_cut_bp": 21,
+        }
+        hi = self._highlight("X" * 50, resite)
+        assert hi["rec_start"] == 10 and hi["rec_end"] == 16
+
+
+class TestPrimerFlapWrapSplit:
+    """Regression for the 2026-05-30 primer-flap wrap fix. A primer whose
+    BOUND region crosses the origin is split into tail + head pieces by
+    `_feats_in_chunk`. Its 5' flap must ride on exactly ONE piece (the
+    side it attaches to: forward → tail/`start`, reverse → head/`end`),
+    not be copied onto both — otherwise the flap was drawn twice AND the
+    duplicate collided in the 2D packer, splitting the bound bar across
+    two rows so the wrap primer looked like two features."""
+
+    @staticmethod
+    def _wrap_primer(strand):
+        if strand >= 0:        # bound [37,7), flap [29,37)
+            return {"start": 37, "end": 7, "strand": 1,
+                    "type": "primer_bind", "color": "white", "label": "P",
+                    "_flap_start": 29, "_flap_end": 37,
+                    "_flap_bases": "TTTTTTTT", "_flap_len": 8}
+        return {"start": 35, "end": 5, "strand": -1,   # bound [35,5), flap [5,13)
+                "type": "primer_bind", "color": "white", "label": "P",
+                "_flap_start": 5, "_flap_end": 13,
+                "_flap_bases": "AAAAAAAA", "_flap_len": 8}
+
+    def test_forward_flap_rides_tail_piece_only(self):
+        pieces = sc._feats_in_chunk([self._wrap_primer(1)], 0, 40, 40)
+        assert len(pieces) == 2
+        with_flap = [p for p in pieces if p.get("_flap_bases")]
+        assert len(with_flap) == 1, "flap must ride exactly one split piece"
+        assert with_flap[0]["end"] == 40  # tail piece (holds binding start)
+
+    def test_reverse_flap_rides_head_piece_only(self):
+        pieces = sc._feats_in_chunk([self._wrap_primer(-1)], 0, 40, 40)
+        assert len(pieces) == 2
+        with_flap = [p for p in pieces if p.get("_flap_bases")]
+        assert len(with_flap) == 1
+        assert with_flap[0]["start"] == 0  # head piece (holds binding end)
+
+    def test_non_wrap_primer_not_split_flap_intact(self):
+        feat = {"start": 3, "end": 18, "strand": 1, "type": "primer_bind",
+                "color": "white", "label": "P", "_flap_start": -7,
+                "_flap_end": 3, "_flap_bases": "GGGGGTTTTT", "_flap_len": 10}
+        pieces = sc._feats_in_chunk([feat], 0, 40, 40)
+        assert len(pieces) == 1
+        assert pieces[0]["_flap_bases"] == "GGGGGTTTTT"
+
+    def test_wrapping_primer_flap_rendered_once(self):
+        """End-to-end: a wrapping forward primer's flap bases appear in
+        exactly ONE display row (pre-fix: two)."""
+        seq = "ACGT" * 10
+        feat = {"start": 37, "end": 7, "strand": 1, "type": "primer_bind",
+                "color": "white", "label": "P",
+                "_primer_seq": "TTTTTTTT" + seq[37:40] + seq[0:7],
+                "_bound_len": 10, "_flap_start": 29, "_flap_end": 37,
+                "_flap_bases": "TTTTTTTT", "_flap_len": 8}
+        rendered = sc._build_seq_text(seq, [feat], line_width=60).plain
+        assert rendered.count("TTTTTTTT") == 1
+
+
+class TestRederivePrimerBinding:
+    """The add-to-map safety net (2026-05-30): re-derive a primer's true
+    binding straight from the template so a stale / mis-saved
+    pos_start/pos_end snaps to where the primer actually anneals — its
+    displayed letters then line up with the DNA."""
+
+    _TMPL = ("ACGTTGCA" * 5) + "GACTGACTTAGGCCATGCATTA" + ("TTGGAACC" * 5)
+    _ANNEAL = "GACTGACTTAGGCCATGCATTA"   # 22 bp, at index 40
+
+    def test_forward_finds_true_binding_aligned(self):
+        primer = "GCGCCGTCTCG" + self._ANNEAL      # 11 flap + 22 anneal
+        rb = sc._rederive_primer_binding(primer, 1, self._TMPL,
+                                         len(self._TMPL), hint_start=38)
+        assert rb == (40, 62)
+        m, e = rb
+        assert self._TMPL[m:e] == self._ANNEAL      # letters align
+
+    def test_reverse_finds_true_binding_aligned(self):
+        primer = "GCGCCGTCTCG" + sc._rc(self._ANNEAL)
+        rb = sc._rederive_primer_binding(primer, -1, self._TMPL,
+                                         len(self._TMPL), hint_start=38)
+        assert rb == (40, 62)
+        m, e = rb
+        assert sc._rc(self._TMPL[m:e]) == sc._rc(self._ANNEAL)
+
+    def test_stale_hint_still_snaps_to_real_site(self):
+        # A stored position 5 bp off (the real bug) still lands correctly.
+        primer = "GCGCCGTCTCG" + self._ANNEAL
+        rb = sc._rederive_primer_binding(primer, 1, self._TMPL,
+                                         len(self._TMPL), hint_start=35)
+        assert rb == (40, 62)
+
+    def test_wraps_origin_encoded(self):
+        body = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"   # 40
+        tmpl = "GGTTCCAA" + body + "TTAAGGCC"               # 56
+        anneal = tmpl[-8:] + tmpl[:12]                      # [48,56)+[0,12)
+        primer = "GCGCCGTCTCG" + anneal
+        rb = sc._rederive_primer_binding(primer, 1, tmpl, len(tmpl),
+                                         hint_start=50)
+        assert rb == (48, 12)        # pos_end < pos_start → wrap-encoded
+
+    def test_no_clean_match_returns_none(self):
+        # Primer that doesn't bind → None (caller keeps stored positions).
+        assert sc._rederive_primer_binding(
+            "AAAAAAAAAAAAAAAAAAAA", 1, "CGCGCGCGCGCGCGCGCGCG" * 4,
+            80, hint_start=0) is None
+
+    def test_picks_occurrence_nearest_hint(self):
+        # Same annealing present twice; hint disambiguates.
+        site = "TTAGGCCATGCATTACGGAT"   # 20 bp, unique-ish
+        tmpl = ("A" * 20) + site + ("A" * 20) + site + ("A" * 20)
+        # second copy starts at 20+20+20 = 60
+        primer = "GCGCCGTCTCG" + site
+        near0 = sc._rederive_primer_binding(primer, 1, tmpl, len(tmpl),
+                                            hint_start=18)
+        near1 = sc._rederive_primer_binding(primer, 1, tmpl, len(tmpl),
+                                            hint_start=62)
+        assert near0[0] == 20
+        assert near1[0] == 60
 
 
 class TestRestrictionScanLinearVsCircular:

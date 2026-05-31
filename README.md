@@ -158,7 +158,9 @@ editable fragment. Or hit **Open** to
 load a sequence straight from a single-entry FASTA (or other amino-acid file) — a
 file browser highlights the loadable formats in pink. Compose a part,
 hit **Clone Fragment**, and it's handed straight to the Domesticator as an L0
-building block.
+building block. **Save** (and **Save As**, which forks a copy and only lights up
+once the fragment has been saved once) let you pick which collection the
+fragment lands in, and keep editing it there.
 
 ### Parts
 
@@ -194,7 +196,9 @@ matches a whole results folder against your library in one pass, and the
 **Verification Report** grades every construct (✓ verified / ⚠ near-match /
 ~ partial / ✗ divergent) in one sortable table — click a row to jump to the
 first variant. The Library panel even shows a per-plasmid **Seq** badge so
-you can see what's been verified at a glance.
+you can see what's been verified at a glance, alongside a **Kind** badge
+(`○` plasmid · `/` fragment · `≈` amplicon · `ρ` protein) telling you what
+each entry is.
 
 ### Experiments
 
@@ -207,9 +211,15 @@ cross-references — type `@plasmid`, `!action`, or `&gel` and double-click (or
 ### History
 
 Every plasmid you build through SpliceCraft remembers how it was made.
-**History** renders that provenance as an expandable tree — fragment by
-fragment, parent by parent — so "how did I make this again?" is always one
-keystroke away.
+**History** opens with a **Protocol** summary — a numbered, plain-English
+recipe of the real assembly steps (*"TU_GFP ⟵ pProm + pCDS_GFP + pTerm into
+pENTR_L1 ✂ Esp3I"*) — above a **lineage tree** that opens collapsed to the
+finished plasmid and its direct inputs and lets you drill in as deep as you
+like. A backbone or part reused across branches is shown once and then
+referenced, so even a multi-part Golden Braid / MoClo build reads at a glance.
+Construction history also rides along when you import and re-export a
+CommercialSaaS `.dna` file. "How did I make this again?" is always one keystroke
+away.
 
 ### File & Settings
 

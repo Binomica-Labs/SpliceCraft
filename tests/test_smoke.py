@@ -2986,6 +2986,87 @@ class TestTypeIISCutRegionHighlight:
             assert sp._sel_range is None
             assert sp._re_highlight is None
 
+    def test_primer_flap_follows_origin_rotation(self):
+        """Catastrophic-class guard (2026-05-30): a primer's 5' flap must
+        travel WITH the primer when the map origin rotates. Pre-fix the
+        flap stayed in the original frame, so its head floated at display
+        bp 0 regardless of rotation. `_get_rotated_state` now re-derives
+        the flap off the rotated start/end, so it always sits 5' of the
+        (rotated) primer."""
+        n = 60
+        seq = ("ACGTACGT" * 8)[:n]
+        # Forward primer bound [3,18), 12-bp 5' flap (wraps the origin).
+        feat = {"start": 3, "end": 18, "strand": 1, "type": "primer_bind",
+                "color": "white", "label": "P",
+                "_primer_seq": "TTTGGGCCCAAA" + seq[3:18], "_bound_len": 15,
+                "_flap_len": 12, "_flap_start": -9, "_flap_end": 3,
+                "_flap_bases": "TTTGGGCCCAAA"}
+        sp = sc.SequencePanel()
+        sp._seq = seq
+        sp._feats = [feat]
+        for o in (0, 10, 30, 55):
+            sp._view_origin_bp = o
+            sp._rotated_cache_key = None
+            sp._rotated_seq = sp._rotated_feats = None
+            _, disp_feats = sp._get_rotated_state()
+            pf = next(f for f in disp_feats if f.get("type") == "primer_bind")
+            # Flap ends exactly at the rotated primer's start and spans
+            # flap_len immediately before it — i.e. it tracks the primer.
+            assert pf["_flap_end"] == pf["start"], (o, pf)
+            assert pf["start"] - pf["_flap_start"] == pf["_flap_len"], (o, pf)
+
+    def test_reverse_primer_flap_follows_origin_rotation(self):
+        """Mirror of the forward case for a reverse primer: the 5' flap
+        sits 3' of `end` and must track the primer across rotation."""
+        n = 60
+        seq = ("ACGTACGT" * 8)[:n]
+        feat = {"start": 40, "end": 55, "strand": -1, "type": "primer_bind",
+                "color": "white", "label": "R",
+                "_primer_seq": "TTTGGGCCCAAA" + sc._rc(seq[40:55]),
+                "_bound_len": 15, "_flap_len": 12,
+                "_flap_start": 55, "_flap_end": 67,
+                "_flap_bases": sc._rc("TTTGGGCCCAAA")}
+        sp = sc.SequencePanel()
+        sp._seq = seq
+        sp._feats = [feat]
+        for o in (0, 12, 45):
+            sp._view_origin_bp = o
+            sp._rotated_cache_key = None
+            sp._rotated_seq = sp._rotated_feats = None
+            _, disp_feats = sp._get_rotated_state()
+            pf = next(f for f in disp_feats if f.get("type") == "primer_bind")
+            assert pf["_flap_start"] == pf["end"], (o, pf)
+            assert pf["_flap_end"] - pf["_flap_start"] == pf["_flap_len"], (o, pf)
+
+    async def test_parse_rederives_stale_primer_to_true_binding(
+            self, tiny_record):
+        """Catastrophic-class guard (2026-05-30): a primer_bind whose SAVED
+        location is wrong is re-derived on parse to where its sequence
+        actually anneals, so a cloning primer is NEVER drawn off its true
+        binding site (forward + arrow points into the amplicon)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        seq = ("ACGTTGCA" * 5) + "GACTGACTTAGGCCATGCATTA" + ("TTGGAACC" * 5)
+        anneal = "GACTGACTTAGGCCATGCATTA"          # unique, at index 40
+        primer = "GCGCCGTCTCG" + anneal            # flap ends 'G' (no extend)
+        rec = SeqRecord(Seq(seq), id="rb", name="rb")
+        rec.annotations["topology"] = "circular"
+        rec.annotations["molecule_type"] = "DNA"
+        # Deliberately SAVE the feature at the wrong place [10,32).
+        rec.features.append(SeqFeature(
+            FeatureLocation(10, 32, strand=1), type="primer_bind",
+            qualifiers={"label": ["P"], "primer_seq": [primer]}))
+        app = _build_app(tiny_record, isolated_library=None)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            feats = app.query_one(sc.PlasmidMap)._parse(rec)
+            pf = next(f for f in feats if f.get("type") == "primer_bind")
+            # Re-derived to the TRUE binding [40,62), NOT the saved [10,32).
+            assert pf["start"] == 40 and pf["end"] == 62, pf
+            bound = pf["_primer_seq"][pf["_flap_len"]:]
+            assert bound == seq[pf["start"]:pf["end"]]   # letters align
+
     def test_rotation_invalidates_owner_cache_for_resite_clicks(self):
         """Pre-2026-05-08 the owner cache (`_chunks_owners`) keyed
         only on `id(self._feats)`, which doesn't change under

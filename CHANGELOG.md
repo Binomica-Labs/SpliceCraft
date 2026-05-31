@@ -14,6 +14,27 @@
 
 ---
 
+## [1.0.8] — 2026-05-30
+
+### New features
+
+- **Choose which collection to save a synthesis fragment into.** Saving (or Save As) from the Synthesis composer now offers the collection picker — the same one the cloning tools use — so a fragment or back-translated protein can land in any collection, not just the active one. Re-saving keeps editing it in place there (no stray duplicate in the active collection). **Save As** is now enabled only once a fragment has been saved at least once — before that it did exactly what **Save** does, so it just sat there as a confusing twin.
+- **A "Kind" badge in the library.** Each plasmid row now carries a small coloured badge identifying it as a **plasmid** (`○`), **fragment** (`/`), **amplicon** (`≈`), or **protein** (`ρ`) — so a glance tells you what each entry is, beyond just its length. New saves are tagged at creation (PCR products → amplicon, the Protein tab → protein); existing entries are classified on the fly from their topology and origin, so nothing in your library is rewritten.
+- **A clearer construction-history view.** The History viewer now opens with a **Protocol** summary — a numbered, plain-English recipe of how a plasmid was built (e.g. *"TU_GFP ⟵ pProm + pCDS_GFP + pTerm into pENTR_L1 ✂ Esp3I"*), one line per real assembly step — sitting above the lineage tree. The lineage tree itself is far quieter: it opens collapsed to the finished plasmid and its direct inputs (drill in as deep as you like), a backbone or part that fed several branches is now drawn **once** and then referenced (*"↳ … shown above"*) instead of repeated in every branch, and each row is trimmed to a name, a compact size, and a friendly step verb. A multi-part Golden Braid / MoClo build that used to dump dozens of repeated rows now reads at a glance.
+
+### Bug fixes
+
+- **Restriction sites that straddle the origin now highlight every recognition base.** Clicking the name of an enzyme whose recognition sequence wraps the circular origin (common for Type IIS sites like BsaI / Esp3I sitting at a cloning junction) only coloured the handful of bases before the origin — the rest of the recognition sequence past base 1 was left uncoloured or mis-coloured as spacer/overhang. The whole recognition site (and its cut overhang) is now highlighted correctly across the origin.
+- **Primers now always render on the exact bases they bind.** A primer on the map is now positioned by matching its annealing region directly against the loaded sequence, so it sits base-for-base on its true binding site even if its stored position was stale or off — its letters line up with the DNA in the sequence panel, the forward primer reads 5'→3' on the top strand and the reverse 3'→5' on the bottom, and each primer's arrow points *inward* toward the region it primes. (A cloning primer drawn off its real site is a serious, misleading error; this guarantees the displayed binding matches reality.)
+- **A primer's 5' flap behaves correctly across the origin and under rotation.** A primer whose binding crosses the circular origin drew its unbound 5' flap twice and split its bar across two rows (one primer looked like two); and rotating the map origin left the flap pinned to the start of the view while the primer moved. The flap is now drawn once, attached to the correct (5') side, and travels *with* the primer through any origin rotation, fully wrap-aware — forward and reverse.
+- **Opening a single `.dna` file no longer loses its construction history on re-export.** Importing one CommercialSaaS `.dna` (rather than a whole folder) and saving it to the library kept the sequence but quietly dropped the embedded construction history — and, on export back to `.dna`, every CommercialSaaS-only detail (alignments, custom enzymes, …) along with it. Single-file opens now preserve the history on the library entry and keep a copy of the original bytes, so re-exporting round-trips the history *and* those extra details intact — the same way folder imports already did. Re-saving after an edit keeps the history too. (Files opened this way *before* this update never captured their history, so it isn't stored to recover — for those, the History view now nudges you to re-open the original `.dna` file once to restore the lineage.)
+
+### Hardening
+
+- **History viewer holds up on hostile or huge imported files.** Both history viewers now build their tree iteratively with depth + node caps, so a deeply-nested imported history can't stall the app, and every plasmid name / operation / enzyme label is escaped so a crafted name can't bend the display.
+
+---
+
 ## [1.0.7] — 2026-05-30
 
 ### New features

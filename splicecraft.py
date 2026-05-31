@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.7"
+__version__ = "1.0.8"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -5265,7 +5265,65 @@ def _collection_name_taken(name: str) -> bool:
     return False
 
 
-def _commit_library_entry_to_collection(entry: dict, collection: str) -> str:
+# ── Library-entry "kind" taxonomy (Kind column) ──────────────────────────────
+# Stamped explicitly at creation (future-proof — captures `amplicon`,
+# which has no derivable signal). `_entry_kind` falls back to
+# `_derive_entry_kind` for legacy entries saved before the field
+# existed, so the column reads correctly WITHOUT rewriting the user's
+# (large) library / collections files. Re-saving a legacy entry stamps
+# it going forward.
+_LIBRARY_KINDS: "frozenset[str]" = frozenset(
+    {"plasmid", "fragment", "amplicon", "protein"})
+_LIBRARY_KIND_BADGE: "dict[str, str]" = {
+    "plasmid":  "○",   # closed loop
+    "fragment": "/",   # linear piece
+    "amplicon": "≈",   # PCR product
+    "protein":  "ρ",   # protein-coding (codon-optimized CDS)
+}
+# Colour per kind for the library panel's Kind column — distinct hues so
+# the badge reads at a glance even before the legend is learned.
+_LIBRARY_KIND_STYLE: "dict[str, str]" = {
+    "plasmid":  "green",
+    "fragment": "cyan",
+    "amplicon": "yellow",
+    "protein":  "magenta",
+}
+
+
+def _derive_entry_kind(entry: dict) -> str:
+    """Classify a library entry for the Kind column when no explicit
+    ``kind`` was stamped. Priority: protein-optimized source → protein;
+    amplicon/PCR source → amplicon; circular topology → plasmid; else
+    fragment (linear DNA). 'amplicon' has no reliable signal beyond a
+    source tag, so a PCR product saved before tagging reads as
+    'fragment'."""
+    src = str(entry.get("source") or "").lower()
+    if "synthesis-protein" in src:
+        return "protein"
+    if "amplicon" in src or "pcr" in src:
+        return "amplicon"
+    topo = str(entry.get("topology") or "").lower()
+    if not topo:
+        gb = entry.get("gb_text") or ""
+        if isinstance(gb, str) and gb:
+            head = gb[:200].lower()   # GenBank LOCUS line carries topology
+            if "circular" in head:
+                topo = "circular"
+            elif "linear" in head:
+                topo = "linear"
+    return "plasmid" if topo == "circular" else "fragment"
+
+
+def _entry_kind(entry: dict) -> str:
+    """The entry's stored ``kind`` (validated against `_LIBRARY_KINDS`)
+    or a derived fallback for legacy entries."""
+    k = str(entry.get("kind") or "").strip().lower()
+    return k if k in _LIBRARY_KINDS else _derive_entry_kind(entry)
+
+
+def _commit_library_entry_to_collection(entry: dict, collection: str,
+                                        *, replace_id: "str | None" = None
+                                        ) -> str:
     """Append a library entry (linear OR circular — topology is the
     producer's choice) to the named collection, name- and id-collision-
     renaming so existing entries are never clobbered, and re-mirror the
@@ -5283,6 +5341,16 @@ def _commit_library_entry_to_collection(entry: dict, collection: str) -> str:
       * Name collisions get " COPY" / " COPY N" (spaces, never `_`); id
         collisions get `_N` (ids are sanitised by design).
 
+    ``replace_id`` (2026-05-30): when given AND an entry with that id
+    already lives in the collection, REPLACE it in place (keep its slot,
+    no `_N`/" COPY" rename) rather than appending — lets a re-saveable
+    document (the Synthesis composer) overwrite its own entry in a
+    NON-active collection. The caller MUST guarantee the id belongs to
+    the document being saved (the append path never sets it, so a fresh
+    save can't accidentally clobber an unrelated same-id entry). The
+    name-collision rename still runs against the OTHER entries. Falls
+    back to append when the id isn't present.
+
     Raises `OSError` / `RuntimeError` on save failure.
     """
     from copy import deepcopy as _deepcopy
@@ -5299,8 +5367,17 @@ def _commit_library_entry_to_collection(entry: dict, collection: str) -> str:
             idx = len(colls) - 1
         plasmids = [e for e in (colls[idx].get("plasmids") or [])
                     if isinstance(e, dict)]
-        names = {(e.get("name") or "") for e in plasmids}
-        ids = {(e.get("id") or "") for e in plasmids}
+        # Document re-save: locate the existing slot to overwrite.
+        ridx = -1
+        if replace_id:
+            ridx = next((i for i, e in enumerate(plasmids)
+                         if (e.get("id") or "") == replace_id), -1)
+        # Collision sets exclude the slot being replaced (re-saving with
+        # the same name must not " COPY"-rename against itself).
+        names = {(e.get("name") or "")
+                 for i, e in enumerate(plasmids) if i != ridx}
+        ids = {(e.get("id") or "")
+               for i, e in enumerate(plasmids) if i != ridx}
 
         landing = _deepcopy(entry)
         base_name = (landing.get("name") or "").strip() or "plasmid"
@@ -5313,17 +5390,22 @@ def _commit_library_entry_to_collection(entry: dict, collection: str) -> str:
                 n += 1
         landing["name"] = new_name
 
-        base_id = (landing.get("id") or "").strip() or "plasmid"
-        new_id = base_id
-        if new_id in ids:
-            n = 2
-            new_id = f"{base_id}_{n}"
-            while new_id in ids:
-                n += 1
+        if ridx >= 0:
+            # Replace in place — keep the document's id (no rename).
+            landing["id"] = replace_id
+            plasmids[ridx] = landing
+        else:
+            base_id = (landing.get("id") or "").strip() or "plasmid"
+            new_id = base_id
+            if new_id in ids:
+                n = 2
                 new_id = f"{base_id}_{n}"
-        landing["id"] = new_id
+                while new_id in ids:
+                    n += 1
+                    new_id = f"{base_id}_{n}"
+            landing["id"] = new_id
+            plasmids.append(landing)
 
-        plasmids.append(landing)
         colls[idx]["plasmids"] = plasmids
         _save_collections(colls)
 
@@ -6574,6 +6656,11 @@ def _scan_restriction_sites_impl(
                 "label":      name,
                 "cut_col":    cut_col,
                 "ext_cut_bp": ext_cut_bp,
+                # Full recognition span (== start/end when it doesn't
+                # wrap). Carried explicitly so the click-highlight knows
+                # the TRUE recognition bounds even on a wrapped piece.
+                "rec_start":  p,
+                "rec_end":    p + site_len,
                 **common,
             })
             return
@@ -6590,6 +6677,13 @@ def _scan_restriction_sites_impl(
         tail_cut_col = cut_col if (cut_col is not None and cut_col < tail_len) else None
         head_cut_col = ((cut_col - tail_len) if (cut_col is not None and cut_col >= tail_len)
                         else None)
+        # Both pieces carry the SAME wrap-encoded recognition span
+        # `[p, head_len)` (rec_end < rec_start signals the origin wrap)
+        # so clicking the labeled tail can still highlight the full
+        # recognition — tail bases [p, n) AND head bases [0, head_len).
+        # Pre-2026-05-30 the tail piece reported `rec_end = n`, so the
+        # click-highlight coloured only the pre-origin bases ("too few
+        # purple bases" on a near-origin BsaI / Esp3I site).
         hits.append({
             "type":       "resite",
             "start":      p,
@@ -6599,6 +6693,8 @@ def _scan_restriction_sites_impl(
             "label":      name,
             "cut_col":    tail_cut_col,
             "ext_cut_bp": ext_cut_bp,
+            "rec_start":  p,
+            "rec_end":    head_len,
             **common,
         })
         hits.append({
@@ -6610,6 +6706,8 @@ def _scan_restriction_sites_impl(
             "label":      "",     # unlabeled continuation
             "cut_col":    head_cut_col,
             "ext_cut_bp": ext_cut_bp,
+            "rec_start":  p,
+            "rec_end":    head_len,
             **common,
         })
 
@@ -9264,6 +9362,14 @@ _CHUNK_OVERLAY_CACHE_MAX = 16
 _LAZY_RENDER_THRESHOLD_BP = 1_000_000
 
 
+# Primer-flap fields stamped by `PlasmidMap._parse`. Grouped so the
+# wrap-split below can move them as a unit onto the single piece the
+# flap actually attaches to.
+_FLAP_KEYS: tuple[str, ...] = (
+    "_flap_start", "_flap_end", "_flap_bases", "_flap_len",
+)
+
+
 def _feats_in_chunk(
     feats: list[dict], chunk_start: int, chunk_end: int, total: int
 ) -> list[dict]:
@@ -9303,14 +9409,30 @@ def _feats_in_chunk(
         # back to a feature in `pm._feats` (without it the App's
         # `event.feat is f` check fails for wrap features and falls
         # back to bp-search).
+        # A primer's 5' flap attaches to exactly ONE side of a wrap-split
+        # feature: forward → the TAIL piece (which holds the binding
+        # `start`, and the flap sits just 5' of it); reverse → the HEAD
+        # piece (which holds the binding `end`, with the flap just 3' of
+        # it). Copying `{**f}` would put the flap fields on BOTH halves,
+        # so the flap-bar painter drew it twice AND the duplicate copy
+        # collided in the 2D packer, bumping the two bound-bar halves onto
+        # different rows (the wrap bar looked like two features). Strip the
+        # flap from the non-attaching piece. [primer flap wrap, 2026-05-30]
+        _strand = f.get("strand", 1)
         if s < chunk_end and total > chunk_start:
-            out.append({**f, "end": total,
-                        "_orig_start": s, "_orig_end": e,
-                        "_orig_dict": f})
+            tail = {**f, "end": total,
+                    "_orig_start": s, "_orig_end": e, "_orig_dict": f}
+            if _strand < 0:
+                for _k in _FLAP_KEYS:
+                    tail.pop(_k, None)
+            out.append(tail)
         if 0 < chunk_end and e > chunk_start:
-            out.append({**f, "start": 0, "label": "",
-                        "_orig_start": s, "_orig_end": e,
-                        "_orig_dict": f})
+            head = {**f, "start": 0, "label": "",
+                    "_orig_start": s, "_orig_end": e, "_orig_dict": f}
+            if _strand >= 0:
+                for _k in _FLAP_KEYS:
+                    head.pop(_k, None)
+            out.append(head)
     return out
 
 
@@ -9722,10 +9844,22 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
     chunk_rev = chunk_fwd.translate(_DNA_COMP_PRESERVE_CASE)
     chunk_len = chunk_end - chunk_start
 
+    # RE-highlight intersection — wrap-aware. A near-origin Type IIS
+    # highlight is encoded `reh_e < reh_s` (it spans the origin). The
+    # old linear `reh_s < end and reh_e > start` test then matched
+    # NEITHER the head chunk nor the tail chunk, so the chunk took the
+    # fast no-overlay path and the clicked site's bases rendered
+    # unstyled (compounded the "too few purple bases" report). 2026-05-30.
+    if reh_s < 0:
+        reh_hit = False
+    elif reh_e >= reh_s:
+        reh_hit = (reh_s < chunk_end and reh_e > chunk_start)
+    else:
+        reh_hit = (reh_s < chunk_end or reh_e > chunk_start)
     chunk_has_overlay = (
         (usr_s < chunk_end and usr_e > chunk_start)
         or (sel_s < chunk_end and sel_e > chunk_start)
-        or (reh_s < chunk_end and reh_e > chunk_start)
+        or reh_hit
         or (chunk_start <= cursor_pos < chunk_end)
     )
 
@@ -9816,9 +9950,17 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
                 #     top → green bg, bot → orange bg.
                 #
                 # All overlays use bold + black foreground.
-                in_recognition = (
-                    reh_rec_s >= 0 and reh_rec_s <= i < reh_rec_e
-                )
+                # Wrap-aware: a near-origin Type IIS recognition is
+                # encoded `reh_rec_e < reh_rec_s` (spans the origin), so
+                # the head bases [0, reh_rec_e) are recognition too —
+                # a linear test would leave them mis-coloured as
+                # spacer/overhang ("too few purple bases"). 2026-05-30.
+                if reh_rec_s < 0:
+                    in_recognition = False
+                elif reh_rec_e >= reh_rec_s:
+                    in_recognition = (reh_rec_s <= i < reh_rec_e)
+                else:
+                    in_recognition = (i >= reh_rec_s or i < reh_rec_e)
                 if reh_top_cut >= 0 and reh_bot_cut >= 0:
                     lo_cut = min(reh_top_cut, reh_bot_cut)
                     hi_cut = max(reh_top_cut, reh_bot_cut)
@@ -10849,6 +10991,25 @@ def load_genbank(path: str):
                 extra_primers = _augment_dna_record_from_packets(rec, _dna_bytes)
                 if extra_primers:
                     rec._dna_primer_entries = extra_primers
+                # Stash the construction-history packet + the raw bytes
+                # on the record so a SINGLE-file open (→ `add_entry`)
+                # round-trips history the way the bulk-import path
+                # already does. Pre-fix only bulk import extracted the
+                # 0x07 history + saved the `.dna` sidecar; opening one
+                # `.dna` and re-exporting it silently dropped both the
+                # history AND every CommercialSaaS-specific packet
+                # (alignments, enzymes, …). `add_entry` consumes these.
+                try:
+                    hist_xml = _extract_commercialsaas_history_xml(_dna_bytes)
+                    if hist_xml:
+                        rec._dna_history_xml = hist_xml
+                except ValueError as exc:
+                    _log.warning("dna history extract failed for %s: %s",
+                                 path, exc)
+                # Original bytes enable splice-mode export (byte-exact
+                # round-trip preserving unknown packets). Only retained
+                # when within the augment cap — see the skip branch above.
+                rec._dna_original_bytes = _dna_bytes
         except (OSError, ValueError) as exc:
             _log.warning(
                 "dna augment failed for %s (%s); record loads with "
@@ -17395,6 +17556,24 @@ class PlasmidMap(Widget):
                 if isinstance(primer_seq_q, list) and primer_seq_q:
                     primer_seq = str(primer_seq_q[0]).strip().upper()
                 if primer_seq:
+                    # Re-derive the binding straight from the template so a
+                    # primer ALWAYS renders on the exact bases it anneals
+                    # to — even if its SAVED feature location is stale or
+                    # off (a cloning primer drawn off its real binding
+                    # site is a catastrophic-class error). Overrides
+                    # start/end for display; falls back to the stored
+                    # location when the primer doesn't cleanly match this
+                    # template (foreign primer / intended mismatches).
+                    # [primer binding re-derive, 2026-05-30]
+                    if _seq_upper_for_cds:
+                        _rb = _rederive_primer_binding(
+                            primer_seq, int(strand) if isinstance(strand, int)
+                            else 1, _seq_upper_for_cds, total,
+                            hint_start=int(start),
+                        )
+                        if _rb is not None:
+                            start, end = _rb
+                            new_feat["start"], new_feat["end"] = start, end
                     bound_len = _feat_len(start, end, total) or 0
                     flap_len  = max(0, len(primer_seq) - bound_len)
                     # `_primer_seq` + `_bound_len` are always stamped
@@ -20419,7 +20598,10 @@ class LibraryPanel(Widget):
         #   Seq — sequencing-alignment status badge (✓ / ⚠ / ~ /
         #         ✗ / —) via `_library_entry_alignment_summary`.
         #   bp — sequence length.
-        plas.add_columns("●", "Name", "Status", "Seq", "bp")
+        #   K — kind badge (○ plasmid · / fragment · ≈ amplicon ·
+        #       ρ protein) via `_entry_kind`. Derived for legacy
+        #       entries, explicit for new saves. [2026-05-30]
+        plas.add_columns("●", "Name", "Status", "Seq", "bp", "K")
         self._apply_view_mode()
         self._apply_panel_width()
         self._repopulate()
@@ -20706,23 +20888,41 @@ class LibraryPanel(Widget):
                     seq_summary["label"],
                     style=f"{seq_summary['color']} bold",
                 )
+            # Kind column: one-char colour badge (plasmid / fragment /
+            # amplicon / protein). `_entry_kind` reads the stored `kind`
+            # or derives it for legacy entries.
+            kind = _entry_kind(entry)
+            kind_cell = Text(_LIBRARY_KIND_BADGE.get(kind, "?"),
+                              style=_LIBRARY_KIND_STYLE.get(kind, "dim"))
             t.add_row(
                 ball_cell,
                 name_cell,
                 status_cell,
                 seq_cell,
                 f"{entry['size']:,}",
+                kind_cell,
                 key=entry_id,
             )
 
     # ── Plasmid view: existing flow + back button ──────────────────────────
 
-    def add_entry(self, record) -> bool:
+    def add_entry(self, record, *, target_collection: "str | None" = None,
+                  replace_in_target: bool = False) -> bool:
         """Serialize record and persist into the active collection.
 
         Returns True on a successful save (cache updated, disk write
         dispatched), False on disk failure. The caller can use this
         to gate a "saved" notification.
+
+        ``target_collection`` (2026-05-30): route the entry into a
+        NAMED collection instead of the active one (lets the Synthesis
+        composer pick a destination). When it equals the active
+        collection (or is None/blank) the normal active-collection
+        document model below runs unchanged. When it names a DIFFERENT
+        collection, the entry is committed there via
+        `_commit_library_entry_to_collection`; ``replace_in_target``
+        (set by a re-save of a document that already lives there)
+        replaces in place by id rather than appending a copy.
 
         Preserves any existing workflow `status` on the entry —
         re-saving a plasmid that was already marked VERIFIED keeps
@@ -20745,10 +20945,12 @@ class LibraryPanel(Widget):
         entries = _load_library()
         prev_status = ""
         prev_name = ""
+        prev_history = ""
         for e in entries:
             if e.get("id") == record.id:
                 prev_status = _sanitize_plasmid_status(e.get("status"))
                 prev_name = str(e.get("name") or "").strip()
+                prev_history = str(e.get("history_xml") or "")
                 break
         # Pre-build the new entry dict so collision detection can
         # compare against it directly. `.strip()` on the display name
@@ -20782,6 +20984,68 @@ class LibraryPanel(Widget):
             "gb_text": gb_text,
             "status":  prev_status,
         }
+        # Kind tag (Kind column, 2026-05-30). Explicit `_tui_kind` hint
+        # from the producer (Synthesis stamps "fragment"/"protein") wins;
+        # otherwise derive from topology + source so file imports and
+        # edits classify sensibly. Future-proof: an explicit tag captures
+        # `amplicon`, which can't be derived.
+        new_entry["kind"] = (
+            str(getattr(record, "_tui_kind", "") or "").strip().lower()
+            or _derive_entry_kind(new_entry)
+        )
+        # Construction history round-trip ([.dna round-trip], 2026-05-30).
+        # Carry history through a single-file open → save → export:
+        #   * a freshly-opened `.dna` stamps `_dna_history_xml` on the
+        #     record (load_genbank), consumed here;
+        #   * re-saving an EDITED plasmid (same id) rebuilds the record
+        #     and loses that attr, so fall back to the existing entry's
+        #     history — same preserve-on-resave contract as `status`.
+        # Pre-fix only the bulk-import path attached history; a single
+        # open + Ctrl+S dropped it.
+        _dna_hist = getattr(record, "_dna_history_xml", None)
+        history_xml = _dna_hist or prev_history
+        if history_xml:
+            new_entry["history_xml"] = history_xml
+        # Original `.dna` bytes (single-file open) → sidecar, so export
+        # round-trips byte-exact in splice mode and preserves every
+        # CommercialSaaS packet we don't model. Mirrors the bulk-import
+        # `_save_dna_original` call. Best-effort: a sidecar failure
+        # never blocks the library save.
+        _dna_orig = getattr(record, "_dna_original_bytes", None)
+
+        def _save_dna_sidecar() -> None:
+            if not _dna_orig:
+                return
+            try:
+                _save_dna_original(new_entry["id"], _dna_orig)
+            except (OSError, RuntimeError) as exc:
+                _log.warning("dna sidecar save failed for %r: %s",
+                             new_entry["id"], exc)
+            try:
+                delattr(record, "_dna_original_bytes")
+            except AttributeError:
+                pass
+
+        # Route to a NON-active collection when asked (Synthesis "save to
+        # collection X"). The universal helper appends with collision-
+        # rename, or — for a document re-save back into the same
+        # non-active collection — replaces in place by id
+        # (`replace_in_target`). The active-collection document model
+        # below is untouched. [collection-choice 2026-05-30]
+        active_coll = _get_active_collection_name() or ""
+        tc = (target_collection or "").strip()
+        if tc and tc != active_coll:
+            try:
+                _commit_library_entry_to_collection(
+                    new_entry, tc,
+                    replace_id=(str(record.id) if replace_in_target else None),
+                )
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Plasmid library", exc)
+                return False
+            _save_dna_sidecar()
+            return True
+
         # ID match takes precedence over name match — re-saving an
         # already-loaded record (same id) is the "editing in place"
         # case, never a collision. Strip every same-id entry then add
@@ -20798,6 +21062,7 @@ class LibraryPanel(Widget):
                            if e.get("id") != record.id]
                 entries.insert(0, new_entry)
                 self._commit_library_entries(entries, select_id=record.id)
+            _save_dna_sidecar()
             return True
         # No id match: check for name collisions against entries whose
         # id differs. ``_resolve_load_collisions`` handles the modal
@@ -20812,6 +21077,7 @@ class LibraryPanel(Widget):
                 entries = _load_library()
                 entries.insert(0, new_entry)
                 self._commit_library_entries(entries, select_id=record.id)
+            _save_dna_sidecar()
             return True
 
         def _content_fn(e: dict) -> str:
@@ -22999,6 +23265,24 @@ class SequencePanel(Widget):
                 v = f.get(k)
                 if isinstance(v, int) and v >= 0:
                     new[k] = (v - o) % n
+            # Re-attach a primer's 5' flap to the ROTATED feature so it
+            # travels WITH the primer across an origin rotation. Pre-fix
+            # only start/end rotated; `_flap_start`/`_flap_end` stayed in
+            # the original frame, so the flap's head floated at display
+            # bp 0 regardless of rotation (2026-05-30 user report). Re-
+            # derive off the new start/end with the exact geometry
+            # `PlasmidMap._parse` uses — forward flap sits 5' of `start`,
+            # reverse flap 3' of `end` — so the wrap-aware flap renderer
+            # (`_paint_primer_flap_bar`, mods placement to the origin)
+            # paints it in the right place in the rotated frame.
+            fl = f.get("_flap_len")
+            if isinstance(fl, int) and fl > 0:
+                if f.get("strand", 1) >= 0:
+                    new["_flap_start"] = new["start"] - fl
+                    new["_flap_end"]   = new["start"]
+                else:
+                    new["_flap_start"] = new["end"]
+                    new["_flap_end"]   = new["end"] + fl
             rot_feats.append(new)
         self._rotated_cache_key = key
         self._rotated_seq       = rot_seq
@@ -23744,8 +24028,16 @@ class SequencePanel(Widget):
             # spacer / overhang bases under the per-region colour
             # scheme: recognition stays blue/red, spacer is gray,
             # overhang region is green (top) / yellow (bot).
-            "rec_start":     resite["start"],
-            "rec_end":       min(resite["end"], n),
+            #
+            # Prefer the scan-stamped `rec_start`/`rec_end`: on a
+            # near-origin site that wraps, the clicked (labeled) piece
+            # is only the tail `[p, n)`, but the stamped bounds carry
+            # the FULL recognition `[p, head_len)` wrap-encoded
+            # (rec_end < rec_start), so all recognition bases — tail
+            # AND head — get the recognition colour. Falls back to the
+            # piece's own span for legacy/non-wrap pieces.
+            "rec_start":     resite.get("rec_start", resite["start"]),
+            "rec_end":       resite.get("rec_end", min(resite["end"], n)),
             "color":         resite["color"],
             "name":          resite["label"],
         }
@@ -25422,6 +25714,12 @@ class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
     #hist-title {
         background: $accent-darken-2; padding: 0 1; margin-bottom: 1;
     }
+    #hist-proto-label { color: $accent; text-style: bold; }
+    #hist-proto {
+        height: auto; max-height: 9; margin-bottom: 1;
+        border: solid $primary-darken-2; padding: 0 1; overflow-y: auto;
+    }
+    #hist-proto Static { padding: 0 1; }
     #hist-tree { height: 1fr; }
     #hist-detail {
         height: 8; border: solid $primary-darken-2;
@@ -25443,9 +25741,13 @@ class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
         self._node_by_id: "dict[int, _CommercialSaaSHistoryNode]" = {}
 
     def compose(self) -> ComposeResult:
+        from rich.markup import escape as _esc
         with Vertical(id="hist-box"):
-            yield Static(f" Construction history — {self._title} ",
+            yield Static(f" Construction history — {_esc(self._title)} ",
                           id="hist-title")
+            yield Static("Protocol", id="hist-proto-label")
+            with VerticalScroll(id="hist-proto"):
+                yield Static("", id="hist-proto-text", markup=True)
             yield Tree("History", id="hist-tree")
             with Vertical(id="hist-detail"):
                 yield Static(
@@ -25459,16 +25761,20 @@ class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
         tree = self.query_one("#hist-tree", Tree)
         tree.show_root = False
         tree.guide_depth = 4
-        # Walk the CommercialSaaS history tree and populate the Textual
-        # tree. The root CommercialSaaS node = the result plasmid (the
-        # current library entry).
-        def _add(parent_tree_node, hist_node: "_CommercialSaaSHistoryNode"):
-            label = self._tree_label_for(hist_node)
-            child = parent_tree_node.add(label, expand=True)
-            self._node_by_id[child.id] = hist_node
-            for parent in hist_node.parents:
-                _add(child, parent)
-        _add(tree.root, self._root_node)
+        # De-noised, iterative populate — shared with `HistoryScreen` so
+        # both viewers render identically (only the product auto-expands;
+        # repeated ancestors collapse to references). Replaces the old
+        # recursive `_add`, which both auto-expanded everything AND could
+        # blow the recursion limit on a deeply-nested hostile `.dna`.
+        if _history_populate_tree(tree, self._root_node, self._node_by_id):
+            _log.warning("history: modal tree render truncated by cap "
+                         "for %r", self._title)
+        try:
+            proto = self.query_one("#hist-proto-text", Static)
+            proto.update("\n".join(
+                _history_protocol_lines(self._root_node)))
+        except NoMatches:
+            pass
         # Auto-select the root so the detail pane has something
         # interesting on open.
         try:
@@ -25500,10 +25806,11 @@ class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
 
     @on(Tree.NodeSelected, "#hist-tree")
     def _on_node_selected(self, event) -> None:
-        """When the user picks a node, render its full details (all
-        attributes + regenerated sites + input summaries) into the
-        bottom detail panel. Falls back gracefully if the lookup
-        fails — defence-in-depth against the dict going stale."""
+        """When the user picks a node, render its full details into the
+        bottom detail panel via the shared `_history_detail_lines` (same
+        block the full-screen viewer shows; every dynamic field is
+        Rich-escaped). Falls back gracefully if the lookup fails —
+        defence-in-depth against the dict going stale."""
         hist = self._node_by_id.get(event.node.id)
         if hist is None:
             return
@@ -25511,60 +25818,363 @@ class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
             detail = self.query_one("#hist-detail-text", Static)
         except NoMatches:
             return
-        lines: list[str] = []
-        lines.append(f"[b]{hist.name}[/]")
-        lines.append(
-            f"  {hist.seq_len:,} bp  ·  "
-            f"{'circular' if hist.circular else 'linear'}  ·  "
-            f"strandedness: "
-            f"{hist.element.get('strandedness', '?')}  ·  "
-            f"ID: {hist.node_id}"
-        )
-        lines.append(f"  operation: [cyan]{hist.operation}[/]")
-        if hist.resurrectable:
-            lines.append("  [green]✓ resurrectable[/] (parent fragment "
-                          "can be re-extracted from history)")
-        sites = hist.regenerated_sites
-        if sites:
-            joined = ", ".join(
-                f"{s['name']}@{s['pos']}" for s in sites
-            )
-            lines.append(f"  regenerated sites: {joined}")
-        for sm in hist.input_summaries:
-            lines.append(
-                f"  input: {sm['manipulation']}  "
-                f"({sm['name1']}↔{sm['name2']})"
-            )
-        if hist.parents:
-            lines.append(f"  parents: {len(hist.parents)} "
-                          f"({', '.join(p.name for p in hist.parents)})")
-        else:
-            lines.append("  [dim](leaf — no recorded parents)[/]")
-        detail.update("\n".join(lines))
+        detail.update("\n".join(_history_detail_lines(hist)))
 
 
 _HISTORY_TITLE_NAME_MAX: int = 60
 _HISTORY_LABEL_NAME_MAX: int = 40
 _HISTORY_DETAIL_LIST_MAX: int = 12
+_HISTORY_PROTOCOL_INPUT_MAX: int = 8   # parts listed per step before "+N more"
+
+# Friendly verbs for the operation strings our builders (and CommercialSaaS)
+# stamp on history nodes. Unknown ops pass through verbatim — CommercialSaaS
+# emits operations we don't model, and the renderer must never assume a
+# closed set (see `_COMMERCIALSAAS_HISTORY_KNOWN_OPS`).
+_HISTORY_OP_FRIENDLY: "dict[str, str]" = {
+    "insertFragment": "assemble",
+    "insert":         "insert",
+    "replace":        "replace",
+    "gibsonAssembly": "Gibson",
+}
+# Cosmetic glyph per friendly op (prefixed to the op tag in the tree row).
+_HISTORY_OP_GLYPH: "dict[str, str]" = {
+    "assemble": "⊕",
+    "Gibson":   "⊕",
+    "insert":   "⊕",
+    "replace":  "⇄",
+}
+
+
+def _history_clean_name(name: str) -> str:
+    """Strip the cosmetic ``.dna`` suffix history nodes carry (CommercialSaaS
+    convention — see `_build_history_for_product`) for a cleaner row.
+    Empty / whitespace name → ``(unnamed)`` so a row never collapses to
+    blank. Does NOT escape — callers escape at render time."""
+    n = (name or "").strip()
+    if n[-4:].lower() == ".dna":
+        n = n[:-4].strip()
+    return n or "(unnamed)"
+
+
+def _history_size_label(bp: int) -> str:
+    """Compact length for a tree row: ``712 bp`` · ``13.9 kb`` ·
+    ``1.20 Mb``. The exact base count still shows in the detail pane —
+    the tree just wants something short."""
+    try:
+        b = int(bp)
+    except (TypeError, ValueError):
+        b = 0
+    if b < 0:
+        b = 0
+    if b < 1_000:
+        return f"{b} bp"
+    if b < 1_000_000:
+        return f"{b / 1_000:.1f} kb"
+    return f"{b / 1_000_000:.2f} Mb"
+
+
+def _history_op_label(op: str) -> str:
+    """Friendly verb for an operation string; unknown ops pass through
+    verbatim. Empty op → empty string (caller omits the tag)."""
+    raw = (op or "").strip()
+    return _HISTORY_OP_FRIENDLY.get(raw, raw) if raw else ""
+
+
+def _history_reopen_nudge(source: str) -> str:
+    """Hint appended to the "no construction history" notify when an
+    entry looks like it came from a `.dna` file. Single-file `.dna`
+    opens before 2026-05-30 didn't capture the embedded 0x07 history
+    packet, so those entries have no lineage stored — re-opening the
+    original file (which now stashes + persists the history) restores
+    it. Returns '' for non-`.dna` sources so a hand-built construct
+    that simply hasn't been through a cloning action isn't told to
+    re-open a file that doesn't exist. Both the bulk-import `source`
+    (`file:NAME.dna`) and the single-file `_tui_source` (the path)
+    carry the `.dna` substring; bulk-imported entries already have
+    history and never reach this branch, so the nudge targets exactly
+    the pre-fix single-file case."""
+    return (" Re-open the original .dna file to restore its "
+            "construction history."
+            if source and ".dna" in source.lower() else "")
+
+
+def _history_node_signature(node: "_CommercialSaaSHistoryNode") -> str:
+    """Identity key for collapsing repeated ancestor subtrees in the
+    viewer. Two nodes with the same cleaned name + length + operation
+    are treated as the same plasmid — repeats come from the same parent
+    entry's inherited ``history_xml``, so the subtree IS identical.
+
+    Purely cosmetic: a false match merely renders the 2nd occurrence as
+    a ``↳ … (shown above)`` reference instead of redrawing it. It never
+    touches stored history."""
+    return (f"{_history_clean_name(node.name)}\x00{int(node.seq_len)}"
+            f"\x00{(node.operation or '').strip()}")
 
 
 def _history_tree_label(node: "_CommercialSaaSHistoryNode") -> str:
-    """One-line tree label for the History viewer:
-    ``name · N bp · circular · operation``.
+    """De-noised one-line tree label: ``name   size   ⊕ op`` (markup
+    string; render via ``Text.from_markup``).
 
-    Names + operations are escaped against Rich markup injection (the
-    fields come from XML attributes which can legally contain `[`)
-    and truncated against extremely long values that would push the
-    tree column off-screen. Empty strings render as ``(unnamed)`` /
-    ``(no operation)`` so the row never collapses to whitespace."""
+    The old format crammed name · N bp · circular · operation onto
+    every row; the bp count + topology + raw op string repeated on all
+    of them. Now the row leads with the (``.dna``-stripped) name + a
+    compact size, drops "circular" (the common case — only "linear" is
+    flagged), and shows a friendly op verb. Full bp / topology /
+    strandedness move to the detail pane (`_history_detail_lines`).
+
+    Names + ops are Rich-escaped (XML attrs can legally contain ``[``)
+    and truncated so a hostile value can't push the column off-screen."""
     from rich.markup import escape as _esc
-    raw_name = node.name or "(unnamed)"
-    name = _esc(raw_name)
-    if len(raw_name) > _HISTORY_LABEL_NAME_MAX:
-        name = _esc(raw_name[: _HISTORY_LABEL_NAME_MAX - 1] + "…")
-    topo = "circular" if node.circular else "linear"
-    op = _esc(node.operation) if node.operation else "(no operation)"
-    return f"{name}  ·  {node.seq_len:,} bp  ·  {topo}  ·  {op}"
+    raw = _history_clean_name(node.name)
+    if len(raw) > _HISTORY_LABEL_NAME_MAX:
+        raw = raw[: _HISTORY_LABEL_NAME_MAX - 1] + "…"
+    name = _esc(raw)
+    bits = [f"[b]{name}[/b]", f"[dim]{_history_size_label(node.seq_len)}[/dim]"]
+    if not node.circular:
+        bits.append("[dim]linear[/dim]")
+    # Only nodes that actually combined inputs (have parents) carry an
+    # operation tag — a raw starting material isn't the product of a
+    # step, so tagging every leaf "⊕ assemble" was pure noise.
+    op = _history_op_label(node.operation)
+    if op and node.parents:
+        glyph = _HISTORY_OP_GLYPH.get(op, "")
+        tag = f"{glyph} {_esc(op)}".strip()
+        bits.append(f"[cyan]{tag}[/cyan]")
+    return "   ".join(bits)
+
+
+def _history_reference_label(node: "_CommercialSaaSHistoryNode") -> str:
+    """Compact label for the 2nd+ occurrence of a repeated ancestor —
+    ``↳ name  size  (shown above)``. No operation tag (the canonical
+    occurrence carries the detail); the marker tells the user the full
+    subtree lives elsewhere in the tree rather than being drawn again."""
+    from rich.markup import escape as _esc
+    raw = _history_clean_name(node.name)
+    if len(raw) > _HISTORY_LABEL_NAME_MAX:
+        raw = raw[: _HISTORY_LABEL_NAME_MAX - 1] + "…"
+    name = _esc(raw)
+    return (f"[dim]↳[/dim] {name}   [dim]{_history_size_label(node.seq_len)}"
+            f"[/dim]   [dim i](shown above)[/dim i]")
+
+
+def _history_populate_tree(tree, root: "_CommercialSaaSHistoryNode",
+                            node_by_id: dict) -> bool:
+    """Fill a Textual ``Tree`` from a history root, de-noised:
+
+      * **Progressive disclosure** — only the product (the root) opens
+        by default; deeper generations start collapsed so a multi-step
+        build doesn't dump its whole fractal on open.
+      * **Dedup repeated ancestors** — a subtree seen before renders as
+        a single ``↳ … (shown above)`` leaf, so a backbone reused
+        across N branches is drawn once, not N times (the dominant
+        noise on real GB/MoClo lineages).
+
+    Iterative DFS with the shared depth + node caps (mirrors
+    `_history_node_to_dict` / `_CommercialSaaSHistoryNode.walk` — a
+    hostile deeply-nested ``.dna`` can't trip the recursion limit).
+    Populates ``node_by_id`` ``{textual_node_id: hist_node}`` for the
+    detail pane. Returns ``True`` if a cap truncated the render."""
+    seen: "set[str]" = set()
+    truncated = False
+    n_seen = 0
+    # Frame: (textual_parent_node, hist_node, depth). Pre-order; push
+    # children reversed so the first parent pops next.
+    stack: list = [(tree.root, root, 0)]
+    while stack:
+        parent_tnode, hist, depth = stack.pop()
+        if n_seen >= _HISTORY_NODE_MAX_NODES or depth >= _HISTORY_NODE_MAX_DEPTH:
+            truncated = True
+            continue
+        sig = _history_node_signature(hist)
+        is_ref = sig in seen
+        if is_ref:
+            label = _history_reference_label(hist)
+        else:
+            seen.add(sig)
+            label = _history_tree_label(hist)
+        child = parent_tnode.add(Text.from_markup(label), expand=(depth == 0))
+        node_by_id[child.id] = hist
+        n_seen += 1
+        if is_ref:
+            # Reference occurrence — don't redraw the (identical) subtree.
+            continue
+        for p in reversed(hist.parents):
+            stack.append((child, p, depth + 1))
+    return truncated
+
+
+def _history_step_from_node(node: "_CommercialSaaSHistoryNode") -> dict:
+    """Distil one build STEP from a history node that has parents.
+    ``backbone`` is the entry-vector / acceptor; ``inputs`` the parts
+    that went into it; ``enzyme`` the Type IIS / RE that joined them.
+
+    Backbone detection: our builders add the acceptor first AND record
+    it as ``InputSummary.name1`` — prefer that match, else fall back to
+    the first parent. Imported CommercialSaaS history that doesn't follow
+    the convention degrades to "first parent is the backbone", which is
+    cosmetic-only (the protocol line may swap which input is labelled
+    the acceptor)."""
+    parents = node.parents
+    sites = node.regenerated_sites
+    enzyme = str(sites[0].get("name") or "") if sites else ""
+    summaries = node.input_summaries
+    backbone_label = (_history_clean_name(summaries[0].get("name1") or "")
+                      if summaries else "")
+    backbone = ""
+    inputs: "list[str]" = []
+    if parents:
+        names = [_history_clean_name(p.name) for p in parents]
+        if len(names) == 1:
+            inputs = names
+        else:
+            bi = 0
+            if backbone_label:
+                for i, nm in enumerate(names):
+                    if nm == backbone_label:
+                        bi = i
+                        break
+            backbone = names[bi]
+            inputs = [nm for i, nm in enumerate(names) if i != bi]
+    return {
+        "product":  _history_clean_name(node.name),
+        "op":       _history_op_label(node.operation),
+        "enzyme":   enzyme,
+        "backbone": backbone,
+        "inputs":   inputs,
+        "seq_len":  int(node.seq_len),
+        "circular": bool(node.circular),
+    }
+
+
+def _history_build_steps(root: "_CommercialSaaSHistoryNode") -> "list[dict]":
+    """Flatten a history tree into an ordered, de-duplicated list of
+    build STEPS for the protocol view. A step is any node with parents
+    (an assembly / cloning op); raw leaf inputs are not steps. A reused
+    sub-assembly collapses to ONE step. Ordered earliest-first (deepest
+    in the tree) → final product last, so it reads like a bench recipe.
+
+    The protocol naturally sidesteps the combinatorial leaf-duplication
+    that bloats the tree: duplication lives in the leaf ancestors, and
+    leaves are never steps. Iterative + capped (hostile-XML safe)."""
+    by_sig: "dict[str, dict]" = {}
+    depth_of: "dict[str, int]" = {}
+    order: "list[str]" = []
+    stack: list = [(root, 0)]
+    n_seen = 0
+    while stack:
+        node, depth = stack.pop()
+        if n_seen >= _HISTORY_NODE_MAX_NODES or depth >= _HISTORY_NODE_MAX_DEPTH:
+            break
+        n_seen += 1
+        parents = node.parents
+        if parents:
+            sig = _history_node_signature(node)
+            # A reused sub-assembly sorts to its EARLIEST (deepest) use.
+            depth_of[sig] = max(depth_of.get(sig, 0), depth)
+            if sig not in by_sig:
+                by_sig[sig] = _history_step_from_node(node)
+                order.append(sig)
+        # Push reversed so siblings pop in natural tree order — keeps
+        # the protocol reading vector-then-parts, first-listed-first.
+        for p in reversed(parents):
+            stack.append((p, depth + 1))
+    # Deepest first (earliest build) → product (depth 0) last. Stable on
+    # insertion order for ties (siblings keep tree order).
+    order.sort(key=lambda s: depth_of.get(s, 0), reverse=True)
+    return [by_sig[s] for s in order]
+
+
+def _history_protocol_lines(root: "_CommercialSaaSHistoryNode") -> "list[str]":
+    """Rendered, Rich-escaped protocol lines for the viewer's summary
+    pane — one numbered line per de-duplicated build step, earliest
+    first. A bare record with no assembly steps returns a single
+    placeholder line."""
+    from rich.markup import escape as _esc
+    steps = _history_build_steps(root)
+    if not steps:
+        return ["[dim]Single record — no assembly steps recorded.[/dim]"]
+    lines: "list[str]" = []
+    for i, s in enumerate(steps, 1):
+        parts = [f"[b]{i}.[/b]  [b]{_esc(s['product'])}[/b]"]
+        ins = s["inputs"]
+        if ins:
+            shown = ins[:_HISTORY_PROTOCOL_INPUT_MAX]
+            joined = " + ".join(_esc(x) for x in shown)
+            extra = len(ins) - len(shown)
+            if extra > 0:
+                joined += f" [dim]+{extra} more[/dim]"
+            parts.append(f"⟵ {joined}")
+        if s["backbone"]:
+            parts.append(f"[dim]into[/dim] [cyan]{_esc(s['backbone'])}[/cyan]")
+        if s["enzyme"]:
+            parts.append(f"[magenta]✂ {_esc(s['enzyme'])}[/magenta]")
+        lines.append("  ".join(parts))
+    return lines
+
+
+def _history_detail_lines(hist: "_CommercialSaaSHistoryNode") -> "list[str]":
+    """Full detail block for the selected history node — shared by both
+    viewers so the modal and the full screen never drift. Every dynamic
+    field is Rich-escaped and long lists are capped."""
+    from rich.markup import escape as _esc
+    name_disp = (f"[b]{_esc(_history_clean_name(hist.name))}[/b]"
+                 if hist.name else "[dim](unnamed)[/]")
+    op_raw = hist.operation
+    op_disp = (f"[cyan]{_esc(_history_op_label(op_raw))}[/]  "
+               f"[dim]({_esc(op_raw)})[/]" if op_raw
+               else "[dim](not recorded)[/]")
+    strandedness = hist.element.get("strandedness") or "?"
+    lines: "list[str]" = [name_disp, ""]
+    lines.append("[b]Properties[/]")
+    lines.append(f"  Length:        {hist.seq_len:,} bp")
+    lines.append("  Topology:      "
+                 f"{'circular' if hist.circular else 'linear'}")
+    lines.append(f"  Strandedness:  {_esc(strandedness)}")
+    lines.append(f"  Node ID:       {hist.node_id}")
+    lines.append("")
+    lines.append("[b]Operation[/]")
+    lines.append(f"  {op_disp}")
+    if hist.resurrectable:
+        lines.append("  [green]✓ resurrectable[/] "
+                     "[dim](parent can be re-extracted)[/]")
+    sites = hist.regenerated_sites
+    if sites:
+        lines.append("")
+        lines.append("[b]Regenerated sites[/]")
+        shown = sites[:_HISTORY_DETAIL_LIST_MAX]
+        joined = ", ".join(
+            f"{_esc(str(s['name']) or '(unnamed)')}@{s['pos']}"
+            for s in shown
+        )
+        if len(sites) > _HISTORY_DETAIL_LIST_MAX:
+            joined += f", … (+{len(sites) - _HISTORY_DETAIL_LIST_MAX} more)"
+        lines.append(f"  {joined}")
+    sums = hist.input_summaries
+    if sums:
+        lines.append("")
+        lines.append("[b]Inputs[/]")
+        for sm in sums[:_HISTORY_DETAIL_LIST_MAX]:
+            manip = _esc(str(sm.get('manipulation') or "(unknown)"))
+            n1 = _esc(str(sm.get('name1') or "?"))
+            n2 = _esc(str(sm.get('name2') or "?"))
+            lines.append(f"  {manip}  ({n1} ↔ {n2})")
+        if len(sums) > _HISTORY_DETAIL_LIST_MAX:
+            lines.append(
+                f"  [dim]… (+{len(sums) - _HISTORY_DETAIL_LIST_MAX} more)[/]")
+    parents = hist.parents
+    lines.append("")
+    if parents:
+        lines.append(f"[b]Parents ({len(parents)})[/]")
+        shown_p = parents[:_HISTORY_DETAIL_LIST_MAX]
+        joined = ", ".join(
+            _esc(_history_clean_name(p.name)) for p in shown_p
+        )
+        if len(parents) > _HISTORY_DETAIL_LIST_MAX:
+            joined += f", … (+{len(parents) - _HISTORY_DETAIL_LIST_MAX} more)"
+        lines.append(f"  {joined}")
+    else:
+        lines.append("[dim](leaf — no recorded parents)[/]")
+    return lines
 
 
 def _history_node_count(root: "_CommercialSaaSHistoryNode") -> int:
@@ -25630,9 +26240,14 @@ class HistoryScreen(_OneShotDismissScreen, Screen):
         border-right: solid $primary-darken-2;
     }
     #hist-scr-detail-col { width: 1fr; padding: 1 2; }
-    #hist-scr-tree-label, #hist-scr-detail-label {
+    #hist-scr-tree-label, #hist-scr-detail-label, #hist-scr-proto-label {
         text-style: bold; color: $accent; margin-bottom: 1;
     }
+    #hist-scr-proto {
+        height: auto; max-height: 45%; margin-bottom: 1;
+        border: solid $primary-darken-2; padding: 0 1; overflow-y: auto;
+    }
+    #hist-scr-proto Static { padding: 0 1; }
     #hist-scr-tree { height: 1fr; }
     #hist-scr-detail {
         height: 1fr; border: solid $primary-darken-2;
@@ -25659,13 +26274,18 @@ class HistoryScreen(_OneShotDismissScreen, Screen):
         yield Static(f" Construction history — {_esc(self._title)} ",
                       id="hist-scr-title")
         n_nodes = _history_node_count(self._root_node)
+        n_steps = len(_history_build_steps(self._root_node))
         yield Static(
             f"  {n_nodes} node{'s' if n_nodes != 1 else ''}  ·  "
+            f"{n_steps} build step{'s' if n_steps != 1 else ''}  ·  "
             "Esc / Q to close  ·  E expand all  ·  C collapse",
             id="hist-scr-subtitle",
         )
         with Horizontal(id="hist-scr-main"):
             with Vertical(id="hist-scr-tree-col"):
+                yield Static("Protocol", id="hist-scr-proto-label")
+                with VerticalScroll(id="hist-scr-proto"):
+                    yield Static("", id="hist-scr-proto-text", markup=True)
                 yield Static("Lineage", id="hist-scr-tree-label")
                 yield Tree("History", id="hist-scr-tree")
             with Vertical(id="hist-scr-detail-col"):
@@ -25685,31 +26305,25 @@ class HistoryScreen(_OneShotDismissScreen, Screen):
         tree.guide_depth = 4
         self._build_tree(tree)
         try:
+            proto = self.query_one("#hist-scr-proto-text", Static)
+            proto.update("\n".join(
+                _history_protocol_lines(self._root_node)))
+        except NoMatches:
+            pass
+        try:
             top = tree.root.children[0]
             tree.select_node(top)
         except IndexError:
             pass
 
     def _build_tree(self, tree: Tree) -> None:
-        """Populate the Textual `Tree` with our history nodes.
-
-        Iterative DFS so a 1000+ deep history (hostile XML or a long
-        chain of L0 → L1 → L2 → … builds) can't trip the CPython
-        recursion limit. Mirrors `_CommercialSaaSHistoryNode.walk`'s
-        iteration shape and `_history_node_count` so the three
-        traversal helpers stay consistent.
-        """
-        stack: list[tuple] = [(tree.root, self._root_node)]
-        while stack:
-            parent_tree_node, hist_node = stack.pop()
-            label = _history_tree_label(hist_node)
-            child = parent_tree_node.add(label, expand=True)
-            self._node_by_id[child.id] = hist_node
-            # Push children reversed so the first parent pops next —
-            # preserves the original pre-order traversal.
-            stack.extend(
-                (child, p) for p in reversed(hist_node.parents)
-            )
+        """Populate the Textual `Tree`, de-noised — delegates to the
+        shared `_history_populate_tree` so the modal + full screen stay
+        identical. Iterative DFS (hostile-XML safe); only the product
+        auto-expands and repeated ancestors collapse to references."""
+        if _history_populate_tree(tree, self._root_node, self._node_by_id):
+            _log.warning("history: tree render truncated by node/depth cap "
+                         "for %r", self._title)
 
     @on(Button.Pressed, "#btn-hist-scr-close")
     def _on_close(self, _: Button.Pressed) -> None:
@@ -25767,8 +26381,9 @@ class HistoryScreen(_OneShotDismissScreen, Screen):
         regenerated sites or parents doesn't blow up the column.
 
         Defence-in-depth — a stale dict lookup or missing widget
-        returns silently rather than tracing back at the user."""
-        from rich.markup import escape as _esc
+        returns silently rather than tracing back at the user. Detail
+        text is built by the shared `_history_detail_lines` so the modal
+        + full screen never drift."""
         hist = self._node_by_id.get(event.node.id)
         if hist is None:
             return
@@ -25776,69 +26391,7 @@ class HistoryScreen(_OneShotDismissScreen, Screen):
             detail = self.query_one("#hist-scr-detail-text", Static)
         except NoMatches:
             return
-        name_disp = _esc(hist.name) if hist.name else "[dim](unnamed)[/]"
-        op_raw = hist.operation
-        op_disp = (
-            f"[cyan]{_esc(op_raw)}[/]" if op_raw
-            else "[dim](not recorded)[/]"
-        )
-        strandedness = hist.element.get("strandedness") or "?"
-        lines: list[str] = []
-        lines.append(f"[b]{name_disp}[/]")
-        lines.append("")
-        lines.append("[b]Properties[/]")
-        lines.append(f"  Length:        {hist.seq_len:,} bp")
-        lines.append("  Topology:      "
-                       f"{'circular' if hist.circular else 'linear'}")
-        lines.append(f"  Strandedness:  {_esc(strandedness)}")
-        lines.append(f"  Node ID:       {hist.node_id}")
-        lines.append("")
-        lines.append("[b]Operation[/]")
-        lines.append(f"  {op_disp}")
-        if hist.resurrectable:
-            lines.append("  [green]✓ resurrectable[/] "
-                          "[dim](parent can be re-extracted)[/]")
-        sites = hist.regenerated_sites
-        if sites:
-            lines.append("")
-            lines.append("[b]Regenerated sites[/]")
-            shown = sites[: _HISTORY_DETAIL_LIST_MAX]
-            joined = ", ".join(
-                f"{_esc(str(s['name']) or '(unnamed)')}@{s['pos']}"
-                for s in shown
-            )
-            if len(sites) > _HISTORY_DETAIL_LIST_MAX:
-                joined += f", … (+{len(sites) - _HISTORY_DETAIL_LIST_MAX} more)"
-            lines.append(f"  {joined}")
-        sums = hist.input_summaries
-        if sums:
-            lines.append("")
-            lines.append("[b]Inputs[/]")
-            for sm in sums[: _HISTORY_DETAIL_LIST_MAX]:
-                manip = _esc(str(sm.get('manipulation') or "(unknown)"))
-                n1 = _esc(str(sm.get('name1') or "?"))
-                n2 = _esc(str(sm.get('name2') or "?"))
-                lines.append(f"  {manip}  ({n1} ↔ {n2})")
-            if len(sums) > _HISTORY_DETAIL_LIST_MAX:
-                lines.append(
-                    f"  [dim]… (+{len(sums) - _HISTORY_DETAIL_LIST_MAX} more)[/]"
-                )
-        parents = hist.parents
-        lines.append("")
-        if parents:
-            lines.append(f"[b]Parents ({len(parents)})[/]")
-            shown = parents[: _HISTORY_DETAIL_LIST_MAX]
-            joined = ", ".join(
-                _esc(p.name or "(unnamed)") for p in shown
-            )
-            if len(parents) > _HISTORY_DETAIL_LIST_MAX:
-                joined += (
-                    f", … (+{len(parents) - _HISTORY_DETAIL_LIST_MAX} more)"
-                )
-            lines.append(f"  {joined}")
-        else:
-            lines.append("[dim](leaf — no recorded parents)[/]")
-        detail.update("\n".join(lines))
+        detail.update("\n".join(_history_detail_lines(hist)))
 
 
 class WhatsNewModal(_OneShotDismissScreen, ModalScreen):
@@ -32792,6 +33345,65 @@ def _amplicon_from_stored_primers(
     if body_start > body_end:
         return None
     return fwd + sequence[body_start:body_end] + rev_rc
+
+
+# Shortest contiguous match we'll trust as a genuine primer binding when
+# re-deriving from the template (Domesticator targets 18–25 bp; 12 is a
+# safe floor that still rejects spurious short coincidences).
+_PRIMER_REBIND_MIN: int = 12
+
+
+def _rederive_primer_binding(primer_seq: str, strand: int, template: str,
+                             total: int, hint_start: int = 0,
+                             ) -> "tuple[int, int] | None":
+    """Find where a primer's annealing region ACTUALLY binds the
+    (circular) ``template``, so a stale / mis-saved ``pos_start`` /
+    ``pos_end`` can't park the primer off its true site on the map.
+
+    Returns ``(pos_start, pos_end)`` in top-strand coordinates —
+    half-open, with ``pos_end < pos_start`` when the binding wraps the
+    origin (and ``pos_end == total`` when it ends exactly at the
+    origin). Returns ``None`` when no clean binding is found, so the
+    caller keeps the stored positions.
+
+    The binding region is the LONGEST contiguous stretch at the primer's
+    3' end that matches the template — forward: the primer's own 3'
+    suffix on the top strand; reverse: that suffix's reverse-complement
+    on the top strand (which equals a prefix of ``rc(primer)``). The 5'
+    flap (enzyme site / spacer / fusion overhang) is whatever doesn't
+    match. When a primer legitimately binds more than one site, the
+    occurrence nearest ``hint_start`` (the stored position) wins, so the
+    primer still lands where the user designed it."""
+    seq = (primer_seq or "").upper()
+    if not seq or not template or total <= 0:
+        return None
+    # Circular search space: append the wrap-around head so a binding
+    # that spans the origin is found as one contiguous slice. Cap the
+    # tail at the primer length so we never scan more than necessary.
+    tail = template[:max(0, min(len(seq), total) - 1)]
+    aug = template + tail
+    rc = _rc(seq) if strand < 0 else ""
+    max_L = min(len(seq), total)
+    hint = (int(hint_start) % total) if total else 0
+    for L in range(max_L, _PRIMER_REBIND_MIN - 1, -1):
+        target = (seq[len(seq) - L:] if strand >= 0 else rc[:L])
+        starts: list[int] = []
+        i = aug.find(target)
+        while i != -1 and i < total:
+            starts.append(i)
+            i = aug.find(target, i + 1)
+        if not starts:
+            continue
+        # Closest occurrence to the stored hint (circular distance).
+        def _cdist(p: int) -> int:
+            d = abs(p - hint)
+            return min(d, total - d)
+        m = min(starts, key=_cdist)
+        pos_end = m + L
+        if pos_end > total:          # wraps the origin
+            pos_end -= total
+        return (m, pos_end)
+    return None
 
 
 def _simulate_cloned_plasmid(insert: str, oh5: str, oh3: str,
@@ -68910,6 +69522,10 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         # action dispatch.
         self._loaded_id:   "str | None" = None
         self._loaded_name: "str | None" = None
+        # Collection the DNA fragment was last saved into (chosen at
+        # save time). Re-saves route back here so the document doesn't
+        # duplicate into the active collection. None → active. [2026-05-30]
+        self._loaded_collection: "str | None" = None
         self._saved_snapshot: "tuple[str, list[dict]] | None" = ("", [])
         self._dirty: bool = False
         # Feature library side panel — DNA tab.
@@ -68917,6 +69533,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         # Protein tab state.
         self._protein_loaded_id:   "str | None" = None
         self._protein_loaded_name: "str | None" = None
+        self._protein_loaded_collection: "str | None" = None
         self._protein_saved_snapshot: "str" = ""
         self._protein_dirty: bool = False
         self._motif_rows: list[tuple[str, dict]] = []
@@ -69288,6 +69905,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         }
         # Fresh, unsaved DNA fragment — Save will prompt for a library name.
         self._loaded_id = None
+        self._loaded_collection = None
         self._loaded_name = name
         self._saved_snapshot = ("", [])
         self._dirty = True
@@ -69660,10 +70278,26 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         Each tab carries its own dirty / loaded-name / cursor info
         so the status line reflects the surface the user is
         composing on."""
-        if self._active_tab_id() == "protein":
+        is_protein = self._active_tab_id() == "protein"
+        if is_protein:
             self._refresh_status_protein()
         else:
             self._refresh_status_dna()
+        self._refresh_saveas_enabled(is_protein)
+
+    def _refresh_saveas_enabled(self, is_protein: bool) -> None:
+        """Enable **Save As** only once the active tab's fragment has
+        been saved at least once. Save As forks a NEW copy of an
+        existing entry; for a never-saved fragment it does exactly what
+        Save does (prompt for a name), so leaving it live there is just
+        a confusing duplicate. Disabled until there's an original to
+        fork. Called from `_refresh_status`, which fires on load / save
+        / rename / tab-switch / focus, so the state stays current."""
+        loaded = self._protein_loaded_id if is_protein else self._loaded_id
+        try:
+            self.query_one("#btn-syn-saveas", Button).disabled = (loaded is None)
+        except NoMatches:
+            pass
 
     def _refresh_status_dna(self) -> None:
         try:
@@ -70399,6 +71033,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 return
             ed.load("", [])
             self._loaded_id = None
+            self._loaded_collection = None
             self._loaded_name = None
             self._saved_snapshot = ("", [])
             self._dirty = False
@@ -70501,6 +71136,9 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
             return
         ed.load(seq, feats)
         self._loaded_id   = entry.get("id") or eid
+        # Loaded from the active collection's library → re-saves target
+        # active (None) unless the user later picks another via Save As.
+        self._loaded_collection = None
         self._loaded_name = entry.get("name") or self._loaded_id
         self._saved_snapshot = (seq, [dict(f) for f in feats])
         self._dirty = False
@@ -70532,9 +71170,12 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                              severity="warning")
             return
         default = self._loaded_name or "new_fragment"
-        def _on_named(name):
-            if not name:
+        active = _get_active_collection_name() or ""
+        def _on_named(result):
+            parsed = _name_modal_result(result, active)
+            if parsed is None:
                 return
+            name, coll = parsed
             # Sweep #14 (2026-05-20): hand a unique id to ``_commit_save``
             # directly so the inner ``_do_save`` fallback doesn't fire a
             # second NamePlasmidModal. Pre-fix ``_on_named`` set
@@ -70542,9 +71183,10 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
             # the cleared id and prompted again.
             self._loaded_name = name
             self._loaded_id   = self._make_unique_entry_id(name)
-            self._commit_save(seq, feats, after=None)
+            self._commit_save(seq, feats, after=None, collection=coll)
         self.app.push_screen(
-            NamePlasmidModal(default, target_label="fragment"),
+            NamePlasmidModal(default, target_label="fragment",
+                             default_collection=active),
             callback=_on_named,
         )
 
@@ -70605,22 +71247,26 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 after(False)
             return
         if self._loaded_id is None:
-            # Fresh save → prompt for name.
+            # Fresh save → prompt for name + collection.
             default = self._loaded_name or "new_fragment"
-            def _on_named(name):
-                if not name:
+            active = _get_active_collection_name() or ""
+            def _on_named(result):
+                parsed = _name_modal_result(result, active)
+                if parsed is None:
                     if after:
                         after(False)
                     return
+                name, coll = parsed
                 self._loaded_name = name
                 # Sweep #14 (2026-05-20): unique id so a fresh save
                 # whose sanitised name collides with an existing
                 # library id can't trip ``LibraryPanel.add_entry``'s
                 # silent-replace branch and clobber an unrelated entry.
                 self._loaded_id = self._make_unique_entry_id(name)
-                self._commit_save(seq, feats, after)
+                self._commit_save(seq, feats, after, collection=coll)
             self.app.push_screen(
-                NamePlasmidModal(default, target_label="fragment"),
+                NamePlasmidModal(default, target_label="fragment",
+                                 default_collection=active),
                 callback=_on_named,
             )
             return
@@ -70673,10 +71319,14 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         return f"{base[:24]}_{_secrets.token_hex(3)}"
 
     def _commit_save(self, seq: str, feats: list[dict],
-                       after) -> None:
+                       after, *, collection: "str | None" = None) -> None:
         """Build the SeqRecord, push through LibraryPanel.add_entry,
         update saved snapshot, fire callback. Atomic via `_save_lock`
-        so concurrent DNA/protein saves can't interleave construction."""
+        so concurrent DNA/protein saves can't interleave construction.
+
+        ``collection`` (from the name+collection modal) picks the
+        destination; falls back to the document's current collection
+        (re-save) then the active collection."""
         try:
             from Bio.Seq import Seq
             from Bio.SeqRecord import SeqRecord
@@ -70706,6 +71356,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
             try:
                 rec._tui_display_name = name  # type: ignore[attr-defined]
                 rec._tui_source       = f"synthesis:{eid}"  # type: ignore[attr-defined]
+                rec._tui_kind         = "fragment"  # type: ignore[attr-defined]
             except AttributeError:
                 pass
             n = len(seq)
@@ -70747,17 +71398,25 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 if after:
                     after(False)
                 return
-            ok = lib.add_entry(rec)
+            active_coll = _get_active_collection_name() or ""
+            target = (collection or self._loaded_collection
+                      or active_coll or "").strip()
+            ok = lib.add_entry(
+                rec, target_collection=target,
+                replace_in_target=(self._loaded_collection == target),
+            )
             if not ok:
                 if after:
                     after(False)
                 return
+            self._loaded_collection = target or active_coll
             self._saved_snapshot = (seq, [dict(f) for f in feats])
             self._dirty = False
         # Lock released — UI / log calls outside the critical section.
         self._refresh_status()
         _log_event("synthesis.save",
-                   id=eid, name=name, bp=len(seq), n_feats=len(feats))
+                   id=eid, name=name, bp=len(seq), n_feats=len(feats),
+                   collection=self._loaded_collection)
         self.app.notify(f"Saved '{name}' ({len(seq):,} bp).",
                          severity="information")
         if after:
@@ -71017,6 +71676,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 return
             pe.load("")
             self._protein_loaded_id = None
+            self._protein_loaded_collection = None
             self._protein_loaded_name = None
             self._protein_saved_snapshot = ""
             self._protein_dirty = False
@@ -71082,6 +71742,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 pe.load(seq, feats=[])
                 kept = len(pe.get_state()[0])
                 self._protein_loaded_id = None
+                self._protein_loaded_collection = None
                 self._protein_loaded_name = name
                 self._protein_saved_snapshot = ""
                 self._protein_dirty = True
@@ -71173,6 +71834,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
             return
         pe.load(aa_seq, feats=aa_feats)
         self._protein_loaded_id = entry.get("id") or eid
+        self._protein_loaded_collection = None
         self._protein_loaded_name = entry.get("name") or self._protein_loaded_id
         self._protein_saved_snapshot = aa_seq
         self._protein_dirty = False
@@ -71330,17 +71992,21 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                              severity="warning")
             return
         default = self._protein_loaded_name or "new_protein"
-        def _on_named(name):
-            if not name:
+        active = _get_active_collection_name() or ""
+        def _on_named(result):
+            parsed = _name_modal_result(result, active)
+            if parsed is None:
                 return
+            name, coll = parsed
             # Sweep #14 (2026-05-20): mirror DNA-tab Save As fix —
             # hand a unique id straight to ``_commit_protein_save`` so
             # the inner ``_do_protein_save`` fallback can't prompt twice.
             self._protein_loaded_name = name
             self._protein_loaded_id   = self._make_unique_entry_id(name)
-            self._commit_protein_save(aa_seq, after=None)
+            self._commit_protein_save(aa_seq, after=None, collection=coll)
         self.app.push_screen(
-            NamePlasmidModal(default, target_label="protein"),
+            NamePlasmidModal(default, target_label="protein",
+                             default_collection=active),
             callback=_on_named,
         )
 
@@ -71364,28 +72030,35 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
             return
         if self._protein_loaded_id is None:
             default = self._protein_loaded_name or "new_protein"
-            def _on_named(name):
-                if not name:
+            active = _get_active_collection_name() or ""
+            def _on_named(result):
+                parsed = _name_modal_result(result, active)
+                if parsed is None:
                     if after:
                         after(False)
                     return
+                name, coll = parsed
                 self._protein_loaded_name = name
                 # Sweep #14 (2026-05-20): unique id so a fresh protein
                 # save can't silent-overwrite an unrelated library
                 # entry whose id matches the sanitised name.
                 self._protein_loaded_id = self._make_unique_entry_id(name)
-                self._commit_protein_save(aa_seq, after)
+                self._commit_protein_save(aa_seq, after, collection=coll)
             self.app.push_screen(
-                NamePlasmidModal(default, target_label="protein"),
+                NamePlasmidModal(default, target_label="protein",
+                                 default_collection=active),
                 callback=_on_named,
             )
             return
         self._commit_protein_save(aa_seq, after)
 
-    def _commit_protein_save(self, aa_seq: str, after) -> None:
+    def _commit_protein_save(self, aa_seq: str, after,
+                             *, collection: "str | None" = None) -> None:
         """Build the back-translated SeqRecord + library hand-off,
         guarded by `_save_lock` so concurrent saves can't race the
-        SeqRecord construction with each other."""
+        SeqRecord construction with each other. ``collection`` picks the
+        destination (falls back to the document's collection, then
+        active) — mirrors the DNA tab's `_commit_save`."""
         try:
             from Bio.Seq import Seq
             from Bio.SeqRecord import SeqRecord
@@ -71448,6 +72121,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
             try:
                 rec._tui_display_name = name  # type: ignore[attr-defined]
                 rec._tui_source       = f"synthesis-protein:{eid}"  # type: ignore[attr-defined]
+                rec._tui_kind         = "protein"  # type: ignore[attr-defined]
             except AttributeError:
                 pass
             # CDS feature carries translation= qualifier so a re-load
@@ -71546,11 +72220,18 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 if after:
                     after(False)
                 return
-            ok = lib.add_entry(rec)
+            active_coll = _get_active_collection_name() or ""
+            target = (collection or self._protein_loaded_collection
+                      or active_coll or "").strip()
+            ok = lib.add_entry(
+                rec, target_collection=target,
+                replace_in_target=(self._protein_loaded_collection == target),
+            )
             if not ok:
                 if after:
                     after(False)
                 return
+            self._protein_loaded_collection = target or active_coll
             self._protein_saved_snapshot = aa_seq
             self._protein_dirty = False
         # Lock released — log + UI work outside the critical section.
@@ -71558,7 +72239,8 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         _log_event("synthesis.protein.save",
                    id=eid, name=name, aa=len(aa_seq), bp=len(dna),
                    codon_table=self._codon_table_choice,
-                   n_feats=n_feats_written)
+                   n_feats=n_feats_written,
+                   collection=self._protein_loaded_collection)
         self.app.notify(
             f"Saved '{name}' ({len(aa_seq):,} aa = {len(dna):,} bp).",
             severity="information",
@@ -85127,6 +85809,21 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             p_end   = p.get("pos_end", 0)
             strand  = p.get("strand", 1)
             name    = p.get("name", "primer")
+            full_seq = str(p.get("sequence") or "")
+            # Safety net (2026-05-30): re-derive the binding straight from
+            # the loaded template so a stale / mis-saved pos_start/pos_end
+            # can't park the primer off its real site — the displayed
+            # primer letters then always line up with the DNA they anneal
+            # to. Falls back to the stored positions when the primer
+            # doesn't cleanly match this template (e.g. a primer for a
+            # different construct, or one carrying intended mismatches).
+            if full_seq:
+                rb = _rederive_primer_binding(
+                    full_seq, int(strand or 1), str(new_rec.seq),
+                    total, hint_start=int(p_start or 0),
+                )
+                if rb is not None:
+                    p_start, p_end = rb
             if p_end == p_start:
                 continue
             # Wrap primer: pos_end < pos_start means the binding region
@@ -85166,8 +85863,8 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             # and visualise it as a floating segment offset from the
             # bound bar. Standard `primer_bind` features without
             # this qualifier (e.g. imported from external GenBank
-            # files) keep the legacy plain-bar look.
-            full_seq = str(p.get("sequence") or "")
+            # files) keep the legacy plain-bar look. (`full_seq` was read
+            # above for the binding re-derivation.)
             quals: dict[str, list[str]] = {"label": [name]}
             if full_seq:
                 quals["primer_seq"] = [full_seq]
@@ -87651,6 +88348,7 @@ class SimulatorScreen(Screen):
             "source":  "simulator:pcr",
             "added":   _date.today().isoformat(),
             "gb_text": gb_text,
+            "kind":    "amplicon",
         }
 
     def _commit_amplicon_to_collection(
@@ -104486,10 +105184,13 @@ NcbiTaxonPickerModal { align: center middle; }
         entry = _find_library_entry_by_id(record_id) if record_id else None
         history_xml = entry.get("history_xml") if entry else None
         if not history_xml:
+            src = (entry.get("source") if entry
+                   else getattr(rec, "_tui_source", "")) or ""
             self.notify(
                 f"No construction history recorded for "
-                f"{getattr(rec, 'name', '?')}.",
-                severity="information", timeout=4,
+                f"{getattr(rec, 'name', '?')}."
+                f"{_history_reopen_nudge(str(src))}",
+                severity="information", timeout=6,
             )
             return
         try:
@@ -109063,8 +109764,9 @@ NcbiTaxonPickerModal { align: center middle; }
         if not history_xml:
             self.notify(
                 f"No construction history recorded for "
-                f"{entry.get('name', '?')}.",
-                severity="information", timeout=4,
+                f"{entry.get('name', '?')}."
+                f"{_history_reopen_nudge(str(entry.get('source') or ''))}",
+                severity="information", timeout=6,
             )
             return
         try:

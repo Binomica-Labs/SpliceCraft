@@ -4949,10 +4949,10 @@ class TestLibraryPanelSeqColumn:
             lib._repopulate_plasmids()
             await pilot.pause(0.05)
             t = lib.query_one("#lib-table", DataTable)
-            # 5 columns: ●, Name, Status, Seq, bp.
-            # Verify the table accepted the 5-column row shape (regression
-            # guard for the add_columns / add_row arity match).
-            assert len(t.columns) == 5
+            # 6 columns: ●, Name, Status, Seq, bp, K (kind badge added
+            # 2026-05-30). Regression guard for the add_columns / add_row
+            # arity match.
+            assert len(t.columns) == 6
             assert t.row_count >= 1
 
     async def test_refresh_seq_cell_after_alignment_flush(

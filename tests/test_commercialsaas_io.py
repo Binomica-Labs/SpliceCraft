@@ -621,9 +621,12 @@ class TestHistoryViewerModal:
             _walk(tree.root)
             # Three nodes total: result + parent + grandparent.
             assert len(labels) == 3, labels
-            assert any("result.dna" in lab for lab in labels)
-            assert any("parent.dna" in lab for lab in labels)
-            assert any("grandparent.dna" in lab for lab in labels)
+            # Labels strip the cosmetic `.dna` suffix (de-noised render,
+            # 2026-05-30) — assert on the bare names.
+            assert any("result" in lab for lab in labels)
+            assert any("grandparent" in lab for lab in labels)
+            assert any(lab.split()[0] == "parent"
+                       or "parent" in lab for lab in labels)
 
     async def test_h_key_with_history_opens_modal(
             self, tiny_record, isolated_library):
@@ -746,9 +749,12 @@ class TestHistoryScreen:
                     _walk(c)
             _walk(tree.root)
             assert len(labels) == 3, labels
-            assert any("result.dna" in lab for lab in labels)
-            assert any("parent.dna" in lab for lab in labels)
-            assert any("grandparent.dna" in lab for lab in labels)
+            # Labels strip the cosmetic `.dna` suffix (de-noised render,
+            # 2026-05-30) — assert on the bare names.
+            assert any("result" in lab for lab in labels)
+            assert any("grandparent" in lab for lab in labels)
+            assert any(lab.split()[0] == "parent"
+                       or "parent" in lab for lab in labels)
 
     async def test_action_show_history_pushes_screen_when_loaded(
             self, tiny_record, isolated_library):
@@ -889,8 +895,12 @@ class TestHistoryScreenHardening:
         assert "\\[red]" in label, label
 
     def test_tree_label_empty_fields_render_placeholders(self):
-        """An XML node with no operation / no name produces a
-        readable row rather than a whitespace-only label."""
+        """An XML node with no operation / no name produces a readable
+        row rather than a whitespace-only label. De-noised render
+        (2026-05-30): an empty name still shows ``(unnamed)``, but an
+        empty operation / parent-less node no longer prints a
+        ``(no operation)`` placeholder on every row — the tag is simply
+        omitted (it was per-row noise; the detail pane still records it)."""
         import xml.etree.ElementTree as ET
         # Build a node with empty operation + name attributes — bypassing
         # `.new()` because it always sets them.
@@ -902,7 +912,8 @@ class TestHistoryScreenHardening:
         node = sc._CommercialSaaSHistoryNode(el)
         label = sc._history_tree_label(node)
         assert "(unnamed)" in label
-        assert "(no operation)" in label
+        assert label.strip()                 # never whitespace-only
+        assert "no operation" not in label   # placeholder dropped
 
     def test_title_truncates_long_plasmid_name(self):
         """A library plasmid with a 200-char name shouldn't blow the
@@ -2439,3 +2450,258 @@ class TestGH17LabelOverride:
         sc._augment_dna_record_from_packets(rec, data)
         # Newline scrubbed; the space and other text survives.
         assert rec.features[0].qualifiers["label"] == ["dirtyname"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# De-noised history viewer — render helpers, protocol summary, dedup tree, and
+# the single-file `.dna` open → save → export history round-trip (2026-05-30).
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _hist_leaf(name, bp, circ=True):
+    return sc._CommercialSaaSHistoryNode.new(
+        name=name, seq_len=bp, circular=circ, operation="insertFragment")
+
+
+def _hist_asm(name, bp, backbone, parts, enzyme):
+    r = sc._CommercialSaaSHistoryNode.new(
+        name=name, seq_len=bp, circular=True, operation="insertFragment")
+    r.add_regenerated_site(enzyme, 0, 1)
+    r.add_input_summary(manipulation="gbAssembly",
+                          name1=backbone.name, name2="parts")
+    r.add_parent(backbone)
+    for p in parts:
+        r.add_parent(p)
+    return r
+
+
+class TestHistoryRenderHelpers:
+    """Pure-unit coverage of the de-noised render toolkit. No event loop —
+    these are the helpers both viewers delegate to."""
+
+    def test_clean_name_strips_dna_suffix(self):
+        assert sc._history_clean_name("pUC19.dna") == "pUC19"
+        assert sc._history_clean_name("pUC19.DNA") == "pUC19"
+        assert sc._history_clean_name("plain") == "plain"
+        assert sc._history_clean_name("  spaced.dna  ") == "spaced"
+        assert sc._history_clean_name("") == "(unnamed)"
+        assert sc._history_clean_name(None) == "(unnamed)"  # type: ignore[arg-type]
+
+    def test_size_label_units(self):
+        assert sc._history_size_label(712) == "712 bp"
+        assert sc._history_size_label(13_900) == "13.9 kb"
+        assert sc._history_size_label(2_400_000) == "2.40 Mb"
+        assert sc._history_size_label(-5) == "0 bp"      # clamps negatives
+        assert sc._history_size_label("nope") == "0 bp"  # type: ignore[arg-type]
+
+    def test_op_label_friendly_and_passthrough(self):
+        assert sc._history_op_label("insertFragment") == "assemble"
+        assert sc._history_op_label("gibsonAssembly") == "Gibson"
+        # Unknown ops pass through verbatim — never assume a closed set.
+        assert sc._history_op_label("someFutureOp") == "someFutureOp"
+        assert sc._history_op_label("") == ""
+
+    def test_signature_matches_same_node_not_different(self):
+        a = _hist_leaf("pENTR.dna", 2604)
+        b = _hist_leaf("pENTR.dna", 2604)
+        c = _hist_leaf("pENTR.dna", 2999)
+        assert sc._history_node_signature(a) == sc._history_node_signature(b)
+        assert sc._history_node_signature(a) != sc._history_node_signature(c)
+        # `.dna` suffix is normalised away in the signature.
+        d = _hist_leaf("pENTR", 2604)
+        assert sc._history_node_signature(a) == sc._history_node_signature(d)
+
+    def test_tree_label_omits_op_tag_on_leaf(self):
+        leaf = _hist_leaf("pProm.dna", 712)             # parent-less = material
+        lbl = sc._history_tree_label(leaf)
+        assert "pProm" in lbl and "712 bp" in lbl
+        assert "assemble" not in lbl                    # no op tag on a leaf
+        asm = _hist_asm("TU.dna", 4000, _hist_leaf("v.dna", 2000),
+                         [_hist_leaf("p.dna", 500)], "BsaI")
+        assert "assemble" in sc._history_tree_label(asm)  # has parents → tag
+
+    def test_tree_label_flags_linear_only(self):
+        assert "linear" not in sc._history_tree_label(_hist_leaf("c", 100, True))
+        assert "linear" in sc._history_tree_label(_hist_leaf("l", 100, False))
+
+    def test_tree_label_escapes_markup(self):
+        node = _hist_leaf("ev[red]il.dna", 100)
+        assert "\\[red]" in sc._history_tree_label(node)  # escaped, not raw
+
+    def test_build_steps_orders_earliest_first_and_dedups(self):
+        # Two identical TU subtrees reused in a MOD must collapse to ONE
+        # step; steps order earliest (deepest) → final product last.
+        def tu():
+            return _hist_asm("TU.dna", 4000, _hist_leaf("pENTR.dna", 2000),
+                              [_hist_leaf("prom.dna", 500),
+                               _hist_leaf("cds.dna", 800)], "Esp3I")
+        mod = _hist_asm("MOD.dna", 9000, _hist_leaf("pENTR2.dna", 2500),
+                         [tu(), tu()], "BsaI")
+        steps = sc._history_build_steps(mod)
+        assert [s["product"] for s in steps] == ["TU", "MOD"]
+        tu_step = steps[0]
+        assert tu_step["enzyme"] == "Esp3I"
+        assert tu_step["backbone"] == "pENTR"
+        assert set(tu_step["inputs"]) == {"prom", "cds"}
+
+    def test_build_steps_preserves_sibling_order(self):
+        mod = _hist_asm("MOD.dna", 9000, _hist_leaf("bb.dna", 2500), [
+            _hist_asm("TU_A.dna", 4000, _hist_leaf("v.dna", 2000),
+                       [_hist_leaf("a.dna", 500)], "Esp3I"),
+            _hist_asm("TU_B.dna", 4000, _hist_leaf("v.dna", 2000),
+                       [_hist_leaf("b.dna", 500)], "Esp3I"),
+        ], "BsaI")
+        assert [s["product"] for s in sc._history_build_steps(mod)] == [
+            "TU_A", "TU_B", "MOD"]
+
+    def test_protocol_lines_single_record_placeholder(self):
+        lines = sc._history_protocol_lines(_hist_leaf("pUC19.dna", 2686))
+        assert len(lines) == 1 and "no assembly steps" in lines[0]
+
+    def test_protocol_lines_render_step(self):
+        tu = _hist_asm("TU.dna", 4000, _hist_leaf("pENTR.dna", 2000),
+                        [_hist_leaf("prom.dna", 500)], "Esp3I")
+        joined = sc._history_protocol_lines(tu)[0]
+        for token in ("TU", "prom", "pENTR", "Esp3I"):
+            assert token in joined
+
+    def test_detail_lines_has_properties_and_escapes(self):
+        node = sc._CommercialSaaSHistoryNode.new(
+            name="ev[red]il.dna", seq_len=1234, circular=False,
+            operation="insertFragment")
+        text = "\n".join(sc._history_detail_lines(node))
+        assert "Properties" in text and "1,234 bp" in text and "linear" in text
+        assert "\\[red]" in text   # name markup escaped
+
+    def test_reopen_nudge_only_for_dna_sources(self):
+        # Fires for .dna-sourced entries (both import paths carry .dna)…
+        assert sc._history_reopen_nudge("file:MAV 27.dna")
+        assert sc._history_reopen_nudge("/home/x/p.DNA")     # path, any case
+        # …never for hand-built constructs or non-.dna imports.
+        assert sc._history_reopen_nudge("constructor:gb_l0:backbone") == ""
+        assert sc._history_reopen_nudge("file:plasmid.gb") == ""
+        assert sc._history_reopen_nudge("") == ""
+
+
+class TestHistoryViewerDeNoise:
+    """Drive the real `HistoryScreen` through Pilot and confirm the
+    de-noising fires end-to-end: a protocol pane, and repeated ancestors
+    rendered once with later occurrences collapsed to references."""
+
+    async def test_protocol_pane_and_reference_dedup(self, tiny_record):
+        from textual.widgets import Tree as _TreeWidget, Static as _Static
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        # Two TUs share the SAME backbone (pENTR, 2000 bp). The shared
+        # backbone must render fully once, then as a "shown above" ref.
+        mod = _hist_asm("MOD.dna", 9000, _hist_leaf("pENTR2.dna", 2500), [
+            _hist_asm("TU1.dna", 4000, _hist_leaf("pENTR.dna", 2000),
+                       [_hist_leaf("a.dna", 500)], "Esp3I"),
+            _hist_asm("TU2.dna", 4000, _hist_leaf("pENTR.dna", 2000),
+                       [_hist_leaf("b.dna", 500)], "Esp3I"),
+        ], "BsaI")
+        app = _build_app(tiny_record, isolated_library=None)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            screen = sc.HistoryScreen("MOD", mod)
+            await app.push_screen(screen)
+            await pilot.pause()
+            # Protocol pane: 3 build steps (TU1, TU2, MOD).
+            proto = str(screen.query_one("#hist-scr-proto-text", _Static).render())
+            assert "TU1" in proto and "TU2" in proto and "MOD" in proto
+            assert proto.count("✂") == 3   # one enzyme mark per step
+            tree = screen.query_one("#hist-scr-tree", _TreeWidget)
+            refs, full_shared = [], []
+            def _walk(n):
+                if n is not tree.root:
+                    lab = str(n.label)
+                    if "shown above" in lab:
+                        refs.append(n)
+                    elif lab.split() and lab.split()[0] == "pENTR":
+                        full_shared.append(n)
+                for c in n.children:
+                    _walk(c)
+            _walk(tree.root)
+            # Shared backbone drawn fully exactly once; the repeat is a ref.
+            assert len(full_shared) == 1, [str(x.label) for x in full_shared]
+            assert len(refs) >= 1
+            # Reference nodes never redraw their subtree.
+            for rn in refs:
+                assert len(rn.children) == 0
+
+
+@pytest.mark.skipif(not _SAMPLE_WITH_HISTORY.exists(),
+                     reason="CommercialSaaS history fixture not available")
+class TestDnaSingleOpenStash:
+    """`load_genbank` on a single `.dna` must stash the construction
+    history + original bytes on the record so a later `add_entry`
+    round-trips them (pre-fix only the bulk path did this)."""
+
+    def test_load_genbank_stashes_history_and_bytes(self):
+        rec = sc.load_genbank(str(_SAMPLE_WITH_HISTORY))
+        assert getattr(rec, "_dna_history_xml", None)
+        assert "<HistoryTree>" in rec._dna_history_xml
+        assert getattr(rec, "_dna_original_bytes", None)
+
+
+class TestDnaSingleOpenRoundTrip:
+    """The fix for the user's report: open one `.dna` → save to library →
+    export must preserve the history (and, via the sidecar, every
+    CommercialSaaS packet). Exercised at the `add_entry` seam with a
+    fabricated record carrying the load-time stash."""
+
+    async def test_single_open_save_export_preserves_history(
+            self, tiny_record, isolated_library, tmp_path):
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        xml = ("<HistoryTree><Node name='kid.dna' seqLen='80' circular='1' "
+               "operation='insertFragment'/></HistoryTree>")
+        original = _make_minimal_dna((0x00, bytes([0x01]) + b"ATGCATGCATGC"))
+        rec = SeqRecord(Seq("ATGC" * 25), id="rt_open", name="rt_open")
+        rec.annotations["topology"] = "circular"
+        rec.annotations["molecule_type"] = "DNA"
+        rec._dna_history_xml = xml          # stamped by load_genbank's .dna branch
+        rec._dna_original_bytes = original
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            assert lib.add_entry(rec) is True
+            await pilot.pause()
+            # 1. Library entry carries the history.
+            entry = next((e for e in sc._load_library()
+                          if e.get("id") == "rt_open"), None)
+            assert entry is not None and entry.get("history_xml") == xml
+            # 2. The original bytes were stashed as a sidecar.
+            assert sc._load_dna_original("rt_open") == original
+            # 3. Export re-injects the history (splice mode off the sidecar).
+            out = tmp_path / "rt_open.dna"
+            sc._export_commercialsaas_dna(entry, out)
+            recovered = sc._extract_commercialsaas_history_xml(out.read_bytes())
+            assert recovered == xml
+
+    async def test_resave_after_edit_keeps_history(
+            self, tiny_record, isolated_library):
+        """Re-saving an EDITED plasmid (same id, rebuilt record with no
+        `_dna_history_xml` attr) must keep the history already on the
+        entry — same preserve-on-resave contract as `status`."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        xml = ("<HistoryTree><Node name='h.dna' seqLen='40' circular='1' "
+               "operation='insertFragment'/></HistoryTree>")
+        sc._save_library([{"id": "edited", "name": "edited", "size": 40,
+                           "history_xml": xml}])
+        rec = SeqRecord(Seq("ATGC" * 10), id="edited", name="edited")
+        rec.annotations["topology"] = "circular"
+        rec.annotations["molecule_type"] = "DNA"
+        # NOTE: no _dna_history_xml on the record (an edit rebuilt it).
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            assert lib.add_entry(rec) is True
+            await pilot.pause()
+            entry = next((e for e in sc._load_library()
+                          if e.get("id") == "edited"), None)
+            assert entry is not None and entry.get("history_xml") == xml
