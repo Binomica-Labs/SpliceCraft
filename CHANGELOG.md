@@ -14,6 +14,19 @@
 
 ---
 
+## [1.0.9] — 2026-05-31
+
+### New features
+
+- **The Alignment Manager now shows how many bases are off.** Each stored alignment row gained a **Mism** column (mismatched bases) and a **Gaps** column (gapped bases) next to its identity, so one glance tells you how clean a sequencing read is — a perfect match reads `0 / 0`, and a read that's a single base off reads `1 / 0` — without having to open the read to find out.
+
+### Bug fixes
+
+- **An alignment that isn't a perfect match no longer reads "100%".** A read with even one mismatched base in a large plasmid used to round up to "100.0%" in the Alignment Manager and Verification Report while its colour stayed green — the number said perfect, the colour said otherwise. Identity now shows the true figure when it isn't a genuine 100% (a single off-by-one base in an 18 kb plasmid reads `99.99%`, not `100%`), and a true perfect match shows a clean `100%` so the two are easy to tell apart at a glance.
+- **A single mismatched base now shows up red on the map even when the whole plasmid is zoomed to fit.** With a long plasmid scaled down so that each character on screen covers many bases, a lone one-base mismatch in a sequencing read was being painted over by the matching bases around it and vanished. Any on-screen position that contains a mismatch is now drawn red (and a gap grey), so even a one-base difference is visible at the most zoomed-out view.
+
+---
+
 ## [1.0.8] — 2026-05-30
 
 ### New features

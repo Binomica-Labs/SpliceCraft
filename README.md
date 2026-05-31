@@ -191,11 +191,17 @@ Verify your constructs against real reads. Drop in a Plasmidsaurus `.zip` and
 walk three numbered tabs — pick the run, pick the sample, pick the target
 plasmid — then **Align**. The read lands as a colored bar on the plasmid's
 linear map (green match / red mismatch / gray gap) with its name painted
-right onto the bar so a multi-read pile-up stays readable. **Bulk auto-align**
+right onto the bar so a multi-read pile-up stays readable — and even a
+single-base mismatch shows up red when the whole plasmid is zoomed to fit,
+rather than being swallowed by the surrounding match. **Bulk auto-align**
 matches a whole results folder against your library in one pass, and the
 **Verification Report** grades every construct (✓ verified / ⚠ near-match /
 ~ partial / ✗ divergent) in one sortable table — click a row to jump to the
-first variant. The Library panel even shows a per-plasmid **Seq** badge so
+first variant. The **Alignment Manager** lists every stored alignment with
+its identity, mismatched-base count, and gap count, so one glance tells you
+how clean each read is — and an identity that isn't a true 100% never rounds
+up to "100%" (a single off-by-one base reads as e.g. `99.99%`, not a false
+perfect score). The Library panel even shows a per-plasmid **Seq** badge so
 you can see what's been verified at a glance, alongside a **Kind** badge
 (`○` plasmid · `/` fragment · `≈` amplicon · `ρ` protein) telling you what
 each entry is.

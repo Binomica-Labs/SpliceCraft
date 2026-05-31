@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.8"
+__version__ = "1.0.9"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -15123,6 +15123,71 @@ def _alignment_to_query_letters(
 # clipping, and indicator format without spinning up a PlasmidMap.
 
 
+# State precedence for bar-mode (zoomed-out) collapse: when a single
+# terminal column spans many bp, the WORST state among those bp wins so
+# a difference is never hidden under a neighbouring match. mismatch (a
+# true SNP) outranks gap (an indel) outranks match — the user wants a
+# mismatched base to surface red "even if one bp".
+_ALIGN_STATE_PRIORITY = {"match": 0, "gap": 1, "mismatch": 2}
+
+
+def _alignment_bar_columns(
+    segments: "list[tuple[int, int, str]]",
+    view_s: int, view_e: int, bp_to_col,
+    col_lo_bound: int, col_hi_bound: int,
+) -> "dict[int, str]":
+    """Collapse alignment segments into a per-column ``{col: state}`` map
+    for the zoomed-out (bar-mode, < 1 col/bp) linear overlay.
+
+    Two failure modes of the naïve "paint each segment's
+    ``range(bp_to_col(s), bp_to_col(e))`` in order" approach are fixed
+    here, both of which made a single-bp mismatch invisible when zoomed
+    all the way out:
+
+      1. **Degenerate range.** For a 1-bp mismatch ``[m, m+1)`` at < 1
+         col/bp, ``bp_to_col(m) == bp_to_col(m+1)`` so the column range
+         is empty and nothing is painted. We force every in-view segment
+         to claim at least one column.
+
+      2. **Overwrite by a neighbour.** The match run *after* the mismatch
+         starts at the very same column and, painted later, repaints it
+         blue. We resolve per-column by `_ALIGN_STATE_PRIORITY` (mismatch
+         > gap > match) instead of by paint order, so the mismatch's
+         column stays red regardless of how the surrounding matches map.
+
+    ``bp_to_col`` is the caller's bp→column closure; ``col_lo_bound`` /
+    ``col_hi_bound`` are the inclusive-low / exclusive-high usable column
+    bounds (``margin_l`` and ``margin_l + usable_w``). Pure — takes the
+    mapping as a callable so the suite can pin the collapse without a
+    PlasmidMap.
+    """
+    worst: "dict[int, str]" = {}
+    for seg in segments:
+        try:
+            seg_s, seg_e, state = seg[0], seg[1], seg[2]
+        except (IndexError, TypeError, ValueError):
+            continue
+        s = max(int(seg_s), view_s)
+        e = min(int(seg_e), view_e)
+        if s >= e:
+            continue
+        c0 = bp_to_col(s)
+        c1 = bp_to_col(e)
+        if c1 <= c0:
+            # Sub-cell segment (e.g. a lone mismatch bp) — claim one col.
+            c1 = c0 + 1
+        c0 = max(col_lo_bound, c0)
+        c1 = min(col_hi_bound, c1)
+        if c1 <= c0:
+            continue
+        pr = _ALIGN_STATE_PRIORITY.get(state, 0)
+        for col in range(c0, c1):
+            prev = worst.get(col)
+            if prev is None or pr > _ALIGN_STATE_PRIORITY.get(prev, 0):
+                worst[col] = state
+    return worst
+
+
 def _alignment_name_overlay(
     name: str, col_start: int, bar_width: int,
     col_state: "dict[int, str]", min_bar_cols: int = 4,
@@ -15214,6 +15279,50 @@ def _identity_pct_color(pct: "float | int | None") -> str:
     if v >= 11.0:
         return "red"
     return "grey50"
+
+
+def _format_identity_pct(pct: "float | int | None", *,
+                         decimals: int = 1) -> str:
+    """Format an alignment identity percentage for a compact table cell
+    such that a value below 100% NEVER renders as ``"100%"``.
+
+    The naïve ``f"{v:.1f}%"`` rounds 99.99% up to ``"100.0%"`` — which
+    then reads as a perfect alignment even though `_identity_pct_color`
+    (strict ``>= 100.0`` → light-blue) correctly keeps the cell *green*.
+    The user flagged exactly that contradiction ("says 100% but it's
+    green") for a one-bp mismatch in an 18 kb plasmid. Here, when
+    rounding at ``decimals`` places would land on "100", precision is
+    escalated one place at a time (capped at 4) until the rendered
+    number is strictly < 100, so the same alignment shows e.g.
+    ``"99.99%"`` instead. A genuine 100.0 (``n_matches == aligned_cols``)
+    still renders the clean ``"100%"`` — no decimals — so a true perfect
+    match is visually distinct from a near-perfect one at a glance.
+
+    A value pathologically close to but below 100 (e.g. 99.999999, which
+    rounds to "100.0000" even at 4 places) renders ``"<100%"`` rather
+    than implying perfection. Non-numeric / None → ``"—"`` (no tier
+    implied — matches `_identity_pct_color`'s neutral handling).
+    """
+    if pct is None:
+        return "—"
+    try:
+        v = float(pct)
+    except (TypeError, ValueError):
+        return "—"
+    # Use the SAME strict ``>= 100.0`` boundary as `_identity_pct_color`
+    # so the number and the colour can never disagree about perfection.
+    if v >= 100.0:
+        return "100%"
+    d = max(0, int(decimals))
+    for places in range(d, 5):
+        s = f"{v:.{places}f}"
+        try:
+            shown = float(s)
+        except ValueError:
+            break
+        if shown < 100.0:
+            return f"{s}%"
+    return "<100%"
 
 
 def _alignment_lane_indicator(lane_idx: int, width: int = 2) -> str:
@@ -19143,38 +19252,35 @@ class PlasmidMap(Widget):
                     )
                 align["letters"] = letters
 
-            # Walk segments and paint each visible chunk. In bar mode
-            # we also stash per-column state into ``col_state`` so the
-            # name overlay below can pick up the right background
-            # color (match-blue / mismatch-red / gap-gray) for each
-            # name character without re-walking the segments.
+            # Walk segments and paint each visible chunk. Letter mode
+            # (≥ 1 col/bp) paints one raw query base per column, colored
+            # by its state. Bar mode (< 1 col/bp) collapses many bp into
+            # each column via `_alignment_bar_columns`, which keeps a
+            # sub-column mismatch RED instead of letting the surrounding
+            # match run overwrite or drop it (user request 2026-05-31:
+            # "show red character in region where mismatch occurred even
+            # if one bp"). ``col_state`` feeds the name overlay below so
+            # a name character inherits its column's background color.
             col_state: "dict[int, str]" = {}
-            for seg_s, seg_e, state in align.get("segments", []):
-                s = max(seg_s, view_s)
-                e = min(seg_e, view_e)
-                if s >= e:
-                    continue
-                if state == "match":
-                    color = "color(39)"
-                    glyph = "█"
-                elif state == "mismatch":
-                    color = "color(196)"
-                    glyph = "█"
-                else:  # gap
-                    color = "color(240)"
-                    glyph = "░"
-                if letter_mode and letters:
-                    # At letter mode we cap `col_per_bp` to 1.0 (one
+            if letter_mode and letters:
+                for seg_s, seg_e, state in align.get("segments", []):
+                    s = max(seg_s, view_s)
+                    e = min(seg_e, view_e)
+                    if s >= e:
+                        continue
+                    color = (
+                        "color(196)" if state == "mismatch"
+                        else "color(240)" if state == "gap"
+                        else "color(39)"
+                    )
+                    # At letter mode `col_per_bp` is capped to 1.0 (one
                     # col per bp) via `action_linear_zoom_in`, so
                     # `bp_to_col(bp)` produces tight, adjacent letter
-                    # positions with no blank gutters and no
-                    # alternating 4-5-col gaps. Painting only letter
+                    # positions with no blank gutters. Paint only letter
                     # cells (no colored fill between them, per user
                     # request 2026-05-22 — fill reads as noisy on top
                     # of the feature bar).
-                    letter_style = (
-                        f"{base_style} bold {color}".strip()
-                    )
+                    letter_style = f"{base_style} bold {color}".strip()
                     for bp in range(s, e):
                         col = bp_to_col(bp)
                         # 2026-05-27: right bound is strict `<`. The
@@ -19185,13 +19291,25 @@ class PlasmidMap(Widget):
                             continue
                         ch, _ = letters.get(bp, ("-", state))
                         canvas.put(col, row, ch, letter_style)
-                else:
-                    seg_cx0 = max(margin_l, bp_to_col(s))
-                    seg_cx1 = min(margin_l + usable_w, bp_to_col(e))
-                    bar_style = f"{base_style} {color}".strip()
-                    for col in range(seg_cx0, seg_cx1):
-                        canvas.put(col, row, glyph, bar_style)
-                        col_state[col] = state
+            else:
+                # Bar mode: one glyph per column, colored by the WORST
+                # state among the bp it spans (mismatch > gap > match)
+                # so a lone mismatched base can't be hidden by an
+                # adjacent match run when zoomed all the way out.
+                col_state = _alignment_bar_columns(
+                    align.get("segments", ()), view_s, view_e, bp_to_col,
+                    margin_l, margin_l + usable_w,
+                )
+                for col, state in col_state.items():
+                    if state == "mismatch":
+                        color, glyph = "color(196)", "█"
+                    elif state == "gap":
+                        color, glyph = "color(240)", "░"
+                    else:
+                        color, glyph = "color(39)", "█"
+                    canvas.put(
+                        col, row, glyph, f"{base_style} {color}".strip(),
+                    )
 
             # Strand arrowhead at the right tip of the bar. All
             # registered alignments are forward against the target;
@@ -73281,7 +73399,9 @@ class VerificationReportModal(_OneShotDismissScreen, ModalScreen):
         read_cell = Text(r["read_label"], style="dim")
         seq_cell = Text(r["glyph"], style=f"{r['color']} bold")
         ident_cell = Text(
-            f"{r['ident']:.1f}%",
+            # Honest formatter: a sub-100% identity never rounds up to
+            # "100%" and contradict the (green) colour tier.
+            _format_identity_pct(r.get("ident")),
             style=_identity_pct_color(r.get("ident")),
         )
         cov_cell = Text(f"{r['coverage']:.0f}%")
@@ -73497,8 +73617,12 @@ class AlignmentManagerModal(_OneShotDismissScreen, ModalScreen):
         # conflated the two and the only bulk-delete option was a
         # blanket "Delete All" — a user with 30 alignments and one
         # bad lane had to nuke everything to get rid of it.
+        # "Mism" / "Gaps" quantify the mismatched bases and gapped bp so
+        # the user gets a fast "how bad is it" read without drilling in
+        # (request 2026-05-31). A near-100% identity that rounds clean
+        # still shows e.g. "1 / 0" here, pinning the exact bp delta.
         t.add_columns("Mk", "Vis", "Label", "Target", "Identity",
-                       "Source", "Added")
+                       "Mism", "Gaps", "Source", "Added")
         self._repopulate()
         if self._alignments:
             t.move_cursor(row=0)
@@ -73517,7 +73641,16 @@ class AlignmentManagerModal(_OneShotDismissScreen, ModalScreen):
             marked  = bool(a.get("_marked", False))
             mark_glyph = self._MARK_ON if marked else self._MARK_OFF
             vis_glyph  = self._VIS_ON  if visible else self._VIS_OFF
-            ident = (a.get("result") or {}).get("identity_pct", 0.0)
+            res   = a.get("result") or {}
+            ident = res.get("identity_pct", 0.0)
+            # Mismatched bases + gapped bp straight off the pairwise
+            # result. `n_gap_cols` is the modern field; fall back to the
+            # legacy `n_gaps` alias for alignments persisted before the
+            # split (2026-05-27). Clamp negatives from any corrupted
+            # result so the cell never shows "-1".
+            n_mis = max(0, int(res.get("n_mismatches", 0) or 0))
+            n_gap = max(0, int(res.get("n_gap_cols",
+                                       res.get("n_gaps", 0)) or 0))
             t.add_row(
                 Text.from_markup(mark_glyph),
                 Text.from_markup(vis_glyph),
@@ -73526,7 +73659,9 @@ class AlignmentManagerModal(_OneShotDismissScreen, ModalScreen):
                 Text((a.get("target_label") or "?")[:28],
                      style="" if visible else "dim"),
                 Text(
-                    f"{ident:.1f}%",
+                    # Honest formatter: a sub-100% identity never reads
+                    # "100%" (which would contradict the green tier).
+                    _format_identity_pct(ident),
                     style=(
                         # Color carries the QC signal; hidden rows
                         # dim everything to the same gray so they
@@ -73534,6 +73669,20 @@ class AlignmentManagerModal(_OneShotDismissScreen, ModalScreen):
                         "dim" if not visible
                         else _identity_pct_color(ident)
                     ),
+                ),
+                # Nonzero mismatches/gaps draw the eye (yellow / red,
+                # mirroring the VerificationReportModal SNP / indel
+                # columns); a clean "0" recedes dim. Hidden rows dim
+                # everything to match the rest of the row.
+                Text(
+                    str(n_mis),
+                    style=("dim" if not visible
+                           else ("yellow" if n_mis else "dim")),
+                ),
+                Text(
+                    str(n_gap),
+                    style=("dim" if not visible
+                           else ("red" if n_gap else "dim")),
                 ),
                 Text(a.get("source") or "manual",
                      style="dim italic"),

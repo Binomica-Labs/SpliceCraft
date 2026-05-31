@@ -6273,3 +6273,161 @@ class TestPastTurnRedundancyFoldsInternally:
         assert sc._alignment_terminal_tail_bp(
             res["aligned_q"], res["aligned_t"]) == 0
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _format_identity_pct — honest identity display (no round-up to 100)
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestFormatIdentityPct:
+    """A sub-100% identity must never render as "100%" — otherwise the
+    number contradicts `_identity_pct_color` (strict >= 100 → light-blue,
+    everything below → green/etc). User report 2026-05-31: a one-bp
+    mismatch in an 18 kb plasmid read "100.0%" but coloured green."""
+
+    def test_exact_100_renders_clean(self):
+        # Genuine perfection → no decimals, distinct from near-100.
+        assert sc._format_identity_pct(100.0) == "100%"
+
+    def test_computed_exact_100_renders_clean(self):
+        # The value the aligner actually produces for a perfect match.
+        assert sc._format_identity_pct(100.0 * 18094 / 18094) == "100%"
+
+    def test_one_bp_off_in_18kb_does_not_round_to_100(self):
+        # 18093/18094 = 99.99447% — the user's exact case. Must NOT
+        # show "100.0%"; escalates precision until it reads < 100.
+        v = 100.0 * 18093 / 18094
+        out = sc._format_identity_pct(v)
+        assert out != "100%"
+        assert out != "100.0%"
+        assert out.endswith("%")
+        assert float(out[:-1]) < 100.0
+
+    def test_normal_value_keeps_one_decimal(self):
+        assert sc._format_identity_pct(99.5) == "99.5%"
+        assert sc._format_identity_pct(52.1) == "52.1%"
+
+    def test_escalates_to_two_decimals_when_one_rounds_up(self):
+        # 99.994 rounds to "100.0" at 1 dp; must escalate to "99.99".
+        assert sc._format_identity_pct(99.994) == "99.99%"
+
+    def test_zero(self):
+        assert sc._format_identity_pct(0.0) == "0.0%"
+
+    def test_pathologically_close_to_100_shows_lt_marker(self):
+        # 99.999999 rounds to "100.0000" even at 4 dp — refuse to imply
+        # perfection.
+        assert sc._format_identity_pct(99.999999) == "<100%"
+
+    def test_value_above_100_clamps_to_clean_100(self):
+        # A corrupted >100 rides to the clean "100%" (matches the colour
+        # tier's >= 100 boundary); never shows "100.5%".
+        assert sc._format_identity_pct(100.5) == "100%"
+
+    def test_none_is_dash(self):
+        assert sc._format_identity_pct(None) == "—"
+
+    def test_non_numeric_is_dash(self):
+        assert sc._format_identity_pct("not a number") == "—"
+
+    def test_decimals_zero_still_avoids_false_100(self):
+        # decimals=0 normally shows integers, but a near-100 still
+        # escalates rather than reading "100".
+        assert sc._format_identity_pct(99.0, decimals=0) == "99%"
+        assert sc._format_identity_pct(99.6, decimals=0) == "99.6%"
+
+    def test_color_and_number_never_disagree(self):
+        # The whole point: any value the colour function calls NON-light-
+        # blue must NOT be formatted "100%".
+        for v in (99.99447, 99.994, 99.9, 90.0, 51.0, 11.0, 0.5):
+            num = sc._format_identity_pct(v)
+            color = sc._identity_pct_color(v)
+            if num == "100%":
+                assert color == "bright_cyan", (v, num, color)
+            else:
+                assert color != "bright_cyan", (v, num, color)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _alignment_bar_columns — zoomed-out (bar-mode) per-column collapse
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestAlignmentBarColumns:
+    """When < 1 col/bp (zoomed out), each terminal column spans many bp.
+    The collapse must surface the WORST state in a column (mismatch >
+    gap > match) and must not drop a sub-column segment whose
+    [bp_to_col(s), bp_to_col(e)) range is empty. User request
+    2026-05-31: "show red character in region where mismatch occurred
+    even if one bp"."""
+
+    @staticmethod
+    def _binned(usable_w=10, total=100, margin_l=0):
+        """bp→col mapping with `total` bp packed into `usable_w` cols
+        (so 10 bp/col by default — well into bar mode)."""
+        return lambda bp: margin_l + bp * usable_w // total
+
+    def test_all_match_paints_every_column_blue(self):
+        cols = sc._alignment_bar_columns(
+            [(0, 100, "match")], 0, 100, self._binned(), 0, 10)
+        assert set(cols.values()) == {"match"}
+        assert len(cols) == 10
+
+    def test_one_bp_mismatch_survives_when_zoomed_out(self):
+        # THE bug: 10 bp/col, a 1-bp mismatch at bp 50 collapses to the
+        # same column as the surrounding matches. Must stay mismatch.
+        segs = [(0, 50, "match"), (50, 51, "mismatch"), (51, 100, "match")]
+        cols = sc._alignment_bar_columns(segs, 0, 100, self._binned(), 0, 10)
+        assert cols[5] == "mismatch"
+        # neighbours stay blue
+        assert cols[4] == "match"
+        assert cols[6] == "match"
+
+    def test_mismatch_outranks_gap_in_same_column(self):
+        # bp50 mismatch + bp51 gap both land in col 5 → red wins.
+        segs = [(0, 50, "match"), (50, 51, "mismatch"),
+                (51, 52, "gap"), (52, 100, "match")]
+        cols = sc._alignment_bar_columns(segs, 0, 100, self._binned(), 0, 10)
+        assert cols[5] == "mismatch"
+
+    def test_gap_outranks_match_in_same_column(self):
+        # A lone 1-bp gap must not be hidden by neighbouring matches.
+        segs = [(0, 50, "match"), (50, 51, "gap"), (51, 100, "match")]
+        cols = sc._alignment_bar_columns(segs, 0, 100, self._binned(), 0, 10)
+        assert cols[5] == "gap"
+
+    def test_order_independent_priority(self):
+        # Same column reached match-first then mismatch, and vice-versa
+        # → result identical (priority, not paint-order, decides).
+        a = sc._alignment_bar_columns(
+            [(50, 51, "mismatch"), (51, 100, "match")],
+            0, 100, self._binned(), 0, 10)
+        b = sc._alignment_bar_columns(
+            [(0, 50, "match"), (50, 51, "mismatch")],
+            0, 100, self._binned(), 0, 10)
+        assert a[5] == "mismatch"
+        assert b[5] == "mismatch"
+
+    def test_out_of_view_segments_clipped(self):
+        # Segment entirely left of the view contributes nothing.
+        cols = sc._alignment_bar_columns(
+            [(0, 30, "mismatch"), (60, 100, "match")],
+            50, 100, self._binned(), 0, 10)
+        # cols < 5 are out of view (view starts at bp 50 → col 5)
+        assert all(c >= 5 for c in cols)
+        assert "mismatch" not in cols.values()
+
+    def test_columns_respect_bounds(self):
+        # col_lo_bound / col_hi_bound clamp the painted columns.
+        cols = sc._alignment_bar_columns(
+            [(0, 100, "match")], 0, 100, self._binned(), 3, 7)
+        assert min(cols) >= 3
+        assert max(cols) < 7
+
+    def test_empty_segments(self):
+        assert sc._alignment_bar_columns(
+            [], 0, 100, self._binned(), 0, 10) == {}
+
+    def test_malformed_segment_skipped(self):
+        # A short/garbage tuple is skipped, not fatal.
+        cols = sc._alignment_bar_columns(
+            [(0, 50, "match"), (50,), (50, 51, "mismatch")],
+            0, 100, self._binned(), 0, 10)
+        assert cols[5] == "mismatch"
+
