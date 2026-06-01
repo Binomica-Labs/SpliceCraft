@@ -5039,6 +5039,70 @@ class TestBulkAlignConfirmModalQualityColumns:
             assert t.get_cell_at(Coordinate(0, 8)).plain == "?"
 
 
+class TestWidenedModalsAtNarrowWidth:
+    """The bulk-confirm (10 cols) and Alignment Manager (9 cols) tables
+    grew columns in 1.0.9/1.0.10. They must still mount at an 80-col
+    terminal with the dialog clamped inside the viewport (the wide table
+    scrolls horizontally rather than pushing the modal off-screen).
+    Regression-locks the dialog-width CSS (`max-width` %, `min-width`
+    clamp) against a future column addition that breaks 80-col."""
+
+    async def test_bulk_modal_fits_80_cols(
+            self, tiny_record, isolated_library):
+        from textual.widgets import DataTable
+        matches = [{
+            "sample": {"name": "JP4W9V_4_MAV40-4", "gbk": "x.gbk"},
+            "action": "align",
+            "target_entry": {"id": "T", "name": "MAV40 CAM D1var2+RUBY",
+                             "gb_text": "x"},
+            "score": 1.0, "method": "kmer-strong", "note": "kmer-strong",
+            "_aln": {"ident": 99.99, "mism": 1, "gaps": 0},
+        }]
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            await app.push_screen(sc.BulkAlignConfirmModal(matches))
+            await pilot.pause(0.1)
+            modal = app.screen
+            t = modal.query_one("#bulk-table", DataTable)
+            assert t.row_count == 1
+            assert modal.query_one("#bulk-dlg").size.width <= 80
+
+    async def test_alignment_manager_fits_80_cols(
+            self, tiny_record, isolated_library):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from textual.widgets import DataTable
+        rec = SeqRecord(
+            Seq("T" * 100), id="T", name="T",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        stored = [{
+            "id": "id1", "label": "JP4W9V_4_MAV40-4",
+            "query_label": "Q", "target_label": "MAV40 CAM D1var2+RUBY",
+            "target_id": "T",
+            "target_gb_text": sc._record_to_gb_text(rec),
+            "axis": "query",
+            "result": {"aligned_q": "A" * 100, "aligned_t": "T" * 100,
+                       "identity_pct": 99.99, "n_mismatches": 1,
+                       "n_gap_cols": 0},
+            "visible": True, "added": "2026-05-31", "source": "sequencing",
+        }]
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.AlignmentManagerModal(stored)
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            t = modal.query_one("#alnmgr-table", DataTable)
+            assert t.row_count == 1
+            assert modal.query_one("#alnmgr-dlg").size.width <= 80
+
+
 class TestLibraryPanelSeqColumn:
     """LibraryPanel's "Seq" column shows per-entry sequencing-status
     badges driven by `_library_entry_alignment_summary`. The cell
@@ -6549,4 +6613,255 @@ class TestAlignmentBarColumns:
             [(0, 50, "match"), (50,), (50, 51, "mismatch")],
             0, 100, self._binned(), 0, 10)
         assert cols[5] == "mismatch"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _alignment_indel_events — indel EVENT count (gap runs), report-consistent
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestAlignmentIndelEvents:
+    """`_alignment_indel_events` counts indel EVENTS (contiguous gap
+    runs, either strand) so the Alignment Manager / bulk-confirm "Gaps"
+    columns agree with the Verification Report's "Indels" — a 5 bp
+    deletion is ONE indel, not five gapped bp."""
+
+    def test_no_gaps(self):
+        assert sc._alignment_indel_events(
+            {"n_gap_opens_q": 0, "n_gap_opens_t": 0}) == 0
+
+    def test_sums_both_strands(self):
+        assert sc._alignment_indel_events(
+            {"n_gap_opens_q": 2, "n_gap_opens_t": 1}) == 3
+
+    def test_prefers_gap_opens_over_walk(self):
+        # Explicit fields win even if the aligned strings would say 0.
+        r = {"n_gap_opens_q": 1, "n_gap_opens_t": 0,
+             "aligned_q": "AAAA", "aligned_t": "AAAA"}
+        assert sc._alignment_indel_events(r) == 1
+
+    def test_fallback_multibp_gap_is_one_event(self):
+        # No gap-open fields (old stored alignment) → walk the rows; a
+        # 5 bp deletion is a single gap run → one indel.
+        r = {"aligned_q": "ACG-----TACGT", "aligned_t": "ACGGGGGGTACGT"}
+        assert sc._alignment_indel_events(r) == 1
+
+    def test_fallback_counts_runs_on_both_rows(self):
+        # gap in t (insertion) + gap in q (deletion) = 2 events
+        r = {"aligned_q": "ACGTACGT--ACGTAC",
+             "aligned_t": "ACGT--GTAAACGTAC"}
+        assert sc._alignment_indel_events(r) == 2
+
+    def test_non_dict_is_zero(self):
+        assert sc._alignment_indel_events(None) == 0
+        assert sc._alignment_indel_events("nope") == 0
+
+    def test_matches_verification_report_indel_count(self):
+        # THE consistency guarantee: the helper == the count the
+        # VerificationReportModal derives from the variant extractor.
+        aq = "ACGTACGT--ACGTAC"
+        at = "ACGT--GTAAACGTAC"
+        variants = sc._extract_variants_from_alignment(aq, at)
+        vrm_indels = sum(1 for v in variants
+                         if v["type"] in ("insertion", "deletion"))
+        assert sc._alignment_indel_events(
+            {"aligned_q": aq, "aligned_t": at}) == vrm_indels
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _pairwise_align engine — edlib fast path + Biopython safety net
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestPairwiseAlignEngine:
+    """Hardening for the edlib fast-aligner + Biopython fallback. The
+    fallback / guard tests force the relevant path via monkeypatch so
+    they run under EITHER engine (no edlib install required); the
+    equivalence tests skip when edlib is absent."""
+
+    def test_fallback_when_edlib_disabled(self, monkeypatch):
+        # Force the Biopython path — alignment must still be correct.
+        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
+        r = sc._pairwise_align("ATGCATGCAT", "ATGCATGCAT")
+        assert r["identity_pct"] == 100.0
+        assert r["n_matches"] == 10
+        assert r["n_mismatches"] == 0
+
+    def test_round_trip_guard_falls_back_to_biopython(self, monkeypatch):
+        # Force the edlib branch and make it return a round-trip-violating
+        # alignment; the guard must reject it and fall back to Biopython,
+        # which produces the correct 100% result.
+        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", True)
+        monkeypatch.setattr(sc, "_edlib_align_global",
+                            lambda q, t: ("ZZZZ", "ZZZZ"))
+        r = sc._pairwise_align("ATGC", "ATGC")
+        assert r["identity_pct"] == 100.0
+        assert r["n_matches"] == 4
+
+    def test_edlib_exception_falls_back(self, monkeypatch):
+        # An edlib failure must not abort the alignment — Biopython covers.
+        def _boom(_q, _t):
+            raise RuntimeError("edlib exploded")
+        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", True)
+        monkeypatch.setattr(sc, "_edlib_align_global", _boom)
+        r = sc._pairwise_align("ATGCATGC", "ATGCATGC")
+        assert r["identity_pct"] == 100.0
+        assert r["n_matches"] == 8
+
+    def test_round_trip_reconstructs_inputs(self):
+        # Whatever engine ran, the gapped rows reconstruct the inputs.
+        q = "ATGCAAATTTGGGCCC"
+        t = "ATGCAAATTGGGCCC"   # 1 bp deletion
+        r = sc._pairwise_align(q, t)
+        assert r["aligned_q"].replace("-", "") == q
+        assert r["aligned_t"].replace("-", "") == t
+
+    def test_iupac_ambiguity_aligns_as_match(self):
+        # N / R against compatible bases count as matches under EITHER
+        # engine (edlib gets the IUPAC `additionalEqualities`).
+        r = sc._pairwise_align("ANGCRTGC", "ATGCATGC")
+        assert r["n_mismatches"] == 0
+        assert r["n_matches"] == 8
+
+    def test_empty_and_oversized_rejected(self):
+        with pytest.raises(ValueError):
+            sc._pairwise_align("", "ATGC")
+        with pytest.raises(ValueError):
+            sc._pairwise_align("ATGC", "A" * (sc._PAIRWISE_MAX_LEN + 1))
+
+    def test_edlib_matches_biopython_on_near_identical(self, monkeypatch):
+        if not sc._EDLIB_AVAILABLE:
+            pytest.skip("edlib not installed")
+        q = _det_seq(2000, seed=11)
+        # 1 SNP + a 3 bp deletion — the kind of near-identical pair QC
+        # actually sees; both engines must agree exactly.
+        t = (q[:800] + ("A" if q[800] != "A" else "C")
+             + q[801:1500] + q[1503:])
+        r_edlib = sc._pairwise_align(q, t)
+        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
+        r_bio = sc._pairwise_align(q, t)
+        assert r_edlib["n_matches"] == r_bio["n_matches"]
+        assert r_edlib["n_mismatches"] == r_bio["n_mismatches"]
+        assert r_edlib["n_gap_cols"] == r_bio["n_gap_cols"]
+        assert abs(r_edlib["identity_pct"] - r_bio["identity_pct"]) < 1e-9
+
+    def test_edlib_global_helper_round_trips(self):
+        if not sc._EDLIB_AVAILABLE:
+            pytest.skip("edlib not installed")
+        aq, at = sc._edlib_align_global("ATGCATGC", "ATGGATGC")
+        assert aq.replace("-", "") == "ATGCATGC"
+        assert at.replace("-", "") == "ATGGATGC"
+        assert len(aq) == len(at)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _alignment_bar_column_shades / _alignment_shade_cell — nuanced bar overlay
+# ═══════════════════════════════════════════════════════════════════════════════
+class TestAlignmentShadeCell:
+    """`_alignment_shade_cell` maps a column's (match, mismatch, gap)
+    composition to a glyph + style so the zoomed-out overlay shows the
+    blue/red/gray patchwork: blue where it binds, a red shade (density ∝
+    mismatch fraction) on blue where partial, solid red where it doesn't,
+    gray where gaps dominate."""
+
+    def test_pure_match_is_blue(self):
+        assert sc._alignment_shade_cell(160, 0, 0) == ("█", "color(39)")
+
+    def test_pure_mismatch_is_solid_red(self):
+        assert sc._alignment_shade_cell(0, 160, 0) == ("█", "color(196)")
+
+    def test_gap_dominant_is_gray(self):
+        # gaps outnumber the aligned bp → gray
+        assert sc._alignment_shade_cell(10, 0, 100) == ("░", "color(240)")
+
+    def test_all_gap_is_gray(self):
+        assert sc._alignment_shade_cell(0, 0, 50) == ("░", "color(240)")
+
+    def test_empty_is_none(self):
+        assert sc._alignment_shade_cell(0, 0, 0) is None
+
+    def test_single_snp_is_faint_red_speckle_on_blue(self):
+        # 1 mismatch in 160 bp → f≈0.6% → lightest shade, red on blue:
+        # visible (red), yet you can see it mostly binds (blue bg).
+        g, style = sc._alignment_shade_cell(159, 1, 0)
+        assert g == "░"
+        assert style == "color(196) on color(39)"
+
+    def test_mid_mismatch_uses_medium_shade(self):
+        # ~25% mismatch → ▒ red on blue
+        assert sc._alignment_shade_cell(75, 25, 0) == (
+            "▒", "color(196) on color(39)")
+
+    def test_high_mismatch_uses_heavy_shade(self):
+        # ~50% mismatch → ▓ red on blue
+        assert sc._alignment_shade_cell(50, 50, 0) == (
+            "▓", "color(196) on color(39)")
+
+    def test_mostly_mismatch_tips_to_solid_red(self):
+        # ≥62.5% mismatch → solid red (no longer "binds")
+        assert sc._alignment_shade_cell(20, 80, 0) == ("█", "color(196)")
+
+    def test_shade_density_increases_with_mismatch(self):
+        # The red shade must get denser as the mismatch fraction rises.
+        order = "░▒▓█"
+        prev = -1
+        for f_pct in (1, 20, 50, 90):
+            g, _ = sc._alignment_shade_cell(100 - f_pct, f_pct, 0)
+            idx = order.index(g)
+            assert idx >= prev, (f_pct, g)
+            prev = idx
+
+    def test_negative_counts_clamped(self):
+        # corrupt negatives don't crash / invert
+        assert sc._alignment_shade_cell(-5, -3, -1) is None
+
+
+class TestAlignmentBarColumnShades:
+    """`_alignment_bar_column_shades` accumulates per-column bp counts so
+    a lone mismatch is captured alongside its surrounding match majority
+    (the ratio that drives the shade) instead of being collapsed away."""
+
+    @staticmethod
+    def _binned(usable_w=10, total=100, margin_l=0):
+        return lambda bp: margin_l + bp * usable_w // total
+
+    def test_pure_match_column_counts(self):
+        comp = sc._alignment_bar_column_shades(
+            [(0, 100, "match")], 0, 100, self._binned(), 0, 10)
+        assert comp[0] == (10, 0, 0)
+        assert len(comp) == 10
+
+    def test_single_mismatch_captured_with_match_majority(self):
+        # match(0,50), mismatch(50,51), match(51,100): col 5 spans bp
+        # 50-59 → 1 mismatch + 9 match (NOT dropped, NOT all-red).
+        segs = [(0, 50, "match"), (50, 51, "mismatch"), (51, 100, "match")]
+        comp = sc._alignment_bar_column_shades(
+            segs, 0, 100, self._binned(), 0, 10)
+        assert comp[5] == (9, 1, 0)
+        # and that cell renders as a faint red speckle on blue, not solid
+        assert sc._alignment_shade_cell(*comp[5]) == (
+            "░", "color(196) on color(39)")
+        assert comp[4] == (10, 0, 0)
+
+    def test_gap_counts(self):
+        comp = sc._alignment_bar_column_shades(
+            [(0, 50, "match"), (50, 100, "gap")], 0, 100,
+            self._binned(), 0, 10)
+        assert comp[7] == (0, 0, 10)
+
+    def test_out_of_view_clipped(self):
+        comp = sc._alignment_bar_column_shades(
+            [(0, 30, "mismatch"), (60, 100, "match")], 50, 100,
+            self._binned(), 0, 10)
+        assert all(c >= 5 for c in comp)
+        assert all(v[1] == 0 for v in comp.values())  # no mismatch in view
+
+    def test_col_bounds_respected(self):
+        comp = sc._alignment_bar_column_shades(
+            [(0, 100, "match")], 0, 100, self._binned(), 3, 7)
+        assert min(comp) >= 3 and max(comp) < 7
+
+    def test_empty_and_malformed(self):
+        assert sc._alignment_bar_column_shades(
+            [], 0, 100, self._binned(), 0, 10) == {}
+        comp = sc._alignment_bar_column_shades(
+            [(0, 50, "match"), (50,), (50, 51, "mismatch")],
+            0, 100, self._binned(), 0, 10)
+        assert comp[5][1] == 1  # mismatch still counted; bad tuple skipped
 

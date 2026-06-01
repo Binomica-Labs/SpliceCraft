@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.10"
+__version__ = "1.0.11"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -561,6 +561,10 @@ def _log_startup_banner() -> None:
     _log.info("platform  : %s", _RUNTIME_PLATFORM)
     _log.info("textual   : %s", _ver("textual"))
     _log.info("biopython : %s", _ver("Bio"))
+    _log.info("edlib     : %s", (
+        f"{_ver('edlib')} (active — fast aligner)" if _EDLIB_AVAILABLE
+        else "not installed — Biopython fallback"
+    ))
     _log.info("log path  : %s", _LOG_PATH)
     try:
         _log.info("stacks    : %s  (kill -USR1 <pid> on hang)",
@@ -14758,6 +14762,60 @@ def _normalize_dna_for_align(seq: str) -> str:
     return s
 
 
+# ── edlib fast-aligner engine (optional) ───────────────────────────────────────
+#
+# edlib is a bit-parallel (Myers) edit-distance aligner — ~90–600× faster
+# than Biopython's DP on long near-identical sequences, and it produces
+# the SAME aligned columns for the high-identity alignments that drive QC
+# (validated on real Plasmidsaurus reads, 2026-05-31: identical
+# identity / mismatch / indel counts; it diverges only on low-identity
+# alignments, which the rotation picker discards anyway). It is OPTIONAL:
+# a platform with no edlib wheel transparently falls back to Biopython, so
+# nothing can regress. Match COUNTING in `_pairwise_align` stays IUPAC-
+# aware (`_iupac_compatible`); the same IUPAC pairs are also handed to
+# edlib as `additionalEqualities` so the alignment itself treats N/R/etc.
+# as matches — keeping engine and counting in lockstep.
+try:
+    import edlib as _edlib  # type: ignore[import-not-found]
+    _EDLIB_AVAILABLE = True
+except Exception:
+    _edlib = None
+    _EDLIB_AVAILABLE = False
+
+# Unordered IUPAC-compatible character pairs (N vs A, R vs G, …) for
+# edlib's `additionalEqualities`, built once from `_iupac_compatible` so
+# the alignment engine and the match counting can never disagree about
+# which ambiguity pairings count as a match.
+_EDLIB_IUPAC_EQUALITIES = [
+    (a, b)
+    for a in sorted(_IUPAC_NUC_CHARS)
+    for b in sorted(_IUPAC_NUC_CHARS)
+    if a < b and _iupac_compatible(a, b)
+]
+
+
+def _edlib_align_global(query: str, target: str) -> "tuple[str, str]":
+    """Global (Needleman–Wunsch) alignment via edlib → gapped
+    ``(query, target)`` strings, the fast-path engine for
+    `_pairwise_align`. Raises on any edlib failure so the caller falls
+    through to its ValueError handling. Inputs are already normalised +
+    length-capped by `_pairwise_align`."""
+    if _edlib is None:                       # defensive; gated by caller
+        raise ValueError("edlib not available")
+    res = _edlib.align(
+        query, target, mode="NW", task="path",
+        additionalEqualities=_EDLIB_IUPAC_EQUALITIES,
+    )
+    if res.get("editDistance", -1) < 0:
+        raise ValueError("edlib produced no alignment")
+    nice = _edlib.getNiceAlignment(res, query, target)
+    aq = nice.get("query_aligned") or ""
+    at = nice.get("target_aligned") or ""
+    if not aq or not at:
+        raise ValueError("edlib produced empty aligned rows")
+    return aq, at
+
+
 @_timed("op.pairwise_align")
 def _pairwise_align(query_seq: str, target_seq: str,
                      *, mode: str = "global",
@@ -14804,7 +14862,6 @@ def _pairwise_align(query_seq: str, target_seq: str,
     scalar scoring runs ~2× faster). Identity counting is what
     surfaces in the UI; that's where the IUPAC fix matters most.
     """
-    from Bio.Align import PairwiseAligner
     if not isinstance(query_seq, str) or not isinstance(target_seq, str):
         raise ValueError("query_seq and target_seq must be str")
     q = _normalize_dna_for_align(query_seq)
@@ -14818,33 +14875,55 @@ def _pairwise_align(query_seq: str, target_seq: str,
         )
     if mode not in ("global", "local"):
         raise ValueError(f"mode must be 'global' or 'local' (got {mode!r})")
-    aligner = PairwiseAligner()
-    aligner.mode               = mode
-    aligner.match_score        = match
-    aligner.mismatch_score     = mismatch
-    aligner.open_gap_score     = open_gap
-    aligner.extend_gap_score   = extend_gap
-    try:
-        alignments = aligner.align(q, t)
-    except Exception as exc:
-        raise ValueError(f"pairwise align failed: {exc}") from exc
-    try:
-        first = alignments[0]
-    except (IndexError, StopIteration) as exc:
-        raise ValueError("no alignment produced") from exc
-    # Biopython 1.81+ Alignment supports row-indexing: `aln[0]` is the
-    # gapped first sequence (target), `aln[1]` is the gapped second
-    # (query). The text `format()` representation wraps at 60 cols
-    # with coordinate prefixes which is awkward to parse — direct
-    # row indexing is the documented API.
-    # `aligner.align(q, t)` was called q-first, t-second above. So
-    # `first[0]` is the gapped query and `first[1]` is the gapped
-    # target — preserve that ordering in the result dict.
-    try:
-        aligned_q = str(first[0])
-        aligned_t = str(first[1])
-    except (IndexError, TypeError) as exc:
-        raise ValueError(f"could not extract aligned rows: {exc}") from exc
+    # Engine: edlib for global mode (fast — `_edlib_align_global`), with
+    # Biopython as both the local-mode engine AND a per-call safety net.
+    # `bio_first` holds the Biopython Alignment row object when that path
+    # runs so the affine `score` can be read off it; the edlib path
+    # reconstructs an equivalent score from the counts below.
+    bio_first = None
+    aligned_q: "str | None" = None
+    aligned_t: "str | None" = None
+    if _EDLIB_AVAILABLE and mode == "global":
+        try:
+            aq, at = _edlib_align_global(q, t)
+            # Round-trip guard: the ungapped rows MUST reconstruct the
+            # normalised inputs. If edlib ever returns a corrupt or mis-
+            # ordered alignment (version drift, an upstream bug), reject
+            # it rather than let a wrong alignment reach the QC counts —
+            # fall through to Biopython for this one call.
+            if aq.replace("-", "") != q or at.replace("-", "") != t:
+                raise ValueError("edlib alignment failed round-trip check")
+            aligned_q, aligned_t = aq, at
+        except Exception:
+            _log.debug(
+                "pairwise: edlib path failed (q=%d, t=%d) — falling back "
+                "to Biopython for this call", len(q), len(t), exc_info=True,
+            )
+            aligned_q = aligned_t = None
+    if aligned_q is None or aligned_t is None:
+        from Bio.Align import PairwiseAligner
+        aligner = PairwiseAligner()
+        aligner.mode               = mode
+        aligner.match_score        = match
+        aligner.mismatch_score     = mismatch
+        aligner.open_gap_score     = open_gap
+        aligner.extend_gap_score   = extend_gap
+        try:
+            alignments = aligner.align(q, t)
+        except Exception as exc:
+            raise ValueError(f"pairwise align failed: {exc}") from exc
+        try:
+            bio_first = alignments[0]
+        except (IndexError, StopIteration) as exc:
+            raise ValueError("no alignment produced") from exc
+        # `aligner.align(q, t)` was called q-first, t-second, so
+        # `bio_first[0]` is the gapped query and `[1]` the gapped target —
+        # preserve that ordering in the result dict.
+        try:
+            aligned_q = str(bio_first[0])
+            aligned_t = str(bio_first[1])
+        except (IndexError, TypeError) as exc:
+            raise ValueError(f"could not extract aligned rows: {exc}") from exc
     if not aligned_q or not aligned_t:
         raise ValueError("aligner produced empty rows")
     if len(aligned_q) != len(aligned_t):
@@ -14893,6 +14972,21 @@ def _pairwise_align(query_seq: str, target_seq: str,
     # raising a divide-by-zero — caller already has aq/at to inspect.
     identity_pct          = (100.0 * n_matches / aligned_cols) if aligned_cols else 0.0
     ungapped_identity_pct = (100.0 * n_matches / ungapped_cols) if ungapped_cols else 0.0
+    # Score: read Biopython's affine score off the alignment row when
+    # that engine ran; for the edlib path reconstruct an equivalent
+    # affine score from the counts (same scalar params) so the displayed
+    # "Score" stays comparable across engines. `score` isn't used in any
+    # ranking — the rotation picker ranks by identity (INV-76) — so this
+    # is display-only.
+    n_gap_opens = n_gap_opens_q + n_gap_opens_t
+    if bio_first is not None:
+        # BioPython's Alignment.score isn't in Pyright's stubs but is the
+        # public scalar API (documented + stable since 1.81).
+        score = float(getattr(bio_first, "score", 0.0))
+    else:
+        score = (match * n_matches + mismatch * n_mismatches
+                 + open_gap * n_gap_opens
+                 + extend_gap * max(0, n_gap_cols - n_gap_opens))
     # `identity_pct` is gap-inclusive (BLAST convention). For global
     # alignment of length-mismatched pairs (e.g. a 200 bp insert vs a
     # 5 kb backbone) the denominator is dominated by gap columns and
@@ -14903,9 +14997,7 @@ def _pairwise_align(query_seq: str, target_seq: str,
     # to disambiguate.
     return {
         "mode":                  mode,
-        # BioPython's Alignment.score isn't in Pyright's stubs but
-        # is the public scalar API (documented + stable since 1.81).
-        "score":                 float(getattr(first, "score", 0.0)),
+        "score":                 score,
         "identity_pct":          identity_pct,
         "ungapped_identity_pct": ungapped_identity_pct,
         "aligned_q":             aligned_q,
@@ -15186,6 +15278,95 @@ def _alignment_bar_columns(
             if prev is None or pr > _ALIGN_STATE_PRIORITY.get(prev, 0):
                 worst[col] = state
     return worst
+
+
+def _alignment_bar_column_shades(
+    segments: "list[tuple[int, int, str]]",
+    view_s: int, view_e: int, bp_to_col,
+    col_lo_bound: int, col_hi_bound: int,
+) -> "dict[int, tuple[int, int, int]]":
+    """Per-column composition ``{col: (n_match, n_mismatch, n_gap)}`` for
+    the zoomed-out (bar-mode) overlay — how many bp of each state fall in
+    each terminal column, so a cell can SHADE by how much of its span
+    binds vs mismatches vs gaps (`_alignment_shade_cell`) instead of
+    collapsing to a single worst-state (`_alignment_bar_columns`).
+
+    Walks bp by bp within the visible window, so a lone mismatch bp is
+    counted in its column (no degenerate-range drop) while the
+    surrounding match majority is still captured — that ratio is what
+    drives the shade. Pure; the bp→col mapping is a callable so the suite
+    can pin it without a PlasmidMap.
+    """
+    acc: "dict[int, list[int]]" = {}
+    state_idx = {"match": 0, "mismatch": 1, "gap": 2}
+    for seg in segments:
+        try:
+            seg_s, seg_e, state = seg[0], seg[1], seg[2]
+        except (IndexError, TypeError, ValueError):
+            continue
+        si = state_idx.get(state)
+        if si is None:
+            continue
+        s = max(int(seg_s), view_s)
+        e = min(int(seg_e), view_e)
+        if s >= e:
+            continue
+        for bp in range(s, e):
+            col = bp_to_col(bp)
+            if not (col_lo_bound <= col < col_hi_bound):
+                continue
+            cell = acc.get(col)
+            if cell is None:
+                cell = [0, 0, 0]
+                acc[col] = cell
+            cell[si] += 1
+    return {c: (v[0], v[1], v[2]) for c, v in acc.items()}
+
+
+# Mismatch-fraction → red-shade glyph for `_alignment_shade_cell`. The
+# density of the red foreground over the blue match background grows with
+# the fraction of the column's ALIGNED bp that mismatch: a lone SNP is a
+# faint speckle, a half-and-half column reads clearly mixed, and a
+# mostly-mismatch column tips to solid red.
+_ALIGN_SHADE_TIERS = (
+    (0.125, "░"),
+    (0.375, "▒"),
+    (0.625, "▓"),
+)
+
+
+def _alignment_shade_cell(
+    n_match: int, n_mismatch: int, n_gap: int,
+) -> "tuple[str, str] | None":
+    """Map a bar-mode column's composition to ``(glyph, rich_style)`` for
+    the nuanced overlay (user request 2026-06-01 — preserve the
+    blue/red/gray patchwork at full zoom-out). ``None`` for an empty
+    column.
+
+      * gap-dominant (gaps outnumber the aligned bp) → gray ``░``.
+      * pure match → blue ``█`` (binds).
+      * any mismatch → a red shade glyph (``░``/``▒``/``▓``) on a blue
+        background whose density tracks the mismatch fraction among the
+        column's ALIGNED bp, tipping to a solid red ``█`` once mismatches
+        dominate. So a single-bp mismatch in a ~160 bp cell shows a faint
+        red fleck on blue (visible, yet you can still see it mostly
+        binds), while a heavily-mismatched cell reads solid red.
+    """
+    n_match = max(0, int(n_match))
+    n_mismatch = max(0, int(n_mismatch))
+    n_gap = max(0, int(n_gap))
+    aligned = n_match + n_mismatch
+    if aligned <= 0:
+        return ("░", "color(240)") if n_gap > 0 else None
+    if n_gap > aligned:
+        return ("░", "color(240)")                  # gap-dominant → gray
+    if n_mismatch <= 0:
+        return ("█", "color(39)")                   # pure match → blue
+    f = n_mismatch / aligned
+    for thresh, shade in _ALIGN_SHADE_TIERS:
+        if f < thresh:
+            return (shade, "color(196) on color(39)")  # red shade on blue
+    return ("█", "color(196)")                      # mostly mismatch → red
 
 
 def _alignment_name_overlay(
@@ -15861,6 +16042,42 @@ def _coverage_pct_from_result(result: dict, target_len: int) -> float:
     if aligned_bp <= 0:
         return 0.0
     return min(100.0, 100.0 * aligned_bp / target_len)
+
+
+def _alignment_indel_events(result: dict) -> int:
+    """Number of indel EVENTS (contiguous gap runs, either strand) in a
+    `_pairwise_align` result — a 5 bp deletion is ONE indel, not five.
+
+    This is the count the VerificationReportModal labels "Indels"
+    (`n_indels`, from `_extract_variants_from_alignment`, which merges
+    each gap run into a single record). Use this — NOT `n_gap_cols`
+    (gapped bp) — wherever an indel COUNT is shown, so the Alignment
+    Manager "Gaps" and the bulk-confirm "Gaps" columns agree with the
+    report's "Indels" for the same alignment.
+
+    Equals `n_gap_opens_q + n_gap_opens_t` (gap-run counts per strand:
+    a query gap run = a deletion record, a target gap run = an insertion
+    record). Prefers those precomputed fields; falls back to walking
+    `aligned_q`/`aligned_t` for alignments persisted before the gap-open
+    counts existed (pre-2026-05-27).
+    """
+    if not isinstance(result, dict):
+        return 0
+    oq = result.get("n_gap_opens_q")
+    ot = result.get("n_gap_opens_t")
+    if isinstance(oq, int) and isinstance(ot, int):
+        return max(0, oq) + max(0, ot)
+    events = 0
+    for s in (result.get("aligned_q") or "", result.get("aligned_t") or ""):
+        in_gap = False
+        for ch in str(s):
+            if ch == "-":
+                if not in_gap:
+                    events += 1
+                    in_gap = True
+            else:
+                in_gap = False
+    return events
 
 
 def _alignment_quality_status(
@@ -19292,23 +19509,34 @@ class PlasmidMap(Widget):
                         ch, _ = letters.get(bp, ("-", state))
                         canvas.put(col, row, ch, letter_style)
             else:
-                # Bar mode: one glyph per column, colored by the WORST
-                # state among the bp it spans (mismatch > gap > match)
-                # so a lone mismatched base can't be hidden by an
-                # adjacent match run when zoomed all the way out.
-                col_state = _alignment_bar_columns(
+                # Bar mode: SHADE each column by its composition (how much
+                # of its bp span binds / mismatches / gaps) instead of a
+                # flat worst-state, so at full zoom-out you still see the
+                # blue/red/gray patchwork — blue where it binds, a red
+                # shade (density ∝ mismatch fraction) on blue where it
+                # partially binds, solid red where it doesn't, gray where
+                # gaps dominate. A lone SNP shows a faint red fleck; a
+                # heavily-mismatched stretch reads solid red (user request
+                # 2026-06-01). `col_state` (for the name overlay below) is
+                # derived from the same per-column counts.
+                col_comp = _alignment_bar_column_shades(
                     align.get("segments", ()), view_s, view_e, bp_to_col,
                     margin_l, margin_l + usable_w,
                 )
-                for col, state in col_state.items():
-                    if state == "mismatch":
-                        color, glyph = "color(196)", "█"
-                    elif state == "gap":
-                        color, glyph = "color(240)", "░"
+                for col, (n_m, n_x, n_g) in col_comp.items():
+                    if n_g > n_m + n_x:
+                        col_state[col] = "gap"
+                    elif n_x > 0:
+                        col_state[col] = "mismatch"
                     else:
-                        color, glyph = "color(39)", "█"
+                        col_state[col] = "match"
+                    shaded = _alignment_shade_cell(n_m, n_x, n_g)
+                    if shaded is None:
+                        continue
+                    glyph, shade_style = shaded
                     canvas.put(
-                        col, row, glyph, f"{base_style} {color}".strip(),
+                        col, row, glyph,
+                        f"{base_style} {shade_style}".strip(),
                     )
 
             # Strand arrowhead at the right tip of the bar. All
@@ -62560,8 +62788,8 @@ class SequencingScreen(Screen):
                     f"Aligned {query_label} → {target_label} · "
                     f"{aligned_bp:,}/{tgt_bp:,} bp "
                     f"({coverage_pct:.0f}% coverage) at "
-                    f"{ident_total:.1f}% identity "
-                    f"({ident_ungap:.1f}% in matched region)"
+                    f"{_format_identity_pct(ident_total)} identity "
+                    f"({_format_identity_pct(ident_ungap)} in matched region)"
                     f"{rot_note} · "
                     f"click read on map to inspect.",
                     title="Alignment added",
@@ -62792,6 +63020,14 @@ class SequencingScreen(Screen):
         # same ~18 kb pairwise twice over. Now it runs exactly once here.
         self._compute_bulk_quality(matches)
 
+        # If this worker was cancelled mid-prealign (an exclusive restart
+        # from a second Bulk-align click, or the screen unmounted), do
+        # NOT push its now-stale confirm modal — otherwise a double-click
+        # stacks two modals over the same run.
+        from textual.worker import get_current_worker
+        if get_current_worker().is_cancelled:
+            return
+
         def _ok():
             self._reset_bulk_align_button()
             self._push_bulk_confirm_modal(matches)
@@ -62807,9 +63043,18 @@ class SequencingScreen(Screen):
         Rows with no target / no consensus member get ``_aln = False``
         (rendered "?"). Runs the SAME `_pick_best_rotation(...,
         canvas_axis="target")` call the commit used to run, so the cached
-        result is byte-for-byte what the commit would have computed."""
+        result is byte-for-byte what the commit would have computed.
+
+        Polls `get_current_worker().is_cancelled` each iteration so a
+        long run (every sample is a ~18 kb pairwise) stops promptly when
+        the user re-launches bulk-align or leaves the screen, instead of
+        grinding through every remaining sample first."""
+        from textual.worker import get_current_worker
+        worker = get_current_worker()
         n = len(matches)
         for i, m in enumerate(matches, 1):
+            if worker.is_cancelled:
+                return
             target_entry = m.get("target_entry") or {}
             tgt_gb = target_entry.get("gb_text") or ""
             sample = m.get("sample") or {}
@@ -62847,8 +63092,9 @@ class SequencingScreen(Screen):
                 m["_aln"] = {
                     "ident": float(result.get("identity_pct") or 0.0),
                     "mism":  int(result.get("n_mismatches") or 0),
-                    "gaps":  int(result.get("n_gap_cols",
-                                            result.get("n_gaps", 0)) or 0),
+                    # Indel EVENTS (gap runs), matching the Verification
+                    # Report's "Indels" — not gapped bp.
+                    "gaps":  _alignment_indel_events(result),
                 }
                 m["_aln_result"] = result
             except Exception:
@@ -63078,17 +63324,32 @@ class SequencingScreen(Screen):
                 )
                 n_failed += 1
                 continue
-            try:
-                gb_text = _extract_gbk_member(zip_path, gbk_member)
-                query_rec = _gb_text_to_record(gb_text)
-            except Exception:
-                _log.exception(
-                    "BulkAlign: extract/parse failed for %r",
-                    gbk_member,
-                )
-                n_failed += 1
-                continue
+            # 2026-05-31 (optimisation): only extract + parse the read's
+            # ~38 KB consensus when we actually need its sequence — to
+            # align it (no cached result) or to add it as a new entry.
+            # When the matcher-phase `_compute_bulk_quality` already
+            # produced the alignment (`_aln_result`), the commit reuses it
+            # verbatim and never re-touches the GenBank.
             action = m.get("action")
+            cached = m.get("_aln_result")
+            align_reuse = (
+                action == "align"
+                and isinstance(cached, dict)
+                and bool(cached.get("aligned_q"))
+                and bool(cached.get("aligned_t"))
+            )
+            query_rec = None
+            if not align_reuse:
+                try:
+                    query_rec = _gb_text_to_record(
+                        _extract_gbk_member(zip_path, gbk_member))
+                except Exception:
+                    _log.exception(
+                        "BulkAlign: extract/parse failed for %r",
+                        gbk_member,
+                    )
+                    n_failed += 1
+                    continue
             if action == "align":
                 target_entry = m.get("target_entry") or {}
                 tgt_gb = target_entry.get("gb_text", "")
@@ -63108,17 +63369,20 @@ class SequencingScreen(Screen):
                     (target_rec.annotations or {}).get("topology", "")
                     .lower() == "circular"
                 )
-                # 2026-05-31: reuse the alignment the matcher-phase
-                # `_compute_bulk_quality` already ran for this row (cached
-                # as `_aln_result`) so the same ~18 kb pairwise isn't run
-                # twice. Fall back to a fresh align only if the cache is
-                # missing (e.g. the pre-align failed, or a row reached
-                # "align" by a path that skipped the pre-pass).
-                cached = m.get("_aln_result")
-                if (isinstance(cached, dict)
-                        and cached.get("aligned_q")
-                        and cached.get("aligned_t")):
+                # Reuse the matcher-phase alignment (cached as
+                # `_aln_result`) so the same ~18 kb pairwise isn't run
+                # twice. Fall back to a fresh align only when the cache is
+                # missing (pre-align failed, or a row reached "align" by a
+                # path that skipped the pre-pass).
+                if align_reuse:
                     result = cached
+                elif query_rec is None:
+                    # Unreachable (not align_reuse ⇒ query_rec extracted
+                    # above or the row already `continue`d) — narrows the
+                    # Optional for the type-checker + a belt-and-braces
+                    # guard against a future refactor.
+                    n_failed += 1
+                    continue
                 else:
                     try:
                         result = _pick_best_rotation(
@@ -63194,6 +63458,12 @@ class SequencingScreen(Screen):
                 # Build the new-entry dict (no save here — accumulated
                 # for batch commit). Counters bumped in the commit
                 # step so failures bubble correctly.
+                if query_rec is None:
+                    # Unreachable for "add" (align_reuse is align-only, so
+                    # the read was extracted above) — narrows the Optional
+                    # for the type-checker and guards a future refactor.
+                    n_failed += 1
+                    continue
                 try:
                     gb_text_q = _record_to_gb_text(query_rec)
                     display_name = (
@@ -72641,8 +72911,8 @@ class AlignmentScreen(_OneShotDismissScreen, Screen):
             f"({r['q_len']:,} bp)  \n"
             f"**Target**: `{_esc_md(self._target_label)}`  "
             f"({r['t_len']:,} bp)  \n"
-            f"**Identity**: {ident_total:.2f}% "
-            f"(gap-inclusive) · {ident_ungap:.2f}% (aligned only)  ·  "
+            f"**Identity**: {_format_identity_pct(ident_total, decimals=2)} "
+            f"(gap-inclusive) · {_format_identity_pct(ident_ungap, decimals=2)} (aligned only)  ·  "
             f"**Score**: {r['score']:.0f}  ·  "
             f"**Matches**: {r['n_matches']:,}  ·  "
             f"**Mismatches**: {r['n_mismatches']:,}  ·  "
@@ -73227,9 +73497,14 @@ class BulkAlignConfirmModal(_OneShotDismissScreen, ModalScreen):
         # quality, computed up front by `_compute_bulk_quality` on the
         # button-press worker and cached on each match — the modal just
         # renders them (2026-05-31 user request: align once, not twice).
+        # "k-mer match"/"Name" are how the sample was PAIRED to a
+        # library entry (a confidence score); "Ident"/"Mism"/"Gaps" are
+        # the actual alignment QUALITY. The "match" suffix keeps a strong
+        # k-mer ("100%") from being misread as a perfect alignment — the
+        # confusion that prompted the real-quality columns.
         t.add_columns("#", "Sample", "Action",
                         "Target / new name",
-                        "k-mer", "Name",
+                        "k-mer match", "Name",
                         "Ident", "Mism", "Gaps", "Note")
         for i, m in enumerate(self._matches, 1):
             self._add_or_update_row(t, i, m)
@@ -73795,14 +74070,13 @@ class AlignmentManagerModal(_OneShotDismissScreen, ModalScreen):
             vis_glyph  = self._VIS_ON  if visible else self._VIS_OFF
             res   = a.get("result") or {}
             ident = res.get("identity_pct", 0.0)
-            # Mismatched bases + gapped bp straight off the pairwise
-            # result. `n_gap_cols` is the modern field; fall back to the
-            # legacy `n_gaps` alias for alignments persisted before the
-            # split (2026-05-27). Clamp negatives from any corrupted
-            # result so the cell never shows "-1".
+            # "Mism" = mismatched bases; "Gaps" = indel EVENTS (gap runs,
+            # via `_alignment_indel_events`) — NOT gapped bp — so this
+            # agrees with the Verification Report's "Indels" for the same
+            # alignment (a 5 bp deletion reads "1" in both). Clamp the
+            # mismatch count against a corrupted negative.
             n_mis = max(0, int(res.get("n_mismatches", 0) or 0))
-            n_gap = max(0, int(res.get("n_gap_cols",
-                                       res.get("n_gaps", 0)) or 0))
+            n_gap = _alignment_indel_events(res)
             t.add_row(
                 Text.from_markup(mark_glyph),
                 Text.from_markup(vis_glyph),
@@ -106121,7 +106395,7 @@ NcbiTaxonPickerModal { align: center middle; }
                                       result.get("identity_pct", 0.0))
             self.notify(
                 f"Aligned {q_name} → {t_name} · "
-                f"{ident_ungap:.1f}% identity (aligned region) · "
+                f"{_format_identity_pct(ident_ungap)} identity (aligned region) · "
                 f"click read on map to inspect.",
                 title="Alignment added",
                 severity="information", timeout=6,

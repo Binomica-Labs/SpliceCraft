@@ -14,6 +14,27 @@
 
 ---
 
+## [1.0.11] — 2026-06-01
+
+### New features
+
+- **Alignment is dramatically faster.** Sequencing-read alignment now uses [edlib](https://github.com/Martinsos/edlib) — a bit-parallel aligner — for the heavy lifting. A single read that took ~15–45 seconds to align against an 18 kb plasmid now takes **well under a second**, so bulk-aligning a whole run drops from minutes to seconds. The identity, mismatch, and gap counts are unchanged for any read that aligns well (verified base-for-base on real reads), and on a platform without edlib it transparently falls back to the previous engine — so nothing can break.
+- **The alignment overlay shows more nuance when zoomed all the way out.** Each on-screen cell of a read's overlay bar is now shaded by *how much* of the ~160 bp it covers actually binds: solid blue where it matches, gray where it's a gap, and a red shade on blue whose density grows with the mismatch fraction — a faint fleck for a single mismatch, a heavier shade for a partly-matching stretch, solid red where it doesn't bind. So a read that partially binds now reads as a blue/red/gray patchwork instead of an undifferentiated red block, and a lone SNP still shows red in its region — the same granularity you'd get one or two zoom levels in, now at full zoom-out.
+
+### Bug fixes
+
+- **Alignment pop-ups no longer round a near-perfect read up to "100%".** The toast shown after aligning a read, and the alignment detail panel, used to report e.g. "100.0% identity" for a read that's actually one base off — the same misleading rounding the Alignment Manager already had fixed. They now show the true figure (e.g. `99.99%`); a genuine perfect match still reads a clean `100%`.
+- **The bulk-align window's k-mer column is now labelled "k-mer match"** so its score — which can read "100%" even for a read that isn't a perfect alignment — isn't mistaken for alignment quality. The Identity / Mism / Gaps columns are the quality read.
+- **"Gaps" now means the same thing everywhere.** The Alignment Manager and the bulk-align window count gaps the way the Verification Report always has — as indel *events* (a 5-base deletion is **one** gap), instead of counting gapped *bases* in one view and indels in another. So the same read reads the same in all three.
+
+### Hardening
+
+- **A long bulk auto-align can be interrupted.** Re-pressing Bulk auto-align, or leaving the Sequencing screen, now stops the in-progress per-read alignments promptly instead of grinding through every remaining read — and a quick double-press can no longer stack two confirm windows.
+- **Confirming a bulk alignment does less work.** When a read's quality was already computed (while you pressed Bulk auto-align), committing now reuses it without re-reading and re-parsing that read — only brand-new library entries are parsed.
+- **The fast aligner self-checks every result.** Each alignment from the new engine is verified to reconstruct the input sequences exactly; if anything looks off — or the engine ever errors — that one alignment quietly falls back to the proven Biopython engine, so a wrong alignment can never reach your identity/mismatch/gap numbers.
+
+---
+
 ## [1.0.10] — 2026-05-31
 
 ### New features

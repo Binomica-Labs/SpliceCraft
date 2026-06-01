@@ -190,10 +190,13 @@ it as `&<gel>` in your lab notebook.
 Verify your constructs against real reads. Drop in a Plasmidsaurus `.zip` and
 walk three numbered tabs — pick the run, pick the sample, pick the target
 plasmid — then **Align**. The read lands as a colored bar on the plasmid's
-linear map (green match / red mismatch / gray gap) with its name painted
-right onto the bar so a multi-read pile-up stays readable — and even a
-single-base mismatch shows up red when the whole plasmid is zoomed to fit,
-rather than being swallowed by the surrounding match. **Bulk auto-align**
+linear map (blue match / red mismatch / gray gap) with its name painted
+right onto the bar so a multi-read pile-up stays readable. Zoomed all the
+way out, each cell is shaded by how much of its span actually binds —
+solid blue where it matches, a red shade that deepens with the mismatch
+density, gray for gaps — so a partially-binding read reads as a blue/red/
+gray patchwork and even a single-base mismatch still shows red in its
+region. **Bulk auto-align**
 matches a whole results folder against your library in one pass — and its
 confirm window shows each read's real **identity, mismatched-base, and gap
 counts** (computed by actually aligning, not just the name/k-mer match

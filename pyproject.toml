@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.0.10"
+version         = "1.0.11"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -37,6 +37,17 @@ dependencies = [
     # behaviour matches what shipped.
     "textual>=8.2.7",
     "biopython>=1.87",
+    # edlib is the fast pairwise-alignment engine (bit-parallel Myers
+    # edit distance) used by `_pairwise_align` / `_pick_best_rotation` —
+    # ~90–600× faster than Biopython's DP on the long near-identical
+    # sequences that drive sequencing QC, with IDENTICAL match / mismatch
+    # / indel counts on those alignments (it diverges only on low-identity
+    # pairs the rotation picker discards). `_pairwise_align` imports it
+    # OPTIONALLY (`_EDLIB_AVAILABLE`) and transparently falls back to
+    # Biopython when absent, so the POSIX-only marker (edlib's Windows
+    # wheel story is unreliable, like pyhmmer) costs native-Windows users
+    # only the speedup — never functionality.
+    "edlib>=1.3.9; sys_platform != 'win32'",
     "primer3-py>=2.3.0",
     "platformdirs>=4.9.6",
     # pyhmmer powers the BLAST modal's BLASTN (nhmmer), BLASTP (phmmer),
@@ -89,6 +100,9 @@ dev = [
     "pytest-asyncio>=1.3.0",
     "pytest-xdist>=3.8.0",
     "hypothesis>=6.152.9",
+    # Mirror the runtime edlib dep so CI exercises the fast-aligner path
+    # (not just the Biopython fallback). POSIX-only, matching above.
+    "edlib>=1.3.9; sys_platform != 'win32'",
     "build>=1.5.0",
     "twine>=6.2.0",
     # Linters / type-checkers / coverage — mirror what CI runs
