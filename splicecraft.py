@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.11"
+__version__ = "1.0.12"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -4861,6 +4861,53 @@ def _backfill_library_ids_match_names(
     return entries, n_changed
 
 
+# One-shot origin-history backfill ([INV-93], 2026-06-01). Separate flag
+# from the id-name backfill so each runs once independently.
+_origin_history_backfill_done: bool = False
+_collections_origin_history_backfill_done: bool = False
+
+
+def _backfill_origin_history(
+        entries: list[dict]) -> "tuple[list[dict], int]":
+    """ADDITIVE-ONLY backfill: stamp a minimal origin-history root on any
+    library-entry-shaped dict that has no ``history_xml``, so plasmids
+    created before construction-history existed (e.g. the reported
+    "pei311") show lineage in the History tab without waiting to be
+    re-saved.
+
+    ⚠ SACRED DATA SAFETY — this migration must NEVER nuke or break user
+    data:
+      * It only ever **ADDS** the ``history_xml`` field where absent
+        (via `_ensure_entry_origin_history`, which itself only sets the
+        field on a successful build). It NEVER removes, reorders, edits,
+        or rewrites any other field of any entry.
+      * Entry COUNT is invariant — the list is mutated in place and the
+        caller asserts ``len`` is unchanged before persisting (belt on
+        top of `_save_library`'s L3 catastrophic-shrink guard).
+      * One corrupt row is skipped via per-entry try/except, never
+        dropped.
+      * Idempotent — a second pass changes nothing (every entry already
+        carries history).
+
+    Mutates ``entries`` in place; returns ``(entries, n_changed)``."""
+    n_changed = 0
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        if e.get("history_xml"):
+            continue                 # already has history → leave untouched
+        try:
+            _ensure_entry_origin_history(e)
+            if e.get("history_xml"):
+                n_changed += 1
+        except Exception:
+            _log.exception(
+                "origin-history backfill: skipped an entry that raised "
+                "(left fully untouched)",
+            )
+    return entries, n_changed
+
+
 def _ensure_library_cache_populated_and_migrated() -> None:
     """Idempotent helper that:
       1. Loads the library from disk into `_library_cache` if the
@@ -4886,6 +4933,8 @@ def _ensure_library_cache_populated_and_migrated() -> None:
     locking) but the backfill flag flip is inside.
     """
     global _library_cache, _id_name_backfill_done
+    global _origin_history_backfill_done
+    save_target = None
     with _cache_lock:
         if _library_cache is None:
             entries, warning = _safe_load_json(
@@ -4896,42 +4945,65 @@ def _ensure_library_cache_populated_and_migrated() -> None:
             _library_cache = [
                 e for e in entries if isinstance(e, dict)
             ]
-        if _id_name_backfill_done:
+        # Fast path: both one-shot migrations already ran this process.
+        if _id_name_backfill_done and _origin_history_backfill_done:
             return
-        # Migration runs on whatever is in the cache — usually the
-        # fresh disk read above, but tolerant of a cache that was
-        # warmed by an earlier code path.
-        _library_cache, n_changed = _backfill_library_ids_match_names(
-            _library_cache,
-        )
-        _id_name_backfill_done = True
-        if n_changed == 0:
+        total_changed = 0
+        # (1) id == sanitize(name) + name-trim ([PIT-36], sacred). Runs
+        # on whatever is in the cache — usually the fresh disk read
+        # above, but tolerant of a cache warmed by an earlier path.
+        if not _id_name_backfill_done:
+            _library_cache, n = _backfill_library_ids_match_names(
+                _library_cache,
+            )
+            _id_name_backfill_done = True
+            if n:
+                total_changed += n
+                _log.info(
+                    "library: id-name backfill rewrote %d entry id(s) "
+                    "to match display name", n,
+                )
+                _log_event("library.id_backfill", n_changed=n)
+        # (2) ADDITIVE origin-history backfill ([INV-93]). Stamps a
+        # minimal history root on legacy history-less entries. SACRED
+        # data-safety: additive-only — an (impossible) entry-count change
+        # ABORTS the whole save, persisting nothing, as a belt on top of
+        # `_save_library`'s L3 catastrophic-shrink guard.
+        if not _origin_history_backfill_done:
+            n_before = len(_library_cache)
+            _library_cache, n = _backfill_origin_history(_library_cache)
+            _origin_history_backfill_done = True
+            if len(_library_cache) != n_before:
+                _log.error(
+                    "origin-history backfill changed library entry COUNT "
+                    "(%d → %d) — refusing to persist ANYTHING this pass "
+                    "(data-safety guard)", n_before, len(_library_cache),
+                )
+                return
+            if n:
+                total_changed += n
+                _log.info(
+                    "library: origin-history backfill stamped %d legacy "
+                    "entr%s", n, "y" if n == 1 else "ies",
+                )
+                _log_event("library.origin_history_backfill", n_changed=n)
+        if total_changed == 0:
             return
-        _log.info(
-            "library: id-name backfill rewrote %d entry id(s) "
-            "to match display name", n_changed,
-        )
-        _log_event("library.id_backfill", n_changed=n_changed)
-        # 2026-05-27 (audit-2 M2): capture a deep-clone snapshot
-        # INSIDE the lock so a concurrent `_save_library` between
-        # release and the save below can't reseat `_library_cache`
-        # to a new state under us (the prior code captured the
-        # cache REFERENCE, not a clone, so a subsequent thread's
-        # save would mutate the same list and the backfill save
-        # would write a stale shape over the newer data). RLock
-        # allows the nested `_save_library` to re-enter freely.
+        # 2026-05-27 (audit-2 M2): deep-clone snapshot INSIDE the lock so
+        # a concurrent `_save_library` can't reseat `_library_cache`
+        # under us. RLock allows the nested `_save_library` re-entry.
         save_target = _typed_clone(_library_cache)
     # Save outside the inner block (still RLock-protected via
-    # `_save_library`'s own `with _cache_lock`). Failure is non-fatal:
-    # the cache holds the migrated state for this process; disk
-    # catches up on the next mutation that triggers `_save_library`.
+    # `_save_library`'s own lock). Failure is non-fatal: the cache holds
+    # the migrated state; disk catches up on the next save trigger.
+    if save_target is None:          # nothing changed → nothing to persist
+        return
     try:
         _save_library(save_target)
     except (OSError, RuntimeError):
         _log.exception(
-            "library: id-name backfill save failed; the "
-            "in-memory cache is migrated but disk still "
-            "carries pre-migration ids until the next save",
+            "library: backfill save failed; the in-memory cache is "
+            "migrated but disk catches up on the next save",
         )
 
 
@@ -5128,6 +5200,8 @@ def _ensure_collections_cache_populated_and_migrated() -> None:
     populating path (collections list, picker, search) sees post-
     migration entries."""
     global _collections_cache, _collections_backfill_done
+    global _collections_origin_history_backfill_done
+    save_target = None
     with _cache_lock:
         if _collections_cache is None:
             entries, warning = _safe_load_json(
@@ -5138,37 +5212,85 @@ def _ensure_collections_cache_populated_and_migrated() -> None:
             _collections_cache = [
                 e for e in entries if isinstance(e, dict)
             ]
-        if _collections_backfill_done:
+        if (_collections_backfill_done
+                and _collections_origin_history_backfill_done):
             return
-        n_changed_total = 0
-        for coll in _collections_cache:
-            if not isinstance(coll, dict):
-                continue
-            plasmids = coll.get("plasmids")
-            if not isinstance(plasmids, list):
-                continue
-            _, n = _backfill_library_ids_match_names(plasmids)
-            n_changed_total += n
-        _collections_backfill_done = True
-        if n_changed_total == 0:
+        total_changed = 0
+        # (1) id-name backfill across every collection's embedded
+        # plasmids ([PIT-36], sacred).
+        if not _collections_backfill_done:
+            n_idname = 0
+            for coll in _collections_cache:
+                if not isinstance(coll, dict):
+                    continue
+                plasmids = coll.get("plasmids")
+                if not isinstance(plasmids, list):
+                    continue
+                _, n = _backfill_library_ids_match_names(plasmids)
+                n_idname += n
+            _collections_backfill_done = True
+            if n_idname:
+                total_changed += n_idname
+                _log.info(
+                    "collections: embedded-plasmid id-name backfill "
+                    "rewrote %d entry id(s)/name(s) across all "
+                    "collections", n_idname,
+                )
+                _log_event("collections.plasmid_backfill",
+                            n_changed=n_idname)
+        # (2) ADDITIVE origin-history backfill across embedded plasmids
+        # ([INV-93]). SACRED data-safety: additive-only — the TOTAL
+        # embedded-plasmid count must be invariant; any change ABORTS
+        # the save (persists nothing) on top of `_save_collections`'s
+        # own L3 catastrophic-shrink guard.
+        if not _collections_origin_history_backfill_done:
+            cc = _collections_cache          # narrowed to list in this block
+
+            def _embedded_count(colls: list) -> int:
+                return sum(
+                    len(c.get("plasmids") or [])
+                    for c in colls
+                    if isinstance(c, dict)
+                    and isinstance(c.get("plasmids"), list)
+                )
+            count_before = _embedded_count(cc)
+            n_hist = 0
+            for coll in cc:
+                if not isinstance(coll, dict):
+                    continue
+                plasmids = coll.get("plasmids")
+                if not isinstance(plasmids, list):
+                    continue
+                _, n = _backfill_origin_history(plasmids)
+                n_hist += n
+            _collections_origin_history_backfill_done = True
+            if _embedded_count(cc) != count_before:
+                _log.error(
+                    "collections origin-history backfill changed the "
+                    "embedded-plasmid COUNT (%d → %d) — refusing to "
+                    "persist ANYTHING this pass (data-safety guard)",
+                    count_before, _embedded_count(cc),
+                )
+                return
+            if n_hist:
+                total_changed += n_hist
+                _log.info(
+                    "collections: origin-history backfill stamped %d "
+                    "legacy embedded plasmid(s)", n_hist,
+                )
+                _log_event("collections.origin_history_backfill",
+                            n_changed=n_hist)
+        if total_changed == 0:
             return
-        _log.info(
-            "collections: embedded-plasmid id-name backfill rewrote "
-            "%d entry id(s)/name(s) across all collections",
-            n_changed_total,
-        )
-        _log_event(
-            "collections.plasmid_backfill",
-            n_changed=n_changed_total,
-        )
         save_target = _collections_cache
+    if save_target is None:          # nothing changed → nothing to persist
+        return
     try:
         _save_collections(save_target)
     except (OSError, RuntimeError):
         _log.exception(
-            "collections: embedded-plasmid backfill save failed; "
-            "in-memory cache is migrated but disk still carries "
-            "pre-migration ids until the next save",
+            "collections: backfill save failed; in-memory cache is "
+            "migrated but disk catches up on the next save",
         )
 
 
@@ -5384,6 +5506,11 @@ def _commit_library_entry_to_collection(entry: dict, collection: str,
                for i, e in enumerate(plasmids) if i != ridx}
 
         landing = _deepcopy(entry)
+        # Safety net: any plasmid committed through this universal helper
+        # without construction history (e.g. a PCR amplicon) gets a
+        # minimal origin root so the History tab is never empty. No-op
+        # for the assembly workbenches — they set rich history first.
+        _ensure_entry_origin_history(landing)
         base_name = (landing.get("name") or "").strip() or "plasmid"
         new_name = base_name
         if new_name in names:
@@ -11712,6 +11839,24 @@ class _CommercialSaaSHistoryNode:
             })
         return out
 
+    @property
+    def oligos(self) -> "list[dict]":
+        """PCR primers recorded on an ``amplifyFragment`` history node.
+        CommercialSaaS stores them as ``<Oligo name= sequence= …>``
+        children — the amplify ``InputSummary`` itself carries no
+        name1/name2 (only the val1/val2 amplified-region coordinates),
+        which is why an un-parsed amplify step reads as a bare "amplify
+        ? ↔ ?". Returns ``{name, sequence, description}`` per oligo so
+        the detail pane can name the primers that made the product."""
+        out: list[dict] = []
+        for el in self.element.findall("Oligo"):
+            out.append({
+                "name":        el.get("name", "") or "",
+                "sequence":    el.get("sequence", "") or "",
+                "description": el.get("description", "") or "",
+            })
+        return out
+
     # ── Mutation ─────────────────────────────────────────────────
 
     def add_parent(self, parent: "_CommercialSaaSHistoryNode") -> None:
@@ -11744,6 +11889,22 @@ class _CommercialSaaSHistoryNode:
         el.set("val2", str(int(val2)))
         el.set("siteCount1", str(int(site_count1)))
         el.set("siteCount2", str(int(site_count2)))
+
+    def add_oligo(self, *, name: str, sequence: str,
+                   description: str = "") -> None:
+        """Record a PCR primer on this node as an `<Oligo>` child —
+        SnapGene/CommercialSaaS's representation. Lets SpliceCraft-
+        generated PCR history carry the SAME primer detail a `.dna`
+        import does (`oligos` reads them back; the History detail's
+        Primers block renders them) — harmonised history regardless of
+        whether the plasmid was imported or built de-novo in SpliceCraft
+        (user request 2026-06-01)."""
+        import xml.etree.ElementTree as _ET
+        el = _ET.SubElement(self.element, "Oligo")
+        el.set("name", str(name))
+        el.set("sequence", str(sequence))
+        if description:
+            el.set("description", str(description))
 
     # ── Traversal ────────────────────────────────────────────────
 
@@ -12196,6 +12357,260 @@ def _try_extract_history_xml_from_dna_path(path: Path) -> "str | None":
     except Exception:
         _log.exception("history extract: unexpected error on %s", path)
         return None
+
+
+def _gb_text_is_circular(gb_text: "str | None") -> bool:
+    """Cheap topology read from a GenBank record's LOCUS line, for the
+    origin-history helpers. Returns False only when the LOCUS line
+    explicitly says ``linear`` (PCR amplicons, synthesis fragments);
+    defaults to circular for the common plasmid case + unmarked text."""
+    if not gb_text:
+        return True
+    return "linear" not in gb_text.split("\n", 1)[0].lower()
+
+
+# Source-tag → (history operation, manipulation) for the minimal
+# "origin" history node stamped on a NEW library entry that arrives
+# without richer construction history. The rich cloning workbenches
+# (Constructor / Traditional / Gibson) build their own multi-node trees
+# first, so this only fills the gaps: the generic canvas Save (the
+# pei311 case — source ``id:``), Synthesis fragments, paste, PCR
+# amplicons, and file imports. Move/copy-to-collection never reaches
+# here (it deep-copies existing entries with their history).
+def _origin_history_descriptor(source: str) -> "tuple[str, str]":
+    s = (source or "").strip().lower()
+    if s.startswith("synthesis:"):
+        return ("createDocument", "synthesizeDNA")
+    if s.startswith("paste:"):
+        return ("createDocument", "pasteSequence")
+    if s.startswith(("simulator:pcr", "amplicon", "pcr:")):
+        return ("createDocument", "amplifyPCR")
+    if s.startswith(("file:", "auto-detect", ".dna")):
+        return ("importFile", "importFile")
+    if s.startswith(("sequencing", "plasmidsaurus:")):
+        return ("importFile", "sequencingRead")
+    if s.startswith(("constructor:", "trad", "gibson")):
+        return ("insertFragment", "assembly")
+    # id: (generic canvas Save — pei311), library:, or anything else →
+    # a plain "created in SpliceCraft" document root.
+    return ("createDocument", "createDocument")
+
+
+def _build_origin_history_xml(*, name: str, seq_len: int,
+                                circular: bool, source: str) -> "str | None":
+    """Minimal single-node `<HistoryTree>` documenting how a new library
+    entry came to exist (synthesis / paste / PCR / generic Save /
+    import), so the History tab is never empty for a plasmid the user
+    generated. Best-effort — returns None on any failure (never blocks a
+    save). Superseded by the rich workbench builders
+    (`_build_history_for_assembly` / `_product` / `_gibson`) whenever
+    they run, since those set ``history_xml`` before this is reached."""
+    operation, manipulation = _origin_history_descriptor(source)
+    try:
+        root = _CommercialSaaSHistoryNode.new(
+            name=str(name or "plasmid") + ".dna",
+            seq_len=_coerce_int_or_zero(seq_len),
+            circular=bool(circular),
+            operation=operation,
+            node_id=0,
+        )
+        root.add_input_summary(manipulation=manipulation,
+                                name1=str(name or "plasmid"))
+        return _serialize_commercialsaas_history(root)
+    except Exception:
+        _log.debug("origin history: build failed for %r", name, exc_info=True)
+        return None
+
+
+def _ensure_entry_origin_history(entry: dict) -> None:
+    """Stamp a minimal origin-history root on a library-entry dict when
+    it has no construction history yet, so every newly-saved plasmid
+    shows lineage in the History tab. No-op when history is already
+    present (rich workbench builds, a `.dna` round-trip, or a re-save
+    that preserved prior history) or when the entry is malformed.
+    Mutates ``entry`` in place."""
+    if not isinstance(entry, dict) or entry.get("history_xml"):
+        return
+    xml = _build_origin_history_xml(
+        name=str(entry.get("name") or entry.get("id") or "plasmid"),
+        seq_len=_coerce_int_or_zero(entry.get("size")),
+        circular=_gb_text_is_circular(entry.get("gb_text") or ""),
+        source=str(entry.get("source") or ""),
+    )
+    if xml:
+        entry["history_xml"] = xml
+
+
+def _build_amplicon_history_xml(*, name: str, seq_len: int,
+                                 fwd_seq: str, rev_seq: str,
+                                 start_1based: int, end_1based: int,
+                                 fwd_name: str = "forward primer",
+                                 rev_name: str = "reverse primer",
+                                 ) -> "str | None":
+    """Build a `<HistoryTree>` for a PCR amplicon made IN SpliceCraft
+    that matches the element set a `.dna` import carries: an
+    ``amplifyFragment`` node + an ``amplify`` InputSummary (val1/val2 =
+    the amplified region) + the two primers as `<Oligo>` children. So a
+    de-novo amplicon's History shows the same Primers / region detail as
+    an imported one — harmonised history regardless of origin (user
+    request 2026-06-01). Best-effort; returns None on failure."""
+    try:
+        root = _CommercialSaaSHistoryNode.new(
+            name=str(name or "amplicon") + ".dna",
+            seq_len=_coerce_int_or_zero(seq_len),
+            circular=False, operation="amplifyFragment", node_id=0,
+        )
+        root.add_input_summary(
+            manipulation="amplify",
+            val1=_coerce_int_or_zero(start_1based),
+            val2=_coerce_int_or_zero(end_1based),
+        )
+        if fwd_seq:
+            root.add_oligo(name=fwd_name, sequence=str(fwd_seq))
+        if rev_seq:
+            root.add_oligo(name=rev_name, sequence=str(rev_seq))
+        return _serialize_commercialsaas_history(root)
+    except Exception:
+        _log.debug("amplicon history: build failed for %r", name,
+                    exc_info=True)
+        return None
+
+
+# Bound GENERATED construction history so it can't bloat the library /
+# collections files as in-place edits accumulate over time. The edit
+# chain re-nests the prior tree on every change; without a cap a plasmid
+# edited daily for a year would carry a 1000+-node history (stored in
+# BOTH plasmid_library.json AND collections.json). These caps keep a
+# generous recent window and collapse older lineage. Imported `.dna`
+# history is NOT capped here — it round-trips under its own 32 MB ceiling
+# (`_COMMERCIALSAAS_HISTORY_MAX_XML`); this only governs what WE generate.
+_HISTORY_TREE_MAX_NODES = 256          # recent construction/edit steps kept
+_HISTORY_XML_MAX_BYTES = 256 * 1024    # hard byte ceiling on generated XML
+
+
+def _truncate_history_to_recent(root_node: "_CommercialSaaSHistoryNode",
+                                 max_nodes: int) -> None:
+    """Bound a GENERATED history tree to ~``max_nodes`` nodes so it can't
+    grow without limit as edits accumulate. Breadth-first keeps the
+    shallowest (= most recent) nodes — the new edit on top, then
+    progressively older lineage — and replaces the deepest subtrees at
+    the budget frontier with a single ``(earlier history truncated)``
+    leaf. No-op when already within budget. Iterative (no recursion
+    limit) and mutates the underlying XML element in place."""
+    import xml.etree.ElementTree as _ET
+    from collections import deque
+    el = root_node.element
+    visited = 0
+    frontier: list = []
+    q: "deque" = deque([el])
+    while q:
+        cur = q.popleft()
+        visited += 1
+        children = cur.findall("Node")
+        if visited >= max_nodes and children:
+            frontier.append(cur)               # prune below the budget
+        else:
+            q.extend(children)
+    for node_el in frontier:
+        for c in node_el.findall("Node"):
+            node_el.remove(c)
+        marker = _ET.SubElement(node_el, "Node")
+        marker.set("name", "(earlier history truncated)")
+        marker.set("type", "DNA")
+        marker.set("ID", "0")
+        marker.set("seqLen", "0")
+        marker.set("strandedness", "double")
+        marker.set("circular", "0")
+        marker.set("operation", "truncated")
+
+
+def _maybe_append_edit_history(entry: dict, record, prev_gb_text: str,
+                                prev_size: int, prev_history: str) -> None:
+    """Append an ``editSequence`` node to ``entry['history_xml']`` when
+    an in-place re-save (same id) actually CHANGED the DNA sequence vs
+    the stored version. The pre-edit version — carrying its prior
+    history ``prev_history`` — becomes the parent, so the lineage chains
+    through successive edits. No-op when the sequence is unchanged (a
+    plain re-save or a features-only edit adds nothing — user choice
+    2026-06-01: "append on actual change"). Mutates ``entry`` in place;
+    best-effort, never blocks a save.
+
+    A cheap length check short-circuits the common insert/delete edit
+    without parsing the prior record; only a same-length change (a
+    substitution) needs the full sequence compare."""
+    if not isinstance(entry, dict):
+        return
+    try:
+        new_seq = str(getattr(record, "seq", "") or "").upper()
+        if not new_seq:
+            return
+        prev_seq_len = _coerce_int_or_zero(prev_size)
+        if len(new_seq) != prev_seq_len:
+            changed = True                    # length differs → edited
+        else:
+            # Same length — could be a substitution or a no-op. Parse the
+            # prior record to compare (cached, so a repeat save is cheap).
+            try:
+                prev_seq = str(getattr(_gb_text_to_record(prev_gb_text),
+                                        "seq", "") or "").upper()
+            except Exception:
+                return     # can't read prior seq → don't risk a phantom node
+            if not prev_seq:
+                return
+            prev_seq_len = len(prev_seq)
+            changed = (new_seq != prev_seq)
+        if not changed:
+            return
+        name = str(entry.get("name") or entry.get("id") or "plasmid")
+        edited = _CommercialSaaSHistoryNode.new(
+            name=name + ".dna",
+            seq_len=len(new_seq),
+            circular=_gb_text_is_circular(entry.get("gb_text") or ""),
+            operation="replace",
+            node_id=0,
+        )
+        edited.add_input_summary(
+            manipulation="editSequence", name1=name,
+            val1=prev_seq_len, val2=len(new_seq),
+        )
+        # Parent = the pre-edit version, with its own prior lineage. A
+        # very large prior history is too costly to parse + re-nest on
+        # every edit, so collapse it to a compact leaf rather than
+        # chaining the whole tree (bloat + per-edit-CPU guard).
+        prev_for_parent = (
+            None if (prev_history
+                     and len(prev_history) > _HISTORY_XML_MAX_BYTES)
+            else (prev_history or None)
+        )
+        parent = TraditionalCloningPane._parent_node_for_entry({
+            "name":        name,
+            "size":        prev_seq_len,
+            "history_xml": prev_for_parent,
+            "gb_text":     prev_gb_text,
+        })
+        if parent is not None:
+            edited.add_parent(parent)
+        # Cap the chained tree to a recent window so successive edits
+        # can't grow history_xml without bound.
+        _truncate_history_to_recent(edited, _HISTORY_TREE_MAX_NODES)
+        xml = _serialize_commercialsaas_history(edited)
+        # Defensive final ceiling — if the capped tree still serialises
+        # huge (e.g. pathologically long names), drop to the bare edit
+        # node so a single entry can never bloat the library file.
+        if xml and len(xml) > _HISTORY_XML_MAX_BYTES:
+            bare = _CommercialSaaSHistoryNode.new(
+                name=name + ".dna", seq_len=len(new_seq),
+                circular=_gb_text_is_circular(entry.get("gb_text") or ""),
+                operation="replace", node_id=0,
+            )
+            bare.add_input_summary(manipulation="editSequence", name1=name,
+                                    val1=prev_seq_len, val2=len(new_seq))
+            xml = _serialize_commercialsaas_history(bare)
+        if xml:
+            entry["history_xml"] = xml
+    except Exception:
+        _log.debug("edit history: append failed for %r",
+                    entry.get("name"), exc_info=True)
 
 
 @_timed("op.bulk_import_folder")
@@ -17298,6 +17713,48 @@ def _arrow_char(tangent_angle: float) -> str:
     return ["▶", "▼", "◀", "▲"][sector]
 
 
+def _linear_scrollbar_layout(
+    total: int, view_s: int, view_e: int, w: int, h: int,
+    *, margin_l: int = 5, margin_r: int = 2,
+) -> "tuple[int, int, int, int, int] | None":
+    """Pure geometry for the linear-view horizontal scrollbar.
+
+    Returns ``(row, track_lo, track_w, thumb_lo, thumb_w)`` — all in
+    terminal cells — or ``None`` when no scrollbar is warranted: the
+    whole record already fits the viewport (``view_e - view_s >=
+    total``), the record is empty, or the panel is too small to draw a
+    usable bar. The track spans the rail's column range
+    ``[track_lo, track_lo + track_w]``; the thumb is the visible bp
+    window ``[view_s, view_e)`` mapped onto the whole record so its
+    position + length encode where the viewport sits and how much it
+    covers.
+
+    Kept module-level + pure (no widget / ``self.size``) so the geometry
+    unit-tests without a mounted Textual app. `PlasmidMap`'s renderer and
+    mouse hit-tests both route through `_linear_scrollbar_geom`, which
+    wraps this with the live zoom/offset state — so the drawn thumb and
+    the clickable / draggable region can never drift apart.
+    """
+    if total <= 0:
+        return None
+    track_w = w - margin_l - margin_r
+    # Mirror the renderer's own bail-outs: it refuses to draw below
+    # 30×14, and a sub-4-col track can't carry a legible thumb.
+    if track_w < 4 or h < 14:
+        return None
+    visible_bp = max(1, view_e - view_s)
+    if visible_bp >= total:
+        return None      # whole record visible — nothing to scroll
+    track_lo = margin_l
+    thumb_lo = track_lo + max(0, view_s) * track_w // total
+    thumb_w  = max(1, visible_bp * track_w // total)
+    # Keep the thumb inside the track and at least one cell wide.
+    if thumb_lo + thumb_w > track_lo + track_w:
+        thumb_lo = track_lo + track_w - thumb_w
+    thumb_lo = max(track_lo, thumb_lo)
+    return (h - 1, track_lo, track_w, thumb_lo, thumb_w)
+
+
 # ── PlasmidMap widget ──────────────────────────────────────────────────────────
 
 class PlasmidMap(Widget):
@@ -17439,6 +17896,11 @@ class PlasmidMap(Widget):
         # Currently-selected alignment row (reverse-style highlight),
         # -1 = none. Mirrors `selected_idx` for features.
         self._selected_align_idx: int = -1
+        # True while the user is dragging the linear-view horizontal
+        # scrollbar thumb (between on_mouse_down on the bar and the
+        # matching on_mouse_up). Gates the hover tooltip + routes
+        # MouseMove to panning while the mouse is captured.
+        self._sb_drag: bool = False
 
     def on_mount(self) -> None:
         detected = _detect_char_aspect()
@@ -17562,6 +18024,13 @@ class PlasmidMap(Widget):
         the cursor isn't over a feature, the tooltip is cleared so
         Textual hides the popup.
         """
+        # Scrollbar drag takes precedence over hover tooltips — while a
+        # bottom-scrollbar drag is in progress (mouse captured), every
+        # move pans the viewport instead of resolving a hover target.
+        if self._sb_drag:
+            self._linear_scroll_to_x(event.x)
+            event.stop()
+            return
         try:
             app = self.app
         except Exception:
@@ -18171,6 +18640,101 @@ class PlasmidMap(Widget):
                                 int(self._linear_offset_bp)))
         return (offset, offset + visible)
 
+    def _linear_scrollbar_geom(
+        self, w: int, h: int,
+    ) -> "tuple[int, int, int, int, int] | None":
+        """Live scrollbar geometry for the current zoom/pan, or ``None``
+        when the whole record fits (no scrollbar). Wraps the pure
+        `_linear_scrollbar_layout` with the instance's view range +
+        margins so the renderer and the mouse hit-tests share one source
+        of truth. Returns ``(row, track_lo, track_w, thumb_lo,
+        thumb_w)``."""
+        if self._map_mode != "linear":
+            return None
+        view_s, view_e = self._linear_view_range()
+        return _linear_scrollbar_layout(
+            self._total, view_s, view_e, w, h,
+            margin_l=self._LINEAR_MARGIN_L, margin_r=self._LINEAR_MARGIN_R,
+        )
+
+    def _linear_scroll_to_x(self, x: int) -> None:
+        """Pan the linear viewport so the scrollbar thumb centres under
+        terminal column ``x`` (click-jump + drag). No-op outside linear
+        mode or when the whole record already fits. Centres the visible
+        window on the clicked fraction of the record, matching the
+        ``anchor_center`` convention `_set_linear_zoom` uses."""
+        geom = self._linear_scrollbar_geom(self.size.width, self.size.height)
+        if not geom:
+            return
+        _row, track_lo, track_w, _tlo, _tw = geom
+        if track_w <= 0:
+            return
+        view_s, view_e = self._linear_view_range()
+        visible_bp = max(1, view_e - view_s)
+        total = self._total
+        frac = (x - track_lo) / track_w
+        frac = min(1.0, max(0.0, frac))
+        center_bp = int(frac * total)
+        new_off = max(0, min(total - visible_bp, center_bp - visible_bp // 2))
+        if new_off != self._linear_offset_bp:
+            self._linear_offset_bp = new_off
+            self.refresh()
+
+    def _draw_linear_scrollbar(
+        self, canvas: "_Canvas", sb_geom, total: int,
+        view_s: int, view_e: int,
+    ) -> None:
+        """Paint a native-looking horizontal scrollbar onto the bottom
+        row using Textual's own `ScrollBarRender`, so the thumb gets the
+        same recessed trough + smooth sub-cell edges as every other
+        scrollbar in the app. The thumb brightens while a drag is in
+        progress (`_sb_drag`). Falls back to a plain solid trough+thumb
+        if `ScrollBarRender` ever changes shape under us — the geometry
+        + mouse handlers don't depend on this method, so the fallback is
+        purely cosmetic."""
+        sb_row, track_lo, track_w, thumb_lo, thumb_w = sb_geom
+        size = track_w + 1                       # match the rail's cell span
+        visible_bp = max(1, view_e - view_s)
+        grabbed = bool(getattr(self, "_sb_drag", False))
+        try:
+            from textual.scrollbar import ScrollBarRender
+            from rich.color import Color
+            # Map the bp viewport onto the scrollbar's cell model: the
+            # thumb covers visible_bp/total of the track and sits at
+            # view_s/(total-visible_bp) along it.
+            window = size
+            virtual = max(window + 1, round(size * total / visible_bp))
+            span = max(1, total - visible_bp)
+            position = (virtual - window) * (max(0, view_s) / span)
+            track_color = Color.parse("#303030")
+            thumb_color = Color.parse("#bcbcbc" if grabbed else "#808080")
+            segs = ScrollBarRender.render_bar(
+                size=size, virtual_size=virtual, window_size=window,
+                position=position, vertical=False,
+                back_color=track_color, bar_color=thumb_color,
+            )
+            col = 0
+            for seg in segs.segments:
+                if seg.text == "\n":
+                    continue
+                canvas.put(track_lo + col, sb_row, seg.text or " ",
+                           str(seg.style) if seg.style else "")
+                col += 1
+                if col >= size:
+                    break
+        except Exception:
+            _log.debug(
+                "linear scrollbar: ScrollBarRender path failed — using "
+                "solid-trough fallback", exc_info=True,
+            )
+            track_style = "on #303030"
+            thumb_style = "on #bcbcbc" if grabbed else "on #808080"
+            for cx in range(track_lo, track_lo + size):
+                canvas.put(cx, sb_row, " ", track_style)
+            for cx in range(thumb_lo, thumb_lo + thumb_w):
+                if track_lo <= cx < track_lo + size:
+                    canvas.put(cx, sb_row, " ", thumb_style)
+
     def action_aspect_inc(self):
         new = round(min(5.0, self._aspect + 0.05), 3)
         if new == self._aspect:
@@ -18254,6 +18818,46 @@ class PlasmidMap(Widget):
                 event.stop()
                 return
         self.action_rotate_ccw()
+
+    def on_mouse_down(self, event: MouseDown) -> None:
+        """Begin a linear-view scrollbar drag when the left button
+        presses on the bottom scrollbar track. Any other press falls
+        through untouched so feature selection (`on_click`) and the
+        circular-view handlers keep working."""
+        if event.button != 1 or self._map_mode != "linear":
+            return
+        geom = self._linear_scrollbar_geom(self.size.width, self.size.height)
+        if not geom:
+            return
+        row, track_lo, track_w, _tlo, _tw = geom
+        if event.y != row or not (track_lo <= event.x <= track_lo + track_w):
+            return
+        self._sb_drag = True
+        self.refresh()                       # brighten the thumb on grab
+        self._linear_scroll_to_x(event.x)   # click-jump on press
+        # Drop any lingering hover tooltip so it doesn't hang over the
+        # map while the user drags.
+        if self.tooltip is not None:
+            self.tooltip = None
+        try:
+            self.capture_mouse()
+        except Exception:
+            # capture_mouse can raise if the widget isn't mounted in a
+            # running app (defensive — shouldn't happen for a live drag).
+            _log.debug("scrollbar drag: capture_mouse failed", exc_info=True)
+        event.stop()
+
+    def on_mouse_up(self, event: MouseUp) -> None:
+        """End an in-progress scrollbar drag and release the mouse."""
+        if not self._sb_drag:
+            return
+        self._sb_drag = False
+        self.refresh()                       # restore the idle thumb shade
+        try:
+            self.release_mouse()
+        except Exception:
+            _log.debug("scrollbar drag: release_mouse failed", exc_info=True)
+        event.stop()
 
     def _label_at(self, x: int, y: int) -> int:
         """Return the feature index whose label bbox covers the
@@ -18411,6 +19015,14 @@ class PlasmidMap(Widget):
         if not self.record:
             return
         if self._map_mode == "linear":
+            # A click on the bottom scrollbar is handled by the
+            # mouse-down / drag path; consume it here so it never falls
+            # through to alignment-lane or feature selection.
+            sb_geom = self._linear_scrollbar_geom(
+                self.size.width, self.size.height)
+            if sb_geom and event.y == sb_geom[0] and (
+                    sb_geom[1] <= event.x <= sb_geom[1] + sb_geom[2]):
+                return
             # Alignment lane hit-test runs BEFORE the feature lookup —
             # alignment rows sit in their own band below the rev features
             # and a click should open the alignment (AlignmentScreen
@@ -18583,7 +19195,11 @@ class PlasmidMap(Widget):
                id(self._feats), id(self._restr_feats), self._map_mode,
                self._show_connectors, self.record.name,
                self._linear_zoom, self._linear_offset_bp, self._linear_layout,
-               id(self._alignments), self._selected_align_idx)
+               id(self._alignments), self._selected_align_idx,
+               # _sb_drag flips the scrollbar thumb to its brighter
+               # "grabbed" shade — without it in the key, grabbing the
+               # bar without moving wouldn't repaint the highlight.
+               self._sb_drag)
         if self._draw_cache and self._draw_cache[0] == key:
             return self._draw_cache[1]
         result = self._draw_linear(w, h) if self._map_mode == "linear" else self._draw(w, h)
@@ -19020,6 +19636,15 @@ class PlasmidMap(Widget):
             view_e = view_s + 1
         visible_bp = max(1, view_e - view_s)
 
+        # Reserve the bottom row for the horizontal scrollbar whenever
+        # the record is wider than the current viewport (zoomed in past
+        # "whole record visible"). Feature lanes + the alignment band lay
+        # out against `draw_h` so nothing paints over the scrollbar
+        # track; when the whole record fits, `sb_geom` is None and the
+        # full height is used exactly as before.
+        sb_geom = self._linear_scrollbar_geom(w, h)
+        draw_h = (h - 1) if sb_geom else h
+
         def bp_to_col(bp: int) -> int:
             # Integer math, NOT `int((bp - view_s) / visible_bp * usable_w)`:
             # at `col_per_bp == 1.0` (the letter-mode zoom cap), the float
@@ -19201,7 +19826,7 @@ class PlasmidMap(Widget):
                 # Push reverse lanes below the alignment band (when
                 # present) so the alignment lanes stay nearest the rail.
                 feat_row = rail_row + 2 + align_lanes_count + lane_idx
-                if feat_row >= h:
+                if feat_row >= draw_h:
                     continue
 
             bar_w = cx1 - cx0
@@ -19266,11 +19891,22 @@ class PlasmidMap(Widget):
         # match / red mismatch / gray gap blocks); letter mode at
         # ≥1 col/bp (query base letter in the same 3-colour scheme).
         if align_placed:
+            # Pass `draw_h` (not `h`) so the band — like the rev features
+            # above — never extends onto the reserved scrollbar row.
             self._draw_alignment_band(
-                canvas, w, h, margin_l, usable_w, view_s, view_e,
+                canvas, w, draw_h, margin_l, usable_w, view_s, view_e,
                 visible_bp, bp_to_col, rail_row,
                 align_placed=align_placed,
             )
+
+        # ── Horizontal scrollbar (bottom row) ──
+        # Present only when zoomed in past "whole record visible".
+        # Rendered with Textual's own ScrollBarRender so it matches every
+        # other scrollbar in the app — recessed trough + smooth sub-cell
+        # thumb — instead of a hand-rolled block. Drawn last so it owns
+        # its reserved row.
+        if sb_geom:
+            self._draw_linear_scrollbar(canvas, sb_geom, total, view_s, view_e)
 
         # ── Header ──
         # Same display-name preference as the circular header (see
@@ -21292,11 +21928,17 @@ class LibraryPanel(Widget):
         prev_status = ""
         prev_name = ""
         prev_history = ""
+        prev_gb = ""
+        prev_size = 0
+        found_prev = False
         for e in entries:
             if e.get("id") == record.id:
                 prev_status = _sanitize_plasmid_status(e.get("status"))
                 prev_name = str(e.get("name") or "").strip()
                 prev_history = str(e.get("history_xml") or "")
+                prev_gb = str(e.get("gb_text") or "")
+                prev_size = _coerce_int_or_zero(e.get("size"))
+                found_prev = True
                 break
         # Pre-build the new entry dict so collision detection can
         # compare against it directly. `.strip()` on the display name
@@ -21352,6 +21994,24 @@ class LibraryPanel(Widget):
         history_xml = _dna_hist or prev_history
         if history_xml:
             new_entry["history_xml"] = history_xml
+        # No richer history (not a `.dna` round-trip, not a re-save that
+        # preserved prior history)? Stamp a minimal origin root so a
+        # freshly-generated plasmid — the generic canvas Save (the
+        # pei311 case), a Synthesis fragment, a paste, a file import —
+        # still shows lineage in the History tab. The rich cloning
+        # workbenches set `history_xml` on their own entries before they
+        # save, so they never reach here without one.
+        #
+        # In-place DNA edit → append an `editSequence` step when the
+        # sequence ACTUALLY changed vs the stored version (user choice
+        # 2026-06-01: "append on actual change"). Runs before the origin
+        # fallback so a real edit produces an `edited → pre-edit`
+        # lineage rather than a plain origin root; a no-op / features-
+        # only re-save adds nothing.
+        if found_prev:
+            _maybe_append_edit_history(
+                new_entry, record, prev_gb, prev_size, prev_history)
+        _ensure_entry_origin_history(new_entry)
         # Original `.dna` bytes (single-file open) → sidecar, so export
         # round-trips byte-exact in splice mode and preserves every
         # CommercialSaaS packet we don't model. Mirrors the bulk-import
@@ -25694,6 +26354,7 @@ _HELP_BODY_MD = """\
 | `+` · `=` | Zoom in (linear map) |
 | `-` | Zoom out (linear map) |
 | `0` | Reset zoom + pan to the whole record (linear map) |
+| Drag the bottom scrollbar | Slide through a zoomed-in linear map — click anywhere on it to jump there (appears only when the sequence is wider than the panel) |
 
 ### Find & inspect
 
@@ -26117,8 +26778,7 @@ class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
                          "for %r", self._title)
         try:
             proto = self.query_one("#hist-proto-text", Static)
-            proto.update("\n".join(
-                _history_protocol_lines(self._root_node)))
+            proto.update(_history_protocol_renderable(self._root_node))
         except NoMatches:
             pass
         # Auto-select the root so the detail pane has something
@@ -26177,10 +26837,12 @@ _HISTORY_PROTOCOL_INPUT_MAX: int = 8   # parts listed per step before "+N more"
 # emits operations we don't model, and the renderer must never assume a
 # closed set (see `_COMMERCIALSAAS_HISTORY_KNOWN_OPS`).
 _HISTORY_OP_FRIENDLY: "dict[str, str]" = {
-    "insertFragment": "assemble",
-    "insert":         "insert",
-    "replace":        "replace",
-    "gibsonAssembly": "Gibson",
+    "insertFragment":  "assemble",
+    "insert":          "insert",
+    "replace":         "replace",
+    "gibsonAssembly":  "Gibson",
+    "amplifyFragment": "PCR",
+    "editSequence":    "edit",
 }
 # Cosmetic glyph per friendly op (prefixed to the op tag in the tree row).
 _HISTORY_OP_GLYPH: "dict[str, str]" = {
@@ -26219,11 +26881,24 @@ def _history_size_label(bp: int) -> str:
     return f"{b / 1_000_000:.2f} Mb"
 
 
+# CommercialSaaS/SnapGene sentinel operations that mean "no real
+# construction step" — a base / starting sequence, or a node whose
+# operation it didn't record. Rendered as no-op (not a literal "invalid"
+# tag) — user report 2026-06-01 on pIT6-NEO.
+_HISTORY_OP_SENTINELS: "frozenset[str]" = frozenset(
+    {"invalid", "unknown", "none", "unspecified"})
+
+
 def _history_op_label(op: str) -> str:
     """Friendly verb for an operation string; unknown ops pass through
-    verbatim. Empty op → empty string (caller omits the tag)."""
+    verbatim. Empty op — OR a CommercialSaaS sentinel like ``invalid``
+    (its placeholder for a base/starting sequence with no recorded
+    operation) — returns "" so the caller omits the tag instead of
+    printing a literal "invalid"."""
     raw = (op or "").strip()
-    return _HISTORY_OP_FRIENDLY.get(raw, raw) if raw else ""
+    if not raw or raw.lower() in _HISTORY_OP_SENTINELS:
+        return ""
+    return _HISTORY_OP_FRIENDLY.get(raw, raw)
 
 
 def _history_reopen_nudge(source: str) -> str:
@@ -26362,7 +27037,20 @@ def _history_step_from_node(node: "_CommercialSaaSHistoryNode") -> dict:
     the acceptor)."""
     parents = node.parents
     sites = node.regenerated_sites
-    enzyme = str(sites[0].get("name") or "") if sites else ""
+    # Collect EVERY enzyme — a restriction digest uses ≥2, and the
+    # builders record one RegeneratedSite per enzyme. Pre-fix this took
+    # only sites[0], so a KpnI + XbaI double digest showed just "✂ KpnI"
+    # in the protocol (user report 2026-06-01). Dedup, order-preserve,
+    # and drop the "(reverse insert)" orientation sentinel.
+    enzymes: "list[str]" = []
+    _seen_enz: set = set()
+    for _s in sites:
+        _nm = str(_s.get("name") or "").strip()
+        if not _nm or _nm.startswith("(") or _nm in _seen_enz:
+            continue
+        _seen_enz.add(_nm)
+        enzymes.append(_nm)
+    enzyme = enzymes[0] if enzymes else ""   # back-compat single-enzyme field
     summaries = node.input_summaries
     backbone_label = (_history_clean_name(summaries[0].get("name1") or "")
                       if summaries else "")
@@ -26384,7 +27072,8 @@ def _history_step_from_node(node: "_CommercialSaaSHistoryNode") -> dict:
     return {
         "product":  _history_clean_name(node.name),
         "op":       _history_op_label(node.operation),
-        "enzyme":   enzyme,
+        "enzyme":   enzyme,        # first enzyme (back-compat)
+        "enzymes":  enzymes,       # ALL enzymes in the digest
         "backbone": backbone,
         "inputs":   inputs,
         "seq_len":  int(node.seq_len),
@@ -26430,32 +27119,110 @@ def _history_build_steps(root: "_CommercialSaaSHistoryNode") -> "list[dict]":
     return [by_sig[s] for s in order]
 
 
-def _history_protocol_lines(root: "_CommercialSaaSHistoryNode") -> "list[str]":
-    """Rendered, Rich-escaped protocol lines for the viewer's summary
-    pane — one numbered line per de-duplicated build step, earliest
-    first. A bare record with no assembly steps returns a single
-    placeholder line."""
+def _history_protocol_step_cells(
+        root: "_CommercialSaaSHistoryNode") -> "list[tuple[str, str]]":
+    """``[(number, content_markup), …]`` — one pair per de-duplicated
+    build step, earliest first. ``number`` is like ``"2."``; ``content``
+    is the recipe body read left → right:
+
+        <op>  <ingredients> into <backbone>  →  <product>   ✂ <enzymes>
+
+    The forward arrow points AT the product (ingredients → result), the
+    acceptor/vector is tagged ``into``, ``✂`` marks the enzymes, and an
+    in-place edit (single input == product) collapses to one labelled
+    product. A bare record with no steps returns a single
+    ``("", <placeholder>)`` pair. Splitting the number from the content
+    lets `_history_protocol_renderable`'s table hang-indent WRAPPED lines
+    under the content rather than under the next step's number (user
+    nitpick 2026-06-01)."""
     from rich.markup import escape as _esc
     steps = _history_build_steps(root)
     if not steps:
-        return ["[dim]Single record — no assembly steps recorded.[/dim]"]
-    lines: "list[str]" = []
+        return [("",
+                 "[dim]Single record — no construction steps recorded.[/dim]")]
+    cells: "list[tuple[str, str]]" = []
     for i, s in enumerate(steps, 1):
-        parts = [f"[b]{i}.[/b]  [b]{_esc(s['product'])}[/b]"]
+        product = _esc(s["product"])
         ins = s["inputs"]
+        backbone = s["backbone"]
+        verb = _esc(s["op"]) if s.get("op") else ""
+        enzymes = s.get("enzymes") or ([s["enzyme"]] if s.get("enzyme") else [])
+        enz_tag = (
+            f"   [magenta]✂ {' + '.join(_esc(e) for e in enzymes)}[/magenta]"
+            if enzymes else ""
+        )
+        # In-place edit: a single input that IS the product reads
+        # redundantly as "X → X" — show one labelled product instead.
+        if len(ins) == 1 and not backbone and ins[0] == s["product"]:
+            cells.append(
+                (f"{i}.",
+                 f"[b]{product}[/b]  [dim]· edited[/dim]{enz_tag}"))
+            continue
+        # Ingredients = inputs (+ "into <backbone>" for the acceptor).
+        chunks: "list[str]" = []
         if ins:
             shown = ins[:_HISTORY_PROTOCOL_INPUT_MAX]
             joined = " + ".join(_esc(x) for x in shown)
             extra = len(ins) - len(shown)
             if extra > 0:
                 joined += f" [dim]+{extra} more[/dim]"
-            parts.append(f"⟵ {joined}")
-        if s["backbone"]:
-            parts.append(f"[dim]into[/dim] [cyan]{_esc(s['backbone'])}[/cyan]")
-        if s["enzyme"]:
-            parts.append(f"[magenta]✂ {_esc(s['enzyme'])}[/magenta]")
-        lines.append("  ".join(parts))
-    return lines
+            chunks.append(joined)
+        if backbone:
+            lead = "[dim]into[/dim] " if chunks else ""
+            chunks.append(f"{lead}[cyan]{_esc(backbone)}[/cyan]")
+        prefix = f"[dim]{verb}[/dim]  " if verb else ""
+        if chunks:
+            content = (f"{prefix}{' '.join(chunks)}  [b]→[/b]  "
+                       f"[b]{product}[/b]{enz_tag}")
+        else:
+            content = f"{prefix}[b]{product}[/b]{enz_tag}"
+        cells.append((f"{i}.", content))
+    return cells
+
+
+def _history_protocol_lines(root: "_CommercialSaaSHistoryNode") -> "list[str]":
+    """Plain markup lines (number + content per step) — the testable
+    string surface. The viewers render via `_history_protocol_renderable`
+    for the hanging-indent table; this keeps per-line content stable for
+    unit tests."""
+    out: "list[str]" = []
+    for num, content in _history_protocol_step_cells(root):
+        out.append(f"[b]{num}[/b]  {content}" if num else content)
+    return out
+
+
+# Symbol legend shown above the step list so the protocol is
+# self-explanatory (user request 2026-06-01: the backward arrow + bare
+# symbols weren't intuitive).
+_HISTORY_PROTOCOL_LEGEND = (
+    "[dim]ingredients  [b]→[/b]  product"
+    "       [cyan]into[/cyan] = acceptor / backbone"
+    "       [magenta]✂[/magenta] = enzymes[/dim]"
+)
+
+
+def _history_protocol_renderable(root: "_CommercialSaaSHistoryNode"):
+    """Rich renderable for a viewer's protocol pane: the symbol legend
+    above a borderless 2-column table (right-justified step-number gutter
+    | recipe content). The content column wraps WITHIN its own width, so
+    a long step's wrapped tail hangs-indents under the content instead of
+    dropping back under the next step's number (user nitpick 2026-06-01).
+    Falls back to a bare placeholder Text when there are no steps."""
+    from rich.table import Table
+    from rich.text import Text
+    from rich.console import Group
+    cells = _history_protocol_step_cells(root)
+    if len(cells) == 1 and cells[0][0] == "":
+        return Text.from_markup(cells[0][1])          # placeholder, no legend
+    gutter = max((len(num) for num, _ in cells), default=2)
+    table = Table(show_header=False, box=None, pad_edge=False,
+                   padding=(0, 1, 0, 0), expand=True)
+    table.add_column(justify="right", no_wrap=True, width=gutter,
+                      style="bold")
+    table.add_column(ratio=1, overflow="fold")
+    for num, content in cells:
+        table.add_row(num, Text.from_markup(content))
+    return Group(Text.from_markup(_HISTORY_PROTOCOL_LEGEND), Text(""), table)
 
 
 def _history_detail_lines(hist: "_CommercialSaaSHistoryNode") -> "list[str]":
@@ -26466,9 +27233,15 @@ def _history_detail_lines(hist: "_CommercialSaaSHistoryNode") -> "list[str]":
     name_disp = (f"[b]{_esc(_history_clean_name(hist.name))}[/b]"
                  if hist.name else "[dim](unnamed)[/]")
     op_raw = hist.operation
-    op_disp = (f"[cyan]{_esc(_history_op_label(op_raw))}[/]  "
-               f"[dim]({_esc(op_raw)})[/]" if op_raw
-               else "[dim](not recorded)[/]")
+    op_friendly = _history_op_label(op_raw)
+    if op_friendly:
+        op_disp = (f"[cyan]{_esc(op_friendly)}[/]  "
+                   f"[dim]({_esc(op_raw)})[/]")
+    else:
+        # Empty, or a CommercialSaaS sentinel ("invalid" / "unknown")
+        # for a base / starting sequence with no recorded operation —
+        # don't echo the literal sentinel.
+        op_disp = "[dim](no operation recorded)[/]"
     strandedness = hist.element.get("strandedness") or "?"
     lines: "list[str]" = [name_disp, ""]
     lines.append("[b]Properties[/]")
@@ -26501,12 +27274,42 @@ def _history_detail_lines(hist: "_CommercialSaaSHistoryNode") -> "list[str]":
         lines.append("[b]Inputs[/]")
         for sm in sums[:_HISTORY_DETAIL_LIST_MAX]:
             manip = _esc(str(sm.get('manipulation') or "(unknown)"))
-            n1 = _esc(str(sm.get('name1') or "?"))
-            n2 = _esc(str(sm.get('name2') or "?"))
-            lines.append(f"  {manip}  ({n1} ↔ {n2})")
+            n1 = str(sm.get('name1') or "")
+            n2 = str(sm.get('name2') or "")
+            if n1 or n2:
+                lines.append(
+                    f"  {manip}  ({_esc(n1 or '?')} ↔ {_esc(n2 or '?')})")
+            else:
+                # No name pair — e.g. an `amplify` (PCR) step, which
+                # records its detail as val1/val2 (the amplified region)
+                # + <Oligo> primers (the Primers block below), not
+                # name1/name2. Don't render a bare "? ↔ ?".
+                v1 = _coerce_int_or_zero(sm.get('val1'))
+                v2 = _coerce_int_or_zero(sm.get('val2'))
+                region = (f"  [dim](region {v1:,}–{v2:,})[/dim]"
+                          if (v1 or v2) else "")
+                lines.append(f"  {manip}{region}")
         if len(sums) > _HISTORY_DETAIL_LIST_MAX:
             lines.append(
                 f"  [dim]… (+{len(sums) - _HISTORY_DETAIL_LIST_MAX} more)[/]")
+    # Primers — CommercialSaaS records PCR oligos as <Oligo> children on
+    # an amplify node; surface name + sequence so a PCR step shows WHICH
+    # primers made it (the detail was in the .dna all along) instead of a
+    # bare "amplify".
+    oligos = hist.oligos
+    if oligos:
+        lines.append("")
+        lines.append("[b]Primers[/]")
+        for o in oligos[:_HISTORY_DETAIL_LIST_MAX]:
+            nm = _esc(o.get("name") or "(unnamed)")
+            seq = o.get("sequence") or ""
+            seq_disp = (_esc(seq[:40]) + ("…" if len(seq) > 40 else "")
+                        if seq else "")
+            lines.append(
+                f"  {nm}" + (f"   [dim]{seq_disp}[/dim]" if seq_disp else ""))
+        if len(oligos) > _HISTORY_DETAIL_LIST_MAX:
+            lines.append(
+                f"  [dim]… (+{len(oligos) - _HISTORY_DETAIL_LIST_MAX} more)[/]")
     parents = hist.parents
     lines.append("")
     if parents:
@@ -26652,8 +27455,7 @@ class HistoryScreen(_OneShotDismissScreen, Screen):
         self._build_tree(tree)
         try:
             proto = self.query_one("#hist-scr-proto-text", Static)
-            proto.update("\n".join(
-                _history_protocol_lines(self._root_node)))
+            proto.update(_history_protocol_renderable(self._root_node))
         except NoMatches:
             pass
         try:
@@ -80989,13 +81791,11 @@ class ConstructorModal(ModalScreen):
         to the library by part name to recover their lineage. Parts
         with no matching library entry fall back to a leaf node.
 
-        Returns None when the grammar has no enzyme registered for
-        this level (best-effort: the save still proceeds without
-        history).
+        Always returns a tree (never None over a missing enzyme — that
+        only drops the regenerated-site marker). May still return None
+        if serialization itself fails; the save proceeds regardless.
         """
         enzyme = _enzyme_for_level_up(grammar, source_level + 1)
-        if not enzyme:
-            return None
         root = _CommercialSaaSHistoryNode.new(
             name=name + ".dna",
             seq_len=product_seq_len,
@@ -81003,7 +81803,15 @@ class ConstructorModal(ModalScreen):
             operation="insertFragment",
             node_id=0,
         )
-        root.add_regenerated_site(enzyme, pos=0, site_count=1)
+        # The Type IIS enzyme that releases the parts is a DETAIL of the
+        # history node, not a precondition for recording it. Pre-fix a
+        # grammar whose `enzyme` field didn't resolve (custom grammar
+        # missing it, or a level-parity edge) returned None here and the
+        # whole assembly saved with EMPTY history — the reported pei311
+        # symptom. Now we still build the lineage tree and just skip the
+        # regenerated-site marker when the enzyme is unknown.
+        if enzyme:
+            root.add_regenerated_site(enzyme, pos=0, site_count=1)
         vector_name = str(entry_vector.get("name") or "backbone")
         parts_label = "+".join(
             str(p.get("name") or "?") for p in parts
@@ -88915,7 +89723,7 @@ class SimulatorScreen(Screen):
                 final_name = f"{amp_name}_{n}"
         entry_id = re.sub(r"[^A-Za-z0-9_-]+", "_", final_name).strip("_") \
                    or "amplicon"
-        return {
+        entry = {
             "id":      entry_id,
             "name":    final_name,
             "size":    len(seq),
@@ -88925,6 +89733,19 @@ class SimulatorScreen(Screen):
             "gb_text": gb_text,
             "kind":    "amplicon",
         }
+        # Harmonised history: record the PCR step (amplifyFragment +
+        # region + primer <Oligo>s) so a de-novo amplicon's History shows
+        # the same Primers / region detail a `.dna` import would, instead
+        # of the bare origin root the generic fallback gives.
+        hx = _build_amplicon_history_xml(
+            name=final_name, seq_len=len(seq),
+            fwd_seq=amp.get("fwd_seq", ""), rev_seq=amp.get("rev_seq", ""),
+            start_1based=_coerce_int_or_zero(amp.get("start")) + 1,
+            end_1based=_coerce_int_or_zero(amp.get("end")),
+        )
+        if hx:
+            entry["history_xml"] = hx
+        return entry
 
     def _commit_amplicon_to_collection(
         self, entry: dict, collection: str,
@@ -93426,9 +94247,11 @@ class MoveCopyToCollectionModal(ModalScreen):
         defer to the user picking.
       * Refuses if the source collection no longer exists (race
         between Space-marking and 'm'/'y' press).
-      * For move: refuses if no OTHER collection exists. For copy:
-        always has at least one option (the source itself, as
-        "duplicate here").
+      * Works even when no target collection exists yet — the
+        [New collection] button creates an empty one inline (copies
+        CollectionsModal's create-and-persist path), then selects it so
+        the user can Confirm straight into it. For copy, the source is
+        always offered as "duplicate here".
     """
 
     _blocks_undo: bool = True
@@ -93444,6 +94267,10 @@ class MoveCopyToCollectionModal(ModalScreen):
         self._mode = mode if mode in ("move", "copy") else "move"
         self._dismissed: bool = False
         self._row_to_name: list[str] = []
+        # Re-entrancy guard for the [New collection] button: True while
+        # the CollectionNameModal prompt is open so a double-click can't
+        # stack two name prompts.
+        self._naming: bool = False
 
     def _dismiss_once(self, result) -> None:
         if self._dismissed:
@@ -93481,6 +94308,7 @@ class MoveCopyToCollectionModal(ModalScreen):
             with Horizontal(id="movecopy-btns"):
                 yield Button("Confirm", id="btn-movecopy-go",
                              variant="primary")
+                yield Button("New collection", id="btn-movecopy-newcoll")
                 yield Button("Cancel", id="btn-movecopy-cancel")
 
     def on_mount(self) -> None:
@@ -93534,8 +94362,8 @@ class MoveCopyToCollectionModal(ModalScreen):
             seen += 1
         if seen == 0:
             self._set_status(
-                "[red]No other collections to target. Create one first "
-                "from the Library panel (+ button in collections view).[/red]"
+                "[yellow]No target collections yet — press "
+                "[b]New collection[/b] to make one.[/yellow]"
             )
         else:
             verb = "target" if self._mode == "move" else "destination"
@@ -93582,6 +94410,78 @@ class MoveCopyToCollectionModal(ModalScreen):
     def _row_selected(self, _event) -> None:
         # Enter on a row = Confirm. Same UX as the other Picker modals.
         self._go_btn(None)
+
+    @on(Button.Pressed, "#btn-movecopy-newcoll")
+    def _new_collection_btn(self, _) -> None:
+        """Create a brand-new empty target collection without leaving the
+        picker. Copies CollectionsModal._save's create-and-persist path
+        (normalise via CollectionNameModal → collision check → append an
+        empty collection → `_save_collections` → repopulate). On success
+        the new collection is selected so Enter / Confirm lands on it."""
+        if self._naming:                       # double-click guard
+            return
+
+        def _named(name: "str | None") -> None:
+            self._naming = False
+            if not name:                        # cancelled / empty
+                return
+            # Collision check mirrors CollectionsModal._save. `name` is
+            # already normalised by CollectionNameModal.
+            if _collection_name_taken(name):
+                self._set_status(
+                    f"[red]A collection named '{name}' already exists — "
+                    f"pick it from the list above instead.[/red]"
+                )
+                return
+            try:
+                existing = _load_collections()
+                existing.append({
+                    "name":        name,
+                    "description": "",
+                    "plasmids":    [],
+                    "saved":       _date.today().isoformat(),
+                })
+                _save_collections(existing)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Collections", exc)
+                return
+            self._repopulate()
+            self._select_row_by_name(name)
+            verb = "move" if self._mode == "move" else "copy"
+            self._set_status(
+                f"[green]Created '{name}'. Confirm to {verb} the marked "
+                f"plasmid(s) here.[/green]"
+            )
+
+        self._naming = True
+        try:
+            self.app.push_screen(
+                CollectionNameModal("New collection"), callback=_named,
+            )
+        except Exception:
+            # Push should never fail for a mounted modal, but if it does
+            # don't leave the button permanently dead-locked.
+            self._naming = False
+            _log.debug("movecopy: new-collection prompt push failed",
+                       exc_info=True)
+
+    def _select_row_by_name(self, name: str) -> None:
+        """Move the table cursor onto the row whose key is `name` and
+        focus the table, so a fresh Enter confirms it. No-op if the row
+        isn't present (e.g. it was filtered out as the move source)."""
+        try:
+            table = self.query_one("#movecopy-table", DataTable)
+        except NoMatches:
+            return
+        try:
+            idx = self._row_to_name.index(name)
+        except ValueError:
+            return
+        try:
+            table.move_cursor(row=idx)
+            table.focus()
+        except Exception:
+            _log.debug("movecopy: select-row-by-name failed", exc_info=True)
 
     @on(Button.Pressed, "#btn-movecopy-cancel")
     def _cancel_btn(self, _) -> None:
@@ -109995,8 +110895,9 @@ NcbiTaxonPickerModal { align: center middle; }
         Hardened:
           * Refuses when no active collection is set (nothing to move
             FROM).
-          * Refuses when only one collection exists (nothing to move
-            TO).
+          * Opens the picker even when the source is the only
+            collection — its [New collection] button lets the user
+            create a target inline (move used to refuse here).
           * Filters `entry_ids` down to ids that actually exist in
             the active collection NOW (a parallel delete could have
             invalidated some marks since the Space key landed).
@@ -110018,20 +110919,11 @@ NcbiTaxonPickerModal { align: center middle; }
                 severity="error",
             )
             return
-        # For move: must have at least one OTHER collection to
-        # target (moving to self is a no-op). For copy: a single
-        # collection is fine — the user can duplicate marked entries
-        # in-place inside the active collection.
-        if event.mode == "move" and sum(
-                1 for c in colls
-                if (c.get("name") or "") != source) < 1:
-            self.notify(
-                "Only one collection exists — create another "
-                "(Library → collections view → + button) to move into. "
-                "(Tip: press 'y' instead to duplicate in place.)",
-                severity="warning",
-            )
-            return
+        # Move used to refuse here when no OTHER collection existed, but
+        # the picker now offers a [New collection] button, so opening it
+        # with an empty list is the right call — the user creates a
+        # target inline and moves into it. (Copy always had at least the
+        # source itself as "duplicate here".)
         # Filter the marked ids to ones still present in the source
         # collection. A parallel agent / second-window delete could
         # have invalidated some marks since the user pressed Space.

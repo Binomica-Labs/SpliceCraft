@@ -14,6 +14,28 @@
 
 ---
 
+## [1.0.12] — 2026-06-01
+
+### New features
+
+- **Construction history for everything you build — not just imports.** Every plasmid you make in SpliceCraft now records how it was made: Golden Braid / MoClo, traditional digest + ligation, Gibson, PCR amplicons, gene synthesis, or a plain "save as new". Editing a plasmid's sequence and re-saving adds an "edited" step. PCR steps record the **primers** they used (name + sequence) and the amplified region — so a plasmid you built from scratch shows the same History detail as one imported from a `.dna` file. Plasmids made before this update get their history filled in automatically the next time the app loads them.
+- **The History "Protocol" reads like a bench recipe.** Each step now flows left → right — *ingredients → product* — with a one-line symbol legend, replacing the old backward arrow that wasn't intuitive. The operation (PCR / assemble / Gibson / edit) leads each line, and long steps wrap with a clean hanging indent so the step numbers stay readable.
+- **Horizontal scrollbar on the linear map.** When you zoom a linear map in far enough that the sequence is wider than the panel, a scrollbar appears along the bottom — drag it, or click anywhere on it, to move along the sequence.
+- **Make a new collection while moving plasmids.** The move/copy-marked-plasmids picker now has a **New collection** button, so you can create a destination on the spot instead of backing out to make one first.
+
+### Bug fixes
+
+- **The history protocol now lists every enzyme of a digest.** A two-enzyme cut (e.g. KpnI + XbaI) used to show only the first ("✂ KpnI"); it now shows them all ("✂ KpnI + XbaI").
+- **PCR / "amplify" history steps no longer read "? ↔ ?".** Imported PCR steps kept their primers in a place SpliceCraft wasn't reading — the step detail now surfaces the **primers** and the amplified region. A node a `.dna` file marked with no operation now reads "(no operation recorded)" instead of a literal "invalid".
+
+### Hardening
+
+- **Construction history can't bloat your library over time.** Repeated edits to a plasmid no longer grow its stored history without bound — older steps collapse into a compact summary past a generous recent window.
+- **The legacy-history backfill is strictly additive.** The one-time pass that fills in history for older plasmids only ever *adds* history; it never removes, reorders, or rewrites an entry, with an entry-count guard on top of the existing atomic-save + backup safety net.
+- Refreshed several dependency version floors to their current releases.
+
+---
+
 ## [1.0.11] — 2026-06-01
 
 ### New features

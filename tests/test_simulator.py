@@ -1032,6 +1032,28 @@ class TestBuildAmpliconLibraryEntry:
         import re
         assert re.match(r"^[A-Za-z0-9_-]+$", entry["id"])
 
+    def test_amplicon_entry_records_harmonized_history(self):
+        """A de-novo amplicon carries the SAME history elements a `.dna`
+        import would: an amplifyFragment node, an amplify region summary,
+        and the two primers as <Oligo>s (user request 2026-06-01: uniform
+        history regardless of import vs de-novo)."""
+        s = self._make_screen()
+        amp = {
+            "start": 99, "end": 620, "length": 521, "wraps": False,
+            "fwd_seq": "GCGCGGTACCgccatg", "rev_seq": "GCGCTCTAGAgtccat",
+            "amplicon_seq": "A" * 521,
+            "gc_pct": 50.0, "fwd_tm": 60.0, "rev_tm": 60.0,
+        }
+        entry = s._build_amplicon_library_entry(amp)
+        assert entry.get("history_xml")
+        root = sc._parse_commercialsaas_history(entry["history_xml"])
+        assert root.operation == "amplifyFragment"
+        seqs = [o["sequence"] for o in root.oligos]
+        assert "GCGCGGTACCgccatg" in seqs and "GCGCTCTAGAgtccat" in seqs
+        sm = root.input_summaries[0]
+        assert sm["manipulation"] == "amplify"
+        assert sm["val1"] == 100 and sm["val2"] == 620   # start+1 .. end
+
     def test_explicit_name_used_verbatim(self):
         # The collection-targeted save passes the user's name; it must
         # be used as-is (the commit path re-uniquifies against the

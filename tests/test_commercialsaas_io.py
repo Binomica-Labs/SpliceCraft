@@ -790,15 +790,23 @@ class TestHistoryScreen:
 
     async def test_action_show_history_notifies_when_no_history(
             self, tiny_record, isolated_library):
-        """Loaded record with no library entry (or library entry
-        without `history_xml`) — `action_show_history` notifies rather
-        than pushing a blank screen. The default auto-persist path
-        produces an entry without `history_xml`, so the empty case
-        falls out of `_build_app` naturally."""
+        """A loaded record whose library entry has NO `history_xml` — a
+        legacy entry pre-dating origin-history — makes
+        `action_show_history` notify rather than push a blank screen.
+
+        As of the origin-history change the auto-persist path now
+        BACKFILLS a minimal root, so we strip it here to exercise the
+        genuine no-history notify branch (legacy / history-less entries
+        still hit it)."""
         from tests.test_smoke import _build_app, TERMINAL_SIZE
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause(); await pilot.pause(0.05)
+            # Simulate a legacy entry with no recorded history.
+            lib = sc._load_library()
+            for e in lib:
+                e.pop("history_xml", None)
+            sc._save_library(lib)
             app.action_show_history()
             await pilot.pause()
             assert not any(isinstance(s, sc.HistoryScreen)
@@ -2556,7 +2564,7 @@ class TestHistoryRenderHelpers:
 
     def test_protocol_lines_single_record_placeholder(self):
         lines = sc._history_protocol_lines(_hist_leaf("pUC19.dna", 2686))
-        assert len(lines) == 1 and "no assembly steps" in lines[0]
+        assert len(lines) == 1 and "no construction steps" in lines[0]
 
     def test_protocol_lines_render_step(self):
         tu = _hist_asm("TU.dna", 4000, _hist_leaf("pENTR.dna", 2000),
@@ -2565,6 +2573,38 @@ class TestHistoryRenderHelpers:
         for token in ("TU", "prom", "pENTR", "Esp3I"):
             assert token in joined
 
+    def test_protocol_lists_all_digest_enzymes(self):
+        """A restriction digest uses ≥2 enzymes — the protocol must list
+        BOTH, not just the first (user report 2026-06-01: a KpnI + XbaI
+        double digest showed only "✂ KpnI")."""
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="PHASE 55-C.dna", seq_len=5470, circular=True,
+            operation="insertFragment", node_id=0)
+        root.add_regenerated_site("KpnI", 0, 1)
+        root.add_regenerated_site("XbaI", 0, 1)
+        root.add_parent(sc._CommercialSaaSHistoryNode.new(
+            name="backbone.dna", seq_len=4000, circular=True,
+            operation="insertFragment", node_id=0))
+        step = sc._history_step_from_node(root)
+        assert step["enzymes"] == ["KpnI", "XbaI"]
+        assert step["enzyme"] == "KpnI"                  # back-compat
+        line = sc._history_protocol_lines(root)[0]
+        assert "KpnI" in line and "XbaI" in line         # BOTH shown
+        assert line.count("✂") == 1                       # one scissor prefix
+
+    def test_protocol_dedups_and_drops_reverse_sentinel(self):
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="P.dna", seq_len=100, circular=True,
+            operation="insertFragment", node_id=0)
+        root.add_regenerated_site("EcoRI", 0, 1)
+        root.add_regenerated_site("EcoRI", 0, 1)              # duplicate
+        root.add_regenerated_site("(reverse insert)", 0, 1)  # sentinel
+        root.add_parent(sc._CommercialSaaSHistoryNode.new(
+            name="bb.dna", seq_len=80, circular=True,
+            operation="insertFragment", node_id=0))
+        step = sc._history_step_from_node(root)
+        assert step["enzymes"] == ["EcoRI"]    # deduped, sentinel dropped
+
     def test_detail_lines_has_properties_and_escapes(self):
         node = sc._CommercialSaaSHistoryNode.new(
             name="ev[red]il.dna", seq_len=1234, circular=False,
@@ -2572,6 +2612,95 @@ class TestHistoryRenderHelpers:
         text = "\n".join(sc._history_detail_lines(node))
         assert "Properties" in text and "1,234 bp" in text and "linear" in text
         assert "\\[red]" in text   # name markup escaped
+
+    def test_oligos_property_parses_primers(self):
+        import xml.etree.ElementTree as ET
+        node = sc._CommercialSaaSHistoryNode.new(
+            name="PCR.dna", seq_len=520, circular=False,
+            operation="amplifyFragment")
+        for nm, seq in (("Fwd-1", "ACGT" * 5), ("Rev-1", "TTTT")):
+            o = ET.SubElement(node.element, "Oligo")
+            o.set("name", nm)
+            o.set("sequence", seq)
+        olis = node.oligos
+        assert [x["name"] for x in olis] == ["Fwd-1", "Rev-1"]
+        assert olis[0]["sequence"] == "ACGT" * 5
+
+    def test_detail_amplify_shows_region_and_primers_not_question_marks(self):
+        """A SnapGene amplify (PCR) step stores no name1/name2 — the
+        detail must show the region + <Oligo> primers (extracted from the
+        .dna) instead of a bare "amplify ? ↔ ?" (user report 2026-06-01)."""
+        import xml.etree.ElementTree as ET
+        from rich.text import Text
+        node = sc._CommercialSaaSHistoryNode.new(
+            name="PCR-X.dna", seq_len=500, circular=False,
+            operation="amplifyFragment")
+        node.add_input_summary(manipulation="amplify", val1=100, val2=600)
+        o = ET.SubElement(node.element, "Oligo")
+        o.set("name", "X-F")
+        o.set("sequence", "GCGCGGTACCgccatg")
+        node.add_parent(sc._CommercialSaaSHistoryNode.new(
+            name="template.dna", seq_len=4000, circular=True,
+            operation="insertFragment"))
+        plain = "\n".join(Text.from_markup(ln).plain
+                          for ln in sc._history_detail_lines(node))
+        assert "?" not in plain                       # no bare question marks
+        assert "region 100–600" in plain              # amplified region
+        assert "Primers" in plain and "X-F" in plain  # primer surfaced
+        assert "GCGCGGTACCgccatg" in plain            # primer sequence
+
+    def test_add_oligo_round_trips(self):
+        node = sc._CommercialSaaSHistoryNode.new(
+            name="x.dna", seq_len=10, circular=False,
+            operation="amplifyFragment")
+        node.add_oligo(name="F", sequence="ACGT", description="fwd")
+        node.add_oligo(name="R", sequence="TTTT")
+        assert [(o["name"], o["sequence"]) for o in node.oligos] == [
+            ("F", "ACGT"), ("R", "TTTT")]
+        assert node.oligos[0]["description"] == "fwd"
+
+    def test_build_amplicon_history_matches_dna_element_set(self):
+        """A de-novo amplicon's generated history carries the same
+        elements a `.dna` import does — amplifyFragment op, amplify
+        region InputSummary, and primer <Oligo>s — so the History detail
+        is uniform regardless of origin."""
+        from rich.text import Text
+        xml = sc._build_amplicon_history_xml(
+            name="PCR-X", seq_len=520, fwd_seq="GCGCGGTACCxxx",
+            rev_seq="GCGCTCTAGAyyy", start_1based=100, end_1based=620)
+        root = sc._parse_commercialsaas_history(xml)
+        assert root.operation == "amplifyFragment"
+        assert [o["name"] for o in root.oligos] == [
+            "forward primer", "reverse primer"]
+        assert root.oligos[0]["sequence"] == "GCGCGGTACCxxx"
+        sm = root.input_summaries[0]
+        assert sm["manipulation"] == "amplify"
+        assert sm["val1"] == 100 and sm["val2"] == 620
+        plain = "\n".join(Text.from_markup(ln).plain
+                          for ln in sc._history_detail_lines(root))
+        assert "Primers" in plain and "forward primer" in plain
+        assert "region 100–620" in plain
+
+    def test_op_label_maps_sentinels_to_empty(self):
+        for s in ("invalid", "Invalid", "unknown", "none", "unspecified", ""):
+            assert sc._history_op_label(s) == ""
+        assert sc._history_op_label("amplifyFragment") == "PCR"
+        # A real-but-unmapped op still passes through verbatim.
+        assert sc._history_op_label("goldenGateAssembly") == "goldenGateAssembly"
+
+    def test_detail_invalid_operation_shows_no_op_not_literal(self):
+        """A CommercialSaaS node with operation='invalid' (its sentinel
+        for a base/starting sequence with no recorded operation) must
+        render '(no operation recorded)', not a literal 'invalid' (user
+        report 2026-06-01 on pIT6-NEO)."""
+        from rich.text import Text
+        node = sc._CommercialSaaSHistoryNode.new(
+            name="pIT6.dna", seq_len=8732, circular=True,
+            operation="invalid")
+        plain = "\n".join(Text.from_markup(ln).plain
+                          for ln in sc._history_detail_lines(node))
+        assert "invalid" not in plain.lower()
+        assert "no operation recorded" in plain
 
     def test_reopen_nudge_only_for_dna_sources(self):
         # Fires for .dna-sourced entries (both import paths carry .dna)…
@@ -2605,10 +2734,20 @@ class TestHistoryViewerDeNoise:
             screen = sc.HistoryScreen("MOD", mod)
             await app.push_screen(screen)
             await pilot.pause()
-            # Protocol pane: 3 build steps (TU1, TU2, MOD).
-            proto = str(screen.query_one("#hist-scr-proto-text", _Static).render())
+            # Protocol pane: 3 build steps (TU1, TU2, MOD). The pane now
+            # renders a Rich Group(legend, hanging-indent table); render
+            # that SAME renderable to text (the pane shows exactly this).
+            assert screen.query_one("#hist-scr-proto-text", _Static) is not None
+            from rich.console import Console as _Console
+            from io import StringIO as _SIO
+            _buf = _SIO()
+            _Console(file=_buf, width=120).print(
+                sc._history_protocol_renderable(mod))
+            proto = _buf.getvalue()
             assert "TU1" in proto and "TU2" in proto and "MOD" in proto
-            assert proto.count("✂") == 3   # one enzyme mark per step
+            assert "ingredients" in proto   # symbol legend present
+            # One ✂ in the legend key + one per build step (3 steps).
+            assert proto.count("✂") == 4
             tree = screen.query_one("#hist-scr-tree", _TreeWidget)
             refs, full_shared = [], []
             def _walk(n):

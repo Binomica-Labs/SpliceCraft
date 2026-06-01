@@ -223,16 +223,18 @@ cross-references — type `@plasmid`, `!action`, or `&gel` and double-click (or
 
 ### History
 
-Every plasmid you build through SpliceCraft remembers how it was made.
-**History** opens with a **Protocol** summary — a numbered, plain-English
-recipe of the real assembly steps (*"TU_GFP ⟵ pProm + pCDS_GFP + pTerm into
-pENTR_L1 ✂ Esp3I"*) — above a **lineage tree** that opens collapsed to the
-finished plasmid and its direct inputs and lets you drill in as deep as you
-like. A backbone or part reused across branches is shown once and then
-referenced, so even a multi-part Golden Braid / MoClo build reads at a glance.
-Construction history also rides along when you import and re-export a
-CommercialSaaS `.dna` file. "How did I make this again?" is always one keystroke
-away.
+Every plasmid you build through SpliceCraft remembers how it was made —
+whether you cloned it via Golden Braid, traditional digest/ligation, Gibson,
+or PCR, or just edited and saved it. **History** opens with a **Protocol**
+summary — a numbered recipe that reads left → right like the bench (*"assemble
+pProm + pCDS_GFP + pTerm into pENTR_L1 → TU_GFP ✂ Esp3I"*, with a symbol
+legend) — above a **lineage tree** that opens collapsed to the finished plasmid
+and its direct inputs and lets you drill in as deep as you like. Selecting a
+step shows its detail, including the **primers** used for a PCR. A backbone or
+part reused across branches is shown once and then referenced, so even a
+multi-part Golden Braid / MoClo build reads at a glance. The same history rides
+along when you import or re-export a CommercialSaaS `.dna` file. "How did I make
+this again?" is always one keystroke away.
 
 ### File & Settings
 

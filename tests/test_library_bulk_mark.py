@@ -518,3 +518,106 @@ class TestMoveCopyConcurrency:
         # No dupes.
         ids = [p["id"] for p in ffe["plasmids"]]
         assert len(set(ids)) == 10
+
+
+# ── [New collection] button inside the move/copy picker (2026-06-01) ──
+
+
+class TestMoveCopyNewCollection:
+    """MoveCopyToCollectionModal's [New collection] button — create an
+    empty target collection inline (copied from CollectionsModal._save)
+    without leaving the picker, then select it so Confirm lands on it.
+    Plus the caller change: move mode no longer refuses to open when the
+    source is the only collection (the button is now the escape hatch).
+    """
+
+    # ── caller: move opens even with only the source collection ──
+
+    def test_move_with_only_source_no_longer_refused(self):
+        sc._save_collections([
+            {"name": "Solo", "plasmids": [
+                {"id": "s0", "name": "p", "size": 100, "gb_text": "x"}]},
+        ])
+        sc._set_active_collection_name("Solo")
+        sc._collections_cache = None
+        app = sc.PlasmidApp.__new__(sc.PlasmidApp)
+        pushed, notes = [], []
+        app.notify = lambda msg, severity="information", **k: notes.append(
+            (severity, str(msg)))
+        app.push_screen = lambda screen, callback=None: pushed.append(screen)
+        ev = sc.LibraryPanel.MoveCopyRequested(entry_ids=["s0"], mode="move")
+        app._library_move_copy_requested(ev)
+        assert len(pushed) == 1
+        assert type(pushed[0]).__name__ == "MoveCopyToCollectionModal"
+        assert not any("only one collection" in m.lower() for _s, m in notes)
+
+    # ── modal: the button itself ──
+
+    async def _open_picker(self, app, pilot, *, source, ids, mode):
+        await app.push_screen(sc.MoveCopyToCollectionModal(
+            source_collection=source, entry_ids=ids, mode=mode))
+        await pilot.pause(0.2)
+        return app.screen
+
+    async def test_new_collection_creates_and_selects(self):
+        _seed_two_collections(eden_n=2, ffe_n=0)        # Eden active + FFE
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            picker = await self._open_picker(
+                app, pilot, source="Eden", ids=["eden_0"], mode="move")
+            assert type(picker).__name__ == "MoveCopyToCollectionModal"
+            picker.query_one("#btn-movecopy-newcoll").action_press()
+            await pilot.pause(0.2)
+            name_modal = app.screen
+            assert type(name_modal).__name__ == "CollectionNameModal"
+            name_modal.query_one("#collname-input").value = "Fresh"
+            name_modal.query_one("#btn-collname-ok").action_press()
+            await pilot.pause(0.3)
+            # Persisted as an empty collection…
+            fresh = [c for c in sc._load_collections()
+                     if c.get("name") == "Fresh"]
+            assert len(fresh) == 1 and fresh[0]["plasmids"] == []
+            # …and the picker now shows + selects it.
+            back = app.screen
+            assert type(back).__name__ == "MoveCopyToCollectionModal"
+            assert "Fresh" in back._row_to_name
+            assert back._selected_name() == "Fresh"
+            app.exit()
+
+    async def test_new_collection_rejects_duplicate(self):
+        _seed_two_collections(eden_n=1, ffe_n=0)        # Eden + FFE exist
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            picker = await self._open_picker(
+                app, pilot, source="Eden", ids=["eden_0"], mode="move")
+            picker.query_one("#btn-movecopy-newcoll").action_press()
+            await pilot.pause(0.2)
+            name_modal = app.screen
+            name_modal.query_one("#collname-input").value = "FFE"  # taken
+            name_modal.query_one("#btn-collname-ok").action_press()
+            await pilot.pause(0.3)
+            # No duplicate FFE; only the original.
+            assert sum(1 for c in sc._load_collections()
+                       if c.get("name") == "FFE") == 1
+            app.exit()
+
+    async def test_new_collection_blank_name_creates_nothing(self):
+        _seed_two_collections(eden_n=1, ffe_n=0)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            picker = await self._open_picker(
+                app, pilot, source="Eden", ids=["eden_0"], mode="move")
+            before = {c.get("name") for c in sc._load_collections()}
+            picker.query_one("#btn-movecopy-newcoll").action_press()
+            await pilot.pause(0.2)
+            name_modal = app.screen
+            name_modal.query_one("#collname-input").value = "   "
+            name_modal.query_one("#btn-collname-ok").action_press()
+            await pilot.pause(0.2)
+            # Empty name rejected by the prompt → nothing created.
+            after = {c.get("name") for c in sc._load_collections()}
+            assert after == before
+            app.exit()

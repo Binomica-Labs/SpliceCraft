@@ -6865,3 +6865,151 @@ class TestAlignmentBarColumnShades:
             0, 100, self._binned(), 0, 10)
         assert comp[5][1] == 1  # mismatch still counted; bad tuple skipped
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _linear_scrollbar_layout — bottom horizontal scrollbar geometry
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestLinearScrollbarLayout:
+    """Pure geometry for the linear-view bottom scrollbar. Drives
+    `PlasmidMap._draw_linear_flag` (the drawn track + thumb) and the
+    mouse hit-tests (`on_mouse_down`/`on_mouse_move` drag, `on_click`
+    consume) — so the math has to agree everywhere.
+
+    Returns (row, track_lo, track_w, thumb_lo, thumb_w) or None.
+    """
+
+    def test_whole_record_visible_returns_none(self):
+        # view spans the whole record (zoom 1.0) → no scrollbar.
+        assert sc._linear_scrollbar_layout(1000, 0, 1000, 105, 40) is None
+
+    def test_view_wider_than_record_returns_none(self):
+        # Degenerate over-wide window (clamps would prevent this, but be
+        # defensive) still reads as "everything visible".
+        assert sc._linear_scrollbar_layout(500, 0, 800, 105, 40) is None
+
+    def test_zoomed_in_returns_geometry(self):
+        geom = sc._linear_scrollbar_layout(1000, 0, 100, 105, 40)
+        assert geom is not None
+        row, track_lo, track_w, thumb_lo, thumb_w = geom
+        assert row == 39                 # h - 1
+        assert track_lo == 5             # default margin_l
+        assert track_w == 105 - 5 - 2    # w - margin_l - margin_r
+        assert thumb_w >= 1
+
+    def test_empty_record_returns_none(self):
+        assert sc._linear_scrollbar_layout(0, 0, 0, 105, 40) is None
+        assert sc._linear_scrollbar_layout(-5, 0, 10, 105, 40) is None
+
+    def test_too_short_panel_returns_none(self):
+        # render() refuses < 30x14; the bar bails the same way.
+        assert sc._linear_scrollbar_layout(1000, 0, 100, 105, 13) is None
+
+    def test_too_narrow_track_returns_none(self):
+        # w - margin_l - margin_r < 4 → no usable track.
+        assert sc._linear_scrollbar_layout(1000, 0, 100, 10, 40) is None
+
+    def test_thumb_at_left_when_at_origin(self):
+        _row, track_lo, _tw, thumb_lo, _thw = sc._linear_scrollbar_layout(
+            1000, 0, 100, 105, 40)
+        assert thumb_lo == track_lo      # flush left when view starts at 0
+
+    def test_thumb_moves_right_as_view_advances(self):
+        left = sc._linear_scrollbar_layout(1000, 0, 100, 105, 40)
+        mid = sc._linear_scrollbar_layout(1000, 450, 550, 105, 40)
+        right = sc._linear_scrollbar_layout(1000, 900, 1000, 105, 40)
+        assert left[3] < mid[3] < right[3]   # thumb_lo strictly increases
+
+    def test_thumb_width_tracks_visible_fraction(self):
+        # 1/10 of the record visible → thumb ~1/10 of the track.
+        _r, _tl, track_w, _tlo, thumb_w = sc._linear_scrollbar_layout(
+            1000, 0, 100, 105, 40)
+        assert thumb_w == max(1, 100 * track_w // 1000)
+
+    def test_tiny_window_keeps_min_one_cell_thumb(self):
+        # Zoomed to a handful of bp on a big record: thumb floors at 1.
+        _r, _tl, _tw, _tlo, thumb_w = sc._linear_scrollbar_layout(
+            1_000_000, 500_000, 500_003, 105, 40)
+        assert thumb_w == 1
+
+    def test_thumb_always_inside_track_across_sweep(self):
+        # Slide the viewport from origin to end; the thumb never escapes
+        # the track at any position (covers the right-edge clamp).
+        total, visible, w, h = 1234, 50, 100, 40
+        for view_s in range(0, total - visible + 1, 7):
+            geom = sc._linear_scrollbar_layout(
+                total, view_s, view_s + visible, w, h)
+            assert geom is not None
+            _row, track_lo, track_w, thumb_lo, thumb_w = geom
+            track_hi = track_lo + track_w
+            assert track_lo <= thumb_lo
+            assert thumb_lo + thumb_w <= track_hi
+            assert thumb_w >= 1
+
+    def test_custom_margins_respected(self):
+        geom = sc._linear_scrollbar_layout(
+            1000, 0, 100, 100, 40, margin_l=3, margin_r=4)
+        _row, track_lo, track_w, _tlo, _thw = geom
+        assert track_lo == 3
+        assert track_w == 100 - 3 - 4
+
+    def test_negative_view_start_clamped(self):
+        # A stray negative view_s (shouldn't happen, but be defensive)
+        # still produces a left-pinned thumb, not a negative column.
+        _r, track_lo, _tw, thumb_lo, _thw = sc._linear_scrollbar_layout(
+            1000, -20, 100, 105, 40)
+        assert thumb_lo == track_lo
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _draw_linear_scrollbar — native ScrollBarRender compositing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestLinearScrollbarDraw:
+    """`PlasmidMap._draw_linear_scrollbar` paints Textual's own
+    ScrollBarRender onto the canvas bottom row. Called with a bare
+    namespace as `self` (it only reads `_sb_drag` via getattr) + a real
+    `_Canvas`; we inspect the per-cell style strings on the bar row.
+    Both the native path and the cosmetic fallback emit the same track
+    (`#303030`) / thumb (`#808080` idle, `#bcbcbc` grabbed) colours, so
+    these assertions hold regardless of which path runs.
+    """
+
+    def _draw(self, *, total=1000, view_s=0, view_e=100,
+              w=105, h=40, grabbed=False):
+        import types
+        geom = sc._linear_scrollbar_layout(total, view_s, view_e, w, h)
+        assert geom is not None
+        canvas = sc._Canvas(w, h)
+        sc.PlasmidMap._draw_linear_scrollbar(
+            types.SimpleNamespace(_sb_drag=grabbed),
+            canvas, geom, total, view_s, view_e)
+        return geom, canvas
+
+    def test_paints_track_and_thumb(self):
+        geom, canvas = self._draw()
+        joined = " ".join(canvas._styles[geom[0]])
+        assert "#303030" in joined          # recessed trough
+        assert "#808080" in joined          # thumb (idle)
+        assert "#bcbcbc" not in joined       # not the grabbed colour
+
+    def test_grabbed_thumb_brightens(self):
+        geom, canvas = self._draw(grabbed=True)
+        joined = " ".join(canvas._styles[geom[0]])
+        assert "#bcbcbc" in joined           # brighter thumb while dragging
+
+    def test_only_bottom_row_touched(self):
+        geom, canvas = self._draw()
+        sb_row = geom[0]
+        for r, row in enumerate(canvas._styles):
+            if r == sb_row:
+                assert any(s for s in row)
+            else:
+                assert not any(s for s in row)
+
+    def test_thumb_present_across_positions(self):
+        for view_s in (0, 450, 900):
+            geom, canvas = self._draw(view_s=view_s, view_e=view_s + 100)
+            joined = " ".join(canvas._styles[geom[0]])
+            assert "#808080" in joined and "#303030" in joined

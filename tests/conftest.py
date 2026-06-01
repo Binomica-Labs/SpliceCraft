@@ -150,6 +150,12 @@ def _protect_user_data(tmp_path, monkeypatch):
     monkeypatch.setattr(sc, "_id_name_backfill_done", True)
     monkeypatch.setattr(sc, "_parts_bin_sequence_backfill_done", True)
     monkeypatch.setattr(sc, "_collections_backfill_done", True)
+    # Origin-history backfill ([INV-93]) — skip by default; tests that
+    # exercise it flip the relevant flag to False before loading.
+    monkeypatch.setattr(sc, "_origin_history_backfill_done", True)
+    monkeypatch.setattr(
+        sc, "_collections_origin_history_backfill_done", True,
+    )
     monkeypatch.setattr(
         sc, "_parts_bin_collections_backfill_done", True,
     )
