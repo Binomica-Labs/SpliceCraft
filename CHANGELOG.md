@@ -14,6 +14,27 @@
 
 ---
 
+## [1.0.14] — 2026-06-02
+
+### New features
+
+- **Cloned plasmids show how they were built.** Domesticate a fragment into an L0 part and the resulting cloned plasmid now carries the **domestication primers** that built it — each drawn with its **bound** region (where it anneals, including the fusion overhang) distinct from its **unbound** 5′ tail (the enzyme site + pad). You can see the construction at a glance, and regenerate the amplicon later for a synthesis order.
+- **Store a cloned part in one step.** Saving from the Domesticator now uses a single dialog to name the **cloned plasmid**, pick the **collection** it lands in, and choose which **parts bin** the part files into — independently of the linear synthesis fragment (which keeps its own name + collection). Keep your linear orders and your finished clones in whatever collections you like.
+- **The Parts Bin title bar now shows the active bin** (e.g. *Parts Bin — Phase Genomics*), so you always know which bin you're working in.
+
+### Bug fixes
+
+- **"Save to Feature Library" works on a single feature again** — it used to error *"feature isn't in a group"* unless the feature belonged to a group; now a lone feature saves straight to the library.
+- **No more underscores in cloned-plasmid names** — a plasmid cloned out of the Synthesis composer keeps its spaces-and-all display name instead of falling back to the underscored, truncated LOCUS form.
+- **Capture-to-feature-library moved to `Alt+Shift+C`** (it was `Ctrl+Shift+F`, which terminals intercept — Windows Terminal's Find — and never deliver to the app). The in-app shortcut help and key reference are updated.
+
+### Hardening
+
+- **Primer binding is topology-aware** — a primer on a *linear* fragment no longer "binds" across the (non-joined) cut ends, so its bound/unbound split reflects real-world annealing, not just the circular case.
+- **Tidier Synthesis buttons and cleaner labels** — consistent spacing, sizing, and labels on the Synthesis toolbar and protein tab, and stray dots / ellipses removed from button labels throughout the app.
+
+---
+
 ## [1.0.13] — 2026-06-01
 
 ### New features

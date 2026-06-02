@@ -1748,7 +1748,7 @@ class TestIdentityPctColor:
 
 
 class TestAlignmentManagerNewAlignButton:
-    """`AlignmentManagerModal` gained a "New Align…" button 2026-05-27.
+    """`AlignmentManagerModal` gained a "New Align" button 2026-05-27.
     Clicking it dismisses with a sentinel dict so the caller can chain
     the picker modal and re-open the manager with the new rows once
     workers complete."""
@@ -1833,7 +1833,7 @@ class TestAlignmentManagerOpensOnEmptyStorage:
     """Pre-2026-05-27 the manager refused to open if the plasmid had
     no stored alignments — the user had to know about Alt+A
     separately. Now the manager opens with an empty table and the
-    "New Align…" button starts the workflow from there."""
+    "New Align" button starts the workflow from there."""
 
     async def test_manager_can_be_constructed_with_empty_list(self):
         # The modal itself accepts an empty list — table renders zero

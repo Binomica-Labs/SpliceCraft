@@ -165,9 +165,14 @@ editable fragment. Or hit **Open** to
 load a sequence straight from a single-entry FASTA (or other amino-acid file) — a
 file browser highlights the loadable formats in pink. Compose a part,
 hit **Clone Fragment**, and it's handed straight to the Domesticator as an L0
-building block. **Save** (and **Save As**, which forks a copy and only lights up
-once the fragment has been saved once) let you pick which collection the
-fragment lands in, and keep editing it there.
+building block. When you save the domesticated part, one dialog names the
+**cloned plasmid**, picks its collection, and chooses which parts bin to file
+the part in — independently of the linear fragment — and the **domestication
+primers ride along on the clone**, drawn with their bound (annealing + overhang)
+and unbound (enzyme-tail) regions so you can see exactly how it was built.
+**Save** (and **Save As**, which forks a copy and only lights up once the
+fragment has been saved once) let you pick which collection the fragment lands
+in, and keep editing it there.
 
 ### Parts
 

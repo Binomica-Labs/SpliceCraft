@@ -23,8 +23,9 @@ can drag-select a combo to copy).
 | `Ctrl+A`       | Select-all sequence                          |
 | `Ctrl+E`       | Enter sequence editor mode                   |
 | `Ctrl+S`       | Save edits to file                           |
-| `Ctrl+F`       | Add a new feature (from cursor or blank)     |
-| `Ctrl+Shift+F` | Capture selection / feature → Feature library |
+| `Ctrl+F`       | Find a DNA subsequence (fuzzy, both strands) |
+| `Alt+Shift+F`  | Add a new feature (from the current selection) |
+| `Alt+Shift+C` | Capture selection / feature → Feature library |
 | `Ctrl+P`       | Primer Design workbench                      |
 | `Enter`        | Highlight the feature enclosing the seq cursor |
 | `Delete`       | Context-aware delete (feature or library entry) |

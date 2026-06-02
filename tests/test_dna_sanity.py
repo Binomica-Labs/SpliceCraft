@@ -1100,6 +1100,80 @@ class TestRederivePrimerBinding:
         assert near0[0] == 20
         assert near1[0] == 60
 
+    def test_linear_template_does_not_wrap_origin(self):
+        # Real-world affinity: on a LINEAR molecule the ends don't join,
+        # so a primer whose FULL anneal only matches by crossing the
+        # origin must bind only its non-wrapping 3' portion (or not at
+        # all) — never wrap. Circular keeps the wrap.
+        body = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"   # 40
+        tmpl = "GGTTCCAA" + body + "TTAAGGCC"               # 56
+        anneal = tmpl[-8:] + tmpl[:12]                      # wraps [48,56)+[0,12)
+        primer = "GCGCCGTCTCG" + anneal
+        # Circular: binds across the origin (existing behaviour).
+        assert sc._rederive_primer_binding(
+            primer, 1, tmpl, len(tmpl), hint_start=50) == (48, 12)
+        # Linear: the wrap is impossible; only the 3' 12 bp that sit at
+        # the template's start bind, no wrap.
+        rb_lin = sc._rederive_primer_binding(
+            primer, 1, tmpl, len(tmpl), hint_start=50, circular=False)
+        assert rb_lin == (0, 12), rb_lin
+        assert rb_lin[1] > rb_lin[0]   # never wrap-encoded on a linear template
+
+
+class TestClonePrimerAttachment:
+    """Domestication / PCR primers ride along on the cloned plasmid as
+    `primer_bind` features so a clone shows how it was built — bound
+    (anneal + fusion overhang) vs unbound (enzyme tail). 2026-06-02."""
+
+    _INSERT = ("CTAGGTACCATGCATGCATCGATTACGGATCAGTCAGCATGCAGTACTGATCAGT"
+               "CAGCATGGATCCTTAGCATCAGTACGATCAGTCAGCATCAGGTACCGAT")
+
+    def _primers(self):
+        pad, site, sp, oh5, oh3 = "GCGC", "CGTCTC", "A", "GGAG", "CGCT"
+        fwd = pad + site + sp + oh5 + self._INSERT[:18]
+        rev = pad + site + sp + sc._rc(oh3) + sc._rc(self._INSERT[-18:])
+        return fwd, rev
+
+    def test_attach_adds_primer_bind_features_and_is_idempotent(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        fwd, rev = self._primers()
+        rec = SeqRecord(Seq("GGAG" + self._INSERT + "CGCT" + "ACGT" * 20),
+                        id="clone", name="clone")
+        rec.annotations["topology"] = "circular"
+        assert sc._attach_pcr_primers_to_record(rec, fwd, rev) == 2
+        pf = [f for f in rec.features if f.type == "primer_bind"]
+        assert len(pf) == 2
+        assert all(f.qualifiers.get("primer_seq") for f in pf)
+        # Second call must not double-stamp.
+        assert sc._attach_pcr_primers_to_record(rec, fwd, rev) == 0
+
+    def test_attach_skips_a_nonbinding_primer(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ACGT" * 60), id="x", name="x")
+        rec.annotations["topology"] = "circular"
+        # No clean 3' match → skipped, never drawn at a wrong site.
+        assert sc._attach_pcr_primers_to_record(
+            rec, "TTTTTTTTTTTTTTTTTTTT", "") == 0
+        assert not [f for f in rec.features if f.type == "primer_bind"]
+
+    def test_part_clone_carries_its_primers(self):
+        fwd, rev = self._primers()
+        part = {"name": "probe part", "sequence": self._INSERT,
+                "oh5": "GGAG", "oh3": "CGCT", "type": "Promoter",
+                "grammar": "gb_l0", "level": 0,
+                "fwd_primer": fwd, "rev_primer": rev}
+        clone = sc._part_to_cloned_seqrecord(part)
+        assert clone.annotations.get("topology") == "circular"
+        pf = [f for f in clone.features if f.type == "primer_bind"]
+        assert len(pf) == 2, f"clone should carry both primers, got {len(pf)}"
+        # A primer-less part stays clean (no spurious primer features).
+        part_np = {k: v for k, v in part.items()
+                   if k not in ("fwd_primer", "rev_primer")}
+        clone_np = sc._part_to_cloned_seqrecord(part_np)
+        assert not [f for f in clone_np.features if f.type == "primer_bind"]
+
 
 class TestRestrictionScanLinearVsCircular:
     """Linear records must NOT scan past their end. Pre-2026-05-08

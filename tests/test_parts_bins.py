@@ -99,6 +99,30 @@ class TestActiveBinPointer:
         assert sc._parts_bin_name_taken("A") is True
         assert sc._parts_bin_name_taken("B") is False
 
+    def test_switch_active_parts_bin(self):
+        # Shared bin-switch helper (used by the bins picker's Open AND
+        # the Domesticator store dialog): flips the active pointer +
+        # mirrors the chosen bin's parts; safe no-op for a missing bin;
+        # the outgoing bin's parts are never lost.
+        sc._save_parts_bin_collections([
+            {"name": "A", "description": "", "saved": "",
+             "parts": [{"name": "pa", "type": "CDS", "sequence": "ATG"}]},
+            {"name": "B", "description": "", "saved": "",
+             "parts": [{"name": "pb", "type": "Promoter", "sequence": "TTG"}]},
+        ])
+        sc._set_active_parts_bin_name("A")
+        sc._switch_active_parts_bin("A")          # prime the active mirror
+        assert sc._switch_active_parts_bin("B") is True
+        assert sc._get_active_parts_bin_name() == "B"
+        sc._parts_bin_cache = None
+        assert {p.get("name") for p in sc._load_parts_bin()} == {"pb"}
+        colls = {b["name"]: b for b in sc._load_parts_bin_collections()}
+        assert {p.get("name") for p in colls["A"]["parts"]} == {"pa"}
+        assert {p.get("name") for p in colls["B"]["parts"]} == {"pb"}
+        # Missing bin → no-op, active unchanged.
+        assert sc._switch_active_parts_bin("Ghost") is False
+        assert sc._get_active_parts_bin_name() == "B"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Migration

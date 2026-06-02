@@ -58,17 +58,20 @@ class TestActivePointerFlushSync:
 
     def test_parts_bin_switch_calls_flush(self):
         import inspect
-        # PartsBinPickerModal._open + _delete pair must both flush.
-        src = inspect.getsource(sc.PartsBinPickerModal)
-        assert "_set_active_parts_bin_name(name)" in src
-        assert "_set_active_parts_bin_name(promoted)" in src
-        # Both sites must follow with flush_sync.
-        assert "_settings_flush_sync()" in src
-        # At least 2 flush sites (open + delete-promote).
-        n_flush = src.count("_settings_flush_sync()")
-        assert n_flush >= 2, (
-            f"expected ≥2 flush_sync calls in PartsBinPickerModal, got {n_flush}"
-        )
+        # The Open-path bin switch now lives in the shared
+        # `_switch_active_parts_bin` helper (DRY'd 2026-06-02 — also used
+        # by the Domesticator store dialog); the delete-promote path
+        # stays in PartsBinPickerModal. Both must set the active pointer
+        # AND flush it (sweep #11: flush before mirror so a power loss
+        # can't leave settings.json / parts_bin.json disagreeing).
+        switch_src = inspect.getsource(sc._switch_active_parts_bin)
+        assert "_set_active_parts_bin_name(name)" in switch_src
+        assert "_settings_flush_sync()" in switch_src
+        picker_src = inspect.getsource(sc.PartsBinPickerModal)
+        # Open delegates to the shared helper; delete-promote flushes inline.
+        assert "_switch_active_parts_bin(" in picker_src
+        assert "_set_active_parts_bin_name(promoted)" in picker_src
+        assert "_settings_flush_sync()" in picker_src
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -126,9 +129,15 @@ class TestCrossGroupWriteRMW:
             src = inspect.getsource(
                 obj._domesticator_library_mirror_worker
             )
-            assert "with _cache_lock" in src, (
-                f"{name}._domesticator_library_mirror_worker "
-                f"missing _cache_lock"
+            # The library write must be serialised — either an inline
+            # `with _cache_lock` OR via `_commit_library_entry_to_collection`
+            # (the dual-save routing helper, which takes `_cache_lock`
+            # internally per [INV-50]). Both satisfy the invariant.
+            assert ("with _cache_lock" in src
+                    or "_commit_library_entry_to_collection" in src), (
+                f"{name}._domesticator_library_mirror_worker must "
+                f"serialise its library write (inline _cache_lock or via "
+                f"_commit_library_entry_to_collection)"
             )
 
 

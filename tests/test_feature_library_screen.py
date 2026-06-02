@@ -884,7 +884,7 @@ class TestAddFeatureModalOrientation:
                                                 expected_lit_radio,
                                                 tiny_record):
         """Opening the modal with `prefill={'strand': X}` must light exactly
-        the radio that matches X. Guards the Ctrl+Shift+F flow where a captured
+        the radio that matches X. Guards the Alt+Shift+C flow where a captured
         feature's strand drives which orientation the user sees selected."""
         app = sc.PlasmidApp()
         app._preload_record = tiny_record
@@ -909,11 +909,11 @@ class TestAddFeatureModalOrientation:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Ctrl+Shift+F: capture current selection / highlighted feature → AddFeatureModal
+# Alt+Shift+C: capture current selection / highlighted feature → AddFeatureModal
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestCaptureToFeatures:
-    """Ctrl+Shift+F (``action_capture_to_features``) should:
+    """Alt+Shift+C (``action_capture_to_features``) should:
       1. Read either ``sp._user_sel`` (drag selection) or the highlighted
          feature from the plasmid map and open AddFeatureModal prefilled.
       2. On Save, persist the entry to features.json (via the same
@@ -1097,8 +1097,64 @@ class TestCaptureToFeatures:
             assert not isinstance(app.screen, sc.AddFeatureModal)
 
 
+class TestSaveFeatureAsLibraryFromEditor:
+    """The feature editor's "Save to Feature Library" button persists the
+    edited feature even when it is NOT part of a group. Regression for a
+    2026-06-02 bug: `_apply_save_group_as_entry` dead-ended a lone
+    feature with "Feature isn't in a group.", so saving a single feature
+    (e.g. Pei311) straight from the editor was impossible."""
+
+    async def test_single_feature_saves_as_plain_entry(self, tiny_record):
+        """A non-grouped feature → exactly one single-feature library
+        entry (not ``is_group``), carrying the feature's forward-strand
+        sequence and the user-supplied name."""
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            idx = next(i for i, f in enumerate(pm._feats)
+                       if f.get("type") == "CDS")
+            feat = pm._feats[idx]
+            expected_seq = sp._seq[feat["start"]:feat["end"]].upper()
+            app._apply_save_group_as_entry(
+                {"idx": idx, "group_id": "", "name": "lone-cds"}
+            )
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sc._features_cache = None
+            match = [e for e in sc._load_features()
+                     if e.get("name") == "lone-cds"]
+            assert len(match) == 1, "single feature must persist exactly once"
+            assert not match[0].get("is_group"), "plain entry, not a group"
+            assert match[0].get("sequence", "").upper() == expected_seq
+            assert match[0].get("feature_type") == "CDS"
+
+    async def test_blank_name_aborts_without_writing(self, tiny_record):
+        """A blank name aborts the save — features.json is untouched."""
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            idx = next(i for i, f in enumerate(pm._feats)
+                       if f.get("type") == "CDS")
+            sc._features_cache = None
+            before = len(sc._load_features())
+            app._apply_save_group_as_entry(
+                {"idx": idx, "group_id": "", "name": "   "}
+            )
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sc._features_cache = None
+            assert len(sc._load_features()) == before
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# Ctrl+Shift+F: drag selection that matches a feature's exact range
+# Alt+Shift+C: drag selection that matches a feature's exact range
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestCaptureDragMatchesFeature:
@@ -1190,7 +1246,7 @@ class TestCaptureDragMatchesFeature:
 
 class TestAddFeatureModalColorField:
     """The Add Feature modal gained a Color field so captured-feature
-    colors (from Ctrl+Shift+F) survive through Save, and manual entries can set
+    colors (from Alt+Shift+C) survive through Save, and manual entries can set
     a per-entry color without a round-trip through FeatureLibraryScreen."""
 
     async def test_color_prefill_round_trips_through_save(self, tiny_record):
@@ -1256,7 +1312,7 @@ class TestAddFeatureModalColorField:
             assert modal._color is None
 
     async def test_capture_threads_color_into_addfeature_modal(self, tiny_record):
-        """Full path: Ctrl+Shift+F on a highlighted feature should carry the
+        """Full path: Alt+Shift+C on a highlighted feature should carry the
         feature's ``color`` field (from ``_feats``) into the modal's
         ``_color``. Palette-format ``color(N)`` values get normalised to
         the equivalent hex so the stored library entry and every

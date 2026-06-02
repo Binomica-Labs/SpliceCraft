@@ -2614,6 +2614,54 @@ class TestSynthesisCloneFragmentFlow:
                 f"stack: {stack_types}"
             )
 
+    async def test_clone_preserves_clean_display_name(self, isolated_library):
+        """Regression (2026-06-02): a fragment named with SPACES keeps a
+        clean, underscore-free display name after Clone Fragment loads it
+        onto the canvas. Pre-fix, the gb_text round-trip dropped
+        `_tui_display_name`, so the canvas record fell back to the
+        underscored LOCUS ("Phase_57_clone_t") and a later Ctrl+S
+        persisted underscores."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGAAACCCGGGTTTAAA", [])
+            scr._dirty = True
+            orig_push = app.push_screen
+            def _stub_push(modal, callback=None):
+                if isinstance(modal, sc.NamePlasmidModal):
+                    if callback is not None:
+                        callback("Phase 57 clone test")
+                    return None
+                return orig_push(modal, callback=callback)
+            app.push_screen = _stub_push  # type: ignore[method-assign]
+            try:
+                scr.action_clone_fragment()
+            finally:
+                app.push_screen = orig_push  # type: ignore[method-assign]
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+            # The synthesis save keeps the clean typed name in the library.
+            names = {e.get("name") for e in sc._load_library()}
+            assert "Phase 57 clone test" in names, (
+                f"clean name didn't persist to library; names: {names}"
+            )
+            # The canvas record loaded by the handoff reports a clean
+            # display name — so a later manual save can't leak underscores.
+            rec = app._current_record
+            assert rec is not None
+            disp = app._record_display_name(rec)
+            assert disp == "Phase 57 clone test", (
+                f"canvas display name not restored: {disp!r}"
+            )
+            assert "_" not in disp, f"underscore leaked into name: {disp!r}"
+
     async def test_clone_prefills_direct_input_textarea(
         self, isolated_library,
     ):

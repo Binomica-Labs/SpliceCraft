@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.13"
+__version__ = "1.0.14"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -18216,6 +18216,13 @@ class PlasmidMap(Widget):
                 _seq_upper_for_cds = ""
         else:
             _seq_upper_for_cds = ""
+        # Topology gate for primer re-derivation (real-world affinity):
+        # a primer on a LINEAR record must not bind across the ends.
+        # Only an EXPLICIT linear annotation disables the circular wrap,
+        # so circular / un-annotated records keep their prior behaviour.
+        _rec_is_circular = str(
+            (getattr(record, "annotations", {}) or {}).get("topology", "")
+        ).strip().lower() != "linear"
         for feat in record.features:
             if feat.type in ("source",):
                 continue
@@ -18499,6 +18506,7 @@ class PlasmidMap(Widget):
                             primer_seq, int(strand) if isinstance(strand, int)
                             else 1, _seq_upper_for_cds, total,
                             hint_start=int(start),
+                            circular=_rec_is_circular,
                         )
                         if _rb is not None:
                             start, end = _rb
@@ -26657,7 +26665,7 @@ _HELP_BODY_MD = """\
 | `Ctrl+F` | **Find a DNA subsequence** — fuzzy (allowable mismatches), both strands; jumps to the first hit |
 | `n` · `N` | Jump to the **next · previous** sequence-search hit (each hit is selected, so `Alt+Shift+F` annotates it — handy for tagging repeats by hand) |
 | `Alt+Shift+F` | Add a feature from the current selection |
-| `Ctrl+Shift+F` | Capture the current selection into the feature library |
+| `Alt+Shift+C` | Capture the current selection into the feature library |
 | `Enter` (on a feature) | Open the feature editor (read-only; press **Edit** to modify) |
 | `Delete` | Delete the selected feature — or, with no feature selected, open the edit dialog set to **Delete** the base(s) at the cursor / selection (a modal confirm, not an instant delete) |
 | `Ctrl+Z` · `Ctrl+Shift+Z` | Undo · redo |
@@ -34786,6 +34794,7 @@ _PRIMER_REBIND_MIN: int = 12
 
 def _rederive_primer_binding(primer_seq: str, strand: int, template: str,
                              total: int, hint_start: int = 0,
+                             *, circular: bool = True,
                              ) -> "tuple[int, int] | None":
     """Find where a primer's annealing region ACTUALLY binds the
     (circular) ``template``, so a stale / mis-saved ``pos_start`` /
@@ -34811,8 +34820,13 @@ def _rederive_primer_binding(primer_seq: str, strand: int, template: str,
     # Circular search space: append the wrap-around head so a binding
     # that spans the origin is found as one contiguous slice. Cap the
     # tail at the primer length so we never scan more than necessary.
-    tail = template[:max(0, min(len(seq), total) - 1)]
-    aug = template + tail
+    # A LINEAR template's ends don't join, so a primer can't anneal
+    # across them (real-world affinity) — search the bare template.
+    if circular:
+        tail = template[:max(0, min(len(seq), total) - 1)]
+        aug = template + tail
+    else:
+        aug = template
     rc = _rc(seq) if strand < 0 else ""
     max_L = min(len(seq), total)
     hint = (int(hint_start) % total) if total else 0
@@ -34835,6 +34849,94 @@ def _rederive_primer_binding(primer_seq: str, strand: int, template: str,
             pos_end -= total
         return (m, pos_end)
     return None
+
+
+def _attach_pcr_primers_to_record(
+    rec, fwd_primer: str, rev_primer: str, *,
+    fwd_label: str = "fwd_primer", rev_label: str = "rev_primer",
+    fwd_tm=None, rev_tm=None,
+) -> int:
+    """Attach the PCR primers that built ``rec`` as ``primer_bind``
+    features, so the seq panel + map show each primer's BOUND (3'
+    annealing + fusion overhang) and UNBOUND (5' tail: enzyme pad /
+    site / spacer) regions on the finished clone.
+
+    Binding is re-derived from the record's OWN sequence via
+    ``_rederive_primer_binding``. On a finished clone the enzyme site in
+    the 5' tail has been digested away, so only the primer's 3' portion
+    matches the template — that mismatch IS the bound/unbound split the
+    user wants to see. The full primer goes in the ``primer_seq``
+    qualifier (the seq panel paints the flap from it — see
+    ``_paint_primer_flap_bar``); the feature LOCATION spans the bound
+    region only.
+
+    Shared by every PCR-based cloning path (domestication, and — later —
+    Constructor / Gibson / traditional) so a plasmid built by PCR always
+    carries its run primers, ready to regenerate the amplicon for a
+    synthesis quote.
+
+    A primer that doesn't bind the record (< ``_PRIMER_REBIND_MIN`` bp)
+    is SKIPPED rather than drawn at a wrong site — a mis-placed cloning
+    primer is catastrophic (project_primer_design_catastrophic). A primer
+    already present (same ``primer_seq``) is skipped too, so the helper
+    is safe to call more than once. Returns the number of features added.
+    """
+    from Bio.SeqFeature import (
+        SeqFeature, FeatureLocation, CompoundLocation,
+    )
+    seq = str(getattr(rec, "seq", "") or "").upper()
+    total = len(seq)
+    if total <= 0:
+        return 0
+    is_circular = str(
+        (getattr(rec, "annotations", {}) or {}).get("topology", "")
+    ).strip().lower() == "circular"
+    # Don't double-stamp a primer that's already on the record.
+    existing: set = set()
+    for f in getattr(rec, "features", []) or []:
+        if getattr(f, "type", "") == "primer_bind":
+            q = (f.qualifiers or {}).get("primer_seq") or []
+            if q:
+                existing.add(str(q[0]).strip().upper())
+    added = 0
+    for primer, strand, label, tm in (
+        (fwd_primer, 1, fwd_label, fwd_tm),
+        (rev_primer, -1, rev_label, rev_tm),
+    ):
+        p = (primer or "").strip().upper()
+        if not p or p in existing:
+            continue
+        binding = _rederive_primer_binding(
+            p, strand, seq, total, circular=is_circular,
+        )
+        if binding is None:
+            _log.info(
+                "clone_primers: %s doesn't bind the clone — skipped "
+                "(no >=%d bp 3' match)", label, _PRIMER_REBIND_MIN,
+            )
+            continue
+        s, e = binding
+        if e > s:
+            loc = FeatureLocation(s, e, strand=strand)
+        elif e < s:  # binding wraps the origin: [s, total) + [0, e)
+            tail = FeatureLocation(s, total, strand=strand)
+            loc = (CompoundLocation([tail, FeatureLocation(0, e, strand=strand)])
+                   if e > 0 else tail)
+        else:
+            # Degenerate (would span the whole plasmid) — refuse.
+            continue
+        quals: dict = {"label": [label], "primer_seq": [p]}
+        if tm is not None:
+            try:
+                quals["note"] = [f"Tm {float(tm):.1f}C"]
+            except (TypeError, ValueError):
+                pass
+        rec.features.append(
+            SeqFeature(loc, type="primer_bind", qualifiers=quals)
+        )
+        existing.add(p)
+        added += 1
+    return added
 
 
 def _simulate_cloned_plasmid(insert: str, oh5: str, oh3: str,
@@ -36682,18 +36784,40 @@ def _part_to_cloned_seqrecord(part: dict):
         entry_vector = _get_entry_vector(grammar_id)
     except Exception:
         grammar, entry_vector = {}, None
+
+    # Attach the part's PCR/domestication primers to whichever cloned
+    # record we hand back, so the L0 clone shows how it was built —
+    # bound (anneal + fusion overhang) vs unbound (enzyme tail). Empty
+    # primer fields are skipped inside the helper, and the L1+ short-
+    # circuit above already returned (its primers belong to the
+    # assembly step). [general rule: PCR-built artifacts carry primers]
+    def _with_run_primers(cloned_rec):
+        if cloned_rec is not None:
+            try:
+                _attach_pcr_primers_to_record(
+                    cloned_rec,
+                    str(part.get("fwd_primer", "") or ""),
+                    str(part.get("rev_primer", "") or ""),
+                    fwd_tm=part.get("fwd_tm"), rev_tm=part.get("rev_tm"),
+                )
+            except Exception:
+                _log.exception(
+                    "clone_primers: attach failed for %r", part.get("name"),
+                )
+        return cloned_rec
+
     if isinstance(entry_vector, dict) and entry_vector.get("gb_text"):
         # Tier 1: full IIS simulation
         cloned = _clone_part_into_entry_vector(part, entry_vector, grammar)
         if cloned is not None:
-            return cloned
+            return _with_run_primers(cloned)
         # Tier 2: sequence-based overhang splice (refuses when
         # vector's IIS cuts conflict with the part's overhangs).
         cloned = _splice_part_into_vector_by_overhang(
             entry_vector, part, grammar=grammar,
         )
         if cloned is not None:
-            return cloned
+            return _with_run_primers(cloned)
 
     # Stub backbone fallback — original behaviour pre-2026-05-07.
     oh5 = part.get("oh5", "") or ""
@@ -36736,7 +36860,7 @@ def _part_to_cloned_seqrecord(part: dict):
             "note":  ["; ".join(note_bits)],
         },
     ))
-    return rec
+    return _with_run_primers(rec)
 
 
 def _pick_binding_region(seq: str, target_tm: float = 60.0,
@@ -39561,6 +39685,41 @@ def _parts_bin_name_taken(name: str) -> bool:
     """Dup-name guard for create / rename / duplicate. Pure check,
     no side effects."""
     return _find_parts_bin(name) is not None
+
+
+def _switch_active_parts_bin(name: str) -> bool:
+    """Make the named parts bin active and refresh the active-bin
+    mirror. Returns False (no-op) when the bin doesn't exist.
+
+    ONE implementation of the bin switch, shared by
+    `PartsBinPickerModal._open` and the Domesticator store dialog so the
+    `[INV-83]` mirror-swap rules live in a single place:
+      * flush the settings pointer BEFORE mirroring (sweep #11) so a
+        power loss can't leave settings.json / parts_bin.json disagreeing;
+      * mirror the chosen bin's parts into `parts_bin.json` via
+        `_safe_save_json_mirror` (NOT `_save_parts_bin`, which would
+        re-mirror back into the bin we just switched to) — the helper
+        permits switching to a smaller / empty bin without tripping the
+        L3 shrink guard, because the outgoing bin's parts stay safe in
+        `parts_bin_collections.json`;
+      * invalidate the parts-bin + assembly-fragment caches so the next
+        reader sees the new bin.
+
+    Raises `OSError` / `RuntimeError` on mirror failure (caller notifies).
+    """
+    target = _find_parts_bin(name)
+    if target is None:
+        return False
+    _set_active_parts_bin_name(name)
+    _settings_flush_sync()
+    raw_parts = target.get("parts", [])
+    if not isinstance(raw_parts, list):
+        raw_parts = []
+    target_parts = [p for p in raw_parts if isinstance(p, dict)]
+    _safe_save_json_mirror(_PARTS_BIN_FILE, target_parts, "Parts bin")
+    globals()["_parts_bin_cache"] = None
+    _clear_assembly_fragment_cache()
+    return True
 
 
 def _ensure_default_parts_bin() -> None:
@@ -45186,7 +45345,7 @@ class FeatureEditModal(ModalScreen):
     #featedit-notes-edit { height: 6; border: solid $primary-darken-1; }
     #featedit-status { height: 1; padding: 0 1; }
     #featedit-btns { height: 3; margin-top: 1; }
-    #featedit-btns Button { margin-right: 1; }
+    #featedit-btns Button { margin-right: 1; min-width: 12; }
     /* Sweep #30: members table + row-op buttons replace the
        sweep #29 group-ops row. Same height conventions so the
        layout feels familiar; the table caps at 6 rows tall so
@@ -45595,7 +45754,7 @@ class FeatureEditModal(ModalScreen):
                 yield Button("Save", id="btn-featedit-save",
                              variant="success", disabled=True)
                 yield Button(
-                    "Save To Feature Lib.",
+                    "Save to Feature Library",
                     id="btn-featedit-save-as-library",
                     tooltip=(
                         "Persist this feature (or its group, if "
@@ -45604,7 +45763,7 @@ class FeatureEditModal(ModalScreen):
                     ),
                 )
                 yield Button(
-                    "Group with…", id="btn-featedit-group",
+                    "Group", id="btn-featedit-group",
                     tooltip=(
                         "Merge this feature into a shared group with "
                         "other features on the canvas (they move / "
@@ -51873,7 +52032,7 @@ class HmmDbCatalogModal(ModalScreen):
                              id="btn-hmmdb-cat-check",
                              tooltip="Poll the version-check URL "
                                      "(forced, ignores 24h cache).")
-                yield Button("Add custom URL…",
+                yield Button("Add custom URL",
                              id="btn-hmmdb-cat-add")
                 yield Button("Edit",
                              id="btn-hmmdb-cat-edit",
@@ -52956,7 +53115,7 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
                                          id="blast-hmm-select",
                                          allow_blank=False)
                             yield Button(
-                                "Manage…",
+                                "Manage",
                                 id="btn-blast-hmm-manage",
                                 tooltip=(
                                     "Download / update HMM "
@@ -53012,13 +53171,13 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
                         yield TextArea("", id="online-query")
                         with Horizontal(id="online-src-row"):
                             yield Button(
-                                "From plasmid…",
+                                "From plasmid",
                                 id="btn-online-from-plasmid",
                                 tooltip=("Fill the query with a whole "
                                          "plasmid's sequence from your "
                                          "library."))
                             yield Button(
-                                "From feature…",
+                                "From feature",
                                 id="btn-online-from-feature",
                                 tooltip=("Fill the query with one "
                                          "feature's sequence from a "
@@ -57871,54 +58030,18 @@ class PartsBinPickerModal(_OneShotDismissScreen, ModalScreen):
         if not name:
             self._set_status("[red]No bin selected.[/red]")
             return
-        if _find_parts_bin(name) is None:
-            self._set_status(f"[red]Bin '{name}' not found.[/red]")
-            self._repopulate()
-            return
-        # Sweep #11 (2026-05-20): force-flush the settings pointer
-        # before mirroring parts_bin.json so a power loss can't leave
-        # settings.json saying OLD while parts_bin.json holds NEW
-        # data. Same fix sweep #9 landed on project switch.
-        _set_active_parts_bin_name(name)
-        _settings_flush_sync()
-        # Refresh `parts_bin.json` mirror to match the newly-active bin
-        # so the next `_load_parts_bin()` returns the right parts. We
-        # bypass `_save_parts_bin` here because that would re-mirror
-        # back into the bin we just switched to (the bin IS the source
-        # of truth in this direction).
-        target = _find_parts_bin(name)
-        raw_parts = (target or {}).get("parts", [])
-        # Defensive: a hand-edited `parts_bin_collections.json` could
-        # carry a non-list `parts` field or non-dict entries; refuse
-        # to mirror anything that isn't shaped like a parts row so the
-        # next `_load_parts_bin` doesn't trip on a schema surprise.
-        if not isinstance(raw_parts, list):
-            raw_parts = []
-        target_parts = [p for p in raw_parts if isinstance(p, dict)]
+        # Switch + mirror via the shared helper (single source of truth
+        # for the [INV-83] mirror-swap). Returns False only when the bin
+        # vanished between populate and Open.
         try:
-            # [INV-83, sweep #27 incident fix] Mirror-swap: the
-            # active-bin file (parts_bin.json) is a mirror of the
-            # selected named bin inside parts_bin_collections.json.
-            # Switching from a populated bin to an empty bin must
-            # NOT trip the L3 catastrophic-shrink guard — the
-            # outgoing bin's parts are safely preserved in
-            # parts_bin_collections.json under their original
-            # "Eden Parts" (or wherever) key. Pre-sweep this used
-            # bare `_safe_save_json`; on 2026-05-25 a switch from
-            # Eden (26 parts) to FFE Parts (0 parts) was correctly
-            # refused by the guard, but the UI offered no recovery
-            # path. The mirror helper communicates the intent.
-            _safe_save_json_mirror(
-                _PARTS_BIN_FILE, target_parts, "Parts bin",
-            )
+            switched = _switch_active_parts_bin(name)
         except (OSError, RuntimeError) as exc:
             _notify_save_failure(self.app, "Parts bin", exc)
             return
-        # Invalidate the parts-bin in-memory cache so the next reader
-        # sees the new bin's parts (the file just changed underneath).
-        globals()["_parts_bin_cache"] = None
-        # Same digest-cache hygiene as `_save_parts_bin`.
-        _clear_assembly_fragment_cache()
+        if not switched:
+            self._set_status(f"[red]Bin '{name}' not found.[/red]")
+            self._repopulate()
+            return
         self.dismiss(name)
 
     @on(DataTable.RowSelected, "#binpick-table")
@@ -58161,7 +58284,7 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
     populate and reuse it across renders. The cache is gated on
     ``_features_generation`` — bumped by every ``_save_features``
     call — so the column stays in sync with edits made by Save As
-    Feature, Ctrl+Shift+F capture, or the Feature Library workbench
+    Feature, Alt+Shift+C capture, or the Feature Library workbench
     without paying the scan cost on every populate.
     """
 
@@ -58282,7 +58405,11 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
         """
         yield Header()
         with Vertical(id="parts-box"):
-            yield Static(" Parts Bin ", id="parts-title")
+            # Show the active bin in the banner so the user knows which
+            # parts bin they're working in at a glance (matches the
+            # " Synthesis — … " title style).
+            _bin = _get_active_parts_bin_name() or _DEFAULT_PARTS_BIN_NAME
+            yield Static(f" Parts Bin — {_bin} ", id="parts-title")
             yield Tabs(
                 Tab("L0 parts",   id="tab-parts-l0"),
                 Tab("TUs",        id="tab-parts-tu"),
@@ -59139,7 +59266,14 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
             feats = pm._feats
         except NoMatches:
             pass
-        current_name = (getattr(rec, "name", "") or getattr(rec, "id", "") or "") if rec else ""
+        # Clean display name (spaces preserved), NOT the underscored
+        # LOCUS `rec.name` — so a fragment cloned out of Synthesis
+        # doesn't seed the Domesticator with "PHASE_57_CDS_Pei"
+        # (feedback_no_underscores_in_names).
+        current_name = (
+            self.app._record_display_name(rec)  # type: ignore[attr-defined]
+            if rec else ""
+        )
 
         def _on_result(part_dict):
             if part_dict is None:
@@ -59159,8 +59293,6 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
             # prompt the bulk Load path uses. Pre-2026-05-20 fix this
             # appended silently and tripped the (name, sequence) delete
             # bug when the user later removed the original.
-            existing = _load_parts_bin()
-
             def _content_fn(p: dict) -> str:
                 return (
                     f"{(p.get('sequence') or '').upper()}|"
@@ -59170,63 +59302,117 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
 
             display_name = part_dict.get("name") or "(unnamed)"
 
-            def _on_cancelled() -> None:
-                self.app.notify(
-                    f"Save cancelled. '{display_name}' not added to Parts Bin.",
-                    severity="warning",
-                )
-
-            def _on_resolved(items_to_save: "list[dict]",
-                             replace_names: "set[str]") -> None:
-                if not items_to_save and not replace_names:
+            # Dual-save store dialog FIRST (one prompt): cloned-plasmid
+            # name + its collection AND the parts bin for the part. The
+            # bin choice routes the PART before it's written, so the
+            # collision check + save target the chosen bin; the clone is
+            # then mirrored to the chosen collection. Cancel = nothing
+            # saved (no orphan bin row).
+            def _store(res: "dict | None") -> None:
+                if not isinstance(res, dict):
                     self.app.notify(
-                        f"Skipped duplicate. '{display_name}' already in "
-                        f"the Parts Bin.",
-                        severity="warning",
+                        "Cloning cancelled — nothing saved.",
+                        severity="information",
                     )
                     return
-                try:
-                    # RMW under `_cache_lock` so a concurrent parts-bin
-                    # writer (agent create/delete-part, constructor save)
-                    # can't read the same pre-state and drop this row.
-                    with _cache_lock:
-                        entries = _load_parts_bin()
-                        if replace_names:
-                            entries = [
-                                e for e in entries
-                                if (e.get("name") or "") not in replace_names
-                            ]
-                        entries = items_to_save + entries
-                        _save_parts_bin(entries)
-                except (OSError, RuntimeError) as exc:
-                    _notify_save_failure(self.app, "Parts bin", exc)
-                    return
-                self._populate()
-                # `items_to_save[0]` carries the (possibly COPY-renamed)
-                # name; the library mirror downstream should see the
-                # final value so the mirrored plasmid matches the bin.
-                final_part = items_to_save[0] if items_to_save else part_dict
-                final_name = final_part.get("name") or "(unnamed)"
-                self.app.notify(
-                    f"Saved '{final_name}' to Parts Bin "
-                    f"({len(final_part.get('sequence', ''))} bp). "
-                    f"Mirroring to library…",
-                )
-                # Library mirror: clone the part into the configured
-                # entry vector and save as a library entry. Off-thread
-                # to keep the UI snappy on big libraries. Best-effort:
-                # mirror failure doesn't roll back the bin save.
-                from copy import deepcopy as _deepcopy
-                self._domesticator_library_mirror_worker(
-                    _deepcopy(final_part),
+                clone_name = (res.get("name") or "").strip() or display_name
+                collection = (res.get("collection") or "").strip()
+                chosen_bin = (res.get("bin") or "").strip()
+                # Route the PART to the chosen bin (switch active if the
+                # user picked a different one — same mirror-swap the bins
+                # picker uses, via the shared helper).
+                if chosen_bin and chosen_bin != (
+                        _get_active_parts_bin_name() or ""):
+                    try:
+                        _switch_active_parts_bin(chosen_bin)
+                    except (OSError, RuntimeError) as exc:
+                        _notify_save_failure(self.app, "Parts bin", exc)
+                        return
+                existing = _load_parts_bin()
+
+                def _on_cancelled() -> None:
+                    self.app.notify(
+                        f"Save cancelled. '{display_name}' not added to "
+                        f"Parts Bin.", severity="warning",
+                    )
+
+                def _on_resolved(items_to_save: "list[dict]",
+                                 replace_names: "set[str]") -> None:
+                    if not items_to_save and not replace_names:
+                        self.app.notify(
+                            f"Skipped duplicate. '{display_name}' already "
+                            f"in the Parts Bin.", severity="warning",
+                        )
+                        return
+                    try:
+                        # RMW under `_cache_lock` so a concurrent parts-bin
+                        # writer can't read the same pre-state + drop this row.
+                        with _cache_lock:
+                            entries = _load_parts_bin()
+                            if replace_names:
+                                entries = [
+                                    e for e in entries
+                                    if (e.get("name") or "") not in replace_names
+                                ]
+                            entries = items_to_save + entries
+                            _save_parts_bin(entries)
+                    except (OSError, RuntimeError) as exc:
+                        _notify_save_failure(self.app, "Parts bin", exc)
+                        return
+                    self._populate()
+                    # `items_to_save[0]` carries the (possibly COPY-renamed)
+                    # name so the mirrored plasmid matches the bin row.
+                    final_part = (items_to_save[0] if items_to_save
+                                  else part_dict)
+                    final_name = final_part.get("name") or "(unnamed)"
+                    self.app.notify(
+                        f"Saved '{final_name}' to Parts Bin "
+                        f"({len(final_part.get('sequence', ''))} bp).",
+                    )
+                    # Mirror the cloned plasmid off-thread under the name
+                    # + collection picked up-front in the store dialog.
+                    from copy import deepcopy as _deepcopy
+                    self._domesticator_library_mirror_worker(
+                        _deepcopy(final_part),
+                        clone_name=clone_name,
+                        target_collection=collection,
+                    )
+
+                _resolve_load_collisions(
+                    self.app, "part", [part_dict], existing,
+                    name_key="name",
+                    content_fn=_content_fn,
+                    on_resolved=_on_resolved,
+                    on_cancelled=_on_cancelled,
                 )
 
-            _resolve_load_collisions(
-                self.app, "part", [part_dict], existing,
-                name_key="name",
-                content_fn=_content_fn,
-                on_resolved=_on_resolved,
-                on_cancelled=_on_cancelled,
+            try:
+                _coll_names = [
+                    str(c.get("name") or "")
+                    for c in _iter_collections_readonly()
+                    if isinstance(c, dict) and (c.get("name") or "")
+                ]
+            except Exception:  # noqa: BLE001
+                _coll_names = []
+            try:
+                _bin_names = [
+                    str(b.get("name") or "")
+                    for b in _load_parts_bin_collections()
+                    if isinstance(b, dict) and (b.get("name") or "")
+                ]
+            except Exception:  # noqa: BLE001
+                _bin_names = []
+            self.app.push_screen(
+                AmpliconSaveModal(
+                    default_name=display_name,
+                    collections=_coll_names,
+                    active_collection=_get_active_collection_name(),
+                    title="Store cloned part",
+                    name_label="Cloned plasmid name",
+                    parts_bins=_bin_names,
+                    active_bin=_get_active_parts_bin_name(),
+                ),
+                callback=_store,
             )
 
         # Sweep #14 (2026-05-20): consume the one-shot Clone-Fragment
@@ -59245,8 +59431,17 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
         )
 
     @work(thread=True, exclusive=True, group="dom_library_mirror")
-    def _domesticator_library_mirror_worker(self, part_dict: dict) -> None:
-        """Off-thread Domesticator → library mirror.
+    def _domesticator_library_mirror_worker(
+        self, part_dict: dict, *,
+        clone_name: "str | None" = None,
+        target_collection: "str | None" = None,
+    ) -> None:
+        """Off-thread Domesticator → cloned-plasmid save.
+
+        ``clone_name`` / ``target_collection`` (dual-save) name the clone
+        + pick its destination collection independently of the parts-bin
+        row; both default to the part name / active collection so an
+        un-prompted call matches the prior behaviour.
 
         Mirrors the L0 part as a full part-in-entry-vector plasmid
         in the library. Runs after the parts-bin save (which is sync
@@ -59278,75 +59473,63 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
                 severity="warning",
             )
             return
+        # Dual-save routing (2026-06-02): the cloned plasmid is named +
+        # placed independently of the parts-bin row. ``target_collection``
+        # defaults to the active collection — exactly where the prior
+        # `_save_library` mirror landed it — so an un-prompted call stays
+        # behaviour-compatible; a user-chosen collection routes there
+        # instead. Goes through the SAME `_commit_library_entry_to_collection`
+        # helper every assembly save uses (`_cache_lock` + atomic .bak +
+        # id/name collision-rename + active-library re-mirror), so the
+        # Domesticator no longer hand-rolls its own library write.
+        clone_disp = (clone_name or "").strip() or display_name
+        target = ((target_collection or "").strip()
+                  or _get_active_collection_name() or "Default")
+        base_id = (re.sub(r"[^A-Za-z0-9_]+", "_",
+                          (lib_rec.id or clone_disp)) or "part")
+        lib_entry = {
+            "id":      base_id,
+            "name":    clone_disp,
+            "size":    _seq_len(lib_rec),
+            "n_feats": len(lib_rec.features or []),
+            "source":  "domesticator:l0",
+            "added":   _date.today().isoformat(),
+            "gb_text": _record_to_gb_text(lib_rec),
+        }
         try:
-            # Sweep #11 (2026-05-20): load-modify-save under
-            # `_cache_lock`. Pre-fix the Domesticator mirror, the
-            # Constructor save, Traditional cloning save, Gibson
-            # save, and Ctrl+S all ran load → mutate → save without
-            # a global lock. `exclusive=True` only serialises within
-            # one group; two workers from DIFFERENT groups could
-            # both read the same pre-state, both insert, both save
-            # — the second save's entries list didn't include the
-            # first save's new entry, so the first entry vanished
-            # silently. RLock allows re-entry from `_save_library`'s
-            # own lock.
-            with _cache_lock:
-                lib_entries = _load_library()
-                raw_id = lib_rec.id or display_name
-                safe_id = re.sub(r"[^A-Za-z0-9_]+", "_", raw_id) or "part"
-                existing_ids = {e.get("id") or "" for e in lib_entries}
-                unique_id = safe_id
-                bump = 2
-                while unique_id in existing_ids:
-                    unique_id = f"{safe_id}_{bump}"
-                    bump += 1
-                lib_entry = {
-                    "id":      unique_id,
-                    "name":    display_name,
-                    "size":    _seq_len(lib_rec),
-                    "n_feats": len(lib_rec.features or []),
-                    "source":  "domesticator:l0",
-                    "added":   _date.today().isoformat(),
-                    "gb_text": _record_to_gb_text(lib_rec),
-                }
-                lib_entries.insert(0, lib_entry)
-                _save_library(lib_entries)
+            final_name = _commit_library_entry_to_collection(lib_entry, target)
         except (OSError, RuntimeError) as exc:
             _log.exception(
-                "Domesticator: library-mirror save failed for %r",
-                display_name,
+                "Domesticator: cloned-plasmid save failed for %r", clone_disp,
             )
             _log_event(
                 "domesticator.library_mirror.failed",
-                name=display_name, stage="save",
-                error=str(exc)[:120],
+                name=clone_disp, stage="save", error=str(exc)[:120],
             )
             self.app.call_from_thread(
                 self.app.notify,
-                f"Library mirror failed for '{display_name}' "
+                f"Cloned-plasmid save failed for '{clone_disp}' "
                 f"({exc}). Parts bin row is intact.",
                 severity="error",
             )
             return
         _log_event(
             "domesticator.library_mirror.ok",
-            name=display_name, id=unique_id,
-            bp=lib_entry["size"],
-            n_feats=lib_entry["n_feats"],
+            name=final_name, collection=target,
+            bp=lib_entry["size"], n_feats=lib_entry["n_feats"],
         )
-        # Refresh the library panel so the new entry is visible
-        # without forcing the user to re-open it. Best-effort: the
-        # panel might not be mounted in some test paths.
+        # Best-effort reveal — resolves when the clone landed in the
+        # active collection (mirrored to the library file); a clone routed
+        # to a non-active collection just isn't in the current view yet.
         def _on_mirror_done() -> None:
             try:
                 lib = self.app.query_one("#library", LibraryPanel)
-                lib.reveal_entry_id(unique_id)
+                lib.reveal_entry_id(base_id)
             except (NoMatches, AttributeError):
                 pass
             self.app.notify(
-                f"Library mirror: '{display_name}' "
-                f"({lib_entry['size']:,} bp, "
-                f"{lib_entry['n_feats']} features).",
+                f"Cloned plasmid '{final_name}' → collection '{target}' "
+                f"({lib_entry['size']:,} bp, {lib_entry['n_feats']} features).",
             )
         self.app.call_from_thread(_on_mirror_done)
 
@@ -59876,7 +60059,7 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
         (`_GB_PART_TYPE_TO_INSDC`) and open `AddFeatureModal` so the
         user can adjust the name / qualifiers before committing.
         Saving routes through ``app._persist_feature_entry`` (the same
-        helper Ctrl+Shift+F capture uses) so the latest write wins on
+        helper Alt+Shift+C capture uses) so the latest write wins on
         (name, feature_type) collisions.
 
         Before opening the modal, ``_feature_library_match`` is
@@ -71052,14 +71235,14 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
     }
     #syn-codon-table-label { width: auto; padding: 1 1 0 1; color: $text-muted; }
     #syn-codon-table-select { width: 36; }
-    #btn-syn-codon-manage { width: 11; margin-left: 1; }
+    #btn-syn-codon-manage { width: 12; min-width: 12; margin-left: 1; }
     #syn-codon-mode-label { width: auto; padding: 1 1 0 2; color: $text-muted; }
-    #btn-syn-toggle-codon-mode { width: 22; margin-left: 1; }
+    #btn-syn-toggle-codon-mode { width: 18; min-width: 18; margin-left: 1; }
     #syn-protein-actions { height: 3; align: left middle; }
     #syn-codon-stops-label { width: auto; padding: 1 1 0 1; color: $text-muted; }
     #syn-codon-stops { width: 12; }
-    #btn-syn-forbidden { width: 16; margin-left: 1; }
-    #btn-syn-optimize-dna { width: 18; margin-left: 1; }
+    #btn-syn-forbidden { width: 18; min-width: 18; margin-left: 1; }
+    #btn-syn-optimize-dna { width: 18; min-width: 18; margin-left: 1; }
     #syn-bottom {
         height: 3; margin-top: 1; align: right middle;
     }
@@ -71131,8 +71314,8 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                               variant="success")
                 yield Button("Save As",   id="btn-syn-saveas")
                 yield Button("Rename",    id="btn-syn-rename")
-                yield Button("Insert site", id="btn-syn-insertsite")
-                yield Button("Add feature", id="btn-syn-addfeat")
+                yield Button("Insert Site", id="btn-syn-insertsite")
+                yield Button("Add Feature", id="btn-syn-addfeat")
                 yield Button("Clone Fragment", id="btn-syn-clone",
                               variant="warning")
             yield Static("", id="syn-status", markup=True)
@@ -71262,7 +71445,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                                  "sequence at the cursor.",
                     )
                     yield Button(
-                        "New…", id="btn-syn-motif-new",
+                        "New", id="btn-syn-motif-new",
                         tooltip="Add a new custom motif to your "
                                 "persistent library.",
                     )
@@ -73153,6 +73336,20 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                     severity="error",
                 )
                 return
+            # The gb_text round-trip only carries the underscored,
+            # LOCUS-truncated name (e.g. "PHASE_57_CDS_Pei"); the
+            # library entry's `name` field holds the user's typed
+            # display name with spaces. Re-stamp it so the canvas
+            # record — and any later manual Ctrl+S — keeps the clean
+            # name instead of persisting underscores
+            # (feedback_no_underscores_in_names). Mirrors what the
+            # normal library-load path does at `library_load`.
+            _nm = entry.get("name")
+            if isinstance(_nm, str) and _nm.strip():
+                try:
+                    rec._tui_display_name = _nm.strip()  # type: ignore[attr-defined]
+                except Exception:
+                    _log.debug("clone_fragment: couldn't stamp display name")
             # `self.app` is typed as the generic Textual App at this
             # boundary — `_apply_record` lives on PlasmidApp. Pyright
             # can't see the subclass through the .app pointer; the
@@ -75117,7 +75314,7 @@ class AlignmentManagerModal(_OneShotDismissScreen, ModalScreen):
                             zebra_stripes=True)
             yield Static("", id="alnmgr-status")
             with Horizontal(id="alnmgr-btns"):
-                yield Button("New Align…", id="btn-alnmgr-new-align",
+                yield Button("New Align", id="btn-alnmgr-new-align",
                              variant="primary")
                 yield Button("Hide All", id="btn-alnmgr-hide-all")
                 yield Button("Show All", id="btn-alnmgr-show-all")
@@ -88620,7 +88817,7 @@ class AmpliconSaveModal(ModalScreen):
     DEFAULT_CSS = """
     AmpliconSaveModal { align: center middle; }
     #ampsave-dlg {
-        width: 70; height: 18;
+        width: 70; height: auto; max-height: 90%;
         background: $surface; border: solid $primary; padding: 1 2;
     }
     #ampsave-title {
@@ -88637,8 +88834,19 @@ class AmpliconSaveModal(ModalScreen):
 
     def __init__(self, *, default_name: str,
                  collections: "list[str]",
-                 active_collection: "str | None") -> None:
+                 active_collection: "str | None",
+                 title: str = "Save amplicon to library",
+                 name_label: str = "Amplicon name",
+                 parts_bins: "list[str] | None" = None,
+                 active_bin: "str | None" = None) -> None:
         super().__init__()
+        # Title + name-label are parametrised (back-compat defaults) so the
+        # same hardened name+collection dialog serves the PCR amplicon save
+        # AND the Domesticator cloned-plasmid save (dual-save flow).
+        self._title = (title or "Save amplicon to library").strip() \
+            or "Save amplicon to library"
+        self._name_label = (name_label or "Amplicon name").strip() \
+            or "Amplicon name"
         self._default_name = (default_name or "").strip() or "PCR amplicon"
         # Guarantee the active collection is present + first so the
         # Select always has a valid value; de-dup while preserving
@@ -88652,6 +88860,21 @@ class AmpliconSaveModal(ModalScreen):
             names = ["Default"]
         self._collections = names
         self._active = names[0]
+        # Optional parts-bin picker (dual-save: choose the part's bin in
+        # the SAME dialog). None → no bin field, so the amplicon path is
+        # byte-unchanged. Normalised like collections: active first,
+        # de-duped, never empty.
+        if parts_bins is None:
+            self._parts_bins: "list[str] | None" = None
+            self._active_bin: "str | None" = None
+        else:
+            bins: list[str] = []
+            for raw in [active_bin, *parts_bins]:
+                nm = (raw or "").strip()
+                if nm and nm not in bins:
+                    bins.append(nm)
+            self._parts_bins = bins or ["Main Parts Bin"]
+            self._active_bin = self._parts_bins[0]
         self._dismissed = False
 
     def _dismiss_once(self, result) -> None:
@@ -88662,10 +88885,10 @@ class AmpliconSaveModal(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="ampsave-dlg"):
-            yield Static(" Save amplicon to library ", id="ampsave-title")
-            yield Label("Amplicon name:")
+            yield Static(f" {self._title} ", id="ampsave-title")
+            yield Label(f"{self._name_label}:")
             yield Input(value=self._default_name, id="ampsave-name",
-                          placeholder="Amplicon name")
+                          placeholder=self._name_label)
             yield Label("Save to collection:")
             yield Select(
                 [(n, n) for n in self._collections],
@@ -88673,6 +88896,14 @@ class AmpliconSaveModal(ModalScreen):
                 allow_blank=False,
                 id="ampsave-collection",
             )
+            if self._parts_bins is not None:
+                yield Label("Store part in parts bin:")
+                yield Select(
+                    [(n, n) for n in self._parts_bins],
+                    value=self._active_bin,
+                    allow_blank=False,
+                    id="ampsave-bin",
+                )
             yield Static("", id="ampsave-status", markup=True)
             with Horizontal(id="ampsave-btns"):
                 yield Button("Save", id="btn-ampsave-ok", variant="primary")
@@ -88710,7 +88941,19 @@ class AmpliconSaveModal(ModalScreen):
         coll = coll_w.value
         if not isinstance(coll, str) or not coll.strip():
             coll = self._active
-        self._dismiss_once({"name": name, "collection": coll})
+        result = {"name": name, "collection": coll}
+        # Optional parts-bin choice (dual-save). Absent → caller keeps
+        # the active bin.
+        if self._parts_bins is not None:
+            chosen_bin = self._active_bin
+            try:
+                bv = self.query_one("#ampsave-bin", Select).value
+                if isinstance(bv, str) and bv.strip():
+                    chosen_bin = bv
+            except NoMatches:
+                pass
+            result["bin"] = chosen_bin or ""
+        self._dismiss_once(result)
 
     @on(Button.Pressed, "#btn-ampsave-cancel")
     def _cancel_btn(self, _) -> None:
@@ -104069,7 +104312,17 @@ NcbiTaxonPickerModal { align: center middle; }
         Binding("alt+x", "open_named_menu('Experiments')",  "Experiments",   show=False),
         Binding("alt+h", "open_named_menu('History')",      "History",       show=False),
         Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=False),
-        Binding("ctrl+shift+f","capture_to_features", "→ Feat lib", show=False, priority=True),
+        # Capture selection / highlighted feature → feature library.
+        # Moved off Ctrl+Shift+F (2026-06-02, user bug report): a real
+        # terminal can't deliver it. Windows Terminal swallows
+        # Ctrl+Shift+F for its OWN Find pane, so the keystroke never
+        # reaches the app; other terminals collapse Ctrl+Shift+<letter>
+        # to Ctrl+<letter> (here Ctrl+F = find-sequence), the same
+        # ETX-aliasing trap as [PIT-14] (Ctrl+Shift+C ≡ Ctrl+C).
+        # Alt+Shift+C (`ESC C`) decodes cleanly — identical mechanism to
+        # the Alt+Shift+F add-feature binding above — and "C" = Capture.
+        # Windows Terminal leaves Alt+Shift+C alone.
+        Binding("alt+shift+c", "capture_to_features", "→ Feat lib", show=False, priority=True),
         # UI snapshot — capture a Markdown dump to <DATA_DIR>/
         # ui_snapshots/ AND copy to clipboard via the 4-tier
         # fallback. F9 and Ctrl+U cover the cross-platform
@@ -110806,11 +111059,12 @@ NcbiTaxonPickerModal { align: center middle; }
                          severity="information")
 
     def _apply_save_group_as_entry(self, payload: dict) -> None:
-        """Persist the current feature's group as a single
-        group-style library entry via
-        `_save_features_as_group_entry`. The group's member idxs
-        come from `_features_in_group(group_id)`; the entry name
-        comes from the modal's name prompt."""
+        """Persist the edited feature to the feature library. If the
+        feature is in a group, save the whole group as one group-style
+        entry via `_save_features_as_group_entry`; otherwise save it as
+        a plain single-feature entry (the same shape the Alt+Shift+C
+        capture flow stores). The entry name comes from the modal's
+        name prompt."""
         try:
             pm = self.query_one("#plasmid-map", PlasmidMap)
         except NoMatches:
@@ -110821,18 +111075,34 @@ NcbiTaxonPickerModal { align: center middle; }
         gid = str(payload.get("group_id") or "")
         if not gid:
             gid = str(pm._feats[idx].get("feature_group") or "")
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            self.notify("Empty name — save aborted.",
+                          severity="warning")
+            return
+        # Not in a group → persist the single feature as a plain
+        # library entry (the same shape the Alt+Shift+C capture flow
+        # stores), under the user-supplied name. Previously this
+        # dead-ended with "Feature isn't in a group." even though the
+        # button's contract is "save the current feature OR its group"
+        # — so saving a lone feature (e.g. Pei311) was impossible from
+        # the editor (user bug 2026-06-02).
         if not gid:
-            self.notify("Feature isn't in a group.",
-                          severity="information")
+            if self._current_record is None:
+                self.notify("Load a plasmid first.", severity="warning")
+                return
+            entry = self._prefill_from_feature(
+                pm._feats[idx], str(self._current_record.seq),
+            )
+            entry["name"] = name
+            if self._persist_feature_entry(entry):
+                self._notify_success(
+                    f"Saved '{name}' to feature library."
+                )
             return
         member_idxs = self._features_in_group(gid)
         if not member_idxs:
             self.notify("No members found for this group.",
-                          severity="warning")
-            return
-        name = str(payload.get("name") or "").strip()
-        if not name:
-            self.notify("Empty name — save aborted.",
                           severity="warning")
             return
         try:
@@ -112324,7 +112594,8 @@ NcbiTaxonPickerModal { align: center middle; }
             # a direct-open entry that pops the Ctrl+B BLAST modal. The
             # former Edit actions remain on their keyboard shortcuts:
             # Edit Sequence [^E], Undo [^Z] / Redo [^⇧Z], Add Feature
-            # [^F], Capture→feat-lib [^⇧F], Delete Feature [Delete].
+            # [Alt+Shift+F], Capture→feat-lib [Alt+Shift+C], Delete
+            # Feature [Delete].
             # "Enzymes" is a direct-open menubar entry — clicking the
             # menubar item opens `EnzymeCollectionsModal` straight
             # away. The "Enzyme Settings" tab inside the modal hosts
@@ -112722,7 +112993,7 @@ NcbiTaxonPickerModal { align: center middle; }
     @_action_log("app.edit.custom_enzyme_list")
     @_action_log("app.capture.to_features")
     def action_capture_to_features(self) -> None:
-        """Ctrl+Shift+F: grab the drag-selected DNA *or* the highlighted feature
+        """Alt+Shift+C: grab the drag-selected DNA *or* the highlighted feature
         from the main view, open the AddFeatureModal prefilled, and after
         Save transport the user to the FeatureLibraryScreen so they see the
         new entry in context.
@@ -112845,7 +113116,7 @@ NcbiTaxonPickerModal { align: center middle; }
         }
 
     def _capture_feature_result(self, result) -> None:
-        """Callback for the Ctrl+Shift+F capture flow. On Save, persist and push
+        """Callback for the Alt+Shift+C capture flow. On Save, persist and push
         FeatureLibraryScreen. Insert is unreachable (have_cursor=False)."""
         if not result:
             return

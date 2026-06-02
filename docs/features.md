@@ -62,7 +62,12 @@ What you can do without leaving the terminal.
 - **Domesticator** — 4-source part picker (current map, library,
   Parts Bin, FASTA file). Auto-scrubs forbidden Type IIS sites in the
   CDS body via codon swap with cascade-prevention; primer tails follow
-  the active grammar's pad / site / spacer / overhang.
+  the active grammar's pad / site / spacer / overhang. On save, one
+  dialog names the cloned plasmid + picks its collection + the parts
+  bin (independently of the linear synthesis fragment); the cloned
+  plasmid is mirrored to the library carrying its domestication primers
+  as `primer_bind` features (bound anneal+overhang vs unbound enzyme
+  tail), routed through the shared `_commit_library_entry_to_collection`.
 - **Parts Bin** — domesticated parts catalog with per-grammar filtering;
   legacy parts default to GB L0; "Copy primed sequence" preserves the
   part's stored grammar. **Load Part** auto-classifies the currently-
@@ -254,7 +259,7 @@ and folder-import all accept the same set.
   mitochondrial targeting sequence, common tags, phosphorylation
   sites). Surfaced in the Synthesis protein composer as you type,
   and in the AA lane on the main sequence panel under loaded CDSs.
-- **User-overrides** — add (**New…**), edit, and remove (**Delete**)
+- **User-overrides** — add (**New**), edit, and remove (**Delete**)
   motifs persistently from the Synthesis protein tab's motif pane;
   overrides round-trip through `protein_motifs.json` with the same
   atomic-save + backup discipline as every other persisted file.
