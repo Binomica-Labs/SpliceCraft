@@ -16,7 +16,9 @@ ordering, same abort-on-failure semantics:
   5. Bundles ALL accumulated working-tree changes (version bump +
      anything else the user has iterated on since the last release)
      into a single ``Release v<version>`` commit, tags v<version>,
-     and pushes.
+     and pushes — then creates a GitHub Release for the tag (changelog
+     section as the body + the built wheel/sdist as assets; optional +
+     non-fatal, skipped cleanly when `gh` is absent/unauthed).
   6. GitHub Actions (publish.yml) builds + uploads to PyPI from the tag.
   7. Polls PyPI until the sdist is hosted, then forks
      bioconda-recipes (if needed) and opens a PR with the recipe
@@ -905,6 +907,64 @@ def _current_version() -> str:
     return m.group(1)
 
 
+def _create_github_release(version: str) -> None:
+    """Create a GitHub Release for ``v<version>`` — the matching
+    ``CHANGELOG.md`` section as the body, plus the built wheel + sdist
+    from ``dist/`` as downloadable assets.
+
+    Optional + NON-FATAL: the tag is already pushed and PyPI is already
+    publishing by the time we get here, so a Release is a nice-to-have
+    on top. Skips with a printed note (never aborts) when ``gh`` is
+    missing / unauthenticated, or when the Release already exists — so a
+    box without GitHub CLI still ships to PyPI exactly as before.
+
+    One Release per version tag is the intended GitHub workflow (it
+    surfaces the changelog on the Releases page + notifies watchers);
+    this just stops them being created by hand.
+    """
+    import shutil
+    tag = f"v{version}"
+    if shutil.which("gh") is None:
+        print(f"  gh CLI not found — skipping GitHub Release for {tag} "
+              f"(create later with: gh release create {tag}).")
+        return
+    if subprocess.run(["gh", "auth", "status"],
+                      capture_output=True, text=True).returncode != 0:
+        print(f"  gh not authenticated — skipping GitHub Release for {tag}.")
+        return
+    # Idempotent: a re-run (or a hand-made Release) is left untouched
+    # rather than erroring out the already-completed release.
+    if subprocess.run(["gh", "release", "view", tag],
+                      capture_output=True, text=True).returncode == 0:
+        print(f"  GitHub Release {tag} already exists — leaving it.")
+        return
+    # Body = the `## [<version>]` changelog section, minus a trailing
+    # `---` separator so the Release doesn't end on a stray rule.
+    notes = re.sub(r"\n*-{3,}\s*$", "",
+                   _changelog_section_body(version).strip()).strip()
+    if not notes:
+        notes = f"SpliceCraft {tag}."
+    dist = REPO_ROOT / "dist"
+    assets = (sorted(str(p) for p in dist.iterdir() if p.is_file())
+              if dist.is_dir() else [])
+    result = subprocess.run(
+        ["gh", "release", "create", tag,
+         "--title", f"SpliceCraft {tag}",
+         "--notes", notes, "--latest", *assets],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        url = (result.stdout.strip().splitlines() or [""])[-1].strip()
+        print(f"  GitHub Release {tag} created"
+              + (f" (+{len(assets)} asset(s))" if assets else "")
+              + (f": {url}" if url else "."))
+    else:
+        print("  GitHub Release create failed (non-fatal — the tag is "
+              f"pushed + PyPI is publishing): "
+              f"{result.stderr.strip() or result.returncode}")
+        print(f"  Create it later with: gh release create {tag} …")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Cut a new SpliceCraft release.",
@@ -1012,12 +1072,19 @@ def main(argv: list[str] | None = None) -> int:
     _run(["git", "push", "origin", "master"])
     _run(["git", "push", "origin", f"v{new_version}"])
 
+    # One GitHub Release per version tag (changelog notes + dist assets).
+    # Optional + non-fatal — see `_create_github_release`.
+    _heading("Creating GitHub Release")
+    _create_github_release(new_version)
+
     print()
     print("═" * 61)
     print(f" Release v{new_version} pushed.")
     print(" GitHub Actions will publish to PyPI in ~2 minutes.")
-    print(" Watch:  https://github.com/Binomica-Labs/SpliceCraft/actions")
-    print(" Verify: https://pypi.org/project/splicecraft/")
+    print(" Watch:   https://github.com/Binomica-Labs/SpliceCraft/actions")
+    print(" Verify:  https://pypi.org/project/splicecraft/")
+    print(f" Release: https://github.com/Binomica-Labs/SpliceCraft/"
+          f"releases/tag/v{new_version}")
     print(" (Bioconda PR step skipped — run `./release.py "
           "--bioconda-only` to re-submit the recipe manually.)")
     print("═" * 61)

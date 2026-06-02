@@ -1564,11 +1564,13 @@ class TestAddFeatureModal:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestAddFeatureSelectionPrefill:
-    """Ctrl+F (`action_add_feature`) checks the seq panel for an
+    """Alt+Shift+F (`action_add_feature`) checks the seq panel for an
     active multi-bp selection and pre-fills the modal's Sequence body
     with those bases verbatim. Saves the typical "select region →
     Ctrl+C → paste into modal" round-trip when adding a feature for
-    a region the user just highlighted.
+    a region the user just highlighted. (Add-feature moved off Ctrl+F
+    — now Find-sequence — to Alt+Shift+F on 2026-06-01; not Alt+F,
+    which terminals send as a cursor-motion code.)
 
     Selection sources covered: drag/Shift-click (`_user_sel`) and
     feature picks (`_sel_range`). Single-bp selections are NOT

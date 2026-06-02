@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.12"
+__version__ = "1.0.13"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -15177,6 +15177,123 @@ def _normalize_dna_for_align(seq: str) -> str:
     return s
 
 
+# Hard cap on hits returned by `_search_subsequence` — a degenerate
+# query (all-`N`, or a high mismatch budget) on a large plasmid could
+# otherwise match nearly every position. The scan stops once the cap is
+# reached; the Ctrl+F handler surfaces "first N" when it bites.
+_SEQ_SEARCH_MAX_HITS = 10_000
+
+
+def _search_subsequence(
+    seq: str,
+    query: str,
+    *,
+    max_mismatches: int = 0,
+    circular: bool = False,
+    both_strands: bool = True,
+    max_hits: int = _SEQ_SEARCH_MAX_HITS,
+) -> "list[dict]":
+    """Find every position where ``query`` occurs in ``seq`` within
+    ``max_mismatches`` substitutions (Hamming distance — NO indels).
+
+    IUPAC-aware: each base pair is compared with `_iupac_compatible`, so
+    an ``N`` (or any ambiguity code) in either the query or the template
+    matches every base it admits. Both inputs are scrubbed + validated
+    through `_normalize_dna_for_align` (uppercase, ``U``→``T``, FASTA /
+    whitespace / digits stripped); a foreign character propagates its
+    ``ValueError`` so the caller can show the offending char.
+
+    Returns hits sorted by start (then ``+`` before ``-``, then fewest
+    mismatches), each::
+
+        {"start": int, "end": int, "strand": "+"|"-", "mismatches": int}
+
+    Coordinates are FORWARD (top-strand) for BOTH strands: a ``-`` hit at
+    ``[start, end)`` means the query's reverse-complement sits on the top
+    strand there (the query anneals to the BOTTOM strand across that
+    span) — the same forward-coordinate convention the restriction scan
+    uses for bottom-strand cuts (sacred invariant #2). ``start`` is always
+    in ``[0, len(seq))``; ``end`` can exceed ``len(seq)`` for a hit that
+    wraps the origin (circular only).
+
+    circular: also find matches spanning the origin (scans
+              ``seq + seq[:m-1]``). Leave False for a linear record.
+    both_strands: also search the reverse-complement of the query, so a
+                  motif is found on either strand (handy for annotating
+                  inverted / direct repeats). A hit that lands on the same
+                  span on both strands collapses to one ``+`` entry.
+    max_hits: hard cap; the scan stops once reached. The caller should
+              surface truncation when ``len(result) == max_hits``.
+
+    Empty query, query longer than the sequence, or
+    ``max_mismatches < 0`` → ``[]``.
+    """
+    if max_mismatches < 0:
+        return []
+    # Scrub + validate (may raise ValueError on a foreign char — let it
+    # propagate; the modal turns it into a status-line message).
+    s = _normalize_dna_for_align(seq or "")
+    q = _normalize_dna_for_align(query or "")
+    n = len(s)
+    m = len(q)
+    if m == 0 or n == 0 or m > n:
+        return []
+    # k >= m makes every window a "match"; clamp so the budget is
+    # meaningful and the early-exit still bounds work.
+    k = min(int(max_mismatches), m)
+    iupac_ok = _iupac_compatible
+
+    def _scan(pattern: str, strand: str, out: "list[dict]") -> None:
+        # Origin-wrapping windows for circular records: a start at p in
+        # [0, n) covers [p, p+m), reading across the origin via the
+        # appended head. Linear records stop at n-m.
+        scan_text = (s + s[: m - 1]) if circular else s
+        last_start = (n - 1) if circular else (n - m)
+        for p in range(0, last_start + 1):
+            mm = 0
+            ok = True
+            for i in range(m):
+                if not iupac_ok(pattern[i], scan_text[p + i]):
+                    mm += 1
+                    if mm > k:
+                        ok = False
+                        break
+            if ok:
+                out.append({
+                    "start": p,
+                    "end": p + m,
+                    "strand": strand,
+                    "mismatches": mm,
+                })
+                if len(out) >= max_hits:
+                    return
+
+    hits: "list[dict]" = []
+    _scan(q, "+", hits)
+    if both_strands and len(hits) < max_hits:
+        rc = _rc(q)
+        # A fully palindromic query (rc == q) would duplicate every
+        # forward hit on the reverse pass — skip it.
+        if rc != q:
+            _scan(rc, "-", hits)
+
+    # De-dup: a '+' and '-' hit on the SAME span (semi-palindromic
+    # window) collapse to the '+' entry so find-next doesn't visit the
+    # same bp twice.
+    seen: "dict[tuple, dict]" = {}
+    for h in hits:
+        key = (h["start"], h["end"])
+        prev = seen.get(key)
+        if prev is None or (prev["strand"] == "-" and h["strand"] == "+"):
+            seen[key] = h
+    deduped = list(seen.values())
+    deduped.sort(
+        key=lambda h: (h["start"], 0 if h["strand"] == "+" else 1,
+                       h["mismatches"]),
+    )
+    return deduped[:max_hits]
+
+
 # ── edlib fast-aligner engine (optional) ───────────────────────────────────────
 #
 # edlib is a bit-parallel (Myers) edit-distance aligner — ~90–600× faster
@@ -17858,6 +17975,23 @@ class PlasmidMap(Widget):
             self.shift     = bool(shift)
             super().__init__()
 
+    class AlignmentLaneClicked(Message):
+        """Emitted when the user clicks an alignment row on the linear
+        map. Pre-2026-06-01 an alignment click pushed the full
+        `AlignmentScreen` detail modal; the user asked for the click to
+        instead jump the sequence panel to the clicked region (centered
+        + highlighted) so misaligned bases / regions to re-edit are one
+        click away. Carries the alignment index plus the half-open
+        ``[bp_lo, bp_hi)`` canvas-bp span the clicked column covers
+        (one bp in letter mode, a chunk in bar mode). The full detail
+        view stays reachable from the Alignment Manager (Alt+L → Enter).
+        Handled by `PlasmidApp._map_alignment_lane_clicked`."""
+        def __init__(self, ai: int, bp_lo: int, bp_hi: int):
+            self.ai    = int(ai)
+            self.bp_lo = int(bp_lo)
+            self.bp_hi = int(bp_hi)
+            super().__init__()
+
     class OriginChanged(Message):
         """Emitted whenever `origin_bp` changes (rotation, reset, or
         Alt+O set-origin-to-feature). The App listens and cascades the
@@ -18640,6 +18774,54 @@ class PlasmidMap(Widget):
                                 int(self._linear_offset_bp)))
         return (offset, offset + visible)
 
+    def _linear_x_to_bp(self, x: int) -> int:
+        """Map a linear-view terminal column `x` to the absolute bp it
+        points at, clamped to the visible half-open range. Returns -1
+        outside the usable band (left/right margins) or for an empty
+        record. This is the inverse of the `bp_to_col` closure in
+        `_draw_linear_flag` — shared by `_feat_at_linear` (feature
+        picks) and `_linear_click_bp_span` (alignment-lane navigation)
+        so a click resolves to the SAME bp whichever lane it lands on.
+        Linear-mode only — the formula is meaningless in circular view
+        (and `_align_at_click` already gates clicks there), so guard it
+        here too to keep the helper self-contained.
+        """
+        if self._map_mode != "linear" or not self._total:
+            return -1
+        w        = self.size.width
+        margin_l = self._LINEAR_MARGIN_L
+        margin_r = self._LINEAR_MARGIN_R
+        usable_w = w - margin_l - margin_r
+        if x < margin_l or x >= w - margin_r or usable_w <= 0:
+            return -1
+        view_s, view_e = self._linear_view_range()
+        visible_bp     = max(1, view_e - view_s)
+        bp = view_s + int((x - margin_l) / usable_w * visible_bp)
+        return max(view_s, min(view_e - 1, bp))
+
+    def _linear_click_bp_span(self, x: int) -> "tuple[int, int]":
+        """Half-open ``[bp_lo, bp_hi)`` span the linear-view column at
+        `x` covers. In letter mode (≥1 col/bp) that's a single bp; in
+        bar mode (many bp/col, zoomed out) it's the whole chunk the
+        column paints — clicking a zoomed-out alignment mismatch fleck
+        then selects + centers the entire bp range it represents, so
+        the user can drill in to the offending base(s). Returns
+        ``(-1, -1)`` outside the usable band / empty record."""
+        lo = self._linear_x_to_bp(x)
+        if lo < 0:
+            return -1, -1
+        view_s, view_e = self._linear_view_range()
+        # Upper bound = where the NEXT column starts, so a wide bar-mode
+        # column yields its full bp chunk; clamp to the view end and
+        # guarantee a non-empty span.
+        w        = self.size.width
+        margin_l = self._LINEAR_MARGIN_L
+        usable_w = w - margin_l - self._LINEAR_MARGIN_R
+        visible_bp = max(1, view_e - view_s)
+        hi = view_s + int((x - margin_l + 1) / max(1, usable_w) * visible_bp)
+        hi = max(lo + 1, min(view_e, hi))
+        return lo, hi
+
     def _linear_scrollbar_geom(
         self, w: int, h: int,
     ) -> "tuple[int, int, int, int, int] | None":
@@ -19025,67 +19207,35 @@ class PlasmidMap(Widget):
                 return
             # Alignment lane hit-test runs BEFORE the feature lookup —
             # alignment rows sit in their own band below the rev features
-            # and a click should open the alignment (AlignmentScreen
-            # drill-in), not select whatever feature happens to share
-            # the column. Bbox list is repopulated by
-            # `_draw_alignment_band` every render so it always reflects
-            # the current view.
+            # and a click on one jumps the sequence panel to the clicked
+            # region (centered + highlighted) rather than selecting
+            # whatever feature happens to share the column. Bbox list is
+            # repopulated by `_draw_alignment_band` every render so it
+            # always reflects the current view.
             ai = self._align_at_click(event.x, event.y)
             if ai >= 0:
-                try:
-                    align = self._alignments[ai]
-                except (IndexError, KeyError):
-                    return
-                self._selected_align_idx = ai
-                self.refresh()
-                # Defensive None-guard: AlignmentScreen._body_text
-                # dereferences `target_record.seq` and `.features`, so
-                # a malformed entry would crash the modal push. Workers
-                # currently never produce a None target_record, but if
-                # the schema ever drifts (e.g., persistence path that
-                # loses the record), surface a notify instead.
-                target_record = align.get("target_record")
-                result = align.get("result") or {}
-                if target_record is None or not result:
-                    try:
-                        self.app.notify(
-                            "Alignment entry is incomplete — can't open "
-                            "detail view. Re-run the alignment.",
-                            severity="warning", timeout=4,
-                        )
-                    except Exception:
-                        pass
-                    return
-                # Drop the lane highlight when the detail view closes:
-                # `style="reverse"` on the bar's "█" glyph inverts fg/bg,
-                # which on a dark terminal renders the selected bars as
-                # the default foreground colour (gray-ish) instead of
-                # the original blue/red/gray scheme. Without this hook
-                # the selection persists across the modal dismiss and
-                # the user comes back to all-gray bars (regression
-                # report 2026-05-22). Guard on the captured `ai` so a
-                # mid-modal click on a different lane (impossible right
-                # now since the modal covers the map, but cheap to be
-                # defensive) doesn't get its fresh selection wiped.
-                def _clear_align_selection(
-                    _result=None, _selected_ai=ai,
-                ):
-                    if self._selected_align_idx == _selected_ai:
-                        self._selected_align_idx = -1
-                        self.refresh()
-                try:
-                    self.app.push_screen(
-                        AlignmentScreen(
-                            query_label=align.get("query_label", "query"),
-                            target_label=align.get("target_label", "target"),
-                            target_record=target_record,
-                            result=result,
-                        ),
-                        callback=_clear_align_selection,
+                # User request 2026-06-01: an alignment-lane click no
+                # longer opens the AlignmentScreen detail modal — it
+                # navigates the sequence panel to the clicked region so
+                # misaligned / to-be-re-edited bases are one click away.
+                # The full pairwise-alignment detail view stays reachable
+                # from the Alignment Manager (Alt+L → Enter on the row).
+                # We post the canvas-bp span the clicked column covers
+                # and let the App drive the seq panel (it owns the panel
+                # + the highlight-clearing source of truth). Deliberately
+                # NOT setting `_selected_align_idx` here: the reverse-
+                # video lane highlight it triggers reads as gray bars on
+                # dark terminals (2026-05-22 regression), and with no
+                # modal to close there's nothing to clear it — the seq
+                # panel's own selection is the "you clicked here" cue.
+                bp_lo, bp_hi = self._linear_click_bp_span(event.x)
+                if bp_lo >= 0:
+                    _log_event(
+                        "map.align_click", ai=ai, x=event.x, y=event.y,
+                        bp_lo=bp_lo, bp_hi=bp_hi,
                     )
-                except Exception:
-                    _log.exception(
-                        "alignment lane click: push_screen failed"
+                    self.post_message(
+                        self.AlignmentLaneClicked(ai, bp_lo, bp_hi)
                     )
                 return
             idx, bp = self._feat_at_linear(event.x, event.y)
@@ -19576,10 +19726,9 @@ class PlasmidMap(Widget):
         # are handled above by `_label_at`.
         if y not in (backbone_row - 1, backbone_row, backbone_row + 1):
             return -1, -1
-        view_s, view_e = self._linear_view_range()
-        visible_bp     = max(1, view_e - view_s)
-        bp = view_s + int((x - margin_l) / max(1, usable_w) * visible_bp)
-        bp = max(view_s, min(view_e - 1, bp))
+        bp = self._linear_x_to_bp(x)
+        if bp < 0:
+            return -1, -1
         # Smallest-enclosing wins on nested features (matches the
         # circular path + sequence-panel fallback). No strand gating
         # here because the new layout puts both strands on the same
@@ -20243,7 +20392,8 @@ class PlasmidMap(Widget):
                 for i, ch in enumerate(ind):
                     canvas.put(ind_col + i, row, ch, style)
 
-            # Click bbox for drill-in to AlignmentScreen.
+            # Click bbox — a click here jumps the seq panel to the
+            # clicked region (PlasmidMap.on_click → AlignmentLaneClicked).
             self._align_bboxes.append((
                 cx0_align, max(cx0_align, cx1_align - 1), row, ai,
             ))
@@ -23539,7 +23689,8 @@ class SequencePanel(Widget):
                   for native text-selection (xterm, macOS Terminal,
                   GNOME Terminal) will eat the click before the app
                   sees it. Use Ctrl+click if Shift seems ignored.
-    Ctrl+E                → open insert/replace dialog at cursor / selection.
+    Ctrl+E                → open the edit dialog (insert left/right,
+                            replace, delete) at the cursor / selection.
     Alt+D                 → toggle hover-status debug mode.
     Alt+M                 → toggle click-modifier echo debug.
     H (debug only)        → copy hover-status text to clipboard.
@@ -24370,6 +24521,52 @@ class SequencePanel(Widget):
         if scroll:
             self._ensure_cursor_visible()
         self._refresh_view()
+
+    def focus_span(self, start: int, end: int, *, center: bool = True,
+                   select: bool = True) -> None:
+        """Park the cursor at `start` and bring the half-open span
+        ``[start, end)`` into view — the shared "go to this bp" primitive
+        for alignment-lane clicks, sequence search, and the verification-
+        report jump (closing the "No public jump-to-bp helper" gap flagged
+        in `_jump_to_library_entry_at_pos`).
+
+        select: when True AND the span is more than one bp, mark it as a
+                copyable ``_user_sel`` selection — so Ctrl+C copies it and
+                Alt+Shift+F annotates it base-perfect (the find-a-repeat →
+                annotate → find-next workflow). A single-bp span just
+                parks the cursor (mirrors `action_add_feature`'s span > 1
+                gate, so a 1-bp "selection" never masquerades as a region).
+        center: True vertically centers the span via `center_on_bp`
+                (deliberate jumps shouldn't make the user hunt); False
+                scrolls the minimum to reveal it (`_ensure_cursor_visible`).
+
+        Out-of-range / inverted inputs are clamped into the sequence;
+        an empty record is a no-op.
+        """
+        if not self._seq:
+            return
+        n = len(self._seq)
+        start = max(0, min(int(start), n - 1))
+        end   = max(start + 1, min(int(end), n))
+        self._re_highlight = None
+        if select and (end - start) > 1:
+            self._user_sel   = (start, end)
+            self._sel_range  = None
+            self._sel_anchor = start
+        else:
+            self._user_sel   = None
+            self._sel_range  = None
+            self._sel_anchor = -1
+        self._cursor_pos = start
+        # center_on_bp defers its scroll via call_after_refresh, so it
+        # composes with the refresh either way; _ensure_cursor_visible
+        # wants the scroll BEFORE the refresh (see its docstring).
+        if center:
+            self._refresh_view()
+            self.center_on_bp(start)
+        else:
+            self._ensure_cursor_visible()
+            self._refresh_view()
 
     # ── Mouse / click ──────────────────────────────────────────────────────────
 
@@ -25730,25 +25927,37 @@ class SequencePanel(Widget):
 # ── Sequence edit dialog ───────────────────────────────────────────────────────
 
 class EditSeqDialog(ModalScreen):
-    """Unified sequence-edit modal — insert, replace, delete, or copy.
+    """Unified sequence-edit modal — insert (left/right), replace, or
+    delete.
 
     Sweep #39 (2026-05-27): refactored from a single-mode dialog into
     a context-aware operations modal. User picks the mode in-modal
     via a RadioSet; the caller seeds the initial mode based on
     whether a selection or cursor is present.
 
-    Modes (canonical names = `_mode`):
-      * ``"insert"`` — insert ``new_seq`` at position ``start``;
-        ``end`` is unused (preserves any selection around the
-        insertion point).
+    Modes (internal ``_mode`` names) — user request 2026-06-01 split
+    Insert into LEFT / RIGHT and prefilled the textbox with the region.
+    Ctrl+E (`action_edit_seq`) opens with a NON-destructive default —
+    Replace for a selection, Insert-left for a bare cursor (never Delete,
+    a hand-slip risk); the Delete KEY with no feature selected opens this
+    same dialog forced to Delete mode (`_open_seq_edit_dialog`):
+      * ``"insert_left"`` — insert ``new_seq`` at ``start`` (before the
+        region / cursor bp). Dismisses as ``(new_seq, "insert", start,
+        start)``.
+      * ``"insert_right"`` — insert ``new_seq`` at ``end`` (after the
+        region / cursor bp). Dismisses as ``(new_seq, "insert", end,
+        end)``. A bare cursor opens as a 1-bp region ``[pos, pos+1)`` so
+        left vs right is meaningful.
       * ``"replace"`` — replace ``seq[start:end]`` with ``new_seq``.
       * ``"delete"`` — drop ``seq[start:end]``. Returned as
         ``("", "replace", start, end)`` so the existing dispatch
         in ``_edit_dialog_result`` handles it as a replace-with-
-        empty without needing to know about the new mode name.
-      * ``"copy"`` — copy ``seq[start:end]`` to the OS clipboard.
-        The modal performs the copy itself and dismisses with
-        ``None`` (no canvas mutation, no caller dispatch).
+        empty. ``"insert"`` is kept as a back-compat alias → insert_left.
+        (Copy was dropped 2026-06-01 — five radios overflowed the dialog
+        and the seq panel's Ctrl+C already copies a selection.)
+
+    A colour-coded live WARNING line ("You are about to <action> <N> bp
+    <position>") tracks the focused mode + textbox as the user types.
 
     Input handling:
       * ``TextArea`` instead of ``Input`` — multi-line, so paste
@@ -25761,21 +25970,34 @@ class EditSeqDialog(ModalScreen):
       * Validates the cleaned string against IUPAC alphabet.
 
     Returns via dismiss:
-      * insert / replace: ``(new_seq, "insert"|"replace", start, end)``
-      * delete: ``("", "replace", start, end)``
-      * copy or cancel: ``None``
+      * insert_left:  ``(new_seq, "insert", start, start)``
+      * insert_right: ``(new_seq, "insert", end, end)``
+      * replace:      ``(new_seq, "replace", start, end)``
+      * delete:       ``("", "replace", start, end)``
+      * cancel:       ``None``
     """
 
     _blocks_undo: bool = True   # sweep #10: app-level Ctrl+Z would race the insert
 
     _VALID = frozenset("ATCGNRYSWKMBDHV")   # IUPAC DNA codes
-    _MODE_INSERT  = "insert"
+    # Insert is split into LEFT (insert before the region / cursor bp)
+    # and RIGHT (insert after it) — user request 2026-06-01. The bare
+    # ``"insert"`` name is kept as a back-compat alias that ``__init__``
+    # maps to insert-left (old callers + boundary tests pass "insert").
+    _MODE_INSERT_LEFT  = "insert_left"
+    _MODE_INSERT_RIGHT = "insert_right"
+    _MODE_INSERT       = "insert"          # legacy alias → insert_left
     _MODE_REPLACE = "replace"
     _MODE_DELETE  = "delete"
-    _MODE_COPY    = "copy"
-    _MODES        = (_MODE_INSERT, _MODE_REPLACE, _MODE_DELETE, _MODE_COPY)
-    _MODES_NEEDING_INPUT = (_MODE_INSERT, _MODE_REPLACE)
-    _MODES_NEEDING_REGION = (_MODE_REPLACE, _MODE_DELETE, _MODE_COPY)
+    # Copy was dropped 2026-06-01 — five horizontal radios overflowed the
+    # dialog (user: "ui crowded and lil messy"), and copy is redundant
+    # with the seq panel's Ctrl+C. The four real edit ops fit cleanly.
+    _MODES        = (_MODE_INSERT_LEFT, _MODE_INSERT_RIGHT,
+                     _MODE_REPLACE, _MODE_DELETE)
+    _INSERT_MODES = (_MODE_INSERT_LEFT, _MODE_INSERT_RIGHT)
+    _MODES_NEEDING_INPUT = (_MODE_INSERT_LEFT, _MODE_INSERT_RIGHT,
+                            _MODE_REPLACE)
+    _MODES_NEEDING_REGION = (_MODE_REPLACE, _MODE_DELETE)
     # Sweep #39 hardening (2026-05-27): cap pasted input at 200 kbp
     # (matches `_MAX_FEATURE_SEQ_LEN` precedent — anything longer
     # belongs as a record in the plasmid library, not as a one-shot
@@ -25785,6 +26007,14 @@ class EditSeqDialog(ModalScreen):
     # pastes (headers + whitespace) get their real bp count
     # measured.
     _MAX_INPUT_BP = 200_000
+    # Cap on how many bp we prefill into the textbox (2026-06-01). A
+    # huge selection (e.g. the whole plasmid → Ctrl+E) would be slow to
+    # render in the TextArea AND — for Replace, whose submit reads the
+    # textbox — a truncated prefill would silently commit truncated
+    # bases. Above the cap the box opens EMPTY: the context line + the
+    # warning still convey the region size, and Delete / Copy act on the
+    # region itself (never the textbox), so nothing is lost.
+    _PREFILL_MAX_BP = 20_000
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -25794,7 +26024,7 @@ class EditSeqDialog(ModalScreen):
 
     DEFAULT_CSS = """
     #edit-dlg {
-        width: 90; max-width: 96%; height: auto;
+        width: 84; max-width: 96%; min-width: 76; height: auto;
         background: $surface; border: round $primary;
         padding: 1 2;
     }
@@ -25810,7 +26040,6 @@ class EditSeqDialog(ModalScreen):
         height: 3; margin: 1 0 0 0;
         align: left middle;
     }
-    #edit-mode-row Label { width: 8; padding: 0 1 0 0; }
     #edit-mode-row RadioSet {
         layout: horizontal; height: 3; width: 1fr;
         border: none; padding: 0;
@@ -25838,13 +26067,16 @@ class EditSeqDialog(ModalScreen):
                  start: int = 0, end: int = 0,
                  total: "int | None" = None):
         super().__init__()
+        # Legacy "insert" alias → insert-left.
+        if mode == self._MODE_INSERT:
+            mode = self._MODE_INSERT_LEFT
         if mode not in self._MODES:
-            mode = self._MODE_INSERT
+            mode = self._MODE_INSERT_LEFT
         # If the caller picked a region-required mode but didn't
-        # actually supply a region, demote to insert so the modal
+        # actually supply a region, demote to insert-left so the modal
         # doesn't open in a state that can't be confirmed.
         if mode in self._MODES_NEEDING_REGION and end <= start:
-            mode = self._MODE_INSERT
+            mode = self._MODE_INSERT_LEFT
         self._mode       = mode
         self._existing   = existing
         self._start      = start
@@ -25869,11 +26101,14 @@ class EditSeqDialog(ModalScreen):
             yield Static(self._build_context_line(), id="edit-context",
                           markup=True)
             with Horizontal(id="edit-mode-row"):
-                yield Label("Mode:")
                 with RadioSet(id="edit-mode"):
                     yield RadioButton(
-                        "Insert", id="edit-mode-insert",
-                        value=(self._mode == self._MODE_INSERT),
+                        "Insert left", id="edit-mode-insert_left",
+                        value=(self._mode == self._MODE_INSERT_LEFT),
+                    )
+                    yield RadioButton(
+                        "Insert right", id="edit-mode-insert_right",
+                        value=(self._mode == self._MODE_INSERT_RIGHT),
                     )
                     yield RadioButton(
                         "Replace", id="edit-mode-replace",
@@ -25882,10 +26117,6 @@ class EditSeqDialog(ModalScreen):
                     yield RadioButton(
                         "Delete", id="edit-mode-delete",
                         value=(self._mode == self._MODE_DELETE),
-                    )
-                    yield RadioButton(
-                        "Copy", id="edit-mode-copy",
-                        value=(self._mode == self._MODE_COPY),
                     )
             yield Static(self._build_preview_line(), id="edit-preview",
                           markup=True)
@@ -25911,10 +26142,34 @@ class EditSeqDialog(ModalScreen):
                     "Cancel  [Esc]", id="btn-cancel",
                 )
 
+    def _prefill_text(self) -> str:
+        """Bases to seed the textbox with — the region's existing bases,
+        but only when small enough that rendering is snappy AND (for
+        Replace, whose submit reads the box) it round-trips losslessly.
+        A larger region yields ``""`` (see ``_PREFILL_MAX_BP``)."""
+        return (self._existing
+                if len(self._existing) <= self._PREFILL_MAX_BP else "")
+
     def on_mount(self) -> None:
+        # Prefill the textbox with the region's existing bases so the
+        # user sees exactly what's selected / under the cursor. For
+        # delete / copy it's a read-only preview of what's affected; for
+        # insert / replace it's an editable starting point. Capped — a
+        # very large selection opens with an empty box (see
+        # `_prefill_text`).
+        try:
+            # Insert modes open with an EMPTY box (you're typing NEW
+            # bases — a prefilled region would insert a duplicate);
+            # replace / delete / copy prefill with the region.
+            self.query_one("#edit-input-area", TextArea).text = (
+                "" if self._mode in self._INSERT_MODES
+                else self._prefill_text())
+        except NoMatches:
+            pass
         self._apply_mode_visibility()
-        # Focus the input for Insert/Replace; focus OK for the no-
-        # input modes so a single Enter confirms.
+        # Focus the input for Insert/Replace; focus OK for the no-input
+        # modes (Delete is the default on open — a single Enter confirms
+        # the prefilled deletion).
         try:
             if self._mode in self._MODES_NEEDING_INPUT:
                 self.query_one("#edit-input-area", TextArea).focus()
@@ -25922,6 +26177,28 @@ class EditSeqDialog(ModalScreen):
                 self.query_one("#btn-ok", Button).focus()
         except NoMatches:
             pass
+        # Sync the RadioSet's keyboard-highlight cursor onto the CHECKED
+        # button. Textual's `RadioSet._on_mount` runs `action_next_button`
+        # which highlights index 0 regardless of which radio is
+        # `value=True` — so a non-first default (Replace, or Delete via
+        # the Delete key) leaves the "-selected" highlight box on Insert
+        # left while a different radio is filled (user report 2026-06-01:
+        # "the delete radio is selected but the first radio is
+        # highlighted"). Deferred so it runs AFTER RadioSet._on_mount.
+        def _sync_radio_highlight() -> None:
+            try:
+                rs = self.query_one("#edit-mode", RadioSet)
+                idx = rs.pressed_index
+                if idx >= 0:
+                    rs._selected = idx
+            except Exception:
+                # `_selected` is private — if a future Textual drops it,
+                # the highlight just stays put (purely cosmetic).
+                _log.debug(
+                    "EditSeqDialog: radio highlight sync skipped",
+                    exc_info=True,
+                )
+        self.call_after_refresh(_sync_radio_highlight)
 
     # ── Mode + preview state ───────────────────────────────────────────────────
 
@@ -25946,61 +26223,68 @@ class EditSeqDialog(ModalScreen):
         )
 
     def _build_preview_line(self) -> str:
-        """Sub-line under the mode selector describing the imminent
-        action with concrete bp counts. Updates whenever the mode
-        changes or the textarea contents change."""
-        cleaned = self._sanitize_pasted_sequence(
-            self._current_input_text()
+        """The live WARNING line: "You are about to <action> <N> bp
+        <position>", with the action verb, the bp count, and the
+        position phrase colour-coded by action (green insert / red
+        delete / yellow replace / cyan copy). Rebuilt whenever the mode
+        changes or the textarea contents change (user spec 2026-06-01).
+
+        ``#bp`` is the bases the action WRITES for the input modes
+        (insert / replace — so it updates live as the user types) and
+        the region size for delete / copy.
+        """
+        n = len(self._sanitize_pasted_sequence(self._current_input_text()))
+        region = self._end - self._start
+        if self._mode == self._MODE_INSERT_LEFT:
+            verb, count, where, color = (
+                "insert", n, "to the left of cursor", "green")
+        elif self._mode == self._MODE_INSERT_RIGHT:
+            verb, count, where, color = (
+                "insert", n, "to the right of cursor", "green")
+        elif self._mode == self._MODE_REPLACE:
+            if not self._has_region:
+                return ("[yellow]Replace needs a selection — switch to "
+                        "an Insert mode or pick bases first.[/]")
+            verb, count, where, color = "replace", n, "at cursor", "yellow"
+        elif self._mode == self._MODE_DELETE:
+            if not self._has_region:
+                return ("[yellow]Delete needs a selection — pick "
+                        "bases first.[/]")
+            verb, count, where, color = "delete", region, "at cursor", "red"
+        else:
+            return ""
+        # Colour-coded action verb + bp count + position phrase.
+        return (
+            f"You are about to [b {color}]{verb}[/] "
+            f"[b {color}]{count:,} bp[/] [{color}]{where}[/]"
         )
-        n = len(cleaned)
-        if self._mode == self._MODE_INSERT:
-            return (
-                f"→ Insert [b]{n:,} bp[/] at position "
-                f"{self._start + 1:,}"
-            )
-        if self._mode == self._MODE_REPLACE:
-            if not self._has_region:
-                return (
-                    "[yellow]Replace needs a selection — "
-                    "switch to Insert or pick bases first.[/]"
-                )
-            return (
-                f"→ Replace [b]{self._end - self._start:,} bp[/] "
-                f"({self._start + 1:,}‥{self._end:,}) with "
-                f"[b]{n:,} bp[/]"
-            )
-        if self._mode == self._MODE_DELETE:
-            if not self._has_region:
-                return (
-                    "[yellow]Delete needs a selection — "
-                    "pick bases first.[/]"
-                )
-            return (
-                f"→ Delete [b]{self._end - self._start:,} bp[/] "
-                f"({self._start + 1:,}‥{self._end:,})"
-            )
-        if self._mode == self._MODE_COPY:
-            if not self._has_region:
-                return (
-                    "[yellow]Copy needs a selection — "
-                    "pick bases first.[/]"
-                )
-            return (
-                f"→ Copy [b]{self._end - self._start:,} bp[/] "
-                f"({self._start + 1:,}‥{self._end:,}) to clipboard"
-            )
-        return ""
 
     def _apply_mode_visibility(self) -> None:
-        """Hide the input area + its label for modes that don't take
-        text input. Saves vertical space + makes the OK button
-        the obvious next action."""
+        """Keep the textbox visible in EVERY mode (user request
+        2026-06-01 — the modal always shows the bases being acted on).
+        For insert / replace it's the editable input; for delete / copy
+        it's a READ-ONLY preview of the region the action affects, so the
+        label adapts to never read "New sequence" over a preview."""
         needs_input = self._mode in self._MODES_NEEDING_INPUT
-        for sel in ("#edit-input-area", "#edit-label"):
-            try:
-                self.query_one(sel).display = needs_input
-            except NoMatches:
-                pass
+        try:
+            ta = self.query_one("#edit-input-area", TextArea)
+            ta.read_only = not needs_input
+        except NoMatches:
+            pass
+        try:
+            lbl = self.query_one("#edit-label", Label)
+            note = ("too large to preview — see the count above"
+                    if len(self._existing) > self._PREFILL_MAX_BP
+                    else "read-only preview")
+            if self._mode == self._MODE_DELETE:
+                lbl.update(f"Bases that will be deleted ({note}):")
+            else:
+                lbl.update(
+                    "New sequence  (IUPAC: A T C G N R Y W S K M B D H V — "
+                    "paste OK; FASTA headers + whitespace + U auto-stripped):"
+                )
+        except NoMatches:
+            pass
         self._refresh_preview()
 
     def _current_input_text(self) -> str:
@@ -26088,19 +26372,43 @@ class EditSeqDialog(ModalScreen):
         if btn is None:
             return
         chosen = (btn.id or "").rsplit("-", 1)[-1]
-        if chosen not in self._MODES:
+        if chosen not in self._MODES or chosen == self._mode:
             return
-        if chosen != self._mode:
-            self._mode = chosen
-            self._apply_mode_visibility()
-            # Refocus the relevant widget for fast keyboard-driven flow.
-            try:
-                if chosen in self._MODES_NEEDING_INPUT:
-                    self.query_one("#edit-input-area", TextArea).focus()
-                else:
-                    self.query_one("#btn-ok", Button).focus()
-            except NoMatches:
-                pass
+        prev = self._mode
+        self._mode = chosen
+        # Textbox content follows the mode:
+        #   * delete / copy → show the region as a read-only preview;
+        #   * insert        → clear an UNTOUCHED prefill (or a preview
+        #                     carried over from delete/copy) so the box
+        #                     starts blank for fresh bases, but keep a
+        #                     real edit the user already typed;
+        #   * replace       → seed with the region if the box is empty.
+        try:
+            ta = self.query_one("#edit-input-area", TextArea)
+            pf = self._prefill_text()
+            if chosen == self._MODE_DELETE:
+                ta.text = pf
+            elif chosen in self._INSERT_MODES:
+                if ta.text == pf or prev == self._MODE_DELETE:
+                    ta.text = ""
+            elif chosen == self._MODE_REPLACE:
+                # Seed with the region when arriving from an insert with
+                # an empty box, OR from a delete read-only preview (whose
+                # text — possibly an empty huge-region placeholder — must
+                # not become the replacement payload).
+                if not ta.text or prev == self._MODE_DELETE:
+                    ta.text = pf
+        except NoMatches:
+            pass
+        self._apply_mode_visibility()
+        # Refocus the relevant widget for fast keyboard-driven flow.
+        try:
+            if chosen in self._MODES_NEEDING_INPUT:
+                self.query_one("#edit-input-area", TextArea).focus()
+            else:
+                self.query_one("#btn-ok", Button).focus()
+        except NoMatches:
+            pass
 
     @on(TextArea.Changed, "#edit-input-area")
     def _on_input_changed(self, _event: TextArea.Changed) -> None:
@@ -26164,15 +26472,12 @@ class EditSeqDialog(ModalScreen):
             pass
 
     def _try_submit(self) -> None:
-        if self._mode in (self._MODE_REPLACE, self._MODE_DELETE,
-                           self._MODE_COPY) and not self._has_region:
+        if self._mode in (self._MODE_REPLACE, self._MODE_DELETE) \
+                and not self._has_region:
             self._set_err(
                 "This mode needs a selection — "
-                "switch to Insert or pick bases on the canvas first.",
+                "switch to an Insert mode or pick bases on the canvas first.",
             )
-            return
-        if self._mode == self._MODE_COPY:
-            self._do_copy_to_clipboard()
             return
         if self._mode == self._MODE_DELETE:
             # Empty bases through the replace dispatch.
@@ -26205,41 +26510,17 @@ class EditSeqDialog(ModalScreen):
         bad = [c for c in cleaned if c not in self._VALID]
         if bad:
             return   # live validation already shows the error
-        self.dismiss((cleaned, self._mode,
-                       self._start, self._end))
-
-    def _do_copy_to_clipboard(self) -> None:
-        """Copy ``self._existing`` (the bases inside the selected
-        region) to the OS clipboard and dismiss. Uses the project's
-        existing ``_copy_to_clipboard_with_fallback`` helper so the
-        Textual / OSC52 / xclip / pbcopy / file-fallback chain all
-        get a turn."""
-        text = self._existing
-        if not text:
-            self._set_err("Nothing to copy — the selection is empty.")
-            return
-        try:
-            mode, detail = _copy_to_clipboard_with_fallback(
-                self.app, text, label="seq.edit-modal",
-            )
-        except Exception:  # noqa: BLE001
-            _log.exception("EditSeqDialog: copy to clipboard raised")
-            self._set_err(
-                "Could not copy to clipboard. See log for details.",
-            )
-            return
-        if mode == "file":
-            self.app.notify(
-                f"Copied {len(text):,} bp — terminal clipboard "
-                f"unavailable, wrote to {detail}.",
-                severity="warning", timeout=8,
-            )
-        else:
-            self.app.notify(
-                f"Copied {len(text):,} bp to clipboard.",
-                severity="information", timeout=4,
-            )
-        self.dismiss(None)
+        # Map the internal mode → the (new_bases, mode, s, e) payload
+        # `_edit_dialog_result` expects ("insert" at a position, or
+        # "replace" of [s, e)). Insert-left inserts at the region start,
+        # insert-right at the region end (= after the selection / cursor
+        # bp); both reuse the App's existing "insert" dispatch.
+        if self._mode == self._MODE_INSERT_LEFT:
+            self.dismiss((cleaned, "insert", self._start, self._start))
+        elif self._mode == self._MODE_INSERT_RIGHT:
+            self.dismiss((cleaned, "insert", self._end, self._end))
+        else:  # replace
+            self.dismiss((cleaned, "replace", self._start, self._end))
 
 
 # ── Help modal ─────────────────────────────────────────────────────────────────
@@ -26372,11 +26653,13 @@ _HELP_BODY_MD = """\
 | Key | Action |
 |---|---|
 | `Ctrl+A` | Select the entire sequence |
-| `Ctrl+E` | Edit sequence (insert / replace bases) |
-| `Ctrl+F` | Add a feature from the current selection |
+| `Ctrl+E` | Edit the sequence at the cursor or selection — **Insert left / Insert right / Replace / Delete** (a single cursor bp counts as a 1-bp region), with a live colour-coded "You are about to …" warning. Defaults to **Replace** (selection) or **Insert** (cursor) — never Delete. |
+| `Ctrl+F` | **Find a DNA subsequence** — fuzzy (allowable mismatches), both strands; jumps to the first hit |
+| `n` · `N` | Jump to the **next · previous** sequence-search hit (each hit is selected, so `Alt+Shift+F` annotates it — handy for tagging repeats by hand) |
+| `Alt+Shift+F` | Add a feature from the current selection |
 | `Ctrl+Shift+F` | Capture the current selection into the feature library |
 | `Enter` (on a feature) | Open the feature editor (read-only; press **Edit** to modify) |
-| `Delete` | Delete the selected feature |
+| `Delete` | Delete the selected feature — or, with no feature selected, open the edit dialog set to **Delete** the base(s) at the cursor / selection (a modal confirm, not an instant delete) |
 | `Ctrl+Z` · `Ctrl+Shift+Z` | Undo · redo |
 
 ### Select & copy
@@ -26409,18 +26692,18 @@ _HELP_BODY_MD = """\
 | `Ctrl+P` | Primer design |
 | `Ctrl+B` | BLAST / HMMscan — **Local** (your library) + **Online** (NCBI BLAST · Pfam) |
 | `Ctrl+G` | Cloning-grammar editor (Golden Braid · MoClo · …) |
-| `Alt+A` | Align the current plasmid against library plasmids — each pick adds a row to the linear-map overlay (blue match · red mismatch · gray gap, with a coverage histogram). Click a lane to drill into the alignment. |
+| `Alt+A` | Align the current plasmid against library plasmids — each pick adds a row to the linear-map overlay (blue match · red mismatch · gray gap, with a coverage histogram). **Click a lane to jump the sequence panel to that spot** (centered + highlighted) so misaligned / to-be-edited bases are one click away. |
+| `Alt+L` | Open the Alignment Manager — the full pairwise-alignment detail view (per-base aligned strands) opens with **Enter** on a row. |
 | `Alt+Shift+A` | Clear every alignment row from the overlay |
-| `Alt+L` | Manage alignments |
 
 ## Toolbar menus
 
-Open from the menu bar with the mouse — or jump straight to one with `Alt`+letter:
+Open from the menu bar with the mouse — or jump straight to most with `Alt`+letter (File is mouse-only: terminals send `Alt+F` as a cursor-motion code, so it can't be bound):
 
 | Menu | Shortcut | Holds |
 |---|---|---|
-| File | `Alt+F` | Open · Save · Fetch · What's New |
-| BLAST | `Alt+B` | Opens the BLAST / HMMscan modal (same as `Ctrl+B`) |
+| File | mouse only | Open · Save · Fetch · What's New (or use `Ctrl+O` / `Ctrl+S`) |
+| BLAST | `Ctrl+B` | Opens the BLAST / HMMscan modal |
 | Settings | `Alt+S` | Preferences · cloning grammars |
 | Enzymes | `Alt+N` | Restriction enzymes + custom collections |
 | Primers | `Alt+P` | Primer library + design |
@@ -43271,7 +43554,7 @@ class AddFeatureModal(ModalScreen):
         # SynthesisScreen, which doesn't host `#seq-panel`) supply the
         # length used by the CDS divisibility check. None falls back
         # to the live `#seq-panel` query — the original behaviour for
-        # the on-canvas Ctrl+F path.
+        # the on-canvas add-feature (Alt+Shift+F) path.
         self._total_len = total_len
         # Current color override for this entry. None = Auto (type default).
         self._color: "str | None" = self._prefill.get("color") or None
@@ -63498,8 +63781,9 @@ class SequencingScreen(Screen):
                     )
                     return
             # Register on the linear-map overlay band instead of pushing
-            # AlignmentScreen — the user can click the lane to drill
-            # into the full-screen viewer (kept for base-level review).
+            # AlignmentScreen — clicking the lane jumps the seq panel to
+            # that region (centered + highlighted); the full-screen
+            # detail viewer is kept for base-level review on Alt+L → Enter.
             # `target_record` is the library's original (unrotated)
             # record, matching what the canvas now displays; segments
             # come out in that frame because the query was rotated to
@@ -63697,14 +63981,12 @@ class SequencingScreen(Screen):
         def _scroll():
             try:
                 sp = self.app.query_one("#seq-panel", SequencePanel)
-                clamped = max(0, min(target_bp, len(record.seq) - 1))
-                # No public jump-to-bp helper; the existing
-                # `_focus_feature` path takes a feature dict (not what
-                # we have here). Manual cursor-set + visibility ensure
-                # is the smallest equivalent.
-                sp._cursor_pos = clamped
-                sp._refresh_view()
-                sp._ensure_cursor_visible()
+                # Shared jump-to-bp primitive (added 2026-06-01).
+                # center=False preserves this caller's original
+                # ensure-visible behaviour; select=False parks the
+                # cursor on the first variant without selecting a span.
+                sp.focus_span(target_bp, target_bp + 1,
+                              center=False, select=False)
             except (NoMatches, AttributeError):
                 pass
             except Exception:
@@ -69042,7 +69324,7 @@ class SynthesisEditor(Widget):
         k = event.key
         # Modifier-bearing keys flow up to the screen (Ctrl+F, Ctrl+S,
         # etc. — we never want to swallow them).
-        if k in ("ctrl+f", "ctrl+s", "ctrl+n", "ctrl+o", "ctrl+r",
+        if k in ("ctrl+f", "alt+shift+f", "ctrl+s", "ctrl+n", "ctrl+o", "ctrl+r",
                   "ctrl+l", "ctrl+a", "ctrl+e", "ctrl+z", "ctrl+y",
                   "escape", "tab", "shift+tab"):
             return
@@ -70181,7 +70463,7 @@ class ProteinEditor(Widget):
 
     def on_key(self, event) -> None:
         k = event.key
-        if k in ("ctrl+f", "ctrl+s", "ctrl+n", "ctrl+o", "ctrl+r",
+        if k in ("ctrl+f", "alt+shift+f", "ctrl+s", "ctrl+n", "ctrl+o", "ctrl+r",
                   "ctrl+l", "ctrl+a", "ctrl+e", "ctrl+z", "ctrl+y",
                   "ctrl+t", "ctrl+m", "alt+t",
                   "escape", "tab", "shift+tab"):
@@ -70671,7 +70953,12 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         Binding("ctrl+s", "save",          "Save",  show=True),
         Binding("ctrl+n", "new_fragment",  "New",   show=True),
         Binding("ctrl+o", "load_fragment", "Load",  show=True),
-        Binding("ctrl+f", "add_feature",   "Add feature", show=True),
+        # Alt+Shift+F adds a feature (moved off Ctrl+F 2026-06-01 to keep
+        # the add-feature key uniform with the main canvas, where Ctrl+F
+        # is now Find-sequence). NOT Alt+F — Textual decodes ESC-f as
+        # `ctrl+right` (see the PlasmidApp binding note). The synthesis
+        # editor has no #seq-panel, so it doesn't wire a Find here.
+        Binding("alt+shift+f", "add_feature",   "Add feature", show=True),
         Binding("ctrl+r", "insert_site",   "Insert site", show=True),
         Binding("ctrl+a", "select_all",    "Select all", show=False),
         # Screen-level Backspace / Delete fallback — only fires when
@@ -71858,7 +72145,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
     def _focus_dna_editor(self) -> None:
         """Restore focus to the synth DNA editor's scroll container
         so the user can keep typing bases after a modal flow
-        returns. Used by Add Feature (Ctrl+F), library Insert /
+        returns. Used by Add Feature (Alt+Shift+F), library Insert /
         Annotate, and FeatureEditModal save (Enter on a feature).
         Pre-2026-05-26 focus drifted to whatever widget held it
         when the modal opened (often a toolbar Button), so the
@@ -72695,10 +72982,12 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
 
     @_action_log("app.synthesis.add_feature")
     def action_add_feature(self) -> None:
-        """Ctrl+F — open AddFeatureModal with the current selection as
-        the feature span. The modal's standard ``insert`` payload feeds
+        """Alt+Shift+F — open AddFeatureModal with the current selection
+        as the feature span. The modal's standard ``insert`` payload feeds
         a feat dict back; we land it on the editor. Protein tab uses
-        the motif library instead — gentle notify."""
+        the motif library instead — gentle notify. (Was Ctrl+F before
+        2026-06-01, when Ctrl+F became the main-canvas Find-sequence;
+        not Alt+F — terminals send that as a cursor-motion code.)"""
         if self._active_tab_id() == "protein":
             self.app.notify(
                 "Add Feature is DNA-tab only. On the Protein tab use "
@@ -72714,7 +73003,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         if sel is None:
             self.app.notify(
                 "Highlight a region first (drag in the editor or "
-                "Shift+arrow), then Ctrl+F.",
+                "Shift+arrow), then Alt+Shift+F.",
                 severity="information",
             )
             return
@@ -91566,6 +91855,196 @@ class FeatureSearchModal(_OneShotDismissScreen, ModalScreen):
         self.dismiss(None)
 
 
+class SeqSearchModal(_OneShotDismissScreen, ModalScreen):
+    """Find a DNA subsequence in the loaded plasmid (Ctrl+F), then step
+    through the hits with ``n`` / ``N``.
+
+    Fuzzy by design: an allowable-mismatches budget (Hamming distance —
+    substitutions only, no indels) surfaces near-matches, and both
+    strands are searched by default so inverted / direct repeats show up
+    too. The modal only COLLECTS the query + options and computes the hit
+    list once on submit; the App owns the seq-panel jump and the
+    ``n``/``N`` iteration so the user can walk a plasmid annotating
+    repeat regions by hand (each hit lands as a copyable selection, so
+    Alt+Shift+F annotates it on the spot).
+
+    Dismiss payload:
+      None — cancelled (Escape / Cancel)
+      dict — {"query", "mismatches", "both_strands", "hits"} with a
+             guaranteed-non-empty ``hits`` (the `_search_subsequence`
+             output). A zero-result search stays open with a status hint
+             rather than dismissing, so the user can adjust and retry.
+    """
+
+    _blocks_undo: bool = True   # query Input editing
+
+    BINDINGS = [
+        Binding("escape",    "cancel",             "Cancel"),
+        Binding("tab",       "app.focus_next",     "Next", show=False),
+        Binding("shift+tab", "app.focus_previous", "Prev", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    SeqSearchModal { align: center middle; }
+    #ssm-dlg {
+        width: 78;
+        height: auto;
+        background: $surface;
+        border: heavy $primary;
+        padding: 1;
+    }
+    #ssm-title {
+        text-align: center;
+        background: $primary-darken-2;
+        color: $text;
+        padding: 0 1;
+    }
+    #ssm-query { margin: 1 0 0 0; }
+    #ssm-row   { height: 3; margin-top: 1; }
+    #ssm-mm    { width: 24; }
+    #ssm-both  { width: 1fr; }
+    #ssm-status { color: $text-muted; padding: 0 1; height: auto; min-height: 1; margin-top: 1; }
+    #ssm-btns {
+        height: 3;
+        align: right middle;
+        padding-top: 1;
+    }
+    """
+
+    def __init__(self, seq: str, *, circular: bool = False,
+                 prefill: str = "", mismatches: int = 0,
+                 both_strands: bool = True):
+        super().__init__()
+        self._seq       = seq or ""
+        self._circular  = bool(circular)
+        self._prefill   = prefill or ""
+        self._init_mm   = max(0, int(mismatches))
+        self._init_both = bool(both_strands)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ssm-dlg"):
+            yield Static(" Find sequence ", id="ssm-title")
+            yield Input(
+                value=self._prefill,
+                placeholder="paste / type bases — ACGT, IUPAC codes & U ok…",
+                id="ssm-query",
+            )
+            with Horizontal(id="ssm-row"):
+                yield Input(
+                    value=str(self._init_mm), id="ssm-mm",
+                    placeholder="mismatches",
+                )
+                yield Checkbox(
+                    "Both strands", value=self._init_both, id="ssm-both",
+                )
+            yield Static("", id="ssm-status")
+            with Horizontal(id="ssm-btns"):
+                yield Button("Find", id="btn-ssm-go", variant="primary")
+                yield Button("Cancel", id="btn-ssm-cancel")
+
+    def on_mount(self) -> None:
+        self._set_status(
+            f"[dim]{len(self._seq):,} bp · "
+            f"{'circular' if self._circular else 'linear'} — Enter to "
+            f"search, n / N to step through hits.[/dim]"
+        )
+        try:
+            q = self.query_one("#ssm-query", Input)
+            q.focus()
+            if self._prefill:
+                # Park the caret at the end so a remembered query is
+                # ready to edit, not select-all-overwrite.
+                q.cursor_position = len(self._prefill)
+        except NoMatches:
+            pass
+
+    def _set_status(self, markup: str) -> None:
+        try:
+            self.query_one("#ssm-status", Static).update(markup)
+        except NoMatches:
+            pass
+
+    def _read_mismatches(self) -> int:
+        """Parsed mismatch budget, or -1 when the field isn't a
+        non-negative integer (caller shows an error and stays open)."""
+        try:
+            raw = (self.query_one("#ssm-mm", Input).value or "").strip()
+        except NoMatches:
+            return 0
+        if not raw:
+            return 0
+        try:
+            v = int(raw)
+        except ValueError:
+            return -1
+        return v if v >= 0 else -1
+
+    def _do_search(self) -> None:
+        try:
+            query = (self.query_one("#ssm-query", Input).value or "").strip()
+            both  = bool(self.query_one("#ssm-both", Checkbox).value)
+        except NoMatches:
+            return
+        if not query:
+            self._set_status("[yellow]Type or paste a sequence to find.[/yellow]")
+            return
+        mm = self._read_mismatches()
+        if mm < 0:
+            self._set_status(
+                "[red]Mismatches must be a whole number ≥ 0.[/red]"
+            )
+            return
+        try:
+            hits = _search_subsequence(
+                self._seq, query, max_mismatches=mm,
+                circular=self._circular, both_strands=both,
+            )
+        except ValueError as exc:
+            # Foreign character in the query — name it.
+            self._set_status(f"[red]{exc}[/red]")
+            return
+        except Exception:
+            _log.exception("SeqSearchModal: search failed for %r", query[:64])
+            self._set_status("[red]Search failed — see the log.[/red]")
+            return
+        if not hits:
+            try:
+                qn = _normalize_dna_for_align(query)
+            except ValueError:
+                qn = query.upper()
+            self._set_status(
+                f"[yellow]No matches for [b]{qn}[/b] "
+                f"(≤{mm} mismatch{'es' if mm != 1 else ''}, "
+                f"{'both strands' if both else 'top strand'}).[/yellow]"
+            )
+            return
+        self.dismiss({
+            "query":        query,
+            "mismatches":   mm,
+            "both_strands": both,
+            "hits":         hits,
+        })
+
+    @on(Input.Submitted, "#ssm-query")
+    def _on_query_submit(self, _event: Input.Submitted) -> None:
+        self._do_search()
+
+    @on(Input.Submitted, "#ssm-mm")
+    def _on_mm_submit(self, _event: Input.Submitted) -> None:
+        self._do_search()
+
+    @on(Button.Pressed, "#btn-ssm-go")
+    def _go_btn(self, _) -> None:
+        self._do_search()
+
+    @on(Button.Pressed, "#btn-ssm-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class RestoreFromBackupModal(ModalScreen):
     """Settings → Restore from backup… recovery UI.
 
@@ -103514,7 +103993,23 @@ NcbiTaxonPickerModal { align: center middle; }
         Binding("ctrl+s",      "save",             "Save",          show=True),
         Binding("ctrl+n",      "new_plasmid",      "New",           show=True),
         Binding("ctrl+a",      "select_all",       "Select all",    show=True, priority=True),
-        Binding("ctrl+f",      "add_feature",      "+Feat",         show=True),
+        # Ctrl+F = find a DNA subsequence (the universal "find" reflex),
+        # added 2026-06-01. Add-feature moved to ALT+SHIFT+F (still "F"
+        # for Feature). It is NOT on Alt+F: Textual decodes the Alt+F
+        # byte sequence (ESC-f, readline forward-word) as `ctrl+right`,
+        # so an `alt+f` binding never fires and the keystroke just nudges
+        # the seq cursor (user bug report 2026-06-01). `ESC F` (Shift)
+        # decodes cleanly as `alt+shift+f`. Same trap bites Alt+B → see
+        # the BLAST-menu note below. `n` / `N` step the search hits.
+        Binding("ctrl+f",      "find_sequence",    "Find",          show=True, priority=True),
+        Binding("alt+shift+f", "add_feature",      "+Feat",         show=False),
+        Binding("n",           "find_next",        "Find next",     show=False),
+        # Shift+n: a standard terminal delivers it as the bare uppercase
+        # "N" (what Textual actually fires); only kitty / enhanced-
+        # keyboard protocols emit a distinct "shift+n". Bind BOTH so
+        # find-previous works on every terminal.
+        Binding("N",           "find_prev",        "Find prev",     show=False),
+        Binding("shift+n",     "find_prev",        "Find prev",     show=False),
         Binding("ctrl+p",      "open_primer_design", "Primers",     show=True, priority=True),
         Binding("ctrl+b",      "open_blast",       "BLAST",         show=True, priority=True),
         # Direct shortcut to the cloning-grammar editor (issue #10
@@ -103548,17 +104043,23 @@ NcbiTaxonPickerModal { align: center middle; }
         # internal letter (s`y`nthesis, se`q`uencing, e`x`periments,
         # pa`r`ts, e`n`zymes, s`i`mulator). NOT priority=True so an
         # inner Input/TextArea's own key handling wins (a user typing
-        # in a search box shouldn't trigger a menu). Three menus are
+        # in a search box shouldn't trigger a menu). FIVE menus are
         # deliberately mouse-only because their natural Alt+letter
-        # conflicts with an existing App-level binding:
+        # conflicts with an existing App-level binding OR is undeliverable:
+        #   * File (Alt+F) and BLAST (Alt+B) — UNDELIVERABLE: Textual
+        #     decodes ESC-f / ESC-b (the readline word-motion keys) as
+        #     `ctrl+right` / `ctrl+left`, so an `alt+f` / `alt+b` binding
+        #     can never fire — it just nudges the seq cursor (user bug
+        #     2026-06-01). Both stay mouse-only; File keeps its direct
+        #     Ctrl+O / Ctrl+S / Ctrl+N, and BLAST keeps Ctrl+B (which
+        #     opens the BLAST/HMMscan modal directly). The Alt+B menu
+        #     binding was REMOVED 2026-06-01 rather than left dead.
         #   * Features (Alt+T → SynthesisProteinEditor codon-mode)
         #   * Mutagenize (Alt+M → toggle_click_debug)
         #   * Constructor (Alt+C → copy_selection_bottom)
         # If a future user complains, move one of those bindings
         # before adding the menu shortcut here.
-        Binding("alt+f", "open_named_menu('File')",         "File menu",     show=False),
         Binding("alt+s", "open_named_menu('Settings')",     "Settings menu", show=False),
-        Binding("alt+b", "open_named_menu('BLAST')",        "BLAST menu",    show=False),
         Binding("alt+n", "open_named_menu('Enzymes')",      "Enzymes menu",  show=False),
         Binding("alt+p", "open_named_menu('Primers')",      "Primers",       show=False),
         Binding("alt+y", "open_named_menu('Synthesis')",    "Synthesis",     show=False),
@@ -103792,6 +104293,11 @@ NcbiTaxonPickerModal { align: center middle; }
             _get_setting("constructor_filter_by_grammar", True)
         )
         self._click_debug          = bool(_get_setting("click_debug", False))
+        # Ctrl+F sequence search state — None until the first search.
+        # {query, mismatches, both_strands, hits, idx, seq_len}. `n`/`N`
+        # step `idx` and re-jump; `seq_len` guards against jumping to a
+        # stale bp after the sequence is edited (see `_goto_search_hit`).
+        self._seq_search: "dict | None" = None
         self._check_updates        = bool(_get_setting("check_updates", True))
         self._show_restr           = bool(_get_setting("show_restr",  False))
         self._restr_unique_only    = bool(
@@ -103986,31 +104492,47 @@ NcbiTaxonPickerModal { align: center middle; }
         if not sp._seq:
             self.notify("No sequence loaded.", severity="warning")
             return
+        self._open_seq_edit_dialog(prefer="context")
+
+    def _open_seq_edit_dialog(self, *, prefer: str = "context") -> None:
+        """Shared opener for the Ctrl+E edit dialog.
+
+        ``prefer="context"`` (Ctrl+E) picks a non-destructive default —
+        Replace for a selection, Insert-left for a bare cursor.
+        ``prefer="delete"`` (the Delete KEY on a base with no feature
+        selected) forces Delete mode with the target bases prefilled.
+
+        A bare cursor opens on the 1-bp region ``[pos, pos+1)`` so a
+        single base is editable like a selection; past the last base it
+        falls back to a bare insert point.
+        """
+        sp = self.query_one("#seq-panel", SequencePanel)
+        if not sp._seq:
+            self.notify("No sequence loaded.", severity="warning")
+            return
         cb = self._guard_callback(self._edit_dialog_result, "Edit")
         n = len(sp._seq)
         if sp._user_sel is not None:
-            # Selection present → default to Replace, but the modal
-            # has Insert / Delete / Copy radios so the user can flip
-            # without re-opening (sweep #39).
-            s, e     = sp._user_sel
-            existing = sp._seq[s:e]
+            s, e = sp._user_sel
+            mode = "delete" if prefer == "delete" else "replace"
             self.push_screen(
-                EditSeqDialog("replace", existing, s, e, total=n),
+                EditSeqDialog(mode, sp._seq[s:e], s, e, total=n),
                 callback=cb,
             )
         elif sp._cursor_pos >= 0:
-            # Cursor only — default to Insert (sweep #39 made Insert
-            # the natural default for cursor-without-selection;
-            # pre-sweep this opened in Replace-single-base mode which
-            # confused users who just wanted to type in new bases at
-            # the cursor). The in-modal radios still let them switch
-            # to Replace, Delete, or Copy if they really meant one of
-            # those.
             pos = sp._cursor_pos
-            self.push_screen(
-                EditSeqDialog("insert", "", pos, pos, total=n),
-                callback=cb,
-            )
+            end = min(pos + 1, n)
+            if end > pos:
+                mode = "delete" if prefer == "delete" else "insert_left"
+                self.push_screen(
+                    EditSeqDialog(mode, sp._seq[pos:end], pos, end, total=n),
+                    callback=cb,
+                )
+            else:
+                self.push_screen(
+                    EditSeqDialog("insert_left", "", pos, pos, total=n),
+                    callback=cb,
+                )
         else:
             self.notify(
                 "Click on the sequence to place a cursor, "
@@ -104031,8 +104553,6 @@ NcbiTaxonPickerModal { align: center middle; }
             new_seq = old_seq[:s] + new_bases + old_seq[s:]
         else:
             new_seq = old_seq[:s] + new_bases + old_seq[e:]
-
-        new_cursor = s + len(new_bases)
 
         # Restriction scan deferred to the worker. The edit path
         # rebuilds the record + repopulates panels with empty
@@ -104075,10 +104595,19 @@ NcbiTaxonPickerModal { align: center middle; }
 
         self._mark_dirty()
 
-        # Restore cursor after update_seq resets it
-        sp._cursor_pos = new_cursor
-        sp._user_sel   = None
-        sp._refresh_view()
+        # Highlight the modified bases (the inserted / replaced region,
+        # expanded to its new length) and scroll the viewport to CENTER
+        # the edit, so the user immediately sees exactly what changed
+        # (user request 2026-06-01). `focus_span` sets cursor + selection
+        # + centers in one call, replacing the old cursor-only restore
+        # that left the edit potentially off-screen and unmarked. A pure
+        # deletion inserts nothing, so just park the cursor at the splice
+        # point and center there (no span to highlight).
+        ins_len = len(new_bases)
+        if ins_len > 0:
+            sp.focus_span(s, s + ins_len, center=True, select=True)
+        else:
+            sp.focus_span(s, s + 1, center=True, select=False)
 
     def _reconcile_groups_after_seq_edit(
         self,
@@ -104451,7 +104980,14 @@ NcbiTaxonPickerModal { align: center middle; }
             return
         pm = self.query_one("#plasmid-map", PlasmidMap)
         if pm.selected_idx < 0 or not pm._feats:
-            self.notify("No feature selected.", severity="warning")
+            # No feature under the cursor → treat Delete as a BASE edit:
+            # open the Ctrl+E dialog with the cursor bp / selection
+            # prefilled and the Delete radio pre-selected (user request
+            # 2026-06-01), so a single keypress + Enter removes the base
+            # the cursor rests on. It's a modal confirm — never an
+            # immediate delete — and `_open_seq_edit_dialog` falls back to
+            # a "place a cursor" hint when there's nothing to act on.
+            self._open_seq_edit_dialog(prefer="delete")
             return
         feat = pm._feats[pm.selected_idx]
         label = feat.get("label") or feat.get("type", "feature")
@@ -105362,7 +105898,22 @@ NcbiTaxonPickerModal { align: center middle; }
             displayed = self._restr_cache if self._show_restr else []
             pm._restr_feats = displayed
             pm.refresh()
+            # The overlay re-render must NOT disturb the user's cursor /
+            # selection — only the restriction OVERLAY changed, the
+            # sequence is identical. `update_seq` resets cursor + sel, so
+            # snapshot and restore them across the call. This is also what
+            # keeps a just-applied Ctrl+E edit HIGHLIGHTED on screen: the
+            # edit path centers + selects the modified bases via
+            # `focus_span` right before dispatching this scan, and this
+            # async re-paint would otherwise wipe both (2026-06-01).
+            cur, usel  = sp._cursor_pos, sp._user_sel
+            srng, anch = sp._sel_range,  sp._sel_anchor
             sp.update_seq(seq, pm._feats + displayed)
+            sp._cursor_pos = cur
+            sp._user_sel   = usel
+            sp._sel_range  = srng
+            sp._sel_anchor = anch
+            sp._refresh_view()
 
         self.call_from_thread(_apply)
 
@@ -108601,6 +109152,13 @@ NcbiTaxonPickerModal { align: center middle; }
         """
         if record is None:
             return
+        # A fresh canvas swap invalidates any active Ctrl+F search — its
+        # stored bp positions belong to the outgoing plasmid. The
+        # `_goto_search_hit` length-guard catches an *edited* sequence,
+        # but a swap to a DIFFERENT same-length plasmid would slip past
+        # it, so drop the search here on every fresh load.
+        if clear_undo:
+            self._seq_search = None
         # Emit structured `record.loaded` event so AI parsers can
         # correlate every subsequent panel/scan event back to a single
         # canvas-swap boundary. Pre-0.8.9 only the large-plasmid warning
@@ -109336,6 +109894,42 @@ NcbiTaxonPickerModal { align: center middle; }
         # highlight (`_user_sel = (start, end)`) still spans the full
         # range; we just anchor the cursor and viewport at start.
         self._focus_feature(event.feat_dict, event.feat_dict["start"])
+
+    @on(PlasmidMap.AlignmentLaneClicked)
+    def _map_alignment_lane_clicked(
+        self, event: PlasmidMap.AlignmentLaneClicked,
+    ) -> None:
+        """Alignment-lane click on the linear map → jump the sequence
+        panel to the clicked region, centered + highlighted (user request
+        2026-06-01). Replaces the old AlignmentScreen drill-in, which is
+        still reachable from the Alignment Manager (Alt+L → Enter). Lands
+        the user on a misaligned stretch / the base(s) to re-edit in one
+        click. The posted span is canvas-bp (the band is painted on the
+        canvas axis), so it maps straight onto the seq panel — and being a
+        copyable `_user_sel` selection, Alt+Shift+F annotates the chunk on the
+        spot."""
+        _log_event(
+            "app.align_lane_click",
+            ai=event.ai, bp_lo=event.bp_lo, bp_hi=event.bp_hi,
+        )
+        try:
+            sp = self.query_one("#seq-panel", SequencePanel)
+        except NoMatches:
+            return
+        sp.focus_span(event.bp_lo, event.bp_hi, center=True, select=True)
+        # Echo under click-debug (Alt+M), mirroring feature-select — lets
+        # users on quirky terminals confirm the click resolved to the bp
+        # they expected.
+        if self._click_debug:
+            try:
+                span = (f"{event.bp_lo}–{event.bp_hi}"
+                        if event.bp_hi - event.bp_lo > 1 else str(event.bp_lo))
+                self.notify(
+                    f"alignment lane click → seq bp {span}",
+                    severity="information", timeout=3, markup=False,
+                )
+            except Exception:
+                pass
 
     @on(FeatureSidebar.RowActivated)
     def _sidebar_row_activated(self, event: FeatureSidebar.RowActivated):
@@ -113261,6 +113855,153 @@ NcbiTaxonPickerModal { align: center middle; }
             FeatureSearchModal(feats, total=total),
             callback=_on_pick,
         )
+
+    @_action_log("app.find_sequence")
+    def action_find_sequence(self) -> None:
+        """Ctrl+F — find a DNA subsequence in the loaded plasmid (fuzzy,
+        both strands) and jump the seq panel to the first hit; ``n`` /
+        ``N`` then step forward / back through the rest. Distinct from
+        Ctrl+/ (which searches feature ANNOTATIONS); this searches the
+        BASES. No-op with a helpful nudge when no plasmid is loaded."""
+        # Ctrl+F is priority=True, so a second press while the search box
+        # is open would otherwise stack another modal on top — bail.
+        if isinstance(self.screen, SeqSearchModal):
+            return
+        if self._current_record is None:
+            self.notify(
+                "Load a plasmid before searching its sequence.",
+                severity="information",
+            )
+            return
+        try:
+            sp = self.query_one("#seq-panel", SequencePanel)
+        except NoMatches:
+            return
+        seq = sp._seq or ""
+        if not seq:
+            self.notify(
+                "This plasmid has no sequence to search.",
+                severity="information",
+            )
+            return
+        circular = str(
+            (self._current_record.annotations or {}).get("topology", "")
+        ).lower() == "circular"
+        prev = self._seq_search or {}
+        self.push_screen(
+            SeqSearchModal(
+                seq, circular=circular,
+                prefill=str(prev.get("query", "")),
+                mismatches=int(prev.get("mismatches", 0) or 0),
+                both_strands=bool(prev.get("both_strands", True)),
+            ),
+            callback=self._on_seq_search,
+        )
+
+    def _on_seq_search(self, result) -> None:
+        """Modal callback: stash the hit list and jump to the first hit
+        at/after the cursor (so the search continues from where the user
+        is looking, wrapping to the top otherwise)."""
+        if not isinstance(result, dict):
+            return
+        hits = result.get("hits") or []
+        if not hits:
+            return
+        try:
+            sp = self.query_one("#seq-panel", SequencePanel)
+            seq_len = len(sp._seq or "")
+            cursor = int(getattr(sp, "_cursor_pos", -1))
+        except (NoMatches, AttributeError, TypeError, ValueError):
+            seq_len, cursor = 0, -1
+        start_idx = 0
+        if cursor >= 0:
+            for i, h in enumerate(hits):
+                if int(h.get("start", 0)) >= cursor:
+                    start_idx = i
+                    break
+        self._seq_search = {
+            "query":        result.get("query", ""),
+            "mismatches":   int(result.get("mismatches", 0) or 0),
+            "both_strands": bool(result.get("both_strands", True)),
+            "hits":         hits,
+            "idx":          start_idx,
+            "seq_len":      seq_len,
+        }
+        _log_event(
+            "app.find_sequence.result",
+            n_hits=len(hits), mismatches=self._seq_search["mismatches"],
+            both=self._seq_search["both_strands"],
+            truncated=len(hits) >= _SEQ_SEARCH_MAX_HITS,
+        )
+        self._goto_search_hit(
+            announce_prefix="Found",
+            truncated=len(hits) >= _SEQ_SEARCH_MAX_HITS,
+        )
+
+    def _goto_search_hit(self, *, announce_prefix: str = "Match",
+                         truncated: bool = False) -> None:
+        """Center + select the current search hit and toast its position.
+
+        Guards against a stale jump: if the sequence length changed since
+        the search ran (the user edited bases), the stored positions are
+        no longer trustworthy, so we drop the search rather than land the
+        cursor on the wrong base — a catastrophic-class concern for an
+        editor people use to fix exact bp."""
+        ss = self._seq_search
+        if not ss or not ss.get("hits"):
+            return
+        try:
+            sp = self.query_one("#seq-panel", SequencePanel)
+        except NoMatches:
+            return
+        if len(sp._seq or "") != ss.get("seq_len"):
+            self._seq_search = None
+            self.notify(
+                "The sequence changed since the last search — press Ctrl+F "
+                "to search again.",
+                severity="warning", timeout=4,
+            )
+            return
+        hits = ss["hits"]
+        idx = ss["idx"] % len(hits)
+        ss["idx"] = idx
+        h = hits[idx]
+        start = int(h.get("start", 0))
+        end   = int(h.get("end", start + 1))
+        sp.focus_span(start, end, center=True, select=True)
+        strand = "+" if h.get("strand") == "+" else "−"
+        nmm = int(h.get("mismatches", 0))
+        mmtxt = "" if nmm == 0 else (
+            f", {nmm} mismatch" + ("es" if nmm != 1 else "")
+        )
+        extra = (
+            f" · showing first {len(hits):,}" if truncated else ""
+        )
+        self._notify_success(
+            f"{announce_prefix} {idx + 1}/{len(hits)} · bp {start + 1} "
+            f"({strand}{mmtxt}){extra} · n / N to step"
+        )
+
+    def _find_step(self, delta: int) -> None:
+        """Shared body of `n` (next) / `N` (prev)."""
+        if not self._seq_search or not self._seq_search.get("hits"):
+            self.notify(
+                "No active search — press Ctrl+F to find a sequence.",
+                severity="information", timeout=3,
+            )
+            return
+        self._seq_search["idx"] = int(self._seq_search.get("idx", 0)) + delta
+        self._goto_search_hit(
+            announce_prefix=("Next" if delta >= 0 else "Prev"),
+        )
+
+    def action_find_next(self) -> None:
+        """``n`` — jump to the next sequence-search hit (wraps)."""
+        self._find_step(1)
+
+    def action_find_prev(self) -> None:
+        """``N`` (Shift+n) — jump to the previous search hit (wraps)."""
+        self._find_step(-1)
 
     @_action_log("app.open.primer_design")
     def action_open_primer_design(self) -> None:

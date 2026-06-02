@@ -14,6 +14,20 @@
 
 ---
 
+## [1.0.13] — 2026-06-01
+
+### New features
+
+- **Find any DNA sequence with `Ctrl+F`.** Search the loaded plasmid for a subsequence — *fuzzy* (allow a chosen number of mismatches) and across *both strands* by default, with circular plasmids matched across the origin. It jumps to the first hit; `n` / `N` then step forward / back through the rest. Every match is highlighted **and** pre-selected, so **`Alt+Shift+F`** annotates it as a feature on the spot — purpose-built for walking a plasmid and tagging repeat regions by hand. *(Adding a feature from the current selection moves from Ctrl+F to **`Alt+Shift+F`** — still "F" for Feature — now that Ctrl+F is the universal find. `Ctrl+/` still searches your existing annotations by name.)*
+- **Click a sequencing read on the map to jump to it.** Clicking anywhere on an alignment bar on the linear map now scrolls the sequence panel straight to that position — centered and highlighted — so a misaligned stretch, or the exact base you need to re-edit to match your reads, is a single click away. (The full per-base alignment view is still there in the **Alignment Manager**, `Alt+L` → Enter.)
+- **A clearer `Ctrl+E` sequence editor.** The edit dialog now offers **Insert left**, **Insert right**, **Replace**, and **Delete**, and a single base under the cursor counts as a 1-bp region — so you can edit one base or a whole highlighted stretch the same way. A colour-coded live warning spells out exactly what's about to happen — *"You are about to **delete** **5 bp** at cursor"* — updating as you type, and the box is prefilled with the bases you're acting on. **After you submit, the modified bases are highlighted and the view scrolls to center them**, so you see exactly what changed. `Ctrl+E` defaults to **Replace** (selection) or **Insert** (cursor) — never Delete — while pressing **Delete** with no feature selected opens the same dialog set to Delete the base(s) at the cursor (a modal confirm, not an instant delete). Paste still works, with FASTA headers / whitespace / RNA `U`s auto-cleaned.
+
+### Hardening
+
+- The new sequence search is IUPAC-aware (an `N` or other ambiguity code matches anything it can represent), cleans and validates the query (whitespace, FASTA headers, and RNA `U`s are handled; a non-DNA character is flagged rather than silently mismatching), caps the result count on a degenerate query, and refuses to jump to a stale position if you edit the sequence mid-search.
+
+---
+
 ## [1.0.12] — 2026-06-01
 
 ### New features

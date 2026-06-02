@@ -14164,10 +14164,16 @@ class TestUpdateAvailableModal:
 
 class TestEditSeqDialog:
     """Sweep #39 (2026-05-27): the Ctrl+E sequence-edit modal grew a
-    mode-toggle row (Insert / Replace / Delete / Copy), a multi-line
-    `TextArea` instead of the single `Input`, paste sanitization
-    (whitespace / FASTA headers / U→T), and a live-preview line
-    describing what OK will actually do.
+    mode-toggle row, a multi-line `TextArea` instead of the single
+    `Input`, paste sanitization (whitespace / FASTA headers / U→T), and
+    a live-preview line describing what OK will actually do.
+
+    2026-06-01 (user request): Insert split into **Insert left** /
+    **Insert right** radios; the live line became the colour-coded
+    "You are about to <action> <N> bp <position>" warning; the textbox
+    is prefilled with the region's bases (read-only preview for
+    delete / copy); and Ctrl+E opens on Delete with the selection (or
+    the single cursor bp, as a 1-bp region) prefilled + focused.
     """
 
     def test_sanitize_strips_whitespace_and_fasta_headers(self):
@@ -14206,20 +14212,23 @@ class TestEditSeqDialog:
         """Caller asks for ``replace`` but provides ``start == end``
         (no region selected). Modal demotes to ``insert`` so the
         opening state is something the user can confirm."""
-        for mode in ("replace", "delete", "copy"):
+        for mode in ("replace", "delete"):
             modal = sc.EditSeqDialog(mode, "", 5, 5, total=100)
-            assert modal._mode == "insert", (
+            assert modal._mode == "insert_left", (
                 f"region-required mode {mode!r} should demote to "
-                f"insert when start==end"
+                f"insert_left when start==end"
             )
 
-    def test_init_keeps_insert_when_region_present(self):
-        """Caller passes ``insert`` with a region (e.g. user had
-        selection but action_edit_seq chose insert anyway) — modal
-        respects the caller's pick."""
+    def test_init_maps_insert_alias_to_insert_left(self):
+        """The legacy ``"insert"`` alias maps to ``insert_left`` (Insert
+        was split into left/right 2026-06-01); a real region is kept."""
         modal = sc.EditSeqDialog("insert", "ATCG", 5, 9, total=100)
-        assert modal._mode == "insert"
+        assert modal._mode == "insert_left"
         assert modal._has_region is True
+
+    def test_init_insert_right_is_preserved(self):
+        modal = sc.EditSeqDialog("insert_right", "ATCG", 5, 9, total=100)
+        assert modal._mode == "insert_right"
 
     async def test_modal_mounts_with_default_mode_radio_set(
             self, tiny_record, isolated_library,
@@ -14239,7 +14248,7 @@ class TestEditSeqDialog:
                 "#edit-mode-replace", RadioButton,
             )
             insert_btn = modal.query_one(
-                "#edit-mode-insert", RadioButton,
+                "#edit-mode-insert_left", RadioButton,
             )
             assert replace_btn.value is True
             assert insert_btn.value is False
@@ -14269,40 +14278,62 @@ class TestEditSeqDialog:
                 f"got {result_holder[0]!r}"
             )
 
-    async def test_copy_mode_invokes_clipboard_and_dismisses_none(
-            self, tiny_record, isolated_library, monkeypatch,
+    async def test_mode_radios_fit_within_dialog(
+            self, tiny_record, isolated_library,
     ):
-        """Copy mode performs the clipboard write itself and
-        dismisses with ``None`` — the caller's
-        ``_edit_dialog_result`` short-circuits on None."""
-        clipboard_calls = []
-        def _stub_copy(app, text, label="copy"):
-            clipboard_calls.append((text, label))
-            return ("clipboard", None)
-        monkeypatch.setattr(
-            sc, "_copy_to_clipboard_with_fallback", _stub_copy,
-        )
+        """The four mode radios must fit inside the dialog — five
+        overflowed the border ("ui crowded and lil messy", 2026-06-01).
+        Asserts every RadioButton's right edge is within the dialog."""
+        from textual.widgets import RadioButton
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.EditSeqDialog("delete", "ATCGATCG", 5, 13, total=120)
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            rbs = list(modal.query(RadioButton))
+            assert len(rbs) == 4            # Copy dropped
+            dlg = modal.query_one("#edit-dlg")
+            dlg_right = dlg.region.x + dlg.region.width
+            for rb in rbs:
+                rb_right = rb.region.x + rb.region.width
+                assert rb_right <= dlg_right, (
+                    f"{rb.id} overflows dialog: ends at {rb_right}, "
+                    f"dialog right edge {dlg_right}"
+                )
+
+    async def test_radio_highlight_matches_checked_mode(
+            self, tiny_record, isolated_library,
+    ):
+        """The RadioSet keyboard-highlight cursor (``-selected``) sits on
+        the CHECKED radio, not stuck on index 0 (user report 2026-06-01:
+        "the delete radio is selected but the first radio is
+        highlighted"). Textual's RadioSet highlights index 0 on mount; we
+        re-sync it to ``pressed_index``."""
+        from textual.widgets import RadioButton
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            result_holder = []
-            modal = sc.EditSeqDialog("replace", "ATCGATCG", 5, 13,
-                                        total=120)
-            app.push_screen(modal, lambda r: result_holder.append(r))
-            await pilot.pause()
-            await pilot.pause(0.1)
-            modal._mode = "copy"
-            modal._try_submit()
-            await pilot.pause()
-            await pilot.pause(0.05)
-            assert clipboard_calls == [("ATCGATCG", "seq.edit-modal")], (
-                f"Copy must call the clipboard helper with the "
-                f"existing region bases; got {clipboard_calls!r}"
-            )
-            assert result_holder == [None], (
-                f"Copy must dismiss with None; got {result_holder!r}"
-            )
+            for mode in ("delete", "replace", "insert_right"):
+                modal = sc.EditSeqDialog(mode, "ATCGATCG", 5, 13, total=120)
+                app.push_screen(modal)
+                await pilot.pause()
+                await pilot.pause(0.1)
+                checked = highlighted = None
+                for rb in modal.query(RadioButton):
+                    if rb.value:
+                        checked = rb.id
+                    if "-selected" in rb.classes:
+                        highlighted = rb.id
+                assert checked == highlighted == f"edit-mode-{mode}", (
+                    f"mode={mode}: checked={checked} highlighted={highlighted}"
+                )
+                modal.dismiss(None)
+                await pilot.pause()
+                await pilot.pause(0.05)
 
     async def test_insert_with_sanitized_paste_dispatches_clean(
             self, tiny_record, isolated_library,
@@ -14349,8 +14380,8 @@ class TestEditSeqDialog:
             app.push_screen(modal, lambda r: result_holder.append(r))
             await pilot.pause()
             await pilot.pause(0.1)
-            # Flip to Insert.
-            modal._mode = "insert"
+            # Flip to Insert (left).
+            modal._mode = "insert_left"
             modal._apply_mode_visibility()
             # And back to Replace.
             modal._mode = "replace"
@@ -14392,6 +14423,302 @@ class TestEditSeqDialog:
             assert isinstance(app.screen, sc.EditSeqDialog), (
                 "Modal must stay open and show an error"
             )
+
+    # ── 2026-06-01 rework: insert left/right, warning, prefill ──────────
+
+    async def test_insert_left_dispatches_at_region_start(
+            self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            result = []
+            modal = sc.EditSeqDialog("insert_left", "ATCG", 5, 9, total=120)
+            app.push_screen(modal, lambda r: result.append(r))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            from textual.widgets import TextArea
+            modal.query_one("#edit-input-area", TextArea).text = "GGG"
+            modal._try_submit()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Insert-left inserts AT the region start (s, s).
+            assert result == [("GGG", "insert", 5, 5)], result
+
+    async def test_insert_right_dispatches_at_region_end(
+            self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            result = []
+            modal = sc.EditSeqDialog("insert_right", "ATCG", 5, 9, total=120)
+            app.push_screen(modal, lambda r: result.append(r))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            from textual.widgets import TextArea
+            modal.query_one("#edit-input-area", TextArea).text = "GGG"
+            modal._try_submit()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Insert-right inserts AT the region end (e, e) = after it.
+            assert result == [("GGG", "insert", 9, 9)], result
+
+    async def test_warning_line_action_count_position_colour(
+            self, tiny_record, isolated_library,
+    ):
+        """The live warning carries the colour-coded action verb, bp
+        count, and position phrase, per the 2026-06-01 spec."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            from textual.widgets import TextArea
+            modal = sc.EditSeqDialog("delete", "ATCGA", 5, 10, total=120)
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Default delete → red, region count (5 bp), "at cursor".
+            line = modal._build_preview_line()
+            assert "delete" in line and "5 bp" in line
+            assert "at cursor" in line and "red" in line
+            # Insert-left + typed bases → green, live typed count, "left".
+            modal._mode = "insert_left"
+            modal.query_one("#edit-input-area", TextArea).text = "GGG"
+            line = modal._build_preview_line()
+            assert "insert" in line and "3 bp" in line
+            assert "to the left of cursor" in line and "green" in line
+            # Insert-right → "to the right of cursor".
+            modal._mode = "insert_right"
+            assert "to the right of cursor" in modal._build_preview_line()
+
+    async def test_textbox_prefilled_and_readonly_for_delete(
+            self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            from textual.widgets import TextArea
+            modal = sc.EditSeqDialog("delete", "ATCGA", 5, 10, total=120)
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            ta = modal.query_one("#edit-input-area", TextArea)
+            assert ta.text == "ATCGA"      # prefilled with the region
+            assert ta.read_only is True    # delete = read-only preview
+
+    async def test_ctrl_e_selection_defaults_to_replace_not_delete(
+            self, tiny_record, isolated_library,
+    ):
+        """Ctrl+E on a selection defaults to REPLACE — never Delete
+        (hand-slip risk) — with the bases prefilled for editing."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (5, 10)
+            sp._cursor_pos = 9
+            app.action_edit_seq()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert isinstance(modal, sc.EditSeqDialog)
+            assert modal._mode == "replace"
+            assert (modal._start, modal._end) == (5, 10)
+
+    async def test_ctrl_e_cursor_defaults_to_insert_left_empty(
+            self, tiny_record, isolated_library,
+    ):
+        """Ctrl+E on a bare cursor opens a 1-bp region in INSERT-LEFT
+        (never Delete) with an EMPTY box — type to insert at the cursor."""
+        from textual.widgets import TextArea
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = None
+            sp._cursor_pos = 7
+            app.action_edit_seq()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert isinstance(modal, sc.EditSeqDialog)
+            assert modal._mode == "insert_left"
+            assert (modal._start, modal._end) == (7, 8)
+            assert modal.query_one("#edit-input-area", TextArea).text == ""
+
+    async def test_delete_key_no_feature_opens_delete_dialog(
+            self, tiny_record, isolated_library,
+    ):
+        """Delete with no feature under the cursor opens the edit dialog
+        in DELETE mode on the cursor bp (user request 2026-06-01) — a
+        modal confirm, not just a 'No feature selected' notify."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            pm.selected_idx = -1            # no feature selected
+            sp._user_sel = None
+            sp._cursor_pos = 7
+            app.set_focus(pm)               # focus NOT in the library
+            app.action_delete_feature()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert isinstance(modal, sc.EditSeqDialog)
+            assert modal._mode == "delete"
+            assert (modal._start, modal._end) == (7, 8)
+
+    async def test_cursor_delete_reads_exact_base_no_off_by_one(
+            self, tiny_record, isolated_library,
+    ):
+        """The base read for a cursor delete is EXACTLY ``seq[cursor_pos]``
+        — the base the renderer reverse-videos (``is_cur = cursor_pos ==
+        i``) — with no off-by-one in either direction. Checked across
+        positions including both boundaries (user request 2026-06-01)."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            n = len(sp._seq)
+            for pos in (0, 1, 7, n // 2, n - 1):
+                pm.selected_idx = -1
+                sp._user_sel = None
+                sp._cursor_pos = pos
+                app.set_focus(pm)
+                app.action_delete_feature()
+                await pilot.pause()
+                await pilot.pause(0.05)
+                modal = app.screen
+                assert isinstance(modal, sc.EditSeqDialog), pos
+                assert (modal._start, modal._end) == (pos, pos + 1), pos
+                # The region's bases ARE seq[pos] — not pos-1, not pos+1.
+                assert modal._existing == sp._seq[pos], (
+                    f"off-by-one: cursor {pos} read {modal._existing!r}, "
+                    f"expected {sp._seq[pos]!r}"
+                )
+                modal.dismiss(None)
+                await pilot.pause()
+                await pilot.pause(0.05)
+
+    async def test_huge_region_opens_empty_box(
+            self, tiny_record, isolated_library,
+    ):
+        """A region above the prefill cap opens with an EMPTY box (no
+        slow render of a whole plasmid; no truncated-replace footgun).
+        Delete still dispatches on the region, not the textbox."""
+        from textual.widgets import TextArea
+        big = "A" * (sc.EditSeqDialog._PREFILL_MAX_BP + 5)
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            result = []
+            modal = sc.EditSeqDialog(
+                "delete", big, 0, len(big), total=len(big) + 10,
+            )
+            app.push_screen(modal, lambda r: result.append(r))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert modal.query_one("#edit-input-area", TextArea).text == ""
+            modal._try_submit()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert result == [("", "replace", 0, len(big))], result
+
+    # ── post-edit highlight + scroll-into-view (2026-06-01) ─────────────
+
+    async def test_edit_result_highlights_inserted_region(
+            self, tiny_record, isolated_library,
+    ):
+        """After an insert, the inserted bases are selected (highlighted)
+        with the cursor at the edit start (user request 2026-06-01)."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            app._edit_dialog_result(("GGG", "insert", 10, 10))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert sp._seq[10:13] == "GGG"
+            assert sp._user_sel == (10, 13)   # inserted region highlighted
+            assert sp._cursor_pos == 10
+
+    async def test_edit_result_highlights_replaced_region(
+            self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            app._edit_dialog_result(("GGGG", "replace", 5, 9))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert sp._seq[5:9] == "GGGG"
+            assert sp._user_sel == (5, 9)     # the NEW bases highlighted
+            assert sp._cursor_pos == 5
+
+    async def test_edit_result_delete_parks_cursor_no_highlight(
+            self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            n0 = len(sp._seq)
+            app._edit_dialog_result(("", "replace", 5, 9))   # delete [5,9)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert len(sp._seq) == n0 - 4
+            assert sp._user_sel is None       # nothing to highlight
+            assert sp._cursor_pos == 5        # cursor at the splice point
+
+    async def test_edit_result_boundary_edge_cases_no_crash(
+            self, tiny_record, isolated_library,
+    ):
+        """Boundary edits land sane state and never crash: insert at bp 0,
+        insert at the end (append), and deleting the WHOLE sequence (→
+        empty plasmid) — after which Ctrl+E no-ops with a notify rather
+        than opening on an empty record (hardening 2026-06-01)."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            # Insert at bp 0.
+            app._edit_dialog_result(("GG", "insert", 0, 0))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert sp._seq[:2] == "GG"
+            assert sp._user_sel == (0, 2)
+            # Insert at the very end (append).
+            n2 = len(sp._seq)
+            app._edit_dialog_result(("CC", "insert", n2, n2))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert sp._seq.endswith("CC")
+            assert sp._user_sel == (n2, n2 + 2)
+            # Delete the ENTIRE sequence — must not crash.
+            app._edit_dialog_result(("", "replace", 0, len(sp._seq)))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert sp._seq == ""
+            # Ctrl+E on the now-empty plasmid no-ops (no modal pushed).
+            app.action_edit_seq()
+            await pilot.pause()
+            assert not isinstance(app.screen, sc.EditSeqDialog)
 
     def test_sanitize_does_not_strip_in_sequence_digits(self):
         """Sweep #39 hardening (2026-05-27): tighter digit strip.

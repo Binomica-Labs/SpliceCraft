@@ -118,10 +118,14 @@ class TestGuardCallbackCallsites:
 
     def test_action_edit_seq_uses_guard(self):
         # Existing usage — regression-lock so a future refactor
-        # doesn't accidentally remove it.
+        # doesn't accidentally remove it. The guard lives in the shared
+        # opener `_open_seq_edit_dialog` since 2026-06-01 (Ctrl+E and the
+        # Delete key both route through it); `action_edit_seq` delegates.
         import inspect
-        src = inspect.getsource(sc.PlasmidApp.action_edit_seq)
-        assert "_guard_callback" in src
+        assert "_open_seq_edit_dialog" in inspect.getsource(
+            sc.PlasmidApp.action_edit_seq)
+        assert "_guard_callback" in inspect.getsource(
+            sc.PlasmidApp._open_seq_edit_dialog)
 
     def test_action_transfer_annotations_uses_inline_counter(self):
         # Different shape — inline `_record_load_counter` check

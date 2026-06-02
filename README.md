@@ -120,6 +120,13 @@ onto another construct to either *annotate* a selection or *splice* the
 sequence in. It's the same store the Synthesis editor and Domesticator pull
 from, so your parts stay consistent everywhere.
 
+Marking things up by hand? **Ctrl+F** finds a DNA subsequence — fuzzy, so
+you can allow a few mismatches, and on both strands — then `n` / `N` step
+through every hit. Each match lands pre-selected, so **Alt+Shift+F** tags it
+as a feature on the spot: ideal for walking a plasmid and annotating repeat
+regions one by one. (Looking for an existing annotation instead? `Ctrl+/`
+searches your features by name.)
+
 ### Primers
 
 A full-screen Primer3 designer covering detection, cloning, Golden Braid, and
@@ -196,7 +203,11 @@ way out, each cell is shaded by how much of its span actually binds —
 solid blue where it matches, a red shade that deepens with the mismatch
 density, gray for gaps — so a partially-binding read reads as a blue/red/
 gray patchwork and even a single-base mismatch still shows red in its
-region. **Bulk auto-align**
+region. **Click anywhere on a read's bar to jump the sequence panel to
+that exact spot** — centered and highlighted — so you can land on a
+misaligned stretch (or the precise base to re-edit) without scrolling;
+the full per-base alignment view is still a keystroke away in the
+Alignment Manager. **Bulk auto-align**
 matches a whole results folder against your library in one pass — and its
 confirm window shows each read's real **identity, mismatched-base, and gap
 counts** (computed by actually aligning, not just the name/k-mer match
