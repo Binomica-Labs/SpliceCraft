@@ -165,11 +165,16 @@ editable fragment. Or hit **Open** to
 load a sequence straight from a single-entry FASTA (or other amino-acid file) — a
 file browser highlights the loadable formats in pink. Compose a part,
 hit **Clone Fragment**, and it's handed straight to the Domesticator as an L0
-building block. When you save the domesticated part, one dialog names the
-**cloned plasmid**, picks its collection, and chooses which parts bin to file
-the part in — independently of the linear fragment — and the **domestication
-primers ride along on the clone**, drawn with their bound (annealing + overhang)
-and unbound (enzyme-tail) regions so you can see exactly how it was built.
+building block. When you save the domesticated part, one dialog names — and independently
+files — three things: the **cloned plasmid** (into any collection), the
+**linear fragment** you'd send for a DNA-synthesis order (its own name,
+defaulting to a `FRAG-…` form, into any collection), and which **parts bin**
+the L0 part files into. The fragment is the *primed amplicon* — the insert
+flanked by the designed domestication primers' enzyme sites + overhangs, exactly
+as it would run on the bench — and both the fragment **and** the clone carry the
+**domestication primers**, drawn with their bound (annealing + overhang) and
+unbound (enzyme-tail) regions, so you can see exactly how each was built (and
+regenerate the amplicon later for a synthesis order).
 **Save** (and **Save As**, which forks a copy and only lights up once the
 fragment has been saved once) let you pick which collection the fragment lands
 in, and keep editing it there.

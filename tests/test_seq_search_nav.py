@@ -230,6 +230,42 @@ class TestFocusSpan:
             # Must not raise on an empty sequence.
             sp.focus_span(5, 10)
 
+    async def test_wrap_hit_sets_two_piece_selection(self, tiny_record,
+                                                     isolated_library):
+        # [INV-96 / L2a] An origin-crossing search hit arrives with
+        # end > n; focus_span must encode it as a WRAP selection
+        # (start, head_end) with start > head_end, so the FULL match —
+        # tail [start, n) + head [0, head_end) — highlights / copies /
+        # annotates, not just the tail half (Ctrl+C + Alt+Shift+F + the
+        # DNA-row `in_usr` wrap branch all read this encoding).
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            n = len(sp._seq)
+            sp.focus_span(n - 3, n + 2, center=True, select=True)   # [n-3, n+2)
+            assert sp._cursor_pos == n - 3
+            assert sp._user_sel == (n - 3, 2), (
+                "wrap hit must store (start, head_end) with start > head_end"
+            )
+            # The in_usr wrap branch must render without error.
+            sp._refresh_view()
+            await pilot.pause()
+
+    async def test_hit_ending_exactly_at_origin_is_not_a_wrap(
+            self, tiny_record, isolated_library):
+        # Boundary: end == n is a normal tail selection, NOT a wrap
+        # (head_end == 0 fails the `1 <= head_end < start` guard).
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            n = len(sp._seq)
+            sp.focus_span(n - 5, n, center=True, select=True)
+            assert sp._user_sel == (n - 5, n)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Alignment-lane click → seq-panel navigation

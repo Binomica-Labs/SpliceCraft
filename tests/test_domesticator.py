@@ -10267,3 +10267,131 @@ class TestCloneAtgFusionNoDoubleStart:
         amp = sc._simulate_primed_amplicon(
             "ATGCCCATG", "GGAG", "AATG", part_type="Promoter").upper()
         assert "GGAGATGCCCATG" in amp
+
+
+# ── Primed FRAGMENT record (dual-save: name fragment + clone, 2026-06-02) ──
+
+
+class TestPrimedFragmentRecord:
+    """`_part_to_primed_fragment_seqrecord` builds the LINEAR primed
+    fragment a user orders for DNA synthesis — the amplicon the designed
+    domestication primers would produce: the insert flanked by each
+    primer's 5' tail (Type IIS site + spacer + grammar overhang + pad).
+    The cut sites + overhangs MUST be present, and both primers attached,
+    "as if it were run with the designed domestication primers"."""
+
+    def test_fallback_amplicon_has_sites_and_overhangs(self):
+        # No stored primers → canonical `_simulate_primed_amplicon` form.
+        insert = "ACGTACGTACGTACGTACGTACGTACGTACGT"      # 32 bp, non-CDS
+        part = {"name": "myProm", "type": "Promoter",
+                "oh5": "GGAG", "oh3": "CGCT",
+                "sequence": insert, "grammar": "gb_l0"}
+        rec = sc._part_to_primed_fragment_seqrecord(part, name="FRAG-myProm")
+        seq = str(rec.seq).upper()
+        # LINEAR — never the circular clone.
+        assert rec.annotations.get("topology") == "linear"
+        # The grammar's cut SITE (Esp3I) is present forward + as its
+        # reverse-complement on the far primer tail.
+        assert sc._GB_L0_ENZYME_SITE in seq                # CGTCTC
+        assert sc._rc(sc._GB_L0_ENZYME_SITE) in seq        # GAGACG
+        # Overhangs + the insert body all present.
+        assert "GGAG" in seq and "CGCT" in seq
+        assert insert in seq
+        # Name sanitised for the LOCUS line; display name preserved.
+        assert rec.id == "FRAG_myProm"
+        assert rec.description == "FRAG-myProm"
+
+    def test_fragment_classifies_as_fragment_kind(self):
+        # The stored source/topology classify the row as a linear
+        # "fragment" (the / badge) — matching the user's FRAG- convention.
+        assert sc._derive_entry_kind(
+            {"source": "domesticator:fragment", "topology": "linear"}
+        ) == "fragment"
+
+    def test_designed_primers_attached_to_fragment(self):
+        # With the part's stored primers, the fragment carries BOTH as
+        # primer_bind features so it shows how it's amplified.
+        insert = "ATGGCTAGCAAAGGTGAAGAACTGTTCACCGGTGTTGTC"   # 39 bp
+        oh5, oh3 = "GGAG", "CGCT"
+        tail = sc._GB_PAD + sc._GB_L0_ENZYME_SITE + sc._GB_SPACER
+        fwd = tail + oh5 + insert[:18]
+        rev = tail + sc._rc(oh3) + sc._rc(insert[-18:])
+        part = {"name": "myProm", "type": "Promoter",
+                "oh5": oh5, "oh3": oh3, "sequence": insert,
+                "grammar": "gb_l0", "fwd_primer": fwd, "rev_primer": rev}
+        rec = sc._part_to_primed_fragment_seqrecord(part, name="FRAG-myProm")
+        primer_feats = [f for f in rec.features
+                        if getattr(f, "type", "") == "primer_bind"]
+        assert len(primer_feats) == 2, "both domestication primers attach"
+
+    def test_no_sequence_raises(self):
+        with pytest.raises(ValueError):
+            sc._part_to_primed_fragment_seqrecord({"name": "x"}, name="FRAG-x")
+
+
+class TestDomesticatorDualSaveWorker:
+    """[INV-96] End-to-end: the real `@work(thread=True)` Domesticator
+    mirror worker saves BOTH the cloned plasmid AND the primed fragment,
+    each into its OWN collection, independently. The fragment lands tagged
+    `kind="fragment"`, with construction history and both primers drawn on
+    it; the clone lands in its own collection."""
+
+    def _designed_part(self):
+        rng = random.Random(0xF00D)
+        tmpl = "".join(rng.choice("ACGT") for _ in range(400))
+        for s, r in (("GGTCTC", "GCTGTC"), ("GAGACC", "GACCGA"),
+                     ("CGTCTC", "CGACTC"), ("GAGACG", "GAGACT")):
+            tmpl = tmpl.replace(s, r)
+        tmpl = tmpl[:100] + "ATG" + tmpl[103:]
+        d = sc._design_gb_primers(tmpl, 100, 190, "CDS")
+        return {
+            "name": "DualPart", "type": d["part_type"],
+            "position": d.get("position"),
+            "oh5": d["oh5"], "oh3": d["oh3"], "sequence": d["insert_seq"],
+            "fwd_primer": d["fwd_full"], "rev_primer": d["rev_full"],
+            "fwd_tm": d.get("fwd_tm"), "rev_tm": d.get("rev_tm"),
+            "grammar": "gb_l0", "level": 0,
+        }
+
+    async def test_worker_saves_clone_and_fragment_independently(
+            self, isolated_parts_bin, isolated_library):
+        part = self._designed_part()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            parts_modal._domesticator_library_mirror_worker(
+                part,
+                clone_name="DualClone", target_collection="Clones",
+                frag_name="FRAG-DualPart", frag_collection="Fragments",
+            )
+            # @work(thread=True) — give it room to land (same cadence the
+            # other parts-bin worker tests use).
+            await pilot.pause()
+            await pilot.pause(0.5)
+            await pilot.pause()
+            colls = {c["name"]: c for c in sc._load_collections()}
+            # The cloned plasmid landed in its OWN collection.
+            clones = colls.get("Clones", {}).get("plasmids", [])
+            assert any(e.get("name") == "DualClone" for e in clones), (
+                f"clone not saved to 'Clones'; collections={list(colls)}"
+            )
+            # The primed FRAGMENT landed in a DIFFERENT collection, tagged
+            # as a fragment, with amplicon history + both primers on it.
+            frags = colls.get("Fragments", {}).get("plasmids", [])
+            frag = next((e for e in frags
+                         if e.get("name") == "FRAG-DualPart"), None)
+            assert frag is not None, (
+                f"fragment not saved to 'Fragments'; collections={list(colls)}"
+            )
+            assert sc._entry_kind(frag) == "fragment"
+            assert frag.get("history_xml"), "fragment must carry history"
+            assert sc._parse_commercialsaas_history(
+                frag["history_xml"]) is not None
+            assert "primer_bind" in (frag.get("gb_text") or ""), (
+                "the fragment must carry the domestication primers"
+            )
+            app.exit()

@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.14"
+__version__ = "1.0.15"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -8983,9 +8983,15 @@ def _paint_primer_flap_bar(arr: list[tuple[str, str]], f: dict,
     # Per-base placement so the tail can wrap the origin. `flap_bases`
     # spans `[flap_s, flap_e)` one char per column; base `i` sits at
     # template column `flap_s + i` (mod total on a circular molecule).
+    # On a LINEAR molecule (`_flap_linear`) the ends don't join, so a
+    # tail that dangles past an end is CLIPPED (out-of-range columns are
+    # simply not drawn) rather than mod-wrapped to the opposite end —
+    # which would draw the 5' tail reappearing across a gap that doesn't
+    # exist on a linear fragment.
+    linear = bool(f.get("_flap_linear"))
     for i, ch in enumerate(flap_bases):
         pos = flap_s + i
-        if n:
+        if n and not linear:
             pos %= n
         col = pos - chunk_start
         if 0 <= col < content_w:
@@ -9878,7 +9884,11 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                 continue
         chunk_has_cursor = (chunk_start <= cursor_pos < chunk_end)
         chunk_has_overlay = (
-            (usr_s < chunk_end and usr_e > chunk_start)
+            # Wrap-aware (usr_e < usr_s = origin-crossing selection): the
+            # tail touches any chunk past usr_s, the head any chunk before
+            # usr_e. [INV-96 / L2a]
+            ((usr_s < chunk_end and usr_e > chunk_start) if usr_e >= usr_s
+             else (usr_s < chunk_end or usr_e > chunk_start))
             or (sel_s < chunk_end and sel_e > chunk_start)
             or (reh_s < chunk_end and reh_e > chunk_start)
         )
@@ -9988,7 +9998,9 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
     else:
         reh_hit = (reh_s < chunk_end or reh_e > chunk_start)
     chunk_has_overlay = (
-        (usr_s < chunk_end and usr_e > chunk_start)
+        # Wrap-aware user selection (usr_e < usr_s = origin-crossing).
+        ((usr_s < chunk_end and usr_e > chunk_start) if usr_e >= usr_s
+         else (usr_s < chunk_end or usr_e > chunk_start))
         or (sel_s < chunk_end and sel_e > chunk_start)
         or reh_hit
         or (chunk_start <= cursor_pos < chunk_end)
@@ -10037,7 +10049,16 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
         for j in range(chunk_len):
             i      = chunk_start + j
             base   = styles[i]
-            in_usr = (usr_s <= i < usr_e)
+            # User selection membership: linear when usr_e >= usr_s, WRAP
+            # when usr_e < usr_s (an origin-crossing search hit, encoded by
+            # `focus_span` — tail [usr_s, n) + head [0, usr_e)). Mirrors the
+            # RE-highlight wrap handling just below. [INV-96 / L2a]
+            if usr_s < 0 or usr_e < 0:
+                in_usr = False
+            elif usr_e >= usr_s:
+                in_usr = (usr_s <= i < usr_e)
+            else:
+                in_usr = (i >= usr_s or i < usr_e)
             in_sel = (sel_s <= i < sel_e)
             # RE highlight membership: linear when reh_e >= reh_s, wrap
             # when reh_e < reh_s (cut wraps origin for a near-origin Type
@@ -11917,7 +11938,7 @@ class _CommercialSaaSHistoryNode:
         Iterative (stack-based) so a hostile `.dna` file with a 1000+
         deep nested `<Node><Node>...` history can't trip the CPython
         recursion limit. The total node count is still bounded by the
-        LZMA-decompression cap (`_DNA_HISTORY_XML_MAX_BYTES`).
+        LZMA-decompression cap (`_COMMERCIALSAAS_HISTORY_MAX_XML`).
         """
         stack: list = [self]
         while stack:
@@ -12476,6 +12497,74 @@ def _build_amplicon_history_xml(*, name: str, seq_len: int,
         return None
 
 
+def _build_history_for_l0_clone(*, name: str, seq_len: int,
+                                 grammar_id: str, grammar: dict,
+                                 entry_vector: dict, part: dict,
+                                 ) -> "str | None":
+    """Build a `<HistoryTree>` for a Domesticator L0 clone — the part's
+    primed amplicon ligated into its entry vector at the grammar's
+    Type IIS sites. The single-part analogue of
+    ``ConstructorModal._build_history_for_assembly``: a product root
+    plus a parent node for the entry vector AND the insert part, so a
+    synthesis→parts→clone plasmid's History reads like a Constructor
+    build (insert + backbone lineage) instead of a bare ``createDocument``
+    leaf (INV-93: every generated plasmid records how it was built).
+
+    Parents are cross-referenced back to the library by name so an
+    insert that came from an earlier Save (e.g. the synthesis fragment
+    the Domesticator was handed) inherits its own nested lineage. The
+    Type IIS enzyme is a DETAIL — a grammar that can't resolve one still
+    yields the full lineage tree, just without the regenerated-site
+    marker (same policy as the assembly builder after the pei311 fix).
+    Best-effort — returns None on any failure so the save never blocks."""
+    try:
+        enzyme = grammar.get("enzyme") if isinstance(grammar, dict) else None
+        root = _CommercialSaaSHistoryNode.new(
+            name=str(name or "clone") + ".dna",
+            seq_len=_coerce_int_or_zero(seq_len),
+            circular=True,
+            operation="insertFragment",
+            node_id=0,
+        )
+        if isinstance(enzyme, str) and enzyme:
+            root.add_regenerated_site(enzyme, pos=0, site_count=1)
+        vector_name = str((entry_vector or {}).get("name") or "entry vector")
+        part_name = str(part.get("name") or "part")
+        root.add_input_summary(
+            manipulation=f"{grammar_id or 'gb_l0'}Assembly",
+            name1=vector_name, name2=part_name,
+            site_count1=1, site_count2=1,
+        )
+        # Cross-reference to the library so each input carries its own
+        # nested lineage when it came from an earlier save. Readonly iter
+        # — refs only read by `_parent_node_for_entry`, which builds a
+        # fresh node (no mutation of the cached entries).
+        lib_by_name: dict[str, dict] = {}
+        for e in _iter_library_readonly():
+            if isinstance(e, dict):
+                nm = e.get("name")
+                if nm:
+                    lib_by_name[str(nm)] = e
+        vec_entry = lib_by_name.get(vector_name) or (entry_vector or {})
+        vec_node = TraditionalCloningPane._parent_node_for_entry(vec_entry)
+        if vec_node is not None:
+            root.add_parent(vec_node)
+        part_entry = lib_by_name.get(part_name) or {
+            "name": part_name,
+            "size": _coerce_int_or_zero(
+                part.get("size") or len(part.get("sequence") or "")
+            ),
+        }
+        part_node = TraditionalCloningPane._parent_node_for_entry(part_entry)
+        if part_node is not None:
+            root.add_parent(part_node)
+        return _serialize_commercialsaas_history(root)
+    except Exception:
+        _log.debug("l0-clone history: build failed for %r", name,
+                    exc_info=True)
+        return None
+
+
 # Bound GENERATED construction history so it can't bloat the library /
 # collections files as in-place edits accumulate over time. The edit
 # chain re-nests the prior tree on every change; without a cap a plasmid
@@ -12577,11 +12666,10 @@ def _maybe_append_edit_history(entry: dict, record, prev_gb_text: str,
         # very large prior history is too costly to parse + re-nest on
         # every edit, so collapse it to a compact leaf rather than
         # chaining the whole tree (bloat + per-edit-CPU guard).
-        prev_for_parent = (
-            None if (prev_history
-                     and len(prev_history) > _HISTORY_XML_MAX_BYTES)
-            else (prev_history or None)
+        prev_over_cap = bool(
+            prev_history and len(prev_history) > _HISTORY_XML_MAX_BYTES
         )
+        prev_for_parent = None if prev_over_cap else (prev_history or None)
         parent = TraditionalCloningPane._parent_node_for_entry({
             "name":        name,
             "size":        prev_seq_len,
@@ -12589,6 +12677,18 @@ def _maybe_append_edit_history(entry: dict, record, prev_gb_text: str,
             "gb_text":     prev_gb_text,
         })
         if parent is not None:
+            if prev_over_cap:
+                # The pre-edit version DID carry lineage, but it exceeded
+                # the re-nest budget and was dropped above. Leave the same
+                # "(earlier history truncated)" marker the node-budget cap
+                # (_truncate_history_to_recent) does, so the History viewer
+                # signals upstream lineage existed instead of rendering a
+                # bare, parent-less leaf — otherwise a silent drop at the
+                # display layer.
+                parent.add_parent(_CommercialSaaSHistoryNode.new(
+                    name="(earlier history truncated)", seq_len=0,
+                    circular=False, operation="truncated", node_id=0,
+                ))
             edited.add_parent(parent)
         # Cap the chained tree to a recent window so successive edits
         # can't grow history_xml without bound.
@@ -12605,6 +12705,14 @@ def _maybe_append_edit_history(entry: dict, record, prev_gb_text: str,
             )
             bare.add_input_summary(manipulation="editSequence", name1=name,
                                     val1=prev_seq_len, val2=len(new_seq))
+            if parent is not None:
+                # Had lineage but the capped tree still blew the ceiling;
+                # mark that earlier history existed rather than collapsing
+                # to a silent parent-less leaf.
+                bare.add_parent(_CommercialSaaSHistoryNode.new(
+                    name="(earlier history truncated)", seq_len=0,
+                    circular=False, operation="truncated", node_id=0,
+                ))
             xml = _serialize_commercialsaas_history(bare)
         if xml:
             entry["history_xml"] = xml
@@ -15234,6 +15342,22 @@ def _search_subsequence(
     # propagate; the modal turns it into a status-line message).
     s = _normalize_dna_for_align(seq or "")
     q = _normalize_dna_for_align(query or "")
+    # Coordinate-safety guard (2026-06-02): this matcher returns indices
+    # INTO the normalised haystack `s`, which the caller maps straight
+    # back to a bp position on the loaded record (focus_span / select /
+    # annotate). `_normalize_dna_for_align` only strips length-CHANGING
+    # junk (whitespace / digits / FASTA headers); a loaded record's
+    # sequence never carries those (U→T and upper-casing preserve
+    # length), so `len(s) == len(seq)`. If a future caller ever feeds an
+    # un-cleaned haystack, fail loud here rather than silently jump to /
+    # select the WRONG base — coordinate drift in a search hit is the
+    # same misleading-position class as a mis-drawn primer.
+    if len(s) != len(seq or ""):
+        raise ValueError(
+            "search haystack changed length under normalisation "
+            "(stray whitespace / digits / FASTA header?) — match "
+            "coordinates would not line up with the sequence"
+        )
     n = len(s)
     m = len(q)
     if m == 0 or n == 0 or m > n:
@@ -18553,6 +18677,15 @@ class PlasmidMap(Widget):
                             new_feat["_flap_bases"] = primer_seq[:flap_len][::-1]
                             new_feat["_flap_start"] = end
                             new_feat["_flap_end"]   = end + flap_len
+                        if not _rec_is_circular:
+                            # Linear molecule: the 5' tail dangles past
+                            # the (non-joined) end. Tell the painter to
+                            # CLIP it at [0, total) rather than mod-wrap
+                            # it to the opposite end (a gap that doesn't
+                            # exist on a linear fragment). Matches the
+                            # topology gate the bound region already uses
+                            # via _rederive_primer_binding(circular=…).
+                            new_feat["_flap_linear"] = True
             feats.append(new_feat)
         return feats
 
@@ -24554,17 +24687,32 @@ class SequencePanel(Widget):
         if not self._seq:
             return
         n = len(self._seq)
+        raw_end = int(end)
         start = max(0, min(int(start), n - 1))
-        end   = max(start + 1, min(int(end), n))
         self._re_highlight = None
-        if select and (end - start) > 1:
-            self._user_sel   = (start, end)
+        # A circular search hit that crosses the origin arrives with
+        # raw_end > n (the matcher scans `seq + seq[:m-1]`). Encode it as
+        # a WRAP selection `(start, head_end)` with start > head_end — the
+        # same representation the DNA renderer's `in_usr` wrap branch,
+        # Ctrl+C, and Alt+Shift+F (`action_add_feature`: `_feat_len` +
+        # tail+head) all handle — so the FULL match (tail `[start, n)` +
+        # head `[0, head_end)`) highlights / copies / annotates, not just
+        # the tail half. [INV-96 / L2a]
+        head_end = raw_end - n
+        if select and 1 <= head_end < start:
+            self._user_sel   = (start, head_end)     # start > head_end → wrap
             self._sel_range  = None
             self._sel_anchor = start
         else:
-            self._user_sel   = None
-            self._sel_range  = None
-            self._sel_anchor = -1
+            end = max(start + 1, min(raw_end, n))
+            if select and (end - start) > 1:
+                self._user_sel   = (start, end)
+                self._sel_range  = None
+                self._sel_anchor = start
+            else:
+                self._user_sel   = None
+                self._sel_range  = None
+                self._sel_anchor = -1
         self._cursor_pos = start
         # center_on_bp defers its scroll via call_after_refresh, so it
         # composes with the refresh either way; _ensure_cursor_visible
@@ -36698,6 +36846,75 @@ def _diagnose_part_cloning(part: dict) -> "str | None":
                 f"site(s) — need ≥2 to excise a dropout cassette for "
                 f"IIS cloning. Pick a vector with the dropout intact.")
     return None   # cloning will succeed (digest-match or synthesis)
+
+
+def _part_to_primed_fragment_seqrecord(part: dict, *, name: str = ""):
+    """Build a LINEAR SeqRecord for the part's PRIMED FRAGMENT — the PCR
+    amplicon the designed domestication primers would produce on the
+    insert: the insert flanked by each primer's 5' tail (Type IIS site +
+    spacer + the grammar overhang + pad). This is exactly the sequence a
+    user orders for DNA synthesis — "the primed cut sites and overhangs
+    present, as if it were run with the designed domestication primers".
+
+    Both domestication primers are attached as `primer_bind` features so
+    the fragment also shows how it's amplified. The Type IIS recognition
+    sites live inside the primer tails, so the restriction overlay paints
+    them automatically when the fragment is loaded.
+
+    Distinct from `_part_to_cloned_seqrecord` (the circular clone) and
+    from the parts-bin row (insert + overhang metadata only): this is the
+    linear, orderable amplicon, named + placed independently of the
+    clone (dual-save, 2026-06-02). Raises ValueError when the part has no
+    sequence; falls back to the canonical `_simulate_primed_amplicon`
+    formula when the stored primers don't bind the insert cleanly."""
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    insert = part.get("sequence", "") or ""
+    if not insert:
+        raise ValueError("Part has no sequence — cannot build a fragment.")
+    oh5 = part.get("oh5") or ""
+    oh3 = part.get("oh3") or ""
+    ptype = str(part.get("type") or "")
+    grammar_id = part.get("grammar") or "gb_l0"
+    try:
+        grammar = _all_grammars().get(grammar_id) \
+            or _BUILTIN_GRAMMARS.get("gb_l0") or {}
+    except Exception:
+        grammar = {}
+    fwd = str(part.get("fwd_primer", "") or "")
+    rev = str(part.get("rev_primer", "") or "")
+    # PCR-faithful amplicon from the stored primers (same builder the
+    # parts-bin "Copy full amplicon" button + the clone simulation use),
+    # falling back to the canonical primed-amplicon formula when the
+    # primers don't bind cleanly. Either way the result carries the
+    # enzyme sites + overhangs + pads in its 5' / 3' tails.
+    amplicon = ""
+    if fwd and rev:
+        amplicon = _amplicon_from_stored_primers(fwd, rev, insert, oh5, ptype) or ""
+    if not amplicon:
+        amplicon = _simulate_primed_amplicon(
+            insert, oh5, oh3, grammar=grammar, part_type=ptype,
+        )
+    if not amplicon:
+        raise ValueError("Could not build a primed amplicon for the fragment.")
+    disp = (name or part.get("name") or "fragment").strip() or "fragment"
+    safe_id = (re.sub(r"[^A-Za-z0-9_]+", "_", disp).strip("_")
+               or "fragment")[:_GB_LOCUS_NAME_MAX]
+    rec = SeqRecord(
+        Seq(amplicon), id=safe_id, name=safe_id, description=disp,
+        annotations={"molecule_type": "DNA", "topology": "linear"},
+    )
+    # Attach the domestication primers (bound anneal region vs 5' enzyme
+    # tail), re-derived from the fragment's own sequence — the same
+    # helper the clone uses, so the fragment + clone show the SAME pair.
+    try:
+        _attach_pcr_primers_to_record(
+            rec, fwd, rev,
+            fwd_tm=part.get("fwd_tm"), rev_tm=part.get("rev_tm"),
+        )
+    except Exception:
+        _log.exception("fragment primers: attach failed for %r", disp)
+    return rec
 
 
 def _part_to_cloned_seqrecord(part: dict):
@@ -59318,6 +59535,8 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
                 clone_name = (res.get("name") or "").strip() or display_name
                 collection = (res.get("collection") or "").strip()
                 chosen_bin = (res.get("bin") or "").strip()
+                frag_name = (res.get("frag_name") or "").strip()
+                frag_collection = (res.get("frag_collection") or "").strip()
                 # Route the PART to the chosen bin (switch active if the
                 # user picked a different one — same mirror-swap the bins
                 # picker uses, via the shared helper).
@@ -59369,13 +59588,16 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
                         f"Saved '{final_name}' to Parts Bin "
                         f"({len(final_part.get('sequence', ''))} bp).",
                     )
-                    # Mirror the cloned plasmid off-thread under the name
-                    # + collection picked up-front in the store dialog.
+                    # Mirror the cloned plasmid + primed fragment off-thread
+                    # under the names + collections picked up-front in the
+                    # store dialog (each independent of the parts-bin row).
                     from copy import deepcopy as _deepcopy
                     self._domesticator_library_mirror_worker(
                         _deepcopy(final_part),
                         clone_name=clone_name,
                         target_collection=collection,
+                        frag_name=frag_name,
+                        frag_collection=frag_collection,
                     )
 
                 _resolve_load_collisions(
@@ -59402,15 +59624,23 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
                 ]
             except Exception:  # noqa: BLE001
                 _bin_names = []
+            # Default the fragment name to the user's "FRAG-" synthesis-
+            # order convention (editable / clearable in the dialog). The
+            # fragment can land in any collection too — seed the same list
+            # as the clone, defaulting to the active collection.
             self.app.push_screen(
                 AmpliconSaveModal(
                     default_name=display_name,
                     collections=_coll_names,
                     active_collection=_get_active_collection_name(),
-                    title="Store cloned part",
+                    title="Store cloned part + fragment",
                     name_label="Cloned plasmid name",
                     parts_bins=_bin_names,
                     active_bin=_get_active_parts_bin_name(),
+                    fragment_default_name=f"FRAG-{display_name}",
+                    fragment_collections=_coll_names,
+                    fragment_active_collection=_get_active_collection_name(),
+                    fragment_label="Fragment name (for synthesis orders)",
                 ),
                 callback=_store,
             )
@@ -59435,13 +59665,23 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
         self, part_dict: dict, *,
         clone_name: "str | None" = None,
         target_collection: "str | None" = None,
+        frag_name: "str | None" = None,
+        frag_collection: "str | None" = None,
     ) -> None:
-        """Off-thread Domesticator → cloned-plasmid save.
+        """Off-thread Domesticator → cloned-plasmid + primed-fragment save.
 
         ``clone_name`` / ``target_collection`` (dual-save) name the clone
         + pick its destination collection independently of the parts-bin
         row; both default to the part name / active collection so an
         un-prompted call matches the prior behaviour.
+
+        ``frag_name`` / ``frag_collection`` (2026-06-02) ALSO save the
+        LINEAR primed fragment — the orderable amplicon (insert + the
+        primers' enzyme-site/overhang 5' tails) with both domestication
+        primers attached — under its OWN name + collection, named
+        independently of the clone (the user's "FRAG-…" synthesis-order
+        convention). Gated on ``frag_name`` so an un-prompted call saves
+        the clone only, exactly as before.
 
         Mirrors the L0 part as a full part-in-entry-vector plasmid
         in the library. Runs after the parts-bin save (which is sync
@@ -59496,6 +59736,36 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
             "added":   _date.today().isoformat(),
             "gb_text": _record_to_gb_text(lib_rec),
         }
+        # Construction-history auto-record (INV-93 parity with the
+        # Constructor / Traditional panes). A Domesticator clone is a
+        # single-part L0 assembly — the part's amplicon ligated into its
+        # entry vector — but pre-fix it carried NO history_xml, so the
+        # save chokepoint stamped the bare `createDocument` origin stub
+        # ("domesticator:l0" matched no rich builder) and a
+        # synthesis→parts→clone plasmid showed an empty lineage. Build
+        # the insert + entry-vector tree here so its History reads like a
+        # Constructor build. L0 only (the Domesticator's product); an L1+
+        # part short-circuits in _part_to_cloned_seqrecord and keeps its
+        # own gb_text lineage. Best-effort — never blocks the save.
+        try:
+            if _part_level(part_dict) < 1:
+                _grammar_id = part_dict.get("grammar") or "gb_l0"
+                _grammar = (_all_grammars().get(_grammar_id)
+                            or _BUILTIN_GRAMMARS.get("gb_l0") or {})
+                _entry_vec = _get_entry_vector(_grammar_id)
+                if isinstance(_entry_vec, dict) and _entry_vec.get("gb_text"):
+                    _hist = _build_history_for_l0_clone(
+                        name=clone_disp, seq_len=_seq_len(lib_rec),
+                        grammar_id=_grammar_id, grammar=_grammar,
+                        entry_vector=_entry_vec, part=part_dict,
+                    )
+                    if _hist:
+                        lib_entry["history_xml"] = _hist
+        except Exception:
+            _log.debug(
+                "domesticator: clone history build failed for %r",
+                clone_disp, exc_info=True,
+            )
         try:
             final_name = _commit_library_entry_to_collection(lib_entry, target)
         except (OSError, RuntimeError) as exc:
@@ -59518,6 +59788,78 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
             name=final_name, collection=target,
             bp=lib_entry["size"], n_feats=lib_entry["n_feats"],
         )
+        # Primed-fragment dual-save (2026-06-02): in addition to the
+        # circular clone, save the LINEAR primed fragment — the amplicon
+        # the designed domestication primers produce (insert + each
+        # primer's 5' enzyme-site/overhang tail), with both primers
+        # attached — under its OWN name + collection. This is the
+        # orderable synthesis fragment the user names independently
+        # (e.g. "FRAG-…"). Fully independent of the clone that just
+        # saved: its own try/except so a fragment failure never disturbs
+        # the clone or the parts-bin row. Gated on frag_name + L0 (the
+        # Domesticator's product) so an un-prompted call is unchanged.
+        frag_disp = (frag_name or "").strip()
+        if frag_disp and _part_level(part_dict) < 1:
+            try:
+                frag_rec = _part_to_primed_fragment_seqrecord(
+                    part_dict, name=frag_disp,
+                )
+                frag_target = ((frag_collection or "").strip()
+                               or target or "Default")
+                frag_id = (re.sub(r"[^A-Za-z0-9_]+", "_",
+                                  (frag_rec.id or frag_disp)).strip("_")
+                           or "fragment")
+                frag_entry = {
+                    "id":      frag_id,
+                    "name":    frag_disp,
+                    "size":    _seq_len(frag_rec),
+                    "n_feats": len(frag_rec.features or []),
+                    "kind":    "fragment",          # linear synthesis order
+                    "source":  "domesticator:fragment",
+                    "added":   _date.today().isoformat(),
+                    "gb_text": _record_to_gb_text(frag_rec),
+                }
+                # The fragment IS a PCR amplicon — give it amplicon
+                # construction history (primers as <Oligo> children +
+                # amplified region) so its History matches a de-novo
+                # amplicon's, INV-93-style. Best-effort.
+                try:
+                    _fh = _build_amplicon_history_xml(
+                        name=frag_disp, seq_len=frag_entry["size"],
+                        fwd_seq=str(part_dict.get("fwd_primer") or ""),
+                        rev_seq=str(part_dict.get("rev_primer") or ""),
+                        start_1based=1, end_1based=frag_entry["size"],
+                        fwd_name=f"{frag_disp} fwd",
+                        rev_name=f"{frag_disp} rev",
+                    )
+                    if _fh:
+                        frag_entry["history_xml"] = _fh
+                except Exception:
+                    _log.debug("fragment history build failed for %r",
+                               frag_disp, exc_info=True)
+                frag_final = _commit_library_entry_to_collection(
+                    frag_entry, frag_target,
+                )
+                _log_event(
+                    "domesticator.fragment_mirror.ok",
+                    name=frag_final, collection=frag_target,
+                    bp=frag_entry["size"], n_feats=frag_entry["n_feats"],
+                )
+            except Exception as exc:
+                _log.exception(
+                    "Domesticator: primed-fragment save failed for %r",
+                    frag_name,
+                )
+                _log_event(
+                    "domesticator.fragment_mirror.failed",
+                    name=str(frag_name), error=str(exc)[:120],
+                )
+                self.app.call_from_thread(
+                    self.app.notify,
+                    f"Fragment save failed ({exc}). The clone + parts-bin "
+                    f"row are intact.",
+                    severity="warning",
+                )
         # Best-effort reveal — resolves when the clone landed in the
         # active collection (mirrored to the library file); a clone routed
         # to a non-active collection just isn't in the current view yet.
@@ -64157,12 +64499,24 @@ class SequencingScreen(Screen):
                 entry.get("id"),
             )
             return
+        # Capture the record-load generation right after our load so a
+        # fast navigation (agent API or the user) to ANOTHER plasmid
+        # inside the 0.2 s timer window can't park the cursor on the
+        # wrong molecule. `_apply_record` bumps `_record_load_counter`;
+        # if it shifts before `_scroll` fires, abort the jump. (The
+        # align workers use this same guard; `focus_span` already clamps
+        # out-of-range, so this is correctness-of-target, not a crash.)
+        _jump_counter = getattr(self.app, "_record_load_counter", None)
         # Schedule a cursor jump after the screen-pop + canvas paint
         # settle. `set_timer` on the App side hops to the next tick;
         # by then `_current_record` is the loaded entry and the
         # seq panel is mounted.
         def _scroll():
             try:
+                if (_jump_counter is not None
+                        and getattr(self.app, "_record_load_counter", None)
+                            != _jump_counter):
+                    return                      # canvas changed under us
                 sp = self.app.query_one("#seq-panel", SequencePanel)
                 # Shared jump-to-bp primitive (added 2026-06-01).
                 # center=False preserves this caller's original
@@ -75332,10 +75686,12 @@ class AlignmentManagerModal(_OneShotDismissScreen, ModalScreen):
         # conflated the two and the only bulk-delete option was a
         # blanket "Delete All" — a user with 30 alignments and one
         # bad lane had to nuke everything to get rid of it.
-        # "Mism" / "Gaps" quantify the mismatched bases and gapped bp so
-        # the user gets a fast "how bad is it" read without drilling in
-        # (request 2026-05-31). A near-100% identity that rounds clean
-        # still shows e.g. "1 / 0" here, pinning the exact bp delta.
+        # "Mism" = mismatched bases; "Gaps" = indel EVENTS (gap runs, via
+        # `_alignment_indel_events` — NOT gapped bp), so a fast "how bad
+        # is it" read without drilling in (request 2026-05-31) and the
+        # count matches the Verification Report's "Indels" for the same
+        # alignment. A near-100% identity that rounds clean still shows
+        # e.g. "1 / 0" here, pinning the exact bp delta.
         t.add_columns("Mk", "Vis", "Label", "Target", "Identity",
                        "Mism", "Gaps", "Source", "Added")
         self._repopulate()
@@ -87669,6 +88025,20 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             new_rec.features.append(deepcopy(f))
 
         total = _seq_len(new_rec)
+        # Topology gate (2026-06-02, [INV-74] sibling-path fix): a primer
+        # on a LINEAR record must not bind / draw across the (non-joined)
+        # ends. Mirror PlasmidMap._parse's rule (line ~18223) exactly —
+        # only an EXPLICIT "linear" annotation disables the circular
+        # wrap, so circular / un-annotated records keep prior behaviour.
+        # Without this, _rederive_primer_binding defaulted to
+        # circular=True here and could re-derive — and then persist via
+        # lib.add_entry — a wrap CompoundLocation across a linear
+        # fragment's ends (catastrophic-class: primer drawn off its real
+        # site). _parse got circular=_rec_is_circular in v1.0.14; this
+        # add-to-map sibling was missed.
+        is_circ = str(
+            (getattr(new_rec, "annotations", {}) or {}).get("topology", "")
+        ).strip().lower() != "linear"
         added = []
         for idx in sorted(self._lib_selected):
             if idx < 0 or idx >= len(primers):
@@ -87690,6 +88060,7 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
                 rb = _rederive_primer_binding(
                     full_seq, int(strand or 1), str(new_rec.seq),
                     total, hint_start=int(p_start or 0),
+                    circular=is_circ,
                 )
                 if rb is not None:
                     p_start, p_end = rb
@@ -87697,12 +88068,20 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
                 continue
             # Wrap primer: pos_end < pos_start means the binding region
             # crosses the origin. Represent as a CompoundLocation so
-            # downstream parsers (and GenBank exports) keep the two pieces.
-            if p_end < p_start and 0 <= p_end and p_start < total:
-                loc = CompoundLocation([
-                    FeatureLocation(p_start, total, strand=strand),
-                    FeatureLocation(0,       p_end, strand=strand),
-                ])
+            # downstream parsers (and GenBank exports) keep the two
+            # pieces — but ONLY on a circular molecule. On a linear
+            # record the ends don't join, so a wrap position (a stale
+            # store, or a primer designed against a circular construct)
+            # can't anneal here: skip it rather than draw — and persist —
+            # a phantom wrap feature across the fragment's ends.
+            if p_end < p_start:
+                if is_circ and 0 <= p_end and p_start < total:
+                    loc = CompoundLocation([
+                        FeatureLocation(p_start, total, strand=strand),
+                        FeatureLocation(0,       p_end, strand=strand),
+                    ])
+                else:
+                    continue
             elif 0 <= p_start < p_end <= total:
                 loc = FeatureLocation(p_start, p_end, strand=strand)
             else:
@@ -88838,7 +89217,11 @@ class AmpliconSaveModal(ModalScreen):
                  title: str = "Save amplicon to library",
                  name_label: str = "Amplicon name",
                  parts_bins: "list[str] | None" = None,
-                 active_bin: "str | None" = None) -> None:
+                 active_bin: "str | None" = None,
+                 fragment_default_name: "str | None" = None,
+                 fragment_collections: "list[str] | None" = None,
+                 fragment_active_collection: "str | None" = None,
+                 fragment_label: str = "Fragment name") -> None:
         super().__init__()
         # Title + name-label are parametrised (back-compat defaults) so the
         # same hardened name+collection dialog serves the PCR amplicon save
@@ -88875,6 +89258,29 @@ class AmpliconSaveModal(ModalScreen):
                     bins.append(nm)
             self._parts_bins = bins or ["Main Parts Bin"]
             self._active_bin = self._parts_bins[0]
+        # Optional primed-fragment fields (dual-save, 2026-06-02): name +
+        # place the LINEAR primed fragment independently of the clone.
+        # None → no fragment row, so the amplicon / clone-only paths are
+        # byte-unchanged. Collections normalised like the clone's: active
+        # first, de-duped, never empty.
+        self._fragment_label = (fragment_label or "Fragment name").strip() \
+            or "Fragment name"
+        if fragment_default_name is None:
+            self._fragment_default_name: "str | None" = None
+            self._fragment_collections: "list[str]" = []
+            self._fragment_active: "str | None" = None
+        else:
+            self._fragment_default_name = (
+                (fragment_default_name or "").strip() or "FRAG-fragment")
+            f_src = (fragment_collections
+                     if fragment_collections is not None else collections)
+            f_names: list[str] = []
+            for raw in [fragment_active_collection, *(f_src or [])]:
+                nm = (raw or "").strip()
+                if nm and nm not in f_names:
+                    f_names.append(nm)
+            self._fragment_collections = f_names or list(self._collections)
+            self._fragment_active = self._fragment_collections[0]
         self._dismissed = False
 
     def _dismiss_once(self, result) -> None:
@@ -88896,6 +89302,18 @@ class AmpliconSaveModal(ModalScreen):
                 allow_blank=False,
                 id="ampsave-collection",
             )
+            if self._fragment_default_name is not None:
+                yield Label(f"{self._fragment_label}:")
+                yield Input(value=self._fragment_default_name,
+                            id="ampsave-frag-name",
+                            placeholder=self._fragment_label)
+                yield Label("Save fragment to collection:")
+                yield Select(
+                    [(n, n) for n in self._fragment_collections],
+                    value=self._fragment_active,
+                    allow_blank=False,
+                    id="ampsave-frag-collection",
+                )
             if self._parts_bins is not None:
                 yield Label("Store part in parts bin:")
                 yield Select(
@@ -88942,6 +89360,27 @@ class AmpliconSaveModal(ModalScreen):
         if not isinstance(coll, str) or not coll.strip():
             coll = self._active
         result = {"name": name, "collection": coll}
+        # Optional primed-fragment fields (dual-save). When the fragment
+        # row is present its name must be non-empty too — never save a
+        # fragment under a blank name (parity with the clone-name check).
+        if self._fragment_default_name is not None:
+            try:
+                frag_name = self.query_one(
+                    "#ampsave-frag-name", Input).value.strip()
+            except NoMatches:
+                frag_name = ""
+            if not frag_name:
+                self._set_status("[red]Enter a fragment name.[/red]")
+                return
+            frag_coll = self._fragment_active
+            try:
+                fv = self.query_one("#ampsave-frag-collection", Select).value
+                if isinstance(fv, str) and fv.strip():
+                    frag_coll = fv
+            except NoMatches:
+                pass
+            result["frag_name"] = frag_name
+            result["frag_collection"] = frag_coll or ""
         # Optional parts-bin choice (dual-save). Absent → caller keeps
         # the active bin.
         if self._parts_bins is not None:
@@ -104767,6 +105206,19 @@ NcbiTaxonPickerModal { align: center middle; }
         n = len(sp._seq)
         if sp._user_sel is not None:
             s, e = sp._user_sel
+            if s > e:
+                # Origin-straddling selection — the sole producer of a
+                # reversed _user_sel is an AA-codon click on a wrap CDS,
+                # which encodes the codon as (high_bp, low_bp). A linear
+                # splice (old[:s] + new + old[e:]) can't represent an
+                # edit across the origin and would DUPLICATE the [e:s]
+                # body, so refuse rather than silently corrupt the seq.
+                self.notify(
+                    "That selection crosses the origin — rotate the map "
+                    "origin away from it (Alt+O on a base) to edit it.",
+                    severity="warning", timeout=8,
+                )
+                return
             mode = "delete" if prefer == "delete" else "replace"
             self.push_screen(
                 EditSeqDialog(mode, sp._seq[s:e], s, e, total=n),
@@ -104796,9 +105248,21 @@ NcbiTaxonPickerModal { align: center middle; }
     def _edit_dialog_result(self, result) -> None:
         if result is None:
             return
-        self._push_undo()
         new_bases, mode, s, e = result
         sp      = self.query_one("#seq-panel", SequencePanel)
+        # Defensive (2026-06-02): a reversed span (s > e) would make the
+        # splice below (old[:s] + new + old[e:]) DUPLICATE the [e:s]
+        # region — silent sequence corruption. _open_seq_edit_dialog
+        # already refuses an origin-crossing _user_sel; guard the commit
+        # point too so no future caller can corrupt the sequence here.
+        if not (0 <= s <= e <= len(sp._seq)):
+            self.notify(
+                "Edit refused — invalid selection range "
+                "(does it cross the origin?).",
+                severity="warning", timeout=8,
+            )
+            return
+        self._push_undo()
         pm      = self.query_one("#plasmid-map", PlasmidMap)
         old_seq = sp._seq
 
@@ -106270,7 +106734,11 @@ NcbiTaxonPickerModal { align: center middle; }
             self.notify("No selection — click a feature or drag to select",
                         severity="information")
             return
-        top = seq[sel[0]:sel[1]].upper()
+        # Wrap-aware (an origin-crossing search hit / AA-codon click stores
+        # `_user_sel` as (start, head_end) with start > head_end): copy the
+        # tail [start, n) + head [0, head_end), not an empty slice.
+        s, e = sel[0], sel[1]
+        top = (seq[s:e] if e >= s else seq[s:] + seq[:e]).upper()
         if bottom:
             # `_rc` handles full IUPAC, not just ACGT — sacred invariant #3.
             text = _rc(top)
@@ -110182,7 +110650,12 @@ NcbiTaxonPickerModal { align: center middle; }
                     severity="information", timeout=3, markup=False,
                 )
             except Exception:
-                pass
+                # Diagnostic echo only (Alt+M click-debug) — never let a
+                # toast hiccup break the click. Log per the [PIT-01]
+                # narrow-except+log convention so a recurring failure is
+                # still traceable.
+                _log.debug("alignment lane click-debug echo failed",
+                           exc_info=True)
 
     @on(FeatureSidebar.RowActivated)
     def _sidebar_row_activated(self, event: FeatureSidebar.RowActivated):

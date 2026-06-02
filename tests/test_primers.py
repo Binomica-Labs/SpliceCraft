@@ -949,3 +949,109 @@ class TestPrimerLibraryScrollable:
             t.move_cursor(row=49)
             await pilot.pause()
             assert t.cursor_row == 49
+
+
+class TestPrimerFlapLinearClip:
+    """A primer's 5' flap (the unbound enzyme tail) mod-wraps to the far
+    end on a CIRCULAR molecule — the tail reappears across the origin —
+    but must CLIP at the ends on a LINEAR one, which has no joined ends to
+    wrap across. Gated by `_flap_linear`, stamped at parse time when the
+    record is linear (2026-06-02). Without this, a primer near a linear
+    fragment's terminus drew its tail bizarrely reappearing at the
+    opposite end."""
+
+    @staticmethod
+    def _painted(arr):
+        return {i for i, (c, _s) in enumerate(arr) if c != " "}
+
+    def _arr(self, n):
+        return [(" ", "") for _ in range(n)]
+
+    def test_circular_flap_wraps_across_origin(self):
+        # Forward primer bound at bp 1; 3-bp 5' flap spans bp -2..1, which
+        # on a 10-bp CIRCULAR molecule wraps to columns 8, 9 (and 0).
+        arr = self._arr(10)
+        feat = {"_flap_start": -2, "_flap_end": 1, "_flap_bases": "AAA",
+                "color": "red"}
+        sc._paint_primer_flap_bar(arr, feat, 0, 10, total=10)
+        assert self._painted(arr) == {0, 8, 9}
+
+    def test_linear_flap_clips_at_end(self):
+        # Same flap on a LINEAR molecule: the off-the-left-end tail
+        # (bp -2, -1) is clipped, NOT wrapped to cols 8, 9. Only the
+        # in-range base (bp 0) is drawn.
+        arr = self._arr(10)
+        feat = {"_flap_start": -2, "_flap_end": 1, "_flap_bases": "AAA",
+                "color": "red", "_flap_linear": True}
+        sc._paint_primer_flap_bar(arr, feat, 0, 10, total=10)
+        assert self._painted(arr) == {0}
+
+
+def _topo_record(seq: str, *, circular: bool, rid: str = "TOPO1"):
+    from Bio.SeqRecord import SeqRecord
+    from Bio.Seq import Seq
+    rec = SeqRecord(Seq(seq), id=rid, name=rid, description="topology test")
+    rec.annotations["molecule_type"] = "DNA"
+    rec.annotations["topology"] = "circular" if circular else "linear"
+    return rec
+
+
+class TestAddSelectedPrimerTopology:
+    """[INV-96 / H1] `PrimerDesignScreen._add_selected_to_map` must be
+    topology-aware. Adding a stored library primer whose position WRAPS
+    the origin to a LINEAR record must NOT build — and persist via
+    `lib.add_entry` — a wrap CompoundLocation across the non-joined ends
+    (a primer-on-wrong-bases catastrophe). A CIRCULAR record keeps the
+    wrap. Pre-fix this sibling path defaulted `circular=True` (only
+    `PlasmidMap._parse` got the v1.0.14 topology fix), so it wrapped
+    linear fragments too."""
+
+    SEQ = "ACGTACGTAC" * 12          # 120 bp; no 12-bp run of the primer
+
+    def _seed_wrap_primer(self):
+        # A primer absent from the template (re-derivation returns None →
+        # the STALE wrap position drives the branch) with pos_end <
+        # pos_start (wraps the 120-bp origin).
+        sc._save_primers([{
+            "name": "wrapper",
+            "sequence": "GGGGGCCCCCAAAAATTTTTGG",
+            "pos_start": 110, "pos_end": 6, "strand": 1,
+        }])
+
+    async def _primer_loc_types(self, rec, isolated_library):
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            screen = sc.PrimerDesignScreen(str(rec.seq), [], rec.id)
+            app.push_screen(screen)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            screen._lib_selected = {0}
+            screen._add_selected_to_map(None)
+            await pilot.pause(0.05)
+            locs = [type(f.location).__name__
+                    for f in app._current_record.features
+                    if f.type == "primer_bind"]
+            app.exit()
+            return locs
+
+    async def test_linear_record_does_not_get_wrap_primer(
+            self, isolated_library, isolated_primers):
+        self._seed_wrap_primer()
+        rec = _topo_record(self.SEQ, circular=False, rid="LIN1")
+        locs = await self._primer_loc_types(rec, isolated_library)
+        assert "CompoundLocation" not in locs, (
+            "a linear record must never get a wrap (CompoundLocation) primer"
+        )
+
+    async def test_circular_record_keeps_wrap_primer(
+            self, isolated_library, isolated_primers):
+        # Control: the SAME primer on a CIRCULAR record DOES wrap.
+        self._seed_wrap_primer()
+        rec = _topo_record(self.SEQ, circular=True, rid="CIRC1")
+        locs = await self._primer_loc_types(rec, isolated_library)
+        assert "CompoundLocation" in locs, (
+            "a circular record should keep the wrap primer (topology control)"
+        )

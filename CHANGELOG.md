@@ -14,6 +14,25 @@
 
 ---
 
+## [1.0.15] — 2026-06-02
+
+### New features
+
+- **Save the synthesis fragment and the cloned plasmid separately — each with its own name and collection.** When you store a clone from the Domesticator, you can now name the **linear fragment** (the exact sequence you'd send for a DNA-synthesis order — the insert flanked by the designed domestication primers' enzyme sites + overhangs) independently of the **cloned plasmid**, and file each into whatever collection you like. The fragment name defaults to a `FRAG-…` form (editable/clearable), the fragment carries **both domestication primers drawn on it** and is tagged as a *fragment* in the library, and the parts-bin part still files into the bin you choose — so your synthesis orders, your finished clones, and your reusable L0 parts each land where you want them.
+
+### Bug fixes
+
+- **A plasmid built through Synthesis → Parts → clone now shows how it was built.** A clone domesticated from a synthesis fragment used to open its History as a bare "created in SpliceCraft" node with no parents; it now records the full assembly — the insert plus the entry vector it was cloned into — the same way a Constructor build does. (Plasmids cloned before this update get the richer history the next time they're re-saved.)
+
+### Hardening
+
+- **A library primer added to a *linear* fragment no longer draws — or saves — across the ends.** Adding a stored primer to a linear molecule could place it wrapping the (non-joined) ends and persist that wrong location to your library; primer placement is now topology-aware on this path too, matching the map. A primer's unbound 5′ tail on a linear fragment is likewise clipped at the end instead of reappearing at the opposite end.
+- **The sequence editor refuses an edit that crosses the origin instead of corrupting the sequence.** Selecting a codon that straddles the origin from the protein lane and pressing `Ctrl+E` could silently duplicate a stretch of DNA; that case is now refused with a prompt to rotate the origin first, backed by a second guard at the moment the edit is applied.
+- **Over-large construction history now shows an "(earlier history truncated)" marker** when it's collapsed, instead of silently flattening to a parentless leaf — so you can tell upstream lineage existed. The `Ctrl+F` search fails loudly rather than ever jumping to the wrong base on a mis-cleaned sequence, and the Verification Report's "open in canvas" jump won't land on the wrong plasmid if you navigate away mid-jump.
+- **A `Ctrl+F` match that crosses the circular origin now highlights — and copies (`Ctrl+C`) / annotates (`Alt+Shift+F`) — the *whole* match**, not just the part before the origin. Walking a circular plasmid and tagging an origin-spanning repeat now captures the full region in one step.
+
+---
+
 ## [1.0.14] — 2026-06-02
 
 ### New features

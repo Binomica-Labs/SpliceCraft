@@ -448,3 +448,98 @@ class TestOriginHistoryBackfill:
         plasmids = out[0]["plasmids"]
         assert len(plasmids) == 1                          # count preserved
         assert plasmids[0].get("history_xml")
+
+
+# ── Domesticator L0 clone records insert + entry-vector lineage ─────────
+
+
+class TestDomesticatedCloneHistory:
+    """A Domesticator clone is a single-part L0 assembly — the part's
+    amplicon ligated into its entry vector. `_build_history_for_l0_clone`
+    must record that lineage so a synthesis→parts→clone plasmid's History
+    reads like a Constructor build, NOT a bare `createDocument` leaf (the
+    reported pei311 symptom, again: 2026-06-02). Uses no instance state."""
+
+    def _call(self, grammar):
+        return sc._build_history_for_l0_clone(
+            name="Pei311", seq_len=2553,
+            grammar_id="gb_l0", grammar=grammar,
+            entry_vector={"name": "FFE_1_ENTRY_UPD"},
+            part={"name": "Pei311 insert", "size": 819,
+                  "sequence": "ATGC" * 205},
+        )
+
+    def test_clone_history_records_insert_and_vector(self):
+        xml = self._call({"enzyme": "Esp3I"})
+        assert xml
+        root = sc._parse_commercialsaas_history(xml)
+        assert root is not None
+        # An assembly node, NOT the bare createDocument leaf.
+        assert root.operation == "insertFragment"
+        # Both inputs recorded as parent fragments. (_parent_node_for_entry
+        # stamps a ".dna" suffix on node names, same as the root + the
+        # Constructor's parents — strip it for the identity check.)
+        names = {p.name.removesuffix(".dna") for p in root.parents}
+        assert "FFE_1_ENTRY_UPD" in names, "entry vector must be a parent"
+        assert "Pei311 insert" in names, "insert part must be a parent"
+        # The L0 Type IIS enzyme lands as a regenerated-site marker.
+        assert any(s["name"] == "Esp3I" for s in root.regenerated_sites)
+
+    def test_clone_history_built_when_enzyme_missing(self):
+        # Enzyme is a DETAIL — lineage still recorded, just no site marker
+        # (same policy as _build_history_for_assembly after the pei311 fix).
+        xml = self._call({})
+        root = sc._parse_commercialsaas_history(xml)
+        assert root is not None
+        assert root.operation == "insertFragment"
+        assert len(root.parents) == 2
+        assert root.regenerated_sites == []
+
+
+# ── over-cap prior history collapses WITH a truncation marker ───────────
+
+
+class TestEditHistoryOverCapMarker:
+    """When an in-place edit's prior history exceeds the per-edit re-nest
+    budget it's collapsed to a leaf — but the leaf must carry an
+    "(earlier history truncated)" marker so the History viewer signals
+    dropped lineage instead of a bare, parent-less leaf (2026-06-02).
+    Mirrors the marker the node-budget cap already leaves."""
+
+    @classmethod
+    def _has_marker(cls, node) -> bool:
+        if node.name == "(earlier history truncated)":
+            return True
+        return any(cls._has_marker(c) for c in node.parents)
+
+    def test_over_cap_prior_history_leaves_marker(self):
+        entry = {"name": "Big", "id": "Big",
+                 "gb_text": "LOCUS Big 30 bp DNA circular"}
+        rec = _rec("ATGCATGCATGCATGCATGCATGCATGCAT")        # 30 bp (≠ prev)
+        oversized = "<HistoryTree>" + "x" * (sc._HISTORY_XML_MAX_BYTES + 10)
+        sc._maybe_append_edit_history(
+            entry, rec, prev_gb_text="LOCUS Big 20 bp DNA circular",
+            prev_size=20, prev_history=oversized,
+        )
+        assert "history_xml" in entry
+        root = sc._parse_commercialsaas_history(entry["history_xml"])
+        assert root is not None
+        assert root.parents, "edit must chain the collapsed pre-edit version"
+        assert self._has_marker(root), (
+            "over-cap prior history must leave a truncation marker"
+        )
+
+    def test_within_cap_prior_history_has_no_spurious_marker(self):
+        # A small prior history re-nests normally — no truncation marker.
+        entry = {"name": "Sm", "id": "Sm",
+                 "gb_text": "LOCUS Sm 30 bp DNA circular"}
+        rec = _rec("ATGCATGCATGCATGCATGCATGCATGCAT")        # 30 bp
+        small_prev = sc._build_origin_history_xml(
+            name="Sm", seq_len=20, circular=True, source="paste:x")
+        sc._maybe_append_edit_history(
+            entry, rec, prev_gb_text="LOCUS Sm 20 bp DNA circular",
+            prev_size=20, prev_history=small_prev,
+        )
+        assert "history_xml" in entry
+        root = sc._parse_commercialsaas_history(entry["history_xml"])
+        assert not self._has_marker(root)

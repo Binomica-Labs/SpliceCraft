@@ -2055,6 +2055,39 @@ class TestCursorReachesEndOfSequence:
             assert sp._cursor_pos == n - 1
 
 
+class TestEditDialogReversedSpanGuard:
+    """[INV-96 / H2] A reversed selection (`start > end`) — the signature
+    of an origin-straddling AA-codon click on a wrap CDS — must be REFUSED
+    at the commit splice. `_edit_dialog_result` builds
+    `old[:s] + new + old[e:]`; with s > e that DUPLICATES the `[e:s]` body
+    (silent sequence corruption). The guard validates `0 <= s <= e <= n`
+    BEFORE `_push_undo`, so the sequence is left untouched — while a valid
+    span still applies."""
+
+    async def test_reversed_span_refused_valid_span_applies(
+        self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            before = str(app._current_record.seq)
+            n = len(before)
+            # Reversed span (s > e): must be refused — sequence untouched.
+            app._edit_dialog_result(("GGGG", "replace", n - 3, 5))
+            await pilot.pause(0.05)
+            assert str(app._current_record.seq) == before, (
+                "a reversed (origin-crossing) span must NOT edit the sequence"
+            )
+            # Control: a normal span (s < e) still applies — the guard
+            # isn't a blanket refuse.
+            app._edit_dialog_result(("GGGG", "replace", 5, 8))
+            await pilot.pause(0.05)
+            assert str(app._current_record.seq) != before, (
+                "a valid edit must still apply through the guard"
+            )
+
+
 class TestPlasmidMapLabelClick:
     """Clicking on a feature's text label in the plasmid map should
     route to that feature — same outcome as clicking its arc, the
