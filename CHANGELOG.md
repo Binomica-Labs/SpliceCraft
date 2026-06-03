@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.16] — 2026-06-02
+
+### New features
+
+- **Scrub a plasmid clean of restriction sites — no cloning, just PCR.** Mutato has a new **Scrub** tab that removes your chosen restriction-enzyme cut sites (default BsaI / Esp3I / BbsI — the Type IIS sites Golden Gate / MoClo can't tolerate) from the plasmid on the canvas using the smallest possible point changes: **silent** (synonymous) substitutions inside any coding sequence — checked against *every* overlapping reading frame, including genes on the opposite strand — and minimal base swaps elsewhere, never creating a new forbidden site in the process. Sites that can't be removed without changing a protein are **reported, not forced**. You get the cured circular plasmid (one click to **Apply to canvas**, fully undoable), an **improved-QuikChange primer pair per locus** (partial-overlap, Liu & Naismith — sliced from the cured sequence so each primer binds exactly where it's drawn), and a ready-to-run **protocol** (PCR → DpnI → transform — no ligase, no fragment assembly). Sites clustered together share one PCR; sites far apart are reported as separate rounds. Also available headless via the new **`scrub-plasmid`** agent endpoint.
+
+---
+
 ## [1.0.15] — 2026-06-02
 
 ### New features

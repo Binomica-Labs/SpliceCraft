@@ -107,6 +107,19 @@ What you can do without leaving the terminal.
   (auto-optimised via the active codon table). Edge cases (mutation
   within 60 nt of a CDS end) auto-fall back to a 2-primer modified-outer
   PCR.
+- **Scrub (clone-free restriction-site removal)** — the Mutato modal's
+  second tab cures the plasmid on the canvas of chosen recognition sites
+  (default BsaI / Esp3I / BbsI) using the minimal point substitutions
+  that destroy each site: synonymous swaps inside any overlapping CDS
+  (verified against every reading frame, incl. opposite-strand genes, and
+  preferring the chosen codon table's frequent synonyms), minimal base
+  changes elsewhere, never introducing a new forbidden site.
+  Substitution-only, so feature coordinates never move. Produces the
+  cured circular plasmid (Apply to canvas, undoable), one improved
+  partial-overlap QuikChange primer pair per locus (sliced from the cured
+  template — binding == display), and a PCR → DpnI → transform protocol
+  (no ligase, no assembly). Un-curable sites are reported, not forced.
+  Headless via the `scrub-plasmid` agent endpoint.
 
 ## Simulate
 

@@ -55,8 +55,13 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   set-active-parts-bin (switch the active named bin; mirrors the bin
   into the live parts file).
 - **Design** — gibson-assemble, simulate-gibson, design-mutagenesis,
-  design-gb-part (Golden Braid / MoClo), design-primers (generic
-  Primer3 detection or restriction cloning), optimize-protein
+  scrub-plasmid (clone-free restriction-site removal: silent / synonymous
+  cures inside CDSes + minimal swaps elsewhere, with an improved-QuikChange
+  primer pair per locus; scrubs the loaded record or an explicit
+  `seq`+`features`, optional `codon_taxid` biases coding cures to a host's
+  frequent codons, returns the cured sequence + per-round primers, never
+  mutates the canvas), design-gb-part (Golden Braid / MoClo), design-primers
+  (generic Primer3 detection or restriction cloning), optimize-protein
   (codon-optimise an AA sequence to a chosen table; optional `stops`
   0–3 appends that many stop codons, and a trailing `*` run in the
   protein is honored as-is and overrides it).

@@ -148,6 +148,18 @@ trailing `*` run when you want a double or triple stop codon, and an **Avoid
 sites** picker that scrubs your chosen restriction-enzyme cut sites out of the
 optimized CDS.
 
+Its second tab, **Scrub**, cures a whole plasmid of restriction sites without
+any cloning. Pick the enzymes to remove (Golden Gate / MoClo Type IIS sites by
+default) and SpliceCraft finds the smallest set of point changes that destroy
+each site — **silent** ones inside any coding sequence, checked against *every*
+overlapping reading frame so a protein never changes (and biased toward your
+chosen codon table's frequent synonyms when there's a choice), and minimal
+swaps elsewhere — without ever spawning a new forbidden site. You get the cured
+circular plasmid (one click to apply, fully undoable), an improved-QuikChange
+primer pair per locus designed off the cured sequence so it binds exactly where
+it's drawn, and a copy-ready protocol: PCR → DpnI → transform, no ligase, no
+fragment assembly. Sites it can't remove silently are reported, never forced.
+
 ### Synthesis
 
 A gene-synthesis composer with two tabs. The **DNA tab** is a
