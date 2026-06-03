@@ -821,6 +821,35 @@ class TestSaveKeepsLibraryNameAndFocus:
             assert e2["name"] == "My Plasmid", (
                 f"edited save underscored the name → {e2['name']!r}")
 
+    async def test_ctrl_s_save_worker_keeps_spaced_library_name(
+            self, isolated_library):
+        """Regression (2026-06-03): the Ctrl+S path (`action_save` →
+        `_save_worker`) has its OWN inline library-entry build, separate
+        from `add_entry`. It stored `record.name` (the space-stripped
+        GenBank LOCUS), so every Ctrl+S re-underscored a spaced name
+        ("FFE 6" → "FFE_6") — even right after a correct rename. It must
+        persist the DISPLAY name (`_tui_display_name`) like `add_entry`."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ATGC" * 60), id="FFE_6_ENTRY", name="FFE_6_ENTRY",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec._tui_display_name = "FFE 6 ENTRY"          # spaces — must survive
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            # The live record carries the spaced typed name (as a rename
+            # leaves it); the Ctrl+S worker deep-copies it.
+            app._current_record._tui_display_name = "FFE 6 ENTRY"
+            app.action_save()                          # Ctrl+S → _save_worker
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            e = next(x for x in sc._load_library()
+                     if x.get("id") == "FFE_6_ENTRY")
+            assert e["name"] == "FFE 6 ENTRY", (
+                f"Ctrl+S underscored the name → {e['name']!r}")
+            assert e["id"] == "FFE_6_ENTRY"            # id stays sanitised key
+
     async def test_save_keeps_focus_on_saved_plasmid(self, isolated_library):
         """After a save the library cursor sits on the saved plasmid, not
         row 0 (the table is cleared+repopulated, which resets the cursor)."""
@@ -10412,6 +10441,42 @@ class TestUpdateSubcommandDetection:
         info = sc._detect_install_method()
         assert info["method"] == "editable", info
 
+    def test_editable_sets_git_clone_to_dir(self, monkeypatch, tmp_path):
+        # Regression (2026-06-03): the editable branch left git_clone=None,
+        # so `update`'s refusal guidance fell back to the module path and
+        # printed `cd …/splicecraft.py` — cd into a FILE. git_clone must be
+        # the working-tree DIRECTORY so `cd <git_clone> && git pull` works.
+        repo = tmp_path / "SpliceCraft"
+        repo.mkdir()
+        fake_mod = repo / "splicecraft.py"
+        fake_mod.write_text("# stub")
+        di = tmp_path / "splicecraft-1.0.17.dist-info"
+        di.mkdir()
+        (di / "direct_url.json").write_text(
+            '{"url":"file:///home/me/SpliceCraft",'
+            '"dir_info":{"editable":true}}'
+        )
+        monkeypatch.setattr(sc, "__file__", str(fake_mod))
+        monkeypatch.setattr(sc, "_find_dist_info_dir", lambda *a, **k: di)
+        info = sc._detect_install_method()
+        assert info["method"] == "editable", info
+        assert info["git_clone"] == str(repo)          # the DIR, not the .py
+        assert not info["git_clone"].endswith(".py")
+
+    def test_developer_install_dir_never_returns_a_file(self):
+        # git_clone present → used verbatim.
+        assert sc._developer_install_dir(
+            {"git_clone": "/home/me/clone", "module": "/x/splicecraft.py"}
+        ) == "/home/me/clone"
+        # No git_clone → the module's PARENT dir, never the .py file itself.
+        out = sc._developer_install_dir(
+            {"git_clone": None, "module": "/home/me/clone/splicecraft.py"}
+        )
+        assert out == "/home/me/clone"
+        assert not out.endswith(".py")
+        # Nothing usable → a clearly-marked placeholder, not "".
+        assert sc._developer_install_dir({}) == "(unknown)"
+
     def test_pip_user_classified(self, monkeypatch, tmp_path):
         # ~/.local/lib path with no .git/pyproject sibling and no
         # direct_url.json → pip-user.
@@ -10752,6 +10817,25 @@ class TestUpdateSubcommandFlow:
         assert rc == 1
         err = capsys.readouterr().err
         assert "git pull" in err
+        assert fake.calls == []
+
+    def test_editable_refusal_cds_into_dir_not_module_file(
+            self, monkeypatch, capsys):
+        # Even if git_clone is somehow unset, the refusal must `cd` into a
+        # DIRECTORY, never the bare splicecraft.py module path (the printed
+        # command has to be copy-pasteable: `cd <file>` would error).
+        self._patch_detect(monkeypatch, "editable",
+                            module="/home/me/clone/splicecraft.py",
+                            git_clone=None)
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "cd /home/me/clone\n" in err            # the DIR …
+        assert "cd /home/me/clone/splicecraft.py" not in err   # … not the file
         assert fake.calls == []
 
     def test_source_clone_refuses_to_run_pip(self, monkeypatch, capsys):

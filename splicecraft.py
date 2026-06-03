@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.17"
+__version__ = "1.0.18"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -28547,6 +28547,11 @@ def _detect_install_method() -> dict:
                         if not src else
                         f"Editable install of {src}"
                     )
+                    # Working tree to `git pull` is where __file__ lives
+                    # (splicecraft.py sits at the repo root). Set git_clone —
+                    # like the `source` branch — so the refusal guidance `cd`s
+                    # into the DIRECTORY, not the bare .py module file.
+                    info["git_clone"] = str(mod_path.parent)
                     return info
 
     # Normalise path separators so the substring tests work the same
@@ -30598,6 +30603,19 @@ def _update_handle_restore(restore_id: "str | None",
     return 0
 
 
+def _developer_install_dir(info: dict) -> str:
+    """A DIRECTORY suitable for `cd` in developer-install refusal guidance:
+    the working-tree root (`git_clone`) when known, else the module's PARENT
+    dir — never the bare module path, which would `cd` into a `.py` file
+    (the editable branch used to leave `git_clone` unset, so the fallback
+    printed `cd …/splicecraft.py`)."""
+    target = info.get("git_clone")
+    if target:
+        return str(target)
+    mod = info.get("module") or ""
+    return str(Path(mod).parent) if mod else "(unknown)"
+
+
 def _update_refuse_unsupported_install(method: str, info: dict,
                                           cmd: "list[str] | None"
                                           ) -> "int | None":
@@ -30615,9 +30633,9 @@ def _update_refuse_unsupported_install(method: str, info: dict,
     `subprocess.run`.
     """
     if method in ("editable", "source"):
-        target = info.get("git_clone") or info.get("module") or "(unknown)"
+        target = _developer_install_dir(info)
         print(
-            f"\nThis SpliceCraft is a {method} install at {target}.\n"
+            f"\nThis SpliceCraft is a developer install ({method}) at {target}.\n"
             "Refusing to overwrite a developer install with a PyPI build.\n"
             "Update it from the source tree instead:\n"
             f"  cd {target}\n"
@@ -30626,7 +30644,7 @@ def _update_refuse_unsupported_install(method: str, info: dict,
         )
         return 1
     if method == "pixi-project":
-        target = info.get("git_clone") or info.get("module") or "(unknown)"
+        target = _developer_install_dir(info)
         print(
             f"\nThis SpliceCraft is in a pixi-managed project env at {target}.\n"
             "Refusing to bypass the project manifest with a direct PyPI install.\n"
@@ -108918,8 +108936,18 @@ NcbiTaxonPickerModal { align: center middle; }
                         prev_status = _sanitize_plasmid_status(e.get("status"))
                         break
                 entries = [e for e in entries if e.get("id") != record_id]
+                # entry["name"] is the USER-FACING label: persist the DISPLAY
+                # name (the typed name with spaces / `+` / etc.), NOT
+                # record.name (the sanitised GenBank LOCUS). The library-load
+                # path stashes entry["name"] back into `_tui_display_name`, so
+                # writing the LOCUS here re-baked underscores into the round-
+                # trip on EVERY Ctrl+S ("FFE 6" → "FFE_6") — even right after a
+                # correct rename. The id stays the sanitised LOCUS (stable
+                # key); only the human label keeps the original spacing.
+                # [SACRED: no underscores forced into user names]
+                display_name = self._record_display_name(record)
                 entries.insert(0, {
-                    "name":    record_name or record_id,
+                    "name":    display_name or record_id,
                     "id":      record_id,
                     "size":    _seq_len(record),
                     "n_feats": len([f for f in record.features

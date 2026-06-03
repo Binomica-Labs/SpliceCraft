@@ -14,6 +14,15 @@
 
 ---
 
+## [1.0.18] — 2026-06-03
+
+### Bug fixes
+
+- **Saving a plasmid no longer turns the spaces in its name into underscores.** Even after the v1.0.17 fix, pressing **Save** (Ctrl+S) still rewrote a plasmid's library name from *"FFE 6 ENTRY pCambia2300-GREEN"* to *"FFE_6_ENTRY_pCambia2300_GREEN"* — the Ctrl+S save had a *second*, separate place that wrote the space-stripped GenBank name instead of your typed one. Both save paths now keep the exact display name (spaces, `+`, hyphens and all); only the internal GenBank LOCUS id stays sanitised. If an entry already shows underscores, rename it once and the spaced name now sticks across saves.
+- **`splicecraft update` on a source / editable checkout now points you at the right folder.** The "refusing to overwrite a developer install" message told you to `cd` into `…/splicecraft.py` — a file, not a directory — so the copy-pasted command failed. It now `cd`s into the repository directory before `git pull`, and the line reads "a developer install (editable)" cleanly.
+
+---
+
 ## [1.0.17] — 2026-06-03
 
 ### New features
