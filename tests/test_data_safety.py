@@ -1290,3 +1290,302 @@ class TestLogEventEncodingRobustness:
 
     def test_log_info_with_surrogate_does_not_raise(self):
         sc._log.info("weird OS path: %s", "/x/\udc80\udcff/y.gb")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2026-06-03 disk-hygiene + integrity sweep: backup byte cap, dedup,
+# lost_entries pruning, mirror-swap shrink suppression, backup compression,
+# recovery-chain walk, temp read-back validation, startup housekeeping.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBackupByteCapPruning:
+    """`_prune_backups` stage 2: after the count cap, drop the oldest
+    timestamped backups until the aggregate falls under
+    `_BACKUP_TOTAL_SIZE_CAP_BYTES`, never below `_BACKUP_MIN_KEEP`. Without
+    this a 274 MB collections.json accreted 10 × 274 MB of backups."""
+
+    def test_byte_cap_drops_oldest_beyond_cap(self, tmp_path, monkeypatch):
+        p = tmp_path / "test.json"
+        monkeypatch.setattr(sc, "_BACKUP_RETENTION_COUNT", 100)  # disable count cap
+        monkeypatch.setattr(sc, "_BACKUP_TOTAL_SIZE_CAP_BYTES", 300)
+        monkeypatch.setattr(sc, "_BACKUP_MIN_KEEP", 2)
+        for ts in ["20260101-000000", "20260102-000000", "20260103-000000",
+                   "20260104-000000", "20260105-000000"]:
+            (tmp_path / f"test.json.bak.{ts}").write_text("x" * 100)
+        sc._prune_backups(p)
+        survivors = sorted(tmp_path.glob("test.json.bak.????????-??????"))
+        assert len(survivors) >= 2
+        assert sum(s.stat().st_size for s in survivors) <= 300
+        names = {s.name for s in survivors}
+        assert "test.json.bak.20260105-000000" in names   # newest kept
+        assert "test.json.bak.20260101-000000" not in names  # oldest dropped
+
+    def test_byte_cap_never_below_min_keep(self, tmp_path, monkeypatch):
+        p = tmp_path / "test.json"
+        monkeypatch.setattr(sc, "_BACKUP_RETENTION_COUNT", 100)
+        monkeypatch.setattr(sc, "_BACKUP_TOTAL_SIZE_CAP_BYTES", 10)  # tiny
+        monkeypatch.setattr(sc, "_BACKUP_MIN_KEEP", 2)
+        for ts in ["20260101-000000", "20260102-000000", "20260103-000000"]:
+            (tmp_path / f"test.json.bak.{ts}").write_text("x" * 100)
+        sc._prune_backups(p)
+        survivors = sorted(tmp_path.glob("test.json.bak.????????-??????"))
+        # Every file blows the cap, but MIN_KEEP newest are still retained.
+        assert len(survivors) == 2
+        names = {s.name for s in survivors}
+        assert "test.json.bak.20260103-000000" in names
+        assert "test.json.bak.20260102-000000" in names
+
+
+class TestBackupDedup:
+    """`_safe_save_json` skips both backup writes when the prior file is
+    byte-identical to the most recent existing backup — fixes the 'N
+    identical 274 MB backups in one wall-second' waste."""
+
+    def test_identical_resave_skips_redundant_backup(self, tmp_path):
+        p = tmp_path / "test.json"
+        sc._safe_save_json(p, [{"id": "a"}], "test")   # save 1 — no backup
+        sc._safe_save_json(p, [{"id": "b"}], "test")   # save 2 — backs up a
+        sc._safe_save_json(p, [{"id": "b"}], "test")   # save 3 — backs up b
+        glob = "test.json.bak.????????-??????*"
+        n3 = len(list(tmp_path.glob(glob)))
+        sc._safe_save_json(p, [{"id": "b"}], "test")   # save 4 — DEDUP, no backup
+        n4 = len(list(tmp_path.glob(glob)))
+        assert n4 == n3
+        # The live file is still correct.
+        assert json.loads(p.read_text())["entries"] == [{"id": "b"}]
+
+    def test_changed_resave_still_backs_up(self, tmp_path):
+        p = tmp_path / "test.json"
+        sc._safe_save_json(p, [{"id": "a"}], "test")
+        sc._safe_save_json(p, [{"id": "b"}], "test")
+        glob = "test.json.bak.????????-??????*"
+        n_before = len(list(tmp_path.glob(glob)))
+        sc._safe_save_json(p, [{"id": "c"}], "test")   # changed → must back up
+        assert len(list(tmp_path.glob(glob))) > n_before
+
+
+class TestLostEntriesPruning:
+    """`_prune_lost_entries`: count + aggregate byte cap over the
+    `lost_entries/` spillover dir (pre-1.0.22 it grew unbounded to 1.5 GB)."""
+
+    def test_count_prune_keeps_newest(self, tmp_path, monkeypatch):
+        import os
+        d = tmp_path / "lost_entries"
+        d.mkdir()
+        monkeypatch.setattr(sc, "_LOST_ENTRIES_RETENTION_COUNT", 3)
+        monkeypatch.setattr(sc, "_LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES", 10 ** 9)
+        for i in range(6):
+            f = d / f"lib-2026010{i}-000000.json"
+            f.write_text("x" * 50)
+            os.utime(f, (1000 + i, 1000 + i))   # deterministic mtime order
+        sc._prune_lost_entries(d)
+        survivors = list(d.iterdir())
+        assert len(survivors) == 3
+        names = {s.name for s in survivors}
+        assert "lib-20260105-000000.json" in names     # newest kept
+        assert "lib-20260100-000000.json" not in names  # oldest dropped
+
+    def test_byte_cap_keeps_at_least_one(self, tmp_path, monkeypatch):
+        import os
+        d = tmp_path / "lost_entries"
+        d.mkdir()
+        monkeypatch.setattr(sc, "_LOST_ENTRIES_RETENTION_COUNT", 100)
+        monkeypatch.setattr(sc, "_LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES", 10)
+        for i in range(4):
+            f = d / f"lib-2026010{i}-000000.json"
+            f.write_text("x" * 100)
+            os.utime(f, (1000 + i, 1000 + i))
+        sc._prune_lost_entries(d)
+        assert len(list(d.iterdir())) == 1   # newest survives the byte cap
+
+    def test_missing_dir_is_noop(self, tmp_path):
+        sc._prune_lost_entries(tmp_path / "does_not_exist")   # must not raise
+
+
+class TestMirrorSwapShrinkSuppression:
+    """`_expected_mirror_swap` / `_safe_save_json_mirror` /
+    `_switch_active_collection_library`: an active-slot shrink whose data
+    is mirrored in a sibling collections file neither spills a redundant
+    lost_entries copy nor trips the >90% catastrophic refusal."""
+
+    def test_expected_mirror_swap_suppresses_spill_and_refusal(self, tmp_path):
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [{"id": str(i)} for i in range(20)], "library")
+        with sc._expected_mirror_swap():
+            sc._safe_save_json(p, [{"id": "0"}], "library")   # 95% shrink
+        assert json.loads(p.read_text())["entries"] == [{"id": "0"}]
+        spill_dir = tmp_path / "lost_entries"
+        assert not spill_dir.exists() or not list(spill_dir.iterdir())
+
+    def test_mirror_token_does_not_leak(self, tmp_path):
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [{"id": str(i)} for i in range(20)], "library")
+        with sc._expected_mirror_swap():
+            sc._safe_save_json(p, [{"id": "0"}], "library")
+        assert sc._MIRROR_SWAP_TOKEN == 0
+        # Outside the block the guard is armed again: re-seed then shrink.
+        sc._safe_save_json(p, [{"id": str(i)} for i in range(20)], "library")
+        with pytest.raises(RuntimeError, match="catastrophic shrink"):
+            sc._safe_save_json(p, [{"id": "0"}], "library")
+
+    def test_safe_save_json_mirror_does_not_spill(self, tmp_path):
+        p = tmp_path / "mirror.json"
+        sc._safe_save_json(p, [{"id": str(i)} for i in range(20)], "test")
+        sc._safe_save_json_mirror(p, [{"id": "0"}], "test")   # 95% shrink
+        assert json.loads(p.read_text())["entries"] == [{"id": "0"}]
+        spill_dir = tmp_path / "lost_entries"
+        assert not spill_dir.exists() or not list(spill_dir.iterdir())
+
+    def test_switch_helper_arms_mirror_token(self, monkeypatch):
+        seen = {}
+
+        def _fake_save_library(plasmids, **kw):
+            seen["token"] = sc._MIRROR_SWAP_TOKEN
+            seen["plasmids"] = plasmids
+
+        monkeypatch.setattr(sc, "_save_library", _fake_save_library)
+        sc._switch_active_collection_library([{"id": "x"}])
+        assert seen["token"] >= 1                  # armed during the call
+        assert seen["plasmids"] == [{"id": "x"}]
+        assert sc._MIRROR_SWAP_TOKEN == 0          # released afterwards
+
+
+class TestBackupCompression:
+    """`_compress_old_backups` gzips all but the newest timestamped backup;
+    `_read_backup_bytes` transparently decompresses. The newest backup and
+    legacy `.bak` stay PLAIN so the primary recovery path never decompresses."""
+
+    def test_compresses_all_but_newest(self, tmp_path):
+        p = tmp_path / "test.json"
+        for ts in ["20260101-000000", "20260102-000000", "20260103-000000"]:
+            (tmp_path / f"test.json.bak.{ts}").write_text(
+                json.dumps({"_schema_version": 1, "entries": [{"id": ts}]}))
+        sc._compress_old_backups(p)
+        assert (tmp_path / "test.json.bak.20260101-000000.gz").exists()
+        assert (tmp_path / "test.json.bak.20260102-000000.gz").exists()
+        assert (tmp_path / "test.json.bak.20260103-000000").exists()       # newest plain
+        assert not (tmp_path / "test.json.bak.20260101-000000").exists()   # plain removed
+        assert not (tmp_path / "test.json.bak.20260103-000000.gz").exists()
+
+    def test_read_backup_bytes_roundtrips(self, tmp_path):
+        p = tmp_path / "test.json"
+        original = json.dumps({"_schema_version": 1,
+                               "entries": [{"id": "x"}]}).encode()
+        (tmp_path / "test.json.bak.20260101-000000").write_bytes(original)
+        (tmp_path / "test.json.bak.20260102-000000").write_text("newest")
+        sc._compress_old_backups(p)
+        gz = tmp_path / "test.json.bak.20260101-000000.gz"
+        assert gz.exists()
+        assert sc._read_backup_bytes(gz) == original
+        assert sc._read_backup_bytes(
+            tmp_path / "test.json.bak.20260102-000000") == b"newest"
+
+    def test_idempotent(self, tmp_path):
+        p = tmp_path / "test.json"
+        for ts in ["20260101-000000", "20260102-000000"]:
+            (tmp_path / f"test.json.bak.{ts}").write_text("data-" + ts)
+        sc._compress_old_backups(p)
+        sc._compress_old_backups(p)   # second run is a no-op, must not raise
+        assert (tmp_path / "test.json.bak.20260101-000000.gz").exists()
+        assert (tmp_path / "test.json.bak.20260102-000000").exists()
+
+    def test_single_backup_left_plain(self, tmp_path):
+        p = tmp_path / "test.json"
+        (tmp_path / "test.json.bak.20260101-000000").write_text("only")
+        sc._compress_old_backups(p)
+        assert (tmp_path / "test.json.bak.20260101-000000").exists()
+        assert not (tmp_path / "test.json.bak.20260101-000000.gz").exists()
+
+
+class TestRecoveryChain:
+    """`_safe_load_json` walks the timestamped rotation (newest→oldest,
+    decompressing `.gz`) when BOTH the main file and legacy `.bak` are
+    corrupt — closing the two-bad-saves-in-a-row recovery gap."""
+
+    def test_restores_from_timestamped_when_main_and_bak_corrupt(self, tmp_path):
+        p = tmp_path / "lib.json"
+        (tmp_path / "lib.json.bak.20260101-000000").write_text(
+            json.dumps({"_schema_version": 1, "entries": [{"id": "rescued"}]}))
+        p.write_text("{ broken json")
+        (tmp_path / "lib.json.bak").write_text("{ also broken")
+        entries, warning = sc._safe_load_json(p, "library")
+        assert entries == [{"id": "rescued"}]
+        assert warning and "rotated backup" in warning
+        assert list(tmp_path.glob("lib.json.corrupt-*"))   # main preserved aside
+
+    def test_restores_from_gzipped_rotated_backup(self, tmp_path):
+        p = tmp_path / "lib.json"
+        (tmp_path / "lib.json.bak.20260101-000000").write_text(
+            json.dumps({"_schema_version": 1, "entries": [{"id": "z"}]}))
+        # A newer (corrupt) backup keeps the good one from being "newest"
+        # so compression gzips the good one.
+        (tmp_path / "lib.json.bak.20260102-000000").write_text("{ corrupt newest")
+        sc._compress_old_backups(p)
+        assert (tmp_path / "lib.json.bak.20260101-000000.gz").exists()
+        p.write_text("{ broken")
+        (tmp_path / "lib.json.bak").write_text("{ broken")
+        entries, _ = sc._safe_load_json(p, "library")
+        assert entries == [{"id": "z"}]
+
+
+class TestTempReadbackValidation:
+    """`_safe_save_json` re-reads the temp file before the atomic swap;
+    a mismatch aborts the save and leaves the live file intact."""
+
+    def test_small_file_full_parse_passes(self, tmp_path):
+        p = tmp_path / "test.json"
+        sc._safe_save_json(p, [{"id": "a"}], "test")
+        assert json.loads(p.read_text())["entries"] == [{"id": "a"}]
+
+    def test_large_branch_tail_check_passes(self, tmp_path, monkeypatch):
+        # Force the tail-check branch (threshold below payload size); a
+        # valid save must still succeed.
+        monkeypatch.setattr(sc, "_SAVE_READBACK_FULL_PARSE_MAX_BYTES", 1)
+        p = tmp_path / "test.json"
+        sc._safe_save_json(p, [{"id": "a"}, {"id": "b"}], "test")
+        assert json.loads(p.read_text())["entries"] == [{"id": "a"}, {"id": "b"}]
+
+    def test_corrupt_readback_aborts_and_preserves_live(self, tmp_path,
+                                                         monkeypatch):
+        p = tmp_path / "test.json"
+        sc._safe_save_json(p, [{"id": "g1"}, {"id": "g2"}], "test")
+        real_dumps = json.dumps
+
+        def _bad_dump(obj, fh, **kw):
+            # Write a VALID envelope but with the wrong entry count.
+            fh.write(real_dumps({"_schema_version": 1, "entries": []}))
+
+        monkeypatch.setattr(sc.json, "dump", _bad_dump)
+        with pytest.raises(OSError, match="read-back"):
+            sc._safe_save_json(p, [{"id": "x"}, {"id": "y"}], "test")
+        # Live file untouched (still the two good entries). `json.loads`
+        # is not patched, so this read is safe.
+        assert json.loads(p.read_text())["entries"] == [{"id": "g1"},
+                                                         {"id": "g2"}]
+
+
+class TestDataDirHousekeeping:
+    """`_run_data_dir_housekeeping`: startup pass that compresses older
+    backups + prunes lost_entries, reclaiming the EXISTING residue."""
+
+    def test_compresses_and_prunes(self, tmp_path, monkeypatch):
+        import os
+        lib = sc._LIBRARY_FILE   # redirected to tmp_path by conftest
+        for ts in ["20260101-000000", "20260102-000000", "20260103-000000"]:
+            lib.with_name(f"{lib.name}.bak.{ts}").write_text(
+                json.dumps({"_schema_version": 1, "entries": []}))
+        ld = sc._DATA_DIR / "lost_entries"
+        ld.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(sc, "_LOST_ENTRIES_RETENTION_COUNT", 1)
+        monkeypatch.setattr(sc, "_LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES", 10 ** 9)
+        for i in range(3):
+            f = ld / f"plasmid_library-2026010{i}-000000.json"
+            f.write_text("x" * 50)
+            os.utime(f, (1000 + i, 1000 + i))
+        sc._run_data_dir_housekeeping(sc._DATA_DIR)
+        assert lib.with_name(f"{lib.name}.bak.20260101-000000.gz").exists()
+        assert lib.with_name(f"{lib.name}.bak.20260103-000000").exists()  # newest plain
+        assert len(list(ld.iterdir())) == 1   # lost_entries pruned to retention
+
+    def test_never_raises_on_missing(self, tmp_path):
+        sc._run_data_dir_housekeeping(tmp_path / "empty")   # no-op, no raise

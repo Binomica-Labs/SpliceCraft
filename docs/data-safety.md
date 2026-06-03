@@ -8,16 +8,61 @@ constraints.
 
 For every save through `_safe_save_json` (the only sanctioned path):
 
-1. **Atomic write** via `tempfile.mkstemp` + `os.fsync` + `os.replace`,
-   with the prior version copied to `*.json.bak` first.
+1. **Atomic write** via `tempfile.mkstemp` + `os.fsync` + `os.replace`
+   (plus a parent-dir `fsync` so the rename is journalled), with the
+   prior version copied to `*.json.bak` first. Before the swap the
+   freshly-written temp file is **read back and validated** — a full
+   `json.loads` + entry-count check for files ≤ 32 MB, a cheap
+   "non-empty and closes with `}`" tail check for larger ones — so a
+   silently-truncated write is caught and the live file is left intact
+   instead of being overwritten with garbage.
 2. **Rotating timestamped backups** (`*.json.bak.YYYYMMDD-HHMMSS`,
    last 10 retained per file) so an *old* good copy is recoverable,
-   not just the most recent.
+   not just the most recent. Two refinements keep this from eating
+   disk on big libraries:
+   - **Compression** — at launch, every timestamped backup except the
+     newest is gzipped (`*.bak.<ts>.gz`); plasmid JSON compresses
+     ~4-5×. The newest timestamped backup and the legacy `.bak` stay
+     **plain** so the fast recovery path never has to decompress.
+   - **Aggregate byte cap** — after the count cap, the oldest backups
+     are dropped until the per-file total falls under 1 GB (never
+     below 2 generations). A 274 MB `collections.json` used to accrete
+     10 × 274 MB ≈ 2.7 GB of backups per file.
+   - **Dedup** — a save whose prior file is byte-identical to the most
+     recent backup skips both backup writes (no more "N identical
+     274 MB backups in one wall-second").
 3. **Daily per-file snapshots** to `<data dir>/snapshots/` (30 days
    retained) — written once per calendar day at launch.
 4. **Suspicious-shrink guard**: if a save would discard >50% of
    entries (with ≥5 prior), the discarded entries are spilled to
-   `<data dir>/lost_entries/` **before** the overwrite proceeds.
+   `<data dir>/lost_entries/` **before** the overwrite proceeds; a
+   >90% discard (≥10 prior) is **refused** outright unless an explicit
+   bypass is armed. **Mirror swaps are exempt** — switching the active
+   collection / parts-bin / primer-set / project rewrites the active
+   mirror file (e.g. `plasmid_library.json`) from one collection's
+   contents to another's, which legitimately shrinks it; the dropped
+   entries are *not* lost (they live in the sibling `collections.json`
+   / `*_collections.json`), so those writes go through
+   `_switch_active_collection_library` / `_safe_save_json_mirror`,
+   which neither spill a redundant copy nor refuse a big shrink. (This
+   also fixes a latent bug where switching from a large to a tiny
+   collection could be refused outright.) The `lost_entries/` directory
+   is now itself bounded (last 5 files, ≤ 500 MB) — pre-1.0.22 it grew
+   without limit, reaching 1.5 GB of switch-driven spills.
+
+**Recovery.** On load, a corrupt main file is restored from the legacy
+`.bak`; if **both** the main file and `.bak` are corrupt (e.g. two bad
+saves in a row), `_safe_load_json` walks the timestamped rotation
+newest→oldest — transparently decompressing `.gz` backups — and
+restores from the first that parses. The corrupt main is renamed aside
+to `*.corrupt-<ts>` for forensics first.
+
+**Launch housekeeping.** A background thread at startup
+(`_run_data_dir_housekeeping`) compresses older backups, enforces the
+byte caps, and prunes `lost_entries/` — so the disk savings above also
+reclaim *existing* residue on the next launch, not just future writes.
+It runs off the UI thread because compressing a 274 MB backup is
+CPU-heavy.
 
 **Settings → Restore from backup…** surfaces every recoverable copy
 across all four tiers; pick a row, get a one-click restore (the

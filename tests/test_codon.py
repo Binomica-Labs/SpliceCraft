@@ -1890,10 +1890,21 @@ class TestProteinOptimizeToDna:
             screen.query_one("#syn-protein-editor", sc.ProteinEditor).load("MAEVK")
             await pilot.pause(0.1)
             screen.query_one("#btn-syn-optimize-dna").action_press()
-            await pilot.pause(0.3)
+            # Poll for the confirm modal instead of a fixed sleep — under
+            # `-n auto` parallel load a fixed `pause(0.3)` was occasionally
+            # too short for the screen push to land, reddening the Tests
+            # badge intermittently (passes in isolation). Breaks as soon as
+            # the modal mounts; ~3 s ceiling for a slow CI runner.
+            for _ in range(60):
+                await pilot.pause(0.05)
+                if type(app.screen).__name__ == "SynthesisReplaceDnaConfirmModal":
+                    break
             assert type(app.screen).__name__ == "SynthesisReplaceDnaConfirmModal"
             app.screen.query_one("#btn-srd-cancel").action_press()
-            await pilot.pause(0.2)
+            for _ in range(60):
+                await pilot.pause(0.05)
+                if type(app.screen).__name__ == "SynthesisScreen":
+                    break
             # Cancel returns to Synthesis with the DNA tab untouched.
             assert type(app.screen).__name__ == "SynthesisScreen"
             app.exit()

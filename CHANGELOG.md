@@ -14,6 +14,24 @@
 
 ---
 
+## [1.0.22] — 2026-06-03
+
+### Performance
+
+- **Switching collections is faster and far lighter on disk.** Loading a different collection used to copy the *entire* outgoing collection into a recovery folder on every switch — a ~150 MB write each time on a big library, for data that was never actually at risk (it stays safe in your collections file). That redundant copy is gone, so switching is quicker and no longer piles up gigabytes of spillover.
+- **Backups no longer balloon your data folder.** Older timestamped backups are now compressed (~4–5×) and the per-file backup history is size-capped; the recovery-spillover folder is bounded too. On a heavy library this reclaims **several GB the first time you launch** — automatically, in the background. Your most recent backup stays uncompressed so a restore is still instant.
+
+### Bug fixes
+
+- **Switching from a large collection to a much smaller one no longer fails.** The safety guard that refuses a sudden >90% shrink of a file (the one that protects you from an accidental wipe) was mistakenly firing on a *legitimate* collection switch and could block it. Collection / parts-bin / primer-set / project switches are now recognised as safe state transitions and go through cleanly.
+
+### Hardening
+
+- **More robust recovery from corrupted data files.** If a data file *and* its most recent backup are both unreadable (e.g. two bad saves in a row), SpliceCraft now walks back through the older timestamped backups — decompressing as needed — and restores from the newest one that's intact, instead of starting empty.
+- **Every save is verified before it replaces your file.** A save is now read back and sanity-checked before the new version swaps in, so a truncated or corrupted write is caught and the previous good file is left untouched.
+
+---
+
 ## [1.0.21] — 2026-06-03
 
 ### Performance

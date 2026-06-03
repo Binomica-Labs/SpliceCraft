@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.21"
+__version__ = "1.0.22"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -1619,7 +1619,41 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
 # Lost-entries spillover lives in a sibling `lost_entries/` directory.
 # Rationale: see CLAUDE.md sacred invariant on data safety.
 _BACKUP_RETENTION_COUNT = 10
+# Aggregate byte ceiling across ALL timestamped backups of ONE base
+# file (collections.json's backups counted separately from
+# plasmid_library.json's). After count-pruning to
+# `_BACKUP_RETENTION_COUNT`, `_prune_backups` drops the oldest
+# remaining backups until the total falls under this cap — but never
+# below `_BACKUP_MIN_KEEP` generations (a large single file must not
+# leave the user with zero rollback points). Without this a user with
+# a 274 MB collections.json accumulated 10 × 274 MB ≈ 2.7 GB of
+# backups per base file (observed: 4.7 GB across the two big files).
+# Compressed backups (`_compress_old_backups`) rarely trip it; the cap
+# is the floor-line defense for the window between launches when fresh
+# backups are still uncompressed.
+_BACKUP_TOTAL_SIZE_CAP_BYTES = 1024 * 1024 * 1024   # 1 GB per base file
+_BACKUP_MIN_KEEP = 2   # never byte-prune below this many newest backups
 _LOST_ENTRIES_DIR_NAME  = "lost_entries"
+# lost_entries/ retention. The shrink-guard spillover + raw-bytes spill
+# drop recovery copies here; pre-1.0.22 NOTHING pruned them, so a user
+# who switched between large plasmid collections (each switch shrinks
+# the active library, tripping the suspicious-shrink spill) accumulated
+# a full ~150 MB library dump per switch — observed at 1.5 GB of residue
+# whose contents were never actually at risk (they live in
+# collections.json). Two-stage retention mirrors `_prune_backups`. The
+# mirror-swap fix (`_expected_mirror_swap`) stops the switch-driven
+# spills at the source; this pruning bounds whatever genuine bulk-delete
+# spills remain AND reclaims the existing residue on next launch.
+_LOST_ENTRIES_RETENTION_COUNT      = 5
+_LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES = 500 * 1024 * 1024   # 500 MB
+# Read-back validation threshold. After writing a save's temp file,
+# `_safe_save_json` re-reads it BEFORE the atomic swap to confirm it
+# parses. Files at/under this size get a full `json.loads` + entry-count
+# check; larger files (the 150-274 MB library/collections) get a cheap
+# tail check (non-empty + closes with `}`) so the hot path doesn't eat a
+# multi-second re-parse and RAM spike. 32 MB covers every small data
+# file (settings, primers, parts, features…) with full validation.
+_SAVE_READBACK_FULL_PARSE_MAX_BYTES = 32 * 1024 * 1024   # 32 MB
 
 
 def _backup_filename_patterns(path: Path) -> "tuple[str, ...]":
@@ -1663,12 +1697,20 @@ def _iter_backups(path: Path) -> "list[Path]":
 
 def _prune_backups(path: Path, keep: "int | None" = None) -> None:
     """Delete all but the most recent `keep` timestamped backups of
-    `path`. The plain `<file>.bak` (legacy single-generation) is never
-    pruned by this function — it's overwritten on every save.
+    `path`, then enforce an aggregate byte ceiling.
 
-    `keep` defaults to `_BACKUP_RETENTION_COUNT`, but is read at call
-    time (not bound as a default argument) so a test can monkeypatch
-    the module constant and observe the new value."""
+    Two-stage retention:
+      1. COUNT — keep the newest `keep` (default `_BACKUP_RETENTION_COUNT`)
+         timestamped backups; unlink the rest.
+      2. SIZE — if the survivors still total more than
+         `_BACKUP_TOTAL_SIZE_CAP_BYTES`, drop the oldest remaining ones
+         until the total falls under the cap, but never below
+         `_BACKUP_MIN_KEEP` newest generations.
+
+    The plain `<file>.bak` (legacy single-generation) is never pruned by
+    this function — it's overwritten on every save. `keep` and both caps
+    are read at call time (not bound as default arguments) so a test can
+    monkeypatch the module constants and observe the new values."""
     if keep is None:
         keep = _BACKUP_RETENTION_COUNT
     candidates = _iter_backups(path)
@@ -1680,6 +1722,92 @@ def _prune_backups(path: Path, keep: "int | None" = None) -> None:
             old.unlink()
         except OSError:
             _log.debug("Could not prune old backup %s", old)
+    # Stage 2: aggregate byte cap. Re-scan survivors (the count-prune
+    # above may have unlinked some) newest-first, summing sizes; once
+    # over the cap, drop oldest until under it. Always retain at least
+    # `_BACKUP_MIN_KEEP` newest so a single oversized file can't leave
+    # the user with no rollback point.
+    survivors = _iter_backups(path)
+    survivors.reverse()   # newest first
+    sized: "list[tuple[Path, int]]" = []
+    total = 0
+    for b in survivors:
+        try:
+            sz = b.stat().st_size
+        except OSError:
+            sz = 0
+        sized.append((b, sz))
+        total += sz
+    cap = _BACKUP_TOTAL_SIZE_CAP_BYTES
+    idx = len(sized) - 1
+    while total > cap and idx >= _BACKUP_MIN_KEEP:
+        victim, sz = sized[idx]
+        try:
+            victim.unlink()
+            total -= sz
+            _log.info("Byte-cap pruned old backup %s (%d bytes)", victim, sz)
+        except OSError:
+            _log.debug("Could not byte-prune old backup %s", victim)
+        idx -= 1
+
+
+def _read_backup_bytes(bak: Path) -> bytes:
+    """Read a backup's raw JSON bytes, transparently decompressing a
+    gzipped backup (`.bak.<ts>.gz`). `_compress_old_backups` gzips OLDER
+    timestamped backups to reclaim disk; the newest timestamped backup
+    and the legacy `.bak` stay PLAIN, so the primary recovery path never
+    depends on gzip. Raises OSError on a read / decompress failure so
+    callers can fall through to the next backup."""
+    if bak.name.endswith(".gz"):
+        import gzip
+        with gzip.open(bak, "rb") as fh:
+            return fh.read()
+    return bak.read_bytes()
+
+
+def _compress_old_backups(path: Path) -> None:
+    """Gzip every timestamped backup of `path` EXCEPT the newest, to
+    reclaim disk — JSON of plasmid `gb_text` compresses ~4-5× (the user's
+    backups were 4.7 GB uncompressed across the two big files). The
+    newest timestamped backup and the legacy `.bak` are deliberately left
+    PLAIN so the primary recovery path (main → legacy `.bak` → newest
+    timestamped) never has to decompress; compression only affects
+    tertiary, older recovery points. Idempotent and best-effort:
+    already-`.gz` backups are skipped, failures logged and skipped, never
+    raised. Runs off the interactive path (startup housekeeping) so the
+    CPU of compressing a 274 MB backup never adds latency to a save."""
+    import gzip
+    baks = _iter_backups(path)   # oldest → newest (lex sort)
+    if len(baks) <= 1:
+        return
+    for bak in baks[:-1]:        # leave the newest plain
+        if bak.name.endswith(".gz"):
+            continue
+        gz_path = bak.with_name(bak.name + ".gz")
+        if gz_path.exists():
+            # A prior run wrote the .gz but crashed before unlinking the
+            # plain. Drop the redundant plain copy now.
+            try:
+                bak.unlink()
+            except OSError:
+                pass
+            continue
+        try:
+            raw = bak.read_bytes()
+            # Atomic .gz write (tempfile + replace) so a crash mid-compress
+            # can't leave a truncated .gz masquerading as a good backup.
+            buf = gzip.compress(raw, compresslevel=6)
+            _atomic_write_bytes(gz_path, buf)
+        except OSError:
+            _log.debug("Could not compress backup %s", bak)
+            continue
+        # Only remove the plain backup once the .gz is safely on disk.
+        try:
+            bak.unlink()
+            _log.info("Compressed backup %s → %s (%d → %d bytes)",
+                      bak.name, gz_path.name, len(raw), len(buf))
+        except OSError:
+            _log.debug("Could not remove plain backup %s after compress", bak)
 
 
 def _spill_lost_entries(path: Path, lost: list, label: str) -> "Path | None":
@@ -1718,6 +1846,11 @@ def _spill_lost_entries(path: Path, lost: list, label: str) -> "Path | None":
                 "entries":         lost,
             }, indent=2),
         )
+        # Bound the directory right after writing so a long-running
+        # session that spills repeatedly can't grow it without limit.
+        # The just-written `out` is newest, so it's never the prune
+        # victim. Best-effort — `_prune_lost_entries` never raises.
+        _prune_lost_entries(lost_dir)
         return out
     except Exception:
         _log.exception("Could not spill lost entries for %s", label)
@@ -1749,6 +1882,7 @@ def _spill_raw_bytes(path: Path, data: bytes, label: str,
             "%s: raw-bytes spill (%s) → %s (%d bytes)",
             label, reason, out, len(data),
         )
+        _prune_lost_entries(lost_dir)
         return out
     except Exception:
         _log.exception("Could not raw-spill prior bytes for %s", label)
@@ -1782,6 +1916,74 @@ def _diff_lost_entries(prev_entries: list, new_entries: list) -> list:
             if e not in new_no_id:
                 lost.append(e)
     return lost
+
+
+def _prune_lost_entries(lost_dir: "Path | None" = None) -> None:
+    """Bound the `lost_entries/` spillover directory.
+
+    `_spill_lost_entries` / `_spill_raw_bytes` drop recovery copies here.
+    Pre-1.0.22 nothing pruned them, so collection switching (each switch
+    shrinks the active library, tripping the suspicious-shrink spill)
+    accumulated a full ~150 MB dump per switch — 1.5 GB of residue whose
+    contents were never at risk (they live in collections.json). Two
+    stages mirror `_prune_backups`:
+
+      1. COUNT — keep the newest `_LOST_ENTRIES_RETENTION_COUNT` files.
+      2. SIZE — drop oldest until under `_LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES`,
+         but never below one file (the most-recent recovery point).
+
+    Ranked by mtime: spill names mix `<stem>-<ts>.json` and
+    `<stem>-raw-<ts>.<ext>`, so mtime is the simplest total order.
+    Best-effort — never raises; a locked / read-only data dir just means
+    residue lingers until the next launch. `lost_dir` defaults to
+    `_DATA_DIR/lost_entries` (sandboxed in tests via conftest's
+    `_DATA_DIR` monkeypatch); callers with a known file path pass
+    `<path>.parent / _LOST_ENTRIES_DIR_NAME` explicitly."""
+    if lost_dir is None:
+        lost_dir = _DATA_DIR / _LOST_ENTRIES_DIR_NAME
+    try:
+        files = [p for p in lost_dir.iterdir() if p.is_file()]
+    except OSError:
+        return
+
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    files.sort(key=_mtime, reverse=True)   # newest first
+    keep = _LOST_ENTRIES_RETENTION_COUNT
+    # Stage 1: count.
+    for old in files[keep:]:
+        try:
+            old.unlink()
+            _log.info("Pruned old lost-entries spill %s", old)
+        except OSError:
+            _log.debug("Could not prune lost-entries file %s", old)
+    # Stage 2: aggregate byte cap over the survivors.
+    survivors = files[:keep]
+    sized: "list[tuple[Path, int]]" = []
+    total = 0
+    for p in survivors:
+        try:
+            sz = p.stat().st_size
+        except OSError:
+            sz = 0
+        sized.append((p, sz))
+        total += sz
+    cap = _LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES
+    idx = len(sized) - 1
+    while total > cap and idx >= 1:
+        victim, sz = sized[idx]
+        try:
+            victim.unlink()
+            total -= sz
+            _log.info("Byte-cap pruned lost-entries spill %s (%d bytes)",
+                      victim, sz)
+        except OSError:
+            _log.debug("Could not byte-prune lost-entries file %s", victim)
+        idx -= 1
 
 
 # ── Data-dir write authorisation (L2 chokepoint, 2026-05-22) ───────────────
@@ -1818,6 +2020,43 @@ _SAVES_AUTHORIZED_REASON: str = ""
 # arm the token via `_allow_catastrophic_shrink()` for the duration
 # of the save. Refcount semantics so nested re-entry is safe.
 _CATASTROPHIC_SHRINK_TOKEN: int = 0
+
+# Mirror-swap token (2026-06-03). A "mirror swap" is a write to an
+# ACTIVE-slot file (plasmid_library.json / parts_bin.json / primers.json
+# / experiments.json) whose real source of truth is a sibling
+# *collections* file (collections.json / parts_bin_collections.json /
+# primer_collections.json / experiment_projects.json). Switching the
+# active collection legitimately shrinks the active file from the old
+# collection's size to the new one's — but the "dropped" entries are NOT
+# lost: they remain in the collections file under their key. When this
+# token is positive the shrink guard treats the shrink as expected — it
+# LOGS the transition but neither spills a redundant `lost_entries/` copy
+# (pure waste: a ~150 MB write per collection switch, the cause of the
+# 1.5 GB residue) nor refuses the write on a >90% shrink (the latent bug
+# where a big→tiny collection switch raised RuntimeError). Distinct from
+# `_CATASTROPHIC_SHRINK_TOKEN`, which only bypasses the >90% REFUSAL and
+# deliberately KEEPS the spill as a safety net for genuinely destructive
+# writes (Restore-from-backup). Refcounted for safe nested re-entry.
+_MIRROR_SWAP_TOKEN: int = 0
+
+
+@contextmanager
+def _expected_mirror_swap():
+    """Arm `_MIRROR_SWAP_TOKEN` for the duration of the `with` block.
+
+    Wrap any active-slot write whose data is mirrored in a sibling
+    collections file — the four mirror pairs in `_safe_save_json_mirror`,
+    plus the active-collection switch via `_switch_active_collection_library`.
+    The shrink guard then skips BOTH the redundant `lost_entries/` spill
+    and the >90% catastrophic refusal, because the "dropped" entries are
+    provably safe in the collections file. Refcounted; the decrement runs
+    in `finally` so an exception can't leave the gate stuck open."""
+    global _MIRROR_SWAP_TOKEN
+    _MIRROR_SWAP_TOKEN += 1
+    try:
+        yield
+    finally:
+        _MIRROR_SWAP_TOKEN -= 1
 
 
 @contextmanager
@@ -1857,12 +2096,11 @@ def _safe_save_json_mirror(path: Path, entries: list, label: str,
     the write — saving the user from data loss but also breaking the
     legitimate bin switch. The "old" data was NEVER at risk: the 26
     Eden entries live in ``parts_bin_collections.json`` under the
-    "Eden Parts" key and the L3 spillover dumped a copy to
-    ``lost_entries/`` for triple safety. The shrink guard correctly
-    treats parts_bin.json as the primary store; this helper tells it
-    explicitly that this particular write is a *mirror swap* — the
-    primary is the collections file, the named bin's data is intact,
-    so a 100% shrink is a legitimate state transition.
+    "Eden Parts" key. The shrink guard correctly treats parts_bin.json
+    as the primary store; this helper tells it explicitly that this
+    particular write is a *mirror swap* — the primary is the collections
+    file, the named bin's data is intact, so a 100% shrink is a
+    legitimate state transition.
 
     Symmetric for every mirror pair:
 
@@ -1871,13 +2109,19 @@ def _safe_save_json_mirror(path: Path, entries: list, label: str,
       * `primers.json`     <- `primer_collections.json`        (active primer coll)
       * `experiments.json` <- `experiment_projects.json`       (active project)
 
-    Implementation: just wraps `_safe_save_json` in
-    `_allow_catastrophic_shrink()`. The wrapper exists so:
+    Implementation: wraps `_safe_save_json` in `_expected_mirror_swap()`
+    (2026-06-03). Previously it used `_allow_catastrophic_shrink()`,
+    which bypassed the >90% REFUSAL but STILL spilled the "dropped"
+    entries to `lost_entries/` — a redundant copy of data that already
+    lives in the collections file, and for the plasmid_library mirror a
+    ~150 MB write on every collection switch (the cause of the 1.5 GB
+    `lost_entries/` residue). `_expected_mirror_swap()` skips that
+    redundant spill too. The wrapper exists so:
     (a) callers don't have to remember the context manager pattern;
     (b) a `grep _safe_save_json_mirror` enumerates every cross-mirror
     write — a future audit can confirm none have drifted back to the
     bare `_safe_save_json`."""
-    with _allow_catastrophic_shrink():
+    with _expected_mirror_swap():
         _safe_save_json(path, entries, label, schema_version=schema_version)
 
 
@@ -2122,56 +2366,87 @@ def _safe_save_json(path: Path, entries: list, label: str,
         try:
             existing = path.read_bytes()
             if existing.strip():
-                # 2026-05-27 (audit-2 H1): write the timestamped
-                # backup FIRST so a verified-good rotated copy exists
-                # before we touch the legacy `.bak`. Pre-fix the
-                # order was legacy → timestamped: on ENOSPC during
-                # the legacy write the original-good `.bak` was
-                # clobbered with a truncated file, and the
-                # timestamped write that would have caught the
-                # condition came AFTER. Now: timestamped first
-                # (raises on failure → save aborts before legacy
-                # is touched), legacy second (also raises now to
-                # avoid the silent-corrupt-legacy-bak case).
-                ts = _datetime.now().strftime("%Y%m%d-%H%M%S")
-                bak_ts = path.with_name(f"{path.name}.bak.{ts}")
-                bump = 0
-                while bak_ts.exists():
-                    bump += 1
-                    bak_ts = path.with_name(f"{path.name}.bak.{ts}.{bump}")
-                try:
-                    _atomic_write_bytes(bak_ts, existing)
-                except OSError as exc:
-                    _log.exception(
-                        "Backup rotation failed for %s — aborting "
-                        "save to preserve existing data", path,
-                    )
-                    raise OSError(
-                        f"backup rotation failed for {label} "
-                        f"({path.name}): {exc}. Save aborted to "
-                        f"keep the previous-good file intact."
-                    ) from exc
-                # Legacy single-generation backup — `_safe_load_json`'s
-                # recovery path still reads this exact name, and many
-                # tests depend on it. Keep it overwriting per save.
-                # 2026-05-27 (audit-2 H1): re-raise on failure too. A
-                # half-written legacy `.bak` is worse than no legacy
-                # `.bak` (recovery path tries it first); the
-                # timestamped backup written above is the safety
-                # net if this raises.
-                bak_legacy = path.with_suffix(path.suffix + ".bak")
-                try:
-                    _atomic_write_bytes(bak_legacy, existing)
-                except OSError as exc:
-                    _log.exception(
-                        "Legacy .bak write failed for %s — aborting "
-                        "save to preserve existing data", path,
-                    )
-                    raise OSError(
-                        f"legacy .bak write failed for {label} "
-                        f"({path.name}): {exc}. Save aborted to "
-                        f"keep the previous-good file intact."
-                    ) from exc
+                # Backup dedup (2026-06-03): if the prior file is
+                # byte-identical to the most recent existing backup it is
+                # already preserved, so BOTH backup writes below are
+                # redundant. Fixes the "N identical 274 MB backups in one
+                # wall-second" waste from rapid re-saves of unchanged data
+                # (observed: 3 collections.json backups within 18 s).
+                # Compare size first (cheap stat); read bytes only on a
+                # size match. Dedups only against a PLAIN newest backup —
+                # the newest is always plain (compression touches only
+                # OLDER backups), so a `.gz` newest just means no dedup
+                # this round (conservative, never wrong). When skipped the
+                # legacy `.bak` already equals `existing` (it held the
+                # prior save's content, which == `existing` precisely
+                # because nothing changed), so recovery stays correct.
+                skip_redundant_backup = False
+                _existing_baks = _iter_backups(path)
+                if _existing_baks:
+                    _newest_bak = _existing_baks[-1]
+                    try:
+                        if (not _newest_bak.name.endswith(".gz")
+                                and _newest_bak.stat().st_size == len(existing)
+                                and _newest_bak.read_bytes() == existing):
+                            skip_redundant_backup = True
+                            _log.debug(
+                                "Backup dedup: %s unchanged since %s — "
+                                "skipping redundant backup writes",
+                                path.name, _newest_bak.name,
+                            )
+                    except OSError:
+                        skip_redundant_backup = False
+                if not skip_redundant_backup:
+                    # 2026-05-27 (audit-2 H1): write the timestamped
+                    # backup FIRST so a verified-good rotated copy exists
+                    # before we touch the legacy `.bak`. Pre-fix the
+                    # order was legacy → timestamped: on ENOSPC during
+                    # the legacy write the original-good `.bak` was
+                    # clobbered with a truncated file, and the
+                    # timestamped write that would have caught the
+                    # condition came AFTER. Now: timestamped first
+                    # (raises on failure → save aborts before legacy
+                    # is touched), legacy second (also raises now to
+                    # avoid the silent-corrupt-legacy-bak case).
+                    ts = _datetime.now().strftime("%Y%m%d-%H%M%S")
+                    bak_ts = path.with_name(f"{path.name}.bak.{ts}")
+                    bump = 0
+                    while bak_ts.exists():
+                        bump += 1
+                        bak_ts = path.with_name(f"{path.name}.bak.{ts}.{bump}")
+                    try:
+                        _atomic_write_bytes(bak_ts, existing)
+                    except OSError as exc:
+                        _log.exception(
+                            "Backup rotation failed for %s — aborting "
+                            "save to preserve existing data", path,
+                        )
+                        raise OSError(
+                            f"backup rotation failed for {label} "
+                            f"({path.name}): {exc}. Save aborted to "
+                            f"keep the previous-good file intact."
+                        ) from exc
+                    # Legacy single-generation backup — `_safe_load_json`'s
+                    # recovery path still reads this exact name, and many
+                    # tests depend on it. Keep it overwriting per save.
+                    # 2026-05-27 (audit-2 H1): re-raise on failure too. A
+                    # half-written legacy `.bak` is worse than no legacy
+                    # `.bak` (recovery path tries it first); the
+                    # timestamped backup written above is the safety
+                    # net if this raises.
+                    bak_legacy = path.with_suffix(path.suffix + ".bak")
+                    try:
+                        _atomic_write_bytes(bak_legacy, existing)
+                    except OSError as exc:
+                        _log.exception(
+                            "Legacy .bak write failed for %s — aborting "
+                            "save to preserve existing data", path,
+                        )
+                        raise OSError(
+                            f"legacy .bak write failed for {label} "
+                            f"({path.name}): {exc}. Save aborted to "
+                            f"keep the previous-good file intact."
+                        ) from exc
                 # Count + extract entries for the shrink guard. Accept
                 # both envelope and legacy bare-list formats so the
                 # first save after an upgrade doesn't false-positive.
@@ -2253,38 +2528,58 @@ def _safe_save_json(path: Path, entries: list, label: str,
     #     live file, hypothetical Master-Delete-via-save flows) opt in
     #     via the context manager.
     if existing_count > 0 and len(entries) < existing_count:
+        mirror_swap = _MIRROR_SWAP_TOKEN > 0
         _log.warning(
             "SHRINK GUARD: %s is being overwritten with %d entries "
-            "(was %d). If this is unexpected, restore from %s.bak "
+            "(was %d)%s. If this is unexpected, restore from %s.bak "
             "or %s.bak.<timestamp>.",
-            label, len(entries), existing_count, path, path,
+            label, len(entries), existing_count,
+            " [expected mirror swap — the dropped entries remain in the "
+            "sibling collections file, not lost]" if mirror_swap else "",
+            path, path,
         )
-        suspicious = (existing_count >= 5
-                      and len(entries) < existing_count // 2)
-        catastrophic = (existing_count >= 10
-                        and len(entries) * 10 < existing_count)
-        if suspicious and prev_entries is not None:
-            lost = _diff_lost_entries(prev_entries, entries)
-            spilled = _spill_lost_entries(path, lost, label)
-            if spilled is not None:
-                _log.warning(
-                    "SHRINK GUARD: %d %s entries dumped to %s before "
-                    "overwrite — recoverable on user request.",
-                    len(lost), label, spilled,
+        if mirror_swap:
+            # Expected mirror swap (active-collection / parts-bin / primer
+            # / experiment switch). The "dropped" entries are NOT lost —
+            # they remain in the sibling collections file that is the real
+            # source of truth — so we neither spill a redundant
+            # `lost_entries/` copy (pure waste: a ~150 MB write per
+            # collection switch, the cause of the 1.5 GB residue) nor
+            # refuse the write on a >90% shrink (the latent bug where a
+            # big→tiny collection switch raised RuntimeError). See
+            # `_expected_mirror_swap` / `_safe_save_json_mirror` /
+            # `_switch_active_collection_library`.
+            pass
+        else:
+            suspicious = (existing_count >= 5
+                          and len(entries) < existing_count // 2)
+            catastrophic = (existing_count >= 10
+                            and len(entries) * 10 < existing_count)
+            if suspicious and prev_entries is not None:
+                lost = _diff_lost_entries(prev_entries, entries)
+                spilled = _spill_lost_entries(path, lost, label)
+                if spilled is not None:
+                    _log.warning(
+                        "SHRINK GUARD: %d %s entries dumped to %s before "
+                        "overwrite — recoverable on user request.",
+                        len(lost), label, spilled,
+                    )
+            if catastrophic and _CATASTROPHIC_SHRINK_TOKEN <= 0:
+                raise RuntimeError(
+                    f"refusing to write {label!r}: catastrophic shrink "
+                    f"({existing_count} → {len(entries)} entries, "
+                    f"{100 * (existing_count - len(entries)) / existing_count:.1f}% loss). "
+                    f"This signature matches the 2026-05-22 incident "
+                    f"(running app at startup writing 43 bytes over a "
+                    f"156 MB library). The discarded entries have been "
+                    f"spilled to `lost_entries/` so nothing is lost. "
+                    f"If this save is genuinely intentional (Restore-from-"
+                    f"backup, programmatic data wipe), wrap the call in "
+                    f"`with splicecraft._allow_catastrophic_shrink():`. "
+                    f"For an active-collection/bin/primer switch use "
+                    f"`_switch_active_collection_library` / "
+                    f"`_safe_save_json_mirror` instead."
                 )
-        if catastrophic and _CATASTROPHIC_SHRINK_TOKEN <= 0:
-            raise RuntimeError(
-                f"refusing to write {label!r}: catastrophic shrink "
-                f"({existing_count} → {len(entries)} entries, "
-                f"{100 * (existing_count - len(entries)) / existing_count:.1f}% loss). "
-                f"This signature matches the 2026-05-22 incident "
-                f"(running app at startup writing 43 bytes over a "
-                f"156 MB library). The discarded entries have been "
-                f"spilled to `lost_entries/` so nothing is lost. "
-                f"If this save is genuinely intentional (Restore-from-"
-                f"backup, programmatic data wipe), wrap the call in "
-                f"`with splicecraft._allow_catastrophic_shrink():`."
-            )
 
     # Step 3: atomic write — tempfile in same dir → os.replace.
     payload = {"_schema_version": schema_version, "entries": entries}
@@ -2306,6 +2601,47 @@ def _safe_save_json(path: Path, entries: list, label: str,
                 # a power-loss would lose. The surrounding handler unlinks
                 # the temp file and the error propagates (sacred #7).
                 os.fsync(fh.fileno())
+            # Read-back validation BEFORE the atomic swap (2026-06-03):
+            # confirm the temp file we just wrote + fsynced is actually
+            # parseable before it replaces the live file. `json.dump`
+            # raising is already handled (temp unlinked, main untouched),
+            # but a silent truncation / FS fault between write and rename
+            # would otherwise be promoted to the live file. Size-gated:
+            # files <= `_SAVE_READBACK_FULL_PARSE_MAX_BYTES` get a full
+            # `json.loads` + entry-count check; larger files get a cheap
+            # tail check (non-empty + closes with `}`) that catches
+            # truncation without a multi-second re-parse. On failure raise
+            # so the surrounding handler unlinks the temp and leaves the
+            # live file intact (sacred #7).
+            try:
+                tmp_size = os.path.getsize(tmp_name)
+            except OSError:
+                tmp_size = -1
+            if tmp_size == 0:
+                raise OSError(
+                    f"refusing to commit {label}: temp file is empty "
+                    f"after write ({len(entries)} entries expected)"
+                )
+            if 0 < tmp_size <= _SAVE_READBACK_FULL_PARSE_MAX_BYTES:
+                with open(tmp_name, "r", encoding="utf-8") as _vfh:
+                    _reparsed = json.load(_vfh)
+                if not (isinstance(_reparsed, dict)
+                        and isinstance(_reparsed.get("entries"), list)
+                        and len(_reparsed["entries"]) == len(entries)):
+                    raise OSError(
+                        f"refusing to commit {label}: temp-file read-back "
+                        f"did not match the payload "
+                        f"({len(entries)} entries written)"
+                    )
+            elif tmp_size > _SAVE_READBACK_FULL_PARSE_MAX_BYTES:
+                with open(tmp_name, "rb") as _vfh:
+                    _vfh.seek(max(0, tmp_size - 64))
+                    _tail = _vfh.read()
+                if not _tail.rstrip().endswith(b"}"):
+                    raise OSError(
+                        f"refusing to commit {label}: temp file appears "
+                        f"truncated (tail does not close the JSON object)"
+                    )
             os.replace(tmp_name, str(path))
             # Fsync the parent directory so the rename's directory entry
             # update is journalled — see `_fsync_parent_dir`. Pre-fix
@@ -2522,6 +2858,45 @@ def _prune_old_snapshots(snap_dir: Path,
             )
         except OSError:
             _log.debug("Could not prune snapshot %s", snap)
+
+
+def _run_data_dir_housekeeping(data_dir: Path) -> None:
+    """Reclaim disk left by the backup + spillover safety nets.
+
+    For every user-data file: compress older timestamped backups
+    (`_compress_old_backups`) then enforce the count + byte-cap retention
+    (`_prune_backups`). Then bound the `lost_entries/` spillover
+    directory (`_prune_lost_entries`).
+
+    This is what reclaims the EXISTING residue — a user upgrading with
+    4.7 GB of uncompressed backups + 1.5 GB of un-pruned spillover sees
+    it shrink on the next launch; `_safe_save_json` keeps it bounded
+    thereafter. Runs OFF the UI thread (the caller spawns it as a daemon)
+    because compressing a 274 MB backup is CPU-heavy and would otherwise
+    add a multi-second hang to launch. Best-effort throughout — every
+    step swallows its own errors so a locked / read-only data dir never
+    disrupts launch. `_USER_DATA_FILE_ATTRS` is read via globals() so
+    this can be defined ahead of that table (same pattern as
+    `_snapshot_data_files`)."""
+    g = globals()
+    for attr in g.get("_USER_DATA_FILE_ATTRS", ()):
+        p = g.get(attr)
+        if not isinstance(p, Path):
+            continue
+        # Compress BEFORE pruning so the byte cap measures compressed
+        # sizes and therefore retains more generations.
+        try:
+            _compress_old_backups(p)
+        except Exception:
+            _log.debug("housekeeping: compress failed for %s", p)
+        try:
+            _prune_backups(p)
+        except Exception:
+            _log.debug("housekeeping: backup prune failed for %s", p)
+    try:
+        _prune_lost_entries(data_dir / _LOST_ENTRIES_DIR_NAME)
+    except Exception:
+        _log.debug("housekeeping: lost-entries prune failed")
 
 
 # ── Backup discovery + restore ──────────────────────────────────────────────
@@ -2826,6 +3201,60 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
                 )
         except Exception:
             _log.exception("Backup %s also corrupt: %s", label, bak)
+
+    # Recovery chain (2026-06-03): the legacy `.bak` is the fastest
+    # recovery, but if BOTH the main file and `.bak` are corrupt (e.g.
+    # two bad saves in a row — `.bak` is overwritten every save), the
+    # timestamped rotation still holds older good copies. Walk them
+    # newest → oldest, transparently decompressing gzipped backups
+    # (`_compress_old_backups`), and restore from the first that parses.
+    # The main file is still present here (the legacy block only renames
+    # it aside on SUCCESS), so we preserve it for forensics then rewrite.
+    for chain_bak in reversed(_iter_backups(path)):
+        ok_chain, _r = _safe_file_size_check(
+            chain_bak, _SAFE_LOAD_JSON_MAX_BYTES, label,
+        )
+        if not ok_chain:
+            continue
+        try:
+            chain_raw = json.loads(_read_backup_bytes(chain_bak))
+        except Exception:
+            continue
+        chain_entries, _shape = _extract_entries(chain_raw, label)
+        if chain_entries is None:
+            continue
+        _log.info("Restored %s from rotated backup %s (%d entries)",
+                  label, chain_bak.name, len(chain_entries))
+        if isinstance(chain_raw, dict):
+            cv = chain_raw.get("_schema_version")
+            if isinstance(cv, int) and cv > _CURRENT_SCHEMA_VERSION:
+                _OBSERVED_SCHEMA_VERSIONS[str(path)] = cv
+        try:
+            corrupt_ts = _datetime.now().strftime("%Y%m%d-%H%M%S")
+            corrupt_aside = path.with_name(f"{path.name}.corrupt-{corrupt_ts}")
+            bump = 0
+            while corrupt_aside.exists():
+                bump += 1
+                corrupt_aside = path.with_name(
+                    f"{path.name}.corrupt-{corrupt_ts}.{bump}")
+            if path.exists():
+                path.rename(corrupt_aside)
+        except OSError:
+            _log.warning(
+                "Could not preserve corrupt main file aside for %s — "
+                "overwriting in place", path,
+            )
+        try:
+            _atomic_write_bytes(path, _read_backup_bytes(chain_bak))
+        except OSError:
+            _log.warning(
+                "Could not rewrite main file %s from rotated backup", path,
+            )
+        return chain_entries, (
+            f"{label} and its .bak were corrupt — restored "
+            f"{len(chain_entries)} entries from rotated backup "
+            f"{chain_bak.name}."
+        )
 
     return [], (main_warning
                 or f"{label} is corrupt and no valid backup was found. "
@@ -5134,6 +5563,31 @@ def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
     # includes the gb_text hash so stale entries would simply miss
     # — but blowing the whole map keeps the invariant simple.
     _invalidate_library_kmer_cache()
+
+
+def _switch_active_collection_library(plasmids: list[dict]) -> None:
+    """Load a collection's `plasmids` into the live library as an
+    EXPECTED mirror swap (2026-06-03).
+
+    Switching the active collection rewrites plasmid_library.json from
+    the OLD collection's plasmids to the NEW one's. That legitimately
+    shrinks the file — often by >50%, sometimes >90% (large → tiny
+    collection) — but the dropped plasmids are NOT lost: they remain in
+    `collections.json` under their collection's key. Wrapping
+    `_save_library` in `_expected_mirror_swap()` tells the shrink guard
+    so it:
+      * does NOT spill a redundant `lost_entries/` copy (the data is
+        mirrored — a ~150 MB write per switch was the cause of the 1.5 GB
+        residue), and
+      * does NOT refuse the write on a >90% shrink (the latent bug where
+        a big→tiny collection switch raised RuntimeError).
+
+    This is the plasmid_library↔collections analogue of
+    `_safe_save_json_mirror` (which covers parts-bin / primers /
+    experiments). Grep this name to enumerate every active-collection
+    switch write."""
+    with _expected_mirror_swap():
+        _save_library(plasmids)
 
 
 def _authoritative_library_snapshot(fallback: "list[dict]") -> "list[dict]":
@@ -23681,7 +24135,7 @@ class LibraryPanel(Widget):
                         ) if isinstance(p, dict)
                     ]
                     try:
-                        _save_library(fallback_plasmids)
+                        _switch_active_collection_library(fallback_plasmids)
                     except (OSError, RuntimeError) as exc:
                         _notify_save_failure(
                             self.app, "Plasmid library", exc)
@@ -62450,7 +62904,7 @@ def _create_genbank_collection(name: str, records: list,
     })
     _save_collections(existing)
     _set_active_collection_name(name)
-    _save_library(plasmids)
+    _switch_active_collection_library(plasmids)
 
 
 def _create_fasta_collection(name: str, records: list, file_path: str) -> None:
@@ -62485,7 +62939,7 @@ def _create_fasta_collection(name: str, records: list, file_path: str) -> None:
     _set_active_collection_name(name)
     # Triggers `_sync_active_collection_plasmids` which mirrors the
     # plasmids into the collection we just created.
-    _save_library(plasmids)
+    _switch_active_collection_library(plasmids)
 
 
 # Plasmid file extensions excluding `.dna` — `_PLASMID_FILE_EXTS` keeps
@@ -69316,7 +69770,7 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
                 if isinstance(p, dict)
             ]
             try:
-                _save_library(plasmids)
+                _switch_active_collection_library(plasmids)
             except (OSError, ValueError) as exc:
                 _notify_save_failure(
                     self.app, "Plasmid library", exc,
@@ -94851,7 +95305,7 @@ class CollectionsModal(_OneShotDismissScreen, ModalScreen):
         # no-op only because we read `plasmids` before the mirror runs.
         _set_active_collection_name(name)
         try:
-            _save_library(plasmids)
+            _switch_active_collection_library(plasmids)
         except (OSError, RuntimeError) as exc:
             _notify_save_failure(self.app, "Plasmid library", exc)
             return
@@ -100250,7 +100704,8 @@ def _h_set_active_collection(app, payload):
     # active-collection setting pointing at content that isn't there.
     prev_active = _get_active_collection_name()
     _set_active_collection_name(name)
-    err = _agent_save_or_500(lambda: _save_library(plasmids), "library")
+    err = _agent_save_or_500(
+        lambda: _switch_active_collection_library(plasmids), "library")
     if err is not None:
         # Roll back the active pointer so the next launch loads the
         # collection whose content is actually on disk.
@@ -107846,6 +108301,22 @@ NcbiTaxonPickerModal { align: center middle; }
                 # The snapshot path is purely defensive. Never let it
                 # crash the launch.
                 _log.exception("Daily snapshot failed (non-fatal)")
+            # Data-dir housekeeping: compress older backups + prune the
+            # lost_entries/ spillover so the backup safety net stops
+            # accreting GBs (observed: 4.7 GB backups + 1.5 GB spillover).
+            # Spawned as a daemon thread — compressing a 274 MB backup is
+            # CPU-heavy and must not block launch. Best-effort; reuses the
+            # `_skip_snapshot` guard so tests don't fan out to disk.
+            try:
+                import threading
+                threading.Thread(
+                    target=_run_data_dir_housekeeping,
+                    args=(_DATA_DIR,),
+                    name="sc-housekeeping",
+                    daemon=True,
+                ).start()
+            except Exception:
+                _log.exception("Data-dir housekeeping spawn failed (non-fatal)")
         # Validate all user-data files before anything else. Corrupt files
         # are auto-restored from .bak if possible; the user is notified
         # either way so they know the state of their data.
@@ -111671,7 +112142,7 @@ NcbiTaxonPickerModal { align: center middle; }
                             for p in (coll.get("plasmids") or [])
                             if isinstance(p, dict)]
                 try:
-                    _save_library(plasmids)
+                    _switch_active_collection_library(plasmids)
                 except (OSError, ValueError) as exc:
                     _notify_save_failure(self, "Plasmid library", exc)
                     return
