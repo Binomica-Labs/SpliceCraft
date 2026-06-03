@@ -987,6 +987,128 @@ class TestPrimerFlapLinearClip:
         assert self._painted(arr) == {0}
 
 
+class TestPrimerMismatchBump:
+    """Internal primer mismatches render bound-flap-bound: a mismatched base
+    lifts onto the flap row (the 'bump'), leaving a coloured gap on the bound
+    row. Mutagenic / Scrub QuikChange primers carry their planned edit as
+    exactly such a mismatch, so this makes the edit visible on the map."""
+
+    @staticmethod
+    def _chars(arr):
+        return [c for c, _s in arr]
+
+    def _arr(self, n):
+        return [(" ", "") for _ in range(n)]
+
+    # ── painters (no app needed) ──────────────────────────────────────────
+
+    def test_bound_bar_gaps_the_mismatch(self):
+        # fwd primer, bound bases "GGACTC" at cols [2, 8); col 4 mismatches.
+        f = {"type": "primer_bind", "start": 2, "end": 8, "strand": 1,
+             "color": "green", "_primer_seq": "GGACTC", "_bound_len": 6,
+             "_flap_len": 0, "_bound_mismatch": {4: "A"}}
+        arr = self._arr(12)
+        sc._paint_primer_bound_bar(arr, f, 0, 12)
+        chars = self._chars(arr)
+        assert chars[2] == "G" and chars[3] == "G"   # matched bases inline
+        assert chars[4] == " "                        # mismatch lifted → gap
+        assert chars[5] == "C"                        # back down (bound)
+        assert arr[4][1] == ""                         # app-background gap (no fill)
+
+    def test_flap_bar_draws_the_mismatch(self):
+        f = {"type": "primer_bind", "start": 2, "end": 8, "strand": 1,
+             "color": "green", "_bound_mismatch": {4: "A"}}
+        arr = self._arr(12)
+        sc._paint_primer_flap_bar(arr, f, 0, 12, total=12)
+        assert arr[4][0] == "A"                        # the bump, on flap row
+        assert {i for i, (c, _s) in enumerate(arr) if c != " "} == {4}
+
+    def test_flap_bar_runs_without_5prime_tail(self):
+        # No _flap_bases — a mismatch-only primer must still draw the bump.
+        f = {"_bound_mismatch": {3: "T"}, "color": "red"}
+        arr = self._arr(8)
+        sc._paint_primer_flap_bar(arr, f, 0, 8, total=8)
+        assert arr[3][0] == "T"
+
+    # ── _parse stamping (via the app, both strands) ───────────────────────
+
+    _TMPL = ("ACGTGACTTGCAACGGTATCCAGTTACGGCATTGAC"
+             "AGTCCATGGATCACGTTAGCATGCATCAGTACCGTA")[:64]
+
+    async def _feats_for(self, primer, strand):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq(self._TMPL), id="MM1", name="MM1",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features.append(SeqFeature(
+            FeatureLocation(10, 26, strand=strand), type="primer_bind",
+            qualifiers={"label": ["p"], "primer_seq": [primer]}))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app._apply_snapshot(self._TMPL, 0, rec)
+            await pilot.pause()
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            prim = [f for f in pm._feats if f.get("type") == "primer_bind"]
+            assert prim, "primer feature not parsed"
+            return prim[0]
+
+    async def test_parse_stamps_mismatch_forward(self):
+        bound = list(self._TMPL[10:26])
+        # Mismatch at offset 7 — past the 6 bp annealing anchor, so the 5'
+        # flank stays bound and the base bumps. (A real QuikChange / Scrub
+        # cure sits well inside the primer, never within the first few bp;
+        # a mismatch closer than the anchor is read as a 5' overhang.)
+        bound[7] = "A" if bound[7] != "A" else "T"
+        f = await self._feats_for("".join(bound), 1)
+        # forward base at offset 7 sits at column 10 + 7 = 17
+        assert (f.get("_bound_mismatch") or {}) == {17: bound[7]}
+
+    async def test_parse_no_mismatch_when_perfect_forward(self):
+        f = await self._feats_for(self._TMPL[10:26], 1)
+        assert not f.get("_bound_mismatch")
+
+    async def test_parse_stamps_mismatch_reverse(self):
+        perfect = sc._rc(self._TMPL[10:26])            # perfect rev primer 5'→3'
+        rp = list(perfect)
+        rp[8] = "A" if rp[8] != "A" else "T"           # internal, past the anchor
+        f = await self._feats_for("".join(rp), -1)
+        mism = f.get("_bound_mismatch") or {}
+        assert len(mism) == 1                          # exactly one base lifted
+
+    async def test_parse_no_mismatch_when_perfect_reverse(self):
+        f = await self._feats_for(sc._rc(self._TMPL[10:26]), -1)
+        assert not f.get("_bound_mismatch")
+
+    async def test_internal_mismatch_keeps_both_sides_bound(self):
+        # A primer that matches the template EXCEPT one internal base must
+        # stay FULLY bound with only that base bumped — the matching bases 5'
+        # of the mismatch must NOT collapse into the flap. (Regression: the
+        # old longest-contiguous-3'-match binding dumped everything 5' of the
+        # first mismatch into a flap that never returned to the bound row.)
+        bound = list(self._TMPL[10:26])
+        bound[8] = "A" if bound[8] != "A" else "T"
+        f = await self._feats_for("".join(bound), 1)
+        assert f.get("_bound_len") == 16        # whole primer stays bound
+        assert not f.get("_flap_bases")         # no spurious 5' overhang
+        assert (f.get("_bound_mismatch") or {}) == {18: bound[8]}  # only the bump
+
+    async def test_mismatch_within_anchor_reads_as_overhang(self):
+        # The flip side of the bump: a mismatch CLOSER to the 5' end than the
+        # 6 bp annealing anchor is read as part of the 5' overhang, not a bump.
+        # This is the same signal that keeps a cloning primer's enzyme tail a
+        # clean flap even when its bases coincidentally pair the template —
+        # only a solid (>= 6 bp) matching stretch counts as annealing. Pinned
+        # so a future change can't collapse it back (cloning-tail regression).
+        bound = list(self._TMPL[10:26])
+        bound[3] = "A" if bound[3] != "A" else "T"     # only 3 bp 5' of it
+        f = await self._feats_for("".join(bound), 1)
+        assert not (f.get("_bound_mismatch") or {})    # no bump
+        assert f.get("_flap_len") == 4                 # 5' overhang = first 4 bp
+
+
 def _topo_record(seq: str, *, circular: bool, rid: str = "TOPO1"):
     from Bio.SeqRecord import SeqRecord
     from Bio.Seq import Seq

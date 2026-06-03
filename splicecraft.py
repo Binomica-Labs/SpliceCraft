@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.16"
+__version__ = "1.0.17"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -8906,10 +8906,15 @@ def _paint_primer_bound_bar(arr: list[tuple[str, str]], f: dict,
     # Bases occupy the bar's nominal column range `[s, e)`. The
     # arrow gets one EXTRA cell beyond the bar (col `e` for fwd,
     # col `s-1` for rev) so the full primer sequence stays visible.
+    mism = f.get("_bound_mismatch") or {}
     for i, ch in enumerate(visible_bases):
         col = bar_s + i
         if 0 <= col < content_w:
-            arr[col] = (ch, bg_style)
+            # A mismatched base is lifted onto the flap row (the "bump"); leave
+            # an APP-BACKGROUND gap here (empty style, not the feature colour)
+            # so the hole reads as the base having popped up off the bound bar.
+            arr[col] = ((" ", "") if (chunk_start + col) in mism
+                        else (ch, bg_style))
 
     # Weak-primer marker: when `_weak_primer` is stamped (bound
     # region shorter than the user-set Min primer binding
@@ -8974,7 +8979,8 @@ def _paint_primer_flap_bar(arr: list[tuple[str, str]], f: dict,
     flap_s = int(f.get("_flap_start") or 0)
     flap_e = int(f.get("_flap_end")   or 0)
     flap_bases = str(f.get("_flap_bases") or "")
-    if flap_e <= flap_s or not flap_bases:
+    mism = f.get("_bound_mismatch") or {}
+    if (flap_e <= flap_s or not flap_bases) and not mism:
         return
     color = f.get("color", "white")
     bg_style = f"black on {color}"
@@ -8996,6 +9002,13 @@ def _paint_primer_flap_bar(arr: list[tuple[str, str]], f: dict,
         col = pos - chunk_start
         if 0 <= col < content_w:
             arr[col] = (ch if ch else "▒", bg_style)
+    # Internal mismatches lifted onto this (flap) row — the "bump". Each
+    # mismatched bound base sits at its own absolute template column, so
+    # reading the primer goes bound → flap → bound on either strand.
+    for col, ch in mism.items():
+        c = col - chunk_start
+        if 0 <= c < content_w:
+            arr[c] = (ch if ch else "▒", bg_style)
 
 
 def _paint_feature_bar(arr: list[tuple[str, str]], f: dict,
@@ -9274,7 +9287,8 @@ def _render_packed_strand(result: "Text",
                     f.get("type") == "primer_bind"
                     and f.get("_primer_seq")
                 )
-                has_flap = has_primer_seq and f.get("_flap_bases")
+                has_flap = has_primer_seq and (
+                    f.get("_flap_bases") or f.get("_bound_mismatch"))
                 if sub == 0:
                     if has_primer_seq:
                         _paint_primer_bound_bar(arr, f, chunk_start, chunk_end)
@@ -18616,60 +18630,130 @@ class PlasmidMap(Widget):
                 if isinstance(primer_seq_q, list) and primer_seq_q:
                     primer_seq = str(primer_seq_q[0]).strip().upper()
                 if primer_seq:
-                    # Re-derive the binding straight from the template so a
-                    # primer ALWAYS renders on the exact bases it anneals
-                    # to — even if its SAVED feature location is stale or
-                    # off (a cloning primer drawn off its real binding
-                    # site is a catastrophic-class error). Overrides
-                    # start/end for display; falls back to the stored
-                    # location when the primer doesn't cleanly match this
-                    # template (foreign primer / intended mismatches).
-                    # [primer binding re-derive, 2026-05-30]
-                    if _seq_upper_for_cds:
-                        _rb = _rederive_primer_binding(
-                            primer_seq, int(strand) if isinstance(strand, int)
-                            else 1, _seq_upper_for_cds, total,
-                            hint_start=int(start),
-                            circular=_rec_is_circular,
-                        )
-                        if _rb is not None:
-                            start, end = _rb
-                            new_feat["start"], new_feat["end"] = start, end
-                    bound_len = _feat_len(start, end, total) or 0
-                    flap_len  = max(0, len(primer_seq) - bound_len)
-                    # `_primer_seq` + `_bound_len` are always stamped
-                    # so the seq panel can paint primer bases inline
-                    # with the strand even for full-binding primers
-                    # (no flap → no flap row, but bound bar still
-                    # shows the primer sequence in its cells).
+                    L = len(primer_seq)
+                    _strand = int(strand) if isinstance(strand, int) else 1
                     new_feat["_primer_seq"] = primer_seq
-                    new_feat["_bound_len"]  = bound_len
-                    # Weak-primer flag: bound region shorter than the
-                    # user-set Min primer binding threshold triggers a
-                    # yellow ⚠ on the strand-3'-end arrow in the seq
-                    # panel + a tooltip line. Threshold read at parse
-                    # time so toggling Settings → Min primer binding
-                    # and re-parsing refreshes the stamps. Defensive
-                    # `getattr` chain so a standalone parse (tests, no
-                    # mounted App) still works on the default 15 bp.
-                    threshold = getattr(
-                        getattr(self, "app", None),
-                        "_min_primer_binding", 15,
-                    )
+                    # Re-derive the 3' ANCHOR from the template (a primer drawn
+                    # off its real site is catastrophic-class), then lay the
+                    # FULL primer 3'-anchored and classify EVERY base
+                    # match/mismatch. So an internal mismatch (a mutagenic /
+                    # Scrub cure) renders BOUND-FLAP-BOUND — the matched bases
+                    # on BOTH sides stay on the bound row and the mismatch
+                    # bumps onto the flap row — while the 5' overhang (enzyme
+                    # tail) is everything 5' of the first solid (>= 6 bp)
+                    # matching run, the annealing anchor. Pre-2026-06-03
+                    # the bound region was the longest CONTIGUOUS 3' match, so
+                    # the first internal mismatch dumped itself AND every
+                    # matching base 5' of it into the flap, which never
+                    # returned to the bound row. [primer per-base bound/flap]
+                    _rb = None
+                    if _seq_upper_for_cds and total:
+                        _rb = _rederive_primer_binding(
+                            primer_seq, _strand, _seq_upper_for_cds, total,
+                            hint_start=int(start), circular=_rec_is_circular)
+                    mism: dict = {}
+                    bound_len = 0
+                    flap_len = 0
+                    did_perbase = False
+                    if _seq_upper_for_cds and total:
+                        tmpl = _seq_upper_for_cds
+                        # 3' anchor: re-derived when found (fixes a stale saved
+                        # location); else the stored feature location's 3' end
+                        # — which covers a real binding whose mismatch sits
+                        # within _PRIMER_REBIND_MIN of the 3' end, where
+                        # re-derive can't anchor a contiguous suffix.
+                        rb_start, rb_end = _rb if _rb is not None else (start, end)
+                        # Per-base columns (primer 5'→3') + match mask. Forward:
+                        # 3' end at rb_end-1, base j at rb_end-L+j vs the top
+                        # strand. Reverse: 3' end at rb_start, 5' end at the high
+                        # coord, base j at rb_start+L-1-j vs the COMPLEMENT of
+                        # the top strand (it anneals to the bottom strand).
+                        cols = [0] * L
+                        match = [False] * L
+                        for j in range(L):
+                            if _strand >= 0:
+                                c = (rb_end - L + j) % total
+                                exp = tmpl[c]
+                            else:
+                                c = (rb_start + (L - 1 - j)) % total
+                                exp = _rc(tmpl[c])
+                            cols[j] = c
+                            match[j] = (primer_seq[j] == exp)
+                        # Annealing footprint starts at the first run of
+                        # >= _ANCHOR consecutive matches; everything 5' of it is
+                        # the unbound 5' overhang (enzyme tail / fusion). A
+                        # leading-mismatch-run alone FAILED — one coincidental
+                        # match, where a designed 5' tail happens to pair the
+                        # upstream template, collapsed the flap (e.g. a BsmBI
+                        # tail laid over an AT-rich repeat). Keying on a SOLID
+                        # matching stretch keeps a cloning tail (scattered /
+                        # short coincidental matches) a clean flap, while a
+                        # mutagenic primer (long 5' flank, internal cure)
+                        # anchors at its 5' end so its INTERNAL mismatch bumps
+                        # with bound bases on BOTH sides. _ANCHOR (6) <
+                        # _PRIMER_REBIND_MIN (12) → a re-derived binding always
+                        # contains an anchor run.
+                        _ANCHOR = 6
+                        overhang = None
+                        _run = 0
+                        for j in range(L):
+                            if match[j]:
+                                _run += 1
+                                if _run >= _ANCHOR:
+                                    overhang = j - _run + 1
+                                    break
+                            else:
+                                _run = 0
+                        # Per-base layout only when the primer really binds
+                        # here: an anchor run exists AND (re-derive anchored it
+                        # OR — stored-location fallback — most bases match, so
+                        # it's not a foreign / stale primer at a wrong site).
+                        if overhang is not None and (
+                                _rb is not None or 2 * sum(match) >= L):
+                            did_perbase = True
+                            bound_len = L - overhang
+                            flap_len  = overhang
+                            # Feature location = the annealing footprint (3').
+                            if _strand >= 0:
+                                end = rb_end
+                                start = rb_end - bound_len
+                                if start < 0:
+                                    start += total
+                            else:
+                                start = rb_start
+                                end = rb_start + bound_len
+                                if end > total:
+                                    end -= total
+                            new_feat["start"], new_feat["end"] = start, end
+                            # Internal mismatches (within the footprint) → the
+                            # bound-flap-bound bumps. Column → displayed base;
+                            # the bound bar gaps it, the flap bar lifts it.
+                            mism = {cols[j]: primer_seq[j]
+                                    for j in range(overhang, L) if not match[j]}
+                    if not did_perbase:
+                        # No template, or a foreign primer that doesn't bind the
+                        # stored site: stored location + contiguous 5'-flap split.
+                        bound_len = _feat_len(start, end, total) or 0
+                        flap_len  = max(0, L - bound_len)
+                    # `_bound_len` is always stamped so the bound bar paints the
+                    # primer bases inline with the strand even for a
+                    # full-binding primer (no flap row).
+                    new_feat["_bound_len"] = bound_len
+                    # Weak-primer flag: footprint shorter than the user-set Min
+                    # primer binding threshold → yellow ⚠ on the 3'-end arrow.
+                    # `getattr` chain so a standalone parse (tests, no mounted
+                    # App) still works on the default 15 bp.
+                    threshold = getattr(getattr(self, "app", None),
+                                        "_min_primer_binding", 15)
                     if isinstance(threshold, int) and 0 < bound_len < threshold:
                         new_feat["_weak_primer"] = True
                     if flap_len > 0:
                         new_feat["_flap_len"] = flap_len
-                        # Flap bases read inline with the strand the
-                        # primer anneals to. Forward primer (top
-                        # strand): flap = primer_seq[:flap_len], drawn
-                        # LEFT of the bound region. Reverse primer
-                        # (bottom strand): flap = the plain REVERSE of
-                        # primer_seq[:flap_len] so it reads in the same
-                        # bottom-strand frame as the bound bar, drawn
-                        # RIGHT of the bound region (the rev primer's
-                        # 5' end is on the high-coordinate side).
-                        if strand >= 0:
+                        # Flap (5' overhang) reads inline with the strand:
+                        # forward → primer_seq[:flap_len] drawn LEFT of the
+                        # footprint; reverse → its plain reverse drawn RIGHT
+                        # (the rev primer's 5' end is the high-coordinate side).
+                        if _strand >= 0:
                             new_feat["_flap_bases"] = primer_seq[:flap_len]
                             new_feat["_flap_start"] = start - flap_len
                             new_feat["_flap_end"]   = start
@@ -18678,14 +18762,12 @@ class PlasmidMap(Widget):
                             new_feat["_flap_start"] = end
                             new_feat["_flap_end"]   = end + flap_len
                         if not _rec_is_circular:
-                            # Linear molecule: the 5' tail dangles past
-                            # the (non-joined) end. Tell the painter to
-                            # CLIP it at [0, total) rather than mod-wrap
-                            # it to the opposite end (a gap that doesn't
-                            # exist on a linear fragment). Matches the
-                            # topology gate the bound region already uses
-                            # via _rederive_primer_binding(circular=…).
+                            # Linear molecule: the 5' tail dangles past the
+                            # (non-joined) end — CLIP at [0, total) rather than
+                            # mod-wrap to the opposite end.
                             new_feat["_flap_linear"] = True
+                    if mism:
+                        new_feat["_bound_mismatch"] = mism
             feats.append(new_feat)
         return feats
 
@@ -85221,13 +85303,14 @@ class MutagenizeModal(ModalScreen):
                                     "ligase-free QuikChange.")
                         yield Button("Scrub plasmid", id="btn-scrub-run",
                                      variant="primary")
-                    yield Static("", id="scrub-results", markup=True)
+                    with VerticalScroll(id="scrub-results"):
+                        yield Static("", id="scrub-results-body", markup=True)
                     with Horizontal(id="scrub-btns"):
-                        yield Button("Apply to canvas", id="btn-scrub-apply",
+                        yield Button("Apply cure", id="btn-scrub-apply",
                                      variant="primary", disabled=True)
                         yield Button("Save primers", id="btn-scrub-saveprimers",
                                      variant="default", disabled=True)
-                        yield Button("Copy protocol", id="btn-scrub-protocol",
+                        yield Button("Add to Map", id="btn-scrub-tomap",
                                      variant="default", disabled=True)
                         yield Button("Close  [Esc]", id="btn-scrub-close")
 
@@ -86000,7 +86083,7 @@ class MutagenizeModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-scrub-run")
     def _scrub_run(self, _) -> None:
-        status = self.query_one("#scrub-results", Static)
+        status = self.query_one("#scrub-results-body", Static)
         if not self._template:
             status.update("[red]Load a plasmid first.[/red]")
             return
@@ -86015,7 +86098,7 @@ class MutagenizeModal(ModalScreen):
         status.update("[dim]Scrubbing…[/dim]")
         # Disable commit buttons until the (possibly different) new result lands.
         for bid in ("#btn-scrub-apply", "#btn-scrub-saveprimers",
-                    "#btn-scrub-protocol"):
+                    "#btn-scrub-tomap"):
             try:
                 self.query_one(bid, Button).disabled = True
             except NoMatches:
@@ -86049,7 +86132,7 @@ class MutagenizeModal(ModalScreen):
 
     def _scrub_failed(self, msg: str) -> None:
         try:
-            self.query_one("#scrub-results", Static).update(
+            self.query_one("#scrub-results-body", Static).update(
                 f"[red]Scrub failed: {msg}[/red]")
         except NoMatches:
             pass
@@ -86058,7 +86141,7 @@ class MutagenizeModal(ModalScreen):
         self._scrub_plan = plan
         self._scrub_rounds = rounds
         try:
-            self.query_one("#scrub-results", Static).update(
+            self.query_one("#scrub-results-body", Static).update(
                 self._render_scrub(plan, rounds))
         except NoMatches:
             return
@@ -86066,7 +86149,7 @@ class MutagenizeModal(ModalScreen):
         has_primers = any(not r.get("error") for r in rounds)
         for bid, enabled in (("#btn-scrub-apply", has_edits),
                              ("#btn-scrub-saveprimers", has_primers),
-                             ("#btn-scrub-protocol", has_edits)):
+                             ("#btn-scrub-tomap", has_primers)):
             try:
                 self.query_one(bid, Button).disabled = not enabled
             except NoMatches:
@@ -86121,7 +86204,7 @@ class MutagenizeModal(ModalScreen):
         for w in plan.get("warnings", []):
             t.append(f"\n⚠ {w}\n", style="yellow")
         t.append("\nProtocol: PCR each round, DpnI, transform — no ligase, no "
-                 "cloning. 'Apply to canvas' loads the cured plasmid.\n",
+                 "cloning. 'Apply cure' loads the cured plasmid.\n",
                  style="dim")
         return t
 
@@ -86193,58 +86276,95 @@ class MutagenizeModal(ModalScreen):
             msg += f" ({skipped} duplicate sequence(s) skipped)"
         self.app.notify(msg)
 
-    @on(Button.Pressed, "#btn-scrub-protocol")
-    def _scrub_copy_protocol(self, _) -> None:
-        if not self._scrub_plan:
+    @on(Button.Pressed, "#btn-scrub-tomap")
+    def _scrub_save_to_map(self, _) -> None:
+        """Draw the QuikChange primers on the active map as `primer_bind`
+        features. Mirrors `_add_selected_to_map`: build a fresh record (the
+        undo stack aliases the live one), re-derive each binding from the
+        template (the cure mismatch on an un-applied parent falls back to the
+        designed hint), topology-gate the wrap, then commit + refresh."""
+        rounds = [r for r in self._scrub_rounds if not r.get("error")]
+        plan = self._scrub_plan
+        if not rounds or not plan:
+            self.app.notify("No primers to add to the map.", severity="warning")
             return
-        text = self._scrub_protocol_text()
-        mode, detail = _copy_to_clipboard_with_fallback(
-            self.app, text, "scrub_protocol")
-        if mode == "file":
-            self.app.notify(f"Protocol written to {detail}")
-        elif mode == "log_only":
-            self.app.notify("Could not reach the clipboard (see log).",
+        rec = getattr(self.app, "_current_record", None)
+        if rec is None:
+            self.app.notify("No plasmid loaded.", severity="warning")
+            return
+        total = _seq_len(rec)
+        # Substitution-only cure ⇒ scrubbed plasmid length == what we designed
+        # against. A different length means a different molecule is loaded —
+        # refuse rather than draw primers at coordinates that aren't its own.
+        if total != len(plan.get("cured_seq", "")):
+            self.app.notify("Canvas changed since the scrub — reopen Scrub.",
                             severity="warning")
-        else:
-            self.app.notify("Scrub protocol copied to clipboard.")
-
-    def _scrub_protocol_text(self) -> str:
-        plan = self._scrub_plan or {}
-        rounds = self._scrub_rounds
-        nm = self._plasmid_name or "plasmid"
-        lines = [
-            f"Scrub protocol — {nm}",
-            f"Enzymes removed: {', '.join(plan.get('enzymes', [])) or '—'}",
-            f"Sites removed: {len(plan.get('sites_removed', []))} "
-            f"via {len(plan.get('edits', []))} silent substitution(s)",
-        ]
-        for e in plan.get("edits", []):
-            lines.append(f"  {e['enzyme']} nt {e['pos'] + 1}: "
-                         f"{e['frm']}->{e['to']}  [{e['region']}]")
-        if plan.get("sites_skipped"):
-            lines.append("Could NOT be scrubbed safely:")
-            for s in plan["sites_skipped"]:
-                lines.append(f"  {s['enzyme']} nt {s['pos'] + 1}: {s['reason']}")
-        lines += [
-            "",
-            "Improved-QuikChange, per round (ligase-free, no cloning):",
-            "  template + primer pair + high-fidelity polymerase;",
-            "  ~18-25 cycles, ~1 min/kb extension around the whole plasmid;",
-            "  add DpnI 37 C 1 h (digest parental template);",
-            "  transform; miniprep; sequence-verify.",
-        ]
+            return
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        # deepcopy (NOT a rebuilt SeqRecord) so the user-typed display name
+        # (`_tui_display_name`) + `_source_path` + other `_tui_*` attrs ride
+        # onto the new record. A fresh SeqRecord drops them, and the next
+        # save then falls back to the GenBank LOCUS — which is space-stripped
+        # per INSDC — turning "FFE 6" into "FFE_6" (sacred: never add
+        # underscores to a name). deepcopy also de-aliases the undo stack,
+        # so appending features can't corrupt a prior snapshot.
+        new_rec = deepcopy(rec)
+        is_circ = str((getattr(new_rec, "annotations", {}) or {})
+                      .get("topology", "")).strip().lower() != "linear"
+        specs: list = []
         for r in rounds:
-            if r.get("error"):
-                lines.append(f"Round {r['round']}: NO PRIMER — {r['error']}")
+            specs.append((f"SCRUB_R{r['round']}_FWD", r["fwd_seq"],
+                          r["fwd_start"], r["fwd_len"], 1))
+            specs.append((f"SCRUB_R{r['round']}_REV", r["rev_seq"],
+                          r["rev_start"], r["rev_len"], -1))
+        added: list = []
+        for name, seq, fp_start, fp_len, strand in specs:
+            raw_end = fp_start + fp_len
+            p_start = fp_start
+            # wrap-encode the footprint end (< start) when it crosses origin
+            p_end = raw_end - total if raw_end > total else raw_end
+            rb = _rederive_primer_binding(seq, strand, str(new_rec.seq), total,
+                                          hint_start=p_start, circular=is_circ)
+            if rb is not None:
+                p_start, p_end = rb
+            if p_end == p_start:
                 continue
-            lines.append(f"Round {r['round']} ({r['overlap_style']}):")
-            lines.append(f"  FWD {r['fwd_seq']}  "
-                         f"(Tm {r['fwd_tm']}C, QC {r['fwd_tm_qc']}C, "
-                         f"{r['fwd_len']} nt)")
-            lines.append(f"  REV {r['rev_seq']}  "
-                         f"(Tm {r['rev_tm']}C, QC {r['rev_tm_qc']}C, "
-                         f"{r['rev_len']} nt)")
-        return "\n".join(lines)
+            if p_end < p_start:
+                if is_circ and 0 <= p_end and p_start < total:
+                    loc = CompoundLocation([
+                        FeatureLocation(p_start, total, strand=strand),
+                        FeatureLocation(0, p_end, strand=strand)])
+                else:
+                    continue
+            elif 0 <= p_start < p_end <= total:
+                loc = FeatureLocation(p_start, p_end, strand=strand)
+            else:
+                continue
+            if any(f.type == "primer_bind"
+                   and (f.qualifiers.get("label", [""]) or [""])[0] == name
+                   for f in new_rec.features):
+                continue
+            new_rec.features.append(SeqFeature(
+                loc, type="primer_bind",
+                qualifiers={"label": [name], "primer_seq": [seq]}))
+            added.append(name)
+        if not added:
+            self.app.notify("Those primers are already on the map.",
+                            severity="information")
+            return
+        try:
+            self.app._push_undo()                              # type: ignore[attr-defined]
+            self.app._apply_record(new_rec, clear_undo=False)  # type: ignore[attr-defined]
+            self.app._mark_dirty()                             # type: ignore[attr-defined]
+            self.app.query_one("#library").add_entry(new_rec)  # type: ignore[attr-defined]
+        except Exception:
+            _log.exception("Scrub: failed to add primers to map")
+            self.app.notify("Failed to add primers to the map (see log).",
+                            severity="error")
+            return
+        self.app.notify(
+            f"Added {len(added)} primer{'s' if len(added) != 1 else ''} to the "
+            f"map.")
 
     @on(Button.Pressed, "#btn-scrub-close")
     def _scrub_close(self, _) -> None:
@@ -88997,19 +89117,15 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
 
         primers = _load_primers()
         from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
-        from Bio.Seq import Seq
-        from Bio.SeqRecord import SeqRecord
 
-        # Build a fresh record rather than mutating self.app._current_record:
-        # the undo stack aliases the live record, and appending features in
-        # place would silently corrupt prior undo snapshots.
-        new_rec = SeqRecord(
-            Seq(str(rec.seq)),
-            id=rec.id, name=rec.name, description=rec.description,
-            annotations=dict(rec.annotations),
-        )
-        for f in rec.features:
-            new_rec.features.append(deepcopy(f))
+        # deepcopy rather than mutating self.app._current_record (the undo
+        # stack aliases the live record, so appending features in place would
+        # corrupt prior snapshots) AND rather than rebuilding a fresh
+        # SeqRecord — a rebuild drops `_tui_display_name` / `_source_path`,
+        # so the next save falls back to the space-stripped GenBank LOCUS and
+        # turns "My Plasmid" into "My_Plasmid" (sacred no-added-underscores
+        # rule). deepcopy carries every attr and is still snapshot-safe.
+        new_rec = deepcopy(rec)
 
         total = _seq_len(new_rec)
         # Topology gate (2026-06-02, [INV-74] sibling-path fix): a primer
@@ -105344,9 +105460,13 @@ DomesticatorModal { align: center middle; }
 /* ── Mutagenize modal ───────────────────────────────────── */
 MutagenizeModal { align: center middle; }
 #mut-box {
-    width: 115; height: auto; max-height: 46;
+    /* Fullscreen: fill the whole terminal so every tab's controls AND the
+       action-button row always fit with room to spare — even on a short
+       laptop screen (a sized/centered box clipped the bottom buttons). */
+    width: 100%; height: 100%;
     background: $surface; border: solid $accent; padding: 1 2;
 }
+#mut-tabs { height: 1fr; }
 #mut-title    { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #mut-box Label { color: $text-muted; margin-top: 1; }
 #mut-src-map, #mut-src-lib, #mut-src-parts, #mut-src-prot { height: auto; }
@@ -105380,6 +105500,28 @@ MutagenizeModal { align: center middle; }
 }
 #mut-btns     { height: 3; margin-top: 1; }
 #mut-btns Button { margin-right: 1; }
+
+/* ── Scrub tab (evenly-spaced rows; results scroll, never overflow) ──── */
+#scrub-intro       { height: auto; margin-bottom: 1; }
+#scrub-codon-row   { height: 3; margin-bottom: 1; }
+#scrub-codon-label { width: 1fr; padding: 1 1 0 1; }
+#scrub-codon-row Button { width: 18; }
+#scrub-opts-row    { height: 3; margin-bottom: 1; }
+#scrub-opts-row Button { width: 1fr; margin-right: 1; }
+#scrub-overlap     { width: 1fr; margin-right: 1; }
+/* VerticalScroll (not a bare Static) so a long primer report gets a real
+   scrollbar instead of being silently clipped — a Static with overflow-y
+   doesn't scroll, mirroring why #seq-view lives inside #seq-scroll.
+   height: 1fr so the results soak up the slack between the fixed top rows
+   and the fixed button row — the action buttons can never be pushed off the
+   bottom of the box (regression: a fixed max-height clipped them). */
+#scrub-results {
+    height: 1fr; min-height: 4;
+    border: solid $primary-darken-2; padding: 0 1; margin-bottom: 1;
+}
+#scrub-results-body { height: auto; width: 1fr; }
+#scrub-btns        { height: 3; }
+#scrub-btns Button { width: 1fr; margin-right: 1; }
 
 /* ── AA picker sub-modal (from clicking an AA in the preview) ────────── */
 AminoAcidPickerModal { align: center middle; }

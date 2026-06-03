@@ -117,8 +117,9 @@ What you can do without leaving the terminal.
   Substitution-only, so feature coordinates never move. Produces the
   cured circular plasmid (Apply to canvas, undoable), one improved
   partial-overlap QuikChange primer pair per locus (sliced from the cured
-  template — binding == display), and a PCR → DpnI → transform protocol
-  (no ligase, no assembly). Un-curable sites are reported, not forced.
+  template — binding == display; save to the primer library or add straight
+  to the map), and a PCR → DpnI → transform protocol (no ligase, no
+  assembly). Un-curable sites are reported, not forced.
   Headless via the `scrub-plasmid` agent endpoint.
 
 ## Simulate

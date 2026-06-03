@@ -389,44 +389,90 @@ class TestScrubTabStructure:
             assert modal.query_one("#mut-tab-scrub") is not None
             # scrub widgets present
             for wid in ("#btn-scrub-run", "#scrub-overlap", "#scrub-results",
-                        "#btn-scrub-apply", "#btn-scrub-saveprimers",
-                        "#btn-scrub-protocol", "#btn-scrub-enzymes",
-                        "#btn-scrub-close", "#btn-scrub-codon",
-                        "#scrub-codon-label"):
+                        "#scrub-results-body", "#btn-scrub-apply",
+                        "#btn-scrub-saveprimers", "#btn-scrub-tomap",
+                        "#btn-scrub-enzymes", "#btn-scrub-close",
+                        "#btn-scrub-codon", "#scrub-codon-label"):
                 assert modal.query_one(wid) is not None
+            # Copy protocol was removed — it must no longer be in the tree.
+            assert len(modal.query("#btn-scrub-protocol")) == 0
             # commit buttons start disabled (no scrub computed yet)
             for wid in ("#btn-scrub-apply", "#btn-scrub-saveprimers",
-                        "#btn-scrub-protocol"):
+                        "#btn-scrub-tomap"):
                 assert modal.query_one(wid, sc.Button).disabled is True
             # SOE tab still intact
             assert modal.query_one("#btn-mut-design", sc.Button) is not None
             assert modal.query_one("#mut-source", sc.Select) is not None
 
 
+async def _assert_scrub_layout_fits(size):
+    app = sc.PlasmidApp()
+    async with app.run_test(size=size) as pilot:
+        await pilot.pause()
+        app.push_screen(sc.MutagenizeModal("ATG" * 200, [], "p",
+                                           show_tab="scrub"))
+        await pilot.pause()
+        await pilot.pause(0.1)
+        modal = app.screen
+        box = modal.query_one("#mut-box").region
+        # fullscreen: the box fills the whole terminal
+        assert (box.x, box.y) == (0, 0), f"modal not at origin @ {size}: {box}"
+        assert box.width == size[0] and box.height == size[1], (
+            f"modal not fullscreen @ {size}: {box}")
+        assert modal.query_one("#mut-title").region.y >= 0
+        for wid in ("#btn-scrub-codon", "#btn-scrub-enzymes",
+                    "#btn-scrub-run", "#btn-scrub-apply",
+                    "#btn-scrub-saveprimers", "#btn-scrub-tomap",
+                    "#btn-scrub-close"):
+            r = modal.query_one(wid).region
+            assert r.width > 0 and r.height > 0, f"{wid} not laid out @ {size}"
+            # fully inside the box — horizontally AND vertically (the action
+            # row was being clipped under the box's bottom border).
+            assert box.x <= r.x and r.right <= box.right, (
+                f"{wid} overflows box horizontally @ {size}: {r} vs {box}")
+            assert box.y <= r.y and r.bottom <= box.bottom, (
+                f"{wid} overflows box vertically @ {size}: {r} vs {box}")
+        # bottom action buttons share the row evenly (1fr each)
+        widths = [modal.query_one(w).region.width for w in
+                  ("#btn-scrub-apply", "#btn-scrub-saveprimers",
+                   "#btn-scrub-tomap", "#btn-scrub-close")]
+        assert max(widths) - min(widths) <= 2, f"uneven buttons: {widths}"
+
+
+class TestScrubTabLayout:
+    # Regression for the 2026-06-02 snapshots: the modal first clipped its
+    # title off the top, then the action-button row got clipped under the
+    # box's bottom border. Check the whole thing fits — title, every Scrub
+    # button (horizontally AND vertically) — at a tall and a short terminal.
+    async def test_fits_tall_terminal(self):
+        await _assert_scrub_layout_fits((171, 43))
+
+    async def test_fits_short_terminal(self):
+        await _assert_scrub_layout_fits((120, 30))
+
+
 class TestScrubTabRender:
-    def test_render_and_protocol_without_mount(self):
-        # The formatting methods only touch their args / plain attrs, so an
-        # un-mounted shell exercises them deterministically.
+    def test_render_without_mount(self):
+        # _render_scrub only touches its args, so an un-mounted shell
+        # exercises it deterministically.
         seq, _rec = _record_with_bsai()
         plan = sc._scrub_design(seq, [], ["BsaI"])
         rounds = [sc._scrub_qc_primers(plan["cured_seq"], c["positions"],
                                        round_no=i)
                   for i, c in enumerate(plan["clusters"], 1)]
         m = sc.MutagenizeModal.__new__(sc.MutagenizeModal)
-        m._plasmid_name = "scrubtest"
-        m._scrub_plan = plan
-        m._scrub_rounds = rounds
         rendered = m._render_scrub(plan, rounds).plain
         assert "Removed 1 site" in rendered
         assert "BsaI" in rendered
-        proto = m._scrub_protocol_text()
-        assert "DpnI" in proto and "QuikChange" in proto
-        assert "FWD" in proto and "REV" in proto
+        assert "FWD" in rendered and "REV" in rendered
+        # the PCR → DpnI → transform protocol summary is still shown in-report
+        assert "DpnI" in rendered
 
 
 class TestScrubTabApply:
     async def test_apply_to_canvas_then_undo(self):
         seq, rec = _record_with_bsai()
+        rec._tui_display_name = "Scrub Test 1"   # spaces — must survive
         app = sc.PlasmidApp()
         async with app.run_test(size=_BASELINE) as pilot:
             await pilot.pause()
@@ -453,6 +499,9 @@ class TestScrubTabApply:
             assert cured == plan["cured_seq"]
             assert cured != seq
             assert not sc._scrub_scan_targets(cured, frozenset(["BsaI"]), True)
+            # the user-typed display name (with spaces) must survive the cure
+            assert getattr(app._current_record, "_tui_display_name",
+                           None) == "Scrub Test 1"
             # apply button re-disabled after a successful apply
             assert modal.query_one("#btn-scrub-apply", sc.Button).disabled is True
 
@@ -517,3 +566,89 @@ class TestScrubEndpoint:
                 == sc._translate_cds(cds, 0, 27, 1))
         assert not sc._scrub_scan_targets(cured, frozenset(["BsaI"]), True)
         assert res["edits"][0]["region"].startswith("CDS")
+
+
+# ── primer output scroll + "Primers → Map" ───────────────────────────────────
+
+
+def _multi_site_seq():
+    # 600 bp, 50% GC, four well-separated BsaI sites → four QuikChange rounds
+    # → a primer report tall enough to need scrolling.
+    s = list(("GATCATGC" * 80)[:600])
+    for at in (50, 200, 350, 500):
+        s[at:at + 6] = list("GGTCTC")
+    return "".join(s)
+
+
+class TestScrubScroll:
+    async def test_long_primer_report_scrolls(self):
+        seq = _multi_site_seq()
+        assert len(_site_idents(seq, ["BsaI"])) == 4
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.MutagenizeModal(seq, [], "multi",
+                                               show_tab="scrub"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            plan = sc._scrub_design(seq, [], ["BsaI"], circular=True)
+            assert plan["n_rounds"] == 4
+            rounds = [sc._scrub_qc_primers(plan["cured_seq"], c["positions"],
+                                           round_no=i)
+                      for i, c in enumerate(plan["clusters"], 1)]
+            modal._scrub_apply_result(plan, rounds)
+            await pilot.pause()
+            results = modal.query_one("#scrub-results")
+            # a real scroll container (not a bare clipping Static)
+            assert isinstance(results, sc.VerticalScroll)
+            assert results.max_scroll_y > 0, "tall report should be scrollable"
+
+
+class TestScrubToMap:
+    async def test_primers_added_to_map(self):
+        seq, rec = _record_with_bsai()
+        rec._tui_display_name = "Scrub Test 1"   # spaces — must survive save
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            app._apply_snapshot(seq, 0, rec)
+            await pilot.pause()
+            feats = app.query_one("#plasmid-map", sc.PlasmidMap)._feats
+            app.push_screen(sc.MutagenizeModal(seq, feats, "scrubtest",
+                                               show_tab="scrub"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            plan = sc._scrub_design(seq, feats, ["BsaI"], circular=True)
+            rounds = [sc._scrub_qc_primers(plan["cured_seq"], c["positions"],
+                                           round_no=i)
+                      for i, c in enumerate(plan["clusters"], 1)]
+            modal._scrub_apply_result(plan, rounds)
+            await pilot.pause()
+            assert modal.query_one("#btn-scrub-tomap", sc.Button).disabled is False
+            before = sum(1 for f in app._current_record.features
+                         if f.type == "primer_bind")
+            modal._scrub_save_to_map(None)
+            await pilot.pause()
+            scrub_primers = [
+                f for f in app._current_record.features
+                if f.type == "primer_bind"
+                and (f.qualifiers.get("label", [""]) or [""])[0].startswith(
+                    "SCRUB_")]
+            # one round → a fwd + a rev primer_bind feature, each with seq
+            assert len(scrub_primers) >= 2
+            assert all("primer_seq" in f.qualifiers for f in scrub_primers)
+            after = sum(1 for f in app._current_record.features
+                        if f.type == "primer_bind")
+            assert after >= before + 2
+            # the user-typed display name (with spaces) must survive the
+            # primer-add — a freshly-rebuilt record would drop it and the
+            # next save would underscore it ("FFE 6" → "FFE_6").
+            assert getattr(app._current_record, "_tui_display_name",
+                           None) == "Scrub Test 1"
+            # undoable
+            app._action_undo()
+            await pilot.pause()
+            assert sum(1 for f in app._current_record.features
+                       if f.type == "primer_bind") == before

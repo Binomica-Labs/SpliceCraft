@@ -157,8 +157,9 @@ chosen codon table's frequent synonyms when there's a choice), and minimal
 swaps elsewhere — without ever spawning a new forbidden site. You get the cured
 circular plasmid (one click to apply, fully undoable), an improved-QuikChange
 primer pair per locus designed off the cured sequence so it binds exactly where
-it's drawn, and a copy-ready protocol: PCR → DpnI → transform, no ligase, no
-fragment assembly. Sites it can't remove silently are reported, never forced.
+it's drawn — save it to your primer library or add it straight to the map — with
+the PCR → DpnI → transform recipe (no ligase, no fragment assembly) shown
+alongside. Sites it can't remove silently are reported, never forced.
 
 ### Synthesis
 

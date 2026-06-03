@@ -14,6 +14,20 @@
 
 ---
 
+## [1.0.17] — 2026-06-03
+
+### New features
+
+- **Add Scrub's QuikChange primers straight onto the map.** The Scrub tab has a new **Add to Map** button that draws the designed primer pair(s) onto the active plasmid as `primer_bind` features (each stamped with its 5'→3' sequence and drawn where it anneals) — alongside **Save primers** (to the primer library) and **Apply cure** (write the cured sequence to the plasmid). Undoable like any map edit.
+- **Primer mismatches now "bump" off the binding row.** In the sequence panel, a primer base that doesn't match the template under it — e.g. a mutagenic / Scrub QuikChange cure — lifts onto the flap row at its own column (the primer reads **bound → flap → bound**), leaving an empty gap on the binding row beneath it, so an internal mismatch is obvious instead of hiding inline. Works for forward and reverse primers (a reverse primer is matched against the complement of the top strand).
+
+### Bug fixes
+
+- **Adding primers to the map no longer renames your plasmid.** Drawing primers onto the active plasmid — from the primer library's *add selected to map*, or Scrub's *Add to Map* — rebuilt the record in a way that dropped its typed display name, so the next **Save** fell back to the space-stripped GenBank LOCUS and turned *"FFE 6 ENTRY …"* into *"FFE_6_ENTRY_…"*. The record now keeps its exact name (and source file path) through a primer-add, so spaces survive.
+- **The Mutato modal is now full-screen, scrolls its output, and lines up cleanly.** As a fixed-size centered box it could, on a short laptop screen, clip its title off the top and cram the Scrub tab's action buttons (Apply cure / Save primers / Add to Map / Close) against or under the bottom edge; a long primer report also had no scrollbar and was silently cut off, and a couple of rows were unevenly sized. The modal now fills the whole terminal, the primer report scrolls, and every Scrub row is evenly spaced with the action buttons always in view.
+
+---
+
 ## [1.0.16] — 2026-06-02
 
 ### New features
