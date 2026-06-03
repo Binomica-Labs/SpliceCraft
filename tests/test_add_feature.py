@@ -3392,3 +3392,42 @@ class TestFeatureEditModalGroupMembersSeed:
         # Fallback: 1-row solo from cursor feat.
         assert len(modal._members) == 1
         assert modal._members[0]["label"] == "ok"
+
+
+class TestFeatureModalSpaceMark:
+    """Universal Space-to-mark: in the feature-merge modal, Space toggles the
+    ★ mark on the highlighted member row — the same gesture as the plasmid +
+    primer libraries (so marking is consistent app-wide)."""
+
+    class _SpaceKey:
+        key = "space"
+
+        def stop(self):
+            pass
+
+    async def test_space_toggles_member_mark(self, isolated_library):
+        import splicecraft as sc
+        from textual.widgets import DataTable
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            modal = sc.AddFeatureModal(
+                prefill={"name": "m1", "sequence": "ACGTACGTACGT",
+                         "feature_type": "CDS", "strand": 1},
+                total_len=120)
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            t = modal.query_one("#addfeat-members-tbl", DataTable)
+            assert t.row_count >= 1
+            t.focus()
+            await pilot.pause()
+            t.move_cursor(row=0)
+            await pilot.pause()
+            assert len(modal._marked_ids) == 0
+            modal.on_key(self._SpaceKey())          # Space marks
+            await pilot.pause()
+            assert len(modal._marked_ids) == 1
+            modal.on_key(self._SpaceKey())          # Space again unmarks
+            await pilot.pause()
+            assert len(modal._marked_ids) == 0

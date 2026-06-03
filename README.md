@@ -155,11 +155,17 @@ each site — **silent** ones inside any coding sequence, checked against *every
 overlapping reading frame so a protein never changes (and biased toward your
 chosen codon table's frequent synonyms when there's a choice), and minimal
 swaps elsewhere — without ever spawning a new forbidden site. You get the cured
-circular plasmid (one click to apply, fully undoable), an improved-QuikChange
-primer pair per locus designed off the cured sequence so it binds exactly where
-it's drawn — save it to your primer library or add it straight to the map — with
-the PCR → DpnI → transform recipe (no ligase, no fragment assembly) shown
-alongside. Sites it can't remove silently are reported, never forced.
+circular plasmid (one click to apply, fully undoable) plus primers designed off
+the cured sequence so they bind exactly where they're drawn — save them to your
+primer library or add them straight to the map. Choose how it re-circularizes:
+**QuikChange** — an improved-QuikChange pair per locus, PCR → DpnI → transform
+(no ligase, no assembly); or **Golden Braid** — split the plasmid at each cure
+into BsaI-tailed fragments that a one-pot Golden Gate reaction ligates back
+together, the native 4 nt junction overhangs making reassembly seamless so the
+only net change is the cured sites. (BsaI being the assembly enzyme, every BsaI
+site is force-cured, and the design proves itself by a digest-and-ligate
+simulation before you order.) Sites it can't remove silently are reported,
+never forced.
 
 ### Synthesis
 

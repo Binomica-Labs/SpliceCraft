@@ -14,6 +14,21 @@
 
 ---
 
+## [1.0.19] — 2026-06-03
+
+### New features
+
+- **Scrub can now cure sites by Golden Braid assembly, not just QuikChange.** The Scrub tab has a new **Re-circularize** choice: *QuikChange* (the existing one-plasmid, no-cloning route) or **Golden Braid** — it splits the plasmid at each cure into BsaI-tailed PCR fragments that a one-pot Golden Gate (BsaI) reaction ligates back together. The 4 nt junction overhangs are the plasmid's own native sequence, so reassembly is seamless: the only net change is the cured sites. Each fragment's primer pair, junction overhangs, and a digest-and-ligate **verification** ("re-assembles to the cured plasmid") are shown; **Apply cure** loads the assembled product, **Save primers** / **Add to Map** handle every fragment. Because BsaI is the assembly enzyme, *every* BsaI site is force-cured (an internal one would be cut mid-reaction) — and if a BsaI site can't be silently removed, Golden Braid is refused with a clear reason (use QuikChange instead). Also on the `scrub-plasmid` agent endpoint via `method: "golden_braid"`.
+- **Save primers (Scrub) now lets you name each oligo and pick the collection.** Instead of auto-naming into the active primer collection, *Save primers* opens the same naming + collection chooser the primer designer uses — rename each oligo and route them into any collection (or a new one).
+- **Space marks the highlighted item everywhere.** Marking a list item with the space bar — already how the plasmid and primer libraries work — now also marks rows in the feature-merge tables (Add Feature / Edit Feature), so the gesture is consistent across the app.
+
+### Bug fixes
+
+- **Undo after "Add to Map" no longer leaves the primers behind.** Drawing scrub or library primers onto the map then pressing Undo used to revert the canvas but leave the primers saved in the library entry — they "lingered" off-map and came back on reload. Adding primers to the map is now an in-memory edit (the plasmid shows as unsaved); Undo fully reverses it, and the library only changes when you Save.
+- **Marking a primer in the Primers library no longer jumps the list.** Toggling a primer's ★ mark scrolled the row to the bottom of the viewport, making it jarring to mark several in a row. The scroll position (and cursor row) now stay put.
+
+---
+
 ## [1.0.18] — 2026-06-03
 
 ### Bug fixes

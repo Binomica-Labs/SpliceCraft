@@ -56,11 +56,14 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   into the live parts file).
 - **Design** — gibson-assemble, simulate-gibson, design-mutagenesis,
   scrub-plasmid (clone-free restriction-site removal: silent / synonymous
-  cures inside CDSes + minimal swaps elsewhere, with an improved-QuikChange
-  primer pair per locus; scrubs the loaded record or an explicit
-  `seq`+`features`, optional `codon_taxid` biases coding cures to a host's
-  frequent codons, returns the cured sequence + per-round primers, never
-  mutates the canvas), design-gb-part (Golden Braid / MoClo), design-primers
+  cures inside CDSes + minimal swaps elsewhere; scrubs the loaded record or
+  an explicit `seq`+`features`, optional `codon_taxid` biases coding cures to
+  a host's frequent codons, never mutates the canvas. `method` picks the
+  route: `"quikchange"` (default — cured sequence + an improved-QuikChange
+  primer pair per locus) or `"golden_braid"` (split into BsaI-tailed
+  fragments that Golden-Gate back together; force-cures every BsaI site,
+  returns per-fragment primers + native junction overhangs + a digest+ligate
+  `verified` flag)), design-gb-part (Golden Braid / MoClo), design-primers
   (generic Primer3 detection or restriction cloning), optimize-protein
   (codon-optimise an AA sequence to a chosen table; optional `stops`
   0–3 appends that many stop codons, and a trailing `*` run in the

@@ -533,6 +533,25 @@ class TestScrubEndpoint:
         res = sc._h_scrub_plasmid(None, {"seq": "ACGT" * 30, "overlap": "x"})
         assert isinstance(res, tuple) and res[1] == 400
 
+    def test_bad_method_400(self):
+        res = sc._h_scrub_plasmid(None, {"seq": "ACGT" * 30, "method": "x"})
+        assert isinstance(res, tuple) and res[1] == 400
+
+    def test_golden_braid_method(self):
+        seq = TestScrubGoldenBraid()._seq_with(
+            400, [(100, "GAATTC"), (260, "GAATTC")], seed=7)
+        res = sc._h_scrub_plasmid(None, {"seq": seq, "enzymes": ["EcoRI"],
+                                         "method": "golden_braid"})
+        assert res["ok"] is True, res.get("errors")
+        assert res["method"] == "golden_braid"
+        assert res["verified"] is True
+        assert res["n_fragments"] >= 2 and res["fragments"]
+        # cured product carries neither EcoRI nor BsaI (the assembly enzyme).
+        assert not sc._scrub_scan_targets(res["cured_seq"],
+                                          frozenset(["EcoRI", "BsaI"]), True)
+        for fr in res["fragments"]:
+            assert fr["fwd_seq"].startswith("GCGCGGTCTCA")
+
     def test_features_not_list_400(self):
         res = sc._h_scrub_plasmid(None, {"seq": "ACGT" * 30, "features": "no"})
         assert isinstance(res, tuple) and res[1] == 400
@@ -652,3 +671,413 @@ class TestScrubToMap:
             await pilot.pause()
             assert sum(1 for f in app._current_record.features
                        if f.type == "primer_bind") == before
+
+
+class TestScrubGoldenBraid:
+    """Golden Braid (BsaI Type IIS) fragment-based curing — `_scrub_gb_design`
+    + helpers. The plasmid is split at each cure cluster into PCR fragments
+    with BsaI-tailed primers carrying the NATIVE 4 nt junction overhangs, so a
+    Golden Gate reaction reassembles it with only the unwanted sites cured.
+
+    Catastrophic-class: a wrong fragment/overhang scrambles the plasmid or
+    leaves a site behind. The design's own digest+ligate verification must
+    pass (`verified`), the cured product must carry no EcoRI / no BsaI, and
+    every primer's binding must equal the cured template it anneals to."""
+
+    @staticmethod
+    def _clean_seq(length: int, seed: int) -> str:
+        """A random ACGT sequence with NO EcoRI / BsaI (either strand), so the
+        only sites are the ones a test inserts. Pure string check — no
+        splicecraft import, no data dir."""
+        import random
+        rng = random.Random(seed)
+        bad = ("GAATTC", "GGTCTC", "GAGACC")
+        while True:
+            s = "".join(rng.choice("ACGT") for _ in range(length))
+            # wrap-aware: reject a site spanning the circular origin too
+            if not any(b in (s + s[:5]) for b in bad):
+                return s
+
+    def _seq_with(self, length: int, inserts, seed: int = 7) -> str:
+        s = list(self._clean_seq(length, seed))
+        for pos, site in inserts:
+            for i, c in enumerate(site):
+                s[(pos + i) % length] = c
+        return "".join(s)
+
+    @staticmethod
+    def _has(seq: str, site: str) -> bool:
+        """Wrap-aware presence of `site` or its RC in circular `seq`."""
+        aug = seq + seq[:len(site) - 1]
+        return site in aug or sc._rc(site) in aug
+
+    def test_overhang_ok_rejects_palindrome_and_homopolymer(self):
+        assert sc._scrub_gb_overhang_ok("GGAG")          # clean, asymmetric
+        assert sc._scrub_gb_overhang_ok("AATG")
+        assert not sc._scrub_gb_overhang_ok("GATC")      # palindrome
+        assert not sc._scrub_gb_overhang_ok("AATT")      # palindrome
+        assert not sc._scrub_gb_overhang_ok("AAAA")      # homopolymer
+        assert not sc._scrub_gb_overhang_ok("ACG")       # wrong length
+        assert not sc._scrub_gb_overhang_ok("ACGN")      # non-ACGT
+
+    def test_design_verifies_and_cleans_two_ecorI(self):
+        seq = self._seq_with(400, [(100, "GAATTC"), (260, "GAATTC")], seed=7)
+        plan = sc._scrub_gb_design(seq, [], ["EcoRI"], circular=True)
+        assert plan["ok"], plan["errors"]
+        assert plan["verified"]
+        assert plan["n_fragments"] >= 2
+        # cured plasmid carries no EcoRI and no BsaI (the assembly enzyme).
+        assert not self._has(plan["cured_seq"], "GAATTC")
+        assert not self._has(plan["cured_seq"], "GGTCTC")
+        for fr in plan["fragments"]:                      # BsaI tail on every primer
+            assert fr["fwd_seq"].startswith("GCGCGGTCTCA")
+            assert fr["rev_seq"].startswith("GCGCGGTCTCA")
+
+    def test_primer_binding_matches_cured_template(self):
+        # Binding == display (catastrophic-class): each primer's 3' binding
+        # must equal the cured template it anneals to.
+        seq = self._seq_with(400, [(100, "GAATTC"), (260, "GAATTC")], seed=7)
+        plan = sc._scrub_gb_design(seq, [], ["EcoRI"], circular=True)
+        assert plan["ok"], plan["errors"]
+        cured, n = plan["cured_seq"], len(plan["cured_seq"])
+        tail = "GCGCGGTCTCA"
+        for fr in plan["fragments"]:
+            fwd_bind = fr["fwd_seq"][len(tail):]
+            assert fwd_bind == sc._circ_extract(cured, fr["cut_l"], len(fwd_bind), n)
+            rev_bind = fr["rev_seq"][len(tail):]
+            win = sc._circ_extract(cured, (fr["cut_r"] + 4 - len(rev_bind)) % n,
+                                   len(rev_bind), n)
+            assert rev_bind == sc._rc(win)
+
+    def test_junction_overhangs_unique_and_nonpalindromic(self):
+        seq = self._seq_with(540, [(80, "GAATTC"), (240, "GAATTC"),
+                                   (400, "GAATTC")], seed=11)
+        plan = sc._scrub_gb_design(seq, [], ["EcoRI"], circular=True)
+        assert plan["ok"], plan["errors"]
+        ohs = [fr["oh_left"] for fr in plan["fragments"]]
+        for oh in ohs:
+            assert sc._scrub_gb_overhang_ok(oh)
+        seen: set = set()
+        for oh in ohs:                                    # distinct incl. RC
+            assert oh not in seen and sc._rc(oh) not in seen, ohs
+            seen.add(oh); seen.add(sc._rc(oh))
+
+    def test_bsai_site_is_cured_not_tolerated(self):
+        # An unwanted site that IS BsaI must be REMOVED (it is the assembly
+        # enzyme). Even when the user lists only EcoRI, BsaI is force-cured.
+        seq = self._seq_with(360, [(90, "GAATTC"), (200, "GGTCTC")], seed=5)
+        assert self._has(seq, "GGTCTC")                  # BsaI present to start
+        plan = sc._scrub_gb_design(seq, [], ["EcoRI"], circular=True)
+        assert plan["ok"], plan["errors"]
+        assert plan["verified"]
+        assert not self._has(plan["cured_seq"], "GGTCTC")   # BsaI gone
+        assert not self._has(plan["cured_seq"], "GAATTC")
+
+    def test_uncurable_bsai_fails_with_clear_error(self, monkeypatch):
+        # If the inner cure skips a BsaI site (e.g. an overlapping opposite-
+        # strand CDS leaves no synonymous escape), Golden Braid is impossible:
+        # you cannot assemble with an enzyme that still cuts a fragment.
+        def _fake(seq, feats, enzymes, *, circular=True, codon_raw=None):
+            return {"ok": True, "cured_seq": seq, "edits": [],
+                    "sites_removed": [],
+                    "sites_skipped": [{"enzyme": "BsaI", "pos": 42, "strand": 1,
+                                       "region": "CDS", "reason": "no syn cure"}],
+                    "clusters": [], "warnings": []}
+        monkeypatch.setattr(sc, "_scrub_design", _fake)
+        plan = sc._scrub_gb_design("ACGT" * 80, [], ["BsaI"], circular=True)
+        assert not plan["ok"]
+        joined = " ".join(plan["errors"]).lower()
+        assert "bsai" in joined and "assembly enzyme" in joined
+
+    def test_single_cluster_self_circularizes(self):
+        seq = self._seq_with(220, [(100, "GAATTC")], seed=3)
+        plan = sc._scrub_gb_design(seq, [], ["EcoRI"], circular=True)
+        assert plan["ok"], plan["errors"]
+        assert plan["n_fragments"] == 1
+        assert plan["verified"]
+        fr = plan["fragments"][0]
+        assert fr["oh_left"] == fr["oh_right"]           # one shared junction
+        assert sc._scrub_gb_overhang_ok(fr["oh_left"])
+
+    def test_cured_differs_from_original_only_at_edits(self):
+        seq = self._seq_with(400, [(110, "GAATTC"), (270, "GAATTC")], seed=9)
+        plan = sc._scrub_gb_design(seq, [], ["EcoRI"], circular=True)
+        assert plan["ok"], plan["errors"]
+        edit_pos = {e["pos"] for e in plan["edits"]}
+        diffs = {i for i in range(len(seq)) if seq[i] != plan["cured_seq"][i]}
+        assert diffs == edit_pos        # nothing changed outside the cures
+        assert diffs                    # something WAS cured
+
+    def test_verify_requires_bsai_clean_not_site_free(self):
+        # A skipped NON-BsaI site (couldn't be cured) stays in the product —
+        # like QuikChange, that's reported, not a whole-design failure. Verify
+        # must only require the product to be BsaI-CLEAN (the assembly enzyme),
+        # NOT free of every unwanted site. (Pre-hardening it scanned ALL
+        # forbidden sites and failed the design on a residual EcoRI.)
+        cured = self._seq_with(220, [(90, "GAATTC")], seed=4)   # residual EcoRI
+        assert not self._has(cured, "GGTCTC")                   # but BsaI-clean
+        assert self._has(cured, "GAATTC")
+        frag = {"index": 0, "cut_l": 0, "cut_r": 0, "span": len(cured) + 4,
+                "oh_left": cured[:4], "oh_right": cured[:4],
+                "fwd_bind_len": 20, "rev_bind_len": 20}
+        ok, errors = sc._scrub_gb_verify(cured, cured, [frag], len(cured),
+                                         single=True)
+        assert ok, errors                       # residual EcoRI does NOT fail
+        # …but a residual BsaI must fail (it would be re-cut mid-assembly).
+        bad = self._seq_with(220, [(90, "GGTCTC")], seed=4)
+        fbad = {"index": 0, "cut_l": 0, "cut_r": 0, "span": len(bad) + 4,
+                "oh_left": bad[:4], "oh_right": bad[:4],
+                "fwd_bind_len": 20, "rev_bind_len": 20}
+        ok2, errors2 = sc._scrub_gb_verify(bad, bad, [fbad], len(bad),
+                                           single=True)
+        assert not ok2 and any("BsaI" in e for e in errors2), errors2
+
+    def test_no_target_sites_is_graceful(self):
+        # A plasmid with none of the target sites → nothing to fragment; the
+        # design returns cleanly (no crash, no fragments, a clear note).
+        seq = self._seq_with(200, [], seed=2)            # clean, no sites
+        plan = sc._scrub_gb_design(seq, [], ["EcoRI"], circular=True)
+        assert plan["ok"] is True
+        assert plan["n_fragments"] == 0 and not plan["fragments"]
+        assert any("no sites" in w.lower() or "nothing" in w.lower()
+                   for w in plan["warnings"])
+
+    def test_only_bsai_single_site_force_cured(self):
+        # The user lists NO enzymes, but a lone BsaI site is still force-cured
+        # (it's the assembly enzyme) → one self-circularising fragment.
+        seq = self._seq_with(220, [(90, "GGTCTC")], seed=6)
+        plan = sc._scrub_gb_design(seq, [], [], circular=True)
+        assert plan["ok"], plan["errors"]
+        assert plan["verified"]
+        assert plan["n_fragments"] == 1
+        assert not self._has(plan["cured_seq"], "GGTCTC")
+
+
+class TestScrubGoldenBraidUI:
+    """The Scrub tab's Golden Braid re-circularization mode through
+    MutagenizeModal — method selector, GB render, commit-button gating, and
+    drawing the fragment primers on the map."""
+
+    def _rec(self, seq: str):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        return SeqRecord(Seq(seq), id="GBUI", name="GBUI",
+                         annotations={"molecule_type": "DNA",
+                                      "topology": "circular"})
+
+    async def test_method_selector_defaults_to_quikchange(self):
+        seq, _ = _record_with_bsai()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.MutagenizeModal(seq, [], "x", show_tab="scrub"))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sel = app.screen.query_one("#scrub-method", sc.Select)
+            assert sel.value == "quikchange"
+
+    async def test_golden_braid_greys_out_overlap_picker(self):
+        seq, _ = _record_with_bsai()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.MutagenizeModal(seq, [], "x", show_tab="scrub"))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            screen = app.screen
+            ov = screen.query_one("#scrub-overlap", sc.Select)
+            assert ov.disabled is False                  # QuikChange: live
+            screen.query_one("#scrub-method", sc.Select).value = "golden_braid"
+            await pilot.pause()
+            assert ov.disabled is True                   # GB: greyed (no-op)
+            screen.query_one("#scrub-method", sc.Select).value = "quikchange"
+            await pilot.pause()
+            assert ov.disabled is False                  # back to live
+
+    async def test_gb_result_renders_and_enables_commits(self):
+        gb = TestScrubGoldenBraid()
+        seq = gb._seq_with(400, [(100, "GAATTC"), (260, "GAATTC")], seed=7)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            app._apply_snapshot(seq, 0, self._rec(seq))
+            await pilot.pause()
+            feats = app.query_one("#plasmid-map", sc.PlasmidMap)._feats
+            app.push_screen(sc.MutagenizeModal(seq, feats, "GBUI",
+                                               show_tab="scrub"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            plan = sc._scrub_gb_design(seq, feats, ["EcoRI"], circular=True)
+            assert plan["verified"], plan["errors"]
+            modal._scrub_apply_result(plan, [])
+            await pilot.pause()
+            body = modal._render_scrub_gb(plan).plain
+            assert "Golden Braid" in body
+            for bid in ("#btn-scrub-apply", "#btn-scrub-saveprimers",
+                        "#btn-scrub-tomap"):
+                assert modal.query_one(bid, sc.Button).disabled is False
+            # Add to Map draws the BsaI-tailed fragment primers.
+            modal._scrub_save_to_map(None)
+            await pilot.pause()
+            gbp = [f for f in app._current_record.features
+                   if f.type == "primer_bind"
+                   and (f.qualifiers.get("label", [""]) or [""])[0].startswith(
+                       "GB_F")]
+            assert len(gbp) >= 2
+            assert all("primer_seq" in f.qualifiers for f in gbp)
+            # the user-typed display name (with spaces) survives the add.
+            app._current_record._tui_display_name = "GB UI Test"
+            assert getattr(app._current_record, "_tui_display_name",
+                           None) == "GB UI Test"
+
+    async def test_gb_failed_design_keeps_commits_disabled(self):
+        seq, _ = _record_with_bsai()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            app._apply_snapshot(seq, 0, self._rec(seq))
+            await pilot.pause()
+            app.push_screen(sc.MutagenizeModal(seq, [], "x", show_tab="scrub"))
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            failed = {
+                "method": "golden_braid", "ok": False, "verified": False,
+                "cured_seq": seq, "enzyme": "BsaI",
+                "edits": [{"pos": 1, "frm": "A", "to": "G", "region": "x",
+                           "enzyme": "BsaI"}],
+                "sites_removed": [], "sites_skipped": [], "fragments": [],
+                "errors": ["a BsaI site can't be removed; BsaI is the "
+                           "assembly enzyme"], "warnings": []}
+            modal._scrub_apply_result(failed, [])
+            await pilot.pause()
+            for bid in ("#btn-scrub-apply", "#btn-scrub-saveprimers",
+                        "#btn-scrub-tomap"):
+                assert modal.query_one(bid, sc.Button).disabled is True
+            body = modal._render_scrub_gb(failed).plain
+            assert "assembly enzyme" in body
+
+
+class TestScrubGoldenBraidCDS:
+    """Golden Braid curing inside a coding sequence must stay synonymous: the
+    cure rides in a fragment primer, the fragment reassembles, and the CDS
+    protein is byte-identical to the original."""
+
+    def test_synonymous_cure_in_cds_preserves_protein(self):
+        gb = TestScrubGoldenBraid()
+        body = list(gb._clean_seq(300, seed=21))
+        # BsaI in-frame at codon boundary 60 (GGT-CTC = Gly-Leu → GGA-CTC
+        # cures synonymously). CDS spans the whole circular plasmid.
+        for i, c in enumerate("GGTCTC"):
+            body[60 + i] = c
+        seq = "".join(body)
+        feats = [{"type": "CDS", "start": 0, "end": 300, "strand": 1,
+                  "codon_start": 1, "transl_table": 1, "label": "orf"}]
+        plan = sc._scrub_gb_design(seq, feats, ["BsaI"], circular=True)
+        assert plan["ok"], plan["errors"]
+        assert plan["verified"]
+        assert not gb._has(plan["cured_seq"], "GGTCTC")          # BsaI gone
+        # protein byte-identical across the cure (synonymous)
+        assert (sc._translate_cds(seq, 0, 300, 1)
+                == sc._translate_cds(plan["cured_seq"], 0, 300, 1))
+        # the edit is genuinely silent (only the wobble base moved)
+        assert plan["edits"] and all(e["region"].startswith("CDS")
+                                     for e in plan["edits"])
+
+
+class TestScrubSavePersistence:
+    """Add-to-Map is an in-memory dirty edit (Undo fully reverses it — no
+    primers lingering in the library), and Save-primers routes through the
+    naming + collection modal."""
+
+    def _rec(self, seq: str, rid: str = "LINGER"):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        return SeqRecord(Seq(seq), id=rid, name=rid,
+                         annotations={"molecule_type": "DNA",
+                                      "topology": "circular"})
+
+    def _qc_rounds(self, seq, feats):
+        plan = sc._scrub_design(seq, feats, ["BsaI"], circular=True)
+        rounds = [sc._scrub_qc_primers(plan["cured_seq"], c["positions"],
+                                       round_no=i)
+                  for i, c in enumerate(plan["clusters"], 1)]
+        return plan, rounds
+
+    async def test_add_to_map_does_not_persist_to_library(self):
+        seq, _ = _record_with_bsai()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            app._apply_snapshot(seq, 0, self._rec(seq, "LINGER"))
+            await pilot.pause()
+            # seed a clean (primer-free) library row for this plasmid
+            app.query_one("#library", sc.LibraryPanel).add_entry(
+                app._current_record)
+            await pilot.pause()
+            feats = app.query_one("#plasmid-map", sc.PlasmidMap)._feats
+            modal = sc.MutagenizeModal(seq, feats, "LINGER", show_tab="scrub")
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            plan, rounds = self._qc_rounds(seq, feats)
+            modal._scrub_apply_result(plan, rounds)
+            await pilot.pause()
+            modal._scrub_save_to_map(None)
+            await pilot.pause()
+            # canvas HAS the primers (in-memory dirty edit) …
+            assert any(f.type == "primer_bind"
+                       for f in app._current_record.features)
+            # … but the LIBRARY row was NOT auto-persisted — so Undo (which
+            # only reverts the canvas) can't leave primers lingering there.
+            entry = next((e for e in sc._load_library()
+                          if e.get("id") == "LINGER"), None)
+            assert entry is not None
+            assert "primer_bind" not in (entry.get("gb_text") or "")
+
+    async def test_save_primers_opens_naming_modal(self):
+        seq, _ = _record_with_bsai()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            app._apply_snapshot(seq, 0, self._rec(seq))
+            await pilot.pause()
+            feats = app.query_one("#plasmid-map", sc.PlasmidMap)._feats
+            modal = sc.MutagenizeModal(seq, feats, "x", show_tab="scrub")
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            plan, rounds = self._qc_rounds(seq, feats)
+            modal._scrub_apply_result(plan, rounds)
+            await pilot.pause()
+            modal._scrub_save_primers(None)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert isinstance(app.screen, sc.PrimerSaveModal)
+
+    async def test_commit_primers_uses_typed_names(self):
+        seq, _ = _record_with_bsai()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            app._apply_snapshot(seq, 0, self._rec(seq))
+            await pilot.pause()
+            feats = app.query_one("#plasmid-map", sc.PlasmidMap)._feats
+            modal = sc.MutagenizeModal(seq, feats, "x", show_tab="scrub")
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            plan, rounds = self._qc_rounds(seq, feats)
+            modal._scrub_apply_result(plan, rounds)
+            await pilot.pause()
+            oligos = [{"label": p["name"], "default_name": p["name"],
+                       "sequence": p["seq"], "tm": p["tm"],
+                       "_strand": p["strand"], "_ptype": p["ptype"]}
+                      for p in modal._scrub_primer_list()]
+            assert len(oligos) >= 2
+            custom = [f"CUSTOM_{i}" for i in range(len(oligos))]
+            modal._scrub_commit_primers_with_names(oligos, custom)
+            await pilot.pause()
+            names = {p.get("name") for p in sc._load_primers()}
+            assert all(c in names for c in custom)

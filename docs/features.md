@@ -115,12 +115,22 @@ What you can do without leaving the terminal.
   preferring the chosen codon table's frequent synonyms), minimal base
   changes elsewhere, never introducing a new forbidden site.
   Substitution-only, so feature coordinates never move. Produces the
-  cured circular plasmid (Apply to canvas, undoable), one improved
-  partial-overlap QuikChange primer pair per locus (sliced from the cured
-  template — binding == display; save to the primer library or add straight
-  to the map), and a PCR → DpnI → transform protocol (no ligase, no
-  assembly). Un-curable sites are reported, not forced.
-  Headless via the `scrub-plasmid` agent endpoint.
+  cured circular plasmid (Apply to canvas, undoable) plus primers sliced
+  from the cured template (binding == display; save to the primer library
+  or add straight to the map). A **Re-circularize** selector picks the
+  lab route:
+  - **QuikChange** — one improved partial-overlap pair per locus, PCR →
+    DpnI → transform (no ligase, no assembly).
+  - **Golden Braid** — split the plasmid at each cure into BsaI-tailed PCR
+    fragments that a one-pot Golden Gate (BsaI) reaction reassembles. The
+    4 nt junction overhangs are native sequence, so the product is seamless
+    except the cures. BsaI is the assembly enzyme, so **every** BsaI site is
+    force-cured (an internal one would be cut mid-reaction); a BsaI site
+    that can't be silently removed makes Golden Braid refuse (use
+    QuikChange). The design self-checks by a digest+ligate simulation that
+    must reassemble to the cured plasmid before commit.
+  Un-curable sites are reported, not forced. Headless via the
+  `scrub-plasmid` agent endpoint (`method: "quikchange" | "golden_braid"`).
 
 ## Simulate
 

@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.18"
+__version__ = "1.0.19"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -44203,6 +44203,297 @@ def _scrub_qc_primers(cured_seq: str, positions: list, *,
     return res
 
 
+# ── Scrub: Golden Braid (BsaI Type IIS) fragment-based curing ───────────────
+#
+# An alternative re-circularization to the QuikChange path above. Instead of
+# one whole-plasmid amplicon that self-anneals, the plasmid is split at each
+# cure cluster into PCR fragments; each fragment's primers carry a BsaI
+# (GGTCTC) 5' tail + the NATIVE 4 nt junction overhang, and a Golden Gate /
+# Golden Braid (BsaI) reaction reassembles the fragments seamlessly — the
+# only net change vs the original is the cured sites.
+#
+# Because BsaI is the ASSEMBLY enzyme, EVERY BsaI site in the plasmid (not
+# just user-listed ones) must be cured — a retained BsaI site is cut
+# mid-reaction and scrambles the product. That is the "an unwanted site IS
+# BsaI" edge case: BsaI is force-added to the cure set, and a BsaI site that
+# can't be silently removed makes the whole Golden Braid design fail (you
+# can't Golden-Gate around a site the enzyme still cuts). The cure is sliced
+# into the primer ends from the CURED template, so each amplicon is
+# internally BsaI-clean; a digest+ligate simulation then proves the
+# reassembled product equals the cured plasmid (catastrophic-class: the
+# design IS the product). Primer-tail layout mirrors the Domesticator
+# (PAD + GGTCTC + spacer + native binding); the binding's first 4 nt ARE the
+# fusion overhang, so reassembly restores native sequence except the cures.
+
+_SCRUB_GB_ENZYME    = "BsaI"
+_SCRUB_GB_SITE      = "GGTCTC"
+_SCRUB_GB_PAD       = "GCGC"        # 5' pad → efficient terminal cutting
+_SCRUB_GB_SPACER    = "A"           # 1 nt between recognition and the overhang
+_SCRUB_GB_TARGET_TM = 60.0          # NN target for each fragment's annealing arm
+_SCRUB_GB_BIND_MIN  = 18
+_SCRUB_GB_BIND_MAX  = 25
+_SCRUB_GB_MIN_FRAG  = 50            # shorter than this is impractical to PCR + gel
+_SCRUB_GB_OH_SLIDE  = 10            # ± window to slide a junction for a clean overhang
+_SCRUB_GB_CLUSTER_FOOTPRINT = 18    # tighter than QuikChange: both arms must reach
+
+
+def _scrub_gb_overhang_ok(oh: str) -> bool:
+    """A 4 nt Golden Gate overhang is usable iff it is exactly 4 ACGT bases,
+    NOT palindromic (a palindromic overhang ligates to its own RC → a
+    fragment flips or concatemerizes), and not a single base ×4 (AAAA/TTTT/…
+    ligate promiscuously and misassemble). These are the standard Golden Gate
+    fidelity rules — the difference between a clean 4 nt junction and a
+    scrambled assembly."""
+    if len(oh) != 4 or any(c not in "ACGT" for c in oh):
+        return False
+    if oh == _rc(oh):                  # palindrome
+        return False
+    if len(set(oh)) == 1:              # AAAA / CCCC / GGGG / TTTT
+        return False
+    return True
+
+
+def _scrub_gb_cluster_center(positions: list, n: int) -> int:
+    """Midpoint coordinate of a cure cluster (wrap-aware), where the junction
+    cut is centred so both flanking primers reach every cure in the cluster."""
+    start, end = _scrub_cluster_span(positions, n)   # end < start ⇒ wraps origin
+    span = (end - start) % n
+    return (start + span // 2) % n
+
+
+def _scrub_gb_pick_cuts(cured: str, clusters: list, n: int) -> tuple:
+    """One cut position per cluster, each yielding a clean, mutually-unique
+    4 nt Golden Gate overhang `cured[cut:cut+4]`. Searches outward from each
+    cluster centre within ±_SCRUB_GB_OH_SLIDE. An overhang AND its reverse
+    complement are both reserved once used, so no two junctions can ligate
+    cross-wise. Returns `(cuts_sorted, None)` or `(None, reason)` when a
+    cluster has no usable overhang window (e.g. an AT-homopolymer junction)."""
+    used: set = set()
+    raw: list = []
+    for c in clusters:
+        positions = c["positions"] if isinstance(c, dict) else c
+        center = _scrub_gb_cluster_center(positions, n)
+        chosen: "int | None" = None
+        for d in range(0, _SCRUB_GB_OH_SLIDE + 1):
+            for p in dict.fromkeys(((center + d) % n, (center - d) % n)):
+                oh = _circ_extract(cured, p, 4, n)
+                if not _scrub_gb_overhang_ok(oh):
+                    continue
+                if oh in used or _rc(oh) in used:
+                    continue
+                chosen = p
+                used.add(oh)
+                used.add(_rc(oh))
+                break
+            if chosen is not None:
+                break
+        if chosen is None:
+            return None, (
+                f"no unique non-palindromic BsaI overhang within "
+                f"{_SCRUB_GB_OH_SLIDE} bp of the cure near {center} bp — "
+                "the QuikChange method has no overhang constraint")
+        raw.append(chosen)
+    return sorted(set(raw)), None
+
+
+def _scrub_gb_fragment(cured: str, cut_l: int, cut_r: int, n: int, *,
+                       single: bool, idx: int) -> dict:
+    """Design ONE Golden Braid fragment + its BsaI-tailed primer pair. The
+    fragment spans junction `cut_l`→`cut_r` (the whole plasmid when `single`,
+    i.e. a lone junction whose fragment self-circularises). Both primers are
+    sliced from the CURED template, so the cure rides in the primer end and
+    the binding's first 4 nt are the native fusion overhang."""
+    span = n if single else (cut_r - cut_l) % n
+    body_len = span + 4                 # include the right overhang's 4 nt
+    tail = _SCRUB_GB_PAD + _SCRUB_GB_SITE + _SCRUB_GB_SPACER
+    # Forward primer: native binding STARTING at the left junction; its first
+    # 4 nt become the 5' overhang after BsaI cuts 1 nt past the recognition.
+    fwd_full_bind = _circ_extract(cured, cut_l, _SCRUB_GB_BIND_MAX, n)
+    fwd_bind, fwd_tm = _pick_binding_region(
+        fwd_full_bind, _SCRUB_GB_TARGET_TM,
+        _SCRUB_GB_BIND_MIN, _SCRUB_GB_BIND_MAX)
+    fwd_full = tail + fwd_bind
+    # Reverse primer: binding ENDS at cut_r+4 (so its last template base is the
+    # 4 nt right overhang). rc() of that window is the bottom-strand 5'→3'
+    # primer; its first 4 nt = rc(right overhang). Prefix-of-rc trick: growing
+    # the picked length extends the 3' anchor leftward while the 5' overhang
+    # stays fixed (same as `_pick_binding_region`'s prefix selection).
+    rev_win = _circ_extract(cured, (cut_r + 4 - _SCRUB_GB_BIND_MAX) % n,
+                            _SCRUB_GB_BIND_MAX, n)
+    rev_bind, rev_tm = _pick_binding_region(
+        _rc(rev_win), _SCRUB_GB_TARGET_TM,
+        _SCRUB_GB_BIND_MIN, _SCRUB_GB_BIND_MAX)
+    rev_full = tail + rev_bind
+    return {
+        "index": idx, "cut_l": cut_l, "cut_r": cut_r, "span": body_len,
+        "oh_left": _circ_extract(cured, cut_l, 4, n),
+        "oh_right": _circ_extract(cured, cut_r, 4, n),
+        "fwd_seq": fwd_full, "rev_seq": rev_full,
+        "fwd_bind_len": len(fwd_bind), "rev_bind_len": len(rev_bind),
+        "fwd_tm": round(fwd_tm, 1), "rev_tm": round(rev_tm, 1),
+        "fwd_gc": round(_mut_gc_pct(fwd_full), 1),
+        "rev_gc": round(_mut_gc_pct(rev_full), 1),
+    }
+
+
+def _scrub_gb_verify(orig: str, cured: str, frags: list, n: int, *,
+                     single: bool) -> tuple:
+    """Catastrophic-class proof. Build each amplicon AS REAL PCR PRODUCES IT —
+    cure-bearing primer ends + ORIGINAL-template middle (a cure outside primer
+    reach would NOT make it in) — then: (1) confirm exactly two BsaI sites per
+    amplicon (the two tails, no internal site), (2) release each fragment
+    body, (3) ligate by chaining native overhangs, and (4) assert the
+    reassembled circle equals the CURED plasmid with no forbidden site left.
+    Returns `(ok, errors)`."""
+    errors: list = []
+    site_pat = _iupac_pattern(_SCRUB_GB_SITE)
+    rc_pat = _iupac_pattern(_rc(_SCRUB_GB_SITE))
+    tail = _SCRUB_GB_PAD + _SCRUB_GB_SITE + _SCRUB_GB_SPACER
+    bodies: list = []
+    for fr in frags:
+        cut_l, cut_r = fr["cut_l"], fr["cut_r"]
+        span = n if single else (cut_r - cut_l) % n
+        body_len = span + 4
+        fwd_len, rev_len = fr["fwd_bind_len"], fr["rev_bind_len"]
+        # Released body: CURED base inside a primer's binding footprint,
+        # ORIGINAL-template base in the PCR-copied middle.
+        chars: list = []
+        for i in range(body_len):
+            g = (cut_l + i) % n
+            if i < fwd_len or i >= body_len - rev_len:
+                chars.append(cured[g])
+            else:
+                chars.append(orig[g])
+        body = "".join(chars)
+        bodies.append((cut_l, body))
+        amplicon = tail + body + _rc(tail)
+        n_sites = len(site_pat.findall(amplicon)) + len(rc_pat.findall(amplicon))
+        if n_sites != 2:
+            errors.append(
+                f"fragment {fr['index'] + 1}: amplicon carries {n_sites} BsaI "
+                "site(s) (expected exactly 2 — the two tails); an internal "
+                "site slipped through and would be cut mid-assembly")
+    if not bodies:
+        return False, ["no fragments to verify"]
+    bodies.sort(key=lambda t: t[0])
+    # Each body ends with the next fragment's left overhang (4 nt shared at the
+    # junction); drop it so each base appears once in the reassembled circle.
+    product = "".join(b[:-4] for _, b in bodies)
+    expect = _circ_extract(cured, bodies[0][0], n, n)
+    if len(product) != n or product != expect:
+        errors.append(
+            "re-assembled product does not equal the cured plasmid — a cure "
+            "fell outside primer reach of its junction, or a junction is "
+            "mis-placed")
+    # Final whole-circle scan: the product must be BsaI-CLEAN (wrap-aware).
+    # Every BsaI site was force-cured and the assembly cuts off the added
+    # tails, so a residual BsaI would mean the reaction re-cuts the product
+    # (fratricide). NON-assembly unwanted sites that couldn't be cured stay
+    # reported in `sites_skipped` (exactly like QuikChange) — they leave the
+    # product unchanged at that site but must NOT fail the whole design.
+    asm = (_SCRUB_GB_SITE, _rc(_SCRUB_GB_SITE))
+    if _forbidden_hit_set(product + product[:len(_SCRUB_GB_SITE) - 1], asm):
+        errors.append("re-assembled product still carries a BsaI site")
+    return (not errors), errors
+
+
+def _scrub_gb_design(seq: str, feats: "list | None" = None, enzymes=None, *,
+                     circular: bool = True, codon_raw: "dict | None" = None
+                     ) -> dict:
+    """Plan a Golden Braid (BsaI Type IIS) fragment cure of `seq`. Cures the
+    selected unwanted sites AND every BsaI site (the assembly enzyme), splits
+    the plasmid at each cure cluster into PCR fragments with BsaI-tailed
+    primers carrying the native 4 nt junction overhangs, and verifies a
+    digest+ligate reassembles the cured plasmid seamlessly. Pure biology —
+    designs the primers but mutates nothing on disk.
+
+    `codon_raw` biases coding cures toward host-frequent synonyms (tie-break
+    only — synonymy is guaranteed independently). Returns a result dict with
+    `ok`, `cured_seq`, `fragments` (each with its primer pair + overhangs),
+    `sites_removed` / `sites_skipped`, `verified`, `warnings`, and `errors`."""
+    seq = (seq or "").upper()
+    n = len(seq)
+    # The assembly enzyme MUST be in the cure set — a retained BsaI site is cut
+    # during the Golden Gate reaction and scrambles the product. Force-add it
+    # so BsaI is always cured, never merely tolerated ("unwanted site IS BsaI").
+    base = list(enzymes) if enzymes is not None else list(_SCRUB_DEFAULT_ENZYMES)
+    if _SCRUB_GB_ENZYME not in base:
+        base.append(_SCRUB_GB_ENZYME)
+    plan = _scrub_design(seq, feats, base, circular=circular,
+                         codon_raw=codon_raw)
+    result: dict = {
+        "ok": True, "method": "golden_braid", "enzyme": _SCRUB_GB_ENZYME,
+        "orig_seq": seq, "cured_seq": plan.get("cured_seq", seq),
+        "edits": list(plan.get("edits", [])),
+        "sites_removed": list(plan.get("sites_removed", [])),
+        "sites_skipped": list(plan.get("sites_skipped", [])),
+        "fragments": [], "n_fragments": 0, "verified": False,
+        "warnings": list(plan.get("warnings", [])), "errors": [],
+    }
+    if not seq:
+        result["ok"] = False
+        result["errors"].append("No sequence loaded.")
+        return result
+    if not plan.get("ok", False):
+        result["ok"] = False
+        result["errors"].append("Curing failed; nothing to assemble.")
+        return result
+    # Edge case — a BsaI site that can't be silently cured is FATAL for Golden
+    # Braid: you cannot Golden-Gate around a site the assembly enzyme cuts.
+    bsai_skipped = [s for s in result["sites_skipped"]
+                    if s.get("enzyme") == _SCRUB_GB_ENZYME]
+    if bsai_skipped:
+        result["ok"] = False
+        spots = ", ".join(str(s.get("pos")) for s in bsai_skipped)
+        result["errors"].append(
+            f"{len(bsai_skipped)} BsaI site(s) (at {spots}) can't be silently "
+            "removed, but BsaI is the assembly enzyme — it would cut the "
+            "fragments mid-reaction. Golden Braid curing is impossible here; "
+            "use QuikChange, or supply a codon table so the coding site has a "
+            "synonymous alternative.")
+        return result
+    cured = result["cured_seq"]
+    if not result["edits"]:
+        result["warnings"].append(
+            "No sites needed curing — nothing to fragment.")
+        return result
+    # Junctions sit at cure clusters (tighter footprint than QuikChange so both
+    # flanking primer arms reach every cure in the cluster).
+    gb_clusters = _scrub_cluster_edits(
+        [e["pos"] for e in result["edits"]], n,
+        footprint=_SCRUB_GB_CLUSTER_FOOTPRINT)
+    cuts, reason = _scrub_gb_pick_cuts(cured, gb_clusters, n)
+    if not cuts:                       # None (no clean overhang) or empty
+        result["ok"] = False
+        result["errors"].append(reason or "could not place any junction")
+        return result
+    single = (len(cuts) == 1)
+    frags: list = []
+    for k in range(len(cuts)):
+        cut_l = cuts[k]
+        cut_r = cuts[0] if single else cuts[(k + 1) % len(cuts)]
+        frags.append(_scrub_gb_fragment(cured, cut_l, cut_r, n,
+                                        single=single, idx=k))
+    short = [fr for fr in frags if fr["span"] < _SCRUB_GB_MIN_FRAG]
+    if short:
+        result["ok"] = False
+        result["errors"].append(
+            f"{len(short)} fragment(s) shorter than {_SCRUB_GB_MIN_FRAG} bp — "
+            "the junctions are too close to PCR + gel-purify reliably; use "
+            "QuikChange or cure fewer sites.")
+        result["fragments"] = frags
+        result["n_fragments"] = len(frags)
+        return result
+    ok, errors = _scrub_gb_verify(seq, cured, frags, n, single=single)
+    result["fragments"] = frags
+    result["n_fragments"] = len(frags)
+    result["verified"] = ok
+    if not ok:
+        result["ok"] = False
+        result["errors"].extend(errors)
+    return result
+
+
 def _mut_score_outer(anneal: str, target_tm: float = 60.0) -> float:
     t  = _mut_tm(anneal)
     gc = _mut_gc_pct(anneal)
@@ -45524,6 +45815,24 @@ class AddFeatureModal(ModalScreen):
         if 0 <= new_idx < len(self._members):
             self._selected_idx = new_idx
             self._load_row_into_form(new_idx)
+
+    def on_key(self, event) -> None:
+        """Space toggles the ★ mark on the highlighted member row — the
+        app-wide convention (plasmid + primer libraries already do this).
+        Gated on the members table being focused so Space still types a
+        space inside the modal's text inputs."""
+        if event.key != "space":
+            return
+        try:
+            t = self.query_one("#addfeat-members-tbl", DataTable)
+        except NoMatches:
+            return
+        if self.app.focused is not t or t.row_count == 0:
+            return
+        row = t.cursor_row
+        if 0 <= row < t.row_count:
+            self._toggle_mark(row)
+            event.stop()
 
     @on(DataTable.CellSelected, "#addfeat-members-tbl")
     def _on_cell_selected(
@@ -46863,6 +47172,26 @@ class FeatureEditModal(ModalScreen):
             self._marked_ids.add(mid)
         self._refresh_table()
         self._focus_members_table()
+
+    def on_key(self, event) -> None:
+        """Space toggles the ★ mark on the highlighted member row — the
+        app-wide convention. Gated on the members table being focused (so
+        Space still types in text inputs) and on the same ops-only state the
+        click path checks (`_editing_disabled_for_ops`)."""
+        if event.key != "space":
+            return
+        try:
+            t = self.query_one("#featedit-members-tbl", DataTable)
+        except NoMatches:
+            return
+        if self.app.focused is not t or t.row_count == 0:
+            return
+        if not self._editing_disabled_for_ops():
+            return
+        row = t.cursor_row
+        if 0 <= row < t.row_count:
+            self._toggle_mark(row)
+            event.stop()
 
     @on(DataTable.CellSelected, "#featedit-members-tbl")
     def _on_cell_selected(
@@ -85305,6 +85634,21 @@ class MutagenizeModal(ModalScreen):
                                              "silent cures inside coding "
                                              "sequences (prefers its frequent "
                                              "synonymous codons).")
+                    with Horizontal(id="scrub-method-row"):
+                        yield Static("Re-circularize:", id="scrub-method-label",
+                                     markup=True)
+                        yield Select(
+                            [("QuikChange — one plasmid", "quikchange"),
+                             ("Golden Braid — BsaI fragments", "golden_braid")],
+                            value="quikchange", allow_blank=False,
+                            id="scrub-method",
+                            tooltip="QuikChange: one whole-plasmid amplicon that "
+                                    "self-circularises (DpnI + transform). Golden "
+                                    "Braid: split into BsaI-tailed PCR fragments "
+                                    "that ligate back together in a Golden Gate "
+                                    "reaction — the only net change is the cured "
+                                    "sites. Any BsaI site is force-cured (it is "
+                                    "the assembly enzyme).")
                     with Horizontal(id="scrub-opts-row"):
                         yield Button(_forbidden_sites_label(),
                                      id="btn-scrub-enzymes", variant="default",
@@ -85434,9 +85778,11 @@ class MutagenizeModal(ModalScreen):
                 intro.update(
                     "[dim]Remove the chosen restriction sites from "
                     f"[bold]{self._plasmid_name or 'this plasmid'}[/bold] "
-                    f"({len(self._template):,} bp) by silent QuikChange "
-                    "mutagenesis — one contiguous circular plasmid, no "
-                    "cloning. Pick the sites, then press Scrub.[/dim]")
+                    f"({len(self._template):,} bp) by silent point mutation — "
+                    "re-circularize via QuikChange (one contiguous plasmid, no "
+                    "cloning) or Golden Braid (BsaI-tailed fragments ligated "
+                    "back together). Pick the sites + method, then press "
+                    "Scrub.[/dim]")
         except NoMatches:
             pass
 
@@ -86099,6 +86445,17 @@ class MutagenizeModal(ModalScreen):
         # Same picker + shared `_codon_entry` as the SOE tab's codon button.
         self.app.push_screen(SpeciesPickerModal(), callback=self._codon_picked)
 
+    @on(Select.Changed, "#scrub-method")
+    def _scrub_method_changed(self, event: "Select.Changed") -> None:
+        """Grey out the QuikChange-only 'overlap' picker under Golden Braid —
+        it has no effect on BsaI fragment assembly, so leaving it live read as
+        a no-op control."""
+        try:
+            self.query_one("#scrub-overlap", Select).disabled = (
+                event.value == "golden_braid")
+        except NoMatches:
+            pass
+
     @on(Button.Pressed, "#btn-scrub-run")
     def _scrub_run(self, _) -> None:
         status = self.query_one("#scrub-results-body", Static)
@@ -86113,6 +86470,9 @@ class MutagenizeModal(ModalScreen):
         overlap = self.query_one("#scrub-overlap", Select).value
         if not isinstance(overlap, str):
             overlap = "improved"
+        method = self.query_one("#scrub-method", Select).value
+        if not isinstance(method, str):
+            method = "quikchange"
         status.update("[dim]Scrubbing…[/dim]")
         # Disable commit buttons until the (possibly different) new result lands.
         for bid in ("#btn-scrub-apply", "#btn-scrub-saveprimers",
@@ -86122,24 +86482,33 @@ class MutagenizeModal(ModalScreen):
             except NoMatches:
                 pass
         codon_raw = (self._codon_entry or {}).get("raw")
-        self._scrub_worker([str(n) for n in names], overlap, codon_raw)
+        self._scrub_worker([str(n) for n in names], overlap, codon_raw, method)
 
     @work(thread=True, exclusive=True, group="scrub_design")
     def _scrub_worker(self, enzymes: list, overlap: str,
-                      codon_raw: "dict | None" = None) -> None:
-        """Off-thread scrub: scan → silent-cure → QuikChange primers. Heavy
-        compute lives here (not in the modal open / not on every keystroke),
-        with the same stale-record guard (invariant #28) as the SOE worker."""
+                      codon_raw: "dict | None" = None,
+                      method: str = "quikchange") -> None:
+        """Off-thread scrub: scan → silent-cure → primers. `method` picks the
+        re-circularization route: 'quikchange' (one whole-plasmid amplicon +
+        QuikChange primer rounds) or 'golden_braid' (BsaI-tailed fragments +
+        Golden Gate reassembly). Heavy compute lives here (not on the modal
+        open / not per keystroke), with the same stale-record guard
+        (invariant #28) as the SOE worker."""
         entry_counter = getattr(self.app, "_record_load_counter", 0)
         try:
-            plan = _scrub_design(self._template, self._feats, enzymes,
-                                 circular=True, codon_raw=codon_raw)
-            rounds: list = []
-            if plan.get("ok"):
-                for i, cl in enumerate(plan.get("clusters", []), 1):
-                    rounds.append(_scrub_qc_primers(
-                        plan["cured_seq"], cl["positions"],
-                        circular=True, overlap=overlap, round_no=i))
+            if method == "golden_braid":
+                plan = _scrub_gb_design(self._template, self._feats, enzymes,
+                                        circular=True, codon_raw=codon_raw)
+                rounds: list = []
+            else:
+                plan = _scrub_design(self._template, self._feats, enzymes,
+                                     circular=True, codon_raw=codon_raw)
+                rounds = []
+                if plan.get("ok"):
+                    for i, cl in enumerate(plan.get("clusters", []), 1):
+                        rounds.append(_scrub_qc_primers(
+                            plan["cured_seq"], cl["positions"],
+                            circular=True, overlap=overlap, round_no=i))
         except Exception as exc:           # noqa: BLE001 — surfaced to UI
             _log.exception("Scrub design failed")
             self.app.call_from_thread(self._scrub_failed, str(exc))
@@ -86158,20 +86527,99 @@ class MutagenizeModal(ModalScreen):
     def _scrub_apply_result(self, plan: dict, rounds: list) -> None:
         self._scrub_plan = plan
         self._scrub_rounds = rounds
+        is_gb = plan.get("method") == "golden_braid"
         try:
-            self.query_one("#scrub-results-body", Static).update(
-                self._render_scrub(plan, rounds))
+            body = (self._render_scrub_gb(plan) if is_gb
+                    else self._render_scrub(plan, rounds))
+            self.query_one("#scrub-results-body", Static).update(body)
         except NoMatches:
             return
-        has_edits = bool(plan.get("edits"))
-        has_primers = any(not r.get("error") for r in rounds)
-        for bid, enabled in (("#btn-scrub-apply", has_edits),
-                             ("#btn-scrub-saveprimers", has_primers),
-                             ("#btn-scrub-tomap", has_primers)):
+        if is_gb:
+            # Golden Braid commits (cured product + fragment primers) only on a
+            # design that fully verified (digest+ligate == cured plasmid). A
+            # failed design — e.g. an uncurable BsaI site — leaves them off.
+            ready = bool(plan.get("ok") and plan.get("verified")
+                         and plan.get("fragments"))
+            states = (("#btn-scrub-apply", ready),
+                      ("#btn-scrub-saveprimers", ready),
+                      ("#btn-scrub-tomap", ready))
+        else:
+            has_edits = bool(plan.get("edits"))
+            has_primers = any(not r.get("error") for r in rounds)
+            states = (("#btn-scrub-apply", has_edits),
+                      ("#btn-scrub-saveprimers", has_primers),
+                      ("#btn-scrub-tomap", has_primers))
+        for bid, enabled in states:
             try:
                 self.query_one(bid, Button).disabled = not enabled
             except NoMatches:
                 pass
+
+    def _render_scrub_gb(self, plan: dict) -> Text:
+        """Render the Golden Braid fragment plan: the cures, the fragments
+        with their BsaI-tailed primers (tail dimmed, native binding bright),
+        the junction overhangs, the digest+ligate verification verdict, and
+        the one-pot Golden Gate protocol."""
+        t = Text()
+        t.append("Golden Braid (BsaI) fragment cure\n", style="bold")
+        for e in plan.get("errors", []):
+            t.append(f"✗ {e}\n", style="red")
+        removed = plan.get("sites_removed", [])
+        skipped = plan.get("sites_skipped", [])
+        edits = plan.get("edits", [])
+        frags = plan.get("fragments", [])
+        if not edits and not skipped:
+            t.append("No target sites found — nothing to cure.\n", style="green")
+            for w in plan.get("warnings", []):
+                t.append(f"⚠ {w}\n", style="yellow")
+            return t
+        t.append(f"\nCured {len(removed)} site(s) via {len(edits)} silent "
+                 "substitution(s) — BsaI force-included (it is the assembly "
+                 "enzyme; an internal site would be cut mid-reaction):\n",
+                 style="green")
+        for e in edits:
+            t.append(f"  • {e['enzyme']} ", style="green")
+            t.append(f"nt {e['pos'] + 1}: {e['frm']}→{e['to']}  ", style="white")
+            t.append(f"[{e['region']}]\n", style="dim")
+        if skipped:
+            t.append(f"\n⚠ {len(skipped)} site(s) could NOT be cured:\n",
+                     style="yellow bold")
+            for s in skipped:
+                t.append(f"  • {s['enzyme']} nt {s['pos'] + 1} "
+                         f"[{s.get('region', '?')}]: {s['reason']}\n",
+                         style="yellow")
+        if frags:
+            tl = len(_SCRUB_GB_PAD) + len(_SCRUB_GB_SITE) + len(_SCRUB_GB_SPACER)
+            verdict = ("✓ digest+ligate verified == cured plasmid"
+                       if plan.get("verified") else
+                       "✗ NOT verified — do not order")
+            style = "bold green" if plan.get("verified") else "bold red"
+            t.append(f"\n{len(frags)} fragment(s)  ", style="bold")
+            t.append(f"({verdict})\n", style=style)
+            for fr in frags:
+                t.append(f"\n  Fragment {fr['index'] + 1} ", style="bold cyan")
+                t.append(f"({fr['span']} bp · junction overhangs "
+                         f"{fr['oh_left']} → {fr['oh_right']})\n", style="dim")
+                t.append("    FWD  ", style="green bold")
+                t.append(fr["fwd_seq"][:tl], style="dim green")   # BsaI tail
+                t.append(fr["fwd_seq"][tl:] + "\n", style="green")  # native bind
+                t.append(f"         Tm {fr['fwd_tm']}°C  GC {fr['fwd_gc']}%  "
+                         f"{len(fr['fwd_seq'])} nt\n", style="dim")
+                t.append("    REV  ", style="red bold")
+                t.append(fr["rev_seq"][:tl], style="dim red")
+                t.append(fr["rev_seq"][tl:] + "\n", style="red")
+                t.append(f"         Tm {fr['rev_tm']}°C  GC {fr['rev_gc']}%  "
+                         f"{len(fr['rev_seq'])} nt\n", style="dim")
+        for w in plan.get("warnings", []):
+            t.append(f"\n⚠ {w}\n", style="yellow")
+        if frags and plan.get("verified"):
+            t.append("\nProtocol: PCR each fragment, then one-pot BsaI + T4 "
+                     "ligase Golden Gate, transform. The BsaI tails are cut off "
+                     "during assembly, so the product is seamless — only the "
+                     "cured sites differ. 'Apply cure' loads the assembled "
+                     "product; 'Add to Map' draws every fragment primer.\n",
+                     style="dim")
+        return t
 
     def _render_scrub(self, plan: dict, rounds: list) -> Text:
         t = Text()
@@ -86249,41 +86697,124 @@ class MutagenizeModal(ModalScreen):
             except NoMatches:
                 pass
 
+    def _scrub_primer_list(self) -> "list[dict]":
+        """Unified, method-aware primer list for the current scrub result —
+        QuikChange rounds OR Golden Braid fragments. Each entry carries
+        ``{name, seq, tm, fp_start, fp_len, strand, ptype}`` where
+        ``fp_start``/``fp_len`` is the annealing footprint in CURED coords (for
+        the map feature) and ``seq`` the full primer (tail + binding). One
+        builder feeds both 'Save primers' and 'Add to Map'."""
+        plan = self._scrub_plan or {}
+        out: "list[dict]" = []
+        if plan.get("method") == "golden_braid":
+            n = len(plan.get("cured_seq", "")) or 1
+            for fr in plan.get("fragments", []):
+                i = fr["index"] + 1
+                out.append({"name": f"GB_F{i}_FWD", "seq": fr["fwd_seq"],
+                            "tm": fr["fwd_tm"], "fp_start": fr["cut_l"],
+                            "fp_len": fr["fwd_bind_len"], "strand": 1,
+                            "ptype": "scrub_goldenbraid_fwd"})
+                out.append({"name": f"GB_F{i}_REV", "seq": fr["rev_seq"],
+                            "tm": fr["rev_tm"],
+                            "fp_start": (fr["cut_r"] + 4 - fr["rev_bind_len"]) % n,
+                            "fp_len": fr["rev_bind_len"], "strand": -1,
+                            "ptype": "scrub_goldenbraid_rev"})
+        else:
+            for r in self._scrub_rounds:
+                if r.get("error"):
+                    continue
+                out.append({"name": f"SCRUB_R{r['round']}_FWD",
+                            "seq": r["fwd_seq"], "tm": r["fwd_tm"],
+                            "fp_start": r["fwd_start"], "fp_len": r["fwd_len"],
+                            "strand": 1, "ptype": "scrub_quikchange_fwd"})
+                out.append({"name": f"SCRUB_R{r['round']}_REV",
+                            "seq": r["rev_seq"], "tm": r["rev_tm"],
+                            "fp_start": r["rev_start"], "fp_len": r["rev_len"],
+                            "strand": -1, "ptype": "scrub_quikchange_rev"})
+        return out
+
     @on(Button.Pressed, "#btn-scrub-saveprimers")
     def _scrub_save_primers(self, _) -> None:
-        rounds = [r for r in self._scrub_rounds if not r.get("error")]
-        if not rounds:
+        """Save the scrub primers to the primer library — via `PrimerSaveModal`
+        so the user names each oligo and picks (or creates) the destination
+        primer collection, instead of auto-naming into the active one."""
+        primers = self._scrub_primer_list()
+        if not primers:
             self.app.notify("No primers to save.", severity="warning")
             return
+        base = (re.sub(r"[^\w\-]+", "_", self._plasmid_name or "plasmid")
+                .strip("_")[:24]) or "plasmid"
+        oligos = [{
+            "label":        p["name"].replace("_", " "),
+            "default_name": f"{p['name']}_{base}",
+            "sequence":     p["seq"], "tm": p["tm"],
+            "_strand":      p["strand"], "_ptype": p["ptype"],
+        } for p in primers]
+        active_coll = _get_active_primer_collection_name() or ""
+
+        def _on_save(payload) -> None:
+            if not isinstance(payload, dict):
+                self.app.notify("Primer save cancelled. Library unchanged.",
+                                severity="warning")
+                return
+            names = payload.get("names") or []
+            collection = payload.get("collection") or ""
+            if not names or not collection:
+                return
+            if bool(payload.get("create")):
+                try:
+                    colls = _load_primer_collections()
+                    colls.append({"name": collection, "description": "",
+                                  "primers": [],
+                                  "saved": _date.today().isoformat()})
+                    _save_primer_collections(colls)
+                except (OSError, RuntimeError) as exc:
+                    _notify_save_failure(self.app, "Primer collections", exc)
+                    return
+                _set_active_primer_collection_name(collection)
+                _settings_flush_sync()
+            elif collection != active_coll:
+                _set_active_primer_collection_name(collection)
+                _settings_flush_sync()
+            self._scrub_commit_primers_with_names(oligos, names)
+
+        self.app.push_screen(
+            PrimerSaveModal(oligos, default_collection=active_coll),
+            callback=_on_save)
+
+    def _scrub_commit_primers_with_names(self, oligos: "list[dict]",
+                                         names: "list[str]") -> None:
+        """Persist the scrub oligos under the user-typed `names` into the
+        now-active primer collection (skipping any whose sequence is already
+        stored under a different name). Mirrors `_commit_designed_primers_with
+        _names` but reads the scrub oligo specs."""
         today = _date.today().isoformat()
         base = (re.sub(r"[^\w\-]+", "_", self._plasmid_name or "plasmid")
                 .strip("_")[:24]) or "plasmid"
+        is_gb = (self._scrub_plan or {}).get("method") == "golden_braid"
+        src = f"{'scrub_gb' if is_gb else 'scrub'}:{base}"
         existing = _load_primers()
         seen = {e.get("sequence", "").upper() for e in existing}
         entries = list(existing)
         saved = skipped = 0
-        for r in rounds:
-            for name, seq, tm, strand, ptype in [
-                (f"SCRUB_R{r['round']}_FWD_{base}", r["fwd_seq"], r["fwd_tm"],
-                 1, "scrub_quikchange_fwd"),
-                (f"SCRUB_R{r['round']}_REV_{base}", r["rev_seq"], r["rev_tm"],
-                 -1, "scrub_quikchange_rev"),
-            ]:
-                up = seq.upper()
-                if up in seen and not any(
-                    e.get("name") == name
-                    and e.get("sequence", "").upper() == up for e in entries
-                ):
-                    skipped += 1
-                    continue
-                entries = [e for e in entries if e.get("name") != name]
-                entries.insert(0, {
-                    "name": name, "sequence": seq, "tm": round(tm, 1),
-                    "primer_type": ptype, "source": f"scrub:{base}",
-                    "pos_start": -1, "pos_end": -1, "strand": strand,
-                    "date": today, "status": "Designed"})
-                seen.add(up)
-                saved += 1
+        for i, o in enumerate(oligos):
+            name = names[i] if i < len(names) else o["default_name"]
+            up = str(o["sequence"]).upper()
+            if up in seen and not any(
+                e.get("name") == name
+                and e.get("sequence", "").upper() == up for e in entries
+            ):
+                skipped += 1
+                continue
+            entries = [e for e in entries if e.get("name") != name]
+            entries.insert(0, {
+                "name": name, "sequence": o["sequence"],
+                "tm": round(o["tm"], 1) if o.get("tm") is not None else 0.0,
+                "primer_type": o["_ptype"], "source": src,
+                "pos_start": -1, "pos_end": -1, "strand": o["_strand"],
+                "date": today, "status": "Designed"})
+            seen.add(up)
+            saved += 1
         try:
             _save_primers(entries)
         except (OSError, RuntimeError) as exc:
@@ -86301,9 +86832,9 @@ class MutagenizeModal(ModalScreen):
         undo stack aliases the live one), re-derive each binding from the
         template (the cure mismatch on an un-applied parent falls back to the
         designed hint), topology-gate the wrap, then commit + refresh."""
-        rounds = [r for r in self._scrub_rounds if not r.get("error")]
         plan = self._scrub_plan
-        if not rounds or not plan:
+        primers = self._scrub_primer_list()
+        if not primers or not plan:
             self.app.notify("No primers to add to the map.", severity="warning")
             return
         rec = getattr(self.app, "_current_record", None)
@@ -86329,12 +86860,8 @@ class MutagenizeModal(ModalScreen):
         new_rec = deepcopy(rec)
         is_circ = str((getattr(new_rec, "annotations", {}) or {})
                       .get("topology", "")).strip().lower() != "linear"
-        specs: list = []
-        for r in rounds:
-            specs.append((f"SCRUB_R{r['round']}_FWD", r["fwd_seq"],
-                          r["fwd_start"], r["fwd_len"], 1))
-            specs.append((f"SCRUB_R{r['round']}_REV", r["rev_seq"],
-                          r["rev_start"], r["rev_len"], -1))
+        specs = [(p["name"], p["seq"], p["fp_start"], p["fp_len"], p["strand"])
+                 for p in primers]
         added: list = []
         for name, seq, fp_start, fp_len, strand in specs:
             raw_end = fp_start + fp_len
@@ -86374,15 +86901,21 @@ class MutagenizeModal(ModalScreen):
             self.app._push_undo()                              # type: ignore[attr-defined]
             self.app._apply_record(new_rec, clear_undo=False)  # type: ignore[attr-defined]
             self.app._mark_dirty()                             # type: ignore[attr-defined]
-            self.app.query_one("#library").add_entry(new_rec)  # type: ignore[attr-defined]
         except Exception:
             _log.exception("Scrub: failed to add primers to map")
             self.app.notify("Failed to add primers to the map (see log).",
                             severity="error")
             return
+        # In-memory, undoable edit — deliberately NOT auto-persisted. This
+        # path used to also `add_entry(new_rec)`, writing the primers to the
+        # library immediately; a later Undo reverted the canvas but left the
+        # library row carrying them, so the primers "lingered" off-map and
+        # reappeared on reload. Now the canvas is just marked dirty (like
+        # 'Apply cure'); Ctrl+S / Save to Library persists, and Undo fully
+        # reverses the add — canvas and library never diverge silently.
         self.app.notify(
             f"Added {len(added)} primer{'s' if len(added) != 1 else ''} to the "
-            f"map.")
+            f"map — Save (Ctrl+S) to keep them.")
 
     @on(Button.Pressed, "#btn-scrub-close")
     def _scrub_close(self, _) -> None:
@@ -87809,6 +88342,7 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
     def _refresh_library_table(self) -> None:
         t = self.query_one("#pd-lib-table", DataTable)
         saved_cursor = t.cursor_row if t.row_count > 0 else 0
+        saved_scroll_y = t.scroll_offset.y          # keep the viewport put
         t.clear()
         primers = _load_primers()
         self._lib_selected &= set(range(len(primers)))
@@ -87870,6 +88404,18 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             # snapping to row 0. (A single delete preserves scroll via
             # the surgical row-removal path, which doesn't call this.)
             t.move_cursor(row=min(saved_cursor, len(primers) - 1))
+            # …and KEEP the viewport where it was. `clear()` reset scroll to
+            # 0, so `move_cursor` scrolls the cursor row to the BOTTOM of the
+            # viewport — which jolted the list on every Space-mark. Restore
+            # the pre-refresh scroll AFTER Textual recomputes the table's
+            # virtual size (a `scroll_to` before that refresh clamps to 0).
+            def _restore_scroll(_t=t, _y=saved_scroll_y) -> None:
+                # The screen may have popped between the refresh and this
+                # deferred callback — `scroll_to` on an unmounted table would
+                # raise. Guard so a fast mark-then-close can't error.
+                if _t.is_mounted:
+                    _t.scroll_to(y=_y, animate=False, force=True)
+            self.call_after_refresh(_restore_scroll)
 
     @work(thread=True, exclusive=True, group="primer_usage_index")
     def _index_usage_worker(self) -> None:
@@ -89249,19 +89795,23 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             return
 
         try:
+            # In-memory, undoable edit — deliberately NOT auto-persisted.
             # clear_undo=False keeps the primer-add in the undo stack AND
             # preserves _source_path so Ctrl+S still targets the right file.
+            # This used to also `add_entry(new_rec)`, writing the primers to
+            # the library at once; a later Undo reverted the canvas but left
+            # the library row carrying them (they lingered off-map and
+            # reappeared on reload). Persist on save, not here, so Undo fully
+            # reverses the add.
             self.app._push_undo()  # type: ignore[attr-defined]
             self.app._apply_record(new_rec, clear_undo=False)  # type: ignore[attr-defined]
             self.app._mark_dirty()  # type: ignore[attr-defined]
-            lib = self.app.query_one("#library")
-            lib.add_entry(new_rec)  # type: ignore[attr-defined]
         except Exception:
             _log.exception("Failed to add primer features to map")
 
         self.app.notify(
             f"Added {len(added)} primer{'s' if len(added) != 1 else ''} "
-            f"as features: {', '.join(added)}"
+            f"as features: {', '.join(added)} — Save (Ctrl+S) to keep them."
         )
 
     # ── Primer library management ─────────────────────────────────────────
@@ -102300,7 +102850,7 @@ def _record_to_scrub_feats(record) -> "list[dict]":
 @_agent_endpoint("scrub-plasmid")
 def _h_scrub_plasmid(app, payload):
     """Plan a clone-free restriction-site scrub. Body:
-    ``{seq?, features?, enzymes?, overlap?, circular?, codon_taxid?}``.
+    ``{seq?, features?, enzymes?, overlap?, method?, circular?, codon_taxid?}``.
 
     With no ``seq``, scrubs the plasmid currently on the canvas (using its
     CDS features so the cure stays synonymous / protein-preserving). When
@@ -102312,9 +102862,17 @@ def _h_scrub_plasmid(app, payload):
     (a registered codon-usage table id) makes coding cures prefer that host's
     frequent synonymous codons.
 
-    Returns ``{ok, enzymes, cured_seq, edits, sites_removed, sites_skipped,
-    n_rounds, rounds, warnings}`` — the cured sequence plus the QuikChange
-    primer pair per round. Design-only: never mutates the canvas or any file.
+    ``method`` picks the re-circularization route: ``"quikchange"`` (default —
+    one whole-plasmid amplicon that self-circularises) or ``"golden_braid"``
+    (split into BsaI-tailed PCR fragments that a Golden Gate reaction
+    reassembles seamlessly; BsaI is force-cured as the assembly enzyme).
+
+    QuikChange returns ``{ok, method, enzymes, cured_seq, edits,
+    sites_removed, sites_skipped, n_rounds, rounds, warnings}``. Golden Braid
+    returns ``{ok, method, enzyme, cured_seq, edits, sites_removed,
+    sites_skipped, n_fragments, fragments, verified, warnings, errors}`` —
+    each fragment carrying its BsaI-tailed primer pair + junction overhangs.
+    Design-only: never mutates the canvas or any file.
     """
     seq = payload.get("seq")
     feats: "list[dict]" = []
@@ -102345,6 +102903,9 @@ def _h_scrub_plasmid(app, payload):
     overlap = payload.get("overlap", "improved")
     if overlap not in ("improved", "classic"):
         return ({"error": "'overlap' must be 'improved' or 'classic'"}, 400)
+    method = payload.get("method", "quikchange")
+    if method not in ("quikchange", "golden_braid"):
+        return ({"error": "'method' must be 'quikchange' or 'golden_braid'"}, 400)
     circular = payload.get("circular", True)
     if not isinstance(circular, bool):
         return ({"error": "'circular' must be a boolean"}, 400)
@@ -102357,20 +102918,40 @@ def _h_scrub_plasmid(app, payload):
         if entry is None:
             return ({"error": f"unknown codon_taxid {codon_taxid!r}"}, 404)
         codon_raw = entry.get("raw")
+    rounds: list = []
     try:
-        plan = _scrub_design(seq, feats, enzymes, circular=circular,
-                             codon_raw=codon_raw)
-        rounds: list = []
-        if plan.get("ok"):
-            for i, cl in enumerate(plan.get("clusters", []), 1):
-                rounds.append(_scrub_qc_primers(
-                    plan["cured_seq"], cl["positions"],
-                    circular=circular, overlap=overlap, round_no=i))
+        if method == "golden_braid":
+            plan = _scrub_gb_design(seq, feats, enzymes, circular=circular,
+                                    codon_raw=codon_raw)
+        else:
+            plan = _scrub_design(seq, feats, enzymes, circular=circular,
+                                 codon_raw=codon_raw)
+            if plan.get("ok"):
+                for i, cl in enumerate(plan.get("clusters", []), 1):
+                    rounds.append(_scrub_qc_primers(
+                        plan["cured_seq"], cl["positions"],
+                        circular=circular, overlap=overlap, round_no=i))
     except Exception as exc:
         _log.exception("agent scrub-plasmid: unexpected failure")
         return ({"error": f"unexpected failure: {exc}"}, 500)
+    if method == "golden_braid":
+        return {
+            "ok": plan.get("ok", False),
+            "method": "golden_braid",
+            "enzyme": plan.get("enzyme", "BsaI"),
+            "cured_seq": plan.get("cured_seq", ""),
+            "edits": plan.get("edits", []),
+            "sites_removed": plan.get("sites_removed", []),
+            "sites_skipped": plan.get("sites_skipped", []),
+            "n_fragments": plan.get("n_fragments", 0),
+            "fragments": plan.get("fragments", []),
+            "verified": plan.get("verified", False),
+            "warnings": plan.get("warnings", []),
+            "errors": plan.get("errors", []),
+        }
     return {
         "ok": plan.get("ok", False),
+        "method": "quikchange",
         "enzymes": plan.get("enzymes", []),
         "cured_seq": plan.get("cured_seq", ""),
         "edits": plan.get("edits", []),
@@ -105524,6 +106105,9 @@ MutagenizeModal { align: center middle; }
 #scrub-codon-row   { height: 3; margin-bottom: 1; }
 #scrub-codon-label { width: 1fr; padding: 1 1 0 1; }
 #scrub-codon-row Button { width: 18; }
+#scrub-method-row   { height: 3; margin-bottom: 1; }
+#scrub-method-label { width: auto; padding: 1 1 0 1; }
+#scrub-method       { width: 1fr; }
 #scrub-opts-row    { height: 3; margin-bottom: 1; }
 #scrub-opts-row Button { width: 1fr; margin-right: 1; }
 #scrub-overlap     { width: 1fr; margin-right: 1; }

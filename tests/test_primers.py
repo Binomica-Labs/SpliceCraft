@@ -1177,3 +1177,80 @@ class TestAddSelectedPrimerTopology:
         assert "CompoundLocation" in locs, (
             "a circular record should keep the wrap primer (topology control)"
         )
+
+
+class TestPrimerLibraryMarking:
+    """Space marks the highlighted primer in the main Primers library, and a
+    mark keeps the cursor row + scroll position — no jump to the bottom of the
+    viewport — so marking many primers in a row doesn't jolt the list."""
+
+    @staticmethod
+    def _uniq_seq(i: int) -> str:
+        """A unique 20 nt sequence per i (base-4 ACGT tail) so `_save_primers`'
+        sequence-dedup keeps all N rows — a repeated sequence would collapse
+        the table to a handful of rows and the scroll test would be moot."""
+        tail = "".join("ACGT"[(i >> (2 * k)) & 3] for k in range(8))
+        return "ACGTACGTACGT" + tail
+
+    def _seed(self, n: int) -> None:
+        sc._save_primers([
+            {"name": f"P{i:03d}", "sequence": self._uniq_seq(i),
+             "tm": 60.0, "primer_type": "generic", "source": "t",
+             "pos_start": -1, "pos_end": -1, "strand": 1,
+             "date": "2026-06-03", "status": "Designed"}
+            for i in range(n)])
+
+    async def test_space_marks_highlighted_keeps_cursor_and_scroll(
+            self, isolated_primers):
+        self._seed(60)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 28)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            screen = app.screen
+            t = screen.query_one("#pd-lib-table", sc.DataTable)
+            t.focus()
+            await pilot.pause()
+            t.move_cursor(row=45)
+            await pilot.pause()
+            await pilot.pause()
+            cursor_before = t.cursor_row
+            scroll_before = t.scroll_offset.y
+            await pilot.press("space")
+            await pilot.pause()
+            await pilot.pause()
+            assert len(screen._lib_selected) == 1            # exactly one marked
+            assert t.cursor_row == cursor_before             # cursor didn't jump
+            assert t.scroll_offset.y == scroll_before        # viewport stayed put
+
+    async def test_space_marks_multiple_without_losing_prior(
+            self, isolated_primers):
+        # Invoke the handler directly with a synthetic Space (a real terminal
+        # can double-fire a keypress, which would toggle a row off again — not
+        # what we're testing here). We're checking that marks ACCUMULATE.
+        class _SpaceKey:
+            key = "space"
+            def stop(self):
+                pass
+        self._seed(40)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 28)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            screen = app.screen
+            t = screen.query_one("#pd-lib-table", sc.DataTable)
+            assert t.row_count == 40                         # all rows present
+            t.focus()
+            await pilot.pause()
+            counts = []
+            for r in (8, 20, 33):
+                t.move_cursor(row=r)
+                await pilot.pause()
+                screen.on_key(_SpaceKey())
+                await pilot.pause()
+                counts.append(len(screen._lib_selected))
+            assert counts == [1, 2, 3]                       # each mark accumulates
