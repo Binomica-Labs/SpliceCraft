@@ -1095,6 +1095,40 @@ class TestPrimerMismatchBump:
         assert not f.get("_flap_bases")         # no spurious 5' overhang
         assert (f.get("_bound_mismatch") or {}) == {18: bound[8]}  # only the bump
 
+    async def test_two_scattered_internal_mismatches_both_bump(self):
+        bound = list(self._TMPL[10:26])
+        bound[7] = "A" if bound[7] != "A" else "T"
+        bound[11] = "A" if bound[11] != "A" else "T"
+        f = await self._feats_for("".join(bound), 1)
+        assert (f.get("_bound_mismatch") or {}) == {17: bound[7], 21: bound[11]}
+        assert f.get("_bound_len") == 16 and not f.get("_flap_bases")
+
+    async def test_adjacent_three_base_cure_run_all_bump(self):
+        # a triple-base Scrub cure (3 adjacent mismatches) — all three bump.
+        bound = list(self._TMPL[10:26])
+        for off in (7, 8, 9):
+            bound[off] = "A" if bound[off] != "A" else "T"
+        f = await self._feats_for("".join(bound), 1)
+        assert set(f.get("_bound_mismatch") or {}) == {17, 18, 19}
+        assert f.get("_bound_len") == 16 and not f.get("_flap_bases")
+
+    async def test_arbitrary_count_internal_mismatches_all_bump(self):
+        # No cap: five scattered internal mismatches all bump.
+        bound = list(self._TMPL[10:26])
+        offs = (6, 8, 10, 12, 14)
+        for off in offs:
+            bound[off] = "A" if bound[off] != "A" else "T"
+        f = await self._feats_for("".join(bound), 1)
+        assert set(f.get("_bound_mismatch") or {}) == {10 + o for o in offs}
+
+    async def test_reverse_strand_multiple_mismatches_bump(self):
+        perfect = sc._rc(self._TMPL[10:26])
+        rp = list(perfect)
+        for off in (7, 8):
+            rp[off] = "A" if rp[off] != "A" else "T"
+        f = await self._feats_for("".join(rp), -1)
+        assert len(f.get("_bound_mismatch") or {}) == 2
+
     async def test_mismatch_within_anchor_reads_as_overhang(self):
         # The flip side of the bump: a mismatch CLOSER to the 5' end than the
         # 6 bp annealing anchor is read as part of the 5' overhang, not a bump.

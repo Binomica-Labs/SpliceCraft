@@ -1081,3 +1081,46 @@ class TestScrubSavePersistence:
             await pilot.pause()
             names = {p.get("name") for p in sc._load_primers()}
             assert all(c in names for c in custom)
+
+
+class TestScrubQuikChangeVerify:
+    """`_scrub_qc_verify`: the QuikChange primers, simulated against the
+    ORIGINAL template, must reconstitute the cured plasmid EXACTLY — the same
+    seamless-cure guarantee Golden Braid gets from `_scrub_gb_verify`."""
+
+    def test_primers_reconstitute_cured_only_site_changes(self):
+        seq = TestScrubGoldenBraid()._seq_with(300, [(120, "GGTCTC")], seed=8)
+        plan = sc._scrub_design(seq, [], ["BsaI"], circular=True)
+        assert plan["ok"], plan
+        rounds = [sc._scrub_qc_primers(plan["cured_seq"], c["positions"],
+                                       round_no=i)
+                  for i, c in enumerate(plan["clusters"], 1)]
+        ok, errors = sc._scrub_qc_verify(seq, plan["cured_seq"], rounds,
+                                         len(seq))
+        assert ok, errors
+        # …and the cured plasmid differs from the original ONLY at the edits
+        # (i.e. only the destroyed cut site changed — nothing else).
+        diffs = {i for i in range(len(seq)) if seq[i] != plan["cured_seq"][i]}
+        assert diffs == {e["pos"] for e in plan["edits"]}
+        assert diffs and not TestScrubGoldenBraid()._has(plan["cured_seq"],
+                                                         "GGTCTC")
+
+    def test_catches_cure_outside_primer_reach(self):
+        # A cure no primer footprint covers would NOT be incorporated → the
+        # product keeps the original base → verify must fail (not silently OK).
+        orig = "ACGT" * 50                          # 200 bp
+        flip = "A" if orig[100] != "A" else "T"
+        cured = orig[:100] + flip + orig[101:]
+        rounds = [{"round": 1,
+                   "fwd_seq": cured[0:20], "fwd_start": 0, "fwd_len": 20,
+                   "rev_seq": sc._mut_revcomp(cured[20:40]), "rev_start": 20,
+                   "rev_len": 20}]
+        ok, errors = sc._scrub_qc_verify(orig, cured, rounds, len(orig))
+        assert not ok and errors
+
+    def test_endpoint_quikchange_surfaces_verified(self):
+        seq = TestScrubGoldenBraid()._seq_with(300, [(120, "GGTCTC")], seed=8)
+        res = sc._h_scrub_plasmid(None, {"seq": seq, "enzymes": ["BsaI"],
+                                         "method": "quikchange"})
+        assert res["method"] == "quikchange"
+        assert res["verified"] is True

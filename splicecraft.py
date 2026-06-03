@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.19"
+__version__ = "1.0.20"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -44203,6 +44203,44 @@ def _scrub_qc_primers(cured_seq: str, positions: list, *,
     return res
 
 
+def _scrub_qc_verify(orig: str, cured: str, rounds: list, n: int) -> tuple:
+    """Prove the improved-QuikChange primers reconstitute the CURED plasmid
+    EXACTLY — the seamless-cure guarantee for the QuikChange route (the Golden
+    Braid route has `_scrub_gb_verify`).
+
+    The lab product: each primer anneals to the ORIGINAL template and is
+    extended around the whole plasmid; the product strand is the primer's own
+    bases over its footprint (the cure rides in the primer) + a faithful copy
+    of the template everywhere else; the two strands self-anneal through the
+    shared overlap into the cured nicked circle. So simulate it: start from
+    `orig`, lay every round's forward primer AND the top-strand bases of its
+    reverse primer onto their footprints, and the result MUST equal `cured`.
+    A cure that fell outside every primer's footprint would leave the original
+    base there → product != cured → caught. Returns `(ok, errors)`."""
+    if not orig or len(orig) != len(cured) or n <= 0:
+        return False, ["sequence / length mismatch"]
+    product = list(orig)
+    any_primer = False
+    for r in rounds:
+        if r.get("error"):
+            continue
+        any_primer = True
+        fwd = str(r.get("fwd_seq", ""))
+        fstart = int(r.get("fwd_start", 0))
+        for j, base in enumerate(fwd):
+            product[(fstart + j) % n] = base
+        rev_top = _mut_revcomp(str(r.get("rev_seq", "")))
+        rstart = int(r.get("rev_start", 0))
+        for j, base in enumerate(rev_top):
+            product[(rstart + j) % n] = base
+    if not any_primer:
+        return False, ["no usable primer rounds to verify"]
+    if "".join(product) != cured:
+        return False, ["QuikChange primers would not reconstitute the cured "
+                       "plasmid exactly — a cure fell outside primer reach"]
+    return True, []
+
+
 # ── Scrub: Golden Braid (BsaI Type IIS) fragment-based curing ───────────────
 #
 # An alternative re-circularization to the QuikChange path above. Instead of
@@ -60443,7 +60481,9 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
             return
         try:
             rec = _part_to_cloned_seqrecord(r)
-            seq = str(rec.seq)
+            if rec is None:                 # never None in practice (it raises
+                raise ValueError("no record")   # on no-sequence) — guard for
+            seq = str(rec.seq)                   # the type-checker + safety
         except Exception as exc:
             # `_part_to_cloned_seqrecord` raises ValueError for parts
             # with no sequence; BioPython parsing can also fail on a
@@ -60793,6 +60833,12 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
         # helper every assembly save uses (`_cache_lock` + atomic .bak +
         # id/name collision-rename + active-library re-mirror), so the
         # Domesticator no longer hand-rolls its own library write.
+        if lib_rec is None:             # never None in practice (the clone
+            self.app.call_from_thread(  # raises, caught above) — guard the
+                self.app.notify,        # type-checker + skip a degenerate save
+                "Library mirror skipped: clone produced no record.",
+                severity="warning")
+            return
         clone_disp = (clone_name or "").strip() or display_name
         target = ((target_collection or "").strip()
                   or _get_active_collection_name() or "Default")
@@ -86509,6 +86555,14 @@ class MutagenizeModal(ModalScreen):
                         rounds.append(_scrub_qc_primers(
                             plan["cured_seq"], cl["positions"],
                             circular=True, overlap=overlap, round_no=i))
+                    if any(not r.get("error") for r in rounds):
+                        # Seamless-cure proof: the primers, run as QuikChange,
+                        # reconstitute exactly the cured plasmid (same guarantee
+                        # Golden Braid gets from `_scrub_gb_verify`).
+                        qv_ok, _qv = _scrub_qc_verify(
+                            plan.get("orig_seq", ""), plan["cured_seq"],
+                            rounds, len(plan["cured_seq"]))
+                        plan["verified"] = qv_ok
         except Exception as exc:           # noqa: BLE001 — surfaced to UI
             _log.exception("Scrub design failed")
             self.app.call_from_thread(self._scrub_failed, str(exc))
@@ -86667,6 +86721,13 @@ class MutagenizeModal(ModalScreen):
                          f"GC {r['rev_gc']}%  {r['rev_len']} nt\n", style="dim")
                 for w in r.get("warnings", []):
                     t.append(f"    ⚠ {w}\n", style="yellow")
+            if plan.get("verified"):
+                t.append("\n✓ Verified: simulating these primers reconstitutes "
+                         "the cured plasmid exactly — the only changes are the "
+                         "removed cut site(s).\n", style="bold green")
+            elif "verified" in plan:
+                t.append("\n✗ NOT verified — the primers may not reproduce the "
+                         "cure exactly; do not order.\n", style="bold red")
         for w in plan.get("warnings", []):
             t.append(f"\n⚠ {w}\n", style="yellow")
         t.append("\nProtocol: PCR each round, DpnI, transform — no ligase, no "
@@ -88758,10 +88819,14 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             return row
 
         if event.key == "space":
-            # `space` toggles the ★ mark — natural gesture on a
-            # row-cursor DataTable, consistent with checkbox lists
-            # in other Textual apps. (The legacy `m` binding was
-            # dropped 2026-05-21.)
+            # `space` toggles the ★ mark — natural gesture on a row-cursor
+            # DataTable. SURGICAL single-cell update (not a full repopulate):
+            # a 10k-primer library would otherwise rebuild every row on each
+            # mark (O(N) per keypress → laggy), and the scroll/cursor would
+            # have to be re-seated. Toggling just the name cell's ★ is O(1),
+            # leaves the viewport untouched, and matches how the plasmid
+            # library marks. Falls back to a full refresh if the in-place
+            # write can't land. (The legacy `m` binding was dropped 2026-05-21.)
             row = t.cursor_row
             if 0 <= row < len(primers):
                 pidx = _row_to_primer(row)
@@ -88769,7 +88834,14 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
                     self._lib_selected.discard(pidx)
                 else:
                     self._lib_selected.add(pidx)
-                self._refresh_library_table()
+                mark = "★ " if pidx in self._lib_selected else "  "
+                try:
+                    t.update_cell_at(
+                        _Coordinate(row, 0),
+                        Text(mark + str(primers[pidx].get("name", "?")),
+                             style="bold"))
+                except Exception:
+                    self._refresh_library_table()
             event.stop()
         elif event.key in ("M", "shift+m"):
             # Shift+M = mark all / unmark all (ctrl+m doesn't work in
@@ -102931,6 +103003,11 @@ def _h_scrub_plasmid(app, payload):
                     rounds.append(_scrub_qc_primers(
                         plan["cured_seq"], cl["positions"],
                         circular=circular, overlap=overlap, round_no=i))
+                if any(not r.get("error") for r in rounds):
+                    qv_ok, _qv = _scrub_qc_verify(
+                        plan.get("orig_seq", ""), plan["cured_seq"],
+                        rounds, len(plan["cured_seq"]))
+                    plan["verified"] = qv_ok
     except Exception as exc:
         _log.exception("agent scrub-plasmid: unexpected failure")
         return ({"error": f"unexpected failure: {exc}"}, 500)
@@ -102952,6 +103029,7 @@ def _h_scrub_plasmid(app, payload):
     return {
         "ok": plan.get("ok", False),
         "method": "quikchange",
+        "verified": plan.get("verified", False),
         "enzymes": plan.get("enzymes", []),
         "cured_seq": plan.get("cured_seq", ""),
         "edits": plan.get("edits", []),

@@ -14,7 +14,16 @@
 
 ---
 
-## [1.0.19] — 2026-06-03
+## [1.0.20] — 2026-06-03
+
+### New features
+
+- **Both cure routes now prove the result is seamless.** Scrub already verified Golden Braid by simulating the BsaI digest + ligation against the cured plasmid; the **QuikChange** route now gets the same guarantee — it simulates the primers against the original template and confirms they reconstitute the cured plasmid *exactly*. Either way the report shows **✓ Verified** when the only differences from the original are the removed cut site(s), so you know before ordering primers that the cure is byte-for-byte seamless.
+
+### Bug fixes
+
+- **Marking many primers no longer lags on a large library.** Toggling a primer's ★ mark rebuilt the entire library table every time; it now updates just that one row, so marking stays instant even with thousands of primers (and the scroll position + cursor never move).
+- **Parts Bin cloning fails gracefully on an un-cloneable part.** "Copy cloned" and the library-mirror save now skip cleanly (with a notice) if a part can't be turned into a record, instead of risking a crash on an empty result.
 
 ### New features
 
