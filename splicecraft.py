@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.20"
+__version__ = "1.0.21"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -21734,9 +21734,27 @@ class LibraryPanel(Widget):
             self._marked_ids.discard(entry_id)
         else:
             self._marked_ids.add(entry_id)
-        # Repaint the row so the ▶ / ● toggles in place. Cheaper
-        # than a full repopulate.
-        self._repopulate_plasmids()
+        # Repaint ONLY the cursor row's ● column in place (O(1)). A marked row
+        # shows ▶ (bold magenta), else the status ● / dim ·. The old call
+        # `_repopulate_plasmids()` cleared + re-added EVERY row (O(N) — a
+        # re-sort + full cell build per row) just to flip one glyph, so
+        # marking down a big collection lagged. Marks don't reorder rows, so
+        # the surgical update is exact; full repopulate stays as the fallback.
+        if entry_id in self._marked_ids:
+            ball_cell = Text("▶", style="bold magenta")
+        else:
+            entry = _find_library_entry_by_id(entry_id)
+            status = (_sanitize_plasmid_status(entry.get("status"))
+                      if entry else "")
+            color = _PLASMID_STATUS_COLORS.get(status)
+            ball_cell = (Text("●", style=color) if color is not None
+                         else Text("·", style="dim"))
+        try:
+            t.update_cell_at(_Coordinate(t.cursor_row, 0), ball_cell)
+        except Exception:
+            _log.exception("LibraryPanel.action_toggle_mark: incremental "
+                           "cell update failed; full repopulate")
+            self._repopulate_plasmids()
 
     def action_clear_marks(self) -> None:
         """Drop every mark. Bound to Ctrl+Shift+C so a stray Esc
@@ -24850,6 +24868,7 @@ class SequencePanel(Widget):
         self._mouse_button_held = True
         self._drag_start_bp     = bp
         self._has_dragged       = False
+        self._last_drag_bp      = -1     # reset the drag-move dedup (below)
         # Ctrl is treated as a shift synonym (some terminals eat
         # shift+click for native text-selection). The on_mouse_down
         # extend-selection branch below uses the same combined flag.
@@ -24927,6 +24946,15 @@ class SequencePanel(Widget):
         bp = self._click_to_bp(event.screen_x, event.screen_y)
         if bp < 0 or bp == self._drag_start_bp and not self._has_dragged:
             return
+        # A terminal emits several mouse-moves per character cell, but the
+        # selection only changes when the cursor crosses into a new BASE.
+        # Skip the full-panel `_refresh_view()` repaint while `bp` is
+        # unchanged — otherwise a drag across a large plasmid re-renders the
+        # whole sequence panel on every pixel. (`_last_drag_bp` is reset to
+        # -1 at drag start, so a fresh drag is never suppressed.)
+        if bp == self._last_drag_bp:
+            return
+        self._last_drag_bp = bp
         self._has_dragged = True
         s = min(self._drag_start_bp, bp)
         e = max(self._drag_start_bp, bp) + 1

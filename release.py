@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -1018,16 +1019,43 @@ def main(argv: list[str] | None = None) -> int:
     _verify_bump(PYPROJECT,   new_version, "version")
     _verify_bump(SPLICECRAFT, new_version, "__version__")
 
-    # Run ruff BEFORE pytest — sweep #16 (2026-05-21) added this so a
-    # lint-failing commit can't slip through release and turn the CI
-    # badge red. The same `ruff check` runs in `.github/workflows/
-    # test.yml`'s `lint` job; matching the local invocation means a
-    # release that passes here also passes CI's lint gate. Pyright is
-    # NOT bundled into release.py because it shells out to a separate
-    # JS-pinned binary that's slow + flaky offline — it's a CI-only
-    # gate (`PYRIGHT_PYTHON_FORCE_VERSION=latest` in test.yml).
+    # Run ruff + pyright BEFORE pytest — both mirror `.github/workflows/
+    # test.yml`'s `lint` job EXACTLY, so a release that passes here also
+    # passes CI's lint gate (no post-release red badge). Sweep #16
+    # (2026-05-21) added ruff; pyright joined it 2026-06-03 after v1.0.17–
+    # 1.0.19 shipped green-TESTED but red-LINTED — pyright ran ONLY in CI, so
+    # type errors (a couple of latent Optional-member accesses a newer
+    # `latest` pyright began flagging) sailed through release and reddened the
+    # badge minutes later. Pyright's launcher downloads a JS-pinned binary
+    # (~1 min, flaky offline); set SPLICECRAFT_SKIP_PYRIGHT=1 to bypass when
+    # releasing offline / past a flaky download (CI still runs it).
     _heading("Running ruff lint")
     _run(["ruff", "check", "."])
+
+    if os.environ.get("SPLICECRAFT_SKIP_PYRIGHT", "").strip().lower() in (
+        "1", "true", "yes",
+    ):
+        print("  SPLICECRAFT_SKIP_PYRIGHT set — skipping pyright. CI still "
+              "runs it; the badge may surface a type error this guard would "
+              "have caught.")
+    else:
+        _heading("Running pyright (matches the CI lint gate)")
+        # Same invocation as CI: bare `pyright` (so `[tool.pyright]` restricts
+        # analysis to the three source files) under
+        # PYRIGHT_PYTHON_FORCE_VERSION=latest (so we resolve the SAME pyright
+        # release CI will, closing the version-drift window to ~minutes).
+        env = dict(os.environ)
+        env.setdefault("PYRIGHT_PYTHON_FORCE_VERSION", "latest")
+        try:
+            proc = subprocess.run(["pyright"], env=env)
+        except FileNotFoundError:
+            _die("pyright not installed — run `pip install -e \".[dev]\"` (it "
+                 "is in the dev extras), or set SPLICECRAFT_SKIP_PYRIGHT=1 to "
+                 "release offline / past a flaky pyright download.")
+        if proc.returncode != 0:
+            _die("pyright reported errors — the CI lint gate would fail and "
+                 "the post-release badge would go red. Fix them, or set "
+                 "SPLICECRAFT_SKIP_PYRIGHT=1 to bypass (NOT recommended).")
 
     _heading("Running test suite")
     # Parallel via pytest-xdist; previously serial took ~13 min, -n auto

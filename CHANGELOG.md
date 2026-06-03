@@ -14,6 +14,15 @@
 
 ---
 
+## [1.0.21] — 2026-06-03
+
+### Performance
+
+- **Marking plasmids is now instant on a big collection.** Toggling a plasmid's mark (Space) rebuilt the entire library table — a full re-sort + per-row repaint — just to flip one glyph; it now repaints only that row's marker cell (O(1)). The primer library got the same treatment last release; both libraries now mark without lag, scroll, or cursor jump.
+- **Drag-selecting in the sequence panel is smoother on large plasmids.** A click-drag repainted the whole panel on every mouse-move pixel; since a terminal fires several moves per character cell, that was a lot of redundant redraws. It now repaints only when the selection crosses into a new base — identical selection, far fewer renders.
+
+---
+
 ## [1.0.20] — 2026-06-03
 
 ### New features

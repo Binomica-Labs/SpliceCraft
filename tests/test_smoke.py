@@ -15500,3 +15500,35 @@ class TestOneShotDismissMixin:
             await pilot.pause()
             # Exactly one screen popped (the modal), not two.
             assert len(app.screen_stack) == depth_before - 1
+
+
+class TestSeqPanelDragRefreshDedup:
+    """Responsiveness: a drag-select re-renders the sequence panel only when
+    the cursor crosses into a NEW base, not on every mouse-move pixel (a
+    terminal fires several moves per character cell)."""
+
+    async def test_drag_skips_refresh_when_bp_unchanged(
+            self, tiny_record, isolated_library):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            calls = []
+            sp._refresh_view = lambda: calls.append(1)        # count repaints
+            sp._update_feature_tooltip = lambda *a, **k: None  # no side effects
+            sp._mouse_button_held = True
+            sp._drag_start_bp = 10
+            sp._has_dragged = False
+            sp._last_drag_bp = -1
+            seq = iter([20, 20, 20, 25, 25])                  # 2 distinct bp
+            sp._click_to_bp = lambda x, y: next(seq)
+
+            class _Ev:
+                screen_x = 0
+                screen_y = 0
+
+            for _ in range(5):
+                sp.on_mouse_move(_Ev())
+            # bp 20 (paint) · 20 (skip) · 20 (skip) · 25 (paint) · 25 (skip)
+            assert len(calls) == 2, calls
+            assert sp._user_sel == (10, 26)                   # final selection
