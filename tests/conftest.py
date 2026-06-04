@@ -115,6 +115,11 @@ def _protect_user_data(tmp_path, monkeypatch):
     # never touch the user's real GBs of Pfam-A.
     monkeypatch.setattr(sc, "_HMM_DATABASES_DIR",
                           tmp_path / "hmm_databases")
+    # Content-addressed plasmid blob store (v1.0.23): plasmid sequences
+    # live here as immutable sha256-named blobs. Redirect so dehydrate /
+    # rehydrate / GC never write to or quarantine the user's real blob dir.
+    monkeypatch.setattr(sc, "_PLASMID_BLOB_DIR",
+                          tmp_path / "plasmid_blobs")
 
     # Pre-update snapshot directory (`splicecraft update` data-safety net):
     # tests that exercise the `update` subcommand all the way through to

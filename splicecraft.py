@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.22"
+__version__ = "1.0.23"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -2359,6 +2359,24 @@ def _safe_save_json(path: Path, entries: list, label: str,
             _log.error(msg)
             raise OSError(msg)
 
+    # Blob-store dehydration (v1.0.23): for the two gb_text-heavy files,
+    # replace each entry's inline `gb_text` with a content-addressed
+    # `gb_ref` (the blob is written + VERIFIED first). Done here — at the
+    # single write chokepoint — so EVERY library/collections save path is
+    # covered, present and future (the in-place LibraryPanel workers,
+    # Restore-from-backup, the active-collection mirror, agent endpoints).
+    # A blob-write failure raises BEFORE any backup/metadata write, so the
+    # previous-good file + its blobs stay intact (abort-don't-corrupt).
+    # Entry COUNT is preserved, so the shrink guard / spillover below still
+    # see true counts. `_LIBRARY_FILE` / `_COLLECTIONS_FILE` resolve as
+    # module globals at call time (late binding) so conftest's path
+    # monkeypatch applies in tests; non-blob files (primers, parts, …)
+    # are untouched.
+    if path == _LIBRARY_FILE:
+        entries = _dehydrate_entries(entries)
+    elif path == _COLLECTIONS_FILE:
+        entries = _dehydrate_collections(entries)
+
     # Step 1: read prior content for backup + shrink-guard analysis.
     existing_count = 0
     prev_entries: "list | None" = None
@@ -2897,6 +2915,14 @@ def _run_data_dir_housekeeping(data_dir: Path) -> None:
         _prune_lost_entries(data_dir / _LOST_ENTRIES_DIR_NAME)
     except Exception:
         _log.debug("housekeeping: lost-entries prune failed")
+    # Reclaim disk from superseded/deleted plasmid-sequence blobs. Safe by
+    # construction (quarantines, never deletes; aborts on unreadable
+    # metadata; grace window protects in-flight saves) — see
+    # `_gc_orphan_blobs`.
+    try:
+        _gc_orphan_blobs()
+    except Exception:
+        _log.debug("housekeeping: blob GC failed")
 
 
 # ── Backup discovery + restore ──────────────────────────────────────────────
@@ -3259,6 +3285,432 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
     return [], (main_warning
                 or f"{label} is corrupt and no valid backup was found. "
                    "Starting empty.")
+
+
+# ── Content-addressed plasmid blob store (v1.0.23) ──────────────────────────────
+#
+# The bulk of every library / collection entry is its `gb_text` (the full
+# GenBank record). Pre-1.0.23 that text was stored INLINE in
+# plasmid_library.json AND duplicated into collections.json once per
+# collection a plasmid belonged to, so a plasmid in N collections cost
+# (N+1)x its gb_text on disk and every save rewrote the whole
+# multi-hundred-MB collections file. This store holds each unique gb_text
+# ONCE, content-addressed by sha256, as an immutable write-once blob at
+# `<DATA_DIR>/plasmid_blobs/<sha256>.gb`. Entries carry a small `gb_ref`
+# (the hex digest) instead of inline text; `_rehydrate_entry` resolves it
+# on load, `_dehydrate_entry` strips it on save. In-memory caches stay
+# fully materialised (every reader still sees `gb_text`), so ONLY the
+# on-disk representation + the save/load boundary change.
+#
+# Bulletproofing rules (this store guards user sequence data — the product):
+#   * Blobs are IMMUTABLE + write-once: the filename IS the sha256 of the
+#     content, so a present blob is correct by construction.
+#   * Writes are atomic (`_atomic_write_bytes`) and VERIFIED (re-hash the
+#     bytes that landed; refuse + unlink if they don't match the digest).
+#   * Reads VERIFY (re-hash; a mismatch = bit-rot -> loud failure + None,
+#     never a silently-wrong sequence).
+#   * A ref is validated as 64 lowercase hex BEFORE it touches the
+#     filesystem (path-traversal / corruption guard).
+#   * Dehydrate never drops a gb_text it couldn't first persist+verify; a
+#     save aborts rather than write metadata pointing at a missing blob.
+#   * GC QUARANTINES orphans (never hard-deletes), so even a GC bug is
+#     recoverable.
+
+_PLASMID_BLOB_DIR_NAME = "plasmid_blobs"
+_BLOB_REF_RE = re.compile(r"^[0-9a-f]{64}$")   # sha256 lowercase hex
+# Orphan-blob GC (reclaim disk from superseded/deleted sequences). Bulletproof
+# bias: orphans are QUARANTINED (moved to `plasmid_blobs/.orphaned/`), never
+# hard-deleted, so a wrong ref-set is recoverable; GC ABORTS if any current
+# metadata file is unreadable; blobs younger than the grace window are never
+# touched (protects an in-flight save's just-written blob).
+_BLOB_ORPHAN_DIR_NAME       = ".orphaned"
+_BLOB_GC_GRACE_SECONDS      = 3600          # leave blobs < 1 h old alone
+_BLOB_ORPHAN_RETENTION_DAYS = 30            # prune quarantine after 30 days
+# Module constant (like `_DNA_ORIGINALS_DIR`) so the blob dir is DISCOVERABLE
+# by the user-data machinery — it is listed in `_USER_DATA_DIR_ATTRS`, which
+# makes Master Delete wipe it AND the pre-update snapshot include it (so an
+# upgrade-rollback restores blobs alongside the metadata that references
+# them). conftest monkeypatches this to a tmp path for every test.
+_PLASMID_BLOB_DIR = _DATA_DIR / _PLASMID_BLOB_DIR_NAME
+
+
+def _plasmid_blob_dir() -> Path:
+    """Blob store dir. Returns the module constant `_PLASMID_BLOB_DIR` so
+    there is a single source of truth that conftest can monkeypatch and the
+    user-data machinery (snapshot / Master Delete) can discover."""
+    return _PLASMID_BLOB_DIR
+
+
+def _blob_hash_bytes(data: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def _blob_hash(gb_text: str) -> str:
+    """sha256 hex of `gb_text` (utf-8) — the content address / blob name."""
+    return _blob_hash_bytes(gb_text.encode("utf-8"))
+
+
+def _blob_path(gb_ref: str) -> Path:
+    """Filesystem path for a blob ref. Raises ValueError unless `gb_ref` is
+    a 64-char lowercase-hex sha256 digest — a path-traversal / corruption
+    guard so a mangled ref can never escape the blob dir."""
+    if not (isinstance(gb_ref, str) and _BLOB_REF_RE.match(gb_ref)):
+        raise ValueError(f"invalid blob ref {gb_ref!r} (expected sha256 hex)")
+    return _plasmid_blob_dir() / f"{gb_ref}.gb"
+
+
+def _blob_exists(gb_ref: str) -> bool:
+    try:
+        return _blob_path(gb_ref).is_file()
+    except (ValueError, OSError):
+        return False
+
+
+def _blob_write(gb_text: str) -> str:
+    """Persist `gb_text` as an immutable content-addressed blob; return its
+    ref (sha256 hex). Idempotent: an existing blob is correct by
+    construction (name == hash) so the write is skipped. New blobs are
+    written atomically THEN re-read + re-hashed; a mismatch unlinks the bad
+    file and raises so a corrupt write never becomes a trusted blob.
+    Raises ValueError/OSError on failure so callers ABORT rather than
+    reference a blob that isn't safely on disk."""
+    if not isinstance(gb_text, str):
+        raise ValueError("gb_text must be a str")
+    data = gb_text.encode("utf-8")
+    ref = _blob_hash_bytes(data)
+    path = _blob_path(ref)
+    if path.is_file():
+        return ref
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_bytes(path, data)
+    try:
+        back = path.read_bytes()
+    except OSError as exc:
+        raise OSError(
+            f"blob {ref} unreadable immediately after write: {exc}"
+        ) from exc
+    if _blob_hash_bytes(back) != ref:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise OSError(
+            f"blob {ref} failed post-write verification — written bytes "
+            f"hash to a different digest (corrupt write); aborting"
+        )
+    return ref
+
+
+def _blob_read(gb_ref: str) -> "str | None":
+    """Resolve a blob ref to its gb_text, VERIFYING the content hashes to
+    `gb_ref` (bit-rot guard). Returns None — with a loud error log — on a
+    missing, unreadable, non-utf-8, or hash-mismatched blob. Callers MUST
+    treat None as 'sequence unavailable' and never substitute empty text
+    for a real sequence."""
+    try:
+        path = _blob_path(gb_ref)
+    except ValueError:
+        _log.error("blob read: invalid ref %r", gb_ref)
+        return None
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        _log.error("blob read: missing blob %s", gb_ref)
+        return None
+    except OSError as exc:
+        _log.error("blob read: %s unreadable: %s", gb_ref, exc)
+        return None
+    if _blob_hash_bytes(data) != gb_ref:
+        _log.error(
+            "blob read: %s FAILED hash verification (bit-rot?) — %d bytes "
+            "hash to a different digest", gb_ref, len(data),
+        )
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _log.error("blob read: %s not valid utf-8: %s", gb_ref, exc)
+        return None
+
+
+# ── gb_text dehydrate / rehydrate (blob store <-> materialised entries) ──────────
+#
+# `_dehydrate_*` strip inline `gb_text` to a `gb_ref` (writing+verifying the
+# blob FIRST) for the on-disk form; `_rehydrate_*` resolve `gb_ref` back to
+# `gb_text` for the in-memory cache. Invariants:
+#   * Inline `gb_text` ALWAYS wins over a `gb_ref` (old-format read +
+#     transitional safety) — a stray ref alongside real text is dropped.
+#   * All produce NEW dicts; the caller's objects are never mutated
+#     (sacred pitfall #17).
+#   * Dehydrate is idempotent and raises if a blob can't be persisted, so
+#     the caller aborts rather than reference a missing blob.
+#   * A missing/corrupt blob on rehydrate does NOT drop the entry: gb_text
+#     is left "" and the `gb_ref` is RETAINED so a restored blob
+#     auto-resolves on a later load (loud log meanwhile).
+#   * Non-dict / gb_text-less entries pass through untouched.
+
+_GB_REF_KEY = "gb_ref"
+_GB_TEXT_KEY = "gb_text"
+
+
+def _dehydrate_entry(entry: dict) -> dict:
+    """Return a copy of `entry` with inline `gb_text` replaced by a
+    `gb_ref` (blob written + verified first). Idempotent: an
+    already-dehydrated entry (gb_ref, no/empty gb_text) returns unchanged.
+    Empty/missing gb_text is left as-is. Raises (ValueError/OSError) if the
+    blob can't be safely persisted — caller MUST abort the save."""
+    if not isinstance(entry, dict):
+        return entry
+    gb_text = entry.get(_GB_TEXT_KEY)
+    if not (isinstance(gb_text, str) and gb_text):
+        return entry                       # nothing to dehydrate
+    ref = _blob_write(gb_text)             # writes + verifies; raises on fail
+    out = dict(entry)
+    out.pop(_GB_TEXT_KEY, None)
+    out[_GB_REF_KEY] = ref
+    return out
+
+
+def _rehydrate_entry(entry: dict) -> dict:
+    """Return a copy of `entry` with `gb_text` materialised. Inline
+    `gb_text` wins (and a stray `gb_ref` is dropped). Otherwise a `gb_ref`
+    is resolved from the blob store. A missing/corrupt blob leaves gb_text
+    "" but RETAINS the ref (auto-recovers if the blob is restored) and logs
+    loudly — never silently presents an unresolved entry as empty."""
+    if not isinstance(entry, dict):
+        return entry
+    inline = entry.get(_GB_TEXT_KEY)
+    if isinstance(inline, str) and inline:
+        if _GB_REF_KEY in entry:
+            out = dict(entry)
+            out.pop(_GB_REF_KEY, None)
+            return out
+        return dict(entry)
+    ref = entry.get(_GB_REF_KEY)
+    if not (isinstance(ref, str) and ref):
+        return dict(entry)                 # no text, no ref → unchanged
+    gb_text = _blob_read(ref)
+    out = dict(entry)
+    if gb_text is None:
+        out[_GB_TEXT_KEY] = ""             # keep ref for auto-recovery
+        _log.error(
+            "rehydrate: entry %r references missing/corrupt blob %s — "
+            "sequence unavailable (left empty; ref retained for recovery)",
+            entry.get("id") or entry.get("name") or "?", ref,
+        )
+        return out
+    out.pop(_GB_REF_KEY, None)
+    out[_GB_TEXT_KEY] = gb_text
+    return out
+
+
+def _dehydrate_entries(entries: list) -> list:
+    """Dehydrate a list of entries. Blobs are written+verified per entry;
+    a failure raises so the caller aborts BEFORE any metadata referencing a
+    missing blob is persisted."""
+    return [_dehydrate_entry(e) for e in entries]
+
+
+def _rehydrate_entries(entries: list) -> list:
+    return [_rehydrate_entry(e) for e in entries]
+
+
+def _dehydrate_collections(colls: list) -> list:
+    """Dehydrate every collection's embedded `plasmids` list (new dicts)."""
+    out: list = []
+    for c in colls:
+        if isinstance(c, dict) and isinstance(c.get("plasmids"), list):
+            c2 = dict(c)
+            c2["plasmids"] = _dehydrate_entries(c["plasmids"])
+            out.append(c2)
+        else:
+            out.append(c)
+    return out
+
+
+def _rehydrate_collections(colls: list) -> list:
+    out: list = []
+    for c in colls:
+        if isinstance(c, dict) and isinstance(c.get("plasmids"), list):
+            c2 = dict(c)
+            c2["plasmids"] = _rehydrate_entries(c["plasmids"])
+            out.append(c2)
+        else:
+            out.append(c)
+    return out
+
+
+def _entries_have_inline_gb_text(entries: list) -> bool:
+    """True if any entry still carries inline `gb_text` — i.e. the list is
+    in (or partially in) the pre-blob-store format and a dehydrating save
+    would shrink it. Drives the one-time proactive migration."""
+    for e in entries:
+        if isinstance(e, dict) and isinstance(e.get(_GB_TEXT_KEY), str) \
+                and e.get(_GB_TEXT_KEY):
+            return True
+    return False
+
+
+def _collections_have_inline_gb_text(colls: list) -> bool:
+    for c in colls:
+        if isinstance(c, dict) and isinstance(c.get("plasmids"), list):
+            if _entries_have_inline_gb_text(c["plasmids"]):
+                return True
+    return False
+
+
+# ── Orphan-blob garbage collection (quarantine, never delete) ───────────────────
+
+
+def _gc_collect_refs(entries: list, refs: "set[str]", *, nested: bool) -> None:
+    """Add every blob ref implied by `entries` to `refs`: explicit `gb_ref`
+    fields AND the recomputed hash of any inline `gb_text` (covers
+    not-yet-migrated entries). `nested=True` walks each collection's
+    `plasmids` list."""
+    def _one(e):
+        if not isinstance(e, dict):
+            return
+        r = e.get(_GB_REF_KEY)
+        if isinstance(r, str) and _BLOB_REF_RE.match(r):
+            refs.add(r)
+        gb = e.get(_GB_TEXT_KEY)
+        if isinstance(gb, str) and gb:
+            refs.add(_blob_hash(gb))
+    if nested:
+        for c in entries:
+            if isinstance(c, dict) and isinstance(c.get("plasmids"), list):
+                for p in c["plasmids"]:
+                    _one(p)
+    else:
+        for e in entries:
+            _one(e)
+
+
+def _gc_orphan_blobs() -> int:
+    """Quarantine blobs not referenced by any current OR backed-up
+    library/collections metadata. Returns the count quarantined.
+
+    Bulletproofing (this touches user sequence data — the product):
+      * ABORTS (returns 0) if a CURRENT metadata file is unreadable — a
+        partial ref-set could orphan live blobs.
+      * Retained backups (legacy `.bak` + timestamped, incl. `.gz`) also
+        count as live, so a rollback's blobs survive (best-effort; a
+        corrupt backup is skipped, not fatal).
+      * Blobs younger than `_BLOB_GC_GRACE_SECONDS` are never touched
+        (protects a concurrent/in-flight save's just-written blob).
+      * Orphans are QUARANTINED to `plasmid_blobs/.orphaned/` (mtime
+        re-stamped so retention runs from quarantine time), NEVER
+        hard-deleted — so even a wrong ref-set is recoverable.
+    Best-effort; never raises."""
+    blob_dir = _plasmid_blob_dir()
+    try:
+        if not blob_dir.is_dir():
+            return 0
+    except OSError:
+        return 0
+    refs: "set[str]" = set()
+    # CURRENT metadata is authoritative.
+    for f in (_LIBRARY_FILE, _COLLECTIONS_FILE):
+        try:
+            if not f.exists():
+                continue
+            raw = json.loads(f.read_text(encoding="utf-8"))
+            entries, _ = _extract_entries(raw, "blob-gc")
+        except (OSError, json.JSONDecodeError):
+            entries = None
+        if entries is None:
+            _log.warning(
+                "blob GC aborted: %s unreadable/unparseable — refusing to "
+                "risk orphaning live blobs", f.name,
+            )
+            return 0
+        _gc_collect_refs(entries, refs, nested=(f == _COLLECTIONS_FILE))
+    # Every RECOVERY copy that could be restored also keeps its blobs live
+    # (best-effort — a corrupt/unreadable copy is skipped, not fatal):
+    # legacy `.bak` + timestamped backups (incl. `.gz`), daily snapshots,
+    # and lost_entries spills. So restoring ANY of them resolves cleanly
+    # without a manual un-quarantine. (The pre-update snapshot is
+    # self-contained — it copies the whole blob dir — so it needs no
+    # protection here.) Nested (collections) vs flat (library) is detected
+    # by filename so globbed snapshot/spill copies classify correctly.
+    recovery: "list[Path]" = []
+    for f in (_LIBRARY_FILE, _COLLECTIONS_FILE):
+        recovery.append(f.with_suffix(f.suffix + ".bak"))
+        recovery.extend(_iter_backups(f))
+    for sub in (_SNAPSHOT_DIR_NAME, _LOST_ENTRIES_DIR_NAME):
+        d = _DATA_DIR / sub
+        try:
+            recovery.extend(d.glob("plasmid_library-*.json"))
+            recovery.extend(d.glob("collections-*.json"))
+        except OSError:
+            pass
+    for src in recovery:
+        try:
+            raw = json.loads(_read_backup_bytes(src))
+            entries, _ = _extract_entries(raw, "blob-gc")
+        except Exception:
+            continue
+        if entries is not None:
+            _gc_collect_refs(entries, refs,
+                             nested=("collections" in src.name))
+    import time
+    now = time.time()
+    quarantine = blob_dir / _BLOB_ORPHAN_DIR_NAME
+    try:
+        blobs = [p for p in blob_dir.iterdir()
+                 if p.is_file() and p.suffix == ".gb"]
+    except OSError:
+        return 0
+    n = 0
+    for blob in blobs:
+        ref = blob.stem
+        if ref in refs:
+            continue
+        try:
+            age = now - blob.stat().st_mtime
+        except OSError:
+            continue
+        if age < _BLOB_GC_GRACE_SECONDS:
+            continue                       # too recent — protect in-flight saves
+        try:
+            quarantine.mkdir(parents=True, exist_ok=True)
+            dest = quarantine / blob.name
+            if dest.exists():
+                blob.unlink()              # same content (content-addressed)
+            else:
+                blob.rename(dest)
+                try:
+                    import os
+                    os.utime(dest, None)   # retention runs from quarantine time
+                except OSError:
+                    pass
+            n += 1
+        except OSError:
+            _log.debug("blob GC: could not quarantine %s", blob)
+    if n:
+        _log.info("blob GC: quarantined %d orphan blob(s) to %s",
+                  n, quarantine)
+    _prune_blob_quarantine(quarantine)
+    return n
+
+
+def _prune_blob_quarantine(quarantine: Path) -> None:
+    """Delete quarantined orphan blobs older than
+    `_BLOB_ORPHAN_RETENTION_DAYS` (by quarantine mtime). Best-effort."""
+    try:
+        files = [p for p in quarantine.iterdir() if p.is_file()]
+    except OSError:
+        return
+    import time
+    cutoff = time.time() - _BLOB_ORPHAN_RETENTION_DAYS * 86400
+    for p in files:
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                _log.info("blob GC: pruned quarantined orphan %s", p.name)
+        except OSError:
+            _log.debug("blob GC: could not prune quarantined %s", p)
 
 
 # ── CommercialSaaS .dna sidecar storage (Phase 4d) ──────────────────────────────────
@@ -5371,9 +5823,14 @@ def _ensure_library_cache_populated_and_migrated() -> None:
             )
             if warning:
                 _log.warning(warning)
-            _library_cache = [
-                e for e in entries if isinstance(e, dict)
-            ]
+            # Rehydrate gb_ref -> gb_text so the cache is fully materialised
+            # (every reader still sees inline gb_text). Old-format inline
+            # entries pass through unchanged (2-version backward read
+            # compat); a missing/corrupt blob leaves that one entry's text
+            # empty with a loud log, never dropping the entry.
+            _library_cache = _rehydrate_entries(
+                [e for e in entries if isinstance(e, dict)]
+            )
         # Fast path: both one-shot migrations already ran this process.
         if _id_name_backfill_done and _origin_history_backfill_done:
             return
@@ -5663,9 +6120,11 @@ def _ensure_collections_cache_populated_and_migrated() -> None:
             )
             if warning:
                 _log.warning(warning)
-            _collections_cache = [
-                e for e in entries if isinstance(e, dict)
-            ]
+            # Rehydrate each collection's embedded plasmids (gb_ref ->
+            # gb_text). Old-format inline entries pass through unchanged.
+            _collections_cache = _rehydrate_collections(
+                [e for e in entries if isinstance(e, dict)]
+            )
         if (_collections_backfill_done
                 and _collections_origin_history_backfill_done):
             return
@@ -22568,9 +23027,11 @@ class LibraryPanel(Widget):
         a fresh load.
         """
         if lib_entries is None:
-            lib_entries = _load_library()
+            # Read-only width scan (names/ids only) — no entry escapes this
+            # method, so the no-copy view is safe and skips a 150 MB clone.
+            lib_entries = _iter_library_readonly()
         if coll_entries is None:
-            coll_entries = _load_collections()
+            coll_entries = _iter_collections_readonly()
         max_name = 0
         for entry in lib_entries:
             n = len(str(entry.get("name") or entry.get("id") or ""))
@@ -29360,6 +29821,7 @@ _USER_DATA_DIR_ATTRS: tuple = (
     "_EXPERIMENTS_DIR",      # lab-notebook image attachments (per-entry)
     "_PLUGINS_DIR",          # reserved for future plugin storage (empty for now)
     "_HMM_DATABASES_DIR",    # downloaded HMM databases (sweep #28) — Pfam-A etc.
+    "_PLASMID_BLOB_DIR",     # content-addressed gb_text blobs (v1.0.23) — sequences
 )
 
 # Reserved field name for forward-compat plugin metadata on entries.
@@ -78912,8 +79374,11 @@ class TraditionalCloningPane(Vertical):
         plasmid added since the modal opened shows up after a Refresh
         (no auto-watch — too noisy). Sorted by ``_natural_sort_key`` so
         ``pBin2`` lands before ``pBin10``."""
+        # Read-only: fields are read into table rows; no entry is returned
+        # or mutated, so the no-copy view is safe (skips a full library clone
+        # on every repaint of this picker).
         entries = sorted(
-            (e for e in _load_library() if isinstance(e, dict)),
+            (e for e in _iter_library_readonly() if isinstance(e, dict)),
             key=lambda e: _natural_sort_key(
                 e.get("name") or e.get("id") or ""
             ),
@@ -82004,8 +82469,9 @@ class GibsonAssemblyPane(Vertical):
     # ── Library table ────────────────────────────────────────────────────────
 
     def _populate_library_table(self) -> None:
+        # Read-only repaint (names/sizes into rows) — safe to skip the clone.
         entries = sorted(
-            (e for e in _load_library() if isinstance(e, dict)),
+            (e for e in _iter_library_readonly() if isinstance(e, dict)),
             key=lambda e: _natural_sort_key(
                 e.get("name") or e.get("id") or ""
             ),
@@ -95245,7 +95711,10 @@ class CollectionsModal(_OneShotDismissScreen, ModalScreen):
     def _repopulate(self) -> None:
         t = self.query_one("#coll-table", DataTable)
         t.clear()
-        for c in _load_collections():
+        # Read-only: names/counts/descriptions into rows — no collection or
+        # embedded plasmid is mutated, so the no-copy view skips cloning the
+        # entire (multi-hundred-MB) collections set on every repaint.
+        for c in _iter_collections_readonly():
             name = c.get("name") or "?"
             n_plas = len(c.get("plasmids", []) or [])
             desc = (c.get("description") or "")[:40]

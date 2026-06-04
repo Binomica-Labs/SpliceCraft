@@ -69,6 +69,45 @@ across all four tiers; pick a row, get a one-click restore (the
 pre-restore state goes through the same backup chain, so even an
 accidental restore is reversible).
 
+## Content-addressed sequence store (v1.0.23)
+
+The bulk of every entry is its `gb_text` (the full GenBank record).
+Previously that text was stored inline in `plasmid_library.json` **and**
+duplicated into `collections.json` once per collection a plasmid belonged
+to — so a plasmid in N collections cost (N+1)× its sequence on disk, and
+every save rewrote the whole multi-hundred-MB collections file. Each
+unique `gb_text` is now stored **once**, content-addressed by SHA-256, as
+an immutable write-once blob at `<DATA_DIR>/plasmid_blobs/<sha256>.gb`;
+entries carry a small `gb_ref` instead. The change is transparent — the
+in-memory caches stay fully materialised (every reader still sees inline
+`gb_text`); only the on-disk form changes. Saves dehydrate (`gb_text` →
+blob + `gb_ref`), loads rehydrate. Migration is automatic on the first
+save of each file; old inline-format files are read unchanged
+(backward-compatible).
+
+Bulletproofing, because this is the product:
+
+- **Immutable + verified.** A blob's filename *is* the SHA-256 of its
+  content, so a present blob is correct by construction. Writes are atomic
+  and re-hashed after landing; reads re-hash and refuse a mismatch (a
+  corrupt/truncated blob fails loudly and is never returned as a
+  silently-wrong or empty sequence).
+- **Abort, don't corrupt.** A save dehydrates (writing every blob first);
+  if a blob can't be persisted+verified the save aborts before any
+  metadata that would reference a missing blob is written.
+- **Self-healing reads.** A missing blob leaves that one entry's text
+  empty with a loud log and *keeps the reference*, so restoring the blob
+  (from a backup) auto-resolves it on the next load — the entry is never
+  dropped.
+- **Quarantine, never delete.** A startup GC reclaims superseded/deleted
+  blobs by **moving** them to `plasmid_blobs/.orphaned/` (kept 30 days),
+  never hard-deleting. It refuses to run if any current metadata file is
+  unreadable, treats everything referenced by your **backups** as live,
+  and skips blobs younger than an hour (protects an in-flight save).
+- **Complete snapshots.** `plasmid_blobs/` is part of the pre-update
+  snapshot and Master Delete, so upgrade-rollback and full-wipe stay
+  consistent with the metadata that references it.
+
 ## Pre-update snapshots
 
 Every `splicecraft update` snapshots your full library, collections,
@@ -152,8 +191,9 @@ directory.
 
 | File                            | Purpose                                                  |
 |---------------------------------|----------------------------------------------------------|
-| `collections.json`              | Named collections of plasmids — source of truth          |
-| `plasmid_library.json`          | Live mirror of the active collection's plasmids          |
+| `collections.json`              | Named collections — source of truth (plasmids as `gb_ref`) |
+| `plasmid_library.json`          | Live mirror of the active collection (plasmids as `gb_ref`) |
+| `plasmid_blobs/<sha256>.gb`     | Content-addressed sequence store (each `gb_text` once)    |
 | `parts_bin.json`                | Active parts-bin's user-domesticated cloning parts       |
 | `parts_bin_collections.json`    | Named parts-bin snapshots (multi-bin storage)            |
 | `primers.json`                  | Designed primer library                                  |

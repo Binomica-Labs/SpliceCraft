@@ -14,6 +14,18 @@
 
 ---
 
+## [1.0.23] — 2026-06-03
+
+### Performance
+
+- **Saving is far faster on large libraries, and your data folder shrinks a lot.** Plasmid sequences are now stored once in a shared, content-addressed store instead of being copied in full into every collection *and* into the active-library file. A plasmid that lived in several collections used to be written many times over; now it's stored a single time and referenced. In practice `collections.json` drops from hundreds of MB to a few MB, and an edit/add/delete/collection-switch no longer rewrites that whole file — so working in a big library is much snappier. It's automatic: each library/collection migrates the first time it's saved, and older files are read transparently in the meantime.
+
+### Hardening
+
+- **The new sequence store is built to be bulletproof.** Every stored sequence is content-addressed (named by its SHA-256), written atomically, and re-verified on both write and read — a corrupted or truncated sequence is caught loudly and never silently returned as wrong/empty. A save aborts rather than record a reference it couldn't safely persist. Superseded sequence files are reclaimed only by being **quarantined** (recoverable for 30 days), never hard-deleted, and that cleanup refuses to run if it can't fully account for what's still in use (including everything referenced by your backups). The store is included in the pre-update snapshot and Master Delete, so upgrade-rollback and full-wipe both stay complete and consistent.
+
+---
+
 ## [1.0.22] — 2026-06-03
 
 ### Performance
