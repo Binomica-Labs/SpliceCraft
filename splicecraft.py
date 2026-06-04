@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.24"
+__version__ = "1.0.25"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -85804,225 +85804,7 @@ class NewMotifModal(_OneShotDismissScreen, ModalScreen):
         self.dismiss(None)
 
 
-# ── Codon-table TSV import (paste a custom usage table) ────────────────────────
-
-class CodonTsvImportModal(_OneShotDismissScreen, ModalScreen):
-    """Paste a tab / space / comma-delimited codon-usage table. Dismisses
-    with the pasted text (str) on Import, or None on Cancel — parsing
-    happens in the caller via `_parse_codon_tsv`."""
-
-    _blocks_undo: bool = True
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
-    DEFAULT_CSS = """
-    CodonTsvImportModal { align: center middle; }
-    #ctsv-dlg { width: 84; height: auto; max-height: 90%;
-                background: $surface; border: solid $primary; padding: 1 2; }
-    #ctsv-title { background: $primary-darken-2; color: $text;
-                  padding: 0 1; margin-bottom: 1; text-align: center;
-                  text-style: bold; }
-    #ctsv-help { color: $text-muted; height: auto; padding: 0 1; }
-    #ctsv-text { height: 14; min-height: 6; margin-top: 1;
-                 border: solid $primary-darken-2; }
-    #ctsv-status { height: auto; margin-top: 1; color: $text-muted; }
-    #ctsv-btns { height: 3; margin-top: 1; align-horizontal: right; }
-    #ctsv-btns Button { margin-right: 1; min-width: 12; }
-    """
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="ctsv-dlg"):
-            yield Static(" Import codon table (TSV) ", id="ctsv-title")
-            yield Static(
-                "[dim]Paste a tab / space / comma-delimited table — one row "
-                "per codon: [b]codon  [amino acid]  count[/b]. Header lines, "
-                "blank lines, and `#` comments are ignored; the amino-acid "
-                "column is optional.[/dim]",
-                id="ctsv-help", markup=True,
-            )
-            yield TextArea(id="ctsv-text")
-            yield Static("", id="ctsv-status", markup=True)
-            with Horizontal(id="ctsv-btns"):
-                yield Button("Import", id="btn-ctsv-go", variant="primary")
-                yield Button("Cancel", id="btn-ctsv-cancel")
-
-    @on(Button.Pressed, "#btn-ctsv-go")
-    def _go(self, _) -> None:
-        try:
-            text = self.query_one("#ctsv-text", TextArea).text
-        except NoMatches:
-            text = ""
-        if not text.strip():
-            try:
-                self.query_one("#ctsv-status", Static).update(
-                    "[red]Paste a TSV codon table first.[/red]")
-            except NoMatches:
-                pass
-            return
-        self.dismiss(text)
-
-    @on(Button.Pressed, "#btn-ctsv-cancel")
-    def _cancel(self, _) -> None:
-        self.dismiss(None)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-
-# ── Species picker (shared modal for codon-table selection) ────────────────────
-
-class GenomeCodonBuilderModal(_OneShotDismissScreen, ModalScreen):
-    """Build a codon-usage table straight from an NCBI genome. The user gives a
-    RefSeq/GenBank assembly accession (``GCF_…``/``GCA_…``) or an NCBI taxid
-    (resolved to the species' RefSeq reference assembly) and a mode:
-
-      * **Highly-expressed genes (ribosomal proteins)** — recommended; the
-        codon bias that drives strong heterologous expression.
-      * **Whole genome** — every CDS (a fuller, less expression-weighted table).
-
-    A worker thread downloads the CDS via the NCBI Datasets API, builds the
-    table (`_genome_build_codon_table`), and saves it into the shared registry
-    (`_codon_tables_add`, source ``genome``). Dismisses with the saved entry
-    dict on success, or None on cancel — the caller refreshes its picker.
-    """
-
-    _blocks_undo: bool = True   # builds + persists a codon table
-
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
-    DEFAULT_CSS = """
-    GenomeCodonBuilderModal { align: center middle; }
-    #gcb-dlg { width: 86; height: auto; max-height: 90%;
-               background: $surface; border: solid $primary; padding: 1 2; }
-    #gcb-title { background: $primary-darken-2; color: $text;
-                 padding: 0 1; margin-bottom: 1; text-align: center;
-                 text-style: bold; }
-    #gcb-help { color: $text-muted; height: auto; padding: 0 1; }
-    #gcb-row { height: auto; margin-top: 1; }
-    #gcb-query { width: 1fr; }
-    #gcb-name { width: 1fr; }
-    #gcb-mode { height: auto; margin-top: 1; }
-    #gcb-status { height: auto; min-height: 1; margin-top: 1; color: $text-muted; }
-    #gcb-btns { height: 3; margin-top: 1; align-horizontal: right; }
-    #gcb-btns Button { margin-right: 1; min-width: 12; }
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._building = False
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="gcb-dlg"):
-            yield Static(" Build codon table from genome ", id="gcb-title")
-            yield Static(
-                "[dim]Enter an NCBI assembly accession ([b]GCF_…[/b] / "
-                "[b]GCA_…[/b]) or a numeric [b]taxid[/b] (resolved to the "
-                "species' RefSeq reference genome). The table is built from the "
-                "genome's coding sequences and added to your codon-table "
-                "library.[/dim]",
-                id="gcb-help", markup=True,
-            )
-            with Horizontal(id="gcb-row"):
-                yield Input(placeholder="accession or taxid "
-                                        "(e.g. GCF_009734005.1, 1352)",
-                            id="gcb-query")
-                yield Input(placeholder="Display name (optional)", id="gcb-name")
-            with RadioSet(id="gcb-mode"):
-                yield RadioButton(
-                    "Highly-expressed genes (ribosomal proteins) — recommended",
-                    id="gcb-mode-heg", value=True)
-                yield RadioButton("Whole genome (all CDS)", id="gcb-mode-genome")
-            yield Static("", id="gcb-status", markup=True)
-            with Horizontal(id="gcb-btns"):
-                yield Button("Build", id="btn-gcb-go", variant="primary")
-                yield Button("Cancel  [Esc]", id="btn-gcb-cancel")
-
-    def on_mount(self) -> None:
-        self.query_one("#gcb-query", Input).focus()
-
-    def _set_status(self, text: str) -> None:
-        try:
-            self.query_one("#gcb-status", Static).update(text)
-        except NoMatches:
-            pass
-
-    @on(Button.Pressed, "#btn-gcb-go")
-    def _go(self, _) -> None:
-        if self._building:
-            return
-        query = self.query_one("#gcb-query", Input).value.strip()
-        if not query:
-            self._set_status("[red]Enter an assembly accession or taxid.[/red]")
-            return
-        try:
-            idx = self.query_one("#gcb-mode", RadioSet).pressed_index
-        except NoMatches:
-            idx = 0
-        mode = "genome" if idx == 1 else "heg"
-        name_hint = self.query_one("#gcb-name", Input).value.strip()
-        self._building = True
-        try:
-            self.query_one("#btn-gcb-go", Button).disabled = True
-        except NoMatches:
-            pass
-        self._set_status(
-            f"[yellow]Building from {query} — resolving + downloading CDS "
-            f"(this can take a few seconds)…[/yellow]")
-        self._build_worker(query, mode, name_hint)
-
-    @work(thread=True, exclusive=True, group="codon_genome_build")
-    def _build_worker(self, query: str, mode: str, name_hint: str) -> None:
-        try:
-            raw, msg, meta = _genome_build_codon_table(query, mode)
-        except Exception as exc:            # worker-body carve-out ([PIT-01])
-            _log.exception("Genome codon-table worker crashed for %s", query)
-            raw, msg, meta = None, f"Build failed: {exc}", None
-        self.app.call_from_thread(self._build_done, name_hint, raw, msg, meta)
-
-    def _build_done(self, name_hint: str, raw: "dict | None",
-                    msg: str, meta: "dict | None") -> None:
-        self._building = False
-        # Persist a successful build even if the modal was dismissed mid-flight
-        # (don't waste the network round-trip); only then skip the UI work.
-        saved = None
-        if raw is not None and meta is not None:
-            display = (_sanitize_label(name_hint, max_len=200)
-                       or meta.get("organism")
-                       or meta.get("accession") or "Genome codon table")
-            try:
-                saved = _codon_tables_add(display, meta.get("taxid", ""), raw,
-                                          source="genome")
-                _log_event("codon_table.build_genome",
-                           accession=meta.get("accession", ""),
-                           taxid=meta.get("taxid", ""),
-                           mode=meta["stats"]["mode"],
-                           n_cds=meta["stats"]["n_cds_total"],
-                           n_codons=meta["stats"]["n_codons"])
-            except (OSError, RuntimeError) as exc:
-                if self.is_mounted:
-                    try:
-                        self.query_one("#btn-gcb-go", Button).disabled = False
-                    except NoMatches:
-                        pass
-                    _notify_save_failure(self.app, "Codon tables", exc)
-                else:
-                    _log.exception("Genome codon-table save failed (modal gone)")
-                return
-        if not self.is_mounted:
-            return
-        if saved is None:
-            try:
-                self.query_one("#btn-gcb-go", Button).disabled = False
-            except NoMatches:
-                pass
-            self._set_status(f"[red]{msg}[/red]")
-            return
-        self.dismiss(saved)
-
-    @on(Button.Pressed, "#btn-gcb-cancel")
-    def _cancel_btn(self, _) -> None:
-        self.dismiss(None)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
+# ── Codon-table manager (tabbed: Library · Kazusa · genome build · TSV) ────────
 
 class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
     """Reusable codon-table picker — any modal that cares about codon usage
@@ -86045,36 +85827,89 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
     def __init__(self) -> None:
         super().__init__()
         self._fetching = False
+        self._building = False
+        # Guards a single programmatic `#sp-filter` clear (in
+        # `_after_table_added`) from triggering a second, cursor-clobbering
+        # `_refresh_list` via the Input.Changed handler.
+        self._suppress_filter_refresh = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="sp-box"):
-            yield Static(" Codon Usage Table  —  Pick or Fetch ", id="sp-title")
-            yield Label("Filter species")
-            yield Input(placeholder="search by genus, species, or taxid "
-                                    "(e.g. Escherichia, coli, 9606)",
-                        id="sp-filter")
-            yield DataTable(id="sp-list", cursor_type="row",
-                            zebra_stripes=True)
-            yield Static("", id="sp-info", markup=True)
-            with Horizontal(id="sp-fetch-row"):
-                yield Input(placeholder="taxid or name (e.g. 9606, Homo sapiens, "
-                                        "Escherichia coli)",
-                            id="sp-taxid")
-                yield Input(placeholder="Display name (optional)",
-                            id="sp-name")
-                yield Button("Fetch from Kazusa", id="btn-sp-fetch",
-                             variant="primary")
+            yield Static(" Codon Usage Tables ", id="sp-title")
+            with TabbedContent(initial="sp-tab-library", id="sp-tabs"):
+                # TAB 1 — Library: pick an existing table (or delete one).
+                with TabPane("Library", id="sp-tab-library"):
+                    yield Label("Filter species")
+                    yield Input(placeholder="search by genus, species, or taxid "
+                                            "(e.g. Escherichia, coli, 9606)",
+                                id="sp-filter")
+                    yield DataTable(id="sp-list", cursor_type="row",
+                                    zebra_stripes=True)
+                    yield Static("", id="sp-info", markup=True)
+                    with Horizontal(id="sp-lib-btns"):
+                        yield Button("Use Selected", id="btn-sp-use",
+                                     variant="primary", disabled=True)
+                        yield Button("Delete", id="btn-sp-delete",
+                                     disabled=True)
+                # TAB 2 — Fetch a published table from the Kazusa database.
+                with TabPane("Fetch (Kazusa)", id="sp-tab-fetch"):
+                    yield Static(
+                        "[dim]Fetch a codon-usage table from the Kazusa "
+                        "database by NCBI taxid — or type a species / genus "
+                        "name and pick from the NCBI matches. The table is "
+                        "added to your Library.[/dim]",
+                        id="sp-fetch-help", markup=True)
+                    with Horizontal(id="sp-fetch-row"):
+                        yield Input(placeholder="taxid or name (e.g. 9606, "
+                                                "Homo sapiens, Escherichia coli)",
+                                    id="sp-taxid")
+                        yield Input(placeholder="Display name (optional)",
+                                    id="sp-name")
+                    with Horizontal(id="sp-fetch-go-row"):
+                        yield Button("Fetch from Kazusa", id="btn-sp-fetch",
+                                     variant="primary")
+                    yield Static("", id="sp-fetch-status", markup=True)
+                # TAB 3 — Build a table from an NCBI genome's CDS.
+                with TabPane("Build from genome", id="sp-tab-genome"):
+                    yield Static(
+                        "[dim]Build a table from an NCBI genome's coding "
+                        "sequences. Enter an assembly accession ([b]GCF_…[/b] / "
+                        "[b]GCA_…[/b]) or a numeric [b]taxid[/b] (resolved to "
+                        "the species' RefSeq reference genome). The table is "
+                        "added to your Library.[/dim]",
+                        id="sp-genome-help", markup=True)
+                    with Horizontal(id="sp-genome-row"):
+                        yield Input(placeholder="accession or taxid "
+                                                "(e.g. GCF_009734005.1, 1352)",
+                                    id="sp-genome-query")
+                        yield Input(placeholder="Display name (optional)",
+                                    id="sp-genome-name")
+                    with RadioSet(id="sp-genome-mode"):
+                        yield RadioButton(
+                            "Highly-expressed genes (ribosomal proteins) — "
+                            "recommended", id="sp-genome-mode-heg", value=True)
+                        yield RadioButton("Whole genome (all CDS)",
+                                          id="sp-genome-mode-all")
+                    with Horizontal(id="sp-genome-go-row"):
+                        yield Button("Build", id="btn-sp-genome-go",
+                                     variant="primary")
+                    yield Static("", id="sp-genome-status", markup=True)
+                # TAB 4 — Import a custom table pasted as TSV.
+                with TabPane("Import TSV", id="sp-tab-import"):
+                    yield Static(
+                        "[dim]Paste a tab / space / comma-delimited table — one "
+                        "row per codon: [b]codon  \\[amino acid]  count[/b]. "
+                        "Header lines, blank lines, and `#` comments are "
+                        "ignored; the amino-acid column is optional.[/dim]",
+                        id="sp-import-help", markup=True)
+                    yield TextArea(id="sp-import-text")
+                    with Horizontal(id="sp-import-row"):
+                        yield Input(placeholder="Display name (optional)",
+                                    id="sp-import-name")
+                        yield Button("Import", id="btn-sp-import-go",
+                                     variant="primary")
+                    yield Static("", id="sp-import-status", markup=True)
             with Horizontal(id="sp-btns"):
-                yield Button("Use Selected", id="btn-sp-use", variant="primary",
-                             disabled=True)
-                yield Button("Import TSV", id="btn-sp-import",
-                             tooltip="Paste a custom codon-usage table "
-                                     "(TSV: codon, [amino acid], count).")
-                yield Button("Build from genome", id="btn-sp-genome",
-                             tooltip="Build a codon table from an NCBI genome "
-                                     "(accession or taxid) — highly-expressed "
-                                     "genes or whole genome.")
-                yield Button("Delete", id="btn-sp-delete", disabled=True)
                 yield Button("Cancel  [Esc]", id="btn-sp-cancel")
 
     def on_mount(self) -> None:
@@ -86093,8 +85928,8 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
             dt.add_row(str(e.get("name", "?") or "?"), taxid, src)
         info = self.query_one("#sp-info", Static)
         if not self._entries:
-            info.update("[dim]No matching entries. Use the fetch row below to "
-                        "import a new table from Kazusa.[/dim]")
+            info.update("[dim]No matching entries. Use the Fetch / Build / "
+                        "Import tabs to add a new table.[/dim]")
         else:
             summary = self._genus_summary(query, self._entries)
             if summary:
@@ -86139,6 +85974,12 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
 
     @on(Input.Changed, "#sp-filter")
     def _filter_changed(self, event: Input.Changed) -> None:
+        # Skip exactly one refresh when `_after_table_added` clears the filter
+        # programmatically — it does its own refresh + cursor placement, and a
+        # second `dt.clear()` here would reset the cursor off the new row.
+        if self._suppress_filter_refresh:
+            self._suppress_filter_refresh = False
+            return
         self._refresh_list(event.value)
 
     @on(DataTable.RowHighlighted, "#sp-list")
@@ -86177,74 +86018,185 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
             return
         self._refresh_list(self.query_one("#sp-filter", Input).value)
 
-    @on(Button.Pressed, "#btn-sp-import")
-    def _import_tsv(self, _) -> None:
-        """Paste-import a custom codon table from TSV (parsed by
-        `_parse_codon_tsv`, persisted via `_codon_tables_add`). The display
-        name comes from the Display-name Input, else 'Custom codon table'."""
-        name_hint = ""
+    def _after_table_added(self, match, msg: str) -> None:
+        """Shared post-add UX for the Fetch / Build / Import tabs: jump to the
+        Library tab, refresh the list from the live registry, move the cursor
+        onto the freshly-added row, and confirm in the Library info line.
+        `match(entry)` returns True for the new entry."""
         try:
-            name_hint = self.query_one("#sp-name", Input).value.strip()
+            self.query_one("#sp-tabs", TabbedContent).active = "sp-tab-library"
+        except (NoMatches, LookupError, AttributeError):
+            pass
+        # Clear any stale Library filter first — a leftover filter from an
+        # earlier browse could hide the new table, defeating the whole
+        # "land on the new row, ready to Use" point. The clear fires
+        # Input.Changed; `_suppress_filter_refresh` skips that one refresh so
+        # the cursor move below isn't clobbered.
+        try:
+            flt = self.query_one("#sp-filter", Input)
+            if flt.value:
+                self._suppress_filter_refresh = True
+                flt.value = ""
+        except NoMatches:
+            pass
+        try:
+            self._refresh_list("")
+        except NoMatches:
+            return
+        for i, e in enumerate(self._entries):
+            try:
+                if match(e):
+                    self.query_one("#sp-list", DataTable).move_cursor(row=i)
+                    self._sync_row_buttons()
+                    break
+            except Exception:
+                continue
+        try:
+            self.query_one("#sp-info", Static).update(f"[green]{msg}[/green]")
         except NoMatches:
             pass
 
-        def _on_text(text) -> None:
-            if not isinstance(text, str) or not text.strip():
-                return
-            try:
-                info = self.query_one("#sp-info", Static)
-            except NoMatches:
-                info = None
-            try:
-                raw = _parse_codon_tsv(text)
-            except ValueError as exc:
-                if info:
-                    info.update(f"[red]Import failed — {exc}[/red]")
-                return
-            display = (_sanitize_label(name_hint, max_len=200)
-                       or "Custom codon table")
-            try:
-                _codon_tables_add(display, "", raw, source="user")
-            except (OSError, RuntimeError) as exc:
-                _notify_save_failure(self.app, "Codon tables", exc)
-                return
-            _log_event("codon_table.import_tsv",
-                       name=display, n_codons=len(raw))
-            try:
-                self._refresh_list(
-                    self.query_one("#sp-filter", Input).value)
-                if info:
-                    info.update(
-                        f"[green]Imported '{display}' "
-                        f"({len(raw)} codons).[/green]")
-            except NoMatches:
-                pass
+    @on(Button.Pressed, "#btn-sp-import-go")
+    def _import_tsv(self, _) -> None:
+        """Import-tab handler: parse the pasted TSV (`_parse_codon_tsv`) and
+        persist it (`_codon_tables_add`). The display name comes from the
+        Display-name Input, else 'Custom codon table'. On success the new
+        table is selected on the Library tab."""
+        try:
+            text = self.query_one("#sp-import-text", TextArea).text
+        except NoMatches:
+            text = ""
+        try:
+            status = self.query_one("#sp-import-status", Static)
+        except NoMatches:
+            status = None
+        if not text.strip():
+            if status:
+                status.update("[red]Paste a TSV codon table first.[/red]")
+            return
+        try:
+            raw = _parse_codon_tsv(text)
+        except ValueError as exc:
+            if status:
+                status.update(f"[red]Import failed — {exc}[/red]")
+            return
+        name_hint = ""
+        try:
+            name_hint = self.query_one("#sp-import-name", Input).value.strip()
+        except NoMatches:
+            pass
+        display = _sanitize_label(name_hint, max_len=200) or "Custom codon table"
+        try:
+            saved = _codon_tables_add(display, "", raw, source="user")
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Codon tables", exc)
+            return
+        _log_event("codon_table.import_tsv", name=display, n_codons=len(raw))
+        key = saved.get("taxid") or saved.get("name")
+        self._after_table_added(
+            match=lambda e: (e.get("taxid") or e.get("name")) == key,
+            msg=f"Imported '{display}' ({len(raw)} codons).")
+        if status:
+            status.update(
+                f"[green]Imported '{display}' ({len(raw)} codons).[/green]")
 
-        self.app.push_screen(CodonTsvImportModal(), callback=_on_text)
-
-    @on(Button.Pressed, "#btn-sp-genome")
+    @on(Button.Pressed, "#btn-sp-genome-go")
     def _build_from_genome(self, _) -> None:
-        """Open `GenomeCodonBuilderModal`; on a successful build the table is
-        already saved, so refresh the list and move the cursor onto the new
-        entry (mirrors `_fetch_done`'s post-add selection)."""
-        def _on_built(entry) -> None:
-            if not isinstance(entry, dict):
-                return
+        """Build-tab handler: kick off the off-thread genome → codon-table
+        build. On success the table is saved and selected on the Library tab
+        (mirrors `_fetch`'s post-add selection)."""
+        if self._building:
+            return
+        query = self.query_one("#sp-genome-query", Input).value.strip()
+        try:
+            status = self.query_one("#sp-genome-status", Static)
+        except NoMatches:
+            status = None
+        if not query:
+            if status:
+                status.update("[red]Enter an assembly accession or taxid.[/red]")
+            return
+        try:
+            idx = self.query_one("#sp-genome-mode", RadioSet).pressed_index
+        except NoMatches:
+            idx = 0
+        mode = "genome" if idx == 1 else "heg"
+        name_hint = self.query_one("#sp-genome-name", Input).value.strip()
+        self._building = True
+        try:
+            self.query_one("#btn-sp-genome-go", Button).disabled = True
+        except NoMatches:
+            pass
+        if status:
+            status.update(
+                f"[yellow]Building from {query} — resolving + downloading CDS "
+                f"(this can take a few seconds)…[/yellow]")
+        self._genome_build_worker(query, mode, name_hint)
+
+    @work(thread=True, exclusive=True, group="codon_genome_build")
+    def _genome_build_worker(self, query: str, mode: str,
+                             name_hint: str) -> None:
+        try:
+            raw, msg, meta = _genome_build_codon_table(query, mode)
+        except Exception as exc:            # worker-body carve-out ([PIT-01])
+            _log.exception("Genome codon-table worker crashed for %s", query)
+            raw, msg, meta = None, f"Build failed: {exc}", None
+        self.app.call_from_thread(
+            self._genome_build_done, name_hint, raw, msg, meta)
+
+    def _genome_build_done(self, name_hint: str, raw: "dict | None",
+                           msg: str, meta: "dict | None") -> None:
+        self._building = False
+        # Persist a successful build even if the modal was dismissed mid-flight
+        # (don't waste the network round-trip); only then skip the UI work.
+        saved = None
+        if raw is not None and meta is not None:
+            display = (_sanitize_label(name_hint, max_len=200)
+                       or meta.get("organism")
+                       or meta.get("accession") or "Genome codon table")
             try:
-                self._refresh_list(self.query_one("#sp-filter", Input).value)
-                key = entry.get("taxid") or entry.get("name")
-                for i, e in enumerate(self._entries):
-                    if (e.get("taxid") or e.get("name")) == key:
-                        self.query_one("#sp-list", DataTable).move_cursor(row=i)
-                        self._sync_row_buttons()
-                        break
-                self.query_one("#sp-info", Static).update(
-                    f"[green]Added '{entry.get('name', '?')}' from genome "
-                    f"build.[/green]")
+                saved = _codon_tables_add(display, meta.get("taxid", ""), raw,
+                                          source="genome")
+                _log_event("codon_table.build_genome",
+                           accession=meta.get("accession", ""),
+                           taxid=meta.get("taxid", ""),
+                           mode=meta["stats"]["mode"],
+                           n_cds=meta["stats"]["n_cds_total"],
+                           n_codons=meta["stats"]["n_codons"])
+            except (OSError, RuntimeError) as exc:
+                if self.is_mounted:
+                    try:
+                        self.query_one("#btn-sp-genome-go",
+                                       Button).disabled = False
+                    except NoMatches:
+                        pass
+                    _notify_save_failure(self.app, "Codon tables", exc)
+                else:
+                    _log.exception(
+                        "Genome codon-table save failed (modal gone)")
+                return
+        if not self.is_mounted:
+            return
+        try:
+            self.query_one("#btn-sp-genome-go", Button).disabled = False
+        except NoMatches:
+            pass
+        if saved is None:
+            try:
+                self.query_one("#sp-genome-status", Static).update(
+                    f"[red]{msg}[/red]")
             except NoMatches:
                 pass
-
-        self.app.push_screen(GenomeCodonBuilderModal(), callback=_on_built)
+            return
+        key = saved.get("taxid") or saved.get("name")
+        self._after_table_added(
+            match=lambda e: (e.get("taxid") or e.get("name")) == key,
+            msg=f"Added '{saved.get('name', '?')}' from genome build.")
+        try:
+            self.query_one("#sp-genome-status", Static).update(
+                "[green]Built and added to your Library.[/green]")
+        except NoMatches:
+            pass
 
     @on(Button.Pressed, "#btn-sp-fetch")
     def _fetch(self, _) -> None:
@@ -86252,34 +86204,32 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
             return
         query = self.query_one("#sp-taxid", Input).value.strip()
         name  = self.query_one("#sp-name", Input).value.strip()
-        info  = self.query_one("#sp-info", Static)
+        status = self.query_one("#sp-fetch-status", Static)
         if not query:
-            info.update("[red]Enter an NCBI taxid or species/genus name.[/red]")
+            status.update(
+                "[red]Enter an NCBI taxid or species/genus name.[/red]")
             return
         if query.isdigit():
-            # Numeric taxid: go straight to Kazusa
+            # Numeric taxid: go straight to Kazusa.
             self._fetching = True
             self.query_one("#btn-sp-fetch", Button).disabled = True
-            info.update(f"[yellow]Fetching taxid {query} from Kazusa…[/yellow]")
+            status.update(
+                f"[yellow]Fetching taxid {query} from Kazusa…[/yellow]")
             self._do_fetch(query, name)
             return
         # Non-numeric: push the NCBI picker sub-modal. Button stays enabled
         # during the sub-modal so Esc-cancel can return to a clean state.
         def _picked(hit: "dict | None") -> None:
             if hit is None:
-                try:
-                    self._refresh_list(self.query_one("#sp-filter", Input).value)
-                except NoMatches:
-                    pass
                 return
             taxid = hit["taxid"]
             display = name or hit.get("name") or f"Species (taxid {taxid})"
             self._fetching = True
             try:
                 self.query_one("#btn-sp-fetch", Button).disabled = True
-                self.query_one("#sp-info", Static).update(
-                    f"[yellow]Fetching taxid {taxid} ({display}) from Kazusa…[/yellow]"
-                )
+                self.query_one("#sp-fetch-status", Static).update(
+                    f"[yellow]Fetching taxid {taxid} ({display}) from "
+                    f"Kazusa…[/yellow]")
             except NoMatches:
                 pass
             self._do_fetch(taxid, display)
@@ -86298,6 +86248,10 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
     def _fetch_done(self, taxid: str, name: str,
                     raw: "dict | None", msg: str) -> None:
         self._fetching = False
+        # Sanitize the user-typed display name (strip control chars / markup,
+        # cap length) before it reaches the registry + DataTable — parity with
+        # the genome / TSV-import paths and the `add-codon-table` endpoint.
+        name = _sanitize_label(name, max_len=200)
         # If the user dismissed the modal mid-fetch, persist the result (so
         # they don't lose a successful HTTP round-trip) but skip the UI calls.
         if not self.is_mounted:
@@ -86309,23 +86263,53 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
                     _log.exception("Codon-table add failed for taxid %s", taxid)
             return
         try:
-            info = self.query_one("#sp-info", Static)
-            btn  = self.query_one("#btn-sp-fetch", Button)
-            btn.disabled = False
-            if raw is None:
-                info.update(f"[red]{msg}[/red]")
-                return
-            display = name or f"Species (taxid {taxid})"
+            self.query_one("#btn-sp-fetch", Button).disabled = False
+        except NoMatches:
+            pass
+        if raw is None:
+            try:
+                self.query_one("#sp-fetch-status", Static).update(
+                    f"[red]{msg}[/red]")
+            except NoMatches:
+                pass
+            return
+        display = name or f"Species (taxid {taxid})"
+        try:
             _codon_tables_add(display, taxid, raw, source="kazusa")
-            info.update(f"[green]{msg} — added as '{display}'.[/green]")
-            self._refresh_list(self.query_one("#sp-filter", Input).value)
-            for i, e in enumerate(self._entries):
-                if str(e.get("taxid")) == str(taxid):
-                    self.query_one("#sp-list", DataTable).move_cursor(row=i)
-                    self._sync_row_buttons()
-                    break
-        except Exception:
-            _log.exception("SpeciesPickerModal fetch-callback failed")
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Codon tables", exc)
+            return
+        self._after_table_added(
+            match=lambda e: str(e.get("taxid")) == str(taxid),
+            msg=f"{msg} — added as '{display}'.")
+        try:
+            self.query_one("#sp-fetch-status", Static).update(
+                f"[green]{msg} — added as '{display}'.[/green]")
+        except NoMatches:
+            pass
+
+    @on(TabbedContent.TabActivated, "#sp-tabs")
+    def _on_tab_activated(
+        self, _event: "TabbedContent.TabActivated",
+    ) -> None:
+        """Focus the most useful input on the now-active tab."""
+        focus_map = {
+            "sp-tab-library": "#sp-filter",
+            "sp-tab-fetch":   "#sp-taxid",
+            "sp-tab-genome":  "#sp-genome-query",
+            "sp-tab-import":  "#sp-import-text",
+        }
+        try:
+            active = self.query_one("#sp-tabs", TabbedContent).active
+        except (NoMatches, LookupError):
+            return
+        sel = focus_map.get(active)
+        if not sel:
+            return
+        try:
+            self.query_one(sel).focus()
+        except NoMatches:
+            pass
 
     @on(Button.Pressed, "#btn-sp-cancel")
     def _cancel_btn(self, _) -> None:
@@ -107675,20 +107659,32 @@ AminoAcidPickerModal { align: center middle; }
 #aa-pick-btns  { height: 3; margin-top: 1; }
 #aa-pick-btns Button { margin-right: 1; }
 
-/* ── Species picker modal ───────────────────────────────── */
+/* ── Codon-table manager (tabbed: Library / Kazusa / genome / TSV) ─────────── */
 SpeciesPickerModal { align: center middle; }
 #sp-box {
-    width: 90; height: auto; max-height: 34;
+    width: 92; height: 34; max-height: 95%;
     background: $surface; border: solid $accent; padding: 1 2;
 }
 #sp-title    { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#sp-tabs { height: 1fr; }
+#sp-tabs > TabPane { padding: 0 1; }
 #sp-box Label { color: $text-muted; margin-top: 1; }
-#sp-list     { height: 12; border: solid $primary-darken-2; }
+/* Library tab: the DataTable flexes to fill the (bounded) tab body. */
+#sp-list     { height: 1fr; min-height: 6; border: solid $primary-darken-2; }
 #sp-info     { height: 1; margin: 1 0; }
-#sp-fetch-row { height: 3; margin-top: 1; }
-#sp-fetch-row Input { width: 2fr; margin-right: 1; }
-#sp-fetch-row Button { width: 1fr; }
-#sp-btns     { height: 3; margin-top: 1; }
+#sp-lib-btns { height: 3; margin-top: 1; }
+#sp-lib-btns Button { margin-right: 1; min-width: 14; }
+/* Acquisition tabs (Fetch / Build / Import): help text + inputs + status. */
+#sp-fetch-help, #sp-genome-help, #sp-import-help { height: auto; padding: 0 1; }
+#sp-fetch-row, #sp-genome-row { height: 3; margin-top: 1; }
+#sp-fetch-row Input, #sp-genome-row Input { width: 1fr; margin-right: 1; }
+#sp-genome-mode { height: auto; margin-top: 1; }
+#sp-fetch-go-row, #sp-genome-go-row { height: 3; margin-top: 1; }
+#sp-import-text { height: 1fr; min-height: 6; margin-top: 1; border: solid $primary-darken-2; }
+#sp-import-row { height: 3; margin-top: 1; }
+#sp-import-row Input { width: 1fr; margin-right: 1; }
+#sp-fetch-status, #sp-genome-status, #sp-import-status { height: auto; min-height: 1; margin-top: 1; }
+#sp-btns     { height: 3; margin-top: 1; align-horizontal: right; }
 #sp-btns Button { margin-right: 1; }
 
 /* ── NCBI taxon picker modal (centered dialog — mirrors the species
@@ -116463,8 +116459,14 @@ NcbiTaxonPickerModal { align: center middle; }
         if name == "Mutato":
             self.action_open_mutagenize()
             return
-        # Synthesis is a dropdown (workspace + codon-table manager) — see the
-        # `menus` dict below; no direct-open branch.
+        if name == "Synthesis":
+            # Direct-open the gene-fragment composer (the pre-1.0.24
+            # behaviour). Codon-table management lives on the workspace's
+            # "Manage" button (the tabbed `SpeciesPickerModal`), the Settings
+            # entry, and the Mutato / Constructor codon pickers — so the
+            # menubar entry no longer needs an intermediate dropdown.
+            self.action_open_synthesis()
+            return
         if name == "Simulator":
             self.action_open_simulator()
             return
@@ -116489,10 +116491,6 @@ NcbiTaxonPickerModal { align: center middle; }
         # keyboard shortcuts (e.g. `r`) keep working via App.BINDINGS
         # independent of any menu.
         menus = {
-            "Synthesis": [
-                ("Synthesis workspace",          "open_synthesis"),
-                ("Codon tables (build / fetch)", "open_codon_tables"),
-            ],
             "File": [
                 ("Open file (.gb / .dna)  [^O]", "open_file"),
                 ("Fetch from NCBI  [f]",         "fetch"),
@@ -116687,22 +116685,27 @@ NcbiTaxonPickerModal { align: center middle; }
 
     @_action_log("app.open.synthesis")
     def action_open_synthesis(self) -> None:
-        """Synthesis menu → open the gene-synthesis composer screen.
+        """Synthesis menu (direct-open) → the gene-synthesis composer screen.
 
-        Full-screen workbench for penning a linear DNA fragment ready
-        for gene synthesis. Document model: load a linear plasmid from
-        the active library, edit bases / annotate features / insert
-        restriction sites, save back as the same library entry. New /
-        Save As / Rename available from the toolbar."""
+        Clicking "Synthesis" / Alt+Y opens this workbench straight away
+        (no dropdown). Full-screen workbench for penning a linear DNA
+        fragment ready for gene synthesis. Document model: load a linear
+        plasmid from the active library, edit bases / annotate features /
+        insert restriction sites, save back as the same library entry.
+        New / Save As / Rename available from the toolbar; codon tables
+        are managed from the Protein tab's "Manage" button."""
         self.push_screen(SynthesisScreen())
 
     @_action_log("app.open.codon_tables")
     def action_open_codon_tables(self) -> None:
-        """Synthesis menu → Codon tables: open the codon-table manager (browse,
-        Build from genome, Fetch from Kazusa, Import TSV). Picking a table with
-        "Use Selected" sets it as the active default for codon optimization
-        across Synthesis + Mutato (persisted via `active_codon_table` when the
-        table carries a taxid)."""
+        """Open the tabbed codon-table manager (Library / Fetch from Kazusa /
+        Build from genome / Import TSV). No longer a Synthesis-menu entry —
+        kept as a callable action for keybindings / command-palette access;
+        the GUI reaches the same manager from the Synthesis workspace's
+        "Manage" button and the Settings → Codon Tables entry. Picking a
+        table with "Use Selected" sets it as the active default for codon
+        optimization across Synthesis + Mutato (persisted via
+        `active_codon_table` when the table carries a taxid)."""
         def _picked(entry: "dict | None") -> None:
             if not isinstance(entry, dict):
                 return

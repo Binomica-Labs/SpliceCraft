@@ -228,23 +228,20 @@ class TestSynthesisScreen:
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
             await pilot.pause()
-            # Synthesis is now a dropdown (workspace / codon tables): opening
-            # the menu shows the DropdownScreen, and selecting the workspace
-            # row dispatches `action_open_synthesis`.
+            # Synthesis direct-opens the composer (no dropdown): opening the
+            # menu pushes the SynthesisScreen straight away.
             app.open_menu("Synthesis", 0, 0)
-            await pilot.pause()
-            assert isinstance(app.screen, sc.DropdownScreen)
-            app._menu_action("open_synthesis")
             await pilot.pause()
             await pilot.pause()
             assert isinstance(app.screen, sc.SynthesisScreen)
 
-    async def test_codon_tables_menu_opens_manager(self):
+    async def test_codon_tables_action_opens_manager(self):
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
             await pilot.pause()
-            # New Synthesis ▸ Codon tables entry opens the codon-table manager.
+            # The codon-table manager action (kept for keybindings / command
+            # palette; no longer a Synthesis-menu entry) opens the manager.
             app.action_open_codon_tables()
             await pilot.pause()
             await pilot.pause()

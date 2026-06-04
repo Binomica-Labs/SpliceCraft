@@ -174,12 +174,14 @@ horizontally-scrolling linear editor with anti-parallel strand markers, live
 feature stripes, restriction overlay, and AA translation, plus a feature
 library side-pane (Insert to splice, Annotate to overlay). The **Protein
 tab** lets you type or paste amino acids and watch the codons appear underneath
-using your chosen codon table — pick a different one or hit **Manage** to **build
-one straight from an NCBI genome** (give an assembly accession or a taxid, and
+using your chosen codon table — pick a different one or hit **Manage** to open
+the **tabbed codon-table manager**, where each way of getting a table has its
+own tab: **Build from genome** (give an NCBI assembly accession or a taxid, and
 choose highly-expressed genes — ribosomal proteins, the recommended bias for
-strong expression — or the whole genome), fetch one from Kazusa, import your own
-as a TSV, or delete one. The same manager is on the menu bar under **Synthesis ▸
-Codon tables**. Codons are reflected live — and a built-in motif library (His6, FLAG, HA, TEV,
+strong expression — or the whole genome), **Fetch (Kazusa)**, **Import TSV**,
+plus a **Library** tab to pick or delete. The same manager opens from
+**Settings ▸ Codon Tables** and the Mutato / Constructor codon pickers. Codons
+are reflected live — and a built-in motif library (His6, FLAG, HA, TEV,
 P2A, NLS, GS linkers, and ~30 more) inserts pre-colored tags. Hit **Optimize →
 DNA** to codon-optimize the protein (with the same stop-count and **Avoid
 sites** controls as Mutato) and hand the CDS straight to the DNA tab as an

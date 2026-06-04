@@ -164,7 +164,6 @@ _MODAL_CASES = [
     ("AminoAcidPickerModal",       lambda: sc.AminoAcidPickerModal(42, "W")),
     ("NcbiTaxonPickerModal",       lambda: sc.NcbiTaxonPickerModal("")),
     ("SpeciesPickerModal",         lambda: sc.SpeciesPickerModal()),
-    ("GenomeCodonBuilderModal",    lambda: sc.GenomeCodonBuilderModal()),
     ("ConstructorModal",           lambda: sc.ConstructorModal()),
     ("DomesticatorModal",          lambda: sc.DomesticatorModal("ATG" * 50,
                                                                  _make_feats())),

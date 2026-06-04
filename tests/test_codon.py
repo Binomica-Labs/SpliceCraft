@@ -11,6 +11,26 @@ import pytest
 import splicecraft as sc
 
 
+async def _settle_tab(pilot, tabs, want, tries=12):
+    """Drain the message queue until a `TabbedContent` reports `want` as its
+    active tab (Textual processes `.active` assignments asynchronously). Avoids
+    races when a test flips tabs and then immediately drives a callback."""
+    for _ in range(tries):
+        await pilot.pause()
+        if tabs.active == want:
+            return
+    return
+
+
+async def _switch_tab(pilot, tabs, want, initial="sp-tab-library"):
+    """Switch a `TabbedContent` to `want` robustly. A `.active` assignment made
+    before the content finishes mounting loses to the `initial` tab, so first
+    wait for `initial` to settle, then switch and settle on `want`."""
+    await _settle_tab(pilot, tabs, initial)
+    tabs.active = want
+    await _settle_tab(pilot, tabs, want)
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 class TestRegistry:
@@ -1284,10 +1304,11 @@ class TestParseCodonTsv:
             sc._parse_codon_tsv(None)   # type: ignore[arg-type]
 
     def test_import_modal_and_handler_exist(self):
-        # The paste-import feature is reachable: the modal class exists and
-        # SpeciesPickerModal wires an Import-TSV handler.
-        assert hasattr(sc, "CodonTsvImportModal")
+        # The paste-import + genome-build features are reachable as tabs in the
+        # codon-table manager: SpeciesPickerModal wires the handlers directly
+        # (the old standalone sub-modals were folded into tabs).
         assert hasattr(sc.SpeciesPickerModal, "_import_tsv")
+        assert hasattr(sc.SpeciesPickerModal, "_build_from_genome")
 
 
 # ── Reachability — Settings entry point + Synthesis live dropdown refresh ────
@@ -1775,6 +1796,295 @@ class TestNcbiTaxonPickerModalStyle:
             assert box.region.height < 43        # not full height
             # The list it wraps is present and styled as a bordered list.
             assert app.screen.query_one("#ncbi-list") is not None
+
+
+class TestCodonManagerTabs:
+    """The codon-table manager (`SpeciesPickerModal`) is a tabbed modal:
+    Library / Fetch (Kazusa) / Build from genome / Import TSV. Library is the
+    picker; the other three add a table to the registry and bounce back to
+    Library with the new row selected. (The genome-build + TSV-import flows
+    were folded in from their old standalone sub-modals.)"""
+
+    async def test_manager_has_four_tabs(self):
+        from textual.widgets import TabbedContent, TabPane
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SpeciesPickerModal())
+            await pilot.pause(0.3)
+            modal = app.screen
+            pane_ids = {p.id for p in modal.query(TabPane)}
+            assert {"sp-tab-library", "sp-tab-fetch",
+                    "sp-tab-genome", "sp-tab-import"} <= pane_ids
+            # Library is the initial tab and hosts the picker DataTable.
+            tabs = modal.query_one("#sp-tabs", TabbedContent)
+            assert tabs.active == "sp-tab-library"
+            assert modal.query_one("#sp-list") is not None
+            app.exit()
+
+    async def test_import_tab_adds_and_selects(self, monkeypatch):
+        """Pasting a valid TSV + Import adds the table (real `_parse_codon_tsv`)
+        and folds back to the Library tab with the new row selected."""
+        from textual.widgets import TabbedContent, TextArea, DataTable, Button
+        added = {}
+
+        def fake_add(name, taxid, raw, source="user"):
+            entry = {"name": name, "taxid": taxid, "raw": raw, "source": source}
+            added["entry"] = entry
+            return entry
+
+        monkeypatch.setattr(sc, "_codon_tables_add", fake_add)
+        monkeypatch.setattr(
+            sc, "_codon_search",
+            lambda q="": ([dict(added["entry"])] if "entry" in added else []))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SpeciesPickerModal())
+            await pilot.pause(0.3)
+            modal = app.screen
+            tabs = modal.query_one("#sp-tabs", TabbedContent)
+            await _switch_tab(pilot, tabs, "sp-tab-import")
+            modal.query_one("#sp-import-text", TextArea).text = (
+                "ATG\tM\t100\nGCT\tA\t40\n")
+            modal.query_one("#btn-sp-import-go", Button).action_press()
+            await _settle_tab(pilot, tabs, "sp-tab-library")
+            assert added.get("entry", {}).get("name") == "Custom codon table"
+            assert added["entry"]["source"] == "user"
+            # Folded back to Library with the new row present + selected.
+            assert tabs.active == "sp-tab-library"
+            assert len(modal.query_one("#sp-list", DataTable).rows) >= 1
+            app.exit()
+
+    async def test_import_bad_tsv_shows_error_no_switch(self, monkeypatch):
+        """A parse error keeps the user on the Import tab with a red status —
+        no table added, no tab switch."""
+        from textual.widgets import TabbedContent, TextArea, Button, Static
+        monkeypatch.setattr(
+            sc, "_codon_tables_add",
+            lambda *a, **k: pytest.fail("must not add on parse error"))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SpeciesPickerModal())
+            await pilot.pause(0.3)
+            modal = app.screen
+            tabs = modal.query_one("#sp-tabs", TabbedContent)
+            await _switch_tab(pilot, tabs, "sp-tab-import")
+            # ATG is Met, not Ala → _parse_codon_tsv raises ValueError.
+            modal.query_one("#sp-import-text", TextArea).text = "ATG\tA\t5\n"
+            modal.query_one("#btn-sp-import-go", Button).action_press()
+            await pilot.pause(0.2)
+            assert tabs.active == "sp-tab-import"
+            assert "failed" in str(modal.query_one(
+                "#sp-import-status", Static).render()).lower()
+            app.exit()
+
+    async def test_genome_build_done_adds_and_selects(self, monkeypatch):
+        """The post-build callback persists with source='genome' and folds back
+        to Library (the worker is just a thread wrapper around the pure
+        `_genome_build_codon_table`, so we drive the callback directly)."""
+        from textual.widgets import TabbedContent, DataTable
+        added = {}
+
+        def fake_add(name, taxid, raw, source="user"):
+            entry = {"name": name, "taxid": taxid, "raw": raw, "source": source}
+            added["entry"] = entry
+            return entry
+
+        monkeypatch.setattr(sc, "_codon_tables_add", fake_add)
+        monkeypatch.setattr(
+            sc, "_codon_search",
+            lambda q="": ([dict(added["entry"])] if "entry" in added else []))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SpeciesPickerModal())
+            await pilot.pause(0.3)
+            modal = app.screen
+            tabs = modal.query_one("#sp-tabs", TabbedContent)
+            await _switch_tab(pilot, tabs, "sp-tab-genome")
+            meta = {"organism": "Enterococcus faecium",
+                    "accession": "GCF_009734005.1", "taxid": "1352",
+                    "stats": {"mode": "heg", "n_cds_total": 60,
+                              "n_codons": 7475}}
+            modal._genome_build_done("", {"GCT": ("A", 10)}, "ok", meta)
+            await _settle_tab(pilot, tabs, "sp-tab-library")
+            assert added["entry"]["source"] == "genome"
+            assert added["entry"]["taxid"] == "1352"
+            assert tabs.active == "sp-tab-library"
+            assert len(modal.query_one("#sp-list", DataTable).rows) >= 1
+            assert modal._building is False
+            app.exit()
+
+    async def test_build_empty_query_shows_error(self):
+        """Build with no accession/taxid → red status, no worker kicked off."""
+        from textual.widgets import TabbedContent, Button, Static
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SpeciesPickerModal())
+            await pilot.pause(0.3)
+            modal = app.screen
+            tabs = modal.query_one("#sp-tabs", TabbedContent)
+            await _switch_tab(pilot, tabs, "sp-tab-genome")
+            modal.query_one("#btn-sp-genome-go", Button).action_press()
+            await pilot.pause(0.1)
+            assert modal._building is False
+            assert "enter" in str(modal.query_one(
+                "#sp-genome-status", Static).render()).lower()
+            app.exit()
+
+    async def test_fetch_done_adds_and_selects(self, monkeypatch):
+        """The Kazusa post-fetch callback persists with source='kazusa' and
+        folds back to Library (worker wraps `_codon_fetch_kazusa`)."""
+        from textual.widgets import TabbedContent, DataTable
+        added = {}
+
+        def fake_add(name, taxid, raw, source="user"):
+            entry = {"name": name, "taxid": taxid, "raw": raw, "source": source}
+            added["entry"] = entry
+            return entry
+
+        monkeypatch.setattr(sc, "_codon_tables_add", fake_add)
+        monkeypatch.setattr(
+            sc, "_codon_search",
+            lambda q="": ([dict(added["entry"])] if "entry" in added else []))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SpeciesPickerModal())
+            await pilot.pause(0.3)
+            modal = app.screen
+            tabs = modal.query_one("#sp-tabs", TabbedContent)
+            await _switch_tab(pilot, tabs, "sp-tab-fetch")
+            modal._fetch_done("9606", "Homo sapiens",
+                              {"GCT": ("A", 10)}, "Fetched 1 table")
+            await _settle_tab(pilot, tabs, "sp-tab-library")
+            assert added["entry"]["source"] == "kazusa"
+            assert added["entry"]["taxid"] == "9606"
+            assert tabs.active == "sp-tab-library"
+            assert len(modal.query_one("#sp-list", DataTable).rows) >= 1
+            app.exit()
+
+    async def test_add_clears_stale_filter_to_show_new_row(self, monkeypatch):
+        """A leftover Library filter that hides the new table is cleared on
+        add, so the row is always visible + selected (and the programmatic
+        clear doesn't clobber the cursor)."""
+        from textual.widgets import TabbedContent, TextArea, DataTable, Input, Button
+        added = {}
+
+        def fake_add(name, taxid, raw, source="user"):
+            entry = {"name": name, "taxid": taxid, "raw": raw, "source": source}
+            added["entry"] = entry
+            return entry
+
+        # The new entry only surfaces under an EMPTY query — i.e. the stale
+        # "zzz" filter must actually be cleared for the row to appear.
+        monkeypatch.setattr(sc, "_codon_tables_add", fake_add)
+        monkeypatch.setattr(
+            sc, "_codon_search",
+            lambda q="": ([dict(added["entry"])]
+                          if ("entry" in added and not q) else []))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SpeciesPickerModal())
+            await pilot.pause(0.3)
+            modal = app.screen
+            tabs = modal.query_one("#sp-tabs", TabbedContent)
+            await _settle_tab(pilot, tabs, "sp-tab-library")
+            modal.query_one("#sp-filter", Input).value = "zzz-no-match"
+            await pilot.pause(0.1)
+            assert len(modal.query_one("#sp-list", DataTable).rows) == 0
+            await _switch_tab(pilot, tabs, "sp-tab-import")
+            modal.query_one("#sp-import-text", TextArea).text = "ATG\tM\t9\n"
+            modal.query_one("#btn-sp-import-go", Button).action_press()
+            await _settle_tab(pilot, tabs, "sp-tab-library")
+            await pilot.pause(0.2)
+            # Filter cleared, new row visible + cursor parked on it.
+            assert modal.query_one("#sp-filter", Input).value == ""
+            dt = modal.query_one("#sp-list", DataTable)
+            assert len(dt.rows) == 1
+            assert dt.cursor_row == 0
+            app.exit()
+
+    async def test_build_guard_blocks_concurrent_press(self, monkeypatch):
+        """A second Build press while one is in flight is ignored — no second
+        worker / network round-trip."""
+        from textual.widgets import TabbedContent, Input, Button
+        called = {"n": 0}
+
+        def fake_build(q, m):
+            called["n"] += 1
+            return ({"GCT": ("A", 1)}, "ok",
+                    {"taxid": "1", "accession": "X", "organism": "o",
+                     "stats": {"mode": "heg", "n_cds_total": 1, "n_codons": 1}})
+
+        monkeypatch.setattr(sc, "_genome_build_codon_table", fake_build)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SpeciesPickerModal())
+            await pilot.pause(0.3)
+            modal = app.screen
+            tabs = modal.query_one("#sp-tabs", TabbedContent)
+            await _switch_tab(pilot, tabs, "sp-tab-genome")
+            modal.query_one("#sp-genome-query", Input).value = "1352"
+            # Simulate a build already running, then press again.
+            modal._building = True
+            modal.query_one("#btn-sp-genome-go", Button).action_press()
+            await pilot.pause(0.2)
+            assert called["n"] == 0   # guard short-circuited; no worker dispatched
+            app.exit()
+
+    async def test_imported_table_round_trips_through_optimize(self):
+        """Deep biological check (REAL registry, sandboxed by conftest): a
+        table imported via the Import tab is stored byte-for-byte intact AND
+        drives a correct optimization — every body codon encodes the intended
+        residue, output is ACGT-only and in-frame, trailing codon is a stop."""
+        from textual.widgets import TabbedContent, TextArea, Input, Button
+        # Complete table: all 64 codons, count 1 — covers all 20 AAs + stop.
+        tsv = "".join(f"{codon}\t{aa}\t1\n"
+                      for codon, aa in sc._CODON_GENETIC_CODE.items())
+        expect_raw = sc._parse_codon_tsv(tsv)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SpeciesPickerModal())
+            await pilot.pause(0.3)
+            modal = app.screen
+            tabs = modal.query_one("#sp-tabs", TabbedContent)
+            await _switch_tab(pilot, tabs, "sp-tab-import")
+            modal.query_one("#sp-import-name", Input).value = "RoundTrip Table"
+            modal.query_one("#sp-import-text", TextArea).text = tsv
+            modal.query_one("#btn-sp-import-go", Button).action_press()
+            await _settle_tab(pilot, tabs, "sp-tab-library")
+            await pilot.pause(0.2)
+            app.exit()
+        # 1. Stored intact — no corruption in the UI → registry plumbing.
+        stored = sc._codon_tables_get("RoundTrip Table")
+        assert stored is not None, "imported table missing from registry"
+        assert stored["raw"] == expect_raw, "raw codon table corrupted on store"
+        # 2. Biologically usable + correct: optimize a 20-AA protein + stop.
+        protein = "MKAILVFWYGSTPNQDECRH*"
+        body = protein.rstrip("*")
+        cds = sc._codon_optimize(protein, stored["raw"])
+        assert set(cds) <= set("ACGT"), "optimized CDS has non-ACGT bases"
+        assert len(cds) % 3 == 0, "optimized CDS not in frame"
+        codons = [cds[i:i + 3] for i in range(0, len(cds), 3)]
+        for res, codon in zip(body, codons):
+            assert sc._CODON_GENETIC_CODE[codon] == res, (
+                f"{codon} encodes {sc._CODON_GENETIC_CODE[codon]}, want {res}")
+        assert sc._CODON_GENETIC_CODE[codons[len(body)]] == "*", \
+            "trailing codon is not a stop"
+
+    def test_incomplete_table_optimize_raises_clear(self):
+        """Biological safety net: a partial table (missing an amino acid) fails
+        LOUDLY in optimization — never silently emits a wrong/empty codon."""
+        raw = sc._parse_codon_tsv("ATG\tM\t9\nGCT\tA\t4\n")   # only M and A
+        with pytest.raises(ValueError):
+            sc._codon_optimize("MAK", raw)   # K has no codon → must raise
 
 
 class TestPickerDataTables:

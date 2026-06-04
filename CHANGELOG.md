@@ -14,6 +14,19 @@
 
 ---
 
+## [1.0.25] — 2026-06-04
+
+### New features
+
+- **The codon-table manager is one tabbed window now.** Browsing, **Fetch from Kazusa**, **Build from genome**, and **Import TSV** each get their own roomy tab instead of being crammed into a single pane with pop-up dialogs stacked on top. Add a table on any tab and you land back on the **Library** tab with the new table highlighted and ready to **Use Selected**. The manager opens from the Synthesis composer's **Manage** button, **Settings ▸ Codon Tables**, and the Mutato / Constructor codon pickers.
+
+### Bug fixes
+
+- **Synthesis opens the composer in one click again.** The brief two-item Synthesis dropdown added last release is gone — clicking **Synthesis** (or Alt+Y) jumps straight into the gene-fragment composer as before. Codon tables moved into the tabbed manager above (reachable from the composer's **Manage** button and **Settings ▸ Codon Tables**).
+- **Codon-table TSV import hint reads correctly.** The "one row per codon: codon `[amino acid]` count" help was silently dropping the optional `[amino acid]` column from the line; it now shows in full.
+
+---
+
 ## [1.0.24] — 2026-06-04
 
 ### New features
