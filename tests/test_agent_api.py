@@ -2673,3 +2673,51 @@ class TestSimulatorAgentRegistration:
         eps = {ep["name"]: ep for ep in sc._h_tools(None, {})["endpoints"]}
         assert "simulate-gel" in eps
         assert eps["simulate-gel"]["write"] is False
+
+
+class TestAddCodonTableGenome:
+    """`add-codon-table` source='genome' branch. The NCBI Datasets fetch is
+    monkeypatched (no network); validation + save wiring are exercised."""
+
+    def test_missing_accession_and_taxid(self):
+        result = sc._h_add_codon_table(None, {"source": "genome"})
+        payload, status = result
+        assert status == 400
+        assert "accession" in payload["error"]
+
+    def test_bad_mode_rejected(self):
+        result = sc._h_add_codon_table(
+            None, {"source": "genome", "taxid": "1352", "mode": "best"})
+        payload, status = result
+        assert status == 400
+        assert "mode" in payload["error"]
+
+    def test_happy_path_builds_and_saves(self, monkeypatch):
+        fake_raw = {"GCT": ("A", 100), "ATG": ("M", 30), "TAA": ("*", 5)}
+
+        def fake_build(query, mode, timeout=60.0):
+            return fake_raw, "built ok", {
+                "accession": "GCF_TEST.1",
+                "taxid": query if str(query).isdigit() else "",
+                "organism": "Testus organismus",
+                "stats": {"mode": mode, "n_cds_total": 7, "n_codons": 135},
+            }
+        monkeypatch.setattr(sc, "_genome_build_codon_table", fake_build)
+        result = sc._h_add_codon_table(
+            None, {"source": "genome", "taxid": "1352", "mode": "heg"})
+        assert result["ok"] is True
+        assert result["entry"]["source"] == "genome"
+        assert result["entry"]["taxid"] == "1352"
+        got = sc._codon_tables_get("1352")
+        assert got is not None and got["source"] == "genome"
+        assert got["name"] == "Testus organismus"   # default from organism
+
+    def test_build_failure_returns_502(self, monkeypatch):
+        monkeypatch.setattr(
+            sc, "_genome_build_codon_table",
+            lambda q, m, timeout=60.0: (None, "no such assembly", None))
+        result = sc._h_add_codon_table(
+            None, {"source": "genome", "accession": "GCF_000000000.0"})
+        payload, status = result
+        assert status == 502
+        assert "no such assembly" in payload["error"]

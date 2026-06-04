@@ -14,6 +14,18 @@
 
 ---
 
+## [1.0.24] — 2026-06-04
+
+### New features
+
+- **Build a codon-usage table straight from a genome.** The codon-table manager has a new **Build from genome** option: give it an NCBI assembly accession (`GCF_…`/`GCA_…`) or just a taxid, and SpliceCraft fetches that genome's coding sequences and builds a usage table for you — no command line, no scripts. Choose **Highly-expressed genes (ribosomal proteins)** — the recommended bias for strong heterologous expression — or **Whole genome**. The table joins your library and works everywhere codon optimization does (Synthesis, Mutato). The manager is now reachable straight from the menu bar under **Synthesis ▸ Codon tables** (the Synthesis menu is a short dropdown: *Synthesis workspace* / *Codon tables*), as well as the Synthesis screen's **Manage** button. Automation can build tables too, via the `add-codon-table` agent endpoint with `source: "genome"`.
+
+### Hardening
+
+- **The genome builder is defensive end to end.** The download is size-capped and retried once on a transient hiccup, redirects are bounded and kept on HTTPS, and the archive is opened with zip-bomb guards. A bad accession, a taxid with no reference genome, an assembly with no annotated genes, or an oversized (e.g. large eukaryotic) download each surface a clear, specific message instead of failing obscurely. Ribosomal-protein tables automatically backfill any amino acid the r-proteins happen to lack (some are cysteine- or tryptophan-poor), so every protein still optimizes cleanly.
+
+---
+
 ## [1.0.23] — 2026-06-03
 
 ### Performance

@@ -2049,3 +2049,78 @@ class TestForbiddenSitesModalAndButtons:
             btn = app.screen.query_one("#btn-syn-forbidden")
             assert str(btn.label).startswith("Avoid sites")
             app.exit()
+
+
+# ── Genome → HEG codon-table builder (pure) ───────────────────────────────────
+
+class TestHegBuilder:
+    """`_build_heg_table_from_cds` — pure FASTA → {codon: (aa, count)} builder.
+    No network; an inline CDS FASTA stands in for `cds_from_genomic.fna`."""
+
+    _FASTA = "\n".join([
+        ">lcl|X_cds_1 [gene=rplB] [protein=50S ribosomal protein L2]",
+        "ATGAAAGCTCGT",     # M K A R   (ribosomal -> HEG)
+        ">lcl|X_cds_2 [gene=dnaA] [protein=replication initiator]",
+        "ATGTGGTGGTGG",     # M W W W   (non-HEG; supplies Trp)
+        ">lcl|X_cds_3 [gene=rimI] [protein=ribosomal protein S18-alanine "
+        "N-acetyltransferase]",
+        "ATGTGTTGT",        # M C C     (transferase -> excluded; supplies Cys)
+    ])
+
+    def test_heg_counts_only_ribosomal(self):
+        raw, stats = sc._build_heg_table_from_cds(self._FASTA, "heg")
+        assert stats["n_cds_total"] == 3 and stats["n_cds_heg"] == 1
+        assert raw["AAA"] == ("K", 1) and raw["CGT"] == ("R", 1)
+
+    def test_heg_backfills_missing_amino_acids(self):
+        # r-proteins can be Cys/Trp-poor; missing residues backfill from genome.
+        raw, stats = sc._build_heg_table_from_cds(self._FASTA, "heg")
+        assert raw["TGG"][0] == "W" and raw["TGT"][0] == "C"
+        assert stats["backfilled"] == ["C", "W"]
+
+    def test_transferase_not_counted_as_ribosomal(self):
+        # rimI carries "ribosomal protein" but is a transferase, so it's NOT
+        # part of the HEG set. Its two Cys (TGT TGT) reach the HEG table only
+        # via backfill from the whole-genome counts -> ("C", 2).
+        raw, _ = sc._build_heg_table_from_cds(self._FASTA, "heg")
+        assert raw["TGT"] == ("C", 2)
+
+    def test_genome_mode_counts_all_cds_no_backfill(self):
+        raw, stats = sc._build_heg_table_from_cds(self._FASTA, "genome")
+        assert stats["n_cds_total"] == 3 and stats["backfilled"] == []
+        assert raw["TGG"] == ("W", 3)
+
+    def test_built_table_optimizes_cys_trp_protein(self):
+        raw, _ = sc._build_heg_table_from_cds(self._FASTA, "heg")
+        dna = sc._codon_optimize("MWCKAR", raw, stops=1)
+        assert sc._mut_translate(dna) == "MWCKAR"
+
+    def test_skips_non_acgt_and_partial_codons(self):
+        fasta = (">x [gene=rplA] [protein=50S ribosomal protein L1]\n"
+                 "ATGNNNAAAGC\n")          # NNN dropped; trailing GC not in frame
+        raw, stats = sc._build_heg_table_from_cds(fasta, "genome")
+        assert raw == {"ATG": ("M", 1), "AAA": ("K", 1)}
+        assert stats["n_codons"] == 2
+
+    def test_empty_and_bad_mode_raise(self):
+        with pytest.raises(ValueError):
+            sc._build_heg_table_from_cds("", "genome")
+        with pytest.raises(ValueError, match="unknown mode"):
+            sc._build_heg_table_from_cds(self._FASTA, "bogus")
+
+    def test_no_ribosomal_cds_raises_in_heg_mode(self):
+        non_heg = ">x [gene=dnaA] [protein=foo]\nATGGCT\n"
+        with pytest.raises(ValueError, match="ribosomal"):
+            sc._build_heg_table_from_cds(non_heg, "heg")
+        raw, _ = sc._build_heg_table_from_cds(non_heg, "genome")
+        assert raw["GCT"] == ("A", 1)
+
+    def test_genome_build_rejects_injection_accession(self):
+        # Malformed accessions (URL / shell metacharacters) are rejected
+        # offline — `_sanitize_accession` at the shared chokepoint, BEFORE any
+        # request is built. Covers the modal path, which doesn't pre-sanitize.
+        for bad in ("GCF_1/../../etc?x=y", "GCF_009; rm -rf /",
+                    "../secret", "GCF 009734005.1", "http://evil/x"):
+            raw, msg, meta = sc._genome_build_codon_table(bad, "heg")
+            assert raw is None and meta is None, bad
+            assert "accession" in msg.lower() or "taxid" in msg.lower(), msg

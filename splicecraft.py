@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.23"
+__version__ = "1.0.24"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -43273,6 +43273,125 @@ def _parse_codon_tsv(text: str) -> dict:
     return raw
 
 
+def _build_heg_table_from_cds(cds_fasta_text: str,
+                              mode: str = "heg") -> "tuple[dict, dict]":
+    """Build a codon-usage table from a genome's CDS FASTA (the
+    ``cds_from_genomic.fna`` shape NCBI Datasets ships). Pure — no I/O, no
+    network — so it unit-tests against an inline FASTA string.
+
+    ``mode``:
+      * ``"heg"``    — count only highly-expressed genes (ribosomal proteins),
+        the right signal for heterologous-expression optimization. Amino acids
+        absent from the r-protein set (ribosomal proteins can be Cys/Trp-poor)
+        are BACKFILLED from the whole-genome counts so every protein still
+        optimizes — backfill only supplies a synonym pool for an otherwise-
+        missing residue; it never overrides the HEG bias where it exists.
+      * ``"genome"`` — count every CDS (whole-genome average; what Kazusa
+        approximates).
+
+    Returns ``(raw, stats)`` where ``raw`` is the ``{codon: (aa, count)}``
+    registry shape consumed by `_codon_optimize` / `_codon_tables_add`, and
+    ``stats`` carries mode / n_cds_total / n_cds_heg / n_codons / aa_coverage /
+    backfilled / gc3 for the status line. Each record is read in frame 0 (CDS
+    FASTA is in-frame); codons containing non-ACGT (N, gaps) are skipped — a
+    codon is counted iff it is one of the 64 keys of `_CODON_GENETIC_CODE`.
+
+    Raises ``ValueError`` on an unknown ``mode``, when no usable CDS were found,
+    or (heg mode) when the genome carries no ribosomal-protein CDS — callers
+    surface it in a status line.
+    """
+    if mode not in ("heg", "genome"):
+        raise ValueError(f"unknown mode {mode!r} (expected 'heg' or 'genome')")
+    import io
+    from collections import Counter
+
+    def _is_rprotein(header: str) -> bool:
+        h = header.lower()
+        if "transferase" in h:           # rimI / prmA modification enzymes
+            return False                 # carry "ribosomal protein" but aren't one
+        if "ribosomal protein" in h:
+            return True
+        # NCBI cds_from_genomic deflines carry [gene=rplB] / [gene=rpsL] /
+        # [gene=rpmA] for the 50S/30S/large-subunit r-proteins.
+        return bool(re.search(r"\[gene=rp[lsm]", h))
+
+    genome_counts: "Counter" = Counter()
+    heg_counts: "Counter" = Counter()
+    n_cds_total = 0
+    n_cds_heg = 0
+
+    def _consume(hdr: "str | None", parts: list) -> None:
+        """Count one CDS record's in-frame ACGT codons into the two Counters."""
+        nonlocal n_cds_total, n_cds_heg
+        if hdr is None:
+            return
+        s = "".join(parts).upper().replace("U", "T")
+        usable = (len(s) // 3) * 3
+        if usable <= 0:
+            return
+        n_cds_total += 1
+        is_heg = _is_rprotein(hdr)
+        if is_heg:
+            n_cds_heg += 1
+        for i in range(0, usable, 3):
+            codon = s[i:i + 3]
+            if codon in _CODON_GENETIC_CODE:   # 64 ACGT keys → skips N/gaps
+                genome_counts[codon] += 1
+                if is_heg:
+                    heg_counts[codon] += 1
+
+    # Stream line-by-line (lazy — avoids materialising a whole-file line list
+    # AND a records list; at the 256 MB download cap that's the difference
+    # between ~1× and ~2-3× the input in peak memory). Each record is consumed
+    # the instant its sequence is complete; only one record is held at a time.
+    header: "str | None" = None
+    seq_parts: list = []
+    for raw_line in io.StringIO(cds_fasta_text):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            _consume(header, seq_parts)
+            header = line[1:].strip()
+            seq_parts = []
+        else:
+            seq_parts.append(line)
+    _consume(header, seq_parts)
+
+    if not genome_counts:
+        raise ValueError("no usable CDS found — expected an in-frame CDS "
+                         "FASTA (e.g. NCBI cds_from_genomic.fna)")
+    base = heg_counts if mode == "heg" else genome_counts
+    if not base:
+        raise ValueError("no highly-expressed (ribosomal-protein) CDS found "
+                         "in this genome — try whole-genome mode")
+
+    raw: dict = {c: (_CODON_GENETIC_CODE[c], int(n)) for c, n in base.items()}
+    backfilled: list = []
+    if mode == "heg":
+        have_aa = {_CODON_GENETIC_CODE[c] for c in raw}
+        for c, n in genome_counts.items():
+            aa = _CODON_GENETIC_CODE[c]
+            if aa not in have_aa:
+                raw[c] = (aa, int(n))
+                if aa not in backfilled:
+                    backfilled.append(aa)
+
+    n_codons = sum(n for _aa, n in raw.values())
+    gc3 = ((sum(n for c, (_aa, n) in raw.items() if c[2] in "GC")
+            / n_codons * 100) if n_codons else 0.0)
+    stats = {
+        "mode":        mode,
+        "n_cds_total": n_cds_total,
+        "n_cds_heg":   n_cds_heg,
+        "n_codons":    n_codons,
+        "aa_coverage": len({_aa for _aa, _n in raw.values()} - {"*"}),
+        "backfilled":  sorted(backfilled),
+        "gc3":         round(gc3, 1),
+    }
+    return raw, stats
+
+
 def _codon_name_parts(name: str) -> tuple[str, str]:
     """Return (genus, species) as lowercased tokens from an entry name.
 
@@ -43545,6 +43664,13 @@ def _ncbi_taxid_search_terms(query: str) -> list[str]:
 # 4 MB is wildly generous. Kazusa showcodon HTML is ~30 KB; 1 MB is plenty.
 _NCBI_MAX_RESPONSE_BYTES   = 4 * 1024 * 1024
 _KAZUSA_MAX_RESPONSE_BYTES = 1 * 1024 * 1024
+# NCBI Datasets CDS-FASTA zip download (codon-table genome builder). A
+# bacterial genome's CDS set zips to ~1 MB; 256 MB caps a hostile / oversized
+# response. The builder targets prokaryotic hosts — an accidentally-eukaryotic
+# CDS set trips this cap and surfaces a "use a smaller / prokaryotic genome"
+# error rather than ballooning memory.
+_NCBI_CDS_ZIP_MAX_BYTES    = 256 * 1024 * 1024
+_NCBI_DATASETS_TIMEOUT_S   = 60.0
 
 
 def _ncbi_taxid_search(query: str, retmax: int = 200,
@@ -43703,6 +43829,168 @@ def _codon_fetch_kazusa(taxid: str, timeout: float = 15.0) -> tuple:
     if raw is None:
         return None, f"Could not parse Kazusa table for taxid {taxid}"
     return raw, f"Fetched from Kazusa: {len(raw)} codons (taxid {taxid})"
+
+
+# ── Genome → codon table (NCBI Datasets HEG builder) ──────────────────────────
+# Build a codon-usage table from a genome's CDS instead of Kazusa: resolve a
+# taxid → RefSeq reference accession, download the CDS_FASTA zip from the NCBI
+# Datasets v2 API, extract the in-frame `cds_from_genomic.fna`, hand it to
+# `_build_heg_table_from_cds`. Network reads are size-capped + retried once
+# (250 ms) through the shared hardened opener ([PIT-20] / [RECIPE] "New HTTP
+# fetch"); the zip is opened with the existing zip-safety guards. Worker-thread
+# helpers — never call from the UI thread.
+_NCBI_DATASETS_BASE = "https://api.ncbi.nlm.nih.gov/datasets/v2"
+
+
+def _genome_datasets_request(url: str, max_bytes: int, timeout: float) -> bytes:
+    """GET `url` through the shared hardened opener, one 250 ms-backoff retry on
+    transient errors, body bounded at `max_bytes` (ValueError if exceeded —
+    [PIT-20]). HTTP/URL errors propagate for the caller to message."""
+    import socket
+    import time as _time
+    import urllib.error
+    import urllib.request
+    opener = _build_hardened_url_opener()
+    req = urllib.request.Request(
+        url, headers={"User-Agent": f"SpliceCraft/{__version__}"})
+    last_exc: "BaseException | None" = None
+    for attempt in range(2):                       # 1 try + 1 retry
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                body = resp.read(max_bytes + 1)
+            if len(body) > max_bytes:
+                raise ValueError(
+                    f"response exceeded {max_bytes:,}-byte cap "
+                    f"(genome too large — try a prokaryote / smaller assembly)")
+            return body
+        except urllib.error.HTTPError:
+            raise                                  # 4xx/5xx is permanent
+        except (urllib.error.URLError, socket.timeout) as exc:
+            last_exc = exc
+            if attempt == 0:
+                _time.sleep(_HMM_DB_RETRY_BACKOFF_S)
+                continue
+            raise
+    assert last_exc is not None                    # unreachable
+    raise last_exc
+
+
+def _genome_resolve_reference_accession(
+        taxid: str, timeout: float = _NCBI_DATASETS_TIMEOUT_S) -> tuple:
+    """Resolve an NCBI taxid → its RefSeq reference-genome assembly accession.
+    Returns (accession, organism_name) on success or (None, error_message)."""
+    import json as _json
+    taxid = str(taxid).strip()
+    if not taxid.isdigit():
+        return None, f"Invalid taxid '{taxid}' (must be numeric)"
+    url = (f"{_NCBI_DATASETS_BASE}/genome/taxon/{taxid}/dataset_report"
+           f"?filters.reference_only=true&filters.assembly_source=refseq"
+           f"&page_size=1")
+    try:
+        body = _genome_datasets_request(url, _NCBI_MAX_RESPONSE_BYTES, timeout)
+        report = _json.loads(body.decode("utf-8", errors="replace"))
+    except ValueError as exc:                      # size cap / malformed JSON
+        return None, f"Could not read assembly report for taxid {taxid}: {exc}"
+    except Exception as exc:                        # network / HTTP
+        _log.exception("Datasets taxon resolve failed for %s", taxid)
+        return None, f"Could not resolve taxid {taxid}: {exc}"
+    reports = report.get("reports") if isinstance(report, dict) else None
+    if not reports:
+        return None, (f"No RefSeq reference genome for taxid {taxid} — supply a "
+                      f"specific assembly accession (GCF_…) instead")
+    rec = reports[0] or {}
+    acc = str(rec.get("accession", "") or "")
+    org = rec.get("organism") if isinstance(rec.get("organism"), dict) else {}
+    name = str((org or {}).get("organism_name", "") or "")
+    if not acc:
+        return None, f"Reference assembly for taxid {taxid} carried no accession"
+    return acc, name
+
+
+def _genome_extract_cds_fasta(zip_bytes: bytes) -> str:
+    """Extract the `cds_from_genomic.fna` member from an in-memory NCBI Datasets
+    CDS zip, reusing the zip-safety guards (`_is_safe_zip_member_name`, member-
+    size cap, bounded read — [SUB-plasmidsaurus]). ValueError when the archive
+    is not a zip, carries no CDS FASTA (unannotated assembly), or trips a cap."""
+    import io
+    import zipfile
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zf:
+            member = next(
+                (info for info in zf.infolist()
+                 if info.filename.endswith("cds_from_genomic.fna")
+                 and _is_safe_zip_member_name(info.filename)), None)
+            if member is None:
+                raise ValueError(
+                    "assembly has no annotated CDS (no cds_from_genomic.fna) — "
+                    "try a RefSeq (GCF_) accession that includes annotation")
+            if member.file_size > _NCBI_CDS_ZIP_MAX_BYTES:
+                raise ValueError(
+                    f"CDS member too large ({member.file_size:,} bytes; cap "
+                    f"{_NCBI_CDS_ZIP_MAX_BYTES:,})")
+            with zf.open(member, "r") as fh:
+                raw = fh.read(_NCBI_CDS_ZIP_MAX_BYTES + 1)
+    except zipfile.BadZipFile:
+        raise ValueError("downloaded file is not a valid zip — the assembly "
+                         "accession may not exist or has no CDS download")
+    if len(raw) > _NCBI_CDS_ZIP_MAX_BYTES:
+        raise ValueError("CDS member exceeded cap during decompression "
+                         "— possible zip-bomb")
+    return raw.decode("utf-8", errors="replace")
+
+
+def _genome_build_codon_table(
+        query: str, mode: str = "heg",
+        timeout: float = _NCBI_DATASETS_TIMEOUT_S) -> tuple:
+    """Build a codon table from an NCBI genome. `query` is an assembly accession
+    (`GCF_…`/`GCA_…`) or an NCBI taxid (digits → resolve to the RefSeq reference
+    assembly). `mode` is 'heg' or 'genome'. Returns (raw_or_None, message,
+    meta_or_None); meta carries accession / taxid / organism / stats for the
+    caller's display name + saved entry. Worker-thread only (network + parse)."""
+    query = str(query or "").strip()
+    if not query:
+        return None, "Enter a genome assembly accession (GCF_…) or NCBI taxid", None
+    if mode not in ("heg", "genome"):
+        return None, f"Invalid mode '{mode}' (expected 'heg' or 'genome')", None
+    taxid = ""
+    organism = ""
+    accession = query
+    if query.isdigit():
+        taxid = query
+        resolved, info = _genome_resolve_reference_accession(query, timeout)
+        if resolved is None:
+            return None, info, None                # info = error message
+        accession, organism = resolved, info       # info = organism name
+    # Sanitize before the accession reaches the request URL — blocks path /
+    # query injection (e.g. "GCF_1/../x?y=z") from the un-sanitized modal
+    # input; the taxid path is already digit-only. `_sanitize_accession`
+    # permits the GCF_…/GCA_… charset and rejects URL/shell metacharacters.
+    accession = _sanitize_accession(accession) or ""
+    if not accession.upper().startswith(("GCF_", "GCA_")):
+        return None, (f"'{query}' is not a valid assembly accession "
+                      f"(expected GCF_… / GCA_…) or a numeric taxid"), None
+    url = (f"{_NCBI_DATASETS_BASE}/genome/accession/{accession}/download"
+           f"?include_annotation_type=CDS_FASTA")
+    try:
+        zip_bytes = _genome_datasets_request(url, _NCBI_CDS_ZIP_MAX_BYTES, timeout)
+        fasta = _genome_extract_cds_fasta(zip_bytes)
+        raw, stats = _build_heg_table_from_cds(fasta, mode)
+    except ValueError as exc:                       # cap / no-CDS / build error
+        return None, str(exc), None
+    except Exception as exc:                         # network / HTTP
+        _log.exception("Genome codon-table build failed for %s", accession)
+        return None, f"Download failed for {accession}: {exc}", None
+    label = "ribosomal-protein (HEG)" if mode == "heg" else "whole-genome"
+    n_cds = stats["n_cds_heg"] if mode == "heg" else stats["n_cds_total"]
+    bf = (f", backfilled {', '.join(stats['backfilled'])}"
+          if stats.get("backfilled") else "")
+    msg = (f"Built {label} table from {accession}"
+           + (f" ({organism})" if organism else "")
+           + f": {stats['n_codons']:,} codons from {n_cds} CDS, "
+           + f"{stats['aa_coverage']}/20 AAs, GC3 {stats['gc3']}%{bf}")
+    meta = {"accession": accession, "taxid": taxid,
+            "organism": organism, "stats": stats}
+    return raw, msg, meta
 
 
 def _codon_build_aa_map(raw: dict) -> tuple[dict, dict]:
@@ -85581,6 +85869,161 @@ class CodonTsvImportModal(_OneShotDismissScreen, ModalScreen):
 
 # ── Species picker (shared modal for codon-table selection) ────────────────────
 
+class GenomeCodonBuilderModal(_OneShotDismissScreen, ModalScreen):
+    """Build a codon-usage table straight from an NCBI genome. The user gives a
+    RefSeq/GenBank assembly accession (``GCF_…``/``GCA_…``) or an NCBI taxid
+    (resolved to the species' RefSeq reference assembly) and a mode:
+
+      * **Highly-expressed genes (ribosomal proteins)** — recommended; the
+        codon bias that drives strong heterologous expression.
+      * **Whole genome** — every CDS (a fuller, less expression-weighted table).
+
+    A worker thread downloads the CDS via the NCBI Datasets API, builds the
+    table (`_genome_build_codon_table`), and saves it into the shared registry
+    (`_codon_tables_add`, source ``genome``). Dismisses with the saved entry
+    dict on success, or None on cancel — the caller refreshes its picker.
+    """
+
+    _blocks_undo: bool = True   # builds + persists a codon table
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    GenomeCodonBuilderModal { align: center middle; }
+    #gcb-dlg { width: 86; height: auto; max-height: 90%;
+               background: $surface; border: solid $primary; padding: 1 2; }
+    #gcb-title { background: $primary-darken-2; color: $text;
+                 padding: 0 1; margin-bottom: 1; text-align: center;
+                 text-style: bold; }
+    #gcb-help { color: $text-muted; height: auto; padding: 0 1; }
+    #gcb-row { height: auto; margin-top: 1; }
+    #gcb-query { width: 1fr; }
+    #gcb-name { width: 1fr; }
+    #gcb-mode { height: auto; margin-top: 1; }
+    #gcb-status { height: auto; min-height: 1; margin-top: 1; color: $text-muted; }
+    #gcb-btns { height: 3; margin-top: 1; align-horizontal: right; }
+    #gcb-btns Button { margin-right: 1; min-width: 12; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._building = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="gcb-dlg"):
+            yield Static(" Build codon table from genome ", id="gcb-title")
+            yield Static(
+                "[dim]Enter an NCBI assembly accession ([b]GCF_…[/b] / "
+                "[b]GCA_…[/b]) or a numeric [b]taxid[/b] (resolved to the "
+                "species' RefSeq reference genome). The table is built from the "
+                "genome's coding sequences and added to your codon-table "
+                "library.[/dim]",
+                id="gcb-help", markup=True,
+            )
+            with Horizontal(id="gcb-row"):
+                yield Input(placeholder="accession or taxid "
+                                        "(e.g. GCF_009734005.1, 1352)",
+                            id="gcb-query")
+                yield Input(placeholder="Display name (optional)", id="gcb-name")
+            with RadioSet(id="gcb-mode"):
+                yield RadioButton(
+                    "Highly-expressed genes (ribosomal proteins) — recommended",
+                    id="gcb-mode-heg", value=True)
+                yield RadioButton("Whole genome (all CDS)", id="gcb-mode-genome")
+            yield Static("", id="gcb-status", markup=True)
+            with Horizontal(id="gcb-btns"):
+                yield Button("Build", id="btn-gcb-go", variant="primary")
+                yield Button("Cancel  [Esc]", id="btn-gcb-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#gcb-query", Input).focus()
+
+    def _set_status(self, text: str) -> None:
+        try:
+            self.query_one("#gcb-status", Static).update(text)
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-gcb-go")
+    def _go(self, _) -> None:
+        if self._building:
+            return
+        query = self.query_one("#gcb-query", Input).value.strip()
+        if not query:
+            self._set_status("[red]Enter an assembly accession or taxid.[/red]")
+            return
+        try:
+            idx = self.query_one("#gcb-mode", RadioSet).pressed_index
+        except NoMatches:
+            idx = 0
+        mode = "genome" if idx == 1 else "heg"
+        name_hint = self.query_one("#gcb-name", Input).value.strip()
+        self._building = True
+        try:
+            self.query_one("#btn-gcb-go", Button).disabled = True
+        except NoMatches:
+            pass
+        self._set_status(
+            f"[yellow]Building from {query} — resolving + downloading CDS "
+            f"(this can take a few seconds)…[/yellow]")
+        self._build_worker(query, mode, name_hint)
+
+    @work(thread=True, exclusive=True, group="codon_genome_build")
+    def _build_worker(self, query: str, mode: str, name_hint: str) -> None:
+        try:
+            raw, msg, meta = _genome_build_codon_table(query, mode)
+        except Exception as exc:            # worker-body carve-out ([PIT-01])
+            _log.exception("Genome codon-table worker crashed for %s", query)
+            raw, msg, meta = None, f"Build failed: {exc}", None
+        self.app.call_from_thread(self._build_done, name_hint, raw, msg, meta)
+
+    def _build_done(self, name_hint: str, raw: "dict | None",
+                    msg: str, meta: "dict | None") -> None:
+        self._building = False
+        # Persist a successful build even if the modal was dismissed mid-flight
+        # (don't waste the network round-trip); only then skip the UI work.
+        saved = None
+        if raw is not None and meta is not None:
+            display = (_sanitize_label(name_hint, max_len=200)
+                       or meta.get("organism")
+                       or meta.get("accession") or "Genome codon table")
+            try:
+                saved = _codon_tables_add(display, meta.get("taxid", ""), raw,
+                                          source="genome")
+                _log_event("codon_table.build_genome",
+                           accession=meta.get("accession", ""),
+                           taxid=meta.get("taxid", ""),
+                           mode=meta["stats"]["mode"],
+                           n_cds=meta["stats"]["n_cds_total"],
+                           n_codons=meta["stats"]["n_codons"])
+            except (OSError, RuntimeError) as exc:
+                if self.is_mounted:
+                    try:
+                        self.query_one("#btn-gcb-go", Button).disabled = False
+                    except NoMatches:
+                        pass
+                    _notify_save_failure(self.app, "Codon tables", exc)
+                else:
+                    _log.exception("Genome codon-table save failed (modal gone)")
+                return
+        if not self.is_mounted:
+            return
+        if saved is None:
+            try:
+                self.query_one("#btn-gcb-go", Button).disabled = False
+            except NoMatches:
+                pass
+            self._set_status(f"[red]{msg}[/red]")
+            return
+        self.dismiss(saved)
+
+    @on(Button.Pressed, "#btn-gcb-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
     """Reusable codon-table picker — any modal that cares about codon usage
     (Mutagenize, future codon-optimize, future gene-synthesis) can
@@ -85627,6 +86070,10 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
                 yield Button("Import TSV", id="btn-sp-import",
                              tooltip="Paste a custom codon-usage table "
                                      "(TSV: codon, [amino acid], count).")
+                yield Button("Build from genome", id="btn-sp-genome",
+                             tooltip="Build a codon table from an NCBI genome "
+                                     "(accession or taxid) — highly-expressed "
+                                     "genes or whole genome.")
                 yield Button("Delete", id="btn-sp-delete", disabled=True)
                 yield Button("Cancel  [Esc]", id="btn-sp-cancel")
 
@@ -85774,6 +86221,30 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
                 pass
 
         self.app.push_screen(CodonTsvImportModal(), callback=_on_text)
+
+    @on(Button.Pressed, "#btn-sp-genome")
+    def _build_from_genome(self, _) -> None:
+        """Open `GenomeCodonBuilderModal`; on a successful build the table is
+        already saved, so refresh the list and move the cursor onto the new
+        entry (mirrors `_fetch_done`'s post-add selection)."""
+        def _on_built(entry) -> None:
+            if not isinstance(entry, dict):
+                return
+            try:
+                self._refresh_list(self.query_one("#sp-filter", Input).value)
+                key = entry.get("taxid") or entry.get("name")
+                for i, e in enumerate(self._entries):
+                    if (e.get("taxid") or e.get("name")) == key:
+                        self.query_one("#sp-list", DataTable).move_cursor(row=i)
+                        self._sync_row_buttons()
+                        break
+                self.query_one("#sp-info", Static).update(
+                    f"[green]Added '{entry.get('name', '?')}' from genome "
+                    f"build.[/green]")
+            except NoMatches:
+                pass
+
+        self.app.push_screen(GenomeCodonBuilderModal(), callback=_on_built)
 
     @on(Button.Pressed, "#btn-sp-fetch")
     def _fetch(self, _) -> None:
@@ -102844,12 +103315,16 @@ def _h_add_codon_table(app, payload):
     Kazusa or stamps a raw dict directly:
 
       * Fetch:   ``{taxid: str, name?: str, source: "kazusa"}``
+      * Genome:  ``{source: "genome", accession|taxid: str,
+                   mode?: "heg"|"genome", name?: str}``
       * Raw:     ``{name: str, taxid?: str, raw: {<codon>: count, ...}}``
 
     The Kazusa fetch is size-capped at `_KAZUSA_MAX_RESPONSE_BYTES`
-    and timeout-bounded; the raw path caps at 64 codons (the
-    standard genetic code) and validates each value is a non-negative
-    int.
+    and timeout-bounded; the genome build downloads the CDS from the
+    NCBI Datasets API (size-capped at `_NCBI_CDS_ZIP_MAX_BYTES`,
+    default ``mode="heg"`` → ribosomal-protein bias); the raw path
+    caps at 64 codons (the standard genetic code) and validates each
+    value is a non-negative int.
     """
     source = payload.get("source", "user")
     if not isinstance(source, str):
@@ -102876,6 +103351,39 @@ def _h_add_codon_table(app, payload):
             _log.exception("agent add-codon-table: save failed")
             return ({"error": f"save failed: {exc}"}, 500)
         return {"ok": True, "entry": {
+            "name":   entry["name"],
+            "taxid":  entry["taxid"],
+            "source": entry["source"],
+        }}
+    if source == "genome":
+        # Build from an NCBI genome's CDS — accession (GCF_…/GCA_…) or taxid.
+        query_raw = payload.get("accession") or payload.get("taxid")
+        if not isinstance(query_raw, str) or not query_raw.strip():
+            return ({"error": "'accession' or 'taxid' required for genome "
+                              "source"}, 400)
+        query = _sanitize_accession(query_raw) or ""
+        if not query:
+            return ({"error": "invalid 'accession' or 'taxid'"}, 400)
+        mode = payload.get("mode", "heg")
+        if mode not in ("heg", "genome"):
+            return ({"error": "'mode' must be 'heg' or 'genome'"}, 400)
+        name_in = _sanitize_label(payload.get("name"), max_len=200)
+        try:
+            raw, msg, meta = _genome_build_codon_table(query, mode)
+        except Exception as exc:
+            _log.exception("agent add-codon-table: genome build failed")
+            return ({"error": f"genome build failed: {exc}"}, 502)
+        if raw is None or meta is None:
+            return ({"error": msg or "genome build returned no data"}, 502)
+        display = (name_in or meta.get("organism")
+                   or meta.get("accession") or "Genome codon table")
+        try:
+            entry = _codon_tables_add(display, meta.get("taxid", ""), raw,
+                                      source="genome")
+        except (OSError, RuntimeError) as exc:
+            _log.exception("agent add-codon-table: save failed")
+            return ({"error": f"save failed: {exc}"}, 500)
+        return {"ok": True, "message": msg, "entry": {
             "name":   entry["name"],
             "taxid":  entry["taxid"],
             "source": entry["source"],
@@ -115955,9 +116463,8 @@ NcbiTaxonPickerModal { align: center middle; }
         if name == "Mutato":
             self.action_open_mutagenize()
             return
-        if name == "Synthesis":
-            self.action_open_synthesis()
-            return
+        # Synthesis is a dropdown (workspace + codon-table manager) — see the
+        # `menus` dict below; no direct-open branch.
         if name == "Simulator":
             self.action_open_simulator()
             return
@@ -115982,6 +116489,10 @@ NcbiTaxonPickerModal { align: center middle; }
         # keyboard shortcuts (e.g. `r`) keep working via App.BINDINGS
         # independent of any menu.
         menus = {
+            "Synthesis": [
+                ("Synthesis workspace",          "open_synthesis"),
+                ("Codon tables (build / fetch)", "open_codon_tables"),
+            ],
             "File": [
                 ("Open file (.gb / .dna)  [^O]", "open_file"),
                 ("Fetch from NCBI  [f]",         "fetch"),
@@ -116184,6 +116695,22 @@ NcbiTaxonPickerModal { align: center middle; }
         restriction sites, save back as the same library entry. New /
         Save As / Rename available from the toolbar."""
         self.push_screen(SynthesisScreen())
+
+    @_action_log("app.open.codon_tables")
+    def action_open_codon_tables(self) -> None:
+        """Synthesis menu → Codon tables: open the codon-table manager (browse,
+        Build from genome, Fetch from Kazusa, Import TSV). Picking a table with
+        "Use Selected" sets it as the active default for codon optimization
+        across Synthesis + Mutato (persisted via `active_codon_table` when the
+        table carries a taxid)."""
+        def _picked(entry: "dict | None") -> None:
+            if not isinstance(entry, dict):
+                return
+            taxid = str(entry.get("taxid", "") or "")
+            if taxid:
+                _set_setting("active_codon_table", taxid)
+            self.notify(f"Active codon table: {entry.get('name', '?')}")
+        self.push_screen(SpeciesPickerModal(), callback=_picked)
 
     @_action_log("app.open.experiments")
     def action_open_experiments(self) -> None:

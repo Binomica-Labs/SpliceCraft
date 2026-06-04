@@ -228,12 +228,27 @@ class TestSynthesisScreen:
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
             await pilot.pause()
-            # `open_menu` directly dispatches the synthesis action,
-            # bypassing the dropdown (it's a direct-action menu).
+            # Synthesis is now a dropdown (workspace / codon tables): opening
+            # the menu shows the DropdownScreen, and selecting the workspace
+            # row dispatches `action_open_synthesis`.
             app.open_menu("Synthesis", 0, 0)
+            await pilot.pause()
+            assert isinstance(app.screen, sc.DropdownScreen)
+            app._menu_action("open_synthesis")
             await pilot.pause()
             await pilot.pause()
             assert isinstance(app.screen, sc.SynthesisScreen)
+
+    async def test_codon_tables_menu_opens_manager(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            # New Synthesis ▸ Codon tables entry opens the codon-table manager.
+            app.action_open_codon_tables()
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, sc.SpeciesPickerModal)
 
     async def test_initial_state_empty(self):
         app = sc.PlasmidApp()
