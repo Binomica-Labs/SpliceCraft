@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.0.25"
+__version__ = "1.0.26"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -13881,6 +13881,69 @@ def _bulk_import_folder(
     return entries, failures
 
 
+# ── Arrowless (strand 0) GenBank round-trip ────────────────────────────────────
+# BioPython's GenBank writer can't tell strand 0 (arrowless) from +1 (forward) —
+# both emit a plain `1..10` location, which re-parses as +1. So a feature the
+# user marked arrowless silently flips to a forward arrow on reload (user report
+# 2026-06-05, FRAG-Pei311 "Primer Padding"). Reverse (-1) survives natively via
+# complement(); double (±2) already rides the `SpliceCraft_strand=["double"]`
+# qualifier ([INV-…], `PlasmidMap._parse`). We carry arrowless in that SAME
+# qualifier: encode `["none"]` on write, restore strand 0 (and drop the marker)
+# on read so the live record stays faithful + clean.
+_SC_STRAND_QUAL = "SpliceCraft_strand"
+
+
+def _arrowless_encode_features(features):
+    """Return a features list in which every strand-0 / strand-None feature
+    carries ``SpliceCraft_strand=["none"]`` (so the GenBank writer's plain
+    location round-trips as arrowless, not forward). Pure: the input features
+    are never mutated — only the tagged ones are replaced with shallow copies
+    bearing a fresh qualifiers dict. Features that already carry a
+    ``SpliceCraft_strand`` value (the double-strand ``["double"]`` marker) and
+    the ``source`` feature are left untouched. Returns the SAME list object
+    when nothing needs encoding (common case → zero allocation)."""
+    feats = features or []
+    out: list = []
+    changed = False
+    for f in feats:
+        loc = getattr(f, "location", None)
+        strand = getattr(loc, "strand", None) if loc is not None else None
+        quals = getattr(f, "qualifiers", None) or {}
+        if (strand in (0, None) and getattr(f, "type", "") != "source"
+                and _SC_STRAND_QUAL not in quals):
+            nf = _shallow_copy(f)
+            nf.qualifiers = {**quals, _SC_STRAND_QUAL: ["none"]}
+            out.append(nf)
+            changed = True
+        else:
+            out.append(f)
+    return out if changed else features
+
+
+def _arrowless_decode_features(record):
+    """Inverse of `_arrowless_encode_features`, applied to a freshly-parsed
+    record we own: any feature tagged ``SpliceCraft_strand=["none"]`` has its
+    location strand restored to 0 (arrowless) and the marker stripped, so the
+    live record is both faithful (location.strand == 0) and clean (no leftover
+    marker to confuse a later edit or re-export). The strand setter propagates
+    to every part of a compound/wrap location. Mutates in place; returns the
+    record."""
+    for f in getattr(record, "features", None) or []:
+        quals = getattr(f, "qualifiers", None)
+        if not isinstance(quals, dict):
+            continue
+        q = quals.get(_SC_STRAND_QUAL)
+        if isinstance(q, list) and q and str(q[0]).strip().lower() == "none":
+            loc = getattr(f, "location", None)
+            if loc is not None:
+                try:
+                    loc.strand = 0
+                except (AttributeError, ValueError, TypeError):
+                    pass
+            quals.pop(_SC_STRAND_QUAL, None)
+    return record
+
+
 def _record_to_gb_text(record) -> str:
     """Serialize a SeqRecord to GenBank format text.
 
@@ -13890,12 +13953,17 @@ def _record_to_gb_text(record) -> str:
     SeqRecord copy so the caller's record is never mutated (avoids
     subtle races with concurrent readers and surprise side effects for
     callers that compare records by annotation contents).
+
+    Arrowless (strand 0) features are tagged with `SpliceCraft_strand=["none"]`
+    here so they survive the round-trip (`_arrowless_encode_features`); the
+    parse side restores them. No-op when nothing is arrowless.
     """
     from Bio import SeqIO
     anns = dict(getattr(record, "annotations", None) or {})
     anns.setdefault("molecule_type", "DNA")
     rec = _shallow_copy(record)
     rec.annotations = anns
+    rec.features = _arrowless_encode_features(getattr(record, "features", None))
     buf = StringIO()
     SeqIO.write(rec, buf, "genbank")
     return buf.getvalue()
@@ -13968,6 +14036,9 @@ def _gb_text_to_record(text: str, *, cache: bool = True):
                 return deepcopy(hit)
     from Bio import SeqIO
     rec = SeqIO.read(StringIO(text), "genbank")
+    # Restore arrowless (strand 0) features tagged on the write side before
+    # the result is cached, so every caller sees a faithful + clean record.
+    _arrowless_decode_features(rec)
     if cache:
         with _GB_PARSE_CACHE_LOCK:
             _GB_PARSE_CACHE[hash(text)] = deepcopy(rec)
@@ -19310,10 +19381,15 @@ class PlasmidMap(Widget):
             # `_paint_feature_bar` strand==2 branch fires and the
             # double-arrow rendering survives save/reload.
             sc_strand_q = feat.qualifiers.get("SpliceCraft_strand")
-            if (isinstance(sc_strand_q, list) and sc_strand_q
-                    and str(sc_strand_q[0]).strip().lower()
-                        == "double"):
-                strand = 2
+            if isinstance(sc_strand_q, list) and sc_strand_q:
+                _q = str(sc_strand_q[0]).strip().lower()
+                if _q == "double":
+                    strand = 2
+                elif _q == "none":
+                    # Arrowless marker (see `_arrowless_*`). Normally stripped
+                    # by `_gb_text_to_record`, but a record loaded straight via
+                    # BioPython (bypassing that decode) still honours it here.
+                    strand = 0
             feat_exons: "list[tuple[int, int]] | None" = None
 
             # Compound / joined locations need special handling:
@@ -43016,6 +43092,17 @@ _CODON_GENETIC_CODE: dict[str, str] = {
     "GGT": "G", "GGC": "G", "GGA": "G", "GGG": "G",
 }
 
+# Single-letter → three-letter amino-acid names for the genetic-code chart
+# (`_render_codon_chart`). Stop is spelled "Stop" to match the canonical
+# textbook wall chart. The full-name catalog lives on `AminoAcidPickerModal`.
+_AA_NAME_3: dict[str, str] = {
+    "A": "Ala", "R": "Arg", "N": "Asn", "D": "Asp", "C": "Cys",
+    "Q": "Gln", "E": "Glu", "G": "Gly", "H": "His", "I": "Ile",
+    "L": "Leu", "K": "Lys", "M": "Met", "F": "Phe", "P": "Pro",
+    "S": "Ser", "T": "Thr", "W": "Trp", "Y": "Tyr", "V": "Val",
+    "*": "Stop",
+}
+
 _CODON_BUILTIN_K12: dict[str, tuple[str, int]] = {
     "GGG": ("G",  44), "GGA": ("G",  47), "GGT": ("G", 109), "GGC": ("G", 171),
     "GAG": ("E",  94), "GAA": ("E", 224), "GAT": ("D", 194), "GAC": ("D", 105),
@@ -44013,6 +44100,122 @@ def _codon_build_aa_map(raw: dict) -> tuple[dict, dict]:
     for aa in aa_codons:
         aa_codons[aa].sort(key=lambda x: -x[1])
     return dict(aa_codons), codon_frac
+
+
+def _render_codon_chart(raw: dict, *, rna: bool = True) -> str:
+    """Render a codon-usage table as the classic textbook genetic-code grid,
+    returned as a Rich-markup string.
+
+    The layout matches the canonical wall chart: the four 1st-base blocks
+    (U/C/A/G) stack vertically, the 2nd base runs across the four columns,
+    and the four lines inside every cell are the 3rd base (U/C/A/G). Each
+    codon is annotated with its usage *within its amino-acid family* (the
+    relative synonymous usage, as a percentage), and each amino-acid family's
+    single most-used codon is highlighted bold green for easy visual
+    identification. The choice is FAMILY-WIDE (matching the % shown), so a
+    family split across two cells — Leu, Ser, Arg, and the three stops
+    (UAA/UAG/UGA, treated as one family) — yields exactly one highlight, not
+    one per cell. A codon with no usage in the table is never highlighted.
+    Synonymous residues are bracketed and named (3-letter; stops as "Stop").
+    Codons missing from the table render a dim "·" placeholder.
+
+    Bases display as RNA (U) by default to match the iconic chart; lookups
+    are always by the stored DNA (T) key. Pure — display only, no I/O."""
+    _aa_codons, codon_frac = _codon_build_aa_map(raw)
+
+    def _count(codon: str) -> int:
+        v = raw.get(codon)
+        return int(v[1]) if v else 0
+
+    # The single most-used codon in each amino-acid family is highlighted green.
+    # The choice is FAMILY-WIDE (matching the relative-synonymous-usage % shown),
+    # so a family split across two cells — Leu (UU+CU), Ser (UC+AG), Arg (CG+AG),
+    # and the stops UAA/UAG/UGA (UA+UG) — yields exactly ONE highlight, never one
+    # per cell. Stops are one family. Deterministic tie-break by codon; a family
+    # with no usage in the table gets no highlight.
+    _fam: dict = {}
+    for _codon, _aa in _CODON_GENETIC_CODE.items():
+        _fam.setdefault(_aa, []).append(_codon)
+    dominant: set = set()
+    for _members in _fam.values():
+        champ = sorted(_members, key=lambda c: (-_count(c), c))[0]
+        if _count(champ) > 0:
+            dominant.add(champ)
+
+    order = "TCAG"                       # U, C, A, G in DNA (T) coordinates
+    CW, AAW, LGUT, RGUT = 17, 4, 2, 2    # cell / AA-label / gutter widths
+    label_row = {1: 0, 2: 0, 3: 1, 4: 1}  # which row of a run carries the name
+
+    def _disp(b: str) -> str:
+        return "U" if (rna and b == "T") else b
+
+    def _cell(first: str, second: str) -> list:
+        """Four markup lines (3rd base = U/C/A/G) for one grid cell, each
+        exactly CW visible columns wide (markup tags are zero-width)."""
+        codons = [first + second + third for third in order]
+        aas = [_CODON_GENETIC_CODE[c] for c in codons]
+        # Group the four residues into runs of equal AA (for the brackets). The
+        # green highlight is the family-wide champion computed above (`dominant`).
+        run_of: dict = {}
+        i = 0
+        while i < 4:
+            j = i
+            while j < 4 and aas[j] == aas[i]:
+                j += 1
+            for r in range(i, j):
+                run_of[r] = (i, j - i)
+            i = j
+        out: list = []
+        for r in range(4):
+            cdn = codons[r]
+            show = "".join(_disp(b) for b in cdn)
+            frac = codon_frac.get(cdn)
+            pct = ("[dim]   ·[/dim]" if frac is None
+                   else f"{round(frac * 100):>3d}%")     # 4 visible cols
+            field = f"{show} {pct}"                       # 8 visible cols
+            if cdn in dominant:
+                field = f"[b green]{field}[/]"            # stark + easy to spot
+            start, length = run_of[r]
+            pos = r - start
+            if length == 1:
+                g = "─"
+            elif pos == 0:
+                g = "╮"
+            elif pos == length - 1:
+                g = "╯"
+            elif pos == label_row[length]:
+                g = "┤"
+            else:
+                g = "│"
+            if pos == label_row[length]:
+                nm = _AA_NAME_3.get(aas[r], aas[r])
+                lab = (f"[red]{nm:<{AAW}}[/red]" if aas[r] == "*"
+                       else f"{nm:<{AAW}}")
+            else:
+                lab = " " * AAW
+            out.append(f" {field} [dim]{g}[/dim] {lab} ")   # CW visible
+        return out
+
+    def _rule(left: str, mid: str, right: str) -> str:
+        return (" " * LGUT) + left + mid.join(["─" * CW] * 4) + right + \
+               (" " * RGUT)
+
+    width = LGUT + 1 + CW * 4 + 3 + 1 + RGUT
+    lines: list = [f"{'second base':^{width}}"]
+    # Column header: 2nd-base letter centred over each column.
+    lines.append((" " * (LGUT + 1))
+                 + " ".join(f"[b]{_disp(s):^{CW}}[/b]" for s in order)
+                 + " " + (" " * RGUT))
+    lines.append(_rule("┌", "┬", "┐"))
+    for bi, first in enumerate(order):
+        cells = [_cell(first, second) for second in order]
+        for r in range(4):
+            row = "│".join(cells[c][r] for c in range(4))
+            left = f" [b]{_disp(first)}[/b]" if r == 1 else "  "
+            right = f" [b]{_disp(order[r])}[/b]"
+            lines.append(f"{left}│{row}│{right}")
+        lines.append(_rule("├", "┼", "┤") if bi < 3 else _rule("└", "┴", "┘"))
+    return "\n".join(lines)
 
 
 def _codon_allocate(codons: list, n: int) -> list:
@@ -85832,6 +86035,10 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
         # `_after_table_added`) from triggering a second, cursor-clobbering
         # `_refresh_list` via the Input.Changed handler.
         self._suppress_filter_refresh = False
+        # Last codon table logged as a Chart-tab "view" — dedups the
+        # `codon_table.view` event so programmatic re-selection / tab flips
+        # don't spam the log.
+        self._view_logged_key: "str | None" = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="sp-box"):
@@ -85851,7 +86058,21 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
                                      variant="primary", disabled=True)
                         yield Button("Delete", id="btn-sp-delete",
                                      disabled=True)
-                # TAB 2 — Fetch a published table from the Kazusa database.
+                # TAB 2 — Chart: view any table as the classic genetic-code grid.
+                with TabPane("Chart", id="sp-tab-view"):
+                    yield Static(
+                        "[dim]View any table from your Library as the classic "
+                        "genetic-code chart. Each codon shows its usage within "
+                        "its amino-acid family (relative synonymous usage); each "
+                        "family's single [b green]most-used[/] codon is "
+                        "highlighted green.[/dim]",
+                        id="sp-view-help", markup=True)
+                    yield Select([], id="sp-view-select", allow_blank=True,
+                                 prompt="Pick a codon table to chart")
+                    yield Static("", id="sp-view-meta", markup=True)
+                    with VerticalScroll(id="sp-view-scroll"):
+                        yield Static("", id="sp-view-chart", markup=True)
+                # TAB 3 — Fetch a published table from the Kazusa database.
                 with TabPane("Fetch (Kazusa)", id="sp-tab-fetch"):
                     yield Static(
                         "[dim]Fetch a codon-usage table from the Kazusa "
@@ -85869,7 +86090,7 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
                         yield Button("Fetch from Kazusa", id="btn-sp-fetch",
                                      variant="primary")
                     yield Static("", id="sp-fetch-status", markup=True)
-                # TAB 3 — Build a table from an NCBI genome's CDS.
+                # TAB 4 — Build a table from an NCBI genome's CDS.
                 with TabPane("Build from genome", id="sp-tab-genome"):
                     yield Static(
                         "[dim]Build a table from an NCBI genome's coding "
@@ -85894,7 +86115,7 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
                         yield Button("Build", id="btn-sp-genome-go",
                                      variant="primary")
                     yield Static("", id="sp-genome-status", markup=True)
-                # TAB 4 — Import a custom table pasted as TSV.
+                # TAB 5 — Import a custom table pasted as TSV.
                 with TabPane("Import TSV", id="sp-tab-import"):
                     yield Static(
                         "[dim]Paste a tab / space / comma-delimited table — one "
@@ -85916,6 +86137,9 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
         dt = self.query_one("#sp-list", DataTable)
         dt.add_columns("Species", "Taxid", "Source")
         self._refresh_list("")
+        # The Chart tab populates + renders lazily on first activation
+        # (`_on_tab_activated`) — no chart work at mount for a tab the user may
+        # never open.
         self.query_one("#sp-filter", Input).focus()
 
     def _refresh_list(self, query: str) -> None:
@@ -86055,6 +86279,113 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
             self.query_one("#sp-info", Static).update(f"[green]{msg}[/green]")
         except NoMatches:
             pass
+        # The Chart-tab dropdown re-reads the registry every time that tab is
+        # activated (`_on_tab_activated`), so a table added here shows up the
+        # next time the user opens Chart — no explicit refresh needed.
+
+    # ── Chart tab — view a table as the classic genetic-code grid ────────────
+    @staticmethod
+    def _view_option_label(e: dict) -> str:
+        """Dropdown label for a codon table: the name, with taxid / source in
+        parentheses when present (plain text — Select labels aren't markup)."""
+        name = str(e.get("name", "?") or "?")
+        extra = " · ".join(
+            x for x in (str(e.get("taxid", "") or ""),
+                        str(e.get("source", "") or "")) if x)
+        return f"{name}  ({extra})" if extra else name
+
+    def _refresh_view_options(self) -> None:
+        """(Re)populate the Chart-tab dropdown from the live registry, keep the
+        current pick if it still exists (else default to the first table), and
+        re-render. Called on mount, on Chart-tab activation, and after a table
+        is added so newly-acquired tables show up immediately."""
+        try:
+            sel = self.query_one("#sp-view-select", Select)
+        except NoMatches:
+            return
+        opts: list = []
+        for e in _codon_tables_load():
+            key = str(e.get("taxid") or e.get("name") or "")
+            if key:
+                opts.append((self._view_option_label(e), key))
+        cur = sel.value if sel.value is not Select.BLANK else None
+        keys = [v for _l, v in opts]
+        # `set_options` fires Select.Changed; the handler just re-renders (and
+        # only logs while the Chart tab is active), so no guarding is needed.
+        sel.set_options(opts)
+        if cur in keys:
+            sel.value = cur
+        elif keys:
+            sel.value = keys[0]
+        self._render_view_chart()
+
+    def _render_view_chart(self) -> None:
+        """Render the dropdown's current table into the Chart pane, or a hint
+        when the Library is empty / the table can't be loaded."""
+        try:
+            sel = self.query_one("#sp-view-select", Select)
+            chart = self.query_one("#sp-view-chart", Static)
+            meta = self.query_one("#sp-view-meta", Static)
+        except NoMatches:
+            return
+        key = sel.value
+        if key is Select.BLANK or not key:
+            chart.update("")
+            meta.update("[dim]No codon tables in your Library yet — add one via "
+                        "the Fetch, Build, or Import tab.[/dim]")
+            return
+        entry = _codon_tables_get(str(key))
+        if not entry or not entry.get("raw"):
+            chart.update("")
+            meta.update("[red]That table could not be loaded.[/red]")
+            return
+        from rich.markup import escape as _esc
+        raw = entry["raw"]
+        # A registry table is always well-formed {codon: (aa, count)}, but
+        # render defensively — a corrupt entry should show a message, never
+        # take down the modal.
+        try:
+            grid = _render_codon_chart(raw)
+            total = sum(int(n) for _aa, n in raw.values())
+        except (ValueError, TypeError, KeyError, AttributeError):
+            # AttributeError guards a `raw` that isn't a dict of (aa, count)
+            # tuples (corrupt entry) — `.values()` / unpack would blow up.
+            _log.exception("Codon chart render failed for %r", key)
+            chart.update("")
+            meta.update("[red]Could not render this table as a chart.[/red]")
+            return
+        bits = [f"[b]{_esc(str(entry.get('name', '?') or '?'))}[/b]"]
+        taxid = str(entry.get("taxid", "") or "")
+        if taxid:
+            bits.append(f"taxid {_esc(taxid)}")
+        src = str(entry.get("source", "") or "")
+        if src:
+            bits.append(_esc(src))
+        bits.append(f"{len(raw)} codons · {total:,} counted")
+        chart.update(grid)
+        meta.update("[dim] · [/dim]".join(bits))
+
+    @on(Select.Changed, "#sp-view-select")
+    def _on_view_select(self, event: "Select.Changed") -> None:
+        self._render_view_chart()
+        # Log only genuine, user-driven views: the Chart tab must be active
+        # (so mount-time pre-population doesn't log) and the table must differ
+        # from the last one logged.
+        val = event.value
+        try:
+            on_view = (self.query_one("#sp-tabs", TabbedContent).active
+                       == "sp-tab-view")
+        except (NoMatches, LookupError):
+            on_view = False
+        if (on_view and val is not Select.BLANK and val
+                and val != self._view_logged_key):
+            self._view_logged_key = str(val)
+            entry = _codon_tables_get(str(val))
+            if entry:
+                _log_event("codon_table.view",
+                           name=str(entry.get("name", "") or ""),
+                           taxid=str(entry.get("taxid", "") or ""),
+                           n_codons=len(entry.get("raw", {}) or {}))
 
     @on(Button.Pressed, "#btn-sp-import-go")
     def _import_tsv(self, _) -> None:
@@ -86295,6 +86626,7 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
         """Focus the most useful input on the now-active tab."""
         focus_map = {
             "sp-tab-library": "#sp-filter",
+            "sp-tab-view":    "#sp-view-select",
             "sp-tab-fetch":   "#sp-taxid",
             "sp-tab-genome":  "#sp-genome-query",
             "sp-tab-import":  "#sp-import-text",
@@ -86303,6 +86635,13 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
             active = self.query_one("#sp-tabs", TabbedContent).active
         except (NoMatches, LookupError):
             return
+        # Refresh the Chart dropdown on entry so tables added on other tabs
+        # while this modal is open are charted without a reopen.
+        if active == "sp-tab-view":
+            try:
+                self._refresh_view_options()
+            except NoMatches:
+                pass
         sel = focus_map.get(active)
         if not sel:
             return
@@ -107662,7 +108001,7 @@ AminoAcidPickerModal { align: center middle; }
 /* ── Codon-table manager (tabbed: Library / Kazusa / genome / TSV) ─────────── */
 SpeciesPickerModal { align: center middle; }
 #sp-box {
-    width: 92; height: 34; max-height: 95%;
+    width: 92; height: 40; max-height: 95%;
     background: $surface; border: solid $accent; padding: 1 2;
 }
 #sp-title    { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
@@ -107674,6 +108013,12 @@ SpeciesPickerModal { align: center middle; }
 #sp-info     { height: 1; margin: 1 0; }
 #sp-lib-btns { height: 3; margin-top: 1; }
 #sp-lib-btns Button { margin-right: 1; min-width: 14; }
+/* Chart tab: table picker + a scrollable genetic-code grid. */
+#sp-view-help { height: auto; padding: 0 1; }
+#sp-view-select { margin-top: 1; }
+#sp-view-meta { height: auto; min-height: 1; margin: 1 0; }
+#sp-view-scroll { height: 1fr; min-height: 6; border: solid $primary-darken-2; }
+#sp-view-chart { width: auto; height: auto; padding: 0 1; }
 /* Acquisition tabs (Fetch / Build / Import): help text + inputs + status. */
 #sp-fetch-help, #sp-genome-help, #sp-import-help { height: auto; padding: 0 1; }
 #sp-fetch-row, #sp-genome-row { height: 3; margin-top: 1; }
@@ -117867,10 +118212,12 @@ NcbiTaxonPickerModal { align: center middle; }
             raw_strand = getattr(f.location, "strand", None)
             strand = int(raw_strand) if raw_strand is not None else 0
             sc_strand_q = f.qualifiers.get("SpliceCraft_strand")
-            if (isinstance(sc_strand_q, list) and sc_strand_q
-                    and str(sc_strand_q[0]).strip().lower()
-                        == "double"):
-                strand = 2
+            if isinstance(sc_strand_q, list) and sc_strand_q:
+                _q = str(sc_strand_q[0]).strip().lower()
+                if _q == "double":
+                    strand = 2
+                elif _q == "none":
+                    strand = 0          # arrowless marker (see `_arrowless_*`)
             # Strip group / SpliceCraft-internal / color qualifiers
             # from the member's saved qualifiers — those are stamped
             # again at annotate-time by the group helper. Keeping

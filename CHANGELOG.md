@@ -14,6 +14,18 @@
 
 ---
 
+## [1.0.26] — 2026-06-05
+
+### New features
+
+- **See any codon table as the classic genetic-code chart.** The codon-table manager has a new **Chart** tab: pick any table from your library and SpliceCraft draws it as the textbook genetic-code grid — first base down the left, second base across the top, third base within each cell, synonymous codons bracketed and named (stops spelled out). Every codon is annotated with how often it's used *within its amino-acid family* (relative synonymous usage), and each amino-acid family's single most-used codon is highlighted in bold green for easy visual identification — family-wide, so a codon split across cells (Leu, Ser, Arg, and the three stop codons as one family) lights up exactly once. Tables you add on the **Fetch**, **Build from genome**, or **Import TSV** tabs show up in the Chart picker too.
+
+### Bug fixes
+
+- **Arrowless features stay arrowless after save/reload.** A feature you set to **None (arrowless ▒)** — e.g. the *Primer Padding* flanks on a cloned fragment — was quietly coming back as a forward **▶** arrow the next time you opened the plasmid. The GenBank format can't tell "arrowless" from "forward" on its own, so SpliceCraft now records the arrowless choice alongside the feature and restores it on load. Forward, reverse, double-stranded, and origin-spanning features are unaffected.
+
+---
+
 ## [1.0.25] — 2026-06-04
 
 ### New features

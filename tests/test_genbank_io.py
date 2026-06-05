@@ -103,6 +103,109 @@ class TestGenbankTextRoundtrip:
         assert pos_in == pos_out
 
 
+class TestArrowlessStrandRoundtrip:
+    """Arrowless (strand 0) features must survive `_record_to_gb_text` →
+    `_gb_text_to_record`. BioPython's GenBank writer emits a plain location
+    for BOTH strand 0 and +1, so without the `SpliceCraft_strand=["none"]`
+    marker an arrowless feature silently reloads as a forward arrow
+    (user-reported 2026-06-05, FRAG-Pei311 "Primer Padding"). Reverse (-1)
+    rides complement() natively; double (±2) rides the existing
+    `["double"]` marker."""
+
+    @staticmethod
+    def _rec(features):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        r = SeqRecord(Seq("ACGT" * 40), id="t", name="t",
+                      annotations={"molecule_type": "DNA", "topology": "linear"})
+        r.features = list(features)
+        return r
+
+    @staticmethod
+    def _roundtrip(rec):
+        return sc._gb_text_to_record(sc._record_to_gb_text(rec), cache=False)
+
+    def test_arrowless_survives_roundtrip(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = self._rec([SeqFeature(
+            FeatureLocation(0, 10, strand=0), type="misc_feature",
+            qualifiers={"label": ["pad"]})])
+        f = self._roundtrip(rec).features[0]
+        assert f.location.strand == 0                 # NOT coerced to +1
+        # The marker is internal — stripped from the live record on read.
+        assert "SpliceCraft_strand" not in f.qualifiers
+
+    def test_forward_and_reverse_unchanged(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = self._rec([
+            SeqFeature(FeatureLocation(0, 10, strand=1), type="misc_feature",
+                       qualifiers={"label": ["f"]}),
+            SeqFeature(FeatureLocation(20, 30, strand=-1), type="misc_feature",
+                       qualifiers={"label": ["r"]}),
+        ])
+        got = {f.qualifiers["label"][0]: f.location.strand
+               for f in self._roundtrip(rec).features}
+        assert got == {"f": 1, "r": -1}
+
+    def test_encode_does_not_mutate_original(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        feat = SeqFeature(FeatureLocation(0, 10, strand=0), type="misc_feature",
+                          qualifiers={"label": ["pad"]})
+        sc._record_to_gb_text(self._rec([feat]))
+        assert feat.location.strand == 0
+        assert "SpliceCraft_strand" not in feat.qualifiers
+
+    def test_double_strand_marker_untouched(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = self._rec([SeqFeature(
+            FeatureLocation(0, 10, strand=1), type="misc_feature",
+            qualifiers={"label": ["d"], "SpliceCraft_strand": ["double"]})])
+        rec2 = self._roundtrip(rec)
+        # The arrowless encoder must not clobber an existing marker, and the
+        # double bit must still read back as strand 2 in the map.
+        assert rec2.features[0].qualifiers.get("SpliceCraft_strand") == ["double"]
+        assert sc.PlasmidMap()._parse(rec2)[0]["strand"] == 2
+
+    def test_wrap_arrowless_survives(self):
+        from Bio.SeqFeature import (SeqFeature, FeatureLocation,
+                                    CompoundLocation)
+        wrap = SeqFeature(
+            CompoundLocation([FeatureLocation(150, 160, strand=0),
+                              FeatureLocation(0, 5, strand=0)]),
+            type="misc_feature", qualifiers={"label": ["w"]})
+        assert self._roundtrip(self._rec([wrap])).features[0].location.strand == 0
+
+    def test_plasmidmap_dict_renders_arrowless(self):
+        """The seq-panel / map arrowhead is drawn from PlasmidMap._parse's
+        dict strand, which must be 0 after the round-trip (not 1)."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = self._rec([SeqFeature(
+            FeatureLocation(0, 10, strand=0), type="misc_feature",
+            qualifiers={"label": ["pad"]})])
+        d = sc.PlasmidMap()._parse(self._roundtrip(rec))
+        assert d[0]["strand"] == 0
+
+    def test_source_feature_is_never_tagged(self):
+        """The `source` feature (often strand 0 / None) is skipped — it's not
+        drawn as an arrow, and tagging it would noise up every export."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        src = SeqFeature(FeatureLocation(0, 160, strand=0), type="source",
+                         qualifiers={"organism": ["synthetic construct"]})
+        assert "SpliceCraft_strand" not in sc._record_to_gb_text(self._rec([src]))
+
+    def test_no_arrowless_is_zero_alloc_noop(self):
+        """A record with no features, or only ±1-strand features, encodes to
+        the SAME list object (no copy) and emits no marker — the common path
+        must stay allocation-free and clean."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        assert "SpliceCraft_strand" not in sc._record_to_gb_text(self._rec([]))
+        feats = [SeqFeature(FeatureLocation(0, 10, strand=1),
+                            type="misc_feature", qualifiers={"label": ["f"]})]
+        rec = self._rec(feats)
+        assert sc._arrowless_encode_features(rec.features) is rec.features
+        assert "SpliceCraft_strand" not in sc._record_to_gb_text(rec)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Library persistence (JSON)
 # ═══════════════════════════════════════════════════════════════════════════════

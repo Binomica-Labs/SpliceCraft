@@ -6,15 +6,19 @@ _codon_optimize / _codon_fix_sites / _codon_cai / _codon_gc helpers, and
 the Kazusa HTML parser. The Kazusa HTTP fetch itself is not exercised (no
 network in tests) — we test the parser on a synthetic HTML fixture.
 """
+import re
+
 import pytest
 
 import splicecraft as sc
 
 
-async def _settle_tab(pilot, tabs, want, tries=12):
+async def _settle_tab(pilot, tabs, want, tries=24):
     """Drain the message queue until a `TabbedContent` reports `want` as its
     active tab (Textual processes `.active` assignments asynchronously). Avoids
-    races when a test flips tabs and then immediately drives a callback."""
+    races when a test flips tabs and then immediately drives a callback. The
+    drain returns as soon as the tab settles, so a generous budget only ever
+    costs extra pauses on a genuinely slow/contended switch."""
     for _ in range(tries):
         await pilot.pause()
         if tabs.active == want:
@@ -1798,14 +1802,103 @@ class TestNcbiTaxonPickerModalStyle:
             assert app.screen.query_one("#ncbi-list") is not None
 
 
+class TestCodonChart:
+    """`_render_codon_chart` lays a codon-usage table out as the classic
+    textbook genetic-code grid (pure, display-only). Bases display as RNA (U)
+    by default; lookups are by the stored DNA (T) key."""
+
+    @staticmethod
+    def _vis(markup: str) -> str:
+        """Markup string → visible text (drop zero-width Rich tags)."""
+        return re.sub(r"\[/?[^\]]*\]", "", markup)
+
+    def test_grid_is_rectangular(self):
+        """Every line is the same visible width — markup tags are zero-width,
+        so the box-drawing grid must stay aligned."""
+        raw = {c: (aa, n) for c, (aa, n) in sc._CODON_BUILTIN_K12.items()}
+        lines = sc._render_codon_chart(raw).split("\n")
+        widths = {len(self._vis(l)) for l in lines}
+        assert len(widths) == 1, f"ragged grid: {sorted(widths)}"
+        # 4 header/border lines + 4 blocks × (4 rows + 1 rule).
+        assert len(lines) == 23
+
+    def test_layout_axes_and_residues(self):
+        """RNA codons, the three base axes, and 3-letter residues are present;
+        single-codon residues (Met/Trp) and stops are spelled out."""
+        raw = {c: (aa, n) for c, (aa, n) in sc._CODON_BUILTIN_K12.items()}
+        vis = self._vis(sc._render_codon_chart(raw))
+        assert "second base" in vis
+        for codon in ("UUU", "AUG", "UGG", "UGA"):     # RNA, not TTT/ATG/…
+            assert codon in vis
+        assert "TTT" not in vis                          # DNA never displayed
+        for name in ("Phe", "Leu", "Ser", "Met", "Stop"):
+            assert name in vis
+
+    def test_relative_synonymous_usage_percentages(self):
+        """Each codon is annotated with its within-family fraction; a 2-fold
+        family's two codons must sum to 100%."""
+        raw = {"TTT": ("F", 70), "TTC": ("F", 30),
+               "ATG": ("M", 99), "TGG": ("W", 5)}
+        vis = self._vis(sc._render_codon_chart(raw))
+        assert "UUU  70%" in vis and "UUC  30%" in vis
+        assert "AUG 100%" in vis                          # sole Met codon
+        # Codons absent from the table render a dim placeholder, not 0%.
+        assert "·" in vis
+
+    def test_dominant_codon_per_family_is_highlighted(self):
+        """Each amino-acid family highlights (bold green) its SINGLE most-used
+        codon, family-wide — so a family split across two cells (Leu here)
+        highlights ONLY its global champion, not the local max in each cell.
+        A sole-codon residue with usage still counts; a rarer synonym never."""
+        raw = {
+            # Leu spans UU(UUA,UUG) + CU(CUN). Global champ = CUG (240),
+            # even though UUG (50) is the local max of the UU cell.
+            "TTA": ("L", 30), "TTG": ("L", 50),
+            "CTT": ("L", 10), "CTC": ("L", 20),
+            "CTA": ("L", 40), "CTG": ("L", 240),
+            # Phe confined to the UU cell: champ UUU.
+            "TTT": ("F", 70), "TTC": ("F", 30),
+            "TGG": ("W", 3),                              # sole Trp codon
+        }
+        out = sc._render_codon_chart(raw)
+        assert "[b green]CUG" in out                      # global Leu champion
+        # The UU-cell Leu local max (UUG) is NOT highlighted — family is split.
+        assert "[b green]UUG" not in out and "[b green]UUA" not in out
+        assert "[b green]UUU" in out                      # Phe champ (own cell)
+        assert "[b green]UUC" not in out
+        assert "[b green]UGG" in out                      # sole codon, used
+
+    def test_stops_are_one_family_single_highlight(self):
+        """The three stops (UAA/UAG/UGA) span the UA + UG cells but are ONE
+        family — only the single most-abundant stop is highlighted, never one
+        per cell (regression: UGA, alone in its cell, must not light up unless
+        it's the global stop champion)."""
+        raw = {"TAA": ("*", 50), "TAG": ("*", 10), "TGA": ("*", 30),
+               "ATG": ("M", 5)}
+        out = sc._render_codon_chart(raw)
+        # Exactly one stop highlighted — the most abundant (UAA, 50) — even
+        # though UGA (30) is the sole stop in its own cell.
+        assert re.findall(r"\[b green\](UAA|UAG|UGA)", out) == ["UAA"]
+        assert "[b green]AUG" in out                      # Met champ unaffected
+
+    def test_no_codons_does_not_crash(self):
+        """An empty table still renders the bare grid (all placeholders) — and
+        with no usage data, no *codon* is highlighted (axis letters stay
+        bold)."""
+        out = sc._render_codon_chart({})
+        assert "second base" in self._vis(out)
+        assert re.search(r"\[b green\][ACGU]{3}", out) is None   # none dominant
+
+
 class TestCodonManagerTabs:
     """The codon-table manager (`SpeciesPickerModal`) is a tabbed modal:
-    Library / Fetch (Kazusa) / Build from genome / Import TSV. Library is the
-    picker; the other three add a table to the registry and bounce back to
-    Library with the new row selected. (The genome-build + TSV-import flows
-    were folded in from their old standalone sub-modals.)"""
+    Library / Chart / Fetch (Kazusa) / Build from genome / Import TSV. Library
+    is the picker; Chart views any table as the classic genetic-code grid; the
+    other three add a table to the registry and bounce back to Library with the
+    new row selected. (The genome-build + TSV-import flows were folded in from
+    their old standalone sub-modals.)"""
 
-    async def test_manager_has_four_tabs(self):
+    async def test_manager_has_five_tabs(self):
         from textual.widgets import TabbedContent, TabPane
         app = sc.PlasmidApp()
         async with app.run_test(size=(140, 50)) as pilot:
@@ -1814,12 +1907,72 @@ class TestCodonManagerTabs:
             await pilot.pause(0.3)
             modal = app.screen
             pane_ids = {p.id for p in modal.query(TabPane)}
-            assert {"sp-tab-library", "sp-tab-fetch",
+            assert {"sp-tab-library", "sp-tab-view", "sp-tab-fetch",
                     "sp-tab-genome", "sp-tab-import"} <= pane_ids
             # Library is the initial tab and hosts the picker DataTable.
             tabs = modal.query_one("#sp-tabs", TabbedContent)
             assert tabs.active == "sp-tab-library"
             assert modal.query_one("#sp-list") is not None
+            app.exit()
+
+    async def test_chart_tab_renders_selected_table(self):
+        """Switching to Chart populates the dropdown from the live registry
+        (K12 is always seeded) and renders the genetic-code grid + a meta line
+        naming the table."""
+        from textual.widgets import TabbedContent, Select, Static
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SpeciesPickerModal())
+            await pilot.pause(0.3)
+            modal = app.screen
+            tabs = modal.query_one("#sp-tabs", TabbedContent)
+            await _switch_tab(pilot, tabs, "sp-tab-view")
+            # The dropdown picked a real table (not BLANK).
+            sel = modal.query_one("#sp-view-select", Select)
+            assert sel.value is not Select.BLANK and sel.value
+            # The grid rendered: RNA codons + residue names are present.
+            grid = str(modal.query_one("#sp-view-chart", Static).render())
+            assert "UUU" in grid and "Met" in grid and "Stop" in grid
+            # The meta line names the table + a codon count.
+            meta = str(modal.query_one("#sp-view-meta", Static).render())
+            assert "codons" in meta
+            app.exit()
+
+    async def test_chart_tab_switch_table_rerenders(self, monkeypatch):
+        """Picking a different table in the dropdown re-renders the grid with
+        that table's data."""
+        from textual.widgets import TabbedContent, Select, Static
+        # Two distinct tables: one rich (K12-like), one tiny single-codon set.
+        tables = [
+            {"name": "Alpha", "taxid": "111", "source": "user",
+             "raw": {c: (aa, n)
+                     for c, (aa, n) in sc._CODON_BUILTIN_K12.items()}},
+            {"name": "Beta", "taxid": "222", "source": "user",
+             "raw": {"ATG": ("M", 9), "TGG": ("W", 9)}},
+        ]
+        monkeypatch.setattr(sc, "_codon_tables_load",
+                            lambda: [dict(t) for t in tables])
+        monkeypatch.setattr(
+            sc, "_codon_tables_get",
+            lambda k: next((dict(t) for t in tables
+                            if k in (t["taxid"], t["name"])), None))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SpeciesPickerModal())
+            await pilot.pause(0.3)
+            modal = app.screen
+            tabs = modal.query_one("#sp-tabs", TabbedContent)
+            await _switch_tab(pilot, tabs, "sp-tab-view")
+            sel = modal.query_one("#sp-view-select", Select)
+            sel.value = "222"                       # switch to the tiny table
+            await pilot.pause(0.2)
+            grid = str(modal.query_one("#sp-view-chart", Static).render())
+            # Beta only has Met + Trp counts → most codons are placeholders.
+            assert "AUG 100%" in grid and grid.count("·") > 50
+            meta = str(modal.query_one("#sp-view-meta", Static).render())
+            assert "Beta" in meta
             app.exit()
 
     async def test_import_tab_adds_and_selects(self, monkeypatch):

@@ -50,7 +50,10 @@ What you can do without leaving the terminal.
   usage-table catalog by organism / taxid and persist a preferred table
   (also via `set-active-codon-table`). **Import TSV** pastes a custom
   usage table (codon, optional amino acid, count) straight into your
-  library.
+  library. **Chart** views any table as the classic genetic-code grid —
+  each codon annotated with its within-family usage (relative synonymous
+  usage), each amino-acid family's single most-used codon highlighted in
+  bold green (family-wide; stops counted as one family).
 
 ## Cloning
 

@@ -2039,11 +2039,19 @@ class TestSynthesisTabbing:
                 "#syn-protein-editor", sc.ProteinEditor,
             )
             ed.insert_at_cursor("ATGC")
-            await pilot.pause()
+            # `insert_at_cursor` flips `_dirty` via a posted change message;
+            # under `-n auto` load a single pause may not drain it, so poll.
+            for _ in range(20):
+                await pilot.pause()
+                if scr._dirty:
+                    break
             assert scr._dirty is True
             assert scr._protein_dirty is False
             pe.insert_at_cursor("MS")
-            await pilot.pause()
+            for _ in range(20):
+                await pilot.pause()
+                if scr._protein_dirty:
+                    break
             assert scr._dirty is True
             assert scr._protein_dirty is True
 

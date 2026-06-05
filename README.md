@@ -179,7 +179,12 @@ the **tabbed codon-table manager**, where each way of getting a table has its
 own tab: **Build from genome** (give an NCBI assembly accession or a taxid, and
 choose highly-expressed genes — ribosomal proteins, the recommended bias for
 strong expression — or the whole genome), **Fetch (Kazusa)**, **Import TSV**,
-plus a **Library** tab to pick or delete. The same manager opens from
+plus a **Library** tab to pick or delete and a **Chart** tab that draws any
+table as the classic genetic-code grid — each codon annotated with its usage
+within its amino-acid family (relative synonymous usage), and each family's
+single most-used codon highlighted in bold green (family-wide, so a codon
+split across cells — Leu, Ser, Arg, the stops — lights up once) for easy
+visual identification. The same manager opens from
 **Settings ▸ Codon Tables** and the Mutato / Constructor codon pickers. Codons
 are reflected live — and a built-in motif library (His6, FLAG, HA, TEV,
 P2A, NLS, GS linkers, and ~30 more) inserts pre-colored tags. Hit **Optimize →
