@@ -1386,13 +1386,15 @@ class TestPrimerCollectionReadsAndMove:
                                       {"name": "m0", "to": "ProjA"})[1] in (404, 409)
 
     def test_move_to_active_collection_is_noop(self):
-        # "" and the ACTIVE collection's name address the SAME store, so trying
-        # to move a primer that's already in the active library "to" that
-        # collection is a no-op → 409 (already there). (This was the catch-22
-        # mirror-safety refusal before the move-out path below was fixed.)
-        self._seed()
+        # "" and the ACTIVE collection's name address the SAME store, so moving
+        # a primer that's already in the active library "to" that collection is
+        # a no-op → 409 (already there). (set-active re-mirrors the live
+        # library to the active collection, so `a0` is what "" resolves to.)
+        self._h("create-primer-collection")(None, {"name": "ProjA"})
         self._h("set-active-primer-collection")(None, {"name": "ProjA"})
-        r = self._h("move-primer")(None, {"name": "m1", "to": "ProjA"})
+        self._h("create-primer")(None, {"name": "a0",
+                                         "sequence": "ACGT" * 5 + "AA"})
+        r = self._h("move-primer")(None, {"name": "a0", "to": "ProjA"})
         assert isinstance(r, tuple) and r[1] == 409
 
     def test_move_out_of_active_collection(self):

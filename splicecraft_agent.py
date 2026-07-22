@@ -1747,30 +1747,62 @@ def _h_list_primer_collections(app, payload):
 
 @_agent_endpoint("set-active-primer-collection", write=True)
 def _h_set_active_primer_collection(app, payload):
-    """Switch the active primer collection. Body: ``{name}`` where
-    `name` is one of the collections returned by
-    `list-primer-collections` (empty string = default top-level).
-    Routes through `_set_active_primer_collection_name` so the
-    mirror discipline (pitfall #10) keeps the live primers.json in
-    sync with the chosen collection's contents."""
+    """Switch the active primer collection AND re-point the live
+    ``primers.json`` mirror at it. Body: ``{name}`` where `name` is one of
+    the collections from `list-primer-collections` (empty string = the
+    free-standing default library).
+
+    Setting the active pointer alone is NOT enough: ``primers.json`` is the
+    live mirror of the active collection (`_save_primers` keeps them in
+    lock-step), so if the switch left it holding the PREVIOUS collection's
+    primers, the very next `create-primer` / `_save_primers` would mirror that
+    stale content back over the newly-active collection and destroy its
+    primers. So — like the plasmid `set-active-collection` handler and the
+    startup restore ([INV-83]) — a switch to a NAMED collection rewrites
+    ``primers.json`` from that collection's stored primers (via
+    `_safe_save_json_mirror`, which permits the legitimate shrink) and busts
+    the cache. Switching to the ``""`` default leaves ``primers.json`` as-is
+    (it becomes the free-standing default), matching
+    `_restore_primers_from_active_primer_collection`, which also no-ops for
+    ``""``. If the mirror write fails the active pointer is reverted, so the
+    live library and the active-name setting never disagree."""
     name = payload.get("name")
     if name is None:
         return ({"error": "missing 'name' (use \"\" for default)"}, 400)
     if not isinstance(name, str):
         return ({"error": "'name' must be a string"}, 400)
     name = name.strip()
-    valid_names = {c.get("name") for c in _load_primer_collections()}
-    valid_names.add("")  # default sentinel
-    if name not in valid_names:
-        return ({"error": (
-            f"unknown primer collection {name!r}; "
-            f"valid: {sorted(n for n in valid_names if n)}"
-        )}, 404)
-
-    if (err := _agent_save_or_500(
-            lambda: _set_active_primer_collection_name(name or None),
-            "primer_collections")) is not None:
-        return err
+    # Validate + swap under ONE lock so a concurrent create-primer can't
+    # interleave between the pointer move and the mirror re-point.
+    with _state._cache_lock:
+        colls = _load_primer_collections()
+        valid_names = {(c.get("name") or "") for c in colls}
+        valid_names.add("")  # default sentinel
+        if name not in valid_names:
+            return ({"error": (
+                f"unknown primer collection {name!r}; "
+                f"valid: {sorted(n for n in valid_names if n)}"
+            )}, 404)
+        prev = _get_active_primer_collection_name() or ""
+        if (err := _agent_save_or_500(
+                lambda: _set_active_primer_collection_name(name or None),
+                "primer_collections")) is not None:
+            return err
+        if name:
+            # Named collection → swap the live mirror to its stored primers.
+            coll = next((c for c in colls
+                         if (c.get("name") or "") == name), None)
+            primers = [dict(p) for p in ((coll or {}).get("primers") or [])
+                       if isinstance(p, dict)]
+            if (err := _agent_save_or_500(
+                    lambda: _safe_save_json_mirror(
+                        _state._PRIMERS_FILE, primers, "Primer library"),
+                    "primer library")) is not None:
+                # Mirror failed AFTER the pointer moved — revert so the live
+                # library and the active-name setting stay consistent.
+                _set_active_primer_collection_name(prev or None)
+                return err
+            _state._primers_cache = None
     return {"ok": True, "active": name}
 
 
@@ -6741,6 +6773,7 @@ def _h_set_active_parts_bin(app, payload):
             return ({"error":
                       f"unknown parts bin {name!r}; "
                       f"valid: {sorted(v for v in valid if v)}"}, 404)
+        prev = _get_active_parts_bin_name()
         _set_active_parts_bin_name(name)
         _state._settings_flush_sync_hook()
         raw_parts = target.get("parts", [])
@@ -6752,6 +6785,11 @@ def _h_set_active_parts_bin(app, payload):
                 _state._PARTS_BIN_FILE, target_parts, "Parts bin"),
             "Parts bin")
         if err:
+            # Mirror failed AFTER the pointer moved — revert so the active name
+            # and the live parts_bin.json can't disagree (the desync would
+            # clobber the target bin on the next save). [INV-161]
+            _set_active_parts_bin_name(prev)
+            _state._settings_flush_sync_hook()
             return err
         _state._parts_bin_cache = None
         _state._clear_assembly_fragment_cache_hook()
@@ -7860,6 +7898,7 @@ def _h_set_active_experiment_project(app, payload):
         if not isinstance(raw_entries, list):
             raw_entries = []
         target_entries = [e for e in raw_entries if isinstance(e, dict)]
+        prev = _get_active_project_name()
         _set_active_project_name(name)
         _state._settings_flush_sync_hook()
         try:
@@ -7869,6 +7908,11 @@ def _h_set_active_experiment_project(app, payload):
                 _state._EXPERIMENTS_FILE, target_entries, "Experiments",
             )
         except (OSError, RuntimeError) as exc:
+            # Mirror failed AFTER the pointer moved — revert so the active name
+            # and the live experiments.json can't disagree (the desync would
+            # clobber the target project on the next save). [INV-161]
+            _set_active_project_name(prev)
+            _state._settings_flush_sync_hook()
             _notify_save_failure(
                 _state._LIVE_APP_REF.get(), "Experiments", exc,
             )

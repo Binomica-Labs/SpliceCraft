@@ -41,7 +41,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.31"
+__version__ = "1.2.32"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -454,6 +454,18 @@ def _check_deps():
         print("Missing dependencies — install with:")
         print(f"  pip install {' '.join(missing)}")
         sys.exit(1)
+    # CLI subcommands that never launch the TUI (`update`, `logs`, `--version`,
+    # `--help`) must run even when Textual is too old — otherwise `splicecraft
+    # update`, whose whole job is to REPAIR a broken install, is blocked at
+    # import time by the very version gate it exists to fix (user report: a
+    # system Python with distro Textual 8.2.7 couldn't self-update). Textual
+    # imports cleanly at the wrong version; it only fails later in CSS parsing,
+    # which these paths never reach — so skip the version gate for them. The
+    # missing-dependency check above still applies (the module import itself
+    # needs Textual/Biopython present, just not necessarily a recent Textual).
+    _first_arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if _first_arg in ("update", "logs", "--version", "-V", "--help", "-h"):
+        return
     # Version gate (2026-06-09): Textual is present but might be too old —
     # the distro-package trap (`apt install python3-textual` → 2.1.2). It
     # imports cleanly, then fails later deep in CSS parsing with an opaque
@@ -23138,7 +23150,8 @@ def _detect_install_method() -> dict:
 
 
 def _build_upgrade_command(method: str, *, force: bool, pre: bool = False,
-                            pin_version: "str | None" = None) -> "list[str] | None":
+                            pin_version: "str | None" = None,
+                            eager: bool = True) -> "list[str] | None":
     """Translate a detected install method into the argv list for the
     upgrade command. Returns None for methods that we refuse to upgrade
     automatically (`editable`, `source`, `pixi-project` — for the last,
@@ -23157,6 +23170,17 @@ def _build_upgrade_command(method: str, *, force: bool, pre: bool = False,
     "upgrade" to an older version — we have to ask for an explicit
     reinstall. ``pre`` is silently ignored when pinning because the
     user has already chosen the exact version they want.
+
+    When ``eager`` is True (the default), the command also upgrades
+    SpliceCraft's DEPENDENCIES to the latest versions its pins still allow —
+    pip's default ``only-if-needed`` strategy leaves a satisfying-but-stale
+    dependency in place, so a routine `splicecraft update` could keep running
+    on an old textual/biopython/etc. Realised as ``--upgrade-strategy eager``
+    for the pip front-ends and forwarded to the pip that ``pipx upgrade``
+    invokes via ``--pip-args``. The uv / pixi front-ends re-resolve the whole
+    environment to the highest compatible versions on every upgrade, so they
+    are already eager and ``eager`` is a no-op there. Skipped when pinning: a
+    rollback install wants the exact prior state, not the newest deps.
     """
     if method in ("editable", "source", "pixi-project"):
         return None
@@ -23165,10 +23189,22 @@ def _build_upgrade_command(method: str, *, force: bool, pre: bool = False,
     if method == "pipx":
         if force or pinned:
             # `pipx upgrade` is a no-op when versions match; `install
-            # --force` re-runs the install end-to-end. Also the only
-            # way to install a specific version (incl. older).
+            # --force` re-runs the install end-to-end (re-resolving deps to
+            # the latest compatible for free). Also the only way to install a
+            # specific version (incl. older).
             return ["pipx", "install", "--force", pkg_spec]
-        return ["pipx", "upgrade", "splicecraft"]
+        cmd = ["pipx", "upgrade", "splicecraft"]
+        if eager:
+            # `pipx upgrade` runs pip with the default only-if-needed
+            # strategy, so a stale-but-satisfying dep is left alone. Forward
+            # an eager upgrade-strategy to the pip it invokes underneath.
+            # MUST be a SINGLE `--pip-args=<value>` token: pipx's `--pip-args`
+            # is a single-value option, and a following token that itself
+            # starts with `--` is parsed as a separate flag ("expected one
+            # argument"), so `["--pip-args", "--upgrade-strategy=eager"]`
+            # makes `pipx upgrade` exit 2 with a usage error.
+            cmd.append("--pip-args=--upgrade-strategy=eager")
+        return cmd
     if method == "uv-tool":
         if force or pinned:
             # `uv tool upgrade` is also a no-op when versions match;
@@ -23203,23 +23239,28 @@ def _build_upgrade_command(method: str, *, force: bool, pre: bool = False,
             # installed package regardless of direction.
             return [sys.executable, "-m", "pip", "install", "--user",
                     "--force-reinstall", pkg_spec]
-        cmd = [sys.executable, "-m", "pip", "install", "--user",
-               "--upgrade", "splicecraft"]
+        cmd = [sys.executable, "-m", "pip", "install", "--user", "--upgrade"]
+        if eager:
+            cmd += ["--upgrade-strategy", "eager"]
+        if pre:
+            cmd.append("--pre")
+        cmd.append("splicecraft")
         if force:
             cmd.append("--force-reinstall")
-        if pre:
-            cmd.insert(4, "--pre")
         return cmd
     # pip-venv, pip-system, unknown — same baseline command. Caller
     # decides whether to run it or just print it.
     if pinned:
         return [sys.executable, "-m", "pip", "install",
                 "--force-reinstall", pkg_spec]
-    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "splicecraft"]
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
+    if eager:
+        cmd += ["--upgrade-strategy", "eager"]
+    if pre:
+        cmd.append("--pre")
+    cmd.append("splicecraft")
     if force:
         cmd.append("--force-reinstall")
-    if pre:
-        cmd.insert(3, "--pre")
     return cmd
 
 
@@ -23726,7 +23767,8 @@ _UPDATE_HELP_TEXT = (
     "splicecraft update — upgrade SpliceCraft to the latest PyPI release\n"
     "\n"
     "Usage:\n"
-    "  splicecraft update [--check|--dry-run] [--force] [--yes|-y] [--help|-h]\n"
+    "  splicecraft update [--check|--dry-run] [--force] [--keep-deps]\n"
+    "                     [--yes|-y] [--help|-h]\n"
     "  splicecraft update VERSION                    # downgrade / pin\n"
     "  splicecraft update --pin VERSION              # explicit form\n"
     "  splicecraft update --list-snapshots\n"
@@ -23737,6 +23779,10 @@ _UPDATE_HELP_TEXT = (
     "                         and print the install command — but DON'T run\n"
     "                         pip/pipx/uv/pixi. Useful for CI verification.\n"
     "  --force                Reinstall even if the local version matches PyPI.\n"
+    "  --keep-deps            Upgrade only SpliceCraft, not its dependencies.\n"
+    "                         By default `update` also bumps deps (textual,\n"
+    "                         biopython, …) to the latest versions SpliceCraft\n"
+    "                         supports, so a stale dependency can't linger.\n"
     "  --yes,-y               Skip the confirmation prompt before installing.\n"
     "  --pin VERSION          Install splicecraft==VERSION instead of latest.\n"
     "                         Use this to roll back a broken release without\n"
@@ -23852,6 +23898,10 @@ def _update_build_parser() -> "_SubcommandParser":
                           dest="want_help")
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--force", action="store_true")
+    # By default `update` upgrades SpliceCraft's dependencies to the latest
+    # versions its pins allow (eager). --keep-deps opts out: upgrade only
+    # SpliceCraft itself and leave already-satisfying deps untouched.
+    parser.add_argument("--keep-deps", action="store_true", dest="keep_deps")
     parser.add_argument("--yes", "-y", action="store_true",
                           dest="assume_yes")
     parser.add_argument("--list-snapshots", action="store_true",
@@ -24596,7 +24646,8 @@ def _run_update_subcommand(argv: "list[str]") -> int:
         return 0
 
     cmd = _build_upgrade_command(method, force=args.force,
-                                   pin_version=pin_version)
+                                   pin_version=pin_version,
+                                   eager=not args.keep_deps)
     # Refuse upgrades for install methods we don't auto-handle
     # (editable / source / pixi-project / pip-system) or where the
     # upgrade front-end isn't on PATH.
@@ -39364,13 +39415,24 @@ def _switch_active_parts_bin(name: str) -> bool:
     target = _find_parts_bin(name)
     if target is None:
         return False
+    prev = _get_active_parts_bin_name()
     _set_active_parts_bin_name(name)
     _settings_flush_sync()
     raw_parts = target.get("parts", [])
     if not isinstance(raw_parts, list):
         raw_parts = []
     target_parts = [p for p in raw_parts if isinstance(p, dict)]
-    _safe_save_json_mirror(_state._PARTS_BIN_FILE, target_parts, "Parts bin")
+    try:
+        _safe_save_json_mirror(_state._PARTS_BIN_FILE, target_parts, "Parts bin")
+    except (OSError, RuntimeError):
+        # Mirror failed AFTER the pointer moved — revert so the active name and
+        # parts_bin.json stay consistent, then re-raise for the caller to
+        # notify (matches the agent handler + [INV-161]). Without the revert the
+        # pointer sits on the new bin over a stale live file, and the next save
+        # mirrors the stale parts over the new bin.
+        _set_active_parts_bin_name(prev)
+        _settings_flush_sync()
+        raise
     _state._parts_bin_cache = None
     _clear_assembly_fragment_cache()
     return True
@@ -39970,6 +40032,36 @@ def _restore_primers_from_active_primer_collection() -> None:
     # source-of-truth, primers.json is the mirror.
     _safe_save_json_mirror(_state._PRIMERS_FILE, primers, "Primer library")
     _state._primers_cache = _typed_clone(primers)
+
+
+def _restore_parts_bin_from_active_bin() -> None:
+    """Refresh `parts_bin.json` with the active bin's parts on startup — the
+    parts-bin twin of `_restore_primers_from_active_primer_collection`
+    ([INV-83]). `parts_bin_collections.json` is the source of truth; the live
+    file is the mirror. Self-heals a pointer/mirror desync left by an
+    interrupted bin switch (`set-active-parts-bin` / `_switch_active_parts_bin`)
+    or a `move-part` whose live re-sync failed — parts bins had NO launch
+    restore before, so such a desync used to survive relaunch and get clobbered
+    by the next `_save_parts_bin`. Silent no-op when no active bin exists."""
+    name = _get_active_parts_bin_name()
+    if not name:
+        return
+    target = _find_parts_bin(name)
+    if target is None:
+        return
+    raw = target.get("parts", [])
+    parts = [p for p in raw if isinstance(p, dict)] if isinstance(raw, list) else []
+    # Only rewrite when the live file actually DIFFERS from the active bin: a
+    # consistent launch (the normal case) must NOT touch parts_bin.json —
+    # redundant I/O + it would break the no-op-save mtime invariant. The write
+    # self-heals a real desync left by an interrupted switch / move-part.
+    try:
+        if _load_parts_bin() == parts:
+            return
+    except (OSError, RuntimeError):
+        pass
+    _safe_save_json_mirror(_state._PARTS_BIN_FILE, parts, "Parts bin")
+    _state._parts_bin_cache = None
 
 
 # ── Feature library persistence ───────────────────────────────────────────────
@@ -55722,6 +55814,35 @@ def _sync_active_project_experiments(entries: "list[dict]") -> None:
             return
 
 
+def _restore_experiments_from_active_project() -> None:
+    """Refresh `experiments.json` with the active project's entries on startup —
+    the experiments twin of `_restore_primers_from_active_primer_collection`
+    ([INV-83]). `experiment_projects.json` is the source of truth; the live file
+    is the mirror. Self-heals a pointer/mirror desync left by an interrupted
+    project switch (`set-active-experiment-project` /
+    `ExperimentProjectsPickerModal`) or a `move-experiment` whose live re-sync
+    failed — experiments had NO launch restore before, so such a desync used to
+    survive relaunch and get clobbered by the next `_save_experiments`. Silent
+    no-op when no active project exists."""
+    name = _get_active_project_name()
+    if not name:
+        return
+    target = _find_project(name)
+    if target is None:
+        return
+    raw = target.get("experiments", [])
+    entries = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+    # Only rewrite on an actual desync (see _restore_parts_bin_from_active_bin):
+    # a consistent launch must NOT touch experiments.json.
+    try:
+        if _load_experiments() == entries:
+            return
+    except (OSError, RuntimeError):
+        pass
+    _safe_save_json_mirror(_state._EXPERIMENTS_FILE, entries, "Experiments")
+    _state._experiments_cache = None
+
+
 # ── Register the experiments hooks the dataaccess sibling fires ──────────────
 # `_migrate_legacy_tag_format` (shared with the editor body-readers) and the
 # synchronous active-project mirror `_sync_active_project_experiments` (whose
@@ -58798,17 +58919,19 @@ class ExperimentProjectsPickerModal(_OneShotDismissScreen, ModalScreen):
         #
         # New ordering: update active-pointer in memory, FORCE
         # synchronous flush so disk-settings reflects the new
-        # active project, then write experiments. Any crash
-        # between the flush and the experiments write recovers
-        # cleanly because the next launch sees consistent
-        # "active=NEW" + experiments.json still=OLD, then
-        # `_save_experiments` on first mutation correctly mirrors
-        # into NEW (matching the active pointer).
+        # active project, then write experiments. A crash between
+        # the flush and the experiments write self-heals on the
+        # NEXT LAUNCH: `_restore_experiments_from_active_project`
+        # rebuilds experiments.json from the active (NEW) project,
+        # so the stale OLD entries can't be mirrored back over NEW
+        # by the next `_save_experiments`. (A same-session mirror
+        # failure is reverted in the `except` below.)
         target = _find_project(name)
         raw_entries = (target or {}).get("experiments", [])
         if not isinstance(raw_entries, list):
             raw_entries = []
         target_entries = [e for e in raw_entries if isinstance(e, dict)]
+        prev = _get_active_project_name()
         _set_active_project_name(name)
         _settings_flush_sync()
         try:
@@ -58823,6 +58946,11 @@ class ExperimentProjectsPickerModal(_OneShotDismissScreen, ModalScreen):
                 _state._EXPERIMENTS_FILE, target_entries, "Experiments",
             )
         except (OSError, RuntimeError) as exc:
+            # Revert the pointer so active-name and experiments.json stay
+            # consistent — the desync would clobber the target project on the
+            # next save. [INV-161]
+            _set_active_project_name(prev)
+            _settings_flush_sync()
             _notify_save_failure(self.app, "Experiments", exc)
             return
         # Invalidate the experiments in-memory cache so the next
@@ -83251,9 +83379,14 @@ class MutagenizeModal(ModalScreen):
                     return
                 _set_active_primer_collection_name(collection)
                 _settings_flush_sync()
+                _restore_primers_from_active_primer_collection()
             elif collection != active_coll:
                 _set_active_primer_collection_name(collection)
                 _settings_flush_sync()
+                # Re-point the live library at the switched-to collection before
+                # the commit re-loads it, so the commit appends to `collection`'s
+                # own primers rather than clobbering it with the previous one's.
+                _restore_primers_from_active_primer_collection()
             self._scrub_commit_primers_with_names(oligos, names)
 
         self.app.push_screen(
@@ -86679,11 +86812,16 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
                 # `_save_primers` mirror lands in it.
                 _set_active_primer_collection_name(collection)
                 _settings_flush_sync()
+                _restore_primers_from_active_primer_collection()
             elif collection != active_coll:
                 # User picked an existing non-active collection.
                 # Switch active so the mirror writes there.
                 _set_active_primer_collection_name(collection)
                 _settings_flush_sync()
+                # Re-point the live library at the switched-to collection first,
+                # so the canonical save loads ITS primers (not the previous
+                # collection's) and can't clobber it on the mirror write.
+                _restore_primers_from_active_primer_collection()
             # Delegate to the canonical save path (does dup-sequence
             # check + collision resolution + `_save_primers`).
             self._commit_designed_primers_with_names(names)
@@ -101161,12 +101299,18 @@ NcbiTaxonPickerModal { align: center middle; }
         # children that read the active bin during mount would
         # otherwise see no active bin.
         _ensure_default_parts_bin()
+        # Rebuild parts_bin.json from the active bin (twin of the primer /
+        # library restores above) so an interrupted bin switch or move-part
+        # self-heals on relaunch instead of the next save clobbering it.
+        _restore_parts_bin_from_active_bin()
         # Same idempotent migration for experiment projects — wraps
         # any pre-existing flat `experiments.json` entries into a
         # "Main Project" wrapper on first 0.9.7 launch; no-op
         # afterwards. Mount-ordering rationale same as above —
         # `ExperimentsScreen` reads the active project during mount.
         _ensure_default_project()
+        # Rebuild experiments.json from the active project — same self-heal.
+        _restore_experiments_from_active_project()
         # Per-instance alignment list — class-level [] would be shared
         # across instances. Test fixtures (and a hypothetical future
         # multi-app process) must not leak alignment state between
@@ -108893,9 +109037,14 @@ NcbiTaxonPickerModal { align: center middle; }
                     return
                 _set_active_primer_collection_name(collection)
                 _settings_flush_sync()
+                _restore_primers_from_active_primer_collection()
             elif collection != active_coll:
                 _set_active_primer_collection_name(collection)
                 _settings_flush_sync()
+                # Re-point the live library at the switched-to collection BEFORE
+                # loading it — otherwise `entries` below is the PREVIOUS
+                # collection's primers and the save clobbers `collection`.
+                _restore_primers_from_active_primer_collection()
             try:
                 entries = _load_primers()
             except Exception:

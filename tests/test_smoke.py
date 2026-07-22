@@ -11640,12 +11640,51 @@ class TestUpdateSubcommandDetection:
         assert info["method"] == "pixi-global", info
 
 
+class TestCheckDepsSubcommandExemption:
+    """`_check_deps` runs at import; its Textual version gate must NOT block the
+    no-TUI subcommands — `splicecraft update` is the command that repairs a
+    stale-Textual install, so gating it out defeats the purpose (user report:
+    system Python with distro Textual 8.2.7 couldn't self-update)."""
+
+    def test_update_bypasses_textual_version_gate(self, monkeypatch):
+        monkeypatch.setattr(sc.sys, "argv", ["splicecraft", "update"])
+        monkeypatch.setattr(sc, "_version_at_least",
+                            lambda have, need: False)   # simulate too-old
+        sc._check_deps()   # must return WITHOUT SystemExit
+
+    def test_no_tui_args_bypass_gate(self, monkeypatch):
+        monkeypatch.setattr(sc, "_version_at_least", lambda have, need: False)
+        for arg in ("update", "logs", "--version", "-V", "--help", "-h"):
+            monkeypatch.setattr(sc.sys, "argv", ["splicecraft", arg])
+            sc._check_deps()   # no SystemExit for any of them
+
+    def test_bare_tui_launch_still_gated(self, monkeypatch):
+        # A normal TUI launch on too-old Textual still exits with guidance.
+        monkeypatch.setattr(sc.sys, "argv", ["splicecraft"])
+        monkeypatch.setattr(sc, "_version_at_least", lambda have, need: False)
+        raised = False
+        try:
+            sc._check_deps()
+        except SystemExit:
+            raised = True
+        assert raised
+
+
 class TestUpdateSubcommandCommandBuilder:
     """`_build_upgrade_command` translates a detected method + the
     --force / --pre flags into the correct argv list."""
 
     def test_pipx_normal(self):
+        # Eager by default: forward --upgrade-strategy to the pip pipx invokes,
+        # as a SINGLE `--pip-args=<value>` token — a separate token that starts
+        # with `--` makes real pipx exit 2 with a usage error.
         cmd = sc._build_upgrade_command("pipx", force=False)
+        assert cmd == ["pipx", "upgrade", "splicecraft",
+                       "--pip-args=--upgrade-strategy=eager"]
+        assert "--pip-args" not in cmd   # NOT the broken two-token form
+
+    def test_pipx_keep_deps_omits_pip_args(self):
+        cmd = sc._build_upgrade_command("pipx", force=False, eager=False)
         assert cmd == ["pipx", "upgrade", "splicecraft"]
 
     def test_pipx_force_uses_install_force(self):
@@ -11722,6 +11761,37 @@ class TestUpdateSubcommandCommandBuilder:
         # surface a clear "run pixi update" message.
         assert sc._build_upgrade_command("pixi-project", force=False) is None
         assert sc._build_upgrade_command("pixi-project", force=True) is None
+
+    # ── eager dependency upgrades (default; opt out with keep-deps) ─
+
+    def test_pip_eager_default_adds_upgrade_strategy(self):
+        cmd = sc._build_upgrade_command("pip-venv", force=False)
+        assert "--upgrade-strategy" in cmd
+        assert cmd[cmd.index("--upgrade-strategy") + 1] == "eager"
+        assert cmd[-1] == "splicecraft"      # package name still last
+
+    def test_pip_keep_deps_omits_upgrade_strategy(self):
+        cmd = sc._build_upgrade_command("pip-venv", force=False, eager=False)
+        assert "--upgrade-strategy" not in cmd
+        assert cmd == [sys.executable, "-m", "pip", "install",
+                       "--upgrade", "splicecraft"]
+
+    def test_pip_user_eager_keeps_package_last(self):
+        cmd = sc._build_upgrade_command("pip-user", force=False)
+        assert "--upgrade-strategy" in cmd and cmd[-1] == "splicecraft"
+
+    def test_pip_eager_with_force_has_both(self):
+        cmd = sc._build_upgrade_command("pip-venv", force=True)
+        assert "--upgrade-strategy" in cmd and "--force-reinstall" in cmd
+
+    def test_pin_is_never_eager(self):
+        # A pinned/rollback install wants the exact prior state, not latest deps.
+        cmd = sc._build_upgrade_command("pip-venv", force=False,
+                                        pin_version="0.8.10")
+        assert "--upgrade-strategy" not in cmd
+        cmd = sc._build_upgrade_command("pipx", force=False,
+                                        pin_version="0.8.10")
+        assert "--pip-args" not in cmd
 
 
 class TestUpdateSubcommandFlow:
@@ -11936,6 +12006,23 @@ class TestUpdateSubcommandFlow:
         monkeypatch.setattr(sc, "_query_installed_version",
                               lambda *a, **k: "99.0.0.0")
         rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 0
+        assert fake.calls == [["pipx", "upgrade", "splicecraft",
+                               "--pip-args=--upgrade-strategy=eager"]]
+
+    def test_keep_deps_flag_runs_plain_upgrade(self, monkeypatch, capsys):
+        # --keep-deps opts out of the eager dependency upgrade → the bare
+        # `pipx upgrade splicecraft`, no forwarded --pip-args.
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        fake = _FakeRun(returncode=0)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+        monkeypatch.setattr(sc, "_query_installed_version",
+                              lambda *a, **k: "99.0.0.0")
+        rc = sc._run_update_subcommand(["--yes", "--keep-deps"])
         assert rc == 0
         assert fake.calls == [["pipx", "upgrade", "splicecraft"]]
 
@@ -15159,12 +15246,15 @@ class TestUpdateVersionPin:
                                               pin_version="0.8.10") is None
 
     def test_build_upgrade_command_without_pin_unchanged(self):
-        # Regression: the no-pin path must produce the historical
-        # commands (already covered by other tests, but assert one
-        # explicitly here so a future pin refactor can't drift).
+        # Regression: the no-pin path must not inject a pinned spec. With
+        # --keep-deps (eager=False) it reproduces the historical command; the
+        # eager default just adds the dependency-upgrade flags on top.
         cmd = sc._build_upgrade_command("pipx", force=False,
-                                          pin_version=None)
+                                          pin_version=None, eager=False)
         assert cmd == ["pipx", "upgrade", "splicecraft"]
+        cmd = sc._build_upgrade_command("pipx", force=False, pin_version=None)
+        assert cmd[:3] == ["pipx", "upgrade", "splicecraft"]
+        assert "splicecraft==" not in " ".join(cmd)   # no accidental pin
 
     # ── CLI dispatch ──────────────────────────────────────────────
 

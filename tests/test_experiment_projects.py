@@ -104,6 +104,45 @@ class TestActiveProjectPointer:
         assert sc._project_name_taken("B") is False
 
 
+class TestExperimentMirrorHardening:
+    """Startup restore + set-active revert for experiment projects — the
+    experiments twins of the primer-collection mirror hardening
+    ([INV-161]/[INV-83]). Experiments previously had NO launch restore, so a
+    switch/move-experiment whose live re-sync failed left a permanent desync."""
+
+    _A = {"name": "A", "description": "", "saved": "",
+          "experiments": [{"id": "e1", "body": "from-A", "tags": []}]}
+    _B = {"name": "B", "description": "", "saved": "",
+          "experiments": [{"id": "e2", "body": "from-B", "tags": []}]}
+
+    def test_restore_rebuilds_live_file_from_active_project(self):
+        import json
+        sc._save_experiment_projects([dict(self._A)])
+        sc._set_active_project_name("A")
+        # Stash a stale live experiments.json directly, then assert the restore
+        # rebuilds it from the active project (source of truth).
+        sc._safe_save_json_mirror(
+            sc._state._EXPERIMENTS_FILE,
+            [{"id": "stale", "body": "stale", "tags": []}], "Experiments")
+        sc._restore_experiments_from_active_project()
+        with open(sc._state._EXPERIMENTS_FILE) as fh:
+            data = json.load(fh)
+        entries = data.get("entries", data) if isinstance(data, dict) else data
+        ids = {e.get("id") for e in entries}
+        assert ids == {"e1"} and "stale" not in ids
+
+    def test_agent_set_active_reverts_on_mirror_failure(self, monkeypatch):
+        import splicecraft_agent as sca
+        sc._save_experiment_projects([dict(self._A), dict(self._B)])
+        sc._h_set_active_experiment_project(None, {"name": "A"})
+        def _boom(*a, **k):
+            raise OSError("simulated disk failure")
+        monkeypatch.setattr(sca, "_safe_save_json_mirror", _boom)
+        r = sc._h_set_active_experiment_project(None, {"name": "B"})
+        assert isinstance(r, tuple) and r[1] == 500
+        assert (sc._get_active_project_name() or "") == "A"   # reverted
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Migration
 # ═══════════════════════════════════════════════════════════════════════════════

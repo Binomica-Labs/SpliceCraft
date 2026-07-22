@@ -124,6 +124,57 @@ class TestActiveBinPointer:
         assert sc._get_active_parts_bin_name() == "B"
 
 
+class TestPartsBinMirrorHardening:
+    """Startup restore + set-active revert for parts bins — the parts-bin
+    twins of the primer-collection mirror hardening ([INV-161]/[INV-83]).
+    Parts bins previously had NO launch restore, so a switch/move-part whose
+    live re-sync failed left a permanent pointer↔mirror desync."""
+
+    _A = {"name": "A", "description": "", "saved": "",
+          "parts": [{"name": "pa", "type": "CDS", "sequence": "ATG"}]}
+    _B = {"name": "B", "description": "", "saved": "",
+          "parts": [{"name": "pb", "type": "Promoter", "sequence": "TTG"}]}
+
+    def test_restore_rebuilds_live_file_from_active_bin(self):
+        # Simulate a stale live parts_bin.json, then assert the startup restore
+        # rebuilds it from the active bin (source of truth).
+        sc._save_parts_bin_collections([dict(self._A)])
+        sc._set_active_parts_bin_name("A")
+        sc._save_parts_bin([{"name": "stale", "type": "CDS", "sequence": "TTT"}])
+        # `_save_parts_bin` mirrored the stale part into A too — re-seed A fresh.
+        sc._save_parts_bin_collections([dict(self._A)])
+        sc._restore_parts_bin_from_active_bin()
+        names = {p.get("name") for p in sc._load_parts_bin()}
+        assert names == {"pa"} and "stale" not in names
+
+    def test_switch_reverts_active_pointer_on_mirror_failure(self, monkeypatch):
+        sc._save_parts_bin_collections([dict(self._A), dict(self._B)])
+        sc._set_active_parts_bin_name("A")
+        sc._switch_active_parts_bin("A")          # prime the mirror
+        def _boom(*a, **k):
+            raise OSError("simulated disk failure")
+        monkeypatch.setattr(sc, "_safe_save_json_mirror", _boom)
+        raised = False
+        try:
+            sc._switch_active_parts_bin("B")
+        except OSError:
+            raised = True
+        assert raised
+        # Pointer reverted so active-name and parts_bin.json stay consistent.
+        assert sc._get_active_parts_bin_name() == "A"
+
+    def test_agent_set_active_reverts_on_mirror_failure(self, monkeypatch):
+        import splicecraft_agent as sca
+        sc._save_parts_bin_collections([dict(self._A), dict(self._B)])
+        sc._h_set_active_parts_bin(None, {"name": "A"})
+        def _boom(*a, **k):
+            raise OSError("simulated disk failure")
+        monkeypatch.setattr(sca, "_safe_save_json_mirror", _boom)
+        r = sc._h_set_active_parts_bin(None, {"name": "B"})
+        assert isinstance(r, tuple) and r[1] == 500
+        assert (sc._get_active_parts_bin_name() or "") == "A"   # reverted
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Migration
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -176,6 +176,71 @@ class TestCreatePrimerCollectionEndpoint:
         assert coll["description"] == "notes here"
 
 
+class TestSetActivePrimerCollectionRemirror:
+    """`set-active-primer-collection` must re-point the live primers.json at
+    the newly-active collection — otherwise the next create/save mirrors the
+    PREVIOUS collection's primers back over the new one (data loss). The agent
+    parallel to the plasmid `set-active-collection` + startup restore."""
+
+    def test_switch_remirrors_live_library(self):
+        sc._save_primer_collections([
+            {"name": "Alpha", "primers": [{"name": "a1", "sequence": "AAAA"}]},
+            {"name": "Beta",  "primers": [{"name": "b1", "sequence": "CCCC"},
+                                          {"name": "b2", "sequence": "GGGG"}]},
+        ])
+        sc._h_set_active_primer_collection(None, {"name": "Alpha"})
+        assert {p["name"] for p in sc._load_primers()} == {"a1"}
+        r = sc._h_set_active_primer_collection(None, {"name": "Beta"})
+        assert r["ok"] and r["active"] == "Beta"
+        # Live library is now Beta's primers, not the stale Alpha ones.
+        assert {p["name"] for p in sc._load_primers()} == {"b1", "b2"}
+
+    def test_switch_then_create_does_not_clobber(self):
+        # The corruption the re-mirror prevents: after switching to Beta, a new
+        # primer lands in Beta and does NOT overwrite it with Alpha's content.
+        sc._save_primer_collections([
+            {"name": "Alpha", "primers": [{"name": "a1", "sequence": "AAAA"}]},
+            {"name": "Beta",  "primers": [{"name": "b1", "sequence": "CCCC"}]},
+        ])
+        sc._h_set_active_primer_collection(None, {"name": "Alpha"})
+        sc._h_set_active_primer_collection(None, {"name": "Beta"})
+        sc._h_create_primer(None, {"name": "b2", "sequence": "TTTT"})
+        beta = next(c for c in sc._load_primer_collections()
+                    if c["name"] == "Beta")
+        assert {p["name"] for p in beta["primers"]} == {"b1", "b2"}   # no a1
+        alpha = next(c for c in sc._load_primer_collections()
+                     if c["name"] == "Alpha")
+        assert {p["name"] for p in alpha["primers"]} == {"a1"}        # untouched
+
+    def test_switch_to_default_keeps_live_library(self):
+        # Switching to "" leaves primers.json as-is (the free-standing
+        # default) — matching the startup restore, which no-ops for "".
+        sc._save_primer_collections([
+            {"name": "Alpha", "primers": [{"name": "a1", "sequence": "AAAA"}]},
+        ])
+        sc._h_set_active_primer_collection(None, {"name": "Alpha"})
+        assert {p["name"] for p in sc._load_primers()} == {"a1"}
+        r = sc._h_set_active_primer_collection(None, {"name": ""})
+        assert r["ok"] and r["active"] == ""
+        assert {p["name"] for p in sc._load_primers()} == {"a1"}
+
+    def test_mirror_failure_reverts_active_pointer(self, monkeypatch):
+        import splicecraft_agent as sca
+        sc._save_primer_collections([
+            {"name": "Alpha", "primers": [{"name": "a1", "sequence": "AAAA"}]},
+            {"name": "Beta",  "primers": [{"name": "b1", "sequence": "CCCC"}]},
+        ])
+        sc._h_set_active_primer_collection(None, {"name": "Alpha"})
+
+        def _boom(*a, **k):
+            raise OSError("simulated disk failure")
+        monkeypatch.setattr(sca, "_safe_save_json_mirror", _boom)
+        r = sc._h_set_active_primer_collection(None, {"name": "Beta"})
+        assert isinstance(r, tuple) and r[1] == 500
+        # Pointer reverted so the live library + active-name setting agree.
+        assert (sc._get_active_primer_collection_name() or "") == "Alpha"
+
+
 class TestRestoreFromBackupCoverage:
     def test_primer_collections_in_restore_targets(self):
         labels = [label for label, attr in sc.RestoreFromBackupModal._TARGETS]

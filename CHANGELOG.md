@@ -14,6 +14,44 @@
 
 ---
 
+## [1.2.32] — 2026-07-21
+
+### New features
+
+- **`splicecraft update` now brings your dependencies up to date too.** An
+  update previously upgraded only SpliceCraft itself and could leave an old
+  textual / biopython / … behind if it still technically satisfied the
+  requirements. It now also upgrades dependencies to the latest versions
+  SpliceCraft supports. Pass `--keep-deps` to upgrade just SpliceCraft; version
+  pins and rollbacks (`splicecraft update <version>`) are unaffected.
+
+### Bug fixes
+
+- **`splicecraft update` could be blocked by its own dependency check.** If your
+  installed Textual was slightly too old, launching *any* SpliceCraft command —
+  including `splicecraft update`, the command meant to fix exactly that — exited
+  with the "needs Textual ≥ …" message before doing anything. `update`, `logs`,
+  `--version` and `--help` now run regardless of the Textual version, so you can
+  always self-update.
+
+- **Switching a primer collection could overwrite it with the previous
+  collection's primers.** When you switched the active primer collection (or
+  saved a designed primer into a different collection), the live primer list
+  wasn't re-pointed at the new collection first — so the next save could
+  replace the target collection's primers with the ones from the collection
+  you came from. Switching now correctly loads the target collection's own
+  primers, in both the agent API and the primer-save dialogs.
+
+- **The same switch-clobber affected parts bins and experiment projects.**
+  Switching a parts bin or experiment project (or moving a part / entry into a
+  non-active one) had the identical stale-live-list bug — and because those two,
+  unlike the plasmid library, had no launch-time self-heal, a failed switch
+  could clobber the target for good. Switching now reverts cleanly on a write
+  error, and both are rebuilt from the active bin/project at startup so an
+  interrupted switch can't leave them inconsistent.
+
+---
+
 ## [1.2.31] — 2026-07-21
 
 ### Bug fixes
