@@ -14,6 +14,21 @@
 
 ---
 
+## [1.2.33] — 2026-07-21
+
+### Hardening
+
+- **`splicecraft babs-setup` runs even on an older Textual.** Like `update` and
+  `logs`, the Babs setup command is pure command-line (it clones and bootstraps
+  the Babs engine), so it no longer stops at the Textual version check.
+
+- **Imported Plasmidsaurus runs are committed more safely over the agent API.**
+  A sequencing import via the agent now finishes writing its library update
+  before returning, closing a small window where an ill-timed crash could drop
+  a freshly-imported run on the next launch.
+
+---
+
 ## [1.2.32] — 2026-07-21
 
 ### New features

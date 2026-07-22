@@ -11654,7 +11654,8 @@ class TestCheckDepsSubcommandExemption:
 
     def test_no_tui_args_bypass_gate(self, monkeypatch):
         monkeypatch.setattr(sc, "_version_at_least", lambda have, need: False)
-        for arg in ("update", "logs", "--version", "-V", "--help", "-h"):
+        for arg in ("update", "logs", "babs-setup",
+                    "--version", "-V", "--help", "-h"):
             monkeypatch.setattr(sc.sys, "argv", ["splicecraft", arg])
             sc._check_deps()   # no SystemExit for any of them
 

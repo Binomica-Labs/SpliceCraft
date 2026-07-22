@@ -2422,8 +2422,15 @@ def _h_download_plasmidsaurus(app, payload):
                 e["id"] = f"{base}_{n}"
             seen.add(e["id"])
             lib.append(e)
+        # Sync mirror (NOT async_sync): the agent is headless, so deferring the
+        # active-collection mirror to the background worker buys nothing and
+        # opens a crash window where the freshly-imported plasmids are in
+        # `plasmid_library.json` but not yet in the active collection — a
+        # crash + restart would then rebuild the live file from the active
+        # collection (`_restore_library_from_active_collection`) and LOSE the
+        # imports. Blocking the import response on the mirror is fine here.
         if (err := _agent_save_or_500(
-                lambda: _save_library(lib, async_sync=True), "library")):
+                lambda: _save_library(lib), "library")):
             return err
         added = [{"name": e["name"], "size": e["size"],
                   "n_feats": e["n_feats"]} for e in entries]

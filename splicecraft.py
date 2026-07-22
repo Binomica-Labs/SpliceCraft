@@ -41,7 +41,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.32"
+__version__ = "1.2.33"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -454,8 +454,8 @@ def _check_deps():
         print("Missing dependencies — install with:")
         print(f"  pip install {' '.join(missing)}")
         sys.exit(1)
-    # CLI subcommands that never launch the TUI (`update`, `logs`, `--version`,
-    # `--help`) must run even when Textual is too old — otherwise `splicecraft
+    # CLI subcommands that never launch the TUI (`update`, `logs`, `babs-setup`,
+    # `--version`, `--help`) must run even when Textual is too old — `splicecraft
     # update`, whose whole job is to REPAIR a broken install, is blocked at
     # import time by the very version gate it exists to fix (user report: a
     # system Python with distro Textual 8.2.7 couldn't self-update). Textual
@@ -464,7 +464,8 @@ def _check_deps():
     # missing-dependency check above still applies (the module import itself
     # needs Textual/Biopython present, just not necessarily a recent Textual).
     _first_arg = sys.argv[1] if len(sys.argv) > 1 else ""
-    if _first_arg in ("update", "logs", "--version", "-V", "--help", "-h"):
+    if _first_arg in ("update", "logs", "babs-setup",
+                      "--version", "-V", "--help", "-h"):
         return
     # Version gate (2026-06-09): Textual is present but might be too old —
     # the distro-package trap (`apt install python3-textual` → 2.1.2). It
