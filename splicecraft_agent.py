@@ -1944,11 +1944,23 @@ def _h_move_primer(app, payload):
     Body: ``{name|id|sequence, to, from?}``. ``to``/``from`` are collection
     names (``""`` = the default / live library).
 
-    Resolves the primer in ``from`` (or searches every collection when
+    The live library (``primers.json``) IS the ACTIVE collection's content —
+    `_save_primers` mirrors one into the other — so ``""`` and the active
+    collection's own NAME address the SAME store. Both are canonicalised to
+    ``""`` and the move routes through `_save_primers` (the only writer that
+    keeps ``primers.json`` and the stored mirror consistent). That makes
+    moving a primer OUT of (or INTO) the active collection safe: before this
+    there was no such path — ``""`` was refused while a named collection was
+    active, and passing the active collection's name edited its stored mirror
+    directly, a change the next `_save_primers` silently reverted (leaving the
+    primer duplicated).
+
+    Resolves the primer in ``from`` (or searches every DISTINCT store when
     ``from`` is omitted; 409 if it lives in more than one), removes it there
     and adds it to ``to`` — all under ONE lock, so the primer is never
     momentarily absent. 404 if the primer or a named collection is missing;
-    409 on an ambiguous name or a sequence already present in ``to``."""
+    409 on an ambiguous name, a sequence already present in ``to``, or when
+    ``to`` is the store the primer already lives in."""
     if (derr := _agent_reject_dangerous_unknowns(
             payload, {"name", "id", "sequence", "to", "from"})) is not None:
         return derr
@@ -1956,7 +1968,7 @@ def _h_move_primer(app, payload):
     if not isinstance(to_in, str):
         return ({"error":
                   "missing 'to' (collection name; \"\" = default)"}, 400)
-    to_name = to_in.strip()
+    to_raw = to_in.strip()
     from_in = payload.get("from")
     seq = payload.get("sequence")
     name = payload.get("name") or payload.get("id")
@@ -1976,24 +1988,42 @@ def _h_move_primer(app, payload):
         default_list = _load_primers()
         active = _get_active_primer_collection_name() or ""
 
-        def _store(cn):
+        # The live library (primers.json) IS the active collection's content
+        # (`_save_primers` mirrors one into the other, [INV-50] / pitfall #10),
+        # so "" and the active collection's own NAME are the SAME store.
+        # Canonicalise any reference to the active collection down to "" so the
+        # move routes through `_save_primers` — the ONLY writer that keeps
+        # primers.json and the stored mirror consistent. Editing the active
+        # collection's stored `primers` list directly (the pre-fix bug) desynced
+        # it from primers.json, and the next `_save_primers` silently reverted.
+        def _canon(cn):
+            return "" if (cn == "" or (active and cn == active)) else cn
+
+        def _store(cn):        # cn is a CANONICAL id ("" or a non-active name)
             if cn == "":
                 return default_list
             c = by_name.get(cn)
             return c.get("primers") if c is not None else None
 
-        if to_name and to_name not in by_name:
+        # Validate + canonicalise the target.
+        if to_raw and to_raw not in by_name:
             return ({"error":
-                      f"no primer collection named {to_name!r}; create it "
+                      f"no primer collection named {to_raw!r}; create it "
                       f"with create-primer-collection"}, 404)
-        # Resolve the source collection.
+        to_name = _canon(to_raw)
+        # Resolve + canonicalise the source.
         if isinstance(from_in, str) and from_in.strip():
-            from_name = from_in.strip()
-            if from_name and from_name not in by_name:
+            from_raw = from_in.strip()
+            if from_raw and from_raw not in by_name:
                 return ({"error":
-                          f"no primer collection named {from_name!r}"}, 404)
+                          f"no primer collection named {from_raw!r}"}, 404)
+            from_name = _canon(from_raw)
         elif from_in in (None, ""):
-            cands = [cn for cn in [""] + list(by_name)
+            # DISTINCT stores only: the active collection is already covered by
+            # "" (same data), so exclude its name to avoid a spurious
+            # "in multiple collections" 409.
+            canon_stores = [""] + [n for n in by_name if n and n != active]
+            cands = [cn for cn in canon_stores
                      if any(_match(p) for p in (_store(cn) or []))]
             if not cands:
                 return ({"error": "primer not found in any collection"}, 404)
@@ -2007,15 +2037,6 @@ def _h_move_primer(app, payload):
         if from_name == to_name:
             return ({"error":
                       f"primer already in {to_name or 'default'!r}"}, 409)
-        # Mirror safety: touching the DEFAULT store while a NAMED collection
-        # is active would make `_save_primers` mis-mirror the default into the
-        # active collection. The common case (default active) is fine.
-        if active and "" in (from_name, to_name):
-            return ({"error":
-                      f"a named primer collection ({active!r}) is active — "
-                      f"switch to the default (set-active-primer-collection "
-                      f"{{\"name\": \"\"}}) before moving to/from the default "
-                      f"library, so the live mirror stays consistent"}, 409)
         src = _store(from_name)
         assert src is not None             # from_name validated above
         idxs = [i for i, p in enumerate(src) if _match(p)]
@@ -2034,18 +2055,48 @@ def _h_move_primer(app, payload):
             return ({"error":
                       f"a primer with that sequence already exists in "
                       f"{to_name or 'default'!r}"}, 409)
-        # The move — under the single lock, so no momentary gap.
+        # The move — under the single lock, so no momentary gap. Persist the
+        # store the primer is ADDED to (`to`) BEFORE the store it's removed
+        # from, so a crash between the two atomic writes DUPLICATES the primer
+        # (recoverable) rather than LOSING it (the data-safety contract is
+        # "never lose, may duplicate"). Mirror correctness holds because the
+        # ordering keeps `_save_primers`' active re-mirror as the last word on
+        # the active entry.
         del src[idxs[0]]
         tgt.insert(0, primer)
-        if from_name != "" or to_name != "":      # a named store changed
+        if to_name == "":
+            # Added to the live/active library: make primers.json + the active
+            # stored mirror durable FIRST (both via `_save_primers`), then the
+            # removal from the named source.
+            if (e := _agent_save_or_500(
+                    lambda: _save_primers(default_list), "primers")) is not None:
+                return e
+            if from_name != "":
+                # `_save_primers` just re-mirrored the active collection into the
+                # collections file from the (deduped) saved library. Refresh
+                # `colls`' active entry to match, so the removal-save below keeps
+                # it rather than reverting to the stale pre-move snapshot.
+                if active and active in by_name:
+                    by_name[active]["primers"] = _load_primers()
+                if (e := _agent_save_or_500(
+                        lambda: _save_primer_collections(colls),
+                        "primer_collections")) is not None:
+                    return e
+        else:
+            # Added to a NAMED collection: make that store durable FIRST, then
+            # (only when the source is the live library) persist its removal.
+            # `_save_primers` runs LAST here, so its re-mirror leaves the active
+            # entry correct even though `colls` carried a stale copy of it.
             if (e := _agent_save_or_500(
                     lambda: _save_primer_collections(colls),
                     "primer_collections")) is not None:
                 return e
-        if from_name == "" or to_name == "":       # the default changed
-            if (e := _agent_save_or_500(
-                    lambda: _save_primers(default_list), "primers")) is not None:
-                return e
+            if from_name == "":
+                if (e := _agent_save_or_500(
+                        lambda: _save_primers(default_list), "primers")) is not None:
+                    return e
+    _log_event("primer.moved", name=primer.get("name", ""),
+               source=from_name, dest=to_name, via="agent")
     return {"ok": True, "name": primer.get("name"),
             "sequence": primer.get("sequence"),
             "from": from_name, "to": to_name,

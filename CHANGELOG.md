@@ -14,6 +14,27 @@
 
 ---
 
+## [1.2.31] — 2026-07-21
+
+### Bug fixes
+
+- **Moving a primer into or out of the active primer collection (agent API) now
+  works and stays consistent.** Through the `move-primer` endpoint, reassigning a
+  primer to or from the collection that's currently active was either refused or
+  left the live primer list out of step with the collection's saved copy — and
+  the reassignment then silently undid itself on the next primer edit. Moves now
+  go through the canonical save path, so the library and the collection always
+  agree.
+
+### Hardening
+
+- **A primer can't be lost if a `move-primer` is interrupted by a disk error.**
+  The destination collection is now written before the primer is cleared from its
+  source, so a failure mid-move duplicates the primer (easily undone) instead of
+  dropping it. Primer moves are also recorded in the event log for traceability.
+
+---
+
 ## [1.2.30] — 2026-07-20
 
 ### Bug fixes

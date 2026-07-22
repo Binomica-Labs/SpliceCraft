@@ -1385,13 +1385,119 @@ class TestPrimerCollectionReadsAndMove:
         assert self._h("move-primer")(None,
                                       {"name": "m0", "to": "ProjA"})[1] in (404, 409)
 
-    def test_move_primer_refuses_default_while_named_active(self):
-        # Mirror-safety guard: touching the default store while a named
-        # collection is active would mis-mirror — refuse with 409.
+    def test_move_to_active_collection_is_noop(self):
+        # "" and the ACTIVE collection's name address the SAME store, so trying
+        # to move a primer that's already in the active library "to" that
+        # collection is a no-op → 409 (already there). (This was the catch-22
+        # mirror-safety refusal before the move-out path below was fixed.)
         self._seed()
         self._h("set-active-primer-collection")(None, {"name": "ProjA"})
         r = self._h("move-primer")(None, {"name": "m1", "to": "ProjA"})
         assert isinstance(r, tuple) and r[1] == 409
+
+    def test_move_out_of_active_collection(self):
+        # THE FIX: with a named collection ACTIVE, primers.json holds its live
+        # content (the mirror). Moving a primer OUT must route through
+        # `_save_primers` so primers.json and the stored mirror stay
+        # consistent — previously there was NO safe path ("" was refused while
+        # a named collection was active, and passing the active name edited the
+        # stored mirror only, which the next `_save_primers` reverted).
+        self._h("create-primer-collection")(None, {"name": "GLOW"})
+        self._h("create-primer-collection")(None, {"name": "SINK"})
+        self._h("set-active-primer-collection")(None, {"name": "GLOW"})
+        for i, suf in enumerate(["AA", "CC", "GG"]):
+            self._h("create-primer")(None, {"name": f"g{i}",
+                                             "sequence": "ACGT" * 5 + suf})
+        # Live library (active GLOW) and GLOW's stored mirror agree at 3.
+        assert self._h("list-primers")(None, {})["count"] == 3
+        assert self._h("list-primers")(None,
+                                       {"collection": "GLOW"})["count"] == 3
+        # Move g0 OUT of the ACTIVE collection into SINK — previously blocked.
+        r = self._h("move-primer")(None,
+                                    {"name": "g0", "from": "GLOW", "to": "SINK"})
+        assert r["ok"]
+        assert self._h("list-primers")(None, {})["count"] == 2        # live −1
+        assert self._h("list-primers")(None,
+                                       {"collection": "SINK"})["count"] == 1
+        # CONSISTENCY: primers.json (live) == GLOW's stored mirror (no desync).
+        live = {p["name"] for p in self._h("list-primers")(None, {})["primers"]}
+        stored = {p["name"] for p in
+                  self._h("list-primers")(None, {"collection": "GLOW"})["primers"]}
+        assert live == stored == {"g1", "g2"}
+
+    def test_move_into_active_collection_by_name(self):
+        # The inverse, addressing the active collection by its NAME: moving a
+        # primer INTO it lands in BOTH primers.json and the stored mirror, and
+        # leaves the source — also impossible before the fix.
+        self._h("create-primer-collection")(None, {"name": "GLOW"})
+        self._h("create-primer-collection")(None, {"name": "SRC"})
+        self._h("set-active-primer-collection")(None, {"name": "GLOW"})
+        self._h("create-primer")(None,
+                                 {"name": "g0", "sequence": "ACGT" * 5 + "AA"})
+        self._h("create-primer")(None, {"name": "s0",
+                                        "sequence": "TTTT" * 5 + "CC",
+                                        "collection": "SRC"})
+        # Reference the active collection by its NAME ("GLOW") for `to`.
+        r = self._h("move-primer")(None,
+                                    {"name": "s0", "from": "SRC", "to": "GLOW"})
+        assert r["ok"]
+        assert self._h("list-primers")(None,
+                                       {"collection": "SRC"})["count"] == 0
+        live = {p["name"] for p in self._h("list-primers")(None, {})["primers"]}
+        stored = {p["name"] for p in
+                  self._h("list-primers")(None, {"collection": "GLOW"})["primers"]}
+        assert "s0" in live and live == stored == {"g0", "s0"}
+
+    def test_move_into_active_collection_survives_save_failure(self, monkeypatch):
+        # HARDENING: moving INTO the active/live library persists the ADDITION
+        # (primers.json + mirror) BEFORE the removal from the named source, so a
+        # failed first save NEVER loses the primer — it stays in the source.
+        # (The pre-hardening order removed from the source first, so a failed
+        # second write dropped the primer entirely.)
+        import splicecraft_agent as sca
+        self._h("create-primer-collection")(None, {"name": "GLOW"})
+        self._h("create-primer-collection")(None, {"name": "SRC"})
+        self._h("set-active-primer-collection")(None, {"name": "GLOW"})
+        self._h("create-primer")(None, {"name": "s0",
+                                         "sequence": "TTTT" * 5 + "CC",
+                                         "collection": "SRC"})
+
+        def _boom(*a, **k):
+            raise OSError("simulated disk failure")
+        monkeypatch.setattr(sca, "_save_primers", _boom)
+
+        r = self._h("move-primer")(None, {"name": "s0",
+                                          "from": "SRC", "to": "GLOW"})
+        assert isinstance(r, tuple) and r[1] == 500      # surfaced, not silent
+        # NOT lost — still in SRC (the removal never ran).
+        assert self._h("list-primers")(None,
+                                       {"collection": "SRC"})["count"] == 1
+        assert self._h("get-primer")(None, {"name": "s0", "collection": "SRC"}
+                                     )["primer"]["name"] == "s0"
+
+    def test_move_out_of_active_collection_survives_save_failure(self, monkeypatch):
+        # HARDENING (other direction): moving OUT of the active library adds to
+        # the named target FIRST, then removes from the live library. A failed
+        # removal DUPLICATES the primer (in both stores), never loses it.
+        import splicecraft_agent as sca
+        self._h("create-primer-collection")(None, {"name": "GLOW"})
+        self._h("create-primer-collection")(None, {"name": "SINK"})
+        self._h("set-active-primer-collection")(None, {"name": "GLOW"})
+        self._h("create-primer")(None, {"name": "g0",
+                                         "sequence": "ACGT" * 5 + "AA"})
+
+        def _boom(*a, **k):
+            raise OSError("simulated disk failure")
+        monkeypatch.setattr(sca, "_save_primers", _boom)
+
+        r = self._h("move-primer")(None, {"name": "g0",
+                                          "from": "GLOW", "to": "SINK"})
+        assert isinstance(r, tuple) and r[1] == 500
+        # DUPLICATED, not lost: the target got it (saved first) AND the live
+        # library still has it (the removal save failed).
+        assert self._h("get-primer")(None, {"name": "g0", "collection": "SINK"}
+                                     )["primer"]["name"] == "g0"
+        assert self._h("get-primer")(None, {"name": "g0"})["primer"]["name"] == "g0"
 
     # ── delete-primer {collection}: prune a collection without data loss ──
     def test_delete_primer_from_collection_keeps_dups_elsewhere(self):
