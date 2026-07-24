@@ -415,6 +415,89 @@ def _win_range(dna, w=50):
     return sc._codon_gc_window_range(dna, w)
 
 
+def _at_rich_table():
+    """Synthetic AT-biased usage table: every residue's dominant synonym ends
+    A/T. Mimics an AT-rich host (Petunia-like) so max_cai collapses GC3."""
+    from collections import defaultdict
+    by_aa = defaultdict(list)
+    for codon, aa in sc._CODON_GENETIC_CODE.items():
+        by_aa[aa].append(codon)
+    raw = {}
+    for aa, codons in by_aa.items():
+        at_end = [c for c in codons if c[2] in "AT"]
+        dom = (at_end or codons)[0]
+        for c in codons:
+            raw[c] = (aa, 900 if c == dom else 10)
+    return raw
+
+
+class TestGC3Warning:
+    """GC3 (third-position wobble GC) swings far more than overall GC. max_cai
+    on an AT-rich host stacks AT-ending codons, collapsing GC3 while overall GC
+    still looks fine — the response surfaces GC3 and warns."""
+
+    PROT = "MAEVKLAGHIKQRSTVWYFNDPCEGHILMNQ" * 2
+
+    def test_gc3_helper_endpoints(self):
+        assert sc._codon_gc3("AAGAAGAAG") == 100.0    # 3rd always G
+        assert sc._codon_gc3("GGAGGAGGA") == 0.0      # 3rd always A
+        assert sc._codon_gc3("") == 0.0
+        assert round(sc._codon_gc3("ATGGGCAAA"), 1) == 66.7  # G,C,A
+
+    def test_gc3_helper_ignores_partial_trailing_codon(self):
+        # 2 complete codons + 2 dangling bases; GC3 over the complete ones only.
+        assert sc._codon_gc3("AAGAAGAT") == 100.0
+
+    def test_max_cai_at_rich_collapses_gc3_and_warns(self):
+        sc._codon_tables_add("AT-rich test", "999001", _at_rich_table())
+        r = sc._h_optimize_protein(
+            None, {"protein": self.PROT, "table": "999001", "mode": "max_cai"})
+        assert r["cai"] >= 0.99            # CAI looks great...
+        assert r["gc3"] < 30               # ...but the wobble position collapsed
+        assert r["warnings"]               # and it's surfaced
+        assert "GC3" in r["warnings"][0] and "max_cai" in r["warnings"][0]
+
+    def test_min_gc_rescues_gc3(self):
+        sc._codon_tables_add("AT-rich test", "999001", _at_rich_table())
+        r = sc._h_optimize_protein(
+            None, {"protein": self.PROT, "table": "999001", "mode": "max_cai",
+                   "min_gc": 45.0})
+        assert r["gc3"] > 30
+        assert not r["warnings"]
+        assert sc._mut_translate(r["dna"]) == self.PROT
+
+    def test_normal_host_no_false_positive(self):
+        for mode in ("frequency", "max_cai"):
+            r = sc._h_optimize_protein(
+                None, {"protein": self.PROT, "table": "83333", "mode": mode})
+            assert not r["warnings"], f"K12 {mode} should not warn (GC3 mid-range)"
+
+    def test_gc3_field_always_present(self):
+        r = sc._h_optimize_protein(None, {"protein": "MGKAAA"})
+        assert "gc3" in r and 0.0 <= r["gc3"] <= 100.0
+        assert isinstance(r["warnings"], list)
+
+    def test_short_cds_does_not_warn_even_when_gc3_extreme(self):
+        """A His6 tag (6 codons, all CAC/CAT) hits GC3 0% under max_cai — but
+        warning on a tag is noise: it's fused into a larger construct whose GC3
+        is what matters. Below the min-codon floor the number is still
+        reported, the warning is suppressed."""
+        r = sc._h_optimize_protein(
+            None, {"protein": "HHHHHH", "table": "83333", "mode": "max_cai"})
+        assert r["gc3"] < 30           # genuinely extreme...
+        assert r["warnings"] == []     # ...but too short to be meaningful
+        assert "gc3" in r              # number still surfaced
+
+    def test_at_min_length_boundary_warns(self):
+        """At exactly the floor the warning is back on (a real short ORF)."""
+        sc._codon_tables_add("AT-rich test", "999001", _at_rich_table())
+        prot = "K" * sc._CODON_GC3_MIN_CODONS   # AAA/AAG → AT-rich max_cai
+        r = sc._h_optimize_protein(
+            None, {"protein": prot, "table": "999001", "mode": "max_cai"})
+        assert r["n_codons"] >= sc._CODON_GC3_MIN_CODONS
+        assert r["gc3"] < 30 and r["warnings"]
+
+
 class TestHazardMotifs:
     def test_known_hosts_resolve(self):
         assert sc._codon_hazard_motifs(["plant"])["plant polyA signal"] == "AATAAA"

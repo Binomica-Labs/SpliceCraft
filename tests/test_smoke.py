@@ -14515,6 +14515,81 @@ class TestRobustnessHardening:
         finally:
             sc._release_data_dir_lock(fd)
 
+    def test_lock_reclaim_logs_dead_pid(self, tmp_path, monkeypatch, caplog):
+        """Observability (2026-07-24): reclaiming a PRE-EXISTING lockfile left
+        by a dead holder is the COMMON case — flock frees on death, so the
+        first-try acquire succeeds and the stale-detection branch is skipped.
+        It used to overwrite the dead-PID stamp silently; now it logs, so the
+        lingering file reads as handled, not orphaned."""
+        if sc.sys.platform == "win32":
+            pytest.skip("reclaim log is POSIX flock-specific")
+        import logging
+        import subprocess
+        monkeypatch.delenv("SPLICECRAFT_SKIP_LOCK", raising=False)
+        # A reliably-dead PID: spawn a trivial child and reap it (avoids
+        # assuming a fixed high PID is free on a large-pid_max box).
+        proc = subprocess.Popen([sc.sys.executable, "-c", ""])
+        proc.wait()
+        dead_pid = proc.pid
+        assert not sc._pid_alive(dead_pid)
+        lockfile = tmp_path / "splicecraft.lock"
+        lockfile.write_text(f"{dead_pid}\n0.0.0\n", encoding="utf-8")
+        # The `splicecraft` logger sets propagate=False, so caplog's root
+        # handler can't see it — capture on the logger itself.
+        monkeypatch.setattr(sc._log, "propagate", True)
+        with caplog.at_level(logging.INFO, logger="splicecraft"):
+            fd, path = sc._acquire_data_dir_lock(
+                tmp_path, lockfile_override=lockfile)
+        try:
+            assert fd is not None                       # reclaimed + acquired
+            assert "Reclaimed stale data-dir lock" in caplog.text
+            assert str(dead_pid) in caplog.text
+            # Our PID overwrote the dead one.
+            assert lockfile.read_text().splitlines()[0] == str(sc.os.getpid())
+        finally:
+            sc._release_data_dir_lock(fd)
+
+    def test_fresh_lock_does_not_log_reclaim(
+            self, tmp_path, monkeypatch, caplog):
+        """A lockfile WE create (nothing pre-existing) has nothing to reclaim,
+        so the reclaim line must NOT fire — no false 'stale lock' noise on a
+        clean first launch."""
+        if sc.sys.platform == "win32":
+            pytest.skip("reclaim log is POSIX flock-specific")
+        import logging
+        monkeypatch.delenv("SPLICECRAFT_SKIP_LOCK", raising=False)
+        lockfile = tmp_path / "splicecraft.lock"        # does not exist yet
+        monkeypatch.setattr(sc._log, "propagate", True)
+        with caplog.at_level(logging.INFO, logger="splicecraft"):
+            fd, _ = sc._acquire_data_dir_lock(
+                tmp_path, lockfile_override=lockfile)
+        try:
+            assert "Reclaimed stale data-dir lock" not in caplog.text
+        finally:
+            sc._release_data_dir_lock(fd)
+
+    @pytest.mark.parametrize("content", ["", "not-a-pid\ngarbage\n", "   \n"])
+    def test_lock_reclaim_tolerates_garbage_lockfile(
+            self, tmp_path, monkeypatch, caplog, content):
+        """A pre-existing lockfile with an unparseable PID (corruption, a
+        crash mid-write) must still acquire and must NOT emit a bogus reclaim
+        line naming a PID it couldn't read."""
+        if sc.sys.platform == "win32":
+            pytest.skip("reclaim log is POSIX flock-specific")
+        import logging
+        monkeypatch.delenv("SPLICECRAFT_SKIP_LOCK", raising=False)
+        lockfile = tmp_path / "splicecraft.lock"
+        lockfile.write_text(content, encoding="utf-8")
+        monkeypatch.setattr(sc._log, "propagate", True)
+        with caplog.at_level(logging.INFO, logger="splicecraft"):
+            fd, _ = sc._acquire_data_dir_lock(
+                tmp_path, lockfile_override=lockfile)
+        try:
+            assert fd is not None                        # still acquires
+            assert "Reclaimed stale data-dir lock" not in caplog.text
+        finally:
+            sc._release_data_dir_lock(fd)
+
     # ── (2) Thread excepthook ──────────────────────────────────────
 
     def test_thread_excepthook_routes_to_log(self, monkeypatch, caplog):

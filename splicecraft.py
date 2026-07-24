@@ -41,7 +41,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.34"
+__version__ = "1.2.35"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -2329,6 +2329,7 @@ def _acquire_data_dir_lock(
     held_by: "str | None" = None
     held_by_pid: "int | None" = None
     locked = False
+    stale_logged = False   # True once the stale-retry path below has logged
     try:
         if sys.platform == "win32":
             try:
@@ -2407,6 +2408,7 @@ def _acquire_data_dir_lock(
                 )
                 _log_event("lock.stale", path=_scrub_path(str(lockfile)),
                             stale_pid=held_by_pid, reason=stale_reason)
+                stale_logged = True
                 try:
                     if sys.platform != "win32":
                         import fcntl  # type: ignore[import-not-found]
@@ -2440,6 +2442,39 @@ def _acquire_data_dir_lock(
                     "(NOT RECOMMENDED — concurrent instances can corrupt "
                     "the library cache)."
                 )
+
+        # Observability (2026-07-24): if we opened a PRE-EXISTING lockfile and
+        # still won the flock on the first try, the previous holder is gone —
+        # it died (flock frees on death) or exited without unlinking (we never
+        # unlink the file, by design — see `_release_data_dir_lock`). We're
+        # about to overwrite its dead-PID stamp; log the reclaim FIRST (reading
+        # the old PID before the truncate below) so the lingering lockfile
+        # reads as HANDLED to anyone inspecting the data dir, not orphaned. The
+        # stale-retry branch above already logs its own case, so skip then; and
+        # a file we created has nothing to reclaim.
+        if not we_created_lockfile and not stale_logged:
+            prev_pid = None
+            try:
+                os.lseek(fd, 0, 0)
+                head = os.read(fd, 256).decode("utf-8", errors="replace").strip()
+                if head:
+                    try:
+                        prev_pid = int(head.splitlines()[0])
+                    except ValueError:
+                        prev_pid = None
+            except OSError:
+                pass
+            if prev_pid is not None and prev_pid != os.getpid():
+                # First-try flock success means the recorded holder released
+                # it (died / exited). Usually the PID is now dead; on a busy
+                # long-uptime box it may have been recycled to something else.
+                dead = not _pid_alive(prev_pid)
+                _log.info(
+                    "Reclaimed stale data-dir lock from %s PID %d.",
+                    "dead" if dead else "exited (PID since reused)", prev_pid,
+                )
+                _log_event("lock.reclaimed", path=_scrub_path(str(lockfile)),
+                            prev_pid=prev_pid, prev_dead=dead)
 
         # Write our PID + version + start-time to the file so a
         # second-instance error message has something useful. Fsync the
@@ -5475,6 +5510,10 @@ from splicecraft_codon import (  # noqa: E402
     _codon_forbidden_sites as _codon_forbidden_sites,
     _codon_cai as _codon_cai,
     _codon_gc as _codon_gc,
+    _codon_gc3 as _codon_gc3,
+    _CODON_GC3_LOW as _CODON_GC3_LOW,
+    _CODON_GC3_HIGH as _CODON_GC3_HIGH,
+    _CODON_GC3_MIN_CODONS as _CODON_GC3_MIN_CODONS,
     _AA_NAME_3 as _AA_NAME_3,
     _render_codon_chart as _render_codon_chart,
     # ── codon-table network builders (codon slice 2) ──

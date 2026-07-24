@@ -345,6 +345,63 @@ class TestParser:
         assert args.endpoint == "rename-plasmid"
         assert args.json == '{"old":"a","new":"b"}'
 
+    def test_optimize_protein_exposes_all_flags(self):
+        """The dedicated subcommand must reach the endpoint's full power, not
+        just --table (else `call optimize-protein --json` is the only capable
+        path — a discoverability trap)."""
+        args = cli._build_parser().parse_args([
+            "optimize-protein", "MAKR", "--mode", "max_cai", "--stops", "2",
+            "--transl-table", "11", "--hazard-hosts", "plant", "mammalian",
+            "--forbidden-motifs", "GGTCTC", "--min-gc", "40", "--max-gc", "60",
+            "--gc-window", "45", "--avoid-repeats-with", "ATGCATGC",
+            "--max-repeat", "20",
+        ])
+        assert args.mode == "max_cai" and args.stops == 2
+        assert args.transl_table == 11
+        assert args.hazard_hosts == ["plant", "mammalian"]
+        assert args.forbidden_motifs == ["GGTCTC"]
+        assert args.min_gc == 40.0 and args.max_gc == 60.0
+        assert args.gc_window == 45
+        assert args.avoid_repeats_with == ["ATGCATGC"] and args.max_repeat == 20
+
+    def test_optimize_protein_builds_full_payload(self, tmp_path, monkeypatch):
+        _setup_token(tmp_path, monkeypatch)
+        captured = {}
+
+        def _fake(endpoint, method, payload=None, **_kw):
+            captured["endpoint"] = endpoint
+            captured["payload"] = payload
+            return {"dna": "ATG", "warnings": [], "fixes": []}
+
+        args = cli._build_parser().parse_args([
+            "optimize-protein", "MAKR", "--mode", "max_cai",
+            "--hazard-hosts", "plant", "--min-gc", "40",
+            "--avoid-repeats-with", "ATGCATGC",
+        ])
+        with patch.object(cli, "_request", side_effect=_fake):
+            args.fn(args)
+        p = captured["payload"]
+        assert captured["endpoint"] == "optimize-protein"
+        assert p["protein"] == "MAKR" and p["mode"] == "max_cai"
+        assert p["hazard_hosts"] == ["plant"] and p["min_gc"] == 40.0
+        assert p["avoid_repeats_with"] == ["ATGCATGC"]
+        # Unset flags must NOT appear (so server defaults apply).
+        assert "max_gc" not in p and "forbidden_motifs" not in p
+
+    def test_optimize_protein_omits_unset_flags(self, tmp_path, monkeypatch):
+        _setup_token(tmp_path, monkeypatch)
+        captured = {}
+
+        def _fake(endpoint, method, payload=None, **_kw):
+            captured["payload"] = payload
+            return {"dna": "ATG"}
+
+        args = cli._build_parser().parse_args(["optimize-protein", "MK"])
+        with patch.object(cli, "_request", side_effect=_fake):
+            args.fn(args)
+        # Bare call → only the protein; every optional key absent.
+        assert captured["payload"] == {"protein": "MK"}
+
     def test_call_surfaces_structured_error_as_json(
             self, tmp_path, monkeypatch, capsys):
         _setup_token(tmp_path, monkeypatch)

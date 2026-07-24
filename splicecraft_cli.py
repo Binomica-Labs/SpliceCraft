@@ -460,14 +460,37 @@ def cmd_list_codon_tables(args) -> None:
 
 
 def cmd_optimize_protein(args) -> None:
-    payload = {"protein": args.protein}
-    if args.table:
-        payload["table"] = args.table
+    payload: "dict" = {"protein": args.protein}
+    # Straight scalar pass-throughs; only set when given so the server's
+    # defaults keep applying (and the response stays minimal).
+    for src, key in (("table", "table"), ("mode", "mode"),
+                     ("stops", "stops"), ("transl_table", "transl_table"),
+                     ("min_gc", "min_gc"), ("max_gc", "max_gc"),
+                     ("gc_window", "gc_window"), ("max_repeat", "max_repeat")):
+        val = getattr(args, src, None)
+        if val is not None:
+            payload[key] = val
+    # List params: argparse gives a list (nargs) or None.
+    if args.hazard_hosts:
+        payload["hazard_hosts"] = args.hazard_hosts
+    if args.forbidden_motifs:
+        payload["forbidden_motifs"] = args.forbidden_motifs
+    if args.avoid_repeats_with:
+        payload["avoid_repeats_with"] = args.avoid_repeats_with
     result = _request("optimize-protein", "POST", payload)
     if args.json:
         _emit_json(result)
         return
+    # DNA to stdout (pipeable); the audit trail + warnings to stderr so a
+    # `... | tee gene.txt` still captures just the sequence.
     print(result.get("dna", ""))
+    for w in result.get("warnings") or []:
+        print(f"warning: {w}", file=sys.stderr)
+    fixes = result.get("fixes") or []
+    if fixes:
+        print(f"# {len(fixes)} synonymous fix(es) applied; "
+              f"CAI {result.get('cai')}, GC {result.get('gc')}%, "
+              f"GC3 {result.get('gc3')}%", file=sys.stderr)
 
 
 # ── Argparse wiring ────────────────────────────────────────────────────────────
@@ -665,7 +688,44 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_harm.add_argument("protein", help="1-letter AA sequence.")
     p_harm.add_argument("--table", default=None,
-                          help="Codon-table taxid (see list-codon-tables).")
+                          help="Codon-table taxid (see list-codon-tables; add "
+                               "hosts with `add-codon-table`).")
+    p_harm.add_argument("--mode", choices=["frequency", "max_cai"],
+                          default=None,
+                          help="frequency (default; matches the host's codon "
+                               "distribution) or max_cai (every position its "
+                               "best synonym — watch the GC3 warning on AT-rich "
+                               "hosts).")
+    p_harm.add_argument("--stops", type=int, default=None,
+                          help="Stop codons to append (0-3); a trailing '*' run "
+                               "in the protein overrides this.")
+    p_harm.add_argument("--transl-table", dest="transl_table", type=int,
+                          default=None,
+                          help="NCBI genetic-code id (default 1; e.g. 4, 6, 11).")
+    p_harm.add_argument("--hazard-hosts", dest="hazard_hosts", nargs="+",
+                          metavar="HOST", default=None,
+                          help="Scrub built-in expression hazards for these "
+                               "hosts: plant, mammalian, bacterial.")
+    p_harm.add_argument("--forbidden-motifs", dest="forbidden_motifs",
+                          nargs="+", metavar="MOTIF", default=None,
+                          help="Also scrub these IUPAC motifs (both strands).")
+    p_harm.add_argument("--min-gc", dest="min_gc", type=float, default=None,
+                          metavar="PCT",
+                          help="Raise every gc-window below this percent.")
+    p_harm.add_argument("--max-gc", dest="max_gc", type=float, default=None,
+                          metavar="PCT",
+                          help="Lower every gc-window above this percent.")
+    p_harm.add_argument("--gc-window", dest="gc_window", type=int,
+                          default=None, metavar="BASES",
+                          help="Window size for --min-gc/--max-gc (default 50).")
+    p_harm.add_argument("--avoid-repeats-with", dest="avoid_repeats_with",
+                          nargs="+", metavar="DNA", default=None,
+                          help="Break perfect repeats shared with these already-"
+                               "built DNA sequences.")
+    p_harm.add_argument("--max-repeat", dest="max_repeat", type=int,
+                          default=None, metavar="BASES",
+                          help="Shared-run length to break for "
+                               "--avoid-repeats-with (default 25).")
     p_harm.add_argument("--json", action="store_true")
     p_harm.set_defaults(fn=cmd_optimize_protein)
 

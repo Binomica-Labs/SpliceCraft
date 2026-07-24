@@ -14,6 +14,39 @@
 
 ---
 
+## [1.2.35] — 2026-07-24
+
+### Hardening
+
+- **Reclaiming a stale data-dir lock now says so in the log.** When a launch
+  takes over a `splicecraft.lock` left behind by a process that was killed (or
+  exited without cleanup), it logs `Reclaimed stale data-dir lock from dead
+  PID N` instead of silently overwriting the file. Purely observability — the
+  reclaim itself already worked — so an inspector of the data directory sees
+  the lingering lock file was handled, not orphaned.
+
+### New features
+
+- **The `optimize-protein` CLI subcommand now exposes the full optimizer.**
+  It previously took only `--table`, so every new option was reachable only
+  through the generic `call optimize-protein --json …` passthrough. It now has
+  `--mode`, `--stops`, `--transl-table`, `--hazard-hosts`, `--forbidden-motifs`,
+  `--min-gc`, `--max-gc`, `--gc-window`, `--avoid-repeats-with`, and
+  `--max-repeat`. The DNA still prints to stdout (pipeable); any warnings and a
+  one-line audit trail go to stderr.
+
+- **Codon optimizer reports third-position GC and warns when it collapses.**
+  The response now includes `gc3` (wobble-position GC) next to overall `gc`.
+  `max_cai` against an AT- or GC-biased host stacks that host's single
+  most-frequent codon everywhere, which can crater GC3 (a gene-silencing and
+  mRNA-instability risk) while the overall GC still looks healthy — so when GC3
+  is extreme the response carries a `warnings` entry that says so and points at
+  `frequency` mode or a `min_gc` floor. For an AT-rich host like a plant,
+  `frequency` mode (which matches the native GC3) is usually the safer choice
+  than `max_cai`.
+
+---
+
 ## [1.2.34] — 2026-07-24
 
 ### New features

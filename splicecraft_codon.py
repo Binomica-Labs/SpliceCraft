@@ -1187,6 +1187,37 @@ def _codon_gc(dna: str) -> float:
     return gc / len(dna) * 100.0
 
 
+# GC3 outside this band is a near-monotonous wobble position — a real
+# silencing / mRNA-instability / synthesis-complexity risk that a healthy
+# OVERALL GC number hides. `max_cai` is the worst offender: it stacks each
+# residue's single most-frequent codon, so on an AT- (or GC-) biased host the
+# third position collapses. Thresholds are deliberately wide so a genuinely
+# AT-rich host in `frequency` mode (native GC3 ~39%) does NOT trip them.
+_CODON_GC3_LOW = 30.0
+_CODON_GC3_HIGH = 85.0
+# GC3 is only statistically meaningful — and only a real silencing/stability
+# concern — for an actual expression unit, not a tag or peptide. A His6 (6
+# codons, all CAC/CAT) optimised to max-CAI has GC3 0%, but warning on it is
+# noise: it's fused into a larger construct whose GC3 is what matters. Suppress
+# the WARNING below this length (the `gc3` number is still always reported).
+# Clears every standard tag (His6/FLAG/HA/Myc/Strep/V5/3xFLAG all < 30 codons).
+_CODON_GC3_MIN_CODONS = 30
+
+
+def _codon_gc3(dna: str) -> float:
+    """GC% at the THIRD (wobble) codon position over complete codons.
+    Empty / <1 codon → 0.
+
+    This is where synonymous choice actually lives, so it swings far more than
+    overall GC — a max-CAI optimise against an AT-rich host can leave overall
+    GC healthy while GC3 collapses, which a single GC number would hide."""
+    third = dna[2:(len(dna) // 3) * 3:3]
+    if not third:
+        return 0.0
+    gc = sum(1 for c in third if c in "GCgc")
+    return gc / len(third) * 100.0
+
+
 # ── codon usage chart (Phase D, moved from hub) ─────────────────────────────
 # Renders a per-amino-acid synonymous-codon usage chart as a Rich-markup
 # STRING (no Rich object dependency). _AA_NAME_3 (AA 1->3 letter) is used only

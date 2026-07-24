@@ -42,7 +42,7 @@ from splicecraft_dataaccess import (_load_custom_labware, _load_protocol_collect
 from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len)
 from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi)
-from splicecraft_codon import (_CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_cai, _codon_diversify, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_gc, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
+from splicecraft_codon import (_CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_cai, _codon_diversify, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
 from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
 from splicecraft_experiments import (_new_experiment_id, _normalise_experiment_entry, _sanitize_experiment_id)
 from splicecraft_fileio import (_PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
@@ -1052,6 +1052,15 @@ def _h_optimize_protein(app, payload):
     counts shared windows left, and `gc_window_min` / `gc_window_max` give the
     achieved window range. Check those, don't assume.
 
+    The response also reports `gc3` (third-position "wobble" GC) alongside
+    overall `gc`, and a `warnings` list. GC3 is where synonymous choice lives,
+    so it swings far more than overall GC — and `max_cai` on an AT- or GC-biased
+    host stacks that host's single most-frequent codon everywhere, collapsing
+    GC3 (a silencing / mRNA-instability risk) while overall GC still looks
+    healthy. When GC3 is extreme a warning says so; for such a host `frequency`
+    mode (which matches the native GC3) is usually the safer choice than
+    `max_cai`, or set `min_gc` to pull the wobble position back up.
+
     `mode` picks the strategy — ``"frequency"`` (default) matches the host's
     codon-usage DISTRIBUTION, deliberately using rare codons at their natural
     rate, so the result can score a lower CAI than the wild-type gene and an
@@ -1246,6 +1255,25 @@ def _h_optimize_protein(app, payload):
         if _iupac_pattern(motif).search(dna)
         or _iupac_pattern(_rc(motif)).search(dna)
     })
+    # GC3 (third-position GC) is where synonymous choice lives, so it swings
+    # far more than overall GC — a healthy overall number can hide a collapsed
+    # wobble position, which is a real silencing / mRNA-instability risk. Warn
+    # when it is extreme so the caller isn't lulled by the top-line GC.
+    gc3 = round(_codon_gc3(dna), 2)
+    warnings: list = []
+    if ((len(dna) // 3) >= _CODON_GC3_MIN_CODONS
+            and (gc3 < _CODON_GC3_LOW or gc3 > _CODON_GC3_HIGH)):
+        side = "well below" if gc3 < _CODON_GC3_LOW else "well above"
+        msg = (f"third-position GC (GC3) is {gc3}% — {side} the typical range, "
+               f"so the wobble position is nearly monotonous. That is a "
+               f"silencing / mRNA-instability / synthesis-complexity risk the "
+               f"overall GC ({round(_codon_gc(dna), 2)}%) hides.")
+        if mode == "max_cai":
+            msg += (" max_cai stacks each residue's single most-frequent codon, "
+                    "which skews GC3 hardest on AT- or GC-biased hosts; "
+                    "'frequency' mode matches the host's native GC3, or set "
+                    "min_gc to pull it back.")
+        warnings.append(msg)
     return {
         "ok":     True,
         "protein":      protein,
@@ -1263,12 +1291,14 @@ def _h_optimize_protein(app, payload):
         "gc_window":         gc_window,
         "gc_window_min":    round(win_lo, 2),
         "gc_window_max":    round(win_hi, 2),
+        "warnings":          warnings,
         # Display/report-only metrics, matching the Synthesis + Mutato toasts.
         # Scored against the SAME genetic code the sequence was optimised under
         # so a reassigned-codon host isn't mis-scored. Additive (V1_GATE-safe).
         "cai":          round(_codon_cai(dna, entry["raw"],
                                          transl_table=transl_table), 4),
         "gc":           round(_codon_gc(dna), 2),
+        "gc3":          gc3,
     }
 
 

@@ -217,8 +217,13 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   runs against constructs you've already built) — each opt-in, with the
   response reporting `fixes`, `remaining_motifs`, `remaining_repeats`,
   and the achieved `gc_window_min` / `gc_window_max` so an unreachable
-  target is visible, not implied met). Only E. coli K12 ships as a
-  table — `add-codon-table` fetches your host from Kazusa by taxid,
+  target is visible, not implied met. The response also carries `gc3`
+  (third-position "wobble" GC) and a `warnings` list: `max_cai` on an
+  AT- or GC-biased host stacks that host's single top codon everywhere,
+  collapsing GC3 — a silencing / mRNA-instability risk — while overall
+  `gc` still looks healthy, so it warns; on such a host prefer `frequency`
+  mode (matches the native GC3) or set `min_gc`). Only E. coli K12 ships
+  as a table — `add-codon-table` fetches your host from Kazusa by taxid,
   builds one from an NCBI genome, or imports a local CDS FASTA.
 - **Simulate** — simulate-pcr (exact-match in-silico amplification,
   wrap-aware on circular templates) and simulate-gel (per-lane band
