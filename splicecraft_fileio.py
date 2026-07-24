@@ -195,15 +195,58 @@ def _export_genbank_to_path(record, path) -> dict:
     src_sigs = sorted(_feature_signature(f) for f in normalized.features)
     dst_sigs = sorted(_feature_signature(f) for f in parsed.features)
     if src_sigs != dst_sigs:
-        # Find the first divergence to surface in the error.
-        diffs = [
-            (s, d) for s, d in zip(src_sigs, dst_sigs) if s != d
-        ]
-        first_diff = diffs[0] if diffs else (None, None)
+        # Compare as MULTISETS rather than zipping the two sorted lists:
+        # one changed signature re-sorts, so the zip flags every feature
+        # after it as divergent too and buries the one that actually moved.
+        from collections import Counter as _Counter
+        src_only = sorted((_Counter(src_sigs) - _Counter(dst_sigs)).elements())
+        dst_only = sorted((_Counter(dst_sigs) - _Counter(src_sigs)).elements())
+
+        def _handle(sig) -> str:
+            """`CDS 'GeneX' at [10:40]` — something findable in the map."""
+            ftype, loc_str, qual_sig = sig
+            quals = dict(qual_sig)
+            for key in ("label", "gene", "product", "note"):
+                if quals.get(key):
+                    return f"{ftype or 'feature'} {quals[key][0]!r} at {loc_str}"
+            return f"{ftype or 'feature'} at {loc_str}"
+
+        def _no_strand(loc_str: str) -> str:
+            for suffix in ("(+)", "(-)", "(?)"):
+                loc_str = loc_str.replace(suffix, "")
+            return loc_str
+
+        # Say what diverged, in words. This used to print the raw signature
+        # tuples, which is unreadable in the common case: a feature built
+        # with `strand=None` differs from its round-tripped self ONLY by a
+        # `(?)` the reader has to spot inside two near-identical tuples.
+        detail = ""
+        if src_only:
+            bad = src_only[0]
+            # Same type + qualifiers ⇒ this is the same feature, come back
+            # changed; that pairing is what makes a specific diagnosis safe.
+            mate = next((d for d in dst_only
+                          if d[0] == bad[0] and d[2] == bad[2]), None)
+            if mate is not None and _no_strand(bad[1]) == _no_strand(mate[1]):
+                if "(" not in bad[1]:
+                    detail = (
+                        f": {_handle(bad)} has no strand. GenBank cannot "
+                        f"represent a strandless feature, so it parsed back "
+                        f"as {mate[1]}. Set strand=1 (forward) or strand=-1 "
+                        f"(reverse) on the feature, then export again."
+                    )
+                else:
+                    detail = (f": {_handle(bad)} changed strand "
+                              f"({bad[1]} → {mate[1]})")
+            elif mate is not None:
+                detail = (f": {_handle(bad)} moved "
+                          f"({bad[1]} → {mate[1]})")
+            else:
+                detail = (f": {_handle(bad)} did not survive the round-trip "
+                          f"— its type or qualifiers changed")
         raise ValueError(
-            f"export round-trip feature signature mismatch "
-            f"({len(diffs)} divergent features; first: "
-            f"src={first_diff[0]!r} dst={first_diff[1]!r})"
+            f"export round-trip feature signature mismatch — "
+            f"{len(src_only)} of {len(src_sigs)} features diverged{detail}"
         )
 
     _atomic_write_text(p, text)

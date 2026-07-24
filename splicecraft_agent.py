@@ -42,7 +42,7 @@ from splicecraft_dataaccess import (_load_custom_labware, _load_protocol_collect
 from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len)
 from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi)
-from splicecraft_codon import (_CODON_GENETIC_CODE, _codon_cai, _codon_fetch_kazusa, _codon_gc, _codon_optimize, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
+from splicecraft_codon import (_CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_cai, _codon_diversify, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_gc, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
 from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
 from splicecraft_experiments import (_new_experiment_id, _normalise_experiment_entry, _sanitize_experiment_id)
 from splicecraft_fileio import (_PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
@@ -1018,8 +1018,50 @@ def _h_set_active_codon_table(app, payload):
 def _h_optimize_protein(app, payload):
     """Codon-optimize a 1-letter AA sequence to DNA using a codon
     table from the registry. Body: ``{protein, table?, stops?,
-    transl_table?}`` where
-    `table` is a taxid (defaults to E. coli K12 = 83333) and `stops`
+    transl_table?, mode?, hazard_hosts?, forbidden_motifs?, min_gc?,
+    max_gc?, gc_window?, avoid_repeats_with?, max_repeat?}`` where
+
+    `hazard_hosts` pulls built-in host-expression hazards to scrub out of the
+    CDS — ``"plant"`` (polyA signal AATAAA, cryptic splice donor GTRAG),
+    ``"mammalian"``, ``"bacterial"`` (internal Shine-Dalgarno) — and
+    `forbidden_motifs` adds your own, either ``["AATAAA", ...]`` or
+    ``{"name": "MOTIF"}``. Any IUPAC pattern is accepted; the reverse
+    complement is scrubbed too. `min_gc` / `max_gc` (PERCENT) then pull every
+    `gc_window`-base window (default 50) into that band by further synonymous
+    swaps, guarded so they cannot re-create a motif the scrub just removed.
+
+    `avoid_repeats_with` takes DNA sequences you have ALREADY built and breaks
+    any perfect-identity run of `max_repeat`+ bases (default 25) that the new
+    design shares with them. Same-protein variants optimized one at a time all
+    converge on the same table and end up sharing hundreds of bases, which is
+    a recombination substrate when they meet in one cell; pass the panel built
+    so far and each new member comes out diversified.
+
+    The GC-window and diversify passes are heavier (roughly quadratic), so
+    they are capped at 1500 codons — a protein longer than that with `min_gc`/
+    `max_gc` or `avoid_repeats_with` set returns 400 (optimize it without those
+    passes, or scrub in segments). The plain optimize and the motif scrub have
+    no such limit.
+
+    All of these are opt-in — omit them and the output is exactly what it was.
+    Because a constraint can be physically unreachable (a Lys/Ile/Phe/Asn
+    stretch has no synonym richer than one G/C per codon, so it tops out near
+    33% and a 35% floor is impossible there), the response REPORTS what was
+    achieved rather than implying success: `fixes` lists every swap made,
+    `remaining_motifs` names any motif still present, `remaining_repeats`
+    counts shared windows left, and `gc_window_min` / `gc_window_max` give the
+    achieved window range. Check those, don't assume.
+
+    `mode` picks the strategy — ``"frequency"`` (default) matches the host's
+    codon-usage DISTRIBUTION, deliberately using rare codons at their natural
+    rate, so the result can score a lower CAI than the wild-type gene and an
+    individual residue can get a worse synonym than a native gene used;
+    ``"max_cai"`` gives every position its most-frequent synonym, which
+    maximises CAI and can never downgrade a residue, at the cost of a much
+    more repetitive sequence. Only one table (E. coli K12) ships — use
+    ``add-codon-table`` to fetch your host from Kazusa by taxid, build one
+    from an NCBI genome, or import a local CDS FASTA. `table`
+    is a taxid (defaults to E. coli K12 = 83333) and `stops`
     (0–3, default 1) is how many stop codons to append when `protein`
     has no trailing '*'. A trailing '*' run in `protein` (1–3) is honored
     verbatim and overrides `stops`; a single stop is TAA, 2–3 are
@@ -1056,25 +1098,171 @@ def _h_optimize_protein(app, payload):
         except (TypeError, ValueError):
             return ({"error": "'transl_table' must be an NCBI genetic-code "
                       "integer (e.g. 1, 4, 6, 11)"}, 400)
+    mode = payload.get("mode", "frequency")
+    if mode not in _CODON_MODES:
+        return ({"error": f"'mode' must be one of "
+                          f"{', '.join(repr(m) for m in _CODON_MODES)}"}, 400)
     taxid = _sanitize_accession(payload.get("table")) or "83333"
     entry = _codon_tables_get(taxid)
     if entry is None:
+        # Point at the ADD path too: only K12 ships, so "no table for my host"
+        # is the expected first result, and a caller who only hears
+        # "see list-codon-tables" concludes the host is unsupported and
+        # hand-builds a table instead of fetching one.
         return ({"error": f"no codon table with taxid {taxid!r}; "
-                          f"see list-codon-tables"}, 404)
+                          f"see list-codon-tables, or add one with "
+                          f"add-codon-table (source 'kazusa' fetches by "
+                          f"taxid, 'genome' builds from an NCBI assembly, "
+                          f"'file' from a local CDS FASTA)"}, 404)
+    # ── optional scrub passes (all no-ops unless asked for) ──────────────
+    scrub: "dict[str, str]" = {}
+    hosts = payload.get("hazard_hosts")
+    if hosts is not None:
+        if not isinstance(hosts, (list, str)):
+            return ({"error": "'hazard_hosts' must be a list of host names"},
+                    400)
+        try:
+            scrub.update(_codon_hazard_motifs(hosts))
+        except ValueError as exc:
+            return ({"error": str(exc)}, 400)
+    motifs = payload.get("forbidden_motifs")
+    if motifs is not None:
+        if isinstance(motifs, dict):
+            pairs = [(str(k), v) for k, v in motifs.items()]
+        elif isinstance(motifs, list):
+            pairs = [(str(m), m) for m in motifs]
+        else:
+            return ({"error": "'forbidden_motifs' must be a list of motifs "
+                              "or a {name: motif} object"}, 400)
+        for name, motif in pairs:
+            text = str(motif or "").upper()
+            if not text:
+                return ({"error": "'forbidden_motifs' contains an empty "
+                                  "motif"}, 400)
+            try:
+                _iupac_pattern(text)
+            except ValueError:
+                return ({"error": f"motif {text!r} is not a valid IUPAC "
+                                  f"pattern"}, 400)
+            scrub[name] = text
+    gc_window = _CODON_GC_WINDOW_DEFAULT
+    if payload.get("gc_window") is not None:
+        gc_window = _coerce_int(payload["gc_window"], name="gc_window")
+        if isinstance(gc_window, str):
+            return ({"error": gc_window}, 400)
+    if gc_window <= 0:
+        return ({"error": "'gc_window' must be a positive integer"}, 400)
+    bounds: "dict[str, float]" = {}
+    for key in ("min_gc", "max_gc"):
+        if payload.get(key) is None:
+            continue
+        try:
+            bounds[key] = float(payload[key])
+        except (TypeError, ValueError):
+            return ({"error": f"'{key}' must be a number (percent, 0-100)"},
+                    400)
+        if not 0.0 <= bounds[key] <= 100.0:
+            return ({"error": f"'{key}' must be between 0 and 100 (percent)"},
+                    400)
+    refs_in = payload.get("avoid_repeats_with")
+    refs: list = []
+    if refs_in is not None:
+        if isinstance(refs_in, str):
+            refs_in = [refs_in]
+        if not isinstance(refs_in, list):
+            return ({"error": "'avoid_repeats_with' must be a DNA string or "
+                              "a list of DNA strings"}, 400)
+        for ref in refs_in:
+            if not isinstance(ref, str):
+                return ({"error": "'avoid_repeats_with' entries must be DNA "
+                                  "strings"}, 400)
+            text, err = _sanitize_bases(ref)
+            if err or not text:
+                return ({"error": "'avoid_repeats_with' contains a value that "
+                                  "is not a DNA sequence"
+                                  + (f": {err}" if err else "")}, 400)
+            refs.append(text)
+    max_repeat = _CODON_REPEAT_RUN_DEFAULT
+    if payload.get("max_repeat") is not None:
+        max_repeat = _coerce_int(payload["max_repeat"], name="max_repeat")
+        if isinstance(max_repeat, str):
+            return ({"error": max_repeat}, 400)
+    if max_repeat <= 0:
+        return ({"error": "'max_repeat' must be a positive integer"}, 400)
+
+    # The GC-window and diversify passes are O(n²); refuse them past a
+    # generous CDS length rather than pegging a worker thread (the plain
+    # optimize + the linear motif scrub stay uncapped).
+    n_codons = len(protein.rstrip("*"))
+    if (bounds or refs) and n_codons > _CODON_SCRUB_MAX_CODONS:
+        which = " and ".join(
+            w for w, on in (("GC-window (min_gc/max_gc)", bool(bounds)),
+                            ("repeat diversification (avoid_repeats_with)",
+                             bool(refs))) if on)
+        return ({"error":
+                  f"{which} is limited to {_CODON_SCRUB_MAX_CODONS} codons; "
+                  f"this protein is {n_codons}. Optimize without that pass, or "
+                  f"scrub the CDS in segments."}, 400)
+
     try:
         dna = _codon_optimize(protein, entry["raw"], stops=stops,
-                              transl_table=transl_table)
+                              transl_table=transl_table, mode=mode)
+        body = protein.rstrip("*")
+        fixes: list = []
+        if scrub:
+            dna, site_fixes = _codon_fix_sites(
+                dna, body, entry["raw"], sites=scrub,
+                transl_table=transl_table)
+            fixes.extend(site_fixes)
+        if refs:
+            dna, rep_fixes = _codon_diversify(
+                dna, body, entry["raw"], refs, min_run=max_repeat,
+                sites=scrub or None, transl_table=transl_table)
+            fixes.extend(rep_fixes)
+        if bounds:
+            # LAST, and guarded by BOTH the motif set and the repeat k-mers,
+            # so a GC swap can't re-create a motif the scrub removed nor a
+            # shared run the diversification broke. `remaining_*` below are
+            # still measured on the FINAL sequence, not trusted from here.
+            dna, gc_fixes = _codon_fix_gc_window(
+                dna, body, entry["raw"], window=gc_window,
+                min_gc=bounds.get("min_gc"), max_gc=bounds.get("max_gc"),
+                sites=scrub or None, transl_table=transl_table,
+                avoid_kmers=_codon_kmer_set(refs, max_repeat) if refs else None,
+                kmer_len=max_repeat if refs else 0)
+            fixes.extend(gc_fixes)
     except ValueError as exc:
         return ({"error": str(exc)}, 400)
+
+    # Re-MEASURE rather than assume: a constraint can be unreachable (a
+    # Lys/Ile/Phe/Asn stretch tops out near 33% GC, so a 35% floor is
+    # impossible there), and reporting the achieved numbers beats implying
+    # success. `remaining_motifs` does the same for the scrub.
+    win_lo, win_hi = _codon_gc_window_range(dna, gc_window)
+    remaining_repeats = len(_codon_shared_runs(dna, refs, max_repeat)) if refs \
+        else 0
+    remaining = sorted({
+        name for name, motif in scrub.items()
+        if _iupac_pattern(motif).search(dna)
+        or _iupac_pattern(_rc(motif)).search(dna)
+    })
     return {
         "ok":     True,
         "protein":      protein,
         "table":        taxid,
         "table_name":   entry.get("name", "?"),
         "transl_table": transl_table or 1,
+        "mode":         mode,
         "dna":          dna,
         "length":       len(dna),
         "n_codons":     len(dna) // 3,
+        "fixes":             fixes,
+        "remaining_motifs":  remaining,
+        "max_repeat":        max_repeat,
+        "remaining_repeats": remaining_repeats,
+        "gc_window":         gc_window,
+        "gc_window_min":    round(win_lo, 2),
+        "gc_window_max":    round(win_hi, 2),
         # Display/report-only metrics, matching the Synthesis + Mutato toasts.
         # Scored against the SAME genetic code the sequence was optimised under
         # so a reassigned-codon host isn't mis-scored. Additive (V1_GATE-safe).

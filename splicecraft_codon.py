@@ -103,6 +103,15 @@ def _codon_table_for(table_id: "int | None") -> "dict[str, str]":
 
 _STOP_CODONS = frozenset(("TAA", "TAG", "TGA"))
 
+# Codon-selection strategies for `_codon_optimize`. Deliberately NOT offering
+# "harmonize": true Angov-style harmonization needs the SOURCE organism's usage
+# table to preserve the relative rare-codon positions that pace cotranslational
+# folding, and we only consume the target table. Calling this "harmonize" is the
+# exact mislabel that was removed in 2026-05-01; naming it back would undo that.
+_CODON_MODE_FREQUENCY = "frequency"
+_CODON_MODE_MAX_CAI   = "max_cai"
+_CODON_MODES = (_CODON_MODE_FREQUENCY, _CODON_MODE_MAX_CAI)
+
 
 _CODON_FIX_POS_RE = re.compile(r"codon (\d+)")
 
@@ -142,6 +151,66 @@ _CODON_DEFAULT_FORBIDDEN: dict[str, str] = {
     "KpnI":    "GGTACC",
     "SacI":    "GAGCTC",
 }
+
+
+# Host-expression hazards that are NOT restriction sites. `_codon_fix_sites`
+# has always accepted any IUPAC pattern, so these could be passed by hand —
+# but `_codon_forbidden_sites` only resolves ENZYME NAMES out of the enzyme
+# catalog, so there was no built-in route to a polyA signal or a splice donor
+# and every caller had to hand-write the dict (agent-API field report,
+# 2026-07-23). Degenerate codes are used where the consensus is degenerate;
+# each entry is a sequence motif whose presence INSIDE a CDS causes trouble in
+# that host, not a cut site.
+_CODON_HOST_HAZARD_MOTIFS: "dict[str, dict[str, str]]" = {
+    "bacterial": {
+        # Internal ribosome-binding site — drives spurious internal
+        # translation initiation and truncated product.
+        "Shine-Dalgarno": "AGGAGG",
+    },
+    "plant": {
+        # Canonical plant polyadenylation signal: premature transcript
+        # cleavage part-way through the CDS.
+        "plant polyA signal": "AATAAA",
+        # 5' splice-donor core, GT(A/G)AG — cryptic intron excision.
+        "cryptic splice donor": "GTRAG",
+    },
+    "mammalian": {
+        "polyA signal":         "AATAAA",
+        "polyA signal variant": "ATTAAA",
+        "cryptic splice donor": "GTRAG",
+    },
+}
+
+
+def _codon_hazard_motifs(hosts) -> "dict[str, str]":
+    """Merge the built-in hazard motifs for each host in ``hosts`` into the
+    ``{name: motif}`` shape `_codon_fix_sites` consumes.
+
+    Raises ValueError naming the unknown host rather than silently returning
+    a smaller set — a typo'd host that quietly scrubbed nothing would read as
+    "my construct is clean" when nothing was ever checked.
+    """
+    if isinstance(hosts, str):
+        hosts = [hosts]
+    out: dict[str, str] = {}
+    seen_motifs: set = set()
+    for host in hosts or []:
+        key = str(host or "").strip().lower()
+        group = _CODON_HOST_HAZARD_MOTIFS.get(key)
+        if group is None:
+            raise ValueError(
+                f"unknown host {host!r} — expected one of "
+                f"{', '.join(repr(h) for h in sorted(_CODON_HOST_HAZARD_MOTIFS))}")
+        # Dedup by the PATTERN, not the name: AATAAA is both the plant and the
+        # mammalian polyA signal (under different names), and carrying it twice
+        # would scrub the same site twice and list it twice in remaining_motifs.
+        # First host named wins the label — the merge is host-order-stable.
+        for name, motif in group.items():
+            if motif in seen_motifs:
+                continue
+            seen_motifs.add(motif)
+            out[name] = motif
+    return out
 
 
 def _codon_tables_add(name: str, taxid: str, raw: dict,
@@ -430,11 +499,32 @@ def _codon_allocate(codons: list, n: int) -> list:
 
 
 def _codon_optimize(protein: str, raw: dict, *, stops: int = 1,
-                    transl_table: "int | None" = None) -> str:
-    """Frequency-matching codon optimization: distribute synonymous codons
-    across the protein so each amino acid's codon distribution matches
-    the target organism's overall usage frequencies. Raises ValueError on
-    unknown amino acids.
+                    transl_table: "int | None" = None,
+                    mode: str = _CODON_MODE_FREQUENCY) -> str:
+    """Codon-optimize a protein against a target organism's usage table.
+    Raises ValueError on unknown amino acids or an unknown ``mode``.
+
+    ``mode`` picks the strategy (default ``"frequency"`` — byte-identical to
+    every pre-2026-07-23 call):
+
+      * ``"frequency"`` — distribute synonymous codons so each amino acid's
+        codon distribution MATCHES the target's overall usage frequencies.
+        Deliberately uses rare codons at their natural rate, which is why the
+        result can score a LOWER CAI than the wild-type gene, and why an
+        individual residue can be assigned a worse synonym than a native gene
+        used at that position (the reported CGT→CGA Arg case). That is the
+        strategy working as designed, not a defect — but it is a surprise if
+        you read "optimize" as "maximise CAI", so:
+      * ``"max_cai"`` — give EVERY position its single most-frequent synonym.
+        Maximises CAI by construction and therefore can never downgrade a
+        residue that already had the best codon. The trade-off is real:
+        one codon per residue removes the natural rare-codon pacing and
+        produces a far more repetitive sequence, so pair it with
+        ``_codon_fix_sites`` / repeat-diversification if you care about
+        synthesis complexity or recombination between similar constructs.
+
+    Both modes share the stop-codon handling below, and stops don't affect CAI
+    (``_codon_cai`` skips them), so the choice is confined to the coding body.
 
     Stop codons (2026-05-30): a run of trailing ``*`` in ``protein`` is
     honored verbatim — ``"MGK*"`` → one stop, ``"MGK**"`` → two, ``"MGK***"``
@@ -470,6 +560,10 @@ def _codon_optimize(protein: str, raw: dict, *, stops: int = 1,
     still yields the requested stop run (``stops`` default 1 ⇒ ``TAA``) so the
     ``len == 3·len(body) + 3·n_stops`` invariant holds — see
     ``test_empty_protein_is_lone_stop``."""
+    if mode not in _CODON_MODES:
+        raise ValueError(
+            f"unknown codon mode {mode!r} — expected one of "
+            f"{', '.join(repr(m) for m in _CODON_MODES)}")
     gc = (_CODON_GENETIC_CODE if transl_table in (None, 1)
           else _codon_table_for(transl_table))
     aa_codons, codon_frac = _codon_build_aa_map(raw, genetic_code=gc)
@@ -492,8 +586,14 @@ def _codon_optimize(protein: str, raw: dict, *, stops: int = 1,
         codons_for_aa = aa_codons.get(aa, [])
         if not codons_for_aa:
             raise ValueError(f"No codons for amino acid '{aa}' in this table")
-        for pos, codon in zip(positions,
-                              _codon_allocate(codons_for_aa, len(positions))):
+        if mode == _CODON_MODE_MAX_CAI:
+            # `aa_codons` is sorted by fraction descending, so [0] is the peak
+            # synonym — the same codon `_codon_cai` divides by. Assigning it
+            # everywhere maximises CAI and makes a downgrade impossible.
+            chosen = [codons_for_aa[0][0]] * len(positions)
+        else:
+            chosen = _codon_allocate(codons_for_aa, len(positions))
+        for pos, codon in zip(positions, chosen):
             codon_at[pos] = codon
 
     # Stop codons come from the TARGET genetic code, not a hardcoded standard
@@ -683,6 +783,345 @@ def _codon_fix_sites(dna: str, protein: str, raw: dict,
                     break
             if not fixed:
                 pos = idx + 1
+    return "".join(dna_list), fixes
+
+
+_CODON_GC_WINDOW_DEFAULT = 50
+
+
+def _codon_gc_window_range(dna: str,
+                           window: int = _CODON_GC_WINDOW_DEFAULT) -> tuple:
+    """``(min_pct, max_pct)`` GC over every ``window``-base window.
+
+    This is what a caller re-measures AFTER `_codon_fix_gc_window` to learn
+    whether the requested band was actually reachable: a Lys/Ile/Phe/Asn
+    stretch has no synonym richer than one G/C per codon, so it tops out near
+    33% and a 35% floor cannot be met there by any number of swaps. Reporting
+    the achieved range beats implying success.
+    """
+    n = len(dna)
+    if n == 0:
+        return (0.0, 0.0)
+    w = min(window, n) if window > 0 else n
+    run = sum(1 for b in dna[:w] if b in "GCgc")
+    lo = hi = run / w * 100.0
+    for i in range(1, n - w + 1):
+        if dna[i - 1] in "GCgc":
+            run -= 1
+        if dna[i + w - 1] in "GCgc":
+            run += 1
+        pct = run / w * 100.0
+        lo = min(lo, pct)
+        hi = max(hi, pct)
+    return (lo, hi)
+
+
+def _codon_fix_gc_window(dna: str, protein: str, raw: dict, *,
+                         window: int = _CODON_GC_WINDOW_DEFAULT,
+                         min_gc: "float | None" = None,
+                         max_gc: "float | None" = None,
+                         sites: "dict | None" = None,
+                         has_appended_stop: bool = True,
+                         transl_table: "int | None" = None,
+                         avoid_kmers: "set | None" = None,
+                         kmer_len: int = 0) -> tuple:
+    """Pull every ``window``-base stretch of ``dna`` into the
+    ``[min_gc, max_gc]`` band by swapping synonymous codons. Both bounds are
+    PERCENT (matching `_codon_gc`); pass either alone for a one-sided floor or
+    ceiling. Returns ``(new_dna, fixes)``; a no-op returning ``(dna, [])`` when
+    neither bound is given.
+
+    Whole-sequence GC can sit at a comfortable 50% while some 50-base stretch
+    is 15% or 85% — and it is the LOCAL window that stalls synthesis and drives
+    secondary structure, which a global GC number cannot see.
+
+    A swap is applied only if it keeps the residue AND introduces no new
+    ``sites`` hit anywhere, so running this after `_codon_fix_sites` can't
+    re-create a forbidden site the scrub just removed. Pass ``avoid_kmers``
+    (with ``kmer_len``) — the shared-run set `_codon_diversify` worked
+    against — to extend the same guard to repeats: without it, running the GC
+    pass after diversification silently re-creates shared runs the
+    diversification just broke, because a GC swap has no reason to prefer a
+    codon the neighbouring construct doesn't use. Windows no synonymous
+    swap can rescue (a stretch of Met/Trp has no choices at all) are left alone
+    and reported via the returned fixes being silent about them — the caller
+    re-measures rather than trusting the pass to have succeeded.
+    """
+    if min_gc is None and max_gc is None:
+        return dna, []
+    if window <= 0:
+        raise ValueError("'window' must be a positive number of bases")
+    if (min_gc is not None and max_gc is not None and min_gc > max_gc):
+        raise ValueError(
+            f"min_gc ({min_gc}) must not exceed max_gc ({max_gc})")
+
+    _gc_code = (_CODON_GENETIC_CODE if transl_table in (None, 1)
+                else _codon_table_for(transl_table))
+    aa_codons, _frac = _codon_build_aa_map(raw, genetic_code=_gc_code)
+
+    # Same forward+RC expansion as `_codon_fix_sites`, so "don't create a new
+    # site" means the same thing in both passes.
+    all_forbidden: list[str] = []
+    for _name, site in (sites or {}).items():
+        s = str(site or "").upper()
+        if not s:
+            continue
+        try:
+            _iupac_pattern(s)
+        except ValueError:
+            continue
+        all_forbidden.append(s)
+        rc = _mut_revcomp(s)
+        if rc != s:
+            all_forbidden.append(rc)
+    forbidden = tuple(all_forbidden)
+
+    dna_list = list(dna)
+    last_safe = len(dna_list) - 3 if has_appended_stop else len(dna_list)
+
+    def _worst_window(seq: str, skip: set):
+        """Largest band violation as ``(lo, hi, need_more_gc)``, else None.
+        Rolling count keeps this O(len(seq)) so the repair loop stays linear
+        per swap instead of rescanning every window from scratch. Windows in
+        ``skip`` are passed over, so one unrescuable stretch doesn't stop the
+        pass from fixing every other window."""
+        n = len(seq)
+        if n == 0:
+            return None
+        w = min(window, n)
+        run = sum(1 for b in seq[:w] if b in "GCgc")
+        worst = None            # (violation, key)
+        for lo in range(0, n - w + 1):
+            if lo:
+                if seq[lo - 1] in "GCgc":
+                    run -= 1
+                if seq[lo + w - 1] in "GCgc":
+                    run += 1
+            pct = run / w * 100.0
+            if min_gc is not None and pct < min_gc:
+                key, gap = (lo, lo + w, True), min_gc - pct
+            elif max_gc is not None and pct > max_gc:
+                key, gap = (lo, lo + w, False), pct - max_gc
+            else:
+                continue
+            if key in skip:
+                continue
+            if worst is None or gap > worst[0]:
+                worst = (gap, key)
+        return worst[1] if worst else None
+
+    fixes: list[str] = []
+    stuck: set = set()
+    # One swap can only ever help one codon, so a codon-count budget bounds the
+    # loop even if a pathological table keeps offering zero-gain swaps.
+    for _ in range(max(1, len(dna_list) // 3)):
+        seq = "".join(dna_list)
+        target = _worst_window(seq, stuck)
+        if target is None:
+            break
+        lo, hi, need_more = target
+        before_hits = _forbidden_hit_set(seq, forbidden) if forbidden else set()
+        # Candidate codons: every codon overlapping the offending window.
+        cands = []
+        for codon_idx in range(lo // 3, min(hi // 3 + 1, len(protein))):
+            codon_start = codon_idx * 3
+            if codon_start + 3 > last_safe:
+                continue
+            aa = protein[codon_idx].upper()
+            current = "".join(dna_list[codon_start:codon_start + 3])
+            cur_gc = sum(1 for b in current if b in "GCgc")
+            for alt, afrac in aa_codons.get(aa, []):
+                if alt == current:
+                    continue
+                delta = sum(1 for b in alt if b in "GCgc") - cur_gc
+                if (need_more and delta > 0) or (not need_more and delta < 0):
+                    # Best GC movement first; among equals prefer the commoner
+                    # codon so the repair costs as little CAI as possible.
+                    cands.append((-abs(delta), -afrac, codon_idx,
+                                  codon_start, aa, current, alt))
+        cands.sort()
+        applied = False
+        # Bind a definitely-set local so the membership test below doesn't
+        # trip the "in <set | None>" type check inside the generator.
+        kmer_guard: set = avoid_kmers or set()
+        check_kmers = bool(kmer_guard) and kmer_len > 0
+        for _d, _f, codon_idx, codon_start, aa, current, alt in cands:
+            dna_list[codon_start:codon_start + 3] = list(alt)
+            # `after` is O(n) to build — only materialise it when a guard
+            # actually reads it. In the common GC-only case (no forbidden
+            # sites, no repeat k-mers) neither branch runs, so we skip the
+            # rebuild entirely; building it unconditionally per candidate was
+            # the O(n²) that made a 6 kb CDS take seconds.
+            if forbidden and not (_forbidden_hit_set("".join(dna_list),
+                                                     forbidden) <= before_hits):
+                dna_list[codon_start:codon_start + 3] = list(current)
+                continue
+            if check_kmers:
+                # Only windows overlapping the 3 bases we changed can be new,
+                # so test a local slice, not the whole sequence.
+                lo_k = max(0, codon_start - kmer_len + 1)
+                hi_k = min(len(dna_list) - kmer_len, codon_start + 2)
+                if any("".join(dna_list[i:i + kmer_len]) in kmer_guard
+                       for i in range(lo_k, hi_k + 1)):
+                    dna_list[codon_start:codon_start + 3] = list(current)
+                    continue
+            direction = "raise" if need_more else "lower"
+            fixes.append(
+                f"GC {direction} at nt {lo + 1}-{hi}: {current}→{alt} "
+                f"(codon {codon_idx + 1} {aa})"
+            )
+            applied = True
+            break
+        if not applied:
+            # No synonymous move can rescue this window; remember it so the
+            # next iteration attacks a different one instead of spinning.
+            stuck.add((lo, hi, need_more))
+    return "".join(dna_list), fixes
+
+
+_CODON_REPEAT_RUN_DEFAULT = 25
+
+# The GC-window and repeat-diversification passes are O(n²) — each makes up to
+# one synonymous swap per codon, and every swap rescans the whole sequence to
+# find the next-worst window / next shared run. That's fine for real proteins
+# (a 1500-codon CDS finishes in ~1.5 s) but a titin-scale input would peg a
+# worker thread for a minute. Callers that request those passes on a longer CDS
+# are refused with a clear limit rather than silently hung; the plain optimize
+# and the (linear) motif scrub stay uncapped. Chosen well above any realistic
+# single-ORF codon-optimization target.
+_CODON_SCRUB_MAX_CODONS = 1500
+
+
+def _codon_kmer_set(references, k: int) -> set:
+    """Every ``k``-mer across ``references`` — the shared-run lookup that both
+    the repeat breaker and the GC pass's repeat guard test against."""
+    out: set = set()
+    if k <= 0:
+        return out
+    for ref in references or []:
+        text = str(ref or "").upper()
+        for i in range(len(text) - k + 1):
+            out.add(text[i:i + k])
+    return out
+
+
+def _codon_shared_runs(dna: str, references, min_run: int) -> "list[int]":
+    """Start offsets in ``dna`` of every ``min_run``-base window that occurs
+    verbatim in at least one reference. Overlapping hits are all reported; a
+    caller breaking a long run re-scans after each swap."""
+    if min_run <= 0 or not dna:
+        return []
+    kmers = _codon_kmer_set(references, min_run)
+    if not kmers:
+        return []
+    up = dna.upper()
+    return [i for i in range(len(up) - min_run + 1)
+            if up[i:i + min_run] in kmers]
+
+
+def _codon_diversify(dna: str, protein: str, raw: dict, references, *,
+                     min_run: int = _CODON_REPEAT_RUN_DEFAULT,
+                     sites: "dict | None" = None,
+                     has_appended_stop: bool = True,
+                     transl_table: "int | None" = None) -> tuple:
+    """Break every perfect-identity run of ``min_run``+ bases that ``dna``
+    shares with any sequence in ``references``, using synonymous codon swaps.
+    Returns ``(new_dna, fixes)``.
+
+    Two constructs carrying a long identical stretch can recombine when they
+    meet in the same cell, so a panel of same-protein variants optimized one
+    at a time is a real hazard: each is optimized against the same table, so
+    they converge on the same codons and end up sharing hundreds of bases (the
+    reported case was a 363 bp perfect repeat across a co-transformed panel).
+    Optimizing each variant against the ones already built removes that.
+
+    Direct repeats only — the shared-sequence recombination substrate. A swap
+    is applied only if it keeps the residue, actually breaks the window it was
+    chosen for, and introduces no new ``sites`` hit, so this composes with the
+    motif scrub in either order. Runs no synonymous swap can break (a
+    Met/Trp-only stretch is invariant) are left alone; re-scan with
+    `_codon_shared_runs` to see what survived rather than assuming none did.
+    """
+    refs = [str(r or "").upper() for r in (references or [])]
+    refs = [r for r in refs if len(r) >= min_run]
+    if not refs or min_run <= 0:
+        return dna, []
+
+    _gc_code = (_CODON_GENETIC_CODE if transl_table in (None, 1)
+                else _codon_table_for(transl_table))
+    aa_codons, _frac = _codon_build_aa_map(raw, genetic_code=_gc_code)
+
+    all_forbidden: list[str] = []
+    for _name, site in (sites or {}).items():
+        s = str(site or "").upper()
+        if not s:
+            continue
+        try:
+            _iupac_pattern(s)
+        except ValueError:
+            continue
+        all_forbidden.append(s)
+        rc = _mut_revcomp(s)
+        if rc != s:
+            all_forbidden.append(rc)
+    forbidden = tuple(all_forbidden)
+
+    kmers = _codon_kmer_set(refs, min_run)
+
+    dna_list = list(dna)
+    last_safe = len(dna_list) - 3 if has_appended_stop else len(dna_list)
+    fixes: list[str] = []
+    stuck: set = set()
+
+    for _ in range(max(1, len(dna_list) // 3)):
+        seq = "".join(dna_list)
+        hit = next((i for i in range(len(seq) - min_run + 1)
+                    if i not in stuck and seq[i:i + min_run] in kmers), None)
+        if hit is None:
+            break
+        before_hits = (_forbidden_hit_set(seq, forbidden) if forbidden
+                       else set())
+        # Break from the MIDDLE outward: a change near the centre splits the
+        # run into two pieces that are each shorter than min_run, where an
+        # edge change just slides the window along by one base.
+        mid = hit + min_run // 2
+        order = sorted(range(hit // 3, min((hit + min_run) // 3 + 1,
+                                           len(protein))),
+                       key=lambda ci: abs(ci * 3 + 1 - mid))
+        applied = False
+        for codon_idx in order:
+            codon_start = codon_idx * 3
+            if codon_start + 3 > last_safe:
+                continue
+            aa = protein[codon_idx].upper()
+            current = "".join(dna_list[codon_start:codon_start + 3])
+            # Commonest synonym first so diversification costs least CAI.
+            for alt, afrac in aa_codons.get(aa, []):
+                if alt == current:
+                    continue
+                dna_list[codon_start:codon_start + 3] = list(alt)
+                # Did the swap actually break THIS window? Check the local
+                # slice, not a freshly-joined whole sequence (that rebuild per
+                # candidate was O(n²) on a long CDS).
+                if "".join(dna_list[hit:hit + min_run]) in kmers:
+                    dna_list[codon_start:codon_start + 3] = list(current)
+                    continue        # didn't actually break this window
+                if forbidden and not (_forbidden_hit_set("".join(dna_list),
+                                                         forbidden)
+                                      <= before_hits):
+                    dna_list[codon_start:codon_start + 3] = list(current)
+                    continue
+                fixes.append(
+                    f"repeat at nt {hit + 1}-{hit + min_run}: "
+                    f"{current}→{alt} (codon {codon_idx + 1} {aa}, "
+                    f"freq={afrac:.3f})"
+                )
+                applied = True
+                break
+            if applied:
+                break
+        if not applied:
+            stuck.add(hit)
     return "".join(dna_list), fixes
 
 

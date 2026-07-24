@@ -1016,6 +1016,63 @@ class TestExportGenBankToPath:
         assert out.exists()
 
 
+class TestExportRoundTripDiagnostics:
+    """The round-trip guard blocks a lossy export — but it has to say WHAT
+    to fix. It used to print raw signature tuples, which in the common case
+    (a `strand=None` feature) differ only by a `(?)` buried inside two
+    near-identical tuples."""
+
+    @staticmethod
+    def _rec(strands):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("ATGC" * 80), id="DIAG", name="DIAG",
+                        description="round-trip diagnostics")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        rec.features = [
+            SeqFeature(FeatureLocation(10 + 20 * i, 30 + 20 * i, strand=s),
+                       type="CDS", qualifiers={"label": [f"feat{i}"]})
+            for i, s in enumerate(strands)
+        ]
+        return rec
+
+    def test_strandless_feature_is_named_with_the_fix(self, tmp_path):
+        rec = self._rec([None])
+        with pytest.raises(ValueError) as exc:
+            sc._export_genbank_to_path(rec, tmp_path / "out.gb")
+        msg = str(exc.value)
+        assert "has no strand" in msg
+        assert "'feat0'" in msg            # names the offending feature
+        assert "strand=1" in msg           # and how to fix it
+        assert "strand=-1" in msg
+
+    def test_strandless_failure_leaves_no_file(self, tmp_path):
+        """The round-trip runs BEFORE the target is touched."""
+        out = tmp_path / "out.gb"
+        with pytest.raises(ValueError):
+            sc._export_genbank_to_path(self._rec([None]), out)
+        assert not out.exists()
+
+    def test_one_bad_feature_reports_one_divergence(self, tmp_path):
+        """Multiset diff, not a zip of two sorted lists: a single changed
+        signature re-sorts, and the old zip then flagged every feature
+        after it too — burying the one that actually moved."""
+        rec = self._rec([1, 1, None, -1, 1])
+        with pytest.raises(ValueError) as exc:
+            sc._export_genbank_to_path(rec, tmp_path / "out.gb")
+        msg = str(exc.value)
+        assert "1 of 5 features diverged" in msg
+        assert "'feat2'" in msg            # the strandless one, not a neighbour
+
+    def test_fully_stranded_record_exports_clean(self, tmp_path):
+        """The guard must not fire on ordinary records."""
+        out = tmp_path / "ok.gb"
+        summary = sc._export_genbank_to_path(self._rec([1, -1, 1]), out)
+        assert out.exists() and summary["features"] == 3
+
+
 class TestExportFastaToPath:
     """`_export_fasta_to_path(name, sequence, path)` writes a minimal
     single-record FASTA atomically, validates its inputs, and cleans up

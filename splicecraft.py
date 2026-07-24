@@ -41,7 +41,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.33"
+__version__ = "1.2.34"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -5446,6 +5446,9 @@ from splicecraft_codon import (  # noqa: E402
     _CODON_TABLE_BY_ID as _CODON_TABLE_BY_ID,
     _codon_table_for as _codon_table_for,
     _STOP_CODONS as _STOP_CODONS,
+    _CODON_MODE_FREQUENCY as _CODON_MODE_FREQUENCY,
+    _CODON_MODE_MAX_CAI as _CODON_MODE_MAX_CAI,
+    _CODON_MODES as _CODON_MODES,
     _CODON_FIX_POS_RE as _CODON_FIX_POS_RE,
     _codon_fix_mutation_positions as _codon_fix_mutation_positions,
     _CODON_DEFAULT_FORBIDDEN as _CODON_DEFAULT_FORBIDDEN,
@@ -5459,6 +5462,16 @@ from splicecraft_codon import (  # noqa: E402
     _codon_allocate as _codon_allocate,
     _codon_optimize as _codon_optimize,
     _codon_fix_sites as _codon_fix_sites,
+    _CODON_HOST_HAZARD_MOTIFS as _CODON_HOST_HAZARD_MOTIFS,
+    _codon_hazard_motifs as _codon_hazard_motifs,
+    _CODON_GC_WINDOW_DEFAULT as _CODON_GC_WINDOW_DEFAULT,
+    _codon_gc_window_range as _codon_gc_window_range,
+    _codon_fix_gc_window as _codon_fix_gc_window,
+    _CODON_REPEAT_RUN_DEFAULT as _CODON_REPEAT_RUN_DEFAULT,
+    _CODON_SCRUB_MAX_CODONS as _CODON_SCRUB_MAX_CODONS,
+    _codon_kmer_set as _codon_kmer_set,
+    _codon_shared_runs as _codon_shared_runs,
+    _codon_diversify as _codon_diversify,
     _codon_forbidden_sites as _codon_forbidden_sites,
     _codon_cai as _codon_cai,
     _codon_gc as _codon_gc,
@@ -92866,6 +92879,81 @@ def _h_restart(app, payload):
             "running_version":   __version__,
             "installed_version": installed}
 
+
+def _agent_shutdown_exec(app) -> None:
+    """Quit the app so `main()`'s existing teardown runs, after a short
+    delay so the `shutdown` HTTP response reaches the client first.
+
+    Calls `App.exit()` and deliberately NOT `action_quit()`: the latter
+    pushes the Save / Abandon / Cancel modal on unsaved edits, which in a
+    headless daemon would wait forever for a keypress nobody can send.
+    The dirty check happens up-front in the handler instead.
+
+    `App.exit()` unwinds `app.run()`, so main()'s `finally` does the real
+    work — stops the API server, flushes settings and the pending
+    collection sync, drains in-flight workers, releases the data-dir lock.
+    That is the whole point: never force-exit here, because `os._exit`
+    would skip exactly the flushes that make this shutdown graceful. A
+    wedged loop is left alive and logged for the caller to kill.
+    """
+    import time as _t
+    _t.sleep(0.5)
+    # Same guard as `_bg_notify_save_failure`: `call_from_thread` on a
+    # stopped loop schedules a coroutine nobody awaits.
+    if not getattr(app, "is_running", False):
+        _log.info("agent shutdown: app loop already stopped; nothing to do")
+        return
+    try:
+        app.call_from_thread(app.exit)
+    except Exception:
+        _log.exception(
+            "agent shutdown: App.exit() failed; daemon left running "
+            "(kill it manually — a forced exit here would drop pending saves)"
+        )
+
+
+def _agent_schedule_shutdown(app) -> None:
+    """Spawn the delayed quit on a daemon thread. Split out from the
+    handler so a test can stub it without stopping the test process."""
+    threading.Thread(target=_agent_shutdown_exec, args=(app,),
+                     name="sc-agent-shutdown", daemon=True).start()
+
+
+@_agent_endpoint("shutdown", write=True)
+def _h_shutdown(app, payload):
+    """Stop the ``--agent`` daemon gracefully. Body: ``{}``, or
+    ``{"force": true}`` to quit with unsaved canvas edits.
+
+    Without this the only way to stop a detached daemon was a SIGKILL,
+    which skips the flush-on-exit path (pending collection sync, settings
+    writes, in-flight workers) and leaves a dead-PID ``splicecraft.lock``
+    behind. Here the app unwinds through its normal teardown, so those
+    flushes land and the lock is released cleanly. Returns immediately;
+    the process exits ~0.5 s later, so poll the PID (or the port) to
+    confirm rather than expecting the socket to outlive the reply.
+
+    Refuses with ``409`` when the canvas has unsaved edits (pass
+    ``force``) — quitting is not undoable and the headless daemon has no
+    modal to ask through.
+
+    HEADLESS-ONLY, matching ``restart``: an interactive ``--agent``
+    session has a keyboard and its own quit flow (which prompts about
+    unsaved work), so it returns ``409``. The gap this fills is the
+    detached daemon, which has neither. Note ``--agent`` auto-headlesses
+    when it has no controlling TTY, so a daemon launched from an agent
+    context is already eligible.
+    """
+    if not bool(getattr(app, "_headless", False)):
+        return ({"error":
+                  "shutdown is headless-only — an interactive --agent "
+                  "session has its own quit flow (press q). Quit that one "
+                  "at the terminal, or run --headless for remote shutdown."},
+                409)
+    guard = _agent_dirty_guard(app, payload)
+    if guard:
+        return guard
+    _agent_schedule_shutdown(app)
+    return {"ok": True, "shutting_down": True, "pid": os.getpid()}
 
 
 @_agent_endpoint("features")

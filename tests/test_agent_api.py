@@ -35,6 +35,7 @@ guard. Smoke-level "real app + real port" coverage lives in
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import time
@@ -1836,6 +1837,115 @@ class TestRestartEndpoint:
             assert called == [True]
         finally:
             sc._agent_schedule_restart = orig
+
+
+class TestShutdownEndpoint:
+    """`shutdown` stops a HEADLESS daemon through the normal teardown, so
+    the flush-on-exit path runs and the data-dir lock is released — the
+    thing a SIGKILL skips. Refuses in a GUI session (it has its own quit
+    flow) and on unsaved edits (quitting is not undoable)."""
+
+    class _FakeApp:
+        def __init__(self, *, headless=True, unsaved=False, running=True):
+            self._headless = headless
+            self._unsaved = unsaved
+            self.is_running = running
+            self.exited = False
+            self.marshalled = []
+
+        def exit(self):
+            self.exited = True
+
+        def call_from_thread(self, fn, *a, **kw):
+            self.marshalled.append(fn)
+            return fn(*a, **kw)
+
+    def _stub_schedule(self, sink):
+        orig = sc._agent_schedule_shutdown
+        sc._agent_schedule_shutdown = lambda app: sink.append(app)
+        return orig
+
+    def test_non_headless_refused_409(self):
+        called = []
+        orig = self._stub_schedule(called)
+        try:
+            r = sc._h_shutdown(self._FakeApp(headless=False), {})
+            assert isinstance(r, tuple) and r[1] == 409
+            assert not called            # did NOT schedule a quit
+        finally:
+            sc._agent_schedule_shutdown = orig
+
+    def test_headless_schedules_shutdown(self):
+        called = []
+        orig = self._stub_schedule(called)
+        try:
+            r = sc._h_shutdown(self._FakeApp(), {})
+            assert r["ok"] and r["shutting_down"] is True
+            # The caller polls this pid to confirm the process is gone.
+            assert r["pid"] == os.getpid()
+            assert len(called) == 1
+        finally:
+            sc._agent_schedule_shutdown = orig
+
+    def test_unsaved_edits_refused_409(self):
+        called = []
+        orig = self._stub_schedule(called)
+        try:
+            r = sc._h_shutdown(self._FakeApp(unsaved=True), {})
+            assert isinstance(r, tuple) and r[1] == 409
+            assert r[0]["dirty"] is True
+            assert not called            # unsaved work is never dropped silently
+        finally:
+            sc._agent_schedule_shutdown = orig
+
+    def test_force_overrides_dirty(self):
+        called = []
+        orig = self._stub_schedule(called)
+        try:
+            r = sc._h_shutdown(self._FakeApp(unsaved=True), {"force": True})
+            assert r["ok"] and r["shutting_down"] is True
+            assert len(called) == 1
+        finally:
+            sc._agent_schedule_shutdown = orig
+
+    def test_exec_marshals_app_exit(self, monkeypatch):
+        """Must go through `App.exit()` on the app thread — NOT
+        `action_quit()`, which pushes a modal a headless daemon can
+        never answer."""
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+        app = self._FakeApp()
+        sc._agent_shutdown_exec(app)
+        assert app.exited is True
+        assert app.marshalled == [app.exit]
+
+    def test_exec_noop_when_loop_stopped(self, monkeypatch):
+        """A stopped loop must not be marshalled to — `call_from_thread`
+        would queue a coroutine nobody awaits."""
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+        app = self._FakeApp(running=False)
+        sc._agent_shutdown_exec(app)
+        assert app.exited is False
+        assert app.marshalled == []
+
+    def test_exec_never_force_exits_on_failure(self, monkeypatch):
+        """A wedged loop is logged and left alive: `os._exit` here would
+        skip the very flushes that make this shutdown graceful."""
+        monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("loop wedged")
+
+        app = self._FakeApp()
+        monkeypatch.setattr(app, "call_from_thread", _boom)
+        hard_exit = []
+        monkeypatch.setattr(os, "_exit", lambda code: hard_exit.append(code))
+        sc._agent_shutdown_exec(app)          # must not raise
+        assert hard_exit == []
+
+    def test_registered_as_write_endpoint(self):
+        fn, write = sc._state._AGENT_HANDLERS["shutdown"]
+        assert fn is sc._h_shutdown
+        assert write is True                  # bearer token required
 
 
 class TestGoldenGate:

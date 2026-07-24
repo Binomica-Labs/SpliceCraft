@@ -198,6 +198,31 @@ def _emit_json(obj) -> None:
     print(json.dumps(obj, indent=2, default=str))
 
 
+def _call_pick_method(endpoint: str, method: str, payload: "dict | None",
+                       *, allow_upgrade: bool) -> dict:
+    """Issue the request, retrying once with the method the server names.
+
+    `call` has to guess a method: with no `--json` there is no body to
+    infer POST from, so a body-less WRITE endpoint (`add-current-to-library`,
+    `save`) guessed GET and came back 405 "requires POST" — leaving the
+    caller to re-run by hand. The server's 405 body carries the authoritative
+    `allow`, so honour it instead of guessing twice. Reads pay nothing: the
+    retry only fires on the 405 that would otherwise have been a hard failure.
+
+    An explicit `--method` is never overridden — the caller asked for that
+    method and gets the real 405 back.
+    """
+    try:
+        return _request(endpoint, method=method, payload=payload)
+    except _AgentCliError as exc:
+        allow = (exc.payload or {}).get("allow") if isinstance(
+            exc.payload, dict) else None
+        if (allow_upgrade and exc.code == 405 and method == "GET"
+                and str(allow or "").upper() == "POST"):
+            return _request(endpoint, method="POST", payload=payload or {})
+        raise
+
+
 def cmd_call(args) -> None:
     """Generic passthrough: call ANY agent endpoint by name (snag #1).
 
@@ -215,10 +240,11 @@ def cmd_call(args) -> None:
             sys.exit("Error: --json must be a JSON object")
     # Default to POST when a body is supplied (writes require POST), else
     # GET — matching the server's read/write method split.
-    method = (args.method or ("POST" if payload is not None else "GET"))
+    explicit_method = args.method is not None
+    method = (args.method or ("POST" if payload is not None else "GET")).upper()
     try:
-        result = _request(args.endpoint, method=method.upper(),
-                          payload=payload)
+        result = _call_pick_method(args.endpoint, method, payload,
+                                    allow_upgrade=not explicit_method)
     except _AgentCliError as exc:
         # Surface the structured server error as JSON (then exit
         # non-zero) rather than a bare message, so a calling script can
@@ -652,8 +678,10 @@ def _build_parser() -> argparse.ArgumentParser:
                               "rename-plasmid.")
     p_call.add_argument("--method", choices=["GET", "POST", "get", "post"],
                          default=None,
-                         help="HTTP method (default: POST when --json is "
-                              "given, else GET).")
+                         help="HTTP method. Default: POST when --json is "
+                              "given, else GET auto-upgraded to POST if the "
+                              "endpoint is a mutation. Setting this "
+                              "explicitly disables the auto-upgrade.")
     p_call.add_argument("--json", default=None, metavar="JSON",
                          help="Request body as a JSON object, e.g. "
                               "'{\"old\": \"a\", \"new\": \"b\"}'.")

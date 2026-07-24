@@ -236,6 +236,88 @@ class TestOptimize:
         assert sc._mut_translate(dna) == aa
 
 
+class TestOptimizeModes:
+    """`mode` splits the optimizer's intent. Frequency-matching (the default)
+    deliberately spends rare codons at their natural rate, so it can score a
+    LOWER CAI than wild-type and hand a residue a worse synonym than a native
+    gene used — correct by design, surprising if you read "optimize" as
+    "maximise CAI". `max_cai` is the other intent, stated explicitly."""
+
+    ARG_HEAVY = "MRRRSSRRLLRRGGAARRVVRRDDRRKKRREE" * 2
+
+    def test_default_is_frequency_and_byte_identical(self):
+        """V1_GATE compat: adding `mode` must not move the default output."""
+        aa = "MAEVKLAGHIKQRSTVWYFND"
+        assert (sc._codon_optimize(aa, sc._CODON_BUILTIN_K12)
+                == sc._codon_optimize(aa, sc._CODON_BUILTIN_K12,
+                                      mode="frequency"))
+
+    def test_unknown_mode_rejected(self):
+        # Notably 'harmonize' — true Angov harmonization needs a SOURCE table,
+        # so we must not quietly accept the name and do something else.
+        with pytest.raises(ValueError, match="unknown codon mode"):
+            sc._codon_optimize("MAK", sc._CODON_BUILTIN_K12, mode="harmonize")
+
+    def test_max_cai_uses_only_the_peak_synonym(self):
+        aa_codons, _ = sc._codon_build_aa_map(sc._CODON_BUILTIN_K12)
+        dna = sc._codon_optimize(self.ARG_HEAVY, sc._CODON_BUILTIN_K12,
+                                 mode="max_cai")
+        body = [dna[i:i + 3] for i in range(0, len(self.ARG_HEAVY) * 3, 3)]
+        for aa, codon in zip(self.ARG_HEAVY, body):
+            assert codon == aa_codons[aa][0][0], (
+                f"{aa} got {codon}, not the peak synonym "
+                f"{aa_codons[aa][0][0]}")
+
+    def test_max_cai_never_downgrades_a_residue(self):
+        """The reported regression: a native Arg went from its best synonym to
+        a near-worst one. In max_cai no position can be worse than the best."""
+        aa_codons, frac = sc._codon_build_aa_map(sc._CODON_BUILTIN_K12)
+        dna = sc._codon_optimize(self.ARG_HEAVY, sc._CODON_BUILTIN_K12,
+                                 mode="max_cai")
+        body = [dna[i:i + 3] for i in range(0, len(self.ARG_HEAVY) * 3, 3)]
+        for aa, codon in zip(self.ARG_HEAVY, body):
+            best = aa_codons[aa][0][1]
+            assert frac[codon] >= best - 1e-12
+
+    def test_max_cai_scores_at_least_as_high(self):
+        freq = sc._codon_optimize(self.ARG_HEAVY, sc._CODON_BUILTIN_K12)
+        best = sc._codon_optimize(self.ARG_HEAVY, sc._CODON_BUILTIN_K12,
+                                  mode="max_cai")
+        cai_freq = sc._codon_cai(freq, sc._CODON_BUILTIN_K12)
+        cai_best = sc._codon_cai(best, sc._CODON_BUILTIN_K12)
+        assert cai_best > cai_freq
+        assert cai_best == pytest.approx(1.0)
+
+    def test_max_cai_preserves_translation(self):
+        """Zero-tolerance: a mode must never change the encoded protein."""
+        dna = sc._codon_optimize(self.ARG_HEAVY, sc._CODON_BUILTIN_K12,
+                                 mode="max_cai")
+        assert sc._mut_translate(dna) == self.ARG_HEAVY
+        assert dna.endswith("TAA")
+        assert len(dna) == 3 * len(self.ARG_HEAVY) + 3
+
+    def test_max_cai_has_no_internal_stop(self):
+        dna = sc._codon_optimize(self.ARG_HEAVY, sc._CODON_BUILTIN_K12,
+                                 mode="max_cai")
+        body = [dna[i:i + 3] for i in range(0, len(dna) - 3, 3)]
+        assert not [c for c in body if c in sc._STOP_CODONS]
+
+    def test_max_cai_is_deterministic(self):
+        a = sc._codon_optimize(self.ARG_HEAVY, sc._CODON_BUILTIN_K12,
+                               mode="max_cai")
+        b = sc._codon_optimize(self.ARG_HEAVY, sc._CODON_BUILTIN_K12,
+                               mode="max_cai")
+        assert a == b
+
+    def test_frequency_mode_still_spends_rare_codons(self):
+        """Guards the CONTRAST: if frequency mode ever silently became
+        max_cai, the documented trade-off would be a lie."""
+        freq = sc._codon_optimize(self.ARG_HEAVY, sc._CODON_BUILTIN_K12)
+        body = [freq[i:i + 3] for i in range(0, len(freq) - 3, 3)]
+        rare_arg = {"CGA", "CGG", "AGA", "AGG"}
+        assert rare_arg & set(body)
+
+
 # ── Restriction-site fixer ────────────────────────────────────────────────────
 
 class TestFixSites:
@@ -319,6 +401,180 @@ class TestFixSites:
         # floor so a future refactor that silently stops exercising the sweep
         # is caught.
         assert cases > 1000
+
+
+# ── Host-hazard motifs + GC-window floor + repeat diversification ─────────────
+
+
+def _translate_ok(dna, protein):
+    from Bio.Seq import Seq
+    return str(Seq(dna).translate()) == protein + "*"
+
+
+def _win_range(dna, w=50):
+    return sc._codon_gc_window_range(dna, w)
+
+
+class TestHazardMotifs:
+    def test_known_hosts_resolve(self):
+        assert sc._codon_hazard_motifs(["plant"])["plant polyA signal"] == "AATAAA"
+        assert sc._codon_hazard_motifs("bacterial")["Shine-Dalgarno"] == "AGGAGG"
+
+    def test_merge_dedupes_shared_motif(self):
+        # AATAAA is both plant and mammalian; the merge keeps it once (by name).
+        merged = sc._codon_hazard_motifs(["plant", "mammalian"])
+        assert list(merged.values()).count("AATAAA") == 1
+
+    def test_unknown_host_raises_named(self):
+        with pytest.raises(ValueError, match="unknown host 'petunia'"):
+            sc._codon_hazard_motifs(["petunia"])
+
+    def test_scrub_removes_plant_polya(self):
+        """The reporter's case: AATAAA inside a Lys/Asn CDS is scrubbed out."""
+        prot = "MKKNNKKNNKKNNKKNNKKNNKKNN"
+        dna = sc._codon_optimize(prot, sc._CODON_BUILTIN_K12)
+        # Force a polyA in by hand so the test is deterministic across tables.
+        idx = dna.find("AAT")
+        assert idx != -1
+        seeded = dna[:idx] + "AATAAA" + dna[idx + 6:]
+        motifs = sc._codon_hazard_motifs(["plant"])
+        fixed, fixes = sc._codon_fix_sites(seeded, prot, sc._CODON_BUILTIN_K12,
+                                           sites=motifs)
+        assert "AATAAA" not in fixed
+        assert _translate_ok(fixed, prot)
+
+
+class TestGCWindow:
+    PROT_AT = "MKKIIFNNKKIIFNNKKIIFNNLLKKIIFNNKKIIFNNSSKKIIFNN"
+    PROT_GC = "MRRRSSRRLLRRGGAARRVVRRDDRRKKRREE" * 3
+
+    def test_no_bounds_is_noop(self):
+        dna = sc._codon_optimize(self.PROT_AT, sc._CODON_BUILTIN_K12)
+        out, fixes = sc._codon_fix_gc_window(dna, self.PROT_AT.rstrip("*"),
+                                             sc._CODON_BUILTIN_K12)
+        assert out == dna and fixes == []
+
+    def test_min_gc_raises_window(self):
+        dna = sc._codon_optimize(self.PROT_AT, sc._CODON_BUILTIN_K12)
+        lo0, _ = _win_range(dna)
+        out, _ = sc._codon_fix_gc_window(dna, self.PROT_AT.rstrip("*"),
+                                         sc._CODON_BUILTIN_K12, min_gc=30.0)
+        lo1, _ = _win_range(out)
+        assert lo1 > lo0
+        assert _translate_ok(out, self.PROT_AT)
+
+    def test_max_gc_lowers_window(self):
+        dna = sc._codon_optimize(self.PROT_GC, sc._CODON_BUILTIN_K12,
+                                 mode="max_cai")
+        _, hi0 = _win_range(dna)
+        out, _ = sc._codon_fix_gc_window(dna, self.PROT_GC.rstrip("*"),
+                                         sc._CODON_BUILTIN_K12, max_gc=62.0)
+        _, hi1 = _win_range(out)
+        assert hi1 < hi0 and hi1 <= 62.0 + 1e-9
+        assert _translate_ok(out, self.PROT_GC)
+
+    def test_two_sided_band_converges(self):
+        dna = sc._codon_optimize(self.PROT_GC, sc._CODON_BUILTIN_K12,
+                                 mode="max_cai")
+        out, _ = sc._codon_fix_gc_window(dna, self.PROT_GC.rstrip("*"),
+                                         sc._CODON_BUILTIN_K12,
+                                         min_gc=40.0, max_gc=60.0)
+        lo, hi = _win_range(out)
+        assert 40.0 - 1e-9 <= lo and hi <= 60.0 + 1e-9
+        assert _translate_ok(out, self.PROT_GC)
+
+    def test_idempotent(self):
+        prot = "MAEVKLAGHIKQRSTVWYFNDPCEGHILMNQ" * 3
+        dna = sc._codon_optimize(prot, sc._CODON_BUILTIN_K12)
+        a, _ = sc._codon_fix_gc_window(dna, prot, sc._CODON_BUILTIN_K12,
+                                       min_gc=40.0, max_gc=60.0)
+        b, f2 = sc._codon_fix_gc_window(a, prot, sc._CODON_BUILTIN_K12,
+                                        min_gc=40.0, max_gc=60.0)
+        assert a == b and f2 == []
+
+    def test_unreachable_floor_terminates_without_lying(self):
+        # Met/Trp have one codon each: no swap can raise GC. Must stop, not spin.
+        prot = "MWMWMWMWMWMWMWMWMW"
+        dna = sc._codon_optimize(prot, sc._CODON_BUILTIN_K12)
+        out, fixes = sc._codon_fix_gc_window(dna, prot, sc._CODON_BUILTIN_K12,
+                                             min_gc=99.0)
+        assert out == dna and fixes == []
+
+    def test_inverted_band_rejected(self):
+        with pytest.raises(ValueError, match="must not exceed"):
+            sc._codon_fix_gc_window("ATGAAATAA", "MK", sc._CODON_BUILTIN_K12,
+                                    min_gc=70.0, max_gc=30.0)
+
+    def test_gc_repair_never_creates_forbidden_site(self):
+        dna = sc._codon_optimize(self.PROT_AT, sc._CODON_BUILTIN_K12)
+        sites = dict(sc._CODON_DEFAULT_FORBIDDEN)
+        pats = []
+        for s in sites.values():
+            pats.append(s)
+            rc = sc._mut_revcomp(s)
+            if rc != s:
+                pats.append(rc)
+        import splicecraft_biology as _bio
+        before = _bio._forbidden_hit_set(dna, tuple(pats))
+        out, _ = sc._codon_fix_gc_window(dna, self.PROT_AT.rstrip("*"),
+                                         sc._CODON_BUILTIN_K12, min_gc=30.0,
+                                         sites=sites)
+        after = _bio._forbidden_hit_set(out, tuple(pats))
+        assert not (after - before)
+
+
+class TestDiversify:
+    PROT = "MAEVKLAGHIKQRSTVWYFNDPCEGHILMNQKRSTVWYFNDPCEGHILMNQ" * 2
+
+    @staticmethod
+    def _longest_shared(a, b):
+        best = 0
+        prev = [0] * (len(b) + 1)
+        for i in range(1, len(a) + 1):
+            cur = [0] * (len(b) + 1)
+            for j in range(1, len(b) + 1):
+                if a[i - 1] == b[j - 1]:
+                    cur[j] = prev[j - 1] + 1
+                    best = max(best, cur[j])
+            prev = cur
+        return best
+
+    def test_breaks_shared_run(self):
+        v1 = sc._codon_optimize(self.PROT, sc._CODON_BUILTIN_K12)
+        v2 = sc._codon_optimize(self.PROT, sc._CODON_BUILTIN_K12)
+        assert v1 == v2                    # same input → converges (the hazard)
+        assert self._longest_shared(v1, v2) >= 25
+        div, fixes = sc._codon_diversify(v2, self.PROT.rstrip("*"),
+                                         sc._CODON_BUILTIN_K12, [v1],
+                                         min_run=25)
+        assert self._longest_shared(div, v1) < 25
+        assert _translate_ok(div, self.PROT)
+        assert fixes
+
+    def test_no_references_is_noop(self):
+        v1 = sc._codon_optimize(self.PROT, sc._CODON_BUILTIN_K12)
+        out, fixes = sc._codon_diversify(v1, self.PROT.rstrip("*"),
+                                         sc._CODON_BUILTIN_K12, [], min_run=25)
+        assert out == v1 and fixes == []
+
+    def test_shared_runs_finder_matches_diversify(self):
+        v1 = sc._codon_optimize(self.PROT, sc._CODON_BUILTIN_K12)
+        v2 = sc._codon_optimize(self.PROT, sc._CODON_BUILTIN_K12)
+        div, _ = sc._codon_diversify(v2, self.PROT.rstrip("*"),
+                                     sc._CODON_BUILTIN_K12, [v1], min_run=25)
+        # Post-condition the endpoint reports as `remaining_repeats`.
+        assert sc._codon_shared_runs(div, [v1], 25) == []
+
+    def test_diversify_preserves_translation_over_panel(self):
+        panel = []
+        for _ in range(4):
+            d = sc._codon_optimize(self.PROT, sc._CODON_BUILTIN_K12)
+            if panel:
+                d, _ = sc._codon_diversify(d, self.PROT.rstrip("*"),
+                                           sc._CODON_BUILTIN_K12, panel,
+                                           min_run=25)
+            assert _translate_ok(d, self.PROT)
+            panel.append(d)
 
 
 # ── CAI / GC ──────────────────────────────────────────────────────────────────
@@ -1979,6 +2235,135 @@ class TestOptimizeProteinEndpoint:
         r = sc._h_optimize_protein(None, {"protein": "MGKAAA"})
         assert 0.0 < r["cai"] <= 1.0
         assert 0.0 <= r["gc"] <= 100.0
+
+    # ── mode / scrub / GC / diversify additions (agent-API field report) ──
+
+    def test_mode_defaults_to_frequency_and_reports_it(self):
+        r = sc._h_optimize_protein(None, {"protein": "MRRRLLKK"})
+        assert r["mode"] == "frequency"
+
+    def test_unknown_mode_400(self):
+        _b, code = sc._h_optimize_protein(
+            None, {"protein": "MGK", "mode": "harmonize"})
+        assert code == 400
+
+    def test_max_cai_scores_higher_than_frequency(self):
+        aa = "MRRRSSRRLLRRGGAARRVVRRDDRRKKRREE"
+        freq = sc._h_optimize_protein(None, {"protein": aa})
+        best = sc._h_optimize_protein(None, {"protein": aa, "mode": "max_cai"})
+        assert best["cai"] >= freq["cai"]
+        assert best["cai"] == pytest.approx(1.0)
+
+    def test_missing_table_error_points_at_add(self):
+        _b, code = sc._h_optimize_protein(
+            None, {"protein": "MGK", "table": "999999999"})
+        assert code == 404
+        assert "add-codon-table" in _b["error"]
+
+    def test_hazard_hosts_scrubs_and_reports(self):
+        r = sc._h_optimize_protein(
+            None, {"protein": "MKKNNKKNNKKNNKKNN", "hazard_hosts": ["plant"]})
+        assert r["ok"] is True
+        assert r["remaining_motifs"] == []          # nothing left
+        assert isinstance(r["fixes"], list)
+
+    def test_unknown_host_400(self):
+        _b, code = sc._h_optimize_protein(
+            None, {"protein": "MGK", "hazard_hosts": ["petunia"]})
+        assert code == 400
+
+    def test_forbidden_motifs_list_and_dict(self):
+        for motifs in (["GGTCTC"], {"BsaI": "GGTCTC"}):
+            r = sc._h_optimize_protein(
+                None, {"protein": "MRALADAGSGK", "forbidden_motifs": motifs})
+            assert r["ok"] is True
+            assert "GGTCTC" not in r["dna"]
+
+    def test_bad_motif_400(self):
+        _b, code = sc._h_optimize_protein(
+            None, {"protein": "MGK", "forbidden_motifs": ["ZZZZ"]})
+        assert code == 400
+
+    def test_gc_window_reports_achieved_range(self):
+        r = sc._h_optimize_protein(
+            None, {"protein": "MKKIIFNNKKIIFNNKKIIFNN", "min_gc": 30.0})
+        assert "gc_window_min" in r and "gc_window_max" in r
+        assert r["gc_window_min"] <= r["gc_window_max"]
+
+    def test_out_of_range_gc_400(self):
+        _b, code = sc._h_optimize_protein(
+            None, {"protein": "MGK", "min_gc": 120})
+        assert code == 400
+
+    def test_inverted_band_400(self):
+        _b, code = sc._h_optimize_protein(
+            None, {"protein": "MGK", "min_gc": 70, "max_gc": 30})
+        assert code == 400
+
+    def test_translation_preserved_under_all_scrubs(self):
+        aa = "MRRRSSRRLLRRGGAARRVVRRDDRRKKRREE"
+        r = sc._h_optimize_protein(None, {
+            "protein": aa, "mode": "max_cai", "hazard_hosts": ["plant"],
+            "forbidden_motifs": ["GGTCTC"], "min_gc": 40.0, "max_gc": 65.0,
+        })
+        assert r["ok"] is True
+        assert sc._mut_translate(r["dna"]) == aa
+
+    def test_avoid_repeats_breaks_shared_run(self):
+        aa = "MAEVKLAGHIKQRSTVWYFNDPCEGHILMNQKRSTVWYFND"
+        first = sc._h_optimize_protein(None, {"protein": aa})
+        second = sc._h_optimize_protein(
+            None, {"protein": aa, "avoid_repeats_with": [first["dna"]],
+                   "max_repeat": 25})
+        assert second["ok"] is True
+        assert second["remaining_repeats"] == 0
+        assert sc._mut_translate(second["dna"]) == aa
+
+    def test_avoid_repeats_bad_input_400(self):
+        for body in ({"avoid_repeats_with": ["ZZZZ"]},
+                     {"avoid_repeats_with": [123]},
+                     {"avoid_repeats_with": ["ATGC"], "max_repeat": 0}):
+            _b, code = sc._h_optimize_protein(None, {"protein": "MGK", **body})
+            assert code == 400
+
+    def test_heavy_passes_capped_by_length(self):
+        """GC-window + diversify are O(n²); past the codon cap they 400
+        instead of pegging a worker thread."""
+        big = "M" + "A" * sc._CODON_SCRUB_MAX_CODONS   # cap + 1 codons
+        for body in ({"min_gc": 40.0}, {"max_gc": 60.0},
+                     {"avoid_repeats_with": ["ATGC" * 8]}):
+            _b, code = sc._h_optimize_protein(None, {"protein": big, **body})
+            assert code == 400
+            assert str(sc._CODON_SCRUB_MAX_CODONS) in _b["error"]
+
+    def test_plain_optimize_and_scrub_uncapped(self):
+        """The length cap is only for the heavy passes — plain optimize and
+        the linear motif scrub run at any length."""
+        big = "M" + "A" * sc._CODON_SCRUB_MAX_CODONS
+        r = sc._h_optimize_protein(None, {"protein": big, "mode": "max_cai"})
+        assert r["ok"] is True
+        r2 = sc._h_optimize_protein(
+            None, {"protein": big, "hazard_hosts": ["plant"]})
+        assert r2["ok"] is True
+
+    def test_at_cap_is_allowed(self):
+        at = "M" + "A" * (sc._CODON_SCRUB_MAX_CODONS - 1)   # exactly the cap
+        r = sc._h_optimize_protein(None, {"protein": at, "min_gc": 30.0})
+        assert r["ok"] is True
+
+    def test_all_additions_composed_stay_within_constraints(self):
+        """The interaction the probe caught: the GC pass runs last and could
+        re-create a repeat the diversification broke — the endpoint wires the
+        repeat k-mers into the GC guard so it can't."""
+        aa = "MAEVKLAGHIKQRSTVWYFNDPCEGHILMNQ" * 2
+        v1 = sc._h_optimize_protein(None, {"protein": aa})["dna"]
+        r = sc._h_optimize_protein(None, {
+            "protein": aa, "avoid_repeats_with": [v1], "max_repeat": 25,
+            "hazard_hosts": ["plant"], "min_gc": 38.0, "max_gc": 62.0,
+        })
+        assert r["remaining_repeats"] == 0
+        assert r["remaining_motifs"] == []
+        assert sc._mut_translate(r["dna"]) == aa
 
 
 class TestNcbiTaxonPickerModalStyle:

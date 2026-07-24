@@ -45,6 +45,18 @@ itself — it re-execs and the API returns on the same port (poll `/healthz`);
 a GUI `--agent` session refuses (it would lose its live view — restart it
 manually).
 
+To stop a headless daemon, `POST /shutdown` rather than killing it. The app
+quits through its normal teardown, so pending collection-sync and settings
+writes are flushed, in-flight workers are drained, and the data-dir lock is
+released; a `SIGKILL` skips all of that. The reply returns immediately and
+the process exits about half a second later, so poll the returned `pid` (or
+the port) to confirm — don't expect the socket to outlive the response. It
+refuses with `409` when the canvas has unsaved edits (pass `{"force": true}`
+to quit anyway), and, like `restart`, refuses on a GUI `--agent` session,
+which has a keyboard and its own quit flow. Note that `--agent` already
+auto-headlesses when it has no controlling TTY, so a daemon launched from
+an agent context is eligible.
+
 The server writes a token file at
 `<DATA_DIR>/agent_token` containing the port + bearer token on the
 first two lines. Hand the token to any client that needs to call the
@@ -196,7 +208,18 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   protein is honored as-is and overrides it; optional `transl_table`
   is an NCBI genetic-code id — default 1 = standard — so a host with a
   reassigned codon, e.g. 4 *Mycoplasma* or 6 ciliate, optimises and
-  terminates against the code it actually reads).
+  terminates against the code it actually reads; `mode` is `frequency`
+  (default, matches the host's codon distribution) or `max_cai`
+  (every position gets its best synonym); optional scrub passes —
+  `hazard_hosts` (built-in plant/mammalian/bacterial expression
+  hazards), `forbidden_motifs` (your own IUPAC patterns), `min_gc` /
+  `max_gc` over a `gc_window`, and `avoid_repeats_with` (break shared
+  runs against constructs you've already built) — each opt-in, with the
+  response reporting `fixes`, `remaining_motifs`, `remaining_repeats`,
+  and the achieved `gc_window_min` / `gc_window_max` so an unreachable
+  target is visible, not implied met). Only E. coli K12 ships as a
+  table — `add-codon-table` fetches your host from Kazusa by taxid,
+  builds one from an NCBI genome, or imports a local CDS FASTA.
 - **Simulate** — simulate-pcr (exact-match in-silico amplification,
   wrap-aware on circular templates) and simulate-gel (per-lane band
   positions + optional rendered ASCII gel image; ladder / plasmid /

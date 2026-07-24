@@ -14,6 +14,65 @@
 
 ---
 
+## [1.2.34] — 2026-07-24
+
+### New features
+
+- **Codon optimizer: choose your intent.** `optimize-protein` takes a new
+  **mode** — the default `frequency` matches the host's codon-usage
+  distribution (spending rare codons at their natural rate, as before), while
+  `max_cai` gives every position its most-frequent synonym so CAI is
+  maximised and a residue is never handed a worse codon than the best one. The
+  response reports which mode ran and the resulting CAI.
+
+- **Codon optimizer: clear host-hazard motifs in one call.** `optimize-protein`
+  now accepts **hazard_hosts** (`plant`, `mammalian`, `bacterial`) to scrub
+  built-in expression hazards — plant/mammalian polyA signals, cryptic splice
+  donors, internal Shine-Dalgarno — plus **forbidden_motifs** for your own
+  patterns (any IUPAC sequence; the reverse complement is cleared too). Both
+  the forward and reverse strand are checked, and the response lists any motif
+  it could not remove instead of implying the sequence is clean.
+
+- **Codon optimizer: keep a local GC window in range.** Pass **min_gc** /
+  **max_gc** (percent) and an optional **gc_window** (default 50 bases) and the
+  optimizer pulls every window into that band with synonymous swaps — a global
+  GC number can look healthy while a stretch is 15% or 85%, and it is the local
+  window that stalls synthesis. The response reports the achieved window range
+  so an unreachable target (a Lys/Ile-rich stretch tops out near 33% GC) is
+  visible rather than silently missed. (The GC-window and repeat-diversification
+  passes are limited to 1500 codons — a longer protein with those options set is
+  refused with a clear message; plain optimization has no such limit.)
+
+- **Codon optimizer: diversify against constructs you have already built.**
+  Pass **avoid_repeats_with** a list of sequences and the optimizer breaks any
+  perfect repeat of **max_repeat**+ bases (default 25) the new design shares
+  with them. Same-protein variants optimized one at a time otherwise converge
+  on identical codons and share hundreds of bases — a recombination hazard when
+  they meet in one cell; this makes each new panel member unique.
+
+- **Stop a headless agent daemon cleanly.** A headless `--agent` daemon now
+  answers `POST /shutdown`, quitting through the normal teardown so pending
+  saves flush and the data-dir lock is released — where a `kill -9` skipped all
+  of that. Like `restart`, it refuses on an interactive session (which has its
+  own quit flow) and on unsaved edits unless you pass `force`.
+
+### Bug fixes
+
+- **`splicecraft-cli call` no longer fails a body-less write with "requires
+  POST".** A mutation with no `--json` (e.g. `add-current-to-library`) was sent
+  as GET and rejected; the CLI now honours the method the server names and
+  retries once, so it just works. Reads are unaffected, and an explicit
+  `--method` is still respected.
+
+- **The GenBank exporter says what to fix when a feature has no strand.** A
+  feature built without a strand can't round-trip through GenBank, and the
+  export used to fail with an unreadable dump of internal signature tuples. It
+  now names the feature and tells you to set its strand — and when several
+  features differ, it points at the one that actually changed instead of every
+  feature after it.
+
+---
+
 ## [1.2.33] — 2026-07-21
 
 ### Hardening
