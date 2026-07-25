@@ -1630,7 +1630,15 @@ def _scan_restriction_sites_impl(
     # site_len-1 bp re-attached from the beginning so matches starting near
     # the end (that would otherwise be truncated) are found too.
     max_site_len = max((e[2] for e in _state._scan_catalog_hook()), default=0)
-    scan_seq = (seq_u + seq_u[: max_site_len - 1]) if (circular and n > 0) else seq_u
+    # `max_site_len > 1` guard mirrors `_enzyme_cuts_impl`: at 0 (empty catalog)
+    # the slice would be `seq_u[:-1]`, appending the whole sequence bar its last
+    # base — a pointless O(n) copy of a ~2n string. Harmless today (an empty
+    # catalog scans no enzymes) but exactly the asymmetry that bites a later
+    # refactor or a catalog-monkeypatching test.
+    if circular and n > 0 and max_site_len > 1:
+        scan_seq = seq_u + seq_u[: max_site_len - 1]
+    else:
+        scan_seq = seq_u
 
     def _emit_resite(hits, p, site_len, strand, color, name,
                      cut_col, ext_cut_bp,
@@ -2127,37 +2135,68 @@ def _split_features_at_cuts(features: list[dict], n: int,
                 return i
         return n_cuts
 
+    # Absolute span of each fragment, as a list of linear intervals (the
+    # origin-crossing fragment needs two; a single circular cut makes ONE
+    # fragment that covers the whole molecule).
+    spans: list[list[tuple[int, int]]] = []
+    if circular:
+        for i in range(n_cuts):
+            a = cut_top_positions[i]
+            b = cut_top_positions[(i + 1) % n_cuts]
+            spans.append([(a, b)] if a < b else [(a, n), (0, b)])
+    else:
+        bounds = [0] + list(cut_top_positions) + [n]
+        spans = [[(bounds[i], bounds[i + 1])]
+                 for i in range(len(bounds) - 1)]
+
     out: dict[int, list[dict]] = {}
     for f in features:
         s = int(f.get("start", 0))
         e = int(f.get("end",   0))
         if e == s:
+            # Zero-length marker — no span to intersect; slot by position.
             slot = _slot_for(s)
             out.setdefault(slot, []).append(dict(f))
             continue
-        slot_s = _slot_for(s)
-        # End is half-open. A feature ending exactly at a cut belongs in
-        # the fragment that ends at that cut. Use end-1 then bump.
-        slot_e = _slot_for(e - 1)
-        if slot_s == slot_e:
-            # Both ends in the same fragment — BUT if a cut falls STRICTLY
-            # inside the feature, an excised piece was removed from its middle
-            # (the classic case: cloning into lacZα's MCS excises the stuffer
-            # between two cuts that both sit inside lacZα). The remnant rides
-            # whole in this fragment, yet the gene is DISRUPTED — tag it
-            # ``_split="whole"`` so the labeller flags it, even though it
-            # wasn't split across two fragments.
+        # Slot by OVERLAP, not by endpoint. Endpoint-slotting emitted a piece
+        # into the fragment holding `start` and the one holding `end-1` and
+        # NOTHING else, which lost annotation in two ways:
+        #   (1) a feature LONGER than one fragment covers the fragments
+        #       BETWEEN its ends entirely — a 230 bp gene over three 100 bp
+        #       fragments annotated only the two end pieces and left the
+        #       middle fragment (100% inside the gene) bare;
+        #   (2) on a circular molecule a feature long enough to run past every
+        #       cut lands BOTH endpoints back in the SAME fragment, which
+        #       endpoint-slotting read as "contained in one fragment" — so the
+        #       gene vanished from every other fragment it actually covers.
+        # Intersecting the feature's span with each fragment's span reports
+        # both correctly and is what "which fragments carry this gene?" means.
+        cut_inside = any(s < c < e for c in cut_top_positions)
+        for i, ivs in enumerate(spans):
+            if not any(max(s, lo) < min(e, hi) for lo, hi in ivs):
+                continue
+            starts_here = any(lo <= s < hi for lo, hi in ivs)
+            ends_here   = any(lo <= e - 1 < hi for lo, hi in ivs)
             piece = dict(f)
-            if any(s < c < e for c in cut_top_positions):
-                piece["_split"] = "whole"
-            out.setdefault(slot_s, []).append(piece)
-        else:
-            # Feature crosses one or more cuts; emit a half-feature into
-            # each affected fragment. For v1 we don't try to chain them
-            # across fragments — each half stands alone with its local
-            # coords; the user can re-annotate if they want.
-            out.setdefault(slot_s, []).append({**f, "_split": "head"})
-            out.setdefault(slot_e, []).append({**f, "_split": "tail"})
+            if starts_here and ends_here:
+                # Both ends in this fragment — BUT if a cut falls STRICTLY
+                # inside the feature, an excised piece was removed from its
+                # middle (the classic case: cloning into lacZα's MCS excises
+                # the stuffer between two cuts that both sit inside lacZα).
+                # The remnant rides whole here, yet the gene is DISRUPTED —
+                # tag it ``_split="whole"`` so the labeller flags it, even
+                # though it wasn't split across two fragments.
+                if cut_inside:
+                    piece["_split"] = "whole"
+            elif starts_here:
+                piece["_split"] = "head"
+            elif ends_here:
+                piece["_split"] = "tail"
+            else:
+                # Fragment lies wholly INSIDE the feature. `_fragments_from_cuts`
+                # clamps the piece to the fragment's full extent.
+                piece["_split"] = "mid"
+            out.setdefault(i, []).append(piece)
     return out
 
 
@@ -2229,6 +2268,7 @@ def _fragments_from_cuts(seq: str, cuts: list[dict], *,
             else:
                 top_seq = seq[a:] + seq[:b]
                 offset  = a   # fragment-local coord = (abs - a) % n
+            frag_len = len(top_seq)
             local_feats: list[dict] = []
             for f in feat_slots.get(i, []):
                 fs = int(f.get("start", 0))
@@ -2238,14 +2278,48 @@ def _fragments_from_cuts(seq: str, cuts: list[dict], *,
                     new_s = fs - offset
                     new_e = fe - offset
                 else:
+                    # Origin-crossing fragment — the local map is MODULAR, and
+                    # two things go wrong with a naive `(x - offset) % n`:
+                    #
+                    # (1) A slotted piece may overhang this fragment (the head/
+                    #     tail halves emitted by `_split_features_at_cuts` keep
+                    #     the feature's FULL span; the clamp below is what trims
+                    #     them). Modularly, any absolute bp outside
+                    #     `[a, n) ∪ [0, b)` maps ABOVE `frag_len` — so the plain
+                    #     `min(...)` clamp pinned an overhanging START to the
+                    #     fragment's END and emitted an INVERTED feature
+                    #     (`start > end`). Downstream that renders as a phantom
+                    #     near-full-length annotation on the cloning product
+                    #     (a 49 bp AmpR remnant shipped as a 489 bp "AmpR").
+                    #     Overhang is only ever "began before this fragment"
+                    #     (start → 0) or "ran past it" (end → frag_len).
+                    #
+                    # (2) The END needs the half-open form `((e-a-1) % n) + 1`:
+                    #     the naive `(e-a) % n` sends an end landing exactly on
+                    #     the fragment's 3' edge to 0 instead of `frag_len`
+                    #     (reachable on the single-cut `a == b` linearisation).
                     new_s = (fs - offset) % n
-                    new_e = (fe - offset) % n
+                    if new_s >= frag_len:
+                        new_s = 0
+                    if fe == fs:
+                        new_e = new_s          # zero-length marker feature
+                    else:
+                        new_e = ((fe - offset - 1) % n) + 1
+                        if new_e > frag_len:
+                            new_e = frag_len
                 # Clamp to fragment bounds.
-                local_feats.append({
-                    **f,
-                    "start": max(0, min(new_s, len(top_seq))),
-                    "end":   max(0, min(new_e, len(top_seq))),
-                })
+                new_s = max(0, min(new_s, frag_len))
+                new_e = max(0, min(new_e, frag_len))
+                if new_s > new_e:
+                    # The piece straddles this fragment's OWN 5'/3' ends. Only
+                    # reachable on the single-cut circular digest (`a == b`),
+                    # where the lone cut falls inside the feature. The fragment
+                    # is LINEAR, so a `start > end` "wrap" is meaningless here —
+                    # emit the two real pieces so no annotated base is lost.
+                    local_feats.append({**f, "start": new_s, "end": frag_len})
+                    local_feats.append({**f, "start": 0,     "end": new_e})
+                    continue
+                local_feats.append({**f, "start": new_s, "end": new_e})
             fragments.append({
                 "top_seq": top_seq,
                 "left":  {"overhang_seq": c["overhang_seq"],

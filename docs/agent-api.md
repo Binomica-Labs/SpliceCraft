@@ -84,7 +84,14 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   dirty-check), list features (`features`, alias `list-features`), find ORFs
   (length cutoff in AMINO ACIDS —
   `min_aa`; `min_length`/`min_bp` are rejected so a bp-vs-aa mix-up can't
-  silently return a default-length result), `undo` / `redo` the last edit,
+  silently return a default-length result. Each ORF carries `start`, `end`,
+  `strand`, `length_aa`, `aa_seq`, plus `nt_len` — the exact coding length in
+  bases INCLUDING the stop codon — and `exceeds_one_lap`. **Take length from
+  `nt_len` / `length_aa`, never from `end - start`:** on a circular plasmid a
+  frame can run a full lap or more without an in-frame stop, and no
+  start/end pair on an n-bp circle can express that. Such an ORF sets
+  `exceeds_one_lap: true` and has its span pinned to the near-full circle),
+  `undo` / `redo` the last edit,
   `discard-changes` (revert the canvas to its library-stored copy / clear a
   stuck-dirty flag so the next load / new-plasmid proceeds without `force`),
   transfer annotations, apply GFF3 features to the loaded record

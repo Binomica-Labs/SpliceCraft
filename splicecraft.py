@@ -41,7 +41,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.35"
+__version__ = "1.2.36"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -5281,6 +5281,7 @@ from splicecraft_gels import (  # noqa: E402
     _GEL_AGAROSE_MAX as _GEL_AGAROSE_MAX,
     _AGAROSE_RANGES as _AGAROSE_RANGES,
     _AGAROSE_CHOICES as _AGAROSE_CHOICES,
+    _GEL_EDGE_BAND as _GEL_EDGE_BAND,
     _GEL_FORM_FACTOR as _GEL_FORM_FACTOR,
     _GEL_LADDERS as _GEL_LADDERS,
     _LADDER_NAMES as _LADDER_NAMES,
@@ -7954,6 +7955,17 @@ def _translate_cds(full_seq: str, start: int, end: int, strand: int,
                     codon_start: int = 1, transl_table: int = 1) -> str:
     """Translate a CDS region to single-letter AA string (stop codon → *).
 
+    The result is the HONEST translation of the annotated bases: a trailing
+    ``*`` appears if and only if the CDS's last complete codon really is a
+    stop. Until 2026-07-24 this force-appended ``*`` whenever the last codon
+    wasn't one, so a CDS annotated WITHOUT its stop (the common GenBank case,
+    and every ``<1..n`` partial) read back as terminated — in a cloning tool
+    where "did my construct keep its stop codon?" is a real question, that is
+    a phantom answer. It also disagreed with `_cds_aa_list`, the sibling that
+    feeds the on-screen AA lane and the premature-stop ⚠ count, which never
+    fabricated one. The sole production caller `rstrip("*")`s the result, so
+    nothing downstream depended on the fabrication.
+
     Uses _IUPAC_COMP for the reverse-complement step so IUPAC ambiguity codes
     (N, R, Y, etc.) are handled correctly. An earlier version used a bare
     ACGT-only maketrans which would silently pass degenerate bases through
@@ -7990,11 +8002,9 @@ def _translate_cds(full_seq: str, start: int, end: int, strand: int,
     # `transl_table` (GenBank /transl_table) selects a non-standard NCBI
     # genetic code; defaults to 1 (standard). See `_codon_table_for`.
     table_map = _codon_table_for(transl_table)
-    aa = [table_map.get(sub[i:i+3], "?") for i in range(0, len(sub) - 2, 3)]
-    result = "".join(aa)
-    if result and not result.endswith("*"):
-        result += "*"
-    return result
+    return "".join(
+        table_map.get(sub[i:i + 3], "?") for i in range(0, len(sub) - 2, 3)
+    )
 
 
 # Hand the QuikChange-scrub engine (splicecraft_primer, L2) CDS translation
@@ -21819,6 +21829,8 @@ terminal.*
 | `Ctrl+C` | Copy the selection (top strand, 5'→3') |
 | `Alt+C` | Copy the selection (bottom strand, reverse-complement) |
 
+Click a CDS bar (or its amino-acid letters) and `Ctrl+C` copies the **protein** instead of the DNA. The translation shows exactly what the annotated bases encode — a trailing `*` appears **only if the CDS really ends in a stop codon**, so a CDS annotated without its stop (common in GenBank, and every `<1..n` partial) reads back without one. `Alt+C` still copies DNA.
+
 ## Edit the loaded plasmid
 
 *Change the sequence, annotate features, undo mistakes.*
@@ -21845,6 +21857,8 @@ terminal.*
 | `Alt+A` | Align the current plasmid against library plasmids — each pick adds a row to the linear-map overlay (blue match · red mismatch · gray gap, with a coverage histogram). **Click a lane to jump the sequence panel to that spot** (centered + highlighted) so misaligned / to-be-edited bases are one click away. |
 | `Alt+L` | Open the Alignment Manager — the full pairwise-alignment detail view (per-base aligned strands) opens with **Enter** on a row. |
 | `Alt+Shift+A` | Clear every alignment row from the overlay |
+
+**Find ORFs** — File ▸ *Find ORFs in this sequence*, or `Ctrl+K` and type "ORF". Six-frame scan, wrap-aware on circular plasmids; ATG-only by default with GTG/TTG opt-in for bacterial starts. Pick a row to highlight that ORF in the sequence panel. Read the **aa** column for length — on a circular plasmid an ORF can run the whole way round (marked **full lap**), and no start/end pair can express that.
 
 ## Toolbar menus
 
@@ -28471,10 +28485,19 @@ class ORFFinderModal(_OneShotDismissScreen, ModalScreen):
                 preview += "…"
             # 1-based bp display matches GenBank coordinates the user
             # reads in features lane / sidebar.
+            # An ORF with no in-frame stop for a whole lap has no (start, end)
+            # pair on a circle that can express it, so its span is pinned to
+            # the near-full circle — say so rather than letting the user read
+            # the arc as the real extent. `length_aa` is exact either way.
+            if o.get("exceeds_one_lap"):
+                end_txt = f"{o['end']:,} (full lap)"
+            elif o["end"] < o["start"]:
+                end_txt = f"{o['end']:,} (wrap)"
+            else:
+                end_txt = f"{o['end']:,}"
             t.add_row(
                 f"{o['start'] + 1:,}",
-                f"{o['end']:,}" if o["end"] >= o["start"]
-                                else f"{o['end']:,} (wrap)",
+                end_txt,
                 "+" if o["strand"] == 1 else "-",
                 str(o["length_aa"]),
                 preview,

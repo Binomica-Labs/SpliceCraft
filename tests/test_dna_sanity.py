@@ -1352,14 +1352,38 @@ class TestTranslateCds:
         assert aa == "MK*"
 
     def test_forward_strand_with_context(self):
-        # Stop is added if missing
+        # Only the CDS window is translated; flanking bases are ignored.
         pre  = "GGGG"
         cds  = "ATGAAAAAA"   # M K K (no stop in window)
         post = "CCCC"
         full = pre + cds + post
         aa = sc._translate_cds(full, 4, 13, strand=1)
-        # _translate_cds appends a trailing * if the last codon isn't a stop
-        assert aa == "MKK*"
+        assert aa == "MKK"
+
+    def test_no_phantom_stop_is_appended(self):
+        """A trailing ``*`` appears IFF the last complete codon really is a
+        stop. Until 2026-07-24 this force-appended one whenever the CDS
+        didn't end in a stop — so a CDS annotated without its stop (the
+        common GenBank case, and every ``<1..n`` partial) read back as
+        terminated, in a tool where "did my construct keep its stop codon?"
+        is a real question. It also disagreed with `_cds_aa_list`, the
+        sibling that feeds the on-screen AA lane, which never fabricated
+        one."""
+        from Bio.Seq import Seq
+        for nt in ("ATGAAAAAA", "ATGAAACAT", "ATGAAATAA", "ATGAAATAG",
+                   "ATGAAATGA", "ATGTGGTGG"):
+            got = sc._translate_cds(nt, 0, len(nt), strand=1)
+            assert got == str(Seq(nt).translate()), nt
+        assert not sc._translate_cds("ATGAAAAAA", 0, 9, strand=1).endswith("*")
+        assert sc._translate_cds("ATGAAATAA", 0, 9, strand=1).endswith("*")
+
+    def test_agrees_with_the_aa_lane_translator(self):
+        """`_translate_cds` and `_cds_aa_list` must report the SAME protein —
+        they used to differ by a fabricated terminal stop."""
+        for nt in ("ATGAAAAAA", "ATGAAATAA", "ATGTGGCATAAA"):
+            f = {"start": 0, "end": len(nt), "strand": 1}
+            lane, _len, _ve = sc._cds_aa_list(nt, f)
+            assert "".join(lane) == sc._translate_cds(nt, 0, len(nt), strand=1)
 
     def test_reverse_strand_matches_forward_after_rc(self):
         """The same CDS, placed on the reverse strand, must translate to the
@@ -1506,11 +1530,11 @@ class TestTranslateCds:
     def test_wrapped_cds_length_not_multiple_of_three(self):
         """Wrapped CDS with trailing partial codon: the extra 1-2 nt must be
         dropped identically to the non-wrap partial-codon case."""
-        # tail 'ATG' + head 'AAAT' = 'ATGAAAT' (7 nt) → MK + 1 leftover → 'MK*'
+        # tail 'ATG' + head 'AAAT' = 'ATGAAAT' (7 nt) → MK + 1 leftover dropped
         seq = "AAAT" + "XXXX" + "ATG"
         assert len(seq) == 11
         aa = sc._translate_cds(seq, start=8, end=4, strand=1)
-        assert aa == "MK*"
+        assert aa == "MK"
 
     def test_empty_cds_returns_empty(self):
         """start == end is treated as empty (consistent with `_bp_in` which
@@ -1555,9 +1579,6 @@ class TestTranslateCds:
         plasmid = cds[15:] + "XX" + cds[:15]
         assert len(plasmid) == 32
         aa = sc._translate_cds(plasmid, start=17, end=15, strand=1)
-        # _translate_cds force-appends '*' if absent; expected already has one
-        if not expected.endswith("*"):
-            expected += "*"
         assert aa == expected
 
 
@@ -1755,6 +1776,60 @@ class TestFindOrfs:
     def test_too_short_sequence(self):
         """A 5 bp seq has no room for any ORF."""
         assert sc._find_orfs("ACGTA", circular=False) == []
+
+    def test_nt_len_is_reported_and_matches_the_coordinates(self):
+        """`nt_len` is the exact coding length (incl. the stop), so no caller
+        has to derive length from `(start, end)`. For an ORF under one lap
+        the two must agree exactly."""
+        import random
+        rng = random.Random(20260724)
+        for _ in range(200):
+            n = rng.randint(150, 700)
+            s = "".join(rng.choice("ACGT") for _ in range(n))
+            for o in sc._find_orfs(s, min_aa=10, circular=True):
+                assert o["nt_len"] == (o["length_aa"] + 1) * 3
+                assert o["nt_len"] == len(o["aa_seq"]) * 3
+                assert 0 <= o["start"] < n and 0 <= o["end"] <= n
+                if not o["exceeds_one_lap"]:
+                    st, en = o["start"], o["end"]
+                    span = (n - st) + en if en < st else en - st
+                    assert span == o["nt_len"], (n, o, span)
+
+    def test_orf_running_a_full_lap_is_flagged_not_understated(self):
+        """A circular frame with no in-frame stop for a whole lap produces an
+        ORF LONGER than the molecule. No `(start, end)` pair on an n-bp
+        circle can express that — pre-2026-07-24 the span silently wrapped
+        back inside the ORF and under-stated it by whole turns (a 486 nt ORF
+        on a 458 bp plasmid drew a 28 bp arc). Reachable whenever
+        `n % 3 != 0`, because the reading frame shifts across the origin."""
+        import random
+        rng = random.Random(99)
+        seen = 0
+        for _ in range(1500):
+            n = rng.randint(120, 400)
+            s = "".join(rng.choice("ACGT") for _ in range(n))
+            for o in sc._find_orfs(s, min_aa=5, circular=True):
+                if not o["exceeds_one_lap"]:
+                    continue
+                seen += 1
+                assert o["nt_len"] >= n            # genuinely ≥ one lap
+                st, en = o["start"], o["end"]
+                span = (n - st) + en if en < st else en - st
+                assert span == n - 1               # pinned to the near-full circle
+        assert seen, "no full-lap ORF generated — test lost its coverage"
+
+    def test_linear_orfs_never_claim_a_full_lap(self):
+        """`exceeds_one_lap` is a circular-only concept; a linear scan can
+        never exceed the molecule."""
+        import random
+        rng = random.Random(7)
+        for _ in range(100):
+            n = rng.randint(150, 600)
+            s = "".join(rng.choice("ACGT") for _ in range(n))
+            for o in sc._find_orfs(s, min_aa=8, circular=False):
+                assert o["exceeds_one_lap"] is False
+                assert o["nt_len"] <= n
+                assert o["end"] - o["start"] == o["nt_len"]
 
     def test_dedupe_no_duplicate_in_doubled_scan(self):
         """A circular ORF that does NOT wrap should not be reported twice

@@ -344,18 +344,66 @@ class TestAgaroseMobility:
         # Strict monotone — larger bp stays closer to the well
         assert m_20k > m_50k > m_100k
 
-    def test_in_window_bounds_unchanged(self):
-        """Sanity: the in-window branch is unchanged by the
-        extrapolation refactor. A 1 kb band on a 1% gel still
-        returns the same Helling-Goodman-Boyer linear result it
-        always did."""
+    def test_in_window_is_helling_goodman_boyer(self):
+        """The in-window branch is still the Helling-Goodman-Boyer
+        linear-in-(-log10 bp) map — compressed into the interior band
+        `[_GEL_EDGE_BAND, 1 - _GEL_EDGE_BAND]` so the out-of-window
+        branches have reserved lane space beyond each edge."""
         import math
         m = sc._agarose_mobility(1000, 1.0)
         # raw = (log10(10000) - log10(1000)) / (log10(10000) - log10(500))
         log_lo = math.log10(500)
         log_hi = math.log10(10000)
-        expected = (log_hi - math.log10(1000)) / (log_hi - log_lo)
-        assert m == pytest.approx(expected, abs=1e-6)
+        raw = (log_hi - math.log10(1000)) / (log_hi - log_lo)
+        band = sc._GEL_EDGE_BAND
+        assert m == pytest.approx(band + (1.0 - 2.0 * band) * raw, abs=1e-6)
+
+    def test_window_edges_map_to_the_reserved_band(self):
+        """`bp_min` / `bp_max` are the smallest / largest RESOLVABLE
+        fragments — not the dye front and the well. They must land on
+        the interior band edges, leaving room beyond for the
+        sub-/above-resolution bands."""
+        band = sc._GEL_EDGE_BAND
+        assert sc._agarose_mobility(500, 1.0) == pytest.approx(1.0 - band)
+        assert sc._agarose_mobility(10_000, 1.0) == pytest.approx(band)
+
+    def test_no_inversion_across_the_window_boundaries(self):
+        """Regression: pre-fix the in-window map spanned the FULL lane
+        while the out-of-window branches were squeezed into
+        [0.97, 0.995] / [0.005, 0.03], so the regions OVERLAPPED and
+        the size ordering INVERTED one bp outside each edge — a 499 bp
+        band rendered ABOVE the 500 bp band, and a 10_001 bp band below
+        the 10_000 bp one."""
+        # Lower edge: smaller must always run at least as far.
+        assert sc._agarose_mobility(499, 1.0) > sc._agarose_mobility(500, 1.0)
+        assert sc._agarose_mobility(400, 1.0) > sc._agarose_mobility(500, 1.0)
+        # Upper edge: larger must always stay at least as close to the well.
+        assert sc._agarose_mobility(10_001, 1.0) < sc._agarose_mobility(10_000, 1.0)
+        assert sc._agarose_mobility(20_000, 1.0) < sc._agarose_mobility(10_000, 1.0)
+
+    def test_monotone_over_every_gel_and_form(self):
+        """Mobility is non-increasing in fragment size for every
+        configured agarose % and every DNA form — the property the
+        boundary inversion broke."""
+        sizes = [1, 10, 25, 50, 99, 100, 199, 200, 399, 400, 499, 500, 999,
+                 1000, 1499, 1500, 2000, 4000, 7000, 9999, 10_000, 10_001,
+                 12_000, 30_000, 100_000, 1_000_000]
+        for pct in sc._AGAROSE_CHOICES:
+            for form in ("linear", "supercoiled", "nicked", "relaxed"):
+                mobs = [sc._agarose_mobility(bp, pct, form) for bp in sizes]
+                for (a_bp, a), (b_bp, b) in zip(zip(sizes, mobs),
+                                                zip(sizes[1:], mobs[1:])):
+                    assert a >= b - 1e-12, (
+                        f"{pct}% {form}: {b_bp} bp ({b:.6f}) runs further "
+                        f"than {a_bp} bp ({a:.6f})")
+
+    def test_out_of_window_is_continuous_with_the_edge(self):
+        """One bp outside the window must not JUMP half the reserved
+        band — the damped extrapolation starts AT the edge value."""
+        edge_lo = sc._agarose_mobility(500, 1.0)
+        assert sc._agarose_mobility(499, 1.0) - edge_lo < 0.005
+        edge_hi = sc._agarose_mobility(10_000, 1.0)
+        assert edge_hi - sc._agarose_mobility(10_001, 1.0) < 0.005
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

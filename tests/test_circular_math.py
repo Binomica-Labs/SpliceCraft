@@ -658,8 +658,11 @@ class TestIntronAwareTranslation:
         assert spliced == "ATGGGGAAATTTTGTAAA"
         # Translate via the exon-aware path.
         result = sc._translate_cds(seq, 0, 22, 1, exons=exons)
-        assert result == "MGKFCK*", (
-            f"Expected MGKFCK* (correctly spliced); got {result!r}. "
+        # Six AAs, no trailing stop — the spliced CDS genuinely has none
+        # (2026-07-24: the translator used to fabricate one, which is why
+        # this asserted a seventh character its own comment didn't expect).
+        assert result == "MGKFCK", (
+            f"Expected MGKFCK (correctly spliced); got {result!r}. "
             f"Pre-fix the intron's 4 bp shifted every downstream codon's "
             f"reading frame."
         )
@@ -703,9 +706,9 @@ class TestIntronAwareTranslation:
         assert len(seq) == 30
         exons = [(4, 13), (17, 26)]
         result = sc._translate_cds(seq, 4, 26, -1, exons=exons)
-        assert result == "MGKFCK*", (
+        assert result == "MGKFCK", (
             f"Reverse-strand spliced CDS should still translate to "
-            f"MGKFCK*; got {result!r}"
+            f"MGKFCK; got {result!r}"
         )
 
     def test_cds_aa_list_uses_exons_from_feature_dict(self):

@@ -355,6 +355,48 @@ def _ot2_mix_errors(mix: Any, spec: "tuple[float, float, int] | None",
     return errs
 
 
+_OT2_DEF_MAX_DEPTH = 32
+
+
+def _ot2_literal_errors(value: Any, tag: str, _depth: int = 0) -> "list[str]":
+    """Reject anything ``repr()`` would NOT render as a valid Python literal.
+
+    A custom labware definition is embedded in the generated protocol via
+    ``repr()`` — the right tool, since ``json.dumps`` emits ``true`` /
+    ``false`` / ``null``, none of which are Python. ``repr()`` is
+    literal-safe for every JSON type EXCEPT non-finite floats:
+    ``repr(float('inf'))`` is the bare NAME ``inf``, and ``json.loads``
+    accepts ``Infinity`` / ``-Infinity`` / ``NaN`` by DEFAULT. So a
+    definition carrying one emitted a protocol that ``NameError``s on the
+    robot instead of being refused here, where the message is actionable.
+    Depth is capped so a pathologically nested definition can't blow the
+    recursion limit inside ``repr()`` during emit.
+    """
+    if _depth > _OT2_DEF_MAX_DEPTH:
+        return [f"{tag}: nested more than {_OT2_DEF_MAX_DEPTH} levels deep"]
+    if isinstance(value, bool) or value is None or isinstance(value, (int, str)):
+        return []
+    if isinstance(value, float):
+        return ([] if math.isfinite(value) else
+                [f"{tag}: {value!r} is not a finite number — Infinity / NaN "
+                 f"cannot be written into a protocol"])
+    if isinstance(value, (list, tuple)):
+        out: "list[str]" = []
+        for i, v in enumerate(value):
+            out += _ot2_literal_errors(v, f"{tag}[{i}]", _depth + 1)
+        return out
+    if isinstance(value, dict):
+        out = []
+        for k, v in value.items():
+            if not isinstance(k, (str, int)) or isinstance(k, bool):
+                out.append(f"{tag}: key {k!r} must be a string or integer")
+                continue
+            out += _ot2_literal_errors(v, f"{tag}[{k!r}]", _depth + 1)
+        return out
+    return [f"{tag}: value of type {type(value).__name__} cannot be written "
+            f"into a protocol"]
+
+
 def _ot2_normalize_step(step: Any, default_new_tip: str) -> "dict[str, Any]":
     """Normalise one designer step into canonical form (parse refs, coerce types).
     Unknown / malformed steps normalise to ``{"type": <as-given>}`` and are flagged
@@ -664,6 +706,11 @@ def _ot2_validate_plan(plan: "dict[str, Any]") -> "dict[str, list[str]]":
     for lid, lw in p["labware"].items():
         _check_slot(lw.get("slot"), f"labware {lid!r}")
         if isinstance(lw.get("definition"), dict):
+            # The definition is `repr()`-embedded into the emitted protocol —
+            # refuse anything that wouldn't be a valid Python literal BEFORE
+            # it reaches the compiler.
+            errors += _ot2_literal_errors(lw["definition"],
+                                          f"custom labware (id {lid!r}) definition")
             if _ot2_custom_wells(lw["definition"]) is None:
                 warnings.append(f"custom labware (id {lid!r}) declares no 'wells' — well "
                                 "checks skipped; the robot will validate it")
@@ -2087,6 +2134,12 @@ def _ot2_compile_position_check(plan: "dict[str, Any]", *,
         if not (isinstance(slot, int) and not isinstance(slot, bool) and 1 <= slot <= 11):
             raise OT2Error(f"position check: labware {lid!r} has an invalid slot "
                            f"{slot!r} (slots are integers 1-11)")
+        # Same reason for the `repr()`-embedded custom definition below.
+        if isinstance(lw.get("definition"), dict):
+            lit = _ot2_literal_errors(lw["definition"],
+                                      f"position check: labware {lid!r} definition")
+            if lit:
+                raise OT2Error("\n  - ".join(["invalid custom labware:"] + lit))
 
     md = p["metadata"]
     out: "list[str]" = [

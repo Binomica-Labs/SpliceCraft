@@ -62,6 +62,15 @@ _AGAROSE_RANGES: dict[float, tuple[int, int]] = {
 
 _AGAROSE_CHOICES: tuple[float, ...] = tuple(sorted(_AGAROSE_RANGES.keys()))
 
+# Fraction of the lane reserved at EACH end for fragments outside the gel's
+# resolution window — sub-resolution bands running past `bp_min` toward the
+# dye front, and above-resolution bands sitting behind `bp_max` toward the
+# well. `_agarose_mobility` compresses the in-window Helling-Goodman-Boyer
+# map into the interior `[_GEL_EDGE_BAND, 1 - _GEL_EDGE_BAND]` so the two
+# regions can never overlap (an overlap inverts the size ordering at each
+# window boundary).
+_GEL_EDGE_BAND = 0.03
+
 # Effective MW multiplier per DNA form. Supercoiled runs faster than
 # linear of equal size → effectively migrates as a smaller linear.
 # Nicked / open-circle (relaxed) migrates slower → effectively a larger
@@ -207,30 +216,38 @@ def _agarose_mobility(bp: int, gel_pct: float,
     log_lo = math.log10(bp_min)
     log_hi = math.log10(bp_max)
     log_x  = math.log10(eff_bp)
-    # In-window raw mobility (0..1 maps to well..dye-front).
+    # In-window raw mobility, 0..1 across the resolution window.
     raw = (log_hi - log_x) / (log_hi - log_lo)
     if 0.0 <= raw <= 1.0:
-        return raw
-    # Out-of-window: damped extrapolation so multiple below-window
-    # (or above-window) fragments retain size ordering.  Map the
-    # excess log-distance through a tanh-like squash so the result
-    # asymptotes toward 1.0 (or 0.0) without reaching it. Each
-    # additional log10 unit past the boundary halves the remaining
-    # gap to the asymptote — gives ~3 visually distinct rows of
-    # ordering even on a small render before the floor / ceiling
-    # binds.
+        # Compress into the INTERIOR band [_GEL_EDGE_BAND, 1-_GEL_EDGE_BAND].
+        # `bp_min` is the smallest RESOLVABLE fragment, not the dye front, and
+        # `bp_max` the largest resolvable, not the well — so lane space has to
+        # be reserved beyond both for the out-of-window branches below.
+        # Pre-fix the in-window map spanned the FULL 0..1 lane while the
+        # out-of-window branches were squeezed into [0.97, 0.995] / [0.005,
+        # 0.03], so the two regions OVERLAPPED and the order inverted at each
+        # boundary: on a 1% gel a 499 bp fragment scored 0.983 against the
+        # 500 bp fragment's 1.000, rendering the SMALLER band ABOVE the larger
+        # one (and a 10 001 bp band below a 10 000 bp one). Visible on any
+        # ladder that straddles a window edge — the 100 bp ladder on a 1% gel
+        # put its 500 bp band below 400/300/200/100.
+        return _GEL_EDGE_BAND + (1.0 - 2.0 * _GEL_EDGE_BAND) * raw
+    # Out-of-window: damped extrapolation into the reserved edge band so
+    # multiple below-window (or above-window) fragments retain size ordering
+    # instead of hard-clamping onto one row. Each additional log10 unit past
+    # the boundary halves the remaining gap to the asymptote (dye front /
+    # well), which it approaches but never reaches. `0.5 ** excess` (not
+    # `0.5 ** (1 + excess)`) makes the curve CONTINUOUS with the in-window
+    # edge — the old form jumped half the band the instant a fragment fell
+    # one bp outside the window.
     if raw > 1.0:
-        excess = raw - 1.0       # > 0
-        damped = 1.0 - 0.5 ** (1.0 + excess)
-        # Anchor at the in-window edge (1.0) and stretch a small
-        # range past it. `0.97 + 0.025 * damped` keeps in [0.97, 0.995].
-        return 0.97 + 0.025 * damped
-    # raw < 0.0
+        excess = raw - 1.0       # > 0 — below bp_min, runs past the window
+        damped = 1.0 - 0.5 ** excess          # 0 → 1
+        return (1.0 - _GEL_EDGE_BAND) + _GEL_EDGE_BAND * damped
+    # raw < 0.0 — above bp_max, sits behind the window toward the well
     deficit = -raw            # > 0
-    damped = 1.0 - 0.5 ** (1.0 + deficit)
-    # Anchor at the in-window edge (0.0). `0.03 - 0.025 * damped`
-    # keeps in [0.005, 0.03].
-    return 0.03 - 0.025 * damped
+    damped = 1.0 - 0.5 ** deficit             # 0 → 1
+    return _GEL_EDGE_BAND - _GEL_EDGE_BAND * damped
 
 
 def _gel_bands_for_lane(

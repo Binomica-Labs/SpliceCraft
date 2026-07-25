@@ -941,8 +941,12 @@ def _label_disrupted_split_features(features: "list[dict]",
     where = f" ({'/'.join(enz)} cut site inside it)" if enz else ""
     for f in features:
         # head/tail = split across fragments; whole = cut(s) inside it but the
-        # remnant stayed in one fragment (an excised middle, e.g. a lacZ MCS).
-        if f.get("_split") not in ("head", "tail", "whole") or f.get("_disrupted"):
+        # remnant stayed in one fragment (an excised middle, e.g. a lacZ MCS);
+        # mid = this whole fragment lies INSIDE the feature, so it was cut on
+        # BOTH sides — disrupted by definition (the excised lacZ-MCS stuffer
+        # itself, which endpoint-slotting used to drop entirely).
+        if (f.get("_split") not in ("head", "tail", "whole", "mid")
+                or f.get("_disrupted")):
             continue
         base = str(f.get("label") or f.get("type") or "feature")
         if "(disrupted)" not in base:

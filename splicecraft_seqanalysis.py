@@ -35,10 +35,17 @@ def _find_orfs(seq: str, *,
                include_alt_starts: bool = False,
                circular: bool = True) -> list[dict]:
     """Six-frame ORF scan. Returns
-    ``[{start, end, strand, length_aa, aa_seq}, ...]`` sorted by length
-    descending. Wrap-aware on circular plasmids: an ORF crossing the
-    origin is reported with ``end < start``, matching the wrap-feature
-    convention `_feat_len` / `_bp_in` already implement.
+    ``[{start, end, strand, length_aa, nt_len, exceeds_one_lap, aa_seq},
+    ...]`` sorted by length descending. Wrap-aware on circular plasmids: an
+    ORF crossing the origin is reported with ``end < start``, matching the
+    wrap-feature convention `_feat_len` / `_bp_in` already implement.
+
+    ``nt_len`` is the exact coding length in bases INCLUDING the stop codon.
+    Read it (or ``length_aa``) for length — never derive length from
+    ``(start, end)``, which on a circle cannot express an ORF of a full lap
+    or more. Such an ORF (a frame with no in-frame stop for the whole
+    molecule — reachable on short synthetic constructs) is reported with
+    ``exceeds_one_lap=True`` and its span pinned to the near-full circle.
 
     `min_aa` excludes the stop codon (so ``min_aa=30`` ⇒ ORFs ≥ 30
     coded residues, i.e. ≥ 93 bp including the trailing stop).
@@ -103,19 +110,30 @@ def _find_orfs(seq: str, *,
                             else:
                                 o_s = n - e_rc
                                 o_e = n - p_rc
-                        # Full-lap ORF (fwd or rev): [o_s, o_s) mod n is ambiguous
-                        # (0-length vs whole-circle) and `_feat_len` would render
-                        # it as length 0. Any ORF reaching here has aa_len >=
-                        # min_aa (never truly zero-length), so o_e == o_s can only
-                        # mean full-lap — nudge the end 1 bp short so it draws as a
-                        # near-full-circle wrap arc; length_aa / aa_seq stay exact.
-                        if circular and o_e == o_s:
+                        # Coding length in bases, INCLUDING the stop codon —
+                        # reported explicitly so no consumer ever has to infer
+                        # it from `(start, end)`, which on a circle cannot.
+                        nt_len = len(nt_seq)
+                        # An ORF that runs a full lap or more (a frame with no
+                        # in-frame stop for the whole molecule) has NO (start,
+                        # end) pair on an n-bp circle that can express it:
+                        # `(o_s + nt_len) % n` lands back inside the ORF, so the
+                        # arc drawn from it UNDER-states the ORF by whole turns
+                        # — an exactly-one-lap ORF even collapses to `o_e ==
+                        # o_s`, which `_feat_len` reads as length 0. Pin the
+                        # span to the near-full circle (the honest "it goes all
+                        # the way round" arc) and flag it; `length_aa` /
+                        # `nt_len` / `aa_seq` stay exact either way.
+                        over_lap = circular and nt_len >= n
+                        if over_lap:
                             o_e = (o_s - 1) % n
                         orfs.append({
                             "start":     o_s,
                             "end":       o_e,
                             "strand":    strand,
                             "length_aa": aa_len,
+                            "nt_len":    nt_len,
+                            "exceeds_one_lap": over_lap,
                             "aa_seq":    aa_seq,
                         })
                         current_start = -1
@@ -523,6 +541,14 @@ def _synthesis_lint(seq, *, circular: bool = True, expect_cds: bool = False,
         orf_count = len(orfs)
         if expect_cds:
             def _span(o):
+                # Read the reported coding length, NOT the coordinate pair:
+                # on a circle `(start, end)` cannot express an ORF of a full
+                # lap or more, which is exactly the "spans ~the whole
+                # sequence" case this check is looking for. Coord fallback
+                # keeps a hand-built ORF dict working.
+                nt = o.get("nt_len")
+                if nt is not None:
+                    return int(nt)
                 st, en = int(o["start"]), int(o["end"])
                 return (len(s) - st) + en if en < st else en - st
             if not any(_span(o) >= 0.9 * len(s) for o in orfs):

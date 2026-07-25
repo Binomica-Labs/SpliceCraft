@@ -251,6 +251,119 @@ class TestDigestWithEnzymes:
         assert ft["start"] == 3
         assert ft["end"]   == 10
 
+    def test_feature_crossing_the_wrap_fragment_start_is_not_inverted(self):
+        """Regression: a feature spanning the cut at the ORIGIN-CROSSING
+        fragment's 5' end used to come back INVERTED (`start > end`).
+
+        The wrap fragment maps absolute→local modularly, so a piece that
+        begins BEFORE the fragment lands ABOVE `frag_len`, and the old
+        `min(new_s, frag_len)` clamp pinned that START to the fragment's
+        END instead of to 0. The inverted feature rode straight through
+        `_simulate_traditional_cloning` (which shifts start/end by the same
+        offset) into the shipped product, where `_feat_len` reads it as a
+        wrap — a 49 bp AmpR remnant rendered as a 489 bp "AmpR"."""
+        # 28 bp circular. Cuts: EcoRI top=5, BamHI top=19.
+        #   frag A = [5, 19)  len 14
+        #   frag B = [19, 5)  len 14  (wraps the origin)
+        # A feature [15, 24) crosses the BamHI cut at 19, so its TAIL half
+        # belongs to the wrap fragment at local [0, 5)  (abs 19..24).
+        feats = [{"start": 15, "end": 24, "label": "span", "strand": 1}]
+        frags = sc._digest_with_enzymes(TINY_PLASMID, ["EcoRI", "BamHI"],
+                                        circular=True, features=feats)
+        wrap_frag = next(f for f in frags if f["left"]["enzyme"] == "BamHI")
+        tail = next(ft for ft in wrap_frag["features"]
+                    if ft.get("label") == "span")
+        assert tail["start"] == 0
+        assert tail["end"] == 5
+        assert tail["start"] <= tail["end"]
+
+    def test_single_cut_linearisation_splits_a_spanning_feature(self):
+        """One cut on a circular plasmid yields ONE linear fragment. A
+        feature spanning that cut is genuinely split across the new 5' and
+        3' ends — it must come back as two in-bounds pieces, never as a
+        single `start > end` "wrap" (meaningless on a linear fragment)."""
+        # TINY_PLASMID is 28 bp with a single EcoRI cut at top=5.
+        feats = [{"start": 2, "end": 9, "label": "span", "strand": 1}]
+        frags = sc._digest_with_enzymes(TINY_PLASMID, ["EcoRI"],
+                                        circular=True, features=feats)
+        assert len(frags) == 1
+        n = len(frags[0]["top_seq"])
+        pieces = [ft for ft in frags[0]["features"]
+                  if ft.get("label") == "span"]
+        assert len(pieces) == 2
+        for p in pieces:
+            assert 0 <= p["start"] <= p["end"] <= n
+        # abs [2, 5) → local [25, 28); abs [5, 9) → local [0, 4).
+        assert sorted((p["start"], p["end"]) for p in pieces) == [(0, 4), (25, 28)]
+        # No annotated base is lost by the split.
+        assert sum(p["end"] - p["start"] for p in pieces) == 7
+
+    def test_fragment_wholly_inside_a_feature_still_gets_it(self):
+        """Regression: features were slotted by ENDPOINT — a piece went to the
+        fragment holding `start` and the one holding `end-1`, and nowhere else.
+        A feature longer than one fragment therefore lost every fragment
+        BETWEEN its ends, even though those are 100% inside the gene."""
+        seq = "".join("ACGT"[i % 4] for i in range(300))
+        seq = seq[:40] + "GAATTC" + seq[46:]      # EcoRI   → cut 41
+        seq = seq[:140] + "GGATCC" + seq[146:]    # BamHI   → cut 141
+        seq = seq[:240] + "AAGCTT" + seq[246:]    # HindIII → cut 241
+        enz = ["EcoRI", "BamHI", "HindIII"]
+        feats = [{"start": 30, "end": 260, "label": "longGene", "strand": 1}]
+        frags = sc._digest_with_enzymes(seq, enz, circular=True, features=feats)
+        assert len(frags) == 3
+        for i, f in enumerate(frags):
+            got = [ft for ft in f["features"] if ft.get("label") == "longGene"]
+            assert got, f"fragment {i} is inside the gene but lost the annotation"
+        # The two fully-enclosed fragments are covered end to end.
+        mids = [f for f in frags
+                if any(ft.get("_split") == "mid" for ft in f["features"])]
+        assert len(mids) == 2
+        for f in mids:
+            ft = next(x for x in f["features"] if x.get("label") == "longGene")
+            assert (ft["start"], ft["end"]) == (0, len(f["top_seq"]))
+
+    def test_feature_wrapping_past_every_cut_is_not_read_as_contained(self):
+        """A circular feature long enough to run past ALL the cuts lands both
+        endpoints back in the SAME fragment. Endpoint-slotting read that as
+        'contained in one fragment' and dropped it from every other fragment
+        it actually covers."""
+        # 28 bp, cuts at 5 (EcoRI) and 19 (BamHI). A feature [22, 18) wraps
+        # the origin, so it is pre-split into [22, 28) + [0, 18) — the latter
+        # runs from before cut 5, past it, to inside fragment [5, 19).
+        feats = [{"start": 22, "end": 18, "label": "big", "strand": 1}]
+        frags = sc._digest_with_enzymes(TINY_PLASMID, ["EcoRI", "BamHI"],
+                                        circular=True, features=feats)
+        for i, f in enumerate(frags):
+            assert any(ft.get("label") == "big" for ft in f["features"]), (
+                f"fragment {i} lost the wrap feature")
+
+    def test_no_fragment_feature_is_ever_inverted(self):
+        """Property guard across both topologies and cut counts: a
+        fragment is a LINEAR molecule, so every feature slotted onto it
+        must satisfy `0 <= start <= end <= len(top_seq)`."""
+        import random
+        rng = random.Random(20260724)
+        enz = ["EcoRI", "BamHI", "HindIII", "PstI", "XhoI"]
+        for _ in range(300):
+            seq = "".join(rng.choice("ACGT") for _ in range(120))
+            for name in rng.sample(enz, rng.randint(1, 3)):
+                site = sc._NEB_ENZYMES[name][0]
+                p = rng.randrange(len(seq) - len(site))
+                seq = seq[:p] + site + seq[p + len(site):]
+            fs, fe = rng.randrange(len(seq)), rng.randrange(len(seq))
+            for circ in (True, False):
+                # `end < start` means "wraps the origin" — well-formed only on
+                # a circular molecule; on a linear one it is malformed input.
+                feats = [{"start": fs, "end": fe if circ else max(fs, fe),
+                          "label": "f", "strand": 1}]
+                for frag in sc._digest_with_enzymes(seq, enz, circular=circ,
+                                                    features=feats):
+                    L = len(frag["top_seq"])
+                    for ft in frag["features"]:
+                        assert 0 <= ft["start"] <= ft["end"] <= L, (
+                            f"circular={circ} feat={feats} -> {ft} on a "
+                            f"{L} bp fragment")
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # _make_synthetic_fragment (modes b + c — PCR product / feature with tails)

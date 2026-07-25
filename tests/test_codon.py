@@ -66,6 +66,33 @@ async def _switch_tab(pilot, tabs, want, initial="sp-tab-library"):
             return
 
 
+async def _quiesce_tab(pilot, tabs, want, stable=8, tries=240):
+    """Pump until `tabs.active == want` has HELD across `stable` consecutive
+    drains, re-asserting it if a straggler reverts it in between.
+
+    Stronger than `_settle_tab`, which returns as soon as the value survives
+    ONE extra drain. Under `-n auto` CPU contention the modal's mount-time
+    `TabActivated` can land several pauses later than that, reverting
+    `.active` to the default library tab — which is what flaked
+    `test_import_bad_tsv_shows_error_no_switch` and aborted a release on a
+    false failure.
+
+    Call this BEFORE the interaction under test, never after: quiescing first
+    closes the straggler window without masking anything, because a handler
+    that genuinely navigates away does so afterwards and still fails the
+    assertion."""
+    held = 0
+    for _ in range(tries):
+        await pilot.pause()
+        if tabs.active == want:
+            held += 1
+            if held >= stable:
+                return
+        else:
+            held = 0
+            tabs.active = want
+
+
 async def _settle_foldback_to_library(pilot, tabs, modal, tries=80):
     """Wait for a codon-manager acquisition callback's fold-back to Library to
     settle (library active + list populated + not building), re-asserting the
@@ -2690,15 +2717,21 @@ class TestCodonManagerTabs:
             modal = app.screen
             tabs = modal.query_one("#sp-tabs", TabbedContent)
             await _switch_tab(pilot, tabs, "sp-tab-import")
+            # Quiesce BEFORE pressing. The mount-time `TabActivated` straggler
+            # can still be in flight when `_switch_tab` returns (it confirms
+            # the value survived only ONE extra drain), and under `-n auto`
+            # load it landed after the press and reverted `.active` to the
+            # library tab — failing this assert even though the handler had
+            # correctly taken the error path (the `_codon_tables_add` monkey-
+            # patch proves it never took the success path). Draining to a
+            # stable fixed point first closes that window; a handler that
+            # genuinely navigated away still fails, because it acts after this.
+            await _quiesce_tab(pilot, tabs, "sp-tab-import")
             # ATG is Met, not Ala → _parse_codon_tsv raises ValueError.
             modal.query_one("#sp-import-text", TextArea).text = "ATG\tA\t5\n"
             modal.query_one("#btn-sp-import-go", Button).action_press()
             # `_import_tsv` is synchronous and does NOT switch tabs on a
-            # parse error, so the Import tab must HOLD. Use `_settle_tab`
-            # (not a fixed pause) to flush the trailing TabActivated message
-            # that can transiently revert `.active` — the documented race
-            # that flaked this under the release's `-n auto` load. The
-            # success-path import tests already settle this way.
+            # parse error, so the Import tab must HOLD.
             await _settle_tab(pilot, tabs, "sp-tab-import")
             assert tabs.active == "sp-tab-import"
             assert "failed" in str(modal.query_one(

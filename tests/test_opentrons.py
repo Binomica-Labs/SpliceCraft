@@ -230,6 +230,58 @@ class TestCustomLabware:
         assert rep["errors"] == []
         assert any("declares no 'wells'" in w for w in rep["warnings"])
 
+    @pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+    def test_non_finite_in_definition_is_refused(self, bad):
+        """Regression: the definition is `repr()`-embedded into the emitted
+        protocol. `repr(float('inf'))` is the bare NAME `inf` — not a literal —
+        and `json.loads` accepts `Infinity` / `NaN` BY DEFAULT, so a definition
+        carrying one used to compile into a protocol that NameErrors on the
+        robot instead of being refused here."""
+        d = {**self._DEF, "wells": {"A1": {"depth": bad}}}
+        rep = ot2._ot2_validate_plan(self._plan(
+            labware={"src": {"labware": "custom_rack", "slot": 1, "definition": d},
+                     "dst": {"labware": "plate_24", "slot": 2}}))
+        assert any("finite" in e for e in rep["errors"]), rep
+        with pytest.raises(ot2.OT2Error):
+            ot2._ot2_compile_protocol(self._plan(
+                labware={"src": {"labware": "custom_rack", "slot": 1,
+                                 "definition": d},
+                         "dst": {"labware": "plate_24", "slot": 2}}))
+
+    def test_emitted_protocol_is_always_valid_python(self):
+        """Every user-controlled string reaches the generated protocol through
+        `json.dumps` (literals) or `_ot2_safe_var` (identifiers). Hostile
+        content must not break the syntax or inject a statement."""
+        import ast
+        hostile = ['"); import os; os.system("id"); ("',
+                   "'); __import__('os').system('id'); ('",
+                   "line\nbreak", "nul\x00byte", "back\\slash", "🧬", "'''\"\"\""]
+        for h in hostile:
+            plan = self._plan(name=h, author=h, description=h)
+            plan["steps"] = plan["steps"] + [
+                {"type": "comment", "text": h},
+                {"type": "pause", "message": h},
+                {"type": "delay", "seconds": 1, "message": h},
+            ]
+            proto = ot2._ot2_compile_protocol(plan)
+            tree = ast.parse(proto)          # must be syntactically valid
+            imported = [n for n in ast.walk(tree)
+                        if isinstance(n, (ast.Import, ast.ImportFrom))]
+            assert len(imported) == 1        # only `from opentrons import …`
+            calls = {n.func.id for n in ast.walk(tree)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            assert not (calls & {"eval", "exec", "compile", "open", "__import__"})
+
+    def test_deeply_nested_definition_is_refused(self):
+        d = cur = {}
+        for _ in range(ot2._OT2_DEF_MAX_DEPTH + 5):
+            cur["n"] = {}
+            cur = cur["n"]
+        rep = ot2._ot2_validate_plan(self._plan(
+            labware={"src": {"labware": "custom_rack", "slot": 1, "definition": d},
+                     "dst": {"labware": "plate_24", "slot": 2}}))
+        assert any("levels deep" in e for e in rep["errors"]), rep
+
 
 # ── Deck visualizer ─────────────────────────────────────────────────────────────
 class TestDeckVisualizer:

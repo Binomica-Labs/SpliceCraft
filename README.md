@@ -115,6 +115,17 @@ use). **Ctrl+F** finds a subsequence — fuzzy, both strands — and `n`/`N` ste
 the hits, each pre-selected so **Alt+Shift+F** tags it on the spot. (`Ctrl+/`
 searches features by name instead.)
 
+Click a CDS and **Ctrl+C** copies the protein rather than the DNA. What you
+get is what the annotated bases actually encode — a trailing `*` shows up
+only when the CDS really ends in a stop codon, so a CDS annotated without its
+stop (common in GenBank, and every partial) reads back without one.
+
+**File ▸ Find ORFs** runs a six-frame scan with a minimum length in amino
+acids, ATG-only or with bacterial GTG/TTG starts, wrap-aware around the
+origin — pick a row to jump the sequence panel to it. On a circular plasmid a
+frame can run the whole way round without a stop; those are flagged **full
+lap**, since no start/end pair can describe an ORF longer than the plasmid.
+
 ### Primers
 
 A full-screen Primer3 designer for detection, cloning, Golden Braid, and

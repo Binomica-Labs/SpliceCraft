@@ -559,15 +559,48 @@ def _pick_binding_region(seq: str, target_tm: float = 60.0,
     # below. Using two separate names avoids the param-name mismatch
     # pyright flags when a `def _tm(s)` re-defines the same binding.
     def _tm_fallback(s: str) -> float:
-        gc = sum(1 for c in s.upper() if c in "GC")
-        at = sum(1 for c in s.upper() if c in "AT")
-        return float(2 * at + 4 * gc)
+        u = s.upper()
+        gc = sum(1 for c in u if c in "GC")
+        at = sum(1 for c in u if c in "AT")
+        # Degenerate / ambiguous bases score the AT–GC midpoint so an
+        # N-containing arm isn't Tm-UNDERestimated into looking unusable
+        # (mirrors `_primer_tm` / `_mut_tm`).
+        return float(2 * at + 4 * gc + 3 * (len(u) - gc - at))
     _tm: "_Callable[..., float]"
     try:
         import primer3
-        _tm = primer3.calc_tm
+        _p3_tm = primer3.calc_tm
     except ImportError:
         _tm = _tm_fallback
+    else:
+        # primer3's nearest-neighbour model REFUSES any non-ACGT base
+        # (`ValueError: Sequence contains non-ACGT base 'N' at position …`),
+        # and real templates carry them: a Plasmidsaurus consensus has N at
+        # low-coverage positions, NCBI records carry IUPAC ambiguity codes,
+        # and the Synthesis composer lets you TYPE IUPAC ([INV-53]). Pre-fix
+        # only `ImportError` was caught, so designing primers over such a
+        # region raised straight out of the worker instead of degrading to
+        # the approximation — every sibling Tm helper (`_primer_tm`,
+        # `_mut_tm`, `_tm_cached`, the `.dna` import `_calc_tm`) already
+        # falls back per-call; this one didn't.
+        #
+        # Decide ONCE for the whole candidate window rather than per length:
+        # mixing a nearest-neighbour Tm for the clean prefixes with a 2+4
+        # estimate for the ones that reach the ambiguous base would compare
+        # two different scales and pick the length whose ESTIMATOR happened
+        # to land nearest `target_tm`.
+        # NB distinct name (see the two-separate-names note above): a
+        # `def _tm(...)` here would re-declare the annotated binding and
+        # pyright's `reportRedeclaration` fails the release lint gate.
+        def _tm_nn(s: str) -> float:
+            try:
+                return float(_p3_tm(s))
+            except (ValueError, OSError, RuntimeError, TypeError):
+                return _tm_fallback(s)
+        _window = seq[:max_len].upper()
+        _tm = (_tm_nn
+               if (_window and all(c in "ACGT" for c in _window))
+               else _tm_fallback)
 
     # Defensive init: if the caller forgot the len(seq) >= min_len guard,
     # the loop below won't execute and we'd otherwise return Tm=0 with a

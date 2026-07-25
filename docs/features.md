@@ -222,6 +222,19 @@ What you can do without leaving the terminal.
 - **New Plasmid modal** (`Ctrl+N`) — paste a sequence, optionally name
   + set topology, then either Create / Annotate-from-library
   (substring match) / Annotate-via-BLAST (≥90% identity → `misc_feature`).
+- **ORF finder** (File ▸ Find ORFs, or the command palette) — six-frame
+  scan with a minimum length in **amino acids**; ATG-only by default,
+  with GTG / TTG opt-in for bacterial starts. Wrap-aware on circular
+  plasmids: an ORF crossing the origin is listed with its end before its
+  start and marked *(wrap)*. Picking a row highlights that ORF in the
+  sequence panel.
+
+  Read the **aa** column (or the API's `length_aa` / `nt_len`) for
+  length — never the start/end pair. On a circular plasmid a frame can
+  run the whole way round without hitting a stop, and no start/end pair
+  on an n-bp circle can express an ORF of a full lap or more. Those are
+  listed as **full lap** with their span pinned to the near-full circle;
+  the reported length stays exact.
 
 ## Library
 

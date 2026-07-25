@@ -384,6 +384,55 @@ class TestPickBindingRegionNextBest:
         assert tm > 0
 
 
+class TestPickBindingRegionAmbiguousBases:
+    """Regression: `_pick_binding_region` used to catch only `ImportError`
+    around primer3, but `primer3.calc_tm` RAISES `ValueError` on any
+    non-ACGT base. A Plasmidsaurus consensus carries N at low-coverage
+    positions, NCBI records carry IUPAC ambiguity codes, and the Synthesis
+    composer lets you type IUPAC ([INV-53]) — so designing primers over
+    such a region raised straight out of the worker instead of degrading
+    to the 2+4 approximation the way every sibling Tm helper does."""
+
+    _CLEAN = "ACGTTGCAAGCTTGGCACTGGCCGTCGTTTTACAACGTCGTGACTGGGAAAAC"
+
+    def test_n_in_the_binding_window_does_not_raise(self):
+        seq = "ACGTNNCAAGCTTGGCACTGGCCGTCGTTTTACAACGTCGTGACTGGGAAAAC"
+        bind, tm = sc._pick_binding_region(seq, target_tm=60.0)
+        assert 18 <= len(bind) <= 25
+        assert tm > 0
+
+    def test_iupac_in_the_binding_window_does_not_raise(self):
+        seq = "ACGTRYCAAGCTTGGCACTGGCCGTCGTTTTACAACGTCGTGACTGGGAAAAC"
+        bind, tm = sc._pick_binding_region(seq, target_tm=60.0)
+        assert 18 <= len(bind) <= 25
+        assert tm > 0
+
+    def test_ambiguous_base_scores_the_at_gc_midpoint(self):
+        # The fallback must not UNDERestimate an ambiguous arm into looking
+        # unusable — N counts 3, between AT's 2 and GC's 4 (mirrors
+        # `_primer_tm` / `_mut_tm`).
+        _b, tm_n = sc._pick_binding_region("N" * 18, target_tm=60.0)
+        _b, tm_at = sc._pick_binding_region("AT" * 9, target_tm=60.0)
+        _b, tm_gc = sc._pick_binding_region("GC" * 9, target_tm=60.0)
+        assert tm_at < tm_n < tm_gc
+
+    def test_clean_template_still_uses_primer3(self):
+        # The fallback must not silently take over the ACGT path.
+        primer3 = pytest.importorskip("primer3")
+        _bind, tm = sc._pick_binding_region(self._CLEAN, target_tm=60.0)
+        assert any(tm == pytest.approx(primer3.calc_tm(self._CLEAN[:L]))
+                   for L in range(18, 26))
+
+    def test_generic_primer_design_survives_an_n(self):
+        # End-to-end: the crash surfaced through the region designers.
+        import random
+        rng = random.Random(4)
+        seq = "".join(rng.choice("ACGT") for _ in range(400))
+        seq = seq[:50] + "NN" + seq[52:]
+        res = sc._design_generic_primers(seq, 50, 250)
+        assert res.get("fwd_seq") and res.get("rev_seq")
+
+
 class TestPrimerOligoLengthCap:
     """The 50 bp total-oligo cap (2026-06-09 user report): designs grow the
     binding region to reach ~60 °C for low-GC (AT-rich) templates — the old

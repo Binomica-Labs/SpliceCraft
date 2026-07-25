@@ -14,6 +14,65 @@
 
 ---
 
+## [1.2.36] — 2026-07-24
+
+A full from-scratch review of the codebase — biology re-checked against
+independent reference implementations rather than against itself. Seven fixes,
+most of them silent wrong answers rather than crashes.
+
+### Bug fixes
+
+- **Cloning products no longer carry mangled gene annotations.** When you cut a
+  plasmid with two enzymes and a feature spanned the cut that the
+  origin-crossing fragment starts at, that feature came back with its start and
+  end swapped — and the swap survived into the cloned product, where it renders
+  as an origin-spanning annotation. A 49 bp AmpR remnant was drawn as a 489 bp
+  "AmpR". Any traditional restriction clone where a vector feature crosses the
+  upstream cut site was affected.
+- **Digest fragments that sit entirely inside a gene now keep the gene's
+  annotation.** A feature was only ever attached to the fragment holding its
+  start and the one holding its end, so anything in between came back bare — a
+  230 bp gene cut into three 100 bp fragments annotated the two outer pieces and
+  left the middle one blank. The excised stuffer between two cuts inside the
+  same gene (cloning into a lacZα MCS) was the everyday case. Recovered pieces
+  are flagged "(disrupted)" like the others.
+- **Gel bands at the edge of a gel's resolution range are no longer drawn in the
+  wrong order.** On a 1% gel, fragments below 500 bp were rendered *above* the
+  500 bp band — so a 100 bp ladder ran 500, then 400/300/200/100 higher up the
+  lane. The same inversion happened at the top of every gel's range.
+- **Designing primers over a region containing N or an ambiguity code no longer
+  fails.** Sequencing consensus with low-coverage `N`s, NCBI records with IUPAC
+  codes, and anything typed with ambiguity in the Synthesis composer would abort
+  primer design outright. Those regions now fall back to an approximate melting
+  temperature instead, the way every other part of the app already did.
+- **Protein translation no longer invents a stop codon.** A CDS annotated
+  without its stop — the common case in GenBank, and every partial CDS — used to
+  read back with a trailing `*` that isn't in the DNA. Copying a CDS as protein
+  now shows exactly what the annotated bases encode, matching the amino-acid row
+  drawn under the sequence.
+- **Find ORFs no longer under-reports an ORF that circles the whole plasmid.** A
+  reading frame with no stop for a full lap was listed with a start and end just
+  a few bases apart, because no start/end pair on a circle can describe
+  something longer than the circle. Those ORFs are now marked **full lap**, drawn
+  as a near-complete circle, and report their true length.
+- **A custom labware definition containing an infinite or not-a-number value is
+  refused** instead of compiling into an OT-2 protocol that fails on the robot.
+
+### Hardening
+
+- Fragment annotations are now guaranteed to stay inside their fragment and
+  never come back inverted, on any combination of cut count and topology.
+- Gel migration is now verified monotonic in fragment size across every agarose
+  percentage and DNA form — a smaller fragment can never render as running less
+  far than a larger one.
+- The ORF list reports an exact coding length alongside the coordinates, so
+  nothing has to infer length from a start/end pair that may not be able to
+  express it.
+- The generated OT-2 protocol is verified to stay valid, un-injectable Python no
+  matter what you name a plate, a run, or a pause message.
+- The `?` help now covers Find ORFs and explains what a trailing `*` on a
+  translated CDS does and doesn't mean.
+
 ## [1.2.35] — 2026-07-24
 
 ### Hardening
