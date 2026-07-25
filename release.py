@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -1163,6 +1164,163 @@ def _check_private_tokens() -> None:
           "appear in tracked files.")
 
 
+# Generic vocabulary that legitimately appears BOTH in plasmid names and in
+# ordinary prose/code. Without this, deriving tokens from the library flags
+# things like "forward primer" or "template" on every release. Measured on the
+# real library: raw derivation produced ~90% false positives, and this list plus
+# the newly-introduced-only filter below is what makes the gate precise enough
+# to block on.
+_LIBRARY_LEAK_STOPWORDS = {
+    "adapter", "annotated", "antisense", "assembly", "backbone", "binary",
+    "broken",
+    "chloroplast", "chromosome", "circular", "cloning", "complete", "construct",
+    "control", "default", "deleted", "digest", "domesticated", "downstream",
+    "empty", "escherichia", "exonuclease", "flanks", "forward", "fragment",
+    "fusion", "genome", "genomes", "hypothetical", "illumina", "insert",
+    "intron", "isolation", "lambda", "legacy", "library", "linear", "linker",
+    "marker", "mitochondrial", "module", "multigene", "mutant", "native",
+    "operon", "origin", "partial", "pcambia", "plasmid", "plasmids",
+    "positive", "primer",
+    "promoter", "protein", "prototype", "rebuild", "refactor", "replication",
+    "reporter", "reverse", "scaffold", "seamless", "sequence", "sequenced",
+    "strain", "synthetic", "target", "template", "terminator", "upstream",
+    "vector", "yellow",
+}
+
+_LIBRARY_LEAK_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]{5,}")
+
+
+def _library_private_tokens() -> "set[str]":
+    """Distinctive word-pieces taken from the LOCAL plasmid library's collection
+    and plasmid names. Read-only, and deliberately does NOT import splicecraft
+    (importing it computes/creates the data dir — see CLAUDE.md's data-dir
+    rules); this only ever reads one JSON file if it happens to exist."""
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    coll = Path(base) / "splicecraft" / "collections.json"
+    if not coll.is_file():
+        return set()
+    try:
+        doc = json.loads(coll.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    entries = doc.get("entries", doc) if isinstance(doc, dict) else doc
+    names: set[str] = set()
+    if isinstance(entries, list):
+        for c in entries:
+            if not isinstance(c, dict):
+                continue
+            names.add(str(c.get("name") or ""))
+            for pl in c.get("plasmids") or []:
+                if isinstance(pl, dict):
+                    names.add(str(pl.get("name") or ""))
+    toks: set[str] = set()
+    for n in names:
+        for w in _LIBRARY_LEAK_WORD_RE.findall(n):
+            wl = w.lower()
+            if wl not in _LIBRARY_LEAK_STOPWORDS:
+                toks.add(wl)
+    return toks
+
+
+def _check_library_name_leaks() -> None:
+    """Abort if a name from the user's PRIVATE plasmid library was NEWLY
+    introduced into a tracked file since the previous release.
+
+    `origin` is the PUBLIC release repo, so a construct or collection name that
+    lands in a doc, a comment or a test variable ships to every user. The
+    curated `.private-names` gate above catches only what someone remembered to
+    add to it — on 2026-07-25 that was 2 of the 6 names an agent had just
+    written into `docs/invariants.md` and a new test. This gate needs no
+    curation: it reads the names straight out of the local library.
+
+    Only tokens NEWLY ADDED since `_previous_release_ref()` are reported.
+    Scanning the whole tree instead would surface historical usages (and plenty
+    of generic-word noise) and block every release; the point here is to stop
+    THIS release adding a new leak. Pre-existing ones are a separate cleanup.
+
+    COMPLEMENTARY to the curated gate, not a replacement: this one only derives
+    tokens of 6+ characters, because short collection names collide with
+    ordinary English words and would fire on every release. Short or ambiguous
+    names still need a human-curated `.private-names` entry — which is what
+    caught a private collection name surviving as a bare local VARIABLE in a
+    test on 2026-07-25, after the string literals around it had already been
+    scrubbed. Names leak through identifiers and comments, not just strings.
+
+    Best-effort: no library on this machine, or no previous tag, means the gate
+    prints a notice and continues rather than blocking a release it cannot
+    judge. `SPLICECRAFT_SKIP_PRIVATE_CHECK=1` bypasses it (same switch as the
+    curated gate)."""
+    if os.environ.get("SPLICECRAFT_SKIP_PRIVATE_CHECK", "").strip().lower() in (
+        "1", "true", "yes",
+    ):
+        return
+    _heading("Checking for private library names in new code")
+    toks = _library_private_tokens()
+    if not toks:
+        print("  No local plasmid library found — gate skipped on this machine.")
+        return
+    prev = _previous_release_ref()
+    if not prev:
+        print("  No previous release tag — nothing to diff against. Continuing.")
+        return
+    try:
+        diff = subprocess.run(
+            ["git", "diff", "--unified=0", prev, "--"],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+        ).stdout
+    except Exception as exc:                       # noqa: BLE001 — best-effort
+        print(f"  Could not diff against {prev} ({exc}). Continuing.")
+        return
+    # `git diff <tag>` only covers TRACKED files, but release.py `git add -A`s
+    # later — so a brand-new untracked file would sail past the gate and ship.
+    # Everything in such a file is by definition newly introduced, so scan it
+    # whole and splice it into the same stream as `+` lines.
+    extra: list[str] = []
+    try:
+        untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+        ).stdout.split()
+    except Exception:                              # noqa: BLE001 — best-effort
+        untracked = []
+    for rel in untracked:
+        f = REPO_ROOT / rel
+        if f.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".ico",
+                                 ".svg", ".zip", ".gz", ".whl", ".pyc", ".pdf"}:
+            continue
+        try:
+            body = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        extra.append(f"+++ b/{rel}")
+        extra.extend("+" + ln for ln in body.splitlines())
+
+    cur = ""
+    hits: list[str] = []
+    for line in diff.splitlines() + extra:
+        if line.startswith("+++ b/"):
+            cur = line[6:]
+            continue
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        found = {w.lower() for w in _LIBRARY_LEAK_WORD_RE.findall(line)} & toks
+        if found:
+            hits.append(f"    {cur}: {', '.join(sorted(found))}\n"
+                        f"        {line[1:].strip()[:88]}")
+    if hits:
+        shown = "\n".join(hits[:30])
+        more = f"\n    … and {len(hits) - 30} more" if len(hits) > 30 else ""
+        _die(
+            "name(s) from your PRIVATE plasmid library appear in code added "
+            f"since {prev} — `origin` is PUBLIC, so releasing would leak them. "
+            "Replace each with a generic standin (e.g. promoter `Pdemo`, CDS "
+            "`GeneX`, plasmid `Demo NN`), including in comments and test "
+            "variable names:\n" + shown + more
+        )
+    print(f"  Clean — no private library name (of {len(toks)} derived) appears "
+          f"in code added since {prev}.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Cut a new SpliceCraft release.",
@@ -1204,6 +1362,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _summarize_pending_changes()
     _check_private_tokens()
+    _check_library_name_leaks()
     _ensure_tag_unused(new_version)
     _ensure_changelog_entry(new_version)
 

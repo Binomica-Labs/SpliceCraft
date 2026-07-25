@@ -4354,11 +4354,24 @@ class LibraryDeleteConfirmModal(ModalScreen):
         Binding("tab",    "app.focus_next", "Next button", show=False),
     ]
 
-    def __init__(self, name: str, size: int, entry_id: str):
+    def __init__(self, name: str, size: int, entry_id: str,
+                 dup_count: "int | None" = None):
+        """`dup_count` = how many OTHER entries carry this entry's exact
+        sequence (by `_entry_content_key` — `gb_ref` when dehydrated,
+        else a hash of inline `gb_text`). None = not computed (primer
+        library and other non-plasmid callers), keeping the original
+        wording rather than inventing a reassurance or an alarm.
+
+        Drives the "is this the last copy?" line ([INV-167]). The
+        2026-07-25 incident: entries were deleted as presumed copies when
+        they were distinct sequences that merely shared a name, so the
+        modal now answers that question instead of leaving it to the name.
+        """
         super().__init__()
         self.entry_name = name
         self.entry_size = size
         self.entry_id   = entry_id
+        self.dup_count  = dup_count
         # [INV-50] dismiss-once guard
         self._dismissed: bool = False
 
@@ -4369,12 +4382,38 @@ class LibraryDeleteConfirmModal(ModalScreen):
         self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
+        # Escape the name: this Static renders with markup=True, so a
+        # plasmid called `pUC19 [old]` would have the bracketed part
+        # SILENTLY SWALLOWED as a style tag and the dialog would ask you
+        # to confirm deleting "pUC19" — the wrong name, in the one
+        # dialog where that matters most ([INV-167]). Bracketed text is
+        # routine in NCBI-derived names (`[Candida] glabrata`).
+        from rich.markup import escape as _esc
         size_str = f" ({self.entry_size:,} bp)" if self.entry_size > 0 else ""
+        # Answer "am I about to lose this sequence?" up front — a name
+        # alone never settles it ([INV-167]).
+        if self.dup_count is None:
+            dup_line = ""
+        elif self.dup_count > 0:
+            other = "entry" if self.dup_count == 1 else "entries"
+            dup_line = (
+                f"  [green]An identical sequence is kept by "
+                f"{self.dup_count} other {other}[/green] — "
+                f"removing this one does not lose it.\n\n"
+            )
+        else:
+            dup_line = (
+                "  [bold red]This is the ONLY entry holding this "
+                "sequence.[/bold red]\n"
+                "  [red]No other entry has the same bases — removing it "
+                "loses it.[/red]\n\n"
+            )
         with Vertical(id="libdel-dlg"):
             yield Static(" Remove from library ", id="libdel-title")
             yield Static(
-                f"  Remove [bold]{self.entry_name}[/bold]"
+                f"  Remove [bold]{_esc(str(self.entry_name))}[/bold]"
                 f"{size_str} from the library?\n\n"
+                f"{dup_line}"
                 f"  [dim]This cannot be undone from within the app.\n"
                 f"  A backup (.bak) of the library file is kept.[/dim]",
                 id="libdel-msg",

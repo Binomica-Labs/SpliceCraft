@@ -78,12 +78,28 @@ from splicecraft_util import _RUNTIME_PLATFORM, _is_windows_reserved_stem
 _SNAPSHOT_RETENTION_DAYS = 30
 
 
-# Per-file cap for daily snapshots. A user with a 1 GB plasmid library
-# would otherwise see 30 × 1 GB = 30 GB of daily snapshots accumulate.
-# Files above this size skip the daily-snapshot copy; rollback is still
-# available via `_safe_save_json`'s .bak rotation (last 10 generations)
-# and the pre-update snapshot system (last 5 update points).
-_SNAPSHOT_FILE_SIZE_CAP  = 50 * 1024 * 1024  # 50 MB
+# Per-file cap for daily snapshots, expressed as a fraction of the
+# aggregate ceiling below (kept in sync by construction, see [INV-167]).
+#
+# This used to be a flat 50 MB, which meant the BIGGEST and most
+# expensive-to-lose library was the one file with NO daily snapshot —
+# the worst possible place for the safety net to have a hole, and a real
+# 2026-07-25 data-loss recovery turned on precisely that snapshot
+# existing. Disk growth is already bounded properly by
+# `_SNAPSHOT_TOTAL_SIZE_CAP` in `_prune_old_snapshots` (oldest-first),
+# so the only job left for a per-file cap is to refuse a file so large
+# that snapshotting it would evict every other snapshot for no net gain.
+# Half the aggregate budget guarantees at least two generations can
+# coexist. Anything skipped here still has `_safe_save_json`'s .bak
+# rotation (10 generations) and the pre-update snapshots.
+#
+# NB: compression was evaluated as an alternative to skipping and
+# REJECTED — `_snapshot_data_files` runs SYNCHRONOUSLY on the launch
+# path, and gzip level 6 measures ~1.2 s per 43 MB (≈4.5 s for a 160 MB
+# library) versus ~0.3 s for a plain copy. That is exactly the hang the
+# sibling housekeeping pass spawns a daemon thread to avoid. Do not
+# re-add compression here without moving the work off the launch path.
+_SNAPSHOT_FILE_SIZE_CAP  = 250 * 1024 * 1024  # = _SNAPSHOT_TOTAL_SIZE_CAP // 2
 
 
 # Aggregate cap across the entire snapshots directory. Per-file cap
@@ -336,20 +352,30 @@ def _snapshot_data_files(data_dir: Path,
             continue
         if src_size == 0:
             continue
-        # Per-file size cap: a 1 GB plasmid library × 30 daily
-        # snapshots = 30 GB of effectively-redundant copies (the
-        # `.bak` rotation already provides recent rollback). Skip
-        # any individual file larger than `_SNAPSHOT_FILE_SIZE_CAP`
-        # so a heavy user doesn't accidentally fill their disk.
+        # Refuse only a file so large that snapshotting it would evict
+        # every other snapshot (see the cap's own comment). This is now
+        # a genuinely rare case, so say so LOUDLY — the old flat 50 MB
+        # cap skipped the user's most valuable file in silence
+        # ([INV-167]). Checked BEFORE the read so an oversized file is
+        # never pulled into memory.
         if src_size > _SNAPSHOT_FILE_SIZE_CAP:
             _log.warning(
-                "Skipping daily snapshot of %s: %d bytes > cap %d "
-                "(use _safe_save_json's .bak rotation for rollback)",
+                "NO daily snapshot for %s: %d bytes exceeds the "
+                "per-file cap of %d (half the %d-byte snapshot-dir "
+                "budget). Rollback for this file is limited to "
+                "_safe_save_json's .bak rotation and the pre-update "
+                "snapshots.",
                 src.name, src_size, _SNAPSHOT_FILE_SIZE_CAP,
+                _SNAPSHOT_TOTAL_SIZE_CAP,
             )
             continue
         dest = snap_dir / f"{src.stem}-{today}{src.suffix}"
-        if dest.exists():
+        # A `.gz` sibling also counts as "today is already snapshotted".
+        # Nothing here WRITES one — compression is deliberately not done
+        # on the launch path — but a user who hand-compresses a snapshot
+        # to reclaim disk must not have it silently re-copied (and must
+        # not lose the pre-damage snapshot to a same-day relaunch).
+        if dest.exists() or dest.with_name(dest.name + ".gz").exists():
             continue
         try:
             _atomic_write_bytes(dest, src.read_bytes())
@@ -378,6 +404,21 @@ def _prune_old_snapshots(snap_dir: Path,
     # regex pulls the date out of the trailing portion of the stem so
     # arbitrary stems (with their own dashes) round-trip cleanly.
     date_re = _re.compile(r"-(\d{4})-(\d{2})-(\d{2})$")
+
+    def _dated_stem(p: Path) -> str:
+        """Stem with a trailing `.gz` peeled off first.
+
+        `_snapshot_data_files` never writes `.gz` itself, but a user may
+        hand-compress a snapshot to reclaim disk. `Path.stem` of
+        `x-<date>.json.gz` still ends in `.json`, so the `$`-anchored
+        regex would miss it — the file would look UNDATED, and undated
+        files are deleted before any dated one by the aggregate cap
+        below. That would quietly destroy the snapshots a user cared
+        enough about to compress ([INV-167]).
+        """
+        name = p.name[:-3] if p.name.endswith(".gz") else p.name
+        return Path(name).stem
+
     try:
         candidates = list(snap_dir.iterdir())
     except OSError:
@@ -385,7 +426,7 @@ def _prune_old_snapshots(snap_dir: Path,
     for snap in candidates:
         if not snap.is_file():
             continue
-        m = date_re.search(snap.stem)
+        m = date_re.search(_dated_stem(snap))
         if m is None:
             continue
         try:
@@ -418,7 +459,7 @@ def _prune_old_snapshots(snap_dir: Path,
         except OSError:
             continue
         total += sz
-        m = date_re.search(s.stem)
+        m = date_re.search(_dated_stem(s))
         if m is None:
             sized.append((sz, None, s))
         else:

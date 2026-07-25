@@ -193,6 +193,97 @@ class TestSnapshotDataFiles:
         out = sc._snapshot_data_files(tmp_path, paths=[empty])
         assert out == []
 
+    def test_oversized_skip_is_loud_not_silent(self, tmp_path, monkeypatch):
+        """[INV-167] The old flat 50 MB cap SILENTLY skipped the biggest
+        library — the one file whose loss hurts most, and the one whose
+        daily snapshot a real 2026-07-25 recovery depended on. The cap
+        is now half the whole-directory budget (so it only refuses files
+        that would evict everything else), and a skip says so.
+
+        NB: handler-attach rather than caplog — `_log.propagate` is
+        False, so caplog's root handler never sees these records.
+        """
+        import logging
+        import splicecraft_backup as scb
+        monkeypatch.setattr(scb, "_SNAPSHOT_FILE_SIZE_CAP", 100)
+        big = tmp_path / "coll.json"
+        big.write_text(json.dumps({"_schema_version": 1,
+                                     "entries": [{"id": "x" * 500}]}))
+        assert big.stat().st_size > 100
+
+        records: "list[logging.LogRecord]" = []
+
+        class _ListHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        h = _ListHandler(level=logging.WARNING)
+        scb._log.addHandler(h)
+        try:
+            written = sc._snapshot_data_files(tmp_path, paths=[big])
+        finally:
+            scb._log.removeHandler(h)
+        assert written == []
+        assert not list((tmp_path / "snapshots").glob("coll-*"))
+        assert any("NO daily snapshot" in r.getMessage()
+                   for r in records), [r.getMessage() for r in records]
+
+    def test_cap_is_half_the_directory_budget(self):
+        """The per-file cap only exists to stop ONE file evicting every
+        other snapshot; half the aggregate budget guarantees at least two
+        generations coexist. Pinned so the two constants can't drift
+        apart ([INV-167])."""
+        import splicecraft_backup as scb
+        assert (scb._SNAPSHOT_FILE_SIZE_CAP
+                == scb._SNAPSHOT_TOTAL_SIZE_CAP // 2)
+
+    def test_no_compression_on_the_launch_path(self):
+        """`_snapshot_data_files` runs SYNCHRONOUSLY at launch. gzip
+        level 6 costs ~1.2 s per 43 MB (~4.5 s for a 160 MB library) —
+        exactly the hang the sibling housekeeping pass spawns a daemon
+        thread to avoid. Guard the decision so it can't silently
+        regress ([INV-167])."""
+        import inspect
+        import splicecraft_backup as scb
+        src = inspect.getsource(scb._snapshot_data_files)
+        assert "gzip" not in src.replace("hand-compress", ""), (
+            "compression re-added to the synchronous launch path"
+        )
+
+    def test_a_hand_compressed_snapshot_counts_as_todays(self, tmp_path):
+        """Nothing here writes `.gz`, but a user may compress a snapshot
+        to reclaim disk. That must still count as "today is done", or a
+        same-day relaunch would re-copy alongside it — and, worse, could
+        replace a pre-damage snapshot with a post-damage one."""
+        a = tmp_path / "coll.json"
+        a.write_text(json.dumps({"_schema_version": 1,
+                                   "entries": [{"id": "keep-me"}]}))
+        snap_dir = tmp_path / "snapshots"
+        snap_dir.mkdir()
+        from datetime import date as _d
+        (snap_dir / f"coll-{_d.today().isoformat()}.json.gz").write_bytes(
+            b"\x1f\x8b pretend-gzip"
+        )
+        assert sc._snapshot_data_files(tmp_path, paths=[a]) == []
+
+    def test_prune_reads_date_through_gz_suffix(self, tmp_path):
+        """`Path.stem` of `x-<date>.json.gz` still ends in `.json`, so a
+        naive `$`-anchored date regex misses it — the aggregate cap then
+        treats it as undated and deletes it FIRST, quietly destroying
+        exactly the snapshots a user cared enough about to compress."""
+        snap_dir = tmp_path / "snapshots"
+        snap_dir.mkdir()
+        from datetime import date as _d, timedelta
+        old = (_d.today() - timedelta(days=60)).isoformat()
+        fresh = _d.today().isoformat()
+        stale_gz = snap_dir / f"coll-{old}.json.gz"
+        fresh_gz = snap_dir / f"coll-{fresh}.json.gz"
+        stale_gz.write_bytes(b"stale")
+        fresh_gz.write_bytes(b"fresh")
+        sc._prune_old_snapshots(snap_dir, retain_days=30)
+        assert not stale_gz.exists(), "dated .gz snapshot was not pruned"
+        assert fresh_gz.exists(), "today's .gz snapshot was wrongly pruned"
+
     def test_prunes_older_than_retention(self, tmp_path, monkeypatch):
         snap_dir = tmp_path / "snapshots"
         snap_dir.mkdir()

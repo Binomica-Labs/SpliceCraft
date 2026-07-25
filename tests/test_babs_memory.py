@@ -96,3 +96,119 @@ def test_memory_index_survives_non_utf8(tmp_path, monkeypatch):
     monkeypatch.setattr(sc, "_learn_resolve_babs_home", lambda: tmp_path)
     idx = sc._babs_memory_index()
     assert isinstance(idx, str) and "valid line" in idx and "still readable" in idx
+
+
+class TestBabsCanRememberHerself:
+    """Memory used to be write-only-by-human: nothing but a user typing `/remember` could ever
+    fill it, so Babs could be told something durable and never learn it (on a real box the
+    store was empty and `_babs_memory_index` returned "" every turn). She now has a
+    `splicecraft_remember` tool behind the normal write-approval gate, plus list/forget so the
+    user can review what she has decided to keep."""
+
+    def _fake_run(self, monkeypatch, tmp_path, stdout="my-slug\n", rc=0):
+        seen = {}
+
+        def run(argv, **kwargs):
+            seen["argv"] = argv
+            return types.SimpleNamespace(returncode=rc, stdout=stdout, stderr="")
+        monkeypatch.setattr(sc, "_learn_resolve_babs_home", lambda: tmp_path)
+        monkeypatch.setattr(sc, "_learn_babs_python", lambda h: "/usr/bin/python3")
+        monkeypatch.setattr(subprocess, "run", run)
+        return seen
+
+    def test_remember_tags_babs_as_the_source(self, monkeypatch, tmp_path):
+        """A memory Babs saved herself must be distinguishable from one the user typed, so a
+        bad autonomous memory is findable later."""
+        seen = self._fake_run(monkeypatch, tmp_path)
+        assert sc._babs_remember("the user works in ChassisX", source="babs") == "my-slug"
+        assert "--source=babs" in seen["argv"]
+        assert any(a.startswith("--body=the user works in ChassisX") for a in seen["argv"])
+
+    def test_remember_passes_an_optional_title(self, monkeypatch, tmp_path):
+        seen = self._fake_run(monkeypatch, tmp_path)
+        sc._babs_remember("body text", "Chassis", source="babs")
+        assert "--title=Chassis" in seen["argv"]
+
+    def test_remember_omits_an_empty_title(self, monkeypatch, tmp_path):
+        """bb_memory derives a title from the body when none is given — passing --title= would
+        defeat that."""
+        seen = self._fake_run(monkeypatch, tmp_path)
+        sc._babs_remember("body text")
+        assert not any(a.startswith("--title=") for a in seen["argv"])
+
+    def test_memory_list_parses_the_store_listing(self, monkeypatch, tmp_path):
+        self._fake_run(monkeypatch, tmp_path,
+                       stdout="  chassis-is-chassisx              The user works in ChassisX\n"
+                              "  prefers-goldenbraid              Assembly standard is GoldenBraid\n")
+        mem = sc._babs_memory_list()
+        assert [m["slug"] for m in mem] == ["chassis-is-chassisx", "prefers-goldenbraid"]
+        assert mem[0]["title"] == "The user works in ChassisX"
+
+    def test_memory_list_empty_without_babs(self, monkeypatch):
+        monkeypatch.setattr(sc, "_learn_resolve_babs_home", lambda: None)
+        assert sc._babs_memory_list() == []
+
+    def test_forget_rejects_a_path_traversal_slug(self, monkeypatch, tmp_path):
+        """A slug becomes a filename inside the memory store — it must never escape it."""
+        seen = self._fake_run(monkeypatch, tmp_path, stdout="removed\n")
+        for bad in ("../../etc/passwd", "a/b", "", "  ", ".hidden"):
+            assert sc._babs_memory_forget(bad) is False
+        assert "argv" not in seen        # never even shelled out
+
+    def test_forget_reports_a_miss(self, monkeypatch, tmp_path):
+        self._fake_run(monkeypatch, tmp_path, stdout="no such memory\n")
+        assert sc._babs_memory_forget("nope") is False
+
+    def test_forget_succeeds(self, monkeypatch, tmp_path):
+        seen = self._fake_run(monkeypatch, tmp_path, stdout="removed\n")
+        assert sc._babs_memory_forget("chassis-is-chassisx") is True
+        assert seen["argv"][-2:] == ["forget", "chassis-is-chassisx"]
+
+
+class TestMemoryEndpoints:
+    def test_remember_is_a_write_so_it_rides_the_approval_gate(self):
+        """Memory shapes every future answer — an autonomous agent must not fill it silently."""
+        assert sc._state._AGENT_HANDLERS["remember-fact"][1] is True
+        assert sc._state._AGENT_HANDLERS["memory-forget"][1] is True
+        assert sc._state._AGENT_HANDLERS["memory-list"][1] is False
+
+    def test_remember_requires_a_fact(self):
+        fn = sc._state._AGENT_HANDLERS["remember-fact"][0]
+        body, status = fn(None, {})
+        assert status == 400 and "fact" in body["error"]
+
+    def test_remember_caps_length(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sc, "_learn_resolve_babs_home", lambda: tmp_path)
+        fn = sc._state._AGENT_HANDLERS["remember-fact"][0]
+        body, status = fn(None, {"fact": "x" * 4001})
+        assert status == 400
+
+    def test_remember_without_babs_is_actionable(self, monkeypatch):
+        monkeypatch.setattr(sc, "_learn_resolve_babs_home", lambda: None)
+        fn = sc._state._AGENT_HANDLERS["remember-fact"][0]
+        body, status = fn(None, {"fact": "hello"})
+        assert status == 400 and "babs" in body["error"].lower()
+
+    def test_remember_surfaces_a_refused_write(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sc, "_learn_resolve_babs_home", lambda: tmp_path)
+        monkeypatch.setattr(sc, "_babs_remember", lambda *a, **k: None)
+        fn = sc._state._AGENT_HANDLERS["remember-fact"][0]
+        body, status = fn(None, {"fact": "hello"})
+        assert status == 500
+
+    def test_forget_404s_on_an_unknown_slug(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sc, "_learn_resolve_babs_home", lambda: tmp_path)
+        monkeypatch.setattr(sc, "_babs_memory_forget", lambda s: False)
+        fn = sc._state._AGENT_HANDLERS["memory-forget"][0]
+        body, status = fn(None, {"slug": "nope"})
+        assert status == 404
+
+    def test_tool_routes_to_the_endpoint(self, monkeypatch):
+        scr = sc.BabsScreen()
+        seen = {}
+        monkeypatch.setattr(scr, "_dispatch_agent_endpoint",
+                            lambda ep, body, **k: seen.update(ep=ep, body=body) or {"ok": 1})
+        scr._run_tool_call({"function": {"name": "splicecraft_remember",
+                                         "arguments": {"fact": "works in ChassisX"}}})
+        assert seen["ep"] == "remember-fact"
+        assert seen["body"] == {"fact": "works in ChassisX"}

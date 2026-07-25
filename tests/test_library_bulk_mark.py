@@ -12,7 +12,8 @@ edge case this PLEASE"):
   * Move with 0-source-match → refused with clean notify
   * Move into self → refused
   * Move when target disappeared mid-flight → refused, source intact
-  * Copy with name collision in target → silent rename via " COPY"
+  * Copy with name collision in target → silent rename, content-aware:
+    " COPY" for the same sequence, " ALT" for a different one ([INV-167])
   * Copy duplicates are deep-copied (mutating source post-copy
     doesn't bleed into target)
   * Move preserves metadata (status, alignments, gb_text, history_xml)
@@ -151,8 +152,10 @@ class TestMoveCopyCommit:
         ffe = next(c for c in colls2 if c["name"] == "FFE")
         assert ffe["plasmids"][0]["metadata_marker"] == "unique-democoll-0"
 
-    def test_copy_with_name_collision_appends_copy_suffix(self, app):
-        # FFE already has a plasmid named "plasmid_0".
+    def test_copy_with_name_collision_appends_alt_suffix(self, app):
+        # FFE already has a plasmid named "plasmid_0" — carrying
+        # DIFFERENT content ("y" vs "x"), so the landing is NOT a copy of
+        # it and must not be labelled one ([INV-167]).
         sc._save_collections([
             {"name": "DemoColl", "plasmids": [
                 {"id": "eden_0", "name": "plasmid_0", "size": 100,
@@ -173,11 +176,14 @@ class TestMoveCopyCommit:
         ffe = next(c for c in colls if c["name"] == "FFE")
         names = [p["name"] for p in ffe["plasmids"]]
         assert "plasmid_0" in names
-        assert "plasmid_0 COPY" in names
+        assert "plasmid_0 ALT" in names
+        assert "plasmid_0 COPY" not in names
 
     def test_copy_with_multiple_collisions_increments_suffix(self, app):
-        # Pre-seed FFE with `plasmid_0`, `plasmid_0 COPY` → next
-        # landing must be `plasmid_0 COPY 2`.
+        # Pre-seed FFE with `plasmid_0`, `plasmid_0 ALT` → next
+        # landing must be `plasmid_0 ALT 2`. (All three carry different
+        # content, so the suffix is ALT; the point of the test is that
+        # the NUMBERING still increments — see [INV-167].)
         sc._save_collections([
             {"name": "DemoColl", "plasmids": [
                 {"id": "eden_0", "name": "plasmid_0", "size": 100,
@@ -186,7 +192,7 @@ class TestMoveCopyCommit:
             {"name": "FFE", "plasmids": [
                 {"id": "a", "name": "plasmid_0", "size": 200,
                  "gb_text": "y"},
-                {"id": "b", "name": "plasmid_0 COPY", "size": 300,
+                {"id": "b", "name": "plasmid_0 ALT", "size": 300,
                  "gb_text": "z"},
             ]},
         ])
@@ -199,7 +205,7 @@ class TestMoveCopyCommit:
         colls = sc._load_collections()
         ffe = next(c for c in colls if c["name"] == "FFE")
         names = [p["name"] for p in ffe["plasmids"]]
-        assert "plasmid_0 COPY 2" in names
+        assert "plasmid_0 ALT 2" in names
 
     def test_move_same_source_and_target_refused(self, app):
         sc._save_collections([
@@ -621,3 +627,100 @@ class TestMoveCopyNewCollection:
             after = {c.get("name") for c in sc._load_collections()}
             assert after == before
             app.exit()
+
+
+class TestAltRenameOnMove:
+    """[INV-167] Verbatim reproduction of the 2026-07-25 data-loss
+    incident: a MOVE landed fragments whose names already existed in the
+    target, carrying DIFFERENT sequences. The old code renamed them
+    "<name> COPY" on the strength of the name alone and reported only
+    "3 renamed for name collision"; the user read that as "these are
+    redundant duplicates" and deleted all three.
+    """
+
+    @pytest.fixture
+    def app(self):
+        app = sc.PlasmidApp.__new__(sc.PlasmidApp)
+        app._notify_log = []
+
+        def _notify(msg, severity="information", **_kwargs):
+            app._notify_log.append((severity, msg))
+
+        app.notify = _notify
+        return app
+
+    @staticmethod
+    def _seed():
+        # The target collection already holds FRAG-promoter; the source
+        # holds a DIFFERENT sequence under that same name.
+        # NB: `_save_collections` drops `gb_ref` for entries carrying
+        # inline `gb_text`, so content identity here comes from the text
+        # itself (that is exactly what `_entry_content_key` exists for).
+        sc._save_collections([
+            {"name": "Source", "plasmids": [
+                {"id": "src_0", "name": "FRAG-promoter", "size": 857,
+                 "gb_text": "LOCUS variant 857 bp\n"},
+            ]},
+            {"name": "Target", "plasmids": [
+                {"id": "tgt_0", "name": "FRAG-promoter", "size": 857,
+                 "gb_text": "LOCUS incumbent 857 bp\n"},
+            ]},
+        ])
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
+
+    def test_different_sequence_lands_as_ALT_not_COPY(self, app):
+        self._seed()
+        app._move_copy_commit(source="Source", target="Target",
+                                entry_ids=["src_0"], mode="move")
+        tgt = next(c for c in sc._load_collections() if c["name"] == "Target")
+        names = [p["name"] for p in tgt["plasmids"]]
+        assert "FRAG-promoter ALT" in names
+        # The label that caused the incident must never appear here.
+        assert "FRAG-promoter COPY" not in names
+
+    def test_the_landing_keeps_its_own_sequence(self, app):
+        self._seed()
+        app._move_copy_commit(source="Source", target="Target",
+                                entry_ids=["src_0"], mode="move")
+        tgt = next(c for c in sc._load_collections() if c["name"] == "Target")
+        by_name = {p["name"]: p["gb_text"] for p in tgt["plasmids"]}
+        # Both survive, each keeping its own distinct sequence — the
+        # rename must never merge or overwrite them.
+        assert by_name["FRAG-promoter"] == "LOCUS incumbent 857 bp\n"
+        assert by_name["FRAG-promoter ALT"] == (
+            "LOCUS variant 857 bp\n")
+
+    def test_user_is_warned_that_it_is_not_a_duplicate(self, app):
+        self._seed()
+        app._move_copy_commit(source="Source", target="Target",
+                                entry_ids=["src_0"], mode="move")
+        sev, msg = app._notify_log[-1]
+        # A bare "renamed for name collision" info-toast is what the
+        # user acted on last time — this has to be louder and explicit.
+        assert sev == "warning", app._notify_log
+        assert "DIFFERENT" in msg
+        assert "NOT a duplicate" in msg
+
+    def test_identical_sequence_still_reports_plain_copy(self, app):
+        # Control: a genuine duplicate keeps the COPY label and stays a
+        # quiet information toast — no crying wolf.
+        sc._save_collections([
+            {"name": "S", "plasmids": [
+                {"id": "s0", "name": "frag", "size": 10,
+                 "gb_ref": "same-ref", "gb_text": "x"},
+            ]},
+            {"name": "T", "plasmids": [
+                {"id": "t0", "name": "frag", "size": 10,
+                 "gb_ref": "same-ref", "gb_text": "x"},
+            ]},
+        ])
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
+        app._move_copy_commit(source="S", target="T",
+                                entry_ids=["s0"], mode="move")
+        t = next(c for c in sc._load_collections() if c["name"] == "T")
+        assert "frag COPY" in [p["name"] for p in t["plasmids"]]
+        sev, msg = app._notify_log[-1]
+        assert sev == "information"
+        assert "ALT" not in msg

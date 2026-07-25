@@ -263,7 +263,7 @@ cloud, no API key, nothing leaves your machine — wearing the Babs chat UX:
 streaming answers with markdown highlighting, reasoning (`<think>`) hidden by
 default, a **❤ context lifebar** that shows how much chat memory is left, and
 slash commands (`/help`, `/model`, `/system`, `/temp`, `/reset`, `/retry`,
-`/agent`, `/autonomy`). The
+`/agent`, `/autonomy`, `/recall`, `/ingest`, `/learn`, `/forget`). The
 transcript keeps a long, selectable, copy-pasteable history, and **Ctrl+E**
 exports the whole conversation to markdown. Three tabs:
 
@@ -272,7 +272,14 @@ exports the whole conversation to markdown. Three tabs:
   in your research corpus, with cited sources** — the same hybrid retrieval Babs'
   own `rag_bot` does, streamed into the chat. Off, it's a plain local-model chat.
   So you can grow a corpus in the Paper scraper *and query it* without leaving
-  SpliceCraft.
+  SpliceCraft. With Corpus on, relevant passages are folded into the turn
+  automatically — inside a token budget scaled to your model's real context
+  window, so grounding never crowds out the persona. **`/recall`** toggles it;
+  **`/recall <query>`** searches the corpus directly and shows you the passages
+  with their sources. Read a page you want to keep? **`/ingest <url>`** stores it
+  in the corpus permanently (open-licence pages only, so the corpus stays
+  redistributable) instead of it vanishing at the end of the turn, and
+  **`/learn <topic>`** kicks off a focused crawl without leaving the chat.
 - **Agent mode** — flip **Agent** on (or `/agent`) and Babs can *drive
   SpliceCraft herself*: she calls the same scripting endpoints the external
   `--agent` API exposes — read the loaded plasmid, find a motif, design primers,
@@ -331,12 +338,32 @@ exports the whole conversation to markdown. Three tabs:
   off into adjacent fields. Each topic gets its own isolated corpus. Live status
   (kept / fetched / dropped / frontier) and a scored "kept papers" table. Requires
   arming Settings → "Allow Babs online database lookups" (only topic query strings
-  are sent — never your sequences). Also drivable over the agent API (`learn-start`
-  / `learn-status` / `learn-results` / `learn-list`).
+  are sent — never your sequences). When a session finishes you can **fold it into
+  Babs' main corpus** (behind a confirm) so what she learned becomes knowledge she
+  always consults, instead of a separate pack you have to remember to query.
+  Also drivable over the agent API (`learn-start` / `learn-status` /
+  `learn-results` / `learn-list` / `learn-merge`).
+- **Index my library** — point Babs at *your own work*: plasmids, primers, parts
+  and lab-notebook entries get indexed into her corpus, so she can answer
+  "which of my plasmids carries a KanR and a T7 promoter?" from recall instead of
+  walking the library one entry at a time. The pack is rebuilt from scratch each
+  run (so a renamed or deleted plasmid never lingers as a ghost) and is
+  **private by construction** — every record is flagged private, the directory
+  carries a `.no-egress` marker, the corpus-sync script skips it, and recall
+  never derives a web query from it. Nothing leaves the machine.
+- **Reference lookup** — a curated, offline registry Babs checks for named
+  reagents instead of guessing: antibiotics and selection agents, promoters,
+  terminators, UTRs, origins, Type IIS enzymes, assembly standards,
+  markers/reporters, *E. coli* and *Agrobacterium* strains, binary and CRISPR
+  vectors, base/prime editors, gRNA promoters, localization signals, chassis,
+  media, plant growth regulators, bench recipes and troubleshooting. Returns whole
+  structured records — working concentrations, cut notation, host ranges,
+  genotypes — instantly, with no embedding step and no network.
 - **Persistent memory** — tell Babs something to keep with **`/remember <fact>`**
   and it survives across sessions (loaded into every future conversation);
-  **`/memory`** shows what it holds. Stored as plain, hand-editable markdown in the
-  Babs corpus, kept separate from crawled documents.
+  **`/memory`** shows what it holds, and **`/forget <slug>`** removes one. Stored
+  as plain, hand-editable markdown in the Babs corpus, kept separate from crawled
+  documents.
 
 The BABS tab is **persistent** — switch to another part of SpliceCraft or close
 it and your conversation, model choice and agent mode are still there when you

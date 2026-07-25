@@ -310,6 +310,39 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   Only topic query strings leave the machine — never your sequences. The crawl
   engine lives in the separate Babs repo (`bb_learn.py`); each topic is isolated in
   its own corpus + vector collection.
+- **Corpus, memory + reference** (`recall-knowledge`, `index-library`,
+  `ingest-url`, `remember-fact`, `memory-list`, `memory-forget`,
+  `reference-lookup`, `learn-merge`) — what Babs KNOWS, as opposed to what she can
+  look up. `recall-knowledge {query, max_passages?}` retrieves scored passages
+  (with sources) from the local corpus. `reference-lookup {query, registry?,
+  max_hits?}` (or `{list_registries: true}`) reads Babs' CURATED registries —
+  antibiotics/selection agents, promoters, terminators, UTRs, origins, Type IIS
+  enzymes, assembly standards, markers, *E. coli*/*Agrobacterium* strains, binary
+  and CRISPR vectors, base/prime editors, localization signals, chassis, media,
+  growth regulators, bench recipes, troubleshooting — returning WHOLE structured
+  records (working concentrations, cut notation, host ranges, genotypes) rather
+  than retrieved prose. Prefer it over corpus recall for a named reagent, enzyme,
+  strain or part: deterministic, instant, no embedding step. Both read-only and
+  fully LOCAL — they send nothing anywhere.
+
+  The **writes** all grow or prune what Babs believes, so each is write-flagged
+  and the in-app Babs asks first. `index-library {}` indexes the user's OWN work
+  (plasmids, primers, parts, lab notebook) into a **private** pack so recall can
+  answer "which of my plasmids carries a KanR and a T7 promoter?" — it READS the
+  SpliceCraft data dir and writes only into the Babs repo, rebuilding the pack
+  each run so a renamed or deleted plasmid can't linger as a ghost. That pack is
+  private by construction: every record flagged private, a `.no-egress` marker in
+  its directory, excluded from the corpus-sync script, and never used to derive a
+  web query. `ingest-url {url, title?}` is the only one with EGRESS — it persists
+  ONE page into the corpus (SSRF-gated, redirects checked, open-licence pages
+  only so the corpus stays redistributable) and is refused `403` unless the user
+  armed Settings → "Allow Babs online database lookups". `remember-fact {fact,
+  title?}` saves a durable fact; `memory-list` returns `[{slug, title}]` (check it
+  before saving a duplicate, and to get slugs); `memory-forget {slug}` deletes one
+  — forgetting changes what Babs believes in every future session, so it goes
+  through the same approval as any other write. `learn-merge {slug}` folds a
+  finished Background Learning session into the MAIN corpus.
+
 - **RNA structure + RBS** — fold-rna (minimum-free-energy secondary
   structure: dot-bracket fold + ΔG in kcal/mol, pure-Python Turner-2004,
   no external dependency); cofold-rna (bound-state heterodimer ΔG of two

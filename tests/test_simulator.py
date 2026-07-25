@@ -1227,9 +1227,21 @@ class TestCommitAmpliconToCollection:
         # Active (Default) mirror untouched.
         assert sc._load_library() == []
 
-    def test_name_collision_gets_copy_suffix(self):
+    def test_name_collision_with_different_content_gets_alt_suffix(self):
+        # The incumbent amplicon carries `LOCUS existing_id ...`, the
+        # landing `LOCUS amp1 ...` — different sequences under the same
+        # name, so " ALT" not " COPY" ([INV-167]).
         _seed_collections(active="Default",
                           seed_entries=[_amp_entry("amp1", "existing_id")])
+        s = self._screen()
+        final = s._commit_amplicon_to_collection(
+            _amp_entry("amp1", "amp1"), "Default")
+        assert final == "amp1 ALT"
+
+    def test_name_collision_with_identical_content_gets_copy_suffix(self):
+        # Same bytes on both sides → genuinely a copy, so say so.
+        _seed_collections(active="Default",
+                          seed_entries=[_amp_entry("amp1", "amp1")])
         s = self._screen()
         final = s._commit_amplicon_to_collection(
             _amp_entry("amp1", "amp1"), "Default")

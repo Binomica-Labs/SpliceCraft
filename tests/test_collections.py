@@ -1504,3 +1504,221 @@ class TestActionFindPlasmid:
             assert app._current_record is not None
             assert app._current_record.id == tiny_record.id
             app.exit()
+
+
+# ── Content-aware collision rename ([INV-167]) ────────────────────────────────
+
+class TestCopyVsAltRename:
+    """A name-collision suffix is a CLAIM about the entry, so it has to
+    be true.
+
+    2026-07-25 incident: a cross-collection move landed three fragments
+    whose names already existed in the target. Each was renamed
+    "<name> COPY" purely because the NAME matched — but all three held
+    different sequences. The user read "COPY", concluded they were
+    redundant duplicates, and deleted them. They were distinct
+    constructs; the data was only recovered from the daily snapshot.
+
+    Rule: " COPY" only when the sequence (`gb_ref`) genuinely matches,
+    " ALT" when the name collides but the content differs.
+    """
+
+    @staticmethod
+    def _commit(name, gb_ref, collection="T"):
+        sc._commit_library_entry_to_collection(
+            {"id": sc._sanitize_name_for_id(name) if hasattr(
+                sc, "_sanitize_name_for_id") else name,
+             "name": name, "size": 10, "n_feats": 0,
+             "gb_ref": gb_ref, "gb_text": "FAKE"},
+            collection,
+        )
+
+    @staticmethod
+    def _names(collection="T"):
+        colls = sc._load_collections()
+        c = next(x for x in colls if x.get("name") == collection)
+        return [p.get("name") for p in c.get("plasmids", [])]
+
+    def test_same_sequence_is_labelled_copy(self):
+        self._commit("frag", "ref-identical")
+        self._commit("frag", "ref-identical")
+        # Same gb_ref → genuinely a copy, so say so.
+        assert self._names() == ["frag", "frag COPY"]
+
+    def test_different_sequence_is_labelled_alt_not_copy(self):
+        self._commit("frag", "ref-aaa")
+        self._commit("frag", "ref-bbb")
+        names = self._names()
+        assert names == ["frag", "frag ALT"], names
+        # The regression that caused the incident: never claim "COPY"
+        # for a different sequence.
+        assert "frag COPY" not in names
+
+    def test_unknown_ref_keeps_the_legacy_copy_label(self):
+        # " ALT" is a claim too, and it needs proof. Without a gb_ref on
+        # both sides we cannot show the sequences differ, so the legacy
+        # " COPY" stands — calling a genuine duplicate "ALT" would be
+        # its own lie (the duplicate-in-place flow is exactly that case).
+        # Real entries always carry a gb_ref once dehydrated, so the
+        # proof is available wherever it actually matters.
+        self._commit("frag", "")
+        self._commit("frag", "")
+        assert self._names() == ["frag", "frag COPY"]
+
+    def test_alt_needs_every_collider_to_be_known(self):
+        # One collider with an unknown ref → difference is unprovable →
+        # fall back to " COPY" rather than guess.
+        self._commit("frag", "")
+        self._commit("frag", "ref-known")
+        assert self._names() == ["frag", "frag COPY"]
+
+    def test_suffix_numbering_stays_per_kind(self):
+        self._commit("frag", "ref-same")
+        self._commit("frag", "ref-same")   # frag COPY
+        self._commit("frag", "ref-other")  # frag ALT
+        self._commit("frag", "ref-same")   # frag COPY 2
+        names = self._names()
+        assert names == ["frag", "frag COPY", "frag ALT", "frag COPY 2"], names
+
+    def test_suffix_uses_spaces_never_underscore(self):
+        # [feedback_no_underscores_in_names] — display names stay
+        # underscore-free.
+        self._commit("frag", "ref-x")
+        self._commit("frag", "ref-y")
+        assert all("_" not in n for n in self._names())
+
+
+class TestDeleteConfirmLastCopyWarning:
+    """[INV-167] The delete confirm must answer "am I about to lose this
+    sequence?" — the question the user actually has. A NAME can never
+    settle it (the 2026-07-25 incident deleted distinct constructs that
+    merely shared a name), so the modal reports how many other entries
+    carry the same `gb_ref`.
+    """
+
+    @staticmethod
+    def _msg(modal) -> str:
+        raw = modal.query_one("#libdel-msg").render()
+        return getattr(raw, "plain", None) or str(raw)
+
+    async def _render(self, dup_count):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            app.push_screen(
+                sc.LibraryDeleteConfirmModal("frag", 100, "frag", dup_count)
+            )
+            await pilot.pause(0.2)
+            out = self._msg(app.screen)
+            app.exit()
+        return out
+
+    async def test_sole_copy_is_flagged_loudly(self):
+        msg = await self._render(0)
+        assert "ONLY entry" in msg
+        assert "loses it" in msg
+
+    async def test_redundant_copy_is_reassuring(self):
+        msg = await self._render(2)
+        assert "identical sequence" in msg
+        assert "2 other entries" in msg
+        assert "ONLY entry" not in msg
+
+    async def test_singular_grammar(self):
+        msg = await self._render(1)
+        assert "1 other entry" in msg
+        assert "other entries" not in msg
+
+    async def test_bracketed_name_is_not_swallowed_as_markup(self):
+        """[INV-167] The message Static renders with markup=True. An
+        unescaped `pUC19 [old]` has the bracketed part parsed as a style
+        tag and SILENTLY DROPPED, so the dialog asks you to confirm
+        deleting "pUC19" — the wrong name, in the one dialog where
+        showing the wrong name is worst. Bracketed text is routine in
+        NCBI-derived names (`[Candida] glabrata`)."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LibraryDeleteConfirmModal(
+                "pUC19 [old]", 100, "e1", 0))
+            await pilot.pause(0.2)
+            msg = self._msg(app.screen)
+            app.exit()
+        assert "pUC19 [old]" in msg, msg
+
+    async def test_unknown_stays_neutral(self):
+        # Primer library + other non-plasmid callers pass no count and
+        # must keep the original wording (no false reassurance, no
+        # false alarm).
+        msg = await self._render(None)
+        assert "ONLY entry" not in msg
+        assert "identical sequence" not in msg
+        assert "cannot be undone" in msg
+
+
+class TestDeleteConfirmCountsAcrossCollections:
+    """[INV-167] The count that drives the warning must span EVERY
+    collection, not just the active one — a sequence still referenced
+    from another collection genuinely survives the delete (and its blob
+    won't be GC'd), while one referenced nowhere else is gone for good.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_seed(self, monkeypatch):
+        monkeypatch.setattr(sc.PlasmidApp, "_seed_default_library",
+                            lambda self: None)
+
+    @staticmethod
+    def _entry(eid, ref):
+        return {"id": eid, "name": eid, "size": 10, "n_feats": 0,
+                "gb_ref": ref, "gb_text": "FAKE"}
+
+    async def _dup_count_for(self, collections, target_id):
+        sc._save_collections(collections)
+        sc._set_active_collection_name("A")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            t = lib.query_one("#lib-table")
+            rows = [str(r.value) for r in t.rows]
+            t.move_cursor(row=rows.index(target_id))
+            lib._request_plasmid_delete()
+            await pilot.pause(0.2)
+            modal = app.screen
+            assert isinstance(modal, sc.LibraryDeleteConfirmModal)
+            count = modal.dup_count
+            modal.query_one("#btn-libdel-no").action_press()
+            await pilot.pause(0.1)
+            app.exit()
+        return count
+
+    async def test_sequence_held_only_here_reports_zero(self):
+        n = await self._dup_count_for([
+            {"name": "A", "plasmids": [self._entry("solo", "ref-unique")]},
+            {"name": "B", "plasmids": [self._entry("other", "ref-else")]},
+        ], "solo")
+        assert n == 0
+
+    async def test_sequence_mirrored_in_another_collection_is_counted(self):
+        # The exact shape of the 2026-07-25 incident: same sequence
+        # living in two collections. Deleting one copy loses nothing.
+        n = await self._dup_count_for([
+            {"name": "A", "plasmids": [self._entry("here", "ref-shared")]},
+            {"name": "B", "plasmids": [self._entry("there", "ref-shared")]},
+        ], "here")
+        assert n == 1
+
+    async def test_same_name_different_sequence_is_NOT_counted(self):
+        # The trap itself: identical NAMES, different sequences. The
+        # name suggests a duplicate; the count must not agree.
+        n = await self._dup_count_for([
+            {"name": "A", "plasmids": [
+                {"id": "twin", "name": "frag", "size": 10, "n_feats": 0,
+                 "gb_ref": "ref-aaa", "gb_text": "FAKE"},
+                {"id": "twin2", "name": "frag", "size": 10, "n_feats": 0,
+                 "gb_ref": "ref-bbb", "gb_text": "FAKE"},
+            ]},
+        ], "twin")
+        assert n == 0, "same name must never count as the same sequence"

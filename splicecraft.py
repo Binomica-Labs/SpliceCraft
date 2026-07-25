@@ -41,7 +41,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.36"
+__version__ = "1.2.37"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -4411,6 +4411,46 @@ def _entry_kind(entry: dict) -> str:
     return k if k in _LIBRARY_KINDS else _derive_entry_kind(entry)
 
 
+def _entry_content_key(entry: dict) -> str:
+    """Stable identity for an entry's SEQUENCE CONTENT, independent of
+    its name ([INV-167]).
+
+    Two storage forms exist, and they are NOT interchangeable:
+      * dehydrated → `gb_ref`, already a SHA of the blob. Returned as-is.
+      * inline/legacy → `gb_text`. Hashed, and namespaced with a `t:`
+        prefix so it can never be compared against a `gb_ref`.
+
+    The prefix matters: a `gb_ref` blob could perfectly well CONTAIN some
+    other entry's `gb_text`, so a bare hash-vs-ref comparison would claim
+    "different" without proof. Callers decide comparability by checking
+    both keys share a namespace — see `_content_keys_comparable`.
+
+    Returns "" for an entry carrying neither, meaning CONTENT UNKNOWN.
+    Callers must treat "" as unprovable, never as a match.
+    """
+    ref = str(entry.get("gb_ref") or "")
+    if ref:
+        return ref
+    txt = entry.get("gb_text") or ""
+    if not txt:
+        return ""
+    import hashlib
+    return "t:" + hashlib.sha256(
+        str(txt).encode("utf-8", "replace")
+    ).hexdigest()
+
+
+def _content_keys_comparable(key: str, others: "set[str]") -> bool:
+    """True when `key` can be meaningfully compared against every key in
+    `others`: all non-empty (content known on both sides) and all in the
+    SAME namespace (`gb_ref` vs hashed `gb_text` — see
+    `_entry_content_key`). Anything else is unprovable ([INV-167])."""
+    if not key or not others or not all(others):
+        return False
+    inline = key.startswith("t:")
+    return all(k.startswith("t:") == inline for k in others)
+
+
 def _commit_library_entry_to_collection(entry: dict, collection: str,
                                         *, replace_id: "str | None" = None
                                         ) -> str:
@@ -4428,8 +4468,11 @@ def _commit_library_entry_to_collection(entry: dict, collection: str,
       * Atomic `_save_collections` (.bak chain) — on failure the disk is
         unchanged and the error propagates to the caller.
       * A target collection deleted in another window is recreated.
-      * Name collisions get " COPY" / " COPY N" (spaces, never `_`); id
-        collisions get `_N` (ids are sanitised by design).
+      * Name collisions get a content-aware suffix (spaces, never `_`):
+        " COPY"/" COPY N" when the colliding entry holds the SAME
+        sequence, " ALT"/" ALT N" when the name matches but the
+        sequence differs ([INV-167]). Id collisions get `_N` (ids are
+        sanitised by design).
 
     ``replace_id`` (2026-05-30): when given AND an entry with that id
     already lives in the collection, REPLACE it in place (keep its slot,
@@ -4468,6 +4511,14 @@ def _commit_library_entry_to_collection(entry: dict, collection: str,
                  for i, e in enumerate(plasmids) if i != ridx}
         ids = {(e.get("id") or "")
                for i, e in enumerate(plasmids) if i != ridx}
+        # name → content keys under that name, so the collision rename
+        # can tell a real duplicate from a bare name clash ([INV-167]).
+        refs_by_name: "dict[str, set[str]]" = {}
+        for i, e in enumerate(plasmids):
+            if i != ridx:
+                refs_by_name.setdefault(
+                    (e.get("name") or ""), set()
+                ).add(_entry_content_key(e))
 
         landing = _deepcopy(entry)
         # Safety net: any plasmid committed through this universal helper
@@ -4478,10 +4529,20 @@ def _commit_library_entry_to_collection(entry: dict, collection: str,
         base_name = (landing.get("name") or "").strip() or "plasmid"
         new_name = base_name
         if new_name in names:
-            new_name = f"{base_name} COPY"
+            # " ALT" when the collision is PROVABLY a different sequence
+            # so the user is never told a distinct construct is a
+            # redundant duplicate; " COPY" otherwise ([INV-167]). Proof
+            # = our ref known, every collider's ref known, ours matching
+            # none. Without proof keep the legacy " COPY" — mislabelling
+            # a real duplicate "ALT" is its own lie.
+            _ref = _entry_content_key(landing)
+            _others = refs_by_name.get(base_name, set())
+            _provable = _content_keys_comparable(_ref, _others)
+            _sfx = " ALT" if (_provable and _ref not in _others) else " COPY"
+            new_name = f"{base_name}{_sfx}"
             n = 2
             while new_name in names:
-                new_name = f"{base_name} COPY {n}"
+                new_name = f"{base_name}{_sfx} {n}"
                 n += 1
         landing["name"] = new_name
 
@@ -18543,6 +18604,31 @@ class LibraryPanel(Widget):
             return
         name = entry.get("name") or entry_id
         size = entry.get("size", 0) or 0
+        # How many OTHER entries hold this exact sequence? The name can
+        # never answer that (the 2026-07-25 incident deleted distinct
+        # constructs that merely shared a name), so count `gb_ref`
+        # matches across EVERY collection — a sequence still referenced
+        # from another collection genuinely survives this delete, and
+        # its blob won't be GC'd. Best-effort: a scan failure degrades
+        # to the neutral wording rather than blocking the delete.
+        dup_count: "int | None" = None
+        try:
+            _ref = _entry_content_key(entry)
+            if _ref:
+                _total = sum(
+                    1
+                    for _c in _load_collections()
+                    for _e in (_c.get("plasmids") or [])
+                    if isinstance(_e, dict)
+                    and _entry_content_key(_e) == _ref
+                )
+                # Subtract the entry being deleted (counted once in its
+                # own collection). Identity by position, not by id —
+                # ids are only unique WITHIN a collection.
+                dup_count = max(0, _total - 1)
+        except Exception:
+            _log.exception("Delete confirm: duplicate-sequence scan failed")
+            dup_count = None
 
         def _on_confirm(yes: "bool | None") -> None:
             if not yes:
@@ -18685,7 +18771,7 @@ class LibraryPanel(Widget):
             self._delete_save_to_disk(entries, cascaded_bin)
 
         self.app.push_screen(
-            LibraryDeleteConfirmModal(name, size, entry_id),
+            LibraryDeleteConfirmModal(name, size, entry_id, dup_count),
             callback=_on_confirm,
         )
 
@@ -29130,6 +29216,57 @@ class BabsUninstallConfirmModal(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class BabsLearnMergeModal(ModalScreen[bool]):
+    """Confirm folding a Background Learning pack into Babs' MAIN corpus. This appends to the
+    user's real knowledge base (hours of crawling), so it asks first and states the safeguards
+    — dedupe + a pre-merge snapshot. Default focus is Cancel."""
+
+    _blocks_undo: bool = True
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    BabsLearnMergeModal { align: center middle; }
+    #blm-box { width: 68; height: auto; max-height: 80%; padding: 1 2;
+        border: solid $primary; background: $surface; }
+    #blm-body { height: auto; margin: 1 0; color: $text-muted; }
+    #blm-btns { height: 3; align-horizontal: right; margin-top: 1; }
+    #blm-btns Button { margin-left: 1; }
+    """
+
+    def __init__(self, slug: str, topic: str = "") -> None:
+        super().__init__()
+        self._slug = slug
+        self._topic = topic or slug
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="blm-box"):
+            yield Static(f"[b]Add “{_esc(self._topic[:60])}” to Babs' main corpus?[/b]",
+                         markup=True)
+            yield Static(
+                "It becomes permanent knowledge Babs always consults, instead of a separate "
+                "learning pack that only the most recent sessions get searched from.\n\n"
+                "Chunks already in the corpus are skipped, and the corpus is snapshotted to "
+                "[b].premerge-bak[/b] first. A background re-index then makes the new text "
+                "semantically searchable.",
+                id="blm-body", markup=True)
+            with Horizontal(id="blm-btns"):
+                yield Button("Cancel", id="blm-cancel")
+                yield Button("Add to corpus", id="blm-go", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#blm-cancel", Button).focus()
+
+    @on(Button.Pressed, "#blm-go")
+    def _go(self, _e: "Button.Pressed") -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#blm-cancel")
+    def _no(self, _e: "Button.Pressed") -> None:
+        self.dismiss(False)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class BabsModelCollectionDeleteModal(ModalScreen[bool]):
     """Confirm deleting a model COLLECTION (the grouping only — the models stay
     installed in Ollama; uninstall is a separate, scarier action). Default
@@ -29202,6 +29339,18 @@ _BABS_AGENT_PREAMBLE = (
     "require their approval — call only the endpoints you actually need, then "
     "summarise what you did in plain language. If a tool returns an error, read "
     "it and adjust.\n"
+    "You have TWO local knowledge tools. For anything with a NAME — a reagent, "
+    "enzyme, strain, promoter, terminator, origin, marker, vector, medium or "
+    "growth regulator — call `splicecraft_reference_lookup(query)` first: it "
+    "returns whole curated records (working concentrations, recognition/cut "
+    "notation, host ranges, genotypes) instantly and exactly.\n"
+    "For a broader question of FACT — a protocol, a method, why something "
+    "failed — call "
+    "`splicecraft_recall_knowledge(query)`. That searches your own local "
+    "corpus of papers, protocols and curated reference data (including anything "
+    "a Background Learning session taught you) and returns cited passages. It is "
+    "local, fast and free — prefer it over answering from memory and over going "
+    "online. Cite what you use as [1], [2].\n"
     "To look a NAME or term up ONLINE, call `splicecraft_search_online(source, "
     "query)` — do NOT use blast-online for a name (it needs a full sequence). "
     "`source` is fpbase (fluorescent proteins like GFP), genbank (any "
@@ -29211,7 +29360,17 @@ _BABS_AGENT_PREAMBLE = (
     "refuses with a 403, relay that so they can enable it. After a search, call "
     "`splicecraft_fetch_page(url)` to OPEN a result and read its full page text "
     "(the search only returns snippets); the same arming applies. Only your "
-    "query string / the URL is sent — never the user's sequence."
+    "query string / the URL is sent — never the user's sequence.\n"
+    "A page you fetch is gone at the end of the turn. If it is worth KEEPING, "
+    "call `splicecraft_call('ingest-url', {'url': …})` to add it to your corpus "
+    "permanently (openly-licensed pages only), or "
+    "`splicecraft_call('learn-start', {'topic': …})` to crawl a whole topic in "
+    "the background. Suggest these when the user hits a gap in what you know.\n"
+    "When the user tells you something DURABLE about themselves or their work "
+    "— their organism, chassis, strains, naming conventions, a decision and its "
+    "reason, a stated preference — call `splicecraft_remember(fact)` so you "
+    "still know it next session. One short sentence per memory; they ask before "
+    "it is saved."
 )
 
 _BABS_META_TOOLS = [
@@ -29323,6 +29482,96 @@ _BABS_READ_URL_TOOL = {"type": "function", "function": {
 }}
 
 
+# Recall tunables. Defined HERE, beside the tool that advertises them, because the tool
+# manifest interpolates the cap into its description at import time — the recall ENGINE
+# itself lives down beside the other babs-shelling helpers and reads them from here.
+_RECALL_MAX_PASSAGES = 12       # merged ceiling handed to the model (num_ctx discipline)
+_RECALL_MAX_PACKS = 6           # default pack + up to 5 learn packs per recall
+_RECALL_TIMEOUT = 120           # a cold pack builds its BM25 cache on first query
+_RECALL_MAX_OUTPUT = 4 * 1024 * 1024
+_REFERENCE_MAX_HITS = 12        # curated-registry lookup ceiling (whole records, so keep it small)
+
+# Recall from Babs' OWN knowledge corpus — the local half of "look it up". Before this
+# existed, corpus knowledge was only reachable by flipping the Corpus toggle, which swapped
+# the whole turn out to a separate `rag_bot --ask` subprocess: it answered with citations but
+# could not see the open plasmid, the chat history, or any tool. As a tool instead, recall
+# composes — Babs can consult the corpus, look at the construct on screen and call an
+# endpoint in the SAME turn. Purely local (no egress) unless `web` is asked for.
+_BABS_RECALL_TOOL = {"type": "function", "function": {
+    "name": "splicecraft_recall_knowledge",
+    "description": (
+        "Search Babs' OWN knowledge corpus — the papers, protocols and curated reference data "
+        "on this machine, including anything a Background Learning session taught you. Returns "
+        "ranked passages with citations. Use this BEFORE answering any question of fact about "
+        "protocols, reagents, strains, promoters, antibiotics, media, plant tissue culture or "
+        "cloning methods — it is your real source, and it is local and free, unlike "
+        "splicecraft_search_online. Cite the passages you use as [1], [2] and say what they "
+        "came from. If it returns nothing relevant, say so instead of inventing specifics."),
+    "parameters": {"type": "object", "properties": {
+        "query": {"type": "string",
+                  "description": "what to look up, as a question or topic phrase"},
+        "max_passages": {"type": "integer",
+                         "description": f"optional cap on passages (default 6, max {_RECALL_MAX_PASSAGES})"},
+    }, "required": ["query"]},
+}}
+
+
+# The curated-reference lookup: structured facts, no embedding, whole records. Separate from
+# recall on purpose — for a NAMED reagent/enzyme/strain a curated record beats a retrieved
+# prose fragment every time, and a small model needs that distinction spelled out or it
+# reaches for semantic search when an exact table lookup was available.
+_BABS_REFERENCE_TOOL = {"type": "function", "function": {
+    "name": "splicecraft_reference_lookup",
+    "description": (
+        "Look up a NAMED reagent, enzyme, part, strain or vector in Babs' curated reference "
+        "tables — antibiotics and selection agents, promoters, terminators, UTRs/enhancers, "
+        "plasmid origins, Type IIS enzymes, assembly standards, markers and reporters, E. coli "
+        "and Agrobacterium strains, binary and CRISPR vectors, base/prime editors, gRNA "
+        "promoters, localization signals, morphogenic genes, chassis, basal media, plant growth "
+        "regulators, bench recipes, validation methods, troubleshooting. Returns whole "
+        "structured records — working concentrations, recognition and cut notation, host "
+        "ranges, genotypes. Use this FIRST for anything with a name (\"kanamycin\", \"BsaI\", "
+        "\"EHA105\", \"35S\", \"pCAMBIA\"); it is exact and instant, where "
+        "splicecraft_recall_knowledge searches prose. Pass `list_registries` to see every "
+        "table, or `registry` to list one table's whole contents."),
+    "parameters": {"type": "object", "properties": {
+        "query": {"type": "string",
+                  "description": "the reagent / enzyme / strain / part name to look up"},
+        "registry": {"type": "string",
+                     "description": "optional: restrict to one table (e.g. 'promoters'), or "
+                                    "pass it alone to list that table in full"},
+        "list_registries": {"type": "boolean",
+                            "description": "true = return the catalog of available tables"},
+        "max_hits": {"type": "integer",
+                     "description": f"optional cap on records (default 8, max {_REFERENCE_MAX_HITS})"},
+    }},
+}}
+
+
+# Let Babs WRITE to her own persistent memory. Memory existed before this, but only a human
+# typing `/remember` could ever fill it — so Babs could be told things and never learn them,
+# and in practice the store stayed empty. It is a WRITE endpoint, so the normal autonomy gate
+# applies: in the default ask-mode the user sees and approves the exact sentence before it
+# becomes something Babs believes in every future session.
+_BABS_REMEMBER_TOOL = {"type": "function", "function": {
+    "name": "splicecraft_remember",
+    "description": (
+        "Save a durable fact to your persistent memory, so you still know it in future "
+        "sessions. Use it when the user tells you something lasting about themselves or their "
+        "work — their organism, chassis, strains, lab conventions, naming scheme, a decision "
+        "they made and why, a preference they state. Keep each memory ONE short sentence. Do "
+        "NOT save transient chatter, the contents of the current plasmid, or anything you "
+        "merely inferred. Check splicecraft_call('memory-list') first to avoid duplicates. The "
+        "user approves each save."),
+    "parameters": {"type": "object", "properties": {
+        "fact": {"type": "string",
+                 "description": "the durable fact, as one short sentence"},
+        "title": {"type": "string",
+                  "description": "optional short label; derived from the fact if omitted"},
+    }, "required": ["fact"]},
+}}
+
+
 # Run SEVERAL endpoints in ONE model step — the multi-call companion to
 # splicecraft_call. Lets Babs carry out a whole workflow per turn instead of
 # spending a turn per endpoint, so multi-step tasks finish inside the iteration
@@ -29365,9 +29614,13 @@ _BABS_AGENT_MAX_TOOL_ITERS = 24
 
 
 def _babs_tool_manifest():
-    """The Ollama function-tool list Babs hands the model in agentic mode."""
-    return _BABS_META_TOOLS + [_BABS_SEARCH_TOOL, _BABS_READ_URL_TOOL,
-                               _BABS_BATCH_TOOL]
+    """The Ollama function-tool list Babs hands the model in agentic mode.
+
+    Recall leads the non-meta tools deliberately: a local model picks tools partly by order,
+    and consulting the local corpus should be the reflex before reaching for the network."""
+    return _BABS_META_TOOLS + [_BABS_REFERENCE_TOOL, _BABS_RECALL_TOOL,
+                               _BABS_SEARCH_TOOL, _BABS_READ_URL_TOOL,
+                               _BABS_REMEMBER_TOOL, _BABS_BATCH_TOOL]
 
 
 def _babs_tool_call_name(tc) -> str:
@@ -29655,7 +29908,6 @@ class BabsScreen(Screen):
         self._generating = False
         self._cancel: "threading.Event | None" = None   # set for the duration of a turn
         self._active_resp = None                    # open Ollama response (for responsive stop)
-        self._active_proc = None                    # grounded-mode rag_bot subprocess (for stop)
         self._grounded = False                      # answer from the Babs corpus (rag_bot) vs. plain chat
         # Agentic mode (2026-06-30): the in-process tool-loop + write policy.
         # Hydrated from settings in on_mount; defaults here so the attributes
@@ -29793,13 +30045,28 @@ class BabsScreen(Screen):
                     yield Static("", id="babs-learn-note", markup=True)
                     yield Static("[dim]Grow Babs' knowledge about a topic with a focused, "
                                  "drift-resistant crawl of open scientific databases. Each topic "
-                                 "gets its own isolated corpus.[/dim]", classes="babs-h", markup=True)
+                                 "gets its own isolated corpus, indexed when the crawl finishes "
+                                 "— then Babs recalls it in chat like the rest of her "
+                                 "knowledge.[/dim]", classes="babs-h", markup=True)
                     with Horizontal(classes="babs-row"):
                         yield Input(placeholder="topic — e.g. T7 expression optimization in E. coli",
                                     id="babs-learnq")
                         yield Input(placeholder="papers (40)", id="babs-learn-docs",
                                     classes="babs-narrow")
                         yield Button("Start learning", id="babs-learn-go", variant="primary")
+                    # Past sessions are selectable: a learning pack outlives the app run that
+                    # made it, and recall only fans out over the most RECENT few packs — so the
+                    # user needs to see every session and be able to retire an old one into the
+                    # main corpus.
+                    with Horizontal(classes="babs-row"):
+                        yield Select([], id="babs-learn-session", prompt="past sessions",
+                                     allow_blank=True)
+                        yield Button("Add to main corpus", id="babs-learn-merge")
+                        yield Button("Index my library", id="babs-index-library")
+                    yield Static("[dim]“Index my library” makes your own plasmids, primers, "
+                                 "parts and notebook entries recallable in chat. It stays on "
+                                 "this machine — the pack is marked no-egress and excluded "
+                                 "from corpus sync.[/dim]", classes="babs-h", markup=True)
                     yield Static("", id="babs-learn-status", markup=True)
                     with Horizontal(classes="babs-row"):
                         yield Button("Refresh", id="babs-learn-refresh")
@@ -29866,7 +30133,6 @@ class BabsScreen(Screen):
         self._generating = False
         self._cancel = None
         self._active_resp = None
-        self._active_proc = None
         self._cur_assistant = None
         self._pulling = False
         self._pull_cancel = None
@@ -29895,7 +30161,12 @@ class BabsScreen(Screen):
                 f"Esc to stop / close.[/dim]")
         self._refresh_scrape_note()
         self._refresh_learn_note()
-        self._grounded = False                          # default: plain chat; the Corpus toggle grounds it
+        self._refresh_learn_sessions()
+        # Corpus recall defaults ON when a corpus exists (persisted in `babs_recall`). Recall is
+        # purely ADDITIVE now — it folds cited passages into the turn instead of swapping the
+        # turn out to another model — so the old default-off (which existed because grounding
+        # disabled the agent and the plasmid context) would just leave a good corpus unused.
+        self._grounded = bool(_get_setting("babs_recall", True))
         self._refresh_ground_button()
         # Agentic mode: hydrate the persisted tool-loop arm + write policy.
         self._agent_enabled = bool(_get_setting("babs_tools_enabled", False))
@@ -29910,8 +30181,13 @@ class BabsScreen(Screen):
                 f"(write policy: [b]{self._autonomy}[/b]). Toggle with the "
                 f"[b]Agent[/b] button or /autonomy.[/dim]")
         if self._corpus_available() and not resuming:
-            self._sys_note("[dim]You have a Babs corpus — turn [b]Corpus[/b] on to ground answers "
-                           "in it (with sources).[/dim]")
+            self._sys_note(
+                "[dim]Corpus recall is [b]on[/b] — Babs looks in your papers, protocols and "
+                "reference data before answering, and cites what she used. Toggle with the "
+                "[b]Corpus[/b] button; ask her to look something up with /recall.[/dim]"
+                if self._grounded else
+                "[dim]You have a Babs corpus — turn [b]Corpus[/b] on and Babs will consult it "
+                "(with sources) before answering.[/dim]")
         self._refresh_bars()
         self._preflight()
         self._refresh_num_ctx()
@@ -30192,7 +30468,12 @@ class BabsScreen(Screen):
         # evicting the persona on a small context window.
         ctx = self._plasmid_context()
         system = self._effective_system(ctx)
-        reserve = _babs.est_tokens(system)
+        # Auto-recall reserves its passage budget UP FRONT, before the query is clamped and
+        # history trimmed — the passages are fetched later (in the worker, since recall shells
+        # a subprocess and must not block the UI thread), so if we didn't reserve here they'd
+        # arrive as unbudgeted tokens and push the window over, evicting the persona.
+        recall = bool(self._grounded)
+        reserve = _babs.est_tokens(system) + (self._recall_budget_tokens() if recall else 0)
         query, truncated = _babs.clamp_prompt(
             query, num_ctx=self._num_ctx, reserve_tokens=reserve)
         if truncated:
@@ -30212,19 +30493,6 @@ class BabsScreen(Screen):
         if self._think_timer is not None:
             self._think_timer.resume()
         self._refresh_bars()
-        if self._grounded:
-            # Grounded mode answers from the corpus via rag_bot (single-shot, cited); it manages
-            # its own retrieval context, so the plain-chat history/messages below are skipped.
-            if self._agent_enabled:
-                # Both toggles on: grounded wins (the corpus path is a separate cited-answer
-                # subprocess that can't also run the agentic tool loop), so SURFACE that the
-                # Agent toggle is paused this turn rather than silently ignoring it (the same
-                # mode-conflict footgun the agent-API guard avoids).
-                self._sys_note("[dim]Corpus grounding is on — this answer comes from your "
-                               "corpus with sources, and agent actions are paused this turn. "
-                               "Turn Corpus off to let Babs drive SpliceCraft.[/dim]")
-            self._generate_grounded(query)
-            return
         # `system` + `reserve` were computed once at the top and reused here —
         # the query clamp above reserved the SAME string, so the ❤ bar's
         # reserve, the clamp, and this history trim all reckon with the
@@ -30237,7 +30505,7 @@ class BabsScreen(Screen):
             del self._history[: len(self._history) - self._MAX_HISTORY_TURNS * 2]
         messages = _babs.build_messages(system, self._history, query)
         if self._agent_enabled:
-            self._generate_agentic(query, messages)
+            self._generate_agentic(query, messages, recall)
         else:
             # Discoverability: if a plain-chat message reads like a live lookup,
             # point the user at Agent mode ONCE — without it Babs can only answer
@@ -30248,16 +30516,189 @@ class BabsScreen(Screen):
                     "[dim]💡 That looks like a live lookup. Turn on [b]Agent[/b] "
                     "(the button above, or /agent) and Babs can search online and "
                     "act in SpliceCraft for you.[/dim]")
-            self._generate(query, messages)
+            self._generate(query, messages, recall)
 
     def _register_resp(self, resp) -> None:
         # Called from the worker thread; a bare attribute set is thread-safe enough
         # for the main thread to later read + close() it on cancel.
         self._active_resp = resp
 
+    # ── auto-recall (corpus passages folded INTO the turn) ───────────────────────
+    def _recall_budget_tokens(self) -> int:
+        """Token room set aside for recalled corpus passages this turn. Scaled to the model's
+        REAL window — a 4096-context model cannot spend what a 32k one can — and clamped at
+        both ends, so recall enriches a turn without ever crowding out the persona, the
+        plasmid context or the conversation."""
+        try:
+            return max(320, min(2000, int(self._num_ctx) // 4))
+        except (TypeError, ValueError):
+            return 320
+
+    def _recall_for_turn(self, query: str) -> "dict | None":
+        """WORKER THREAD ONLY (it shells a subprocess). Recall corpus passages for `query`,
+        trimmed to fit :meth:`_recall_budget_tokens`. Returns the recall result with a
+        ready-to-prepend ``block``, or None when there is nothing to add. Never raises — a
+        missing/broken corpus must degrade to plain chat, not break the answer."""
+        try:
+            res = _babs_recall(query, k=6, cancel=self._cancel)
+        except Exception:      # pragma: no cover - _babs_recall swallows its own
+            _log.exception("BABS auto-recall failed")
+            return None
+        rows = list((res or {}).get("passages") or [])
+        if not rows:
+            return None
+        budget = self._recall_budget_tokens()
+        block = _recall_block({"passages": rows})
+        # Drop the LOWEST-ranked passage and re-measure until the block fits. Dropping whole
+        # passages (rather than clipping mid-<source>) keeps every surviving citation intact,
+        # so a [n] the model quotes always has complete text behind it.
+        while len(rows) > 1 and _babs.est_tokens(block) > budget:
+            rows.pop()
+            block = _recall_block({"passages": rows})
+        if _babs.est_tokens(block) > budget:
+            # A single oversized passage: clip its text rather than lose recall entirely.
+            only = dict(rows[0])
+            only["text"] = (only.get("text") or "")[: max(200, budget * 3)]
+            block = _recall_block({"passages": [only]})
+            rows = [only]
+        out = dict(res or {})
+        out["passages"] = rows
+        out["block"] = block
+        return out
+
+    def _apply_recall(self, query: str, msgs: "list[dict]") -> "dict | None":
+        """WORKER THREAD. Fold recalled passages into THIS turn's user message and surface the
+        sources in the transcript. Prepending to the user message (rather than adding a second
+        system message) mirrors rag_bot's own ``build_user`` — it keeps the passages adjacent
+        to the question they answer, and llama.cpp handles multiple system messages
+        inconsistently. Returns the recall result, or None if nothing was recalled."""
+        res = self._recall_for_turn(query)
+        if not res or not msgs:
+            return None
+        tail = msgs[-1]
+        if not isinstance(tail, dict) or tail.get("role") != "user":
+            return None
+        tail["content"] = f"{res['block']}\n\n---\n\nQuestion: {tail.get('content') or query}"
+        self.app.call_from_thread(self._mount_recall_bubble, res)
+        return res
+
+    def _mount_recall_bubble(self, res: dict) -> None:
+        """UI THREAD. Show WHICH corpus sources this turn consulted, so a recalled answer is as
+        auditable as the old grounded mode's 'Sources:' footer — the user can see the citation
+        legend before the answer streams over it."""
+        rows = (res or {}).get("passages") or []
+        if not rows:
+            return
+        seen: "list[str]" = []
+        for p in rows:
+            title = str(p.get("title") or "untitled")[:78]
+            if title in seen:
+                continue
+            seen.append(title)
+            src = str(p.get("source") or "?")
+            pack = p.get("pack")
+            tag = f"{src} · {pack}" if pack and pack != "plant_tc" else src
+            seen[-1] = f"[cyan]\\[{p.get('n')}][/cyan] [dim]({_esc(tag)})[/dim] {_esc(title)}"
+        body = "\n".join(seen)
+        self._mount_bubble(
+            f"[dim]📚 recalled from your corpus[/dim]\n{body}", "babs-tool")
+
+    # ── growing the corpus from the conversation ────────────────────────────────
+    @work(thread=True, exclusive=True, group="babs_ingest")
+    def _ingest_url_worker(self, url: str) -> None:
+        res = _babs_ingest_url(url)
+        self.app.call_from_thread(self._ingest_done, url, res)
+
+    def _ingest_done(self, url: str, res: dict) -> None:
+        if res.get("ok"):
+            lic = res.get("license") or "open"
+            self._sys_note(
+                f"[green]Learned[/green] [b]{_esc(str(res.get('title') or url)[:80])}[/b] "
+                f"[dim]— {res.get('chunks')} chunk(s), licence {_esc(str(lic)[:40])}. "
+                f"Babs can recall it once the index finishes.[/dim]")
+        elif res.get("duplicate"):
+            self._sys_note("[dim]Already in Babs' corpus — nothing to do.[/dim]")
+        else:
+            self._sys_note(f"[yellow]Didn't ingest that page.[/yellow] "
+                           f"[dim]{_esc(str(res.get('reason') or 'unknown reason'))}[/dim]")
+
+    def _start_learning_from_chat(self, topic: str) -> None:
+        """`/learn <topic>` — start a Background Learning session without leaving the chat, then
+        point at the Learn tab. Learning was UI-tab-only, so the natural moment to start one
+        (mid-conversation, when a gap shows up) had no path to it."""
+        home = _learn_resolve_babs_home()
+        if home is None:
+            self._sys_note("[yellow]Babs repo not found.[/yellow] [dim]Run "
+                           "`splicecraft babs-setup` first.[/dim]")
+            return
+        topic = topic[:200]
+        if _learn_session_running(home, _learn_slug(topic)):
+            self._sys_note("[dim]A learning session for that topic is already running — see the "
+                           "Learn tab.[/dim]")
+            return
+        try:
+            info = _launch_learning_session(topic, None, None)
+        except Exception as exc:
+            _log.exception("BABS /learn launch failed")
+            self._sys_note(f"[yellow]Couldn't start learning:[/yellow] [dim]{_esc(str(exc))}[/dim]")
+            return
+        self._learn_active_slug = info["slug"]
+        _set_setting("babs_learn_slug", info["slug"])
+        self._jobs.insert(0, {"pid": info["pid"], "kind": "learn", "label": topic[:60],
+                              "log": info["log"], "started": time.strftime("%Y%m%d-%H%M%S"),
+                              "started_mono": time.monotonic(), "token": "bb_learn.py",
+                              "running": True})
+        self._indicator_idle_shown = False
+        self._sys_note(
+            f"[green]Learning about[/green] [b]{_esc(topic)}[/b] [dim](pid {info['pid']}). "
+            f"It crawls open databases in the background and indexes what it keeps — watch it "
+            f"in the [b]Learn[/b] tab. Ask me again once it's done and I'll know more.[/dim]")
+        self._refresh_jobs_table()
+        self._refresh_learn_sessions()
+        self._refresh_bars()
+
+    def _lookup_corpus(self, query: str) -> None:
+        """`/recall <query>` — show what the corpus HOLDS on a topic, with no model turn spent.
+        Useful for checking whether a Background Learning session actually landed something
+        before asking a question that depends on it."""
+        self._sys_note(f"[dim]searching your corpus for [b]{_esc(query)}[/b] …[/dim]")
+        self._lookup_corpus_worker(query)
+
+    @work(thread=True, exclusive=True, group="babs_recall")
+    def _lookup_corpus_worker(self, query: str) -> None:
+        res = _babs_recall(query, k=_RECALL_MAX_PASSAGES)
+        self.app.call_from_thread(self._show_corpus_lookup, query, res)
+
+    def _show_corpus_lookup(self, query: str, res: dict) -> None:
+        rows = (res or {}).get("passages") or []
+        packs = ", ".join((res or {}).get("packs_searched") or []) or "—"
+        if not rows:
+            errs = "; ".join((res or {}).get("errors") or [])
+            self._sys_note(
+                f"[yellow]Nothing in your corpus about “{_esc(query)}”.[/yellow] "
+                f"[dim]Searched: {_esc(packs)}."
+                + (f" ({_esc(errs)})" if errs else "")
+                + " Grow it in the Learn tab.[/dim]")
+            return
+        lines = []
+        for p in rows:
+            title = str(p.get("title") or "untitled")[:76]
+            pack = p.get("pack")
+            tag = str(p.get("source") or "?")
+            if pack and pack != "plant_tc":
+                tag += f" · {pack}"
+            snippet = " ".join(str(p.get("text") or "").split())[:150]
+            lines.append(f"[cyan]\\[{p.get('n')}][/cyan] [dim]({_esc(tag)})[/dim] {_esc(title)}\n"
+                         f"    [dim]{_esc(snippet)}…[/dim]")
+        self._sys_note(f"[b]Corpus — {len(rows)} passage(s)[/b] [dim]· packs: {_esc(packs)}[/dim]\n"
+                       + "\n".join(lines))
+
     @work(thread=True, exclusive=True, group="babs_chat")
-    def _generate(self, query: str, messages: "list[dict]") -> None:
+    def _generate(self, query: str, messages: "list[dict]",
+                  recall: bool = False) -> None:
         cancel = self._cancel
+        if recall and not (cancel is not None and cancel.is_set()):
+            self._apply_recall(query, messages)     # mutates this turn's user message in place
         stripper = _babs.ThinkStripper()
         display_parts: "list[str]" = []
         content_parts: "list[str]" = []
@@ -30312,22 +30753,32 @@ class BabsScreen(Screen):
         stopped = bool(cancel is not None and cancel.is_set())
         self.app.call_from_thread(self._finalize, query, display, answer, err, stopped)
 
-    # ── corpus grounding (answer FROM the Babs corpus via rag_bot) ────────────────
+    # ── corpus auto-recall (fold corpus passages INTO the turn) ───────────────────
+    # Was "grounding": a MODE that swapped the whole turn out to `rag_bot --ask`, a second
+    # context-free model that could cite the corpus but saw neither the open plasmid, the
+    # chat history nor any tool — so Babs could know things or do things, never both. It is
+    # now auto-RECALL: the same retrieval pipeline, but the passages come back to the model
+    # SpliceCraft is already running. Corpus, memory, plasmid context and the agent tool loop
+    # all compose in one turn, and follow-up questions keep working.
     def _corpus_available(self) -> bool:
-        """True if there's a Babs corpus to ground answers in — the repo resolves AND its
-        corpus.jsonl is non-empty. Drives the toggle default + its enabled state."""
+        """True if there's a Babs corpus to recall from — the repo resolves AND either the
+        default corpus or some Background Learning pack has content. Drives the toggle default
+        + its enabled state. A learn-pack-only corpus counts: a user whose whole knowledge base
+        came from the Learn tab must still be able to turn recall on."""
         home = self._resolve_babs_home()
         if home is None:
             return False
         try:
             corpus = home / "knowledge_base" / "corpus.jsonl"
-            return corpus.is_file() and corpus.stat().st_size > 0
+            if corpus.is_file() and corpus.stat().st_size > 0:
+                return True
         except OSError:
-            return False
+            pass
+        return len(_recall_searchable_packs(home)) > 1
 
     def _refresh_ground_button(self) -> None:
         """Label/variant/enabled-ness of the Corpus toggle. Disabled (and forced off) when no
-        corpus is available, so it can't promise grounding it can't deliver."""
+        corpus is available, so it can't promise recall it can't deliver."""
         try:
             btn = self.query_one("#babs-ground", Button)
         except NoMatches:
@@ -30342,13 +30793,18 @@ class BabsScreen(Screen):
     @on(Button.Pressed, "#babs-ground")
     def _on_ground_toggle(self, _event=None) -> None:
         if not self._corpus_available():
-            self.app.notify("No Babs corpus found. Grow one in the Paper scraper tab, or run "
-                            "`splicecraft babs-setup`.", severity="information")
+            self.app.notify("No Babs corpus found. Grow one in the Learn or Paper scraper tab, "
+                            "or run `splicecraft babs-setup`.", severity="information")
             return
         self._grounded = not self._grounded
+        _set_setting("babs_recall", self._grounded)
+        _settings_flush_sync()
         self._refresh_ground_button()
-        self._sys_note("[dim]Grounded — answers now come from your Babs corpus, with sources.[/dim]"
-                       if self._grounded else "[dim]Back to plain model chat (no corpus).[/dim]")
+        self._sys_note(
+            "[dim]Corpus recall [b]on[/b] — Babs now looks in your papers, protocols and "
+            "reference data before answering, and cites what she used. Works alongside Agent "
+            "mode.[/dim]" if self._grounded else
+            "[dim]Corpus recall off — answering from the model's own knowledge.[/dim]")
 
     # ── agentic mode (Babs drives SpliceCraft via the agent endpoints) ───────────
     def _refresh_agent_button(self) -> None:
@@ -30426,88 +30882,24 @@ class BabsScreen(Screen):
         else:
             self._sys_note("[dim]Agent mode off — plain chat.[/dim]")
 
-    @work(thread=True, exclusive=True, group="babs_chat")
-    def _generate_grounded(self, query: str) -> None:
-        """Answer grounded in the Babs corpus: shell `rag_bot.py --ask … --plain` in the babs
-        repo and stream its cited answer into the bubble. Keeps SpliceCraft free of chromadb —
-        retrieval + the corpus live in babs; we just shell + stream (the Paper-scraper pattern).
-        Stop works by terminating the subprocess (which unblocks the os.read in _stop_generation)."""
-        import codecs
-        import subprocess
-        cancel = self._cancel
-        home = self._resolve_babs_home()
-        err = None
-        parts: "list[str]" = []
-        last = [time.monotonic()]
-        proc = None
-
-        def flush(force: bool = False) -> None:
-            now = time.monotonic()
-            if not force and now - last[0] < 0.08:
-                return
-            last[0] = now
-            self.app.call_from_thread(self._render_assistant, "".join(parts))
-
-        try:
-            if home is None:
-                raise _babs.BabsError("Babs repo not found — run `splicecraft babs-setup` "
-                                      "or set $SPLICECRAFT_BABS_HOME.")
-            py = self._babs_python(home)
-            proc = subprocess.Popen(
-                [py, "rag_bot.py", "--ask", query, "--plain"], cwd=str(home),
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                env=os.environ.copy())
-            self._active_proc = proc
-            dec = codecs.getincrementaldecoder("utf-8")("replace")
-            out = proc.stdout
-            if out is None:               # stdout=PIPE always yields a stream; this narrows the type
-                raise _babs.BabsError("rag_bot produced no output stream")
-            fd = out.fileno()
-            while True:
-                if cancel is not None and cancel.is_set():
-                    break
-                chunk = os.read(fd, 4096)      # blocks for output; b"" at EOF (done/terminated)
-                if not chunk:
-                    break
-                parts.append(dec.decode(chunk))
-                flush()
-        except _babs.BabsError as exc:
-            err = str(exc)
-        except Exception as exc:               # worker-body carve-out ([PIT-01])
-            _log.exception("BABS grounded chat worker failed")
-            err = f"corpus query error: {exc}"
-        finally:
-            if proc is not None:
-                try:
-                    if proc.stdout is not None:
-                        proc.stdout.close()
-                except Exception:
-                    pass
-                try:
-                    proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-            self._active_proc = None
-        flush(force=True)
-        display = "".join(parts).strip()
-        if not display and not err:
-            display = "[dim](no answer — is the corpus populated?)[/dim]"
-        stopped = bool(cancel is not None and cancel.is_set())
-        self.app.call_from_thread(self._finalize, query, display, display, err, stopped)
-
     # ── agentic tool-loop worker ─────────────────────────────────────────────────
     @work(thread=True, exclusive=True, group="babs_chat")
-    def _generate_agentic(self, query: str, messages: "list[dict]") -> None:
+    def _generate_agentic(self, query: str, messages: "list[dict]",
+                          recall: bool = False) -> None:
         """Agentic turn: stream chat WITH the SpliceCraft tool manifest; when the
         model emits a tool call, run it in-process (the SAME `_agent_invoke` path
         + live TUI refresh as the external side-door) and feed the result back,
         looping until the model answers in plain text. Writes obey the autonomy
-        policy (ask / auto / readonly)."""
+        policy (ask / auto / readonly).
+
+        With `recall` on, corpus passages are folded into the opening user message
+        BEFORE the loop starts — so the model reasons about tools with the
+        knowledge already in hand. It can still call `splicecraft_recall_knowledge`
+        mid-loop to look something else up; corpus and tools now compose."""
         cancel = self._cancel
         msgs = list(messages)
+        if recall and not (cancel is not None and cancel.is_set()):
+            self._apply_recall(query, msgs)
         tools = _babs_tool_manifest()
         opts = {"temperature": float(self._temp), "num_ctx": int(self._num_ctx)}
         # Agent turns may run on a faster model than chat (see _resolve_agent_model).
@@ -30649,6 +31041,23 @@ class BabsScreen(Screen):
                 alt = args.get("body")
                 body = alt if isinstance(alt, dict) else {}
             return self._dispatch_agent_endpoint(endpoint, body)
+        if name == "splicecraft_reference_lookup":
+            body = {}
+            for src, dst in (("query", "query"), ("registry", "registry"),
+                             ("max_hits", "max_hits"), ("list_registries", "list_registries")):
+                if args.get(src) is not None:
+                    body[dst] = args.get(src)
+            return self._dispatch_agent_endpoint("reference-lookup", body)
+        if name == "splicecraft_recall_knowledge":
+            q = str(args.get("query") or "").strip()
+            if not q:
+                return {"error": "missing 'query'"}
+            # A distinct name, not `body`: that one is declared dict elsewhere in this
+            # function, and an inferred dict[str, str] here would reject the int max_passages.
+            recall_body = {"query": q, "max_passages": args.get("max_passages")}
+            if recall_body["max_passages"] is None:
+                del recall_body["max_passages"]
+            return self._dispatch_agent_endpoint("recall-knowledge", recall_body)
         if name == "splicecraft_search_online":
             src = str(args.get("source") or "").strip().lower()
             endpoint = _BABS_SEARCH_SOURCES.get(src)
@@ -30666,6 +31075,14 @@ class BabsScreen(Screen):
             # max_chars passed through as-is (None → handler uses its default).
             return self._dispatch_agent_endpoint(
                 "read-url", {"url": url, "max_chars": args.get("max_chars")})
+        if name == "splicecraft_remember":
+            fact = str(args.get("fact") or "").strip()
+            if not fact:
+                return {"error": "missing 'fact'"}
+            body = {"fact": fact}
+            if args.get("title"):
+                body["title"] = str(args.get("title"))
+            return self._dispatch_agent_endpoint("remember-fact", body)
         if name == "splicecraft_batch":
             return self._dispatch_agent_batch(args.get("calls"))
         return {"error": f"unknown tool {name!r}"}
@@ -31015,12 +31432,6 @@ class BabsScreen(Screen):
                 r.close()   # unblock a socket read mid-stream
             except Exception:
                 pass
-        p = self._active_proc
-        if p is not None:
-            try:
-                p.terminate()   # grounded mode: closes the pipe, unblocking the worker's os.read
-            except Exception:
-                pass
 
     # ── slash commands ───────────────────────────────────────────────────────────
     def _handle_command(self, raw: str) -> None:
@@ -31060,9 +31471,58 @@ class BabsScreen(Screen):
                                    "Clone github.com/ATinyGreenCell/babs to ~/babs or set "
                                    "$SPLICECRAFT_BABS_HOME.)[/dim]")
         elif cmd in ("memory", "memories"):
-            idx = _babs_memory_index()
-            self._sys_note(f"[b]Babs memory[/b]\n{_esc(idx)}" if idx
-                           else "[dim]No memories yet — use [b]/remember <fact>[/b] to save one.[/dim]")
+            # Show the reviewable list (slug + title) rather than just the index text, so the
+            # user can actually prune with /forget — memory shapes every future answer, and
+            # now that Babs can write it herself, review has to be one command away.
+            mem = _babs_memory_list()
+            if mem:
+                lines = "\n".join(f"  [cyan]{_esc(m['slug'])}[/cyan]  [dim]{_esc(m['title'])}[/dim]"
+                                  for m in mem)
+                self._sys_note(f"[b]Babs memory[/b] [dim]({len(mem)} — /forget <slug> to "
+                               f"remove one)[/dim]\n{lines}")
+            else:
+                idx = _babs_memory_index()
+                self._sys_note(f"[b]Babs memory[/b]\n{_esc(idx)}" if idx else
+                               "[dim]No memories yet — use [b]/remember <fact>[/b] to save one, "
+                               "or let Babs save one when you tell her something durable.[/dim]")
+        elif cmd in ("forget",):
+            slug = rest.strip()
+            if not slug:
+                self._sys_note("[dim]usage: /forget <slug>  ([b]/memory[/b] lists them)[/dim]")
+            elif _babs_memory_forget(slug):
+                self._sys_note(f"[dim]forgot [b]{_esc(slug)}[/b].[/dim]")
+            else:
+                self._sys_note(f"[yellow]No memory called [b]{_esc(slug)}[/b].[/yellow] "
+                               "[dim](/memory lists the slugs.)[/dim]")
+        elif cmd in ("ingest", "learnurl"):
+            url = rest.strip()
+            if not url:
+                self._sys_note("[dim]usage: /ingest <url> — read a page and KEEP it in Babs' "
+                               "corpus (openly-licensed pages only)[/dim]")
+            elif not _get_setting("allow_online_lookups", False):
+                self._sys_note("[yellow]Online lookups are off.[/yellow] [dim]Enable Settings → "
+                               "'Allow Babs online database lookups' first.[/dim]")
+            else:
+                self._sys_note(f"[dim]fetching [b]{_esc(url[:90])}[/b] …[/dim]")
+                self._ingest_url_worker(url)
+        elif cmd in ("learn",):
+            topic = rest.strip()
+            if not topic:
+                self._sys_note("[dim]usage: /learn <topic> — grow Babs' corpus about a topic "
+                               "with a focused crawl (watch it in the Learn tab)[/dim]")
+            elif not _get_setting("allow_online_lookups", False):
+                self._sys_note("[yellow]Online lookups are off.[/yellow] [dim]Enable Settings → "
+                               "'Allow Babs online database lookups' first.[/dim]")
+            else:
+                self._start_learning_from_chat(topic)
+        elif cmd in ("recall", "corpus"):
+            # No argument = toggle auto-recall (the Corpus button's keyboard twin).
+            # With a query = a one-off lookup: show the passages WITHOUT spending a
+            # model turn, so the user can see exactly what the corpus holds.
+            if not rest.strip():
+                self._on_ground_toggle()
+            else:
+                self._lookup_corpus(rest.strip())
         elif cmd in ("temp", "temperature"):
             if rest:
                 try:
@@ -32375,9 +32835,135 @@ class BabsScreen(Screen):
             f"fetched {prog.get('fetched', 0)} · dropped {prog.get('dropped', 0)} · "
             f"frontier {prog.get('frontier', 0)}{drift}")
 
+    def _refresh_learn_sessions(self) -> None:
+        """Repopulate the past-sessions picker. A learning pack outlives the run that made it,
+        but the tab only ever tracked ONE active slug — so every earlier session was invisible
+        (and un-mergeable) after a restart."""
+        try:
+            sel = self.query_one("#babs-learn-session", Select)
+        except NoMatches:
+            return
+        home = _learn_resolve_babs_home()
+        sessions = _learn_list_sessions(home) if home is not None else []
+        opts = []
+        for s in sessions:
+            label = f"{(s.get('topic') or s['slug'])[:52]} · {s.get('kept', 0)} kept · {s.get('status', '?')}"
+            opts.append((label, s["slug"]))
+        cur = self._learn_active_slug
+        sel.set_options(opts)
+        # Only ASSIGN when the slug is a real option — `Select.BLANK` is `False` in Textual
+        # 8.2.8 and assigning it raises InvalidSelectValueError (which is not a ValueError,
+        # so it isn't catchable as one). `set_options` has already cleared the selection.
+        if cur and any(v == cur for _, v in opts):
+            sel.value = cur
+
+    @on(Select.Changed, "#babs-learn-session")
+    def _on_learn_session_pick(self, ev: "Select.Changed") -> None:
+        if ev.value is Select.BLANK or not isinstance(ev.value, str):
+            return
+        self._learn_active_slug = ev.value
+        _set_setting("babs_learn_slug", ev.value)
+        self._refresh_learn_status()
+        self._on_learn_results()
+
+    @on(Button.Pressed, "#babs-learn-merge")
+    def _on_learn_merge(self, _e=None) -> None:
+        slug = self._learn_active_slug
+        if not slug:
+            self.app.notify("Pick a learning session first.", severity="information")
+            return
+        home = _learn_resolve_babs_home()
+        topic = ""
+        if home is not None:
+            anchor = _learn_read_json_safe(_learn_session_dir(home, slug) / "anchor.json")
+            topic = str((anchor or {}).get("topic") or "")
+        self.app.push_screen(
+            BabsLearnMergeModal(slug, topic),
+            lambda ok: self._learn_merge_confirmed(slug) if ok else None)
+
+    def _learn_merge_confirmed(self, slug: str) -> None:
+        home = _learn_resolve_babs_home()
+        if home is None:
+            return
+        if _learn_session_running(home, slug):
+            self.app.notify("That session is still running — stop it first.", severity="warning")
+            return
+        try:
+            stats = _learn_merge_pack_into_main(home, slug)
+        except RuntimeError as exc:
+            self.app.notify(f"Couldn't merge: {exc}", severity="error")
+            return
+        except Exception as exc:
+            _log.exception("BABS learn merge failed")
+            self.app.notify(f"Couldn't merge: {exc}", severity="error")
+            return
+        if not stats["added"]:
+            self.app.notify(f"Nothing new to add ({stats['skipped']} already in the corpus).",
+                            severity="information")
+            return
+        pid = _learn_reindex_main(home)
+        if pid:
+            self._jobs.insert(0, {"pid": pid, "kind": "index", "label": f"index {slug}"[:60],
+                                  "log": "", "started": time.strftime("%Y%m%d-%H%M%S"),
+                                  "started_mono": time.monotonic(), "token": "bb_index.py",
+                                  "running": True})
+            self._refresh_jobs_table()
+        self.app.notify(
+            f"Added {stats['added']} chunk(s) to the main corpus"
+            + (f" ({stats['skipped']} already there)" if stats["skipped"] else "")
+            + (" — indexing in the background." if pid else "."),
+            severity="information")
+        self._refresh_bars()
+
+    @on(Button.Pressed, "#babs-index-library")
+    def _on_index_library(self, _e=None) -> None:
+        if _learn_resolve_babs_home() is None:
+            self.app.notify("Babs repo not found — run `splicecraft babs-setup` first.",
+                            severity="warning")
+            return
+        self.app.notify("Indexing your library — this stays on this machine.",
+                        severity="information")
+        self._index_library_worker()
+
+    @work(thread=True, exclusive=True, group="babs_libindex")
+    def _index_library_worker(self) -> None:
+        home = _learn_resolve_babs_home()
+        if home is None:
+            return
+        try:
+            stats = _write_library_pack(home)
+        except RuntimeError as exc:
+            self.app.call_from_thread(self.app.notify, str(exc), severity="warning")
+            return
+        except Exception as exc:
+            _log.exception("BABS library index failed")
+            self.app.call_from_thread(self.app.notify, f"Couldn't index: {exc}",
+                                      severity="error")
+            return
+        pid = _index_library_pack(home)
+        self.app.call_from_thread(self._index_library_done, stats, pid)
+
+    def _index_library_done(self, stats: dict, pid) -> None:
+        if pid:
+            self._jobs.insert(0, {"pid": pid, "kind": "index", "label": "index my library",
+                                  "log": "", "started": time.strftime("%Y%m%d-%H%M%S"),
+                                  "started_mono": time.monotonic(), "token": "bb_index.py",
+                                  "running": True})
+            self._refresh_jobs_table()
+        self.app.notify(
+            f"Indexed {stats['docs']} item(s) from your library ({stats['chunks']} chunks)"
+            + (" — embedding in the background." if pid else "."),
+            severity="information")
+        self._sys_note(
+            f"[green]Your library is now recallable[/green] [dim]— {stats['docs']} plasmid(s), "
+            f"primer(s), part(s) and notebook entries. Ask me things like “which of my "
+            f"plasmids has a KanR marker?”. This index never leaves this machine.[/dim]")
+        self._refresh_ground_button()
+
     @on(Button.Pressed, "#babs-learn-refresh")
     def _on_learn_refresh(self, _e=None) -> None:
         self._refresh_learn_status()
+        self._refresh_learn_sessions()
         self._poll_jobs()
 
     @on(Button.Pressed, "#babs-learn-results-btn")
@@ -38883,6 +39469,14 @@ _SETTINGS_SCHEMA: "dict[str, tuple[tuple, object]]" = {
     "babs_temp":               ((int, float),          0.0),
     "babs_show_think":         ((bool,),               False),
     "babs_home":               ((str,),                ""),
+    # Corpus auto-recall (2026-07-24). When on, every chat turn first pulls
+    # ranked, cited passages from the local Babs corpus (default pack + every
+    # Background Learning pack) and folds them INTO the turn — so corpus
+    # knowledge composes with the persona, the open plasmid and the agent tool
+    # loop instead of replacing them, as the old grounded MODE did. Purely
+    # local: recall never egresses unless a caller explicitly asks for `web`,
+    # which is itself gated on the human-armed `allow_online_lookups`.
+    "babs_recall":             ((bool,),               True),
     # Agentic Babs (2026-06-30): `babs_tools_enabled` arms the in-process
     # tool-loop (Babs may call the agent endpoints to drive the app);
     # `babs_autonomy` is the WRITE policy when armed — "ask" (confirm each
@@ -92546,6 +93140,14 @@ def _launch_learning_session(topic, max_docs=None, max_minutes=None):
         parts += ["--max-docs", str(int(max_docs))]
     if max_minutes:
         parts += ["--max-minutes", str(int(max_minutes))]
+    # THEN INDEX WHAT IT LEARNED. bb_learn only writes the pack's corpus.jsonl; without this
+    # step the pack has no Chroma collection, so everything the session collected is
+    # dense-unsearchable — and the learning loop stays OPEN (the crawl runs, the results list,
+    # and no answer can ever use them). Chained with `;` (not `&&`) so a budget-exhausted or
+    # interrupted crawl still indexes whatever it did keep. BABS_PACK scopes bb_index to this
+    # session's isolated pack, exactly as bb_learn scopes its own run — the default corpus is
+    # never touched. Mirrors the Paper-scraper chain, which has always ended in bb_index.
+    parts += [";", f"BABS_PACK={shlex.quote(slug)}", shlex.quote(py), "bb_index.py"]
     ts = time.strftime("%Y%m%d-%H%M%S")
     logdir = home / "knowledge_base" / "jobs"
     try:
@@ -92563,6 +93165,294 @@ def _launch_learning_session(topic, max_docs=None, max_minutes=None):
         fh.close()   # the child dup'd the fd; the parent doesn't need its copy
     return {"slug": slug, "session_dir": str(_learn_session_dir(home, slug)),
             "pid": proc.pid, "log": str(logf), "topic": topic}
+
+
+# ── The user's OWN work as recallable knowledge (private, local-only) ─────────────
+# The richest project-specific knowledge on the box is the user's own library: their
+# plasmids, primers, parts and lab notebook. Babs could only reach it one endpoint at a time
+# inside a tool loop, which a 7B does badly — "which of my plasmids has a KanR and a T7
+# promoter?" was effectively unanswerable. Indexing it as a Babs pack makes it recallable.
+#
+# PRIVACY — this is the user's unpublished work, so the pack is barred from every egress path
+# we control, not merely "not uploaded by default":
+#   * every record carries `private: true`,
+#   * the pack directory holds a `.no-egress` marker,
+#   * `push_corpus.sh` (the babs corpus→another-machine rsync) excludes it by name AND skips
+#     any pack carrying that marker,
+#   * recall never passes `--web` for it, so no query derived from it reaches a search engine.
+# Nothing here is ever sent anywhere; it is a local index over local files.
+_LIBRARY_PACK = "splicecraft_library"
+_LIBRARY_PACK_MAX_DOCS = 5000        # a huge library must not wedge the indexer
+_LIBRARY_PACK_MAX_CHARS = 4000       # per section, before it is split into chunks
+_LIBRARY_CHUNK_CHARS = 1200
+
+# Feature labels are pulled straight out of the stored GenBank text rather than parsed with
+# Biopython: indexing runs over the WHOLE library, and a regex pass is orders of magnitude
+# cheaper than building a SeqRecord per entry for what is ultimately just retrieval text.
+_GB_LABEL_RE = re.compile(r'/(?:label|gene|product)="([^"]{1,80})"')
+_GB_FEATURE_RE = re.compile(r"^ {5}(\w[\w']*)\s+(\S.*)$", re.MULTILINE)
+
+_INGEST_TIMEOUT = 120
+
+
+def _library_doc_chunks(doc_id, title, sections, *, kind):
+    """Turn one SpliceCraft object into corpus chunk records, matching the shape
+    ``bb_lib.chunk_document`` emits so the babs indexer and retriever need no special case."""
+    stamp = _now_iso()
+    out = []
+    for s_idx, (head, text) in enumerate(sections):
+        text = " ".join(str(text or "").split())[:_LIBRARY_PACK_MAX_CHARS]
+        # A low floor on purpose: unlike crawled prose (where babs drops sub-80-char fragments
+        # as heading noise), a SHORT section here is still the whole fact. 'pTEST contains:
+        # KanR.' is 21 chars and is exactly the sentence that answers "which of my plasmids has
+        # a KanR?" — a prose-sized floor would silently drop single-feature plasmids.
+        if len(text) < 12:
+            continue
+        pieces = [text[i:i + _LIBRARY_CHUNK_CHARS]
+                  for i in range(0, len(text), _LIBRARY_CHUNK_CHARS)] or [text]
+        for c_idx, chunk in enumerate(pieces):
+            out.append({
+                "chunk_id": f"{doc_id}::{s_idx}::{c_idx}",
+                "doc_id": doc_id,
+                "source": "SpliceCraft",
+                "title": title,
+                "doi": None, "url": None, "pub_date": None,
+                "fetched_at": stamp,
+                "trust": "curated",          # the user's own verified records
+                "license": None,
+                "section": head,
+                "context": f"{title} — {head} (the user's own {kind} in SpliceCraft).",
+                "text": chunk,
+                "private": True,             # NEVER leaves this machine
+            })
+    return out
+
+
+def _library_pack_records():
+    """Build the whole private pack from the user's data. READ-ONLY: every loader here returns
+    a readonly view or a copy and nothing is written back to the data dir. Bounded at
+    ``_LIBRARY_PACK_MAX_DOCS`` documents; never raises."""
+    records = []
+    docs = 0
+
+    def _add(doc_id, title, sections, kind):
+        nonlocal docs
+        if docs >= _LIBRARY_PACK_MAX_DOCS:
+            return False
+        docs += 1
+        records.extend(_library_doc_chunks(doc_id, title, sections, kind=kind))
+        return True
+
+    def _slug(s):
+        return re.sub(r"[^A-Za-z0-9._-]", "_", str(s or "x"))[:80]
+
+    try:
+        for e in _iter_library_readonly():
+            if not isinstance(e, dict):
+                continue
+            name = str(e.get("name") or e.get("id") or "unnamed")
+            gb = str(e.get("gb_text") or "")
+            labels = []
+            seen = set()
+            for m in _GB_LABEL_RE.finditer(gb):
+                lab = m.group(1).strip()
+                if lab and lab.lower() not in seen:
+                    seen.add(lab.lower())
+                    labels.append(lab)
+                if len(labels) >= 120:
+                    break
+            topo = "linear" if "linear" in gb[:200].lower() else "circular"
+            head = (f"{name} is a {int(e.get('size') or 0)} bp {topo} plasmid in the user's "
+                    f"SpliceCraft library with {int(e.get('n_feats') or 0)} annotated features.")
+            src = str(e.get("source") or "").strip()
+            if src:
+                head += f" Source: {src}."
+            sections = [("Plasmid", head)]
+            if labels:
+                sections.append(("Features", f"{name} contains: " + ", ".join(labels) + "."))
+            if not _add(f"sc::plasmid::{_slug(e.get('id') or name)}", name, sections, "plasmid"):
+                break
+    except Exception:
+        _log.exception("library pack: plasmid pass failed")
+
+    try:
+        for p in (_load_primers() or []):
+            if not isinstance(p, dict):
+                continue
+            name = str(p.get("name") or "primer")
+            seq = str(p.get("sequence") or "")
+            bits = [f"{name} is a primer in the user's SpliceCraft collection, {len(seq)} nt: {seq}."]
+            for key, label in (("notes", "Notes"), ("target", "Target"),
+                               ("bound_to", "Bound to"), ("tm", "Tm")):
+                val = str(p.get(key) or "").strip()
+                if val:
+                    bits.append(f"{label}: {val}.")
+            if not _add(f"sc::primer::{_slug(name)}", name, [("Primer", " ".join(bits))], "primer"):
+                break
+    except Exception:
+        _log.exception("library pack: primer pass failed")
+
+    try:
+        for part in (_load_parts_bin() or []):
+            if not isinstance(part, dict):
+                continue
+            name = str(part.get("name") or "part")
+            bits = [f"{name} is a {part.get('type') or 'part'} in the user's parts bin",
+                    f"grammar {part.get('grammar') or '?'}",
+                    f"level {part.get('level', '?')}",
+                    f"position {part.get('position') or '?'}",
+                    f"overhangs {part.get('oh5') or '?'}/{part.get('oh3') or '?'}",
+                    f"{part.get('size') or 0} bp."]
+            if not _add(f"sc::part::{_slug(name)}", name,
+                        [("Part", ", ".join(bits))], "part"):
+                break
+    except Exception:
+        _log.exception("library pack: parts pass failed")
+
+    try:
+        for x in (_load_experiments() or []):
+            if not isinstance(x, dict):
+                continue
+            title = str(x.get("title") or x.get("id") or "experiment")
+            body = str(x.get("body") or "")
+            when = str(x.get("date") or x.get("created") or "")
+            sections = [("Experiment", f"{title} ({when}) — lab-notebook entry. {body}")]
+            if not _add(f"sc::experiment::{_slug(x.get('id') or title)}", title,
+                        sections, "experiment"):
+                break
+    except Exception:
+        _log.exception("library pack: experiment pass failed")
+
+    return records, docs
+
+
+_LIBRARY_PACK_MODULE = '''"""AUTO-GENERATED by SpliceCraft — the user's OWN library as a Babs topic pack.
+
+PRIVATE / LOCAL ONLY. This pack indexes unpublished user work (plasmids, primers, parts, lab
+notebook). It carries a `.no-egress` marker in its data directory and is excluded from
+push_corpus.sh. Do not add it to any upload, sync or publication path.
+
+Regenerate from SpliceCraft: Babs tab -> Learn -> "Index my library".
+"""
+NAME = {name!r}
+DISPLAY_NAME = "My SpliceCraft library"
+COLLECTION = {collection!r}
+PRIVATE = True
+
+# This pack is never CRAWLED — SpliceCraft writes its corpus directly — so the search/gate
+# vocabularies exist only to satisfy the pack contract bb_config validates on load.
+TOPIC_TERMS = ["plasmid", "primer", "construct"]
+METHOD_TERMS = ["cloning", "assembly"]
+CONTEXT_MARKERS = ["plasmid", "vector", "construct"]
+TOPIC_MARKERS = ["plasmid", "primer", "part"]
+METHOD_MARKERS = ["cloning", "assembly", "pcr"]
+CONSTRUCTION_MARKERS = ["golden gate", "gibson", "moclo", "goldenbraid"]
+MIN_MARKERS = 1
+EXCLUDE_KEYWORDS = []
+POLICY_TITLE_TERMS = []
+METHOD_NUMBER_SIGNAL = []
+'''
+
+
+def _write_library_pack(home):
+    """Write the private pack (module + corpus + no-egress marker) into the babs repo.
+    Returns ``{docs, chunks, path}``; raises RuntimeError with an actionable message."""
+    records, docs = _library_pack_records()
+    if not records:
+        raise RuntimeError("nothing to index — your library, primers, parts and experiments "
+                           "are all empty")
+    pack_dir = home / "knowledge_base" / "packs" / _LIBRARY_PACK
+    try:
+        pack_dir.mkdir(parents=True, exist_ok=True)
+        (home / "packs" / f"{_LIBRARY_PACK}.py").write_text(
+            _LIBRARY_PACK_MODULE.format(name=_LIBRARY_PACK,
+                                        collection=f"{_LIBRARY_PACK}_v1"),
+            encoding="utf-8")
+        # The marker is what push_corpus.sh keys off, so write it BEFORE the corpus: a crash
+        # between the two must never leave private text in a directory that looks shareable.
+        (pack_dir / ".no-egress").write_text(
+            "This pack indexes the user's unpublished SpliceCraft work.\n"
+            "Do not sync, upload or publish this directory.\n", encoding="utf-8")
+        tmp = pack_dir / "corpus.jsonl.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, pack_dir / "corpus.jsonl")   # atomic: a re-index never half-replaces
+    except OSError as exc:
+        raise RuntimeError(f"can't write the library pack: {exc}")
+    return {"docs": docs, "chunks": len(records), "path": str(pack_dir)}
+
+
+def _index_library_pack(home):
+    """Embed the private pack (detached `bb_index.py --reset` scoped to it). --reset because the
+    pack is REBUILT each time: without it a renamed or deleted plasmid would linger in the
+    vector store as a ghost the user can still be told about. Returns the pid, or None."""
+    import subprocess
+    env = os.environ.copy()
+    env["BABS_PACK"] = _LIBRARY_PACK
+    logdir = home / "knowledge_base" / "jobs"
+    try:
+        logdir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        import pathlib
+        logdir = pathlib.Path(tempfile.gettempdir())
+    try:
+        fh = open(logdir / f"sc-lib-index-{time.strftime('%Y%m%d-%H%M%S')}.log", "ab")
+    except OSError:
+        return None
+    try:
+        proc = subprocess.Popen([_learn_babs_python(home), "bb_index.py", "--reset"],
+                                cwd=str(home), stdout=fh, stderr=fh,
+                                stdin=subprocess.DEVNULL, start_new_session=True, env=env)
+    except (OSError, ValueError):
+        return None
+    finally:
+        fh.close()
+    return proc.pid
+
+
+def _babs_ingest_url(url, title=""):
+    """Persist ONE web page into Babs' corpus, then embed it — the bridge from "Babs just read
+    this" to "Babs knows this".
+
+    Pages Babs opens with ``read-url`` are EPHEMERAL: they live in one turn's context and are
+    gone, so the same lookup is paid for forever and nothing accumulates. This shells the babs
+    repo's ``bb_websearch.py --ingest-url`` (which owns the SSRF gate, the boilerplate strip and
+    the OPEN-LICENCE requirement — a page that declares no open licence is refused, not copied)
+    and then chains ``bb_index.py`` so the new chunks are immediately recallable.
+
+    Returns the engine's result dict, plus ``indexed`` — never raises."""
+    import subprocess
+    home = _learn_resolve_babs_home()
+    if home is None:
+        return {"ok": False, "reason": "Babs repo not found - clone "
+                "github.com/ATinyGreenCell/babs to ~/babs or set $SPLICECRAFT_BABS_HOME"}
+    url = (url or "").strip()
+    if not url:
+        return {"ok": False, "reason": "no url"}
+    if len(url) > 2000:
+        return {"ok": False, "reason": "url too long"}
+    if not url.lower().startswith(("http://", "https://")):
+        return {"ok": False, "reason": "only http(s) URLs can be ingested"}
+    argv = [_learn_babs_python(home), "bb_websearch.py", "--ingest-url", url]
+    if title:
+        argv += ["--title", title[:200]]
+    try:
+        r = subprocess.run(argv, cwd=str(home), capture_output=True, text=True,
+                           timeout=_INGEST_TIMEOUT, env=os.environ.copy())
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "reason": "the page took too long to fetch"}
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "reason": f"couldn't run the ingest engine: {exc}"}
+    res = _recall_parse_json(r.stdout or "")
+    if not isinstance(res, dict):
+        return {"ok": False, "reason": "the ingest engine returned no result "
+                                       "(is the Babs repo up to date?)"}
+    if res.get("ok"):
+        res["indexed"] = bool(_learn_reindex_main(home))
+    return res
 
 
 def _learn_kept_docs(home, slug, limit):
@@ -92594,6 +93484,115 @@ def _learn_kept_docs(home, slug, limit):
         return []
     docs = sorted(by_doc.values(), key=lambda d: (d.get("relevance_score") or 0.0), reverse=True)
     return docs[:limit]
+
+
+def _learn_pack_corpus(home, slug):
+    return home / "knowledge_base" / "packs" / slug / "corpus.jsonl"
+
+
+def _learn_merge_pack_into_main(home, slug):
+    """Fold a Background Learning pack's corpus into the DEFAULT corpus, making what a session
+    learned permanent, first-class knowledge rather than a pack that recall has to reach into.
+
+    Why this exists even though recall already searches learn packs: recall fans out over at
+    most ``_RECALL_MAX_PACKS`` packs, so after enough sessions the OLDEST ones silently stop
+    being consulted. Merging retires a pack into the corpus proper.
+
+    Deduped by ``chunk_id`` against the existing corpus, so re-merging is a no-op rather than
+    a duplicate-inflating mistake. Takes a ``.premerge-bak`` snapshot first — this appends to
+    the user's real knowledge base, which is hours of crawling. Returns
+    ``{added, skipped, total}``; raises RuntimeError with an actionable message on failure.
+
+    The caller must run ``bb_index.py`` afterwards to embed the appended chunks (the merge
+    only moves text; without the re-index the new lines are BM25-searchable but not dense)."""
+    import shutil
+    src = _learn_pack_corpus(home, slug)
+    dst = home / "knowledge_base" / "corpus.jsonl"
+    if not src.is_file():
+        raise RuntimeError(f"learning session {slug} has no corpus yet — nothing to merge")
+    seen = set()
+    try:
+        if dst.is_file():
+            with open(dst, encoding="utf-8", errors="replace") as f:
+                for i, ln in enumerate(f):
+                    if i > 2_000_000:
+                        break
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        rec = json.loads(ln)
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict) and rec.get("chunk_id"):
+                        seen.add(rec["chunk_id"])
+    except OSError as exc:
+        raise RuntimeError(f"can't read the main corpus: {exc}")
+    fresh, skipped = [], 0
+    try:
+        with open(src, encoding="utf-8", errors="replace") as f:
+            for i, ln in enumerate(f):
+                if i > 500_000:
+                    break
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    rec = json.loads(ln)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                cid = rec.get("chunk_id")
+                if cid and cid in seen:
+                    skipped += 1
+                    continue
+                if cid:
+                    seen.add(cid)
+                fresh.append(json.dumps(rec, ensure_ascii=False))
+    except OSError as exc:
+        raise RuntimeError(f"can't read the session corpus: {exc}")
+    if not fresh:
+        return {"added": 0, "skipped": skipped, "total": len(seen)}
+    try:
+        if dst.is_file():
+            shutil.copy2(dst, dst.with_suffix(".jsonl.premerge-bak"))
+        # One write of complete newline-terminated lines, then fsync: an interrupted merge
+        # can't leave a torn record that would break every later corpus read.
+        with open(dst, "a", encoding="utf-8") as f:
+            f.write("\n".join(fresh) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as exc:
+        raise RuntimeError(f"can't write the main corpus: {exc}")
+    return {"added": len(fresh), "skipped": skipped, "total": len(seen)}
+
+
+def _learn_reindex_main(home):
+    """Re-embed the default corpus after a merge (detached `bb_index.py`, no --reset: it adds
+    the new chunks rather than rebuilding 17k of them). Returns the pid, or None."""
+    import subprocess
+    py = _learn_babs_python(home)
+    logdir = home / "knowledge_base" / "jobs"
+    try:
+        logdir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        import pathlib
+        logdir = pathlib.Path(tempfile.gettempdir())
+    logf = logdir / f"sc-merge-index-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    try:
+        fh = open(logf, "ab")
+    except OSError:
+        return None
+    try:
+        proc = subprocess.Popen([py, "bb_index.py"], cwd=str(home), stdout=fh, stderr=fh,
+                                stdin=subprocess.DEVNULL, start_new_session=True,
+                                env=os.environ.copy())
+    except (OSError, ValueError):
+        return None
+    finally:
+        fh.close()
+    return proc.pid
 
 
 def _learn_list_sessions(home):
@@ -92674,22 +93673,409 @@ def _babs_memory_index():
     return "\n".join(lines).strip()[:4000]
 
 
-def _babs_remember(text):
+def _babs_remember(text, title="", source="chat"):
     """Persist a memory by shelling bb_memory.py in the babs repo (one owner for the write logic);
-    returns the slug, or None if there's no babs repo / the write failed."""
+    returns the slug, or None if there's no babs repo / the write failed.
+
+    ``source`` distinguishes who saved it — "chat" for the human's /remember, "babs" when Babs
+    saved it herself — so the store stays auditable and a bad autonomous memory is findable."""
     home = _learn_resolve_babs_home()
     if home is None:
         return None
     import subprocess
+    argv = [_learn_babs_python(home), "bb_memory.py", "remember",
+            f"--body={text[:8000]}",              # '=' form: a body that starts with '-' isn't
+            f"--source={source[:32] or 'chat'}"]  # mistaken for an argparse flag
+    if title:
+        argv.append(f"--title={title[:120]}")
     try:
-        r = subprocess.run([_learn_babs_python(home), "bb_memory.py", "remember",
-                            f"--body={text[:8000]}", "--source=chat"],   # '=' form: a body that
-                           cwd=str(home), capture_output=True, text=True, timeout=30)  # starts with '-' isn't an argparse flag
+        r = subprocess.run(argv, cwd=str(home), capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
     if r.returncode != 0 or not (r.stdout or "").strip():
         return None
     return r.stdout.strip().splitlines()[-1].strip()
+
+
+# `bb_memory.py list` prints "  <slug padded to 40>  <title>" per memory. Parsed rather than
+# re-implemented so the store's layout + frontmatter stay owned by the babs repo.
+_MEMORY_LIST_RE = re.compile(r"^\s*(\S+)\s\s+(.*)$")
+
+
+def _babs_memory_list():
+    """Every saved memory as ``[{slug, title}]`` — the review list behind `/memory` and the
+    memory-list endpoint. Returns [] when there's no babs repo or nothing saved."""
+    home = _learn_resolve_babs_home()
+    if home is None:
+        return []
+    import subprocess
+    try:
+        r = subprocess.run([_learn_babs_python(home), "bb_memory.py", "list"],
+                           cwd=str(home), capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []
+    out = []
+    for line in (r.stdout or "").splitlines()[:500]:
+        m = _MEMORY_LIST_RE.match(line)
+        if m:
+            out.append({"slug": m.group(1), "title": m.group(2).strip()})
+    return out
+
+
+def _babs_memory_forget(slug):
+    """Delete one memory by slug. True on success. The slug is validated here (it becomes a
+    filename inside the babs memory store) so a crafted value can't escape the directory."""
+    slug = (slug or "").strip()
+    if not slug or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}", slug):
+        return False
+    home = _learn_resolve_babs_home()
+    if home is None:
+        return False
+    import subprocess
+    try:
+        r = subprocess.run([_learn_babs_python(home), "bb_memory.py", "forget", slug],
+                           cwd=str(home), capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and "removed" in (r.stdout or "").lower()
+
+
+# ── Babs corpus RECALL — retrieval as a TOOL, not a mode ───────────────────────────
+# Grounded mode (`rag_bot.py --ask`) answers from the corpus but is a MODE SWITCH: it runs a
+# second, context-free model in a subprocess, so the turn loses the persona, the persistent
+# memory index, the open-plasmid context, the chat history AND the whole agent tool loop
+# (Babs could know things or do things, never both). Recall inverts that: we shell
+# `rag_bot.py --retrieve` for ranked, cited PASSAGES only, and hand them to the model
+# SpliceCraft is already running — so corpus knowledge composes with tools, history and the
+# construct on screen instead of replacing them.
+def _recall_searchable_packs(home):
+    """Pack names worth searching: the DEFAULT pack first, then every Background Learning pack
+    that has actually collected something. A learn pack needs BOTH its generated scope module
+    (``packs/<slug>.py``, or bb_config refuses to load it) and a non-empty corpus — a session
+    that was launched and killed before its first keep would otherwise cost a subprocess to
+    return nothing. Bounded; never raises."""
+    names = [""]        # "" = inherit the ambient default pack (plant_tc unless $BABS_PACK)
+    try:
+        base = home / "knowledge_base" / "packs"
+        entries = sorted(base.iterdir()) if base.is_dir() else []
+    except OSError:
+        return names
+    # The user's OWN library goes SECOND (right after the default corpus): a question about
+    # "my plasmids" should never be crowded out by learn packs when several exist.
+    ordered = [d for d in entries if d.name == _LIBRARY_PACK]
+    ordered += [d for d in entries if d.name.startswith("learn_")]
+    for d in ordered:
+        if len(names) >= _RECALL_MAX_PACKS:
+            break
+        try:
+            if not (home / "packs" / f"{d.name}.py").is_file():
+                continue
+            corpus = d / "corpus.jsonl"
+            if corpus.is_file() and corpus.stat().st_size > 0:
+                names.append(d.name)
+        except OSError:
+            continue
+    return names
+
+
+def _recall_one_pack(home, query, pack, k, web, cancel=None):
+    """Shell ONE `rag_bot.py --retrieve` and parse its JSON. Returns the dict, or None on any
+    failure (missing repo, crash, timeout, garbage) — a broken learn pack must never sink the
+    recall. rag_bot exits 1 WITH a JSON body when retrieval degraded, so parse before judging
+    the return code. argv-only (no shell), and stdout is strictly JSON (its warnings go to
+    stderr), so the parse needs no scraping.
+
+    Polls rather than blocking on ``run()`` so a user pressing Stop mid-recall gets an
+    immediate stop: a cold pack builds its BM25 cache on first query and can legitimately take
+    seconds, which is far too long to leave Stop unresponsive."""
+    import subprocess
+    env = os.environ.copy()
+    if pack:
+        env["BABS_PACK"] = pack
+    else:
+        env.pop("BABS_PACK", None)
+    argv = [_learn_babs_python(home), "rag_bot.py", "--retrieve", query, "--n", str(int(k))]
+    argv.append("--web" if web else "--no-web")
+    try:
+        proc = subprocess.Popen(argv, cwd=str(home), stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                text=True, env=env)
+    except (OSError, ValueError):
+        return None
+    deadline = _monotonic() + _RECALL_TIMEOUT
+    try:
+        while True:
+            if cancel is not None and cancel.is_set():
+                proc.kill()
+                return None
+            try:
+                out, _ = proc.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                if _monotonic() > deadline:
+                    proc.kill()
+                    proc.communicate()
+                    return None
+    except (OSError, ValueError):
+        return None
+    finally:
+        if proc.poll() is None:      # never leave a recall child behind
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    blob = _recall_parse_json(out or "")
+    return blob if isinstance(blob, dict) else None
+
+
+def _recall_parse_json(out):
+    """Parse the JSON object out of a `--retrieve` run's stdout.
+
+    rag_bot keeps stdout strictly JSON in retrieve mode, but these are two INDEPENDENTLY
+    updated repos: an older babs checkout lets the retrieval stack's own diagnostics (e.g.
+    "[warn] dense search failed … falling back to BM25 only", printed when a learn pack has no
+    Chroma collection yet) land on stdout ahead of the payload. Falling back to the LAST line
+    keeps recall working against such a checkout instead of silently reporting every pack as
+    failed. Returns None if nothing parses."""
+    out = (out or "")[:_RECALL_MAX_OUTPUT].strip()
+    if not out:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        pass
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            return json.loads(line)
+        except ValueError:
+            continue
+    return None
+
+
+def _babs_recall(query, *, k=6, web=False, packs=None, cancel=None):
+    """Recall ranked, cited passages from Babs' corpus for ``query``.
+
+    Searches the default pack AND every Background Learning pack CONCURRENTLY, then merges
+    ROUND-ROBIN by rank (default pack first) rather than by score: each pack fuses its own
+    dense+sparse ranking, so a raw score from a 17k-chunk corpus and one from a 40-paper learn
+    pack are not on the same scale, and sorting across them would bury everything the user
+    just taught Babs. Interleaving keeps the best of each and is deterministic.
+
+    Returns ``{passages, count, packs_searched, errors}``; ``passages`` carry their source
+    pack so the UI and the model can say WHERE a fact came from. Never raises."""
+    home = _learn_resolve_babs_home()
+    if home is None:
+        return {"passages": [], "count": 0, "packs_searched": [],
+                "errors": ["Babs corpus repo not found - clone github.com/ATinyGreenCell/babs "
+                           "to ~/babs or set $SPLICECRAFT_BABS_HOME"]}
+    query = (query or "").strip()
+    if not query:
+        return {"passages": [], "count": 0, "packs_searched": [], "errors": ["empty query"]}
+    names = list(packs) if packs else _recall_searchable_packs(home)
+    names = names[:_RECALL_MAX_PACKS]
+    k = max(1, min(int(k), _RECALL_MAX_PASSAGES))
+    per_pack = {}
+    errors = []
+    if len(names) == 1:
+        per_pack[names[0]] = _recall_one_pack(home, query, names[0], k, web, cancel)
+    else:
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=len(names)) as pool:
+            futs = {pool.submit(_recall_one_pack, home, query, n, k, web, cancel): n
+                    for n in names}
+            for fut in _cf.as_completed(futs):
+                name = futs[fut]
+                try:
+                    per_pack[name] = fut.result()
+                except Exception:      # pragma: no cover - _recall_one_pack swallows its own
+                    _log.exception("BABS recall worker failed for pack %r", name or "default")
+                    per_pack[name] = None
+    ranked, searched = [], []
+    for name in names:                          # preserve the caller's / default-first order
+        blob = per_pack.get(name)
+        if blob is None:
+            errors.append(f"pack {name or 'default'}: recall failed")
+            continue
+        searched.append(blob.get("pack") or name or "default")
+        if blob.get("error"):
+            errors.append(f"pack {blob.get('pack') or name or 'default'}: {blob['error']}")
+        rows = blob.get("passages")
+        ranked.append([p for p in (rows if isinstance(rows, list) else []) if isinstance(p, dict)])
+    merged = []
+    for i in range(max((len(r) for r in ranked), default=0)):
+        for pack_i, rows in enumerate(ranked):
+            if i < len(rows) and len(merged) < k:
+                row = dict(rows[i])
+                row["pack"] = searched[pack_i] if pack_i < len(searched) else "?"
+                merged.append(row)
+        if len(merged) >= k:
+            break
+    for i, row in enumerate(merged, 1):         # renumber so [n] matches the merged legend
+        row["n"] = i
+    return {"passages": merged, "count": len(merged),
+            "packs_searched": searched, "errors": errors}
+
+
+# ── Curated reference registries (structured facts, no embedding) ──────────────────
+# Babs' knowledge base ships ~25 hand-curated JSON registries — antibiotics, promoters,
+# terminators, plasmid origins, Type IIS enzymes, selection markers, E. coli / Agrobacterium
+# strains, CRISPR vectors, assembly standards, media, PGRs, troubleshooting … — which are
+# exactly the lookups a cloning assistant needs. They were only reachable as prose chunks
+# through RAG, i.e. only in the one mode where Babs could not act. This reads them DIRECTLY:
+# deterministic, structured, sub-millisecond, and it returns whole records rather than a
+# retrieved fragment of one.
+# (_REFERENCE_MAX_HITS lives up beside the tool manifest, which interpolates it at import.)
+_REFERENCE_MAX_FILE_BYTES = 4 * 1024 * 1024
+_REFERENCE_CACHE: "dict" = {}
+
+
+def _reference_dir(home):
+    return home / "knowledge_base" / "reference"
+
+
+def _reference_load(home):
+    """Every curated registry as ``[{registry, title, description, entries}]``.
+
+    Cached on the directory's (name, mtime, size) signature so a hand-edit of a registry is
+    picked up without a restart while repeat lookups stay free. Files whose name starts with
+    ``_`` are babs-internal (e.g. ``_media_compositions.json``, which has no ``entries``
+    list) and are skipped. Never raises."""
+    d = _reference_dir(home)
+    try:
+        files = sorted(p for p in d.iterdir()
+                       if p.suffix == ".json" and not p.name.startswith(("_", ".")))
+    except OSError:
+        return []
+    try:
+        sig = tuple((p.name, int(p.stat().st_mtime), p.stat().st_size) for p in files)
+    except OSError:
+        return []
+    key = (str(d), sig)
+    hit = _REFERENCE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out = []
+    for p in files:
+        try:
+            if p.stat().st_size > _REFERENCE_MAX_FILE_BYTES:
+                continue
+            with open(p, encoding="utf-8", errors="replace") as f:
+                blob = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(blob, dict):
+            continue
+        entries = blob.get("entries")
+        if not isinstance(entries, list):
+            continue
+        out.append({
+            "registry": str(blob.get("registry") or p.stem),
+            "title": str(blob.get("title") or p.stem),
+            "description": str(blob.get("description") or ""),
+            "entries": [e for e in entries if isinstance(e, dict)],
+        })
+    _REFERENCE_CACHE.clear()      # one signature at a time; registries are small + rarely edited
+    _REFERENCE_CACHE[key] = out
+    return out
+
+
+def _reference_registries(home):
+    """The registry catalog — what Babs can look up without any search."""
+    return [{"registry": r["registry"], "title": r["title"],
+             "description": r["description"], "count": len(r["entries"])}
+            for r in _reference_load(home)]
+
+
+def _reference_entry_text(entry):
+    """All of an entry's values flattened to one lowercase haystack for substring matching."""
+    parts = []
+    for v in entry.values():
+        if isinstance(v, str):
+            parts.append(v)
+        elif isinstance(v, (list, tuple)):
+            parts.extend(str(x) for x in v)
+        elif v is not None:
+            parts.append(str(v))
+    return " ".join(parts).lower()
+
+
+def _reference_lookup(query, *, registry=None, max_hits=8, home=None):
+    """Look a term up across the curated registries.
+
+    Ranked so the obvious answer wins: an exact name/key match first, then a name that
+    CONTAINS the query, then a hit anywhere in the record. Returns whole entries (with their
+    registry's title + description for context), because a curated record is only useful
+    intact — half a Type IIS enzyme record is worse than none.
+
+    ``registry`` narrows to one registry; an empty ``query`` with a registry returns that
+    registry's full contents (the "show me every promoter you know" case)."""
+    if home is None:
+        home = _learn_resolve_babs_home()
+    if home is None:
+        return {"hits": [], "count": 0, "registries": [],
+                "error": "Babs reference data not found - clone "
+                         "github.com/ATinyGreenCell/babs to ~/babs or set $SPLICECRAFT_BABS_HOME"}
+    q = (query or "").strip().lower()
+    want = (registry or "").strip().lower()
+    max_hits = max(1, min(int(max_hits), _REFERENCE_MAX_HITS))
+    scored = []
+    searched = []
+    for reg in _reference_load(home):
+        if want and reg["registry"].lower() != want and reg["title"].lower() != want:
+            continue
+        searched.append(reg["registry"])
+        for entry in reg["entries"]:
+            names = entry.get("names")
+            names = [str(n).lower() for n in names] if isinstance(names, list) else []
+            key = str(entry.get("key") or "").lower()
+            if not q:
+                score = 1.0 if want else 0.0     # bare registry dump only when one is named
+            elif q == key or q in names:
+                score = 4.0
+            elif any(q in n for n in names) or q in key:
+                score = 3.0
+            elif any(n and n in q for n in names + [key]):
+                score = 2.0                       # the query CONTAINS the name ("BsaI overhang")
+            elif q in _reference_entry_text(entry):
+                score = 1.0
+            else:
+                score = 0.0
+            if score:
+                scored.append((score, {
+                    "registry": reg["registry"], "registry_title": reg["title"],
+                    "registry_description": reg["description"], "entry": entry}))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return {"hits": [h for _, h in scored[:max_hits]], "count": min(len(scored), max_hits),
+            "total_matches": len(scored), "registries": searched}
+
+
+def _recall_block(result, *, header="Retrieved from Babs' knowledge corpus"):
+    """Render recall passages as a prompt block. Each passage is fenced in <source> tags so the
+    model can tell quoted corpus text from instructions — a crawled chunk saying "ignore
+    previous instructions" is DATA here, not a directive (same containment rag_bot's
+    ``build_user`` uses). Returns '' when nothing was recalled."""
+    rows = (result or {}).get("passages") or []
+    if not rows:
+        return ""
+    out = [header + " (cite these as [n]):"]
+    for p in rows:
+        head = f"[{p.get('n')}] {p.get('title') or 'untitled'}"
+        sec = (p.get("section") or "").strip()
+        if sec:
+            head += f" — {sec}"
+        meta = [str(p.get("source") or "?")]
+        if p.get("pack") and p.get("pack") != "plant_tc":
+            meta.append(f"pack {p['pack']}")
+        if p.get("url"):
+            meta.append(str(p["url"]))
+        head += f" ({' · '.join(meta)})"
+        out.append(f"{head}\n<source>\n{p.get('text') or ''}\n</source>")
+    return "\n\n".join(out)
 
 
 def _learn_online_refusal():
@@ -92796,6 +94182,258 @@ def _h_learn_list(app, payload):
     if home is None:
         return ({"error": "Babs corpus repo not found"}, 400)
     return {"sessions": _learn_list_sessions(home)}
+
+
+@_agent_endpoint("index-library", write=True)
+def _h_index_library(app, payload):
+    """Index the user's OWN work - plasmids, primers, parts and lab-notebook entries - into a
+    PRIVATE Babs pack, so Babs can answer questions about their constructs from recall
+    ("which of my plasmids carries a KanR and a T7 promoter?") instead of walking endpoints one
+    at a time. Body: ``{}``. Rebuilds the pack from scratch each run, then re-embeds it.
+
+    PRIVATE / LOCAL ONLY. Nothing is sent anywhere: this reads local files and writes a local
+    index. Every record is flagged private, the pack directory carries a ``.no-egress`` marker,
+    the corpus-sync script excludes it, and recall never sends a web query derived from it.
+
+    write=True - it writes into the Babs repo (never the SpliceCraft data dir, which this only
+    ever READS)."""
+    home = _learn_resolve_babs_home()
+    if home is None:
+        return ({"error": "Babs repo not found - clone github.com/ATinyGreenCell/babs to "
+                 "~/babs or set $SPLICECRAFT_BABS_HOME"}, 400)
+    try:
+        stats = _write_library_pack(home)
+    except RuntimeError as exc:
+        return ({"error": str(exc)}, 400)
+    except Exception as exc:
+        _log.exception("index-library failed")
+        return ({"error": f"indexing failed: {_scrub_path(str(exc))}"}, 500)
+    pid = _index_library_pack(home)
+    return {"ok": True, "pack": _LIBRARY_PACK, "documents": stats["docs"],
+            "chunks": stats["chunks"], "index_pid": pid, "private": True,
+            "note": ("indexed - Babs can recall your own constructs once the background "
+                     "embed finishes. This pack never leaves the machine.")}
+
+
+@_agent_endpoint("ingest-url", write=True)
+def _h_ingest_url(app, payload):
+    """Persist ONE web page into Babs' knowledge corpus so she knows it in every future session.
+    Body: ``{url, title?}``.
+
+    This is the companion to ``read-url``: reading a page puts it in ONE turn's context and then
+    drops it; ingesting keeps it. Only OPENLY LICENSED HTML pages are persisted - a page with no
+    open licence is refused (you can still read it), which keeps the corpus redistributable.
+    Chains a background re-index so the new text is immediately recallable.
+
+    EGRESS: fetches the URL you name (SSRF-gated, redirects checked); refused 403 unless the user
+    armed Settings -> 'Allow Babs online database lookups'. write=True: it grows the corpus, so
+    in-app Babs asks first."""
+    refusal = _learn_online_refusal()
+    if refusal:
+        return refusal
+    url = payload.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return ({"error": "missing or non-string 'url'"}, 400)
+    title = payload.get("title")
+    if title is not None and not isinstance(title, str):
+        return ({"error": "'title' must be a string"}, 400)
+    res = _babs_ingest_url(url.strip(), (title or "").strip())
+    if not res.get("ok"):
+        reason = str(res.get("reason") or "ingest failed")
+        # A duplicate is not an error the caller should retry — report it as a benign no-op.
+        if res.get("duplicate"):
+            return {"ok": False, "duplicate": True, "doc_id": res.get("doc_id"),
+                    "note": "already in the corpus - nothing to do"}
+        status = 502 if res.get("transient") else 400
+        return ({"error": reason}, status)
+    return {"ok": True, "doc_id": res.get("doc_id"), "title": res.get("title"),
+            "url": res.get("url"), "license": res.get("license"),
+            "chunks": res.get("chunks"), "indexed": res.get("indexed"),
+            "note": "added to the corpus - recall can use it once the index finishes"}
+
+
+@_agent_endpoint("remember-fact", write=True)
+def _h_remember_fact(app, payload):
+    """Save a durable fact to Babs' persistent memory. Body: ``{fact, title?}``.
+
+    Memory is a small, human-readable store of things worth carrying between sessions - the
+    user's conventions, their chassis and strains, a decision they made and why. It is injected
+    into the chat system prompt every turn, so keep entries short and durable; transient chatter
+    does not belong here. write=True, so in-app Babs asks the user before saving one (and never
+    saves in read-only mode) - memory shapes every future answer, which is exactly why an
+    autonomous agent should not fill it silently.
+
+    LOCAL ONLY: writes a markdown file in the Babs repo; sends nothing anywhere."""
+    fact = payload.get("fact")
+    if not isinstance(fact, str) or not fact.strip():
+        return ({"error": "missing or non-string 'fact'"}, 400)
+    fact = fact.strip()
+    if len(fact) > 4000:
+        return ({"error": "'fact' too long (max 4000 chars) - memories should be short"}, 400)
+    title = payload.get("title")
+    if title is not None and not isinstance(title, str):
+        return ({"error": "'title' must be a string"}, 400)
+    if _learn_resolve_babs_home() is None:
+        return ({"error": "Babs repo not found - clone github.com/ATinyGreenCell/babs to "
+                 "~/babs or set $SPLICECRAFT_BABS_HOME"}, 400)
+    slug = _babs_remember(fact, (title or "").strip(), source="babs")
+    if not slug:
+        return ({"error": "the memory store refused the write - see the Babs repo logs"}, 500)
+    return {"ok": True, "slug": slug,
+            "note": "saved - this is now in Babs' memory for every future session"}
+
+
+@_agent_endpoint("memory-list")
+def _h_memory_list(app, payload):
+    """Everything in Babs' persistent memory: ``[{slug, title}]``. Use it to check what she
+    already knows before saving a duplicate, and to get the slug for memory-forget. Read-only."""
+    if _learn_resolve_babs_home() is None:
+        return ({"error": "Babs repo not found"}, 400)
+    mem = _babs_memory_list()
+    return {"memories": mem, "count": len(mem)}
+
+
+@_agent_endpoint("memory-forget", write=True)
+def _h_memory_forget(app, payload):
+    """Delete one memory by slug. Body: ``{slug}``. Get slugs from memory-list.
+
+    write=True - forgetting changes what Babs believes in every future session, so it goes
+    through the same approval as any other write."""
+    slug = payload.get("slug")
+    if not isinstance(slug, str) or not slug.strip():
+        return ({"error": "missing or non-string 'slug'"}, 400)
+    if _learn_resolve_babs_home() is None:
+        return ({"error": "Babs repo not found"}, 400)
+    if not _babs_memory_forget(slug):
+        return ({"error": f"no such memory {slug.strip()!r} (call memory-list for the slugs)"}, 404)
+    return {"ok": True, "slug": slug.strip(), "note": "forgotten"}
+
+
+@_agent_endpoint("reference-lookup")
+def _h_reference_lookup(app, payload):
+    """Look a term up in Babs' CURATED reference registries - antibiotics and selection agents,
+    promoters, terminators, UTRs/enhancers, plasmid origins, Type IIS enzymes, assembly
+    standards, markers/reporters, E. coli and Agrobacterium strains, binary + CRISPR vectors,
+    base/prime editors, gRNA promoters, localization signals, morphogenic genes, chassis, basal
+    media, plant growth regulators, bench recipes, validation methods and troubleshooting.
+
+    Body: ``{query, registry?, max_hits?}``, or ``{list_registries: true}`` for the catalog.
+    Returns WHOLE structured records (working concentrations, recognition/cut notation, host
+    ranges, genotypes, ...), not retrieved prose - deterministic and instant, with no embedding
+    step. Prefer this over corpus recall for a named reagent, enzyme, strain or part.
+
+    LOCAL ONLY: reads JSON files in the Babs repo; sends nothing anywhere. Read-only."""
+    home = _learn_resolve_babs_home()
+    if home is None:
+        return ({"error": "Babs reference data not found - clone "
+                 "github.com/ATinyGreenCell/babs to ~/babs or set $SPLICECRAFT_BABS_HOME"}, 400)
+    if payload.get("list_registries"):
+        regs = _reference_registries(home)
+        return {"registries": regs, "count": len(regs)}
+    query = payload.get("query")
+    registry = payload.get("registry")
+    if registry is not None and not isinstance(registry, str):
+        return ({"error": "'registry' must be a string"}, 400)
+    if not isinstance(query, str) or not query.strip():
+        # A bare registry name is a legitimate "show me everything you know about X" request.
+        if not (isinstance(registry, str) and registry.strip()):
+            return ({"error": "missing 'query' (or pass 'registry' to dump one registry, "
+                     "or 'list_registries': true for the catalog)"}, 400)
+        query = ""
+    else:
+        query = query.strip()
+    if len(query) > 200:
+        return ({"error": "'query' too long (max 200 chars)"}, 400)
+    max_hits = _coerce_int(payload.get("max_hits", 8), name="max_hits")
+    if isinstance(max_hits, str):
+        return ({"error": max_hits}, 400)
+    res = _reference_lookup(query, registry=registry, max_hits=max_hits, home=home)
+    if res.get("error"):
+        return ({"error": res["error"]}, 400)
+    if registry and not res["registries"]:
+        known = ", ".join(r["registry"] for r in _reference_registries(home))
+        return ({"error": f"unknown registry {registry!r}. Known: {known}"}, 400)
+    return {"query": query, "registry": registry or None, **res}
+
+
+@_agent_endpoint("learn-merge", write=True)
+def _h_learn_merge(app, payload):
+    """Fold a finished Background Learning session's corpus into Babs' MAIN corpus, making what
+    it learned permanent. Body: ``{slug}``.
+
+    Recall already reaches into learning packs, but only the most recent few - merging retires a
+    pack into the corpus proper so it is consulted forever. Deduped by chunk id (re-merging is a
+    no-op), snapshots the corpus to ``.premerge-bak`` first, and kicks off a background re-index
+    so the new text becomes semantically searchable. Refuses while the session is still running.
+
+    LOCAL ONLY: reads and writes files under the Babs repo; sends nothing anywhere."""
+    slug = payload.get("slug")
+    if not isinstance(slug, str) or not _LEARN_SLUG_RE.match(slug):
+        return ({"error": "missing or invalid 'slug' (expected 'learn_...')"}, 400)
+    home = _learn_resolve_babs_home()
+    if home is None:
+        return ({"error": "Babs corpus repo not found"}, 400)
+    if _learn_session_running(home, slug):
+        return ({"error": f"session {slug} is still running - stop it or wait for it to "
+                 "finish, then merge"}, 409)
+    try:
+        stats = _learn_merge_pack_into_main(home, slug)
+    except RuntimeError as exc:
+        return ({"error": str(exc)}, 400)
+    except Exception as exc:
+        _log.exception("learn-merge failed")
+        return ({"error": f"merge failed: {_scrub_path(str(exc))}"}, 500)
+    pid = _learn_reindex_main(home) if stats["added"] else None
+    return {"ok": True, "slug": slug, **stats, "reindex_pid": pid,
+            "note": ("merged - a background re-index is embedding the new text"
+                     if pid else "nothing new to merge")}
+
+
+@_agent_endpoint("recall-knowledge")
+def _h_recall_knowledge(app, payload):
+    """Recall passages from Babs' knowledge corpus (papers, protocols and curated reference
+    data) for a question. Body: ``{query, max_passages?, packs?, web?}``.
+
+    Returns ranked, CITED passages - not a generated answer - so the caller keeps its own
+    conversation, tools and context. Searches the default corpus AND every Background Learning
+    pack, so anything a learning session taught Babs is recallable here.
+
+    EGRESS: corpus-only by default and entirely LOCAL. ``web:true`` additionally consults the
+    live web and is refused 403 unless the user armed Settings -> 'Allow Babs online database
+    lookups'; only the query string is ever sent. Read-only."""
+    query = payload.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return ({"error": "missing or non-string 'query'"}, 400)
+    query = query.strip()
+    if len(query) > 400:
+        return ({"error": "'query' too long (max 400 chars)"}, 400)
+    k = _coerce_int(payload.get("max_passages", 6), name="max_passages")
+    if isinstance(k, str):
+        return ({"error": k}, 400)
+    k = max(1, min(k, _RECALL_MAX_PASSAGES))
+    web = bool(payload.get("web", False))
+    if web:
+        refusal = _learn_online_refusal()
+        if refusal:
+            return refusal
+    packs = payload.get("packs")
+    if packs is not None:
+        if not isinstance(packs, list) or not all(isinstance(p, str) for p in packs):
+            return ({"error": "'packs' must be a list of pack-name strings"}, 400)
+        # Only a real learn pack or the default may be named — a pack name reaches
+        # bb_config via $BABS_PACK, so never let an arbitrary string through.
+        home = _learn_resolve_babs_home()
+        allowed = set(_recall_searchable_packs(home)) if home is not None else {""}
+        bad = [p for p in packs if p not in allowed]
+        if bad:
+            return ({"error": f"unknown pack(s): {', '.join(bad[:5])}. "
+                     f"Call learn-list for the sessions on this machine."}, 400)
+    if _learn_resolve_babs_home() is None:
+        return ({"error": "Babs corpus repo not found - clone github.com/ATinyGreenCell/babs "
+                 "to ~/babs or set $SPLICECRAFT_BABS_HOME"}, 400)
+    res = _babs_recall(query, k=k, web=web, packs=packs)
+    return {"query": query, "count": res["count"], "passages": res["passages"],
+            "packs_searched": res["packs_searched"], "errors": res["errors"]}
 
 
 @_agent_endpoint("status")
@@ -98115,7 +99753,7 @@ _BUTTON_TOOLTIPS: "dict[str, str]" = {
     # ── BABS chat ──
     "babs-send": "Send your message to Babs",
     "babs-stop": "Stop the answer that's generating",
-    "babs-ground": "Toggle grounding answers in your Babs corpus (with cited sources) vs. plain chat",
+    "babs-ground": "Toggle corpus recall — look in your papers, protocols and reference data before answering, and cite what was used",
     "babs-agent": "Toggle Agent mode — let Babs drive SpliceCraft by calling its endpoints",
     "babs-refresh": "Reload installed models + status from Ollama",
     "babs-hfsearch": "Search HuggingFace for GGUF models",
@@ -98144,6 +99782,10 @@ _BUTTON_TOOLTIPS: "dict[str, str]" = {
     "babs-learn-refresh": "Refresh the live learning-session status",
     "babs-learn-stop": "Stop the running Background-Learning crawl",
     "babs-learn-results-btn": "Show the papers this learning session has kept so far",
+    "babs-learn-merge": "Fold this session's papers into Babs' main corpus so she consults them forever",
+    "babs-index-library": "Make your own plasmids, primers, parts and notebook recallable in chat (stays on this machine)",
+    "blm-go": "Append this session's papers to the main corpus and re-index",
+    "blm-cancel": "Leave the main corpus untouched",
     "babs-reembed-no": "Keep the existing corpus — don't re-embed",
     "babs-reembed-yes": "Re-ingest (re-embed) the whole corpus now",
     # ── Custom enzymes + enzyme collections ──
@@ -109994,10 +111636,11 @@ NcbiTaxonPickerModal { align: center middle; }
           * `_cache_lock` covers the load+mutate+save RMW so a
             concurrent worker can't interleave (matches [INV-50] /
             [INV-66] convention).
-          * Name collisions in target → silent rename to "name COPY",
-            "name COPY 2", … (mirrors `_ensure_unique_copy_name`
-            from [INV-49]). For move, the OLD entry retains its
-            name; only the NEW landing position is renamed if needed.
+          * Name collisions in target → silent rename. The suffix is
+            content-aware ([INV-167]): " COPY" only when the colliding
+            target entry holds the SAME sequence, " ALT" when the name
+            matches but the sequence differs. For move, the OLD entry
+            retains its name; only the NEW landing is renamed.
           * Source = target → refused with a clear notify.
           * Source disappears mid-commit (rare race) → refuse cleanly.
           * Target disappears mid-commit → refuse cleanly.
@@ -110031,6 +111674,11 @@ NcbiTaxonPickerModal { align: center middle; }
             return
         landed_names: list[str] = []
         renamed_count = 0
+        # Of the renames, how many were " ALT" — same name, provably
+        # DIFFERENT sequence. Surfaced in the notify because "renamed for
+        # name collision" alone is what the user saw on 2026-07-25 before
+        # deleting the renamed entries as presumed duplicates ([INV-167]).
+        alt_count = 0
         try:
             with _cache_lock:
                 colls = _load_collections()
@@ -110067,11 +111715,49 @@ NcbiTaxonPickerModal { align: center middle; }
                     (e.get("id") or "")
                     for e in tgt_plasmids if isinstance(e, dict)
                 }
+                # name → the gb_refs already living under that name in
+                # the target. Lets the collision rename tell a genuine
+                # duplicate (same sequence) from a bare name clash
+                # (different sequence) — see the COPY/ALT split below.
+                tgt_refs_by_name: "dict[str, set[str]]" = {}
+                for e in tgt_plasmids:
+                    if isinstance(e, dict):
+                        tgt_refs_by_name.setdefault(
+                            (e.get("name") or ""), set()
+                        ).add(_entry_content_key(e))
 
-                def _unique_name_for_target(base: str) -> str:
+                def _unique_name_for_target(base: str, ref: str = "") -> str:
+                    """Disambiguate `base` against the target's names.
+
+                    The suffix is a CLAIM about the entry, so it has to
+                    be TRUE ([INV-167] — see the 2026-07-25 incident):
+
+                      * " ALT"  — same name, PROVABLY different sequence.
+                        Labelling that "COPY" tells the user it's
+                        redundant and invites them to delete a distinct
+                        construct.
+                      * " COPY" — otherwise (the legacy label).
+
+                    " ALT" requires PROOF: this entry's `gb_ref` is known,
+                    every colliding entry's `gb_ref` is known, and ours
+                    matches none of them. Anything less falls back to
+                    " COPY", because the alternative — calling a genuine
+                    duplicate "ALT" merely because a ref was missing — is
+                    its own lie, and the duplicate-in-place flow (which
+                    copies an entry onto itself) is exactly that case.
+                    Real entries always carry a `gb_ref` once dehydrated,
+                    so the proof is available where it matters.
+                    """
                     if base not in tgt_names:
                         return base
-                    suffix = " COPY"
+                    nonlocal alt_count
+                    others = tgt_refs_by_name.get(base, set())
+                    provable = _content_keys_comparable(ref, others)
+                    if provable and ref not in others:
+                        suffix = " ALT"
+                        alt_count += 1
+                    else:
+                        suffix = " COPY"
                     candidate = f"{base}{suffix}"
                     n = 2
                     while candidate in tgt_names:
@@ -110125,7 +111811,9 @@ NcbiTaxonPickerModal { align: center middle; }
                     landing = deepcopy(src_entry)
                     orig_name = (landing.get("name") or "").strip()
                     orig_id = (landing.get("id") or "").strip()
-                    new_name = _unique_name_for_target(orig_name)
+                    new_name = _unique_name_for_target(
+                        orig_name, _entry_content_key(landing),
+                    )
                     if new_name != orig_name:
                         renamed_count += 1
                         landing["name"] = new_name
@@ -110135,6 +111823,11 @@ NcbiTaxonPickerModal { align: center middle; }
                     new_tgt_plasmids.append(landing)
                     tgt_names.add(landing["name"])
                     tgt_ids.add(landing["id"])
+                    # Keep the ref index in step so a second landing under
+                    # the same name still resolves COPY-vs-ALT correctly.
+                    tgt_refs_by_name.setdefault(
+                        landing["name"], set()
+                    ).add(_entry_content_key(landing))
                     landed_names.append(landing["name"])
 
                 if mode == "move":
@@ -110214,7 +111907,17 @@ NcbiTaxonPickerModal { align: center middle; }
             if renamed_count:
                 msg += (f" ({renamed_count} renamed for name "
                         f"collision)")
-        self.notify(msg, severity="information")
+        # An ALT rename means the target already held that NAME with a
+        # DIFFERENT sequence. Say so loudly: the bare "renamed for name
+        # collision" reads as "these are duplicates", which is precisely
+        # how the 2026-07-25 deletions happened ([INV-167]).
+        if alt_count:
+            _dup = "a duplicate" if alt_count == 1 else "duplicates"
+            msg += (f" — {alt_count} marked ALT: same name, DIFFERENT "
+                    f"sequence, NOT {_dup}")
+            self.notify(msg, severity="warning", timeout=12)
+        else:
+            self.notify(msg, severity="information")
         _log_event(
             "library.move_copy.ok",
             mode=mode, source=source, target=target,

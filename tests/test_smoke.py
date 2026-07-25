@@ -15003,18 +15003,33 @@ class TestRobustnessHardening:
     def test_snapshot_skips_oversized_file(self, tmp_path, monkeypatch):
         # Create a fake "library file" larger than the cap and verify
         # `_snapshot_data_files` skips it.
+        #
+        # The cap is monkeypatched small rather than used at its real
+        # value: sparse-truncating to the production cap made a 250 MB
+        # file on every run for no extra coverage.
+        import splicecraft_backup as scb
+        monkeypatch.setattr(scb, "_SNAPSHOT_FILE_SIZE_CAP", 4096)
         big = tmp_path / "huge.json"
         # Write a sparse file — actual disk content size > cap.
         # `_snapshot_data_files` reads st_size, not contents, so a
         # truncate to cap+1 is enough.
         with open(big, "wb") as f:
-            f.truncate(sc._SNAPSHOT_FILE_SIZE_CAP + 1)
+            f.truncate(4096 + 1)
         small = tmp_path / "small.json"
         small.write_bytes(b'{"_schema_version": 1, "entries": []}')
         written = sc._snapshot_data_files(tmp_path, paths=[big, small])
         # Oversized file was skipped; small one was snapshotted.
         snap_dir = tmp_path / sc._state._SNAPSHOT_DIR_NAME
-        assert not (snap_dir / "huge-*.json").is_file()
+        # NB: this was `(snap_dir / "huge-*.json").is_file()` — a LITERAL
+        # path containing `*`, which can never exist, so the assertion
+        # was vacuous and passed even while the file was being
+        # snapshotted. Glob properly, and cover the `.gz` form too.
+        assert not list(snap_dir.glob("huge-*")), (
+            "oversized file must not be snapshotted in any form"
+        )
+        assert big not in written and not any(
+            p.name.startswith("huge-") for p in written
+        )
         assert any(p.name.startswith("small-") for p in written)
 
 

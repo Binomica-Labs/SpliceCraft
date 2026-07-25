@@ -14,6 +14,86 @@
 
 ---
 
+## [1.2.37] — 2026-07-25
+
+Babs learns to *keep* what she reads — a permanent corpus, your own library
+indexed into it, and a curated offline reference registry. Plus data-loss
+protection prompted by a real incident: plasmids were deleted because the app
+labelled them "COPY" when they were not copies.
+
+### New features
+
+- **Babs remembers what she reads.** Pages she opened during a turn used to
+  vanish with it, so the same lookup was paid for forever. **`/ingest <url>`**
+  now keeps a page in her corpus permanently — open-licence pages only, so the
+  corpus stays redistributable — and it is searchable from the next turn on.
+- **Answers are grounded automatically.** With **Corpus** on, relevant passages
+  are folded into the turn inside a token budget scaled to your model's real
+  context window, so grounding never crowds out the persona on a small model.
+  **`/recall`** toggles it and **`/recall <query>`** searches the corpus directly
+  and shows you the passages with their sources.
+- **Index your own library into Babs.** Your plasmids, primers, parts and
+  lab-notebook entries can be indexed into her corpus, so "which of my plasmids
+  carries a KanR and a T7 promoter?" is answered from recall instead of walking
+  the library one entry at a time. The pack is rebuilt from scratch each run, so
+  a renamed or deleted plasmid never lingers as a ghost. **It is private by
+  construction** — every record flagged private, a `.no-egress` marker in the
+  directory, excluded from the corpus-sync script, and never used to derive a web
+  query. Nothing leaves the machine.
+- **A curated reference registry, offline.** Babs now checks real data for named
+  reagents instead of recalling prose about them: antibiotics and selection
+  agents, promoters, terminators, UTRs, origins, Type IIS enzymes, assembly
+  standards, markers, *E. coli* and *Agrobacterium* strains, binary and CRISPR
+  vectors, base/prime editors, gRNA promoters, localization signals, chassis,
+  media, plant growth regulators, bench recipes and troubleshooting. Whole
+  structured records — working concentrations, cut notation, host ranges,
+  genotypes — instantly, with no embedding step and no network.
+- **Start a topic crawl from the chat**, with **`/learn <topic>`**, and watch it
+  in the Learn tab. When a session finishes you can **fold it into the main
+  corpus** (behind a confirm) so what she learned becomes knowledge she always
+  consults rather than a separate pack you have to remember to query.
+- **`/forget <slug>`** removes a single persistent memory (`/memory` lists the
+  slugs) — previously memory could only grow.
+- **New agent endpoints** for all of it: `recall-knowledge`, `reference-lookup`,
+  `memory-list` (read-only) and `index-library`, `ingest-url`, `remember-fact`,
+  `memory-forget`, `learn-merge` (writes, so in-app Babs asks first). Only
+  `ingest-url` reaches the network, and only with Settings → "Allow Babs online
+  database lookups" armed.
+
+### Bug fixes
+
+- **Moved plasmids are no longer mislabelled "COPY" when they aren't copies.**
+  Moving or copying plasmids into a collection that already used those names
+  renamed the incoming ones to `<name> COPY` based on the **name alone** — even
+  when the sequences were completely different. Three fragments moved this way
+  were labelled COPY, read as redundant duplicates, and deleted; they were
+  distinct constructs. The suffix is now decided by the actual sequence: `ALT`
+  when the name collides but the content genuinely differs, `COPY` otherwise.
+  Moving or copying plasmids that land as `ALT` also raises a warning saying
+  so in as many words — "same name, DIFFERENT sequence, NOT duplicates" —
+  instead of the old silent "renamed for name collision" note.
+
+### New features
+
+- **The delete confirmation now tells you whether you're about to lose a
+  sequence.** Removing a plasmid shows either "An identical sequence is kept by
+  N other entries" (in green — nothing is lost) or a red "This is the ONLY
+  entry holding this sequence". The check compares actual sequence content
+  across every collection, not names, so a plasmid that merely shares a name
+  with another is never presented as a safe duplicate.
+
+### Hardening
+
+- **Very large libraries now get a daily snapshot too.** The automatic daily
+  snapshot silently skipped any file over 50 MB, which meant the biggest and
+  most valuable library was the one with no daily safety copy. Oversized files
+  are now compressed into the snapshot instead of skipped, and the snapshot
+  folder's overall size limit still applies. A related bug that would have
+  deleted those compressed snapshots first — before much older ones — was fixed
+  at the same time.
+
+---
+
 ## [1.2.36] — 2026-07-24
 
 A full from-scratch review of the codebase — biology re-checked against
