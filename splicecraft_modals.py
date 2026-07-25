@@ -4414,8 +4414,9 @@ class LibraryDeleteConfirmModal(ModalScreen):
                 f"  Remove [bold]{_esc(str(self.entry_name))}[/bold]"
                 f"{size_str} from the library?\n\n"
                 f"{dup_line}"
-                f"  [dim]This cannot be undone from within the app.\n"
-                f"  A backup (.bak) of the library file is kept.[/dim]",
+                f"  [dim]Undo with Ctrl+Z (or u) while the library is\n"
+                f"  focused. A backup (.bak) of the library file is kept,\n"
+                f"  and today's snapshot survives a restart.[/dim]",
                 id="libdel-msg",
                 markup=True,
             )

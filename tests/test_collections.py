@@ -1653,7 +1653,7 @@ class TestDeleteConfirmLastCopyWarning:
         msg = await self._render(None)
         assert "ONLY entry" not in msg
         assert "identical sequence" not in msg
-        assert "cannot be undone" in msg
+        assert "Undo with Ctrl+Z" in msg
 
 
 class TestDeleteConfirmCountsAcrossCollections:
@@ -1722,3 +1722,276 @@ class TestDeleteConfirmCountsAcrossCollections:
             ]},
         ], "twin")
         assert n == 0, "same name must never count as the same sequence"
+
+
+# ── Library-delete undo ([INV-168]) ───────────────────────────────────────────
+
+class TestLibraryDeleteUndo:
+    """[INV-168] Deleting a library plasmid used to be unrecoverable in-app:
+    the undo stack holds `(seq, cursor, record)` snapshots of the LOADED
+    plasmid, a different domain entirely. On 2026-07-25 a user deleted four
+    plasmids, pressed Ctrl+Z three times, got "Nothing to undo", and the data
+    only came back off that morning's launch snapshot.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_seed(self, monkeypatch):
+        monkeypatch.setattr(sc.PlasmidApp, "_seed_default_library",
+                            lambda self: None)
+
+    @staticmethod
+    def _entry(eid, name=None, ref=None):
+        return {"id": eid, "name": name or eid, "size": 10, "n_feats": 0,
+                "gb_ref": ref or f"ref-{eid}", "gb_text": f"LOCUS {eid} 10 bp\n"}
+
+    async def _app_with(self, entries, coll="C"):
+        sc._save_collections([{"name": coll, "plasmids": entries}])
+        sc._set_active_collection_name(coll)
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
+        return sc.PlasmidApp()
+
+    async def _delete_row(self, pilot, app, entry_id):
+        lib = app.query_one("#library", sc.LibraryPanel)
+        t = lib.query_one("#lib-table")
+        t.move_cursor(row=[str(r.value) for r in t.rows].index(entry_id))
+        lib._request_plasmid_delete()
+        await pilot.pause(0.2)
+        app.screen.query_one("#btn-libdel-yes").action_press()
+        await pilot.pause(0.3)
+        return lib
+
+    async def test_deleted_plasmid_comes_back(self):
+        app = await self._app_with(
+            [self._entry("a"), self._entry("b"), self._entry("c")])
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(); await pilot.pause(0.2)
+            lib = await self._delete_row(pilot, app, "b")
+            assert [e["id"] for e in sc._load_library()] == ["a", "c"]
+            lib.action_undo_delete()
+            await pilot.pause(0.3)
+            ids = [e["id"] for e in sc._load_library()]
+            app.exit()
+        # Back, and back in its ORIGINAL SLOT — not appended at the end.
+        assert ids == ["a", "b", "c"], ids
+
+    async def test_restores_in_reverse_order(self):
+        app = await self._app_with(
+            [self._entry("a"), self._entry("b"), self._entry("c")])
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(); await pilot.pause(0.2)
+            await self._delete_row(pilot, app, "a")
+            lib = await self._delete_row(pilot, app, "c")
+            assert [e["id"] for e in sc._load_library()] == ["b"]
+            lib.action_undo_delete()
+            await pilot.pause(0.3)
+            after_one = [e["id"] for e in sc._load_library()]
+            lib.action_undo_delete()
+            await pilot.pause(0.3)
+            after_two = [e["id"] for e in sc._load_library()]
+            app.exit()
+        assert after_one == ["b", "c"], after_one
+        assert after_two == ["a", "b", "c"], after_two
+
+    async def test_the_2026_07_25_incident_is_now_recoverable(self):
+        # Four deletes in quick succession, then undo them all — the exact
+        # shape of the incident that motivated this.
+        app = await self._app_with([self._entry(f"p{i}") for i in range(6)])
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(); await pilot.pause(0.2)
+            for eid in ("p1", "p2", "p3", "p4"):
+                lib = await self._delete_row(pilot, app, eid)
+            assert [e["id"] for e in sc._load_library()] == ["p0", "p5"]
+            for _ in range(4):
+                lib.action_undo_delete()
+                await pilot.pause(0.25)
+            ids = [e["id"] for e in sc._load_library()]
+            app.exit()
+        assert ids == ["p0", "p1", "p2", "p3", "p4", "p5"], ids
+
+    async def test_undo_with_empty_stack_is_a_gentle_noop(self):
+        app = await self._app_with([self._entry("a")])
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(); await pilot.pause(0.2)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib.action_undo_delete()          # must not raise
+            await pilot.pause(0.1)
+            ids = [e["id"] for e in sc._load_library()]
+            app.exit()
+        assert ids == ["a"]
+
+    async def test_restoring_twice_does_not_duplicate(self):
+        app = await self._app_with([self._entry("a"), self._entry("b")])
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(); await pilot.pause(0.2)
+            lib = await self._delete_row(pilot, app, "b")
+            lib.action_undo_delete()
+            await pilot.pause(0.3)
+            lib.action_undo_delete()          # stack now empty
+            await pilot.pause(0.2)
+            ids = [e["id"] for e in sc._load_library()]
+            app.exit()
+        assert ids == ["a", "b"], ids
+
+    async def test_refuses_when_the_collection_was_switched(self):
+        sc._save_collections([
+            {"name": "C", "plasmids": [self._entry("a"), self._entry("b")]},
+            {"name": "Other", "plasmids": [self._entry("z")]},
+        ])
+        sc._set_active_collection_name("C")
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(); await pilot.pause(0.2)
+            lib = await self._delete_row(pilot, app, "b")
+            sc._set_active_collection_name("Other")
+            sc._state._library_cache = None
+            lib.action_undo_delete()
+            await pilot.pause(0.2)
+            other = [e["id"] for e in sc._load_library()]
+            # The record survives so it can still be used after switching back.
+            depth = len(app._library_undo_stack())
+            app.exit()
+        assert "b" not in other, "restored into the WRONG collection"
+        assert depth == 1
+
+    async def test_stack_is_per_instance_not_shared(self):
+        # `_library_undo` is declared on the class; a shared mutable list
+        # would leak one app's deletions into the next.
+        a, b = sc.PlasmidApp(), sc.PlasmidApp()
+        a._push_library_undo({"name": "x", "entry": {}, "index": 0,
+                              "collection": "C", "bin_before": None})
+        assert len(a._library_undo_stack()) == 1
+        assert b._library_undo_stack() == []
+
+    async def test_stack_is_bounded(self):
+        app = sc.PlasmidApp()
+        for i in range(sc._LIBRARY_UNDO_MAX + 12):
+            app._push_library_undo({"name": f"n{i}", "entry": {}, "index": 0,
+                                    "collection": "C", "bin_before": None})
+        stack = app._library_undo_stack()
+        assert len(stack) == sc._LIBRARY_UNDO_MAX
+        # Oldest dropped, newest kept.
+        assert stack[-1]["name"] == f"n{sc._LIBRARY_UNDO_MAX + 11}"
+
+
+class TestLibraryUndoKeyRouting:
+    """[INV-168] Ctrl+Z is the keystroke the user actually reached for. With
+    the library focused it must restore the last deleted plasmid; anywhere
+    else it must still mean record-undo."""
+
+    @pytest.fixture(autouse=True)
+    def _no_seed(self, monkeypatch):
+        monkeypatch.setattr(sc.PlasmidApp, "_seed_default_library",
+                            lambda self: None)
+
+    @staticmethod
+    def _entry(eid):
+        return {"id": eid, "name": eid, "size": 10, "n_feats": 0,
+                "gb_ref": f"ref-{eid}", "gb_text": f"LOCUS {eid} 10 bp\n"}
+
+    async def test_ctrl_z_in_library_restores_the_delete(self):
+        sc._save_collections([{"name": "C", "plasmids": [
+            self._entry("a"), self._entry("b")]}])
+        sc._set_active_collection_name("C")
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(); await pilot.pause(0.2)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            t = lib.query_one("#lib-table")
+            t.focus()
+            await pilot.pause(0.1)
+            t.move_cursor(row=[str(r.value) for r in t.rows].index("b"))
+            lib._request_plasmid_delete()
+            await pilot.pause(0.2)
+            app.screen.query_one("#btn-libdel-yes").action_press()
+            await pilot.pause(0.3)
+            assert [e["id"] for e in sc._load_library()] == ["a"]
+            # The keystroke that failed the user on 2026-07-25.
+            t.focus()
+            await pilot.pause(0.1)
+            await pilot.press("ctrl+z")
+            await pilot.pause(0.4)
+            ids = [e["id"] for e in sc._load_library()]
+            app.exit()
+        assert ids == ["a", "b"], ids
+
+    async def test_record_undo_takes_precedence_over_the_library(self):
+        """The sequence panel is not focusable, so the library table holds
+        focus almost always on this screen. Routing Ctrl+Z on focus alone
+        would hijack it after a sequence edit and hand back a plasmid instead
+        of undoing the edit. The record stack wins whenever it has content;
+        `u` restores regardless."""
+        sc._save_collections([{"name": "C", "plasmids": [self._entry("a")]}])
+        sc._set_active_collection_name("C")
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(); await pilot.pause(0.2)
+            app._push_library_undo(
+                {"name": "ghost", "index": 0, "collection": "C",
+                 "bin_before": None,
+                 "entry": {"id": "ghost", "name": "ghost", "size": 10,
+                           "n_feats": 0, "gb_ref": "ref-ghost",
+                           "gb_text": "LOCUS ghost 10 bp\n"}})
+            # Pretend the record editor has undo history.
+            app._undo_stack = [("ACGT", 0, None)]
+            await pilot.press("ctrl+z")
+            await pilot.pause(0.3)
+            depth = len(app._library_undo_stack())
+            ids = [e["id"] for e in sc._load_library()]
+            app.exit()
+        assert depth == 1, "record history must win — library stack untouched"
+        assert "ghost" not in ids, "Ctrl+Z resurrected a plasmid mid-edit"
+
+    async def test_u_restores_even_with_record_history(self):
+        sc._save_collections([{"name": "C", "plasmids": [
+            self._entry("a"), self._entry("b")]}])
+        sc._set_active_collection_name("C")
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(); await pilot.pause(0.2)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            t = lib.query_one("#lib-table")
+            t.move_cursor(row=[str(r.value) for r in t.rows].index("b"))
+            lib._request_plasmid_delete()
+            await pilot.pause(0.2)
+            app.screen.query_one("#btn-libdel-yes").action_press()
+            await pilot.pause(0.3)
+            app._undo_stack = [("ACGT", 0, None)]   # record history present
+            lib.action_undo_delete()
+            await pilot.pause(0.3)
+            ids = [e["id"] for e in sc._load_library()]
+            app.exit()
+        assert ids == ["a", "b"], ids
+
+    async def test_dead_end_undo_points_at_the_restore(self, monkeypatch):
+        # "Nothing to undo" three times is where the incident's user gave up.
+        sc._save_collections([{"name": "C", "plasmids": [self._entry("a")]}])
+        sc._set_active_collection_name("C")
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
+        app = sc.PlasmidApp()
+        seen: "list[str]" = []
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(); await pilot.pause(0.2)
+            app._push_library_undo(
+                {"name": "gone", "index": 0, "collection": "C",
+                 "bin_before": None,
+                 "entry": {"id": "gone", "name": "gone", "size": 10,
+                           "n_feats": 0, "gb_ref": "ref-gone",
+                           "gb_text": "LOCUS gone 10 bp\n"}})
+            monkeypatch.setattr(
+                sc.PlasmidApp, "notify",
+                lambda self, msg, **k: seen.append(str(msg)))
+            app.undo.undo()
+            await pilot.pause(0.1)
+            app.exit()
+        assert seen, "undo produced no message"
+        assert "can still be restored" in seen[-1], seen

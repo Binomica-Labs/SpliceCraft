@@ -14,6 +14,27 @@
 
 ---
 
+## [1.2.38] — 2026-07-25
+
+### New features
+
+- **Deleting a plasmid can now be undone.** Removing a library entry was
+  permanent as far as the app was concerned — Ctrl+Z only ever applied to the
+  sequence editor, so a mistaken delete meant digging a backup out by hand.
+  Press **`u`** (or **Ctrl+Z**) with the library focused and the last plasmid
+  you deleted comes back, in the position it came from, along with any parts-bin
+  rows the delete removed. Up to 25 deletions are held for the session, restored
+  newest-first, and the delete confirmation now tells you the shortcut. If you
+  press Ctrl+Z with nothing left to undo in the editor, it now points at the
+  restore instead of just saying "Nothing to undo".
+
+  Ctrl+Z still belongs to the sequence editor whenever it has anything to undo,
+  so this never steals an edit-undo out from under you — `u` restores
+  regardless. Undo lasts for the session; after a restart, use the daily
+  snapshot or a `.bak` file as before.
+
+---
+
 ## [1.2.37] — 2026-07-25
 
 Babs learns to *keep* what she reads — a permanent corpus, your own library

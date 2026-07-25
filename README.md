@@ -209,7 +209,7 @@ The assembly bench: Traditional cloning, Gibson, Golden Braid, MoClo, or your
 own grammar, driven by a 4-source part picker. Every assembly, at every level,
 lands as one library entry (payload + overhangs + backbone) that carries every
 parent feature forward — so you can trace a finished L3 construct back to its L0
-parts from the Library panel.
+parts from the Library panel. Deleted a plasmid by mistake? Press **`u`** (or **Ctrl+Z**) with the library focused and it comes back where it was — the last 25 deletions of the session are undoable.
 
 ### Simulator
 

@@ -30,7 +30,7 @@ can drag-select a combo to copy).
 | `Ctrl+P`       | Primer Design workbench                      |
 | `Enter`        | Highlight the feature enclosing the seq cursor |
 | `Delete`       | Context-aware delete (feature or library entry) |
-| `Ctrl+Z`       | Undo                                         |
+| `Ctrl+Z`       | Undo — the sequence editor, or (when it has nothing left and the library has focus) the last plasmid delete |
 | `Ctrl+Y`       | Redo (`Ctrl+Shift+Z` also works on terminals that report it) |
 | `Ctrl+C`       | Copy selection (top strand 5'→3', or AA when CDS highlighted) |
 | `Alt+C`        | Copy selection (bottom strand, reverse-complement) |
@@ -51,6 +51,7 @@ can drag-select a combo to copy).
 | `m` / `y` | Move / copy the marked plasmids to another collection |
 | `p`       | Export the marked plasmids as circular-map images (PNG / SVG) |
 | `s` / `h` | Set status / view history for the highlighted plasmid |
+| `u`       | Undo the last plasmid delete of this session (restores it to its original slot) |
 
 ## Mouse
 

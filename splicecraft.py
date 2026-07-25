@@ -41,7 +41,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.37"
+__version__ = "1.2.38"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -4362,6 +4362,13 @@ _DEFAULT_COLLECTION_NAME = "Main Collection"
 # existed, so the column reads correctly WITHOUT rewriting the user's
 # (large) library / collections files. Re-saving a legacy entry stamps
 # it going forward.
+# How many library deletions stay undoable in one session ([INV-168]).
+# Bounded because each record holds a deep copy of the deleted entry (and, when
+# a delete cascaded into the parts bin, a copy of that list too). Deep enough to
+# cover a burst of "clearing out duplicates" — the exact shape of the
+# 2026-07-25 incident, which was four deletes in ninety seconds.
+_LIBRARY_UNDO_MAX = 25
+
 _LIBRARY_KINDS: "frozenset[str]" = frozenset(
     {"plasmid", "fragment", "amplicon", "protein"})
 _LIBRARY_KIND_BADGE: "dict[str, str]" = {
@@ -17019,7 +17026,99 @@ class LibraryPanel(Widget):
         # kitty-protocol terminals. `c` clears marks everywhere.
         Binding("c", "clear_marks", "Clear marks",
                 show=False, priority=False),
+        # [INV-168] Bring back the last plasmid deleted this session.
+        # Ctrl+Z reaches the same action when the library has focus (see
+        # the App's `on_key`); `u` is the always-available spelling, and
+        # the delete confirmation names it.
+        Binding("u", "undo_delete", "Undo delete",
+                show=False, priority=False),
     ]
+
+    def action_undo_delete(self) -> None:
+        """Restore the most recently deleted library plasmid ([INV-168]).
+
+        Puts the entry back in the SLOT it came from (not appended at the
+        end) and reverses the parts-bin cascade the delete performed.
+        Persists through the same worker + `_cache_lock` discipline as the
+        delete itself, so the authoritative-cache race the delete path
+        guards against ([INV-50] / sweep #30) is handled identically.
+        """
+        app = self.app
+        # `self.app` is typed as the base `App`, so app-specific members are
+        # reached via getattr — the same convention `_on_confirm` uses for
+        # `_clear_canvas` / `_current_record`.
+        _stack_of = getattr(app, "_library_undo_stack", None)
+        _raw = _stack_of() if callable(_stack_of) else None
+        # Keep the LIVE list (so `pop()` below really consumes the record);
+        # the isinstance check both narrows for the type checker and guards
+        # against a stubbed app in a bare unit test.
+        stack: "list[dict]" = _raw if isinstance(_raw, list) else []
+        if not stack:
+            app.notify("Nothing to restore — no plasmid deleted this session.",
+                       severity="information", timeout=4)
+            _log_event("library.undo.empty")
+            return
+        rec = stack[-1]
+        name = str(rec.get("name") or "?")
+        # The library file IS the active collection's contents, so an entry
+        # can only go back while the collection it left is still active —
+        # otherwise the restore would silently land it somewhere else.
+        want = str(rec.get("collection") or "")
+        active = _get_active_collection_name()
+        if want and want != active:
+            app.notify(
+                f"{name} was deleted from collection {want!r}. Switch to "
+                f"that collection to restore it.",
+                severity="warning", timeout=8,
+            )
+            _log_event("library.undo.refused", reason="collection_switched",
+                       name=name, wanted=want, active=str(active or ""))
+            return
+        entry = rec.get("entry") or {}
+        entry_id = str(entry.get("id") or "")
+        lib = _load_library()
+        if any(str(e.get("id") or "") == entry_id for e in lib):
+            # Already back (re-imported, or restored by another route).
+            # Drop the record rather than creating a duplicate.
+            stack.pop()
+            app.notify(f"{name} is already in the library.",
+                       severity="information", timeout=4)
+            _log_event("library.undo.skipped", reason="already_present",
+                       name=name)
+            return
+        # Clamp: the library may have shrunk since the delete.
+        idx = max(0, min(int(rec.get("index") or 0), len(lib)))
+        lib.insert(idx, _typed_clone(entry))
+        _state._library_cache = _typed_clone(lib)
+        _clear_primer_cache = globals().get("_primer_usage_clear_cache")
+        if _clear_primer_cache is not None:
+            _clear_primer_cache()
+        # Reverse the parts-bin cascade, when the delete performed one.
+        cascaded_bin: "list[dict] | None" = None
+        bin_before = rec.get("bin_before")
+        if isinstance(bin_before, list):
+            cascaded_bin = _typed_clone(bin_before)
+            _state._parts_bin_cache = _typed_clone(cascaded_bin)
+            _clear_assembly_fragment_cache()
+        stack.pop()
+        # Persist BEFORE touching the UI. A render error must not be able to
+        # leave the entry in the cache but not on disk — the restore is the
+        # point, the repaint is cosmetic.
+        self._delete_save_to_disk(lib, cascaded_bin, op="Plasmid restore")
+        try:
+            if self._view_mode == "plasmids":
+                self._repopulate_plasmids()
+                # Park the cursor on the row we just brought back.
+                t = self.query_one("#lib-table", DataTable)
+                for row_idx, key in enumerate(t.rows):
+                    if str(key.value) == entry_id:
+                        t.move_cursor(row=row_idx)
+                        break
+        except Exception:
+            _log.exception("Undo delete: panel refresh failed")
+        app.notify(f"Restored {name}.", severity="information", timeout=5)
+        _log_event("library.undo.restored", name=name, index=idx,
+                   remaining=len(stack))
 
     def action_request_history(self) -> None:
         """Open the construction-history viewer for the cursor row.
@@ -18641,7 +18740,17 @@ class LibraryPanel(Widget):
             # `cursor_row` is still on the row that prompted delete.
             t_lib = self.query_one("#lib-table", DataTable)
             deleted_row_idx = t_lib.cursor_row
-            entries = [e for e in _load_library() if e.get("id") != entry_id]
+            # Remember WHERE it sat so an undo puts it back in its slot
+            # rather than at the end ([INV-168]). Sweep #11 deliberately
+            # avoided a whole-library deepcopy here, so capture only the
+            # index + the single entry — not a copy of the list.
+            _lib_before = _load_library()
+            _del_idx = next(
+                (i for i, e in enumerate(_lib_before)
+                 if e.get("id") == entry_id),
+                len(_lib_before),
+            )
+            entries = [e for e in _lib_before if e.get("id") != entry_id]
             # Update the in-memory cache + invalidate dependent caches
             # synchronously so the panel repopulate below sees the
             # post-delete state instantly. The actual disk write fires
@@ -18668,6 +18777,9 @@ class LibraryPanel(Widget):
             # itself runs synchronously (fast in-memory list comp);
             # only the disk write is dispatched off-thread.
             cascaded_bin: "list[dict] | None" = None
+            # Pre-cascade parts-bin snapshot, kept ONLY when rows were
+            # actually dropped, so an undo can reverse the cascade too.
+            _bin_before: "list[dict] | None" = None
             try:
                 src_field = str(entry.get("source") or "")
                 lib_grammar = ""
@@ -18709,6 +18821,7 @@ class LibraryPanel(Widget):
                     # Update the bin cache sync so palette refreshes
                     # already see the cascade; the disk write goes
                     # to a separate worker dispatch below.
+                    _bin_before = _typed_clone(bin_entries)
                     _state._parts_bin_cache = _typed_clone(kept)
                     _clear_assembly_fragment_cache()
                     cascaded_bin = kept
@@ -18724,6 +18837,22 @@ class LibraryPanel(Widget):
                     f"failed: {exc}",
                     severity="warning",
                 )
+            # [INV-168] Make the delete undoable. Pushed AFTER the cascade
+            # so `_bin_before` reflects whatever the cascade actually did;
+            # best-effort, because failing to record an undo must never
+            # turn into a failed delete.
+            try:
+                _push_undo = getattr(self.app, "_push_library_undo", None)
+                if callable(_push_undo):
+                    _push_undo({
+                        "entry":      _typed_clone(entry),
+                        "index":      _del_idx,
+                        "collection": _get_active_collection_name(),
+                        "name":       name,
+                        "bin_before": _bin_before,
+                    })
+            except Exception:
+                _log.exception("Plasmid delete: could not record undo")
             self._repopulate_plasmids()
             # Park the cursor on the row directly above the one we
             # just deleted. Rows above the deleted index keep their
@@ -18778,8 +18907,15 @@ class LibraryPanel(Widget):
     @work(thread=True, exclusive=True, group="library_delete_save")
     def _delete_save_to_disk(
             self, entries: "list[dict]",
-            cascaded_bin: "list[dict] | None") -> None:
+            cascaded_bin: "list[dict] | None",
+            op: str = "Plasmid delete") -> None:
         """Worker: persist a plasmid delete off-thread.
+
+        Also serves the [INV-168] undo path, which needs the identical
+        three writes (library → active-collection mirror → parts bin) and
+        MUST share this `@work` group so a restore can't overtake the
+        delete it reverses. `op` only labels the log lines, so a restore
+        failure doesn't read as a delete failure in a diagnostic bundle.
 
         Writes library, then mirrors the active collection (the latter
         via `async_write=True` so back-to-back deletes coalesce into a
@@ -18800,7 +18936,7 @@ class LibraryPanel(Widget):
                     _state._LIBRARY_FILE, to_write, "Plasmid library",
                 )
         except (OSError, RuntimeError) as exc:
-            _log.exception("Plasmid delete: library save failed")
+            _log.exception("%s: library save failed", op)
             self.app.call_from_thread(
                 _notify_save_failure,
                 self.app, "Plasmid library", exc,
@@ -18810,7 +18946,7 @@ class LibraryPanel(Widget):
             _sync_active_collection_plasmids(to_write, async_write=True)
         except Exception:
             _log.exception(
-                "Plasmid delete: active-collection mirror dispatch failed",
+                "%s: active-collection mirror dispatch failed", op,
             )
         if cascaded_bin is not None:
             try:
@@ -18820,7 +18956,7 @@ class LibraryPanel(Widget):
                     )
             except (OSError, RuntimeError) as exc:
                 _log.exception(
-                    "Plasmid delete: parts-bin cascade save failed",
+                    "%s: parts-bin cascade save failed", op,
                 )
                 self.app.call_from_thread(
                     _notify_save_failure,
@@ -100458,6 +100594,24 @@ class UndoController:
     def undo(self) -> None:
         app = self.app
         if not self._undo_stack:
+            # [INV-168] Don't dead-end. If plasmids were deleted this
+            # session, say so — this exact message ("Nothing to undo",
+            # three times) is where the 2026-07-25 user gave up and lost
+            # the data until it was recovered from a snapshot.
+            pending = 0
+            try:
+                pending = len(app._library_undo_stack())
+            except Exception:
+                pending = 0
+            if pending:
+                app.notify(
+                    f"Nothing to undo here. {pending} deleted plasmid"
+                    f"{'' if pending == 1 else 's'} can still be restored — "
+                    f"focus the library and press Ctrl+Z (or u).",
+                    severity="warning", timeout=8,
+                )
+                _log_event("undo.empty", library_undo_available=pending)
+                return
             app.notify("Nothing to undo", severity="information")
             _log_event("undo.empty")
             return
@@ -105424,6 +105578,54 @@ NcbiTaxonPickerModal { align: center middle; }
         # dead code via Ctrl+Z (menu-Undo respected it, keyboard
         # did not).
         if event.key == "ctrl+z":
+            # [INV-168] Undo applies to the context you're working in. With
+            # the library focused, Ctrl+Z brings back the last plasmid you
+            # deleted — the keystroke the user actually reached for on
+            # 2026-07-25, when it hit the record undo stack (a different
+            # domain: `(seq, cursor, record)` snapshots) and reported
+            # "nothing to undo". Routed here rather than via a LibraryPanel
+            # binding so it can't depend on Textual's key-dispatch order
+            # against this App-level handler, which stops the event.
+            # The try/except covers the ROUTING DECISION ONLY. Wrapping the
+            # restore call too would mean a restore that failed halfway
+            # silently fell through to record-undo — two actions from one
+            # keystroke, on top of a half-applied restore.
+            lib = None
+            in_library = False
+            try:
+                focused = self.focused
+                lib = self.query_one("#library", LibraryPanel)
+                in_library = focused is not None and (
+                    focused is lib or lib in focused.ancestors
+                )
+            except Exception:
+                _log.exception("Ctrl+Z: library-undo routing failed")
+                lib = None
+            # PRECEDENCE: the record editor wins whenever it has anything to
+            # undo. The library table is this screen's usual focus holder (the
+            # sequence panel isn't even focusable), so routing on focus alone
+            # would hijack Ctrl+Z after a sequence edit and hand back a plasmid
+            # instead of undoing the edit. Falling through only when the record
+            # stack is EMPTY still covers the 2026-07-25 incident exactly —
+            # that session logged `undo.trigger {"stack_depth": 0}` before
+            # `undo.empty`. `u` restores regardless of record history.
+            record_depth = 0
+            try:
+                record_depth = len(getattr(self, "_undo_stack", None) or [])
+            except Exception:
+                record_depth = 0
+            # The restore WRITES to disk, so it honours the same
+            # `_blocks_undo` guard as record-undo (a save / commit in
+            # flight must not be raced). Focus already makes this
+            # unreachable while a modal is up — focus moves into the modal,
+            # so `in_library` is False — but this path persists data, so
+            # don't rely on that being the only way in.
+            if (lib is not None and in_library and not record_depth
+                    and self._library_undo_stack()
+                    and not self._undo_blocked_by_modal()):
+                lib.action_undo_delete()
+                event.stop()
+                return
             self.action_undo()
             event.stop()
             return
@@ -114816,6 +115018,48 @@ NcbiTaxonPickerModal { align: center middle; }
         except (IndexError, AttributeError):
             return False
         return bool(getattr(top, "_blocks_undo", False))
+
+    # ── Library-delete undo ([INV-168]) ───────────────────────────────────────
+    # Deleting a library entry never entered the record undo stack, which holds
+    # `(seq, cursor, record)` snapshots of the LOADED plasmid — a different
+    # domain entirely. On 2026-07-25 a user deleted four plasmids, pressed
+    # Ctrl+Z three times, got `undo.empty`, and had no in-app route back; the
+    # data came back off that morning's launch snapshot. This stack closes
+    # that gap for the session.
+    #
+    # Session-scoped ON PURPOSE. Restoring an entry only works while its
+    # sequence blob is still on disk, and orphan blobs are GC'd at launch — so
+    # an undo that outlived the process could hand back an entry whose bases
+    # were gone. Cross-session recovery stays with the daily snapshot + `.bak`
+    # chain (the layers that actually performed the 2026-07-25 recovery).
+    _library_undo: "list[dict] | None" = None   # per-instance; see the getter
+
+    def _library_undo_stack(self) -> "list[dict]":
+        """The per-INSTANCE undo stack.
+
+        `_library_undo` is declared on the class (PlasmidApp states its
+        attributes there), so it must never be mutated in place — every test
+        builds a fresh `PlasmidApp()` and a shared class-level list would leak
+        one test's deletions into the next. Read through `__dict__` so the
+        class default can't masquerade as instance state, and assign on first
+        use to bind a genuinely per-instance list.
+        """
+        stack = self.__dict__.get("_library_undo")
+        if stack is None:
+            stack = []
+            self._library_undo = stack
+        return stack
+
+    def _push_library_undo(self, record: dict) -> None:
+        """Record one undoable library deletion (newest last, bounded)."""
+        stack = self._library_undo_stack()
+        stack.append(record)
+        if len(stack) > _LIBRARY_UNDO_MAX:
+            del stack[: len(stack) - _LIBRARY_UNDO_MAX]
+        _log_event("library.undo.recorded",
+                   name=str(record.get("name") or ""),
+                   collection=str(record.get("collection") or ""),
+                   depth=len(stack))
 
     @_action_log("app.undo")
     def action_undo(self) -> None:
