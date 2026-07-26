@@ -14,6 +14,25 @@
 
 ---
 
+## [1.2.39] — 2026-07-25
+
+### New features
+
+- **An agent's library deletes can be undone too.** Anything removed via the
+  scripting API's `delete-from-library` now lands on the same undo stack as a
+  delete you made yourself — press **`u`** (or **Ctrl+Z**) in the library panel
+  and it comes back in its original slot. If one call removed several
+  same-named entries, they all come back, in order. Managing the library is
+  what an agent is for; the whole-data master wipe still has no endpoint at
+  all, by design.
+
+### Hardening
+
+- Test and documentation fixtures now use generic placeholder names throughout,
+  and the release process checks for stragglers automatically.
+
+---
+
 ## [1.2.38] — 2026-07-25
 
 ### New features

@@ -5175,9 +5175,9 @@ class TestWidenedModalsAtNarrowWidth:
             self, tiny_record, isolated_library):
         from textual.widgets import DataTable
         matches = [{
-            "sample": {"name": "JP4W9V_4_DEMO40-4", "gbk": "x.gbk"},
+            "sample": {"name": "RUN01A_4_DEMO40-4", "gbk": "x.gbk"},
             "action": "align",
-            "target_entry": {"id": "T", "name": "DEMO40 CAM D1var2+REPORTERR",
+            "target_entry": {"id": "T", "name": "DEMO40 CAM VarB+REPORTERR",
                              "gb_text": "x"},
             "score": 1.0, "method": "kmer-strong", "note": "kmer-strong",
             "_aln": {"ident": 99.99, "mism": 1, "gaps": 0},
@@ -5203,8 +5203,8 @@ class TestWidenedModalsAtNarrowWidth:
             annotations={"molecule_type": "DNA", "topology": "linear"},
         )
         stored = [{
-            "id": "id1", "label": "JP4W9V_4_DEMO40-4",
-            "query_label": "Q", "target_label": "DEMO40 CAM D1var2+REPORTERR",
+            "id": "id1", "label": "RUN01A_4_DEMO40-4",
+            "query_label": "Q", "target_label": "DEMO40 CAM VarB+REPORTERR",
             "target_id": "T",
             "target_gb_text": sc._record_to_gb_text(rec),
             "axis": "query",

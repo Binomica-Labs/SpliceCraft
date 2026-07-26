@@ -576,6 +576,16 @@ The mutation endpoints `rename-plasmid`, `set-plasmid-status`,
 elsewhere, `set-active-collection` to its home first — `search-library`
 shows which collection holds it.
 
+`delete-from-library` is **undoable by the human**: every entry it removes
+is pushed onto the running app's library-undo stack, so the user can press
+`u` (or Ctrl+Z) in the library panel and take back what an agent deleted —
+restored to its original slot, newest first, for the rest of that session.
+It matches by NAME, so one call can remove several entries; they come back
+in their original order. Nothing is recorded if the save fails. Managing
+the library IS an agent's job; what stays unreachable over HTTP is the
+whole-data **master wipe**, which has no endpoint by design (enforced by
+`tests/test_master_delete.py::test_no_agent_endpoint_exposes_wipe`).
+
 `transfer-annotations` resolves its `source_id` **across collections**
 (like `load-entry`): the active collection first, then the others, by
 display **name or id**. Pass `source_collection` to pin the search, and an

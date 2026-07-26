@@ -41,7 +41,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.38"
+__version__ = "1.2.39"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -96378,6 +96378,14 @@ def _h_delete_from_library(app, payload):
     disk-full / RO-mount / EACCES surfaces as ``500 {"error": "save
     failed for library: ..."}`` instead of a generic 500 with an
     opaque exception. The in-process UI user also sees a toast.
+
+    Undoable ([INV-168]): every removal is pushed onto the session's
+    library-undo stack, so the human can press `u` (or Ctrl+Z) in the
+    library panel and take back what an agent deleted. Deliberately
+    NOT a reason to gate the endpoint — agents are meant to manage the
+    library; it is the whole-data MASTER WIPE that stays unreachable
+    over HTTP (see the Master Delete section's rationale and
+    `test_master_delete.py::test_no_agent_endpoint_exposes_wipe`).
     """
     name = _sanitize_label(payload.get("name"), max_len=200)
     if not name:
@@ -96401,12 +96409,40 @@ def _h_delete_from_library(app, payload):
             # compare against the currently-loaded record below.
             deleted_ids = {e.get("id") for e in entries
                            if e.get("name") == name and e.get("id")}
+            # [INV-168] Record the removals so the USER can undo an
+            # agent's delete from the library panel — an autonomous
+            # agent gets the same one-keystroke safety net a human
+            # delete has. Captured before the filter, with each entry's
+            # index, so a restore lands in its original slot.
+            _undo_records = [
+                {"entry": _typed_clone(e), "index": i,
+                 "collection": _get_active_collection_name(),
+                 "name": str(e.get("name") or name),
+                 # The agent path performs no parts-bin cascade, so
+                 # there is nothing for an undo to put back there.
+                 "bin_before": None}
+                for i, e in enumerate(entries)
+                if e.get("name") == name
+            ]
             kept = [e for e in entries if e.get("name") != name]
             if len(kept) == len(entries):
                 return ({"error": f"no entry named {name!r}"}, 404)
             if (err := _agent_save_or_500(
                     lambda: _save_library(kept), "library")) is not None:
                 return err
+        # Only after the save actually landed. Pushed HIGHEST index first
+        # so the LIFO stack pops them back in ascending order — each
+        # restore then lands in a list that already holds its
+        # lower-indexed siblings, which is the only order that puts a
+        # multi-entry delete back exactly as it was.
+        try:
+            _push_undo = getattr(app, "_push_library_undo", None)
+            if callable(_push_undo):
+                for _rec in sorted(_undo_records,
+                                   key=lambda r: r["index"], reverse=True):
+                    _push_undo(_rec)
+        except Exception:
+            _log.exception("delete-from-library: could not record undo")
         # If the deleted entry is the loaded record, clear the canvas
         # + drop the panel's active pointer so subsequent saves can't
         # re-resurrect it from the stale in-memory state.
@@ -112294,7 +112330,7 @@ NcbiTaxonPickerModal { align: center middle; }
                     rec = _gb_text_to_record(e.get("gb_text", ""))
                     # The GenBank LOCUS line forbids whitespace and caps at
                     # _GB_LOCUS_NAME_MAX chars. A display name like
-                    # "DEMO 33 MOD D1var1+REPORTERR" makes the SeqIO writer raise
+                    # "DEMO 33 MOD VarA+REPORTERR" makes the SeqIO writer raise
                     # ValueError("Invalid whitespace in '...' for LOCUS line").
                     # Sanitise to a LOCUS-safe form for rec.name; the
                     # user-visible name stays on e["name"].

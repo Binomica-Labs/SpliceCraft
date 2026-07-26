@@ -1995,3 +1995,99 @@ class TestLibraryUndoKeyRouting:
             app.exit()
         assert seen, "undo produced no message"
         assert "can still be restored" in seen[-1], seen
+
+
+class TestAgentDeleteIsUndoable:
+    """[INV-168] Agents are meant to manage the library — `delete-from-library`
+    exists and should. What must NOT be reachable over HTTP is the whole-data
+    master wipe (a different thing, guarded by
+    `test_master_delete.py::test_no_agent_endpoint_exposes_wipe`). So an agent
+    delete gets the same one-keystroke safety net a human delete has.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_seed(self, monkeypatch):
+        monkeypatch.setattr(sc.PlasmidApp, "_seed_default_library",
+                            lambda self: None)
+
+    @staticmethod
+    def _entry(eid, name=None):
+        return {"id": eid, "name": name or eid, "size": 10, "n_feats": 0,
+                "gb_ref": f"ref-{eid}", "gb_text": f"LOCUS {eid} 10 bp\n"}
+
+    @staticmethod
+    def _inline_call_from_thread(app):
+        """The handler marshals its work onto the UI thread via
+        `call_from_thread`, which Textual refuses to run FROM that thread.
+        These tests already run on it, so call inline — the same shim the
+        agent-API suite's fake app uses."""
+        app.call_from_thread = lambda fn, *a, **k: fn(*a, **k)
+
+    async def test_agent_delete_can_be_undone_by_the_user(self):
+        sc._save_collections([{"name": "C", "plasmids": [
+            self._entry("a"), self._entry("b"), self._entry("c")]}])
+        sc._set_active_collection_name("C")
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(); await pilot.pause(0.2)
+            self._inline_call_from_thread(app)
+            res = sc._h_delete_from_library(app, {"name": "b"})
+            await pilot.pause(0.2)
+            assert res.get("ok") and res.get("deleted") == 1, res
+            assert [e["id"] for e in sc._load_library()] == ["a", "c"]
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib.action_undo_delete()
+            await pilot.pause(0.3)
+            ids = [e["id"] for e in sc._load_library()]
+            app.exit()
+        assert ids == ["a", "b", "c"], ids
+
+    async def test_multi_entry_delete_restores_in_order(self):
+        # `delete-from-library` matches by NAME, so one call can remove
+        # several entries. They must come back in their original slots.
+        sc._save_collections([{"name": "C", "plasmids": [
+            self._entry("a", "keep"), self._entry("b", "dupe"),
+            self._entry("c", "keep2"), self._entry("d", "dupe")]}])
+        sc._set_active_collection_name("C")
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(); await pilot.pause(0.2)
+            self._inline_call_from_thread(app)
+            res = sc._h_delete_from_library(app, {"name": "dupe"})
+            await pilot.pause(0.2)
+            assert res.get("deleted") == 2, res
+            assert [e["id"] for e in sc._load_library()] == ["a", "c"]
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib.action_undo_delete()
+            await pilot.pause(0.3)
+            lib.action_undo_delete()
+            await pilot.pause(0.3)
+            ids = [e["id"] for e in sc._load_library()]
+            app.exit()
+        assert ids == ["a", "b", "c", "d"], ids
+
+    async def test_failed_save_records_no_undo(self, monkeypatch):
+        # A delete that never reached disk must not leave a phantom undo
+        # record offering to "restore" something that was never removed.
+        sc._save_collections([{"name": "C", "plasmids": [
+            self._entry("a"), self._entry("b")]}])
+        sc._set_active_collection_name("C")
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(); await pilot.pause(0.2)
+            monkeypatch.setattr(
+                sc, "_save_library",
+                lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+            self._inline_call_from_thread(app)
+            res = sc._h_delete_from_library(app, {"name": "b"})
+            await pilot.pause(0.2)
+            depth = len(app._library_undo_stack())
+            app.exit()
+        assert isinstance(res, tuple) and res[1] == 500, res
+        assert depth == 0, "a failed delete must not record an undo"
