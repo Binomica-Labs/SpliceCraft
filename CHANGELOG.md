@@ -14,6 +14,36 @@
 
 ---
 
+## [1.2.41] — 2026-07-27
+
+### New features
+
+- **Pick a Plasmidsaurus run from a list instead of typing its code.** The
+  Fetch button now shows your orders, newest first, with the name you gave
+  each one — select a row and press Enter to download and import it. The code
+  box is still there for an order someone shared with you, which won't appear
+  in your own list. Orders with nothing to fetch (shipping labels, canceled
+  orders) are hidden behind a checkbox rather than left to fail at download,
+  and picking one tells you so instead of making the round trip. Your order
+  list is held for two minutes so reopening the window is instant, and
+  **Refresh** re-fetches on demand.
+- **Library marks now say what they'll do.** Pressing **Space** on a plasmid
+  cycles its mark through **Ⓜ (move) → Ⓒ (copy) → none**, so you can stage a
+  mixed batch in one pass: **`m`** sends the Ⓜ rows to a collection you pick,
+  **`y`** sends the Ⓒ rows, and committing one kind leaves the other still
+  marked. With nothing marked, both keys still act on the row under the
+  cursor, and `c` clears every mark as before. This matches how marking
+  already worked in the primer library.
+
+### Bug fixes
+
+- **Downloading a Plasmidsaurus run no longer re-authenticates unnecessarily**,
+  which matters because the API allows only ten requests a minute — and if the
+  saved sign-in has expired by the time you pick a run, it quietly renews
+  instead of failing.
+
+---
+
 ## [1.2.40] — 2026-07-27
 
 ### Bug fixes

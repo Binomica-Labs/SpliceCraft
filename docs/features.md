@@ -207,7 +207,15 @@ What you can do without leaving the terminal.
   "Fetch by item code from Plasmidsaurus API". Pulls a finished run from
   your Plasmidsaurus account over the official OAuth2 REST API and
   imports its `.gbk` assemblies into the library as new entries
-  (tagged `plasmidsaurus:<code>:<sample>`, never overwriting). Credentials
+  (tagged `plasmidsaurus:<code>:<sample>`, never overwriting). Opening it
+  ENUMERATES your orders (newest first, with the order name you typed)
+  into a table — select a row and press Enter to download it, or type a
+  code for an order someone shared with you. Orders with no results —
+  shipping labels and canceled orders, roughly 40% of a real listing —
+  are hidden behind the "Show orders with no results" checkbox rather
+  than left to 404 at download. The listing and its access token are
+  cached for two minutes, because the account is capped at 10 API
+  requests per minute; Refresh forces a re-fetch. Credentials
   resolve env-first (`PLASMIDSAURUS_CLIENT_ID` / `_SECRET`) then
   Settings ▸ Plasmidsaurus API. Scriptable via the `plasmidsaurus-items`
   / `download-plasmidsaurus` agent endpoints.
@@ -282,7 +290,19 @@ What you can do without leaving the terminal.
 - **Export marked plasmids as images** — mark rows in the library, press
   `p`, and every marked plasmid is rendered to a circular-map PNG / SVG
   in a folder you pick. Runs on a worker thread with per-entry failure
-  isolation; ids resolve across every collection.
+  isolation; ids resolve across every collection. Takes rows carrying
+  *either* mark — export doesn't distinguish move from copy.
+- **Staging plasmids for another collection (Ⓜ / Ⓒ)** — **Space** cycles
+  the highlighted library row through **none → Ⓜ (move) → Ⓒ (copy) →
+  none**, so the mark itself says what will happen to that plasmid —
+  the same idea as the primer library's ★ / $ / M cycle. Press **`m`**
+  to send the Ⓜ rows to a collection you pick and **`y`** to send the
+  Ⓒ rows; a mixed batch is staged in one pass and committed in two,
+  and committing one kind leaves the other kind marked. With nothing
+  marked, `m` / `y` still act on the row under the cursor. Copies are
+  deep-copied into the target and renamed on collision (`COPY` for the
+  same sequence, `ALT` for a different one); `c` clears every mark, and
+  marks reset on a collection switch.
 
 ## File formats
 

@@ -41,7 +41,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.40"
+__version__ = "1.2.41"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -17018,11 +17018,11 @@ class LibraryPanel(Widget):
         Binding("h", "request_history", "View history",
                 show=False, priority=False),
         # Sweep #28: bulk-mark + move/copy across collections.
-        Binding("space", "toggle_mark", "Toggle mark",
+        Binding("space", "toggle_mark", "Cycle mark Ⓜ/Ⓒ",
                 show=False, priority=False),
-        Binding("m", "move_marked", "Move marked to…",
+        Binding("m", "move_marked", "Move Ⓜ-marked to…",
                 show=False, priority=False),
-        Binding("y", "copy_marked", "Copy marked to…",
+        Binding("y", "copy_marked", "Copy Ⓒ-marked to…",
                 show=False, priority=False),
         Binding("p", "export_marked_images", "Export marked as images",
                 show=False, priority=False),
@@ -17166,11 +17166,60 @@ class LibraryPanel(Widget):
 
     # ── Bulk-mark + move/copy (sweep #28) ──────────────────────────────
 
+    def _cycle_mark(self, entry_id: str) -> str:
+        """Advance one row through none → "move" → "copy" → none and return
+        the new state ("" when it lands back on unmarked). Split out from the
+        key handler so the state machine is testable without a live
+        DataTable."""
+        if entry_id not in self._marked_ids:                     # none → Ⓜ
+            self._marked_ids.add(entry_id)
+            self._mark_kind[entry_id] = "move"
+            return "move"
+        if self._mark_kind.get(entry_id, "move") == "move":      # Ⓜ → Ⓒ
+            self._mark_kind[entry_id] = "copy"
+            return "copy"
+        self._marked_ids.discard(entry_id)                       # Ⓒ → none
+        self._mark_kind.pop(entry_id, None)
+        return ""
+
+    # Sentinel: "no status colour supplied, go look it up". A plain None
+    # can't do this job — None is the legitimate value for "entry has no
+    # status", and conflating the two is what forces the lookup.
+    _MARK_CELL_LOOKUP: "object" = object()
+
+    def _mark_cell(self, entry_id: str,
+                   status_color: "object" = _MARK_CELL_LOOKUP) -> Text:
+        """The row's left-column glyph: Ⓜ (staged to move) / Ⓒ (staged to
+        copy) / the status ● / dim ·. Shared by the full repopulate AND the
+        surgical Space update so the two can't render a row differently.
+
+        PASS `status_color` from the repopulate loop, which has already
+        derived it. Letting this method look it up per row costs an
+        `_find_library_entry_by_id` per row — an O(N) cache walk that takes
+        `_cache_lock` and deep-clones the match (sweep #11) — turning one
+        repopulate into O(N²) with N lock acquisitions. The single-row Space
+        path omits it and eats exactly one lookup, as it always did."""
+        if entry_id in self._marked_ids:
+            if self._mark_kind.get(entry_id, "move") == "copy":
+                return Text("Ⓒ", style="bold cyan")
+            return Text("Ⓜ", style="bold magenta")
+        if status_color is self._MARK_CELL_LOOKUP:
+            entry = _find_library_entry_by_id(entry_id)
+            status = (_sanitize_plasmid_status(entry.get("status"))
+                      if entry else "")
+            status_color = _PLASMID_STATUS_COLORS.get(status)
+        return (Text("●", style=str(status_color))
+                if status_color is not None else Text("·", style="dim"))
+
     def action_toggle_mark(self) -> None:
-        """Space-bar in plasmids view toggles the mark on the cursor
-        row. Marks are transient (cleared on collection switch).
-        Pressing Space on a marked row unmarks it. No-op in
-        collections view (the marks model is per-plasmid)."""
+        """Space-bar in plasmids view CYCLES the cursor row's mark:
+        none → Ⓜ (move) → Ⓒ (copy) → none.
+
+        The mark carries the intent, mirroring the primer library's
+        ★/$/M Space cycle — so a mixed batch can be staged in one pass and
+        committed as two (`m` takes the Ⓜ rows, `y` the Ⓒ rows). Marks are
+        transient (cleared on collection switch). No-op in collections view
+        (the marks model is per-plasmid)."""
         if self._view_mode != "plasmids":
             return
         try:
@@ -17180,27 +17229,15 @@ class LibraryPanel(Widget):
         entry_id = _cursor_row_key(t)
         if not entry_id:
             return
-        if entry_id in self._marked_ids:
-            self._marked_ids.discard(entry_id)
-        else:
-            self._marked_ids.add(entry_id)
-        # Repaint ONLY the cursor row's ● column in place (O(1)). A marked row
-        # shows ▶ (bold magenta), else the status ● / dim ·. The old call
-        # `_repopulate_plasmids()` cleared + re-added EVERY row (O(N) — a
+        self._cycle_mark(entry_id)
+        # Repaint ONLY the cursor row's glyph column in place (O(1)). The old
+        # call `_repopulate_plasmids()` cleared + re-added EVERY row (O(N) — a
         # re-sort + full cell build per row) just to flip one glyph, so
         # marking down a big collection lagged. Marks don't reorder rows, so
         # the surgical update is exact; full repopulate stays as the fallback.
-        if entry_id in self._marked_ids:
-            ball_cell = Text("▶", style="bold magenta")
-        else:
-            entry = _find_library_entry_by_id(entry_id)
-            status = (_sanitize_plasmid_status(entry.get("status"))
-                      if entry else "")
-            color = _PLASMID_STATUS_COLORS.get(status)
-            ball_cell = (Text("●", style=color) if color is not None
-                         else Text("·", style="dim"))
         try:
-            t.update_cell_at(_Coordinate(t.cursor_row, 0), ball_cell)
+            t.update_cell_at(_Coordinate(t.cursor_row, 0),
+                             self._mark_cell(entry_id))
         except Exception:
             _log.exception("LibraryPanel.action_toggle_mark: incremental "
                            "cell update failed; full repopulate")
@@ -17216,6 +17253,7 @@ class LibraryPanel(Widget):
             return
         n = len(self._marked_ids)
         self._marked_ids.clear()
+        self._mark_kind.clear()
         self._repopulate_plasmids()
         try:
             self.app.notify(
@@ -17225,13 +17263,27 @@ class LibraryPanel(Widget):
         except Exception:
             pass
 
-    def _resolve_marked_or_cursor(self) -> "list[str]":
-        """Return the list of entry ids to operate on for move/copy.
-        Marked rows win; if no marks are set, fall back to the cursor
-        row (single-plasmid is the common case + matches the
-        keyboard-driven workflow)."""
+    def _marked_of_kind(self, kind: str) -> "list[str]":
+        """Marked ids staged for `kind` ("move"/"copy"). A mark with no
+        recorded kind counts as "move" — older code (and tests) that add
+        straight to `_marked_ids` then behave exactly as before."""
+        return [eid for eid in self._marked_ids
+                if eid and self._mark_kind.get(eid, "move") == kind]
+
+    def _resolve_marked_or_cursor(self, kind: str = "") -> "list[str]":
+        """Entry ids to operate on for move/copy.
+
+        With marks set, ONLY rows staged for `kind` are returned (empty when
+        every mark is the other kind — the caller then explains rather than
+        the command silently falling through to the cursor row, which would
+        move a plasmid the user had staged to copy). With no marks at all,
+        falls back to the cursor row: single-plasmid is the common case and
+        it matches the keyboard-driven workflow. `kind=""` means "any mark",
+        for callers that don't distinguish (e.g. image export)."""
         if self._marked_ids:
-            return [eid for eid in self._marked_ids if eid]
+            if not kind:
+                return [eid for eid in self._marked_ids if eid]
+            return self._marked_of_kind(kind)
         # No marks → use cursor row as a single-item set.
         try:
             t = self.query_one("#lib-table", DataTable)
@@ -17240,44 +17292,53 @@ class LibraryPanel(Widget):
         cur = _cursor_row_key(t)
         return [cur] if cur else []
 
+    def _notify_nothing_staged(self, kind: str) -> None:
+        """Explain an empty move/copy. Two DIFFERENT causes, and conflating
+        them is what makes the cycle confusing: nothing marked at all (say how
+        to mark), versus rows marked but all staged the other way (say so and
+        name the key that commits them) — the latter would otherwise look like
+        the keypress did nothing."""
+        other = "copy" if kind == "move" else "move"
+        n_other = len(self._marked_of_kind(other))
+        glyph = "Ⓜ" if kind == "move" else "Ⓒ"
+        if n_other:
+            o_glyph, o_key = (("Ⓒ", "y") if other == "copy" else ("Ⓜ", "m"))
+            msg = (f"Nothing marked {glyph} ({kind}) — {n_other} row(s) are "
+                   f"marked {o_glyph} ({other}). Press {o_key} for those.")
+        else:
+            msg = (f"Nothing to {kind}. Press Space to cycle a row's mark "
+                   f"(Ⓜ move → Ⓒ copy), or focus a row.")
+        try:
+            self.app.notify(msg, severity="warning")
+        except Exception:
+            pass
+
     def action_move_marked(self) -> None:
-        """Move marked plasmids (or the cursor row if none marked) to
-        a different collection. Posts `MoveCopyRequested` up so the
-        app can push the target-picker modal."""
+        """Move the Ⓜ-marked plasmids (or the cursor row if nothing is
+        marked at all) to a different collection. Posts `MoveCopyRequested`
+        up so the app can push the target-picker modal. Rows marked Ⓒ are
+        left alone — they're staged for `y`."""
         if self._view_mode != "plasmids":
             return
-        ids = self._resolve_marked_or_cursor()
+        ids = self._resolve_marked_or_cursor("move")
         if not ids:
-            try:
-                self.app.notify(
-                    "Nothing to move. Press Space to mark a row first "
-                    "(or focus a row).",
-                    severity="warning",
-                )
-            except Exception:
-                pass
+            self._notify_nothing_staged("move")
             return
         self.post_message(
             self.MoveCopyRequested(entry_ids=list(ids), mode="move"),
         )
 
     def action_copy_marked(self) -> None:
-        """Copy marked plasmids (or the cursor row if none marked)
-        into a different collection. Source collection's entries
-        stay intact; the target gets deep-copied duplicates with
-        `_2`/`_3` suffix on id+name collisions."""
+        """Copy the Ⓒ-marked plasmids (or the cursor row if nothing is
+        marked at all) into a different collection. Source collection's
+        entries stay intact; the target gets deep-copied duplicates with
+        `_2`/`_3` suffix on id+name collisions. Rows marked Ⓜ are left
+        alone — they're staged for `m`."""
         if self._view_mode != "plasmids":
             return
-        ids = self._resolve_marked_or_cursor()
+        ids = self._resolve_marked_or_cursor("copy")
         if not ids:
-            try:
-                self.app.notify(
-                    "Nothing to copy. Press Space to mark a row first "
-                    "(or focus a row).",
-                    severity="warning",
-                )
-            except Exception:
-                pass
+            self._notify_nothing_staged("copy")
             return
         self.post_message(
             self.MoveCopyRequested(entry_ids=list(ids), mode="copy"),
@@ -17426,6 +17487,15 @@ class LibraryPanel(Widget):
         # successful move/copy. Lives in a set so duplicate spaces
         # don't double-mark and the toggle is O(1).
         self._marked_ids:   "set[str]"   = set()
+        # Which OPERATION each marked row is staged for: id → "move" | "copy",
+        # cycled by Space (Ⓜ → Ⓒ → none), mirroring the primer library's
+        # ★/$/M cycle where the mark itself carries the intent. Kept ALONGSIDE
+        # `_marked_ids` rather than replacing it so every existing
+        # "is anything marked" check, `.add`/`.discard`/`.clear` call and test
+        # keeps working; entries are only ever consulted for ids that are in
+        # `_marked_ids`, and a missing kind reads as "move" — so a bare
+        # `_marked_ids.add(x)` from older code still behaves.
+        self._mark_kind:    "dict[str, str]" = {}
         # Active fuzzy filter text. Empty string = no filter (show all
         # rows). Set/cleared by `_on_search_submitted`; consulted in
         # `_repopulate_*`.
@@ -17727,13 +17797,12 @@ class LibraryPanel(Widget):
             # wins (mark is the more urgent signal).
             entry_id = entry["id"]
             self._lib_full_names[entry_id] = name
-            is_marked = entry_id in self._marked_ids
-            if is_marked:
-                ball_cell = Text("▶", style="bold magenta")
-            elif color is not None:
-                ball_cell = Text("●", style=color)
-            else:
-                ball_cell = Text("·", style="dim")
+            # Shared with the surgical Space update so a repopulate can't
+            # disagree with an in-place mark flip. A mark outranks the status
+            # ● — it's the more urgent signal, and it says which operation
+            # the row is staged for. `color` is already derived above; passing
+            # it keeps this loop O(N) (see `_mark_cell`).
+            ball_cell = self._mark_cell(entry_id, color)
             # Name column: clean display name (no circle prefix —
             # that moved to its own ● column on the left).
             name_cell = Text(no_wrap=True, overflow="ellipsis")
@@ -19088,6 +19157,7 @@ class LibraryPanel(Widget):
         # longer visible).
         if self._marked_ids:
             self._marked_ids.clear()
+            self._mark_kind.clear()
         self.post_message(self.CollectionSwitched(name))
         self._collection_switch_save_to_disk(plasmids)
 
@@ -56942,16 +57012,133 @@ def _spellcheck_body(body_md: str) -> "list[tuple[str, list[str]]]":
 # (PLASMIDSAURUS_CLIENT_ID / _SECRET) then Settings; the disk write goes
 # through the L2 chokepoint; the temp zip is deleted after import.
 
-class PlasmidsaurusFetchModal(ModalScreen):
-    """Fetch a Plasmidsaurus run by item code and import its samples.
+# The API allows only 10 requests per minute ([INV-169], verified live) and
+# listing the account costs two of them (token + items). Reopening the modal to
+# pick a second run would spend that budget re-fetching data we already have,
+# so the order list and its bearer token are cached briefly and reused; the
+# Refresh button forces a round-trip. Process-local and never persisted — the
+# token is a short-lived credential. Keyed on a digest of the credentials so
+# changing them in Settings misses the cache instead of showing the previous
+# account's orders (the raw values are never stored).
+_PS_ORDERS_CACHE_TTL_S = 120.0
+_PS_ORDERS_CACHE: "dict[str, object]" = {"at": 0.0, "items": [], "token": "",
+                                         "key": ""}
+_PS_ORDERS_CACHE_LOCK = threading.Lock()
 
-    Self-contained: enter the 6-character item code, Download & Import, and
-    the run's .gbk assemblies are added to the library as new entries
-    (tagged ``source: plasmidsaurus:<code>:<sample>``, never overwriting
-    existing entries). The actual download + parse happen on a worker thread
-    with live progress; closing the modal cancels an in-flight download.
-    Dismisses with ``None`` (it mutates the library directly rather than
-    returning a value)."""
+
+def _plasmidsaurus_cred_key(client_id: str, client_secret: str) -> str:
+    """Digest identifying a credential pair for cache-keying. Never store or
+    log the raw values."""
+    import hashlib
+    return hashlib.sha256(
+        f"{client_id}:{client_secret}".encode("utf-8")).hexdigest()
+
+
+def _plasmidsaurus_orders(client_id: str, client_secret: str, *,
+                          force: bool = False) -> "tuple[list, str]":
+    """Return ``(items, token)`` for the account's orders, served from the
+    short-lived process cache unless ``force``. Raises whatever the API client
+    raises (OSError / ValueError) on a cache miss that fails."""
+    key = _plasmidsaurus_cred_key(client_id, client_secret)
+    if not force:
+        with _PS_ORDERS_CACHE_LOCK:
+            # Narrow on read rather than trusting the slot types: the dict is
+            # written from a worker thread, and a wrong type here would take
+            # out the modal on open instead of just missing the cache.
+            at = _PS_ORDERS_CACHE.get("at")
+            cached = _PS_ORDERS_CACHE.get("items")
+            tok = _PS_ORDERS_CACHE.get("token")
+            age = _monotonic() - (at if isinstance(at, float) else 0.0)
+            if (isinstance(tok, str) and tok
+                    and isinstance(cached, list) and cached
+                    and age < _PS_ORDERS_CACHE_TTL_S
+                    and _PS_ORDERS_CACHE.get("key") == key):
+                return (list(cached), tok)
+    token = _plasmidsaurus_oauth_token(client_id, client_secret)
+    items = _plasmidsaurus_list_items(token)
+    with _PS_ORDERS_CACHE_LOCK:
+        _PS_ORDERS_CACHE["at"] = _monotonic()
+        _PS_ORDERS_CACHE["items"] = list(items)
+        _PS_ORDERS_CACHE["token"] = token
+        _PS_ORDERS_CACHE["key"] = key
+    return (list(items), token)
+
+
+def _plasmidsaurus_order_rows(items: "list", *,
+                              include_empty: bool = False) -> "list[dict]":
+    """Turn a raw ``/api/items`` listing into display rows, newest first.
+
+    PURE (no widgets, no network) so the selection logic is testable without
+    driving a DataTable. Rows whose code doesn't match the published
+    ``^[A-Z0-9]{6}$`` are dropped — they could not be downloaded anyway.
+
+    By default only orders that HAVE results are returned: on a real account
+    roughly 40% of the listing is shipping labels, which are marked
+    ``status: complete`` yet 404 on download and sort to the top, so showing
+    them by default puts undownloadable rows in front of the user. Pass
+    ``include_empty=True`` for the full listing (the UI's checkbox), where they
+    are marked rather than hidden.
+
+    Server-supplied text goes through `_sanitize_label` before it reaches the
+    terminal — an order name is remote input, and a control byte in one would
+    otherwise be rendered raw."""
+    rows: "list[dict]" = []
+    seen: "set[str]" = set()
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        code = _sanitize_plasmidsaurus_item_code(it.get("code"))
+        if code is None:
+            continue
+        # The code is the DataTable row key, and Textual's `add_row` RAISES
+        # DuplicateKey on a repeat — a duplicated row in the server's listing
+        # would take the whole modal down rather than showing one row twice.
+        # Newest-first ordering means the first occurrence is the one to keep.
+        if code in seen:
+            continue
+        seen.add(code)
+        ok = _plasmidsaurus_item_has_results(it)
+        if not ok and not include_empty:
+            continue
+        # Column caps: real order names reach 35 chars and product names 23,
+        # which together overflow the modal and force the table to scroll
+        # sideways. Cap both so every column stays visible at once.
+        name = _sanitize_label(str(it.get("order_name") or ""), max_len=26)
+        product = _sanitize_label(
+            str(it.get("product_name") or "").replace("_", " "), max_len=20)
+        qty = it.get("quantity")
+        rows.append({
+            "code": code,
+            "has_results": ok,
+            "order": name or "—",
+            "product": product or "—",
+            # Universal slash-free date form; the time is dropped for the
+            # table, so pass the date half only.
+            "date": _history_human_dt(str(it.get("done_date") or "")[:10]) or "—",
+            "qty": str(qty) if isinstance(qty, int) else "—",
+        })
+    return rows
+
+
+class PlasmidsaurusFetchModal(ModalScreen):
+    """Browse your Plasmidsaurus orders and import a run's samples.
+
+    Opening the modal ENUMERATES the account's orders (most recent first) so a
+    run is picked from a table rather than recalled as a 6-character code —
+    selecting a row and pressing Enter downloads it. The code box remains for
+    an order someone shared with you, which won't be in your own listing.
+
+    Orders with nothing to download are hidden by default: about 40% of a real
+    listing is shipping labels, which carry ``status: complete`` yet 404 on
+    download and sort to the TOP ([INV-169]). The checkbox reveals them, marked
+    rather than silently dropped, so the listing can still be reconciled
+    against the dashboard.
+
+    The run's .gbk assemblies are added to the library as new entries (tagged
+    ``source: plasmidsaurus:<code>:<sample>``, never overwriting existing
+    entries). Listing and download both run on worker threads with live
+    progress; closing the modal cancels an in-flight download. Dismisses with
+    ``None`` (it mutates the library directly rather than returning a value)."""
 
     _blocks_undo: bool = True
 
@@ -56964,7 +57151,7 @@ class PlasmidsaurusFetchModal(ModalScreen):
         align: center middle;
     }
     #ps-fetch-box {
-        width: 72; height: auto; max-height: 80%;
+        width: 92; height: auto; max-height: 90%;
         background: $surface; border: thick $primary;
         padding: 1 2;
     }
@@ -56974,6 +57161,9 @@ class PlasmidsaurusFetchModal(ModalScreen):
         padding: 0 1; margin-bottom: 1;
     }
     #ps-fetch-creds { margin-bottom: 1; }
+    #ps-fetch-toolbar { height: auto; margin-bottom: 1; }
+    #ps-fetch-toolbar Button { margin-right: 2; }
+    #ps-fetch-table { height: auto; max-height: 16; margin-bottom: 1; }
     #ps-fetch-code { margin-bottom: 1; }
     #ps-fetch-btns { height: auto; margin-bottom: 1; }
     #ps-fetch-btns Button { margin-right: 2; }
@@ -56983,13 +57173,22 @@ class PlasmidsaurusFetchModal(ModalScreen):
     def __init__(self) -> None:
         super().__init__()
         self._busy = False
+        self._listing = False
+        self._items: "list" = []
+        self._token = ""
+        self._rows: "list[dict]" = []
 
     def compose(self) -> ComposeResult:
         with Vertical(id="ps-fetch-box"):
             yield Static("Fetch from Plasmidsaurus", id="ps-fetch-title")
             yield Static("", id="ps-fetch-creds", markup=True)
+            with Horizontal(id="ps-fetch-toolbar"):
+                yield Button("Refresh orders", id="btn-ps-refresh")
+                yield Checkbox("Show orders with no results",
+                               id="ps-show-empty", value=False)
+            yield DataTable(id="ps-fetch-table", cursor_type="row")
             yield Input(
-                placeholder="Item code (6 chars, e.g. ABC123)",
+                placeholder="…or type an item code (6 chars, e.g. ABC123)",
                 id="ps-fetch-code",
             )
             with Horizontal(id="ps-fetch-btns"):
@@ -56997,25 +57196,154 @@ class PlasmidsaurusFetchModal(ModalScreen):
                              id="btn-ps-fetch-go", variant="primary")
                 yield Button("Close  [Esc]", id="btn-ps-fetch-close")
             yield Static(
-                "[dim]Enter an item code and import its samples.[/dim]",
+                "[dim]Loading your orders…[/dim]",
                 id="ps-fetch-status", markup=True,
             )
 
     def on_mount(self) -> None:
+        try:
+            tbl = self.query_one("#ps-fetch-table", DataTable)
+            tbl.add_columns("", "Code", "Order", "Type", "Done", "Qty")
+        except NoMatches:
+            pass
         cid, sec = _plasmidsaurus_credentials()
         creds = self.query_one("#ps-fetch-creds", Static)
         if cid and sec:
             creds.update("[dim]Using your saved Plasmidsaurus API "
                          "credentials.[/dim]")
+            # Auto-enumerate on open — that IS the point of the screen. Served
+            # from the process cache when it's warm, so reopening costs no
+            # requests against the 10/min budget.
+            self._list_worker(cid, sec, False)
+            self._listing = True
         else:
             creds.update(
                 "[yellow]No API credentials found. Set "
                 "PLASMIDSAURUS_CLIENT_ID / PLASMIDSAURUS_CLIENT_SECRET, "
                 "or add them under Settings → Plasmidsaurus.[/yellow]")
+            self._set_status(
+                "[dim]Add credentials to browse your orders, or type a "
+                "code you were given.[/dim]")
+            try:
+                self.query_one("#ps-fetch-code", Input).focus()
+            except NoMatches:
+                pass
+
+    # ── order listing ────────────────────────────────────────────────────
+    @work(thread=True, exclusive=True, group="plasmidsaurus_list")
+    def _list_worker(self, cid: str, sec: str, force: bool) -> None:
         try:
-            self.query_one("#ps-fetch-code", Input).focus()
+            items, token = _plasmidsaurus_orders(cid, sec, force=force)
+            outcome: "tuple" = ("ok", items, token)
+        except (OSError, ValueError, RuntimeError) as exc:
+            outcome = ("err", str(exc), "")
+        if self.is_mounted:
+            try:
+                self.app.call_from_thread(self._list_done, outcome)
+            except Exception:
+                _log.exception("Plasmidsaurus list: done callback failed")
+
+    def _list_done(self, outcome: "tuple") -> None:
+        self._listing = False
+        if outcome[0] == "err":
+            self._set_status(
+                f"[red]Could not list your orders: "
+                f"{_esc_md(str(outcome[1]))}[/red]")
+            return
+        self._items, self._token = list(outcome[1]), str(outcome[2])
+        _log_event("plasmidsaurus.orders_listed", count=len(self._items),
+                   via="gui")
+        self._repopulate()
+
+    def _include_empty(self) -> bool:
+        try:
+            return bool(self.query_one("#ps-show-empty", Checkbox).value)
+        except NoMatches:
+            return False
+
+    def _repopulate(self) -> None:
+        """Rebuild the table from `self._items` under the current filter."""
+        include_empty = self._include_empty()
+        self._rows = _plasmidsaurus_order_rows(
+            self._items, include_empty=include_empty)
+        try:
+            tbl = self.query_one("#ps-fetch-table", DataTable)
+        except NoMatches:
+            return
+        tbl.clear()
+        for r in self._rows:
+            tbl.add_row("✓" if r["has_results"] else "·", r["code"],
+                        r["order"], r["product"], r["date"], r["qty"],
+                        key=r["code"])
+        total = sum(1 for it in self._items if isinstance(it, dict))
+        with_results = len(_plasmidsaurus_order_rows(self._items))
+        if not self._rows:
+            self._set_status(
+                "[yellow]No orders with results found on this account.[/yellow]"
+                if total else "[yellow]This account has no orders.[/yellow]")
+            return
+        hidden = ("" if include_empty else
+                  f", {total - with_results} with nothing to download hidden")
+        self._set_status(
+            f"[dim]{with_results} of {total} order(s) have results"
+            f"{hidden}. Select one and press Enter, or type a code.[/dim]")
+        # Don't yank focus off the code box. The auto-listing lands
+        # asynchronously, so a user who started typing a shared order code the
+        # moment the modal opened would otherwise have the caret pulled out
+        # from under them mid-word.
+        try:
+            if not self.query_one("#ps-fetch-code", Input).has_focus:
+                tbl.focus()
+        except Exception:
+            pass
+
+    @on(Checkbox.Changed, "#ps-show-empty")
+    def _toggle_empty(self, _) -> None:
+        if self._items:
+            self._repopulate()
+
+    @on(Button.Pressed, "#btn-ps-refresh")
+    def _refresh(self, _) -> None:
+        if self._busy or self._listing:
+            return
+        cid, sec = _plasmidsaurus_credentials()
+        if not cid or not sec:
+            self._set_status("[red]No API credentials — set the env vars or "
+                             "add them in Settings first.[/red]")
+            return
+        self._listing = True
+        self._set_status("[yellow]Refreshing your orders…[/yellow]")
+        self._list_worker(cid, sec, True)
+
+    @on(DataTable.RowHighlighted, "#ps-fetch-table")
+    def _row_highlighted(self, ev) -> None:
+        """Mirror the highlighted row's code into the code box, so the code
+        box and the table can never disagree about what Download will fetch."""
+        code = str(getattr(ev, "row_key", None) and ev.row_key.value or "")
+        if not code:
+            return
+        try:
+            self.query_one("#ps-fetch-code", Input).value = code
         except NoMatches:
             pass
+
+    @on(DataTable.RowSelected, "#ps-fetch-table")
+    def _row_selected(self, ev) -> None:
+        code = str(getattr(ev, "row_key", None) and ev.row_key.value or "")
+        if not code:
+            return
+        try:
+            self.query_one("#ps-fetch-code", Input).value = code
+        except NoMatches:
+            pass
+        row = next((r for r in self._rows if r["code"] == code), None)
+        if row is not None and not row["has_results"]:
+            # Refuse before spending two requests on a guaranteed 404.
+            self._set_status(
+                f"[yellow]{code} has nothing to download — shipping-label and "
+                f"canceled orders carry no results.[/yellow]")
+            return
+        self._start()
 
     def action_cancel(self) -> None:
         # The worker treats an unmounted modal as the cancel signal, so
@@ -57065,10 +57393,11 @@ class PlasmidsaurusFetchModal(ModalScreen):
             pass
         self._set_status(
             f"[yellow]Connecting to Plasmidsaurus for {code}…[/yellow]")
-        self._fetch_worker(code, cid, sec)
+        self._fetch_worker(code, cid, sec, self._token)
 
     @work(thread=True, exclusive=True, group="plasmidsaurus_fetch")
-    def _fetch_worker(self, code: str, cid: str, sec: str) -> None:
+    def _fetch_worker(self, code: str, cid: str, sec: str,
+                      token: str = "") -> None:
         import shutil
         import tempfile
         tmpdir = tempfile.mkdtemp(prefix="splicecraft-ps-")
@@ -57099,11 +57428,29 @@ class PlasmidsaurusFetchModal(ModalScreen):
             def _cancelled() -> bool:
                 return not self.is_mounted
 
-            try:
-                zip_path = _plasmidsaurus_fetch_item_zip(
-                    code, tmpdir, kind="results",
+            def _fetch(tok: "str | None"):
+                return _plasmidsaurus_fetch_item_zip(
+                    code, tmpdir, kind="results", token=tok,
                     client_id=cid, client_secret=sec,
                     progress_cb=_prog, cancel_check_cb=_cancelled)
+
+            try:
+                try:
+                    # Reuse the listing's bearer token — the account is capped
+                    # at 10 requests/minute and re-authenticating per download
+                    # spends one for nothing.
+                    zip_path = _fetch(token or None)
+                except OSError as exc:
+                    # A cached token can age out between listing and download.
+                    # Re-auth once rather than making the user press Refresh to
+                    # recover from an expiry they have no way to see.
+                    if (not token
+                            or getattr(exc, "http_status", None)
+                            not in (401, 403)):
+                        raise
+                    _log.info("Plasmidsaurus: cached token rejected for %s — "
+                              "re-authenticating", code)
+                    zip_path = _fetch(None)
                 entries, warnings = _plasmidsaurus_zip_to_entries(
                     zip_path, run_id=code)
                 if not entries:
@@ -99995,6 +100342,8 @@ _BUTTON_TOOLTIPS: "dict[str, str]" = {
         "Fetch a sequencing run by item code from the Plasmidsaurus API",
     "btn-ps-fetch-go":
         "Download the run and import its samples into the library",
+    "btn-ps-refresh":
+        "Re-fetch your order list from Plasmidsaurus (cached for 2 minutes)",
     "btn-ps-fetch-close": "Close without fetching",
     "set-ps-save": "Save these Plasmidsaurus API credentials",
     "set-ps-clear": "Clear the stored Plasmidsaurus API credentials",
@@ -112139,7 +112488,13 @@ NcbiTaxonPickerModal { align: center middle; }
         # invocation that bypasses Textual's mount).
         try:
             panel = self.query_one(LibraryPanel)
-            panel._marked_ids.clear()
+            # Clear ONLY the marks just committed. A mixed batch (some Ⓜ, some
+            # Ⓒ) commits in two passes, so wiping every mark after the first
+            # would silently discard the half the user still meant to send.
+            for eid in list(panel._marked_ids):
+                if panel._mark_kind.get(eid, "move") == mode:
+                    panel._marked_ids.discard(eid)
+                    panel._mark_kind.pop(eid, None)
             panel._repopulate()
         except Exception:
             pass

@@ -99,6 +99,31 @@ def use_router(monkeypatch):
     return _install
 
 
+# A realistic listing: one downloadable run, one shipping label (complete but
+# undated, no results), one canceled order.
+_ORDERS = [
+    {"code": "AAAAAA", "status": "complete", "order_name": "run one",
+     "product_name": "plasmid_low_copy", "quantity": 2,
+     "done_date": "2026-06-01T10:00:00+00:00", "gross": 30.0},
+    {"code": "BBBBBB", "status": "complete", "order_name": "label",
+     "product_name": "ups_shipping_label", "quantity": 1,
+     "done_date": None, "gross": 12.0},
+    {"code": "CCCCCC", "status": "canceled", "order_name": "dropped",
+     "product_name": "plasmid", "quantity": 1,
+     "done_date": "2026-05-01T10:00:00+00:00", "gross": 0.0},
+]
+
+
+@pytest.fixture(autouse=True)
+def _clear_ps_order_cache():
+    """The GUI order cache is module-level; a leak across tests would let one
+    test serve another's listing."""
+    blank = {"at": 0.0, "items": [], "token": "", "key": ""}
+    sc._PS_ORDERS_CACHE.update(blank)
+    yield
+    sc._PS_ORDERS_CACHE.update(blank)
+
+
 # ── item-code sanitiser ──────────────────────────────────────────────────────
 class TestItemCodeSanitizer:
     def test_valid_uppercased(self):
@@ -607,11 +632,119 @@ class TestSettingsModalCreds:
 
 
 # ── GUI: PlasmidsaurusFetchModal ─────────────────────────────────────────────
+class TestOrderRows:
+    """`_plasmidsaurus_order_rows` — pure, so the selection logic is testable
+    without driving a DataTable (headless DataTable has its own quirks)."""
+
+    def test_hides_orders_with_nothing_to_download(self):
+        rows = sc._plasmidsaurus_order_rows(_ORDERS)
+        assert [r["code"] for r in rows] == ["AAAAAA"]
+
+    def test_include_empty_shows_all_and_marks_them(self):
+        rows = sc._plasmidsaurus_order_rows(_ORDERS, include_empty=True)
+        assert [r["code"] for r in rows] == ["AAAAAA", "BBBBBB", "CCCCCC"]
+        assert [r["has_results"] for r in rows] == [True, False, False]
+
+    def test_date_uses_the_universal_slash_free_form(self):
+        rows = sc._plasmidsaurus_order_rows(_ORDERS)
+        assert rows[0]["date"] == "JUN 1 2026"
+
+    def test_undated_order_shows_a_dash_not_a_bogus_date(self):
+        rows = sc._plasmidsaurus_order_rows(_ORDERS, include_empty=True)
+        assert rows[1]["date"] == "—"
+
+    def test_product_underscores_become_spaces(self):
+        rows = sc._plasmidsaurus_order_rows(_ORDERS)
+        assert rows[0]["product"] == "plasmid low copy"
+
+    def test_unusable_codes_are_dropped(self):
+        bad = [{"code": "toolongcode", "status": "complete",
+                "done_date": "2026-06-01", "product_name": "plasmid"},
+               {"code": None, "status": "complete",
+                "done_date": "2026-06-01", "product_name": "plasmid"}]
+        assert sc._plasmidsaurus_order_rows(bad, include_empty=True) == []
+
+    def test_order_name_is_sanitised(self):
+        # Order names are remote input rendered into a terminal.
+        evil = [{"code": "AAAAAA", "status": "complete",
+                 "order_name": "boom\x1b[31mred", "product_name": "plasmid",
+                 "done_date": "2026-06-01", "quantity": 1}]
+        rows = sc._plasmidsaurus_order_rows(evil)
+        assert "\x1b" not in rows[0]["order"]
+
+    def test_duplicate_codes_are_collapsed(self):
+        """The code is the DataTable row key and Textual raises DuplicateKey
+        on a repeat, so a duplicated server row must not reach the table."""
+        dupes = _ORDERS + [dict(_ORDERS[0], order_name="same code again")]
+        rows = sc._plasmidsaurus_order_rows(dupes, include_empty=True)
+        codes = [r["code"] for r in rows]
+        assert len(codes) == len(set(codes))
+        # Newest-first: the first occurrence is the one kept.
+        assert rows[0]["order"] == "run one"
+
+    def test_non_dict_rows_are_skipped(self):
+        assert sc._plasmidsaurus_order_rows(
+            ["junk", None, 7], include_empty=True) == []
+
+    def test_missing_quantity_shows_a_dash(self):
+        one = [{"code": "AAAAAA", "status": "complete",
+                "done_date": "2026-06-01", "product_name": "plasmid"}]
+        assert sc._plasmidsaurus_order_rows(one)[0]["qty"] == "—"
+
+
+class TestOrdersCache:
+    """The account is capped at 10 requests/minute, so the listing is cached."""
+
+    def test_second_call_costs_no_requests(self, use_router):
+        r = use_router(_Router(items=_ORDERS))
+        items_a, tok_a = sc._plasmidsaurus_orders("cid", "sec")
+        spent = len(r.calls)
+        items_b, tok_b = sc._plasmidsaurus_orders("cid", "sec")
+        assert len(r.calls) == spent          # nothing new went out
+        assert tok_a == tok_b
+        assert [i["code"] for i in items_a] == [i["code"] for i in items_b]
+
+    def test_force_refetches(self, use_router):
+        r = use_router(_Router(items=_ORDERS))
+        sc._plasmidsaurus_orders("cid", "sec")
+        spent = len(r.calls)
+        sc._plasmidsaurus_orders("cid", "sec", force=True)
+        assert len(r.calls) > spent
+
+    def test_different_credentials_miss_the_cache(self, use_router):
+        # Otherwise changing the key in Settings would keep showing the
+        # previous account's orders.
+        r = use_router(_Router(items=_ORDERS))
+        sc._plasmidsaurus_orders("cid", "sec")
+        spent = len(r.calls)
+        sc._plasmidsaurus_orders("other", "creds")
+        assert len(r.calls) > spent
+
+    def test_expired_entry_refetches(self, use_router):
+        r = use_router(_Router(items=_ORDERS))
+        sc._plasmidsaurus_orders("cid", "sec")
+        spent = len(r.calls)
+        sc._PS_ORDERS_CACHE["at"] = (
+            sc._monotonic() - sc._PS_ORDERS_CACHE_TTL_S - 1.0)
+        sc._plasmidsaurus_orders("cid", "sec")
+        assert len(r.calls) > spent
+
+    def test_raw_credentials_are_never_stored(self, use_router):
+        use_router(_Router(items=_ORDERS))
+        sc._plasmidsaurus_orders("cid-secret-value", "sec-secret-value")
+        blob = repr(sc._PS_ORDERS_CACHE)
+        assert "cid-secret-value" not in blob
+        assert "sec-secret-value" not in blob
+
+
 class TestFetchModal:
-    async def test_invalid_code_shows_error(self, monkeypatch):
+    async def test_invalid_code_shows_error(self, monkeypatch, use_router):
         from textual.widgets import Input, Static
         monkeypatch.setenv("PLASMIDSAURUS_CLIENT_ID", "cid")
         monkeypatch.setenv("PLASMIDSAURUS_CLIENT_SECRET", "sec")
+        # Credentials present means the modal auto-enumerates on mount, so the
+        # opener MUST be stubbed or this test would reach the real API.
+        use_router(_Router(items=_ORDERS))
         app = sc.PlasmidApp()
         async with app.run_test(size=(120, 50)) as pilot:
             await pilot.pause()
@@ -640,6 +773,143 @@ class TestFetchModal:
             status = str(modal.query_one("#ps-fetch-status", Static).render())
             assert "Imported 2" in status and "1 skipped" in status
             assert modal._busy is False
+            app.exit()
+
+    async def test_open_enumerates_orders(self, monkeypatch, use_router):
+        from textual.widgets import DataTable, Static
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_ID", "cid")
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_SECRET", "sec")
+        use_router(_Router(items=_ORDERS))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.PlasmidsaurusFetchModal())
+            await pilot.pause()
+            modal = app.screen
+            # Drive the callback directly rather than racing the thread worker.
+            modal._list_done(("ok", _ORDERS, "tok"))
+            await pilot.pause()
+            tbl = modal.query_one("#ps-fetch-table", DataTable)
+            assert tbl.row_count == 1          # only the downloadable order
+            assert modal._token == "tok"       # reused for the download
+            status = str(modal.query_one("#ps-fetch-status", Static).render())
+            assert "1 of 3" in status
+            app.exit()
+
+    async def test_show_empty_checkbox_reveals_the_rest(self, monkeypatch,
+                                                        use_router):
+        from textual.widgets import Checkbox, DataTable
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_ID", "cid")
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_SECRET", "sec")
+        use_router(_Router(items=_ORDERS))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.PlasmidsaurusFetchModal())
+            await pilot.pause()
+            modal = app.screen
+            modal._list_done(("ok", _ORDERS, "tok"))
+            await pilot.pause()
+            modal.query_one("#ps-show-empty", Checkbox).value = True
+            await pilot.pause()
+            assert modal.query_one("#ps-fetch-table", DataTable).row_count == 3
+            app.exit()
+
+    async def test_selecting_a_no_results_row_refuses_before_requesting(
+            self, monkeypatch, use_router):
+        from textual.widgets import Checkbox, Static
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_ID", "cid")
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_SECRET", "sec")
+        use_router(_Router(items=_ORDERS))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.PlasmidsaurusFetchModal())
+            await pilot.pause()
+            modal = app.screen
+            modal._list_done(("ok", _ORDERS, "tok"))
+            modal.query_one("#ps-show-empty", Checkbox).value = True
+            await pilot.pause()
+
+            class _Ev:                      # only `.row_key.value` is read
+                class row_key:              # noqa: N801
+                    value = "BBBBBB"        # the shipping label
+            modal._row_selected(_Ev())
+            await pilot.pause()
+            status = str(modal.query_one("#ps-fetch-status", Static).render())
+            assert "nothing to download" in status
+            assert modal._busy is False     # no download was started
+            app.exit()
+
+    async def test_listing_does_not_steal_focus_from_the_code_box(
+            self, monkeypatch, use_router):
+        from textual.widgets import DataTable, Input
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_ID", "cid")
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_SECRET", "sec")
+        use_router(_Router(items=_ORDERS))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.PlasmidsaurusFetchModal())
+            await pilot.pause()
+            modal = app.screen
+            # User starts typing a shared code before the listing lands.
+            box = modal.query_one("#ps-fetch-code", Input)
+            box.focus()
+            await pilot.pause()
+            modal._list_done(("ok", _ORDERS, "tok"))
+            await pilot.pause()
+            assert box.has_focus, "listing yanked focus out of the code box"
+            app.exit()
+
+    async def test_listing_focuses_the_table_when_code_box_is_idle(
+            self, monkeypatch, use_router):
+        from textual.widgets import DataTable
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_ID", "cid")
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_SECRET", "sec")
+        use_router(_Router(items=_ORDERS))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.PlasmidsaurusFetchModal())
+            await pilot.pause()
+            modal = app.screen
+            modal._list_done(("ok", _ORDERS, "tok"))
+            await pilot.pause()
+            assert modal.query_one("#ps-fetch-table", DataTable).has_focus
+            app.exit()
+
+    async def test_listing_failure_is_reported_not_swallowed(self, monkeypatch,
+                                                             use_router):
+        from textual.widgets import Static
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_ID", "cid")
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_SECRET", "sec")
+        use_router(_Router(items=_ORDERS))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.PlasmidsaurusFetchModal())
+            await pilot.pause()
+            modal = app.screen
+            modal._list_done(("err", "rate limit reached", ""))
+            await pilot.pause()
+            status = str(modal.query_one("#ps-fetch-status", Static).render())
+            assert "rate limit" in status and modal._listing is False
+            app.exit()
+
+    async def test_no_credentials_does_not_enumerate(self, monkeypatch):
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_SECRET", raising=False)
+        sc._set_setting("plasmidsaurus_client_id", "")
+        sc._set_setting("plasmidsaurus_client_secret", "")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.PlasmidsaurusFetchModal())
+            await pilot.pause()
+            modal = app.screen
+            # No creds must mean no request attempt at all.
+            assert modal._listing is False and modal._items == []
             app.exit()
 
     async def test_creds_hint_when_unset(self, monkeypatch):

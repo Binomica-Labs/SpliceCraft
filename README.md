@@ -221,9 +221,13 @@ reload later, or cite it as `&<gel>` in your notebook.
 ### Sequencing
 
 Verify constructs against real reads. Drop in a Plasmidsaurus `.zip` — or
-**fetch a run by item code straight from the Plasmidsaurus API** (the button on
-the Sequencing screen; set credentials under Settings ▸ Plasmidsaurus API or via
-the `PLASMIDSAURUS_CLIENT_ID` / `PLASMIDSAURUS_CLIENT_SECRET` env vars) — then walk
+**fetch a run straight from the Plasmidsaurus API** (the button on the
+Sequencing screen; set credentials under Settings ▸ Plasmidsaurus API or via the
+`PLASMIDSAURUS_CLIENT_ID` / `PLASMIDSAURUS_CLIENT_SECRET` env vars). It lists
+your orders newest-first with the name you gave each one, so you pick a run from
+the table instead of remembering its code — select and press Enter to download
+and import. Orders with nothing to fetch (shipping labels, canceled orders) are
+hidden behind a checkbox rather than left to fail at download. Then walk
 run → sample → target, and **Align**: the read lands as a colored bar (blue
 match / red mismatch / gray gap) on the plasmid's linear map, named in place,
 shaded by how much of each span actually binds so even a single-base mismatch

@@ -83,6 +83,109 @@ class TestSanity:
         assert hasattr(sc.LibraryPanel, "MoveCopyRequested")
 
 
+class TestMarkCycle:
+    """Space cycles a row none → Ⓜ (move) → Ⓒ (copy) → none, mirroring the
+    primer library's ★/$/M cycle where the mark carries the intent. The state
+    machine is split out of the key handler so it tests without a DataTable."""
+
+    @pytest.fixture
+    def panel(self):
+        p = sc.LibraryPanel.__new__(sc.LibraryPanel)
+        p._marked_ids = set()
+        p._mark_kind = {}
+        return p
+
+    def test_space_cycles_through_move_copy_and_off(self, panel):
+        assert panel._cycle_mark("a") == "move"
+        assert panel._mark_kind["a"] == "move"
+        assert panel._cycle_mark("a") == "copy"
+        assert panel._mark_kind["a"] == "copy"
+        assert panel._cycle_mark("a") == ""
+        assert "a" not in panel._marked_ids and "a" not in panel._mark_kind
+
+    def test_cycle_is_per_row(self, panel):
+        panel._cycle_mark("a")                       # a → move
+        panel._cycle_mark("b"); panel._cycle_mark("b")   # b → copy
+        assert panel._marked_of_kind("move") == ["a"]
+        assert panel._marked_of_kind("copy") == ["b"]
+
+    def test_legacy_bare_add_reads_as_move(self, panel):
+        # Older code (and existing tests) add straight to `_marked_ids` with
+        # no kind; that must keep behaving as a move mark, not vanish.
+        panel._marked_ids.add("legacy")
+        assert panel._marked_of_kind("move") == ["legacy"]
+        assert panel._marked_of_kind("copy") == []
+
+    def test_move_ignores_copy_marked_rows(self, panel):
+        panel._cycle_mark("a")                       # move
+        panel._cycle_mark("b"); panel._cycle_mark("b")   # copy
+        assert panel._resolve_marked_or_cursor("move") == ["a"]
+        assert panel._resolve_marked_or_cursor("copy") == ["b"]
+
+    def test_kindless_resolve_returns_every_mark(self, panel):
+        # Image export doesn't distinguish move from copy.
+        panel._cycle_mark("a")
+        panel._cycle_mark("b"); panel._cycle_mark("b")
+        assert sorted(panel._resolve_marked_or_cursor()) == ["a", "b"]
+
+    def test_all_marks_other_kind_yields_nothing_not_the_cursor_row(
+            self, panel):
+        # The dangerous fallback: marks set, none of this kind. Falling
+        # through to the cursor row would move a plasmid staged to copy.
+        panel._cycle_mark("a"); panel._cycle_mark("a")    # copy only
+        assert panel._resolve_marked_or_cursor("move") == []
+
+    def test_notify_names_the_other_key_when_marks_are_all_other_kind(
+            self, panel, monkeypatch):
+        panel._cycle_mark("a"); panel._cycle_mark("a")    # copy only
+        seen = []
+
+        class _App:
+            def notify(self, msg, severity="information", **_k):
+                seen.append(msg)
+        monkeypatch.setattr(type(panel), "app", property(lambda self: _App()))
+        panel._notify_nothing_staged("move")
+        # "did nothing" is the worst possible message here — it must say the
+        # marks exist and which key commits them.
+        assert seen and "y" in seen[0] and "copy" in seen[0]
+
+    def test_mark_cell_with_supplied_colour_does_no_library_lookup(
+            self, panel, monkeypatch):
+        """PERF LOCK. `_find_library_entry_by_id` is an O(N) cache walk that
+        takes `_cache_lock` and deep-clones (sweep #11). Calling it once per
+        row makes a repopulate O(N**2) with N lock acquisitions, so the
+        repopulate loop MUST pass the status colour it already derived."""
+        calls = []
+        monkeypatch.setattr(sc, "_find_library_entry_by_id",
+                            lambda *a, **k: calls.append(1))
+        panel._mark_cell("x", None)         # unmarked, colour supplied
+        panel._mark_cell("x", "green")
+        assert calls == [], "repopulate path must not hit the library"
+        panel._cycle_mark("m1")
+        panel._mark_cell("m1")              # marked → glyph needs no status
+        assert calls == []
+        panel._mark_cell("y")               # unmarked, no colour → lookup
+        assert len(calls) == 1
+
+    def test_mark_cell_renders_the_two_glyphs(self, panel):
+        panel._cycle_mark("a")                            # Ⓜ
+        panel._cycle_mark("b"); panel._cycle_mark("b")    # Ⓒ
+        assert "Ⓜ" in str(panel._mark_cell("a"))
+        assert "Ⓒ" in str(panel._mark_cell("b"))
+        assert "·" in str(panel._mark_cell("c", None))    # unmarked, no status
+
+    def test_notify_explains_how_to_mark_when_nothing_is_marked(
+            self, panel, monkeypatch):
+        seen = []
+
+        class _App:
+            def notify(self, msg, severity="information", **_k):
+                seen.append(msg)
+        monkeypatch.setattr(type(panel), "app", property(lambda self: _App()))
+        panel._notify_nothing_staged("move")
+        assert seen and "Space" in seen[0]
+
+
 # ── Move / copy commit logic (the heavy hardening) ───────────────────
 
 
@@ -118,6 +221,25 @@ class TestMoveCopyCommit:
         assert len(ffe["plasmids"]) == 3
         # Order preserved.
         assert [p["id"] for p in ffe["plasmids"]] == eden_ids
+
+    def test_commit_clears_only_the_committed_kind(self, app):
+        """A mixed batch commits in two passes. Clearing EVERY mark after the
+        first would silently discard the half still staged for the other
+        operation — and the user would have no way to tell it was dropped."""
+        eden_ids = _seed_two_collections(eden_n=3, ffe_n=0)
+        panel = sc.LibraryPanel.__new__(sc.LibraryPanel)
+        panel._marked_ids, panel._mark_kind = set(), {}
+        panel._cycle_mark(eden_ids[0])                              # Ⓜ
+        panel._cycle_mark(eden_ids[1]); panel._cycle_mark(eden_ids[1])  # Ⓒ
+        panel._repopulate = lambda: None
+        app.query_one = lambda *a, **k: panel
+
+        app._move_copy_commit(
+            source="DemoColl", target="FFE",
+            entry_ids=[eden_ids[0]], mode="move",
+        )
+        assert panel._marked_ids == {eden_ids[1]}
+        assert panel._mark_kind == {eden_ids[1]: "copy"}
 
     def test_copy_basic(self, app):
         eden_ids = _seed_two_collections(eden_n=2, ffe_n=0)
