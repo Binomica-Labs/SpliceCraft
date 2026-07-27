@@ -379,7 +379,18 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   are deliberately NOT exposed through get-settings / set-setting.
   `download` runs synchronously and imports only `kind=results` (the
   archive that carries assemblies); no credentials → 400, a download /
-  parse failure → 502, an archive with no samples → 422.
+  parse failure → 502, an archive with no samples → 422, and a 429 means
+  the account's 10-requests-per-minute budget is spent.
+  Each listed item is `{code, status, order_name, product_name,
+  quantity, done_date, gross, has_results}`. **Choose a run by
+  `has_results`, not by `status`** — roughly 40% of a real listing is
+  shipping-label orders that are marked `status: "complete"` with a null
+  `done_date` and sort to the top, but have no results zip (feeding one
+  to `download-plasmidsaurus` 404s); `status` also takes `"canceled"`.
+  `downloadable` counts the items that do have results. The server
+  truncates the listing at 1000 items and offers no pagination, so a
+  `truncated: true` response means older orders exist that the API
+  cannot reach.
 - **Custom enzymes + enzyme collections** — list / get / create /
   update / delete-custom-enzyme; list / get / create / update /
   delete-enzyme-collection; get / set-active-enzyme-collection.

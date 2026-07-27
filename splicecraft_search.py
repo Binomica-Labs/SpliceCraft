@@ -1728,10 +1728,71 @@ _PLASMIDSAURUS_API_MAX_BYTES = 16 * 1024 * 1024   # items/samples JSON listing
 # Results-zip cap a touch above the importer's 500 MB so the clearer
 # "parser refused" message wins over a raw byte-cap abort for a borderline run.
 _PLASMIDSAURUS_DOWNLOAD_MAX_BYTES = 600 * 1024 * 1024
+# `/api/items` DEFAULTS to 100 items and silently truncates — an account with
+# 218 orders looked like it only had its most recent 100 (one year of a
+# four-year history) until this was found against a live account (2026-07-27).
+# `?limit=N` is honoured up to 1000 ("Limit parameter can't be more than a
+# 1000."); there is NO pagination — `offset` / `page` / `skip` / `per_page` /
+# `cursor` are all accepted-and-ignored, returning the identical first page. So
+# `limit` is the only lever, and past 1000 items the tail is unreachable via
+# this API (callers surface `_PLASMIDSAURUS_ITEMS_TRUNCATED_HINT` at the cap).
+_PLASMIDSAURUS_ITEMS_LIMIT = 1000
+_PLASMIDSAURUS_ITEMS_TRUNCATED_HINT = (
+    f"listing hit the server's {_PLASMIDSAURUS_ITEMS_LIMIT}-item ceiling; "
+    f"older orders exist but the API offers no pagination to reach them")
+# Live-observed rate limit, shared across `/oauth/token` + `/api/*`: exceeding
+# it returns `429 {"message": "10 per 1 minute"}`. Tight enough that a single
+# GUI fetch (token + link + download) is already 3 of the 10.
+_PLASMIDSAURUS_RATE_LIMIT_MSG = (
+    "Plasmidsaurus rate limit reached (10 requests per minute) — wait about "
+    "a minute and try again.")
+# Order types that never carry a results zip. Shipping labels are ~40% of a
+# typical listing, are marked `status: complete` with a null `done_date`, and
+# sort to the TOP — so "the newest complete item" is usually a shipping label,
+# whose `/results` 404s. Used by `_plasmidsaurus_item_has_results` to flag them
+# rather than hide them (dropping rows would break the agent-API compat
+# promise for anything already consuming the listing).
+_PLASMIDSAURUS_NON_RESULT_PRODUCTS: frozenset[str] = frozenset({
+    "ups_shipping_label"})
 
 
 def _plasmidsaurus_user_agent() -> str:
     return f"SpliceCraft/{_state._sc_version} (Plasmidsaurus API client)"
+
+
+def _plasmidsaurus_oserror(msg: str, status: "int | None") -> OSError:
+    """Build the OSError callers see, tagging it with the HTTP status so a
+    caller can branch on it (`getattr(exc, "http_status", None)`) instead of
+    string-sniffing the message."""
+    err = OSError(msg)
+    err.http_status = status        # type: ignore[attr-defined]
+    return err
+
+
+def _plasmidsaurus_item_has_results(item: "dict | None") -> bool:
+    """Best-effort 'this order has a downloadable results zip'.
+
+    NOT authoritative — the API exposes no such field, so this is the
+    heuristic that matches live data: a real completed run is `status:
+    complete` AND carries a `done_date` AND isn't one of the known
+    non-sequencing products. Shipping labels fail on the last two, canceled
+    orders on the first. Callers use it to steer a picker away from the
+    dead rows; the download path still has to handle a 404.
+
+    Both error directions are tolerable because the row is listed either
+    way: a run that is complete but not yet dated reads False for that
+    window (the user can still feed its code to the download), and the
+    product list is a snapshot that a new non-sequencing order type could
+    outrun — which is why `done_date` is checked too rather than trusting
+    `_PLASMIDSAURUS_NON_RESULT_PRODUCTS` alone to stay current."""
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("status") or "").strip().lower() != "complete":
+        return False
+    if not item.get("done_date"):
+        return False
+    product = str(item.get("product_name") or "").strip().lower()
+    return product not in _PLASMIDSAURUS_NON_RESULT_PRODUCTS
 
 
 def _plasmidsaurus_credentials() -> "tuple[str | None, str | None]":
@@ -1803,14 +1864,21 @@ def _plasmidsaurus_oauth_token(client_id: str, client_secret: str,
     try:
         resp = opener.open(req, timeout=timeout)
     except urllib.error.HTTPError as exc:
+        # 429 first: it shares the 4xx space but says nothing about the
+        # credentials, and telling a rate-limited user to "check your
+        # client ID" sends them off debugging a key that's perfectly fine.
+        if exc.code == 429:
+            raise _plasmidsaurus_oserror(
+                _PLASMIDSAURUS_RATE_LIMIT_MSG, 429) from exc
         if exc.code in (400, 401, 403):
-            raise OSError(
+            raise _plasmidsaurus_oserror(
                 "Plasmidsaurus rejected the API credentials "
                 f"(HTTP {exc.code}). Check PLASMIDSAURUS_CLIENT_ID / "
-                "PLASMIDSAURUS_CLIENT_SECRET (or the Settings values)."
-            ) from exc
-        raise OSError(
-            f"Plasmidsaurus token request failed: HTTP {exc.code}") from exc
+                "PLASMIDSAURUS_CLIENT_SECRET (or the Settings values).",
+                exc.code) from exc
+        raise _plasmidsaurus_oserror(
+            f"Plasmidsaurus token request failed: HTTP {exc.code}",
+            exc.code) from exc
     except urllib.error.URLError as exc:
         raise OSError(
             f"Plasmidsaurus token request failed: {exc.reason}") from exc
@@ -1860,14 +1928,19 @@ def _plasmidsaurus_api_get(path: str, token: str,
     try:
         resp = opener.open(req, timeout=timeout)
     except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise _plasmidsaurus_oserror(
+                _PLASMIDSAURUS_RATE_LIMIT_MSG, 429) from exc
         if exc.code == 404:
-            raise OSError(
-                "Plasmidsaurus: item or results not found (HTTP 404)") from exc
+            raise _plasmidsaurus_oserror(
+                "Plasmidsaurus: item or results not found (HTTP 404)",
+                404) from exc
         if exc.code in (401, 403):
-            raise OSError(
+            raise _plasmidsaurus_oserror(
                 f"Plasmidsaurus: not authorised for this item "
-                f"(HTTP {exc.code})") from exc
-        raise OSError(f"Plasmidsaurus API GET failed: HTTP {exc.code}") from exc
+                f"(HTTP {exc.code})", exc.code) from exc
+        raise _plasmidsaurus_oserror(
+            f"Plasmidsaurus API GET failed: HTTP {exc.code}", exc.code) from exc
     except urllib.error.URLError as exc:
         raise OSError(f"Plasmidsaurus API GET failed: {exc.reason}") from exc
     try:
@@ -1888,11 +1961,22 @@ def _plasmidsaurus_api_get(path: str, token: str,
 
 def _plasmidsaurus_list_items(token: str,
                                *, shared: bool = False,
+                               limit: "int | None" = None,
                                timeout: "float | None" = None) -> "list":
     """Return the caller's items (most-recent first). ``shared=True`` returns
     items shared with the caller by other users. Always a list (empty if the
-    account has none / the API returns a non-list)."""
-    path = "/api/items?shared=true" if shared else "/api/items"
+    account has none / the API returns a non-list).
+
+    ALWAYS sends an explicit ``limit`` — the server's own default is 100 and
+    it truncates silently, which hid 118 of a real account's 218 orders (75 of
+    them actual sequencing runs) behind a listing that looked complete.
+    ``limit`` is clamped to the server's 1000 ceiling; a request for more is
+    rejected with a 400 rather than capped server-side."""
+    if limit is None:
+        limit = _PLASMIDSAURUS_ITEMS_LIMIT
+    limit = max(1, min(int(limit), _PLASMIDSAURUS_ITEMS_LIMIT))
+    path = (f"/api/items?shared=true&limit={limit}" if shared
+            else f"/api/items?limit={limit}")
     data = _plasmidsaurus_api_get(path, token, timeout=timeout)
     return data if isinstance(data, list) else []
 
@@ -1904,8 +1988,22 @@ def _plasmidsaurus_result_link(token: str, item_code: str,
     results / reads / pod5 zip. ``item_code`` MUST already be sanitised."""
     if kind not in _PLASMIDSAURUS_RESULT_KINDS:
         raise ValueError(f"unknown Plasmidsaurus result kind: {kind!r}")
-    data = _plasmidsaurus_api_get(
-        f"/api/item/{item_code}/{kind}", token, timeout=timeout)
+    try:
+        data = _plasmidsaurus_api_get(
+            f"/api/item/{item_code}/{kind}", token, timeout=timeout)
+    except OSError as exc:
+        # A bare "not found" reads as a bad item code, but the common cause is
+        # an order that simply has no results: shipping-label orders and
+        # canceled orders both live in the listing (the former marked
+        # `complete`!) and both 404 here. Name them so the user stops
+        # re-checking a code that's perfectly valid.
+        if getattr(exc, "http_status", None) == 404:
+            raise _plasmidsaurus_oserror(
+                f"Plasmidsaurus item {item_code} has no {kind} to download. "
+                f"Shipping-label orders, canceled orders and runs still in "
+                f"progress all appear in the item list but have no results.",
+                404) from exc
+        raise
     link = data.get("link") if isinstance(data, dict) else None
     if not isinstance(link, str) or not link:
         raise ValueError(
@@ -1959,8 +2057,19 @@ def _plasmidsaurus_download_zip(url: str, dest: Path,
     try:
         resp = opener.open(req, timeout=_PLASMIDSAURUS_NETWORK_TIMEOUT_S)
     except urllib.error.HTTPError as exc:
-        raise OSError(
-            f"Plasmidsaurus download failed: HTTP {exc.code}") from exc
+        # The results URL is a short-lived pre-signed S3 link, not an API
+        # endpoint — the object store answers an expired or already-consumed
+        # signature with 403/404, which as a bare status reads like "your
+        # account can't see this run". Re-fetching the link is the fix, so
+        # say that rather than sending the user at their credentials.
+        if exc.code in (403, 404):
+            raise _plasmidsaurus_oserror(
+                f"Plasmidsaurus download link rejected (HTTP {exc.code}) — "
+                f"these links are pre-signed and short-lived, so request the "
+                f"download again to get a fresh one.", exc.code) from exc
+        raise _plasmidsaurus_oserror(
+            f"Plasmidsaurus download failed: HTTP {exc.code}",
+            exc.code) from exc
     except (urllib.error.URLError, socket.timeout) as exc:
         raise OSError(f"Plasmidsaurus download failed: {exc}") from exc
 

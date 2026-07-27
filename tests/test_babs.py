@@ -760,7 +760,7 @@ class TestBabsUI:
             app.action_open_babs()
             await pilot.pause(); await pilot.pause()
             scr = app.screen
-            scr._jobs.insert(0, {"pid": 1, "kind": "get-paper", "label": "rice",
+            scr._jobs.insert(0, {"pid": 1, "kind": "get-paper", "label": "photosynthesis",
                                  "log": "", "started": "", "started_mono": 0.0,
                                  "token": "tok", "running": True})
             monkeypatch.setattr(scr, "_job_running", lambda job: True)  # force running
@@ -768,7 +768,7 @@ class TestBabsUI:
             await pilot.pause()
             ind = scr.query_one("#babs-ingest-indicator", sc.Static)
             text = str(ind.render())
-            assert "ingest running" in text and "rice" in text
+            assert "ingest running" in text and "photosynthesis" in text
             assert scr._indicator_idle_shown is False
 
     async def _open_model_tab(self, monkeypatch, pilot, app, models=None):

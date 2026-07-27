@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.2.39"
+version         = "1.2.40"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -215,6 +215,11 @@ only-include = [
     "splicecraft_opentrons.py",
     # Circular plasmid-map image export (SVG + PNG) sibling.
     "splicecraft_mapimage.py",
+    # Plant splice-site scoring + its vendored PWM data, and the eukaryotic
+    # expression-cassette assembler.
+    "splicecraft_splice.py",
+    "splicecraft_splice_model.py",
+    "splicecraft_cassette.py",
     "CHANGELOG.md",
 ]
 
@@ -249,6 +254,9 @@ include = [
     "splicecraft_babs.py",
     "splicecraft_opentrons.py",
     "splicecraft_mapimage.py",
+    "splicecraft_splice.py",
+    "splicecraft_splice_model.py",
+    "splicecraft_cassette.py",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",

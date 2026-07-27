@@ -46,6 +46,9 @@ _LAYER_RULES = [
     ("splicecraft_babs", 1),        # BABS chat engine: Ollama HTTP + HF search + chat protocol; imports net/util/logging/state L0
     ("splicecraft_opentrons", 1),   # OT-2 protocol compiler + robot-server LAN client; imports logging/util/state L0
     ("splicecraft_mapimage", 1),    # circular plasmid-map image export (SVG + PNG); imports biology/util/logging L0
+    ("splicecraft_splice", 0),      # plant splice-site PWM scoring; imports logging L0 only
+    ("splicecraft_splice_model", 0),  # generated PWM data, no imports (longest-prefix wins over _splice)
+    ("splicecraft_cassette", 3),    # eukaryotic expression-cassette assembler; imports biology L0 + dataaccess L1
     ("splicecraft_cli_parser", 0),
     ("splicecraft_biology", 0),
     ("splicecraft_cli", 0),        # stdlib-only sidecar (standalone client)

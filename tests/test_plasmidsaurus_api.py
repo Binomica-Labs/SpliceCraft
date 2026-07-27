@@ -201,6 +201,99 @@ class TestApiClient:
             sc._plasmidsaurus_result_link("tok", "ABCDEF")
 
 
+# ── live-API behaviours (found against a real account, 2026-07-27) ───────────
+class TestLiveApiQuirks:
+    """Server behaviour the mocked happy path never exercised, all of it
+    confirmed against a live Plasmidsaurus account: `/api/items` silently
+    truncating at its 100-item default (which hid 118 of 218 real orders),
+    the 10-request/minute rate limit, and the shipping-label / canceled
+    orders that sit in the listing marked `complete` with nothing to fetch.
+    """
+
+    def test_list_items_sends_explicit_limit(self, use_router):
+        r = use_router(_Router(items=[]))
+        sc._plasmidsaurus_list_items("tok")
+        assert f"limit={sc._PLASMIDSAURUS_ITEMS_LIMIT}" in r.calls[-1]
+
+    def test_list_items_shared_keeps_both_params(self, use_router):
+        r = use_router(_Router(items=[]))
+        sc._plasmidsaurus_list_items("tok", shared=True)
+        assert "shared=true" in r.calls[-1]
+        assert f"limit={sc._PLASMIDSAURUS_ITEMS_LIMIT}" in r.calls[-1]
+
+    def test_list_items_clamps_limit_to_server_max(self, use_router):
+        # The server 400s a limit above 1000 rather than capping it, so an
+        # over-large request must be clamped client-side.
+        r = use_router(_Router(items=[]))
+        sc._plasmidsaurus_list_items("tok", limit=99999)
+        assert f"limit={sc._PLASMIDSAURUS_ITEMS_LIMIT}" in r.calls[-1]
+        sc._plasmidsaurus_list_items("tok", limit=0)
+        assert "limit=1" in r.calls[-1]
+
+    @staticmethod
+    def _raise_status(monkeypatch, code: int):
+        import urllib.error
+
+        class _O:
+            def open(self, req, timeout=None):
+                raise urllib.error.HTTPError(
+                    req.get_full_url(), code, "err", {}, None)
+        monkeypatch.setattr(_search, "_build_hardened_url_opener", lambda: _O())
+
+    def test_token_429_says_rate_limit_not_bad_credentials(self, monkeypatch):
+        # 429 shares the 4xx space with the credential rejections; reporting
+        # it as "check your client ID" sends the user debugging a good key.
+        self._raise_status(monkeypatch, 429)
+        with pytest.raises(OSError) as ei:
+            sc._plasmidsaurus_oauth_token("cid", "sec")
+        assert "rate limit" in str(ei.value).lower()
+        assert "credential" not in str(ei.value).lower()
+        assert getattr(ei.value, "http_status", None) == 429
+
+    def test_api_get_429_says_rate_limit(self, monkeypatch):
+        self._raise_status(monkeypatch, 429)
+        with pytest.raises(OSError, match="rate limit"):
+            sc._plasmidsaurus_api_get("/api/items", "tok")
+
+    def test_api_get_tags_http_status(self, monkeypatch):
+        self._raise_status(monkeypatch, 404)
+        with pytest.raises(OSError) as ei:
+            sc._plasmidsaurus_api_get("/api/item/ABCDEF/results", "tok")
+        assert getattr(ei.value, "http_status", None) == 404
+
+    def test_result_link_404_names_the_real_cause(self, monkeypatch):
+        self._raise_status(monkeypatch, 404)
+        with pytest.raises(OSError) as ei:
+            sc._plasmidsaurus_result_link("tok", "ABCDEF")
+        msg = str(ei.value).lower()
+        assert "no results to download" in msg
+        assert "canceled" in msg and "shipping" in msg
+
+    def test_result_link_non_404_passes_through(self, monkeypatch):
+        self._raise_status(monkeypatch, 403)
+        with pytest.raises(OSError, match="not authorised"):
+            sc._plasmidsaurus_result_link("tok", "ABCDEF")
+
+    @pytest.mark.parametrize("item,expected", [
+        ({"status": "complete", "done_date": "2026-06-01",
+          "product_name": "plasmid_low_copy"}, True),
+        # Shipping label: marked complete, sorts to the top, 404s on /results.
+        ({"status": "complete", "done_date": None,
+          "product_name": "ups_shipping_label"}, False),
+        ({"status": "canceled", "done_date": "2026-06-01",
+          "product_name": "plasmid_low_copy"}, False),
+        ({"status": "complete", "done_date": None,
+          "product_name": "plasmid_low_copy"}, False),
+        ({"status": "COMPLETE", "done_date": "2026-06-01",
+          "product_name": "Plasmid_Low_Copy"}, True),
+        ({}, False),
+        (None, False),
+        ("not-a-dict", False),
+    ])
+    def test_has_results_heuristic(self, item, expected):
+        assert sc._plasmidsaurus_item_has_results(item) is expected
+
+
 # ── zip download (PK magic + caps + content-type) ────────────────────────────
 class TestDownloadZip:
     def _opener_returning(self, monkeypatch, body, ctype="application/zip"):
@@ -239,6 +332,26 @@ class TestDownloadZip:
         with pytest.raises(ValueError, match="cap"):
             sc._plasmidsaurus_download_zip(
                 "https://files/x.zip", tmp_path / "x.zip", max_bytes=8)
+
+    @pytest.mark.parametrize("code", [403, 404])
+    def test_expired_presigned_link_says_so(self, tmp_path, monkeypatch, code):
+        # The results URL is a short-lived pre-signed S3 link; the object
+        # store answers an expired signature with 403/404, which as a bare
+        # status reads like an account-permission problem.
+        import urllib.error
+
+        class _O:
+            def open(self, req, timeout=None):
+                raise urllib.error.HTTPError(
+                    req.get_full_url(), code, "err", {}, None)
+        monkeypatch.setattr(_search, "_build_hardened_url_opener", lambda: _O())
+        with pytest.raises(OSError) as ei:
+            sc._plasmidsaurus_download_zip(
+                "https://files/x.zip", tmp_path / "x.zip",
+                max_bytes=10 * 1024 * 1024)
+        msg = str(ei.value).lower()
+        assert "pre-signed" in msg and "short-lived" in msg
+        assert getattr(ei.value, "http_status", None) == code
 
     def test_rejects_non_https(self, tmp_path):
         with pytest.raises(ValueError, match="HTTPS"):
@@ -332,6 +445,51 @@ class TestAgentEndpoints:
         r = self._items()(None, {})
         assert r["ok"] and r["count"] == 1
         assert r["items"][0]["code"] == "ABCDEF"
+
+    def test_items_projects_order_name_and_flags_has_results(
+            self, monkeypatch, use_router):
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_ID", "cid")
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_SECRET", "sec")
+        use_router(_Router(items=[
+            {"code": "AAAAAA", "status": "complete", "order_name": "my run",
+             "product_name": "plasmid_low_copy", "quantity": 2,
+             "done_date": "2026-06-01", "gross": 30.0},
+            {"code": "BBBBBB", "status": "complete", "order_name": "label",
+             "product_name": "ups_shipping_label", "quantity": 1,
+             "done_date": None, "gross": 12.0},
+        ]))
+        r = self._items()(None, {})
+        assert r["count"] == 2 and r["downloadable"] == 1
+        assert r["items"][0]["order_name"] == "my run"
+        assert r["items"][0]["has_results"] is True
+        # The shipping label is KEPT in the listing (dropping rows would break
+        # the agent-API compat promise) but flagged so a picker can skip it.
+        assert r["items"][1]["has_results"] is False
+        assert "truncated" not in r
+
+    def test_items_flags_truncation_at_the_server_ceiling(
+            self, monkeypatch, use_router):
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_ID", "cid")
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_SECRET", "sec")
+        n = sc._PLASMIDSAURUS_ITEMS_LIMIT
+        use_router(_Router(items=[{"code": f"{i:06d}"} for i in range(n)]))
+        r = self._items()(None, {})
+        assert r["count"] == n and r["truncated"] is True
+        assert "pagination" in r["warning"]
+
+    def test_truncation_measured_on_the_raw_server_list(
+            self, monkeypatch, use_router):
+        # A junk row drops out of the projection, so counting the PROJECTED
+        # rows would put a genuinely-full page under the ceiling and retract
+        # the warning on exactly the listing that needed it.
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_ID", "cid")
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_SECRET", "sec")
+        n = sc._PLASMIDSAURUS_ITEMS_LIMIT
+        items = [{"code": f"{i:06d}"} for i in range(n - 2)] + ["junk", None]
+        use_router(_Router(items=items))
+        r = self._items()(None, {})
+        assert r["count"] == n - 2          # junk rows dropped from output
+        assert r["truncated"] is True       # but the page WAS full
 
     def test_download_bad_code_400(self):
         payload, status = self._download()(None, {"item_code": "bad/x"})

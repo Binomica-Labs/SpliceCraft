@@ -53,7 +53,7 @@ from splicecraft_net import (_sanitize_accession)
 from splicecraft_persistence import (_safe_file_size_check, _safe_load_json)
 from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_design, _scrub_qc_primers, _scrub_qc_verify)
 from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq)
-from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
+from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint)
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_picker, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
@@ -2543,10 +2543,21 @@ def _h_plasmidsaurus_items(app, payload):
 
     Credentials resolve env-first (``PLASMIDSAURUS_CLIENT_ID`` /
     ``PLASMIDSAURUS_CLIENT_SECRET``) then the Settings values — returns 400
-    if neither is set. Each item carries ``{code, status, product_name,
-    quantity, done_date, gross}``; feed a ``code`` whose status is
-    ``complete`` to ``download-plasmidsaurus``. Network/credential failures
-    surface as 502 (the secret is never echoed)."""
+    if neither is set. Each item carries ``{code, status, order_name,
+    product_name, quantity, done_date, gross, has_results}``.
+
+    **Pick by ``has_results``, not by ``status``.** Roughly 40% of a real
+    listing is shipping-label orders (``product_name:
+    "ups_shipping_label"``), which are marked ``status: "complete"`` with a
+    null ``done_date`` and sort to the TOP — but have no results zip, so
+    feeding one to ``download-plasmidsaurus`` 404s. ``status`` also takes the
+    value ``"canceled"``, likewise with nothing to download. ``has_results``
+    folds all of that into one flag; ``downloadable`` counts them.
+
+    The server truncates at 1000 items with no pagination available — if
+    ``truncated`` is true, older orders exist that the API cannot reach.
+    Network/credential failures surface as 502 (the secret is never echoed);
+    a 429 means the account's 10-requests-per-minute budget is spent."""
     cid, sec = _plasmidsaurus_credentials()
     if not cid or not sec:
         return ({"error": "no Plasmidsaurus API credentials — set "
@@ -2559,12 +2570,30 @@ def _h_plasmidsaurus_items(app, payload):
         _log.warning("agent plasmidsaurus-items failed: %s", exc)
         return ({"error": f"Plasmidsaurus API error: {_scrub_path(str(exc))}"},
                 502)
-    fields = ("code", "status", "product_name", "quantity", "done_date",
-              "gross")
-    out = [{k: it.get(k) for k in fields}
-           for it in items if isinstance(it, dict)]
-    _log_event("plasmidsaurus.items", count=len(out), via="agent")
-    return {"ok": True, "count": len(out), "items": out}
+    # `order_name` is the human-meaningful label the user typed when placing
+    # the order; without it a caller only sees `plasmid_low_copy` + a date and
+    # can't tell which run is which.
+    fields = ("code", "status", "order_name", "product_name", "quantity",
+              "done_date", "gross")
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        row = {k: it.get(k) for k in fields}
+        row["has_results"] = _plasmidsaurus_item_has_results(it)
+        out.append(row)
+    n_dl = sum(1 for r in out if r["has_results"])
+    resp = {"ok": True, "count": len(out), "downloadable": n_dl, "items": out}
+    # Truncation is about what the SERVER returned, so measure the raw list —
+    # `out` drops any non-dict row, and a single junk entry in a full page
+    # would otherwise put the count under the ceiling and silently retract
+    # the warning on exactly the listing that needed it.
+    if len(items) >= _PLASMIDSAURUS_ITEMS_LIMIT:
+        resp["truncated"] = True
+        resp["warning"] = _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT
+    _log_event("plasmidsaurus.items", count=len(out), downloadable=n_dl,
+               via="agent")
+    return resp
 
 
 @_agent_endpoint("download-plasmidsaurus", write=True)

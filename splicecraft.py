@@ -41,7 +41,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.39"
+__version__ = "1.2.40"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -5679,7 +5679,12 @@ from splicecraft_search import (  # noqa: E402
     _PLASMIDSAURUS_RESULT_KINDS as _PLASMIDSAURUS_RESULT_KINDS,
     _PLASMIDSAURUS_NETWORK_TIMEOUT_S as _PLASMIDSAURUS_NETWORK_TIMEOUT_S,
     _PLASMIDSAURUS_DOWNLOAD_MAX_BYTES as _PLASMIDSAURUS_DOWNLOAD_MAX_BYTES,
+    _PLASMIDSAURUS_ITEMS_LIMIT as _PLASMIDSAURUS_ITEMS_LIMIT,
+    _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT as _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT,
+    _PLASMIDSAURUS_RATE_LIMIT_MSG as _PLASMIDSAURUS_RATE_LIMIT_MSG,
+    _PLASMIDSAURUS_NON_RESULT_PRODUCTS as _PLASMIDSAURUS_NON_RESULT_PRODUCTS,
     _plasmidsaurus_user_agent as _plasmidsaurus_user_agent,
+    _plasmidsaurus_item_has_results as _plasmidsaurus_item_has_results,
     _plasmidsaurus_credentials as _plasmidsaurus_credentials,
     _sanitize_plasmidsaurus_item_code as _sanitize_plasmidsaurus_item_code,
     _plasmidsaurus_oauth_token as _plasmidsaurus_oauth_token,
@@ -57069,14 +57074,22 @@ class PlasmidsaurusFetchModal(ModalScreen):
         tmpdir = tempfile.mkdtemp(prefix="splicecraft-ps-")
         outcome: "tuple[str, object, list] | None" = None
         try:
+            # Integer-MB division rendered a real 1 MB single-sample run as
+            # "0 / 0 MB (100%)" — scale the unit to the transfer instead.
+            def _sz(n: int) -> str:
+                if n >= 1024 * 1024:
+                    return f"{n / (1024 * 1024):.1f} MB"
+                if n >= 1024:
+                    return f"{n / 1024:.0f} KB"
+                return f"{n} B"
+
             def _prog(done: int, total: "int | None") -> None:
-                mb = done // (1024 * 1024)
                 if total:
                     pct = int(100 * done / max(1, total))
-                    m = (f"[yellow]Downloading {code}: {mb} / "
-                         f"{total // (1024 * 1024)} MB ({pct}%)…[/yellow]")
+                    m = (f"[yellow]Downloading {code}: {_sz(done)} / "
+                         f"{_sz(total)} ({pct}%)…[/yellow]")
                 else:
-                    m = f"[yellow]Downloading {code}: {mb} MB…[/yellow]"
+                    m = f"[yellow]Downloading {code}: {_sz(done)}…[/yellow]"
                 if self.is_mounted:
                     try:
                         self.app.call_from_thread(self._set_status, m)

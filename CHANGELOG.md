@@ -14,6 +14,41 @@
 
 ---
 
+## [1.2.40] — 2026-07-27
+
+### Bug fixes
+
+- **Your Plasmidsaurus order list was only ever showing the 100 most recent
+  orders.** The listing looked complete, so there was nothing to tell you the
+  rest existed — on a real account that hid 118 of 218 orders, 75 of them
+  actual sequencing runs, and made a four-year history look like one year.
+  SpliceCraft now asks for the full list (up to the 1000 the server will
+  return) and says so explicitly if you have more orders than that.
+- **"Item or results not found" no longer sends you hunting for a typo in a
+  perfectly good order code.** Shipping-label orders, canceled orders and runs
+  still in progress all appear in your order list but have nothing to
+  download; the message now names those causes instead of implying the code
+  was wrong.
+- **Hitting the Plasmidsaurus request limit used to look like a credential
+  problem.** The API allows 10 requests a minute, and going over reported an
+  error telling you to check your Client ID — sending you to debug a key that
+  was fine. It now tells you it's a rate limit and to wait about a minute.
+- **A failed download no longer blames your account.** Download links are
+  short-lived, and an expired one used to surface as a bare permission error;
+  it now tells you to request the download again.
+- **Small sequencing runs showed "0 / 0 MB" while downloading.** Progress now
+  scales to the size of the transfer.
+
+### New features
+
+- **The Plasmidsaurus order list tells you which orders you can actually
+  download**, and shows the order name you typed when you placed the order
+  rather than only the product type and a date. Nearly half a typical listing
+  is shipping labels, which are marked complete but have no results — those
+  are now flagged rather than left to fail at download time.
+
+---
+
 ## [1.2.39] — 2026-07-25
 
 ### New features
