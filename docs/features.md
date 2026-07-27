@@ -292,17 +292,28 @@ What you can do without leaving the terminal.
   in a folder you pick. Runs on a worker thread with per-entry failure
   isolation; ids resolve across every collection. Takes rows carrying
   *either* mark — export doesn't distinguish move from copy.
-- **Staging plasmids for another collection (Ⓜ / Ⓒ)** — **Space** cycles
-  the highlighted library row through **none → Ⓜ (move) → Ⓒ (copy) →
+- **Staging plasmids (Ⓜ / Ⓒ / Ⓧ)** — **Space** cycles the highlighted
+  library row through **none → Ⓜ (move) → Ⓒ (copy) → Ⓧ (delete) →
   none**, so the mark itself says what will happen to that plasmid —
   the same idea as the primer library's ★ / $ / M cycle. Press **`m`**
-  to send the Ⓜ rows to a collection you pick and **`y`** to send the
-  Ⓒ rows; a mixed batch is staged in one pass and committed in two,
-  and committing one kind leaves the other kind marked. With nothing
-  marked, `m` / `y` still act on the row under the cursor. Copies are
-  deep-copied into the target and renamed on collision (`COPY` for the
-  same sequence, `ALT` for a different one); `c` clears every mark, and
-  marks reset on a collection switch.
+  to send the Ⓜ rows to a collection you pick, **`y`** to send the
+  Ⓒ rows, and **Delete** to remove the Ⓧ rows. A mixed batch is staged
+  in one pass and committed in as many, and committing one kind leaves
+  the others marked. With nothing marked, `m` / `y` / Delete still act
+  on the row under the cursor. Copies are deep-copied into the target
+  and renamed on collision (`COPY` for the same sequence, `ALT` for a
+  different one); `c` clears every mark, and marks reset on a
+  collection switch.
+- **Deleting several plasmids at once** — with rows marked Ⓧ, Delete
+  opens one confirmation that leads with **how many** plasmids are
+  about to go and names them, and — the number that actually matters —
+  how many **sequences** would be held by no other entry afterwards.
+  That count is per sequence, not per row, so two marked copies of the
+  same construct report one sequence at risk rather than two. The whole
+  delete is a single undo step: press **`u`** once and every plasmid
+  returns to its original slot. Undo is all-or-nothing — if you switched
+  collections in between, it restores nothing and says so, rather than
+  bringing back part of the batch.
 
 ## File formats
 

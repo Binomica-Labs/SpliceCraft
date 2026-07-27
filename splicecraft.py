@@ -41,7 +41,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.41"
+__version__ = "1.2.42"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -17065,6 +17065,16 @@ class LibraryPanel(Widget):
             return
         rec = stack[-1]
         name = str(rec.get("name") or "?")
+        # A bulk delete pushes one record PER ENTRY, all tagged with the same
+        # `batch` id, pushed highest-index-first so popping walks ascending.
+        # One press must bring the WHOLE batch back: restoring 1 of 5 and
+        # leaving four gone is the failure shape of the 2026-05-22 incident,
+        # where partial recovery read as complete recovery. A record with no
+        # `batch` (single delete, agent delete) restores exactly one, as
+        # before.
+        batch = str(rec.get("batch") or "")
+        if batch:
+            return self._undo_delete_batch(stack, batch)
         # The library file IS the active collection's contents, so an entry
         # can only go back while the collection it left is still active —
         # otherwise the restore would silently land it somewhere else.
@@ -17125,6 +17135,82 @@ class LibraryPanel(Widget):
         _log_event("library.undo.restored", name=name, index=idx,
                    remaining=len(stack))
 
+    def _undo_delete_batch(self, stack: "list[dict]", batch: str) -> None:
+        """Restore every entry of one bulk delete in a single press.
+
+        Records were pushed highest-index-first, so popping walks them in
+        ASCENDING index order — which is the order they must be re-inserted
+        for the original layout to come back. One save, one repopulate, one
+        toast for the whole batch.
+
+        Refusal is all-or-nothing: if the collection was switched since the
+        delete, the records go back on the stack untouched so the batch stays
+        recoverable once the user switches back. Restoring a partial batch is
+        precisely the outcome this design exists to prevent."""
+        app = self.app
+        recs: "list[dict]" = []
+        while stack and str(stack[-1].get("batch") or "") == batch:
+            recs.append(stack.pop())
+        if not recs:
+            return
+        want = str(recs[0].get("collection") or "")
+        active = _get_active_collection_name()
+        if want and want != active:
+            for r in reversed(recs):        # exact stack order restored
+                stack.append(r)
+            app.notify(
+                f"Those {len(recs)} plasmids were deleted from collection "
+                f"{want!r}. Switch to that collection to restore them.",
+                severity="warning", timeout=8,
+            )
+            _log_event("library.undo.refused", reason="collection_switched",
+                       count=len(recs), wanted=want, active=str(active or ""))
+            return
+        lib = _load_library()
+        present = {str(e.get("id") or "") for e in lib}
+        restored: "list[str]" = []
+        already = 0
+        for rec in recs:
+            entry = rec.get("entry") or {}
+            eid = str(entry.get("id") or "")
+            if eid and eid in present:
+                already += 1        # back by another route; don't duplicate
+                continue
+            idx = max(0, min(int(rec.get("index") or 0), len(lib)))
+            lib.insert(idx, _typed_clone(entry))
+            present.add(eid)
+            restored.append(str(rec.get("name") or eid))
+        _state._library_cache = _typed_clone(lib)
+        _clear_primer_cache = globals().get("_primer_usage_clear_cache")
+        if _clear_primer_cache is not None:
+            _clear_primer_cache()
+        # Every record in a batch carries the SAME pre-batch parts-bin
+        # snapshot, so reversing the cascade once covers the whole delete.
+        cascaded_bin: "list[dict] | None" = None
+        for rec in recs:
+            bin_before = rec.get("bin_before")
+            if isinstance(bin_before, list):
+                cascaded_bin = _typed_clone(bin_before)
+                _state._parts_bin_cache = _typed_clone(cascaded_bin)
+                _clear_assembly_fragment_cache()
+                break
+        # Persist BEFORE the repaint — the restore is the point, the repaint
+        # is cosmetic and must not be able to strand the entries in cache.
+        self._delete_save_to_disk(lib, cascaded_bin, op="Plasmid restore")
+        try:
+            if self._view_mode == "plasmids":
+                self._repopulate_plasmids()
+        except Exception:
+            _log.exception("Undo bulk delete: panel refresh failed")
+        n = len(restored)
+        extra = f" ({already} already present)" if already else ""
+        app.notify(
+            f"Restored {n} plasmid{'s' if n != 1 else ''}{extra}.",
+            severity="information", timeout=6,
+        )
+        _log_event("library.undo.restored_batch", count=n, skipped=already,
+                   remaining=len(stack))
+
     def action_request_history(self) -> None:
         """Open the construction-history viewer for the cursor row.
         No-op in collections view + when the cursor is empty.
@@ -17166,21 +17252,33 @@ class LibraryPanel(Widget):
 
     # ── Bulk-mark + move/copy (sweep #28) ──────────────────────────────
 
+    # The Space cycle, in order. Data rather than branches so adding a state
+    # can't leave one of the transitions behind. "delete" sits LAST on
+    # purpose: reaching it takes three deliberate presses, and a row can never
+    # arrive there by one stray keypress on an unmarked row.
+    _MARK_CYCLE: "tuple[str, ...]" = ("move", "copy", "delete")
+
     def _cycle_mark(self, entry_id: str) -> str:
-        """Advance one row through none → "move" → "copy" → none and return
-        the new state ("" when it lands back on unmarked). Split out from the
-        key handler so the state machine is testable without a live
-        DataTable."""
-        if entry_id not in self._marked_ids:                     # none → Ⓜ
+        """Advance one row through none → "move" → "copy" → "delete" → none
+        and return the new state ("" when it lands back on unmarked). Split
+        out from the key handler so the state machine is testable without a
+        live DataTable. An unrecognised stored kind falls off the end to
+        unmarked rather than sticking."""
+        if entry_id not in self._marked_ids:
             self._marked_ids.add(entry_id)
-            self._mark_kind[entry_id] = "move"
-            return "move"
-        if self._mark_kind.get(entry_id, "move") == "move":      # Ⓜ → Ⓒ
-            self._mark_kind[entry_id] = "copy"
-            return "copy"
-        self._marked_ids.discard(entry_id)                       # Ⓒ → none
-        self._mark_kind.pop(entry_id, None)
-        return ""
+            self._mark_kind[entry_id] = self._MARK_CYCLE[0]
+            return self._MARK_CYCLE[0]
+        cur = self._mark_kind.get(entry_id, self._MARK_CYCLE[0])
+        try:
+            nxt = self._MARK_CYCLE[self._MARK_CYCLE.index(cur) + 1]
+        except (ValueError, IndexError):
+            nxt = ""
+        if not nxt:
+            self._marked_ids.discard(entry_id)
+            self._mark_kind.pop(entry_id, None)
+            return ""
+        self._mark_kind[entry_id] = nxt
+        return nxt
 
     # Sentinel: "no status colour supplied, go look it up". A plain None
     # can't do this job — None is the legitimate value for "entry has no
@@ -17200,7 +17298,10 @@ class LibraryPanel(Widget):
         repopulate into O(N²) with N lock acquisitions. The single-row Space
         path omits it and eats exactly one lookup, as it always did."""
         if entry_id in self._marked_ids:
-            if self._mark_kind.get(entry_id, "move") == "copy":
+            kind = self._mark_kind.get(entry_id, "move")
+            if kind == "delete":
+                return Text("Ⓧ", style="bold red")
+            if kind == "copy":
                 return Text("Ⓒ", style="bold cyan")
             return Text("Ⓜ", style="bold magenta")
         if status_color is self._MARK_CELL_LOOKUP:
@@ -18762,9 +18863,183 @@ class LibraryPanel(Widget):
         keypress can never wipe out a whole library.
         """
         if self._view_mode == "plasmids":
-            self._request_plasmid_delete()
+            # Ⓧ-marked rows win over the cursor row: reaching Ⓧ takes three
+            # deliberate Space presses, so it's an explicit staging the
+            # cursor position must not silently override.
+            marked = self._marked_of_kind("delete")
+            if marked:
+                self._request_plasmid_bulk_delete(marked)
+            else:
+                self._request_plasmid_delete()
         else:
             self._request_collection_delete()
+
+    def _bulk_sequences_lost(self, entries: "list[dict]") -> "int | None":
+        """How many distinct SEQUENCES vanish entirely if `entries` go.
+
+        Counted per content key across every collection: a key whose total
+        occurrences are all inside the delete set is lost, one whose copies
+        survive elsewhere is not. Counting entries instead would double-count
+        two marked rows that share one sequence and overstate the damage —
+        and an alarm that cries wolf is an alarm people stop reading
+        ([INV-167]). Returns None if the scan fails, so the dialog falls back
+        to neutral wording rather than blocking the delete."""
+        try:
+            wanted: "dict[str, int]" = {}
+            for e in entries:
+                k = _entry_content_key(e)
+                if k:
+                    wanted[k] = wanted.get(k, 0) + 1
+            if not wanted:
+                return None
+            total: "dict[str, int]" = {}
+            for c in _load_collections():
+                for e in (c.get("plasmids") or []):
+                    if isinstance(e, dict):
+                        k = _entry_content_key(e)
+                        if k in wanted:
+                            total[k] = total.get(k, 0) + 1
+            return sum(1 for k, n in wanted.items()
+                       if total.get(k, 0) - n <= 0)
+        except Exception:
+            _log.exception("Bulk delete: sequence-loss scan failed")
+            return None
+
+    def _request_plasmid_bulk_delete(self, ids: "list[str]") -> None:
+        """Confirm and delete every Ⓧ-marked plasmid as ONE operation.
+
+        Deliberately not a loop over the single-entry path: that would pop N
+        dialogs, write the library N times, and push N independent undo
+        records. Instead one dialog states the count, one save persists the
+        result, and one batch of undo records (sharing a `batch` id) makes a
+        single `u` bring the whole set back ([INV-168])."""
+        entries = [e for e in (_find_library_entry_by_id(i) for i in ids)
+                   if e is not None]
+        if not entries:
+            # Every marked id is gone already — clear the stale marks rather
+            # than leaving glyphs pointing at nothing.
+            for eid in ids:
+                self._marked_ids.discard(eid)
+                self._mark_kind.pop(eid, None)
+            self._repopulate_plasmids()
+            try:
+                self.app.notify("Those plasmids are no longer in the library.",
+                                severity="warning")
+            except Exception:
+                pass
+            return
+        id_set = {str(e.get("id") or "") for e in entries}
+        names = [str(e.get("name") or e.get("id") or "?") for e in entries]
+        lost = self._bulk_sequences_lost(entries)
+
+        def _on_confirm(yes: "bool | None") -> None:
+            if not yes:
+                return
+            _lib_before = _load_library()
+            # Indices against the PRE-delete library, so a restore puts every
+            # entry back in its own slot rather than appending the batch.
+            recs: "list[dict]" = []
+            for i, e in enumerate(_lib_before):
+                eid = str(e.get("id") or "")
+                if eid in id_set:
+                    recs.append({
+                        "entry": _typed_clone(e),
+                        "index": i,
+                        "collection": _get_active_collection_name(),
+                        "name": str(e.get("name") or eid),
+                    })
+            remaining = [e for e in _lib_before
+                         if str(e.get("id") or "") not in id_set]
+            _state._library_cache = _typed_clone(remaining)
+            _clear_primer_cache = globals().get("_primer_usage_clear_cache")
+            if _clear_primer_cache is not None:
+                _clear_primer_cache()
+            # Parts-bin cascade for the whole batch in one pass, matching the
+            # single-delete rule: (name, grammar) when the entry carries a
+            # constructor source, name-only for legacy rows.
+            cascaded_bin: "list[dict] | None" = None
+            _bin_before: "list[dict] | None" = None
+            try:
+                targets = set()
+                for e in entries:
+                    nm = str(e.get("name") or "").strip()
+                    src = str(e.get("source") or "")
+                    gram = ""
+                    if src.startswith("constructor:"):
+                        bits = src.split(":", 2)
+                        if len(bits) >= 2:
+                            gram = bits[1]
+                    targets.add((nm, gram))
+                bin_entries = _load_parts_bin()
+                kept = []
+                for b in bin_entries:
+                    bn = str(b.get("name") or "").strip()
+                    bg = b.get("grammar") or "gb_l0"
+                    drop = any(
+                        bn == nm and (not gram or bg == gram)
+                        for nm, gram in targets
+                    )
+                    if not drop:
+                        kept.append(b)
+                if len(kept) < len(bin_entries):
+                    _bin_before = _typed_clone(bin_entries)
+                    _state._parts_bin_cache = _typed_clone(kept)
+                    _clear_assembly_fragment_cache()
+                    cascaded_bin = kept
+                    _log.info("Bulk delete: cascaded %d parts-bin row(s)",
+                              len(bin_entries) - len(kept))
+            except ValueError as exc:
+                _log.exception("Bulk delete: parts-bin cascade failed")
+                try:
+                    self.app.notify(
+                        f"Plasmids deleted, but parts-bin cleanup failed: "
+                        f"{exc}", severity="warning")
+                except Exception:
+                    pass
+            # One batch id across every record: `action_undo_delete` pops the
+            # run in one press. Pushed HIGHEST index first so popping walks
+            # ascending, which is the order re-insertion needs.
+            try:
+                _push_undo = getattr(self.app, "_push_library_undo", None)
+                if callable(_push_undo):
+                    batch_id = f"bulk-{_now_iso()}-{len(recs)}"
+                    for rec in sorted(recs, key=lambda r: r["index"],
+                                      reverse=True):
+                        rec["batch"] = batch_id
+                        rec["bin_before"] = _bin_before
+                        _push_undo(rec)
+            except Exception:
+                _log.exception("Bulk delete: could not record undo")
+            # The marks are spent.
+            for eid in id_set:
+                self._marked_ids.discard(eid)
+                self._mark_kind.pop(eid, None)
+            # Clear the canvas if the loaded plasmid was one of them.
+            app = self.app
+            cur = getattr(app, "_current_record", None)
+            if cur is not None and str(getattr(cur, "id", "")) in id_set:
+                self.set_active(None)
+                clear = getattr(app, "_clear_canvas", None)
+                if callable(clear):
+                    clear()
+            self._repopulate_plasmids()
+            self._delete_save_to_disk(remaining, cascaded_bin)
+            n = len(recs)
+            try:
+                app.notify(
+                    f"Deleted {n} plasmid{'s' if n != 1 else ''}. "
+                    f"Press u to bring them back.",
+                    severity="information", timeout=6)
+            except Exception:
+                pass
+            _log_event("library.bulk_delete", count=n)
+
+        self.app.push_screen(
+            LibraryDeleteConfirmModal(
+                names[0], 0, list(id_set)[0] if id_set else "",
+                dup_count=None, bulk_names=names, bulk_last_copies=lost),
+            callback=_on_confirm,
+        )
 
     def _request_plasmid_delete(self) -> None:
         entry_id = _cursor_row_key(self.query_one("#lib-table", DataTable))

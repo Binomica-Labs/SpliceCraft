@@ -14,6 +14,27 @@
 
 ---
 
+## [1.2.42] — 2026-07-27
+
+### New features
+
+- **Mark plasmids for deletion, and delete them together.** **Space** now
+  cycles a library row through **Ⓜ (move) → Ⓒ (copy) → Ⓧ (delete) → none**,
+  and pressing **Delete** removes everything marked Ⓧ in one go. Delete is
+  last in the cycle on purpose — no single stray keypress can stage it.
+- **One confirmation that answers the question that matters.** Deleting a
+  marked set tells you how many plasmids are about to go and names them, and
+  then how many **sequences** would be left in no other entry afterwards.
+  That count is per sequence rather than per row, so two marked copies of the
+  same construct report one sequence at risk, not two.
+- **One press brings the whole batch back.** A bulk delete is a single undo
+  step: press **`u`** and every plasmid returns to its original slot. If you
+  switched collections in between, undo restores nothing and tells you which
+  collection to switch back to — it will never bring back part of a batch and
+  leave you thinking that was all of it.
+
+---
+
 ## [1.2.41] — 2026-07-27
 
 ### New features

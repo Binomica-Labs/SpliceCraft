@@ -95,13 +95,23 @@ class TestMarkCycle:
         p._mark_kind = {}
         return p
 
-    def test_space_cycles_through_move_copy_and_off(self, panel):
+    def test_space_cycles_through_move_copy_delete_and_off(self, panel):
         assert panel._cycle_mark("a") == "move"
-        assert panel._mark_kind["a"] == "move"
         assert panel._cycle_mark("a") == "copy"
-        assert panel._mark_kind["a"] == "copy"
+        assert panel._cycle_mark("a") == "delete"
         assert panel._cycle_mark("a") == ""
         assert "a" not in panel._marked_ids and "a" not in panel._mark_kind
+
+    def test_delete_is_last_so_a_stray_press_cannot_reach_it(self, panel):
+        # One press on an unmarked row must never stage a delete.
+        assert panel._cycle_mark("a") != "delete"
+        assert panel._MARK_CYCLE[-1] == "delete"
+
+    def test_unknown_stored_kind_falls_off_to_unmarked(self, panel):
+        panel._marked_ids.add("a")
+        panel._mark_kind["a"] = "bogus"
+        assert panel._cycle_mark("a") == ""
+        assert "a" not in panel._marked_ids
 
     def test_cycle_is_per_row(self, panel):
         panel._cycle_mark("a")                       # a → move
@@ -167,12 +177,24 @@ class TestMarkCycle:
         panel._mark_cell("y")               # unmarked, no colour → lookup
         assert len(calls) == 1
 
-    def test_mark_cell_renders_the_two_glyphs(self, panel):
+    def test_mark_cell_renders_all_three_glyphs(self, panel):
         panel._cycle_mark("a")                            # Ⓜ
         panel._cycle_mark("b"); panel._cycle_mark("b")    # Ⓒ
+        for _ in range(3):
+            panel._cycle_mark("c")                        # Ⓧ
         assert "Ⓜ" in str(panel._mark_cell("a"))
         assert "Ⓒ" in str(panel._mark_cell("b"))
-        assert "·" in str(panel._mark_cell("c", None))    # unmarked, no status
+        assert "Ⓧ" in str(panel._mark_cell("c"))
+        assert "·" in str(panel._mark_cell("d", None))    # unmarked, no status
+
+    def test_each_command_sees_only_its_own_mark(self, panel):
+        panel._cycle_mark("a")                            # move
+        panel._cycle_mark("b"); panel._cycle_mark("b")    # copy
+        for _ in range(3):
+            panel._cycle_mark("c")                        # delete
+        assert panel._marked_of_kind("move") == ["a"]
+        assert panel._marked_of_kind("copy") == ["b"]
+        assert panel._marked_of_kind("delete") == ["c"]
 
     def test_notify_explains_how_to_mark_when_nothing_is_marked(
             self, panel, monkeypatch):
@@ -184,6 +206,128 @@ class TestMarkCycle:
         monkeypatch.setattr(type(panel), "app", property(lambda self: _App()))
         panel._notify_nothing_staged("move")
         assert seen and "Space" in seen[0]
+
+
+class TestBulkDelete:
+    """Ⓧ-marked bulk delete + its single-press undo. Deletion is the path
+    behind the 2026-05-22 incident, so the round trip is tested end to end
+    rather than by inspection."""
+
+    @pytest.fixture
+    def rig(self, monkeypatch):
+        """A LibraryPanel wired to a stub app: captures the confirm modal so
+        the test can answer it, and records undo pushes."""
+        eden_ids = _seed_two_collections(eden_n=4, ffe_n=0)
+        panel = sc.LibraryPanel.__new__(sc.LibraryPanel)
+        panel._marked_ids, panel._mark_kind = set(), {}
+        panel._view_mode = "plasmids"
+        box = {"modal": None, "cb": None, "stack": [], "notes": [],
+               "saved": None}
+
+        class _App:
+            _current_record = None
+
+            def push_screen(self, screen, callback=None):
+                box["modal"], box["cb"] = screen, callback
+
+            def notify(self, msg, severity="information", **_k):
+                box["notes"].append(msg)
+
+            def _push_library_undo(self, rec):
+                box["stack"].append(rec)
+
+            def _library_undo_stack(self):
+                return box["stack"]
+
+        monkeypatch.setattr(type(panel), "app", property(lambda self: _App()))
+        monkeypatch.setattr(type(panel), "_repopulate_plasmids",
+                            lambda self: None)
+        monkeypatch.setattr(type(panel), "set_active", lambda self, x: None)
+        monkeypatch.setattr(
+            type(panel), "_delete_save_to_disk",
+            lambda self, entries, bin_, op="": box.update(saved=entries))
+        return panel, eden_ids, box
+
+    def test_deletes_every_marked_row_and_leaves_the_rest(self, rig):
+        panel, ids, box = rig
+        for eid in ids[:2]:
+            for _ in range(3):
+                panel._cycle_mark(eid)          # → Ⓧ
+        panel.request_delete_under_cursor()
+        assert box["modal"] is not None, "no confirm modal was pushed"
+        box["cb"](True)
+        left = [e["id"] for e in sc._load_library()]
+        assert left == ids[2:]
+
+    def test_confirm_states_the_count_and_names(self, rig):
+        panel, ids, box = rig
+        for eid in ids[:3]:
+            for _ in range(3):
+                panel._cycle_mark(eid)
+        panel.request_delete_under_cursor()
+        assert len(box["modal"].bulk_names) == 3
+
+    def test_nothing_marked_falls_through_to_the_single_delete(self, rig,
+                                                               monkeypatch):
+        panel, ids, box = rig
+        called = []
+        monkeypatch.setattr(type(panel), "_request_plasmid_delete",
+                            lambda self: called.append(1))
+        panel.request_delete_under_cursor()
+        assert called == [1] and box["modal"] is None
+
+    def test_move_and_copy_marks_are_not_deleted(self, rig):
+        panel, ids, box = rig
+        panel._cycle_mark(ids[0])                       # Ⓜ
+        panel._cycle_mark(ids[1]); panel._cycle_mark(ids[1])   # Ⓒ
+        for _ in range(3):
+            panel._cycle_mark(ids[2])                   # Ⓧ
+        panel.request_delete_under_cursor()
+        box["cb"](True)
+        left = [e["id"] for e in sc._load_library()]
+        assert ids[0] in left and ids[1] in left and ids[2] not in left
+        # The spent Ⓧ mark clears; the others stay staged.
+        assert panel._marked_of_kind("delete") == []
+        assert panel._marked_of_kind("move") == [ids[0]]
+        assert panel._marked_of_kind("copy") == [ids[1]]
+
+    def test_one_undo_press_restores_the_whole_batch_in_place(self, rig):
+        panel, ids, box = rig
+        for eid in ids[:3]:
+            for _ in range(3):
+                panel._cycle_mark(eid)
+        panel.request_delete_under_cursor()
+        box["cb"](True)
+        assert len(sc._load_library()) == 1
+        # Every record shares one batch id, so ONE press takes them all back.
+        assert len({r["batch"] for r in box["stack"]}) == 1
+        panel.action_undo_delete()
+        assert [e["id"] for e in sc._load_library()] == ids   # original slots
+        assert box["stack"] == []
+
+    def test_undo_refuses_as_a_whole_when_the_collection_changed(self, rig):
+        panel, ids, box = rig
+        for eid in ids[:2]:
+            for _ in range(3):
+                panel._cycle_mark(eid)
+        panel.request_delete_under_cursor()
+        box["cb"](True)
+        sc._set_active_collection_name("FFE")
+        panel.action_undo_delete()
+        # All-or-nothing: nothing restored, and the batch stays recoverable.
+        assert len(sc._load_library()) == 2
+        assert len(box["stack"]) == 2
+        assert any("Switch to that collection" in m for m in box["notes"])
+
+    def test_sequence_loss_counts_sequences_not_entries(self, rig):
+        panel, ids, box = rig
+        lib = sc._load_library()
+        # Two entries, one shared sequence: deleting both loses ONE sequence.
+        pair = [e for e in lib if e["id"] in ids[:2]]
+        for e in pair:
+            e["gb_text"] = lib[0].get("gb_text", "")
+            e.pop("gb_ref", None)
+        assert panel._bulk_sequences_lost(pair) == 1
 
 
 # ── Move / copy commit logic (the heavy hardening) ───────────────────

@@ -4355,7 +4355,9 @@ class LibraryDeleteConfirmModal(ModalScreen):
     ]
 
     def __init__(self, name: str, size: int, entry_id: str,
-                 dup_count: "int | None" = None):
+                 dup_count: "int | None" = None,
+                 bulk_names: "list[str] | None" = None,
+                 bulk_last_copies: "int | None" = None):
         """`dup_count` = how many OTHER entries carry this entry's exact
         sequence (by `_entry_content_key` — `gb_ref` when dehydrated,
         else a hash of inline `gb_text`). None = not computed (primer
@@ -4366,12 +4368,22 @@ class LibraryDeleteConfirmModal(ModalScreen):
         2026-07-25 incident: entries were deleted as presumed copies when
         they were distinct sequences that merely shared a name, so the
         modal now answers that question instead of leaving it to the name.
+
+        `bulk_names` turns this into the BULK confirm: the dialog leads with
+        how many plasmids are marked and names them (capped) instead of
+        naming one. `bulk_last_copies` is how many of them are the only
+        entry holding their sequence — the bulk analogue of the
+        `dup_count == 0` alarm, and the number that actually decides whether
+        this delete loses data ([INV-167]). Both None = the original
+        single-entry dialog, unchanged.
         """
         super().__init__()
         self.entry_name = name
         self.entry_size = size
         self.entry_id   = entry_id
         self.dup_count  = dup_count
+        self.bulk_names = [str(n) for n in (bulk_names or [])]
+        self.bulk_last_copies = bulk_last_copies
         # [INV-50] dismiss-once guard
         self._dismissed: bool = False
 
@@ -4408,11 +4420,42 @@ class LibraryDeleteConfirmModal(ModalScreen):
                 "  [red]No other entry has the same bases — removing it "
                 "loses it.[/red]\n\n"
             )
+        if self.bulk_names:
+            n = len(self.bulk_names)
+            shown = [_esc(s) for s in self.bulk_names[:8]]
+            listing = "\n".join(f"    • {s}" for s in shown)
+            if n > len(shown):
+                listing += f"\n    [dim]… and {n - len(shown)} more[/dim]"
+            # Lead with the count — "how many am I about to lose" is the
+            # question a bulk delete has to answer before anything else.
+            head = (f"  Remove [bold]{n} marked plasmid"
+                    f"{'s' if n != 1 else ''}[/bold] from the library?\n\n"
+                    f"{listing}\n\n")
+            if self.bulk_last_copies is None:
+                dup_line = ""
+            elif self.bulk_last_copies > 0:
+                # Counted as SEQUENCES, not entries: two marked rows sharing
+                # one sequence lose one sequence between them, and saying
+                # "2 entries are the only holder" would be false.
+                k = self.bulk_last_copies
+                dup_line = (
+                    f"  [bold red]{k} sequence{'s' if k != 1 else ''} "
+                    f"{'are' if k != 1 else 'is'} held by no other "
+                    f"entry.[/bold red]\n"
+                    f"  [red]Removing these loses "
+                    f"{'them' if k != 1 else 'it'} — nothing else has the "
+                    f"same bases.[/red]\n\n")
+            else:
+                dup_line = (
+                    "  [green]Every sequence here is also kept by an entry "
+                    "you are not deleting[/green] — nothing is lost.\n\n")
+        else:
+            head = (f"  Remove [bold]{_esc(str(self.entry_name))}[/bold]"
+                    f"{size_str} from the library?\n\n")
         with Vertical(id="libdel-dlg"):
             yield Static(" Remove from library ", id="libdel-title")
             yield Static(
-                f"  Remove [bold]{_esc(str(self.entry_name))}[/bold]"
-                f"{size_str} from the library?\n\n"
+                f"{head}"
                 f"{dup_line}"
                 f"  [dim]Undo with Ctrl+Z (or u) while the library is\n"
                 f"  focused. A backup (.bak) of the library file is kept,\n"
