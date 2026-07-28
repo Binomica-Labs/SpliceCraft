@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import re
+import itertools as _itertools
 import shutil
 import subprocess
 import sys
@@ -41,7 +42,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.42"
+__version__ = "1.2.43"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -4367,7 +4368,17 @@ _DEFAULT_COLLECTION_NAME = "Main Collection"
 # a delete cascaded into the parts bin, a copy of that list too). Deep enough to
 # cover a burst of "clearing out duplicates" — the exact shape of the
 # 2026-07-25 incident, which was four deletes in ninety seconds.
-_LIBRARY_UNDO_MAX = 25
+# Undo-stack depth, counted in RECORDS (one per deleted plasmid). Sized 25 when
+# only single deletes existed; the Ⓧ bulk delete ([INV-171]) made one user
+# action able to consume the whole stack, so a realistic marked batch now has
+# to fit or it isn't undoable at all. Records hold a `_typed_clone` of the
+# entry, which is small for the dehydrated entries a large library stores
+# (`gb_ref` rather than inline `gb_text`).
+_LIBRARY_UNDO_MAX = 100
+# Monotonic id source for bulk-delete batches. A timestamp is NOT enough:
+# `_now_iso()` is second-resolution, so two bulk deletes of the same size
+# within one second would share an id and a single undo would restore BOTH.
+_BULK_DELETE_SEQ = _itertools.count(1)
 
 _LIBRARY_KINDS: "frozenset[str]" = frozenset(
     {"plasmid", "fragment", "amplicon", "protein"})
@@ -17204,12 +17215,26 @@ class LibraryPanel(Widget):
             _log.exception("Undo bulk delete: panel refresh failed")
         n = len(restored)
         extra = f" ({already} already present)" if already else ""
+        # Belt and braces: `_push_library_undo` drops any batch the depth cap
+        # broke, so a short run should be impossible here. If one ever shows
+        # up anyway, SAY the shortfall — a silent partial restore reading as
+        # a complete one is the exact failure this design exists to prevent.
+        expected = max((int(r.get("batch_size") or 0) for r in recs),
+                       default=len(recs))
+        if expected and len(recs) < expected:
+            _log.error("Undo bulk delete: batch %s had %d of %d records",
+                       batch, len(recs), expected)
+            extra += (f" — only {len(recs)} of {expected} were still in the "
+                      f"undo history")
+            severity = "warning"
+        else:
+            severity = "information"
         app.notify(
             f"Restored {n} plasmid{'s' if n != 1 else ''}{extra}.",
-            severity="information", timeout=6,
+            severity=severity, timeout=8 if severity == "warning" else 6,
         )
         _log_event("library.undo.restored_batch", count=n, skipped=already,
-                   remaining=len(stack))
+                   expected=expected, remaining=len(stack))
 
     def action_request_history(self) -> None:
         """Open the construction-history viewer for the cursor row.
@@ -18999,15 +19024,22 @@ class LibraryPanel(Widget):
             # One batch id across every record: `action_undo_delete` pops the
             # run in one press. Pushed HIGHEST index first so popping walks
             # ascending, which is the order re-insertion needs.
+            undoable = False
             try:
-                _push_undo = getattr(self.app, "_push_library_undo", None)
-                if callable(_push_undo):
-                    batch_id = f"bulk-{_now_iso()}-{len(recs)}"
-                    for rec in sorted(recs, key=lambda r: r["index"],
-                                      reverse=True):
+                _push_batch = getattr(self.app, "_push_library_undo_batch",
+                                      None)
+                if callable(_push_batch):
+                    batch_id = f"bulk-{next(_BULK_DELETE_SEQ)}"
+                    ordered = sorted(recs, key=lambda r: r["index"],
+                                     reverse=True)
+                    for rec in ordered:
                         rec["batch"] = batch_id
+                        rec["batch_size"] = len(recs)
                         rec["bin_before"] = _bin_before
-                        _push_undo(rec)
+                    # Atomic: one extend + one trim, so the batch is never
+                    # transiently incomplete. Returns whether it survived the
+                    # depth cap, which decides what the toast may promise.
+                    undoable = bool(_push_batch(ordered))
             except Exception:
                 _log.exception("Bulk delete: could not record undo")
             # The marks are spent.
@@ -19026,13 +19058,23 @@ class LibraryPanel(Widget):
             self._delete_save_to_disk(remaining, cascaded_bin)
             n = len(recs)
             try:
-                app.notify(
-                    f"Deleted {n} plasmid{'s' if n != 1 else ''}. "
-                    f"Press u to bring them back.",
-                    severity="information", timeout=6)
+                if undoable:
+                    app.notify(
+                        f"Deleted {n} plasmid{'s' if n != 1 else ''}. "
+                        f"Press u to bring them back.",
+                        severity="information", timeout=6)
+                else:
+                    # Never claim an undo that isn't on the stack.
+                    app.notify(
+                        f"Deleted {n} plasmid{'s' if n != 1 else ''}. This "
+                        f"batch is larger than the {_LIBRARY_UNDO_MAX}-step "
+                        f"undo history, so it CANNOT be undone in-app — "
+                        f"recover from today's snapshot or the .bak if you "
+                        f"need it.",
+                        severity="warning", timeout=12)
             except Exception:
                 pass
-            _log_event("library.bulk_delete", count=n)
+            _log_event("library.bulk_delete", count=n, undoable=undoable)
 
         self.app.push_screen(
             LibraryDeleteConfirmModal(
@@ -115730,15 +115772,72 @@ NcbiTaxonPickerModal { align: center middle; }
         return stack
 
     def _push_library_undo(self, record: dict) -> None:
-        """Record one undoable library deletion (newest last, bounded)."""
+        """Record one undoable library deletion (newest last, bounded).
+
+        The depth trim drops from the FRONT, which can cut a bulk delete's
+        records in half ([INV-171]): the survivors would then restore a
+        PARTIAL batch and report success — the partial-recovery-reads-as-
+        complete failure the batch design exists to prevent, and the shape of
+        the 2026-05-22 incident. So after trimming, any batch that is no
+        longer whole is dropped entirely: a batch that cannot be fully
+        restored must not be half-restorable. `_request_plasmid_bulk_delete`
+        checks whether its batch survived and adjusts what it promises.
+        """
         stack = self._library_undo_stack()
         stack.append(record)
-        if len(stack) > _LIBRARY_UNDO_MAX:
-            del stack[: len(stack) - _LIBRARY_UNDO_MAX]
+        self._trim_library_undo(stack)
         _log_event("library.undo.recorded",
                    name=str(record.get("name") or ""),
                    collection=str(record.get("collection") or ""),
                    depth=len(stack))
+
+    @staticmethod
+    def _trim_library_undo(stack: "list[dict]") -> None:
+        """Enforce the depth cap, then drop any batch the trim broke.
+
+        The trim deletes from the FRONT, which can cut a bulk delete's records
+        in half ([INV-171]); the survivors would restore a PARTIAL batch and
+        report success — the 2026-05-22 failure shape. A batch that cannot be
+        restored whole must not be restorable at all."""
+        if len(stack) <= _LIBRARY_UNDO_MAX:
+            return
+        del stack[: len(stack) - _LIBRARY_UNDO_MAX]
+        counts: "dict[str, int]" = {}
+        sizes: "dict[str, int]" = {}
+        for r in stack:
+            b = str(r.get("batch") or "")
+            if not b:
+                continue
+            counts[b] = counts.get(b, 0) + 1
+            sizes[b] = max(sizes.get(b, 0), int(r.get("batch_size") or 0))
+        broken = {b for b, n in counts.items() if n < sizes.get(b, 0)}
+        if broken:
+            stack[:] = [r for r in stack
+                        if str(r.get("batch") or "") not in broken]
+            _log.info("Library undo: dropped %d incomplete batch(es) past "
+                      "the %d-record cap", len(broken), _LIBRARY_UNDO_MAX)
+
+    def _push_library_undo_batch(self, records: "list[dict]") -> bool:
+        """Append a whole bulk-delete batch ATOMICALLY; return True if it fit
+        the depth cap intact.
+
+        Pushing the records one at a time cannot work: a batch is transiently
+        incomplete until its last record lands, so a per-push completeness
+        check would drop it on record 1 and the tail would then rebuild an
+        orphan fragment — a partial batch, which is the one state this must
+        never leave behind. Extending in one go and trimming once avoids the
+        transient entirely. Records must already be ordered highest-index
+        first, so popping walks ascending."""
+        stack = self._library_undo_stack()
+        if not records:
+            return False
+        batch = str(records[0].get("batch") or "")
+        stack.extend(records)
+        self._trim_library_undo(stack)
+        kept = sum(1 for r in stack if str(r.get("batch") or "") == batch)
+        _log_event("library.undo.recorded_batch", count=len(records),
+                   kept=kept, depth=len(stack))
+        return kept == len(records)
 
     @_action_log("app.undo")
     def action_undo(self) -> None:

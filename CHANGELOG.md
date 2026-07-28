@@ -14,6 +14,31 @@
 
 ---
 
+## [1.2.43] — 2026-07-27
+
+### Bug fixes
+
+- **Undoing a large bulk delete could quietly bring back only some of it.**
+  The undo history held 25 steps, so deleting more marked plasmids than that
+  pushed the earliest ones out — and pressing **`u`** then restored what was
+  left while reporting success, which is exactly the situation where you'd
+  assume everything came back. Deleting two batches in a row could truncate
+  the earlier one the same way. The history now holds 100 steps, a batch that
+  doesn't fit is discarded rather than left half-restorable, and if a delete
+  is too large to undo the confirmation says so outright instead of telling
+  you to press `u`.
+- **Two bulk deletes within the same second could be undone together.** They
+  shared an identifier, so one press of `u` brought back both. Each delete now
+  gets its own.
+
+### Housekeeping
+
+- Removed a stale "Unreleased" changelog section left over from the Phase 4
+  era; its contents shipped long ago and it risked being mistaken for the next
+  release's notes.
+
+---
+
 ## [1.2.42] — 2026-07-27
 
 ### New features
@@ -7586,26 +7611,6 @@ existing library + collections file keeps loading without migration.
 - v1.0.0.0 scope status: 6/6 v1.0 features done; the data-safety
   hardening backfills a "STABLE" requirement from before features.
   commercial SaaS .dna round-trip remains the long-pole.
-
----
-
-## [Unreleased] — Phase 4 stability gate
-
-### Fixed
-
-- **`_diff_align_worker` now captures `_record_load_counter` at entry** and refuses to push `AlignmentScreen` if the user paged to a different plasmid mid-alignment. Brings the new diff worker in line with the same stale-load contract `_restr_scan_worker` and `_seed_default_library` follow.
-- **`_find_annotation_transfers` whole-plasmid match.** When `feat_len == n_tgt` the wrap-fold collapsed `t_e` to `t_s` and the dedupe key aliased every full match — a circular permutation of the same plasmid returned 0 transfers. Now special-cased to a single `[0, n_tgt)` transfer.
-- **`_apply_annotation_transfers` degenerate wrap.** `t_e == 0` (origin-spanning end at the origin itself) used to construct `FeatureLocation(0, 0)` which Biopython rejects on serialise; now collapses to a single tail `FeatureLocation(t_s, n)`.
-- **`_h_find_orfs` empty-record guard.** A record with `seq=""` or `annotations=None` (partial-parse edge case) used to traverse `(rec.annotations or {})` then call `_find_orfs` on an empty string. Now short-circuits to `{orfs: [], count: 0}`.
-- **`_search_collections_library` skips id-less entries.** Library entries with no `id` would round-trip as `(collection, "")` and the loader's `entry.get("id") == ""` match aliased every untagged entry to the first one found — picking the wrong plasmid.
-
-### Added (CLAUDE.md)
-
-- Sacred-invariants entries #26–#30 covering GFF3 off-by-one + wrap-split convention, annotation-transfer exact-match contract + whole-plasmid case, pairwise-alignment cancellation semantics, cross-collection search id requirement, and agent-endpoint active-collection scope.
-
-### Tests
-
-- +3 regression guards: whole-plasmid annotation-transfer match, `_h_find_orfs` on empty / no-annotations record, `_search_collections_library` skipping id-less entries.
 
 ---
 

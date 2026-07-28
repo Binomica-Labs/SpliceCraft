@@ -208,45 +208,55 @@ class TestMarkCycle:
         assert seen and "Space" in seen[0]
 
 
+def _make_bulk_rig(monkeypatch, n_entries: int):
+    """A LibraryPanel wired to a stub app: captures the confirm modal so a
+    test can answer it, and records undo pushes.
+
+    The stub delegates to the REAL `PlasmidApp._push_library_undo` rather than
+    appending blindly — the depth cap and its drop-incomplete-batches rule are
+    part of what these tests are checking, so faking the push would hide
+    exactly the bug the batch design guards against."""
+    eden_ids = _seed_two_collections(eden_n=n_entries, ffe_n=0)
+    panel = sc.LibraryPanel.__new__(sc.LibraryPanel)
+    panel._marked_ids, panel._mark_kind = set(), {}
+    panel._view_mode = "plasmids"
+    box = {"modal": None, "cb": None, "stack": [], "notes": [], "saved": None}
+
+    # A REAL PlasmidApp with only the UI hooks stubbed, so the undo push goes
+    # through the actual depth-cap + drop-incomplete-batches logic. A hand-
+    # rolled stub would silently miss `_trim_library_undo` and hide the very
+    # bug these tests exist for.
+    app = sc.PlasmidApp.__new__(sc.PlasmidApp)
+    app._current_record = None
+    app._library_undo_stack = lambda: box["stack"]
+    app.push_screen = lambda screen, callback=None: box.update(
+        modal=screen, cb=callback)
+    app.notify = lambda msg, severity="information", **_k: box["notes"].append(
+        msg)
+    monkeypatch.setattr(type(panel), "app", property(lambda self: app))
+    monkeypatch.setattr(type(panel), "_repopulate_plasmids", lambda self: None)
+    monkeypatch.setattr(type(panel), "set_active", lambda self, x: None)
+    monkeypatch.setattr(
+        type(panel), "_delete_save_to_disk",
+        lambda self, entries, bin_, op="": box.update(saved=entries))
+    return panel, eden_ids, box
+
+
+@pytest.fixture
+def rig(monkeypatch):
+    return _make_bulk_rig(monkeypatch, 4)
+
+
+@pytest.fixture
+def rig_big(monkeypatch):
+    """More marked rows than the undo stack can hold whole."""
+    return _make_bulk_rig(monkeypatch, sc._LIBRARY_UNDO_MAX + 3)
+
+
 class TestBulkDelete:
     """Ⓧ-marked bulk delete + its single-press undo. Deletion is the path
     behind the 2026-05-22 incident, so the round trip is tested end to end
     rather than by inspection."""
-
-    @pytest.fixture
-    def rig(self, monkeypatch):
-        """A LibraryPanel wired to a stub app: captures the confirm modal so
-        the test can answer it, and records undo pushes."""
-        eden_ids = _seed_two_collections(eden_n=4, ffe_n=0)
-        panel = sc.LibraryPanel.__new__(sc.LibraryPanel)
-        panel._marked_ids, panel._mark_kind = set(), {}
-        panel._view_mode = "plasmids"
-        box = {"modal": None, "cb": None, "stack": [], "notes": [],
-               "saved": None}
-
-        class _App:
-            _current_record = None
-
-            def push_screen(self, screen, callback=None):
-                box["modal"], box["cb"] = screen, callback
-
-            def notify(self, msg, severity="information", **_k):
-                box["notes"].append(msg)
-
-            def _push_library_undo(self, rec):
-                box["stack"].append(rec)
-
-            def _library_undo_stack(self):
-                return box["stack"]
-
-        monkeypatch.setattr(type(panel), "app", property(lambda self: _App()))
-        monkeypatch.setattr(type(panel), "_repopulate_plasmids",
-                            lambda self: None)
-        monkeypatch.setattr(type(panel), "set_active", lambda self, x: None)
-        monkeypatch.setattr(
-            type(panel), "_delete_save_to_disk",
-            lambda self, entries, bin_, op="": box.update(saved=entries))
-        return panel, eden_ids, box
 
     def test_deletes_every_marked_row_and_leaves_the_rest(self, rig):
         panel, ids, box = rig
@@ -319,7 +329,100 @@ class TestBulkDelete:
         assert len(box["stack"]) == 2
         assert any("Switch to that collection" in m for m in box["notes"])
 
-    def test_sequence_loss_counts_sequences_not_entries(self, rig):
+    def test_batch_ids_are_unique_within_a_second(self, rig):
+        """A second-resolution timestamp collided for two same-sized deletes
+        in the same second, and one undo would then restore BOTH batches."""
+        panel, ids, box = rig
+        for eid in ids[:2]:
+            for _ in range(3):
+                panel._cycle_mark(eid)
+        panel.request_delete_under_cursor(); box["cb"](True)
+        for eid in ids[2:4]:
+            for _ in range(3):
+                panel._cycle_mark(eid)
+        panel.request_delete_under_cursor(); box["cb"](True)
+        assert len({r["batch"] for r in box["stack"]}) == 2
+
+    def test_undo_of_one_batch_leaves_the_other_intact(self, rig):
+        panel, ids, box = rig
+        for eid in ids[:2]:
+            for _ in range(3):
+                panel._cycle_mark(eid)
+        panel.request_delete_under_cursor(); box["cb"](True)
+        for eid in ids[2:4]:
+            for _ in range(3):
+                panel._cycle_mark(eid)
+        panel.request_delete_under_cursor(); box["cb"](True)
+        panel.action_undo_delete()                      # newest batch only
+        assert sorted(e["id"] for e in sc._load_library()) == sorted(ids[2:4])
+        assert len(box["stack"]) == 2                   # older batch survives
+
+
+class TestUndoDepthCapNeverSplitsABatch:
+    """The depth trim deletes from the FRONT of the stack, which could cut a
+    bulk delete's records in half — the survivors would then restore a PARTIAL
+    batch and report success. That is the 2026-05-22 failure shape, so a batch
+    the cap can't hold whole is dropped whole."""
+
+    @pytest.fixture
+    def app(self):
+        app = sc.PlasmidApp.__new__(sc.PlasmidApp)
+        app._lib_undo = []
+        app._library_undo_stack = lambda: app._lib_undo
+        return app
+
+    def _push_batch(self, app, batch: str, n: int, start: int = 0):
+        # Atomically, the way the bulk delete does — pushing one at a time
+        # would make the batch transiently incomplete and drop it mid-push.
+        return app._push_library_undo_batch([
+            {"entry": {"id": f"{batch}-{i}"}, "index": start + i,
+             "collection": "DemoColl", "name": f"{batch}-{i}",
+             "batch": batch, "batch_size": n}
+            for i in range(n)
+        ])
+
+    def test_a_batch_cut_by_the_cap_is_dropped_whole(self, app):
+        self._push_batch(app, "A", 20)
+        self._push_batch(app, "B", sc._LIBRARY_UNDO_MAX - 10)
+        # B pushed A past the cap. A must be GONE entirely, not truncated.
+        left = {str(r.get("batch") or "") for r in app._lib_undo}
+        assert "A" not in left, "a partially-evicted batch survived"
+        assert "B" in left
+        assert all(r["batch"] == "B" for r in app._lib_undo)
+
+    def test_a_batch_larger_than_the_cap_does_not_linger(self, app):
+        self._push_batch(app, "BIG", sc._LIBRARY_UNDO_MAX + 5)
+        assert app._lib_undo == [], "an unrestorable batch was left half-there"
+
+    def test_untagged_single_deletes_still_trim_normally(self, app):
+        for i in range(sc._LIBRARY_UNDO_MAX + 7):
+            app._push_library_undo({"entry": {"id": str(i)}, "index": i,
+                                    "collection": "DemoColl", "name": str(i)})
+        assert len(app._lib_undo) == sc._LIBRARY_UNDO_MAX
+        assert app._lib_undo[0]["name"] == "7"      # oldest dropped, in order
+
+    def test_complete_batches_are_kept(self, app):
+        self._push_batch(app, "A", 5)
+        self._push_batch(app, "B", 5)
+        assert len(app._lib_undo) == 10
+
+
+class TestBulkDeleteHonesty:
+    def test_toast_refuses_to_promise_an_undo_that_is_not_there(self, rig_big):
+        """Over-cap batches are dropped whole, so 'press u' would be a lie."""
+        panel, ids, box = rig_big
+        for eid in ids:
+            for _ in range(3):
+                panel._cycle_mark(eid)
+        panel.request_delete_under_cursor()
+        box["cb"](True)
+        assert box["stack"] == []
+        assert any("CANNOT be undone" in m for m in box["notes"])
+        assert not any("Press u" in m for m in box["notes"])
+
+
+class TestBulkDeleteSequenceCount:
+    def test_counts_sequences_not_entries(self, rig):
         panel, ids, box = rig
         lib = sc._load_library()
         # Two entries, one shared sequence: deleting both loses ONE sequence.
