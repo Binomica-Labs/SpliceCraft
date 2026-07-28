@@ -219,6 +219,25 @@ What you can do without leaving the terminal.
   resolve env-first (`PLASMIDSAURUS_CLIENT_ID` / `_SECRET`) then
   Settings ▸ Plasmidsaurus API. Scriptable via the `plasmidsaurus-items`
   / `download-plasmidsaurus` agent endpoints.
+- **New L0 part from a synthetic fragment** — Constructor → any modular
+  tab → **New Part from Syn Frag**. Pick a saved FRAG (one built by
+  Synthesis → L0 Fragment) and the part type it will become; SpliceCraft
+  loads the entry vector assigned to that tab's grammar and *simulates
+  the cloning* — digests both the fragment and the vector with the
+  grammar's Type IIS enzyme, ligates the released insert into the
+  backbone and closes the circle — then files the result as a Level-0
+  part, ready in the palette, **and saves the circular L0 plasmid to
+  your library** as *"<part> (L0)"* with its construction lineage
+  attached, so History shows the insert and the entry vector it went
+  into. The part's fusion overhangs come from the
+  grammar's own position table, so a two-tier fragment (entry overhangs
+  wrapping the category pair) files the *category* pair, which is what
+  L0→L1 actually uses. Only that grammar's positions are offered, and a
+  fragment that doesn't carry the chosen type's overhangs is refused
+  rather than filed as a part that can't assemble. Unwrapped fragments,
+  a missing entry vector and duplicate names each fail with the specific
+  reason. Scriptable — and available to Babs — via the
+  `make-l0-part-from-fragment` agent endpoint.
 - **Sanger trace viewer (`.ab1`)** — Sequencing → Sanger tab.
   Browse a directory for AB1 traces (highlighted sky-blue), pick
   one to see the base-called length, mean Phred quality, and a

@@ -131,6 +131,68 @@ def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, **kwargs)
 
 
+def _upgrade_pyright() -> None:
+    """Pull the newest pyright BEFORE the type-check runs.
+
+    ``PYRIGHT_PYTHON_FORCE_VERSION=latest`` already makes the pyright BINARY
+    match the one CI resolves, but the pip *wrapper* stays pinned wherever it
+    was installed and prints "there is a new pyright version available" on
+    every single run — noise that trains you to skim past pyright's output,
+    which is the failure mode the gate exists to prevent. Upgrading first
+    means the checker that clears the release is the current one, and a
+    genuinely quiet run stays meaningful.
+
+    **Non-fatal by design.** Releasing offline has to work, so a failed
+    upgrade warns and the installed wrapper is used — the type-check itself
+    still runs and still gates. Set ``SPLICECRAFT_SKIP_PYRIGHT_UPGRADE=1`` to
+    skip the network round-trip entirely (a pinned or air-gapped env);
+    ``SPLICECRAFT_SKIP_PYRIGHT=1`` skips this too, since it skips the check
+    this exists to feed.
+    """
+    if os.environ.get("SPLICECRAFT_SKIP_PYRIGHT_UPGRADE", "").strip().lower() \
+            in ("1", "true", "yes"):
+        print("  SPLICECRAFT_SKIP_PYRIGHT_UPGRADE set — using the installed "
+              "pyright.")
+        return
+    _heading("Checking for a newer pyright")
+    before = _pyright_wrapper_version()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "pyright"],
+            capture_output=True, text=True, timeout=180,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"  Could not check for a newer pyright ({exc}) — continuing "
+              f"with {before or 'the installed version'}.")
+        return
+    if proc.returncode != 0:
+        lines = (proc.stderr or proc.stdout or "").strip().splitlines()
+        why = lines[-1] if lines else "no output"
+        have = before or "the installed version"
+        print(f"  pyright upgrade check failed ({why}) — continuing with "
+              f"{have}.")
+        return
+    after = _pyright_wrapper_version()
+    if before and after and before != after:
+        print(f"  pyright {before} → {after}")
+    else:
+        print(f"  pyright {after or before or '?'} is current")
+
+
+def _pyright_wrapper_version() -> str:
+    """Installed version of the ``pyright`` pip wrapper, or "" if it can't be
+    read (not installed / metadata unavailable). Deliberately does NOT shell
+    out to ``pyright --version``: that downloads the node binary, which is the
+    slow, network-flaky step this check runs ahead of."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        return version("pyright")
+    except (ImportError, PackageNotFoundError):
+        return ""
+    except Exception:                       # noqa: BLE001 — advisory only
+        return ""
+
+
 def _summarize_pending_changes() -> None:
     """Sweep #18 (2026-05-21): release.py now BUNDLES accumulated
     work into the release commit instead of refusing to proceed.
@@ -1396,6 +1458,7 @@ def main(argv: list[str] | None = None) -> int:
               "runs it; the badge may surface a type error this guard would "
               "have caught.")
     else:
+        _upgrade_pyright()
         _heading("Running pyright (matches the CI lint gate)")
         # Same invocation as CI: bare `pyright` (so `[tool.pyright]` restricts
         # analysis to the three source files) under

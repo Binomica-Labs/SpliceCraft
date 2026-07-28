@@ -125,7 +125,28 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   overhangs / sequence plus `backbone`, selection `marker`, and
   `fwd_primer` / `rev_primer` domestication primers, Tms derived),
   delete-part, move-part (reassign a part to another bin in one atomic
-  call), classify-part (overhang-pair lookup against every grammar).
+  call), classify-part (overhang-pair lookup against every grammar),
+  make-l0-part-from-fragment (turn a saved synthetic FRAG into a
+  Level-0 part *and the L0 plasmid it lives on*, by SIMULATING the
+  clone into the grammar's entry vector — body `{fragment, part_type,
+  [grammar], [name], [bin], [collection], [product_name],
+  [save_plasmid]}`; the part goes to the bin and the circular plasmid
+  is saved to the library as `<part> (L0)` with its lineage, via
+  `domesticate-part` so there is one definition of an L0 clone
+  (`save_plasmid: false` files only the part); the part's
+  overhangs come from that grammar's position table, so a two-tier
+  nested fragment files its CATEGORY pair rather than the entry pair a
+  digest would report; 400 names the cause for an unwrapped fragment, a
+  part type the grammar doesn't define — the error lists the ones it
+  does — a part type whose overhangs aren't on the fragment, or a
+  grammar with no entry vector assigned; 409 on a duplicate
+  `(name, grammar)`. The filed `sequence` is the body BETWEEN the
+  overhangs, exactly as `create-part` expects, so the part re-clones
+  into the plasmid the call simulated; the reply carries `part_len`,
+  `insert_len`, `plasmid_len`, `entry_vector`, `nested`, and
+  `saved_name` / `saved_id` / `collection` for the plasmid — plus
+  `plasmid_error` in the rare case the part filed but the plasmid
+  didn't, which is reported rather than swallowed).
   `create-part` / `list-parts` / `delete-part` accept a `{bin}` to file
   into / read / prune just that named bin's own parts (a bin is a real
   partition, not only for writes). Parts-bin containers:

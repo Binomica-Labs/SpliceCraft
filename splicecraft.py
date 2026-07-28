@@ -42,7 +42,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.43"
+__version__ = "1.2.44"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -79819,6 +79819,132 @@ def _grammar_pos_slots(grammar: dict) -> dict[str, int]:
     return slots
 
 
+class PartFromSynFragModal(ModalScreen):
+    """Pick a saved synthetic fragment + the part type it will become.
+
+    The grammar is FIXED to the Constructor tab that opened this — a part
+    only means anything inside one grammar, and the overhangs come from that
+    grammar's position table. The part-type list is therefore the grammar's
+    OWN positions, so a type it doesn't define can't be chosen at all.
+
+    Dismisses with ``{entry_id, part_type, name}`` or None."""
+
+    _blocks_undo: bool = True
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = """
+    PartFromSynFragModal { align: center middle; }
+    #pfsf-box { width: 86; height: auto; max-height: 90%;
+        background: $surface; border: thick $primary; padding: 1 2; }
+    #pfsf-title { text-align: center; text-style: bold;
+        color: $text; background: $primary-darken-2;
+        padding: 0 1; margin-bottom: 1; }
+    #pfsf-ev { margin-bottom: 1; }
+    #pfsf-table { height: auto; max-height: 12; margin-bottom: 1; }
+    #pfsf-type { margin-bottom: 1; }
+    #pfsf-name { margin-bottom: 1; }
+    #pfsf-btns { height: auto; }
+    #pfsf-btns Button { margin-right: 2; }
+    #pfsf-status { height: auto; }
+    """
+
+    def __init__(self, grammar: dict) -> None:
+        super().__init__()
+        self._grammar = grammar if isinstance(grammar, dict) else {}
+        self._frags: "list[dict]" = []
+
+    def compose(self) -> ComposeResult:
+        gname = self._grammar.get("name") or self._grammar.get("id") or "?"
+        with Vertical(id="pfsf-box"):
+            yield Static(f"New L0 Part from Synthetic Fragment — {gname}",
+                         id="pfsf-title")
+            yield Static("", id="pfsf-ev", markup=True)
+            yield DataTable(id="pfsf-table", cursor_type="row")
+            types = [(str(p.get("type") or p.get("name") or "?"),
+                      str(p.get("type") or ""))
+                     for p in (self._grammar.get("positions") or [])
+                     if isinstance(p, dict) and p.get("oh5") and p.get("oh3")]
+            yield Select(types, prompt="Part type…", id="pfsf-type")
+            yield Input(placeholder="Part name (blank = the fragment's name)",
+                        id="pfsf-name")
+            with Horizontal(id="pfsf-btns"):
+                yield Button("Create Part", id="btn-pfsf-go",
+                             variant="primary")
+                yield Button("Cancel  [Esc]", id="btn-pfsf-cancel")
+            yield Static("", id="pfsf-status", markup=True)
+
+    def on_mount(self) -> None:
+        gid = str(self._grammar.get("id") or "")
+        ev = _get_entry_vector(gid)
+        evw = self.query_one("#pfsf-ev", Static)
+        if isinstance(ev, dict) and ev.get("gb_text"):
+            evw.update(f"[dim]Cloning into entry vector "
+                       f"[b]{_esc_md(str(ev.get('name') or '?'))}[/b] "
+                       f"with {_esc_md(str(self._grammar.get('enzyme') or '?'))}"
+                       f".[/dim]")
+        else:
+            evw.update(
+                f"[yellow]No entry vector assigned to {_esc_md(gid)} — set "
+                f"one under Settings → Entry Vectors first.[/yellow]")
+        tbl = self.query_one("#pfsf-table", DataTable)
+        tbl.add_columns("Fragment", "bp", "Added")
+        # FRAG entries only: a plasmid or amplicon isn't a synthesis fragment
+        # and would fail the digest with a confusing message.
+        for e in _load_library():
+            if not isinstance(e, dict):
+                continue
+            if _entry_kind(e) != "fragment":
+                continue
+            eid = str(e.get("id") or "")
+            if not eid:
+                continue
+            self._frags.append(e)
+            tbl.add_row(str(e.get("name") or eid),
+                        str(e.get("size") or ""),
+                        str(e.get("added") or ""), key=eid)
+        if not self._frags:
+            self._status(
+                "[yellow]No synthetic fragments in the library. Build one "
+                "with Synthesis → L0 Fragment, then save it.[/yellow]")
+        else:
+            tbl.focus()
+
+    def _status(self, msg: str) -> None:
+        try:
+            self.query_one("#pfsf-status", Static).update(msg)
+        except NoMatches:
+            pass
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-pfsf-cancel")
+    def _cancel(self, _) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-pfsf-go")
+    def _go(self, _) -> None:
+        try:
+            tbl = self.query_one("#pfsf-table", DataTable)
+            sel = self.query_one("#pfsf-type", Select)
+        except NoMatches:
+            return
+        eid = _cursor_row_key(tbl)
+        if not eid:
+            self._status("[red]Pick a fragment first.[/red]")
+            return
+        ptype = sel.value
+        if not isinstance(ptype, str) or not ptype:
+            self._status("[red]Pick the part type this will become.[/red]")
+            return
+        name = ""
+        try:
+            name = self.query_one("#pfsf-name", Input).value.strip()
+        except NoMatches:
+            pass
+        self.dismiss({"entry_id": eid, "part_type": ptype, "name": name})
+
+
 class ConstructorModal(ModalScreen):
     """Modular + Traditional cloning constructor.
 
@@ -79999,6 +80125,11 @@ class ConstructorModal(ModalScreen):
                                id=f"btn-ctor-add-{gid}",
                                variant="primary",
                                tooltip="Add the selected part to the lane")
+                yield Button("New Part from Syn Frag",
+                               id=f"btn-ctor-from-frag-{gid}",
+                               tooltip=("Clone a saved synthetic fragment "
+                                        "into this grammar's entry vector to "
+                                        "make a new L0 part"))
             with Vertical(id=f"ctor-lane-col-{gid}",
                             classes="ctor-lane-col"):
                 yield Static(" Assembly Lane ",
@@ -80212,6 +80343,117 @@ class ConstructorModal(ModalScreen):
             if btn_id.endswith("-" + gid):
                 return gid
         return ""
+
+    # ── New L0 part from a saved synthetic fragment ──────────────────────
+
+    def _open_part_from_frag(self, gid: str) -> None:
+        """Open the fragment picker for grammar ``gid``. Routed from the
+        class's single `_on_button` dispatcher, not a second `@on` handler —
+        a competing catch-all would double-dispatch every button in the
+        modal."""
+        grammar = _all_grammars().get(gid)
+        if not isinstance(grammar, dict):
+            return
+        self.app.push_screen(
+            PartFromSynFragModal(grammar),
+            callback=lambda res: self._on_part_from_frag(res, gid),
+        )
+
+    def _on_part_from_frag(self, res, gid: str) -> None:
+        """Dispatch the picked fragment to the build worker.
+
+        Routes through the `make-l0-part-from-fragment` AGENT handler rather
+        than re-implementing the resolve → clone → file chain, so the button
+        and the scripting API can never disagree about what a part built this
+        way contains."""
+        if not isinstance(res, dict):
+            return
+        self.app.notify("Cloning the fragment into the entry vector…",
+                        severity="information", timeout=4, markup=False)
+        self._part_from_frag_worker(gid, {
+            "fragment":  res.get("entry_id"),
+            "part_type": res.get("part_type"),
+            "grammar":   gid,
+            "name":      res.get("name") or None,
+            # Log-line label only — otherwise a button press would be
+            # recorded as `via=agent` and read as a script's doing.
+            "via":       "ui",
+            # A button press IS the user acting; the canvas being dirty has
+            # nothing to do with filing a part.
+            "force":     True,
+        })
+
+    @work(thread=True, exclusive=True, group="part_from_frag")
+    def _part_from_frag_worker(self, gid: str, req: dict) -> None:
+        """Worker: run the endpoint OFF the UI thread.
+
+        Not a nicety — a requirement, twice over. The endpoint saves the L0
+        plasmid to the library, and a 100 MB+ collections write on the UI
+        thread freezes the app for seconds (the same audit fix behind
+        `_add_save_to_disk`); and the save finishes by refreshing the library
+        panel via `app.call_from_thread`, which RAISES when it is already on
+        the app's own thread."""
+        handler = _state._AGENT_HANDLERS.get("make-l0-part-from-fragment")
+        if not handler:
+            return
+
+        def _report(out, error: str) -> None:
+            """Hand the result back to the UI thread. Swallows the
+            "App is not running" RuntimeError: the user can quit while the
+            clone is in flight, and the WORK is already on disk by then — a
+            traceback about a toast that couldn't be shown is noise."""
+            try:
+                self.app.call_from_thread(
+                    self._on_part_from_frag_done, gid, out, error)
+            except RuntimeError:
+                _log.info("part from fragment: app gone before the result "
+                          "could be reported (part/plasmid already saved)")
+
+        try:
+            out = handler[0](self.app, req)
+        except Exception as exc:                      # noqa: BLE001 — reported
+            _log.exception("part from fragment: build crashed")
+            _report(None, f"Could not build the part: {exc}")
+            return
+        if isinstance(out, tuple):
+            payload = out[0] if isinstance(out[0], dict) else {}
+            _report(None, str(payload.get("error")
+                              or "Could not build the part."))
+            return
+        _report(out, "")
+
+    def _on_part_from_frag_done(self, gid: str, out: "dict | None",
+                                  error: str) -> None:
+        """Back on the UI thread: refresh the palette + report BOTH artifacts.
+
+        The message names the part and the plasmid separately, because they
+        land in different places (bin vs collection) and a user who only sees
+        "part built" would go looking for the construct in the wrong panel."""
+        if error or out is None:
+            self.app.notify(error or "Could not build the part.",
+                            severity="error", timeout=12, markup=False)
+            return
+        try:
+            self._refresh_palette(gid)
+        except (NoMatches, AttributeError):
+            pass
+        msg = (f"Built L0 part {out.get('name')} ({out.get('oh5')}/"
+               f"{out.get('oh3')}) in {out.get('entry_vector')}.")
+        if out.get("saved_id"):
+            msg += (f" Saved plasmid {out.get('saved_name')} "
+                    f"({out.get('plasmid_len')} bp)")
+            # No active collection (fresh install) → say nothing rather than
+            # "to None".
+            msg += (f" to {out['collection']}." if out.get("collection")
+                    else " to the library.")
+        # Honest about a half-done result: the part exists, the plasmid does
+        # not, and saying only "built" would send the user hunting for a
+        # construct that was never saved.
+        sev = "information"
+        if out.get("plasmid_error"):
+            msg += f" The plasmid was NOT saved: {out['plasmid_error']}"
+            sev = "warning"
+        self.app.notify(msg, severity=sev, timeout=10, markup=False)
 
     # ── Palette ──────────────────────────────────────────────────────────
 
@@ -80905,6 +81147,9 @@ class ConstructorModal(ModalScreen):
             self._lanes[gid] = []
             self._refresh_lane(gid)
             self._refresh_validation(gid)
+        elif stem == "btn-ctor-from-frag":
+            event.stop()
+            self._open_part_from_frag(gid)
 
     def _lane_move(self, gid: str, delta: int) -> None:
         try:
@@ -100661,6 +100906,9 @@ _BUTTON_TOOLTIPS: "dict[str, str]" = {
         "Download the run and import its samples into the library",
     "btn-ps-refresh":
         "Re-fetch your order list from Plasmidsaurus (cached for 2 minutes)",
+    "btn-pfsf-go":
+        "Clone this fragment into the grammar's entry vector as a new L0 part",
+    "btn-pfsf-cancel": "Close without building a part",
     "btn-ps-fetch-close": "Close without fetching",
     "set-ps-save": "Save these Plasmidsaurus API credentials",
     "set-ps-clear": "Clear the stored Plasmidsaurus API credentials",

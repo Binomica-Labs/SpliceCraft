@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.2.43"
+version         = "1.2.44"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -145,8 +145,11 @@ dev = [
     # / CI install ALWAYS pulls latest via PYRIGHT_PYTHON_FORCE_VERSION
     # (set in test.yml + recommended for local). The pip-resolved
     # version is only the bootstrap; the launcher then downloads the
-    # current latest into a managed cache and runs it.
-    "pyright>=1.1.409",
+    # current latest into a managed cache and runs it. `release.py`
+    # upgrades the wrapper itself (`_upgrade_pyright`) before the lint
+    # gate runs, so the floor here tracks what a release last used
+    # rather than drifting years behind it.
+    "pyright>=1.1.411",
     "coverage>=7.14.1",
 ]
 

@@ -2902,6 +2902,255 @@ def _design_gb_primers(
     }
 
 
+def _released_insert_from_fragment(frag_seq: str, enzyme: str) -> dict:
+    """Digest a LINEAR synthesised fragment and return the piece the enzyme
+    releases — the one cut on BOTH ends, i.e. what actually enters a vector.
+
+    Refuses loudly rather than guessing: a fragment that isn't a properly
+    wrapped L0 fragment (no sites, one site, or extra internal sites) would
+    otherwise yield a plausible-looking part that cannot assemble. Raises
+    ValueError with a message naming the actual cause."""
+    seq = "".join(c for c in (frag_seq or "").upper()
+                  if c in "ACGTRYSWKMBDHVN")
+    if not seq:
+        raise ValueError("the fragment has no sequence")
+    if not enzyme:
+        raise ValueError("this grammar has no Type IIS enzyme configured")
+    if enzyme not in _state._all_enzymes_hook():
+        # Without this the digest simply finds no sites and the fragment gets
+        # blamed — sending the user to rebuild a perfectly good fragment when
+        # the fault is a custom grammar naming an enzyme nothing can cut with.
+        raise ValueError(
+            f"this grammar's enzyme {enzyme!r} isn't in the enzyme catalog — "
+            f"fix the grammar (or add the enzyme under Settings → Enzymes); "
+            f"the fragment is not the problem.")
+    pieces = _digest_with_enzymes(seq, [enzyme], circular=False)
+    cut_both = [p for p in pieces
+                if p["left"].get("kind") != "linear"
+                and p["right"].get("kind") != "linear"]
+    if not cut_both:
+        n_cuts = sum(1 for p in pieces
+                     if p["right"].get("kind") != "linear")
+        if n_cuts == 0:
+            raise ValueError(
+                f"no {enzyme} site found — this is a plain fragment, not a "
+                f"wrapped L0 fragment. Build one with Synthesis → L0 Fragment.")
+        raise ValueError(
+            f"only one {enzyme} cut — an L0 fragment needs the enzyme on BOTH "
+            f"ends so the insert can be released.")
+    if len(cut_both) > 1:
+        raise ValueError(
+            f"{len(cut_both) + 1} {enzyme} cuts — the insert carries an extra "
+            f"internal site, so the digest would fragment it. Scrub the site "
+            f"(Optimize) and rebuild the fragment.")
+    return cut_both[0]
+
+
+def _clone_syn_fragment_into_entry_vector(
+        frag_seq: str, vector_seq: str, *, grammar: dict,
+        frag_features: "list[dict] | None" = None,
+        vector_features: "list[dict] | None" = None,
+) -> dict:
+    """Simulate cloning a SYNTHESISED L0 fragment into its entry vector.
+
+    The real bench steps, in order ([INV-127] — simulate, never hand-build the
+    product): digest the fragment and the vector with the grammar's Type IIS
+    enzyme, ligate the released insert into the surviving backbone, close the
+    circle. The fragment's own layout is never reverse-engineered — the
+    overhangs come from the digest, so the two-tier nesting
+    (`_build_synthesis_l0_fragment`'s entry overhangs wrapping the category
+    pair) needs no special handling and an AATG overlapping a body's start
+    codon can't be miscounted.
+
+    Deliberately does NOT report the part's fusion overhangs: reading them
+    back off the finished plasmid is the very inference [INV-172] exists to
+    forbid — a two-tier fragment answers with the ENTRY pair. The caller takes
+    them from the grammar's position table instead.
+
+    Returns ``{sequence, features, insert_len, enzyme, vector_len}``.
+    Raises ValueError, message-first, on any step that can't happen."""
+    enzyme = str(grammar.get("enzyme") or "")
+    insert = _released_insert_from_fragment(frag_seq, enzyme)
+    if frag_features:
+        # Re-digest carrying the features so they ride onto the insert in
+        # fragment-local coords instead of being dropped.
+        seq = "".join(c for c in (frag_seq or "").upper()
+                      if c in "ACGTRYSWKMBDHVN")
+        for p in _digest_with_enzymes(seq, [enzyme], circular=False,
+                                      features=list(frag_features)):
+            if (p["left"].get("kind") != "linear"
+                    and p["right"].get("kind") != "linear"):
+                insert = p
+                break
+    vseq = "".join(c for c in (vector_seq or "").upper()
+                   if c in "ACGTRYSWKMBDHVN")
+    if not vseq:
+        raise ValueError("the entry vector has no sequence")
+    vpieces = _digest_with_enzymes(vseq, [enzyme], circular=True,
+                                   features=list(vector_features or []))
+    if len(vpieces) < 2:
+        raise ValueError(
+            f"the entry vector has no {enzyme} dropout to replace — it must "
+            f"be cut twice to open a slot for the insert.")
+    # The dropout is whichever piece presents the SAME overhang pair as the
+    # insert; everything else chains into the backbone. Mirrors
+    # `_clone_part_into_entry_vector`'s handling of vectors that picked up an
+    # extra site: any number of survivors ligate end to end.
+    want = (insert["left"].get("overhang_seq", ""),
+            insert["right"].get("overhang_seq", ""))
+    keep = [p for p in vpieces
+            if (p["left"].get("overhang_seq", ""),
+                p["right"].get("overhang_seq", "")) != want]
+    if len(keep) == len(vpieces):
+        raise ValueError(
+            f"the insert's {want[0]}/{want[1]} overhangs match nothing the "
+            f"vector releases — wrong entry vector for this grammar, or the "
+            f"fragment was built against a different one.")
+    if not keep:
+        # Every piece looked like the dropout, which only happens on a
+        # degenerate vector whose two cuts leave the SAME overhang on both
+        # ends. Ligating nothing would close the insert on itself and report a
+        # backbone-free "plasmid" as a success.
+        raise ValueError(
+            f"the entry vector leaves {want[0]}/{want[1]} at both cuts, so "
+            f"nothing survives as a backbone — it can't take a directional "
+            f"insert.")
+    chain = insert
+    for p in keep:
+        merged = _ligate_fragments(chain, p)
+        if merged is None:
+            raise ValueError(
+                "the vector backbone pieces don't ligate onto the insert — "
+                "check that the fragment and vector share a grammar.")
+        chain = merged
+    closed = _close_circular(chain)
+    if closed is None:
+        raise ValueError(
+            "the assembly won't close into a circle — the free ends don't "
+            "match.")
+    return {
+        "sequence":   closed["top_seq"],
+        "features":   closed["features"],
+        "insert_len": len(insert["top_seq"]),
+        "enzyme":     enzyme,
+        "vector_len": len(vseq),
+    }
+
+
+def _grammar_position_for_type(grammar: dict, part_type: str) -> "dict | None":
+    """Case-tolerant lookup of a grammar's position row for ``part_type``.
+
+    Defers to the existing exact-match `_grammar_position_by_type` first, so
+    there is ONE definition of what a position is; the fallback only relaxes
+    case, which the agent API needs (a caller sending `"cds"` means `CDS`).
+    Deliberately does NOT match on the position's `name` — names like
+    `Pos 3-4` could alias another row's type."""
+    hit = _grammar_position_by_type(grammar, part_type)
+    if hit is not None:
+        return hit
+    want = str(part_type or "").strip().lower()
+    if not want:
+        return None
+    for p in (grammar.get("positions") or []):
+        if isinstance(p, dict) and str(p.get("type") or "").strip().lower() == want:
+            return p
+    return None
+
+
+def _l0_part_from_syn_fragment(
+        frag_seq: str, vector_seq: str, *, grammar: dict, part_type: str,
+        name: str = "", frag_features: "list[dict] | None" = None,
+        vector_features: "list[dict] | None" = None) -> dict:
+    """Turn a synthesised L0 fragment into a Level-0 PART of ``grammar``.
+
+    The caller chooses the part type; its fusion overhangs come from the
+    grammar's own position table, never from inferring them off the sequence.
+    Two guards make "wrong grammar / wrong part type" fail loudly instead of
+    producing a part that looks right and cannot assemble:
+
+      * the part type must BE a position in this grammar (so a MoClo type
+        can't be filed under a Golden Braid grammar, and vice versa);
+      * the overhangs that type declares must actually be present at the ends
+        of the released insert — picking `CDS` for a fragment built as a
+        promoter would otherwise store `AATG/GCTT` against a body that
+        carries `GGAG/AATG`.
+
+    The stored ``sequence`` is the body BETWEEN those overhangs, never the
+    flanked region: the L0 storage contract holds `oh5`/`oh3` separately and
+    the assembly chain re-adds them (`_assembly_fragment_strip_oh5`,
+    `_clone_part_into_entry_vector`), so storing them inline duplicates 8 bp
+    per part — a frameshift in a CDS. For a two-tier fragment the entry
+    overhangs come off too; they belong to the vector junction, not the part.
+
+    Returns a parts-bin-ready dict plus the cloned plasmid under
+    ``cloned_seq`` / ``cloned_features``. Raises ValueError, message first."""
+    pos = _grammar_position_for_type(grammar, part_type)
+    if pos is None:
+        known = ", ".join(
+            str(p.get("type") or p.get("name") or "?")
+            for p in (grammar.get("positions") or []) if isinstance(p, dict)
+        ) or "none"
+        raise ValueError(
+            f"{grammar.get('name') or grammar.get('id') or 'this grammar'} has "
+            f"no {part_type!r} position — it defines: {known}.")
+    oh5 = str(pos.get("oh5") or "").upper()
+    oh3 = str(pos.get("oh3") or "").upper()
+    if len(oh5) != 4 or len(oh3) != 4:
+        raise ValueError(
+            f"the {part_type!r} position has no usable 4-nt overhang pair.")
+    enzyme = str(grammar.get("enzyme") or "")
+    insert = _released_insert_from_fragment(frag_seq, enzyme)
+    # The region that lands in the vector is the insert's top strand plus the
+    # overhang carried by the NEXT piece (see `_fragments_from_cuts`: top_seq
+    # holds the left overhang, not the right).
+    region = insert["top_seq"] + insert["right"].get("overhang_seq", "")
+    # Locate the CATEGORY overhangs at the two EXACT offsets the layout
+    # allows — flush (one-tier) or one 4-nt entry overhang in (two-tier). A
+    # substring search over the same window would pass a body that merely
+    # happens to begin with the other type's overhang, filing a part whose
+    # declared ends aren't its real ones. The offsets double as the trim: what
+    # sits outside the category pair is vector junction, not part.
+    if region[:4] == oh5:
+        off5 = 0
+    elif region[4:8] == oh5:
+        off5 = 4
+    else:
+        raise ValueError(
+            f"this fragment doesn't start with the {oh5} overhang that "
+            f"{part_type!r} requires — it was built as a different part type.")
+    if region[-4:] == oh3:
+        off3 = 0
+    elif region[-8:-4] == oh3:
+        off3 = 4
+    else:
+        raise ValueError(
+            f"this fragment doesn't end with the {oh3} overhang that "
+            f"{part_type!r} requires — it was built as a different part type.")
+    body = region[off5 + 4:len(region) - off3 - 4]
+    if not body:
+        raise ValueError(
+            f"there is nothing between the {oh5} and {oh3} overhangs — this "
+            f"fragment carries no insert.")
+    cloned = _clone_syn_fragment_into_entry_vector(
+        frag_seq, vector_seq, grammar=grammar,
+        frag_features=frag_features, vector_features=vector_features)
+    return {
+        "name":       (name or "").strip() or "part",
+        "type":       str(pos.get("type") or part_type),
+        "position":   str(pos.get("name") or pos.get("type") or part_type),
+        "oh5":        oh5,
+        "oh3":        oh3,
+        "sequence":   body,
+        "nested":     bool(off5 or off3),
+        "grammar":    str(grammar.get("id") or ""),
+        "level":      0,
+        "enzyme":     enzyme,
+        "cloned_seq": cloned["sequence"],
+        "cloned_features": cloned["features"],
+        "insert_len": cloned["insert_len"],
+    }
+
+
 def _build_synthesis_l0_fragment(
     sequence: str, oh5: str, oh3: str, *,
     grammar: "dict | None" = None,

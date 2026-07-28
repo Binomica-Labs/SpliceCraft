@@ -59,7 +59,7 @@ from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
 from splicecraft_biology import (_digest_with_enzymes, _enzyme_cuts, _scan_restriction_sites)
-from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _build_synthesis_l0_fragment, _design_gb_primers, _entry_vector_acceptor_overhangs, _grammar_position_by_type)
+from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _build_synthesis_l0_fragment, _design_gb_primers, _entry_vector_acceptor_overhangs, _grammar_position_by_type, _l0_part_from_syn_fragment)
 from splicecraft_dataaccess import (_active_enzyme_allowed_set, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
 from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member)
 from splicecraft_gels import (_AGAROSE_CHOICES, _GEL_HEIGHT_MAX, _GEL_HEIGHT_MIN, _GEL_LANE_WIDTH_MAX, _GEL_LANE_WIDTH_MIN, _GEL_MAX_LANES, _agarose_mobility, _gel_bands_for_lane, _render_gel_image)
@@ -3150,6 +3150,221 @@ def _h_create_part(app, payload):
             return err
     return {"ok": True, "name": p["name"], "grammar": p["grammar"],
             "bin": _get_active_parts_bin_name() or ""}
+
+
+@_agent_endpoint("make-l0-part-from-fragment", write=True)
+def _h_make_l0_part_from_fragment(app, payload):
+    """Turn a saved synthetic fragment into a Level-0 PART **and the L0
+    plasmid it lives on**, by cloning it into the grammar's entry vector. Body:
+    ``{fragment, part_type, [grammar], [name], [bin], [collection],
+    [product_name], [save_plasmid]}``.
+
+    ``fragment`` is a library entry id or name — a FRAG built by Synthesis →
+    L0 Fragment (or ``design-synthesis-fragment``), i.e. one already wrapped
+    in the grammar's Type IIS ends. ``part_type`` is the position the part
+    will occupy (``CDS``, ``Promoter``, …); its fusion overhangs come from
+    THAT grammar's position table, never from guessing at the sequence — which
+    is what makes the two-tier nested layout come out right. ``grammar``
+    defaults to the active one; ``bin`` routes exactly as in `create-part`.
+
+    The clone is SIMULATED, not assembled by hand ([INV-127]): both the
+    fragment and the entry vector are digested with the grammar's enzyme, the
+    released insert is ligated into the surviving backbone, and the circle is
+    closed. Anything that can't happen is a 400 naming the cause — a plain
+    (unwrapped) fragment, a part type this grammar doesn't define (the error
+    lists the ones it does), a part type whose overhangs aren't on this
+    fragment, or a grammar with no entry vector assigned. 409 if a part of
+    that ``(name, grammar)`` already exists.
+
+    **Both artifacts are kept**, because the point of cloning a fragment is to
+    end up holding the plasmid: the part goes to the bin, and the circular L0
+    plasmid is SAVED to the library (active collection, or the one named by
+    ``collection``) with its construction lineage attached, so History shows
+    the insert and the entry vector it came from. That save is delegated to
+    `domesticate-part` — the same engine the GUI Domesticator uses — so there
+    is one definition of what an L0 clone is. The plasmid is named
+    ``<part> (L0)`` so it can't be mistaken for the FRAGMENT it came from
+    (which usually sits in the library under the part's own name);
+    ``product_name`` overrides that, and a clash gets a ``-2`` suffix rather
+    than overwriting anything. Pass ``save_plasmid: false`` to file only the
+    part.
+
+    The part's stored ``sequence`` is the body BETWEEN its overhangs, matching
+    what `create-part` and the Domesticator file — `oh5`/`oh3` are held apart
+    and re-added by the assembly, so the part re-clones through
+    `_clone_part_into_entry_vector` into the very plasmid saved here.
+
+    ``via`` is an internal label for the log line only (the Constructor button
+    routes through this same handler and passes ``"ui"``); it defaults to
+    ``"agent"`` and changes nothing about what is built."""
+    if not isinstance(payload, dict):
+        return ({"error": "expected a JSON object body"}, 400)
+    known = {"fragment", "part_type", "grammar", "name", "bin", "collection",
+             "product_name", "save_plasmid", "via"}
+    # A mistyped `bin`/`collection` would silently route the part or the
+    # plasmid somewhere else and still answer ok (SC-D).
+    if (derr := _agent_reject_dangerous_unknowns(payload, known)) is not None:
+        return derr
+    # Guard ONCE, up front (`domesticate-parts`' pattern): the delegated save
+    # guards too, and finding out the canvas is dirty AFTER the part is filed
+    # would leave the two artifacts out of step.
+    guard = _agent_dirty_guard(app, payload)
+    if guard is not None:
+        return guard
+    frag_ref = payload.get("fragment")
+    if not isinstance(frag_ref, str) or not frag_ref.strip():
+        return ({"error": "missing or non-string 'fragment' "
+                 "(library entry id or name)"}, 400)
+    part_type = payload.get("part_type")
+    if not isinstance(part_type, str) or not part_type.strip():
+        return ({"error": "missing or non-string 'part_type'"}, 400)
+    entry = (_find_library_entry_by_id(frag_ref)
+             or _find_library_entry_by_name(frag_ref))
+    if entry is None:
+        return ({"error": f"no library entry {frag_ref!r}"}, 404)
+    gid = payload.get("grammar")
+    if gid in (None, ""):
+        gid = _get_setting("active_grammar", "gb_l0") or "gb_l0"
+    if not isinstance(gid, str):
+        return ({"error": "'grammar' must be a string"}, 400)
+    # `_all_grammars()` is keyed BY id — iterating it yields keys, not dicts.
+    grammar = _all_grammars().get(gid)
+    if not isinstance(grammar, dict):
+        return ({"error": f"no grammar {gid!r}"}, 404)
+    vec = _get_entry_vector(gid)
+    if not isinstance(vec, dict) or not str(vec.get("gb_text") or ""):
+        return ({"error": f"grammar {gid!r} has no entry vector assigned — "
+                 f"set one first (Settings → Entry Vectors, or "
+                 f"set-entry-vector)."}, 400)
+    save_plasmid = payload.get("save_plasmid", True)
+    if not isinstance(save_plasmid, bool):
+        return ({"error": "'save_plasmid' must be true or false"}, 400)
+    # Confirm the destination EXISTS before anything is filed. `domesticate-
+    # part`'s `_agent_resolve_save_dest` is still the resolver that routes the
+    # save — this only moves the "no such collection" failure ahead of the
+    # part, so a typo can't leave a part filed with no plasmid beside it.
+    coll_in = payload.get("collection")
+    if coll_in not in (None, ""):
+        # Same resolution as every other endpoint here: normalise, then exact
+        # match on the readonly cache view (mirrors `_find_collection`).
+        coll_name = _normalize_collection_name(coll_in)
+        if coll_name is None:
+            return ({"error": "invalid 'collection'"}, 400)
+        if not any(isinstance(c, dict) and c.get("name") == coll_name
+                   for c in _iter_collections_readonly()):
+            return ({"error": f"no collection named {coll_name!r}"}, 404)
+    try:
+        frag_rec = _gb_text_to_record(str(entry.get("gb_text") or ""))
+        vec_rec = _gb_text_to_record(str(vec.get("gb_text") or ""))
+    except Exception as exc:                       # noqa: BLE001 — reported
+        return ({"error": f"could not parse a record: {exc}"}, 400)
+    # A CIRCULAR entry is not a synthesis fragment, and digesting one as if it
+    # were linear is not an error — it happily "releases" whatever sits
+    # between two sites, so pointing this at a plasmid (pUPD2 itself, say)
+    # would file its stuffer as a part. Refuse by name instead.
+    if (frag_rec.annotations.get("topology") or "").lower() == "circular":
+        return ({"error":
+                  f"{entry.get('name') or frag_ref!r} is a circular plasmid, "
+                  f"not a linear synthesis fragment — this builds a part from "
+                  f"a FRAG wrapped in {grammar.get('enzyme') or 'Type IIS'} "
+                  f"ends (Synthesis → L0 Fragment)."}, 400)
+    try:
+        built = _l0_part_from_syn_fragment(
+            str(frag_rec.seq), str(vec_rec.seq), grammar=grammar,
+            part_type=part_type.strip(),
+            name=str(payload.get("name") or entry.get("name") or "part"),
+        )
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
+    # Delegate the actual filing so bin routing, the (name, grammar) dedup
+    # and the save-failure path stay in ONE place (`create-part`).
+    res = _h_create_part(app, {
+        "name":     built["name"],
+        "sequence": built["sequence"],
+        "grammar":  built["grammar"],
+        "type":     built["type"],
+        "position": built["position"],
+        "oh5":      built["oh5"],
+        "oh3":      built["oh3"],
+        "level":    0,
+        "bin":      payload.get("bin"),
+    })
+    if isinstance(res, tuple):          # (error_dict, status) — pass through
+        return res
+    # ── The plasmid the part lives on ────────────────────────────────────
+    # Delegated to `domesticate-part` (via the shared registry — this sibling
+    # can't import the hub) rather than saving our own simulated record: that
+    # handler already owns the two-tier nesting, the fail-loud "no stub"
+    # policy, name/id dedup against the destination, the L0 lineage history
+    # and collection routing. `_clone_part_into_entry_vector` under it
+    # rebuilds the identical circle we simulated — pinned by
+    # `test_the_filed_part_reclones_into_the_same_plasmid` — so delegating
+    # costs a second digest and buys one definition of an L0 clone.
+    saved: "dict | None" = None
+    plasmid_error = ""
+    if save_plasmid:
+        dom = _state._AGENT_HANDLERS.get("domesticate-part")
+        if dom is None:                 # registry gutted — should be unreachable
+            plasmid_error = "the domesticate-part engine is unavailable"
+        else:
+            dres = dom[0](app, {
+                "name":     built["name"],
+                "sequence": built["sequence"],
+                "oh5":      built["oh5"],
+                "oh3":      built["oh3"],
+                "grammar":  built["grammar"],
+                "type":     built["type"],
+                # Synthesised, not amplified: there are no domestication
+                # primers to attach, and inventing some would put a PCR that
+                # never happened into the construct's History.
+                "collection":   payload.get("collection"),
+                # Distinct from the FRAGMENT it was built from, which is
+                # usually sitting in the library under exactly this name —
+                # letting them collide would leave the user with "MyFrag" and
+                # a dedup-suffixed "MyFrag-2" and no way to tell which is the
+                # plasmid. Mirrors the Domesticator's "(domesticated)" tag.
+                "product_name": (payload.get("product_name")
+                                 or f"{built['name']} (L0)"),
+                "force":        True,   # guarded once, at the top
+            })
+            if isinstance(dres, tuple):
+                plasmid_error = str((dres[0] or {}).get(
+                    "error", "the L0 plasmid could not be saved"))
+                _log.warning("part.from_fragment: part %r filed but the "
+                             "plasmid save failed: %s",
+                             built["name"], plasmid_error)
+            else:
+                saved = dres
+    via = payload.get("via")
+    _log_event("part.from_fragment", grammar=gid, part_type=built["type"],
+               nested=built["nested"], plasmid_saved=bool(saved),
+               via="ui" if via == "ui" else "agent")
+    out = dict(res)
+    out.update({
+        "part_type":   built["type"],
+        "position":    built["position"],
+        "oh5":         built["oh5"],
+        "oh3":         built["oh3"],
+        "insert_len":  built["insert_len"],
+        "part_len":    len(built["sequence"]),
+        "nested":      built["nested"],
+        # The saved artifact's own length when there is one — the same circle
+        # either way (`test_the_filed_part_reclones_into_the_same_plasmid`),
+        # but a number that came off a real entry beats one that didn't.
+        "plasmid_len": ((saved or {}).get("length")
+                        or len(built["cloned_seq"])),
+        "entry_vector": vec.get("name") or "",
+        # The plasmid half of the result. `saved_id` is None when the part
+        # filed but the plasmid didn't — reported rather than swallowed,
+        # since the caller is now holding one artifact instead of two.
+        "saved_name":  (saved or {}).get("saved_name"),
+        "saved_id":    (saved or {}).get("saved_id"),
+        "collection":  (saved or {}).get("collection"),
+        "ignored":     _agent_ignored_keys(payload, known),
+    })
+    if plasmid_error:
+        out["plasmid_error"] = plasmid_error
+    return out
 
 
 @_agent_endpoint("update-part", write=True)

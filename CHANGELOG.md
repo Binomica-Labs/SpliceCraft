@@ -14,6 +14,37 @@
 
 ---
 
+## [1.2.44] — 2026-07-27
+
+### New features
+
+- **Turn a synthetic fragment into an L0 part, from the Constructor.** Any
+  modular tab now has **New Part from Syn Frag**: pick a fragment you saved
+  from Synthesis → L0 Fragment, say which part type it should become, and
+  SpliceCraft loads that grammar's entry vector and runs the actual cloning —
+  cutting both with the grammar's enzyme, ligating the insert into the
+  backbone and closing the plasmid — then files the result as a Level-0 part,
+  ready to use in the palette.
+- **You keep the plasmid, not just the part.** The circular L0 construct is
+  saved to your library as *"<part> (L0)"* — named apart from the fragment it
+  came from — with its History showing the insert and the entry vector it was
+  built into, exactly like a domesticated part. It's the same construct the
+  Domesticator would have made, so it opens, maps and assembles like any
+  other plasmid.
+- **It refuses rather than guessing.** Only the chosen grammar's own part
+  types are offered, and a fragment whose ends don't match the type you
+  picked is turned away — so a CDS fragment can't quietly be filed as a
+  promoter and fail at the bench. An unwrapped fragment, a grammar with no
+  entry vector, and a duplicate part name each say exactly what's wrong. So
+  do the awkward ones: pointing it at a whole plasmid instead of a fragment,
+  a fragment with nothing between its ends, and a custom grammar naming an
+  enzyme that isn't in the catalog — which now blames the grammar rather
+  than sending you off to rebuild a fragment that was fine.
+- **Available to scripts and to Babs** as `make-l0-part-from-fragment`, which
+  produces the identical part the button does.
+
+---
+
 ## [1.2.43] — 2026-07-27
 
 ### Bug fixes

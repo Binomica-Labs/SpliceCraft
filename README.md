@@ -209,7 +209,19 @@ The assembly bench: Traditional cloning, Gibson, Golden Braid, MoClo, or your
 own grammar, driven by a 4-source part picker. Every assembly, at every level,
 lands as one library entry (payload + overhangs + backbone) that carries every
 parent feature forward — so you can trace a finished L3 construct back to its L0
-parts from the Library panel. Deleted a plasmid by mistake? Press **`u`** (or **Ctrl+Z**) with the library focused and it comes back where it was — the last 25 deletions of the session are undoable.
+parts from the Library panel. Deleted a plasmid by mistake? Press **`u`** (or **Ctrl+Z**) with the library focused and it comes back where it was — the last 100 deletions of the session are undoable.
+
+Ordered a synthetic fragment and it arrived? **New Part from Syn Frag** (on any
+modular tab) turns it into a Level-0 part: pick a saved `FRAG` and the part type
+it becomes, and SpliceCraft *runs the cloning* — cutting the fragment and the
+grammar's entry vector with its Type IIS enzyme, ligating the released insert
+into the backbone, closing the circle — then files the part into the palette,
+ready to assemble, **and saves the finished L0 plasmid to your library** as
+*"&lt;part&gt; (L0)"*, its History showing the insert and the entry vector it went
+into. Fusion overhangs come from the grammar's own position table, so a
+two-tier fragment files the **category** pair (`AATG`/`GCTT`), not the entry
+pair it happened to enter on. A fragment whose ends don't match the type you
+picked is turned away rather than filed as a part that can't assemble.
 
 ### Simulator
 

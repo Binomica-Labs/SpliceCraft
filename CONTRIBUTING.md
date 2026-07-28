@@ -63,6 +63,14 @@ the launcher caches whatever release was current when it was
 installed, which drifts away from CI's version over time. CI sets
 the env var explicitly (`.github/workflows/test.yml`).
 
+`release.py` goes one step further: right before the lint gate it
+runs `pip install --upgrade pyright`, so the release is cleared by
+the current checker and the launcher stops printing "a new pyright
+version is available" on every run — a warning you learn to skim
+past is a warning that hides the next real one. The upgrade is
+non-fatal (offline releases still work) and skippable with
+`SPLICECRAFT_SKIP_PYRIGHT_UPGRADE=1`.
+
 Inner-loop sanity check (under 2 seconds):
 
 ```bash
