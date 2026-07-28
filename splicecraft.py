@@ -42,7 +42,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.44"
+__version__ = "1.2.45"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -36699,6 +36699,108 @@ def _clone_part_marshal_vec_features(vec_rec) -> list[dict]:
     return vec_features
 
 
+def _clone_part_body_span(top_seq: str, fused: str, oh3: str) -> tuple[int, int]:
+    """Return ``(offset, strand)`` of the ``oh5 + body`` fusion inside a
+    released insert fragment's top strand, or ``(-1, 1)`` if it isn't
+    there.
+
+    A Type IIS digest releases the body in exactly TWO layouts — flush
+    with the fragment's 3' edge (one-tier: the 3' overhang lives at the
+    START of the next fragment, per `_fragments_from_cuts`), or with the
+    part's own 3' overhang behind it (two-tier, and the synthesised
+    fallback's `left_oh + fused + oh3`). Whatever sits in FRONT is the
+    vector-side overhang and is not ours to assume a width for. So the
+    offset is COMPUTED from the 3' edge and then confirmed with
+    `startswith`, never searched for.
+
+    A bare `top_seq.find(fused)` would take the LEFTMOST hit, which on a
+    body that repeats with the overhang's period is the wrong one —
+    the same substring-vs-positional trap [INV-172]'s overhang guard hit
+    (and which a probe on `AATG<body>AATG<body>` reproduced here).
+
+    The reverse-complement case is the mirror image: `_rc(top_seq)` reads
+    ``[rc(oh3)] rc(body) rc(oh5) [rc(ext5)]``, so the fusion is measured
+    from the FRONT instead.
+    """
+    for probe, strand in ((fused, 1), (_rc(fused), -1)):
+        room = len(top_seq) - len(probe)
+        offsets = ((room - len(oh3), room) if strand > 0
+                   else (len(oh3), 0))
+        for off in offsets:
+            if off >= 0 and top_seq.startswith(probe, off):
+                return off, strand
+    return -1, 1
+
+
+def _clone_part_place_part_feature(
+    part_feature: dict, top_seq: str, insert: str,
+    oh5: str, oh3: str, part_type: str,
+) -> dict:
+    """Position the whole-part annotation over the part BODY inside a
+    released insert fragment's top strand, and return the placed copy.
+
+    Neither edge of `top_seq` can be assumed. A one-tier acceptor
+    releases `[oh5]<body>` (the 3' overhang lives at the START of the
+    next fragment, per `_fragments_from_cuts`); a two-tier Golden-Braid
+    UPD acceptor releases `[CTCG]<[oh5]<body>[oh3]>` — the external pair
+    wrapping the category pair. So the body is LOCATED rather than
+    measured from an edge, by searching for the same `oh5 + body` fusion
+    the amplicon simulator built (`_fuse_overhang_body`, which collapses
+    a duplicated AATG start codon).
+
+    For a coding part the annotation extends `_atg_offset_for_part`
+    bases upstream INTO the 5' overhang, because GB 2.0 puts the start
+    codon inside the AATG fusion site and the stored body therefore
+    begins at codon 2. Getting this wrong is not cosmetic: the
+    pre-2026-07-28 code spanned the WHOLE released fragment, so on a
+    two-tier acceptor the CDS started on the vector-side CTCG — 5 bases
+    early, out of frame — and the map/seq panel showed a premature-stop
+    ⚠ and garbage protein over a perfectly good ORF.
+
+    Falls back to spanning the whole fragment (the historical
+    behaviour) when the body can't be located, so an unrecognised
+    layout still gets an annotation rather than none.
+    """
+    f = dict(part_feature)
+    # Case-normalise BOTH sides: the digest yields upper-case, but a body
+    # that reached here in mixed case (a hand-built part dict, a custom
+    # caller) would simply fail to match and fall back to the pre-fix
+    # whole-fragment span — silently correct-looking and wrong.
+    top_seq = (top_seq or "").upper()
+    insert = (insert or "").upper()
+    oh5, oh3 = (oh5 or "").upper(), (oh3 or "").upper()
+    fused = _fuse_overhang_body(oh5, insert, part_type) if insert else ""
+    atg = _atg_offset_for_part(oh5, part_type)
+    idx, strand = _clone_part_body_span(top_seq, fused, oh3) if fused else (-1, 1)
+    if idx < 0:
+        # Not a layout we recognise. Keep the historical whole-fragment
+        # span so the part still gets AN annotation — but say so, because
+        # a silent revert to the pre-[INV-173] placement is exactly how
+        # the frameshift it fixes went unnoticed for a release.
+        _log.warning(
+            "clone_sim: could not locate the body of %r inside the %d bp "
+            "released insert (oh5 %r / oh3 %r) — annotating the whole "
+            "fragment; a CDS may read out of frame",
+            f.get("label") or "part", len(top_seq), oh5, oh3,
+        )
+        f["start"], f["end"] = 0, len(top_seq)
+        return f
+    if strand > 0:
+        # …[oh5]<body>… — trim the overhang off the front, minus the
+        # `atg` bases of it that carry the start codon.
+        f["start"] = max(0, idx + len(oh5) - atg)
+        f["end"]   = idx + len(fused)
+    else:
+        # The fusion sits reverse-complemented, so `oh5` is at its RIGHT
+        # edge and the trim comes off the end instead.
+        f["start"] = idx
+        f["end"]   = min(len(top_seq), idx + len(fused) - len(oh5) + atg)
+        f["strand"] = -1
+    if f["end"] <= f["start"]:          # degenerate body — keep the old span
+        f["start"], f["end"] = 0, len(top_seq)
+    return f
+
+
 def _clone_part_build_part_feature(
     part: dict, raw_name: str, oh5: str, oh3: str,
 ) -> dict:
@@ -36822,9 +36924,9 @@ def _clone_part_try_primer_path(
                 "end":   new_e,
             })
     else:
-        f = dict(part_feature)
-        f["end"] = len(insert_frag["top_seq"])
-        insert_frag["features"].append(f)
+        insert_frag["features"].append(_clone_part_place_part_feature(
+            part_feature, insert_frag["top_seq"], insert, oh5, oh3, ptype,
+        ))
     return insert_frag, dropout_idx
 
 
@@ -36877,16 +36979,17 @@ def _clone_part_synthesise_insert(
                 "end":   new_e,
             })
     else:
-        f = dict(part_feature)
         # Place the part feature so that the BsaI overhangs flank it:
         # the insert annotation covers exactly the user's designed
         # sequence (between oh5 and oh3). The L1-junction overhangs
-        # themselves stay untagged.
-        # Extend the annotation `atg_off` bases upstream into the overhang
-        # so an AATG-CDS feature still covers the start codon it now supplies.
-        f["start"] = max(0, len(left_oh) + len(oh5) - atg_off)
-        f["end"]   = len(left_oh) + len(fused)
-        built_features = [f]
+        # themselves stay untagged — except for the start codon an AATG
+        # 5' overhang supplies, which the shared placer extends over.
+        # Same placer as the primer path so there is ONE definition of
+        # where a part annotation sits (the two used to disagree: this
+        # one dropped the ATG, that one covered the whole fragment).
+        built_features = [_clone_part_place_part_feature(
+            part_feature, synth_top, insert, oh5, oh3, ptype,
+        )]
     insert_frag = {
         "top_seq":      synth_top,
         "left":         left_end,

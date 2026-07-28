@@ -599,3 +599,210 @@ class TestGrammarPositionLookup:
     def test_unknown_and_blank_return_none(self, grammar):
         assert cl._grammar_position_for_type(grammar, "nope") is None
         assert cl._grammar_position_for_type(grammar, "") is None
+
+
+
+# A real ORF: ATG, all-Ala codons, one terminator, and no Type IIS site on
+# either strand. The module-level `BODY` carries internal `TAG`s (harmless
+# for the storage-contract tests above, useless for a frame test).
+ORF_BODY = "ATG" + "GCTGCAGCAGCTGCAGCA" * 4 + "TAA"
+
+
+class TestClonedCdsFrame:
+    """The CDS annotation on the saved L0 plasmid must sit ON the ORF.
+
+    2026-07-28 (user report: "why is there a broken frame"): Constructor →
+    new part from syn fragment saved a plasmid whose CDS spanned the WHOLE
+    released insert. A two-tier acceptor releases `[CTCG][AATG]<body>[GCTT]`,
+    so that annotation began on the vector-side external overhang — 5 bases
+    before the ATG, out of frame. The map + seq panel translated garbage and
+    stamped the premature-stop ⚠ over a perfectly good ORF.
+
+    The DNA was always right; only the annotation moved. Pinned on BOTH tiers
+    because they are different branches: the one-tier
+    `_clone_part_synthesise_insert` had the mirror-image bug — it started at
+    codon 2 and dropped the ATG that the AATG overhang supplies.
+    """
+
+    @staticmethod
+    def _cloned(grammar, *, nested):
+        pos = _position(grammar, "CDS")
+        built = cl._build_synthesis_l0_fragment(
+            ORF_BODY, pos["oh5"], pos["oh3"], grammar=grammar,
+            part_type="CDS",
+            entry_overhangs=("CTCG", "TGAG") if nested else None)
+        vec_seq = _entry_vector(grammar, built["entry_oh5"],
+                                built["entry_oh3"])
+        part = cl._l0_part_from_syn_fragment(
+            built["fragment"], vec_seq, grammar=grammar,
+            part_type="CDS", name="MyPart")
+        if nested:
+            # Exactly what `domesticate-part` stamps when the configured
+            # vector's external pair differs from the category pair.
+            part["entry_oh5"] = built["entry_oh5"]
+            part["entry_oh3"] = built["entry_oh3"]
+        rec = sc._clone_part_into_entry_vector(
+            part, {"gb_text": _gb(vec_seq, "pUPD2", "circular")}, grammar)
+        assert rec is not None, "the clone simulation bailed"
+        cds = [f for f in rec.features
+               if f.type == "CDS"
+               and (f.qualifiers.get("label") or [""])[0] == "MyPart"]
+        assert len(cds) == 1
+        return str(rec.seq).upper(), cds[0]
+
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_cds_starts_on_the_atg_the_overhang_supplies(self, grammar,
+                                                         nested):
+        seq, cds = self._cloned(grammar, nested=nested)
+        start = int(cds.location.start)
+        assert seq[start:start + 3] == "ATG", (
+            f"CDS starts on {seq[start:start + 3]!r}, not the start codon "
+            f"(context {seq[max(0, start - 6):start + 6]!r})")
+
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_cds_is_in_frame_and_has_no_premature_stop(self, grammar,
+                                                       nested):
+        from Bio.Seq import Seq
+        seq, cds = self._cloned(grammar, nested=nested)
+        start, end = int(cds.location.start), int(cds.location.end)
+        assert (end - start) % 3 == 0, "CDS isn't a whole number of codons"
+        aa = str(Seq(seq[start:end]).translate())
+        # The rule `PlasmidMap._parse` applies before stamping ⚠: a trailing
+        # run of stops collapses to one terminator, anything else is premature.
+        assert aa.startswith("M")
+        assert aa.rstrip("*").count("*") == 0, f"premature stop in {aa!r}"
+
+    def test_the_external_overhang_stays_outside_the_cds(self, grammar):
+        """The regression proper: annotating the released insert from index 0
+        swallows the vector-side `CTCG` and shifts the frame by 5."""
+        seq, cds = self._cloned(grammar, nested=True)
+        start, end = int(cds.location.start), int(cds.location.end)
+        assert start != 0
+        assert "CTCG" not in seq[start:end]
+        # …and the body it DOES cover is the part's own sequence.
+        assert ORF_BODY[3:] in seq[start:end]
+
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_a_non_coding_part_is_not_extended_into_its_overhang(
+            self, grammar, nested):
+        """`_atg_offset_for_part` is coding-only: a Promoter's GGAG 5'
+        overhang carries no start codon, so its annotation must stop at the
+        body — otherwise every non-coding part grows 3 phantom bases."""
+        pos = _position(grammar, "Promoter")
+        built = cl._build_synthesis_l0_fragment(
+            ORF_BODY, pos["oh5"], pos["oh3"], grammar=grammar,
+            part_type="Promoter",
+            entry_overhangs=("CTCG", "TGAG") if nested else None)
+        vec_seq = _entry_vector(grammar, built["entry_oh5"],
+                                built["entry_oh3"])
+        part = cl._l0_part_from_syn_fragment(
+            built["fragment"], vec_seq, grammar=grammar,
+            part_type="Promoter", name="MyProm")
+        if nested:
+            part["entry_oh5"], part["entry_oh3"] = ("CTCG", "TGAG")
+        rec = sc._clone_part_into_entry_vector(
+            part, {"gb_text": _gb(vec_seq, "pUPD2", "circular")}, grammar)
+        assert rec is not None
+        f = next(f for f in rec.features
+                 if (f.qualifiers.get("label") or [""])[0] == "MyProm")
+        seq = str(rec.seq).upper()
+        body = seq[int(f.location.start):int(f.location.end)]
+        assert body == part["sequence"]
+        assert not body.startswith(part["oh5"])
+
+
+class TestPartFeaturePlacement:
+    """Unit-level hardening of the placer behind [INV-173].
+
+    `TestClonedCdsFrame` drives it through the whole clone; these pin the
+    layouts and the degenerate inputs a clone won't reach on its own.
+    """
+
+    BODY = "GTGTCCAGCGGGGAGGACATCTTCTCGGGCCTCGTGCCC"      # codon 2 on, 39 nt
+    TPL = {"start": 0, "end": 0, "strand": 1, "type": "CDS",
+           "label": "MyPart", "color": "white"}
+
+    def _place(self, top, insert, oh5="AATG", oh3="GCTT", ptype="CDS"):
+        f = sc._clone_part_place_part_feature(
+            dict(self.TPL), top, insert, oh5, oh3, ptype)
+        return f["start"], f["end"], f.get("strand", 1)
+
+    def test_two_tier_release_skips_the_vector_side_overhang(self):
+        top = "CTCG" + "AATG" + self.BODY + "GCTT"
+        assert self._place(top, self.BODY) == (5, 4 + 4 + len(self.BODY), 1)
+        assert top[5:8] == "ATG"
+
+    def test_one_tier_release_is_flush_with_the_body(self):
+        # No 3' overhang on this fragment — it lives at the START of the
+        # next one (`_fragments_from_cuts`), so the body runs to the edge.
+        top = "AATG" + self.BODY
+        assert self._place(top, self.BODY) == (1, len(top), 1)
+
+    def test_a_duplicated_overhang_picks_the_inner_one(self):
+        """`_clone_part_synthesise_insert` builds `left_oh + oh5 + body`, so
+        on a one-tier acceptor the overhang appears TWICE. The annotation
+        belongs on the second."""
+        top = "AATG" + "AATG" + self.BODY + "GCTT"
+        assert self._place(top, self.BODY)[0] == 5
+        assert top[5:8] == "ATG"
+
+    def test_reverse_complemented_fragment_flips_the_strand(self):
+        """`_clone_part_try_primer_path` RCs the candidate when the forward
+        orientation finds no matching dropout."""
+        top = sc._rc("CTCG" + "AATG" + self.BODY + "GCTT")
+        start, end, strand = self._place(top, self.BODY)
+        assert strand == -1
+        # The ATG sits at the far end, reverse-complemented.
+        assert top[end - 3:end] == "CAT"
+        assert (end - start) % 3 == 0
+
+    def test_a_body_repeating_with_the_overhang_period_is_not_mismatched(self):
+        """The substring-vs-positional trap ([INV-172]'s guard, again): a bare
+        leftmost `find` locks onto the FIRST copy and shifts the frame."""
+        top = "AATG" + self.BODY + "AATG" + self.BODY
+        start, _end, _s = self._place(top, self.BODY)
+        assert start == 4 + len(self.BODY) + 1     # the second copy
+        assert top[start:start + 3] == "ATG"
+
+    def test_a_non_coding_part_covers_the_body_only(self):
+        top = "CTCG" + "GGAG" + self.BODY + "AATG"
+        start, end, _ = self._place(top, self.BODY, oh5="GGAG", oh3="AATG",
+                                    ptype="Promoter")
+        assert top[start:end] == self.BODY
+
+    def test_mixed_case_still_matches(self):
+        """The digest yields upper case, but a hand-built part dict need not
+        — and a silent no-match falls back to the pre-fix whole span."""
+        top = "CTCG" + "AATG" + self.BODY + "GCTT"
+        assert self._place(top, self.BODY.lower()) == self._place(top, self.BODY)
+
+    def test_an_unlocatable_body_falls_back_and_says_so(self):
+        """Fail loud, not silent: the whole-fragment span IS the pre-[INV-173]
+        placement, so reverting to it without a word is how the frameshift
+        survived a release.
+
+        NOT `caplog`: `_log` sets `propagate=False`, so pytest's handler on
+        the root logger never sees these records — the assertion would pass
+        vacuously against an empty list.
+        """
+        import logging
+        seen: list[str] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                seen.append(record.getMessage())
+
+        h = _Capture()
+        sc._log.addHandler(h)
+        try:
+            span = self._place("TTTT" * 20, self.BODY)
+        finally:
+            sc._log.removeHandler(h)
+        assert span == (0, 80, 1)
+        assert any("could not locate the body" in m for m in seen), seen
+
+    def test_an_empty_body_does_not_invent_a_feature(self):
+        """`_clone_part_into_entry_vector` bails before this, but the placer
+        must not annotate a bare start codon as if it were the part."""
+        top = "CTCG" + "AATG" + "GCTT"
+        assert self._place(top, "") == (0, len(top), 1)

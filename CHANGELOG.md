@@ -14,6 +14,47 @@
 
 ---
 
+## [1.2.45] — 2026-07-28
+
+### Bug fixes
+
+- **New Part from Syn Frag no longer breaks the reading frame of the part it
+  builds.** The Level-0 plasmid it saves was annotated across the *whole*
+  piece of DNA that came out of the digest — which, for the two-tier entry
+  vectors (pUPD-style, with an outer overhang pair wrapping the inner one),
+  starts four bases before the part itself. A CDS annotated that way begins
+  five bases before its own ATG, so the map and sequence panel translated it
+  out of frame: garbage protein and a red ⚠ premature-stop warning over a
+  perfectly good gene. The DNA was always correct — only the annotation was
+  in the wrong place — so the plasmid still assembles as designed. Promoters,
+  terminators and other non-coding parts were affected too, just invisibly:
+  their annotations ran a few bases long at each end. Parts now get annotated
+  exactly on the sequence you designed, with a CDS starting on its start
+  codon. **Plasmids you already saved keep the old annotation** — re-make them
+  from their fragments to pick up the correct one.
+- **A part cloned without domestication primers no longer loses its start
+  codon.** The fallback path used when a part has no stored primers annotated
+  its CDS from codon 2, leaving the ATG (which the `AATG` fusion overhang
+  supplies) outside the feature. It stayed in frame, so nothing warned about
+  it. Both cloning paths now place the annotation the same way.
+
+### Hardening
+
+- **A part whose sequence repeats is annotated correctly.** Finding the part
+  inside the cloned plasmid used a plain text search, which locks onto the
+  first copy — so a body containing an internal repeat of its own fusion site
+  could still land four bases off. The position is now worked out from the
+  ends of the fragment rather than searched for, which also keeps custom
+  grammars with non-standard overhang widths working.
+- **When a part can't be placed, the log now says so.** In the rare case
+  SpliceCraft doesn't recognise the layout of a digested fragment it falls
+  back to annotating the whole thing — previously in silence, which is how
+  the frame bug above went unnoticed. It now writes a warning naming the part
+  and its overhangs, so `~/.local/share/splicecraft/logs/splicecraft.log` is
+  grep-able for it.
+
+---
+
 ## [1.2.44] — 2026-07-27
 
 ### New features
