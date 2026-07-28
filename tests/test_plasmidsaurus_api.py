@@ -161,6 +161,120 @@ class TestCredentials:
         assert cid == "only-id" and sec is None
 
 
+
+class TestCredentialShapeHint:
+    """A rejection should say WHAT is wrong when the shape gives it away.
+
+    2026-07-28 (user report): the Settings fields held a Plasmidsaurus
+    *website login* — email in Client ID, account password in Client Secret —
+    and the modal reported only a bare `HTTP 401`. An email address sitting in
+    a field that wants 32 hex characters is diagnosable at a glance, so the
+    message now says so.
+    """
+
+    ID, SEC = "a" * 32, "b" * 64
+
+    def test_a_correct_pair_produces_no_hint(self):
+        # Append-safe: "" must be the answer whenever nothing looks wrong,
+        # or every successful-shape rejection grows a bogus tail.
+        assert sc._plasmidsaurus_credential_hint(self.ID, self.SEC) == ""
+        assert sc._plasmidsaurus_credential_hint(self.ID.upper(), self.SEC) == ""
+
+    def test_an_email_in_the_client_id_is_named(self):
+        h = sc._plasmidsaurus_credential_hint("seb@example.org", "hunter2")
+        assert "email address" in h and "website login" in h
+        # The wrong-KIND diagnosis wins outright — listing lengths underneath
+        # would bury it.
+        assert "characters, expected" not in h
+
+    def test_wrong_length_or_non_hex_is_named_per_field(self):
+        h = sc._plasmidsaurus_credential_hint("abc", self.SEC)
+        assert "Client ID" in h and "Client Secret" not in h
+        h = sc._plasmidsaurus_credential_hint(self.ID, "not-hex-" + "z" * 56)
+        assert "Client Secret" in h and "isn't hex" in h
+        h = sc._plasmidsaurus_credential_hint("a" * 30, "b" * 60)
+        assert "30 characters, expected 32" in h
+        assert "60 characters, expected 64" in h
+
+    def test_a_missing_half_is_not_reported_as_malformed(self):
+        # `_plasmidsaurus_credentials` already refuses a missing half with its
+        # own message; complaining about "0 characters" here would double up.
+        assert sc._plasmidsaurus_credential_hint("", self.SEC) == ""
+        assert sc._plasmidsaurus_credential_hint(self.ID, "") == ""
+
+    def test_the_hint_never_echoes_a_credential(self):
+        """It reaches the UI and the log — lengths and character classes only."""
+        secret = "sk-DO-NOT-ECHO-ME-abc123"
+        h = sc._plasmidsaurus_credential_hint("seb@example.org", secret)
+        assert secret not in h
+        h = sc._plasmidsaurus_credential_hint("zz" * 20, secret)
+        assert secret not in h and "zz" * 20 not in h
+
+    @staticmethod
+    def _raise_status(monkeypatch, code: int):
+        import urllib.error
+
+        class _O:
+            def open(self, req, timeout=None):
+                raise urllib.error.HTTPError(
+                    req.get_full_url(), code, "err", {}, None)
+        monkeypatch.setattr(_search, "_build_hardened_url_opener", lambda: _O())
+
+    def test_a_401_carries_the_hint(self, monkeypatch):
+        """The whole point: the message the modal shows must contain it."""
+        self._raise_status(monkeypatch, 401)
+        with pytest.raises(OSError) as ei:
+            sc._plasmidsaurus_oauth_token("seb@example.org", "hunter2")
+        msg = str(ei.value)
+        assert "HTTP 401" in msg and "email address" in msg
+
+    def test_hostile_input_can_never_raise(self):
+        """It runs INSIDE the `except HTTPError` block that reports the
+        rejection — anything it raises replaces a clear "HTTP 401" with a
+        traceback, i.e. the diagnostic destroys the diagnosis. Probed with
+        non-str types, which every one of these used to raise on."""
+        for cid, sec in ((None, None), (12345678, "b" * 64),
+                         ("a" * 32, b"b" * 64), (["a"], "b" * 64),
+                         ("a" * 32, {"k": 1}), (True, False),
+                         ("   ", "\t\n"), (object(), object())):
+            assert sc._plasmidsaurus_credential_hint(cid, sec) == ""
+
+    def test_a_value_cannot_forge_a_log_line_or_emit_escapes(self):
+        """The hint reaches both the log and the terminal, and it is built
+        from an attacker-influenced-ish value (whatever is in Settings)."""
+        for bad in ("b" * 32 + "\nFAKE LOG LINE", "\x1b[31mred", "\r\n" * 5):
+            h = sc._plasmidsaurus_credential_hint("a" * 32, bad)
+            assert "\n" not in h and "\r" not in h and "\x1b" not in h
+            assert bad not in h
+
+    def test_an_oversized_value_reports_a_length_not_the_value(self):
+        h = sc._plasmidsaurus_credential_hint("a" * 32, "b" * 1_000_000)
+        assert "1000000 characters" in h and len(h) < 200
+
+    def test_the_agent_endpoint_surfaces_the_hint_too(self, monkeypatch):
+        """One placement, every surface: the GUI modal, the download path and
+        the agent endpoints all obtain their token through
+        `_plasmidsaurus_oauth_token`, so the hint rides along. Pinned rather
+        than asserted, since a future caller could bypass it."""
+        import splicecraft_agent as _ag
+        # The moved handler resolves its deps in the SIBLING's namespace.
+        monkeypatch.setattr(_ag, "_plasmidsaurus_credentials",
+                            lambda: ("seb@example.org", "hunter2"))
+        self._raise_status(monkeypatch, 401)
+        handler = sc._state._AGENT_HANDLERS["plasmidsaurus-items"][0]
+        body, status = handler(None, {})
+        assert status == 502
+        assert "email address" in body["error"]
+
+    def test_a_429_is_still_not_blamed_on_the_credentials(self, monkeypatch):
+        """The pre-existing carve-out must survive: a rate limit says nothing
+        about the key, so it must not pick up a shape hint either."""
+        self._raise_status(monkeypatch, 429)
+        with pytest.raises(OSError) as ei:
+            sc._plasmidsaurus_oauth_token("seb@example.org", "hunter2")
+        assert "email address" not in str(ei.value)
+
+
 # ── OAuth + JSON API ─────────────────────────────────────────────────────────
 class TestApiClient:
     def test_token_happy(self, use_router):

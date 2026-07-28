@@ -1813,6 +1813,62 @@ def _plasmidsaurus_credentials() -> "tuple[str | None, str | None]":
     return (cid or None, sec or None)
 
 
+# The published shape of the OAuth pair: two lowercase-hex strings off the
+# account's API page. Used ONLY to explain a rejection after the fact — never
+# to gate a request, because a provider that changes its key format must not
+# be able to lock the feature out from our side. A wasted call costs one of
+# the 10/min budget ([INV-169]); a false refusal costs the whole feature.
+_PLASMIDSAURUS_CLIENT_ID_LEN     = 32
+_PLASMIDSAURUS_CLIENT_SECRET_LEN = 64
+_PLASMIDSAURUS_HEX_RE            = re.compile(r"\A[0-9a-fA-F]+\Z")
+
+
+def _plasmidsaurus_credential_hint(client_id: str, client_secret: str) -> str:
+    """Explain WHY Plasmidsaurus rejected the credentials, when their shape
+    gives it away. Returns "" (append-safe) when nothing looks wrong.
+
+    Same spirit as the 429 branch above: a bare "rejected the API
+    credentials" sends the user off to re-check a key that may be fine, or —
+    the case this exists for — to re-check the RIGHT field while the wrong
+    KIND of value sits in it. 2026-07-28: a user had their website login
+    (email + account password) in the two Settings fields and got only a
+    bare HTTP 401; the email in a field wanting 32 hex characters was
+    diagnosable at a glance and the message said nothing about it.
+
+    Never includes a credential VALUE — only lengths and character classes,
+    since this string reaches the UI and the log. (That also means a value
+    carrying newlines or ANSI escapes can't forge a log line or reach the
+    terminal — verified by probe, pinned by test.)
+
+    TOTAL BY CONSTRUCTION: non-`str` inputs are treated as absent rather than
+    raising. This runs INSIDE the `except urllib.error.HTTPError` block that
+    reports the rejection, so anything it raises would replace a clear
+    "HTTP 401" with an `AttributeError` — a diagnostic destroying the
+    diagnosis it exists to improve. Type-strictness is what makes that
+    impossible, so no bare-except crutch is needed (cf.
+    `_sanitize_plasmidsaurus_item_code`, type-strict for the same reason).
+    """
+    cid = client_id.strip() if isinstance(client_id, str) else ""
+    sec = client_secret.strip() if isinstance(client_secret, str) else ""
+    if "@" in cid:
+        return (" That Client ID looks like an email address — that's your "
+                "Plasmidsaurus website login, not the API credentials. The "
+                "Client ID and Secret are hex strings from your account's "
+                "API page (Settings → Plasmidsaurus).")
+    off = []
+    for label, val, want in (
+        ("Client ID", cid, _PLASMIDSAURUS_CLIENT_ID_LEN),
+        ("Client Secret", sec, _PLASMIDSAURUS_CLIENT_SECRET_LEN),
+    ):
+        if not val:
+            continue
+        if not _PLASMIDSAURUS_HEX_RE.match(val):
+            off.append(f"the {label} isn't hex (expected {want} hex characters)")
+        elif len(val) != want:
+            off.append(f"the {label} is {len(val)} characters, expected {want}")
+    return f" Note: {'; '.join(off)}." if off else ""
+
+
 def _sanitize_plasmidsaurus_item_code(code: "str | None") -> "str | None":
     """Validate/normalise an item code to the published ``^[A-Z0-9]{6}$``
     shape (upper-cased). Returns None on any deviation so callers refuse it
@@ -1874,7 +1930,8 @@ def _plasmidsaurus_oauth_token(client_id: str, client_secret: str,
             raise _plasmidsaurus_oserror(
                 "Plasmidsaurus rejected the API credentials "
                 f"(HTTP {exc.code}). Check PLASMIDSAURUS_CLIENT_ID / "
-                "PLASMIDSAURUS_CLIENT_SECRET (or the Settings values).",
+                "PLASMIDSAURUS_CLIENT_SECRET (or the Settings values)."
+                + _plasmidsaurus_credential_hint(client_id, client_secret),
                 exc.code) from exc
         raise _plasmidsaurus_oserror(
             f"Plasmidsaurus token request failed: HTTP {exc.code}",

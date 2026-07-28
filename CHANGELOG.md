@@ -14,6 +14,35 @@
 
 ---
 
+## [1.2.46] — 2026-07-28
+
+### New features
+
+- **A rejected Plasmidsaurus login now tells you what's wrong with it.** If
+  the credentials come back rejected, SpliceCraft checks their shape and says
+  so: an email address in the Client ID field is called out as your
+  *website login* rather than your API credentials, and a value of the wrong
+  length or with non-hex characters is named per field. Previously any bad
+  value produced the same bare "rejected the API credentials (HTTP 401)",
+  which is no help when the problem is the wrong *kind* of value rather than
+  a wrong one. The check only ever explains a rejection — it never blocks a
+  request, so a future change to Plasmidsaurus's key format can't lock you
+  out. Credential values are never included in the message.
+
+### Hardening
+
+- **The credential check can't turn a clear error into a crash.** It runs
+  while SpliceCraft is already reporting a rejection, so anything it choked
+  on would have replaced a readable "HTTP 401" with a traceback — exactly
+  when you most need the message. It now handles any value you can put in
+  those fields without failing.
+- **The explanation can't leak or garble anything.** It reports only lengths
+  and whether a value is hex, never the value itself, so a credential
+  containing line breaks or terminal escape codes can't corrupt the log file
+  or your terminal.
+
+---
+
 ## [1.2.45] — 2026-07-28
 
 ### Bug fixes

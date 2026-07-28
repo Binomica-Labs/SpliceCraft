@@ -42,7 +42,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.45"
+__version__ = "1.2.46"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -5697,6 +5697,7 @@ from splicecraft_search import (  # noqa: E402
     _plasmidsaurus_user_agent as _plasmidsaurus_user_agent,
     _plasmidsaurus_item_has_results as _plasmidsaurus_item_has_results,
     _plasmidsaurus_credentials as _plasmidsaurus_credentials,
+    _plasmidsaurus_credential_hint as _plasmidsaurus_credential_hint,
     _sanitize_plasmidsaurus_item_code as _sanitize_plasmidsaurus_item_code,
     _plasmidsaurus_oauth_token as _plasmidsaurus_oauth_token,
     _plasmidsaurus_api_get as _plasmidsaurus_api_get,
