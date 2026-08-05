@@ -42,7 +42,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.49"
+__version__ = "1.2.50"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -18171,6 +18171,16 @@ class LibraryPanel(Widget):
         prev_history = ""
         prev_gb = ""
         prev_size = 0
+        # Per-plasmid VIEW state + saved alignment results are entry-level
+        # data the record knows nothing about, so a rebuilt record (edit,
+        # relabel, primer-add) silently dropped them on the next save: the
+        # map snapped back to circular and a saved BLAST/Plasmidsaurus
+        # alignment vanished. Carried forward on a same-id re-save, exactly
+        # like `status` and the construction history above. Found by the
+        # 2026-08-05 label repair, which re-saved 155 entries and cost 3 of
+        # them their `map_mode` and one its `alignments`. [INV-179]
+        prev_map_mode = ""
+        prev_alignments = None
         found_prev = False
         for e in entries:
             if e.get("id") == record.id:
@@ -18179,6 +18189,9 @@ class LibraryPanel(Widget):
                 prev_history = str(e.get("history_xml") or "")
                 prev_gb = str(e.get("gb_text") or "")
                 prev_size = _coerce_int_or_zero(e.get("size"))
+                prev_map_mode = str(e.get("map_mode") or "").strip().lower()
+                if isinstance(e.get("alignments"), list) and e.get("alignments"):
+                    prev_alignments = deepcopy(e["alignments"])
                 found_prev = True
                 break
         # Pre-build the new entry dict so collision detection can
@@ -18223,6 +18236,15 @@ class LibraryPanel(Widget):
             str(getattr(record, "_tui_kind", "") or "").strip().lower()
             or _derive_entry_kind(new_entry)
         )
+        # Carry the entry-level view/alignment state (see prev_* above). A
+        # live `_tui_map_mode` on the record WINS — that's the user toggling
+        # the view right now — with the stored value as the fallback.
+        _live_mode = str(getattr(record, "_tui_map_mode", "") or "").strip().lower()
+        _mode = _live_mode if _live_mode in ("linear", "circular") else prev_map_mode
+        if _mode in ("linear", "circular"):
+            new_entry["map_mode"] = _mode
+        if prev_alignments:
+            new_entry["alignments"] = prev_alignments
         # Construction-history contract (shared with the canvas Ctrl+S
         # worker via `_apply_entry_construction_history`): carry a `.dna`
         # round-trip's history or preserve prior history on a same-id
@@ -111050,6 +111072,23 @@ NcbiTaxonPickerModal { align: center middle; }
                 f"sequence length — clamped to fit.",
                 severity="warning", timeout=8,
             )
+        # `.dna` import: the file carried annotations whose coordinates don't
+        # line up with anything BioPython parsed, so we couldn't place their
+        # names. Those features keep their parsed labels rather than being
+        # handed a neighbour's — but the user needs to know some names may be
+        # missing, because "quietly wearing the wrong name" is exactly the
+        # failure this replaced. [INV-179]
+        n_unclaimed = getattr(record, "_dna_augment_unclaimed", 0)
+        if n_unclaimed:
+            self.notify(
+                f"⚠ {n_unclaimed} annotation name(s) in the .dna file could "
+                f"not be matched to a feature — see {_LOG_PATH}.",
+                severity="warning", timeout=8,
+            )
+            try:
+                delattr(record, "_dna_augment_unclaimed")
+            except AttributeError:
+                pass
         topology = (record.annotations or {}).get("topology", "").lower()
         # Only force linear when the user has no per-plasmid preference
         # stashed on the record — otherwise their library-stored

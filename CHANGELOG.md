@@ -14,6 +14,54 @@
 
 ---
 
+## [1.2.50] — 2026-08-05
+
+### Bug fixes
+
+- **Imported `.dna` files could put every annotation name one feature out of
+  place.** The DNA itself was always perfect — right sequence, right
+  coordinates, right lengths — but on affected files each feature wore its
+  *neighbour's* name. Homology arms were the worst case: search for the second
+  arm's sequence and you'd land on a block labelled as the first. Two genes could
+  swap names while every length check, digest and re-simulation still passed,
+  because nothing about the molecule was wrong — only the labels.
+
+  It happened when SpliceCraft matched the names stored in the file against
+  the features it had parsed **by their position in the list** rather than by
+  where they actually sit on the plasmid. A `.dna` made by importing a
+  GenBank record carries an extra "source" row that SpliceCraft skipped on
+  one side but not the other, and everything after it slid by one. The
+  give-away symptom: the first real feature on the map labelled literally
+  `source`. Files SpliceCraft wrote itself were never affected — only ones
+  authored elsewhere.
+
+  Names are now matched to features by coordinate, so each feature keeps its
+  own. A feature the file has no name for keeps the name it was parsed with
+  instead of borrowing a neighbour's.
+
+  If you have already imported an affected file, the wrong names were saved
+  with it — re-importing the original `.dna` now reads it correctly.
+
+- **Saving a plasmid no longer loses its view mode or its saved alignments.**
+  Whether a plasmid opens linear or circular, and any BLAST / Plasmidsaurus
+  alignment results stored against it, are kept on the library entry rather
+  than on the sequence — so re-saving after an edit quietly reset the map to
+  circular and dropped the alignments. Both now survive a re-save, and toggling
+  the view with `v` before saving still wins.
+
+### Hardening
+
+- **A `.dna` import now tells you when it couldn't place some of the file's
+  own annotation names**, instead of silently guessing. Every import also
+  records how many names it matched, so a future mismatch shows up in the log
+  rather than as a quietly mislabelled map.
+- Names are matched most-specific-first — exact segments plus type and
+  direction, then coordinates alone — so two features that sit on top of each
+  other (a gene and its CDS, a promoter and its reverse twin, two features that
+  both wrap the origin) can no longer be handed each other's name.
+
+---
+
 ## [1.2.49] — 2026-08-05
 
 ### Bug fixes

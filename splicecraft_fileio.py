@@ -1654,6 +1654,59 @@ def _write_commercialsaas_dna_bytes(record, *,
     return b"".join(parts)
 
 
+def _commercialsaas_segment_parts(segments) -> "tuple[tuple[int, int], ...]":
+    """Every ``<Segment range="a-b">`` as a sorted tuple of BioPython-frame
+    ``(start, end)`` pairs — the PRECISE identity of a multi-part feature.
+
+    ``_commercialsaas_segment_span`` reduces those to min-start / max-end, which
+    an **origin-spanning** feature collapses to ``(0, len)`` — the whole
+    molecule. Two different wrap features (or a wrap feature and a genuine
+    full-length one) then key identically and can be handed each other's name.
+    Matching on the parts first keeps them apart; the span stays as the
+    fallback for the ordinary single-segment case. [INV-179]
+    """
+    out: list[tuple[int, int]] = []
+    for seg in segments:
+        rng = (seg.get("range") or "").strip()
+        head, _, tail = rng.partition("-")
+        try:
+            start_1based, end_1based = int(head), int(tail)
+        except ValueError:
+            continue
+        if start_1based < 1 or end_1based < start_1based:
+            continue
+        out.append((start_1based - 1, end_1based))
+    return tuple(sorted(out))
+
+
+def _commercialsaas_segment_span(segments) -> "tuple[int, int] | None":
+    """Reduce a ``.dna`` ``<Feature>``'s ``<Segment range="a-b">`` children to a
+    single BioPython-frame span ``(start, end)`` — 0-based inclusive start,
+    exclusive end — so it compares directly against
+    ``feature.location.start/end``.
+
+    The packet writes ranges 1-based inclusive (``_build_commercialsaas_features_packet``
+    emits ``f"{int(part.start) + 1}-{int(part.end)}"``), so the decode is
+    ``start - 1`` / ``end`` verbatim.
+
+    A join / origin-spanning feature carries several ``<Segment>``s; reducing to
+    min-start / max-end matches what BioPython reports for the corresponding
+    ``CompoundLocation`` (``.start`` is the min of the parts' starts, ``.end``
+    the max of their ends), so multi-segment features key the same on both
+    sides. Malformed, inverted or non-positive ranges are skipped; ``None``
+    comes back when nothing usable survives, which the caller treats as
+    "unmatchable" and leaves the feature's parsed label alone.
+
+    Derived from ``_commercialsaas_segment_parts`` so the range decode and its
+    malformed-input rules live in ONE place — two copies would be free to
+    disagree about what counts as a usable segment.
+    """
+    parts = _commercialsaas_segment_parts(segments)
+    if not parts:
+        return None
+    return (min(p[0] for p in parts), max(p[1] for p in parts))
+
+
 def _augment_dna_record_from_packets(
     rec, data: bytes, *, packets=None,
 ) -> list[dict]:
@@ -1719,8 +1772,12 @@ def _augment_dna_record_from_packets(
             at = sum(1 for c in s.upper() if c in "AT")
             return float(2 * at + 4 * gc)
 
-    feature_colors: list[str] = []
-    feature_names_from_xml: list[str] = []
+    # One dict per 0x0A `<Feature>`, carrying the span + type we match on
+    # alongside the name + colour we stamp. Kept as a LIST (not a dict keyed on
+    # span) because two features may legitimately share a span — an NCBI-derived
+    # gene/CDS pair sits at identical coordinates — and each still needs its own
+    # entry to hand out. [INV-179]
+    xml_features: list[dict] = []
     standalone_primers: list[dict] = []
 
     # Iterate the packet stream ONCE: the file-load path materialises
@@ -1745,10 +1802,9 @@ def _augment_dna_record_from_packets(
             if root is None:
                 continue
             for feat_el in root.findall(".//Feature"):
-                seg = feat_el.find("Segment")
-                feature_colors.append(
-                    seg.get("color", "") if seg is not None else ""
-                )
+                segments = feat_el.findall("Segment")
+                seg = segments[0] if segments else None
+                color = seg.get("color", "") if seg is not None else ""
                 # Capture the raw XML `name` attribute too. BioPython's
                 # `.dna` parser has been observed to mangle whitespace
                 # in feature names (GH #17, a user 2026-05-13:
@@ -1762,7 +1818,18 @@ def _augment_dna_record_from_packets(
                 # survive verbatim.
                 xml_name = feat_el.get("name", "") or ""
                 xml_name = _CONTROL_CHARS_RE.sub("", xml_name)[:200]
-                feature_names_from_xml.append(xml_name)
+                # `directionality`: "1" forward, "2" reverse, omitted when the
+                # writer has no opinion (see `_build_commercialsaas_features_packet`).
+                _dir = (feat_el.get("directionality") or "").strip()
+                xml_features.append({
+                    "strand": 1 if _dir == "1" else (-1 if _dir == "2" else None),
+                    "parts": _commercialsaas_segment_parts(segments),
+                    "span":  _commercialsaas_segment_span(segments),
+                    "type":  (feat_el.get("type", "") or "").strip(),
+                    "name":  xml_name,
+                    "color": color,
+                    "used":  False,
+                })
         elif type_byte == _COMMERCIALSAAS_PACKET_PRIMERS:
             if len(payload) > _COMMERCIALSAAS_PACKET_MAX_XML:
                 _log.warning("dna augment: 0x05 primers packet too large "
@@ -1797,12 +1864,33 @@ def _augment_dna_record_from_packets(
                     "status":      "Imported",
                 })
 
-    # Stamp colour qualifiers + override feature labels on features
-    # by enumeration order. The 0x0A packet only carries the features
-    # the editor itself created; any `source` row in the SeqRecord
-    # comes from BioPython's LOCUS parsing (not the 0x0A packet) so
-    # it doesn't consume a slot. Out-of-order or extra features are
-    # tolerated — we stop when we run off the end of either list.
+    # Stamp colour qualifiers + override feature labels by matching each 0x0A
+    # `<Feature>` to the record feature at the SAME COORDINATES. [INV-179]
+    #
+    # This used to zip the two lists by enumeration index, on the assumption
+    # that the 0x0A packet holds exactly the non-source features BioPython
+    # produces, in the same order. That assumption is false in the wild and
+    # fails SILENTLY — every label lands on its neighbour:
+    #   * a `.dna` authored by importing a GenBank record carries an explicit
+    #     `<Feature type="source">` as entry #0, but the loop skips the
+    #     record's `source` row, so the XML source entry displaces every
+    #     subsequent name by one (the tell-tale symptom: the first real
+    #     feature comes out labelled literally "source");
+    #   * `primer_bind` features come from the 0x05 packet and have no 0x0A
+    #     entry at all, so any file mixing the two desynchronises;
+    #   * a third-party writer is free to order `<Feature>` elements however
+    #     it likes — nothing pins them to BioPython's emission order.
+    # A user hit this on a 4-arm homology-arm reference (2026-08-05): the arm
+    # blocks were byte-correct but every arm wore its neighbour's name, which
+    # is exactly the kind of wrong that reads as right. Coordinates are the
+    # only thing both sides genuinely agree on, so they are the join key.
+    #
+    # Two features may share a span (an NCBI gene/CDS pair), so entries are
+    # handed out from per-span buckets: try (span, type) first — that keeps a
+    # gene/CDS pair straight — then fall back to span alone for writers whose
+    # type string doesn't survive BioPython's mapping. Each entry is consumed
+    # at most once, and a feature with no match keeps the label BioPython
+    # parsed rather than being handed a stranger's.
     #
     # Label override: BioPython's `.dna` parser has been observed to
     # mangle whitespace in feature names (GH #17 — user-typed
@@ -1813,30 +1901,140 @@ def _augment_dna_record_from_packets(
     # BioPython produced. Skipped when the XML name is empty (some
     # third-party .dna writers omit the attribute), in which case
     # BioPython's parsed label survives untouched.
-    feat_idx = 0
+    # `deque` (not list) so `popleft` stays O(1): a degenerate file that piles
+    # thousands of features onto one span would make list.pop(0) quadratic.
+    from collections import deque as _deque
+    by_parts_type_strand: dict[tuple, "_deque[dict]"] = {}
+    by_parts_type: dict[tuple, "_deque[dict]"] = {}
+    by_span_type: dict[tuple[int, int, str], "_deque[dict]"] = {}
+    by_span: dict[tuple[int, int], "_deque[dict]"] = {}
+    for _ent in xml_features:
+        if _ent["span"] is None:
+            continue
+        # A `source` entry has NO legitimate partner: the stamping loop skips
+        # the record's own `source` row by design, so this entry can only ever
+        # be claimed by something it doesn't describe. Left in, the span-only
+        # fallback hands it to whatever genuine feature happens to span the
+        # whole molecule — a terminator or misc_feature comes out labelled
+        # literally "source", which is the exact symptom this whole match was
+        # written to eliminate. Found by the 2026-08-05 repair sweep, on
+        # records whose 0x0A source entry spans the full length. [INV-179]
+        if _ent["type"] == "source":
+            continue
+        if _ent["parts"]:
+            if _ent["strand"] is not None:
+                by_parts_type_strand.setdefault(
+                    (_ent["parts"], _ent["type"], _ent["strand"]),
+                    _deque()).append(_ent)
+            by_parts_type.setdefault(
+                (_ent["parts"], _ent["type"]), _deque()).append(_ent)
+        by_span_type.setdefault(
+            (_ent["span"][0], _ent["span"][1], _ent["type"]),
+            _deque()).append(_ent)
+        by_span.setdefault(_ent["span"], _deque()).append(_ent)
+
+    def _take(bucket) -> "dict | None":
+        """Pop the first not-yet-consumed entry off a bucket, marking it used.
+
+        Already-consumed entries are discarded as we pass them — an entry
+        claimed through one index is dead in the other too, and it can never
+        be needed again, so dropping it keeps both indexes converging."""
+        while bucket:
+            ent = bucket.popleft()
+            if not ent["used"]:
+                ent["used"] = True
+                return ent
+        return None
+
+    n_matched = 0
+    n_unmatched = 0
     for f in rec.features:
         if f.type == "source":
             continue
-        # Color stamp (existing behaviour).
-        if feat_idx < len(feature_colors):
-            c = feature_colors[feat_idx]
-            if c and isinstance(c, str):
-                c = c.strip()
-                # Defensive: only accept plausible CSS hex colours
-                # so a malformed packet can't sneak arbitrary strings
-                # into our qualifiers.
-                if c.startswith("#") and len(c) in (4, 7):
-                    f.qualifiers["ApEinfo_revcolor"] = [c]
-                    f.qualifiers["ApEinfo_fwdcolor"] = [c]
+        try:
+            span = (int(f.location.start), int(f.location.end))
+            _loc_parts = getattr(f.location, "parts", None) or [f.location]
+            rec_parts = tuple(sorted(
+                (int(p.start), int(p.end)) for p in _loc_parts))
+        except (TypeError, ValueError, AttributeError):
+            # A location BioPython couldn't resolve to plain ints (unknown /
+            # external reference position). Nothing to match on — leave it be.
+            n_unmatched += 1
+            continue
+        # Most precise first, degrading gracefully: parts+type+STRAND (the
+        # only way two otherwise-identical features can differ), then the exact
+        # set of parts (which keeps two origin-spanning features apart, since
+        # both reduce to the whole molecule), then span+type, then span alone
+        # for writers whose type string doesn't survive BioPython's mapping.
+        # Each tier only ever narrows — a miss falls through to the next.
+        ent = None
+        _rec_strand = getattr(f.location, "strand", None)
+        if _rec_strand in (1, -1):
+            ent = _take(by_parts_type_strand.get(
+                (rec_parts, f.type or "", _rec_strand)))
+        if ent is None:
+            ent = _take(by_parts_type.get((rec_parts, f.type or "")))
+        if ent is None:
+            ent = _take(by_span_type.get((span[0], span[1], f.type or "")))
+        if ent is None:
+            ent = _take(by_span.get(span))
+        if ent is None:
+            n_unmatched += 1
+            continue
+        n_matched += 1
+        # Color stamp.
+        c = ent["color"]
+        if c and isinstance(c, str):
+            c = c.strip()
+            # Defensive: only accept plausible CSS hex colours
+            # so a malformed packet can't sneak arbitrary strings
+            # into our qualifiers.
+            if c.startswith("#") and len(c) in (4, 7):
+                f.qualifiers["ApEinfo_revcolor"] = [c]
+                f.qualifiers["ApEinfo_fwdcolor"] = [c]
         # Label override from raw XML.
-        if feat_idx < len(feature_names_from_xml):
-            xml_name = feature_names_from_xml[feat_idx]
-            if xml_name:
-                f.qualifiers["label"] = [xml_name]
-        feat_idx += 1
-        if (feat_idx >= len(feature_colors)
-                and feat_idx >= len(feature_names_from_xml)):
-            break
+        if ent["name"]:
+            f.qualifiers["label"] = [ent["name"]]
+
+    # Leftovers are diagnostic gold: a 0x0A entry nobody claimed means the
+    # file's coordinates and BioPython's disagree, which is precisely the
+    # condition the old index-zip papered over. Log it (with a couple of
+    # examples) so a future parser drift shows up in the log instead of as
+    # quietly-misnamed features on a map. `source` is expected to go
+    # unclaimed — we skip the record's source row by design — so it never
+    # counts toward the warning.
+    _leftover = [e for e in xml_features
+                 if not e["used"] and e["span"] is not None
+                 and e["type"] != "source"]
+    # Structured event on EVERY augment, so the match rate for an import is
+    # greppable after the fact rather than only when something looks wrong.
+    _log_event("dna.augment",
+               xml_entries=len(xml_features),
+               matched=n_matched,
+               feats_unmatched=n_unmatched,
+               xml_unclaimed=len(_leftover))
+    if _leftover:
+        _log.warning(
+            "dna augment: %d of %d 0x0A feature entries did not match a "
+            "parsed feature by coordinate (%d matched, %d record features "
+            "unmatched); those features keep their parsed labels. "
+            "Unclaimed examples: %s",
+            len(_leftover), len(xml_features), n_matched, n_unmatched,
+            ", ".join(
+                f"{e['name'] or '<unnamed>'}@{e['span'][0] + 1}..{e['span'][1]}"
+                for e in _leftover[:5]),
+        )
+        # Stash for the app so an import that couldn't place some of the
+        # file's own annotations tells the USER, not just the log. A silent
+        # log line is how the 2026-08-05 mislabelling went unnoticed.
+        try:
+            rec._dna_augment_unclaimed = len(_leftover)   # type: ignore[attr-defined]
+        except AttributeError:
+            pass
+    else:
+        _log.debug("dna augment: matched %d/%d 0x0A feature entries by "
+                   "coordinate (%d record features unmatched)",
+                   n_matched, len(xml_features), n_unmatched)
 
     # Build primer DB entries from the primer_bind features. Two
     # sources for the primer sequence:

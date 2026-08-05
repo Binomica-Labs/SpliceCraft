@@ -3327,3 +3327,439 @@ class TestHistoryHardening:
             input_summaries = []
         assert sc._history_node_warnings(
             _Hostile(), "ACGT", enzymes=self.ENZ) == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# `.dna` label/colour stamping is keyed on COORDINATES, not list position.
+# Regression guard for the 2026-08-05 user report. [INV-179]
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `_augment_dna_record_from_packets` used to zip the 0x0A `<Feature>` list
+# against `rec.features` by enumeration index. Any difference in length or
+# order silently slid every label onto its neighbour. The trigger in the wild:
+# a `.dna` authored by importing a GenBank record carries an explicit
+# `<Feature type="source">` as entry #0, but the stamping loop skips the
+# record's `source` row — so the XML source entry displaced every subsequent
+# name by one. A user's 4-arm homology-arm reference came out with each arm
+# wearing its neighbour's name (HomArm2's DNA labelled "HomArm1", …) while
+# the sequence itself was byte-perfect: wrong in the way that reads as right.
+#
+# These tests drive the REAL matching code — the record passed in is the
+# input, never a stand-in for the mechanism being verified.
+
+
+class TestSegmentSpanDecoding:
+    """`_commercialsaas_segment_span` — the 1-based-inclusive → BioPython-frame
+    decode that the whole coordinate match rests on."""
+
+    def _segs(self, *ranges):
+        import xml.etree.ElementTree as ET
+        return [ET.fromstring(f'<Segment range="{r}"/>') for r in ranges]
+
+    def test_single_range_decodes_to_biopython_frame(self):
+        # The writer emits f"{int(part.start) + 1}-{int(part.end)}", so a
+        # feature at BioPython (13, 2239) round-trips through "14-2239".
+        assert _fileio._commercialsaas_segment_span(
+            self._segs("14-2239")) == (13, 2239)
+
+    def test_multi_segment_join_reduces_to_min_start_max_end(self):
+        """A join / origin-spanning feature has several <Segment>s; BioPython
+        reports the CompoundLocation's min-start / max-end, so we must too."""
+        assert _fileio._commercialsaas_segment_span(
+            self._segs("7000-7825", "1-500")) == (0, 7825)
+
+    def test_malformed_and_inverted_ranges_are_skipped(self):
+        assert _fileio._commercialsaas_segment_span(self._segs("not-a-range")) is None
+        assert _fileio._commercialsaas_segment_span(self._segs("500-100")) is None
+        # A 0 or negative start is malformed, not "a feature at coordinate 0".
+        assert _fileio._commercialsaas_segment_span(self._segs("0-100")) is None
+        # …and one good range among bad ones still lands.
+        assert _fileio._commercialsaas_segment_span(
+            self._segs("500-100", "14-2239")) == (13, 2239)
+
+    def test_no_segments_is_unmatchable_not_a_crash(self):
+        assert _fileio._commercialsaas_segment_span([]) is None
+
+
+class TestDnaLabelsFollowCoordinates:
+    """The stamping loop must hand every feature ITS OWN name."""
+
+    @staticmethod
+    def _features_packet(*entries: tuple[str, str, str]) -> bytes:
+        """entries: (name, type, "start-end") 1-based inclusive."""
+        body = "".join(
+            f'<Feature recentID="{i}" name="{name}" type="{ftype}">'
+            f'<Segment range="{rng}" color="#33ccff" type="standard"/>'
+            f'</Feature>'
+            for i, (name, ftype, rng) in enumerate(entries)
+        )
+        return (f'<?xml version="1.0"?><Features nextValidID="{len(entries)}">'
+                f'{body}</Features>').encode("utf-8")
+
+    @staticmethod
+    def _rec(*feats: tuple[str, str, int, int]):
+        """feats: (label, type, start0, end) in BioPython frame."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.Seq import Seq
+        return SeqRecord(
+            Seq("ACGT" * 2500), id="syn", name="syn",
+            features=[SeqFeature(location=FeatureLocation(s, e, strand=1),
+                                 type=t, qualifiers={"label": [lab]})
+                      for lab, t, s, e in feats])
+
+    @staticmethod
+    def _labels(rec):
+        return [(f.type, int(f.location.start), int(f.location.end),
+                 (f.qualifiers.get("label") or [""])[0])
+                for f in rec.features]
+
+    def test_source_entry_in_packet_does_not_shift_every_label(self):
+        """THE bug. The 0x0A packet leads with a `source` <Feature>, which the
+        old index-zip let displace every following name by one — the tell-tale
+        symptom being the first real feature coming out labelled "source"."""
+        data = _make_minimal_dna((0x0A, self._features_packet(
+            ("source",    "source",       "1-10000"),
+            ("HomArm1",  "misc_feature", "3096-3595"),
+            ("HomArm2",  "misc_feature", "3596-4095"),
+            ("HomArm3",  "misc_feature", "4096-4595"),
+            ("HomArm4",  "misc_feature", "4596-5095"),
+        )))
+        rec = self._rec(
+            ("parsed_source", "source",       0,    10000),
+            ("x",             "misc_feature", 3095, 3595),
+            ("x",             "misc_feature", 3595, 4095),
+            ("x",             "misc_feature", 4095, 4595),
+            ("x",             "misc_feature", 4595, 5095),
+        )
+        sc._augment_dna_record_from_packets(rec, data)
+        assert self._labels(rec) == [
+            ("source",       0,    10000, "parsed_source"),   # untouched
+            ("misc_feature", 3095, 3595,  "HomArm1"),
+            ("misc_feature", 3595, 4095,  "HomArm2"),
+            ("misc_feature", 4095, 4595,  "HomArm3"),
+            ("misc_feature", 4595, 5095,  "HomArm4"),
+        ]
+
+    def test_gene_and_cds_at_identical_coords_keep_distinct_names(self):
+        """NCBI-derived records carry a gene/CDS pair at the same span; the
+        type disambiguates which XML entry belongs to which."""
+        data = _make_minimal_dna((0x0A, self._features_packet(
+            ("QFC41_RS02110",      "gene", "2257-4140"),
+            ("Beta-galactosidase", "CDS",  "2257-4140"),
+        )))
+        rec = self._rec(("x", "CDS",  2256, 4140),
+                        ("x", "gene", 2256, 4140))
+        sc._augment_dna_record_from_packets(rec, data)
+        assert self._labels(rec) == [
+            ("CDS",  2256, 4140, "Beta-galactosidase"),
+            ("gene", 2256, 4140, "QFC41_RS02110"),
+        ]
+
+    def test_feature_with_no_packet_entry_keeps_its_parsed_label(self):
+        """`primer_bind` features come from the 0x05 packet and have no 0x0A
+        entry. They must keep the name BioPython parsed rather than be handed
+        whatever entry happens to sit at their coordinates."""
+        data = _make_minimal_dna((0x0A, self._features_packet(
+            ("RAND-2A", "misc_feature", "1-25"),
+        )))
+        rec = self._rec(("x",          "misc_feature", 0, 25),
+                        ("RAND-2A-F",  "primer_bind",  0, 25))
+        sc._augment_dna_record_from_packets(rec, data)
+        assert self._labels(rec) == [
+            ("misc_feature", 0, 25, "RAND-2A"),
+            ("primer_bind",  0, 25, "RAND-2A-F"),   # NOT renamed to RAND-2A
+        ]
+
+    def test_packet_order_independent_of_record_order(self):
+        """Nothing pins a third-party writer's `<Feature>` order to
+        BioPython's emission order, so the match must not depend on it."""
+        data = _make_minimal_dna((0x0A, self._features_packet(
+            ("last",   "misc_feature", "900-1000"),
+            ("first",  "misc_feature", "1-100"),
+            ("middle", "misc_feature", "400-500"),
+        )))
+        rec = self._rec(("x", "misc_feature", 0,   100),
+                        ("x", "misc_feature", 399, 500),
+                        ("x", "misc_feature", 899, 1000))
+        sc._augment_dna_record_from_packets(rec, data)
+        assert [t[3] for t in self._labels(rec)] == ["first", "middle", "last"]
+
+    def test_colour_follows_the_same_match_as_the_label(self):
+        """Colours were stamped off the same index, so they shifted too."""
+        packet = (
+            '<?xml version="1.0"?><Features nextValidID="3">'
+            '<Feature recentID="0" name="source" type="source">'
+            '<Segment range="1-10000" color="#ffffff" type="standard"/></Feature>'
+            '<Feature recentID="1" name="A" type="misc_feature">'
+            '<Segment range="101-200" color="#112233" type="standard"/></Feature>'
+            '<Feature recentID="2" name="B" type="misc_feature">'
+            '<Segment range="301-400" color="#445566" type="standard"/></Feature>'
+            '</Features>').encode("utf-8")
+        rec = self._rec(("s", "source",       0,   10000),
+                        ("x", "misc_feature", 100, 200),
+                        ("x", "misc_feature", 300, 400))
+        sc._augment_dna_record_from_packets(rec, _make_minimal_dna((0x0A, packet)))
+        assert rec.features[1].qualifiers["ApEinfo_revcolor"] == ["#112233"]
+        assert rec.features[2].qualifiers["ApEinfo_revcolor"] == ["#445566"]
+        # The source row is skipped by design, so it never takes a colour.
+        assert "ApEinfo_revcolor" not in rec.features[0].qualifiers
+
+    def test_empty_xml_name_leaves_the_parsed_label_alone(self):
+        """Some third-party writers omit the `name` attribute."""
+        data = _make_minimal_dna((0x0A, self._features_packet(
+            ("", "misc_feature", "1-100"),
+        )))
+        rec = self._rec(("biopython_parsed", "misc_feature", 0, 100))
+        sc._augment_dna_record_from_packets(rec, data)
+        assert self._labels(rec) == [("misc_feature", 0, 100, "biopython_parsed")]
+
+    def test_unmatched_packet_entry_is_logged(self, caplog):
+        """An entry nobody claims means the file's coordinates and BioPython's
+        disagree — exactly what the index-zip papered over. It must surface in
+        the log instead of silently mislabelling."""
+        import logging
+        data = _make_minimal_dna((0x0A, self._features_packet(
+            ("ghost", "misc_feature", "9000-9500"),
+        )))
+        rec = self._rec(("kept", "misc_feature", 0, 100))
+        # `sc._log` sets propagate=False, so caplog's root handler never sees
+        # the record — attach it to that logger for the duration instead.
+        logger = logging.getLogger(sc._log.name)
+        prev_level = logger.level
+        logger.addHandler(caplog.handler)
+        logger.setLevel(logging.WARNING)
+        try:
+            sc._augment_dna_record_from_packets(rec, data)
+        finally:
+            logger.removeHandler(caplog.handler)
+            logger.setLevel(prev_level)
+        assert "did not match a parsed feature by coordinate" in caplog.text
+        assert "ghost" in caplog.text
+        # …and the unmatched record feature kept its own label.
+        assert self._labels(rec) == [("misc_feature", 0, 100, "kept")]
+
+    def test_same_span_and_type_are_told_apart_by_strand(self):
+        """Two features can share coordinates AND type and differ only in
+        direction — the last way one could still be handed the other's name."""
+        packet = ('<?xml version="1.0"?><Features nextValidID="2">'
+                  '<Feature recentID="0" name="fwd-one" type="promoter" '
+                  'directionality="1">'
+                  '<Segment range="101-200" color="#111111" type="standard"/>'
+                  '</Feature>'
+                  '<Feature recentID="1" name="rev-one" type="promoter" '
+                  'directionality="2">'
+                  '<Segment range="101-200" color="#222222" type="standard"/>'
+                  '</Feature></Features>').encode("utf-8")
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.Seq import Seq
+        rec = SeqRecord(
+            Seq("ACGT" * 100), id="syn", name="syn",
+            features=[  # reverse first — the OPPOSITE of the packet order
+                SeqFeature(location=FeatureLocation(100, 200, strand=-1),
+                           type="promoter", qualifiers={"label": ["x"]}),
+                SeqFeature(location=FeatureLocation(100, 200, strand=1),
+                           type="promoter", qualifiers={"label": ["x"]}),
+            ])
+        sc._augment_dna_record_from_packets(rec, _make_minimal_dna((0x0A, packet)))
+        assert [f.qualifiers["label"][0] for f in rec.features] == \
+            ["rev-one", "fwd-one"]
+
+    def test_a_directionless_packet_entry_still_matches(self):
+        """The writer omits `directionality` when it has no opinion; the strand
+        tier must degrade to the parts/type match rather than drop the name."""
+        data = _make_minimal_dna((0x0A, self._features_packet(
+            ("no-direction", "misc_feature", "101-200"),
+        )))
+        rec = self._rec(("x", "misc_feature", 100, 200))
+        sc._augment_dna_record_from_packets(rec, data)
+        assert self._labels(rec) == [("misc_feature", 100, 200, "no-direction")]
+
+    def test_two_wrap_features_are_told_apart_by_their_parts(self):
+        """Both origin-spanning features reduce to min-start/max-end = the
+        whole molecule, so a span-only key hands them each other's name. The
+        exact segment set keeps them straight."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        from Bio.Seq import Seq
+        packet = ('<?xml version="1.0"?><Features nextValidID="2">'
+                  '<Feature recentID="0" name="wrapA" type="misc_feature">'
+                  '<Segment range="9900-10000" color="#111111" type="standard"/>'
+                  '<Segment range="1-50" color="#111111" type="standard"/>'
+                  '</Feature>'
+                  '<Feature recentID="1" name="wrapB" type="misc_feature">'
+                  '<Segment range="9500-10000" color="#222222" type="standard"/>'
+                  '<Segment range="1-200" color="#222222" type="standard"/>'
+                  '</Feature></Features>').encode("utf-8")
+        def wrap(a1, b1, a2, b2):
+            return CompoundLocation([FeatureLocation(a1, b1, strand=1),
+                                     FeatureLocation(a2, b2, strand=1)])
+        rec = SeqRecord(
+            Seq("ACGT" * 2500), id="syn", name="syn",
+            features=[
+                # deliberately the OPPOSITE order to the packet
+                SeqFeature(location=wrap(9499, 10000, 0, 200),
+                           type="misc_feature", qualifiers={"label": ["x"]}),
+                SeqFeature(location=wrap(9899, 10000, 0, 50),
+                           type="misc_feature", qualifiers={"label": ["x"]}),
+            ])
+        sc._augment_dna_record_from_packets(rec, _make_minimal_dna((0x0A, packet)))
+        assert [(f.qualifiers["label"][0]) for f in rec.features] == \
+            ["wrapB", "wrapA"]
+
+    def test_a_source_entry_never_claims_a_real_feature(self):
+        """A `source` entry has no legitimate partner — the record's own
+        `source` row is skipped by design. Left matchable, the span-only
+        fallback hands it to whatever genuine feature spans the whole
+        molecule, which is the "labelled `source`" symptom all over again."""
+        data = _make_minimal_dna((0x0A, self._features_packet(
+            ("source",        "source",     "1-14098"),
+            ("gRNA scaffold", "terminator", "1-14098"),
+        )))
+        # BioPython gave the whole-molecule terminator a label already; the
+        # packet's own terminator entry is the only thing allowed to rename it.
+        rec = self._rec(("parsed", "terminator", 0, 14098))
+        sc._augment_dna_record_from_packets(rec, data)
+        assert self._labels(rec) == [("terminator", 0, 14098, "gRNA scaffold")]
+
+    def test_a_source_entry_alone_leaves_the_feature_untouched(self):
+        """…and with no real entry to claim it, the feature keeps its own
+        parsed name rather than being renamed "source"."""
+        data = _make_minimal_dna((0x0A, self._features_packet(
+            ("source", "source", "1-14098"),
+        )))
+        rec = self._rec(("gRNA scaffold", "terminator", 0, 14098))
+        sc._augment_dna_record_from_packets(rec, data)
+        assert self._labels(rec) == [("terminator", 0, 14098, "gRNA scaffold")]
+
+    def test_two_entries_at_one_span_are_handed_out_in_packet_order(self):
+        """Same coordinates AND same type is legal (two overlapping notes).
+        Each record feature must get a DIFFERENT entry, never the same one
+        twice."""
+        data = _make_minimal_dna((0x0A, self._features_packet(
+            ("first-note",  "misc_feature", "1-100"),
+            ("second-note", "misc_feature", "1-100"),
+        )))
+        rec = self._rec(("x", "misc_feature", 0, 100),
+                        ("x", "misc_feature", 0, 100))
+        sc._augment_dna_record_from_packets(rec, data)
+        assert [t[3] for t in self._labels(rec)] == ["first-note", "second-note"]
+
+    def test_span_match_wins_when_the_type_string_differs(self):
+        """BioPython does not always reproduce the packet's `type` verbatim.
+        A lone entry at exactly these coordinates is still this feature's
+        name, so the span-only fallback claims it — deliberately."""
+        data = _make_minimal_dna((0x0A, self._features_packet(
+            ("Ori*", "rep_origin", "1-600"),
+        )))
+        rec = self._rec(("x", "misc_feature", 0, 600))
+        sc._augment_dna_record_from_packets(rec, data)
+        assert self._labels(rec) == [("misc_feature", 0, 600, "Ori*")]
+
+    def test_multi_segment_feature_matches_its_compound_location(self):
+        """An origin-spanning feature is one <Feature> with two <Segment>s and
+        one BioPython CompoundLocation."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        from Bio.Seq import Seq
+        # Two <Segment>s make the span (0, 10000), matching what BioPython
+        # reports for the CompoundLocation below.
+        packet = ('<?xml version="1.0"?><Features nextValidID="1">'
+                  '<Feature recentID="0" name="wrapped" type="misc_feature">'
+                  '<Segment range="9500-10000" color="#33ccff" type="standard"/>'
+                  '<Segment range="1-200" color="#33ccff" type="standard"/>'
+                  '</Feature></Features>').encode("utf-8")
+        loc = CompoundLocation([FeatureLocation(9499, 10000, strand=1),
+                                FeatureLocation(0, 200, strand=1)])
+        rec = SeqRecord(Seq("ACGT" * 2500), id="syn", name="syn",
+                        features=[SeqFeature(location=loc, type="misc_feature",
+                                             qualifiers={"label": ["x"]})])
+        sc._augment_dna_record_from_packets(rec, _make_minimal_dna((0x0A, packet)))
+        assert rec.features[0].qualifiers["label"] == ["wrapped"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Re-saving a library entry must not drop its entry-level state. [INV-179]
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `map_mode` (the per-plasmid linear/circular view) and `alignments` (saved
+# BLAST / Plasmidsaurus results) live on the LIBRARY ENTRY, not the record — so
+# a rebuilt record carried neither, and `add_entry` overwrote them with a fresh
+# dict on every save. Surfaced by the 2026-08-05 label repair: re-saving 155
+# entries cost 3 of them their view mode and one its alignments.
+
+
+@pytest.mark.asyncio
+class TestReSavePreservesEntryState:
+    """Drives the REAL `LibraryPanel.add_entry` through a live app — the
+    preservation logic is exercised, not stood in for."""
+
+    @staticmethod
+    def _rec(seq="ACGTACGTACGTACGTACGT", rid="P"):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        r = SeqRecord(Seq(seq), id=rid, name=rid)
+        r.annotations = {"molecule_type": "DNA"}
+        return r
+
+    async def _resave_with(self, tiny_record, isolated_library, mutate,
+                           second=None):
+        """Save once, stamp entry-level state, then re-save under the same id."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            lib = app.query_one(sc.LibraryPanel)
+            lib.add_entry(self._rec())
+            await pilot.pause(0.1)
+            # stamp the entry-level state the UI would have written
+            entries = sc._load_library()
+            for e in entries:
+                if e.get("id") == "P":
+                    mutate(e)
+            sc._save_library(entries)
+            await pilot.pause(0.1)
+            lib.add_entry(second() if second else self._rec("ACGT" * 8))
+            await pilot.pause(0.1)
+            out = sc._find_library_entry_by_id("P")
+            app.exit()
+            return out
+
+    async def test_map_mode_survives_a_resave(self, tiny_record, isolated_library):
+        e = await self._resave_with(tiny_record, isolated_library,
+                                    lambda x: x.__setitem__("map_mode", "linear"))
+        assert e and e.get("map_mode") == "linear"
+
+    async def test_alignments_survive_a_resave(self, tiny_record, isolated_library):
+        al = [{"id": "a1", "label": "1 1A", "target_id": "X"}]
+        e = await self._resave_with(tiny_record, isolated_library,
+                                    lambda x: x.__setitem__("alignments", al))
+        assert e and e.get("alignments") == al
+
+    async def test_a_live_view_toggle_wins_over_the_stored_value(
+            self, tiny_record, isolated_library):
+        def _toggled():
+            r = self._rec("ACGT" * 8)
+            r._tui_map_mode = "circular"       # user just pressed 'v'
+            return r
+        e = await self._resave_with(tiny_record, isolated_library,
+                                    lambda x: x.__setitem__("map_mode", "linear"),
+                                    second=_toggled)
+        assert e and e.get("map_mode") == "circular"
+
+    async def test_a_brand_new_entry_gets_neither_key(
+            self, tiny_record, isolated_library):
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.query_one(sc.LibraryPanel).add_entry(self._rec(rid="FRESH"))
+            await pilot.pause(0.1)
+            e = sc._find_library_entry_by_id("FRESH")
+            app.exit()
+        assert e is not None
+        assert "map_mode" not in e
+        assert "alignments" not in e
