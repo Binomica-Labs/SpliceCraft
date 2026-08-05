@@ -42,7 +42,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.50"
+__version__ = "1.2.51"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -19579,7 +19579,40 @@ class LibraryPanel(Widget):
         # (or blank the canvas if the collection is empty). Pre-fix
         # 2026-05-21 the canvas kept showing the prior collection's
         # plasmid — stale panel data after a collection switch.
-        first = plasmids[0] if plasmids else None
+        # Match the ROW ORDER the user is looking at. `_repopulate_plasmids`
+        # renders name-sorted, so taking `plasmids[0]` (raw stored order) loaded
+        # a plasmid that isn't the one highlighted at the top of the list — and
+        # left the stored order, which is otherwise invisible, silently deciding
+        # what opens. [INV-180]
+        # `.get` on every entry (not just index 0 as before), so a malformed
+        # row would newly break the SWITCH rather than just the load — filter
+        # to dicts first.
+        _rows = [e for e in plasmids if isinstance(e, dict)]
+        first = min(_rows,
+                    key=lambda e: _natural_sort_key(
+                        e.get("name") or e.get("id") or "")) if _rows else None
+        # …and never BLOCK the switch on a chromosome-scale record. The seq
+        # panel renders the whole molecule up front: 24 s for a 4.8 Mb genome,
+        # minutes for an 18 Mb one, with the UI frozen and no way to cancel —
+        # so entering a collection that merely CONTAINS a genome looked like a
+        # hang (user report 2026-08-05). Over the lazy-render threshold the
+        # canvas is left clear and the user opens it deliberately.
+        # `size` is safe to read here without a fallback: `_repopulate_plasmids`
+        # ran two lines up and formats `entry['size']` directly, so a row
+        # missing it has already raised. A "defensive" gb_text estimate would
+        # be unreachable code claiming to guard something it cannot.
+        _first_bp = (_coerce_int_or_zero(first.get("size")) if first else 0)
+        if first and _first_bp > _LAZY_RENDER_THRESHOLD_BP:
+            _log_event("collection.autoload_skipped_large",
+                       name=str(first.get("name") or ""), size=_first_bp)
+            notify = getattr(self.app, "notify", None)
+            if callable(notify):
+                notify(
+                    f"“{first.get('name')}” is {_first_bp:,} bp — not opened "
+                    f"automatically. Press Enter on it to load.",
+                    severity="information", timeout=8,
+                )
+            first = None
         app = self.app
         if first and first.get("gb_text"):
             # Reuse the existing PlasmidLoad path so `_apply_record` +

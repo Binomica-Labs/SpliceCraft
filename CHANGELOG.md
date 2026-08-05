@@ -14,6 +14,24 @@
 
 ---
 
+## [1.2.51] — 2026-08-05
+
+### Bug fixes
+
+- **Opening a collection that contains a genome no longer freezes the app.**
+  Switching to a collection automatically opened one of its plasmids — and if
+  that plasmid was a chromosome, the sequence panel drew the whole thing before
+  anything else could happen: about 24 seconds for a 4.8 Mb genome, minutes for
+  an 18 Mb one, with no progress bar and no way to cancel. Anything over a
+  megabase is now left closed, with a note telling you which plasmid it was and
+  how big, so you open it when you actually mean to.
+- **The plasmid a collection opens is now the one at the top of the list.** It
+  used to open whichever entry happened to be first in the underlying file,
+  which is not the order the list is sorted in — so the canvas showed one
+  plasmid while a different one sat highlighted at the top.
+
+---
+
 ## [1.2.50] — 2026-08-05
 
 ### Bug fixes

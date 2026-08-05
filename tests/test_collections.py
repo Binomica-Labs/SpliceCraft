@@ -2091,3 +2091,74 @@ class TestAgentDeleteIsUndoable:
             app.exit()
         assert isinstance(res, tuple) and res[1] == 500, res
         assert depth == 0, "a failed delete must not record an undo"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Collection switch: load the row the user SEES, and never block on a genome.
+# [INV-180] — user report 2026-08-05 ("loading the collection and it hangs").
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+class TestCollectionSwitchAutoLoad:
+    """`LibraryPanel._commit_collection_switch` picked `plasmids[0]` — the raw
+    STORED order — while the panel renders name-sorted. A reorder that is
+    invisible in the list therefore changed what opens, and a chromosome-scale
+    entry landing first froze the UI for a full-sequence render (24 s at
+    4.8 Mb). Driven through the real panel on a live app."""
+
+    @staticmethod
+    def _p(name, size, gb="LOCUS x 10 bp DNA linear UNK 01-JAN-2026\n//\n"):
+        return {"id": name.replace(" ", "_"), "name": name, "size": size,
+                "gb_text": gb}
+
+    async def _switch_to(self, plasmids):
+        """Commit a real collection switch; report what reached the canvas."""
+        sc._save_collections([{"name": "Target", "plasmids": plasmids}])
+        app = sc.PlasmidApp()
+        seen = {}
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            panel = app.query_one(sc.LibraryPanel)
+            orig = type(panel).post_message
+            def _spy(self, message):
+                if isinstance(message, sc.LibraryPanel.PlasmidLoad):
+                    seen["entry"] = message.entry
+                return orig(self, message)
+            type(panel).post_message = _spy
+            try:
+                panel._commit_collection_switch(
+                    "Target", {"name": "Target", "plasmids": plasmids})
+                await pilot.pause(0.2)
+            finally:
+                type(panel).post_message = orig
+            app.exit()
+        return seen
+
+    async def test_loads_the_first_row_as_displayed_not_as_stored(self):
+        """Stored order leads with 'zeta'; the list shows 'alpha' on top."""
+        seen = await self._switch_to([self._p("zeta", 100), self._p("alpha", 100)])
+        assert seen.get("entry", {}).get("name") == "alpha"
+
+    async def test_a_chromosome_scale_first_row_is_not_auto_loaded(self):
+        big = sc._LAZY_RENDER_THRESHOLD_BP + 1
+        seen = await self._switch_to([self._p("aaa genome", big),
+                                      self._p("bbb small", 900)])
+        assert "entry" not in seen, "a genome must not be opened automatically"
+
+    async def test_a_normal_first_row_still_auto_loads(self):
+        seen = await self._switch_to([self._p("aaa", 5000)])
+        assert seen.get("entry", {}).get("name") == "aaa"
+
+
+
+    async def test_a_malformed_row_cannot_break_the_switch(self):
+        """The selection now touches EVERY row, not just index 0 — a stray
+        non-dict must not turn a collection switch into a traceback."""
+        seen = await self._switch_to(
+            ["not-a-dict", self._p("aaa ok", 5000)])   # type: ignore[list-item]
+        assert seen.get("entry", {}).get("name") == "aaa ok"
+
+    async def test_an_empty_collection_loads_nothing(self):
+        seen = await self._switch_to([])
+        assert "entry" not in seen
