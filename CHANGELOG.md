@@ -14,6 +14,34 @@
 
 ---
 
+## [1.2.48] — 2026-08-05
+
+### Hardening
+
+- **A search box can no longer run a stale search after its window closes.**
+  Every search bar in the app (library, plasmid picker, part picker, species
+  picker) waits a moment after you stop typing before filtering. Closing the
+  window cancelled that pending search — but closing it also clears the field,
+  which quietly queued a *fresh* one that nothing cancelled, and it ran a
+  fifth of a second later against a screen that no longer existed. Harmless in
+  practice today, since the stale search only logged and gave up; it would not
+  have stayed harmless. The field now stops filtering for good the moment its
+  window starts closing.
+- **Opening a plasmid's History is faster.** Each row in the lineage tree was
+  rebuilding its step description from scratch; it now reads the record
+  directly, cutting roughly 15% off the time to draw the tree — most
+  noticeable on a deeply nested build.
+- **A very long plasmid name can't push the lineage off-screen.** The "built
+  as" line in the History header wasn't length-limited the way the tree rows
+  are, so an unusually long name wrapped across the pane.
+- **Recovering history from `.dna` files can't exhaust memory.** The scan was
+  limited by how many files it read, not by how much it held — and a library
+  of very large files could have grown without bound. It now stops at a
+  memory budget, and **says so**: a scan that stopped early is reported as
+  truncated, with a suggestion to narrow it by collection or name. Previously
+  a truncated scan that recovered nothing would have looked identical to a
+  complete scan that found nothing to recover.
+
 ## [1.2.47] — 2026-08-04
 
 ### New features

@@ -225,6 +225,16 @@ class _SearchInput(Input):
         self._max_len = max(1, int(max_len))
         self._on_filter = on_filter
         self._filter_timer = None
+        # Latched by `on_unmount`. Cancelling the pending timer there is NOT
+        # enough on its own: tearing the widget down changes `value` (focus
+        # is dropped, the prefill is restored), which posts a fresh
+        # `Input.Changed` — and if that lands AFTER `on_unmount`, it arms a
+        # brand-new timer that nothing will ever cancel. Observed as a
+        # load-dependent flake where the filter fired with an EMPTY query
+        # (`['']`, not the typed `['queued']`) a fifth of a second after the
+        # app had gone away. Once latched, this widget never schedules or
+        # runs a filter again.
+        self._filter_disabled = False
 
     def on_focus(self, _event) -> None:
         # Always blank the field on focus gain — matches the spec
@@ -258,6 +268,10 @@ class _SearchInput(Input):
         # No callback / no debounce → behave like a plain Input.
         if self._on_filter is None or self._debounce_s is None:
             return
+        # Teardown re-entry: the value changes as the widget is disposed,
+        # and arming a timer here outlives the tree it would fire against.
+        if self._filter_disabled:
+            return
         # Cancel any pending tick before scheduling a fresh one;
         # without this a burst of N keystrokes spawns N timers and
         # the filter callback fires N times after debounce_s.
@@ -281,6 +295,12 @@ class _SearchInput(Input):
         Wrapped in try/except so a callback that raises (e.g. a stale
         widget query during unmount) doesn't poison the timer."""
         if self._on_filter is None:
+            return
+        # Backstop: a timer already DISPATCHED when unmount landed can no
+        # longer be stopped, so the gate has to sit here too. Callbacks that
+        # raise are merely logged; one that quietly MUTATES state would act
+        # on a dead screen, which is the failure this exists to prevent.
+        if self._filter_disabled:
             return
         try:
             self._on_filter(self.current_query())
@@ -321,6 +341,11 @@ class _SearchInput(Input):
             self._filter_timer = None
 
     def on_unmount(self) -> None:
+        # Latch FIRST, then cancel. Setting the flag before stopping the
+        # timer closes the window where a teardown-driven `Input.Changed`
+        # re-arms after the cancel — the load-dependent path that let a
+        # filter fire against a disposed tree.
+        self._filter_disabled = True
         # Cancel the pending debounce so a queued tick doesn't fire
         # against a disposed widget tree — the callback typically
         # `query_one`s into the parent's table, which would raise

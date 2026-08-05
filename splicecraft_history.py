@@ -877,14 +877,21 @@ def _history_manipulation_detail(node: "_CommercialSaaSHistoryNode") -> str:
     protocol showed WHAT combined, never WHERE it landed. Returns "" when
     the summaries carry no usable coordinates (an assembly records
     enzyme names in name1/name2 instead, and the ``✂`` tag covers that).
-    Plain text — the caller escapes."""
-    for sm in node.input_summaries:
+    Plain text — the caller escapes.
+
+    PERF: iterates the `<InputSummary>` ELEMENTS rather than the
+    `input_summaries` property, which materialises a dict per summary.
+    `_history_tree_label` calls this for EVERY node, and the tree populate
+    walks up to `_HISTORY_NODE_MAX_NODES` (100,000) of them — so a dict
+    build here is paid 100,000 times to produce one short string. Measured
+    at 5.7 µs of a 19.9 µs label before this change."""
+    for el in node.element.findall("InputSummary"):
         # An assembly summary's val1/val2 are cut positions on two
         # DIFFERENT molecules — a range across them is meaningless.
-        if str(sm.get("name1") or "") or str(sm.get("name2") or ""):
+        if (el.get("name1") or "") or (el.get("name2") or ""):
             continue
         phrase = _history_coord_phrase(
-            sm.get("manipulation"), sm.get("val1"), sm.get("val2"))
+            el.get("manipulation"), el.get("val1"), el.get("val2"))
         if phrase:
             return phrase
     return ""
@@ -993,7 +1000,14 @@ def _history_former_name(root: "_CommercialSaaSHistoryNode",
     now = str(entry_name or "").strip()
     if not was or not now or was == "(unnamed)":
         return ""
-    return "" if _history_name_key(was) == _history_name_key(now) else was
+    if _history_name_key(was) == _history_name_key(now):
+        return ""
+    # Capped like a tree label. This lands in a header Static above the
+    # tree; uncapped, a 20,000-character name (hostile file, or just a very
+    # long one) wraps across the pane and pushes the lineage off-screen.
+    if len(was) > _HISTORY_LABEL_NAME_MAX:
+        was = was[:_HISTORY_LABEL_NAME_MAX - 1] + "…"
+    return was
 
 
 def _history_renumber_node_ids(root: "_CommercialSaaSHistoryNode") -> int:

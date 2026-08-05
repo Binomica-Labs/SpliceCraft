@@ -899,6 +899,39 @@ class TestRecoverHistoryFromDna:
     def test_invalid_dry_run_rejected(self):
         assert sc._h_recover_history_from_dna(None, {"dry_run": "yes"})[1] == 400
 
+    def test_scan_reports_when_it_stops_early(self, monkeypatch):
+        """A truncated scan MUST say so. Without the flag, a run that hit
+        the memory budget and recovered nothing looks exactly like a
+        complete run that found nothing to recover — and the user would
+        stop looking."""
+        self._seed()
+        self._sidecar("pRich", self.SEQ_A, self._rich_history("pRich", 6))
+        self._sidecar("pOther", self.SEQ_B, self._rich_history("pOther", 4))
+        # Squeeze the byte budget so the index fills after the first file.
+        monkeypatch.setattr(sc, "_HISTORY_RECOVER_MAX_INDEX_BYTES", 1)
+        index, note = sc._scan_dna_originals_for_history()
+        assert len(index) == 1, "budget must stop the scan after one entry"
+        assert note and "memory budget" in note
+        r = sc._h_recover_history_from_dna(None, {})
+        assert r["truncated"] is True
+        assert "memory budget" in r["note"]
+
+    def test_complete_scan_is_not_flagged_truncated(self):
+        self._seed()
+        self._sidecar("pRich", self.SEQ_A, self._rich_history("pRich", 6))
+        r = sc._h_recover_history_from_dna(None, {})
+        assert r["truncated"] is False
+        assert r["updated_count"] == 1
+        assert "note" not in r
+
+    def test_file_count_cap_is_also_reported(self, monkeypatch):
+        self._seed()
+        self._sidecar("pRich", self.SEQ_A, self._rich_history("pRich", 6))
+        self._sidecar("pOther", self.SEQ_B, self._rich_history("pOther", 4))
+        monkeypatch.setattr(sc, "_HISTORY_RECOVER_MAX_SIDECARS", 1)
+        _index, note = sc._scan_dna_originals_for_history()
+        assert note and ".dna files were scanned" in note
+
 
 class TestGeneratedVsImportedHistorySerialisation:
     """`_finalize_generated_history` renumbers node IDs so a merged

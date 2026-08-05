@@ -42,7 +42,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.47"
+__version__ = "1.2.48"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -98161,6 +98161,15 @@ def _h_move_plasmid(app, payload):
 
 _HISTORY_RECOVER_MAX_SIDECARS = 20_000   # scan bound (real libraries: ~1k)
 
+# The file-count cap alone does NOT bound memory: each sidecar contributes its
+# whole sequence plus its decompressed history, and a single history may reach
+# `_COMMERCIALSAAS_HISTORY_MAX_XML` (32 MB). 20,000 files x even 1 MB is 20 GB.
+# Measured on a 930-file reference library: 66 MB held, 144 MB peak — so this
+# budget is ~8x real-world headroom while still refusing to OOM the process.
+# Hitting it is REPORTED, never silent: a truncated scan that quietly finds
+# nothing looks exactly like "nothing to recover" ([CONV] no silent caps).
+_HISTORY_RECOVER_MAX_INDEX_BYTES = 512 * 1024 * 1024
+
 
 def _gb_text_sequence(gb_text: str) -> str:
     """Upper-cased sequence out of a GenBank ORIGIN block.
@@ -98194,30 +98203,37 @@ def _dna_sidecar_sequence(data: bytes) -> str:
     return ""
 
 
-def _scan_dna_originals_for_history() -> "dict[str, tuple[int, str, str]]":
-    """``{sequence: (node_count, history_xml, filename)}`` over every saved
-    `.dna` original, keeping the RICHEST history per distinct sequence.
+def _scan_dna_originals_for_history() -> "tuple[dict[str, tuple[int, str, str]], str]":
+    """``({sequence: (node_count, history_xml, filename)}, note)`` over every
+    saved `.dna` original, keeping the RICHEST history per distinct sequence.
 
     Two passes on purpose: sequences first (cheap TLV walk), then history
     extraction only for files whose sequence we actually indexed — the
     history packet is xz-compressed and decompressing all of them up front
     is the bulk of the cost. Unreadable files are skipped with a log, never
-    fatal: one corrupt sidecar must not block recovering the rest."""
+    fatal: one corrupt sidecar must not block recovering the rest.
+
+    Bounded on BOTH axes — file count and bytes held — because the index
+    keeps each sequence AND its decompressed history in memory at once.
+    ``note`` is "" for a complete scan, else a human-readable reason the
+    scan stopped early; the caller MUST surface it, since a truncated scan
+    that finds nothing is indistinguishable from "nothing to recover"."""
     import xml.etree.ElementTree as _ET
     index: "dict[str, tuple[int, str, str]]" = {}
+    note = ""
     d = _state._DNA_ORIGINALS_DIR
     try:
         paths = sorted(p for p in d.glob("*.dna") if p.is_file())
     except OSError as exc:
         _log.warning("history recovery: cannot list %s: %s", d, exc)
-        return index
+        return index, f"could not read {d}: {_scrub_path(str(exc))}"
     if len(paths) > _HISTORY_RECOVER_MAX_SIDECARS:
-        _log.warning("history recovery: %d sidecars exceeds the %d scan "
-                     "bound; scanning the first %d",
-                     len(paths), _HISTORY_RECOVER_MAX_SIDECARS,
-                     _HISTORY_RECOVER_MAX_SIDECARS)
+        note = (f"only the first {_HISTORY_RECOVER_MAX_SIDECARS:,} of "
+                f"{len(paths):,} .dna files were scanned")
+        _log.warning("history recovery: %s", note)
         paths = paths[:_HISTORY_RECOVER_MAX_SIDECARS]
-    for p in paths:
+    held = 0
+    for i, p in enumerate(paths):
         try:
             data = p.read_bytes()
             seq = _dna_sidecar_sequence(data)
@@ -98232,8 +98248,21 @@ def _scan_dna_originals_for_history() -> "dict[str, tuple[int, str, str]]":
             continue
         prev = index.get(seq)
         if prev is None or n > prev[0]:
+            if prev is None:
+                held += len(seq)
+            else:
+                held -= len(prev[1])
+            held += len(xml)
             index[seq] = (n, xml, p.name)
-    return index
+            if held > _HISTORY_RECOVER_MAX_INDEX_BYTES:
+                note = (f"stopped after {i + 1:,} of {len(paths):,} .dna "
+                        f"files — the index reached the "
+                        f"{_HISTORY_RECOVER_MAX_INDEX_BYTES // (1024*1024)} MB "
+                        f"memory budget; re-run with a 'collection' or 'name' "
+                        f"filter to narrow the scan")
+                _log.warning("history recovery: %s", note)
+                break
+    return index, note
 
 
 def _history_node_count_of_xml(xml: str) -> int:
@@ -98288,11 +98317,11 @@ def _h_recover_history_from_dna(app, payload):
     if guard is not None:
         return guard
 
-    index = _scan_dna_originals_for_history()
+    index, scan_note = _scan_dna_originals_for_history()
     if not index:
         return {"ok": True, "scanned_sidecars": 0, "updated": [],
-                "dry_run": dry_run,
-                "note": "no .dna originals with history found"}
+                "dry_run": dry_run, "truncated": bool(scan_note),
+                "note": scan_note or "no .dna originals with history found"}
 
     updated: "list[dict]" = []
     with _cache_lock:
@@ -98363,15 +98392,22 @@ def _h_recover_history_from_dna(app, payload):
         if app is not None and hasattr(app, "call_from_thread"):
             app.call_from_thread(_agent_refresh_library_panel, app)
         _log_event("history.recovered", count=len(updated), via="agent")
-    return {
+    out = {
         "ok": True,
         "dry_run": dry_run,
         "scanned_sidecars": len(index),
         "updated_count": len(updated),
         "updated": updated,
+        # True when the scan stopped early — WITHOUT this a truncated run
+        # that recovered nothing is indistinguishable from a complete run
+        # that found nothing to recover.
+        "truncated": bool(scan_note),
         "ignored": _agent_ignored_keys(
             payload, {"dry_run", "collection", "name"}),
     }
+    if scan_note:
+        out["note"] = scan_note
+    return out
 
 
 def _agent_batch_plasmid_keys(payload):

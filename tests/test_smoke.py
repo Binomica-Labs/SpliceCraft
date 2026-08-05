@@ -4311,6 +4311,52 @@ class TestSearchInputWidget:
             f"timer fired post-unmount: {calls}"
         )
 
+    async def test_teardown_value_change_cannot_rearm_the_debounce(self):
+        """Cancelling the timer on unmount is NOT enough on its own.
+
+        Tearing the widget down changes `value` (focus drops, the prefill
+        is restored), which posts a fresh `Input.Changed`. If that lands
+        AFTER `on_unmount`, the old code armed a brand-new timer that
+        nothing would ever cancel, and it fired against a disposed tree.
+
+        Caught as a load-dependent flake during release: the filter fired
+        with an EMPTY query (`['']`) rather than the typed `['queued']` —
+        the tell that it was the mount-time tick surviving teardown, not
+        the typed one. Driven deterministically here instead of being
+        left to scheduler luck.
+        """
+        import asyncio
+        from textual.app import App
+        calls = []
+
+        class _Harness(App):
+            def compose(self):
+                yield sc._SearchInput(
+                    id="harness-search", debounce_s=0.20,
+                    on_filter=lambda q: calls.append(q),
+                )
+
+        app = _Harness()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            inp = app.query_one("#harness-search", sc._SearchInput)
+            inp.value = "queued"
+            await pilot.pause()
+            assert inp._filter_timer is not None
+        # Anything that fired while the widget was ALIVE is legitimate and
+        # not what this test is about; only post-unmount firing is.
+        calls.clear()
+        assert inp._filter_disabled is True
+        # Exactly what teardown does: change the value, let the handler run.
+        inp.value = ""
+        inp.on_input_changed(None)
+        assert inp._filter_timer is None, "re-armed a timer after unmount"
+        # And a tick already DISPATCHED before unmount can't be recalled,
+        # so the callback itself must refuse to run too.
+        inp._fire_filter()
+        await asyncio.sleep(0.30)
+        assert calls == [], f"filter fired post-unmount: {calls}"
+
     async def test_blur_restores_prefill_when_empty(self):
         """An empty + unfocused field shows the prefill again so the
         idle UI keeps its 'Search' affordance. Whitespace-only
