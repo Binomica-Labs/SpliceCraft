@@ -38,7 +38,7 @@ from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, List
 import splicecraft_state as _state
 from splicecraft_cloning import _simulate_cloned_plasmid, _simulate_primed_amplicon
 from splicecraft_dataaccess import _BUILTIN_GRAMMARS, _all_grammars, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections, _search_collections_library
-from splicecraft_history import _CommercialSaaSHistoryNode, _history_detail_lines, _history_populate_tree, _history_protocol_renderable, _history_tree_label
+from splicecraft_history import _CommercialSaaSHistoryNode, _history_consistency_summary, _history_detail_lines, _history_former_name, _history_node_warnings, _history_populate_tree, _history_protocol_renderable, _history_tree_label
 from splicecraft_logging import _log, _log_event
 from splicecraft_util import _CONTROL_CHARS_RE, _PLASMID_STATUS_VALUES, _cursor_row_key, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _sanitize_label, _sanitize_plasmid_name, _sanitize_plasmid_status, _scrub_path, _validate_group_members
 from splicecraft_widgets import _DEFAULT_TYPE_COLORS, _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _HEX6_RE, _InstantPressButton, _PICKER_PLASMID_STYLE, _PLASMID_STATUS_COLORS, _SearchInput, _XtermColorGrid, _ZipAwareDirectoryTree, _markup_safe_color, _normalise_color_input, _xterm_index_to_hex
@@ -8297,6 +8297,8 @@ class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
     #hist-title {
         background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; text-align: center;
     }
+    #hist-formerly { color: $text-muted; margin-bottom: 1; text-align: center; }
+    #hist-warn { color: $warning; margin-bottom: 1; }
     #hist-proto-label { color: $accent; text-style: bold; }
     #hist-proto {
         height: auto; max-height: 9; margin-bottom: 1;
@@ -8305,7 +8307,12 @@ class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
     #hist-proto Static { padding: 0 1; }
     #hist-tree { height: 1fr; }
     #hist-detail {
-        height: 8; border: solid $primary-darken-2;
+        /* Was 8. The detail block now carries conditions, primer
+           binding sites, end chemistry and the unmodelled-field
+           backstop, so 8 rows meant scrolling past the Properties
+           header to reach anything. Still scrollable — this just sets
+           how much is visible without it. */
+        height: 11; border: solid $primary-darken-2;
         padding: 0 1; margin-top: 1; overflow-y: auto;
     }
     #hist-detail Static { padding: 0 1; }
@@ -8314,10 +8321,16 @@ class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
     """
 
     def __init__(self, title: str,
-                  root_node: "_CommercialSaaSHistoryNode") -> None:
+                  root_node: "_CommercialSaaSHistoryNode",
+                  seq: str = "") -> None:
         super().__init__()
         self._title = title
         self._root_node = root_node
+        # The entry's bases, used ONLY to check the ROOT node's claims
+        # against the molecule — that's the one node we can identify with
+        # certainty. Read-only: nothing here writes a sequence or a
+        # history record.
+        self._seq = str(seq or "").upper()
         # Map Textual tree-node-id → CommercialSaaS history node, populated
         # in `on_mount`. Lets the Selected handler look up the
         # backing history node without re-parsing the XML.
@@ -8328,6 +8341,21 @@ class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
         with Vertical(id="hist-box"):
             yield Static(f" Construction history — {_esc(self._title)} ",
                           id="hist-title")
+            # A plasmid renamed after it was built keeps the build-time
+            # name on its history root, so the tree opens on a name the
+            # user may not recognise. Say so instead of leaving them to
+            # guess (177 of the reference library's 1,184 plasmids).
+            was = _history_former_name(self._root_node, self._title)
+            if was:
+                yield Static(f"[dim]built as[/dim] {_esc(was)}",
+                              id="hist-formerly", markup=True)
+            # Flag up front when the record claims something the molecule
+            # doesn't bear out. Read-only — nothing is corrected for them.
+            warn = _history_consistency_summary(_history_node_warnings(
+                self._root_node, self._seq,
+                enzymes=_state._all_enzymes_hook()))
+            if warn:
+                yield Static(f" {warn}", id="hist-warn", markup=True)
             yield Static("Protocol", id="hist-proto-label")
             with VerticalScroll(id="hist-proto"):
                 yield Static("", id="hist-proto-text", markup=True)
@@ -8400,4 +8428,9 @@ class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
             detail = self.query_one("#hist-detail-text", Static)
         except NoMatches:
             return
-        detail.update("\n".join(_history_detail_lines(hist)))
+        detail.update("\n".join(_history_detail_lines(
+            hist,
+            # Root only — an ancestor is just a name and a length here, and
+            # resolving that to a library entry can pick the wrong molecule.
+            self._seq if hist.element is self._root_node.element else "",
+            enzymes=_state._all_enzymes_hook())))

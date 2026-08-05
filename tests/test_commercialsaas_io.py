@@ -2642,11 +2642,26 @@ class TestHistoryRenderHelpers:
         d = _hist_leaf("pENTR", 2604)
         assert sc._history_node_signature(a) == sc._history_node_signature(d)
 
-    def test_tree_label_omits_op_tag_on_leaf(self):
-        leaf = _hist_leaf("pProm.dna", 712)             # parent-less = material
-        lbl = sc._history_tree_label(leaf)
+    def test_tree_label_omits_op_tag_on_starting_material(self):
+        """Raw starting material carries no op tag — but that's because
+        real files stamp it `operation="invalid"` (2,116 such nodes in
+        the reference library), NOT because it lacks parents.
+
+        The old rule ("tag only nodes with parents") ALSO suppressed
+        genuine root actions: an `importFile` / `createDocument` leaf is
+        exactly how a molecule entered the project, and it rendered as a
+        bare name with no hint of its origin."""
+        material = sc._CommercialSaaSHistoryNode.new(
+            name="pProm.dna", seq_len=712, circular=True,
+            operation="invalid")                     # what real files use
+        lbl = sc._history_tree_label(material)
         assert "pProm" in lbl and "712 bp" in lbl
-        assert "assemble" not in lbl                    # no op tag on a leaf
+        assert "invalid" not in lbl                  # sentinel never echoed
+        # A parent-less node WITH a real root action IS tagged.
+        imported = sc._CommercialSaaSHistoryNode.new(
+            name="pUC19.dna", seq_len=2686, circular=True,
+            operation="importFile")
+        assert "import" in sc._history_tree_label(imported)
         asm = _hist_asm("TU.dna", 4000, _hist_leaf("v.dna", 2000),
                          [_hist_leaf("p.dna", 500)], "BsaI")
         assert "assemble" in sc._history_tree_label(asm)  # has parents → tag
@@ -2686,8 +2701,24 @@ class TestHistoryRenderHelpers:
             "TU_A", "TU_B", "MOD"]
 
     def test_protocol_lines_single_record_placeholder(self):
-        lines = sc._history_protocol_lines(_hist_leaf("pUC19.dna", 2686))
+        """A record with no step nodes still says how it got here.
+
+        A stub history is not "nothing happened" — its root records
+        whether the molecule was imported, created de novo, or extracted
+        from a selection. The placeholder names that action instead of
+        flatly reporting no steps; only a root with NO recorded operation
+        (CommercialSaaS's `invalid` sentinel) falls back to the bare form.
+        """
+        no_op = sc._CommercialSaaSHistoryNode.new(
+            name="pUC19.dna", seq_len=2686, circular=True,
+            operation="invalid")
+        lines = sc._history_protocol_lines(no_op)
         assert len(lines) == 1 and "no construction steps" in lines[0]
+        imported = sc._CommercialSaaSHistoryNode.new(
+            name="pUC19.dna", seq_len=2686, circular=True,
+            operation="importFile")
+        lines = sc._history_protocol_lines(imported)
+        assert len(lines) == 1 and "import" in lines[0]
 
     def test_protocol_lines_render_step(self):
         tu = _hist_asm("TU.dna", 4000, _hist_leaf("pENTR.dna", 2000),
@@ -2808,8 +2839,13 @@ class TestHistoryRenderHelpers:
         for s in ("invalid", "Invalid", "unknown", "none", "unspecified", ""):
             assert sc._history_op_label(s) == ""
         assert sc._history_op_label("amplifyFragment") == "PCR"
-        # A real-but-unmapped op still passes through verbatim.
-        assert sc._history_op_label("goldenGateAssembly") == "goldenGateAssembly"
+        # Every op real .dna files carry now has a bench verb — the map
+        # was derived from a full scan of the reference library, so
+        # `goldenGateAssembly` (the 4th most common manipulation there)
+        # no longer reads as raw camelCase mid-protocol.
+        assert sc._history_op_label("goldenGateAssembly") == "Golden Gate"
+        # A genuinely unknown op still passes through verbatim, never dropped.
+        assert sc._history_op_label("someFutureOp2027") == "someFutureOp2027"
 
     def test_detail_invalid_operation_shows_no_op_not_literal(self):
         """A CommercialSaaS node with operation='invalid' (its sentinel
@@ -2967,3 +3003,327 @@ class TestDnaSingleOpenRoundTrip:
             entry = next((e for e in sc._load_library()
                           if e.get("id") == "edited"), None)
             assert entry is not None and entry.get("history_xml") == xml
+
+
+class TestHistoryManipulationDetail:
+    """The `<InputSummary>` val1/val2 coordinates — parsed since the
+    beginning, rendered nowhere until 2026-08-04. The protocol said WHAT
+    combined but never WHERE on the molecule it landed."""
+
+    @staticmethod
+    def _node(manip, v1=0, v2=0, name1="", name2=""):
+        n = sc._CommercialSaaSHistoryNode.new(
+            name="x.dna", seq_len=100, circular=True, operation="replace")
+        n.add_input_summary(manipulation=manip, val1=v1, val2=v2,
+                             name1=name1, name2=name2)
+        return n
+
+    def test_range_manipulations(self):
+        assert sc._history_manipulation_detail(
+            self._node("amplify", 469, 969)) == "region 469–969"
+        assert sc._history_manipulation_detail(
+            self._node("remove", 450, 458)) == "bases 450–458"
+        assert sc._history_manipulation_detail(
+            self._node("editSequence", 7821, 7830)) == "7,821 → 7,830 bp"
+
+    def test_point_manipulations_are_not_rendered_as_ranges(self):
+        """`insertAt`/`renumberBase` carry ONE position and leave val2 at
+        0 — rendering them as a range produced "renumberBase 610–0".
+
+        The point-vs-range split keys off the manipulation NAME, not off
+        which value happens to be zero, because a genuine range can
+        legitimately start at base 0 (`amplify 0–542` is a real region)."""
+        assert sc._history_manipulation_detail(
+            self._node("renumberBase", 610, 0)) == "origin → 610"
+        assert sc._history_manipulation_detail(
+            self._node("insertAt", 4707, 0)) == "at 4,707"
+        # …and a range starting at 0 stays a range.
+        assert sc._history_manipulation_detail(
+            self._node("amplify", 0, 542)) == "region 0–542"
+
+    def test_named_summary_yields_no_coordinates(self):
+        """An assembly's val1/val2 are cut positions on two DIFFERENT
+        molecules; a range across them would be meaningless. Those
+        summaries name their enzymes instead, and the ✂ tag covers it."""
+        assert sc._history_manipulation_detail(
+            self._node("insert", 68, 253, name1="BsaI", name2="BsaI")) == ""
+
+    def test_no_coordinates_at_all(self):
+        assert sc._history_manipulation_detail(self._node("assembly")) == ""
+
+    def test_unknown_manipulation_still_shows_its_numbers(self):
+        """A manipulation this codebase has never seen must still surface
+        its coordinates rather than swallow them."""
+        out = sc._history_manipulation_detail(self._node("warpDrive", 12, 34))
+        assert "12" in out and "34" in out and "warpDrive" in out
+
+    def test_in_place_step_names_what_was_done(self):
+        """A single-input step whose input IS the product used to collapse
+        to a flat "· edited", so consecutive set-origin / delete / insert
+        steps all read identically."""
+        from rich.text import Text
+        node = sc._CommercialSaaSHistoryNode.new(
+            name="P.dna", seq_len=6600, circular=True, operation="setOrigin")
+        node.add_input_summary(manipulation="renumberBase", val1=6491)
+        node.add_parent(sc._CommercialSaaSHistoryNode.new(
+            name="P.dna", seq_len=6600, circular=True, operation="invalid"))
+        cells = sc._history_protocol_step_cells(node)
+        text = " ".join(Text.from_markup(c).plain for _n, c in cells)
+        assert "set origin" in text and "origin → 6,491" in text
+        assert "edited" not in text
+
+    def test_inputs_block_and_tag_share_one_formatter(self):
+        """The detail pane's Inputs block used to hardcode
+        "(region v1–v2)", so a single-position manipulation rendered as
+        "renumberBase (region 6,491–0)" there while the tree row said
+        "origin → 6,491". Both now go through `_history_coord_phrase`."""
+        from rich.text import Text
+        node = sc._CommercialSaaSHistoryNode.new(
+            name="P.dna", seq_len=6600, circular=True, operation="setOrigin")
+        node.add_input_summary(manipulation="renumberBase", val1=6491)
+        plain = "\n".join(Text.from_markup(ln).plain
+                          for ln in sc._history_detail_lines(node))
+        assert "origin → 6,491" in plain
+        assert "6,491–0" not in plain
+
+    def test_former_name_ignores_locus_vs_display_form(self):
+        """`Demo_12_TU_x` (LOCUS-safe id) and `Demo 12 TU x` (display
+        name) are the SAME plasmid — a caller passing the id must not
+        make the viewer claim the plasmid was renamed."""
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="Demo 12 TU Pdemo-GeneX-Tdemo.dna", seq_len=6560,
+            circular=True, operation="setOrigin")
+        assert sc._history_former_name(
+            root, "Demo_12_TU_Pdemo-GeneX-Tdemo") == ""
+        assert sc._history_former_name(
+            root, "Demo 12 TU Pdemo-GeneX-Tdemo") == ""
+        # A genuine rename still reports.
+        assert sc._history_former_name(root, "pDemo99") == \
+            "Demo 12 TU Pdemo-GeneX-Tdemo"
+
+
+class TestHistoryConsistencyCheck:
+    """`_history_node_warnings` reports claims the DNA contradicts.
+
+    STRICTLY READ-ONLY by contract: it never edits a sequence or a history
+    record to make a warning go away. Both are the user's data — the
+    history is a faithful account of what a tool did, and silently
+    "repairing" either destroys the evidence that they diverged.
+
+    Calibrated against a 1,184-plasmid reference library, where it must
+    report ZERO — every apparent error there turned out to be an artefact
+    of checking the wrong node (see `test_ancestor_claims_are_never_checked`).
+    """
+
+    ENZ = {"KpnI": ("GGTACC", 1, 5), "SacI": ("GAGCTC", 5, 1)}
+
+    def _node(self, **kw):
+        kw.setdefault("name", "P.dna")
+        kw.setdefault("seq_len", 40)
+        kw.setdefault("circular", True)
+        kw.setdefault("operation", "insertRestrictionSite")
+        return sc._CommercialSaaSHistoryNode.new(**kw)
+
+    def test_absent_enzyme_site_is_reported(self):
+        n = self._node()
+        n.add_regenerated_site("KpnI", 20, 1)
+        w = sc._history_node_warnings(n, "A" * 40, enzymes=self.ENZ)
+        assert len(w) == 1 and "KpnI" in w[0] and "does not occur" in w[0]
+
+    def test_present_enzyme_site_is_silent(self):
+        n = self._node()
+        n.add_regenerated_site("KpnI", 20, 1)
+        assert sc._history_node_warnings(
+            n, "A" * 17 + "GGTACC" + "A" * 17, enzymes=self.ENZ) == []
+
+    def test_our_own_enzyme_marker_never_warns(self):
+        """SpliceCraft records the enzyme an assembly USED as a
+        `RegeneratedSite` at pos 0 ([INV-93]) — not a claim that the site
+        survives. Type IIS assembly consumes its sites, so checking those
+        would fire on 126 correct records in the reference library."""
+        n = self._node(operation="insertFragment")
+        n.add_regenerated_site("KpnI", 0, 1)
+        assert sc._history_node_warnings(n, "A" * 40, enzymes=self.ENZ) == []
+
+    def test_ancestor_claims_are_never_checked(self):
+        """THE invariant that keeps false positives at zero.
+
+        A real case from the reference library: a plasmid's lineage
+        inserted a KpnI site, then two same-length `replace` steps swapped
+        it for SacI. The final molecule has no KpnI — correctly. Checking
+        the ANCESTOR's KpnI claim against the CURRENT sequence reports an
+        error that does not exist, because an ancestor node describes an
+        EARLIER molecule.
+
+        The checker only ever receives a sequence for a node the caller
+        can identify with certainty; callers pass "" for everything else,
+        and no sequence means no sequence-based check.
+        """
+        ancestor = self._node()
+        ancestor.add_regenerated_site("KpnI", 20, 1)
+        final_molecule = "A" * 34 + "GAGCTC"          # SacI, no KpnI
+        # With a sequence it would (wrongly) fire …
+        assert sc._history_node_warnings(
+            ancestor, final_molecule, enzymes=self.ENZ)
+        # … which is exactly why an ancestor is passed no sequence.
+        assert sc._history_node_warnings(ancestor, "", enzymes=self.ENZ) == []
+
+    def test_primer_that_moved_is_distinguished_from_one_that_vanished(self):
+        n = self._node(operation="amplifyFragment")
+        import xml.etree.ElementTree as ET
+        block = ET.SubElement(n.element, "Primers")
+        pr = ET.SubElement(block, "Primer")
+        pr.set("name", "F1")
+        bs = ET.SubElement(pr, "BindingSite")
+        bs.set("location", "5-14")
+        bs.set("boundStrand", "0")
+        bs.set("annealedBases", "GGGGCCCCTT")
+        # present, but at 20 rather than 5 -> stale coordinate, still binds
+        moved = "A" * 20 + "GGGGCCCCTT" + "A" * 10
+        w = sc._history_node_warnings(moved and n, moved, enzymes=self.ENZ)
+        assert len(w) == 1 and "stale" in w[0] and "still binds" in w[0]
+        # absent entirely -> the sequence changed
+        w = sc._history_node_warnings(n, "T" * 40, enzymes=self.ENZ)
+        assert len(w) == 1 and "does not bind" in w[0]
+        # exactly where claimed -> silent
+        ok = "A" * 5 + "GGGGCCCCTT" + "A" * 25
+        assert sc._history_node_warnings(ok and n, ok, enzymes=self.ENZ) == []
+
+    def test_length_arithmetic_needs_no_sequence(self):
+        """These checks are safe on EVERY node — they compare only the
+        lengths the record itself states."""
+        n = self._node(seq_len=100, operation="setOrigin")
+        n.add_parent(self._node(name="par.dna", seq_len=120,
+                                 operation="invalid"))
+        w = sc._history_node_warnings(n, "", enzymes=self.ENZ)
+        assert len(w) == 1 and "should not change length" in w[0]
+
+    def test_deletion_arithmetic_uses_inclusive_spans(self):
+        """0-based INCLUSIVE — calibrated against the reference library,
+        where 193/193 deletions balance on this rule and none do on the
+        exclusive reading."""
+        n = self._node(seq_len=94, operation="remove")
+        n.add_input_summary(manipulation="remove", val1=10, val2=15)  # 6 bases
+        n.add_parent(self._node(name="par.dna", seq_len=100,
+                                 operation="invalid"))
+        assert sc._history_node_warnings(n, "", enzymes=self.ENZ) == []
+        bad = self._node(seq_len=90, operation="remove")
+        bad.add_input_summary(manipulation="remove", val1=10, val2=15)
+        bad.add_parent(self._node(name="par.dna", seq_len=100,
+                                   operation="invalid"))
+        assert sc._history_node_warnings(bad, "", enzymes=self.ENZ)
+
+    def test_summary_is_empty_when_clean(self):
+        assert sc._history_consistency_summary([]) == ""
+        assert "1" in sc._history_consistency_summary(["x"])
+        assert "2" in sc._history_consistency_summary(["x", "y"])
+
+
+class TestHistoryHardening:
+    """Hostile / degenerate `.dna` input must never crash a viewer or hang
+    a render. Every case here was found by an edge-case sweep of the
+    consistency checker before release."""
+
+    ENZ = {"KpnI": ("GGTACC", 1, 5)}
+
+    @staticmethod
+    def _with_site(loc, annealed, strand=0, seq_len=40):
+        import xml.etree.ElementTree as ET
+        nd = sc._CommercialSaaSHistoryNode.new(
+            name="p.dna", seq_len=seq_len, circular=True,
+            operation="amplifyFragment")
+        block = ET.SubElement(nd.element, "Primers")
+        pr = ET.SubElement(block, "Primer")
+        pr.set("name", "F")
+        bs = ET.SubElement(pr, "BindingSite")
+        bs.set("location", loc)
+        bs.set("boundStrand", str(strand))
+        bs.set("annealedBases", annealed)
+        return nd
+
+    def test_manipulation_name_cannot_inject_a_format_field(self):
+        """`manipulation` comes straight off attacker-controllable XML. A
+        value like `{evil}` folded into a format string raises KeyError —
+        which would take out the tree label AND the protocol pane."""
+        n = sc._CommercialSaaSHistoryNode.new(
+            name="x.dna", seq_len=10, circular=True, operation="remove")
+        n.add_input_summary(manipulation="{evil}", val1=1, val2=5)
+        assert sc._history_manipulation_detail(n) == "{evil} 1–5"
+        n2 = sc._CommercialSaaSHistoryNode.new(
+            name="y.dna", seq_len=10, circular=True, operation="remove")
+        n2.add_input_summary(manipulation="{0}{1}%s%%", val1=7, val2=9)
+        assert "7" in sc._history_manipulation_detail(n2)
+
+    def test_overlong_manipulation_name_is_capped(self):
+        n = sc._CommercialSaaSHistoryNode.new(
+            name="x.dna", seq_len=10, circular=True, operation="remove")
+        n.add_input_summary(manipulation="Z" * 5000, val1=1, val2=5)
+        assert len(sc._history_manipulation_detail(n)) < 80
+
+    def test_negative_binding_offset_never_indexes_from_the_end(self):
+        """A negative start would slice from the END of the sequence and
+        compare the WRONG bases — a false pass or a false warning, both
+        worse than skipping."""
+        seq = "ACGT" * 10
+        assert sc._history_node_warnings(
+            self._with_site("-5-6", "ACGT"), seq, enzymes=self.ENZ) == []
+
+    def test_absurd_or_unparseable_coordinates_are_skipped(self):
+        seq = "ACGT" * 10
+        for loc in ("999999-1000000", "x-y", "--", "1e9-2e9"):
+            assert sc._history_node_warnings(
+                self._with_site(loc, "ACGT"), seq, enzymes=self.ENZ) == []
+
+    def test_annealed_run_longer_than_the_molecule_is_skipped(self):
+        seq = "ACGT" * 10
+        assert sc._history_node_warnings(
+            self._with_site("0-9", "A" * 500), seq, enzymes=self.ENZ) == []
+
+    def test_empty_recognition_site_is_not_treated_as_always_present(self):
+        """An empty site compiles to a pattern matching at every offset —
+        i.e. the check would silently stop checking."""
+        n = sc._CommercialSaaSHistoryNode.new(
+            name="q.dna", seq_len=40, circular=True,
+            operation="insertRestrictionSite")
+        n.add_regenerated_site("BOGUS", 5, 1)
+        assert sc._history_node_warnings(
+            n, "ACGT" * 10, enzymes={"BOGUS": ("", 0, 0)}) == []
+
+    def test_output_and_work_are_both_bounded(self):
+        """The warning cap bounds OUTPUT; a node whose sites all match
+        yields no warnings and still costs a scan each, so the number of
+        claims inspected is capped separately."""
+        n = sc._CommercialSaaSHistoryNode.new(
+            name="b.dna", seq_len=40, circular=True,
+            operation="insertRestrictionSite")
+        for i in range(500):
+            n.add_regenerated_site("KpnI", i + 1, 1)
+        w = sc._history_node_warnings(n, "T" * 40, enzymes=self.ENZ)
+        assert len(w) == sc._HISTORY_WARN_MAX
+
+    def test_chromosome_scale_falls_back_to_arithmetic_only(self):
+        """Each scan is O(len(seq)); on a 4.5 Mb chromosome that stalls
+        `compose()`. Above the cap only the recorded-length checks run."""
+        big = "ACGTTGCA" * (sc._HISTORY_CHECK_MAX_BP // 8 + 100)
+        n = self._with_site("10-29", "TTTTTTTTTT", seq_len=len(big))
+        assert sc._history_node_warnings(n, big, enzymes=self.ENZ) == []
+        # …and the same claim IS checked on a normal-sized molecule.
+        small = "ACGTTGCA" * 10
+        n2 = self._with_site("10-29", "TTTTTTTTTT", seq_len=len(small))
+        assert sc._history_node_warnings(n2, small, enzymes=self.ENZ)
+
+    def test_never_raises_on_a_malformed_node(self):
+        """It runs inside `compose()` — a bad value must degrade to "no
+        warnings", never to a History screen that won't render."""
+        class _Hostile:
+            name = "x"
+            operation = "remove"
+            seq_len = "not-an-int"
+            circular = True
+            parents = property(lambda self: (_ for _ in ()).throw(
+                RuntimeError("boom")))
+            regenerated_sites = []
+            primer_details = []
+            input_summaries = []
+        assert sc._history_node_warnings(
+            _Hostile(), "ACGT", enzymes=self.ENZ) == []

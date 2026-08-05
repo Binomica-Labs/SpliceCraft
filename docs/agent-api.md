@@ -274,7 +274,31 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   (Nanopore / Sanger / a consensus), each aligned rotation + RC-aware; returns
   per-read identity% + a `match`/`mismatch` `verdict` against `min_identity`).
 - **History** — get-history returns the parsed `<HistoryTree>`
-  lineage as nested JSON. Agent assemblies (`gibson-assemble`,
+  lineage as nested JSON — the FULL per-node record, matching what the
+  History tab shows: name / operation / length / topology / date /
+  node_id / resurrectable, the input summaries and regenerated sites,
+  the PCR `oligos`, the `primers` block (each with its binding sites:
+  location, strand, annealed bases, Tm, and the unannealed 5′ flap),
+  `hybridization_params`, run `parameters`, `end_modifications`,
+  `sticky_ends`, `custom_map_label`, `feature_snapshot_count`, and
+  `extra_attributes` / `other_children` for anything the parser doesn't
+  model yet (so a field from a newer writer still reaches you). A
+  `warnings` array lists claims the record makes that the plasmid's own
+  sequence does not support — an absent regenerated enzyme site, a primer
+  that moved or no longer binds, a length-preserving step that changed
+  the length, deletion arithmetic that doesn't balance. Checked against
+  the ROOT node only (an ancestor describes an earlier molecule, so
+  checking it against today's sequence reports errors that aren't real).
+  Read-only: nothing is ever rewritten to clear a warning.
+  **recover-history-from-dna** restores lineage to plasmids whose saved
+  `.dna` original documents more of their build than the library holds:
+  it matches on EXACT sequence identity (so it works across a rename),
+  adopts the source history only when it has strictly more nodes, and
+  writes `history_xml` and nothing else. `dry_run` defaults to `true` —
+  the first call reports what would change; pass
+  `{"dry_run": false}` to apply. Optional `collection` / `name` narrow
+  the scan.
+  Agent assemblies (`gibson-assemble`,
   `traditional-clone`, `golden-gate-assemble`) attach real parent
   lineage — each input fragment / part / vector becomes a parent node, so
   the product reads as a genuine `insertFragment` assembly instead of a

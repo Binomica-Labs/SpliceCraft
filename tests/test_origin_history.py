@@ -597,11 +597,19 @@ class TestDomesticatedCloneHistory:
 
 
 class TestEditHistoryOverCapMarker:
-    """When an in-place edit's prior history exceeds the per-edit re-nest
-    budget it's collapsed to a leaf — but the leaf must carry an
-    "(earlier history truncated)" marker so the History viewer signals
-    dropped lineage instead of a bare, parent-less leaf (2026-06-02).
-    Mirrors the marker the node-budget cap already leaves."""
+    """An in-place edit re-nests the pre-edit version's whole lineage.
+
+    When the chained tree overshoots the byte ceiling, the reduction is
+    SHEDDING COSMETIC PAYLOAD (`<Features>` / `<HistoryColors>` /
+    `<StrandColors>` — annotation + colour snapshots that record no
+    manipulation), NOT dropping ancestors. Pre-2026-08-04 a prior history
+    over 256 KB collapsed to a bare leaf, discarding every imported step;
+    the largest real imported history in the reference library is 233 KB,
+    i.e. one edit away from that cliff.
+
+    The "(earlier history truncated)" marker survives for the genuinely
+    unfittable case, so a viewer never renders a silently parent-less leaf.
+    """
 
     @classmethod
     def _has_marker(cls, node) -> bool:
@@ -609,21 +617,106 @@ class TestEditHistoryOverCapMarker:
             return True
         return any(cls._has_marker(c) for c in node.parents)
 
-    def test_over_cap_prior_history_leaves_marker(self):
+    @staticmethod
+    def _names(node) -> set:
+        return {n.name for n in node.walk()}
+
+    @staticmethod
+    def _bulky_prior_history(n_ancestors: int, feats_per_node: int) -> str:
+        """A VALID prior history: a chain of `n_ancestors` real steps,
+        each weighed down with a cosmetic `<Features>` snapshot."""
+        import xml.etree.ElementTree as ET
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="ANC-0.dna", seq_len=1000, circular=True,
+            operation="goldenGateAssembly")
+        cur = root
+        for i in range(1, n_ancestors):
+            cur.add_input_summary(manipulation="insert", name1="BsaI",
+                                   name2="BsaI", val1=i, val2=i + 10)
+            block = ET.SubElement(cur.element, "Features")
+            for f in range(feats_per_node):
+                el = ET.SubElement(block, "Feature")
+                el.set("name", f"feat-{i}-{f}")
+                el.set("padding", "z" * 200)      # cosmetic bulk
+            nxt = sc._CommercialSaaSHistoryNode.new(
+                name=f"ANC-{i}.dna", seq_len=1000 - i, circular=True,
+                operation="insertFragment")
+            cur.add_parent(nxt)
+            cur = nxt
+        return sc._serialize_commercialsaas_history(root)
+
+    def test_bulky_prior_history_keeps_every_step(self, monkeypatch):
+        """The whole ancestor chain survives an edit whose re-nested tree
+        blows the ceiling — the cosmetic snapshots are what gets shed."""
+        # Squeeze the ceiling rather than generating megabytes: the
+        # function reads the module global at call time.
+        monkeypatch.setattr(sc, "_HISTORY_XML_MAX_BYTES", 8 * 1024)
+        prev = self._bulky_prior_history(n_ancestors=6, feats_per_node=12)
+        assert len(prev) > 8 * 1024, "fixture must actually exceed the ceiling"
         entry = {"name": "Big", "id": "Big",
                  "gb_text": "LOCUS Big 30 bp DNA circular"}
         rec = _rec("ATGCATGCATGCATGCATGCATGCATGCAT")        # 30 bp (≠ prev)
-        oversized = "<HistoryTree>" + "x" * (sc._HISTORY_XML_MAX_BYTES + 10)
         sc._maybe_append_edit_history(
             entry, rec, prev_gb_text="LOCUS Big 20 bp DNA circular",
-            prev_size=20, prev_history=oversized,
+            prev_size=20, prev_history=prev,
         )
-        assert "history_xml" in entry
         root = sc._parse_commercialsaas_history(entry["history_xml"])
         assert root is not None
-        assert root.parents, "edit must chain the collapsed pre-edit version"
+        names = self._names(root)
+        for i in range(6):
+            assert f"ANC-{i}.dna" in names, (
+                f"ancestor ANC-{i} was dropped — a manipulation was lost "
+                f"to a byte budget"
+            )
+        assert not self._has_marker(root), (
+            "nothing was truncated; the marker must not appear"
+        )
+        # …and the record of WHAT each step did survives too.
+        assert any(n.input_summaries for n in root.walk())
+        # The cosmetic payload is what went.
+        assert "<Features" not in entry["history_xml"]
+
+    def test_strip_cosmetic_keeps_the_manipulation_record(self):
+        """`_strip_history_cosmetic_payload` touches ONLY the cosmetic
+        tags — every element that records a manipulation stays."""
+        import xml.etree.ElementTree as ET
+        node = sc._CommercialSaaSHistoryNode.new(
+            name="P.dna", seq_len=500, circular=False,
+            operation="amplifyFragment")
+        node.add_input_summary(manipulation="amplify", val1=10, val2=400)
+        node.add_regenerated_site("BsaI", 42, 1)
+        node.add_oligo(name="F", sequence="ACGT")
+        node.add_parameter(name="polymerase", value="blunt")
+        ET.SubElement(node.element, "Primers")
+        for tag in ("Features", "HistoryColors", "StrandColors"):
+            ET.SubElement(node.element, tag)
+        removed = sc._strip_history_cosmetic_payload(node)
+        assert removed == 3
+        xml = sc._serialize_commercialsaas_history(node)
+        for gone in ("<Features", "<HistoryColors", "<StrandColors"):
+            assert gone not in xml
+        for kept in ("InputSummary", "RegeneratedSite", "Oligo",
+                     "Parameter", "Primers", "amplifyFragment"):
+            assert kept in xml, f"{kept} must survive a cosmetic shed"
+
+    def test_unfittable_history_still_leaves_marker(self, monkeypatch):
+        """A tree that can't fit even after shedding falls back to the
+        bare edit node — and still flags that lineage existed."""
+        monkeypatch.setattr(sc, "_HISTORY_XML_MAX_BYTES", 512)
+        # Names alone blow the budget, so shedding cosmetics can't help.
+        prev = sc._build_origin_history_xml(
+            name="L" * 400, seq_len=20, circular=True, source="paste:x")
+        entry = {"name": "Big", "id": "Big",
+                 "gb_text": "LOCUS Big 30 bp DNA circular"}
+        rec = _rec("ATGCATGCATGCATGCATGCATGCATGCAT")
+        sc._maybe_append_edit_history(
+            entry, rec, prev_gb_text="LOCUS Big 20 bp DNA circular",
+            prev_size=20, prev_history=prev,
+        )
+        root = sc._parse_commercialsaas_history(entry["history_xml"])
+        assert root is not None and root.parents
         assert self._has_marker(root), (
-            "over-cap prior history must leave a truncation marker"
+            "an unfittable prior history must still leave a truncation marker"
         )
 
     def test_within_cap_prior_history_has_no_spurious_marker(self):
@@ -640,3 +733,241 @@ class TestEditHistoryOverCapMarker:
         assert "history_xml" in entry
         root = sc._parse_commercialsaas_history(entry["history_xml"])
         assert not self._has_marker(root)
+
+
+# ── provenance recovery from saved `.dna` originals ─────────────────────
+
+
+def _gb(name: str, seq: str, circular: bool = True) -> str:
+    """Minimal but real GenBank text — `_gb_text_sequence` reads ORIGIN."""
+    topo = "circular" if circular else "linear"
+    body = "".join(
+        f"{i * 60 + 1:>9} {seq[i * 60:(i + 1) * 60]}\n"
+        for i in range((len(seq) + 59) // 60)
+    )
+    return (f"LOCUS       {name} {len(seq)} bp DNA {topo} SYN\n"
+            f"FEATURES             Location/Qualifiers\n"
+            f"ORIGIN\n{body}//\n")
+
+
+class TestRecoverHistoryFromDna:
+    """`recover-history-from-dna` restores lineage from the `.dna` files
+    already on disk, matched by EXACT sequence identity.
+
+    Motivating measurement (2026-08-04, reference library of 1,184
+    plasmids): 41 entries were sequence-identical to a saved `.dna` whose
+    history carried up to 18 MORE nodes than what the library held — real
+    build records, recoverable, invisible."""
+
+    SEQ_A = ("ATGCATGCAT" * 12)          # 120 bp
+    SEQ_B = ("GGCCTTAAGG" * 12)          # 120 bp
+
+    def _sidecar(self, entry_id: str, seq: str, history_xml: str) -> None:
+        """Write a REAL .dna sidecar through the shipping writer, so the
+        test exercises the same bytes the app would read back."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq(seq), id=entry_id, name=entry_id)
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        data = sc._write_commercialsaas_dna_bytes(rec, history_xml=history_xml)
+        p = sc._dna_sidecar_path(entry_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+
+    def _rich_history(self, name: str, n_ancestors: int) -> str:
+        root = sc._CommercialSaaSHistoryNode.new(
+            name=f"{name}.dna", seq_len=120, circular=True,
+            operation="goldenGateAssembly")
+        cur = root
+        for i in range(1, n_ancestors):
+            nxt = sc._CommercialSaaSHistoryNode.new(
+                name=f"{name}-anc{i}.dna", seq_len=100 + i, circular=True,
+                operation="insertFragment")
+            cur.add_parent(nxt)
+            cur = nxt
+        return sc._serialize_commercialsaas_history(root)
+
+    def _seed(self, *, entry_name="pRich", entry_id="pRich",
+               stored_nodes=1, seq=None):
+        seq = seq or self.SEQ_A
+        stub = sc._build_origin_history_xml(
+            name=entry_name, seq_len=len(seq), circular=True,
+            source="id:x")
+        sc._save_collections([
+            {"name": "Work",
+             "plasmids": [{"id": entry_id, "name": entry_name,
+                           "gb_text": _gb(entry_name, seq),
+                           "size": len(seq), "history_xml": stub}],
+             "saved": "2026-01-01"},
+        ])
+        sc._set_active_collection_name("Work")
+        sc._restore_library_from_active_collection()
+        return stub
+
+    def _stored(self, name="pRich"):
+        c = next(c for c in sc._load_collections() if c["name"] == "Work")
+        e = next(p for p in c["plasmids"] if p["name"] == name)
+        return sc._rehydrate_entry(e)
+
+    def test_dry_run_reports_without_writing(self):
+        stub = self._seed()
+        self._sidecar("pRich", self.SEQ_A, self._rich_history("pRich", 6))
+        r = sc._h_recover_history_from_dna(None, {})     # dry_run defaults True
+        assert r["ok"] and r["dry_run"] is True
+        assert r["updated_count"] == 1
+        hit = r["updated"][0]
+        assert hit["name"] == "pRich"
+        assert hit["nodes_before"] == 1 and hit["nodes_after"] == 6
+        # Nothing on disk changed.
+        assert self._stored()["history_xml"] == stub
+
+    def test_apply_restores_the_richer_lineage(self):
+        self._seed()
+        self._sidecar("pRich", self.SEQ_A, self._rich_history("pRich", 6))
+        r = sc._h_recover_history_from_dna(None, {"dry_run": False})
+        assert r["ok"] and r["updated_count"] == 1
+        root = sc._parse_commercialsaas_history(self._stored()["history_xml"])
+        names = {n.name for n in root.walk()}
+        for i in range(1, 6):
+            assert f"pRich-anc{i}.dna" in names
+
+    def test_only_history_is_touched(self):
+        """SACRED: sequence, features, name, id and size must be untouched
+        — this is an annotation-only repair."""
+        self._seed()
+        before = self._stored()
+        self._sidecar("pRich", self.SEQ_A, self._rich_history("pRich", 6))
+        sc._h_recover_history_from_dna(None, {"dry_run": False})
+        after = self._stored()
+        for field in ("id", "name", "size", "gb_text"):
+            assert after[field] == before[field], f"{field} was modified"
+        assert after["history_xml"] != before["history_xml"]
+
+    def test_never_thins_an_existing_history(self):
+        """A source with FEWER nodes than what's stored is ignored — the
+        guard that makes running this repeatedly safe."""
+        self._seed()
+        rich = self._rich_history("pRich", 9)
+        sc._save_collections([
+            {"name": "Work",
+             "plasmids": [{"id": "pRich", "name": "pRich",
+                           "gb_text": _gb("pRich", self.SEQ_A),
+                           "size": len(self.SEQ_A), "history_xml": rich}],
+             "saved": "2026-01-01"}])
+        sc._restore_library_from_active_collection()
+        self._sidecar("pRich", self.SEQ_A, self._rich_history("pRich", 3))
+        r = sc._h_recover_history_from_dna(None, {"dry_run": False})
+        assert r["updated_count"] == 0
+        assert sc._history_node_count_of_xml(
+            self._stored()["history_xml"]) == 9
+
+    def test_matches_across_a_rename(self):
+        """The `.dna` is filed under a different name — an exact sequence
+        match still recovers it. This is the common real case: a plasmid
+        renamed after it was built."""
+        self._seed(entry_name="pNewName", entry_id="pNewName")
+        self._sidecar("SomeOldName", self.SEQ_A,
+                       self._rich_history("SomeOldName", 5))
+        r = sc._h_recover_history_from_dna(None, {"dry_run": False})
+        assert r["updated_count"] == 1
+        assert r["updated"][0]["name"] == "pNewName"
+        root = sc._parse_commercialsaas_history(
+            self._stored("pNewName")["history_xml"])
+        assert "SomeOldName.dna" in root.name
+
+    def test_different_sequence_is_never_matched(self):
+        """A `.dna` whose sequence differs — even by one base — must not
+        donate its lineage. Wrong provenance is worse than none."""
+        self._seed()
+        off_by_one = self.SEQ_A[:-1] + ("G" if self.SEQ_A[-1] != "G" else "C")
+        self._sidecar("Impostor", off_by_one,
+                       self._rich_history("Impostor", 8))
+        r = sc._h_recover_history_from_dna(None, {"dry_run": False})
+        assert r["updated_count"] == 0
+
+    def test_collection_and_name_filters(self):
+        self._seed()
+        self._sidecar("pRich", self.SEQ_A, self._rich_history("pRich", 6))
+        assert sc._h_recover_history_from_dna(
+            None, {"collection": "Nope"})["updated_count"] == 0
+        assert sc._h_recover_history_from_dna(
+            None, {"name": "ghost"})["updated_count"] == 0
+        assert sc._h_recover_history_from_dna(
+            None, {"collection": "Work", "name": "pRich"})["updated_count"] == 1
+
+    def test_invalid_dry_run_rejected(self):
+        assert sc._h_recover_history_from_dna(None, {"dry_run": "yes"})[1] == 400
+
+
+class TestGeneratedVsImportedHistorySerialisation:
+    """`_finalize_generated_history` renumbers node IDs so a merged
+    lineage can't hold duplicates. It must run on trees WE build and
+    NEVER on an imported one — rewriting a source file's own identifiers
+    would break the byte-faithful `.dna` round-trip.
+
+    This regression exists because the split was briefly violated: a
+    bulk edit routed `_stamp_history_root_date` — which touches ONLY the
+    root `date` attribute of imported XML — through the builder path.
+    """
+
+    IMPORTED = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<HistoryTree>'
+        '<Node name="prod.dna" type="DNA" seqLen="900" strandedness="double"'
+        ' ID="7" circular="1" operation="goldenGateAssembly">'
+        '<Node name="vec.dna" type="DNA" seqLen="500" strandedness="double"'
+        ' ID="3" circular="1" operation="invalid"/>'
+        '<Node name="ins.dna" type="DNA" seqLen="400" strandedness="double"'
+        ' ID="9" circular="0" operation="invalid"/>'
+        '</Node></HistoryTree>'
+    )
+
+    @staticmethod
+    def _ids(xml):
+        import xml.etree.ElementTree as ET
+        return [n.get("ID") for n in ET.fromstring(xml).iter("Node")]
+
+    def test_stamping_a_date_preserves_imported_node_ids(self):
+        """The date stamp is the ONLY permitted change."""
+        assert self._ids(self.IMPORTED) == ["7", "3", "9"]
+        out = sc._stamp_history_root_date(self.IMPORTED, "2026-06-11")
+        assert self._ids(out) == ["7", "3", "9"], (
+            "imported node IDs were rewritten — the .dna round-trip is no "
+            "longer byte-faithful"
+        )
+        root = sc._parse_commercialsaas_history(out)
+        assert root.date == "2026-06-11"
+
+    def test_stamp_is_a_no_op_without_a_date(self):
+        assert sc._stamp_history_root_date(self.IMPORTED, None) is self.IMPORTED
+        assert sc._stamp_history_root_date(self.IMPORTED, "") is self.IMPORTED
+
+    def test_builder_path_renumbers_merged_lineages(self):
+        """The other half of the contract: a tree we BUILD gets unique
+        IDs, so nesting two imported subtrees (each numbered from its own
+        origin) can't leave two nodes claiming the same identity."""
+        root = sc._CommercialSaaSHistoryNode.new(
+            name="product.dna", seq_len=900, circular=True,
+            operation="insertFragment", node_id=7)
+        for sub in (self.IMPORTED, self.IMPORTED):
+            root.add_parent(sc._parse_commercialsaas_history(sub))
+        merged = sc._serialize_commercialsaas_history(root)
+        ids = self._ids(merged)
+        assert len(ids) != len(set(ids)), "fixture must actually collide"
+        out = sc._finalize_generated_history(root)
+        ids = self._ids(out)
+        assert ids == [str(i) for i in range(len(ids))]
+        assert len(ids) == len(set(ids))
+
+    def test_renumber_preserves_every_node_and_attribute(self):
+        """Renumbering must touch the ID and nothing else."""
+        import xml.etree.ElementTree as ET
+        root = sc._parse_commercialsaas_history(self.IMPORTED)
+        before = [(n.get("name"), n.get("seqLen"), n.get("operation"))
+                  for n in ET.fromstring(self.IMPORTED).iter("Node")]
+        sc._history_renumber_node_ids(root)
+        after = [(n.get("name"), n.get("seqLen"), n.get("operation"))
+                 for n in ET.fromstring(
+                     sc._serialize_commercialsaas_history(root)).iter("Node")]
+        assert after == before

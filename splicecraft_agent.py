@@ -47,7 +47,7 @@ from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_ent
 from splicecraft_experiments import (_new_experiment_id, _normalise_experiment_entry, _sanitize_experiment_id)
 from splicecraft_fileio import (_PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
 from splicecraft_gels import (_new_gel_id, _normalise_gel_entry)
-from splicecraft_history import (_HISTORY_NODE_MAX_DEPTH, _HISTORY_NODE_MAX_NODES)
+from splicecraft_history import (_HISTORY_NODE_MAX_DEPTH, _HISTORY_NODE_MAX_NODES, _history_node_warnings)
 from splicecraft_logging import (_log, _log_event)
 from splicecraft_net import (_sanitize_accession)
 from splicecraft_persistence import (_safe_file_size_check, _safe_load_json)
@@ -4105,6 +4105,11 @@ def _history_node_to_dict(node) -> "dict | None":
         return None
 
     def _shell(n) -> dict:
+        # Every modelled field, so an agent reading `get-history` sees
+        # exactly what the History viewer shows. The pre-2026-08-04 shape
+        # carried 6 keys and dropped the date, the node identity, the PCR
+        # primers, the run conditions, the end chemistry and the primer
+        # BINDING record — i.e. most of what a `.dna` actually documents.
         return {
             "name":       getattr(n, "name", "") or "",
             "operation":  getattr(n, "operation", "") or "",
@@ -4116,6 +4121,29 @@ def _history_node_to_dict(node) -> "dict | None":
             "input_summaries":   list(
                 getattr(n, "input_summaries", []) or []
             ),
+            "node_id":       int(getattr(n, "node_id", 0) or 0),
+            "date":          getattr(n, "date", "") or "",
+            "resurrectable": bool(getattr(n, "resurrectable", False)),
+            "oligos":        list(getattr(n, "oligos", []) or []),
+            "primers":       list(getattr(n, "primer_details", []) or []),
+            "hybridization_params": dict(
+                getattr(n, "hybridization_params", {}) or {}),
+            "parameters":    list(getattr(n, "parameters", []) or []),
+            "end_modifications": dict(
+                getattr(n, "end_modifications", {}) or {}),
+            "sticky_ends":   dict(getattr(n, "sticky_ends", {}) or {}),
+            "custom_map_label": getattr(n, "custom_map_label", "") or "",
+            "feature_snapshot_count": int(
+                getattr(n, "feature_snapshot_count", 0) or 0),
+            "source_collapsed": bool(getattr(n, "source_collapsed", False)),
+            # Backstop, same as the viewer's "Other recorded fields": a
+            # field this codebase doesn't model still reaches the caller.
+            "extra_attributes": dict(
+                getattr(n, "extra_attributes", {}) or {}),
+            "other_children": [
+                {"tag": t, "count": c}
+                for t, c in (getattr(n, "other_children", []) or [])
+            ],
             "parents":    [],
         }
 
@@ -4178,11 +4206,32 @@ def _h_get_history(app, payload):
     except ValueError as exc:
         _log.warning("agent get-history: malformed history_xml: %s", exc)
         return ({"error": f"malformed history XML: {exc}"}, 422)
+    # Check the ROOT node's claims against the entry's actual bases — the
+    # one node we can identify with certainty (an ancestor is only a name
+    # and a length in the record, and resolving that to a library entry can
+    # land on the wrong molecule). STRICTLY READ-ONLY: this reports a
+    # disagreement, it never edits the sequence or the history to resolve
+    # one. A parse failure just means no check, never a failed request.
+    warnings: "list[str]" = []
+    try:
+        seq = str(getattr(
+            _gb_text_to_record(entry.get("gb_text") or ""), "seq", "") or "")
+        # `_parse_commercialsaas_history` returns None for a `<HistoryTree>`
+        # with no `<Node>` — nothing to check against.
+        if seq and root is not None:
+            warnings = _history_node_warnings(
+                root, seq, enzymes=_state._all_enzymes_hook())
+    except Exception:
+        _log.debug("agent get-history: consistency check skipped for %r",
+                    entry.get("name"), exc_info=True)
     return {
         "ok": True,
         "name": entry.get("name"),
         "id":   entry.get("id"),
         "history": _history_node_to_dict(root),
+        # Claims the record makes that the sequence doesn't support.
+        # Empty list = everything checks out.
+        "warnings": warnings,
     }
 
 

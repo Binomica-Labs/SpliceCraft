@@ -264,12 +264,31 @@ with `F7` against a dictionary you can grow.
 
 Every plasmid remembers how it was made — Golden Braid, digest/ligation,
 Gibson, PCR, or a plain edit. **History** opens with a **Protocol** — a
-numbered recipe that reads left → right like the bench (*"assemble pProm +
-pCDS_GFP + pTerm into pENTR_L1 → TU_GFP ✂ Esp3I"*) — above a **lineage tree** you
-can drill into as deep as you like. Each step is dated and shows its detail
-(including the **primers** for a PCR); a backbone reused across branches is shown
-once and then referenced. The lineage rides along through CommercialSaaS `.dna`
-import / export too.
+numbered recipe that reads left → right like the bench (*"Golden Gate pProm +
+pCDS_GFP + pTerm into pENTR_L1 → TU_GFP  region 184–1,414 ✂ Esp3I"*) — above a
+**lineage tree** you can drill into as deep as you like. A backbone reused
+across branches is shown once and then referenced.
+
+Pick any step and you get **everything the record holds**: what it did and
+where on the molecule, when, the conditions it ran under, the primers — with
+the position, strand and melting temperature of each binding site, and the 5′
+tail that didn't anneal (your restriction site and overhang) — the fragment's
+end chemistry and sticky ends, the enzymes regenerated, and how many features
+that intermediate carried. Anything a file records that SpliceCraft doesn't yet
+model is listed too, rather than quietly dropped. A plasmid renamed after it
+was built says what it was built as.
+
+If a record claims something the plasmid doesn't bear out — a restriction
+site that isn't there, a primer that no longer binds where it was written
+down — the History view says so instead of presenting it as fact. It only
+ever reports: your sequences and your history are never edited to make a
+warning disappear.
+
+The lineage rides along through CommercialSaaS `.dna` import / export, and
+editing a plasmid never costs you its imported history. If a plasmid ended up
+with less history than the `.dna` it came from, `recover-history-from-dna`
+finds the original by sequence — even under a different name — and puts the
+build record back.
 
 ### BABS
 

@@ -42,7 +42,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.46"
+__version__ = "1.2.47"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -8523,6 +8523,11 @@ def _stamp_history_root_date(hist_xml: "str | None",
         if root is None or root.date:
             return hist_xml
         root.element.set("date", str(date_str))
+        # SACRED: the PLAIN serialiser, never `_finalize_generated_history`.
+        # This is an IMPORTED tree — the only change it may carry is the root
+        # `date` attribute. Renumbering its node IDs would rewrite the source
+        # file's own identifiers and break the byte-faithful `.dna` round-trip
+        # ([INV-175]).
         return _serialize_commercialsaas_history(root) or hist_xml
     except Exception:
         _log.debug("history root-date stamp failed", exc_info=True)
@@ -8586,6 +8591,10 @@ from splicecraft_history import (  # noqa: E402
     _history_human_dt as _history_human_dt,
     _CommercialSaaSHistoryNode as _CommercialSaaSHistoryNode,
     _coerce_int_or_zero as _coerce_int_or_zero,
+    # Builder-side: keeps merged lineages' node IDs unique
+    # (`_finalize_generated_history`). Imported here rather than in the
+    # display block below because the history BUILDERS sit above it.
+    _history_renumber_node_ids as _history_renumber_node_ids,
 )
 
 
@@ -8860,7 +8869,7 @@ def _build_origin_history_xml(*, name: str, seq_len: int,
         )
         root.add_input_summary(manipulation=manipulation,
                                 name1=str(name or "plasmid"))
-        return _serialize_commercialsaas_history(root)
+        return _finalize_generated_history(root)
     except Exception:
         _log.debug("origin history: build failed for %r", name, exc_info=True)
         return None
@@ -8914,7 +8923,7 @@ def _build_scrub_assembly_history_xml(*, name: str, seq_len: int,
             node = TraditionalCloningPane._parent_node_for_entry(e)
             if node is not None:
                 root.add_parent(node)
-        return _serialize_commercialsaas_history(root)
+        return _finalize_generated_history(root)
     except Exception:
         _log.debug("scrub assembly history: build failed for %r", name,
                     exc_info=True)
@@ -8969,6 +8978,14 @@ def _build_history_for_agent_assembly(*, name: str, seq_len: int,
         # saved by an earlier step carries its own nested lineage; fall
         # back to the bare {name, size} descriptor otherwise. Readonly
         # iter — refs only read by `_parent_node_for_entry`.
+        #
+        # SACRED: the match must agree on SIZE, not just name. Names are
+        # not unique identifiers — an audit of the reference library found
+        # the same name carrying molecules 58 bp and 573 bp long — and a
+        # name-only match would graft THAT plasmid's whole lineage onto
+        # this product. Fabricated provenance is worse than none: a bare
+        # sized leaf honestly says "we know its name and length, not how it
+        # was made", while a wrong subtree reads as a real build record.
         lib_by_name: dict[str, dict] = {}
         for e in _iter_library_readonly():
             if isinstance(e, dict):
@@ -8978,11 +8995,22 @@ def _build_history_for_agent_assembly(*, name: str, seq_len: int,
         for p in (parents or []):
             if not isinstance(p, dict):
                 continue
-            entry = lib_by_name.get(str(p.get("name") or "")) or p
-            node = TraditionalCloningPane._parent_node_for_entry(entry)
+            entry = lib_by_name.get(str(p.get("name") or ""))
+            if entry is not None:
+                want = _coerce_int_or_zero(p.get("size"))
+                got = _coerce_int_or_zero(entry.get("size"))
+                if want and got and want != got:
+                    _log.debug(
+                        "assembly history: library entry %r is %d bp but the "
+                        "input is %d bp — using a sized leaf rather than "
+                        "grafting a different molecule's lineage",
+                        p.get("name"), got, want,
+                    )
+                    entry = None
+            node = TraditionalCloningPane._parent_node_for_entry(entry or p)
             if node is not None:
                 root.add_parent(node)
-        return _serialize_commercialsaas_history(root)
+        return _finalize_generated_history(root)
     except Exception:
         _log.debug("agent assembly history: build failed for %r", name,
                     exc_info=True)
@@ -9023,7 +9051,7 @@ def _build_scrub_mutagenesis_history_xml(*, name: str, seq_len: int,
             node = TraditionalCloningPane._parent_node_for_entry(source_entry)
             if node is not None:
                 root.add_parent(node)
-        return _serialize_commercialsaas_history(root)
+        return _finalize_generated_history(root)
     except Exception:
         _log.debug("scrub mutagenesis history: build failed for %r", name,
                     exc_info=True)
@@ -9211,23 +9239,91 @@ def _build_history_for_l0_clone(*, name: str, seq_len: int,
         part_node = TraditionalCloningPane._parent_node_for_entry(part_entry)
         if part_node is not None:
             root.add_parent(part_node)
-        return _serialize_commercialsaas_history(root)
+        return _finalize_generated_history(root)
     except Exception:
         _log.debug("l0-clone history: build failed for %r", name,
                     exc_info=True)
         return None
 
 
-# Bound GENERATED construction history so it can't bloat the library /
-# collections files as in-place edits accumulate over time. The edit
-# chain re-nests the prior tree on every change; without a cap a plasmid
-# edited daily for a year would carry a 1000+-node history (stored in
-# BOTH plasmid_library.json AND collections.json). These caps keep a
-# generous recent window and collapse older lineage. Imported `.dna`
-# history is NOT capped here — it round-trips under its own 32 MB ceiling
-# (`_COMMERCIALSAAS_HISTORY_MAX_XML`); this only governs what WE generate.
+# Bound GENERATED construction history so it can't bloat the data files as
+# in-place edits accumulate over time. The edit chain re-nests the prior tree
+# on every change; without a cap a plasmid edited daily for a year would carry
+# a 1000+-node history. These caps keep a generous recent window and collapse
+# older lineage. Imported `.dna` history is NOT capped here — it round-trips
+# under its own 32 MB ceiling (`_COMMERCIALSAAS_HISTORY_MAX_XML`); this only
+# governs what WE generate.
+#
+# Byte ceiling raised 256 KB → 4 MB (2026-08-04). Two reasons the old number
+# was both too small and measuring the wrong thing:
+#
+#   * It predates blob-dehydration — history_xml is content-addressed in
+#     `plasmid_blobs/` now (`_HISTORY_REF_KEY`), so it no longer sits inline
+#     in plasmid_library.json AND collections.json, and no longer gets
+#     re-serialised + triple-backed-up on every unrelated save. The bloat
+#     argument that set 256 KB is gone; what remains is per-edit parse cost.
+#   * Measured against the reference library, the largest real imported
+#     history is 233 KB — 89% of the old ceiling. One sequence edit on a
+#     plasmid barely richer than that would have silently discarded its
+#     ENTIRE imported lineage (see `_maybe_append_edit_history`).
+#
+# Overshoot is now handled by SHEDDING COSMETIC PAYLOAD first
+# (`_strip_history_cosmetic_payload`) — never by dropping manipulations.
 _HISTORY_TREE_MAX_NODES = 256          # recent construction/edit steps kept
-_HISTORY_XML_MAX_BYTES = 256 * 1024    # hard byte ceiling on generated XML
+_HISTORY_XML_MAX_BYTES = 4 * 1024 * 1024   # hard byte ceiling on generated XML
+
+
+# Child elements that record NO manipulation — the per-node annotation and
+# colour snapshots a `.dna` carries for every intermediate. They are ~95% of a
+# real history's bytes (measured: 605 `<Feature>` / 1425 `<V>` / 108
+# `<ColorRange>` vs 26 `<Node>` in the largest file) and nothing in the viewer
+# renders them beyond a count. Shedding these is how an over-ceiling tree gets
+# under budget WITHOUT losing a single step, primer, or input summary.
+_HISTORY_COSMETIC_TAGS = ("Features", "HistoryColors", "StrandColors")
+
+
+def _finalize_generated_history(
+        root_node: "_CommercialSaaSHistoryNode | None") -> "str | None":
+    """Renumber + serialise a history tree WE built.
+
+    Every builder nests parent subtrees, and an imported parent arrives
+    carrying its OWN 0..N numbering — so merging two lineages produces
+    colliding `ID`s (found on 10 plasmids in the reference library, one
+    tree holding IDs ``[3, 1, 2, 10, 4, 11]`` all duplicated). Nothing
+    keys off the ID today, which is why it went unnoticed, but a lineage
+    record with two nodes claiming the same identity is wrong on its face
+    and silently merges unrelated steps for any consumer that indexes by
+    it.
+
+    SACRED: builders ONLY. Never route imported XML through this —
+    `_stamp_history_root_date` deliberately calls the plain serialiser,
+    because rewriting a source file's IDs would break the byte-faithful
+    `.dna` round-trip (verified clean across all 656 real histories)."""
+    if root_node is None:
+        return None
+    _history_renumber_node_ids(root_node)
+    return _serialize_commercialsaas_history(root_node)
+
+
+def _strip_history_cosmetic_payload(
+        root_node: "_CommercialSaaSHistoryNode") -> int:
+    """Remove the cosmetic annotation/colour snapshots from every node of
+    a history tree, in place. Returns how many elements were dropped.
+
+    SACRED: this touches ONLY the tags in `_HISTORY_COSMETIC_TAGS`. Nodes,
+    operations, input summaries, regenerated sites, oligos, primer binding
+    blocks, parameters and every node attribute are left untouched — the
+    manipulation record survives intact. Iterative (no recursion limit)."""
+    removed = 0
+    stack: list = [root_node.element]
+    while stack:
+        el = stack.pop()
+        for tag in _HISTORY_COSMETIC_TAGS:
+            for child in el.findall(tag):
+                el.remove(child)
+                removed += 1
+        stack.extend(el.findall("Node"))
+    return removed
 
 
 def _truncate_history_to_recent(root_node: "_CommercialSaaSHistoryNode",
@@ -9316,39 +9412,41 @@ def _maybe_append_edit_history(entry: dict, record, prev_gb_text: str,
             manipulation="editSequence", name1=name,
             val1=prev_seq_len, val2=len(new_seq),
         )
-        # Parent = the pre-edit version, with its own prior lineage. A
-        # very large prior history is too costly to parse + re-nest on
-        # every edit, so collapse it to a compact leaf rather than
-        # chaining the whole tree (bloat + per-edit-CPU guard).
-        prev_over_cap = bool(
-            prev_history and len(prev_history) > _HISTORY_XML_MAX_BYTES
-        )
-        prev_for_parent = None if prev_over_cap else (prev_history or None)
+        # Parent = the pre-edit version, with its own prior lineage. The
+        # whole tree is re-nested — a prior history is NEVER dropped for
+        # being large. Overshoot is handled below by shedding cosmetic
+        # payload, which costs nothing but annotation snapshots; the old
+        # behaviour (collapse the parent to a leaf past 256 KB) discarded
+        # every imported manipulation the user had, and the largest real
+        # imported history sits at 89% of that old ceiling.
         parent = TraditionalCloningPane._parent_node_for_entry({
             "name":        name,
             "size":        prev_seq_len,
-            "history_xml": prev_for_parent,
+            "history_xml": prev_history or None,
             "gb_text":     prev_gb_text,
         })
         if parent is not None:
-            if prev_over_cap:
-                # The pre-edit version DID carry lineage, but it exceeded
-                # the re-nest budget and was dropped above. Leave the same
-                # "(earlier history truncated)" marker the node-budget cap
-                # (_truncate_history_to_recent) does, so the History viewer
-                # signals upstream lineage existed instead of rendering a
-                # bare, parent-less leaf — otherwise a silent drop at the
-                # display layer.
-                parent.add_parent(_CommercialSaaSHistoryNode.new(
-                    name="(earlier history truncated)", seq_len=0,
-                    circular=False, operation="truncated", node_id=0,
-                ))
             edited.add_parent(parent)
         # Cap the chained tree to a recent window so successive edits
         # can't grow history_xml without bound.
         _truncate_history_to_recent(edited, _HISTORY_TREE_MAX_NODES)
-        xml = _serialize_commercialsaas_history(edited)
-        # Defensive final ceiling — if the capped tree still serialises
+        xml = _finalize_generated_history(edited)
+        # Over the ceiling? Shed the cosmetic annotation/colour snapshots
+        # FIRST — they're ~95% of an imported history's bytes and record
+        # no manipulation, so this buys roughly a 20× reduction while
+        # keeping every step. Only if that still isn't enough do we fall
+        # through to the bare-node collapse below.
+        if xml and len(xml) > _HISTORY_XML_MAX_BYTES:
+            dropped = _strip_history_cosmetic_payload(edited)
+            if dropped:
+                xml = _finalize_generated_history(edited)
+                _log.info(
+                    "edit history for %r exceeded %d KB: shed %d cosmetic "
+                    "snapshot element(s), now %d KB — all steps preserved",
+                    name, _HISTORY_XML_MAX_BYTES // 1024, dropped,
+                    len(xml or "") // 1024,
+                )
+        # Defensive final ceiling — if the shed tree still serialises
         # huge (e.g. pathologically long names), drop to the bare edit
         # node so a single entry can never bloat the library file.
         if xml and len(xml) > _HISTORY_XML_MAX_BYTES:
@@ -9368,7 +9466,7 @@ def _maybe_append_edit_history(entry: dict, record, prev_gb_text: str,
                     name="(earlier history truncated)", seq_len=0,
                     circular=False, operation="truncated", node_id=0,
                 ))
-            xml = _serialize_commercialsaas_history(bare)
+            xml = _finalize_generated_history(bare)
         if xml:
             entry["history_xml"] = xml
     except Exception:
@@ -22764,6 +22862,15 @@ from splicecraft_history import (  # noqa: E402
     _HISTORY_OP_SENTINELS as _HISTORY_OP_SENTINELS,
     _history_op_label as _history_op_label,
     _history_node_signature as _history_node_signature,
+    _history_manipulation_detail as _history_manipulation_detail,
+    _history_coord_phrase as _history_coord_phrase,
+    _history_node_warnings as _history_node_warnings,
+    _history_consistency_summary as _history_consistency_summary,
+    _HISTORY_WARN_MAX as _HISTORY_WARN_MAX,
+    _HISTORY_CHECK_MAX_ITEMS as _HISTORY_CHECK_MAX_ITEMS,
+    _HISTORY_CHECK_MAX_BP as _HISTORY_CHECK_MAX_BP,
+    _HISTORY_MANIP_LABEL_MAX as _HISTORY_MANIP_LABEL_MAX,
+    _history_former_name as _history_former_name,
     _history_tree_label as _history_tree_label,
     _history_reference_label as _history_reference_label,
     _history_populate_tree as _history_populate_tree,
@@ -22919,6 +23026,7 @@ class HistoryScreen(_OneShotDismissScreen, Screen):
         border: solid $primary-darken-2; padding: 0 1; overflow-y: auto;
     }
     #hist-scr-proto Static { padding: 0 1; }
+    #hist-scr-warn { color: $warning; height: auto; padding: 0 2; }
     #hist-scr-tree { height: 1fr; }
     #hist-scr-detail {
         height: 1fr; border: solid $primary-darken-2;
@@ -22930,7 +23038,8 @@ class HistoryScreen(_OneShotDismissScreen, Screen):
     """
 
     def __init__(self, title: str,
-                  root_node: "_CommercialSaaSHistoryNode") -> None:
+                  root_node: "_CommercialSaaSHistoryNode",
+                  seq: str = "") -> None:
         super().__init__()
         # Truncate the title up front so the colored title bar can't
         # wrap or push the subtitle off-screen on narrow terminals.
@@ -22938,6 +23047,12 @@ class HistoryScreen(_OneShotDismissScreen, Screen):
             title = title[: _HISTORY_TITLE_NAME_MAX - 1] + "…"
         self._title = title
         self._root_node = root_node
+        # The loaded plasmid's bases, used ONLY to check the ROOT node's
+        # claims against the molecule (that's the one node we can identify
+        # with certainty — an ancestor is just a name and a length, and
+        # matching those to a library entry can pick the wrong molecule).
+        # Read-only: nothing here ever writes a sequence or a history.
+        self._seq = str(seq or "").upper()
         self._node_by_id: "dict[int, _CommercialSaaSHistoryNode]" = {}
 
     def compose(self) -> ComposeResult:
@@ -22946,12 +23061,24 @@ class HistoryScreen(_OneShotDismissScreen, Screen):
                       id="hist-scr-title")
         n_nodes = _history_node_count(self._root_node)
         n_steps = len(_history_build_steps(self._root_node))
+        # A plasmid renamed after it was built keeps the build-time name
+        # on its history root — state it rather than leaving the user to
+        # wonder why the tree opens on an unfamiliar name.
+        was = _history_former_name(self._root_node, self._title)
+        was_bit = f"built as {_esc(was)}  ·  " if was else ""
         yield Static(
-            f"  {n_nodes} node{'s' if n_nodes != 1 else ''}  ·  "
+            f"  {was_bit}{n_nodes} node{'s' if n_nodes != 1 else ''}  ·  "
             f"{n_steps} build step{'s' if n_steps != 1 else ''}  ·  "
             "Esc / Q to close  ·  E expand all  ·  C collapse",
             id="hist-scr-subtitle",
         )
+        # Flag up front when the record claims something this molecule
+        # doesn't bear out, so the user doesn't have to click a node to
+        # discover it. Read-only — nothing is corrected on their behalf.
+        warn = _history_consistency_summary(_history_node_warnings(
+            self._root_node, self._seq, enzymes=_all_enzymes()))
+        if warn:
+            yield Static(f"  {warn}", id="hist-scr-warn", markup=True)
         with Horizontal(id="hist-scr-main"):
             with Vertical(id="hist-scr-tree-col"):
                 yield Static("Protocol", id="hist-scr-proto-label")
@@ -23061,7 +23188,17 @@ class HistoryScreen(_OneShotDismissScreen, Screen):
             detail = self.query_one("#hist-scr-detail-text", Static)
         except NoMatches:
             return
-        detail.update("\n".join(_history_detail_lines(hist)))
+        detail.update("\n".join(_history_detail_lines(
+            hist, self._verify_seq(hist), enzymes=_all_enzymes())))
+
+    def _verify_seq(self, hist) -> str:
+        """The molecule to check this node's claims against — non-empty
+        ONLY for the root, the one node we know is the loaded plasmid. An
+        ancestor is just a name and a length in the record; resolving that
+        to a library entry can land on the wrong molecule, and a false
+        "this doesn't match" is worse than no check."""
+        return (self._seq
+                if hist.element is self._root_node.element else "")
 
 
 class WhatsNewModal(_OneShotDismissScreen, ModalScreen):
@@ -78460,7 +78597,7 @@ class TraditionalCloningPane(Vertical):
             parent_node = self._parent_node_for_entry(pe)
             if parent_node is not None:
                 root.add_parent(parent_node)
-        return _serialize_commercialsaas_history(root)
+        return _finalize_generated_history(root)
 
     def _current_source_entries(self) -> "tuple[dict, dict]":
         """Return ``(insert_entry, vector_entry)`` for the history XML
@@ -79764,7 +79901,7 @@ class GibsonAssemblyPane(Vertical):
             p_node = TraditionalCloningPane._parent_node_for_entry(entry)
             if p_node is not None:
                 root.add_parent(p_node)
-        return _serialize_commercialsaas_history(root)
+        return _finalize_generated_history(root)
 
 
 def _palette_rows_for_grammar(
@@ -81819,7 +81956,7 @@ class ConstructorModal(ModalScreen):
             )
             if p_node is not None:
                 root.add_parent(p_node)
-        return _serialize_commercialsaas_history(root)
+        return _finalize_generated_history(root)
 
     def _persist_assembly(self, new_rec, gid: str, *,
                             source_level: int,
@@ -98013,6 +98150,230 @@ def _h_move_plasmid(app, payload):
             "ignored": _agent_ignored_keys(payload, {"name", "id", "to", "from"})}
 
 
+# ── Provenance recovery from saved `.dna` originals ────────────────────────
+# A plasmid can end up holding a thinner history than the `.dna` it came from:
+# imported before the history reader existed, re-saved through a path that
+# stamped a bare origin stub, or renamed so its sidecar no longer matched.
+# The `.dna` originals are still on disk, so the lineage is recoverable — the
+# match key is SEQUENCE IDENTITY, which is what makes this safe: an exact
+# base-for-base match means the file documents THIS molecule, whatever either
+# side is called.
+
+_HISTORY_RECOVER_MAX_SIDECARS = 20_000   # scan bound (real libraries: ~1k)
+
+
+def _gb_text_sequence(gb_text: str) -> str:
+    """Upper-cased sequence out of a GenBank ORIGIN block.
+
+    Deliberately NOT `_gb_text_to_record(...).seq`: this runs over every
+    library entry AND every `.dna` sidecar, and a full Biopython parse per
+    record turns a one-shot repair into minutes of CPU for a value we only
+    use as a dict key. Letters only — ORIGIN lines carry the running bp
+    offset and spaces."""
+    out: "list[str]" = []
+    on = False
+    for line in (gb_text or "").splitlines():
+        if not on:
+            if line.startswith("ORIGIN"):
+                on = True
+            continue
+        if line.startswith("//"):
+            break
+        out.append("".join(ch for ch in line if ch.isalpha()))
+    return "".join(out).upper()
+
+
+def _dna_sidecar_sequence(data: bytes) -> str:
+    """Sequence out of a `.dna` byte stream's DNA packet (type 0x00; the
+    first payload byte is topology flags). Cheap — walks the TLV stream
+    without touching the xz-compressed history packet, so the index pass
+    can skip decompression for files that won't match anything."""
+    for ptype, _n, payload in _iter_commercialsaas_packets(data):
+        if ptype == 0x00:
+            return payload[1:].decode("ascii", "replace").upper()
+    return ""
+
+
+def _scan_dna_originals_for_history() -> "dict[str, tuple[int, str, str]]":
+    """``{sequence: (node_count, history_xml, filename)}`` over every saved
+    `.dna` original, keeping the RICHEST history per distinct sequence.
+
+    Two passes on purpose: sequences first (cheap TLV walk), then history
+    extraction only for files whose sequence we actually indexed — the
+    history packet is xz-compressed and decompressing all of them up front
+    is the bulk of the cost. Unreadable files are skipped with a log, never
+    fatal: one corrupt sidecar must not block recovering the rest."""
+    import xml.etree.ElementTree as _ET
+    index: "dict[str, tuple[int, str, str]]" = {}
+    d = _state._DNA_ORIGINALS_DIR
+    try:
+        paths = sorted(p for p in d.glob("*.dna") if p.is_file())
+    except OSError as exc:
+        _log.warning("history recovery: cannot list %s: %s", d, exc)
+        return index
+    if len(paths) > _HISTORY_RECOVER_MAX_SIDECARS:
+        _log.warning("history recovery: %d sidecars exceeds the %d scan "
+                     "bound; scanning the first %d",
+                     len(paths), _HISTORY_RECOVER_MAX_SIDECARS,
+                     _HISTORY_RECOVER_MAX_SIDECARS)
+        paths = paths[:_HISTORY_RECOVER_MAX_SIDECARS]
+    for p in paths:
+        try:
+            data = p.read_bytes()
+            seq = _dna_sidecar_sequence(data)
+            if not seq:
+                continue
+            xml = _extract_commercialsaas_history_xml(data)
+            if not xml:
+                continue
+            n = len(_ET.fromstring(xml).findall(".//Node"))
+        except (OSError, ValueError, _ET.ParseError) as exc:
+            _log.debug("history recovery: skipping %s: %s", p.name, exc)
+            continue
+        prev = index.get(seq)
+        if prev is None or n > prev[0]:
+            index[seq] = (n, xml, p.name)
+    return index
+
+
+def _history_node_count_of_xml(xml: str) -> int:
+    """`<Node>` count in a history XML string; 0 on empty/malformed."""
+    import xml.etree.ElementTree as _ET
+    if not xml:
+        return 0
+    try:
+        return len(_ET.fromstring(xml).findall(".//Node"))
+    except _ET.ParseError:
+        return 0
+
+
+@_agent_endpoint("recover-history-from-dna", write=True)
+def _h_recover_history_from_dna(app, payload):
+    """Restore construction history to plasmids whose saved `.dna`
+    original documents more of their build than the library currently
+    holds. Body: ``{dry_run?: bool, collection?: str, name?: str}``.
+
+    Matching is by EXACT SEQUENCE IDENTITY against the `.dna` originals in
+    the data dir — base-for-base, so a hit means the file describes this
+    exact molecule even if the two are named differently (a plasmid
+    renamed after it was built is the common case). A plasmid is updated
+    only when the source history has STRICTLY MORE nodes than the stored
+    one, so this can never thin an existing lineage.
+
+    **Only ``history_xml`` is written.** Sequence, features, name, id,
+    status and every other field are untouched — the entry count is
+    asserted invariant before the save, on top of `_save_collections`'s
+    own atomic `.bak` chain and shrink guard.
+
+    ``dry_run`` defaults to TRUE: the first call reports what WOULD change
+    and writes nothing. Pass ``{"dry_run": false}`` to apply. ``collection``
+    limits the scan to one collection; ``name`` to a single plasmid.
+
+    Cost note: scans every `.dna` sidecar, so expect seconds on a large
+    library. It's a repair, not a hot path."""
+    dry_run = payload.get("dry_run", True)
+    if not isinstance(dry_run, bool):
+        return ({"error": "'dry_run' must be a boolean"}, 400)
+    coll_filter = None
+    raw_coll = payload.get("collection")
+    if raw_coll not in (None, ""):
+        coll_filter = _normalize_collection_name(raw_coll)
+        if coll_filter is None:
+            return ({"error": "invalid 'collection'"}, 400)
+    name_filter = _sanitize_label(payload.get("name"), max_len=200) or None
+
+    # Dirty-check BEFORE the scan — it reads every `.dna` sidecar, so
+    # doing it first would spend seconds of I/O only to 409.
+    guard = _agent_dirty_guard(app, payload)
+    if guard is not None:
+        return guard
+
+    index = _scan_dna_originals_for_history()
+    if not index:
+        return {"ok": True, "scanned_sidecars": 0, "updated": [],
+                "dry_run": dry_run,
+                "note": "no .dna originals with history found"}
+
+    updated: "list[dict]" = []
+    with _cache_lock:
+        colls = _load_collections()
+        before_counts = [len(c.get("plasmids") or []) for c in colls]
+        for c in colls:
+            cname = c.get("name") or ""
+            if coll_filter is not None and cname != coll_filter:
+                continue
+            for e in (c.get("plasmids") or []):
+                if not isinstance(e, dict):
+                    continue
+                nm = str(e.get("name") or "")
+                if name_filter is not None and nm != name_filter:
+                    continue
+                full = _rehydrate_entry(e)
+                seq = _gb_text_sequence(full.get("gb_text") or "")
+                if not seq:
+                    continue
+                hit = index.get(seq)
+                if hit is None:
+                    continue
+                src_nodes, src_xml, src_file = hit
+                cur_nodes = _history_node_count_of_xml(
+                    full.get("history_xml") or "")
+                if src_nodes <= cur_nodes:
+                    continue
+                # The ONLY mutation. Written inline; the save's dehydrate
+                # step content-addresses it into the blob store and drops
+                # any now-unreferenced old blob at the next GC.
+                if not dry_run:
+                    e["history_xml"] = src_xml
+                    e.pop(_HISTORY_REF_KEY, None)
+                updated.append({
+                    "collection": cname, "name": nm,
+                    "nodes_before": cur_nodes, "nodes_after": src_nodes,
+                    "source": src_file,
+                })
+        if updated and not dry_run:
+            after_counts = [len(c.get("plasmids") or []) for c in colls]
+            if after_counts != before_counts:
+                # Cannot happen — we only assign one field — but this is
+                # user data, so prove it rather than trust it.
+                _log.error("history recovery: entry counts changed "
+                           "(%r -> %r); refusing to save",
+                           before_counts, after_counts)
+                return ({"error": "internal: entry count changed; "
+                                  "nothing was saved"}, 500)
+            if (err := _agent_save_or_500(
+                    lambda: _save_collections(colls),
+                    "collections")) is not None:
+                return err
+            # Re-stage the live mirror if the active collection was touched,
+            # so the running panel + History tab read the recovered lineage
+            # instead of the cached thin one ([INV-83]).
+            active = _get_active_collection_name()
+            if any(u["collection"] == active for u in updated):
+                src = next((c for c in colls
+                            if (c.get("name") or "") == active), None)
+                if src is not None:
+                    _safe_save_json_mirror(
+                        _state._LIBRARY_FILE,
+                        [p for p in (src.get("plasmids") or [])
+                         if isinstance(p, dict)],
+                        "Plasmid library")
+                    _state._library_cache = None
+    if updated and not dry_run:
+        if app is not None and hasattr(app, "call_from_thread"):
+            app.call_from_thread(_agent_refresh_library_panel, app)
+        _log_event("history.recovered", count=len(updated), via="agent")
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "scanned_sidecars": len(index),
+        "updated_count": len(updated),
+        "updated": updated,
+        "ignored": _agent_ignored_keys(
+            payload, {"dry_run", "collection", "name"}),
+    }
+
+
 def _agent_batch_plasmid_keys(payload):
     """Shared front-door for the batch move/copy endpoints: validate
     ``{names|ids: [str,…], to, from?}`` and resolve ``to`` / ``from``.
@@ -108090,7 +108451,11 @@ NcbiTaxonPickerModal { align: center middle; }
             operation=str(getattr(root, "operation", "") or ""),
             n_parents=len(getattr(root, "parents", []) or []),
         )
-        self.push_screen(HistoryScreen(title, root))
+        # Pass the loaded record's bases so the viewer can check the root
+        # node's claims against the actual molecule. READ-ONLY — the
+        # checker never writes a sequence or edits a history record.
+        self.push_screen(HistoryScreen(
+            title, root, str(getattr(rec, "seq", "") or "")))
 
     @_action_log("app.migrate.data")
     def action_migrate_data(self) -> None:
@@ -113240,7 +113605,17 @@ NcbiTaxonPickerModal { align: center middle; }
             self.notify("History is empty.", severity="information")
             return
         title = str(entry.get("name") or entry.get("id") or "?")
-        self.push_screen(HistoryViewerModal(title, root))
+        # The entry's own bases, so the modal can check the root node's
+        # claims against the molecule. Parse failures just mean no check —
+        # never a blocked view. READ-ONLY throughout.
+        try:
+            _seq = str(getattr(
+                _gb_text_to_record(entry.get("gb_text") or ""), "seq", "") or "")
+        except Exception:
+            _seq = ""
+            _log.debug("history: could not read bases for %r; consistency "
+                        "check skipped", entry.get("name"), exc_info=True)
+        self.push_screen(HistoryViewerModal(title, root, _seq))
 
     @on(LibraryPanel.RenameRequested)
     def _library_rename_requested(self, event: LibraryPanel.RenameRequested):

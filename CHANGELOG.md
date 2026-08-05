@@ -14,6 +14,90 @@
 
 ---
 
+## [1.2.47] — 2026-08-04
+
+### New features
+
+- **The History tab now shows everything your `.dna` files recorded.** Imported
+  plasmids carry far more build detail than SpliceCraft was displaying: the
+  conditions each step ran under (the polymerase used, for instance), where
+  every primer actually annealed — position, strand, melting temperature, and
+  the 5′ tail that did *not* anneal, which is the restriction site or overhang
+  the cloning step engineered in — the 5′/3′ end chemistry of each fragment,
+  its sticky ends, the annotation count each intermediate carried, and the
+  source file's own label for a step. None of that was visible before. It was
+  in your files the whole time.
+- **Every kind of manipulation is now named in plain terms.** Steps like
+  Golden Gate assembly, mutagenesis, set-origin, reverse-complement,
+  circularize, linearize, methylation changes and imports used to appear as
+  raw internal codes such as `goldenGateAssembly`; they now read as bench
+  verbs, each with its own symbol in the lineage tree.
+- **Steps say where on the molecule they acted.** A PCR shows the region it
+  amplified, a deletion the bases it removed, an edit the length it changed —
+  in both the lineage tree and the protocol view. The numbers were stored all
+  along and shown nowhere.
+- **A plasmid renamed after it was built now says what it was built as.** The
+  History view labels the earlier name instead of silently opening on a name
+  you may not recognise.
+- **Recover lost build history from your own `.dna` files.** A new
+  `recover-history-from-dna` command finds saved `.dna` originals that are
+  *base-for-base identical* to a plasmid in your library and restores the
+  richer history from them — including across a rename, since the match is on
+  sequence, not name. It only ever adds detail: a source with less history
+  than you already have is ignored, and nothing but the history is written.
+  It reports what it would change before touching anything.
+- **History now tells you when a record doesn't match the DNA.** SpliceCraft
+  checks what each history claims against the actual plasmid — a restriction
+  site the record says was regenerated but that isn't there, a primer that no
+  longer binds where it was recorded (or at all), a step that should not have
+  changed the length but did, a deletion whose arithmetic doesn't balance. If
+  anything doesn't hold up it's flagged at the top of the History view and
+  explained on the step itself. Nothing is corrected on your behalf: your
+  sequences and your history records are never modified to make a warning go
+  away, because a mismatch between them is the thing you need to see.
+- **The history a script or agent reads now matches the app.** `get-history`
+  previously returned six fields per step; it now returns the full record —
+  dates, primers and their binding sites, run conditions, end chemistry and
+  the rest.
+
+### Bug fixes
+
+- **Editing a plasmid's sequence no longer discards its imported history.**
+  Past a size limit, an edit replaced the entire inherited lineage with a
+  single "earlier history truncated" marker — every imported step, gone, on
+  one base change. Large histories now shed only their redundant annotation
+  snapshots, which carry no build information, so the steps themselves always
+  survive. The limit that triggered this was set before histories were stored
+  separately from the library file, and the largest real history sat at 89% of
+  it.
+- **A step marked as recoverable is no longer shown as if it weren't.** Files
+  record this with more than one value, and only one of them was recognised.
+- **An assembly can no longer inherit the wrong plasmid's history.** Inputs
+  were matched to your library by name alone, so a name reused for a different
+  molecule would graft that molecule's entire build record onto the new one.
+  The match now has to agree on length; when it doesn't, the step records the
+  input's name and size honestly rather than inventing a lineage for it.
+- **Merged lineages no longer contain duplicate step identities.** Combining
+  two imported histories renumbered nothing, so both could claim the same
+  step numbers.
+
+### Hardening
+
+- **A malformed `.dna` can't stop History from opening.** A file recording an
+  operation name containing certain punctuation would fail to draw the
+  lineage tree and the protocol at all. Any value now renders as written, and
+  if anything else in a file trips the checks, History still opens and shows
+  you what it could read rather than refusing.
+- **Opening History on a chromosome no longer stalls.** Checking a record
+  against a multi-megabase sequence took most of a second before the view
+  appeared; the sequence checks now stop short of that size and the
+  length-based ones still run. A file padded with thousands of recorded
+  binding sites is bounded too, so it can't hang the pane.
+- **A garbled coordinate can no longer produce a confident wrong answer.** A
+  negative position used to be read from the wrong end of the sequence, which
+  could report a match — or a mismatch — that isn't real. Unreadable and
+  out-of-range positions are now skipped rather than guessed at.
+
 ## [1.2.46] — 2026-07-28
 
 ### New features
