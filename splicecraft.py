@@ -42,7 +42,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.48"
+__version__ = "1.2.49"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -8683,6 +8683,7 @@ from splicecraft_cloning import (  # noqa: E402
 from splicecraft_seqanalysis import (  # noqa: E402
     _find_orfs as _find_orfs,
     _fragment_has_backbone_marker as _fragment_has_backbone_marker,
+    _fragment_backbone_marker_labels as _fragment_backbone_marker_labels,
     _BACKBONE_FEATURE_TYPES as _BACKBONE_FEATURE_TYPES,
     _BACKBONE_LABEL_KEYWORDS as _BACKBONE_LABEL_KEYWORDS,
     _vector_half_top_seq as _vector_half_top_seq,
@@ -33806,7 +33807,7 @@ class OT2LabwarePickerModal(ModalScreen):
             with Horizontal(classes="ot2lw-row"):
                 yield Static("Nickname", classes="ot2lw-lbl")
                 yield Input(value=self._current.get("id", ""),
-                            placeholder="e.g. src  (blank = auto; ignored for tip racks)",
+                            placeholder="e.g. src  (blank = auto)",
                             id="ot2lw-nick")
             with Horizontal(id="ot2lw-btns"):
                 yield Button("Place", id="ot2lw-place", variant="primary",
@@ -34299,7 +34300,7 @@ class AutolabScreen(Screen):
                     with Horizontal(classes="autolab-row"):
                         yield Static("Host", classes="autolab-label")
                         yield Input(value=self._host0,
-                                    placeholder="192.168.1.56   or   opentrons.local",
+                                    placeholder="192.168.1.56 / opentrons.local",
                                     id="autolab-host")
                         yield Button("Status", id="autolab-status",
                                      tooltip="Query the robot's live state — pipette, "
@@ -37550,14 +37551,32 @@ def _pick_insert_fragment(
     # propagate the warning into the user-facing toast / Constructor
     # pane instead of only logging it.
     picked = min(fragments, key=lambda f: len(f.get("top_seq") or ""))
-    if not any(_fragment_has_backbone_marker(f) for f in fragments):
-        sizes = [len(f.get("top_seq") or "") for f in fragments]
+    # Reaching strategy 3 at all means marker evidence FAILED to single out
+    # one fragment, and the pick is therefore a guess. Two ways that happens
+    # and BOTH must warn:
+    #   * no fragment carries a marker (the original case), and
+    #   * EVERY fragment carries one — strategy 1 filters to the fragments
+    #     WITHOUT a marker, so an all-marked digest empties the candidate
+    #     list just as thoroughly as an all-unmarked one.
+    # Pre-2026-08-05 the guard was `if not any(...has_marker...)`, which is
+    # False in the all-marked case — so that half fell through to "smallest"
+    # with no log line and no `_size_fallback_no_marker` flag, meaning the
+    # Constructor's ambiguity warning never fired either. A donor whose
+    # payload half happens to carry an annotated origin (very common — an
+    # "Ori*" or a resistance cassette on both halves) silently cloned the
+    # WRONG half, and the only symptom was a product of the wrong size.
+    # Single-fragment input is not ambiguous: there's nothing to choose.
+    if len(fragments) > 1:
+        sizes    = [len(f.get("top_seq") or "") for f in fragments]
+        n_marked = sum(1 for f in fragments
+                       if _fragment_has_backbone_marker(f))
         _log.warning(
-            "_pick_insert_fragment: no backbone markers on any "
-            "fragment; falling back to smallest (sizes=%r). The "
-            "picked fragment may not be the biological insert — "
-            "library entry likely missing rep_origin / antibiotic "
-            "resistance annotations.", sizes,
+            "_pick_insert_fragment: backbone markers did not single out "
+            "one fragment (%d of %d carry a marker); falling back to "
+            "smallest (sizes=%r). The picked fragment may not be the "
+            "biological insert — check the library entry's rep_origin / "
+            "antibiotic-resistance annotations.", n_marked, len(fragments),
+            sizes,
         )
         # 2026-05-27 (audit-5 GB H2): mutate the IN-PLACE fragment
         # dict (NOT a fresh copy) so downstream callers that do
@@ -37598,14 +37617,22 @@ def _pick_backbone_fragment(fragments: list[dict]) -> "dict | None":
     if len(backbone_candidates) == 1:
         return backbone_candidates[0]
     picked = max(fragments, key=lambda f: len(f.get("top_seq") or ""))
-    if not backbone_candidates:
+    # Mirror `_pick_insert_fragment`: falling through to size means marker
+    # evidence was INCONCLUSIVE, which covers both "no fragment is marked"
+    # AND "several are" (`len(backbone_candidates) != 1`). The old guard
+    # `if not backbone_candidates` stayed silent in the several-marked case
+    # — the common one for a real vector, where the tiny stuffer between two
+    # MCS cuts still carries a slice of the annotated origin, so BOTH halves
+    # look like backbone. Warn whenever the choice was made by size.
+    if len(fragments) > 1 and len(backbone_candidates) != 1:
         sizes = [len(f.get("top_seq") or "") for f in fragments]
         _log.warning(
-            "_pick_backbone_fragment: no backbone markers on any "
-            "fragment; falling back to largest (sizes=%r). The "
-            "picked fragment may not be the biological backbone — "
-            "library entry likely missing rep_origin / antibiotic "
-            "resistance annotations.", sizes,
+            "_pick_backbone_fragment: backbone markers did not single out "
+            "one fragment (%d of %d carry a marker); falling back to "
+            "largest (sizes=%r). The picked fragment may not be the "
+            "biological backbone — check the library entry's rep_origin / "
+            "antibiotic-resistance annotations.",
+            len(backbone_candidates), len(fragments), sizes,
         )
         # Mirror `_pick_insert_fragment`: stamp the ambiguity on the
         # picked fragment so the cloning Simulate can surface a
@@ -46683,7 +46710,7 @@ class PrimerEditModal(_OneShotDismissScreen, ModalScreen):
                         prompt="Restriction site",
                         disabled=True,
                     )
-                    yield Input(placeholder="custom bases (5'→3')",
+                    yield Input(placeholder="bases (5'→3')",
                                  id="primedit-custom-prefix",
                                  disabled=True)
                     yield Button("+ Apply", id="btn-primedit-prefix-apply",
@@ -77779,6 +77806,55 @@ class TraditionalCloningPane(Vertical):
                 "the fragment selector; a large insert can otherwise be "
                 "mistaken for the backbone."
             )
+        # ── "That's the donor's backbone, not its payload" ──────────────
+        # The user DESIGNATED a destination vector, so that plasmid's origin
+        # + selection marker define the product's backbone. Any insert
+        # fragment that ALSO carries an origin / resistance marker is the
+        # donor's own backbone half — ligating it yields a dual-origin,
+        # dual-marker plasmid and leaves the cassette the user actually
+        # wanted behind in the tube.
+        #
+        # Why this needs to be LOUD (reported 2026-08-05): cut a donor and a
+        # vector with the SAME enzyme pair and the donor's two halves come
+        # off the circle with MIRRORED overhangs — payload reads
+        # BamHI→…→XbaI while the backbone half reads XbaI→…→BamHI. Only one
+        # of them matches the vector in the FORWARD orientation, and it is
+        # pure coin-flip which. Here the payload ligated only in REVERSE, so
+        # the results pane led with "Forward ✗ no ligation"; read as "this
+        # fragment can't be cloned", the user switched to the half that did
+        # ligate forward and saved a construct carrying the donor's
+        # resistance cassette instead of the expression circuit. Both halves
+        # are chemically valid products, so no error fires — only naming the
+        # marker distinguishes them.
+        # Cap at 3 rows. A long lane where every donor is marker-bearing
+        # would otherwise bury the ligation result under a wall of identical
+        # paragraphs — and a warning nobody reads is a warning that doesn't
+        # work. The count tells the user the rest exist.
+        _marked: list[tuple[str, list[str]]] = []
+        for spec, frag in zip(inputs["lane"], insert_frags):
+            if not isinstance(frag, dict):
+                continue
+            marks = _fragment_backbone_marker_labels(frag)
+            if marks:
+                _marked.append((str(spec.get("name") or "An insert"), marks))
+        if len(_marked) > 3:
+            outcome.setdefault("warnings", []).append(
+                f"{len(_marked)} of the lane's inserts carry backbone markers "
+                f"(origin / resistance) — showing the first 3. Each is "
+                f"usually the donor's OWN backbone half rather than its "
+                f"payload; check the fragment selector on each row."
+            )
+        for _name, marks in _marked[:3]:
+            outcome.setdefault("warnings", []).append(
+                f"{_name} fragment carries "
+                f"backbone markers ({', '.join(marks[:4])}) — that is "
+                f"usually the donor's OWN backbone half, not the payload. "
+                f"The destination vector already supplies the origin and "
+                f"selection marker, so this product would carry two of "
+                f"each. If you meant the other half, switch it with the "
+                f"fragment selector (and use ↕ Flip, or Save Reverse, if "
+                f"only the reverse orientation ligates)."
+            )
         self.app.call_from_thread(
             self._apply_trad_simulate_result, outcome
         )
@@ -78111,19 +78187,47 @@ class TraditionalCloningPane(Vertical):
         fwd = outcome["forward"]
         rev = outcome["reverse"]
         lines: list[str] = []
+        # Lead with the orientation that actually ligates. The pane used to
+        # open with "Forward orientation / ✗ no ligation" whatever the
+        # chemistry said, and a directional result reads as a REJECTED
+        # FRAGMENT at a glance — which is how a correct payload got
+        # abandoned in favour of the donor's resistance half (2026-08-05).
+        # A fragment excised from a circle carries its two overhangs in
+        # whichever order the circle happened to present them, so "only
+        # reverse ligates" is an ordinary, expected outcome, not a fault in
+        # the fragment. Say which button to press.
+        fwd_ok = bool(fwd.get("compatible", False))
+        rev_ok = bool(rev.get("compatible", False))
+        if rev_ok != fwd_ok:
+            which = "REVERSE" if rev_ok else "FORWARD"
+            btn   = "Save Reverse" if rev_ok else "Save Forward"
+            lines.append(f"[b green]→ Ligates as {which} — use “{btn}”.[/]")
+            lines.append(
+                "[dim]  Directional cloning: the insert only fits this "
+                "vector one way round. Normal — not a bad fragment.[/]")
+            lines.append("")
         lines.append("[b]Forward orientation[/]")
         lines.append(self._product_summary(fwd))
         lines.append("")
         lines.append("[b]Reverse orientation[/]")
         lines.append(self._product_summary(rev))
+        # ESCAPE the messages. They interpolate user-controlled text —
+        # plasmid / lane-row names and, since 2026-08-05, the feature LABELS
+        # that identified a backbone marker. `Static` interprets Rich markup,
+        # so a perfectly ordinary label like "TU [draft]" or "AmpR [old]"
+        # parses as an unclosed tag and swallows the rest of the warning (or
+        # raises MarkupError and blanks the pane). Same hygiene as
+        # RenamePlasmidModal's status line. The messages carry no intentional
+        # markup of their own — the colour tags are added out here.
+        from rich.markup import escape as _md_escape
         if outcome["warnings"]:
             lines.append("")
             for w in outcome["warnings"]:
-                lines.append(f"[yellow]⚠ {w}[/]")
+                lines.append(f"[yellow]⚠ {_md_escape(str(w))}[/]")
         if outcome["errors"]:
             lines.append("")
             for e in outcome["errors"]:
-                lines.append(f"[red]✗ {e}[/]")
+                lines.append(f"[red]✗ {_md_escape(str(e))}[/]")
         results.update("\n".join(lines))
         # Enable Save buttons only for orientations that actually
         # ligate. Save can still be useful on a non-compatible
@@ -102638,7 +102742,34 @@ ModalScreen > * { max-width: 100%; max-height: 100%; }
 /* ── Scrollbars — one consistent theme app-wide ───────────── */
 /* Nothing set scrollbar colours, so every scrollbar fell back to the
    bare default. Pin a single slim style so DataTables, the synthesis
-   / protein editors, and modal bodies all match. */
+   / protein editors, and modal bodies all match.
+
+   DO NOT add `scrollbar-size-horizontal` back to this `*` rule.
+   Textual's own default for it is ALREADY 1, so declaring it here
+   changed nothing anywhere — except on the widgets that deliberately
+   set it to 0, which it silently clobbered (App CSS always outranks a
+   widget's DEFAULT_CSS, whatever the specificity). The casualties:
+
+     • `Input` — height 3 = 1 border + 1 CONTENT row + 1 border. Type a
+       value longer than the box and the resurrected h-scrollbar ate
+       that single content row, so the field rendered as a solid bar
+       with the text nowhere to be seen: you could neither read the
+       value nor see what you were typing. Reported on the Rename
+       plasmid dialog, but it hit EVERY Input in the app.
+     • `Footer` — a ScrollableContainer pinned to `height: 1`. Enough
+       key bindings to overflow and the scrollbar consumed the whole
+       footer.
+     • `MarkdownFence` — Help / What's New / notes code blocks grew a
+       stray scrollbar row under every fence.
+     • `_MenuBarScroll` — already had to re-zero itself via the
+       higher-specificity `#menubar-scroll` rule below to escape this.
+
+   `scrollbar-size-vertical: 1` DOES earn its place (Textual's default
+   is 2) and is safe: none of the widgets above can scroll vertically
+   (Input/Footer are single-row, MarkdownFence is `overflow: … hidden`).
+   Containers that genuinely want a horizontal scrollbar ask for it
+   themselves — see #syn-toolbar, #flib-btns, #parts-btns, #pd-lib-btns.
+   Guarded by tests/test_ui_layout.py::test_star_rule_does_not_force_hscrollbar. */
 * {
     scrollbar-background: $surface-darken-1;
     scrollbar-background-hover: $surface-darken-1;
@@ -102646,7 +102777,6 @@ ModalScreen > * { max-width: 100%; max-height: 100%; }
     scrollbar-color-hover: $primary;
     scrollbar-color-active: $accent;
     scrollbar-size-vertical: 1;
-    scrollbar-size-horizontal: 1;
 }
 
 /* ── Radio buttons — consistent selected highlight ────────── */
@@ -103350,11 +103480,24 @@ ColorPickerModal { align: center middle; }
 
 /* ── Rename plasmid dialog ───────────────────────────────── */
 RenamePlasmidModal { align: center middle; }
+/* width 76, not 60: a real plasmid name is long ("PHASE 64 SPEC
+   pACYC-Pfoo-6xBarBaz-TERM123" is 49 chars before the prefix), and
+   Textual's Input spends 6 of its columns on border + padding. At 60 the
+   "Current name:" line was CLIPPED mid-name and the field held 48 chars,
+   so the very names this dialog exists to edit couldn't be read in it.
+   max-width keeps it honest on a narrow terminal (ModalScreen > * caps at
+   100%). `#rename-current` wraps instead of truncating — a name that
+   outgrows even 76 columns is still readable in full, on two lines. */
 #rename-dlg {
-    width: 60; height: auto;
+    width: 76; max-width: 100%; height: auto;
     background: $surface; border: solid $primary; padding: 1 2;
 }
 #rename-title  { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; text-align: center; }
+/* width 1fr is what makes it WRAP. A Label defaults to `width: auto`, so it
+   sizes to its text and simply overflows the dialog — the name got sliced
+   off at the border with no ellipsis and no way to see the rest. Bounding
+   the width lets Textual reflow onto a second line instead. */
+#rename-current { width: 1fr; height: auto; margin-bottom: 1; }
 #rename-input  { margin-top: 0; margin-bottom: 1; }
 #rename-status { height: 1; color: $text-muted; }
 #rename-btns   { align: center middle;  height: 3; margin-top: 1; }

@@ -14,6 +14,69 @@
 
 ---
 
+## [1.2.49] — 2026-08-05
+
+### Bug fixes
+
+- **Text boxes went blank once you typed past the end of the field.** Every
+  text box in the app is three rows tall — a border, one row for your text,
+  and another border. A styling rule meant to give the app one consistent
+  scrollbar look was also switching *on* the horizontal scrollbar that text
+  boxes deliberately switch off, and that scrollbar took the one row your
+  text lives on. The result: a solid blue bar where the value should be, with
+  no way to read what was there or see what you were typing. It affected
+  every text box in the app, and showed up the moment a value outgrew its
+  box — so it bit hardest on exactly the long plasmid names you most need to
+  read. The same rule was also stealing the footer's only row and adding a
+  stray scrollbar under code blocks in Help and What's New.
+- **The Rename plasmid dialog now fits a real plasmid name.** It was 60
+  columns wide, which left 48 for the name — so the "Current name" line was
+  sliced off mid-name with no ellipsis, and the box itself couldn't show a
+  full-length name. The dialog is wider now, and the current name wraps onto
+  a second line instead of being cut off.
+- **Cloning could quietly build the wrong construct.** When a donor plasmid
+  and its destination vector are cut with the same pair of enzymes, the
+  donor's two halves come off the circle with their sticky ends in *opposite*
+  order — so only one of them drops into the vector "forwards", and which one
+  is pure chance. The results pane always led with "Forward orientation — no
+  ligation", which reads as *this fragment is unusable*; switching to the
+  half that did ligate forwards gave a perfectly valid plasmid carrying the
+  donor's antibiotic-resistance cassette instead of the payload you wanted.
+  Three changes: the results now **lead with the orientation that actually
+  works** and name the button to press; picking a fragment that carries an
+  origin or resistance marker now **warns that it's the donor's own backbone,
+  not its payload**, and names the marker it found; and "only reverse
+  ligates" is spelled out as a normal directional result rather than a
+  failure.
+- **`ermB` is now recognised as a selection marker.** The standard
+  Gram-positive resistance gene — the selection on common shuttle vectors —
+  was missing from the marker vocabulary, so a backbone carrying it looked
+  marker-free and the insert/backbone choice fell back to guessing by
+  fragment size. Marker names too short to match safely (`ermB`, `cat`,
+  `bla`, `nptII`, …) are matched as whole words on gene features only, so a
+  promoter or primer that merely *mentions* a marker no longer counts as one.
+- **A fragment choice made by size now always says so.** The "I had to guess
+  which half is the backbone" warning only appeared when *no* fragment
+  carried a marker. When *every* fragment carried one — common, since a
+  vector's small stuffer piece often includes a slice of the annotated
+  origin — the choice fell back to size in complete silence.
+
+### Hardening
+
+- **A square bracket in a plasmid or feature name can't garble a cloning
+  warning.** The Constructor's results box formats its text with markup, and
+  a perfectly ordinary name like `TU [draft]` reads as an unfinished
+  instruction — swallowing the rest of the message, or blanking the box
+  outright. Names are now quoted before display, so they show as written.
+- **An enormous feature label can't swamp the results box.** Imported
+  GenBank files can carry very long labels; a name quoted in a warning is
+  now trimmed to a readable length.
+- **A long assembly lane can't bury its own result.** If several inserts in
+  one run carry backbone markers, the warnings are summarised with a count
+  instead of repeating a paragraph per row.
+
+---
+
 ## [1.2.48] — 2026-08-05
 
 ### Hardening

@@ -2321,6 +2321,14 @@ _SELECTION_MARKER_KEYWORDS: "tuple[tuple[str, str], ...]" = (
     ("gmr",            "Gentamicin"),
     ("erythromycin",   "Erythromycin"),
     ("ermr",           "Erythromycin"),
+    # ermB/ermC are the standard Gram-positive MLS markers and the actual
+    # selection on common Lactobacillus/Lactococcus shuttle vectors — but
+    # only "ermr" was listed, and matching is whole-token, so a backbone
+    # labelled "ermB" reported NO marker at all (found 2026-08-05).
+    ("erm",            "Erythromycin"),
+    ("ermb",           "Erythromycin"),
+    ("ermc",           "Erythromycin"),
+    ("ermam",          "Erythromycin"),
     ("bla",            "Ampicillin"),   # last — matches "bla" alone
 )
 

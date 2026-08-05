@@ -3823,6 +3823,7 @@ class RenamePlasmidModal(_OneShotDismissScreen, ModalScreen):
             # status line + the History viewer's parent-name render.
             yield Label(
                 f"Current name:  {_md_escape(self.current_name)}",
+                id="rename-current",
             )
             yield Label("New name:")
             yield Input(

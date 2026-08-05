@@ -21,6 +21,8 @@ Re-exported by the hub so `sc.<name>` + every call site resolves unchanged.
 """
 from __future__ import annotations
 
+import re
+
 import splicecraft_state as _state
 from splicecraft_biology import _rc, _enzyme_cuts
 from splicecraft_codon import _CODON_TABLE, _STOP_CODONS
@@ -181,6 +183,53 @@ _BACKBONE_LABEL_KEYWORDS: tuple[str, ...] = (
 )
 
 
+# Resistance genes whose names are too SHORT to substring-match safely.
+# Checked as whole tokens (split on non-alphanumerics), never as substrings:
+#   * "erm" inside "T-erm-inator" / "T-erm 908" — terminators are on nearly
+#     every construct, so substring "erm" would mark practically any fragment
+#     as backbone and silently disable the whole heuristic.
+#   * "cat" inside "category", "bla" inside "blast", "neo" inside "neomycin
+#     phosphotransferase-like" — the same false-positive class that pushed
+#     `_detect_selection_marker` to token matching in sweep #34.
+# ermB/ermC are the reason this exists (found 2026-08-05): a very common
+# Gram-positive selection marker that BOTH this predicate and
+# `_SELECTION_MARKER_KEYWORDS` (which only lists "ermr") failed to recognise,
+# so a shuttle-vector backbone carrying it read as marker-free and the
+# insert/backbone pick silently fell back to fragment size.
+#
+# Only consulted on feature types that actually ENCODE a gene. Verified
+# against real annotated vectors: a genuine marker is `gene`/`CDS`, whereas
+# the tokens leak into other types as references TO a gene rather than the
+# gene itself —
+#     regulatory   /label="as_annotated_pXX-ermB"   (a promoter, annotated
+#                                                    after another plasmid)
+#     primer_bind  /label="ermB-CLO-F"              (an oligo that anneals
+#                                                    near ermB)
+# Both tokenise to include "ermb" and would mark a payload fragment as
+# backbone, which is worse than not knowing ermB at all: it makes BOTH halves
+# look like backbone and collapses the pick back to raw fragment size. The
+# long-form substring keywords above are unrestricted (unchanged behaviour) —
+# they're specific enough not to need this guard.
+_BACKBONE_TOKEN_FEATURE_TYPES: frozenset[str] = frozenset({"cds", "gene"})
+
+_BACKBONE_TOKEN_KEYWORDS: frozenset[str] = frozenset({
+    "erm", "ermb", "ermc", "ermam", "erma", "ermg",      # erythromycin / MLS
+    "bla", "cat", "aada", "aac", "aph",                  # amp / cm / spec / gent
+    "neo", "neor", "nptii", "kan",                       # kanamycin / neomycin
+    "smr", "hyg", "hygr", "hph",                         # spec / hygromycin
+    "zeo", "zeor", "ble", "gmr", "gent",                 # zeocin / gentamicin
+    "tetm", "teta", "tetl",                              # tetracycline
+    "puror", "pac", "sh", "nat1",                        # puromycin / nourseo.
+})
+
+
+def _label_tokens(label: str) -> "set[str]":
+    """Lowercased alphanumeric tokens of a feature label. Mirrors
+    `_detect_selection_marker`'s tokeniser so both marker checks agree on
+    what counts as a whole word."""
+    return {t.lower() for t in re.split(r"[^A-Za-z0-9]+", label) if t}
+
+
 def _fragment_has_backbone_marker(frag: dict) -> bool:
     """Return True iff ``frag``'s features include a typical
     bacterial-backbone marker (origin of replication or antibiotic
@@ -205,7 +254,47 @@ def _fragment_has_backbone_marker(frag: dict) -> bool:
         for kw in _BACKBONE_LABEL_KEYWORDS:
             if kw in label:
                 return True
+        # Short gene names, matched as whole tokens on gene-bearing feature
+        # types only — see `_BACKBONE_TOKEN_KEYWORDS` for why neither the
+        # substring form nor the unrestricted form is safe.
+        if (ftype in _BACKBONE_TOKEN_FEATURE_TYPES
+                and _label_tokens(label) & _BACKBONE_TOKEN_KEYWORDS):
+            return True
     return False
+
+
+def _fragment_backbone_marker_labels(frag: dict) -> "list[str]":
+    """The feature names that make `_fragment_has_backbone_marker` say True,
+    de-duplicated in first-seen order (empty list when it says False).
+
+    Same matching rules as the predicate — this only reports WHICH features
+    tripped it. Lets a caller say "carries AmpR, Ori*", which reads as a
+    diagnosis, instead of "carries a backbone marker", which reads as noise
+    the user has no way to act on."""
+    if not isinstance(frag, dict):
+        return []
+    out: list[str] = []
+    for f in (frag.get("features") or []):
+        if not isinstance(f, dict):
+            continue
+        ftype = str(f.get("type") or "").lower()
+        # Clamp: a label is user-controlled and can be arbitrarily long
+        # (imported GenBank happily carries multi-line /note text). These
+        # names go straight into a one-line warning, so cap them here rather
+        # than letting one pathological label swamp the results pane.
+        label = str(f.get("label") or "").strip()[:80]
+        hit = (
+            ftype in _BACKBONE_FEATURE_TYPES
+            or any(kw in label.lower() for kw in _BACKBONE_LABEL_KEYWORDS)
+            or (ftype in _BACKBONE_TOKEN_FEATURE_TYPES
+                and bool(_label_tokens(label) & _BACKBONE_TOKEN_KEYWORDS))
+        )
+        if not hit:
+            continue
+        name = label or ftype
+        if name and name not in out:
+            out.append(name)
+    return out
 
 
 def _ev_frag_input_features(record) -> "list[dict]":

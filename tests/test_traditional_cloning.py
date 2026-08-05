@@ -2478,3 +2478,426 @@ class TestClonePartWrapperFeature:
                  for n in (f.qualifiers.get("note") or [])]
         assert any(n.startswith("GB part type:") for n in notes), \
             "featureless part lost its single-span wrapper"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Fragment-pick ambiguity + "that's the donor's backbone" guard
+#
+# Field report 2026-08-05: cloning a payload out of a donor and into a
+# designated destination vector produced a construct carrying the DONOR's
+# resistance cassette instead of the expression circuit.
+#
+# Mechanism (all three parts had to line up):
+#   1. Cut donor and vector with the SAME enzyme pair and the donor's two
+#      halves come off the circle with MIRRORED overhangs — the payload
+#      reads BamHI→…→XbaI while the backbone half reads XbaI→…→BamHI. Only
+#      one of them matches the vector in the FORWARD orientation, and which
+#      one is a coin flip. Here the payload ligated only in REVERSE.
+#   2. The results pane always led with "Forward orientation / ✗ no
+#      ligation", which reads as a REJECTED FRAGMENT at a glance.
+#   3. Switching to the half that DID ligate forward produced a perfectly
+#      valid — and biologically wrong — plasmid, with no warning at all.
+#
+# Plus a latent hole found while tracing it: both pickers filter on the
+# backbone-marker predicate and fall back to size when the filter doesn't
+# leave exactly one candidate, but only warned when NO fragment carried a
+# marker. An ALL-marked digest (very common: a vector's tiny inter-MCS
+# stuffer still carries a slice of the annotated origin) emptied the
+# candidate list just as thoroughly and fell through in total silence.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _frag(nbp: int, labels: list[str], ftype: str = "misc_feature") -> dict:
+    """A minimal fragment dict — only the fields the pickers read."""
+    return {"top_seq": "A" * nbp,
+            "features": [{"start": 0, "end": 3, "type": ftype,
+                          "label": lb} for lb in labels]}
+
+
+class TestFragmentPickAmbiguity:
+    def test_all_fragments_marked_is_flagged_ambiguous(self):
+        """The silent hole. Both halves carry a marker => the marker filter
+        leaves ZERO candidates => the pick is made by size and MUST say so."""
+        small, big = _frag(500, ["AmpR"]), _frag(4000, ["p15A ori"])
+        picked = sc._pick_insert_fragment([small, big])
+        assert picked is small                      # size fallback: smallest
+        assert picked.get("_size_fallback_no_marker") is True, (
+            "an all-marked digest fell back to size with no ambiguity flag — "
+            "the Constructor's warning never fires and the wrong half clones "
+            "silently"
+        )
+
+    def test_no_fragments_marked_still_flagged(self):
+        """The case that already worked — must keep working."""
+        small, big = _frag(500, ["geneA"]), _frag(4000, ["geneB"])
+        picked = sc._pick_insert_fragment([small, big])
+        assert picked is small
+        assert picked.get("_size_fallback_no_marker") is True
+
+    def test_exactly_one_marked_is_unambiguous(self):
+        """Marker evidence resolved it — no fallback, so no warning noise."""
+        payload, backbone = _frag(4000, ["geneA"]), _frag(500, ["AmpR"])
+        picked = sc._pick_insert_fragment([payload, backbone])
+        assert picked is payload, "marker evidence must beat the size heuristic"
+        assert "_size_fallback_no_marker" not in picked
+
+    def test_backbone_pick_flags_all_marked(self):
+        """`_pick_backbone_fragment`'s mirror of the same hole: several
+        candidates is just as inconclusive as none."""
+        stuffer = _frag(40, ["p15A ori"])
+        backbone = _frag(6000, ["ermB"], ftype="gene")
+        picked = sc._pick_backbone_fragment([stuffer, backbone])
+        assert picked is backbone                   # size fallback: largest
+        assert picked.get("_size_fallback_no_marker") is True
+
+    def test_backbone_pick_unambiguous_when_one_marked(self):
+        payload, backbone = _frag(4000, ["geneA"]), _frag(500, ["KanR"])
+        picked = sc._pick_backbone_fragment([payload, backbone])
+        assert picked is backbone
+        assert "_size_fallback_no_marker" not in picked
+
+    def test_single_fragment_is_never_ambiguous(self):
+        """Nothing to choose between — don't cry wolf."""
+        only = _frag(500, ["AmpR"])
+        assert sc._pick_insert_fragment([only]) is only
+        assert "_size_fallback_no_marker" not in only
+
+
+class TestBackboneMarkerLabels:
+    def test_names_the_markers_it_matched(self):
+        frag = _frag(500, ["Ori*", "AmpR", "AmpR promoter", "geneA"])
+        labels = sc._fragment_backbone_marker_labels(frag)
+        assert labels == ["Ori*", "AmpR", "AmpR promoter"]
+        assert "geneA" not in labels
+
+    def test_empty_when_predicate_is_false(self):
+        frag = _frag(500, ["geneA", "terminator"])
+        assert sc._fragment_backbone_marker_labels(frag) == []
+        assert sc._fragment_has_backbone_marker(frag) is False
+
+    def test_agrees_with_the_predicate(self):
+        """The list is the predicate's evidence — they must never disagree."""
+        for labels in (["AmpR"], ["geneA"], ["Ori*", "x"], [], ["rep_origin"]):
+            frag = _frag(100, labels)
+            assert bool(sc._fragment_backbone_marker_labels(frag)) is \
+                sc._fragment_has_backbone_marker(frag), labels
+
+    def test_matches_on_feature_type_with_no_label(self):
+        frag = {"top_seq": "A" * 100,
+                "features": [{"start": 0, "end": 3, "type": "rep_origin",
+                              "label": ""}]}
+        assert sc._fragment_has_backbone_marker(frag) is True
+        assert sc._fragment_backbone_marker_labels(frag) == ["rep_origin"]
+
+
+class TestMirroredOverhangsAreDirectional:
+    """The chemistry behind the field report, on synthetic sequence: the two
+    halves of a doubly-cut circle carry their overhangs in OPPOSITE order,
+    so exactly one of them ligates 'forward' into a like-cut vector. Both
+    are valid products — only which DNA rides along differs."""
+
+    def test_both_halves_ligate_but_in_opposite_orientations(self):
+        # 40 bp circle, EcoRI at 4 and BamHI at 18 => two halves.
+        donor = "AAAAGAATTCAAAAAAAAGGATCCAAAAAAAAAAAAAAAA"
+        frags, err = sc._excise_fragment_pair(
+            donor, ["EcoRI", "BamHI"], circular=True,
+            features=[{"start": 11, "end": 17, "type": "CDS",
+                       "label": "payload"},
+                      {"start": 30, "end": 38, "type": "CDS",
+                       "label": "AmpR"}],
+            source_label="donor")
+        assert err is None and len(frags) == 2
+        # Mirrored ends is the whole point — assert it explicitly.
+        a, b = frags
+        assert (a["left"]["overhang_seq"], a["right"]["overhang_seq"]) == \
+               (b["right"]["overhang_seq"], b["left"]["overhang_seq"]), \
+            "halves of a doubly-cut circle should carry mirrored overhangs"
+        vector = sc._pick_backbone_fragment(list(frags))
+        # Each half ligates into that vector in exactly ONE orientation, and
+        # they disagree about which — the trap the user fell into.
+        seen = []
+        for f in frags:
+            out = sc._simulate_traditional_cloning(f, vector)
+            fwd = out["forward"]["compatible"]
+            rev = out["reverse"]["compatible"]
+            assert fwd != rev, "expected a directional (one-way) result"
+            assert not out["errors"], out["errors"]
+            seen.append(fwd)
+        assert seen[0] != seen[1], (
+            "the two halves should prefer OPPOSITE orientations — that is "
+            "why 'Forward ✗' on the right fragment must not read as 'this "
+            "fragment cannot be cloned'"
+        )
+
+
+class TestBackboneMarkerVocabulary:
+    """Short resistance-gene names must match as WHOLE TOKENS, never as
+    substrings — and the vocabulary has to actually cover the markers real
+    shuttle vectors use.
+
+    Found 2026-08-05: `ermB` (the standard Gram-positive MLS marker, and the
+    selection on common Gram-positive shuttle vectors) was absent from both
+    this predicate's keywords and `_SELECTION_MARKER_KEYWORDS`. A backbone
+    carrying it read as marker-free, so insert/backbone selection fell back
+    to fragment size with nothing logged."""
+
+    @pytest.mark.parametrize("label", ["ermB", "ermC", "erm", "ErmB",
+                                       "ermB resistance", "MLS (ermAM)"])
+    def test_erm_family_is_a_backbone_marker(self, label):
+        frag = _frag(500, [label], ftype="gene")
+        assert sc._fragment_has_backbone_marker(frag) is True, \
+            f"{label!r} not recognised as a selection marker"
+
+    @pytest.mark.parametrize("label", [
+        "Terminator", "Term 908", "Lambda T0 Terminator",
+        "T7 terminator", "rrnB T1 terminator",
+    ])
+    def test_terminators_are_not_backbone_markers(self, label):
+        """The reason "erm" can't be a substring: every construct has a
+        terminator, and marking them all would disable the heuristic."""
+        frag = _frag(500, [label], ftype="gene")
+        assert sc._fragment_has_backbone_marker(frag) is False, \
+            f"{label!r} false-positived as a backbone marker"
+
+    @pytest.mark.parametrize("label", ["category", "blast hit", "catalase"])
+    def test_short_name_substrings_do_not_false_positive(self, label):
+        frag = _frag(500, [label], ftype="gene")
+        assert sc._fragment_has_backbone_marker(frag) is False
+
+    @pytest.mark.parametrize("label", ["cat", "bla", "aadA", "nptII"])
+    def test_short_names_match_as_whole_tokens(self, label):
+        frag = _frag(500, [label], ftype="gene")
+        assert sc._fragment_has_backbone_marker(frag) is True
+
+    @pytest.mark.parametrize("ftype,label", [
+        # Real annotations from the field report. Both mention a marker but
+        # neither IS one — a promoter annotated after another plasmid, and
+        # oligos that anneal near the gene. Marking these tagged the PAYLOAD
+        # half as backbone, which made both halves look like backbone and
+        # collapsed the pick back to raw fragment size.
+        ("regulatory",  "as_annotated_pXX-ermB"),
+        ("primer_bind", "ermB-CLO-F"),
+        ("primer_bind", "PermB-CLO-R"),
+        ("primer_bind", "PROM ermB"),
+        ("misc_feature", "ermB homology arm"),
+    ])
+    def test_gene_name_outside_a_gene_feature_is_not_a_marker(
+            self, ftype, label):
+        frag = _frag(500, [label], ftype=ftype)
+        assert sc._fragment_has_backbone_marker(frag) is False, (
+            f"{ftype} /label={label!r} read as a backbone marker — it names "
+            f"something NEAR the gene, not the gene"
+        )
+
+    @pytest.mark.parametrize("ftype", ["gene", "CDS"])
+    def test_real_marker_gene_is_matched(self, ftype):
+        frag = _frag(500, ["ermB"], ftype=ftype)
+        assert sc._fragment_has_backbone_marker(frag) is True
+
+    def test_long_form_keywords_ignore_feature_type(self):
+        """The pre-existing substring keywords are specific enough that they
+        stay unrestricted — don't narrow them and lose coverage."""
+        for ftype in ("misc_feature", "regulatory", "CDS"):
+            assert sc._fragment_has_backbone_marker(
+                _frag(500, ["AmpR"], ftype=ftype)) is True
+            assert sc._fragment_has_backbone_marker(
+                _frag(500, ["p15A ori"], ftype=ftype)) is True
+
+    def test_cloning_mirror_agrees(self):
+        """`splicecraft_cloning._frag_carries_backbone_marker` is a hand-kept
+        copy (L3 can't import seqanalysis — import cycle). Drift between the
+        two means the Constructor and the modular resolver disagree about
+        which half is the backbone."""
+        import splicecraft_cloning as scc
+        cases = [("gene", ["ermB"]), ("gene", ["Terminator"]),
+                 ("misc_feature", ["AmpR"]), ("misc_feature", ["p15A ori"]),
+                 ("gene", ["cat"]), ("gene", ["category"]),
+                 ("CDS", ["geneA"]), ("rep_origin", [""]),
+                 ("regulatory", ["as_annotated_pXX-ermB"]),
+                 ("primer_bind", ["ermB-CLO-F"]),
+                 ("gene", ["Term 908"]), ("CDS", ["nptII"]),
+                 ("misc_feature", ["blast"])]
+        for ftype, labels in cases:
+            frag = _frag(100, labels, ftype=ftype)
+            assert scc._frag_carries_backbone_marker(frag) is \
+                sc._fragment_has_backbone_marker(frag), \
+                f"marker mirrors disagree on {ftype} {labels!r}"
+
+    def test_detect_selection_marker_knows_erm(self):
+        """The user-visible marker name must resolve too — not just the
+        internal backbone heuristic."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+
+        rec = SeqRecord(Seq("ACGT" * 100), id="pShuttle", name="pShuttle")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        rec.features.append(SeqFeature(
+            FeatureLocation(10, 100), type="CDS",
+            qualifiers={"label": ["ermB"]}))
+        assert sc._detect_selection_marker(
+            sc._record_to_gb_text(rec)) == "Erythromycin"
+
+
+class TestResultsPaneHardening:
+    """The results pane interpolates user-controlled text — lane-row names and
+    the feature LABELS naming a backbone marker — into a `Static`, which
+    interprets Rich markup. An ordinary label like "TU [draft]" parses as an
+    unclosed tag: it swallows the rest of the message, or raises MarkupError
+    and blanks the pane outright."""
+
+    @staticmethod
+    def _outcome(warning: str) -> dict:
+        return {
+            "forward": {"top_seq": "A" * 100, "features": [],
+                        "compatible": True},
+            "reverse": {"top_seq": "A" * 100, "features": [],
+                        "compatible": False},
+            "warnings": [warning],
+            "errors": [],
+        }
+
+    @pytest.mark.parametrize("hostile", [
+        "insert TU [draft] carries markers",
+        "AmpR [old] / Ori* [v2]",
+        "unclosed [bold and [/] stray close",
+        "[link=http://x]not a link[/link]",
+    ])
+    async def test_markup_in_a_warning_is_escaped(
+            self, hostile, tiny_record, isolated_library):
+        from textual.widgets import Static
+
+        from tests.test_smoke import TERMINAL_SIZE, _build_app
+
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            pane = modal.query_one("#ctor-trad-pane", sc.TraditionalCloningPane)
+            target = pane.query_one("#trad-results-text", Static)
+            pane._render_results(self._outcome(hostile), target)
+            await pilot.pause()
+            # Must survive markup parsing AND still say what it meant to say.
+            # The contract is "markup is NEUTRALISED, message intact" — not
+            # byte-identical: on a pathological input (a stray `[/]` after an
+            # escaped opener) Textual's Content parser leaves the escaping
+            # backslash visible. That's cosmetic. What must never happen is
+            # the old behaviour: the tag swallowing the rest of the sentence,
+            # or MarkupError blanking the pane.
+            plain = target.visual.plain.replace("\\", "")
+            assert hostile.replace("\\", "") in plain, (
+                f"warning text mangled by markup parsing: {plain!r}"
+            )
+
+    async def test_error_text_is_escaped_too(
+            self, tiny_record, isolated_library):
+        from textual.widgets import Static
+
+        from tests.test_smoke import TERMINAL_SIZE, _build_app
+
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            pane = modal.query_one("#ctor-trad-pane", sc.TraditionalCloningPane)
+            target = pane.query_one("#trad-results-text", Static)
+            out = self._outcome("ok")
+            out["errors"] = ["no overhangs matched on [pFoo v2]"]
+            pane._render_results(out, target)
+            await pilot.pause()
+            plain = target.visual.plain
+            assert "[pFoo v2]" in plain
+
+    @pytest.mark.parametrize("fwd_ok,rev_ok,expect", [
+        (True,  False, "FORWARD"),
+        (False, True,  "REVERSE"),
+    ])
+    async def test_directional_result_names_the_button(
+            self, fwd_ok, rev_ok, expect, tiny_record, isolated_library):
+        """The misread that produced a wrong construct: a one-way ligation
+        must not open with the orientation that DOESN'T work."""
+        from textual.widgets import Static
+
+        from tests.test_smoke import TERMINAL_SIZE, _build_app
+
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            pane = modal.query_one("#ctor-trad-pane", sc.TraditionalCloningPane)
+            target = pane.query_one("#trad-results-text", Static)
+            out = self._outcome("x")
+            out["forward"]["compatible"] = fwd_ok
+            out["reverse"]["compatible"] = rev_ok
+            pane._render_results(out, target)
+            await pilot.pause()
+            plain = target.visual.plain
+            head = plain.strip().splitlines()[0]
+            assert expect in head, (
+                f"one-way ligation did not lead with the working orientation: "
+                f"{head!r}"
+            )
+
+    async def test_no_headline_when_both_or_neither_ligate(
+            self, tiny_record, isolated_library):
+        """Don't invent a recommendation when there isn't one to make."""
+        from textual.widgets import Static
+
+        from tests.test_smoke import TERMINAL_SIZE, _build_app
+
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            pane = modal.query_one("#ctor-trad-pane", sc.TraditionalCloningPane)
+            target = pane.query_one("#trad-results-text", Static)
+            for fwd_ok, rev_ok in ((True, True), (False, False)):
+                out = self._outcome("x")
+                out["forward"]["compatible"] = fwd_ok
+                out["reverse"]["compatible"] = rev_ok
+                pane._render_results(out, target)
+                await pilot.pause()
+                plain = target.visual.plain
+                assert "Ligates as" not in plain, (fwd_ok, rev_ok, plain[:80])
+
+
+class TestMarkerLabelsHardening:
+    @pytest.mark.parametrize("bad", [None, "", 0, [], "notadict"])
+    def test_non_dict_fragment_returns_empty(self, bad):
+        assert sc._fragment_backbone_marker_labels(bad) == []
+
+    def test_missing_and_malformed_features_are_skipped(self):
+        assert sc._fragment_backbone_marker_labels({"top_seq": "A"}) == []
+        assert sc._fragment_backbone_marker_labels(
+            {"features": None}) == []
+        assert sc._fragment_backbone_marker_labels(
+            {"features": ["AmpR", None, 7, {"type": "gene",
+                                            "label": "AmpR"}]}) == ["AmpR"]
+
+    def test_pathological_label_is_clamped(self):
+        """An imported GenBank /label can be enormous; it must not swamp the
+        one-line warning it feeds."""
+        frag = _frag(100, ["AmpR " + "z" * 5000])
+        labels = sc._fragment_backbone_marker_labels(frag)
+        assert len(labels) == 1
+        assert len(labels[0]) <= 80
+
+    def test_non_string_label_does_not_raise(self):
+        frag = {"features": [{"type": "gene", "label": 12345},
+                             {"type": "gene", "label": ["AmpR"]}]}
+        # Must not raise; coerces via str().
+        sc._fragment_backbone_marker_labels(frag)
+        sc._fragment_has_backbone_marker(frag)
+
+    def test_duplicates_collapse(self):
+        frag = _frag(100, ["AmpR", "AmpR", "AmpR"])
+        assert sc._fragment_backbone_marker_labels(frag) == ["AmpR"]

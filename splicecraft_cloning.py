@@ -2327,6 +2327,21 @@ _ACCEPTOR_BACKBONE_LABEL_KEYWORDS = (
     # splicecraft_seqanalysis._BACKBONE_LABEL_KEYWORDS (a counter-selection
     # dropout labeled "...selection..." must NOT read as backbone).
 )
+# Whole-token keywords — mirrors seqanalysis `_BACKBONE_TOKEN_KEYWORDS`. These
+# are too short to substring-match ("erm" is inside every "Terminator"), and
+# are consulted ONLY on gene-bearing feature types — a `regulatory` or
+# `primer_bind` label mentioning a marker names something NEAR the gene, not
+# the gene. See the seqanalysis constant for the worked examples.
+_ACCEPTOR_BACKBONE_TOKEN_FEATURE_TYPES = frozenset({"cds", "gene"})
+_ACCEPTOR_BACKBONE_TOKEN_KEYWORDS = frozenset({
+    "erm", "ermb", "ermc", "ermam", "erma", "ermg",
+    "bla", "cat", "aada", "aac", "aph",
+    "neo", "neor", "nptii", "kan",
+    "smr", "hyg", "hygr", "hph",
+    "zeo", "zeor", "ble", "gmr", "gent",
+    "tetm", "teta", "tetl",
+    "puror", "pac", "sh", "nat1",
+})
 
 
 def _frag_carries_backbone_marker(frag: dict) -> bool:
@@ -2336,12 +2351,18 @@ def _frag_carries_backbone_marker(frag: dict) -> bool:
     for f in (frag.get("features") or []):
         if not isinstance(f, dict):
             continue
-        if str(f.get("type") or "").lower() in _ACCEPTOR_BACKBONE_FEATURE_TYPES:
+        ftype = str(f.get("type") or "").lower()
+        if ftype in _ACCEPTOR_BACKBONE_FEATURE_TYPES:
             return True
         label = str(f.get("label") or "").lower()
-        if label and any(kw in label
-                         for kw in _ACCEPTOR_BACKBONE_LABEL_KEYWORDS):
+        if not label:
+            continue
+        if any(kw in label for kw in _ACCEPTOR_BACKBONE_LABEL_KEYWORDS):
             return True
+        if ftype in _ACCEPTOR_BACKBONE_TOKEN_FEATURE_TYPES:
+            tokens = {t for t in re.split(r"[^a-z0-9]+", label) if t}
+            if tokens & _ACCEPTOR_BACKBONE_TOKEN_KEYWORDS:
+                return True
     return False
 
 
