@@ -120,6 +120,15 @@ get is what the annotated bases actually encode — a trailing `*` shows up
 only when the CDS really ends in a stop codon, so a CDS annotated without its
 stop (common in GenBank, and every partial) reads back without one.
 
+**Alt+Shift+R** flips the whole record — reverse complement, with every
+feature re-framed so it still covers the same bases, read from the other
+strand (arrowless and double-stranded features keep their marker; neither has
+a direction to reverse). **Alt+Shift+O** re-cuts a circular plasmid so the
+cursor becomes base 1, which works in the linear view too — the map's `[` `]`
+only spin a circle on screen, but this one is a real, undoable edit that
+sticks when you save or export. It refuses on a linear record, because
+rotating one would join two ends that aren't joined.
+
 **File ▸ Find ORFs** runs a six-frame scan with a minimum length in amino
 acids, ATG-only or with bacterial GTG/TTG starts, wrap-aware around the
 origin — pick a row to jump the sequence panel to it. On a circular plasmid a

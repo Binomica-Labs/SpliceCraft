@@ -14,6 +14,29 @@
 
 ---
 
+## [1.2.52] — 2026-08-05
+
+### New features
+
+- **Flip a whole plasmid end-for-end — `Alt+Shift+R`.** Reverse-complements
+  the sequence and re-frames every feature so it still sits on the same
+  bases, now read from the other strand; forward and reverse arrows swap.
+  Features you marked arrowless or double-stranded keep their marker, since
+  neither has a direction to reverse. Undoable with `Ctrl+Z`.
+- **Move the origin of a circular plasmid — `Alt+Shift+O`.** Re-cuts the
+  circle so wherever your cursor sits becomes base 1. This works in the
+  linear view, which is the point: the map's `[` and `]` only spin a circle
+  on screen, and once it's drawn as a line there's nothing to spin. This is
+  a real edit, so the new numbering sticks when you save or export. It
+  refuses on a linear record — rotating one would join two ends that aren't
+  joined — and it goes by the molecule's actual topology, not by which map
+  view you happen to be in. Undoable.
+
+  Both clear any alignment overlays you have showing, and won't save them
+  against the plasmid, because every coordinate has moved underneath them.
+
+---
+
 ## [1.2.51] — 2026-08-05
 
 ### Bug fixes

@@ -42,7 +42,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.51"
+__version__ = "1.2.52"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -10667,9 +10667,17 @@ def _find_circular_alignment_offset(
     return 0
 
 
-def _rotate_seq_record(record, offset: int):
+def _rotate_seq_record(record, offset: int, *, keep_source: bool = False):
     """Return a NEW SeqRecord whose sequence + features are rotated
     so position ``offset`` becomes the new origin (position 0).
+
+    ``keep_source`` (default False, the historical behaviour the alignment
+    path relies on) drops the ``source`` feature. The user-facing re-origin
+    action passes True: ``source`` carries the organism / strain metadata,
+    and silently losing it on a rotate would be a real annotation loss.
+    A feature spanning the WHOLE record — which ``source`` almost always
+    does — is emitted whole rather than split at the new origin, since a
+    full-circle span has no meaningful break point. [INV-181]
 
     Wrap-aware: features that straddle the new origin emit as a
     `CompoundLocation` (BioPython's `join(...)`). Linear records (or
@@ -10701,7 +10709,7 @@ def _rotate_seq_record(record, offset: int):
         annotations=dict(record.annotations or {}),
     )
     for f in (record.features or []):
-        if f.type == "source":
+        if f.type == "source" and not keep_source:
             continue
         bounds = _feat_bounds(f, n)
         if bounds is None:
@@ -10711,6 +10719,15 @@ def _rotate_seq_record(record, offset: int):
         # Re-frame to the rotated origin. `_feat_len` handles the
         # wrap case where the feature crosses the original origin.
         flen = _feat_len(s, e, n)
+        if flen >= n:
+            # Spans the whole record (the usual `source` case): there is no
+            # meaningful place to break it, and the generic path below would
+            # emit a degenerate two-part split at the new origin.
+            new_rec.features.append(SeqFeature(
+                FeatureLocation(0, n, strand=strand),
+                type=f.type, qualifiers=dict(f.qualifiers or {}),
+            ))
+            continue
         new_s = (s - offset) % n
         # Sweep #9 (2026-05-19): the ternary already covers the only
         # path where the mod could equal 0 (i.e. `new_s + flen == n`).
@@ -10730,6 +10747,99 @@ def _rotate_seq_record(record, offset: int):
             loc, type=f.type, qualifiers=dict(f.qualifiers or {}),
         ))
     return new_rec
+
+
+def _reverse_complement_record(record):
+    """Return a NEW SeqRecord that is the reverse complement of ``record`` —
+    sequence flipped AND every feature re-framed so it still covers the same
+    physical bases, reading from the other strand. [INV-181]
+
+    Coordinates mirror about the midpoint: a feature at ``[s, e)`` on an
+    ``n``-mer lands at ``[n - e, n - s)``. Strand flips ``+1 ↔ -1``; **0
+    (arrowless) and ``None`` are left alone**, because a feature with no
+    direction has none to reverse — and its ``SpliceCraft_strand`` marker
+    ([INV-105]) rides along in the copied qualifiers so the ▒ / ◀▶ arrow
+    survives the round trip.
+
+    A wrap / spliced feature is a `CompoundLocation`: every part is mirrored
+    and the part order is **kept**. BioPython stores parts in biological
+    5'→3' order (a reverse-strand `complement(join(10..20,30..40))` parses to
+    parts ``[(29,40,-1), (9,20,-1)]`` — decreasing), and mirroring reverses
+    the coordinate axis, so the existing order is already the flipped 5'→3'
+    order. Re-reversing it on top looks right and silently scrambles a
+    spliced CDS's exon order — caught here by the extract-equality test
+    below, not by reading.
+
+    The sequence goes through `_rc` (sacred invariant #3 — full IUPAC via
+    `_IUPAC_COMP`, not just ACGT), so ambiguity codes complement correctly
+    instead of being mangled or dropped. `_rc` upper-cases, which matches
+    every other sequence-building path in the app.
+
+    Does not mutate the input. Returns the record unchanged for an empty
+    sequence (nothing to flip, and `n - e` arithmetic would be meaningless).
+    """
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+
+    seq_str = str(getattr(record, "seq", "") or "")
+    n = len(seq_str)
+    if n == 0:
+        return record
+    new_rec = SeqRecord(
+        Seq(_rc(seq_str)),
+        id=getattr(record, "id", "") or "",
+        name=getattr(record, "name", "") or "",
+        description=getattr(record, "description", "") or "",
+        annotations=dict(getattr(record, "annotations", None) or {}),
+    )
+    for f in (record.features or []):
+        loc = getattr(f, "location", None)
+        parts = list(getattr(loc, "parts", None) or ([loc] if loc else []))
+        new_parts = []
+        for p in parts:
+            try:
+                s, e = int(p.start), int(p.end)
+            except (TypeError, ValueError, AttributeError):
+                # An unresolvable position (UnknownPosition, an external
+                # reference). We cannot mirror what we cannot measure, and a
+                # guessed coordinate is worse than a dropped one.
+                new_parts = []
+                break
+            if s < 0 or e > n or e < s:
+                # Out-of-range or inverted: same reasoning.
+                new_parts = []
+                break
+            new_parts.append(FeatureLocation(
+                n - e, n - s, strand=_flip_feature_strand(p.strand)))
+        if not new_parts:
+            _log.warning(
+                "flip: skipped feature %r (%s) — location could not be "
+                "mirrored onto a %d bp record",
+                (f.qualifiers or {}).get("label", ["?"])[0], f.type, n)
+            continue
+        new_loc = (new_parts[0] if len(new_parts) == 1
+                   else CompoundLocation(
+                       new_parts,
+                       operator=getattr(loc, "operator", "join") or "join"))
+        new_rec.features.append(SeqFeature(
+            new_loc, type=f.type, qualifiers=deepcopy(f.qualifiers or {}),
+        ))
+    _carry_tui_attrs(new_rec, record)
+    return new_rec
+
+
+def _flip_feature_strand(strand):
+    """``+1 ↔ -1``; 0 (arrowless) and ``None`` pass through untouched.
+
+    Split out so the flip and its tests share ONE definition of what
+    "reverse the direction" means — a second copy would be free to disagree
+    about the directionless cases, which is exactly where this is subtle."""
+    if strand == 1:
+        return -1
+    if strand == -1:
+        return 1
+    return strand
 
 
 def _rotate_aligned_to_original_query_frame(
@@ -18243,7 +18353,11 @@ class LibraryPanel(Widget):
         _mode = _live_mode if _live_mode in ("linear", "circular") else prev_map_mode
         if _mode in ("linear", "circular"):
             new_entry["map_mode"] = _mode
-        if prev_alignments:
+        # …unless the record was re-framed (flip / re-origin) since those
+        # alignments were computed — their coordinates no longer describe
+        # this molecule, so carrying them forward would persist a lie.
+        if prev_alignments and not getattr(record, "_sc_alignments_invalid",
+                                           False):
             new_entry["alignments"] = prev_alignments
         # Construction-history contract (shared with the canvas Ctrl+S
         # worker via `_apply_entry_construction_history`): carry a `.dna`
@@ -22543,6 +22657,8 @@ terminal.*
 | `Home` | Reset map origin · jump to start of row (sequence) |
 | `End` | Jump to end of row (sequence) |
 | `Alt+O` | Set the highlighted feature as the new origin (works from any panel) |
+| `Alt+Shift+O` | **Re-cut the molecule** so the cursor becomes base 1 — a real, undoable edit that persists into saves and exports, unlike `Alt+O` above (which only spins the view). Works from either map view, but only on a **circular** record: rotating a linear one would join two ends that aren't joined |
+| `Alt+Shift+R` | **Flip the whole record** (reverse complement). Every feature is re-framed so it still covers the same bases read from the other strand, and ▶/◀ arrows swap. Arrowless (▒) and double-stranded (◀▶) features keep their marker — neither has a direction to reverse. Undoable |
 | `v` | Toggle linear ↔ circular map |
 | `+` · `=` | Zoom in (linear map) |
 | `-` | Zoom out (linear map) |
@@ -104663,6 +104779,17 @@ NcbiTaxonPickerModal { align: center middle; }
         Binding("alt+shift+a", "clear_alignments", "Clear aligns",  show=False, priority=True),
         Binding("alt+l",       "open_alignment_manager", "Manage alignments…",
                 show=False, priority=True),
+        # Whole-record orientation edits (2026-08-05). Both are real,
+        # undoable record edits, not view toggles — `v` still toggles the
+        # MAP between circular and linear without touching the data.
+        # `Alt+Shift+<letter>` because plain `alt+f` ("flip") is
+        # UNDELIVERABLE — Textual decodes ESC-f as `ctrl+right` (see the
+        # menu-shortcut note below) — and `alt+r` / `alt+o` are already
+        # taken by the Parts menu / set-display-origin. [INV-181]
+        Binding("alt+shift+r", "flip_sequence", "Flip (revcomp)",
+                show=False, priority=True),
+        Binding("alt+shift+o", "set_origin_here", "Set origin here",
+                show=False, priority=True),
         # Menu-bar keyboard shortcuts (2026-05-21). Pre-fix the top
         # menus were mouse-only — CI couldn't drive them, accessibility
         # users were stuck. Letters picked for uniqueness across
@@ -105707,6 +105834,185 @@ NcbiTaxonPickerModal { align: center middle; }
         sp = self.query_one("#seq-panel", SequencePanel)
         self._apply_snapshot(str(new_record.seq), sp._cursor_pos, new_record)
         self.notify(f"Deleted '{label}'  (Ctrl+Z to undo)", markup=False)
+
+    def _record_is_circular(self) -> bool:
+        """Is the LOADED MOLECULE circular?
+
+        Deliberately reads the record's topology annotation, NOT the map's
+        `_map_mode` — that is a VIEW toggle (`v`), and a circular plasmid is
+        very often displayed linearly. Re-originating on view mode would
+        refuse exactly the case this feature exists for, and would happily
+        rotate a genuinely linear record whose map happens to be in circular
+        mode. [INV-181]"""
+        rec = getattr(self, "_current_record", None)
+        if rec is None:
+            return False
+        topo = str((getattr(rec, "annotations", None) or {}).get(
+            "topology", "") or "").strip().lower()
+        return topo == "circular"
+
+    @_action_log("app.seq.flip")
+    def action_flip_sequence(self) -> None:
+        """Alt+Shift+R — reverse-complement the WHOLE record in place.
+
+        Every feature is re-framed so it still covers the same physical
+        bases read from the other strand, and forward/reverse arrows swap.
+        Arrowless and double-stranded features keep their marker, because
+        neither has a direction to reverse ([INV-105]).
+
+        Works on linear AND circular records — flipping is meaningful for
+        both (unlike re-originating, which needs a circle to cut).
+        Undoable with Ctrl+Z like any other record edit."""
+        rec = getattr(self, "_current_record", None)
+        if rec is None:
+            self.notify("Nothing loaded to flip.", severity="warning")
+            return
+        if len(str(rec.seq or "")) == 0:
+            self.notify("This record has no sequence to flip.",
+                        severity="warning")
+            return
+        n_before = len(str(rec.seq or ""))
+        feats_before = len(rec.features or [])
+        self._push_undo()
+        flipped = _reverse_complement_record(rec)
+        # Belt-and-braces: a flip must never change how much DNA there is.
+        # If the transform ever regressed, restoring the undo we just pushed
+        # is far better than installing a corrupted record on the canvas.
+        n_after = len(str(getattr(flipped, "seq", "") or ""))
+        if n_after != n_before:
+            self._pop_undo_silently()
+            self.notify(
+                f"Flip aborted — length changed ({n_before} → "
+                f"{n_after} bp). The record is untouched.",
+                severity="error", timeout=10)
+            _log.error("flip: length changed %d -> %d; aborted",
+                       n_before, n_after)
+            return
+        dropped = feats_before - len(flipped.features or [])
+        n_aln = self._invalidate_alignments_for_reframe(flipped)
+        sp = self.query_one("#seq-panel", SequencePanel)
+        self._apply_snapshot(str(flipped.seq), sp._cursor_pos, flipped)
+        msg = f"Flipped {n_before:,} bp (reverse complement)  ·  Ctrl+Z to undo"
+        if n_aln:
+            msg += f"  ·  {n_aln} alignment(s) cleared (coordinates moved)"
+        if dropped > 0:
+            # Never silent: a feature we could not mirror is a real loss the
+            # user must see, not a log line they will never read.
+            msg += f"  ·  ⚠ {dropped} feature(s) had unmappable coordinates"
+        self.notify(msg, markup=False,
+                    severity="warning" if dropped else "information", timeout=8)
+
+    @_action_log("app.seq.set_origin")
+    def action_set_origin_here(self) -> None:
+        """Alt+Shift+O — re-cut a CIRCULAR record so the cursor (or the
+        selected feature's start) becomes base 1.
+
+        This is the linear-view counterpart to the circular map's rotation:
+        the map's `[` / `]` spin the DISPLAY around a circle, which has no
+        meaning once the molecule is drawn as a line. Re-originating the
+        RECORD does — and it persists into saves, exports and the seq panel
+        rather than being a viewing trick. Works from either view.
+
+        **Circular only.** Rotating a linear molecule would fabricate a
+        junction between two ends that are not joined — it would silently
+        invent sequence adjacency that does not exist in the tube."""
+        rec = getattr(self, "_current_record", None)
+        if rec is None:
+            self.notify("Nothing loaded to re-origin.", severity="warning")
+            return
+        n = len(str(rec.seq or ""))
+        if n == 0:
+            self.notify("This record has no sequence.", severity="warning")
+            return
+        if not self._record_is_circular():
+            self.notify(
+                "Set origin needs a CIRCULAR molecule — this record is "
+                "linear, and rotating it would join two ends that aren't "
+                "joined. (File → Edit topology to change it.)",
+                severity="warning", timeout=8)
+            return
+        offset = self._origin_offset_from_ui(n)
+        if offset is None:
+            self.notify(
+                "Put the cursor where the new base 1 should be (click in the "
+                "sequence panel), or select a feature to use its start.",
+                severity="information", timeout=6)
+            return
+        if offset % n == 0:
+            self.notify("Already the origin — nothing to rotate.",
+                        severity="information", timeout=4)
+            return
+        n_before, feats_before = n, len(rec.features or [])
+        self._push_undo()
+        rotated = _rotate_seq_record(rec, offset, keep_source=True)
+        n_after = len(str(getattr(rotated, "seq", "") or ""))
+        if n_after != n_before:
+            self._pop_undo_silently()
+            self.notify(
+                f"Re-origin aborted — length changed ({n_before} → "
+                f"{n_after} bp). The record is untouched.",
+                severity="error", timeout=10)
+            _log.error("set_origin: length changed %d -> %d; aborted",
+                       n_before, n_after)
+            return
+        dropped = feats_before - len(rotated.features or [])
+        n_aln = self._invalidate_alignments_for_reframe(rotated)
+        # Cursor goes to 0: it pointed at the base that IS the new origin, so
+        # keeping the old index would land the user somewhere unrelated.
+        self._apply_snapshot(str(rotated.seq), 0, rotated)
+        msg = (f"Origin moved to old base {offset + 1:,} "
+               f"({n_before:,} bp circular)  ·  Ctrl+Z to undo")
+        if n_aln:
+            msg += f"  ·  {n_aln} alignment(s) cleared (coordinates moved)"
+        if dropped > 0:
+            msg += f"  ·  ⚠ {dropped} feature(s) dropped"
+        self.notify(msg, markup=False,
+                    severity="warning" if dropped else "information", timeout=8)
+
+    def _invalidate_alignments_for_reframe(self, new_record) -> int:
+        """Flip / re-origin move EVERY coordinate, so alignment bands drawn
+        against the old frame now point at the wrong bases. Clear the live
+        band and mark the record so a later Ctrl+S doesn't persist stale
+        ones.
+
+        The mark matters because `LibraryPanel.add_entry` carries a
+        same-id entry's stored `alignments` forward ([INV-179] follow-up) —
+        without it, flip-then-save would re-attach alignments that no longer
+        describe the molecule, and they'd hydrate back wrong on the next
+        load. Returns how many were showing, for the toast. [INV-181]"""
+        n_aln = len(getattr(self, "_alignments", None) or ())
+        try:
+            new_record._sc_alignments_invalid = True
+        except AttributeError:
+            pass
+        if n_aln:
+            try:
+                self._clear_alignments()
+            except (AttributeError, RuntimeError, NoMatches):
+                _log.debug("reframe: alignment clear failed", exc_info=True)
+        return n_aln
+
+    def _origin_offset_from_ui(self, n: int) -> "int | None":
+        """Where should the new base 1 be? Seq-panel cursor first (the user
+        pointed at it), else the selected feature's start. ``None`` when
+        neither is set, so the caller can say so instead of silently
+        rotating to an arbitrary place."""
+        try:
+            sp = self.query_one("#seq-panel", SequencePanel)
+            cur = int(getattr(sp, "_cursor_pos", -1))
+            if 0 <= cur < n:
+                return cur % n
+        except (NoMatches, AttributeError, TypeError, ValueError):
+            pass
+        try:
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+            idx = int(getattr(pm, "selected_idx", -1))
+            feats = getattr(pm, "_feats", None) or []
+            if 0 <= idx < len(feats):
+                return int(feats[idx].get("start", 0)) % n
+        except (NoMatches, AttributeError, TypeError, ValueError):
+            pass
+        return None
 
     @_action_log("app.library.add")
     def action_add_to_library(self):
@@ -107585,6 +107891,22 @@ NcbiTaxonPickerModal { align: center middle; }
 
     def _push_undo(self) -> None:
         self.undo.push()
+
+    def _pop_undo_silently(self) -> None:
+        """Discard the snapshot `_push_undo` just pushed, without restoring it.
+
+        For an operation that pushes undo BEFORE computing its result and
+        then bails: the record was never changed, so leaving the snapshot on
+        the stack would cost the user a wasted Ctrl+Z that appears to do
+        nothing. Best-effort — an empty stack is not an error, and failing to
+        tidy the stack must never turn an aborted edit into a crash.
+        [INV-181]"""
+        try:
+            stack = getattr(self.undo, "_undo_stack", None)
+            if stack:
+                stack.pop()
+        except (AttributeError, IndexError, TypeError):
+            _log.debug("_pop_undo_silently: nothing to pop", exc_info=True)
 
     def _apply_snapshot(self, seq: str, cursor_pos: int, record) -> None:
         pm      = self.query_one("#plasmid-map",  PlasmidMap)

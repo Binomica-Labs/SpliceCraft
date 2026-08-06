@@ -37,6 +37,16 @@ What you can do without leaving the terminal.
   feature enclosing the cursor.
 - **Crash-recovery autosave** writes a 3-second-debounced `.gb`
   snapshot to the data dir; survivors surface on next launch.
+- **Orientation**: `Alt+Shift+R` flips the whole record (reverse
+  complement) — every feature is re-framed so it still covers the same
+  bases read from the other strand, and ▶/◀ arrows swap; arrowless (▒)
+  and double-stranded (◀▶) features keep their marker, since neither has
+  a direction to reverse. `Alt+Shift+O` re-cuts a **circular** record so
+  the cursor becomes base 1, from either map view — a real edit that
+  persists into saves and exports, unlike the map's `Alt+O` / `[` `]`,
+  which only spin the display. It refuses on a linear record: rotating
+  one would join two ends that aren't joined. Both are undoable, and
+  both clear on-screen alignments, whose coordinates no longer apply.
 
 ## Synthesis
 
