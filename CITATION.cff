@@ -30,7 +30,7 @@ identifiers:
     value: 10.5281/zenodo.21960400
     description: Concept DOI, always resolving to the newest archived release
 license: MIT
-version: 1.2.53
+version: 1.2.54
 date-released: '2026-08-15'
 abstract: >-
   SpliceCraft is a terminal-native plasmid workbench for molecular cloning. It

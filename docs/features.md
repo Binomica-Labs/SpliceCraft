@@ -426,6 +426,100 @@ and folder-import all accept the same set.
   stored in a sibling directory so a hypothetical recursive-wipe
   bug in a new version cannot reach the snapshots.
 
+## BABS assistant
+
+An in-app chat with a **local Ollama model** — no cloud, no API key,
+nothing leaves the machine. Streaming markdown, `<think>` reasoning
+hidden by default, a **context lifebar**, a copy-pasteable transcript
+(`Ctrl+E` exports to markdown), and slash commands (`/help`, `/model`,
+`/system`, `/temp`, `/reset`, `/retry`, `/agent`, `/autonomy`,
+`/recall`, `/ingest`, `/learn`, `/forget`, `/remember`, `/memory`).
+
+- **Agent mode** — Babs calls the same endpoints the `--agent` API
+  exposes, and every change shows up live in the app. She is always
+  told which plasmid is open. Default `ask` autonomy prompts before
+  every write (a multi-step workflow lists all its changes and is
+  approved once); `/autonomy auto` runs unattended, `readonly`
+  forbids writes. Whole-library wipes are never reachable, and
+  **physical robot motion always asks first, even in `auto`**. Agent
+  turns run on a fast tool-capable model (qwen2.5:7b default) while
+  ordinary chat stays on your chosen model — override with
+  `/agentmodel <name>|chat|auto`.
+- **Corpus grounding** — with **Corpus** on, answers are grounded in
+  the Babs research corpus with cited sources, folded into the turn
+  inside a token budget scaled to the model's real context window.
+  `/recall <query>` searches it directly; `/ingest <url>` stores an
+  open-licence page permanently; `/learn <topic>` starts a focused
+  crawl.
+- **Learn** — a drift-resistant crawl of open scientific databases:
+  seeds from open-access search, scores every candidate, and only
+  follows citations out of strongly on-topic ones. Each topic gets an
+  isolated corpus that can be folded into the main one afterwards.
+  Also drivable over the agent API (`learn-start` / `-status` /
+  `-results` / `-list` / `-merge`).
+- **Index my library** — indexes your plasmids, primers, parts and
+  notebook entries into her corpus. Rebuilt from scratch each run (no
+  ghost records) and **private by construction**: every record flagged
+  private, a `.no-egress` marker on the directory, skipped by the
+  corpus-sync script, and never used to derive a web query.
+- **Online lookups** — FPbase, UniProt, Europe PMC, NCBI/GenBank,
+  Wikipedia, general web search and patents, including opening a
+  result and reading the page text. Off until *Settings → "Allow Babs
+  online database lookups"*; only the query string (or the URL being
+  read) is ever sent, never a sequence. Web/patent search use Brave
+  Search / PatentsView keys if configured, else keyless fallbacks.
+- **Model manager** — models organise into collections like plasmids:
+  mark rows to move or bulk-uninstall, search HuggingFace for GGUF
+  models, and pull with a live bytes/speed progress bar.
+- **Paper scraper** — runs the real [Babs](https://github.com/ATinyGreenCell/babs)
+  background search (Europe PMC, OpenAlex, CORE, CGSpace, DOAJ) and
+  re-index, with a jobs view and log tail. Shown only when the Babs
+  repo is present (`~/babs`, or `$SPLICECRAFT_BABS_HOME`). Changing
+  the *embedding* model warns that the corpus needs re-ingesting.
+- **Persistent memory** — `/remember <fact>` survives across sessions
+  as hand-editable markdown; `/memory` lists it, `/forget <slug>`
+  removes one.
+
+The tab is persistent — conversation, model choice and agent mode
+survive switching away, and a model download keeps running while you
+work elsewhere. Requires `ollama serve` locally (or
+`$SPLICECRAFT_OLLAMA_HOST`); `splicecraft babs-setup` clones and
+bootstraps the engine in one command.
+
+## AUTOLAB (Opentrons OT-2)
+
+A five-panel protocol designer for an OT-2 liquid handler.
+
+- **Find Robots** scans the network (and USB) and lists what it finds,
+  or auto-connects to the first.
+- **Deck** — a top-down diagram of the robot drawn at the real slot
+  aspect ratio, scaled and centred to the terminal, colour-filled by
+  what each bay holds. Click a bay to place or clear labware.
+- **Designer** — an ordered step sequence: transfer, distribute,
+  consolidate, mix, delay, pause, comment.
+- **Labware** — a library of custom labware defined from a grid form.
+- **Library** — binds a deck plate to a plasmid collection so wells map
+  to your plasmids; cherry-pick or replate by identity, or normalise
+  DNA concentration to a target ng or ng/µL.
+- **Calibrate** — deck / per-pipette offset / tip-length status, home
+  the gantry, set per-slot offsets, and a **position check** that moves
+  the gantry over each labware without ever actuating the plunger.
+
+Designs save as named protocols in collections, compile to a real
+Opentrons protocol, analyze on the robot's built-in simulate, and run
+behind Arm + a clean analysis + health, calibration, attached-pipette
+and door checks — with live Pause / Resume / Abort, a telemetry panel
+(connection, light / door / motor / pipette state, progress bar with
+ETA, fault banner), and Lights / Disengage Motors buttons. A build can
+be logged straight to the Experiments notebook, cross-linked to the
+plasmids it touched.
+
+Scriptable via `ot2-compile` (a `transfers` list or multi-step `steps`
+sequence), `ot2-analyze`, `ot2-status`, `ot2-calibration`, the gated
+`ot2-run` / `ot2-position-check` / `ot2-home`, `ot2-run-control`,
+`ot2-lights`, `ot2-disengage`, `ot2-normalize`, `ot2-plate-map`, plus
+protocol and custom-labware library CRUD.
+
 ## Drive it from outside the GUI
 
 See [Agent API](agent-api.md) and [CLI sidecar](cli.md) for the
@@ -433,7 +527,7 @@ details. In short:
 
 - **Agent API** (`splicecraft --agent`) exposes a localhost JSON API
   with bearer-token auth, covering every GUI action external AI
-  agents need. ~179 endpoints; symlink-guarded write paths;
+  agents need. ~234 endpoints; symlink-guarded write paths;
   length/range/shape validation at the boundary.
 - **`splicecraft-cli`** — stdlib-only sidecar (~50 ms cold start)
   that reads connection details from the running session's token
