@@ -20,17 +20,17 @@ actually running** — no need to remember which release made the plasmid:
 
 ```
 Cocioba, S. (2026). SpliceCraft: a terminal-native plasmid workbench for
-molecular cloning (Version 1.2.52) [Computer software]. Zenodo.
-https://doi.org/10.5281/zenodo.XXXXXXX
+molecular cloning (Version 1.2.53) [Computer software]. Zenodo.
+https://doi.org/10.5281/zenodo.21960400
 
 @software{splicecraft,
   author    = {Cocioba, Sebastian},
   title     = {SpliceCraft: a terminal-native plasmid workbench for molecular cloning},
-  version   = {1.2.52},
+  version   = {1.2.53},
   year      = {2026},
   publisher = {Zenodo},
-  doi       = {10.5281/zenodo.XXXXXXX},
-  url       = {https://doi.org/10.5281/zenodo.XXXXXXX}
+  doi       = {10.5281/zenodo.21960400},
+  url       = {https://doi.org/10.5281/zenodo.21960400}
 }
 ```
 
@@ -74,28 +74,20 @@ every release, and `tests/test_citation.py` fails the suite if any of them
 drift from `splicecraft.__version__` — or if the DOI string is present in some
 files but not others.
 
-### After the first archive
+### Where the DOI lives
 
-Zenodo cannot reserve a DOI before a release exists, so the first archived
-release necessarily ships with `_ZENODO_CONCEPT_DOI = ""` and `--citation`
-falling back to the repository URL. Once that record appears, take the
-**concept** DOI — the one on the record's *Cite all versions* line, not the
-higher-numbered version DOI — and wire it into all four places in one commit:
+The concept DOI is `10.5281/zenodo.21960400`, minted with v1.2.53 on
+2026-08-15 — the first release archived under the Zenodo integration. It is
+written down in four places, and `TestDoiIsAllOrNothing` fails the suite if any
+one of them disagrees with the others:
 
-1. `splicecraft_util.py` — set `_ZENODO_CONCEPT_DOI = "10.5281/zenodo.NNNNNNN"`.
-2. `CITATION.cff` — add the `identifiers:` block the header comment describes:
-   ```yaml
-   identifiers:
-     - type: doi
-       value: 10.5281/zenodo.NNNNNNN
-       description: Concept DOI, always resolving to the newest release
-   ```
-3. `docs/citation.md` — replace the `zenodo.XXXXXXX` placeholders in the
-   worked example above.
-4. `README.md` — the badge already resolves through the repo id and needs no
-   edit, but the citation section should name the DOI.
+- `splicecraft_util.py` — `_ZENODO_CONCEPT_DOI`, the single source of truth
+- `CITATION.cff` — the `identifiers:` entry
+- `docs/citation.md` — the worked example above
+- `README.md` — the citation section
 
-`TestDoiIsAllOrNothing` fails the suite if any one of those is missed, so a
-half-wired DOI cannot ship. The badge (`zenodo.org/badge/<repo id>.svg`)
-returns 404 until the first archive completes — that is expected, not a
-misconfiguration.
+None of these need touching again. The concept DOI is stable across releases,
+per-version DOIs are minted automatically by the webhook on each GitHub
+Release, and the README badge resolves through the repository id rather than
+any DOI string. The one thing that does move every release is the version and
+date stamped into `CITATION.cff` / `.zenodo.json`, which `release.py` handles.

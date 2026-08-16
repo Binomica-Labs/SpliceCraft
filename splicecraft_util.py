@@ -1297,13 +1297,15 @@ def _monotonic() -> float:
 # when the exact version doesn't matter; `--citation` prints the running
 # version alongside it so a methods section can be precise.
 #
-# Zenodo cannot reserve a DOI ahead of the first archived release, so this
-# constant is EMPTY until that first release lands, and every formatter below
-# degrades to the GitHub URL rather than printing a placeholder that looks like
-# a real identifier. Filling it in is a one-line change; tests/test_citation.py
-# then enforces that README.md, CITATION.cff, and docs/citation.md all carry
-# the SAME string (all-or-nothing — a half-wired DOI can't ship).
-_ZENODO_CONCEPT_DOI = ""
+# This is the CONCEPT DOI, minted with the first archived release (v1.2.53,
+# 2026-08-15) and shared by every version since; the per-version DOIs sit one
+# id higher and upward (v1.2.53 is 10.5281/zenodo.21960401) and are listed on
+# the record. The formatters below fall back to the GitHub URL when this is
+# empty rather than printing a placeholder that looks like a real identifier.
+# tests/test_citation.py enforces that README.md, CITATION.cff, and
+# docs/citation.md all carry the SAME string (all-or-nothing — a half-wired
+# DOI can't ship).
+_ZENODO_CONCEPT_DOI = "10.5281/zenodo.21960400"
 
 # GitHub's numeric repository id for Binomica-Labs/SpliceCraft. Zenodo's badge
 # endpoints are keyed on it (`zenodo.org/badge/<id>.svg` renders the badge,

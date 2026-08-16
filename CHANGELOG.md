@@ -14,6 +14,18 @@
 
 ---
 
+## [unreleased]
+
+### New features
+
+- **The DOI is live.** `splicecraft --citation` now prints the real archive
+  DOI instead of falling back to the repository URL, and GitHub's **Cite this
+  repository** button carries it too. The DOI it prints always resolves to the
+  newest release; each individual release also gets its own permanent DOI, so
+  a methods section can pin the exact version that designed a construct.
+
+---
+
 ## [1.2.53] — 2026-08-15
 
 ### New features

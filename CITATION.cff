@@ -7,12 +7,10 @@
 # release, and tests/test_citation.py fails the suite if they ever drift from
 # `splicecraft.__version__`. See docs/citation.md for the full story.
 #
-# The DOI is minted by Zenodo when a GitHub Release is published, so there is
-# nothing to record until the first release archives -- this file deliberately
-# carries no `identifiers:` block yet. The release that mints it adds one for
-# the CONCEPT DOI (the identifier that always resolves to the newest archived
-# version); per-version DOIs stay listed on the Zenodo record itself.
-# docs/citation.md has the exact post-archive checklist.
+# The DOI is minted by Zenodo when a GitHub Release is published. The
+# `identifiers:` entry below is the CONCEPT DOI -- the identifier that always
+# resolves to the newest archived version -- so it never needs stamping;
+# per-version DOIs live on the Zenodo record itself. See docs/citation.md.
 cff-version: 1.2.0
 title: 'SpliceCraft: a terminal-native plasmid workbench for molecular cloning'
 message: >-
@@ -27,6 +25,10 @@ authors:
 repository-code: https://github.com/Binomica-Labs/SpliceCraft
 url: https://splicecraft.bio
 repository-artifact: https://pypi.org/project/splicecraft/
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.21960400
+    description: Concept DOI, always resolving to the newest archived release
 license: MIT
 version: 1.2.53
 date-released: '2026-08-15'

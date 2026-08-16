@@ -3,7 +3,6 @@
 ![SpliceCraft Logo](https://raw.githubusercontent.com/Binomica-Labs/SpliceCraft/master/splicecraftLogo.png)
 
 [![PyPI](https://img.shields.io/pypi/v/splicecraft.svg)](https://pypi.org/project/splicecraft/)
-[![Python](https://img.shields.io/pypi/pyversions/splicecraft.svg)](https://pypi.org/project/splicecraft/)
 [![DOI](https://zenodo.org/badge/1190666059.svg)](https://zenodo.org/badge/latestdoi/1190666059)
 [![100% Python](https://img.shields.io/badge/100%25-Python-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![TUI: Textual](https://img.shields.io/badge/TUI-Textual-5A45FF?logo=python&logoColor=white)](https://textual.textualize.io/)
@@ -526,7 +525,9 @@ security-sensitive code surfaces.
 
 If SpliceCraft did part of the work in something you publish, please cite it.
 Every release is archived on [Zenodo](https://zenodo.org/) with its own DOI, so
-a methods section can point at the exact version that produced the design.
+a methods section can point at the exact version that produced the design. The
+concept DOI [`10.5281/zenodo.21960400`](https://doi.org/10.5281/zenodo.21960400) always
+resolves to the newest release.
 
 ```bash
 splicecraft --citation     # APA reference + BibTeX, pinned to your version
