@@ -66,6 +66,7 @@ nav:
     - Agent API: agent-api.md
     - CLI sidecar: cli.md
   - Architecture: architecture.md
+  - Citing SpliceCraft: citation.md
   - Supported terminals: PLATFORMS.md
   - Project:
     - Contributing: https://github.com/Binomica-Labs/SpliceCraft/blob/master/CONTRIBUTING.md

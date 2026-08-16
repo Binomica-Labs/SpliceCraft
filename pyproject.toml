@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.2.52"
+version         = "1.2.53"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -132,12 +132,21 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "pytest-xdist>=3.8.0",
     "hypothesis>=6.155.1",
+    # Parses CITATION.cff for real in tests/test_citation.py. A YAML syntax
+    # error there breaks GitHub's "Cite this repository" button in public and
+    # the regex readers cannot see it; without this dep that test silently
+    # skips. Dev-only -- never a runtime or conda run dependency.
+    "pyyaml>=6.0.2",
     # Mirror the runtime edlib dep so CI exercises the fast-aligner path
     # (not just the Biopython fallback). Wheel-(arch × Python)-gated,
     # matching above.
     "edlib>=1.3.9; (platform_machine == 'x86_64' or platform_machine == 'arm64') and python_version < '3.14'",
     "build>=1.5.0",
-    "twine>=6.2.0",
+    # Floor-pinned at 7.0.0 (2026-08-15): hatchling 1.32 emits
+    # `Metadata-Version: 2.5`, which twine 6.x rejects as invalid even though
+    # PyPI accepts it. An older twine fails `twine check` at the very end of a
+    # release, after the full suite has already run.
+    "twine>=7.0.0",
     # Linters / type-checkers / coverage — mirror what CI runs
     # so local + CI behaviour stays in step (see test.yml).
     "ruff>=0.15.15",
@@ -263,6 +272,10 @@ include = [
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
+    # Citation metadata travels with the source tarball so downstream
+    # packagers (conda-forge, distro maintainers) and anyone unpacking the
+    # sdist can find the DOI + preferred citation without the git repo.
+    "CITATION.cff",
     "splicecraftLogo.png",
     "splicecraftScreenshot.png",
     "tests/**",

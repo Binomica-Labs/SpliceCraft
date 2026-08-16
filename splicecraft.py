@@ -42,7 +42,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.52"
+__version__ = "1.2.53"
+
+# Release date of `__version__`, stamped by release.py alongside the version
+# bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
+# CITATION.cff — the CURRENT year would be wrong for anyone citing an older
+# install, so the year travels with the build rather than the clock.
+_RELEASE_DATE = "2026-08-15"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -466,7 +472,7 @@ def _check_deps():
     # needs Textual/Biopython present, just not necessarily a recent Textual).
     _first_arg = sys.argv[1] if len(sys.argv) > 1 else ""
     if _first_arg in ("update", "logs", "babs-setup",
-                      "--version", "-V", "--help", "-h"):
+                      "--version", "-V", "--help", "-h", "--citation"):
         return
     # Version gate (2026-06-09): Textual is present but might be too old —
     # the distro-package trap (`apt install python3-textual` → 2.1.2). It
@@ -1406,6 +1412,15 @@ from splicecraft_util import (  # noqa: E402
     _WIN_RESERVED_FILENAMES as _WIN_RESERVED_FILENAMES,  # shared filename-safety guard
     _is_windows_reserved_stem as _is_windows_reserved_stem,
     _strip_fasta_headers as _strip_fasta_headers,  # FASTA-header strip (shared by online-search + 3 hub callers)
+    # Citation / Zenodo-DOI metadata + formatters (pure, L0). The DOI string
+    # lives in exactly ONE place (`_ZENODO_CONCEPT_DOI`); README.md,
+    # CITATION.cff, and docs/citation.md are held in sync with it by
+    # tests/test_citation.py.
+    _ZENODO_CONCEPT_DOI as _ZENODO_CONCEPT_DOI,
+    _ZENODO_GITHUB_REPO_ID as _ZENODO_GITHUB_REPO_ID,
+    _citation_apa as _citation_apa,
+    _citation_bibtex as _citation_bibtex,
+    _citation_text as _citation_text,
 )
 
 # Shared SSRF-hardened network-fetch primitives (Phase D, L0) — re-exported so the
@@ -22774,6 +22789,8 @@ Open from the menu bar with the mouse — or jump straight to most with `Alt`+le
 | `Alt+D` · `Ctrl+U` · `F9` | Capture a UI snapshot — open elements + mouse position + log tail — for a bug report. Saved to `ui_snapshots/` and copied to the clipboard. |
 | `Alt+M` | Toggle click-debug — each click echoes its modifier state in a toast (diagnoses terminals that swallow Shift+click) |
 | `Alt+Shift+D` | Toggle the sequence-panel debug row, then: `H` copies hover info · `D` dumps the rendered chunk |
+
+**Citing SpliceCraft** — run `splicecraft --citation` in a shell for an APA reference and a BibTeX entry pinned to the version you're running. Every release is archived on Zenodo with its own DOI.
 """
 
 
@@ -117243,6 +117260,8 @@ def main():
     )
     main_parser.add_argument("--version", "-V", action="store_true",
                               dest="want_version")
+    main_parser.add_argument("--citation", action="store_true",
+                              dest="want_citation")
     main_parser.add_argument("--help", "-h", action="store_true",
                               dest="want_help")
     main_parser.add_argument("--no-splash", "-Q", action="store_true",
@@ -117312,6 +117331,12 @@ def main():
     if parsed.want_version:
         print(f"splicecraft {__version__}")
         return
+    # `--citation` prints the APA reference + BibTeX entry for the version
+    # that is actually running (see `_citation_text`, L0 util). Handled here
+    # with `--version`, before the TUI loads, so it works over a pipe.
+    if parsed.want_citation:
+        print(_citation_text(__version__, _RELEASE_DATE))
+        return
     if parsed.want_help:
         if rest and rest[0] == "babs-setup":      # subcommand help isn't shadowed by global --help
             sys.exit(_run_babs_setup_subcommand(["--help"]))
@@ -117335,6 +117360,8 @@ def main():
             "                            # for emailing in a bug report\n"
             "  splicecraft babs-setup    # install the Babs research engine for the\n"
             "                            # BABS tab (corpus-grounded chat + scraper)\n"
+            "  splicecraft --citation    # print how to cite this version\n"
+            "                            # (APA reference + BibTeX entry)\n"
             "  splicecraft --no-splash   # skip the launcher splash\n"
             "  splicecraft --agent       # AI-agent mode: expose JSON API on\n"
             f"                            # 127.0.0.1:{_AGENT_API_PORT_DEFAULT} so Claude Code /\n"

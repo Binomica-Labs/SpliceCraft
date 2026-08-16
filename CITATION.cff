@@ -1,0 +1,60 @@
+# Citation metadata for SpliceCraft.
+#
+# GitHub reads this file to render the "Cite this repository" button on the
+# repository page (APA + BibTeX export). Zenodo reads `.zenodo.json` instead
+# whenever both files are present, so the two MUST stay in step: release.py
+# stamps `version:` + `date-released:` here and `"version"` there on every
+# release, and tests/test_citation.py fails the suite if they ever drift from
+# `splicecraft.__version__`. See docs/citation.md for the full story.
+#
+# The DOI is minted by Zenodo when a GitHub Release is published, so there is
+# nothing to record until the first release archives -- this file deliberately
+# carries no `identifiers:` block yet. The release that mints it adds one for
+# the CONCEPT DOI (the identifier that always resolves to the newest archived
+# version); per-version DOIs stay listed on the Zenodo record itself.
+# docs/citation.md has the exact post-archive checklist.
+cff-version: 1.2.0
+title: 'SpliceCraft: a terminal-native plasmid workbench for molecular cloning'
+message: >-
+  If you use SpliceCraft in work you publish, please cite it using the metadata
+  below.
+type: software
+authors:
+  - family-names: Cocioba
+    given-names: Sebastian
+    affiliation: Binomica Labs
+    orcid: https://orcid.org/0000-0002-6821-2996
+repository-code: https://github.com/Binomica-Labs/SpliceCraft
+url: https://splicecraft.bio
+repository-artifact: https://pypi.org/project/splicecraft/
+license: MIT
+version: 1.2.53
+date-released: '2026-08-15'
+abstract: >-
+  SpliceCraft is a terminal-native plasmid workbench for molecular cloning. It
+  renders circular and linear plasmid maps as Unicode braille graphics in any
+  modern terminal, edits sequences base by base, designs PCR and mutagenesis
+  primers, plans and simulates Golden Braid, MoClo, Gibson, and traditional
+  restriction assemblies, runs BLASTN/BLASTP/HMMscan in-process via pyhmmer,
+  optimises codon usage, models agarose gels, ingests Sanger and nanopore
+  sequencing runs, and keeps a lab notebook -- entirely offline, with no cloud
+  account and no data leaving the machine unless the user asks. Written in pure
+  Python on Textual and Biopython, it also exposes a local HTTP API and a
+  stdlib CLI so external agents and shell scripts can drive every workflow.
+keywords:
+  - bioinformatics
+  - molecular biology
+  - synthetic biology
+  - plasmid
+  - molecular cloning
+  - GenBank
+  - primer design
+  - restriction enzymes
+  - Golden Gate
+  - Golden Braid
+  - MoClo
+  - Gibson assembly
+  - codon optimization
+  - sequence analysis
+  - terminal user interface
+  - Python

@@ -14,6 +14,32 @@
 
 ---
 
+## [1.2.53] — 2026-08-15
+
+### New features
+
+- **SpliceCraft is citable — every release now gets a DOI.** Releases are
+  archived on Zenodo, so a paper, thesis, or grant report can point at the
+  exact version that designed a construct instead of a bare GitHub link.
+  Run `splicecraft --citation` for a ready-to-paste APA reference and BibTeX
+  entry, both pinned to the version you're actually running — no guessing
+  which release made the plasmid six months later. GitHub's **Cite this
+  repository** button (top of the repo page) now works too, and exports the
+  same citation in one click.
+
+### Hardening
+
+- The BibTeX entry from `splicecraft --citation` now protects the program
+  name's capitalisation, so bibliography styles that title-case entries render
+  **SpliceCraft** instead of "Splicecraft".
+- Citation details are checked by the test suite before every release: the
+  version and release date have to agree across every file that carries them,
+  the archive record has to carry only fields the archive accepts, and a
+  release that can't update all of them now stops before changing any of them
+  rather than leaving two files disagreeing about which version you have.
+
+---
+
 ## [1.2.52] — 2026-08-05
 
 ### New features

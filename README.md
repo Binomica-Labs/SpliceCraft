@@ -4,6 +4,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/splicecraft.svg)](https://pypi.org/project/splicecraft/)
 [![Python](https://img.shields.io/pypi/pyversions/splicecraft.svg)](https://pypi.org/project/splicecraft/)
+[![DOI](https://zenodo.org/badge/1190666059.svg)](https://zenodo.org/badge/latestdoi/1190666059)
 [![100% Python](https://img.shields.io/badge/100%25-Python-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![TUI: Textual](https://img.shields.io/badge/TUI-Textual-5A45FF?logo=python&logoColor=white)](https://textual.textualize.io/)
 [![Tests](https://github.com/Binomica-Labs/SpliceCraft/actions/workflows/test.yml/badge.svg)](https://github.com/Binomica-Labs/SpliceCraft/actions/workflows/test.yml)
@@ -520,6 +521,20 @@ surfaces at the bench. Issues and PRs welcome at
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a non-trivial PR — it
 walks through the sacred invariants, the test cadence, and the
 security-sensitive code surfaces.
+
+## Citing SpliceCraft
+
+If SpliceCraft did part of the work in something you publish, please cite it.
+Every release is archived on [Zenodo](https://zenodo.org/) with its own DOI, so
+a methods section can point at the exact version that produced the design.
+
+```bash
+splicecraft --citation     # APA reference + BibTeX, pinned to your version
+```
+
+The repository also ships a [`CITATION.cff`](CITATION.cff), so GitHub's **Cite
+this repository** button (top right of the repo page) exports APA or BibTeX
+directly.
 
 ## License
 

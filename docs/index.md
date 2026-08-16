@@ -40,6 +40,9 @@ real-world job.
   client (~50 ms cold start).
 - [**Architecture**](architecture.md) — the hub + layered-siblings
   layout and how to navigate it.
+- [**Citing SpliceCraft**](citation.md) — the Zenodo DOI, and
+  `splicecraft --citation` for an APA reference plus BibTeX pinned to
+  your version.
 
 ## At a glance
 

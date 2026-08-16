@@ -1,0 +1,35 @@
+{
+    "title": "SpliceCraft: a terminal-native plasmid workbench for molecular cloning",
+    "upload_type": "software",
+    "access_right": "open",
+    "license": "mit",
+    "language": "eng",
+    "version": "1.2.53",
+    "creators": [
+        {
+            "name": "Cocioba, Sebastian",
+            "affiliation": "Binomica Labs",
+            "orcid": "0000-0002-6821-2996"
+        }
+    ],
+    "description": "<p><strong>SpliceCraft</strong> is a terminal-native plasmid workbench for molecular cloning. It renders circular and linear plasmid maps as Unicode braille graphics in any modern terminal, edits sequences base by base, designs PCR and mutagenesis primers, plans and simulates Golden Braid, MoClo, Gibson, and traditional restriction assemblies, runs BLASTN/BLASTP/HMMscan in-process via pyhmmer, optimises codon usage, models agarose gels, ingests Sanger and nanopore sequencing runs, and keeps a lab notebook &mdash; entirely offline, with no cloud account and no data leaving the machine unless the user asks for it.</p><p>It is written in pure Python on Textual and Biopython, runs on Linux, macOS, Windows, and WSL, and installs with <code>pipx install splicecraft</code>. Every construction step is simulated rather than asserted: amplicons are really amplified, fragments are really digested and ligated, and the resulting plasmid carries a full construction history. A local HTTP API and a stdlib-only CLI sidecar let external agents and shell scripts drive every workflow. User data lives in a plain-text-first local library protected by atomic writes, four-layer per-file backups, and daily snapshots.</p><p>Source code, issue tracker, and documentation: <a href=\"https://github.com/Binomica-Labs/SpliceCraft\">github.com/Binomica-Labs/SpliceCraft</a> &middot; releases on PyPI as <a href=\"https://pypi.org/project/splicecraft/\">splicecraft</a> &middot; project site <a href=\"https://splicecraft.bio\">splicecraft.bio</a>.</p>",
+    "notes": "Each tagged release is archived here automatically from GitHub and receives its own version DOI; the concept DOI always resolves to the newest version. Released under the MIT licence.",
+    "keywords": [
+        "bioinformatics",
+        "molecular biology",
+        "synthetic biology",
+        "plasmid",
+        "molecular cloning",
+        "GenBank",
+        "primer design",
+        "restriction enzymes",
+        "Golden Gate",
+        "Golden Braid",
+        "MoClo",
+        "Gibson assembly",
+        "codon optimization",
+        "sequence analysis",
+        "terminal user interface",
+        "Python"
+    ]
+}

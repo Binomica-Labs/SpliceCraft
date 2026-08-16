@@ -63,6 +63,8 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"
 SPLICECRAFT = REPO_ROOT / "splicecraft.py"
 CHANGELOG = REPO_ROOT / "CHANGELOG.md"
 CONDA_RECIPE = REPO_ROOT / "conda-recipe" / "meta.yaml"
+CITATION_CFF = REPO_ROOT / "CITATION.cff"
+ZENODO_JSON = REPO_ROOT / ".zenodo.json"
 
 # Upstream bioconda repository — the canonical channel every
 # `conda install -c bioconda <pkg>` user pulls from. The release flow
@@ -90,6 +92,18 @@ _PYPROJECT_VERSION_RE = re.compile(
 _SPLICECRAFT_VERSION_RE = re.compile(
     r'^(__version__\s*=\s*)"[^"]+"', re.MULTILINE,
 )
+
+# Citation metadata (the Zenodo DOI record + GitHub's "Cite this repository"
+# button). Three files carry the version / release date and MUST move together
+# with the bump above, or the archived record cites the wrong release:
+#   * CITATION.cff   — `version:` + `date-released:` (YAML, unquoted / quoted)
+#   * .zenodo.json   — `"version"` (JSON)
+#   * splicecraft.py — `_RELEASE_DATE` (drives the year in `--citation`)
+# `^version:` is anchored so it can't match `cff-version:` on the line above.
+_CFF_VERSION_RE = re.compile(r"^(version:\s*).+$", re.MULTILINE)
+_CFF_DATE_RE = re.compile(r"^(date-released:\s*).+$", re.MULTILINE)
+_ZENODO_VERSION_RE = re.compile(r'^(\s*"version"\s*:\s*)"[^"]*"', re.MULTILINE)
+_RELEASE_DATE_RE = re.compile(r'^(_RELEASE_DATE\s*=\s*)"[^"]*"', re.MULTILINE)
 
 # conda-recipe/meta.yaml uses jinja2-style `{% set version = "..." %}`
 # at the top and a `sha256: <hex>` line under `source:`. The run-deps
@@ -514,6 +528,70 @@ def _bump_version_in_file(path: Path, pattern: re.Pattern[str],
         _die(f"found {n} version-line matches in {label}; refusing to "
              f"bump (please simplify {path.name}).")
     path.write_text(new_text, encoding="utf-8")
+
+
+def _stamp_citation_metadata(new_version: str) -> str:
+    """Stamp *new_version* + today's date into the citation metadata:
+    ``CITATION.cff`` (version + date-released), ``.zenodo.json`` (version), and
+    ``splicecraft.py``'s ``_RELEASE_DATE``.
+
+    These drive the permanent Zenodo/DataCite record for this release and the
+    `splicecraft --citation` output, so a missed stamp means a DOI that cites
+    the WRONG version forever. Every substitution is counted and a miss is
+    fatal — same contract as `_bump_version_in_file`. `tests/test_citation.py`
+    re-checks the result during the pytest gate below.
+
+    Returns the ISO date stamped, for the log line."""
+    import datetime as _dt        # local import, matching this file's style
+    today = _dt.date.today().isoformat()
+    edits = [
+        (CITATION_CFF, _CFF_VERSION_RE, new_version, "CITATION.cff version"),
+        (CITATION_CFF, _CFF_DATE_RE, f"'{today}'", "CITATION.cff date-released"),
+        (ZENODO_JSON, _ZENODO_VERSION_RE, f'"{new_version}"', ".zenodo.json version"),
+        (SPLICECRAFT, _RELEASE_DATE_RE, f'"{today}"', "splicecraft.py _RELEASE_DATE"),
+    ]
+    # PASS 1 — stage every substitution in memory and prove all four matched
+    # BEFORE a single byte lands. Writing file-by-file leaves a half-stamped
+    # tree when a later regex misses: CITATION.cff already bumped, .zenodo.json
+    # still on the old version, and the release dead in between. `staged` is
+    # keyed by path because CITATION.cff takes two edits that must compose.
+    staged: dict[Path, str] = {}
+    for path, pattern, value, label in edits:
+        if path not in staged:
+            if not path.exists():
+                _die(f"{path.name} is missing, so {label} cannot be stamped. "
+                     f"Restore the file (git checkout {path.name}) before "
+                     f"releasing — a release without citation metadata mints "
+                     f"a DOI record with no version on it.")
+            staged[path] = path.read_text(encoding="utf-8")
+        new_text, n = pattern.subn(lambda m: m.group(1) + value, staged[path])
+        if n != 1:
+            _die(f"expected exactly 1 {label} line to rewrite, found {n} "
+                 f"in {path.name}. Citation metadata would ship stale — "
+                 f"fix the file (or the regex) before releasing.")
+        staged[path] = new_text
+
+    # PASS 2 — every substitution matched, so commit them all.
+    for path, text in staged.items():
+        path.write_text(text, encoding="utf-8")
+
+    # Read back — a wrong-encoding / silently-failed write here would put the
+    # wrong version on a permanent DOI, which cannot be taken back.
+    cff = CITATION_CFF.read_text(encoding="utf-8")
+    if f"\nversion: {new_version}\n" not in cff:
+        _die(f"CITATION.cff did not take version {new_version}.")
+    if f"date-released: '{today}'" not in cff:
+        _die(f"CITATION.cff did not take date-released {today}.")
+    try:
+        zen = json.loads(ZENODO_JSON.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        _die(f".zenodo.json is not valid JSON after the stamp: {exc}")
+    if zen.get("version") != new_version:
+        _die(f".zenodo.json version is {zen.get('version')!r}, expected "
+             f"{new_version!r}.")
+    if f'_RELEASE_DATE = "{today}"' not in SPLICECRAFT.read_text(encoding="utf-8"):
+        _die(f"splicecraft.py did not take _RELEASE_DATE {today}.")
+    return today
 
 
 def _verify_bump(path: Path, new_version: str, var_name: str) -> None:
@@ -1437,6 +1515,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     _verify_bump(PYPROJECT,   new_version, "version")
     _verify_bump(SPLICECRAFT, new_version, "__version__")
+    # Citation metadata rides the same bump — CITATION.cff / .zenodo.json /
+    # `_RELEASE_DATE` feed the Zenodo DOI record minted when the GitHub
+    # Release for this tag is published (see docs/citation.md).
+    _stamped = _stamp_citation_metadata(new_version)
+    print(f"  citation metadata stamped (version {new_version}, "
+          f"released {_stamped})")
 
     # Run ruff + pyright BEFORE pytest — both mirror `.github/workflows/
     # test.yml`'s `lint` job EXACTLY, so a release that passes here also

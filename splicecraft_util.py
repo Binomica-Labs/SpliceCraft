@@ -1288,3 +1288,116 @@ def _monotonic() -> float:
     """Monotonic clock reading in seconds. Use for elapsed-time
     measurements; `_now()` for absolute timestamps."""
     return _time_mod.monotonic()
+
+
+# ── Citation metadata (Zenodo DOI) ────────────────────────────────────
+# SpliceCraft is archived on Zenodo: every GitHub Release is snapshotted and
+# stamped with its own version DOI, and one CONCEPT DOI (below) always resolves
+# to the newest archived version. The concept DOI is what a paper should cite
+# when the exact version doesn't matter; `--citation` prints the running
+# version alongside it so a methods section can be precise.
+#
+# Zenodo cannot reserve a DOI ahead of the first archived release, so this
+# constant is EMPTY until that first release lands, and every formatter below
+# degrades to the GitHub URL rather than printing a placeholder that looks like
+# a real identifier. Filling it in is a one-line change; tests/test_citation.py
+# then enforces that README.md, CITATION.cff, and docs/citation.md all carry
+# the SAME string (all-or-nothing — a half-wired DOI can't ship).
+_ZENODO_CONCEPT_DOI = ""
+
+# GitHub's numeric repository id for Binomica-Labs/SpliceCraft. Zenodo's badge
+# endpoints are keyed on it (`zenodo.org/badge/<id>.svg` renders the badge,
+# `zenodo.org/badge/latestdoi/<id>` 302s to the newest version DOI), which is
+# how the README badge can be wired up before any DOI exists.
+_ZENODO_GITHUB_REPO_ID = "1190666059"
+
+_CITATION_TITLE = (
+    "SpliceCraft: a terminal-native plasmid workbench for molecular cloning"
+)
+# BibTeX styles that title-case (plain / unsrt / abbrv run the title through
+# `"t" change.case$`) lowercase every letter but the first, rendering
+# "SpliceCraft" as "Splicecraft" in the bibliography. Wrapping the program name
+# in its own brace group pins the capitalisation; the braces themselves do not
+# render. Derived from the title above so the two can never drift.
+_CITATION_TITLE_BIBTEX = _CITATION_TITLE.replace("SpliceCraft", "{SpliceCraft}", 1)
+
+_CITATION_AUTHOR_APA = "Cocioba, S."
+_CITATION_AUTHOR_BIBTEX = "Cocioba, Sebastian"
+_CITATION_REPO_URL = "https://github.com/Binomica-Labs/SpliceCraft"
+
+
+def _citation_doi_url() -> str:
+    """Resolver URL for the concept DOI, or "" when none is minted yet."""
+    return f"https://doi.org/{_ZENODO_CONCEPT_DOI}" if _ZENODO_CONCEPT_DOI else ""
+
+
+def _citation_year(released: str) -> str:
+    """Publication year for a citation, taken from a ``YYYY-MM-DD`` release
+    date. Falls back to the current year when the stamp is missing or
+    malformed — a citation with a wrong-ish year still resolves; one with a
+    crashed formatter doesn't."""
+    # `str(...)` so a caller handing over a `date` (or anything else with a
+    # sane `__str__`) degrades to the fallback instead of raising mid-citation.
+    # ASCII-only: `"\u0662\u0660\u0662\u0666".isdigit()` is True, and a year in
+    # Arabic-Indic digits would sail into a bibliography unnoticed.
+    head = str(released or "").strip()[:4]
+    if len(head) == 4 and head.isascii() and head.isdigit():
+        return head
+    return str(_now().year)
+
+
+def _citation_apa(version: str, released: str) -> str:
+    """One-line APA-7 software reference for *version*."""
+    where = _citation_doi_url() or _CITATION_REPO_URL
+    publisher = "Zenodo. " if _ZENODO_CONCEPT_DOI else ""
+    return (
+        f"{_CITATION_AUTHOR_APA} ({_citation_year(released)}). "
+        f"{_CITATION_TITLE} (Version {version}) [Computer software]. "
+        f"{publisher}{where}"
+    )
+
+
+def _citation_bibtex(version: str, released: str) -> str:
+    """BibTeX ``@software`` entry for *version*."""
+    lines = [
+        "@software{splicecraft,",
+        f"  author    = {{{_CITATION_AUTHOR_BIBTEX}}},",
+        f"  title     = {{{_CITATION_TITLE_BIBTEX}}},",
+        f"  version   = {{{version}}},",
+        f"  year      = {{{_citation_year(released)}}},",
+    ]
+    if _ZENODO_CONCEPT_DOI:
+        lines.append("  publisher = {Zenodo},")
+        lines.append(f"  doi       = {{{_ZENODO_CONCEPT_DOI}}},")
+        lines.append(f"  url       = {{{_citation_doi_url()}}}")
+    else:
+        lines.append("  publisher = {GitHub},")
+        lines.append(f"  url       = {{{_CITATION_REPO_URL}}}")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _citation_text(version: str, released: str) -> str:
+    """The full block printed by ``splicecraft --citation`` and shown in the
+    in-app help: a plain-text APA reference plus a BibTeX entry, both pinned to
+    the version that is actually running."""
+    out = [
+        f"SpliceCraft {version} — how to cite",
+        "",
+        _citation_apa(version, released),
+        "",
+        _citation_bibtex(version, released),
+        "",
+    ]
+    if _ZENODO_CONCEPT_DOI:
+        out.append(
+            f"The DOI above ({_ZENODO_CONCEPT_DOI}) is the concept DOI and always "
+            f"resolves to the\nnewest release. To cite this exact version instead, "
+            f"open the record and pick\nv{version} from its version list."
+        )
+    else:
+        out.append(
+            "A Zenodo DOI is being minted for the next release; until then cite "
+            "the\nrepository URL above."
+        )
+    return "\n".join(out)
