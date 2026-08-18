@@ -1762,6 +1762,10 @@ def _import_migrate_archive(zip_path: "str | Path") -> dict:
         shutil.rmtree(staging, ignore_errors=True)
 
 
+_SNAPSHOT_MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                    "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+
+
 def _format_pre_update_snapshot_table(snaps: "list[dict]") -> str:
     """Render `_list_pre_update_snapshots()` output as a human-readable
     table for printing to the terminal. Returns the empty string for
@@ -1773,7 +1777,14 @@ def _format_pre_update_snapshot_table(snaps: "list[dict]") -> str:
     lines = ["    Snapshot ID                                 From       Files  Dirs   Size",
              "    " + "─" * 80]
     for s in snaps:
-        when = _dt.datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
+        # Universal date format ("AUG 16 2026 14:30"): uppercase 3-letter
+        # month, no leading-zero day, 24-hour clock, no slashes. Rendered
+        # inline rather than through `_history_human_dt` because that lives
+        # in history (L2) and this module is L1 — importing it would be an
+        # upward import (`tests/test_import_layers.py` refuses).
+        _w = _dt.datetime.fromtimestamp(s["mtime"])
+        when = (f"{_SNAPSHOT_MONTHS[_w.month - 1]} {_w.day} {_w.year} "
+                f"{_w.hour:02d}:{_w.minute:02d}")
         size_kb = s["total_size"] / 1024.0
         if size_kb < 1024:
             size_str = f"{size_kb:7.1f} KB"

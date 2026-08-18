@@ -14,6 +14,91 @@
 
 ---
 
+## [1.2.55] — 2026-08-18
+
+### Bug fixes
+
+- **An `EcoRI` label could make cloning pick the wrong piece of DNA.** To tell
+  a vector backbone from the payload you actually want, SpliceCraft looks for
+  origin and resistance annotations — and it was matching the word "ori"
+  anywhere inside a label. "ori" is the tail of **EcoRI**. Any fragment
+  carrying an EcoRI site annotation therefore looked like backbone, and when
+  *both* halves of a digest look like backbone the choice falls back to
+  guessing by size — so a Golden Gate assembly could quietly ligate the wrong
+  half, and a part that should have been recognised came back as "no
+  detectable grammar" instead. Every one of the plasmids that ships with the
+  demo library carries an EcoRI annotation, so this was not a rare corner.
+  Marker words are now matched at the start of a word only. Every real way of
+  writing an origin still counts — `ori`, `Ori*`, `ColE1 ori`, `f1 ori`,
+  `oriT`, `oriV`, `origin of replication` — while `EcoRI`, `Aequorea
+  victoria`, `a priori`, "the original insert" and "reverse orientation" no
+  longer do. Reported by a user driving SpliceCraft through the agent API.
+- **Tet parts were mistaken for a resistance cassette.** The same
+  match-anywhere rule read `tetR` inside **tetratricopeptide repeat**,
+  **tetramerization domain**, **tetraspanin**, **Tetrahymena** and
+  **tetraloop** — none of which have anything to do with tetracycline, and the
+  first two are among the most commonly annotated protein domains there are.
+  Tet is also the one resistance family whose repressor and operator are
+  ordinary payload parts, so a Tet-On/Tet-Off construct's `tetO` operator,
+  tet-responsive promoter, `tetR` binding site, or a primer named `TetR-F` all
+  counted as backbone too. Tet now counts as a marker only as a whole word on
+  a gene or CDS feature — which is what a real resistance gene looks like.
+- **A reverse-strand gene crossing the origin exported a scrambled protein.**
+  SpliceCraft always displayed it correctly, but the two halves of the feature
+  were written to the GenBank file in the wrong order, so every other tool —
+  Biopython, NCBI, and the commercial viewers — read back a protein whose
+  sequence starts in the middle. Any feature that wraps the origin on the
+  minus strand is now written head-first, the way the format expects.
+- **Re-origin could swallow an intron.** Setting a new origin on a plasmid
+  with a multi-exon gene collapsed that gene into one solid block spanning its
+  introns. Every piece of a split feature is now moved individually, so a gene
+  keeps its shape — and its protein — wherever you put the origin.
+- **A part that does not start with ATG no longer loses three bases.** When a
+  grammar's fusion overhang supplies the start codon and the region you picked
+  does *not* open on ATG, the designed primers silently replaced your first
+  three bases with it, while every on-screen simulation showed them still
+  there. The primers now keep your sequence intact, and the Domesticator says
+  up front that the part will encode an extra starting methionine.
+- **A phantom duplicate PCR product could be listed ahead of the real one.**
+  If a reverse primer bound with its 3' end exactly on the origin, the
+  simulator listed a second, longer product that was really the same pair of
+  sites read once around the circle — and because results sort longest-first,
+  it appeared at the top, with start/end positions that didn't match its own
+  sequence.
+- **FASTA import could turn linear DNA into a circle.** Topology was guessed
+  by looking for the words "circular" or "plasmid" anywhere in the
+  description, with nothing weighing the words next to them. `>pUC19 plasmid,
+  linearized`, `>linear plasmid pBSSB1`, `>plasmid backbone fragment (PCR
+  product)`, `>PCR amplicon from plasmid template`, `>gBlock, non-circular`
+  and `>cpGFP circularly permuted` all came in as circular molecules — which
+  joins two ends that aren't joined and reports restriction sites across the
+  join. An explicit statement of linearity now wins over the hint.
+- **A plasmid named `pLinear2` filed itself as a fragment.** Topology for a
+  stored entry was read by searching the top of its GenBank text for the word
+  "linear" — which also covers the plasmid's own name and its description. So
+  a circular plasmid whose name merely contained "linear" showed the wrong
+  Kind in the library, reported the wrong topology to the agent API, and was
+  described wrongly to the in-app assistant; a linear fragment whose
+  description mentioned a "circular vector backbone" had the opposite
+  problem. All three now read the topology field of the GenBank header, which
+  is the one place that actually states it.
+
+### Hardening
+
+- **The cloning warning can't disagree with itself.** When SpliceCraft warns
+  that a fragment carries backbone markers it also names them — but the
+  naming step trimmed long labels *before* looking for a marker, so a marker
+  sitting past the 80th character produced a warning with nothing listed. The
+  check and the list it prints are now the same piece of code.
+- **Malformed fragment data can't interrupt a cloning run.** Fragment
+  information arriving from the agent API in an unexpected shape now reads as
+  "no marker found" instead of raising out of the run.
+- **Dates in the update-rollback list match the rest of the app.** `splicecraft
+  update --list-backups` printed ISO timestamps; it now uses the same
+  slash-free format as every other date on screen.
+
+---
+
 ## [1.2.54] — 2026-08-15
 
 ### New features

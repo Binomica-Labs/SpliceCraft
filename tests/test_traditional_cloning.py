@@ -2707,7 +2707,8 @@ class TestBackboneMarkerVocabulary:
         """`splicecraft_cloning._frag_carries_backbone_marker` is a hand-kept
         copy (L3 can't import seqanalysis — import cycle). Drift between the
         two means the Constructor and the modular resolver disagree about
-        which half is the backbone."""
+        which half is the backbone. (The full corpus runs through both in
+        `TestBackboneVocabularyCorpus`; these are the erm-family cases.)"""
         import splicecraft_cloning as scc
         cases = [("gene", ["ermB"]), ("gene", ["Terminator"]),
                  ("misc_feature", ["AmpR"]), ("misc_feature", ["p15A ori"]),
@@ -2716,7 +2717,11 @@ class TestBackboneMarkerVocabulary:
                  ("regulatory", ["as_annotated_pXX-ermB"]),
                  ("primer_bind", ["ermB-CLO-F"]),
                  ("gene", ["Term 908"]), ("CDS", ["nptII"]),
-                 ("misc_feature", ["blast"])]
+                 ("misc_feature", ["blast"]),
+                 ("misc_feature", ["EcoRI"]), ("primer_bind", ["EcoRI-F"]),
+                 ("CDS", ["GFP (Aequorea victoria)"]),
+                 ("misc_feature", ["oriT"]), ("misc_feature", ["pMB1ori"]),
+                 ("misc_feature", ["origin of replication"])]
         for ftype, labels in cases:
             frag = _frag(100, labels, ftype=ftype)
             assert scc._frag_carries_backbone_marker(frag) is \
@@ -2738,6 +2743,356 @@ class TestBackboneMarkerVocabulary:
             qualifiers={"label": ["ermB"]}))
         assert sc._detect_selection_marker(
             sc._record_to_gb_text(rec)) == "Erythromycin"
+
+
+class TestOriNeedsALeftBoundary:
+    """`ori` is three letters, and it is the TAIL of names that get annotated
+    on payload fragments constantly — `EcoRI` above all.
+
+    Field report 2026-08-17 (agent-driven Golden Gate): an alpha/omega digest
+    whose INSERT half carried nothing but an `EcoRI` site annotation read as
+    backbone, so BOTH halves did, and the pick fell through to the size
+    heuristic the marker test exists to replace. The reporter worked around
+    it by selecting on the `rep_origin` feature TYPE.
+    """
+
+    # The exact digest from the report: the 886 nt insert half is annotated
+    # only with an EcoRI site; the 1822 nt backbone half carries the real
+    # markers (and an EcoRI site of its own).
+    INSERT_LABELS = ["EcoRI"]
+    BACKBONE_LABELS = ["AmpR", "AmpR promoter", "Ori*", "EcoRI"]
+
+    def test_the_field_report_digest_picks_the_right_half(self):
+        insert = _frag(886, self.INSERT_LABELS)
+        backbone = _frag(1822, self.BACKBONE_LABELS)
+        assert sc._fragment_has_backbone_marker(insert) is False, (
+            "an EcoRI site annotation made the insert half read as backbone"
+        )
+        assert sc._fragment_has_backbone_marker(backbone) is True
+        picked = sc._pick_insert_fragment([insert, backbone])
+        assert picked is insert
+        assert "_size_fallback_no_marker" not in picked, (
+            "marker evidence singled out one fragment — the pick must NOT be "
+            "a size guess"
+        )
+
+    def test_the_field_report_digest_picks_the_right_backbone(self):
+        insert = _frag(886, self.INSERT_LABELS)
+        backbone = _frag(1822, self.BACKBONE_LABELS)
+        picked = sc._pick_backbone_fragment([insert, backbone])
+        assert picked is backbone
+        assert "_size_fallback_no_marker" not in picked
+
+    def test_report_does_not_name_a_restriction_site_as_a_marker(self):
+        """The reporter's `markers=['EcoRI']` diagnosis line came from here."""
+        assert sc._fragment_backbone_marker_labels(
+            _frag(886, self.INSERT_LABELS)) == []
+        assert sc._fragment_backbone_marker_labels(
+            _frag(1822, self.BACKBONE_LABELS)) == ["AmpR", "AmpR promoter",
+                                                   "Ori*"]
+
+    @pytest.mark.parametrize("ftype,label", [
+        ("misc_feature", "EcoRI"),
+        ("misc_feature", "EcoRI site"),
+        ("misc_feature", "EcoRI/BamHI MCS"),
+        ("primer_bind", "EcoRI-F"),
+        ("CDS", "GFP (Aequorea victoria)"),
+        ("CDS", "mCherry (Discosoma sp.)"),
+        ("misc_feature", "a priori design"),
+        ("misc_feature", "historic clone"),
+        # The two English words that OPEN with it — a left boundary alone
+        # lets both through.
+        ("misc_feature", "insert (original)"),
+        ("misc_feature", "original construct"),
+        ("misc_feature", "GFP, reverse orientation"),
+        ("misc_feature", "orientation marker"),
+        ("CDS", "originally from pBR322"),
+    ])
+    def test_letter_joined_ori_is_not_an_origin(self, ftype, label):
+        frag = _frag(500, [label], ftype=ftype)
+        assert sc._fragment_has_backbone_marker(frag) is False, (
+            f"{label!r} false-positived as an origin of replication"
+        )
+        assert sc._fragment_backbone_marker_labels(frag) == []
+
+    @pytest.mark.parametrize("label", [
+        "ori", "Ori*", "ORI", "ori (pMB1)", "ColE1 ori", "pUC ori", "f1 ori",
+        "p15A ori", "pSC101 ori", "R6K gamma ori", "oriT", "oriV", "oriC",
+        "ori2", "oriP", "oriR6K", "oriColE1", "rep_origin",
+        "origin of replication", "origins of replication", "pBR322 origin",
+        "pMB1ori",
+    ])
+    def test_every_real_origin_spelling_still_matches(self, label):
+        """The boundary must not cost coverage — a false NEGATIVE here drops
+        the pick back to the same size heuristic, just quietly."""
+        frag = _frag(500, [label])
+        assert sc._fragment_has_backbone_marker(frag) is True, (
+            f"{label!r} stopped being recognised as an origin"
+        )
+
+    def test_a_marker_past_the_display_clamp_still_reports(self):
+        """`_fragment_backbone_marker_labels` clamps names to 80 chars for the
+        one-line warning. Clamping BEFORE matching would make the predicate
+        say True while the evidence list came back empty."""
+        label = "x" * 100 + " ColE1 ori"
+        frag = _frag(500, [label])
+        assert sc._fragment_has_backbone_marker(frag) is True
+        names = sc._fragment_backbone_marker_labels(frag)
+        assert names, "predicate said backbone, evidence list said nothing"
+        assert len(names[0]) <= 80
+
+    def test_cloning_mirror_agrees_on_ori(self):
+        import splicecraft_cloning as scc
+        for ftype, label in [("misc_feature", "EcoRI"),
+                             ("primer_bind", "EcoRI-F"),
+                             ("CDS", "GFP (Aequorea victoria)"),
+                             ("misc_feature", "ColE1 ori"),
+                             ("misc_feature", "oriT"),
+                             ("misc_feature", "pMB1ori"),
+                             ("misc_feature", "insert (original)"),
+                             ("misc_feature", "reverse orientation"),
+                             ("misc_feature", "origin of replication")]:
+            frag = _frag(100, [label], ftype=ftype)
+            assert scc._frag_carries_backbone_marker(frag) is \
+                sc._fragment_has_backbone_marker(frag), \
+                f"marker mirrors disagree on {ftype} /label={label!r}"
+
+
+# ── The adversarial corpus behind TestBackboneVocabularyCorpus ───────────────
+# Real annotation text, not invented strings: SnapGene / pLannotate / Benchling
+# feature names as they actually appear on plasmid maps. Every entry here was
+# run through the predicate on 2026-08-18 while chasing the `ori`-in-`EcoRI`
+# field report, and the ones marked below FAILED before that sweep.
+_PAYLOAD_ANNOTATIONS = [
+    # restriction sites — `misc_feature` is how every tool writes them
+    ("misc_feature", "EcoRI"),                 # ← the field report
+    ("misc_feature", "EcoRI site"),
+    ("misc_feature", "EcoRI/BamHI MCS"),
+    ("primer_bind",  "EcoRI-F"),
+    ("misc_feature", "BamHI"), ("misc_feature", "XbaI"),
+    ("misc_feature", "EcoRV"), ("misc_feature", "Esp3I"),
+    ("misc_feature", "Tth111I"), ("misc_feature", "PaqCI"),
+    # species / domain names with unlucky substrings
+    ("CDS", "GFP (Aequorea victoria)"),        # ← vict-ORI-a
+    ("CDS", "mCherry (Discosoma sp.)"),
+    ("CDS", "tetratricopeptide repeat"),       # ← TETR-atricopeptide
+    ("CDS", "TPR (tetratricopeptide) domain"),
+    ("CDS", "tetramerization domain"),         # ← TETR-amerization
+    ("CDS", "tetraspanin"),
+    ("CDS", "Tetrahymena ribozyme"),
+    ("misc_feature", "tetraloop"),
+    ("CDS", "campR-like protein"),             # ← c-AMPR-like
+    # tet regulatory parts — payload in every Tet-On / Tet-Off construct
+    ("protein_bind", "tetracycline operator"),
+    ("protein_bind", "tetO"),
+    ("promoter", "tetracycline-responsive promoter"),
+    ("promoter", "TRE (tet response element)"),
+    ("misc_feature", "tetR binding site"),
+    ("primer_bind", "TetR-F"),
+    # ordinary English on hand-annotated features
+    ("misc_feature", "insert (original)"),
+    ("misc_feature", "original construct"),
+    ("misc_feature", "GFP, reverse orientation"),
+    ("CDS", "originally from pBR322"),
+    ("misc_feature", "a priori design"),
+    ("misc_feature", "historic clone"),
+    # parts / tags / sites that must stay payload
+    ("CDS", "lacZ-alpha"), ("CDS", "LacI"), ("CDS", "AraC"),
+    ("promoter", "T7 promoter"), ("terminator", "T7 terminator"),
+    ("terminator", "rrnB T1 terminator"), ("misc_feature", "MCS"),
+    ("CDS", "6xHis"), ("CDS", "FLAG tag"), ("misc_feature", "loxP"),
+    ("primer_bind", "M13 fwd"), ("CDS", "rop"), ("misc_feature", "bom"),
+    ("CDS", "catalase"), ("gene", "category B part"), ("gene", "blast hit"),
+    ("CDS", "spectrin repeat"), ("CDS", "kanamycin-insensitive kinase"),
+]
+
+_MARKER_ANNOTATIONS = [
+    # origins, every spelling that turns up in the wild
+    ("rep_origin", "ori"), ("rep_origin", "Ori*"), ("misc_feature", "ColE1 ori"),
+    ("rep_origin", "pUC ori"), ("rep_origin", "f1 ori"),
+    ("rep_origin", "p15A ori"), ("rep_origin", "pVS1 oriV"),
+    ("misc_feature", "oriT"), ("misc_feature", "oriP"),
+    ("misc_feature", "oriR6K"), ("misc_feature", "ori2"),
+    ("misc_feature", "origin of replication"),
+    ("misc_feature", "origins of replication"),
+    ("misc_feature", "pBR322 origin"), ("misc_feature", "pMB1ori"),
+    ("misc_feature", "rep_origin"),
+    # resistance
+    ("CDS", "AmpR"), ("CDS", "KanR"), ("CDS", "NeoR/KanR"), ("CDS", "SpecR"),
+    ("CDS", "CmR"), ("CDS", "ermB"), ("CDS", "cat"), ("CDS", "bla"),
+    ("CDS", "aadA"), ("CDS", "nptII"), ("CDS", "hygR"),
+    ("promoter", "AmpR promoter"), ("promoter", "KanR Promoter"),
+    ("CDS", "chloramphenicol acetyltransferase"),
+    ("CDS", "carbenicillin resistance"), ("CDS", "spectinomycin resistance"),
+    # tet — on a gene-bearing feature type, which is what makes it the gene
+    ("CDS", "TetR"), ("gene", "tetR"),
+    ("CDS", "tetracycline resistance protein"), ("gene", "tetA"),
+]
+
+
+class TestBackboneVocabularyCorpus:
+    """The whole vocabulary against real annotation text, in both mirrors.
+
+    A false POSITIVE here is the expensive direction: it makes a payload half
+    look like backbone, and once both halves look like backbone every consumer
+    falls back to guessing by size — which is the heuristic the marker test
+    exists to replace. A false NEGATIVE only drops to that same fallback, with
+    a warning. So the corpus is scored asymmetrically on purpose.
+    """
+
+    @pytest.mark.parametrize("ftype,label", _PAYLOAD_ANNOTATIONS)
+    def test_payload_annotation_is_not_a_marker(self, ftype, label):
+        frag = _frag(500, [label], ftype=ftype)
+        assert sc._fragment_has_backbone_marker(frag) is False, (
+            f"{ftype} /label={label!r} read as backbone — a payload fragment "
+            f"carrying it would be mistaken for the vector half"
+        )
+        assert sc._fragment_backbone_marker_labels(frag) == []
+
+    @pytest.mark.parametrize("ftype,label", _MARKER_ANNOTATIONS)
+    def test_real_marker_is_recognised(self, ftype, label):
+        frag = _frag(500, [label], ftype=ftype)
+        assert sc._fragment_has_backbone_marker(frag) is True, (
+            f"{ftype} /label={label!r} stopped being recognised as a backbone "
+            f"marker — the pick silently degrades to fragment size"
+        )
+
+    @pytest.mark.parametrize(
+        "ftype,label", _PAYLOAD_ANNOTATIONS + _MARKER_ANNOTATIONS)
+    def test_cloning_mirror_agrees(self, ftype, label):
+        """`splicecraft_cloning._frag_carries_backbone_marker` is a hand-kept
+        copy (L3 can't import seqanalysis — import cycle). Drift means the
+        Constructor and the domestication resolver disagree about which half
+        of a digest is the backbone."""
+        import splicecraft_cloning as scc
+        frag = _frag(100, [label], ftype=ftype)
+        assert scc._frag_carries_backbone_marker(frag) is \
+            sc._fragment_has_backbone_marker(frag), \
+            f"marker mirrors disagree on {ftype} /label={label!r}"
+
+    @pytest.mark.parametrize(
+        "ftype,label", _PAYLOAD_ANNOTATIONS + _MARKER_ANNOTATIONS)
+    def test_evidence_list_agrees_with_the_predicate(self, ftype, label):
+        """The list IS the predicate's evidence — one shared matcher, so they
+        cannot disagree by construction. This pins that they still share it."""
+        frag = _frag(100, [label], ftype=ftype)
+        assert bool(sc._fragment_backbone_marker_labels(frag)) is \
+            sc._fragment_has_backbone_marker(frag)
+
+
+class TestKeywordMatchingRule:
+    """The word-start rule itself, independent of any particular keyword."""
+
+    def test_keyword_matches_at_a_word_start_only(self):
+        import splicecraft_seqanalysis as sa
+        rx = sa._label_keyword_re(("zzmarker",), {})
+        assert rx.search("zzmarker")            # bare
+        assert rx.search("pUC zzmarker")        # after a space
+        assert rx.search("rep-zzmarker")        # after a separator
+        assert rx.search("p15zzmarker")         # after a DIGIT — pMB1ori
+        assert rx.search("ZZMarker")            # case-insensitive
+        assert not rx.search("xzzmarker")       # mid-word — EcoRI's disease
+        assert not rx.search("Ecozzmarker")
+
+    def test_traps_block_the_words_a_keyword_opens(self):
+        import splicecraft_seqanalysis as sa
+        rx = sa._label_keyword_re(("zz",), {"zz": ("top", "bar")})
+        assert rx.search("zz") and rx.search("zzebra")
+        assert not rx.search("zztop") and not rx.search("zzbarrel")
+
+    def test_regex_is_built_from_the_keyword_tuple(self):
+        """Adding a keyword to the tuple must take effect — the regex is not
+        a hand-written second copy of the vocabulary."""
+        import splicecraft_seqanalysis as sa
+        for kw in sa._BACKBONE_LABEL_KEYWORDS:
+            assert sa._BACKBONE_LABEL_RE.search(kw), \
+                f"{kw!r} is in the vocabulary but its own regex misses it"
+
+    def test_an_empty_vocabulary_matches_nothing(self):
+        """Fail CLOSED. An empty alternation compiles to a pattern that
+        matches the empty string at every position — i.e. every fragment
+        would read as backbone, which is the catastrophic direction."""
+        import splicecraft_seqanalysis as sa
+        for kws in ((), ("",), ("", "")):
+            rx = sa._label_keyword_re(kws, {})
+            assert not rx.search("")
+            assert not rx.search("AmpR")
+            assert not rx.search("anything at all")
+
+    def test_word_start_rule_implies_substring(self):
+        """Soundness of the hot-path gate: `_feature_is_backbone_marker` only
+        runs the regex when a bare keyword substring is present, which is only
+        valid because the regex can never match where the substring doesn't.
+        Fuzzed against strings built from keyword fragments + noise."""
+        import random
+        import splicecraft_seqanalysis as sa
+        rnd = random.Random(20260818)
+        alphabet = ["ori", "tet", "amp", "r", "kan", "-", " ", "1", "x",
+                    "gina", "ent", "ecoRI", "_", "rep", "cm", "spec"]
+        for _ in range(4000):
+            s = "".join(rnd.choice(alphabet)
+                        for _ in range(rnd.randint(1, 8)))
+            if sa._BACKBONE_LABEL_RE.search(s):
+                low = s.lower()
+                assert any(kw in low for kw in sa._BACKBONE_LABEL_KEYWORDS), (
+                    f"{s!r} matches the rule but no bare keyword occurs in it "
+                    f"— the substring pre-filter would skip it"
+                )
+
+
+class TestTetIsARegulatoryPartOutsideAGene:
+    """tet is the one marker family whose repressor and operator are standard
+    PAYLOAD parts (tetO / TRE / tet-responsive promoter). Same rule the erm
+    family already uses: the name counts on a gene-bearing feature type."""
+
+    @pytest.mark.parametrize("ftype", ["CDS", "gene"])
+    @pytest.mark.parametrize("label", [
+        "TetR", "tetR", "tetracycline resistance protein", "tetA", "tetM"])
+    def test_tet_on_a_gene_is_a_marker(self, ftype, label):
+        assert sc._fragment_has_backbone_marker(
+            _frag(500, [label], ftype=ftype)) is True
+
+    @pytest.mark.parametrize("ftype", [
+        "protein_bind", "promoter", "primer_bind", "misc_feature",
+        "regulatory"])
+    @pytest.mark.parametrize("label", [
+        "tetracycline operator", "tetR binding site", "TetR-F"])
+    def test_tet_outside_a_gene_is_not(self, ftype, label):
+        assert sc._fragment_has_backbone_marker(
+            _frag(500, [label], ftype=ftype)) is False
+
+
+class TestMarkerHelpersSurviveMalformedFragments:
+    """Both helpers run inside Constructor workers, on digest output AND on
+    caller-supplied JSON from the agent API. Malformed input must read as
+    "no marker", never raise out of the worker."""
+
+    @pytest.mark.parametrize("frag", [
+        None, "not a fragment", 42, [],
+        {}, {"features": None}, {"features": "AmpR"}, {"features": 7},
+        {"features": [None, 3, "AmpR"]},
+        {"features": [{"type": None, "label": None}]},
+        {"features": [{}]},
+        {"features": ({"type": "rep_origin", "label": ""},)},   # tuple
+    ])
+    def test_no_raise_on_junk(self, frag):
+        import splicecraft_cloning as scc
+        got = sc._fragment_has_backbone_marker(frag)
+        assert isinstance(got, bool)
+        assert isinstance(sc._fragment_backbone_marker_labels(frag), list)
+        assert scc._frag_carries_backbone_marker(frag) is got, \
+            "the mirrors disagree on malformed input"
+
+    def test_a_tuple_of_features_still_matches(self):
+        """The tuple case above is the only junk input that IS a marker."""
+        assert sc._fragment_has_backbone_marker(
+            {"features": ({"type": "rep_origin", "label": ""},)}) is True
+
+    def test_non_string_label_does_not_crash_or_match(self):
+        frag = {"features": [{"type": "CDS", "label": ["AmpR"]}]}
+        # A list label stringifies to "['AmpR']" — the keyword is there, at a
+        # word start (after `['`), so it matches. What matters is no raise.
+        assert isinstance(sc._fragment_has_backbone_marker(frag), bool)
 
 
 class TestResultsPaneHardening:

@@ -42,13 +42,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.54"
+__version__ = "1.2.55"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-08-15"
+_RELEASE_DATE = "2026-08-18"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -4427,13 +4427,9 @@ def _derive_entry_kind(entry: dict) -> str:
         return "amplicon"
     topo = str(entry.get("topology") or "").lower()
     if not topo:
-        gb = entry.get("gb_text") or ""
-        if isinstance(gb, str) and gb:
-            head = gb[:200].lower()   # GenBank LOCUS line carries topology
-            if "circular" in head:
-                topo = "circular"
-            elif "linear" in head:
-                topo = "linear"
+        # From the LOCUS line's topology FIELD — not a substring scan of the
+        # header, which reads the entry's own name and its DEFINITION too.
+        topo = _topology_from_gb_text(entry.get("gb_text") or "", default="")
     return "plasmid" if topo == "circular" else "fragment"
 
 
@@ -4612,6 +4608,7 @@ def _commit_library_entry_to_collection(entry: dict, collection: str,
 # ── Pure helpers moved to splicecraft_util (Phase D) ────────────────────────
 from splicecraft_util import (  # noqa: E402
     _feat_bounds as _feat_bounds,
+    _feature_location as _feature_location,
     _name_modal_result as _name_modal_result,
 )
 
@@ -9107,7 +9104,7 @@ def _build_clone_region_amplicon_entry(
     serialise failure so the caller can surface it."""
     from Bio.Seq import Seq
     from Bio.SeqRecord import SeqRecord
-    from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+    from Bio.SeqFeature import SeqFeature
     seq = (amplicon_seq or "").upper()
     if not seq:
         raise ValueError("amplicon sequence is empty")
@@ -9147,13 +9144,11 @@ def _build_clone_region_amplicon_entry(
         _ps = f.get("primer_seq") or f.get("_primer_seq")
         if _ps:
             quals["primer_seq"] = [_normalize_primer_seq(_ps)]
-        if e > s:
-            loc = FeatureLocation(s, e, strand=strand)
-        else:
-            # Origin-wrap piece (a feature that straddled the source origin and
-            # tiled to the amplicon end): (s, n) + (0, e).
-            loc = CompoundLocation([FeatureLocation(s, n, strand=strand),
-                                    FeatureLocation(0, e, strand=strand)])
+        # `_feature_location` owns the wrap split, including the part ORDER
+        # a minus-strand origin-wrap needs so it exports as the right protein.
+        loc = _feature_location(s, e, n, strand)
+        if loc is None:
+            continue
         rec.features.append(SeqFeature(
             loc, type=str(f.get("type", "misc_feature")), qualifiers=quals))
     # Run primers → primer_bind features (full primer in /primer_seq, binding
@@ -9797,6 +9792,7 @@ from splicecraft_record import (  # noqa: E402
     _arrowless_decode_features as _arrowless_decode_features,
     _repair_wrapped_primer_seqs as _repair_wrapped_primer_seqs,
     _record_to_gb_text as _record_to_gb_text,
+    _topology_from_gb_text as _topology_from_gb_text,
     _gb_text_to_record as _gb_text_to_record,
 )
 
@@ -10726,15 +10722,28 @@ def _rotate_seq_record(record, offset: int, *, keep_source: bool = False):
     for f in (record.features or []):
         if f.type == "source" and not keep_source:
             continue
-        bounds = _feat_bounds(f, n)
-        if bounds is None:
+        # Rotate EVERY PART, not the outer bounds. Going through
+        # `_feat_bounds` (which flattens any compound that isn't a plain
+        # two-part origin wrap to `(min start, max end)`) silently swallowed
+        # the introns of a spliced feature: a two-exon CDS
+        # `join(11..25,41..55)` came back as one contiguous 45 bp block that
+        # translated straight through the intron. [INV-182]
+        loc_in = getattr(f, "location", None)
+        parts_in = list(getattr(loc_in, "parts", None)
+                        or ([loc_in] if loc_in is not None else []))
+        try:
+            spans = [(int(p.start), int(p.end), p.strand) for p in parts_in]
+        except (TypeError, ValueError, AttributeError):
+            # A position BioPython couldn't resolve to a plain int
+            # (UnknownPosition / an external reference). We cannot rotate
+            # what we cannot measure, and a guessed coordinate is worse
+            # than an untouched one.
+            spans = []
+        if not spans or any(a < 0 or b > n or b < a for a, b, _ in spans):
             new_rec.features.append(f)
             continue
-        s, e, strand = bounds
-        # Re-frame to the rotated origin. `_feat_len` handles the
-        # wrap case where the feature crosses the original origin.
-        flen = _feat_len(s, e, n)
-        if flen >= n:
+        strand = spans[0][2]
+        if sum(b - a for a, b, _ in spans) >= n:
             # Spans the whole record (the usual `source` case): there is no
             # meaningful place to break it, and the generic path below would
             # emit a degenerate two-part split at the new origin.
@@ -10743,21 +10752,42 @@ def _rotate_seq_record(record, offset: int, *, keep_source: bool = False):
                 type=f.type, qualifiers=dict(f.qualifiers or {}),
             ))
             continue
-        new_s = (s - offset) % n
-        # Sweep #9 (2026-05-19): the ternary already covers the only
-        # path where the mod could equal 0 (i.e. `new_s + flen == n`).
-        # The follow-up `if new_e == 0 and new_s + flen == n: new_e = n`
-        # was unreachable — removed for clarity.
-        new_e = (new_s + flen) % n if (new_s + flen) != n else n
-        if new_e > new_s and new_e <= n:
-            # Linear span in the rotated frame.
-            loc = FeatureLocation(new_s, new_e, strand=strand)
+        pieces: "list[tuple[int, int, _Any]]" = []
+        for a, b, pstrand in spans:
+            if b == a:
+                continue
+            na = (a - offset) % n
+            nb = na + (b - a)
+            if nb <= n:
+                pieces.append((na, nb, pstrand))
+                continue
+            # This part now straddles the new origin: split it. The half
+            # holding the part's 5' end comes first — the tail for a plus
+            # strand, the head for a minus one. See `_feature_location`.
+            split = [(na, n, pstrand), (0, nb - n, pstrand)]
+            pieces.extend(split[::-1] if pstrand == -1 else split)
+        if not pieces:
+            continue
+        # Re-join halves that became adjacent: a feature that used to wrap
+        # the OLD origin is contiguous again once the rotation lands past
+        # it, and leaving it split would draw a phantom intron.
+        merged: "list[tuple[int, int, _Any]]" = []
+        for pa, pb, pst in pieces:
+            if merged:
+                qa, qb, qst = merged[-1]
+                if qst == pst and qb == pa:            # ascending contiguous
+                    merged[-1] = (qa, pb, qst)
+                    continue
+                if qst == pst and pb == qa:            # descending (minus)
+                    merged[-1] = (pa, qb, qst)
+                    continue
+            merged.append((pa, pb, pst))
+        if len(merged) == 1:
+            a, b, pst = merged[0]
+            loc = FeatureLocation(a, b, strand=pst)
         else:
-            # Rotated span crosses the new origin → CompoundLocation.
-            loc = CompoundLocation([
-                FeatureLocation(new_s, n, strand=strand),
-                FeatureLocation(0, new_e, strand=strand),
-            ])
+            loc = CompoundLocation(
+                [FeatureLocation(a, b, strand=pst) for a, b, pst in merged])
         new_rec.features.append(SeqFeature(
             loc, type=f.type, qualifiers=dict(f.qualifiers or {}),
         ))
@@ -36882,7 +36912,7 @@ def _attach_named_primers_to_record(rec, primers) -> int:
     more than once. Returns the count added.
     """
     from Bio.SeqFeature import (
-        SeqFeature, FeatureLocation, CompoundLocation,
+        SeqFeature,
     )
     seq = str(getattr(rec, "seq", "") or "").upper()
     total = len(seq)
@@ -36928,14 +36958,11 @@ def _attach_named_primers_to_record(rec, primers) -> int:
             )
             continue
         s, e = binding
-        if e > s:
-            loc = FeatureLocation(s, e, strand=strand)
-        elif e < s:  # binding wraps the origin: [s, total) + [0, e)
-            tail = FeatureLocation(s, total, strand=strand)
-            loc = (CompoundLocation([tail, FeatureLocation(0, e, strand=strand)])
-                   if e > 0 else tail)
-        else:
-            # Degenerate (would span the whole plasmid) — refuse.
+        # `_feature_location` returns None for the degenerate `e == s` case
+        # (would span the whole plasmid) and orders a minus-strand wrap's
+        # halves 5'→3' so the export reads back as the right primer.
+        loc = _feature_location(s, e, total, strand)
+        if loc is None:
             continue
         quals: dict = {"label": [label], "primer_seq": [p]}
         if tm is not None:
@@ -37395,19 +37422,13 @@ def _clone_part_build_seqrecord(
         if s == e:
             continue  # zero-length features have no biology
         strand = int(f.get("strand", 1) or 1)
-        if e > s:
-            loc: "FeatureLocation | CompoundLocation" = FeatureLocation(
-                s, e, strand=strand,
-            )
-        else:
-            # Wrap feature: (s, n_seq) + (0, e). Both halves carry the
-            # same strand. CompoundLocation refuses empty parts, so
-            # the s == n_seq / e == 0 edge cases are pre-filtered by
-            # the bounds checks above.
-            loc = CompoundLocation([
-                FeatureLocation(s, n_seq, strand=strand),
-                FeatureLocation(0, e,    strand=strand),
-            ])
+        # Wrap features go through `_feature_location`, which owns both
+        # halves' order (a minus-strand wrap reads head-first) and the
+        # e == 0 / e == s edge cases CompoundLocation refuses.
+        loc: "FeatureLocation | CompoundLocation | None" = _feature_location(
+            s, e, n_seq, strand)
+        if loc is None:
+            continue
         quals: dict = {
             "label": [f.get("label") or f.get("type") or "feature"],
         }
@@ -56635,16 +56656,48 @@ def _make_demo_operon_plasmid():
 # without a positive circular signal stay linear.
 _FASTA_CIRCULAR_HINTS: tuple[str, ...] = ("circular", "plasmid")
 
+# Matched at a WORD START, so `circularly permuted` (cpGFP — a linear coding
+# insert) no longer reads as circular, while `circularised` / `circularized`
+# still do. Same word-start rule as the backbone-marker keywords; the reason
+# it's needed is the same too (2026-08-18 sweep).
+_FASTA_CIRCULAR_RE = re.compile(r"(?<![^\W\d_])(?:circular(?!ly)|plasmid)",
+                                re.IGNORECASE)
+
+# An EXPLICIT statement of linearity anywhere in the description vetoes the
+# hints above. Without this, "plasmid" alone won a description that says the
+# opposite in the very same breath — every one of these is a real FASTA
+# header shape, and every one came back circular:
+#     >pUC19 plasmid, linearized                      (cut vector)
+#     >contig_17 Streptomyces linear plasmid SCP1     (a genuinely linear plasmid)
+#     >plasmid backbone fragment (PCR product)        (a fragment of one)
+#     >gBlock, non-circular
+# Closing a circle that is not there is the expensive direction: it fabricates
+# a junction between two ends that are not joined, and the origin-wrap
+# restriction scan (sacred invariant #6) then reports sites across it. A
+# missed circle only costs a linear map the user can see is wrong.
+# `linear` has no right boundary on purpose — linear / linearised /
+# linearized / linearly all assert the same thing — but it does have a LEFT
+# one, so "collinear" is not a claim about topology.
+_FASTA_LINEAR_OVERRIDE_RE = re.compile(
+    r"(?<![^\W\d_])(?:linear|non-?circular|not circular"
+    r"|amplicon|pcr product|fragment|g-?block)",
+    re.IGNORECASE)
+
 
 def _detect_fasta_topology(rec) -> str:
-    """Return ``"circular"`` when the FASTA description contains a
-    `_FASTA_CIRCULAR_HINTS` token (case-insensitive), else
-    ``"linear"``. FASTA carries no topology field, so callers should
-    default to linear and only flip on a positive signal — assuming
-    circular by default would mis-orient chromosome chunks."""
-    desc = (getattr(rec, "description", "") or "").lower()
-    return "circular" if any(h in desc for h in _FASTA_CIRCULAR_HINTS) \
-        else "linear"
+    """Return ``"circular"`` when the FASTA description carries a
+    `_FASTA_CIRCULAR_HINTS` word AND no explicit linear statement
+    (`_FASTA_LINEAR_OVERRIDE_RE`); ``"linear"`` otherwise.
+
+    FASTA carries no topology field, so this defaults to linear and only
+    flips on a positive signal — assuming circular by default would
+    mis-orient chromosome chunks. The override exists because the positive
+    signal is often sitting right next to its own contradiction
+    ("plasmid, linearized")."""
+    desc = (getattr(rec, "description", "") or "")
+    if _FASTA_LINEAR_OVERRIDE_RE.search(desc):
+        return "linear"
+    return "circular" if _FASTA_CIRCULAR_RE.search(desc) else "linear"
 
 
 def _fasta_records_to_seqrecords(parsed_records, file_path: str) -> list:
@@ -75057,6 +75110,12 @@ class DomesticatorModal(ModalScreen):
         t = Text()
         t.append("── Primers designed ─────────────────────────────────\n",
                  style="dim")
+        # Non-fatal design notes (e.g. an ATG-carrying overhang in front of a
+        # region that doesn't open on ATG). Rendered before the primers so a
+        # caveat about what the part will actually encode isn't buried under
+        # the sequences. [INV-183]
+        for _w in (d.get("warnings") or []):
+            t.append(f"⚠ {_w}\n", style="yellow")
         # If silent mutations were applied to remove internal sites, call
         # them out so the user knows to order the (mutated) insert as a
         # gBlock rather than PCR from the raw template.
@@ -78550,7 +78609,7 @@ class TraditionalCloningPane(Vertical):
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         from Bio.SeqFeature import (
-            SeqFeature, FeatureLocation, CompoundLocation,
+            SeqFeature,
         )
         from datetime import date as _date_mod
         # ``NamePlasmidModal`` already rejected blanks + exact-name
@@ -78627,19 +78686,12 @@ class TraditionalCloningPane(Vertical):
             if _color:
                 qualifiers["ApEinfo_fwdcolor"] = [str(_color)]
                 qualifiers["ApEinfo_revcolor"] = [str(_color)]
-            if e > s:
-                loc = FeatureLocation(s, e, strand=strand)
-            elif e <= 0:
-                loc = FeatureLocation(s, n_top, strand=strand)
-            else:
-                # Origin-spanning (wrap) feature on the circular product:
-                # (s, n) + (0, e), mirroring _gibson_record_from_result so a
-                # backbone feature straddling the ligation join survives
-                # instead of being silently dropped ([INV-44]).
-                loc = CompoundLocation([
-                    FeatureLocation(s, n_top, strand=strand),
-                    FeatureLocation(0, e, strand=strand),
-                ])
+            # Origin-spanning (wrap) features survive the ligation join
+            # instead of being silently dropped ([INV-44]); `_feature_location`
+            # owns the split + the minus-strand half order.
+            loc = _feature_location(s, e, n_top, strand)
+            if loc is None:
+                continue
             rec.features.append(SeqFeature(
                 loc,
                 type=str(f.get("type", "misc_feature")),
@@ -85757,7 +85809,7 @@ class MutagenizeModal(ModalScreen):
             self.app.notify("Canvas changed since the scrub — reopen Scrub.",
                             severity="warning")
             return
-        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        from Bio.SeqFeature import SeqFeature
         # deepcopy (NOT a rebuilt SeqRecord) so the user-typed display name
         # (`_tui_display_name`) + `_source_path` + other `_tui_*` attrs ride
         # onto the new record. A fresh SeqRecord drops them, and the next
@@ -85783,15 +85835,12 @@ class MutagenizeModal(ModalScreen):
             if p_end == p_start:
                 continue
             if p_end < p_start:
-                if is_circ and 0 <= p_end and p_start < total:
-                    loc = CompoundLocation([
-                        FeatureLocation(p_start, total, strand=strand),
-                        FeatureLocation(0, p_end, strand=strand)])
-                else:
+                if not (is_circ and 0 <= p_end and p_start < total):
                     continue
-            elif 0 <= p_start < p_end <= total:
-                loc = FeatureLocation(p_start, p_end, strand=strand)
-            else:
+            elif not (0 <= p_start < p_end <= total):
+                continue
+            loc = _feature_location(p_start, p_end, total, strand)
+            if loc is None:
                 continue
             if any(f.type == "primer_bind"
                    and (f.qualifiers.get("label", [""]) or [""])[0] == name
@@ -89368,12 +89417,10 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             # can't anneal here: skip it rather than draw — and persist —
             # a phantom wrap feature across the fragment's ends.
             if p_end < p_start:
-                if is_circ and 0 <= p_end and p_start < total:
-                    loc = CompoundLocation([
-                        FeatureLocation(p_start, total, strand=strand),
-                        FeatureLocation(0,       p_end, strand=strand),
-                    ])
-                else:
+                if not (is_circ and 0 <= p_end and p_start < total):
+                    continue
+                loc = _feature_location(p_start, p_end, total, strand)
+                if loc is None:
                     continue
             elif 0 <= p_start < p_end <= total:
                 loc = FeatureLocation(p_start, p_end, strand=strand)
@@ -90013,8 +90060,16 @@ def _simulate_pcr(
             wraps = circular and (template_span_end > n)
             start_t = fp
             end_t   = template_span_end % n if circular else template_span_end
-            # `end_t == 0` is a legitimate wrap end-at-origin; preserve.
-            if circular and end_t == 0 and template_span_end == n:
+            # `end_t == 0` is a legitimate wrap end-at-origin; report it as
+            # `n` so the row reads "…..n" rather than "…..0". Normalise for
+            # EVERY multiple of n, not just the first lap: the `== n` form
+            # gave the short product `end = n` and the once-around-the-circle
+            # product (same two binding sites, one full lap longer) `end = 0`,
+            # so the `seen` key below saw two different amplicons and the
+            # duplicate — being longer — sorted to the TOP of the results.
+            # Only reachable when the reverse primer's binding ends exactly on
+            # the origin, which is why it survived until 2026-08-16. [INV-184]
+            if circular and end_t == 0:
                 end_t = n
             key = (start_t, end_t)
             if key in seen:
@@ -94852,7 +94907,7 @@ def _library_pack_records():
                     labels.append(lab)
                 if len(labels) >= 120:
                     break
-            topo = "linear" if "linear" in gb[:200].lower() else "circular"
+            topo = _topology_from_gb_text(gb)
             head = (f"{name} is a {int(e.get('size') or 0)} bp {topo} plasmid in the user's "
                     f"SpliceCraft library with {int(e.get('n_feats') or 0)} annotated features.")
             src = str(e.get("source") or "").strip()
@@ -109619,7 +109674,7 @@ NcbiTaxonPickerModal { align: center middle; }
         `[start, n) + [0, end)` matching how the rest of the codebase
         represents wrap features."""
         from Bio.SeqFeature import (
-            SeqFeature, FeatureLocation, CompoundLocation,
+            SeqFeature, FeatureLocation,
         )
         # Push undo BEFORE mutating so Ctrl+Z brings the un-annotated
         # record back.
@@ -109631,16 +109686,12 @@ NcbiTaxonPickerModal { align: center middle; }
             t_e = int(tr["target_end"])
             t_strand = int(tr["target_strand"])
             if t_e < t_s and n > 0:
-                # `FeatureLocation(0, 0)` is rejected by Biopython on
-                # serialise; degenerate wrap with end exactly at the
-                # origin collapses to a single tail FeatureLocation.
-                if t_e == 0:
-                    loc = FeatureLocation(t_s, n, strand=t_strand)
-                else:
-                    loc = CompoundLocation([
-                        FeatureLocation(t_s, n, strand=t_strand),
-                        FeatureLocation(0, t_e, strand=t_strand),
-                    ])
+                # `_feature_location` collapses the degenerate
+                # end-exactly-at-the-origin wrap (BioPython rejects a
+                # zero-length part) and orders the halves for the strand.
+                loc = _feature_location(t_s, t_e, n, t_strand)
+                if loc is None:
+                    continue
             else:
                 loc = FeatureLocation(t_s, t_e, strand=t_strand)
             qual = {}
@@ -115406,7 +115457,7 @@ NcbiTaxonPickerModal { align: center middle; }
     def _annotate_with_feature_impl(
         self, start: int, end: int, entry: dict,
     ) -> None:
-        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        from Bio.SeqFeature import SeqFeature
 
         if self._current_record is None:
             raise RuntimeError("Load a plasmid first.")
@@ -115442,13 +115493,12 @@ NcbiTaxonPickerModal { align: center middle; }
         # to None on the BioPython side since CompoundLocation parts
         # require ±1 / 0 / None.
         biop_strand = strand if strand in (-1, 1) else None
-        if end > start:
-            loc = FeatureLocation(start, end, strand=biop_strand)
-        else:
-            loc = CompoundLocation([
-                FeatureLocation(start, n, strand=biop_strand),
-                FeatureLocation(0, end, strand=biop_strand),
-            ])
+        loc = _feature_location(start, end, n, biop_strand)
+        if loc is None:
+            # Unreachable: `end == start` already raised above. Kept as a
+            # loud guard so a future relaxation of that check can't build a
+            # feature with no location.
+            raise ValueError("zero-length feature (end == start)")
         qualifiers: dict = {
             k: list(v) if isinstance(v, (list, tuple)) else [v]
             for k, v in (entry.get("qualifiers") or {}).items()

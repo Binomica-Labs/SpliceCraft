@@ -183,6 +183,25 @@ class TestEntryKind:
     def test_entry_kind_missing_field_derives(self):
         assert sc._entry_kind({"gb_text": self._LIN}) == "fragment"
 
+    def test_entry_name_is_not_a_topology_claim(self):
+        """The Kind column read `"linear" in gb_text[:200]`, which also sees
+        the LOCUS NAME: an entry called `pLinear2` filed itself as a fragment
+        (fixed 2026-08-18 — topology now comes from the LOCUS topology
+        field)."""
+        circ_named_linear = (
+            "LOCUS       pLinear2   100 bp ds-DNA circular SYN 01-JAN-2026\n"
+            "DEFINITION  my favourite plasmid\n//\n")
+        assert sc._derive_entry_kind(
+            {"source": "file:x.gb", "gb_text": circ_named_linear}) == "plasmid"
+
+    def test_definition_wording_is_not_a_topology_claim(self):
+        lin_defn_says_circular = (
+            "LOCUS       frag1   100 bp ds-DNA linear SYN 01-JAN-2026\n"
+            "DEFINITION  circular vector backbone, cut with EcoRI\n//\n")
+        assert sc._derive_entry_kind(
+            {"source": "file:x.gb",
+             "gb_text": lin_defn_says_circular}) == "fragment"
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # NamePlasmidModal — collection mode

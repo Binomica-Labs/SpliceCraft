@@ -250,6 +250,40 @@ def _restore_display_name_from_comment(rec) -> None:
             pass
 
 
+def _topology_from_gb_text(gb_text, default: str = "circular") -> str:
+    """Read the molecule topology out of a GenBank LOCUS line.
+
+    LOCUS carries topology as its own FIELD, between the molecule type and
+    the division::
+
+        LOCUS       pUC19    2686 bp    DNA     circular  SYN  27-OCT-2024
+
+    so it is matched as a whole TOKEN, on the LOCUS line only. Three call
+    sites used to ask `"linear" in gb_text[:200].lower()` instead, which also
+    reads DEFINITION / ACCESSION / the plasmid's own NAME and answers with
+    whatever word happens to appear there: an entry named `pLinear2`, or a
+    circular vector whose DEFINITION says "linearized with EcoRI", reported
+    the wrong topology — and topology is not cosmetic, it decides whether the
+    origin-wrap scan runs at all (sacred invariant #6) and what the Kind
+    column and the agent API tell a caller.
+
+    ``default`` is returned when the text is empty, does not start with a
+    LOCUS line, or carries neither token — the historical behaviour at each
+    call site (mostly ``"circular"``: nearly every stored entry is a plasmid).
+    """
+    if not isinstance(gb_text, str) or not gb_text:
+        return default
+    line = gb_text[:200].lstrip().split("\n", 1)[0]
+    if line[:5].upper() != "LOCUS":
+        return default
+    tokens = {t.lower() for t in line.split()}
+    if "linear" in tokens:
+        return "linear"
+    if "circular" in tokens:
+        return "circular"
+    return default
+
+
 def _record_to_gb_text(record) -> str:
     """Serialize a SeqRecord to GenBank format text.
 

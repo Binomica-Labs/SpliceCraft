@@ -151,6 +151,60 @@ class TestSimulatePcrBasics:
         assert amps == []
 
 
+class TestSimulatePcrOriginEdge:
+    """[INV-184] A reverse primer whose binding ends exactly ON the origin
+    used to be counted twice: the short product got `end = n`, the
+    once-around-the-circle product (same two binding sites, one full lap
+    longer) got `end = 0`, so the de-dup key saw two amplicons — and since
+    results sort by length descending, the phantom lap product was listed
+    FIRST. Only reachable when the reverse binding lands on the origin."""
+
+    @staticmethod
+    def _template(n=390, fs=253, seed=6161):
+        import random
+        rng = random.Random(seed)
+        seq = "".join(rng.choice("ACGT") for _ in range(n))
+        fwd = seq[fs:fs + 20]
+        rev = sc._rc(seq[n - 20:n])         # binding ends exactly at the origin
+        return seq, fwd, rev, fs, n
+
+    def test_no_phantom_full_lap_duplicate(self):
+        seq, fwd, rev, fs, n = self._template()
+        amps = sc._simulate_pcr(seq, fwd, rev, circular=True,
+                                max_amplicon=800)
+        assert len(amps) == 1, [
+            (a["start"], a["end"], a["length"]) for a in amps]
+        a = amps[0]
+        assert a["length"] == n - fs
+        assert (a["start"], a["end"]) == (fs, n)
+        assert a["amplicon_seq"] == seq[fs:n]
+
+    def test_end_at_the_origin_reads_n_not_zero(self):
+        seq, fwd, rev, fs, n = self._template()
+        amps = sc._simulate_pcr(seq, fwd, rev, circular=True,
+                                max_amplicon=800)
+        assert amps[0]["end"] == n, "an end-at-origin should print as n, not 0"
+
+    def test_every_amplicon_is_the_slice_its_coords_claim(self):
+        """The general property the phantom broke: start/end must describe
+        the sequence actually returned."""
+        import random
+        rng = random.Random(20260816)
+        for _ in range(120):
+            n = rng.randint(150, 600)
+            seq = "".join(rng.choice("ACGT") for _ in range(n))
+            fs = rng.randrange(0, n - 45)
+            fwd = seq[fs:fs + 20]
+            re_ = rng.randrange(fs + 40, n + 1)
+            rev = sc._rc(seq[re_ - 20:re_])
+            for amp in sc._simulate_pcr(seq, fwd, rev, circular=True,
+                                        max_amplicon=900):
+                s, e = amp["start"], amp["end"]
+                want = seq[s:e] if e > s else seq[s:] + seq[:e]
+                assert amp["amplicon_seq"] == want, (n, fs, re_, s, e,
+                                                     amp["length"])
+
+
 class TestSimulatePcrInputValidation:
     """Input sanitation — bad inputs return [] rather than crash."""
 

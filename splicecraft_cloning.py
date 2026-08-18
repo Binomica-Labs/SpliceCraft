@@ -58,6 +58,7 @@ from splicecraft_history import (
 )
 from splicecraft_logging import _log, _timed
 from splicecraft_record import _gb_text_to_record, _normalize_primer_seq
+from splicecraft_util import _feature_location   # L0
 
 
 def _serialize_commercialsaas_history(root: "_CommercialSaaSHistoryNode | None"
@@ -866,7 +867,7 @@ def _gibson_record_from_result(result: dict, *, name: str) -> "SeqRecord | None"
     from Bio.Seq import Seq
     from Bio.SeqRecord import SeqRecord
     from Bio.SeqFeature import (
-        SeqFeature, FeatureLocation, CompoundLocation,
+        SeqFeature,
     )
     seq_str = str(result.get("product_seq") or "")
     n = len(seq_str)
@@ -911,14 +912,11 @@ def _gibson_record_from_result(result: dict, *, name: str) -> "SeqRecord | None"
         ps = f.get("primer_seq")
         if ps:
             quals["primer_seq"] = [_normalize_primer_seq(ps)]
-        if e > s:
-            loc = FeatureLocation(s, e, strand=strand)
-        else:
-            # Wrap feature: (s, n) + (0, e)
-            loc = CompoundLocation([
-                FeatureLocation(s, n, strand=strand),
-                FeatureLocation(0, e, strand=strand),
-            ])
+        # Wrap features split via `_feature_location`, which orders a
+        # minus-strand origin-wrap's halves 5'→3' (see its docstring).
+        loc = _feature_location(s, e, n, strand)
+        if loc is None:
+            continue
         rec.features.append(SeqFeature(loc, type=ftype, qualifiers=quals))
     return rec
 
@@ -2321,17 +2319,45 @@ def _scrub_gb_design(seq: str, feats: "list | None" = None, enzymes=None, *,
 _ACCEPTOR_BACKBONE_FEATURE_TYPES = frozenset({"rep_origin", "oriT"})
 _ACCEPTOR_BACKBONE_LABEL_KEYWORDS = (
     "ori", "rep_origin", "ampr", "kanr", "specr", "specinomycin",
-    "spectinomycin", "cmr", "chloramphenicol", "tetr", "tetracyclin",
+    "spectinomycin", "cmr", "chloramphenicol",
     "carbr", "carbenicillin",
     # bare "selection"/"antibiotic" excluded on purpose — see the rationale on
     # splicecraft_seqanalysis._BACKBONE_LABEL_KEYWORDS (a counter-selection
     # dropout labeled "...selection..." must NOT read as backbone).
 )
+# Every keyword above matches only at a WORD START, minus the suffixes each
+# one happens to open. Without that, `"ori"` matched inside `EcoRI` (and
+# `Aequorea victoria`, and `a priori`) and tagged payload halves as backbone —
+# the 2026-08-17 field report. The full reasoning, with worked examples, is on
+# splicecraft_seqanalysis `_label_keyword_re`; this is its hand-kept mirror
+# (L3 can't import seqanalysis — cycle), behaviour-pinned by
+# test_traditional_cloning.py::TestBackboneMarkerVocabulary.
+_ACCEPTOR_BACKBONE_LABEL_TRAPS = {
+    "ori": ("ent", "gina"),          # orientation, original — NOT origin(s)
+}
+def _acceptor_label_keyword_re() -> "re.Pattern[str]":
+    """Compile the keywords into one word-start alternation. Mirror of
+    seqanalysis `_label_keyword_re` — that one carries the reasoning."""
+    parts: list[str] = []
+    for kw in _ACCEPTOR_BACKBONE_LABEL_KEYWORDS:
+        if not kw:
+            continue          # an empty branch would match EVERY label
+        bad = _ACCEPTOR_BACKBONE_LABEL_TRAPS.get(kw)
+        parts.append(re.escape(kw)
+                     + (f"(?!{'|'.join(b for b in bad if b)})" if bad else ""))
+    if not parts:
+        return re.compile(r"(?!)")        # never matches — fail CLOSED
+    return re.compile(r"(?<![^\W\d_])(?:" + "|".join(parts) + r")",
+                      re.IGNORECASE)
+
+
+_ACCEPTOR_BACKBONE_LABEL_RE = _acceptor_label_keyword_re()
 # Whole-token keywords — mirrors seqanalysis `_BACKBONE_TOKEN_KEYWORDS`. These
-# are too short to substring-match ("erm" is inside every "Terminator"), and
-# are consulted ONLY on gene-bearing feature types — a `regulatory` or
-# `primer_bind` label mentioning a marker names something NEAR the gene, not
-# the gene. See the seqanalysis constant for the worked examples.
+# are too short to survive even a word-start match ("erm" opens "ermine",
+# "tetr" opens "tetratricopeptide"), and are consulted ONLY on gene-bearing
+# feature types — a `regulatory` or `primer_bind` label mentioning a marker
+# names something NEAR the gene, not the gene. The tet family lives here for
+# both reasons (see the seqanalysis constant for the worked examples).
 _ACCEPTOR_BACKBONE_TOKEN_FEATURE_TYPES = frozenset({"cds", "gene"})
 _ACCEPTOR_BACKBONE_TOKEN_KEYWORDS = frozenset({
     "erm", "ermb", "ermc", "ermam", "erma", "ermg",
@@ -2340,6 +2366,7 @@ _ACCEPTOR_BACKBONE_TOKEN_KEYWORDS = frozenset({
     "smr", "hyg", "hygr", "hph",
     "zeo", "zeor", "ble", "gmr", "gent",
     "tetm", "teta", "tetl",
+    "tetr", "tetracyclin", "tetracycline",
     "puror", "pac", "sh", "nat1",
 })
 
@@ -2347,20 +2374,34 @@ _ACCEPTOR_BACKBONE_TOKEN_KEYWORDS = frozenset({
 def _frag_carries_backbone_marker(frag: dict) -> bool:
     """True iff ``frag``'s features include an origin / resistance marker — the
     signal that identifies the vector BACKBONE (never the dropout an insert
-    replaces). Mirrors splicecraft_seqanalysis._fragment_has_backbone_marker."""
-    for f in (frag.get("features") or []):
+    replaces). Mirrors splicecraft_seqanalysis._fragment_has_backbone_marker,
+    including its tolerance for malformed input: this runs inside the
+    domestication resolver, so a fragment dict that isn't shaped as expected
+    must read as "no marker", never raise."""
+    if not isinstance(frag, dict):
+        return False
+    feats = frag.get("features")
+    if not isinstance(feats, (list, tuple)):
+        return False
+    for f in feats:
         if not isinstance(f, dict):
             continue
         ftype = str(f.get("type") or "").lower()
         if ftype in _ACCEPTOR_BACKBONE_FEATURE_TYPES:
             return True
-        label = str(f.get("label") or "").lower()
+        label = str(f.get("label") or "")
         if not label:
             continue
-        if any(kw in label for kw in _ACCEPTOR_BACKBONE_LABEL_KEYWORDS):
+        # Substring pre-filter then the word-start rule — see the note on
+        # seqanalysis `_feature_is_backbone_marker` (the regex can only match
+        # where the bare keyword already occurs, so the gate is sound).
+        low = label.lower()
+        if (any(kw in low for kw in _ACCEPTOR_BACKBONE_LABEL_KEYWORDS)
+                and _ACCEPTOR_BACKBONE_LABEL_RE.search(label)):
             return True
         if ftype in _ACCEPTOR_BACKBONE_TOKEN_FEATURE_TYPES:
-            tokens = {t for t in re.split(r"[^a-z0-9]+", label) if t}
+            tokens = {t.lower()
+                      for t in re.split(r"[^A-Za-z0-9]+", label) if t}
             if tokens & _ACCEPTOR_BACKBONE_TOKEN_KEYWORDS:
                 return True
     return False
@@ -2669,6 +2710,9 @@ def _design_gb_primers(
     # synonymous codon substitution; non-coding parts have no reading
     # frame so internal sites must be fixed manually.
     mutations: list[str] = []
+    # Non-fatal design notes (the caller renders them next to the primers).
+    # Distinct from `error`, which means nothing was designed at all.
+    design_warnings: list[str] = []
     initial_hits = _gb_find_forbidden_hits(insert, sites=forbidden_sites)
     if initial_hits:
         hit_str = ", ".join(
@@ -2818,7 +2862,32 @@ def _design_gb_primers(
     # codon — the stop codon lives in the user's CDS body OR
     # in the downstream LINK's body. Stripping the last 3 bp
     # of the insert would silently drop the user's real stop.
-    fwd_skip = _atg_offset_for_part(oh5, part_type)
+    # Only skip when there IS a redundant start codon to collapse — the exact
+    # condition `_fuse_overhang_body` uses, and therefore the one
+    # `_simulate_primed_amplicon` (and the junction self-cut scan above, and
+    # the amplicon length below) already assume. Skipping unconditionally
+    # made the forward primer bind at `insert[3:]` even for a region that does
+    # NOT open on ATG, so the amplicon on the bench read `AATG + insert[3:]` —
+    # three of the user's own bases silently replaced by the overhang's start
+    # codon — while every simulation read `AATG + insert`. The scan therefore
+    # checked a junction that does not exist and missed the one that does:
+    # a region starting `AGACG…` behind an `AATG` spells `GAGACG` (Esp3I on
+    # the bottom strand), and the digest released the wrong fragment. [INV-183]
+    _opens_on_atg = insert[:3].upper() == "ATG"
+    fwd_skip = _atg_offset_for_part(oh5, part_type) if _opens_on_atg else 0
+    if not _opens_on_atg and _atg_offset_for_part(oh5, part_type):
+        # The grammar's overhang carries the start codon, so the part will
+        # read `ATG + <selection>` — one extra Met, not a replaced codon.
+        # Say so rather than let it show up as an off-by-one protein later.
+        design_warnings.append(
+            f"The {oh5} overhang supplies the start codon, but the selected "
+            f"region opens on {insert[:3].upper()!r}, not ATG — the part will "
+            f"encode ATG followed by your whole selection (one extra Met). "
+            f"Select from the CDS's own ATG if that is not what you want.")
+        _log.warning(
+            "design_gb_primers: %s part selected from a non-ATG region (%r); "
+            "overhang %s prepends a start codon",
+            part_type, insert[:3].upper(), oh5)
     fwd_insert = insert[fwd_skip:] if fwd_skip else insert
     # Assemble the 5' tails FIRST so each binding region can be capped to keep
     # the TOTAL oligo within `_PRIMER_MAX_OLIGO_LEN` (binding grows to reach
@@ -2843,7 +2912,7 @@ def _design_gb_primers(
     # `_fuse_overhang_body`), so the real amplicon is `fwd_skip` bp shorter
     # whenever that fusion fires. Mirror its exact condition so the displayed
     # length matches the fragment actually built + saved.
-    if fwd_skip and insert[:3].upper() == "ATG":
+    if fwd_skip:
         amplicon_len -= fwd_skip
 
     # Positions of the primer binding regions on the TEMPLATE (not the
@@ -2901,6 +2970,7 @@ def _design_gb_primers(
         "entry_oh3":    entry_oh3,
         "insert_seq":   insert,
         "mutations":    mutations,
+        "warnings":     design_warnings,
         "binding_region_mutations": binding_region_mutations,
         "pairs":        [pair],
         # Segment lengths for the results painter: GB primers

@@ -1488,6 +1488,104 @@ class TestMultiRecordFastaImport:
             assert app.screen_stack[-1] is not modal
 
 
+class TestFastaTopologyHeuristic:
+    """FASTA carries no topology field, so import guesses from the
+    description. Guessing CIRCULAR is the expensive direction: it fabricates
+    a junction between two ends that are not joined, and the origin-wrap
+    restriction scan (sacred invariant #6) then reports sites across it.
+
+    Every "linear" case below is a real FASTA header shape that came back
+    circular before 2026-08-18, because `"plasmid"`/`"circular"` were matched
+    as bare substrings with nothing weighing the words next to them."""
+
+    @staticmethod
+    def _rec(desc):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        return SeqRecord(Seq("ACGT"), id="x", description=desc)
+
+    @pytest.mark.parametrize("desc", [
+        "pUC19 complete circular plasmid sequence",
+        "pACYC184 plasmid",
+        "circular chromosome, E. coli K-12",
+        "x circular plasmid backbone",
+        "circularized ligation product",
+    ])
+    def test_positive_signal_reads_circular(self, desc):
+        assert sc._detect_fasta_topology(self._rec(desc)) == "circular"
+
+    @pytest.mark.parametrize("desc", [
+        "pUC19 plasmid, linearized",              # says both — linear wins
+        "linear plasmid pBSSB1 Borrelia burgdorferi",
+        "plasmid backbone fragment (PCR product)",
+        "PCR amplicon from plasmid template",
+        "contig_17 Streptomyces linear plasmid SCP1",
+        "gBlock, non-circular",
+        "synthetic plasmid, not circular",
+        "cpGFP circularly permuted green fluorescent protein",
+    ])
+    def test_explicit_linearity_beats_the_hint(self, desc):
+        assert sc._detect_fasta_topology(self._rec(desc)) == "linear", (
+            f"{desc!r} was read as circular — SpliceCraft would close a "
+            f"circle the description says is open"
+        )
+
+    @pytest.mark.parametrize("desc", [
+        "", "chromosome 3 scaffold", "synthetic construct",
+        "collinear repeat array",                 # "collinear" is not "linear"
+    ])
+    def test_no_signal_defaults_linear(self, desc):
+        assert sc._detect_fasta_topology(self._rec(desc)) == "linear"
+
+
+class TestTopologyFromLocusLine:
+    """`_topology_from_gb_text` reads the LOCUS line's topology FIELD.
+
+    Three call sites (library Kind column, agent `list-library`, the BABS
+    index) used to ask `"linear" in gb_text[:200].lower()` instead, which
+    also reads the entry's own NAME and its DEFINITION."""
+
+    @staticmethod
+    def _gb(locus_name, topo, definition="."):
+        return (f"LOCUS       {locus_name:<24}2686 bp    DNA     {topo} "
+                f"SYN 27-OCT-2024\nDEFINITION  {definition}\n"
+                f"ACCESSION   x\n//\n")
+
+    def test_reads_the_topology_field(self):
+        assert sc._topology_from_gb_text(self._gb("pUC19", "circular")) \
+            == "circular"
+        assert sc._topology_from_gb_text(self._gb("pUC19cut", "linear")) \
+            == "linear"
+
+    def test_the_entrys_own_name_is_not_a_topology_claim(self):
+        """An entry called `pLinear2` is not linear because of its name."""
+        assert sc._topology_from_gb_text(
+            self._gb("pLinear2", "circular")) == "circular"
+
+    def test_the_definition_is_not_a_topology_claim(self):
+        assert sc._topology_from_gb_text(
+            self._gb("pACYC184", "circular",
+                     "linearized derivative described in ref 3")) == "circular"
+        assert sc._topology_from_gb_text(
+            self._gb("frag1", "linear",
+                     "circular vector backbone, cut with EcoRI")) == "linear"
+
+    @pytest.mark.parametrize("text", [
+        "", None, 42, "not a genbank file at all",
+        "DEFINITION  linear thing\nLOCUS x 10 bp DNA linear\n",   # no LOCUS 1st
+    ])
+    def test_falls_back_to_the_default(self, text):
+        assert sc._topology_from_gb_text(text) == "circular"
+        assert sc._topology_from_gb_text(text, default="") == ""
+
+    def test_locus_line_without_a_topology_token(self):
+        assert sc._topology_from_gb_text(
+            "LOCUS       x   100 bp ds-DNA SYN 01-JAN-2026\n//\n") == "circular"
+        assert sc._topology_from_gb_text(
+            "LOCUS       x   100 bp ds-DNA SYN 01-JAN-2026\n//\n",
+            default="") == ""
+
+
 class TestLoadFileHyphenDisplayName:
     """Loading a hyphenated file whose LOCUS got underscored (`FRAG-Ds3.gb`
     with `LOCUS FRAG_Ds3`, the petunia running-log) must surface the

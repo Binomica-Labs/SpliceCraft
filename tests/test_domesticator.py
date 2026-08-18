@@ -144,8 +144,16 @@ class TestDesignGBPrimers:
         # AATG overhang carries the start codon → forward primer
         # must start at codon 2 (bp+3), not at the insert's own
         # ATG.
-        result = sc._design_gb_primers(random_template, 100, 600, "CDS")
-        insert = random_template[100:600].upper()
+        #
+        # The region has to actually OPEN on ATG for that to be the right
+        # thing to do — the skip collapses a DUPLICATED start codon, so with
+        # no ATG to duplicate there is nothing to collapse and skipping just
+        # eats three of the user's bases ([INV-183]). The shared fixture is
+        # plain random DNA, so plant the start codon here.
+        tmpl = random_template[:100] + "ATG" + random_template[103:]
+        result = sc._design_gb_primers(tmpl, 100, 600, "CDS")
+        insert = tmpl[100:600].upper()
+        assert insert.startswith("ATG")
         assert insert[3:].startswith(result["fwd_binding"])
 
     def test_rev_binding_matches_insert_end_rc(self, random_template):
@@ -11386,3 +11394,105 @@ class TestAuditHardening:
         r = sc._h_design_synthesis_fragment(None, {"sequence": self.CDS,
                                                    "part_type": "Blank"})
         assert isinstance(r, tuple) and r[1] == 400
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [INV-183] The AATG overhang carries the CDS start codon, so the forward
+# primer binds at codon 2 — but ONLY when the selected region actually opens
+# on ATG. It used to skip 3 bp unconditionally, which meant:
+#   * three of the user's own bases were silently replaced by the overhang's
+#     ATG (`insert_seq` still reported them, so nothing looked wrong), and
+#   * the junction self-cut scan simulated `AATG + insert` while the bench
+#     amplicon was `AATG + insert[3:]` — so it checked a junction that does
+#     not exist and missed the one that does.
+# ═══════════════════════════════════════════════════════════════════════════
+class TestAtgOverhangOnANonAtgRegion:
+
+    GRAMMAR_ID = "gb_l0"
+
+    @staticmethod
+    def _grammar():
+        return sc._BUILTIN_GRAMMARS["gb_l0"]
+
+    @staticmethod
+    def _codon_raw():
+        from splicecraft_codon import _CODON_TABLE
+        return {c: (a, 50) for c, a in _CODON_TABLE.items()}
+
+    @staticmethod
+    def _amplicon(res):
+        """The REAL PCR product the returned primers make."""
+        ins, fwd, rev = res["insert_seq"], res["fwd_full"], res["rev_full"]
+        fb, rb = res["fwd_binding"], res["rev_binding"]
+        off5 = ins.upper().find(fb.upper())
+        rcrb = sc._rc(rb).upper()
+        off3 = ins.upper().rfind(rcrb) + len(rcrb)
+        assert off5 >= 0 and off3 > off5, "binding regions not found in insert"
+        return (fwd[:len(fwd) - len(fb)] + ins[off5:off3]
+                + sc._rc(rev[:len(rev) - len(rb)]))
+
+    def test_a_non_atg_region_keeps_all_of_its_bases(self):
+        body = "CGA" + "".join("ACGT"[i % 4] for i in range(180))
+        template = "TTGCATGCATGCATGCATGC" + body + "TTGCATGCATGCATGCATGC"
+        res = sc._design_gb_primers(template, 20, 20 + len(body), "CDS",
+                                    codon_raw=self._codon_raw(),
+                                    grammar=self._grammar())
+        assert "error" not in res, res.get("error")
+        amp = self._amplicon(res)
+        assert body in amp, (
+            "the selected region lost bases off its 5' end — the AATG "
+            "overhang replaced them instead of prefixing a start codon")
+
+    def test_it_says_so_when_the_overhang_supplies_the_start_codon(self):
+        body = "CGA" + "".join("ACGT"[i % 4] for i in range(180))
+        template = "TTGCATGCATGCATGCATGC" + body + "TTGCATGCATGCATGCATGC"
+        res = sc._design_gb_primers(template, 20, 20 + len(body), "CDS",
+                                    codon_raw=self._codon_raw(),
+                                    grammar=self._grammar())
+        warns = " ".join(res.get("warnings") or [])
+        assert "ATG" in warns and "AATG" in warns, res.get("warnings")
+
+    def test_an_atg_region_still_binds_at_codon_two(self):
+        """The regression guard for the behaviour this must NOT change: a CDS
+        that DOES open on ATG keeps the duplicated-start-codon collapse."""
+        rng = random.Random(20260816)
+        body = "ATG" + "".join(rng.choice("ACGT") for _ in range(180))
+        template = "TTGCATGCATGCATGCATGC" + body + "TTGCATGCATGCATGCATGC"
+        res = sc._design_gb_primers(template, 20, 20 + len(body), "CDS",
+                                    codon_raw=self._codon_raw(),
+                                    grammar=self._grammar())
+        assert "error" not in res, res.get("error")
+        assert not (res.get("warnings") or [])
+        amp = self._amplicon(res)
+        assert "AATGATG" not in amp, "duplicated start codon is back"
+        # The forward primer anneals from codon 2 — the ATG is the overhang's.
+        assert res["insert_seq"][3:].upper().startswith(
+            res["fwd_binding"].upper())
+        assert amp.upper().startswith("GCGCCGTCTCAAATG" + body[3:20])
+
+    def test_a_junction_site_on_a_non_atg_region_is_caught(self):
+        """`AATG` in front of `AGACG` spells `GAGACG` — Esp3I on the bottom
+        strand. The body below opens `CCCAGACG`, so the site only forms if
+        the designer skips the first three bases; the old code did that
+        unconditionally, and its junction scan — which simulated the UNskipped
+        fusion — never saw the site it had just engineered. Either the
+        designer refuses, or the amplicon it hands back digests into exactly
+        three pieces. What it must never do is hand back a pair whose product
+        self-cuts."""
+        rng = random.Random(4242)
+        body = ("CCC" + "AGACGCCGAAAGGAGCATTCACAGA"
+                + "".join(rng.choice("ACGT") for _ in range(120)))
+        template = "TTGCATGCATGCATGCATGC" + body + "TTGCATGCATGCATGCATGC"
+        res = sc._design_gb_primers(template, 20, 20 + len(body), "OPERON",
+                                    codon_raw=self._codon_raw(),
+                                    grammar=self._grammar())
+        if "error" in res:
+            assert "junction" in res["error"] or "site" in res["error"]
+            return
+        amp = self._amplicon(res)
+        frags = sc._digest_with_enzymes(
+            amp, [self._grammar()["enzyme"]], circular=False)
+        assert len(frags) == 3, (
+            f"{len(frags)} fragments — the amplicon carries an extra "
+            f"{self._grammar()['enzyme']} site formed at the overhang↔insert "
+            f"junction, so the digest releases the wrong part")

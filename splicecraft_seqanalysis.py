@@ -172,8 +172,12 @@ _BACKBONE_FEATURE_TYPES: frozenset[str] = frozenset({
 _BACKBONE_LABEL_KEYWORDS: tuple[str, ...] = (
     "ori", "rep_origin",
     "ampr", "kanr", "specr", "specinomycin", "spectinomycin",
-    "cmr", "chloramphenicol", "tetr", "tetracyclin",
+    "cmr", "chloramphenicol",
     "carbr", "carbenicillin",
+    # NB: "tetr" / "tetracyclin" USED to be here and are now whole-token +
+    # gene-bearing-type keywords (`_BACKBONE_TOKEN_KEYWORDS`) — see the tet
+    # note there. Every OTHER keyword here is long enough to survive as a
+    # word-start match.
     # NB: bare "selection"/"antibiotic" deliberately excluded — a ccdB/sacB
     # counter-selection DROPOUT is often labeled "...selection cassette", and
     # matching it would tag the dropout as backbone, collapsing the marker-
@@ -181,6 +185,74 @@ _BACKBONE_LABEL_KEYWORDS: tuple[str, ...] = (
     # Specific resistance genes + origins only. Keep in sync with cloning's
     # `_ACCEPTOR_BACKBONE_LABEL_KEYWORDS`.
 )
+
+
+# Suffixes that must NOT follow a keyword: the English words and unrelated
+# biology that keyword happens to OPEN. A word-start match alone doesn't stop
+# these — "orientation" and "original" both start with a real keyword.
+#   ori  → orient(ation), origina(l) …  but "origin" / "origins" must match
+_BACKBONE_LABEL_TRAPS: "dict[str, tuple[str, ...]]" = {
+    "ori": ("ent", "gina"),
+}
+
+
+def _label_keyword_re(
+    keywords: "tuple[str, ...]",
+    traps: "dict[str, tuple[str, ...]]",
+) -> "re.Pattern[str]":
+    r"""Compile marker keywords into one alternation that matches only at a
+    WORD START — never mid-word — with a per-keyword suffix blocklist.
+
+    THE bug this exists to prevent (field report 2026-08-17, agent-driven
+    Golden Gate): the keywords used to be matched as bare case-insensitive
+    substrings, and `"ori"` is three letters. It is the tail of `EcoRI` (also
+    `EcoRI site`, `EcoRI-F`), of `Aequorea victoria`, of `a priori` — labels
+    that sit on PAYLOAD fragments every day. A reporter's alpha/omega digest
+    had an insert half annotated with nothing but an `EcoRI` site, and it read
+    as backbone. Once BOTH halves look like backbone, every consumer degrades
+    differently and all of them are wrong: `_pick_insert_fragment` /
+    `_pick_backbone_fragment` empty their candidate list and collapse to the
+    raw SIZE heuristic the marker test exists to replace
+    (`feedback_never_assume_smaller_frag_is_payload`);
+    `_classify_part_from_plasmid` pass-4 requires `sum(marked) == 1` and bails
+    to "no detectable grammar"; `_grammar_acceptor_tu_pairs` and cloning's
+    `_entry_vector_acceptor_overhangs` fall back to "smallest", which INVERTS
+    the `(oh5, oh3)` acceptor pair whenever a dropout outgrew its backbone.
+
+    Two rules, both learned from real annotation text:
+
+    * **Word start, not whole word.** `(?<![^\W\d_])` = "not preceded by a
+      letter" (Unicode-aware — `[^\W\d_]` is the word class minus digits and
+      underscore). A matching RIGHT boundary would be wrong: `oriT`, `oriV`,
+      `oriP`, `ori2`, `oriR6K`, `origin` and `AmpR promoter` all continue past
+      the keyword. Digits and separators are NOT letters, so `pMB1ori` and
+      `rep_origin` still match.
+    * **Suffix traps** for the words a keyword opens (see
+      `_BACKBONE_LABEL_TRAPS`), because a word-start match can't tell `origin`
+      from `original`.
+
+    Keywords too short to survive even this (`cat`, `bla`, `tetr`, …) don't
+    belong here at all — they go in `_BACKBONE_TOKEN_KEYWORDS`, which demands
+    a whole token AND a gene-bearing feature type.
+    """
+    parts: list[str] = []
+    for kw in keywords:
+        if not kw:
+            continue          # an empty branch would match EVERY label
+        bad = traps.get(kw)
+        parts.append(re.escape(kw)
+                     + (f"(?!{'|'.join(b for b in bad if b)})" if bad else ""))
+    if not parts:
+        # `(?!)` never matches. An empty alternation would compile to a
+        # pattern that matches the empty string at every position, i.e. every
+        # fragment would read as backbone — fail CLOSED instead.
+        return re.compile(r"(?!)")
+    return re.compile(r"(?<![^\W\d_])(?:" + "|".join(parts) + r")",
+                      re.IGNORECASE)
+
+
+_BACKBONE_LABEL_RE = _label_keyword_re(_BACKBONE_LABEL_KEYWORDS,
+                                       _BACKBONE_LABEL_TRAPS)
 
 
 # Resistance genes whose names are too SHORT to substring-match safely.
@@ -219,8 +291,22 @@ _BACKBONE_TOKEN_KEYWORDS: frozenset[str] = frozenset({
     "smr", "hyg", "hygr", "hph",                         # spec / hygromycin
     "zeo", "zeor", "ble", "gmr", "gent",                 # zeocin / gentamicin
     "tetm", "teta", "tetl",                              # tetracycline
+    "tetr", "tetracyclin", "tetracycline",               # ← tet, see below
     "puror", "pac", "sh", "nat1",                        # puromycin / nourseo.
 })
+# The tet family is here rather than in `_BACKBONE_LABEL_KEYWORDS` for BOTH
+# reasons this tier exists (moved 2026-08-18, adversarial corpus sweep):
+#   * substring `"tetr"` is inside `tetr·atricopeptide repeat`, `tetr·amer`
+#     -ization domain, `tetr·aspanin`, `Tetr·ahymena` ribozyme, `tetr·aloop` —
+#     none of which have anything to do with tetracycline, and the first two
+#     are among the most-annotated protein domains there are;
+#   * tet is the ONE marker family whose repressor and operator are standard
+#     PAYLOAD regulatory parts — `tetO`, `TRE`, `tetracycline-responsive
+#     promoter`, `tetR binding site`, primers named `TetR-F`. A tet mention
+#     outside a `CDS`/`gene` names the regulatory element, not the resistance
+#     gene, which is exactly the distinction this tier already draws for ermB.
+# A real `CDS`/`gene` labelled `TetR` or `tetracycline resistance protein`
+# still matches, on the token, as before.
 
 
 def _label_tokens(label: str) -> "set[str]":
@@ -230,35 +316,81 @@ def _label_tokens(label: str) -> "set[str]":
     return {t.lower() for t in re.split(r"[^A-Za-z0-9]+", label) if t}
 
 
+def _feature_is_backbone_marker(ftype, label) -> bool:
+    """Does ONE feature's ``(type, label)`` read as a backbone marker?
+
+    THE matching rule, in one place. `_fragment_has_backbone_marker` and
+    `_fragment_backbone_marker_labels` used to hand-keep two copies of it and
+    the copies DID drift: the evidence list clamped labels to 80 characters
+    BEFORE matching, so a marker past character 80 made the predicate say True
+    while the list that is supposed to be its evidence came back empty (found
+    + fixed 2026-08-18). One rule, no drift.
+
+    Three tiers, narrowest first:
+      1. the feature TYPE is `rep_origin` / `oriT` — unambiguous;
+      2. a `_BACKBONE_LABEL_KEYWORDS` keyword at a WORD START, minus its
+         suffix traps (`_label_keyword_re` carries the worked examples);
+      3. a `_BACKBONE_TOKEN_KEYWORDS` name as a WHOLE TOKEN, and only on a
+         gene-bearing feature type — the short names (`cat`, `bla`, `tetr`)
+         that even a word-start match can't make safe.
+    """
+    ft = str(ftype or "").lower()
+    if ft in _BACKBONE_FEATURE_TYPES:
+        return True
+    lbl = str(label or "")
+    if not lbl:
+        return False
+    low = lbl.lower()
+    # Cheap pre-filter, then the real rule. `_BACKBONE_LABEL_RE` only ever
+    # matches where the bare keyword occurs (it adds boundary + trap
+    # restrictions, never new matches), so a plain substring scan is a SOUND
+    # gate — and C-level `in` beats running an alternation with a lookbehind
+    # over every label. Measured on a 20-feature fragment 2026-08-18: 44 µs
+    # regex-always → 17 µs gated, i.e. back to the pre-boundary cost.
+    # `test_word_start_rule_implies_substring` pins the soundness.
+    if (any(kw in low for kw in _BACKBONE_LABEL_KEYWORDS)
+            and _BACKBONE_LABEL_RE.search(lbl)):
+        return True
+    return (ft in _BACKBONE_TOKEN_FEATURE_TYPES
+            and bool(_label_tokens(lbl) & _BACKBONE_TOKEN_KEYWORDS))
+
+
+def _fragment_features(frag) -> list:
+    """``frag``'s feature dicts, or ``[]`` for anything malformed.
+
+    Both marker helpers are called on digest output, on parsed-GenBank
+    output, and (through the agent API) on caller-supplied JSON, so a
+    non-dict fragment or a `features` value that isn't a list must return
+    "no markers" rather than raising out of a Constructor worker."""
+    if not isinstance(frag, dict):
+        return []
+    feats = frag.get("features")
+    # The list case is returned as-is, NOT copied: callers only iterate, and
+    # these helpers sit in the classifier's inner loop. A tuple is converted
+    # (rare, and it keeps the return type honest).
+    if isinstance(feats, list):
+        return feats
+    return list(feats) if isinstance(feats, tuple) else []
+
+
 def _fragment_has_backbone_marker(frag: dict) -> bool:
     """Return True iff ``frag``'s features include a typical
     bacterial-backbone marker (origin of replication or antibiotic
-    resistance). Case-insensitive substring match on the feature's
-    label / qualifier.
+    resistance) — see `_feature_is_backbone_marker` for the match rule.
 
     Used by `_pick_insert_fragment` to avoid the "smallest fragment
     is the dropout" heuristic — that rule breaks the moment a
     stacked-TU/MOD insert outgrows its carrier vector. Looking for
     the ORIGIN/SELECTION markers is reliable because real Golden
     Braid / MoClo entry vectors annotate them, and the L0 parts
-    chained INTO an insert never do."""
-    for f in (frag.get("features") or []):
-        if not isinstance(f, dict):
-            continue
-        ftype = str(f.get("type") or "").lower()
-        if ftype in _BACKBONE_FEATURE_TYPES:
-            return True
-        label = str(f.get("label") or "").lower()
-        if not label:
-            continue
-        for kw in _BACKBONE_LABEL_KEYWORDS:
-            if kw in label:
-                return True
-        # Short gene names, matched as whole tokens on gene-bearing feature
-        # types only — see `_BACKBONE_TOKEN_KEYWORDS` for why neither the
-        # substring form nor the unrestricted form is safe.
-        if (ftype in _BACKBONE_TOKEN_FEATURE_TYPES
-                and _label_tokens(label) & _BACKBONE_TOKEN_KEYWORDS):
+    chained INTO an insert never do.
+
+    Biased toward false NEGATIVES: a missed marker falls back to the size
+    heuristic and logs it, while a false positive silently picks the wrong
+    half of a digest (see `_label_keyword_re`)."""
+    for f in _fragment_features(frag):
+        if isinstance(f, dict) and _feature_is_backbone_marker(
+                f.get("type"), f.get("label")):
             return True
     return False
 
@@ -267,31 +399,22 @@ def _fragment_backbone_marker_labels(frag: dict) -> "list[str]":
     """The feature names that make `_fragment_has_backbone_marker` say True,
     de-duplicated in first-seen order (empty list when it says False).
 
-    Same matching rules as the predicate — this only reports WHICH features
-    tripped it. Lets a caller say "carries AmpR, Ori*", which reads as a
-    diagnosis, instead of "carries a backbone marker", which reads as noise
-    the user has no way to act on."""
-    if not isinstance(frag, dict):
-        return []
+    Same rule — literally the same function — so the two can never disagree;
+    this only reports WHICH features tripped it. Lets a caller say "carries
+    AmpR, Ori*", which reads as a diagnosis, instead of "carries a backbone
+    marker", which reads as noise the user has no way to act on."""
     out: list[str] = []
-    for f in (frag.get("features") or []):
+    for f in _fragment_features(frag):
         if not isinstance(f, dict):
             continue
-        ftype = str(f.get("type") or "").lower()
-        # Clamp: a label is user-controlled and can be arbitrarily long
-        # (imported GenBank happily carries multi-line /note text). These
-        # names go straight into a one-line warning, so cap them here rather
-        # than letting one pathological label swamp the results pane.
-        label = str(f.get("label") or "").strip()[:80]
-        hit = (
-            ftype in _BACKBONE_FEATURE_TYPES
-            or any(kw in label.lower() for kw in _BACKBONE_LABEL_KEYWORDS)
-            or (ftype in _BACKBONE_TOKEN_FEATURE_TYPES
-                and bool(_label_tokens(label) & _BACKBONE_TOKEN_KEYWORDS))
-        )
-        if not hit:
+        if not _feature_is_backbone_marker(f.get("type"), f.get("label")):
             continue
-        name = label or ftype
+        # Clamp for DISPLAY only (never before matching): a label is
+        # user-controlled and can be arbitrarily long — imported GenBank
+        # happily carries multi-line /note text — and these names go straight
+        # into a one-line warning.
+        name = (str(f.get("label") or "").strip()[:80]
+                or str(f.get("type") or "").lower())
         if name and name not in out:
             out.append(name)
     return out

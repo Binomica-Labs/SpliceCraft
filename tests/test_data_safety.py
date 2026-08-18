@@ -1800,3 +1800,33 @@ class TestDataDirHousekeeping:
 
     def test_never_raises_on_missing(self, tmp_path):
         sc._run_data_dir_housekeeping(tmp_path / "empty")   # no-op, no raise
+
+
+class TestPreUpdateSnapshotTableDate:
+    """`splicecraft update --list-snapshots` is a user-facing surface, so its
+    dates follow the app-wide convention: uppercase 3-letter month, no
+    leading-zero day, 24-hour clock, no slashes. (Rendered inline rather than
+    via `_history_human_dt` — that lives in history, one layer up.)"""
+
+    @staticmethod
+    def _row(**kw):
+        base = {"id": "sc-preupdate-1.2.53", "mtime": 0.0,
+                "from_version": "1.2.53", "n_files": 12, "n_dirs": 3,
+                "total_size": 204800}
+        base.update(kw)
+        return base
+
+    def test_renders_the_universal_date_format(self):
+        import datetime as _dt
+
+        import splicecraft_backup as bk
+
+        when = _dt.datetime(2026, 6, 9, 14, 5)
+        out = bk._format_pre_update_snapshot_table(
+            [self._row(mtime=when.timestamp())])
+        assert "(JUN 9 2026 14:05)" in out, out
+        assert "2026-06-09" not in out and "06/09" not in out
+
+    def test_no_snapshots_renders_nothing(self):
+        import splicecraft_backup as bk
+        assert bk._format_pre_update_snapshot_table([]) == ""

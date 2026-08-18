@@ -296,7 +296,12 @@ class TestDesignerUniformShape:
         (2026-05-21). CDS oh5 = AATG carries the start codon, so
         fwd_pos starts at insert_start + 3 (codon 2), not the
         bare insert start."""
-        seq = self._valid_template()
+        # The skip collapses a DUPLICATED start codon, so the region has to
+        # open on ATG for it to fire at all — otherwise there is nothing to
+        # collapse and skipping would eat three of the user's own bases
+        # ([INV-183]). The shared fixture is plain random DNA; plant it.
+        base = self._valid_template()
+        seq = base[:50] + "ATG" + base[53:]
         r = sc._design_gb_primers(seq, 50, 300, "CDS")
         assert "error" not in r, r
         assert r["fwd_pos"] == (50 + 3, 50 + 3 + len(r["fwd_binding"]))

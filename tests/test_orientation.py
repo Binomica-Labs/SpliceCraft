@@ -278,6 +278,126 @@ class TestReOrigin:
 # ── the canvas actions (driven through a real app) ────────────────────────
 
 
+class TestReOriginKeepsFeatureShape:
+    """[INV-182] Re-origin used to run every feature through `_feat_bounds`,
+    which flattens anything that isn't a plain two-part origin wrap to
+    ``(min start, max end)``. A spliced CDS therefore came back as ONE
+    contiguous block with its introns swallowed, and a minus-strand feature
+    pushed across the new origin came back with its two halves in ascending
+    order — right bases, wrong reading order, i.e. a cyclically rotated
+    protein once exported. Both are invisible unless you compare `extract()`.
+    """
+
+    @pytest.mark.parametrize("offset", [1, 5, 11, 17, 23, 30, 37, 41])
+    def test_every_stranded_feature_keeps_its_dna_at_every_offset(self, offset):
+        r = _mk()
+        rot = sc._rotate_seq_record(r, offset, keep_source=True)
+        before, after = _by_label(r), _by_label(rot)
+        for lbl in ("fwd", "rev", "wrap", "rev-spliced"):
+            assert str(before[lbl].extract(r.seq)) == \
+                str(after[lbl].extract(rot.seq)), f"{lbl} @ offset {offset}"
+
+    @pytest.mark.parametrize("offset", [1, 5, 11, 17, 23, 30, 37, 41])
+    def test_a_spliced_feature_keeps_its_exon_count(self, offset):
+        """An intron is not an annotation detail — a CDS that absorbs one
+        translates straight through it."""
+        r = _mk()
+        rot = sc._rotate_seq_record(r, offset, keep_source=True)
+        got = _by_label(rot)["rev-spliced"]
+        # 11 + 11 exonic bases. The pre-fix code emitted ONE part spanning
+        # 9..40 = 31 bases: the 9 bp intron swallowed into the CDS. (An exon
+        # that lands on the new origin legitimately splits into two pieces,
+        # so the part COUNT varies with the offset — the exonic base count
+        # does not.)
+        assert sum(int(p.end) - int(p.start)
+                   for p in got.location.parts) == 22, (
+            f"offset {offset}: {got.location} — exonic length changed, so "
+            f"the intron between the exons is now part of the CDS")
+        assert len(got.location.parts) >= 2
+
+    def test_a_minus_feature_pushed_across_the_origin_reads_head_first(self):
+        r = _mk()
+        n = len(SEQ)
+        # "rev" sits at [20, 30); rotating by 25 puts the new origin inside it.
+        rot = sc._rotate_seq_record(r, 25, keep_source=True)
+        got = _by_label(rot)["rev"]
+        parts = [(int(p.start), int(p.end)) for p in got.location.parts]
+        assert len(parts) == 2 and parts[0][0] == 0 and parts[1][1] == n, parts
+        assert str(_by_label(r)["rev"].extract(r.seq)) == \
+            str(got.extract(rot.seq))
+
+    def test_the_rotated_record_survives_a_genbank_round_trip(self):
+        """The whole point of the part order: what a THIRD-PARTY tool reads
+        back out of the file we write."""
+        import io
+
+        from Bio import SeqIO
+
+        r = _mk()
+        rot = sc._rotate_seq_record(r, 25, keep_source=True)
+        back = SeqIO.read(io.StringIO(sc._record_to_gb_text(rot)), "genbank")
+        want = {lbl: str(f.extract(r.seq)) for lbl, f in _by_label(r).items()}
+        for lbl, f in _by_label(back).items():
+            if lbl in ("source", "arrowless"):
+                continue          # whole-record / directionless by design
+            assert str(f.extract(back.seq)) == want[lbl], lbl
+
+
+class TestFeatureLocationBuilder:
+    """`_feature_location` is the one place that decides which half of an
+    origin-wrap comes first. [INV-182]"""
+
+    def test_plus_strand_wrap_is_tail_then_head(self):
+        loc = sc._feature_location(90, 10, 100, 1)
+        assert [(int(p.start), int(p.end)) for p in loc.parts] == \
+            [(90, 100), (0, 10)]
+
+    def test_minus_strand_wrap_is_head_then_tail(self):
+        loc = sc._feature_location(90, 10, 100, -1)
+        assert [(int(p.start), int(p.end)) for p in loc.parts] == \
+            [(0, 10), (90, 100)]
+
+    def test_it_round_trips_through_feat_bounds(self):
+        from Bio.SeqFeature import SeqFeature
+        for strand in (1, -1, 0):
+            for start, end in ((10, 40), (90, 10), (0, 100)):
+                loc = sc._feature_location(start, end, 100, strand or None)
+                got = sc._feat_bounds(SeqFeature(loc, type="CDS"), 100)
+                assert got == (start, end, strand), (start, end, strand, got)
+
+    def test_a_wrap_ending_on_the_origin_collapses_to_one_part(self):
+        loc = sc._feature_location(90, 0, 100, -1)
+        assert (int(loc.start), int(loc.end)) == (90, 100)
+        assert len(loc.parts) == 1
+
+    def test_a_zero_length_span_is_refused(self):
+        assert sc._feature_location(40, 40, 100, 1) is None
+
+    def test_minus_strand_wrap_exports_the_protein_it_displays(self):
+        """The bug in one assertion: SpliceCraft's own `_translate_cds` reads
+        the dict model and was always right; the GenBank writer read the part
+        ORDER and was not."""
+        import io
+
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature
+
+        seq = "ATGGGCCCATTAGCTAGCTAGCATCGATCGGGTTTAAACCCGGGTTTAAA"
+        n = len(seq)
+        rec = SeqRecord(Seq(seq), id="w", name="w",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features.append(SeqFeature(
+            sc._feature_location(44, 6, n, -1), type="CDS",
+            qualifiers={"label": ["wrapCDS"]}))
+        shown = sc._translate_cds(seq, 44, 6, -1)
+        back = SeqIO.read(io.StringIO(sc._record_to_gb_text(rec)), "genbank")
+        exported = str(Seq(str(back.features[0].extract(back.seq))).translate())
+        assert exported == shown, (exported, shown)
+
+
 @pytest.mark.asyncio
 class TestOrientationActions:
     """The circular gate and the undo contract, exercised through the real

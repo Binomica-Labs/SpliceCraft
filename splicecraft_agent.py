@@ -52,7 +52,8 @@ from splicecraft_logging import (_log, _log_event)
 from splicecraft_net import (_sanitize_accession)
 from splicecraft_persistence import (_safe_file_size_check, _safe_load_json)
 from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_design, _scrub_qc_primers, _scrub_qc_verify)
-from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq)
+from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq,
+                                _topology_from_gb_text)
 from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint)
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_picker, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
@@ -712,17 +713,14 @@ def _h_list_library(app, payload):
 
     out: list[dict] = []
     for e in source_entries:
-        # Topology: scan the LOCUS line for "circular" or "linear".
-        # Library entries omit explicit topology in the JSON — we get
-        # it from the embedded gb_text. Default to "circular" since
-        # ~99% of stored plasmids are circular and assembling that
-        # default avoids a regex pass on every row.
-        topology = "circular"
-        gb_text = e.get("gb_text") or ""
-        if gb_text:
-            head = gb_text[:200]
-            if "linear" in head.lower():
-                topology = "linear"
+        # Topology from the LOCUS line's topology FIELD (whole token, that
+        # line only). Library entries omit explicit topology in the JSON, so
+        # it comes from the embedded gb_text; default "circular" because
+        # ~99% of stored entries are plasmids. This used to be
+        # `"linear" in gb_text[:200].lower()`, which also read the entry's
+        # own NAME and its DEFINITION — an entry called `pLinear2` reported
+        # itself linear to every agent caller.
+        topology = _topology_from_gb_text(e.get("gb_text") or "")
         out.append({
             "name":        e.get("name", ""),
             "id":          e.get("id", ""),

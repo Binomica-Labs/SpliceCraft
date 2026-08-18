@@ -345,6 +345,52 @@ def _sanitize_plasmid_name(raw: str, *,
 
 
 # ── More pure helpers (moved from hub, Phase D) ─────────────────────────────
+def _feature_location(start: int, end: int, total: int, strand):
+    """Build the BioPython location for a dict-model feature `(start, end,
+    strand)` on a molecule of `total` bp — the INVERSE of `_feat_bounds`.
+
+    `end < start` is the dict convention for an origin-spanning (wrap)
+    feature, which becomes a two-part `CompoundLocation`. Everything else
+    is a plain `FeatureLocation`. Returns `None` for a degenerate span
+    (`end == start`, which would be zero-length or the whole molecule with
+    no break point — callers already refuse those).
+
+    **Why this exists — the part ORDER of a wrap on the minus strand.**
+    BioPython concatenates a `CompoundLocation`'s parts in STORED order when
+    it extracts, and writes `complement(join(...))` by reversing them, so the
+    stored order *is* the 5'→3' reading order. For a plus-strand wrap that is
+    `[(start, total), (0, end)]` — read the tail, then the head. For a MINUS
+    strand it is the other way round: the feature reads from `end - 1` down to
+    `start`, so the head piece `(0, end)` comes FIRST. Emitting the ascending
+    order for both (which every wrap-building call site used to do) is
+    invisible inside SpliceCraft — `_feat_bounds` recovers `(start, end)`
+    from either order, and `_translate_cds` works off those numbers — but it
+    exports `complement(join(1..end, start+1..total))`, which BioPython,
+    SnapGene, Benchling and NCBI all read as `rc(tail) + rc(head)`: the right
+    bases in the wrong order, i.e. a CYCLICALLY ROTATED protein for any
+    reverse-strand CDS that crosses the origin. Route every wrap through here
+    so there is one definition of "which half comes first".
+
+    `strand` is passed through untouched (BioPython wants ±1 / 0 / None);
+    SpliceCraft's `2` = double-stranded convention must be mapped by the
+    caller before it gets here.
+    """
+    from Bio.SeqFeature import CompoundLocation, FeatureLocation
+    start, end, total = int(start), int(end), int(total)
+    if end > start:
+        return FeatureLocation(start, end, strand=strand)
+    if end == 0 and start < total:
+        # Ends exactly ON the origin: a wrap with an empty head half.
+        # `CompoundLocation` refuses a zero-length part, and the tail alone
+        # already describes every base.
+        return FeatureLocation(start, total, strand=strand)
+    if end == start:
+        return None
+    tail = FeatureLocation(start, total, strand=strand)
+    head = FeatureLocation(0, end, strand=strand)
+    return CompoundLocation([head, tail] if strand == -1 else [tail, head])
+
+
 def _feat_bounds(feat, total: int) -> "tuple[int, int, int] | None":
     """Wrap-aware extraction of `(start, end, strand)` from a Biopython
     `SeqFeature`. The returned `(start, end)` follows the dict-feature
