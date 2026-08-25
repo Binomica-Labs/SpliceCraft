@@ -144,6 +144,54 @@ def _feat_len(start: int, end: int, total: int) -> int:
     return (total - start) + end if end < start else end - start
 
 
+def _bp_in_span(bp: int, start: int, end: int,
+                total: "int | None" = None) -> bool:
+    """Is `bp` inside the half-open span ``[start, end)`` on a circular
+    molecule? A span with ``end < start`` crosses the origin, so the test
+    flips from "between" to "outside the gap".
+
+    `total` normalises every coordinate into ``[0, total)`` first; pass
+    ``None`` (the default) when they are known to be in range already —
+    that keeps the render path's arithmetic byte-identical.
+
+    ``start == end`` is an EMPTY span and contains nothing, matching
+    `_feat_len`, which reports it as 0 bp. Hand-rolling this as
+    ``start <= bp < end`` is the single most common way to get a
+    wrap-spanning feature wrong: it reports False for every base in a
+    T-DNA / marker / operon that happens to cross the origin."""
+    if total is not None:
+        if total <= 0:
+            return False
+        bp, start, end = bp % total, start % total, end % total
+    return (start <= bp < end) if end >= start else (bp >= start or bp < end)
+
+
+def _span_in_span(inner_start: int, inner_end: int,
+                  outer_start: int, outer_end: int, total: int) -> bool:
+    """Is the half-open span ``[inner_start, inner_end)`` wholly inside
+    ``[outer_start, outer_end)`` on a circular molecule of `total` bp?
+
+    Either span may cross the origin, independently. Works by rotating the
+    circle so `outer_start` sits at 0: the inner span is contained exactly
+    when its offset plus its own wrap-aware length still fits inside the
+    outer's wrap-aware length. Both lengths come from `_feat_len` (sacred
+    invariant #8), so containment can't disagree with the length the rest
+    of the app reports for the same feature."""
+    if total <= 0:
+        return False
+    outer_len = _feat_len(outer_start % total, outer_end % total, total)
+    if outer_len <= 0:
+        return False                       # an empty outer contains nothing
+    inner_len = _feat_len(inner_start % total, inner_end % total, total)
+    offset = (inner_start - outer_start) % total
+    if inner_len <= 0:
+        # A zero-length inner is an insertion POINT: contained when the
+        # point itself lies in the outer span, which excludes the position
+        # one past its end.
+        return offset < outer_len
+    return offset + inner_len <= outer_len
+
+
 def _seq_len(record) -> int:
     """Length of ``record.seq`` in bp, or 0 if the record has no
     sequence attached. BioPython's ``SeqRecord.seq`` is typed as
@@ -1890,6 +1938,107 @@ def _scan_restriction_sites_impl(
                     h["cut_count"] = n_sites
         feats.extend(hits)
     return feats
+
+
+# ── Enzyme-name resolution (case- and isoschizomer-aware) ──────────────────
+#
+# `_scan_restriction_sites_impl` deliberately COLLAPSES isoschizomers and
+# HF/v2 variants that land on the same span (the `placed` set above): a map
+# that stacked BsmBI, Esp3I and BsmBI-v2 bars on one CGTCTC would be
+# unreadable. That is right for a RENDER and wrong for a QUERY — asking the
+# scan for "Esp3I" comes back empty because the catalog-order winner BsmBI
+# claimed the position, which reads as "no sites" instead of "same sites,
+# other name". These helpers let a query surface expand the collapse back
+# out, and let a caller's typo fail loudly instead of scanning nothing.
+
+
+def _enzyme_signature(name: str) -> "tuple[str, int, int] | None":
+    """``(recognition_site, fwd_cut, rev_cut)`` for `name`, or ``None`` when
+    the combined catalog (built-in ∪ user custom) doesn't know it.
+
+    Two enzymes sharing a signature are isoschizomers: they recognise the
+    same sequence and cleave at the same offsets, so no scan can tell them
+    apart — only the name differs."""
+    try:
+        catalog = _state._all_enzymes_hook() or {}
+    except Exception:                       # pragma: no cover - hook absent
+        return None
+    entry = catalog.get(name)
+    if not entry:
+        return None
+    try:
+        site, fwd_cut, rev_cut = entry
+        return (str(site).upper(), int(fwd_cut), int(rev_cut))
+    except (TypeError, ValueError):
+        # A corrupt custom enzyme — same tolerance as `_rebuild_scan_catalog`.
+        return None
+
+
+def _enzyme_aliases(name: str) -> "list[str]":
+    """Every catalog name that cuts EXACTLY like `name`, `name` included.
+
+    ``_enzyme_aliases("BsmBI") -> ["BsmBI", "BsmBI-v2", "Esp3I"]``. Returns
+    ``[name]`` for an enzyme with no isoschizomer and ``[]`` for one the
+    catalog doesn't know."""
+    sig = _enzyme_signature(name)
+    if sig is None:
+        return []
+    try:
+        catalog = _state._all_enzymes_hook() or {}
+    except Exception:                       # pragma: no cover - hook absent
+        return [name]
+    return sorted(
+        n for n in catalog if _enzyme_signature(n) == sig
+    )
+
+
+# How many unrecognised names get near-miss suggestions computed for them.
+# Beyond this they are still reported, just without advice — see
+# `_resolve_enzyme_names`.
+_RESOLVE_SUGGEST_LIMIT = 20
+
+
+def _resolve_enzyme_names(
+    names: "list[str]",
+) -> "tuple[list[str], list[tuple[str, list[str]]]]":
+    """Match requested enzyme names against the combined catalog.
+
+    Returns ``(resolved, unknown)`` where `resolved` holds the canonical
+    catalog spelling of every name that matched (order preserved, duplicates
+    dropped) and `unknown` holds ``(requested_name, suggestions)`` pairs for
+    the ones that did not.
+
+    Matching is exact first, then case-insensitive — ``"bsai"`` and
+    ``"BSAI"`` both resolve to ``"BsaI"``, because enzyme capitalisation is
+    a REBASE convention nobody types correctly by hand and getting it wrong
+    otherwise silently scans nothing. It deliberately does NOT fuzzy-match:
+    ``BsaI`` and ``BsaXI`` are different enzymes and guessing between them
+    would be the exact wrong-answer failure this function exists to prevent.
+    Near misses come back as `suggestions` for the caller's error message."""
+    try:
+        catalog = _state._all_enzymes_hook() or {}
+    except Exception:                       # pragma: no cover - hook absent
+        catalog = {}
+    lowered = {n.lower(): n for n in catalog}
+    resolved: list[str] = []
+    unknown: list[tuple[str, list[str]]] = []
+    for raw in names:
+        want = str(raw).strip()
+        hit = want if want in catalog else lowered.get(want.lower())
+        if hit is None:
+            # Suggestions are bounded: `difflib.get_close_matches` is O(catalog)
+            # per name, so a payload carrying thousands of bad names would burn
+            # seconds of CPU building advice nobody reads. The first few get
+            # near-misses; the rest are still reported as unknown.
+            near: "list[str]" = []
+            if len(unknown) < _RESOLVE_SUGGEST_LIMIT:
+                import difflib
+                near = difflib.get_close_matches(
+                    want[:64], list(catalog), n=3, cutoff=0.6)
+            unknown.append((want, near))
+        elif hit not in resolved:
+            resolved.append(hit)
+    return resolved, unknown
 
 
 def _enzyme_cuts(seq: str, enzyme_names: list[str], *,

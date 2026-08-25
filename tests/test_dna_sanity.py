@@ -2138,3 +2138,115 @@ class TestTranslTableNonStandard:
         aa_t4, _len, _ve = sc._cds_aa_list(
             seq, {"start": 0, "end": 12, "strand": 1, "transl_table": 4})
         assert aa_t4 == ["M", "W", "K", "*"]
+
+
+class TestCircularIntervals:
+    """`_bp_in_span` / `_span_in_span` — the wrap-aware containment the whole
+    app shares. An agent driving the API hand-rolled this and got a false
+    FAIL on a correct construct whose T-DNA borders wrap the origin, because
+    the obvious linear `a <= x < b` reports every base of an origin-spanning
+    feature as OUTSIDE it (blue field report #2, 2026-08-24)."""
+
+    @staticmethod
+    def _ref_bases(start, end, total):
+        """Independent reference: walk the circle base by base rather than
+        reasoning about the coordinates. Deliberately does NOT reuse the
+        containment logic under test."""
+        n = sc._feat_len(start % total, end % total, total)
+        return [(start + i) % total for i in range(n)]
+
+    def test_bp_in_span_matches_a_brute_force_walk(self):
+        """Exhaustive over every circle size 1..12 and every span."""
+        import itertools
+        for total in range(1, 13):
+            for s, e in itertools.product(range(total), repeat=2):
+                cover = set(self._ref_bases(s, e, total))
+                for bp in range(total):
+                    assert sc._bp_in_span(bp, s, e, total) == (bp in cover), \
+                        f"L={total} span=[{s},{e}) bp={bp}"
+
+    def test_span_in_span_matches_a_brute_force_walk(self):
+        import itertools
+        for total in range(1, 13):
+            for os_, oe in itertools.product(range(total), repeat=2):
+                cover = set(self._ref_bases(os_, oe, total))
+                for is_, ie in itertools.product(range(total), repeat=2):
+                    inner = self._ref_bases(is_, ie, total)
+                    want = (set(inner) <= cover and bool(inner)) if inner \
+                        else sc._bp_in_span(is_, os_, oe, total)
+                    assert sc._span_in_span(is_, ie, os_, oe, total) == want, \
+                        f"L={total} inner=[{is_},{ie}) outer=[{os_},{oe})"
+
+    def test_the_linear_form_disagrees_on_a_wrapping_span(self):
+        """Guards against a well-meaning "simplification" back to linear: on
+        a real 10 kb binary vector with a T-DNA at [9500, 800), a base at 100
+        IS inside and the linear predicate says it isn't."""
+        assert (9500 <= 100 < 800) is False          # the bug that was hit
+        assert sc._bp_in_span(100, 9500, 800, 10_000) is True
+
+    def test_empty_span_contains_nothing(self):
+        """`start == end` is 0 bp per `_feat_len`, not "the whole circle"."""
+        assert sc._feat_len(5, 5, 100) == 0
+        assert sc._bp_in_span(5, 5, 5, 100) is False
+        assert sc._span_in_span(0, 10, 5, 5, 100) is False
+
+    def test_render_path_parity_without_total(self):
+        """`PlasmidMap._bp_in` delegates here with `total=None`; that path
+        must stay byte-identical to the pre-delegation expression."""
+        import itertools
+        for total in range(1, 13):
+            for s, e in itertools.product(range(total), repeat=2):
+                for bp in range(total):
+                    old = (s <= bp < e) if e >= s else (bp >= s or bp < e)
+                    assert sc._bp_in_span(bp, s, e) == old
+
+    def test_degenerate_total(self):
+        assert sc._bp_in_span(0, 0, 1, 0) is False
+        assert sc._span_in_span(0, 1, 0, 1, 0) is False
+
+
+class TestEnzymeNameResolution:
+    """`_resolve_enzyme_names` / `_enzyme_aliases` — the catalog can file two
+    names for one enzyme, and the scan surfaces only one of them."""
+
+    def test_isoschizomers_share_a_signature(self):
+        assert sc._enzyme_signature("BsmBI") == sc._enzyme_signature("Esp3I")
+        assert sc._enzyme_signature("BsaI") == sc._enzyme_signature("BspTNI")
+        assert sc._enzyme_signature("BsaI") != sc._enzyme_signature("BsmBI")
+
+    def test_aliases_are_symmetric_and_include_self(self):
+        assert sc._enzyme_aliases("BsmBI") == ["BsmBI", "BsmBI-v2", "Esp3I"]
+        assert sc._enzyme_aliases("Esp3I") == sc._enzyme_aliases("BsmBI")
+        assert "EcoRI" in sc._enzyme_aliases("EcoRI-HF")
+
+    def test_unknown_name_has_no_signature_and_no_aliases(self):
+        assert sc._enzyme_signature("TotallyMadeUpI") is None
+        assert sc._enzyme_aliases("TotallyMadeUpI") == []
+
+    def test_resolution_is_case_insensitive_and_canonicalises(self):
+        resolved, unknown = sc._resolve_enzyme_names(["bsai", "ECORI"])
+        assert resolved == ["BsaI", "EcoRI"] and unknown == []
+
+    def test_duplicates_collapse_preserving_order(self):
+        resolved, _ = sc._resolve_enzyme_names(["EcoRI", "bsai", "ecori"])
+        assert resolved == ["EcoRI", "BsaI"]
+
+    def test_typo_is_unknown_and_suggests_the_real_name(self):
+        """`Bsa1` (digit one) and `Esp3l` (lowercase L) are the two typos
+        that look right in a terminal font."""
+        _resolved, unknown = sc._resolve_enzyme_names(["Bsa1", "Esp3l"])
+        assert [w for w, _ in unknown] == ["Bsa1", "Esp3l"]
+        assert "BsaI" in dict(unknown)["Bsa1"]
+        assert "Esp3I" in dict(unknown)["Esp3l"]
+
+    def test_it_does_not_fuzzy_match_into_a_real_answer(self):
+        """Suggestions are advisory ONLY — silently resolving `BsaI` from
+        `BsaXI` (or vice versa) would be the exact wrong-answer failure this
+        function exists to prevent."""
+        resolved, unknown = sc._resolve_enzyme_names(["BsaX"])
+        assert resolved == [] and len(unknown) == 1
+
+    def test_every_catalog_name_resolves_to_itself(self):
+        names = list(sc._all_enzymes())
+        resolved, unknown = sc._resolve_enzyme_names(names)
+        assert unknown == [] and resolved == names

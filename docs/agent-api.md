@@ -74,7 +74,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-~220 endpoints across:
+~226 endpoints across:
 
 - **Records** — `new-plasmid` (create from a raw sequence, the Ctrl+N
   flow), get / set sequence, add / update / delete features (with the full
@@ -257,12 +257,71 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   wrap-aware on circular templates) and simulate-gel (per-lane band
   positions + optional rendered ASCII gel image; ladder / plasmid /
   digest / PCR-amplicon sources).
+- **Restriction sites** — `list-restriction-sites` scans the LOADED record
+  (singular `enzyme` accepted; omit it to scan the catalog, honouring your
+  active enzyme collection). Each hit carries `start` / `end` / `strand`,
+  both strand cuts (`cut_bp` / `bottom_cut_bp`), the recognition `site`, and
+  `wraps`. Two rules keep a zero-site answer honest: **an unrecognised
+  enzyme name is a `400`**, never `count: 0` (a typo used to read as "no
+  sites here" instead of "I never looked"), and **isoschizomers resolve by
+  the name you asked for** — the scan collapses enzymes that share a
+  recognition site and cut (BsmBI / Esp3I / BsmBI-v2, BsaI / BspTNI, EcoRI /
+  EcoRI-HF) onto one label so the map stays readable, so the endpoint
+  re-expands it and reports `equivalent_enzymes` telling you which other
+  spellings the answer already covers. Two further refusals exist for the same
+  reason — both would otherwise return a confident `count: 0`: a `min_length`
+  longer than the longest recognition site in the catalog (a units mix-up —
+  `min_length` is in BASE PAIRS), and an `enzymes` list longer than 500 names
+  (which also bounds the near-miss search behind the error message).
 - **Digest** — digest (cut a RAW sequence with named enzymes and report
   the cuts + resulting fragments with their **overhangs** — overhang-aware
   QC for a Golden-Braid / restriction junction without loading the
   sequence onto the canvas; `circular` defaults true, a singular `enzyme`
-  is accepted, and names the catalog doesn't know are reported under
-  `unknown_enzymes` rather than silently dropped).
+  is accepted, names are matched case-insensitively so `bsai` cuts, and names
+  the catalog genuinely doesn't know are reported under `unknown_enzymes`
+  rather than silently dropped — this endpoint reports rather than refuses, so
+  a long list still returns the cuts it can make).
+- **Transcripts** — `predict-transcript` reconstructs the MATURE mRNA of an
+  annotated transcription unit on the loaded record and scores translation
+  initiation on it. Pick the unit with `promoter` / `cds` / `terminator` (a
+  feature index or a label) or let it take the longest CDS and the nearest
+  promoter/terminator on the same strand; `tx_start` + `tx_end` bound it
+  directly when nothing is annotated. Returns `pre_mrna` / `mature_mrna`, the
+  `exons` and `introns` between them (with donor/acceptor and a `canonical`
+  GT–AG flag), `five_utr` / `cds` / `three_utr`, the `kozak` context, and
+  `uorfs` classified `upstream` / `in_frame_extension` /
+  `out_of_frame_overlap`. **The field to read is `removed_by_splicing`:**
+  every upstream ATG that is in the DNA and is NOT in the message, with the
+  intron that deletes it — the false positives a uATG screen run against the
+  plasmid sequence reports as hazards. Introns come from ANNOTATION only
+  (`intron` features, or the gaps between a spliced location's parts); nothing
+  here predicts where a spliceosome would cut. `splice` carries a separate
+  ADVISORY scan of the pre-mRNA with the calibrated plant PWM, marking sites
+  that coincide with an annotated boundary so only genuinely cryptic ones are
+  listed — and reporting `skipped` with a reason if the model is unavailable,
+  never an empty list that would read as clean. `include_sequences: false`
+  drops `pre_mrna` / `mature_mrna` / the UTR sequences and keeps the
+  coordinates and verdicts, for a screening loop over a whole collection.
+- **Enzymes** — `list-enzymes` reads the COMBINED catalog (built-in NEB ∪
+  your custom enzymes; `list-custom-enzymes` returns only the latter) with
+  no sequence involved: recognition site, `fwd_cut` / `rev_cut` offsets,
+  REBASE-style `notation` (`G^TCGAC`, `GGTCTC(1/5)`), overhang length +
+  kind, a `type_iis` flag, and `aliases`. Filter with `names` (exact,
+  case-insensitive), `search` (substring over the name AND the recognition
+  site, so `GGTCTC` finds BsaI and BspTNI), `type_iis_only` or
+  `custom_only`. Exists so a script can check a digest's fragment
+  arithmetic against the enzyme's real offsets instead of hardcoding a
+  private table of them.
+- **Coordinates** — `span-contains` answers "is this base / feature inside
+  that region?" on a molecule where **either** span may cross the origin.
+  Body `{outer, inner, length?}`; spans are half-open `[start, end)` — the
+  convention `list-features` and `list-restriction-sites` report — and one
+  with `end <= start` wraps. `inner` takes one span or a list, and the
+  response shape is the same either way (`results[]` + `all_contained`), so
+  callers never branch on it. **Use it instead of `a <= x < b`:** the linear
+  form reports every base of an origin-spanning T-DNA, marker or operon as
+  OUTSIDE it, failing constructs that are actually correct. `list-features`
+  reports the same thing per feature via `wraps` and a wrap-aware `length`.
 - **Alignment** — diff-plasmid (one target, circular rotation
   auto-detected), multi-align (batch: the loaded plasmid or a given
   sequence vs many targets at once — the Alt+A overlay; rotation-aware
@@ -581,6 +640,14 @@ overwritten). `data` saves you from knowing each endpoint's ad-hoc key (`seq` /
 stripped, unwrapped to the bare value when there's a single content key (a
 scalar or list lands directly under `data`). The original keys stay too, so
 it's a superset — read whichever you prefer.
+
+One caveat worth knowing: on the endpoints that MODEL a reaction —
+`simulate-golden-gate`, `simulate-gibson` — `ok` reports whether the
+**assembly** worked, not whether the request was served. A dry run that
+can't close a circle answers HTTP 200 with `ok: false` and the reason in
+`result.errors`. (These two used to stamp `ok: true` regardless, so the
+natural `if r["ok"]:` accepted a design that cannot be built and callers
+had to write `r.get("ok") or r.get("result", {}).get("ok")`.)
 
 Two **unauthenticated** endpoints are served *ahead* of the envelope wrapper
 and stay bare — neither carries `data` (nor the `_stale` warning): the

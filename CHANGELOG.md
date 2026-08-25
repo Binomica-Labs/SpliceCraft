@@ -14,6 +14,117 @@
 
 ---
 
+## [1.2.56] — 2026-08-24
+
+### Bug fixes
+
+- **Asking for an enzyme by one of its other names found nothing.** Many
+  restriction enzymes are sold under two or more names that cut identically —
+  **Esp3I** is **BsmBI**, **BspTNI** is **BsaI**, **EcoRI-HF** is **EcoRI**.
+  The plasmid map deliberately draws only one of them so three bars don't pile
+  up on one site, and the scripting API was reading its answer off that same
+  drawing. So "check this construct has no Esp3I site" came back **clean** —
+  not because there was no site, but because nothing had looked for that
+  spelling. A check that cannot fail is worse than no check, and this one
+  passed on constructs that did carry the site. Asking by any listed name now
+  returns that enzyme's real sites, and the answer names the other spellings it
+  covered so you can see its scope.
+- **A misspelt enzyme name returned "no sites" instead of an error.** `Esp3l`
+  with a lowercase L, or any name the catalog doesn't know, quietly filtered
+  every hit away and reported zero — which reads as "your sequence is clean".
+  An unrecognised name is now a clear error that suggests what you probably
+  meant, and an empty enzyme list is refused rather than silently scanning
+  everything.
+- **Features that cross the origin were easy to misread as outside a
+  region.** Nothing in the feature listing said a feature wrapped bp 0, so the
+  obvious "is it between the start and the end" test reported every base of an
+  origin-spanning T-DNA, marker or operon as *outside* it — failing constructs
+  that were perfectly correct. Feature listings now say plainly whether a
+  feature wraps and how long it really is, and there's a new containment check
+  that gets the wrap right for you.
+- **A failed assembly dry run reported success.** Simulating a Golden Gate or
+  Gibson reaction that couldn't close a circle answered `ok: true` at the top
+  level while the details underneath said it had failed — so the natural "did
+  it work?" check accepted a design that cannot be built. These now report the
+  reaction's real verdict.
+- **Asking Golden Gate assembly to keep annotations did nothing, silently.**
+  The saved product carries no features, and the option that would have kept
+  them isn't supported there — but passing it was accepted without comment, so
+  a feature-bare construct came back looking like an annotated one. It is now
+  a clear error explaining how to annotate the product instead.
+- **Site counts could disagree with themselves.** A restriction site sitting
+  across the origin is stored in two pieces, and the second, unlabelled piece
+  was being counted as an extra site whenever no enzyme filter was applied —
+  so the same plasmid reported a different number of sites depending on how
+  you asked.
+
+### New features
+
+- **Predicted mature transcripts.** Point SpliceCraft at a transcription unit —
+  promoter, coding sequence, terminator — and it reconstructs the message the
+  cell actually translates: introns removed, exon boundaries reported with
+  their donor and acceptor, and the 5'UTR, coding block and 3'UTR separated
+  out. It scores the Kozak context at the start codon and lists every upstream
+  open reading frame, saying which ones stop before the coding sequence, which
+  extend it, and which overlap it out of frame.
+
+  The reason it exists: when a construct carries a genomic intron in its
+  leader, the biology depends on the spliced message while everything you can
+  check on the plasmid map shows the unspliced one. Upstream start codons that
+  splicing deletes look exactly like real hazards. So the result separates
+  them — the ones a ribosome actually meets, and the ones the plasmid shows
+  but the message doesn't, each named with the intron that removes it. Introns
+  are read from your annotations, never guessed; a separate advisory scan
+  flags cryptic splice sites that would compete with them, and says plainly
+  when it couldn't run rather than reporting nothing found.
+- **Traditional cloning picks the backbone for you when it can.** Cutting with
+  two different enzymes leaves both vector fragments able to accept the insert,
+  so the clone used to stop and ask which one was the backbone even when only
+  one answer made sense. Name the vector and, if exactly one candidate carries
+  an origin or a resistance gene, that one is used — and the response says so,
+  naming the features that decided it. It still refuses when both halves look
+  like backbone, when neither does, or when the vector isn't annotated, and it
+  still never chooses by fragment size.
+- **Enzyme lookup without a sequence.** A new catalogue query returns any
+  enzyme's recognition site, both cut positions, the overhang it leaves,
+  whether it cuts outside its recognition site, and its alternative names —
+  written the way the literature writes them (`G^TCGAC`, `GGTCTC(1/5)`). Search
+  by name or by recognition sequence. Scripts checking that fragment sizes add
+  up no longer need to keep their own copy of the numbers.
+- **Circular containment check.** Ask whether a base or a region sits inside
+  another region on a circular molecule, with either or both crossing the
+  origin. Takes one region or a whole batch and always answers in the same
+  shape.
+- **Restriction site results carry more.** Each hit now reports both strand
+  cut positions, the recognition sequence, and whether it spans the origin.
+
+### Hardening
+
+- **A minimum site length no enzyme could match is now refused.** Asking for
+  restriction sites with a minimum recognition length longer than any real
+  enzyme's returned "no sites found" — which reads as a clean construct rather
+  than as a filter that excluded every enzyme there is. It now says so, and
+  points out that the length is in base pairs.
+- **Asking whether nothing is inside a region no longer answers "yes".** The
+  containment check given an empty list of things to test reported that all of
+  them fitted. It now refuses. Coordinates outside the molecule are still
+  wrapped around it — counting backwards from the origin is genuinely useful —
+  but the result now says when that happened, so a units mistake can't come
+  back looking like a confident answer.
+- **Enzyme names are matched the same way everywhere.** A lowercase name
+  worked when listing sites and quietly cut nothing when running a digest.
+  Both now accept any capitalisation, and the digest still reports rather than
+  refuses names it doesn't know.
+- **Bad input can't stall a lookup.** A request carrying thousands of
+  unrecognised enzyme names spent seconds computing spelling suggestions for
+  every one of them and echoed them all back. Lists are now capped, long names
+  are trimmed out of the error, and the count of unrecognised names is still
+  reported in full.
+- **A fuzzy or hand-edited feature location no longer breaks transcript
+  prediction.** A feature whose position isn't a whole number used to abort the
+  whole analysis with an internal error; those features are now skipped and the
+  result says how many, so the rest of the unit still reads.
+
 ## [1.2.55] — 2026-08-18
 
 ### Bug fixes

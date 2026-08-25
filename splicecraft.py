@@ -42,13 +42,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.55"
+__version__ = "1.2.56"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-08-18"
+_RELEASE_DATE = "2026-08-24"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -5332,6 +5332,12 @@ from splicecraft_biology import (  # noqa: E402
     _split_features_at_cuts as _split_features_at_cuts,
     _fragments_from_cuts as _fragments_from_cuts,
     _digest_with_enzymes as _digest_with_enzymes,
+    _bp_in_span       as _bp_in_span,
+    _span_in_span     as _span_in_span,
+    _enzyme_signature as _enzyme_signature,
+    _enzyme_aliases   as _enzyme_aliases,
+    _resolve_enzyme_names as _resolve_enzyme_names,
+    _RESOLVE_SUGGEST_LIMIT as _RESOLVE_SUGGEST_LIMIT,
     _IUPAC_RE         as _IUPAC_RE,
     _IUPAC_COMP       as _IUPAC_COMP,
     _DNA_COMP_PRESERVE_CASE as _DNA_COMP_PRESERVE_CASE,
@@ -15236,8 +15242,12 @@ class PlasmidMap(Widget):
         self.post_message(self.FeatureSelected(idx, f, bp, shift=ext))
 
     def _bp_in(self, bp: int, f: dict) -> bool:
-        s, e = f["start"], f["end"]
-        return (s <= bp < e) if e >= s else (bp >= s or bp < e)
+        """Wrap-aware hit test for the map's click handling. Delegates to
+        `_bp_in_span` so the render path and the agent API can't drift on
+        what "inside a feature" means; `total` is omitted because `bp` here
+        already comes from the map's own bp lookup, which keeps the
+        arithmetic identical to the pre-delegation form."""
+        return _bp_in_span(bp, f["start"], f["end"])
 
     # ── Geometry ───────────────────────────────────────────────────────────────
 
@@ -94306,6 +94316,8 @@ from splicecraft_agent import (  # noqa: E402  (registers endpoints into _state.
     _agent_save_or_500 as _agent_save_or_500,
     _agent_dirty_guard as _agent_dirty_guard,
     _agent_ignored_keys as _agent_ignored_keys,
+    _agent_reject_dangerous_unknowns as _agent_reject_dangerous_unknowns,
+    _agent_vector_backbone_flags as _agent_vector_backbone_flags,
     _agent_sanitize_qualifiers as _agent_sanitize_qualifiers,
     _agent_traditional_cloning_candidates as _agent_traditional_cloning_candidates,
     _h_simulate_traditional_cloning as _h_simulate_traditional_cloning,
@@ -94439,6 +94451,12 @@ from splicecraft_agent import (  # noqa: E402  (deferred handlers + their valida
     _h_find_sequence as _h_find_sequence,
     _h_export_migrate_archive as _h_export_migrate_archive,
     _h_list_restriction_sites as _h_list_restriction_sites,
+    _h_list_enzymes   as _h_list_enzymes,
+    _h_predict_transcript as _h_predict_transcript,
+    _agent_transcript_feature_dicts as _agent_transcript_feature_dicts,
+    _h_span_contains  as _h_span_contains,
+    _agent_enzyme_dict as _agent_enzyme_dict,
+    _agent_parse_span as _agent_parse_span,
     _h_diff_plasmid as _h_diff_plasmid,
     _h_align_plasmidsaurus_zip as _h_align_plasmidsaurus_zip,
     _h_blast as _h_blast,
@@ -96317,6 +96335,7 @@ def _h_features(app, payload):
         pm = app.query_one("#plasmid-map", PlasmidMap)
     except (NoMatches, AttributeError):
         return {"features": []}
+    total = _seq_len(rec)
     return {"features": [
         {
             "idx":    i,
@@ -96326,6 +96345,15 @@ def _h_features(app, payload):
             "end":    f["end"],
             "strand": f.get("strand", 1),
             "color":  f.get("color"),
+            # An origin-spanning feature has end <= start, and reading these
+            # raw coordinates with a linear `start <= x < end` reports every
+            # base of it as OUTSIDE — a false negative on exactly the
+            # features (T-DNA borders, markers, operons placed across bp 0)
+            # where being wrong costs the most. Say so explicitly, and give
+            # the wrap-aware length (sacred invariant #8) so the caller
+            # never has to derive it from the coordinate pair.
+            "wraps":  bool(f["end"] < f["start"]),
+            "length": _feat_len(f["start"], f["end"], total) if total else 0,
         }
         # Snapshot `pm._feats` (GIL-atomic copy) so a concurrent UI-thread
         # feature-list rebuild can't change its size mid-iteration here.
@@ -99972,9 +100000,20 @@ def _h_traditional_clone(app, payload):
     cutter ligates both orientations, OR (the common case) both vector
     fragments accept the insert because a 2-enzyme digest leaves each piece
     with one cut of each kind — the call returns ``409`` listing the options;
-    pass ``vector_frag_idx`` and/or ``orientation`` to disambiguate. It NEVER
-    silently picks by fragment size (the never-assume-the-smaller-fragment-is-
-    the-insert rule). The product is saved circular ([INV-127]: the design IS
+    pass ``vector_frag_idx`` and/or ``orientation`` to disambiguate.
+
+    **The common case settles itself when the vector is annotated.** Pass
+    ``vector_name`` and, if exactly one candidate vector fragment carries an
+    origin of replication or a resistance gene, that one is taken as the
+    backbone and the clone proceeds — reported back as
+    ``vector_frag_auto_picked`` with a ``vector_frag_pick_reason`` naming the
+    features that decided it, so the choice is never invisible. Both halves
+    marked, neither marked, no ``vector_name``, or a sequence that doesn't
+    exactly match the saved entry all fall back to the 409. An explicit
+    ``vector_frag_idx`` always wins. It STILL never picks by fragment size
+    (the never-assume-the-smaller-fragment-is-the-insert rule) — a stacked-TU
+    insert can outgrow its carrier vector, which is exactly why size is
+    banned here. The product is saved circular ([INV-127]: the design IS
     the product — a real digest + ligation, not a hand-built final)."""
     guard = _agent_dirty_guard(app, payload)
     if guard is not None:
@@ -100018,11 +100057,42 @@ def _h_traditional_clone(app, payload):
                                   "orientation": p["orientation"],
                                   "length": p["length"]}
                                  for p in products]}, 404)
+    # Marker-based default: in a directional two-enzyme digest BOTH vector
+    # fragments legitimately carry one cut of each kind, so both accept the
+    # insert and the caller had to hand `vector_frag_idx` back after reading
+    # `simulate-traditional-cloning` — for a reaction with exactly one sensible
+    # product. Narrow by which fragment carries the ORIGIN / RESISTANCE
+    # markers, never by size: a stacked-TU insert can outgrow its carrier
+    # vector, which is why the size heuristic is banned here. Only when the
+    # caller didn't already say, and only when the vector's own annotations can
+    # settle it — otherwise the 409 stands.
+    auto_pick = None
+    if len(chosen) > 1 and vfi is None:
+        flags, why = _agent_vector_backbone_flags(
+            payload, info.get("vector_enzymes") or [],
+            bool(payload.get("vector_circular", True)))
+        if flags:
+            marked = {i for i, hit in enumerate(flags) if hit}
+            candidates = {p["vector_frag_idx"] for p in chosen}
+            settled = marked & candidates
+            # Exactly one CANDIDATE fragment looks like a backbone. If the
+            # other one does too, that's a real ambiguity — say nothing.
+            if len(settled) == 1 and len(candidates) > 1:
+                keep = next(iter(settled))
+                chosen = [p for p in chosen if p["vector_frag_idx"] == keep]
+                auto_pick = {"vector_frag_idx": keep,
+                             "reason": why.get(keep, "backbone marker")}
     if len(chosen) > 1:
+        extra = ""
+        if auto_pick is not None:
+            extra = (f" Vector fragment {auto_pick['vector_frag_idx']} was "
+                     f"identified as the backbone ({auto_pick['reason']}), so "
+                     "only the orientation is still open.")
         return ({"error":
                   "ambiguous — more than one compatible product. Pass "
                   "'vector_frag_idx' / 'insert_frag_idx' and/or 'orientation' "
-                  "to pick one (this endpoint never guesses by fragment size).",
+                  "to pick one (this endpoint never guesses by fragment size)."
+                  + extra,
                   "options": [{"vector_frag_idx": p["vector_frag_idx"],
                                 "insert_frag_idx": p.get("insert_frag_idx", 0),
                                 "orientation": p["orientation"],
@@ -100093,7 +100163,7 @@ def _h_traditional_clone(app, payload):
         app.call_from_thread(_agent_refresh_library_panel, app)
     else:
         _agent_refresh_library_panel(app)
-    return {"ok": True, "saved_name": name, "saved_id": name,
+    resp = {"ok": True, "saved_name": name, "saved_id": name,
             "vector_frag_idx": product["vector_frag_idx"],
             "insert_frag_idx": product.get("insert_frag_idx", 0),
             "orientation":     product["orientation"],
@@ -100101,6 +100171,15 @@ def _h_traditional_clone(app, payload):
             "insert":          info["insert"],
             "annotations_carried": info.get("annotations_carried", False),
             "carry_warnings":      info.get("carry_warnings", [])}
+    if auto_pick is not None:
+        # Say WHICH choice was made for you and on what evidence — an
+        # automatic pick you can't see is the thing the 409 was protecting
+        # against in the first place.
+        resp["vector_frag_auto_picked"] = True
+        resp["vector_frag_pick_reason"] = (
+            f"fragment {auto_pick['vector_frag_idx']} carries "
+            f"{auto_pick['reason']}")
+    return resp
 
 
 @_agent_endpoint("golden-gate-assemble", write=True)
@@ -100115,10 +100194,26 @@ def _h_golden_gate_assemble(app, payload):
     doesn't release exactly one fragment, a non-Type-IIS enzyme) returns 422
     with the assembler ``result`` so you can see why; fidelity warnings (a
     non-unique junction overhang, a residual enzyme site) ride along in
-    ``result.warnings``. [INV-127: the design IS the product.]"""
+    ``result.warnings``. [INV-127: the design IS the product.]
+
+    **The saved product carries NO features.** Unlike `traditional-clone`
+    there is no ``carry_annotations`` here — the assembler works on bare
+    part sequences and has no library entry to source features from, so the
+    entry lands with ``n_feats: 0``. Passing ``carry_annotations`` is a 400
+    rather than a silent no-op, because a feature-bare construct that was
+    expected to be annotated looks identical to an annotated one until you
+    open it. To annotate the product, follow up with `transfer-annotations`
+    from the parent, or use `assemble-into-entry-vector` for a grammar-aware
+    assembly that keeps part features."""
     guard = _agent_dirty_guard(app, payload)
     if guard is not None:
         return guard
+    # SC-D: reject a routing/selection param this endpoint doesn't implement
+    # instead of ignoring it. `enzyme` IS accepted here, `carry_annotations`
+    # is not.
+    if (derr := _agent_reject_dangerous_unknowns(
+            payload, {"parts", "vector", "enzyme", "product_name"})) is not None:
+        return derr
     parts, vseq, enzyme, err = _agent_golden_gate_inputs(payload)
     if err is not None:
         return err

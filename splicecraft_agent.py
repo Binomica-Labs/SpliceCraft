@@ -40,8 +40,8 @@ import splicecraft_opentrons as _ot2
 from splicecraft_dataaccess import (_load_custom_labware, _load_protocol_collections,
                                     _save_custom_labware, _save_protocol_collections)
 from splicecraft_backup import (_list_pre_update_snapshots)
-from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len)
-from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi)
+from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _feat_len, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len, _span_in_span)
+from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi, _enzyme_is_type_iis)
 from splicecraft_codon import (_CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_cai, _codon_diversify, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
 from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
 from splicecraft_experiments import (_new_experiment_id, _normalise_experiment_entry, _sanitize_experiment_id)
@@ -55,11 +55,11 @@ from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_des
 from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq,
                                 _topology_from_gb_text)
 from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
-from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint)
+from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript)
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_picker, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
-from splicecraft_biology import (_digest_with_enzymes, _enzyme_cuts, _scan_restriction_sites)
+from splicecraft_biology import (_digest_with_enzymes, _enzyme_aliases, _enzyme_cuts, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
 from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _build_synthesis_l0_fragment, _design_gb_primers, _entry_vector_acceptor_overhangs, _grammar_position_by_type, _l0_part_from_syn_fragment)
 from splicecraft_dataaccess import (_active_enzyme_allowed_set, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
 from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member)
@@ -319,6 +319,11 @@ def _agent_ignored_keys(payload, known):
 _AGENT_DANGEROUS_PARAMS = frozenset({
     "collection", "source_collection", "bin", "parts_bin",
     "enzyme", "enzymes", "orientation", "rename",
+    # `carry_annotations` decides whether the saved product keeps its parents'
+    # features. Only `traditional-clone` implements it; silently ignoring it
+    # elsewhere hands back a feature-BARE construct to a caller who asked for
+    # an annotated one and has no way to tell (blue field report #7).
+    "carry_annotations",
 })
 
 
@@ -4442,7 +4447,10 @@ def _h_simulate_gibson(app, payload):
     except Exception as exc:
         _log.exception("agent simulate-gibson: simulator failed")
         return ({"error": f"simulator failed: {_scrub_path(str(exc))}"}, 500)
-    return {"ok": True, "result": result}
+    # See `simulate-golden-gate`: `ok` is the assembly's verdict, not the
+    # simulator's exit status. A Gibson dry run that found no usable overlap
+    # reports `ok: false` with the reason in `result`.
+    return {"ok": bool(result.get("success")), "result": result}
 
 
 def _agent_carry_feature_dicts(rec) -> "list[dict]":
@@ -4592,12 +4600,19 @@ def _agent_traditional_cloning_candidates(payload):
         return None, ({"error":
                         "'insert_enzymes' must be a list of 1 or 2 enzyme "
                         "names"}, 400)
-    catalog = _state._all_enzymes_hook()
+    # Resolve names the same way `list-restriction-sites` does — exact first,
+    # then case-insensitively — so `bsai` and `BsaI` behave identically here
+    # and the error suggests the real spelling instead of just refusing. The
+    # RESOLVED names replace the caller's, because the digest engine looks
+    # enzymes up by exact catalog key.
+    resolved_by_field: "dict[str, list[str]]" = {}
     for grp, field in ((vec_enz, "vector_enzymes"), (ins_enz, "insert_enzymes")):
-        for en in grp:
-            if en not in catalog:
-                return None, ({"error":
-                                f"unknown enzyme {en!r} in {field}"}, 400)
+        resolved, unknown = _resolve_enzyme_names(grp)
+        if unknown:
+            return None, _agent_unknown_enzyme_error(unknown, field=field)
+        resolved_by_field[field] = resolved
+    vec_enz = resolved_by_field["vector_enzymes"]
+    ins_enz = resolved_by_field["insert_enzymes"]
     # carry_annotations (agent-API feedback): lift the vector/insert entries'
     # own features onto the ligated product so a raw cut/ligate clone isn't
     # feature-bare (no follow-up transfer-annotations pass needed). Sourced
@@ -4690,11 +4705,75 @@ def _agent_traditional_cloning_candidates(payload):
         "insert_fragments":   insert_fragments,
         "n_vector_fragments": len(vec_frags),
         "n_insert_fragments": len(ins_frags),
+        # Canonical catalog spellings of what was actually used — the write
+        # path re-digests the vector for its backbone-marker check and must
+        # not re-resolve the caller's raw names a second time.
+        "vector_enzymes":     list(vec_enz),
+        "insert_enzymes":     list(ins_enz),
         "products":           products,
         "incompatible":       incompatible,
         "carry_warnings":     carry_warnings,
         "annotations_carried": annotations_carried,
     }, None)
+
+
+def _agent_vector_backbone_flags(payload, vec_enzymes, circular):
+    """Which digested vector fragments carry a bacterial-backbone marker (an
+    origin of replication or a resistance gene)?
+
+    Returns ``(flags, why)`` — ``flags[i]`` is True when vector fragment `i`
+    carries one and ``why[i]`` names the features that said so — or
+    ``(None, {})`` when the vector's annotations aren't available to judge
+    from. **Every failure path here is SOFT.** This feeds a convenience
+    default on `traditional-clone`; if it can't tell, the caller just gets the
+    409 it would have got anyway. It must never turn a workable clone into an
+    error.
+
+    Deliberately independent of ``carry_annotations``: knowing WHICH half of a
+    digest is the backbone and putting the parent's features onto the product
+    are different questions, and a caller shouldn't have to ask for the second
+    to get the first. It reuses `carry_annotations`' exact-sequence gate for
+    the same reason that gate exists — markers read off a rotated or edited
+    entry would be attributed to the wrong fragment ([INV-127]).
+
+    It does NOT look at fragment size. A stacked-TU insert can outgrow its
+    carrier vector, which is exactly why the size heuristic is banned here."""
+    name = _sanitize_label(payload.get("vector_name"), max_len=200)
+    if not name:
+        return None, {}
+    entry = (_find_library_entry_by_id(name)
+             or _find_library_entry_by_name(name))
+    if entry is None or not (entry.get("gb_text") or ""):
+        return None, {}
+    try:
+        rec = _gb_text_to_record(entry["gb_text"])
+    except Exception:
+        return None, {}
+    vec_seq, err = _sanitize_bases(payload.get("vector_seq"))
+    if err:
+        return None, {}
+    if (_agent_carry_clean_bases(str(getattr(rec, "seq", "") or ""))
+            != _agent_carry_clean_bases(vec_seq)):
+        return None, {}
+    feats = _agent_carry_feature_dicts(rec)
+    if not feats:
+        return None, {}
+    try:
+        frags, ferr = _excise_fragment_pair(
+            vec_seq, list(vec_enzymes), circular=circular,
+            features=feats, source_label="vector")
+    except Exception:                       # pragma: no cover - defensive
+        return None, {}
+    if ferr is not None or not frags:
+        return None, {}
+    flags: "list[bool]" = []
+    why: "dict[int, str]" = {}
+    for i, f in enumerate(frags):
+        hit = _fragment_has_backbone_marker(f)
+        flags.append(hit)
+        if hit:
+            why[i] = ", ".join(_fragment_backbone_marker_labels(f)[:4])
+    return flags, why
 
 
 @_agent_endpoint("simulate-traditional-cloning")
@@ -4799,7 +4878,15 @@ def _h_simulate_golden_gate(app, payload):
     except Exception as exc:
         _log.exception("agent simulate-golden-gate: assembler failed")
         return ({"error": f"assembler failed: {_scrub_path(str(exc))}"}, 500)
-    return {"ok": True, "result": result,
+    # `ok` reports whether the ASSEMBLY worked, not whether the simulator
+    # ran. Hardcoding it True meant a dry run that failed to close a circle
+    # still answered `ok: true` at the top level while `result.ok` said
+    # false — so the natural `if r["ok"]:` accepted a design that cannot be
+    # built, and callers had to write `r.get("ok") or
+    # r.get("result", {}).get("ok")` to get a straight answer (blue field
+    # report #4). Still HTTP 200: the request was served, the reaction it
+    # modelled is what failed. `errors`/`warnings` explain why.
+    return {"ok": bool(result.get("ok")), "result": result,
             "ignored": _agent_ignored_keys(payload,
                                            {"parts", "vector", "enzyme"})}
 
@@ -6061,7 +6148,29 @@ def _h_list_restriction_sites(app, payload):
     force a full-catalog scan regardless. Explicit ``enzymes`` always
     wins.
 
-    Returns each hit as ``{enzyme, start, end, strand, cut_bp}``."""
+    Returns each hit as ``{enzyme, start, end, strand, cut_bp,
+    bottom_cut_bp, site, wraps}`` — `cut_bp`/`bottom_cut_bp` are absolute
+    top-strand coordinates of the two strand cuts, `site` the recognition
+    sequence, so fragment sizes can be checked without a private table of
+    cut offsets.
+
+    **An unknown enzyme name is a 400, never an empty result.** Names are
+    matched case-insensitively against the combined catalog; anything that
+    doesn't match comes back as `unknown_enzymes` with near-miss
+    suggestions. This matters because the failure it replaces was
+    wrong-answer-shaped: a typo used to return `count: 0`, which reads as
+    "no sites here" rather than "I never looked".
+
+    **Isoschizomers resolve by the name you asked for.** The scan collapses
+    enzymes that share a recognition site and cut (BsmBI / Esp3I / BsmBI-v2,
+    BsaI / BspTNI, EcoRI / EcoRI-HF) onto ONE label so the map stays
+    readable; asking for a name on the losing side of that collapse used to
+    return nothing. Named enzymes now go into the scan as the hand-picked
+    set, and every hit is reported under each requested spelling.
+    `equivalent_enzymes` lists the catalog names that cut identically but
+    weren't asked for. Note that `min_length` does not apply to an explicit
+    `enzymes` list (a hand-picked short cutter is kept) — passing both
+    returns a `warnings` entry saying so."""
     rec = getattr(app, "_current_record", None)
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
@@ -6075,53 +6184,601 @@ def _h_list_restriction_sites(app, payload):
         enzymes = payload.get("enzyme")
     if isinstance(enzymes, str):
         enzymes = [enzymes]
+    resolved: "list[str]" = []
     if enzymes is not None:
-        if not isinstance(enzymes, list):
+        # Shape, size and element type up front. A mixed-type list (e.g.
+        # `[1, 2.5, null]`) used to build a set whose `not in` check silently
+        # filtered every hit to zero; the size cap bounds the name resolution
+        # below.
+        if (shape_err := _agent_check_enzyme_list(enzymes)) is not None:
+            return shape_err
+        # Every requested name must BE an enzyme. Pre-fix an unrecognised
+        # name — a typo, or an isoschizomer spelling the scan files under a
+        # different label — filtered every hit away and returned
+        # `{"sites": [], "count": 0}`, so "check this construct carries no
+        # Esp3I site" answered "clean" without ever having scanned for one.
+        # A safety check that cannot fail is worse than no check at all, so
+        # an unknown name is a 400 now. An empty list is refused for the
+        # same reason: it reads as "no enzymes matched", not "scan
+        # everything".
+        resolved, unknown = _resolve_enzyme_names(enzymes)
+        if unknown:
+            return _agent_unknown_enzyme_error(
+                unknown, hint=" — call 'list-enzymes' for the catalog, or "
+                               "'create-custom-enzyme' to add one")
+        if not resolved:
             return ({"error":
-                      "'enzymes' must be a list (or 'enzyme' a string)"}, 400)
-        # Reject non-string elements up front — otherwise a mixed-type
-        # list (e.g. `[1, 2.5, null]`) builds a set whose `not in` check
-        # silently filters every hit to zero. The endpoint owes agents
-        # an explicit 400 rather than an empty `sites: []` result.
-        if not all(isinstance(e, str) for e in enzymes):
-            return ({"error": "'enzymes' must contain only strings"}, 400)
+                      "'enzymes' is empty — omit the key to scan the "
+                      "catalog"}, 400)
     min_len = _coerce_int(payload.get("min_length", 4),
                             name="min_length")
     if isinstance(min_len, str):
         return ({"error": min_len}, 400)
+    # A `min_length` longer than the longest recognition site in the catalog
+    # can only ever return zero sites — and `count: 0` reads as "this
+    # construct is clean", not as "that filter excluded every enzyme there
+    # is". Same vacuous-pass shape as an unrecognised enzyme name, so it gets
+    # the same refusal. The bound is read from the catalog so it can't go
+    # stale when a longer-site enzyme is added.
+    try:
+        longest_site = max((len(str(v[0])) for v in
+                            (_state._all_enzymes_hook() or {}).values()),
+                           default=0)
+    except Exception:                       # pragma: no cover - hook absent
+        longest_site = 0
+    if longest_site and min_len > longest_site:
+        return ({"error":
+                  f"min_length {min_len} is longer than the longest "
+                  f"recognition site in the catalog ({longest_site} bp), so "
+                  "this would report zero sites for every enzyme — check the "
+                  "units (min_length is in BASE PAIRS)"}, 400)
+    min_len = max(0, min_len)
     unique = bool(payload.get("unique_only", False))
     respect_active = bool(payload.get("respect_active_collection", True))
     seq = str(rec.seq)
     is_circular = rec.annotations.get("topology") == "circular"
+    warnings: "list[str]" = []
+
+    # A hand-picked name list goes INTO the scan as `allowed_enzymes` rather
+    # than being post-filtered off a full-catalog scan. `_scan_restriction_
+    # sites_impl` collapses isoschizomers and HF/v2 variants that land on the
+    # same span (its `placed` set) so the map doesn't stack three bars on one
+    # CGTCTC — which means a post-filter for "Esp3I" loses to the catalog-
+    # order winner "BsmBI" and comes back empty. `allowed_enzymes` runs
+    # BEFORE that collapse, and is also exactly what the UI overlay passes,
+    # so this endpoint now genuinely mirrors it rather than claiming to.
+    if resolved:
+        allowed: "frozenset[str] | None" = frozenset(resolved)
+        if "min_length" in payload:
+            warnings.append(
+                "'min_length' does not apply when 'enzymes' is given — a "
+                "hand-picked list keeps short recognition sites")
+    elif respect_active:
+        allowed = _active_enzyme_allowed_set()
+    else:
+        allowed = None
+
     sites = _scan_restriction_sites(
         seq, min_recognition_len=min_len,
         unique_only=unique, circular=is_circular,
+        allowed_enzymes=allowed,
     )
-    # Build the filter set. Explicit `enzymes` overrides everything;
-    # otherwise fall back to the user's active enzyme collection (if
-    # any) so the agent mirrors UI overlay semantics.
-    if enzymes:
-        enzyme_filter: "set[str] | None" = set(enzymes)
-    elif respect_active:
-        active = _active_enzyme_allowed_set()
-        enzyme_filter = set(active) if active is not None else None
-    else:
-        enzyme_filter = None
+
+    # Re-expand the collapse for the names the caller actually asked about:
+    # the scan emits ONE label per (span, recognition site), so a request
+    # naming both BsmBI and Esp3I comes back labelled BsmBI only. Report the
+    # hit under every requested name that cuts identically — the names
+    # differ, the biology does not.
+    want_by_sig: "dict[tuple | None, list[str]]" = {}
+    for nm in resolved:
+        want_by_sig.setdefault(_enzyme_signature(nm), []).append(nm)
+
     out = []
     for s in sites:
         if s.get("type") != "resite":
             continue
         label = s.get("label", "")
-        if enzyme_filter is not None and label not in enzyme_filter:
+        # Skip the unlabeled wrap continuation — sacred invariant #6 emits an
+        # origin-spanning site as a labeled tail piece PLUS an unlabeled head
+        # piece, and counting code must count only the labeled one. Pre-fix an
+        # unfiltered scan emitted the head as a phantom `{"enzyme": ""}` row,
+        # so `count` disagreed with itself depending on whether the caller
+        # passed an enzyme filter.
+        if not label:
             continue
-        out.append({
-            "enzyme":  label,
-            "start":   s.get("start"),
-            "end":     s.get("end"),
-            "strand":  s.get("strand", 1),
-            "cut_bp":  s.get("top_cut_bp", -1),
+        for nm in (want_by_sig.get(_enzyme_signature(label), [label])
+                   if resolved else [label]):
+            out.append({
+                "enzyme":        nm,
+                "start":         s.get("start"),
+                "end":           s.get("end"),
+                "strand":        s.get("strand", 1),
+                "cut_bp":        s.get("top_cut_bp", -1),
+                # Bottom-strand cut + recognition sequence ride along so a
+                # script can check fragment-size arithmetic without keeping a
+                # private table of cut offsets (blue field report #6).
+                "bottom_cut_bp": s.get("bottom_cut_bp", -1),
+                "site":          (_enzyme_signature(nm) or ("", 0, 0))[0],
+                # An origin-spanning site has end <= start in plasmid
+                # coordinates; say so rather than making the caller infer it.
+                "wraps":         bool(s.get("rec_start") is not None
+                                      and s.get("end") == len(seq)
+                                      and s.get("rec_end", 0) > 0),
+            })
+
+    # `allowed_enzymes` deliberately overrides `unique_only` inside the
+    # scanner ("unique cutters of MY hand-picked list" hides the multi-cutter
+    # the user just typed in), so re-apply it here for callers that asked.
+    if unique and allowed is not None:
+        counts: "dict[str, int]" = {}
+        for r in out:
+            counts[r["enzyme"]] = counts.get(r["enzyme"], 0) + 1
+        out = [r for r in out if counts[r["enzyme"]] == 1]
+
+    resp: dict = {"sites": out, "count": len(out)}
+    if resolved:
+        resp["enzymes_scanned"] = resolved
+        # Names in the catalog that cut identically to a requested one. A
+        # zero-site answer is only trustworthy if the caller knows which
+        # spellings it covered.
+        eq = sorted({a for nm in resolved for a in _enzyme_aliases(nm)}
+                    - set(resolved))
+        if eq:
+            resp["equivalent_enzymes"] = eq
+    if warnings:
+        resp["warnings"] = warnings
+    return resp
+
+
+def _agent_enzyme_dict(name: str, site: str, fwd_cut: int,
+                       rev_cut: int, custom_names: "set[str]") -> dict:
+    """One catalog row for `list-enzymes`.
+
+    `fwd_cut` / `rev_cut` are the catalog's own offsets from the START of the
+    recognition site to the top- and bottom-strand cut. Everything else is
+    derived from them with the SAME rule `_enzyme_cuts_impl` uses (blunt when
+    the two coincide, 5' when the top cut comes first, 3' when it doesn't), so
+    a script checking fragment arithmetic against this row can't disagree with
+    the digest engine that produced the fragments."""
+    site_u   = str(site).upper()
+    site_len = len(site_u)
+    overhang = rev_cut - fwd_cut
+    kind = "blunt" if overhang == 0 else ("5'" if overhang > 0 else "3'")
+    # Human notation: a within-site cutter carries a caret at the top-strand
+    # cut (SalI G^TCGAC); one that reaches outside gets REBASE's offset form
+    # (BsaI GGTCTC(1/5), BaeI (10/15)ACNNNNGTAYC for an upstream cutter).
+    if 0 < fwd_cut < site_len:
+        notation = site_u[:fwd_cut] + "^" + site_u[fwd_cut:]
+    elif fwd_cut < 0:
+        notation = "({}/{}){}".format(-fwd_cut, -rev_cut, site_u)
+    else:
+        notation = "{}({}/{})".format(
+            site_u, fwd_cut - site_len, rev_cut - site_len)
+    return {
+        "name":            name,
+        "site":            site_u,
+        "recognition_len": site_len,
+        "fwd_cut":         fwd_cut,
+        "rev_cut":         rev_cut,
+        "notation":        notation,
+        "overhang_len":    abs(overhang),
+        "overhang_kind":   kind,
+        "type_iis":        _enzyme_is_type_iis(name),
+        "custom":          name in custom_names,
+        # Catalog names that cut identically. The scan collapses these onto
+        # one label, so a caller needs to know which spellings a result
+        # already covers.
+        "aliases":         [a for a in _enzyme_aliases(name) if a != name],
+    }
+
+
+def _agent_transcript_feature_dicts(rec) -> "list[dict]":
+    """`_agent_carry_feature_dicts`' shape PLUS the location parts.
+
+    A spliced CDS or mRNA is a compound location, and the gaps between its
+    parts ARE the introns — the standard GenBank way of saying so. The
+    carry-annotations shape drops them (a digest only needs outer bounds),
+    and dropping them here would silently turn a spliced transcript into an
+    unspliced one, which is the exact failure `predict-transcript` exists to
+    prevent.
+
+    An ORIGIN-WRAPPING feature is ALSO a two-part compound location (sacred
+    invariant #9), so `parts` is emitted only when `_feat_bounds` did not
+    already resolve the location as a wrap — otherwise every feature crossing
+    bp 0 would be read as carrying an intron it doesn't have."""
+    out: "list[dict]" = []
+    total = _seq_len(rec)
+    for f in getattr(rec, "features", None) or []:
+        if getattr(f, "type", "") == "source":
+            continue
+        bounds = _feat_bounds(f, total)
+        if bounds is None:
+            continue
+        s, e, strand = bounds
+        quals = getattr(f, "qualifiers", {}) or {}
+        label = (quals.get("label") or quals.get("product") or [f.type])[0]
+        d = {"start": int(s), "end": int(e), "strand": int(strand or 1),
+             "type": f.type, "label": str(label)[:200]}
+        if e >= s:                       # not a wrap — parts may be exons
+            parts: "list[list[int]]" = []
+            for part in (getattr(getattr(f, "location", None), "parts", None)
+                         or []):
+                try:
+                    parts.append([int(part.start), int(part.end)])
+                except (TypeError, ValueError, AttributeError):
+                    parts = []
+                    break
+            if len(parts) > 1:
+                d["parts"] = parts
+        out.append(d)
+    return out
+
+
+# Caps shared by every endpoint that takes a list of enzyme names. 500
+# matches `digest`'s existing limit; the echo cap keeps a validation error
+# from becoming a megabyte response when the payload carries a huge string.
+_AGENT_MAX_ENZYME_NAMES = 500
+_AGENT_NAME_ECHO_MAX = 64
+
+
+def _agent_unknown_enzyme_error(unknown, *, field: str = "enzymes",
+                                hint: str = ""):
+    """The 400 body for unrecognised enzyme name(s), in ONE place.
+
+    `unknown` is `_resolve_enzyme_names`' second return value. Names are
+    CLAMPED before they reach the message and only the first few are quoted:
+    a caller can send thousands of bad names, each arbitrarily long, and
+    echoing them verbatim turns a validation error into a denial of service
+    against whoever reads the response. `n_unknown` reports the real total so
+    the truncation can't be mistaken for the whole story."""
+    shown = unknown[:10]
+    bits = []
+    for want, near in shown:
+        clipped = want[:_AGENT_NAME_ECHO_MAX]
+        if len(want) > _AGENT_NAME_ECHO_MAX:
+            clipped += "…"
+        bits.append(repr(clipped) + (
+            " (did you mean " + ", ".join(near) + "?)" if near else ""))
+    more = len(unknown) - len(shown)
+    body = {
+        "error": (f"unknown enzyme(s) in '{field}': " + "; ".join(bits)
+                  + (f" (+{more} more)" if more else "") + hint),
+        "unknown_enzymes": [w[:_AGENT_NAME_ECHO_MAX] for w, _ in shown],
+        "n_unknown": len(unknown),
+    }
+    return (body, 400)
+
+
+def _agent_check_enzyme_list(names, *, field: str = "enzymes"):
+    """Shape + size check for an enzyme-name list. Returns an error tuple or
+    None. Bounds the list BEFORE resolution so the per-name near-miss search
+    can't be turned into a CPU sink."""
+    if not isinstance(names, list):
+        return ({"error": f"'{field}' must be a list (or a single string)"},
+                400)
+    if len(names) > _AGENT_MAX_ENZYME_NAMES:
+        return ({"error": f"too many enzyme names in '{field}' "
+                          f"(max {_AGENT_MAX_ENZYME_NAMES})"}, 400)
+    if not all(isinstance(e, str) for e in names):
+        return ({"error": f"'{field}' must contain only strings"}, 400)
+    return None
+
+
+@_agent_endpoint("predict-transcript")
+def _h_predict_transcript(app, payload):
+    """Reconstruct the MATURE mRNA of an annotated transcription unit on the
+    loaded record, and score translation initiation on it.
+
+    Body: ``{promoter?, cds?, terminator?, tx_start?, tx_end?,
+    check_splice?=true, min_uorf_aa?=1, include_sequences?=true}``. Set
+    ``include_sequences: false`` to drop `pre_mrna` / `mature_mrna` / the UTR
+    sequences and keep only the coordinates and verdicts — a long unit
+    otherwise puts three copies of itself in the response, which a screening
+    loop over a whole collection doesn't need. Each of `promoter` / `cds` /
+    `terminator` takes a feature index (as `list-features` numbers them) or a
+    label; omit one to pick by feature type — the longest CDS, and the nearest
+    promoter/terminator on the same strand, measured AROUND the circle rather
+    than by raw coordinate order. `tx_start` / `tx_end` bound the unit
+    directly (plus-strand coordinates) when the record annotates no promoter
+    or terminator.
+
+    **Why this exists.** When a construct carries a genomic 5'UTR intron, the
+    biology depends on the SPLICED leader while every check written against
+    the plasmid sequence sees the unspliced one — so an upstream-ATG screen
+    reports intronic ATGs that splicing removes. They look exactly like real
+    uORF hazards. The response separates the two: ``uorfs`` are the ones a
+    ribosome actually meets on the mature message, and
+    ``removed_by_splicing`` names each ATG that is in the DNA and is NOT in
+    the message, with the intron that removes it.
+
+    Returns ``{ok, unit, pre_mrna, mature_mrna, spliced, exons, introns,
+    five_utr, cds, three_utr, kozak, uorfs, removed_by_splicing, splice,
+    warnings}``. Transcript coordinates are offsets into `mature_mrna`
+    (`removed_by_splicing` is in `pre_mrna` offsets and also carries the
+    genomic position). The unit is taken to run from the END of the promoter
+    (a promoter is bound, not transcribed) to the end of the terminator, and
+    it is rotation- and strand-invariant — the same construct answers
+    identically whichever way it is drawn.
+
+    **Introns come from ANNOTATION only** — `intron` features, or the gaps
+    between a spliced location's parts. Nothing here predicts where a
+    spliceosome would cut; `splice` carries a separate ADVISORY scan of the
+    pre-mRNA with the calibrated plant PWM, marking sites that coincide with
+    an annotated boundary so only genuinely cryptic ones are reported. If the
+    model is unavailable the scan reports `skipped` with a reason — never
+    an empty list that would read as clean."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    for key in ("promoter", "cds", "terminator"):
+        v = payload.get(key)
+        if v is not None and not isinstance(v, (int, str)) or isinstance(v, bool):
+            return ({"error": f"'{key}' must be a feature index or a label"},
+                    400)
+    bounds: "dict[str, int]" = {}
+    for key in ("tx_start", "tx_end"):
+        if payload.get(key) is None:
+            continue
+        v = _coerce_int(payload.get(key), name=key)
+        if isinstance(v, str):
+            return ({"error": v}, 400)
+        bounds[key] = int(v)
+    if len(bounds) == 1:
+        return ({"error": "pass BOTH 'tx_start' and 'tx_end', or neither"},
+                400)
+    min_uorf_aa = _coerce_int(payload.get("min_uorf_aa", 1),
+                              name="min_uorf_aa")
+    if isinstance(min_uorf_aa, str):
+        return ({"error": min_uorf_aa}, 400)
+    try:
+        result = _predict_transcript(
+            str(rec.seq),
+            _agent_transcript_feature_dicts(rec),
+            circular=(rec.annotations.get("topology") == "circular"),
+            promoter=payload.get("promoter"),
+            cds=payload.get("cds"),
+            terminator=payload.get("terminator"),
+            tx_start=bounds.get("tx_start"),
+            tx_end=bounds.get("tx_end"),
+            check_splice=bool(payload.get("check_splice", True)),
+            min_uorf_aa=max(0, int(min_uorf_aa)),
+        )
+    except Exception as exc:
+        _log.exception("agent predict-transcript failed")
+        return ({"error":
+                  f"transcript prediction failed: {_scrub_path(str(exc))}"},
+                500)
+    if isinstance(result, dict) and not bool(
+            payload.get("include_sequences", True)):
+        # The message itself is the point of this endpoint, so it ships by
+        # default — but a screening loop over a whole collection only wants
+        # the verdicts, and a long transcription unit puts three copies of
+        # itself in the response. Mirrors `digest`'s `include_fragment_seq`.
+        for key in ("pre_mrna", "mature_mrna"):
+            result.pop(key, None)
+        for block in ("five_utr", "three_utr"):
+            if isinstance(result.get(block), dict):
+                result[block].pop("seq", None)
+    if not result.get("ok"):
+        # The unit couldn't be read — 422, with the reason. Never a partial
+        # transcript: half a message answered confidently is the failure mode
+        # this endpoint was written to remove.
+        return ({"error": result.get("error", "could not read a transcription "
+                                              "unit from this record"),
+                  "warnings": result.get("warnings", [])}, 422)
+    return result
+
+
+@_agent_endpoint("list-enzymes")
+def _h_list_enzymes(app, payload):
+    """Look up the restriction-enzyme catalog: recognition site, cut offsets,
+    overhang and isoschizomers, with no sequence involved.
+
+    Body: ``{names?: [str, ...] | str, search?: str, type_iis_only?: bool,
+    custom_only?: bool, limit?: int = 500}``.
+
+    Covers the COMBINED catalog — built-in NEB plus the user's custom
+    enzymes (``list-custom-enzymes`` returns only the latter). Exists so a
+    script can verify a digest's fragment sizes against the enzyme's real
+    offsets instead of hardcoding a private table of them (blue field report
+    #6), and so `list-restriction-sites`'s "unknown enzyme" 400 has somewhere
+    to point.
+
+    * ``names`` — exact rows, matched case-insensitively. An unrecognised
+      name is a 400 with near-miss suggestions, matching
+      `list-restriction-sites`; use ``search`` for open-ended lookup.
+    * ``search`` — case-insensitive substring over the name AND the
+      recognition site, so ``"GGTCTC"`` finds BsaI and its isoschizomers.
+
+    Each row is ``{name, site, recognition_len, fwd_cut, rev_cut, notation,
+    overhang_len, overhang_kind, type_iis, custom, aliases}``. `fwd_cut` /
+    `rev_cut` are offsets from the start of the recognition site to the top-
+    and bottom-strand cut; `notation` renders them the way REBASE does
+    (``G^TCGAC``, ``GGTCTC(1/5)``)."""
+    catalog = _state._all_enzymes_hook() or {}
+    names = payload.get("names")
+    if isinstance(names, str):
+        names = [names]
+    if names is not None:
+        if (shape_err := _agent_check_enzyme_list(
+                names, field="names")) is not None:
+            return shape_err
+        resolved, unknown = _resolve_enzyme_names(names)
+        if unknown:
+            return _agent_unknown_enzyme_error(unknown, field="names")
+        wanted = resolved
+    else:
+        wanted = sorted(catalog)
+
+    search = payload.get("search")
+    if search is not None and not isinstance(search, str):
+        return ({"error": "'search' must be a string"}, 400)
+    limit = _coerce_int(payload.get("limit", 500), name="limit")
+    if isinstance(limit, str):
+        return ({"error": limit}, 400)
+    limit = max(1, min(int(limit), 2000))
+    type_iis_only = bool(payload.get("type_iis_only", False))
+    custom_only   = bool(payload.get("custom_only", False))
+    custom_names = {str(e.get("name")) for e in _load_custom_enzymes()
+                    if isinstance(e, dict) and e.get("name")}
+
+    rows = []
+    needle = (search or "").strip().upper()
+    for name in wanted:
+        entry = catalog.get(name)
+        if not entry:
+            continue
+        try:
+            site, fwd_cut, rev_cut = entry
+            row = _agent_enzyme_dict(name, str(site), int(fwd_cut),
+                                     int(rev_cut), custom_names)
+        except (TypeError, ValueError):
+            # A corrupt custom enzyme — same tolerance as the scan-catalog
+            # rebuild, which skips it rather than failing the whole read.
+            continue
+        if needle and needle not in name.upper() and needle not in row["site"]:
+            continue
+        if type_iis_only and not row["type_iis"]:
+            continue
+        if custom_only and not row["custom"]:
+            continue
+        rows.append(row)
+
+    truncated = len(rows) > limit
+    return {"enzymes": rows[:limit], "count": min(len(rows), limit),
+            "total": len(rows), "truncated": truncated}
+
+
+def _agent_parse_span(spec, label: str):
+    """Coerce one span spec into ``(start, end)`` or return an error string.
+
+    Accepts ``{start, end}``, ``{bp}`` (a single base — the half-open span
+    ``[bp, bp+1)``), or a two-element ``[start, end]`` list."""
+    if isinstance(spec, (list, tuple)):
+        if len(spec) != 2:
+            return None, f"'{label}' as a list must be [start, end]"
+        spec = {"start": spec[0], "end": spec[1]}
+    if not isinstance(spec, dict):
+        return None, f"'{label}' must be an object with start/end (or bp)"
+    if "bp" in spec and "start" not in spec:
+        bp = _coerce_int(spec.get("bp"), name=f"{label}.bp")
+        if isinstance(bp, str):
+            return None, bp
+        return (int(bp), int(bp) + 1), None
+    if "start" not in spec or "end" not in spec:
+        return None, f"'{label}' needs both 'start' and 'end' (or 'bp')"
+    start = _coerce_int(spec.get("start"), name=f"{label}.start")
+    if isinstance(start, str):
+        return None, start
+    end = _coerce_int(spec.get("end"), name=f"{label}.end")
+    if isinstance(end, str):
+        return None, end
+    return (int(start), int(end)), None
+
+
+@_agent_endpoint("span-contains")
+def _h_span_contains(app, payload):
+    """Circular-aware containment: does a span contain a base or another
+    span, on a molecule where either may cross the origin?
+
+    Body: ``{outer: {start, end}, inner: {start, end} | {bp} | [...],
+    length?: int}``.
+
+    `length` defaults to the loaded record's; pass it to work on
+    coordinates from somewhere else. Spans are half-open ``[start, end)``,
+    the same convention `list-features` and `list-restriction-sites` report,
+    and a span with ``end <= start`` crosses the origin.
+
+    `inner` may be one span or a list of them, and the response is always
+    the same shape: ``{results: [{start, end, length, wraps, contains}],
+    all_contained, outer: {start, end, length, wraps}, length}``. One span
+    in, one row out — there is no separate single-span response to branch on.
+
+    This exists because ``(x - a) % L < (b - a) % L`` is the kind of
+    arithmetic that looks right and isn't: the obvious linear form
+    ``a <= x < b`` reports every base of an origin-spanning T-DNA, marker or
+    operon as OUTSIDE it, and a construct that is actually correct fails the
+    check (blue field report #2). It shares `_feat_len` with the rest of the
+    app, so containment and reported length cannot disagree."""
+    length = payload.get("length")
+    if length is None:
+        rec = getattr(app, "_current_record", None)
+        if rec is None:
+            return ({"error":
+                      "no plasmid loaded — pass 'length' to test coordinates "
+                      "without one"}, 422)
+        total = _seq_len(rec)
+    else:
+        coerced = _coerce_int(length, name="length")
+        if isinstance(coerced, str):
+            return ({"error": coerced}, 400)
+        total = int(coerced)
+    if total <= 0:
+        return ({"error": "'length' must be > 0"}, 400)
+
+    if "outer" not in payload:
+        return ({"error": "missing 'outer'"}, 400)
+    outer, err = _agent_parse_span(payload.get("outer"), "outer")
+    if err is not None:
+        return ({"error": err}, 400)
+    assert outer is not None
+    o_start, o_end = outer[0] % total, outer[1] % total
+
+    if "inner" not in payload:
+        return ({"error": "missing 'inner'"}, 400)
+    raw_inner = payload.get("inner")
+    # A bare [start, end] pair is one span, not a list of two specs — only a
+    # list whose members are themselves dicts/lists is a batch.
+    many = (isinstance(raw_inner, list)
+            and all(isinstance(x, (dict, list, tuple)) for x in raw_inner))
+    specs = list(raw_inner) if many else [raw_inner]
+    if len(specs) > 1000:
+        return ({"error": "too many 'inner' spans (max 1000)"}, 400)
+    # An empty list would answer `all_contained: true` having checked
+    # nothing — "everything fits" is exactly the wrong reading of "I was
+    # given nothing to check".
+    if not specs:
+        return ({"error": "'inner' is empty — nothing to test"}, 400)
+
+    # Coordinates are circular, so a negative or past-the-end value is
+    # normalised rather than refused (`-1` meaning the last base is genuinely
+    # useful). But a value far outside the molecule is far more often a units
+    # or off-by-a-plasmid mistake than an intentional lap, and the answer that
+    # comes back looks equally confident either way — so say when it happened.
+    out_of_range = sum(1 for v in (outer[0], outer[1]) if not 0 <= v < total)
+    results = []
+    for k, spec in enumerate(specs):
+        span, err = _agent_parse_span(spec, f"inner[{k}]" if many else "inner")
+        if err is not None:
+            return ({"error": err}, 400)
+        assert span is not None
+        out_of_range += sum(1 for v in span if not 0 <= v < total)
+        i_start, i_end = span[0] % total, span[1] % total
+        results.append({
+            "start":    i_start,
+            "end":      i_end,
+            "length":   _feat_len(i_start, i_end, total),
+            "wraps":    bool(i_end < i_start),
+            "contains": _span_in_span(i_start, i_end, o_start, o_end, total),
         })
-    return {"sites": out, "count": len(out)}
+
+    resp = {
+        "results":       results,
+        "all_contained": all(r["contains"] for r in results),
+        "outer": {
+            "start":  o_start,
+            "end":    o_end,
+            "length": _feat_len(o_start, o_end, total),
+            "wraps":  bool(o_end < o_start),
+        },
+        "length": total,
+    }
+    if out_of_range:
+        resp["warnings"] = [
+            f"{out_of_range} coordinate(s) were outside [0, {total}) and were "
+            "wrapped around the molecule — check the units if that wasn't "
+            "intended"]
+    return resp
 
 
 @_agent_endpoint("digest")
@@ -6191,15 +6848,19 @@ def _h_digest(app, payload):
     # Report names the catalog doesn't know (they contribute no cuts) so a
     # typo'd enzyme is visible instead of silently scanning nothing — the
     # SC-D "looks authoritative while answering a different question" trap.
-    try:
-        catalog = _state._all_enzymes_hook() or {}
-    except Exception:
-        catalog = {}
-    unknown = sorted({e for e in enzymes if e not in catalog})
+    # Resolve the same way `list-restriction-sites` does — exact first, then
+    # case-insensitively — so `bsai` cuts here too. This endpoint keeps its
+    # REPORT-don't-error contract (a caller digesting with a long list wants
+    # the cuts it can get plus a list of what was skipped), so only genuinely
+    # unrecognised names land in `unknown_enzymes`; the resolved spellings are
+    # what the engines actually receive, since they look enzymes up by exact
+    # catalog key.
+    resolved, unresolved = _resolve_enzyme_names(enzymes)
+    unknown = sorted({w[:_AGENT_NAME_ECHO_MAX] for w, _ in unresolved})
 
     try:
-        cuts = _enzyme_cuts(bases, enzymes, circular=circular)
-        frags = _digest_with_enzymes(bases, enzymes, circular=circular)
+        cuts = _enzyme_cuts(bases, resolved, circular=circular)
+        frags = _digest_with_enzymes(bases, resolved, circular=circular)
     except Exception as exc:
         _log.exception("agent digest failed")
         return ({"error": f"digest failed: {_scrub_path(str(exc))}"}, 500)

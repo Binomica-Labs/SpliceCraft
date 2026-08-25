@@ -6107,3 +6107,567 @@ class TestOnlineSearchGate:
         r = sc._h_hmmer_web(None,
                             {"query": "MKVLAAGGAGGSPVT", "max_hits": 5})
         assert r["ok"] and r["n_hits"] == 1 and seen["max_hits"] == 5
+
+
+# ── blue field report (2026-08-24) ────────────────────────────────────────
+# An agent driving the headless API through a plant-binary-vector build hit
+# four failures that produced WRONG ANSWERS rather than errors. Each class
+# below pins one of them.
+
+
+def _circ(seq):
+    """A circular SeqRecord — Type IIS cuts near an end need the wrap."""
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    rec = SeqRecord(Seq(seq), id="t", name="t")
+    rec.annotations["topology"] = "circular"
+    rec.annotations["molecule_type"] = "DNA"
+    return rec
+
+
+class TestEnzymeNameResolution:
+    """Report #1: `list-restriction-sites` knew BsmBI but not Esp3I, so an
+    Esp3I safety check passed VACUOUSLY — `count: 0` reads as "no sites"
+    when it actually meant "I never scanned for that name"."""
+
+    # CGTCTC at 4 (BsmBI/Esp3I), GGTCTC at 50 (BsaI/BspTNI).
+    SEQ = "AAAA" + "CGTCTC" + "A" * 40 + "GGTCTC" + "T" * 40
+
+    def _app(self):
+        return MockApp(record=_circ(self.SEQ))
+
+    def test_isoschizomer_name_finds_its_own_sites(self):
+        """The regression itself. Esp3I is in the catalog with BsmBI's exact
+        (site, cut, cut) tuple, but the scanner collapses isoschizomers onto
+        ONE label for the map — so a post-filter for the losing name came
+        back empty."""
+        r = sc._h_list_restriction_sites(self._app(), {"enzyme": "Esp3I"})
+        assert r["count"] == 1, r
+        assert r["sites"][0]["enzyme"] == "Esp3I"
+        assert r["sites"][0]["start"] == 4
+        # Same physical site the winning name reports.
+        bsmbi = sc._h_list_restriction_sites(self._app(), {"enzyme": "BsmBI"})
+        assert bsmbi["sites"][0]["start"] == r["sites"][0]["start"]
+        assert bsmbi["sites"][0]["cut_bp"] == r["sites"][0]["cut_bp"]
+
+    def test_every_requested_isoschizomer_gets_its_own_row(self):
+        """Asking for both names returns both — a script filtering on either
+        spelling finds its hits."""
+        r = sc._h_list_restriction_sites(
+            self._app(), {"enzymes": ["BsmBI", "Esp3I"]})
+        assert {s["enzyme"] for s in r["sites"]} == {"BsmBI", "Esp3I"}
+        assert {s["start"] for s in r["sites"]} == {4}
+
+    def test_losing_side_of_the_collapse_for_bsai_too(self):
+        """Not a CGTCTC special case: BspTNI loses to BsaI the same way."""
+        r = sc._h_list_restriction_sites(self._app(), {"enzyme": "BspTNI"})
+        assert [s["start"] for s in r["sites"]] == [50], r
+
+    def test_unknown_enzyme_is_400_not_an_empty_result(self):
+        """The core of the report: a check that cannot fail is worse than no
+        check. `Esp3l` (lowercase L) used to scan nothing and answer clean."""
+        out = sc._h_list_restriction_sites(self._app(), {"enzyme": "Esp3l"})
+        assert isinstance(out, tuple) and out[1] == 400, out
+        assert out[0]["unknown_enzymes"] == ["Esp3l"]
+        assert "Esp3I" in out[0]["error"]          # near-miss suggestion
+
+    def test_unknown_name_with_no_near_miss_still_errors(self):
+        out = sc._h_list_restriction_sites(
+            self._app(), {"enzymes": ["BsaI", "TotallyMadeUpI"]})
+        assert isinstance(out, tuple) and out[1] == 400
+        assert out[0]["unknown_enzymes"] == ["TotallyMadeUpI"]
+
+    def test_case_insensitive(self):
+        """REBASE capitalisation is not something anyone types reliably."""
+        for spelling in ("bsai", "BSAI", "BsaI"):
+            r = sc._h_list_restriction_sites(self._app(), {"enzyme": spelling})
+            assert [s["enzyme"] for s in r["sites"]] == ["BsaI"], spelling
+
+    def test_empty_list_refused(self):
+        """`{"enzymes": []}` used to fall through to a full-catalog scan —
+        the result looked scoped and wasn't."""
+        out = sc._h_list_restriction_sites(self._app(), {"enzymes": []})
+        assert isinstance(out, tuple) and out[1] == 400
+
+    def test_equivalent_enzymes_names_what_the_answer_covers(self):
+        """A zero-site answer is only trustworthy if you know which spellings
+        it accounted for."""
+        r = sc._h_list_restriction_sites(self._app(), {"enzyme": "BsmBI"})
+        assert set(r["equivalent_enzymes"]) == {"Esp3I", "BsmBI-v2"}
+        assert r["enzymes_scanned"] == ["BsmBI"]
+
+    def test_cut_coordinates_and_site_ride_along(self):
+        """Report #6: fragment-size arithmetic shouldn't need a private table
+        of cut offsets."""
+        r = sc._h_list_restriction_sites(self._app(), {"enzyme": "BsaI"})
+        hit = r["sites"][0]
+        assert hit["site"] == "GGTCTC"
+        assert hit["cut_bp"] == 50 + 7            # GGTCTC(1/5): top cut
+        assert hit["bottom_cut_bp"] == 50 + 11    # bottom cut
+
+    def test_wrap_continuation_is_not_counted_as_a_site(self):
+        """Sacred invariant #6 emits an origin-spanning site as a labeled
+        tail piece PLUS an unlabeled head piece. The unlabeled one used to
+        surface as a phantom `{"enzyme": ""}` row whenever no enzyme filter
+        was passed, so `count` disagreed with itself between a filtered and
+        an unfiltered call."""
+        # EcoRI (GAATTC) straddling the origin: last 3 bases + first 3.
+        seq = "TTC" + "A" * 60 + "GAA"
+        r = sc._h_list_restriction_sites(_app_for(seq), {})
+        assert all(s["enzyme"] for s in r["sites"]), r
+        assert r["count"] == len(r["sites"])
+        scoped = sc._h_list_restriction_sites(_app_for(seq), {"enzyme": "EcoRI"})
+        assert scoped["count"] == 1
+        assert [s["enzyme"] for s in r["sites"] if s["enzyme"] == "EcoRI"] \
+            == ["EcoRI"]
+
+
+def _app_for(seq):
+    return MockApp(record=_circ(seq))
+
+
+class TestListEnzymes:
+    """Report #6: cut offsets weren't reachable, so a script verifying digest
+    fragment sizes had to hardcode `SalI G^TCGAC = 1` and `KpnI GGTAC^C = 5`
+    from memory."""
+
+    def _get(self, name):
+        r = sc._h_list_enzymes(None, {"names": [name]})
+        assert not isinstance(r, tuple), r
+        return r["enzymes"][0]
+
+    def test_notation_matches_rebase(self):
+        """The two the report cited by hand, plus a Type IIS and a blunt."""
+        assert self._get("SalI")["notation"] == "G^TCGAC"
+        assert self._get("KpnI")["notation"] == "GGTAC^C"
+        assert self._get("BsaI")["notation"] == "GGTCTC(1/5)"
+        assert self._get("EcoRV")["notation"] == "GAT^ATC"
+
+    def test_overhang_kind_agrees_with_the_digest_engine(self):
+        """`overhang_kind` is derived with the same rule `_enzyme_cuts_impl`
+        uses, so a size check can't disagree with the fragments it checks."""
+        assert (self._get("SalI")["overhang_kind"],
+                self._get("SalI")["overhang_len"]) == ("5'", 4)
+        assert (self._get("KpnI")["overhang_kind"],
+                self._get("KpnI")["overhang_len"]) == ("3'", 4)
+        assert (self._get("EcoRV")["overhang_kind"],
+                self._get("EcoRV")["overhang_len"]) == ("blunt", 0)
+
+    def test_cut_offsets_reproduce_a_real_digest(self):
+        """Independent check: the published offsets must place the cut where
+        `_enzyme_cuts` actually puts it."""
+        seq = "A" * 20 + "GTCGAC" + "T" * 20
+        row = self._get("SalI")
+        cuts = sc._enzyme_cuts(seq, ["SalI"], circular=False)
+        assert cuts[0]["top"] == 20 + row["fwd_cut"]
+        assert cuts[0]["bot"] == 20 + row["rev_cut"]
+
+    def test_type_iis_flag_and_aliases(self):
+        assert self._get("BsaI")["type_iis"] is True
+        assert self._get("EcoRI")["type_iis"] is False
+        assert self._get("BsaI")["aliases"] == ["BspTNI"]
+
+    def test_unknown_name_400_with_suggestion(self):
+        out = sc._h_list_enzymes(None, {"names": ["Bsa1"]})
+        assert isinstance(out, tuple) and out[1] == 400
+        assert "BsaI" in out[0]["error"]
+
+    def test_search_by_recognition_site(self):
+        r = sc._h_list_enzymes(None, {"search": "GGTCTC"})
+        assert {e["name"] for e in r["enzymes"]} == {"BsaI", "BspTNI"}
+
+    def test_type_iis_filter(self):
+        r = sc._h_list_enzymes(None, {"type_iis_only": True})
+        assert r["count"] > 0
+        assert all(e["type_iis"] for e in r["enzymes"])
+
+
+class TestSpanContains:
+    """Report #2: with no circular-aware interval helper, "is this feature
+    inside the T-DNA" had to be hand-rolled, and the obvious linear form
+    reported a false FAIL on a CORRECT construct whose borders wrap the
+    origin."""
+
+    L = 10_000
+    TDNA = {"start": 9500, "end": 800}          # 1300 bp across the origin
+
+    def _q(self, inner, **kw):
+        body = {"outer": self.TDNA, "length": self.L, "inner": inner}
+        body.update(kw)
+        r = sc._h_span_contains(None, body)
+        assert not isinstance(r, tuple), r
+        return r
+
+    def test_the_linear_form_this_replaces_is_wrong(self):
+        """Not a tautology: assert the naive predicate actually disagrees, so
+        this test fails if someone reimplements it linearly."""
+        inner = {"start": 100, "end": 700}
+        naive = (self.TDNA["start"] <= inner["start"] < self.TDNA["end"])
+        assert naive is False                    # what the report hit
+        assert self._q(inner)["results"][0]["contains"] is True
+
+    def test_contains_on_both_sides_of_the_origin(self):
+        rows = self._q([{"start": 9600, "end": 9900},
+                        {"start": 100,  "end": 700},
+                        {"start": 9800, "end": 200}])["results"]
+        assert [r["contains"] for r in rows] == [True, True, True]
+        assert rows[2]["wraps"] is True
+
+    def test_excludes_what_is_outside_and_what_straddles_a_border(self):
+        rows = self._q([{"start": 2000, "end": 3000},
+                        {"start": 700,  "end": 900}])["results"]
+        assert [r["contains"] for r in rows] == [False, False]
+
+    def test_single_bp(self):
+        assert self._q({"bp": 9999})["results"][0]["contains"] is True
+        assert self._q({"bp": 5000})["results"][0]["contains"] is False
+
+    def test_one_response_shape_for_one_or_many(self):
+        """Report #4's complaint applied to a new endpoint: one span in still
+        yields a `results` LIST, so callers never branch on the shape."""
+        one = self._q({"bp": 9999})
+        many = self._q([{"bp": 9999}, {"bp": 5000}])
+        assert len(one["results"]) == 1 and len(many["results"]) == 2
+        assert one["all_contained"] is True and many["all_contained"] is False
+        assert one["outer"]["length"] == 1300 and one["outer"]["wraps"] is True
+
+    def test_bare_start_end_pair_is_one_span_not_two_specs(self):
+        r = self._q([100, 700])
+        assert len(r["results"]) == 1
+        assert (r["results"][0]["start"], r["results"][0]["end"]) == (100, 700)
+
+    def test_length_falls_back_to_the_loaded_record(self):
+        app = MockApp(record=_circ("A" * 10_000))
+        r = sc._h_span_contains(
+            app, {"outer": self.TDNA, "inner": {"bp": 9999}})
+        assert r["length"] == 10_000 and r["results"][0]["contains"] is True
+
+    def test_no_record_and_no_length_is_422(self):
+        out = sc._h_span_contains(
+            MockApp(record=None), {"outer": self.TDNA, "inner": {"bp": 1}})
+        assert isinstance(out, tuple) and out[1] == 422
+
+    def test_bad_input_is_refused(self):
+        for body in ({"outer": self.TDNA, "length": self.L},
+                     {"inner": {"bp": 1}, "length": self.L},
+                     {"outer": self.TDNA, "inner": {"bp": 1}, "length": 0},
+                     {"outer": self.TDNA, "inner": {"start": "x", "end": 5},
+                      "length": self.L}):
+            out = sc._h_span_contains(None, body)
+            assert isinstance(out, tuple) and out[1] == 400, body
+
+
+class TestSimulationOkReflectsTheOutcome:
+    """Report #4: the dry-run endpoints stamped `ok: true` for a reaction
+    that FAILED — `result.ok` said false underneath — so the natural
+    `if r["ok"]:` accepted a design that cannot be built."""
+
+    @staticmethod
+    def _cassette(oh5, body, oh3):
+        return "GGTCTC" + "A" + oh5 + body + oh3 + "A" + "GAGACC"
+
+    def test_failed_golden_gate_reports_ok_false(self):
+        # Overhangs that cannot chain into a circle.
+        A = self._cassette("GGAG", "ATGAAACCCGGGTTTACGT" * 2, "AATG")
+        V = self._cassette("TTTT", "GGGGCCCCAAAATTTT" * 8, "CCCC")
+        r = sc._h_simulate_golden_gate(None, {"parts": [A], "vector": V})
+        assert r["result"]["ok"] is False
+        assert r["ok"] is False, "top-level ok must not outrank result.ok"
+
+    def test_successful_golden_gate_still_reports_ok_true(self):
+        A = self._cassette("GGAG", "ATGAAACCCGGGTTTACGT" * 2, "AATG")
+        B = self._cassette("AATG", "TTGCATGCATGCTAGCTAG" * 2, "CGCT")
+        V = self._cassette("CGCT", "GGGGCCCCAAAATTTT" * 8, "GGAG")
+        r = sc._h_simulate_golden_gate(None, {"parts": [A, B], "vector": V})
+        assert r["ok"] is True and r["result"]["ok"] is True
+
+    def test_failed_gibson_reports_ok_false(self):
+        r = sc._h_simulate_gibson(None, {"fragments": [
+            {"name": "a", "sequence": "ACGTACGT" * 20},
+            {"name": "b", "sequence": "TTTTGGGG" * 20}]})
+        assert r["result"]["success"] is False
+        assert r["ok"] is False
+
+    def test_successful_gibson_still_reports_ok_true(self):
+        ov = "CGATCGATCGATCGATCGAT"
+        r = sc._h_simulate_gibson(None, {"circular": False, "fragments": [
+            {"name": "a", "sequence": "A" * 60 + ov},
+            {"name": "b", "sequence": ov + "T" * 60}]})
+        assert r["ok"] is True and r["result"]["success"] is True
+
+
+class TestGoldenGateAnnotationParity:
+    """Report #7: `golden-gate-assemble` has no `carry_annotations`. It saved
+    a feature-BARE product, and passing the flag was silently ignored — a
+    bare construct believed to be annotated looks identical to an annotated
+    one until you open it."""
+
+    @staticmethod
+    def _design():
+        cas = lambda o5, b, o3: "GGTCTC" + "A" + o5 + b + o3 + "A" + "GAGACC"
+        return (cas("GGAG", "ATGAAACCCGGGTTTACGT" * 2, "AATG"),
+                cas("AATG", "TTGCATGCATGCTAGCTAG" * 2, "CGCT"),
+                cas("CGCT", "GGGGCCCCAAAATTTT" * 8, "GGAG"))
+
+    def test_carry_annotations_is_refused_not_ignored(self):
+        A, B, V = self._design()
+        out = sc._h_golden_gate_assemble(
+            None, {"parts": [A, B], "vector": V, "product_name": "ggx",
+                   "carry_annotations": True})
+        assert isinstance(out, tuple) and out[1] == 400, out
+        assert "carry_annotations" in out[0]["error"]
+        # Nothing was saved.
+        assert not any(e["name"] == "ggx" for e in sc._load_library())
+
+    def test_enzyme_is_still_accepted(self):
+        """The guard must not over-reject a param the endpoint DOES take."""
+        A, B, V = self._design()
+        r = sc._h_golden_gate_assemble(
+            None, {"parts": [A, B], "vector": V, "product_name": "gge",
+                   "enzyme": "BsaI"})
+        assert r["saved_name"] == "gge"
+
+    def test_product_is_feature_bare_and_the_docstring_says_so(self):
+        """Pins the CURRENT truth so a future `carry_annotations` here has to
+        update both the behaviour and the promise."""
+        A, B, V = self._design()
+        r = sc._h_golden_gate_assemble(
+            None, {"parts": [A, B], "vector": V, "product_name": "ggbare"})
+        ent = next(e for e in sc._load_library() if e["name"] == "ggbare")
+        assert ent["n_feats"] == 0
+        rec = sc._gb_text_to_record(ent["gb_text"])
+        assert [f for f in rec.features if f.type != "source"] == []
+        assert "carries NO features" in sc._h_golden_gate_assemble.__doc__
+
+
+class TestTraditionalCloneMarkerDefault:
+    """Report #5: a directional two-enzyme digest leaves BOTH vector fragments
+    with one cut of each kind, so both accept the insert and the caller had to
+    read `simulate-traditional-cloning` and hand `vector_frag_idx` back for a
+    reaction with exactly one sensible product. The 409 now resolves itself
+    when the vector's ORIGIN / RESISTANCE annotations say which half is the
+    backbone — never by fragment size."""
+
+    VECTOR = TestTraditionalCloning.VECTOR      # EcoRI · A×200 · BamHI · C×60
+    INSERT = TestTraditionalCloning.INSERT
+
+    def _base(self):
+        return {"vector_seq": self.VECTOR,
+                "vector_enzymes": ["EcoRI", "BamHI"],
+                "insert_seq": self.INSERT,
+                "insert_enzymes": ["EcoRI", "BamHI"]}
+
+    @staticmethod
+    def _seed(feats, name="MarkedVector", seq=None):
+        """Seed a vector entry carrying `feats` = [(start, end, type, label)]."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        s = TestTraditionalCloneMarkerDefault.VECTOR if seq is None else seq
+        rec = SeqRecord(Seq(s), id="MARKV", name="MARKV",
+                        annotations={"molecule_type": "DNA",
+                                       "topology": "circular"})
+        for start, end, ftype, label in feats:
+            rec.features.append(SeqFeature(
+                FeatureLocation(start, end, strand=1), type=ftype,
+                qualifiers={"label": [label]}))
+        sc._save_library([{
+            "id": "MARKV", "name": name, "size": len(s), "n_feats": len(feats),
+            "added": "2026-08-24", "gb_text": sc._record_to_gb_text(rec)}])
+
+    def test_marker_settles_the_ambiguity(self, isolated_library):
+        """AmpR sits in the A×200 half (vector fragment 0). No
+        `vector_frag_idx` passed — the clone should just work."""
+        self._seed([(20, 190, "CDS", "AmpR")])
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="autoclone", vector_name="MarkedVector"))
+        assert not isinstance(r, tuple), r
+        assert r["vector_frag_idx"] == 0
+        assert r["vector_frag_auto_picked"] is True
+        assert "AmpR" in r["vector_frag_pick_reason"]
+        assert any(e["name"] == "autoclone" for e in sc._load_library())
+
+    def test_without_a_vector_name_it_still_refuses(self, isolated_library):
+        """No annotations to judge from → the 409 stands, unchanged."""
+        r = sc._h_traditional_clone(
+            None, dict(self._base(), product_name="c"))
+        assert isinstance(r, tuple) and r[1] == 409
+
+    def test_markers_on_both_halves_is_a_real_ambiguity(self, isolated_library):
+        """If both fragments look like backbone, nothing has been settled —
+        refuse rather than pick one."""
+        self._seed([(20, 190, "CDS", "AmpR"),
+                    (215, 260, "rep_origin", "ColE1 ori")])
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="c", vector_name="MarkedVector"))
+        assert isinstance(r, tuple) and r[1] == 409
+
+    def test_it_does_not_pick_by_size(self, isolated_library):
+        """The decisive test. Put the marker on the SMALLER fragment (the C×60
+        half, vector fragment 1): a size heuristic would take the 206 bp half,
+        the marker rule must take the 60 bp one."""
+        self._seed([(215, 260, "rep_origin", "ColE1 ori")])
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="smallpick", vector_name="MarkedVector"))
+        assert not isinstance(r, tuple), r
+        assert r["vector_frag_idx"] == 1, "picked the big half — size crept in"
+        assert r["vector_frag_auto_picked"] is True
+
+    def test_an_explicit_index_still_wins(self, isolated_library):
+        """The caller's word beats the inference, even against the marker."""
+        self._seed([(20, 190, "CDS", "AmpR")])
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="explicit", vector_name="MarkedVector",
+            vector_frag_idx=1))
+        assert r["vector_frag_idx"] == 1
+        assert "vector_frag_auto_picked" not in r
+
+    def test_sequence_mismatch_falls_back_to_the_409(self, isolated_library):
+        """Same exact-match gate `carry_annotations` uses: markers read off a
+        rotated or edited entry would be attributed to the wrong fragment, so
+        an inexact match declines to guess instead of guessing wrong."""
+        self._seed([(20, 190, "CDS", "AmpR")], seq=self.VECTOR + "TTTT")
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="c", vector_name="MarkedVector"))
+        assert isinstance(r, tuple) and r[1] == 409
+
+    def test_unknown_vector_name_does_not_break_the_clone(self, isolated_library):
+        """The inference is ADVISORY — a name that resolves to nothing must
+        leave the endpoint exactly as it was, not error."""
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="c", vector_name="ghost",
+            vector_frag_idx=0))
+        assert not isinstance(r, tuple), r
+        assert r["vector_frag_idx"] == 0
+
+    def test_auto_pick_leaves_no_silent_choice(self, isolated_library):
+        """An automatic pick you can't see is what the 409 was protecting
+        against — the response must always say it happened and why."""
+        self._seed([(20, 190, "CDS", "AmpR")])
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="loud", vector_name="MarkedVector"))
+        assert set(("vector_frag_auto_picked", "vector_frag_pick_reason")) \
+            <= set(r)
+        assert str(r["vector_frag_idx"]) in r["vector_frag_pick_reason"]
+
+
+class TestEnzymeInputHardening:
+    """Edge-case sweep on the name-resolution surface added for report #1.
+    Every case here produced either a wrong answer or an unbounded cost."""
+
+    SEQ = "GAATTC" + "A" * 500
+
+    def _app(self):
+        return MockApp(record=_circ(self.SEQ))
+
+    def test_too_many_names_is_refused(self):
+        """`_resolve_enzyme_names` is O(catalog) per unrecognised name, so an
+        unbounded list is a CPU sink in a read endpoint. 500 matches the cap
+        `digest` already had."""
+        out = sc._h_list_restriction_sites(
+            self._app(), {"enzymes": ["EcoRI"] * 501})
+        assert isinstance(out, tuple) and out[1] == 400
+        assert "too many" in out[0]["error"]
+        ok = sc._h_list_restriction_sites(
+            self._app(), {"enzymes": ["EcoRI"] * 500})
+        assert not isinstance(ok, tuple)
+
+    def test_a_huge_name_is_clipped_out_of_the_error(self):
+        """A payload can carry a megabyte string; echoing it verbatim turns a
+        validation error into a megabyte response."""
+        out = sc._h_list_restriction_sites(self._app(), {"enzyme": "X" * 100_000})
+        assert isinstance(out, tuple) and out[1] == 400
+        assert len(out[0]["error"]) < 500
+        assert all(len(n) <= 65 for n in out[0]["unknown_enzymes"])
+
+    def test_many_unknowns_report_a_true_total_not_a_truncated_one(self):
+        out = sc._h_list_restriction_sites(
+            self._app(), {"enzymes": [f"Fake{i}I" for i in range(200)]})
+        assert isinstance(out, tuple) and out[1] == 400
+        assert out[0]["n_unknown"] == 200
+        assert len(out[0]["unknown_enzymes"]) <= 10   # quoted set is bounded
+        assert len(out[0]["error"]) < 2000
+
+    def test_suggestion_work_is_bounded(self):
+        """Only the first few unknowns get near-misses computed; the rest are
+        still reported."""
+        names = [f"Nope{i}I" for i in range(100)]
+        _resolved, unknown = sc._resolve_enzyme_names(names)
+        assert len(unknown) == 100
+        assert sum(1 for _w, near in unknown if near) <= \
+            sc._RESOLVE_SUGGEST_LIMIT
+
+    def test_min_length_longer_than_any_site_is_refused(self):
+        """The vacuous-pass shape again: `min_length: 99` can only ever return
+        zero sites, and `count: 0` reads as 'this construct is clean'."""
+        out = sc._h_list_restriction_sites(self._app(), {"min_length": 99})
+        assert isinstance(out, tuple) and out[1] == 400
+        assert "BASE PAIRS" in out[0]["error"]
+
+    def test_the_min_length_bound_comes_from_the_catalog(self):
+        """Reading it from the catalog means a longer-site enzyme can't make
+        the guard reject a legitimate filter."""
+        longest = max(len(v[0]) for v in sc._all_enzymes().values())
+        assert not isinstance(
+            sc._h_list_restriction_sites(self._app(), {"min_length": longest}),
+            tuple)
+        assert sc._h_list_restriction_sites(
+            self._app(), {"min_length": longest + 1})[1] == 400
+
+    def test_a_negative_min_length_is_treated_as_no_filter(self):
+        r = sc._h_list_restriction_sites(self._app(), {"min_length": -5})
+        assert not isinstance(r, tuple) and r["count"] >= 1
+
+    def test_list_enzymes_caps_names_too(self):
+        out = sc._h_list_enzymes(None, {"names": ["BsaI"] * 501})
+        assert isinstance(out, tuple) and out[1] == 400
+
+    def test_digest_resolves_case_but_still_reports_rather_than_errors(self):
+        """`digest`'s documented contract is REPORT-don't-error on an unknown
+        name. Case-folding must not turn that into a refusal — but a lowercase
+        name must actually cut, which it previously did not."""
+        seq = "AAAA" + "GAATTC" + "AAAA"
+        low = sc._h_digest(None, {"sequence": seq, "enzymes": ["ecori"],
+                                  "circular": False})
+        assert not isinstance(low, tuple), low
+        assert low["n_cuts"] == 1 and low["unknown_enzymes"] == []
+        mixed = sc._h_digest(None, {"sequence": seq,
+                                    "enzymes": ["EcoRI", "NotAnEnzymeI"],
+                                    "circular": False})
+        assert not isinstance(mixed, tuple)
+        assert mixed["n_cuts"] == 1
+        assert mixed["unknown_enzymes"] == ["NotAnEnzymeI"]
+
+
+class TestSpanContainsHardening:
+    def test_an_empty_inner_list_is_refused(self):
+        """`all([])` is True, so an empty list answered `all_contained: true`
+        having checked nothing — the worst possible reading."""
+        out = sc._h_span_contains(
+            None, {"outer": {"start": 0, "end": 10}, "length": 100,
+                   "inner": []})
+        assert isinstance(out, tuple) and out[1] == 400
+
+    def test_out_of_range_coordinates_are_wrapped_but_reported(self):
+        """Circular coordinates make `-1` legitimate, so a far-out value is
+        normalised rather than refused — but the answer looks equally
+        confident either way, so it must say it happened."""
+        r = sc._h_span_contains(
+            None, {"outer": {"start": 0, "end": 10}, "length": 100,
+                   "inner": {"bp": 10 ** 9}})
+        assert not isinstance(r, tuple)
+        assert r["warnings"] and "outside" in r["warnings"][0]
+
+    def test_in_range_coordinates_carry_no_warning(self):
+        r = sc._h_span_contains(
+            None, {"outer": {"start": 0, "end": 10}, "length": 100,
+                   "inner": {"bp": 5}})
+        assert "warnings" not in r
+
+    def test_a_negative_coordinate_still_works(self):
+        """-1 means the last base; that has to keep working."""
+        r = sc._h_span_contains(
+            None, {"outer": {"start": 90, "end": 0}, "length": 100,
+                   "inner": {"bp": -1}})
+        assert r["results"][0]["start"] == 99
+        assert r["results"][0]["contains"] is True

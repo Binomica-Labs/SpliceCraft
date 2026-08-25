@@ -24,7 +24,9 @@ from __future__ import annotations
 import re
 
 import splicecraft_state as _state
-from splicecraft_biology import _rc, _enzyme_cuts
+from splicecraft_biology import (_rc, _enzyme_cuts, _feat_len,
+                                 _slice_circular)
+from splicecraft_splice import (_splice_scan, _splice_model_summary)
 from splicecraft_codon import _CODON_TABLE, _STOP_CODONS
 from splicecraft_record import _gb_text_to_record
 from splicecraft_dataaccess import _all_grammars, _load_entry_vectors
@@ -1200,3 +1202,561 @@ def _part_level_label(level: int) -> str:
     if level == 1:
         return "TU"
     return "MOD"
+
+
+# ── Spliced-transcript prediction ──────────────────────────────────────────
+#
+# The read-direction counterpart to `splicecraft_cassette`'s assembler: given a
+# plasmid that ALREADY carries a transcription unit, reconstruct the mature
+# mRNA and score translation initiation on it.
+#
+# It exists because of a specific, repeatable wrong answer. When a construct
+# carries a genomic 5'UTR intron, the biology depends on the SPLICED leader,
+# but every check written against the plasmid sequence sees the UNSPLICED one.
+# An upstream-ATG screen run that way flags intronic ATGs that splicing
+# removes — false positives that look exactly like real uORF hazards, and that
+# each cost a round of investigation. Reconstructing the mature message by hand
+# per script is how that mistake gets made repeatedly, so it lives here once.
+#
+# Introns come from ANNOTATION — `intron` features, or the gaps between the
+# parts of a spliced CDS/mRNA location — never from de novo prediction.
+# Guessing where a spliceosome cuts and then reporting the guess as the message
+# would be the same class of failure this module was written to remove. The
+# trained PWM in `splicecraft_splice` is still used, but only to flag CRYPTIC
+# sites as an advisory alongside the answer, never to define the transcript.
+
+_TX_MAX_UORFS = 200
+_TX_MAX_SPLICE_HITS = 50
+
+
+def _kozak_context(mrna: str, atg_pos: int) -> dict:
+    """Score the translation-initiation context around `atg_pos` in `mrna`.
+
+    Returns ``{context, minus3, plus4, strength, score, truncated, model}``.
+    `context` is the 10 nt window ``[-6 .. +4]`` with the A of the ATG at
+    offset 6, so it reads the way the literature prints it.
+
+    **This is the positional consensus rule, not a trained matrix** — the two
+    positions that carry most of the signal are a purine at −3 and a G at +4,
+    and `score` just counts how many of those two are satisfied (0–2 →
+    weak / adequate / strong). It is reported as `model` on every result so a
+    caller never mistakes it for the calibrated PWM that
+    `splicecraft_splice` uses for splice sites. A context that runs off the
+    5' end of the message is marked `truncated` — a 5'UTR shorter than 6 nt
+    is itself a finding, and padding it would invent bases."""
+    n = len(mrna)
+    lo = atg_pos - 6
+    truncated = lo < 0 or atg_pos + 4 > n
+    context = mrna[max(0, lo):atg_pos + 4]
+    minus3 = mrna[atg_pos - 3] if atg_pos >= 3 else ""
+    plus4 = mrna[atg_pos + 3] if atg_pos + 4 <= n else ""
+    score = int(minus3 in ("A", "G")) + int(plus4 == "G")
+    return {
+        "context":   context,
+        "minus3":    minus3,
+        "plus4":     plus4,
+        "score":     score,
+        "strength":  ("strong" if score == 2
+                      else "adequate" if score == 1 else "weak"),
+        "truncated": truncated,
+        "model":     "positional -3/+4 consensus (not a trained PWM)",
+    }
+
+
+def _tx_map_span(gs: int, ge: int, a: int, total: int,
+                 strand: int, pre_len: int) -> "tuple[int, int] | None":
+    """Map a genomic half-open span onto pre-mRNA coordinates.
+
+    `a` is the plus-strand genomic start of the transcription unit and
+    `pre_len` its length; `strand` is the unit's orientation. Returns None
+    when the span doesn't lie inside the unit — a partial overlap included,
+    because half of a feature mapped into a transcript is a coordinate lie,
+    not a partial answer.
+
+    On a minus-strand unit the span is FLIPPED as well as shifted: the
+    transcript reads 3'→5' along the plus strand, so its first base is the
+    unit's LAST plus-strand base. Getting this backwards is the classic
+    origin-and-strand fault, so it is derived once here and tested against a
+    sequence whose content identifies its own coordinates."""
+    if total <= 0 or pre_len <= 0:
+        return None
+    off_s = (gs - a) % total
+    off_e = (ge - a) % total
+    # A span ending exactly at the unit's end wraps its offset to 0.
+    if off_e == 0 and off_s != 0:
+        off_e = pre_len
+    if off_s > pre_len or off_e > pre_len or off_s >= off_e:
+        return None
+    if strand >= 0:
+        return (off_s, off_e)
+    return (pre_len - off_e, pre_len - off_s)
+
+
+def _tx_feature_parts(feat: dict) -> "list[tuple[int, int]]":
+    """A feature's location parts as ``[(start, end), ...]``.
+
+    A spliced CDS/mRNA arrives as a compound location, and the gaps BETWEEN
+    its parts are the introns — the standard GenBank way to say so. A feature
+    with no `parts` is a single span."""
+    raw = feat.get("parts")
+    out: "list[tuple[int, int]]" = []
+    if isinstance(raw, (list, tuple)):
+        for p in raw:
+            try:
+                if isinstance(p, dict):
+                    out.append((int(p["start"]), int(p["end"])))
+                else:
+                    out.append((int(p[0]), int(p[1])))
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+    if not out:
+        try:
+            out = [(int(feat["start"]), int(feat["end"]))]
+        except (KeyError, TypeError, ValueError):
+            return []
+    return out
+
+
+def _tx_usable_features(features, warnings: "list[str]") -> "list[dict]":
+    """Feature dicts whose coordinates are actually usable.
+
+    A record can carry a feature with a non-integer or missing position — a
+    hand-edited GenBank, a `<1..>500` fuzzy location, or a caller-built list.
+    Reading one used to raise `ValueError` out of the middle of the transcript
+    walk, which reached the endpoint as an opaque 500. It is not worth failing
+    the whole unit over one bad feature, but it IS worth saying so: a silently
+    shorter feature list could be the reason the promoter went missing."""
+    out: "list[dict]" = []
+    dropped = 0
+    for f in (features or []):
+        if not isinstance(f, dict):
+            dropped += 1
+            continue
+        try:
+            int(f["start"]); int(f["end"])
+            int(f.get("strand", 1) or 1)
+        except (KeyError, TypeError, ValueError):
+            dropped += 1
+            continue
+        out.append(f)
+    if dropped:
+        warnings.append(
+            f"{dropped} feature(s) skipped — their coordinates aren't whole "
+            "numbers (a fuzzy or hand-edited location)")
+    return out
+
+
+def _feat_label_or(feat, fallback: str = "unlabelled") -> str:
+    """A feature dict's display label, or `fallback`. Tolerates a non-dict so
+    it can be used inside a message built before the union is narrowed."""
+    if not isinstance(feat, dict):
+        return fallback
+    return str(feat.get("label") or "") or fallback
+
+
+def _tx_pick_feature(features, want, types, *, strand=None):
+    """Resolve one feature by explicit label / index, else by type.
+
+    `want` may be an int index into `features`, a label string, or None.
+    Returns ``(feature, error_message)``. An explicit request that doesn't
+    resolve is an ERROR, never a silent fall-back to a type guess — picking a
+    different promoter than the one asked for and reporting a transcript for
+    it is exactly the kind of confident wrong answer this module avoids."""
+    if isinstance(want, bool):
+        return None, "expected a feature index or label"
+    if isinstance(want, int):
+        if not (0 <= want < len(features)):
+            return None, f"feature index {want} out of range"
+        return features[want], None
+    if isinstance(want, str) and want.strip():
+        needle = want.strip().lower()
+        hits = [f for f in features
+                if str(f.get("label") or "").lower() == needle]
+        if not hits:
+            hits = [f for f in features
+                    if needle in str(f.get("label") or "").lower()]
+        if not hits:
+            return None, f"no feature labelled {want!r}"
+        if len(hits) > 1:
+            return None, (f"{len(hits)} features match {want!r} — "
+                          "pass an index instead")
+        return hits[0], None
+    cands = [f for f in features
+             if str(f.get("type") or "").lower() in types
+             and (strand is None or int(f.get("strand", 1) or 1) == strand)]
+    if not cands:
+        return None, None                  # caller decides if that's fatal
+    return cands, None
+
+
+def _tx_translate(mrna: str, start: int) -> "tuple[str, int]":
+    """Translate `mrna` from `start` to the first in-frame stop.
+
+    Returns ``(protein, stop_pos)`` where `stop_pos` is the offset of the
+    stop codon, or ``-1`` when the frame runs off the 3' end without one
+    (which is itself a finding — an unterminated ORF in a mature message
+    means the annotation and the sequence disagree)."""
+    aa: "list[str]" = []
+    i = start
+    n = len(mrna)
+    while i + 3 <= n:
+        codon = mrna[i:i + 3]
+        if codon in _STOP_CODONS:
+            return "".join(aa), i
+        aa.append(_CODON_TABLE.get(codon, "X"))
+        i += 3
+    return "".join(aa), -1
+
+
+def _predict_transcript(seq: str, features: "list[dict]", *,
+                        circular: bool = True,
+                        promoter=None, cds=None, terminator=None,
+                        tx_start=None, tx_end=None,
+                        check_splice: bool = True,
+                        min_uorf_aa: int = 1) -> dict:
+    """Reconstruct the mature mRNA of one annotated transcription unit and
+    score translation initiation on it.
+
+    `features` are dicts in `list-features` shape — ``{start, end, strand,
+    type, label}`` — optionally carrying ``parts`` (a compound location's
+    exons). `promoter` / `cds` / `terminator` each take a feature index, a
+    label, or None to pick by type. `tx_start` / `tx_end` override the unit's
+    genomic bounds directly (plus-strand coordinates) when the record has no
+    promoter or terminator annotated.
+
+    Returns a dict with ``ok``, the ``unit`` that was read, the ``pre_mrna``
+    and ``mature_mrna``, the ``exons`` / ``introns`` that separate them, the
+    ``five_utr`` / ``cds`` / ``three_utr`` blocks, the ``kozak`` context, the
+    ``uorfs`` found upstream of the start codon, the ``removed_by_splicing``
+    list, an advisory ``splice`` scan and any ``warnings``.
+
+    **`removed_by_splicing` is the point of the whole function.** It lists
+    every upstream ATG that IS in the unspliced sequence and is NOT in the
+    mature message. Those are precisely the entries a uATG screen run against
+    the plasmid reports as hazards and which the spliceosome deletes before
+    a ribosome ever sees them.
+
+    The transcript is taken to start at the END of the promoter (a promoter is
+    bound, not transcribed — the same reasoning `_assemble_expression_cassette`
+    uses for its splice scan) and to run to the end of the terminator. Introns
+    are read from annotation only; see the module note above.
+    """
+    seq_u = (seq or "").upper()
+    total = len(seq_u)
+    warnings: "list[str]" = []
+    if total == 0:
+        return {"ok": False, "error": "empty sequence", "warnings": warnings}
+    feats = _tx_usable_features(features, warnings)
+
+    # ── 1. The coding feature fixes the unit's strand. ────────────────────
+    picked, err = _tx_pick_feature(feats, cds, {"cds"})
+    if err:
+        return {"ok": False, "error": f"cds: {err}", "warnings": warnings}
+    if isinstance(picked, list):
+        if not picked:
+            return {"ok": False,
+                    "error": "no CDS feature on this record — pass 'cds' with "
+                             "a label or index",
+                    "warnings": warnings}
+        # Longest by the wrap-aware length, never by `end - start`.
+        picked = max(picked, key=lambda f: _feat_len(
+            int(f["start"]) % total, int(f["end"]) % total, total))
+        if len([f for f in feats
+                if str(f.get("type") or "").lower() == "cds"]) > 1:
+            warnings.append(
+                "more than one CDS on this record; took the longest "
+                f"({_feat_label_or(picked)}) — pass "
+                "'cds' to choose")
+    if not isinstance(picked, dict):        # unreachable; narrows the union
+        return {"ok": False, "error": "could not resolve a CDS feature",
+                "warnings": warnings}
+    cds_feat: dict = picked
+    strand = 1 if int(cds_feat.get("strand", 1) or 1) >= 0 else -1
+
+    # ── 2. Bound the unit. ────────────────────────────────────────────────
+    def _anchor(want, types, which, default_edge):
+        f, e = _tx_pick_feature(feats, want, types, strand=strand)
+        if e:
+            return None, f"{which}: {e}"
+        if isinstance(f, list):
+            if not f:
+                return None, None
+            # Nearest one on the correct side of the CDS, measured AROUND the
+            # circle in transcript direction — not by raw coordinate order,
+            # which is meaningless across the origin.
+            def _dist(g):
+                cs = int(cds_feat["start"]) % total
+                ce = int(cds_feat["end"]) % total
+                if which == "promoter":
+                    return ((cs - int(g["end"]) % total) % total if strand >= 0
+                            else (int(g["start"]) % total - ce) % total)
+                return ((int(g["end"]) % total - ce) % total if strand >= 0
+                        else (cs - int(g["start"]) % total) % total)
+            f = min(f, key=_dist)
+        return f, None
+
+    prom, e = _anchor(promoter, {"promoter"}, "promoter", None)
+    if e:
+        return {"ok": False, "error": e, "warnings": warnings}
+    term, e = _anchor(terminator, {"terminator"}, "terminator", None)
+    if e:
+        return {"ok": False, "error": e, "warnings": warnings}
+
+    def _coord(v):
+        try:
+            return int(v) % total
+        except (TypeError, ValueError):
+            return None
+
+    if tx_start is not None or tx_end is not None:
+        a_opt, b_opt = _coord(tx_start), _coord(tx_end)
+        if a_opt is None or b_opt is None:
+            return {"ok": False,
+                    "error": "tx_start and tx_end must BOTH be integers when "
+                             "either is given",
+                    "warnings": warnings}
+    elif prom is None or term is None:
+        return {"ok": False, "error": _tx_missing_anchor(prom, term),
+                "warnings": warnings}
+    elif strand >= 0:
+        a_opt, b_opt = _coord(prom.get("end")), _coord(term.get("end"))
+    else:
+        a_opt, b_opt = _coord(term.get("start")), _coord(prom.get("start"))
+    if a_opt is None or b_opt is None:
+        return {"ok": False,
+                "error": "the promoter/terminator coordinates are not "
+                         "integers",
+                "warnings": warnings}
+    a, b = a_opt, b_opt
+    pre_len = _feat_len(a, b, total)
+    if pre_len <= 0:
+        return {"ok": False,
+                "error": "the transcription unit is empty — check the "
+                         "promoter/terminator order and strand",
+                "warnings": warnings}
+    if not circular and b < a:
+        return {"ok": False,
+                "error": "the transcription unit crosses the origin, but this "
+                         "record is LINEAR",
+                "warnings": warnings}
+    pre_plus = _slice_circular(seq_u, a, b)
+    pre = pre_plus if strand >= 0 else _rc(pre_plus)
+
+    def _to_tx(gs, ge):
+        cs, ce = _coord(gs), _coord(ge)
+        if cs is None or ce is None:
+            return None
+        return _tx_map_span(cs, ce, a, total, strand, pre_len)
+
+    cds_parts_tx = []
+    for ps, pe in _tx_feature_parts(cds_feat):
+        m = _to_tx(ps, pe)
+        if m is not None:
+            cds_parts_tx.append(m)
+    if not cds_parts_tx:
+        return {"ok": False,
+                "error": "the CDS does not lie inside the transcription unit "
+                         "— check the promoter/terminator choice and strand",
+                "warnings": warnings}
+    cds_parts_tx.sort()
+
+    # ── 3. Introns: annotated only. ───────────────────────────────────────
+    introns: "list[list]" = []
+    for f in feats:
+        if str(f.get("type") or "").lower() != "intron":
+            continue
+        m = _to_tx(f.get("start"), f.get("end"))
+        if m is None:
+            continue
+        introns.append([m[0], m[1], str(f.get("label") or "")])
+    # Gaps BETWEEN a spliced location's parts, computed in transcript
+    # coordinates so an origin-crossing CDS needs no special case.
+    for (s1, e1), (s2, _e2) in zip(cds_parts_tx, cds_parts_tx[1:]):
+        if s2 > e1:
+            introns.append([e1, s2, "CDS location gap"])
+    introns.sort()
+    merged: "list[list]" = []
+    for iv in introns:
+        if merged and iv[0] < merged[-1][1]:
+            if iv[1] > merged[-1][1]:
+                merged[-1][1] = iv[1]
+                merged[-1][2] = (merged[-1][2] + " + " + iv[2]).strip(" +")
+            continue
+        merged.append(list(iv))
+    exons: "list[tuple[int, int]]" = []
+    cur = 0
+    for s, e, _lbl in merged:
+        if s > cur:
+            exons.append((cur, s))
+        cur = max(cur, e)
+    if cur < pre_len:
+        exons.append((cur, pre_len))
+    mature = "".join(pre[s:e] for s, e in exons)
+
+    def _mature_pos(local):
+        """pre-mRNA offset → mature offset, or None when it's intronic."""
+        out = 0
+        for s, e in exons:
+            if local < s:
+                return None
+            if local < e:
+                return out + (local - s)
+            out += e - s
+        return out if local >= pre_len else None
+
+    def _mature_end(local):
+        """Half-open END mapping — an end sitting on an exon boundary belongs
+        to the exon it closes, not to the intron that follows it."""
+        if local <= 0:
+            return 0
+        p = _mature_pos(local - 1)
+        return None if p is None else p + 1
+
+    cds_tx_start = cds_parts_tx[0][0]
+    cds_tx_end = max(e for _s, e in cds_parts_tx)
+    cds_start_m = _mature_pos(cds_tx_start)
+    cds_end_m = _mature_end(cds_tx_end)
+    if cds_start_m is None or cds_end_m is None:
+        return {"ok": False,
+                "error": "the CDS start or end falls INSIDE an annotated "
+                         "intron — the annotation is inconsistent",
+                "warnings": warnings}
+    # ── 4. Upstream ATGs: which survive splicing, and which don't. ───────
+    uorfs = []
+    for p in range(0, max(0, cds_start_m)):
+        if mature[p:p + 3] != "ATG":
+            continue
+        protein, stop = _tx_translate(mature, p)
+        if stop == -1:
+            kind = "no_in_frame_stop"
+        elif stop + 3 <= cds_start_m:
+            kind = "upstream"                    # a true uORF: starts and
+        elif (cds_start_m - p) % 3 == 0:         # stops before the CDS
+            kind = "in_frame_extension"          # N-terminal extension
+        else:
+            kind = "out_of_frame_overlap"        # the worst kind
+        if len(protein) < min_uorf_aa:
+            continue
+        uorfs.append({
+            "position":        p,
+            "relative_to_cds": p - cds_start_m,
+            "kind":            kind,
+            "length_aa":       len(protein),
+            "protein":         protein[:200],
+            "stop_position":   stop,
+            "kozak":           _kozak_context(mature, p),
+        })
+        if len(uorfs) >= _TX_MAX_UORFS:
+            warnings.append(
+                f"more than {_TX_MAX_UORFS} upstream ATGs — list truncated")
+            break
+
+    # THE point of this function: upstream ATGs the plasmid sequence shows and
+    # the mature message does not. A uATG screen run on the unspliced sequence
+    # reports every one of these as a hazard; none of them reaches a ribosome.
+    removed = []
+    for p in range(0, min(cds_tx_start, max(0, len(pre) - 2))):
+        if pre[p:p + 3] != "ATG":
+            continue
+        if _mature_pos(p) is not None:
+            continue
+        holder = next((lbl for s, e, lbl in merged if s <= p < e), "")
+        removed.append({
+            "pre_mrna_position": p,
+            "genomic":           _tx_to_genomic(p, a, total, strand, pre_len),
+            "intron":            holder or "annotated intron",
+        })
+        if len(removed) >= _TX_MAX_UORFS:
+            break
+
+    # ── 5. Advisory cryptic-splice scan over the PRE-mRNA. ────────────────
+    # The spliceosome acts on the unspliced message, so that is what gets
+    # scanned; sites coinciding with an ANNOTATED boundary are marked as such
+    # rather than reported as cryptic. Never used to alter the transcript.
+    splice: dict = {"skipped": True, "reason": "not requested"}
+    if check_splice:
+        annotated_edges = {s for s, _e, _l in merged} | {e for _s, e, _l in merged}
+        try:
+            hits = _splice_scan(pre, kind="both")
+            for h in hits:
+                h["annotated"] = (h.get("position") in annotated_edges
+                                  or h.get("position", -9) + 2 in annotated_edges)
+            cryptic = [h for h in hits if not h["annotated"]]
+            splice = {
+                "skipped":  False,
+                "model":    _splice_model_summary().get("source", "?"),
+                "scanned":  "pre_mrna",
+                "n_sites":  len(hits),
+                "n_cryptic": len(cryptic),
+                "sites":    cryptic[:_TX_MAX_SPLICE_HITS],
+            }
+            if cryptic:
+                warnings.append(
+                    f"{len(cryptic)} cryptic splice site(s) in the pre-mRNA "
+                    "score as strongly as real sites — they compete with the "
+                    "annotated ones")
+        except (RuntimeError, ValueError) as exc:
+            # An untrained model must read as NOT CHECKED, never as clean.
+            splice = {"skipped": True, "reason": str(exc)}
+            warnings.append("cryptic-splice scan SKIPPED — " + str(exc))
+
+    protein, stop = _tx_translate(mature, cds_start_m)
+    if stop == -1:
+        warnings.append(
+            "the CDS has no in-frame stop inside the mature message — the "
+            "annotation and the spliced sequence disagree")
+    elif stop + 3 != cds_end_m:
+        warnings.append(
+            f"the first in-frame stop is at mature position {stop}, but the "
+            f"CDS annotation ends at {cds_end_m} — splicing may have shifted "
+            "the frame, or the annotation is stale")
+
+    return {
+        "ok": True,
+        "unit": {
+            "strand":      strand,
+            "genomic":     {"start": a, "end": b, "length": pre_len},
+            "wraps_origin": bool(b < a or (b == a and pre_len == total)),
+            "promoter":    (prom or {}).get("label") or None,
+            "cds":         cds_feat.get("label") or None,
+            "terminator":  (term or {}).get("label") or None,
+        },
+        "pre_mrna":    pre,
+        "mature_mrna": mature,
+        "spliced":     bool(merged),
+        "exons":   [{"start": s, "end": e, "length": e - s} for s, e in exons],
+        "introns": [{"start": s, "end": e, "length": e - s, "label": lbl,
+                     "donor": pre[s:s + 2], "acceptor": pre[max(0, e - 2):e],
+                     "canonical": pre[s:s + 2] == "GT" and pre[e - 2:e] == "AG"}
+                    for s, e, lbl in merged],
+        "five_utr":  {"seq": mature[:cds_start_m], "length": cds_start_m},
+        "cds":       {"start": cds_start_m, "end": cds_end_m,
+                      "length": cds_end_m - cds_start_m,
+                      "protein": protein},
+        "three_utr": {"seq": mature[cds_end_m:],
+                      "length": max(0, len(mature) - cds_end_m)},
+        "kozak":     _kozak_context(mature, cds_start_m),
+        "uorfs":     uorfs,
+        "removed_by_splicing": removed,
+        "splice":    splice,
+        "warnings":  warnings,
+    }
+
+
+def _tx_to_genomic(local: int, a: int, total: int,
+                   strand: int, pre_len: int) -> int:
+    """Transcript offset → plus-strand genomic coordinate. The inverse of
+    `_tx_map_span` for a single position, so a hazard reported in transcript
+    space can be pointed at on the map."""
+    if total <= 0:
+        return 0
+    off = local if strand >= 0 else (pre_len - 1 - local)
+    return (a + off) % total
+
+
+def _tx_missing_anchor(prom, term) -> str:
+    missing = [n for n, v in (("promoter", prom), ("terminator", term))
+               if v is None]
+    return (f"no {' or '.join(missing)} feature on the same strand as the CDS "
+            "— annotate one, or pass tx_start + tx_end to bound the unit "
+            "directly")
