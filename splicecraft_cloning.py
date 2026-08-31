@@ -955,6 +955,71 @@ def _label_disrupted_split_features(features: "list[dict]",
         f["_disrupted"] = True
 
 
+def _rejoin_origin_split_features(features: "list[dict]",
+                                  total: int) -> "list[dict]":
+    """Put back together the two halves of an origin-spanning feature that
+    survived a digest+ligation side by side.
+
+    A feature that wraps bp 0 of a circular input is stored with ``end <
+    start`` (sacred invariant #8/#9) and `_split_features_at_cuts` HAS to
+    halve it at the origin before slotting, tagging the pieces
+    ``_wrap_origin_split`` head/tail with a shared ``_wrap_origin_group``.
+    When the ligated product happens to place those pieces back together —
+    which is the normal outcome for a T-DNA border, marker or operon nowhere
+    near the cloning site — nothing used to rejoin them, so a 25 bp right
+    border came out of `carry_annotations` as two adjacent 12 bp features
+    with the same name. The bases were right; the annotation said the border
+    was in two pieces, which is exactly what an "is my border intact" check
+    is looking for.
+
+    Merges a pair when it is contiguous in the product — directly
+    (``a.end == b.start``) or across the product's own origin
+    (``a.end == total`` and ``b.start == 0``, which re-creates a wrap
+    feature). A pair the cloning genuinely separated is left alone as two
+    pieces, because that IS what happened to it. Returns a new list."""
+    by_group: "dict[str, list[dict]]" = {}
+    for f in features:
+        gid = f.get("_wrap_origin_group")
+        if gid and f.get("_wrap_origin_split") in ("head", "tail"):
+            by_group.setdefault(str(gid), []).append(f)
+
+    merged_ids: "set[int]" = set()
+    replacements: "list[dict]" = []
+    for halves in by_group.values():
+        if len(halves) != 2:
+            continue
+        a, b = halves
+        if int(a.get("strand", 1) or 1) != int(b.get("strand", 1) or 1):
+            continue
+        try:
+            a_s, a_e = int(a["start"]), int(a["end"])
+            b_s, b_e = int(b["start"]), int(b["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if a_e == b_s:
+            start, end = a_s, b_e
+        elif b_e == a_s:
+            start, end = b_s, a_e
+        elif total and a_e == total and b_s == 0:
+            start, end = a_s, b_e          # wraps the product's own origin
+        elif total and b_e == total and a_s == 0:
+            start, end = b_s, a_e
+        else:
+            continue                        # genuinely separated — leave it
+        keep = a if a.get("_wrap_origin_split") == "tail" else b
+        rejoined = {k: v for k, v in keep.items()
+                    if k not in ("_wrap_origin_split", "_wrap_origin_group")}
+        rejoined["start"], rejoined["end"] = start, end
+        replacements.append(rejoined)
+        merged_ids |= {id(a), id(b)}
+
+    if not replacements:
+        return list(features)
+    out = [f for f in features if id(f) not in merged_ids]
+    out.extend(replacements)
+    return out
+
+
 def _ends_compatible(end_a: dict, end_b: dict) -> bool:
     """Return True if two fragment edges can ligate. Same kind +
     matching overhang sequence (both stored top-strand-canonical). A
@@ -1065,6 +1130,11 @@ def _simulate_traditional_cloning(insert_frag: dict,
         insert_frag, len(vector_frag["top_seq"]))
     rev_feats = [dict(f) for f in vector_frag["features"]] + _shift_feats(
         insert_rc,   len(vector_frag["top_seq"]))
+    # An origin-spanning vector feature was halved at bp 0 before slotting; if
+    # the product puts the halves back together, it is ONE feature again. Do
+    # this BEFORE the disrupted pass — a rejoined feature was never disrupted.
+    fwd_feats = _rejoin_origin_split_features(fwd_feats, len(fwd_seq))
+    rev_feats = _rejoin_origin_split_features(rev_feats, len(rev_seq))
     # A cut site that fell inside a vector feature (e.g. cloning into lacZα's
     # MCS) split it into two halves — surface that as "(disrupted)".
     _label_disrupted_split_features(fwd_feats, _junction_enz)
@@ -2076,23 +2146,99 @@ def _gg_released_bodies(seq: str, enzyme: str, *, circular: bool) -> list[dict]:
             and f.get("right", {}).get("kind") != "linear"]
 
 
-def _gg_greedy_chain(start: dict, parts: list[dict]) -> "list[dict] | None":
-    """Order `parts` after `start` by overhang matching: repeatedly append the
-    part whose LEFT end ligates the chain's current RIGHT end (`_ligate_fragments`
-    returns non-None). Returns the ordered chain using EVERY part, or None if it
-    ever gets stuck. A valid Golden Gate design has unique overhangs, so exactly
-    one part matches at each step (deterministic); a tie/no-match means a
-    mis-designed overhang set."""
-    chain = [start]
-    pool = list(parts)
-    while pool:
-        cur = chain[-1]
-        idx = next((i for i, f in enumerate(pool)
-                    if _ligate_fragments(cur, f) is not None), None)
-        if idx is None:
-            return None
-        chain.append(pool.pop(idx))
-    return chain
+# Bound on the chain search below. A one-pot reaction with more distinct
+# fragments than this is not something the simulator should silently spend
+# exponential time on; the caller gets a clear refusal instead.
+_GG_MAX_FRAGMENTS = 60
+
+# Node budget for the whole chain search of ONE simulation (shared across
+# every seed). With unique overhangs the search is linear and never comes
+# near this; with a heavily DUPLICATED overhang set and nothing that closes,
+# a plain DFS is factorial in the fragment count — 30 parts all reading
+# `AAAA→AAAA` would run forever inside a read endpoint. Exhaustion is
+# REPORTED, never silently swallowed: an incomplete search cannot be allowed
+# to read as "this design can't be built".
+_GG_MAX_SEARCH_NODES = 200_000
+
+# How many distinct circles are enumerated per seed before the search stops.
+# More than one already proves the overhang set is ambiguous; the exact count
+# past that buys nothing. It IS a cap, so a result at the ceiling is reported
+# as "at least N" rather than as an exact tally.
+_GG_MAX_SOLUTIONS = 8
+
+
+def _gg_overhang_labels(frags: list[dict]) -> list[str]:
+    """``["CGCT→TTAC", "TTAC→GGAG", …]`` — each fragment's two sticky ends.
+
+    A failed assembly is diagnosed by looking for the overhang with no
+    partner, so the error message shows these rather than asserting a cause."""
+    out = []
+    for f in frags:
+        lo = (f.get("left", {}) or {}).get("overhang_seq", "") or "blunt"
+        ro = (f.get("right", {}) or {}).get("overhang_seq", "") or "blunt"
+        out.append(f"{lo}→{ro}")
+    return out
+
+
+def _gg_close_chain(seed: dict, required: list[dict], optional: list[dict],
+                    budget: "list[int] | None" = None,
+                    ) -> "list[list[dict]]":
+    """Every circular arrangement that starts at `seed`, uses EVERY fragment in
+    `required`, may use any subset of `optional`, and closes back onto `seed`'s
+    left end.
+
+    This is the general Golden Gate: the destination vector does NOT have to
+    contribute exactly one backbone piece. A vector carrying background enzyme
+    sites is cut into several pieces, and the real reaction reassembles ALL of
+    them around the parts — the design is still fully determinate as long as
+    the overhangs are unique. `optional` is that pool of vector pieces: the
+    stuffer/dropout ones simply never appear in a chain that uses every part.
+
+    Returns the solutions found (order is the order they were discovered).
+    Search is depth-first over overhang matches, so with unique overhangs there
+    is one candidate per step and this costs O(fragments); a duplicated
+    overhang branches, which is exactly the ambiguity the caller must be told
+    about, so more than one solution coming back is a RESULT, not a failure.
+
+    `budget` is a single-element list of remaining node visits, shared across
+    the seeds of one simulation. It is DECREMENTED in place, so the caller can
+    tell an exhausted search from a search that finished and found nothing —
+    those two must not read the same, since one means "unbuildable" and the
+    other means "I stopped looking"."""
+    solutions: "list[list[dict]]" = []
+    pool = list(required) + list(optional)
+    if budget is None:
+        budget = [_GG_MAX_SEARCH_NODES]
+    # Identity, not equality: two fragments can be byte-identical (a duplicated
+    # part) and still be two separate molecules.
+    required_ids = {id(f) for f in required}
+
+    def _walk(chain: list, ligated: dict, used: set) -> None:
+        if len(solutions) >= _GG_MAX_SOLUTIONS:   # enough to prove ambiguity
+            return
+        if budget[0] <= 0:
+            return
+        budget[0] -= 1
+        if required_ids <= used and _close_circular(ligated) is not None:
+            solutions.append(list(chain))
+            # Deliberately NOT returning here: with a duplicated overhang a
+            # LONGER chain can close as well, and that second product is the
+            # ambiguity the caller has to hear about. Unique overhangs make
+            # the extra scan of the pool find nothing, so this costs O(pool).
+        for f in pool:
+            if id(f) in used:
+                continue
+            nxt = _ligate_fragments(ligated, f)
+            if nxt is None:
+                continue
+            chain.append(f)
+            used.add(id(f))
+            _walk(chain, nxt, used)
+            used.discard(id(f))
+            chain.pop()
+
+    _walk([seed], seed, {id(seed)})
+    return solutions
 
 
 def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
@@ -2105,12 +2251,28 @@ def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
     overhangs determine the assembly order. Returns:
 
     ``{ok, product_seq, length, circular, n_parts, enzyme, order,
-       junctions:[{overhang}], n_residual_sites, warnings, errors}``
+       junctions:[{overhang}], n_residual_sites, n_vector_sites,
+       n_vector_fragments, n_vector_fragments_used, vector_cut_bp,
+       warnings, errors}``
+
+    **The vector does not have to be cut exactly twice.** A destination
+    plasmid carrying background `enzyme` sites is cut into several pieces and
+    the real one-pot reaction reassembles ALL of them around the parts; the
+    design is still determinate as long as the overhangs are unique. Every
+    released vector piece therefore goes into the chain search, and the ones
+    that aren't part of the closed product (the stuffer/dropout) are reported
+    as dropped. Pre-2026-08-26 the simulator assumed a single backbone piece
+    and answered a 5-cut vector with "the overhangs don't chain … check that
+    adjacent parts share a 4 nt overhang" — pointing at the parts, which were
+    fine.
 
     `ok:false` (with `errors`) when the enzyme isn't Type IIS, a part doesn't
     release exactly one fragment, or the overhangs don't chain into a closed
-    circle. Fidelity `warnings` flag a non-unique junction overhang (ambiguous
-    assembly) or a residual enzyme site in the product (it would be re-cut)."""
+    circle — and in that last case the error reports how many times the
+    vector was cut and where, because that is usually the answer. Fidelity
+    `warnings` flag a non-unique junction overhang (ambiguous assembly), a
+    residual enzyme site in the product (it would be re-cut), and a vector
+    that can re-circularise without the parts (empty-vector background)."""
     warnings: list[str] = []
     if not _enzyme_is_type_iis(enzyme):
         return {"ok": False, "errors": [
@@ -2135,45 +2297,127 @@ def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
                 f"sites — check the part's flanking sites / orientation)."]}
         part_frags.append(bodies[0])
 
+    vec_seq_u = (vector_seq or "").upper()
     try:
-        vec_bodies = _gg_released_bodies((vector_seq or "").upper(), enzyme,
-                                         circular=True)
+        vec_bodies = _gg_released_bodies(vec_seq_u, enzyme, circular=True)
+        vec_cuts = _enzyme_cuts(vec_seq_u, [enzyme], circular=True)
     except Exception as exc:                   # pragma: no cover - defensive
         return {"ok": False, "warnings": [],
                 "errors": [f"vector: digest failed: {exc}"]}
+    # Vector facts worth reporting whatever happens next — when the chain
+    # fails, "cut 5 times at …" is almost always the real answer, and the old
+    # message sent the reader off to audit the parts instead.
+    vec_facts = {
+        "n_vector_sites":     len(vec_cuts),
+        "n_vector_fragments": len(vec_bodies),
+        "vector_cut_bp":      [int(c.get("top", -1)) for c in vec_cuts],
+    }
     if not vec_bodies:
-        return {"ok": False, "warnings": [], "errors": [
+        return {"ok": False, "warnings": [], **vec_facts, "errors": [
             f"vector released no fragment when cut with {enzyme} — it needs "
             f"two {enzyme} sites flanking the dropout."]}
 
-    # Try each vector fragment as the backbone seed (the dropout/stuffer
-    # candidate won't chain — its overhangs don't match the parts).
-    chosen: "tuple[list[dict], dict] | None" = None
-    for vstart in vec_bodies:
-        chain = _gg_greedy_chain(vstart, part_frags)
-        if chain is None:
-            continue
-        ligated = chain[0]
-        good = True
-        for f in chain[1:]:
-            ligated = _ligate_fragments(ligated, f)
-            if ligated is None:
-                good = False
-                break
-        if not good:
-            continue
-        assert ligated is not None         # `good` ⇒ no ligation returned None
-        closed = _close_circular(ligated)
-        if closed is not None:
-            chosen = (chain, closed)
-            break
-    if chosen is None:
-        return {"ok": False, "warnings": [], "errors": [
-            "the overhangs don't chain every part + the vector into a closed "
-            "circle — check that adjacent parts share a 4 nt overhang and the "
-            "vector's two overhangs match the assembly's ends."]}
+    n_frag = len(part_frags) + len(vec_bodies)
+    if n_frag > _GG_MAX_FRAGMENTS:
+        return {"ok": False, "warnings": [], **vec_facts, "errors": [
+            f"{n_frag} fragments ({len(part_frags)} part + "
+            f"{len(vec_bodies)} vector) exceeds the {_GG_MAX_FRAGMENTS}-"
+            f"fragment simulation cap — split the assembly into levels."]}
 
-    chain, closed = chosen
+    # Seed at each released vector piece and find every circular arrangement
+    # that uses ALL the parts. Vector pieces are OPTIONAL: a 2-site dropout
+    # vector contributes one backbone and leaves the stuffer out, while a
+    # vector carrying background sites contributes several pieces that all
+    # have to go back in. Both fall out of the same search.
+    solutions: "list[list[dict]]" = []
+    seen_circles: "set[tuple]" = set()
+    search_budget = [_GG_MAX_SEARCH_NODES]      # shared across every seed
+    capped = False
+    for vstart in vec_bodies:
+        others = [f for f in vec_bodies if f is not vstart]
+        found = _gg_close_chain(vstart, part_frags, others, search_budget)
+        capped = capped or len(found) >= _GG_MAX_SOLUTIONS
+        for chain in found:
+            # The same circle seeded from a different vector piece is the same
+            # product, so canonicalise the ORDER by rotating the smallest id
+            # to the front. Comparing SETS would be wrong: two chains over the
+            # same fragments in a different order are different sequences, and
+            # that is precisely the ambiguity worth reporting.
+            ids = tuple(id(f) for f in chain)
+            lo = ids.index(min(ids))
+            canon = ids[lo:] + ids[:lo]
+            if canon not in seen_circles:
+                seen_circles.add(canon)
+                solutions.append(chain)
+    if not solutions and search_budget[0] <= 0:
+        # An exhausted search is NOT the same answer as "this can't be built",
+        # and must never be reported as one.
+        return {"ok": False, "warnings": [], **vec_facts, "errors": [
+            f"the assembly search hit its {_GG_MAX_SEARCH_NODES}-step limit "
+            "before finding a circle — this usually means many fragments "
+            "share the same overhang, so the number of possible orders "
+            "explodes. Whether a product exists is UNKNOWN here, not 'no'. "
+            "Redesign to all-distinct 4 nt overhangs: "
+            + ", ".join(_gg_overhang_labels(part_frags))]}
+    if not solutions:
+        # Show the WORK, not a guess at the cause: every fragment the digest
+        # actually produced with the overhangs it actually carries. The
+        # dangling one is then visible at a glance, instead of the reader
+        # being sent to audit parts that were fine all along.
+        why = ("the overhangs don't chain every part + the vector into a "
+               "closed circle. Vector: cut " + str(len(vec_cuts)) +
+               f"× by {enzyme} (bp "
+               + ", ".join(str(c) for c in vec_facts["vector_cut_bp"])
+               + f"), releasing {len(vec_bodies)} fragment(s) "
+               + ", ".join(_gg_overhang_labels(vec_bodies))
+               + ". Parts: " + ", ".join(_gg_overhang_labels(part_frags))
+               + ".")
+        if len(vec_bodies) > 2:
+            why += (" The vector backbone is NOT a single piece — background "
+                    f"{enzyme} sites split it, and every released vector "
+                    "fragment has to find a partner too. Domesticate the "
+                    "vector, or check the dangling overhang above.")
+        else:
+            why += (" Check that adjacent parts share a 4 nt overhang and "
+                    "that the vector's two overhangs match the assembly's "
+                    "ends.")
+        return {"ok": False, "warnings": [], **vec_facts,
+                "vector_fragment_overhangs": _gg_overhang_labels(vec_bodies),
+                "part_overhangs": _gg_overhang_labels(part_frags),
+                "errors": [why]}
+
+    chain = solutions[0]
+    ligated = chain[0]
+    for f in chain[1:]:
+        nxt = _ligate_fragments(ligated, f)
+        assert nxt is not None     # the search only returns ligatable chains
+        ligated = nxt
+    closed = _close_circular(ligated)
+    assert closed is not None      # ditto for the closing join
+    if len(solutions) > 1:
+        # "at least" when the enumeration hit its ceiling — an exact-looking
+        # tally that is really a cap is the kind of quiet inaccuracy this
+        # whole batch is about.
+        how_many = (f"At least {len(solutions)}" if capped
+                    else f"{len(solutions)}")
+        warnings.append(
+            f"{how_many} different circles can form from these fragments — "
+            "the overhang set is ambiguous, so the product below is only one "
+            "of the possible outcomes; redesign to all-distinct 4 nt "
+            "overhangs.")
+    elif search_budget[0] <= 0:
+        # One product found, but the hunt for OTHERS was cut short — say so
+        # rather than letting a single result imply "and only this one".
+        warnings.append(
+            "the search for alternative products hit its step limit, so this "
+            "product is not confirmed to be the only one the reaction can "
+            "make — check that every junction overhang is distinct.")
+    used = {id(f) for f in chain}
+    # Vector pieces left out of the product are the dropout/stuffer — that is
+    # what a destination vector's stuffer is FOR, so this is reported, not
+    # warned about. (Vector religation background is a property of every
+    # dropout vector; warning on it every time would be noise.)
+    dropped = [f for f in vec_bodies if id(f) not in used]
     product = str(closed.get("top_seq") or "")
     # Fidelity: every junction overhang must be DISTINCT, or the reaction can
     # mis-assemble (two junctions with the same overhang are interchangeable).
@@ -2203,6 +2447,12 @@ def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
                             for i, f in enumerate(chain)],
         "junctions":       [{"overhang": j} for j in junctions],
         "n_residual_sites": len(residual),
+        # How much of the vector actually went into the product. A dropout
+        # vector reads 2 fragments / 1 used; a vector with background sites
+        # reads more, and seeing that here is how you find out the backbone
+        # wasn't one piece.
+        "n_vector_fragments_used": len(vec_bodies) - len(dropped),
+        **vec_facts,
         "warnings":        warnings,
         "errors":          [],
     }

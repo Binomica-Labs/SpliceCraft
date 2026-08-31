@@ -1592,6 +1592,7 @@ def _scan_restriction_sites(
     unique_only: bool = True,
     circular: bool = True,
     allowed_enzymes: "frozenset[str] | None" = None,
+    distinct_cuts: bool = False,
 ) -> list[dict]:
     """Cached entry point for restriction-site scans. Identical
     signature + return shape to the inner `_scan_restriction_sites_impl`;
@@ -1601,7 +1602,11 @@ def _scan_restriction_sites(
     `allowed_enzymes` (GH #13, 2026-05-14): when supplied, the scan
     restricts to ONLY these names — overrides the `min_recognition_len`
     / `unique_only` filters since the user has hand-picked the set.
-    Pass `None` to use the standard filter rules."""
+    Pass `None` to use the standard filter rules.
+
+    `distinct_cuts` (2026-08-26): keep NEOschizomers apart — see
+    `_scan_restriction_sites_impl`. False (the map's setting) is the
+    historical behaviour; a QUERY surface wants True."""
     # Cache key uses `hash(seq)` rather than `id(seq)`: id-based keys
     # break for transient strings (e.g. unit tests build a fresh seq
     # per test, GC'd between calls — CPython's allocator can hand the
@@ -1618,7 +1623,8 @@ def _scan_restriction_sites(
     # memory cost (unlike full value-keying, which would pin a multi-Mb string
     # per slot; see `_ENZYME_CUTS_CACHE`).
     key = (hash(seq), len(seq), int(min_recognition_len),
-           bool(unique_only), bool(circular), allowed_key)
+           bool(unique_only), bool(circular), allowed_key,
+           bool(distinct_cuts))
     with _state._COMPUTE_CACHE_LOCK:
         hit = _state._RESTR_SCAN_CACHE.get(key)
         if hit is not None:
@@ -1631,7 +1637,7 @@ def _scan_restriction_sites(
             return [dict(d) for d in hit]
     result = _scan_restriction_sites_impl(
         seq, min_recognition_len, unique_only, circular,
-        allowed_enzymes=allowed_enzymes,
+        allowed_enzymes=allowed_enzymes, distinct_cuts=distinct_cuts,
     )
     with _state._COMPUTE_CACHE_LOCK:
         if len(_state._RESTR_SCAN_CACHE) >= _state._RESTR_SCAN_CACHE_MAX:
@@ -1648,6 +1654,7 @@ def _scan_restriction_sites_impl(
     circular: bool = True,
     *,
     allowed_enzymes: "frozenset[str] | None" = None,
+    distinct_cuts: bool = False,
 ) -> list[dict]:
     """Scan both strands; return resite + recut dicts for every hit.
 
@@ -1661,6 +1668,15 @@ def _scan_restriction_sites_impl(
     circular            — if True (default), recognition sequences that span
                           the origin (bp n-1 → bp 0) are also found. SpliceCraft
                           is a plasmid viewer, so circularity is on by default.
+    distinct_cuts       — if True, two enzymes that recognise the SAME sequence
+                          but cleave it at DIFFERENT offsets (neoschizomers —
+                          XmaI `C^CCGGG` vs SmaI `CCC^GGG`, Acc65I `G^GTACC` vs
+                          KpnI `GGTAC^C`) both survive the collapse below.
+                          Default False keeps the MAP readable (one bar per
+                          recognition span); a QUERY passes True, because
+                          collapsing them answers "no SmaI site" for a plasmid
+                          that has one — and the two leave different overhangs,
+                          so they are not interchangeable. [INV-187]
 
     Wrap-around resites are emitted as TWO pieces so the existing linear-span
     rendering in the map / sequence panel stays correct: one piece on the
@@ -1880,8 +1896,8 @@ def _scan_restriction_sites_impl(
             by_enzyme[name] = hits
 
     feats: list[dict] = []
-    # `placed` tracks (start, end, recognition_site) — keying on the
-    # recognition string in addition to the span means HF / iso
+    # `placed` tracks (start, end, recognition_site[, fwd_cut, rev_cut]) —
+    # keying on the recognition string in addition to the span means HF / iso
     # variants of the SAME enzyme (e.g., EcoRI vs EcoRI-HF, both with
     # site "GAATTC") still collapse, but two enzymes with DIFFERENT
     # recognition patterns whose hits happen to land on the same
@@ -1891,10 +1907,20 @@ def _scan_restriction_sites_impl(
     # `unique_only=True`/`False` to disagree on which enzyme to
     # surface when the catalog-order winner was a multi-cutter
     # filtered out by `unique_only=True` but kept by `unique_only=False`.
-    placed: set[tuple[int, int, str]] = set()
+    # `distinct_cuts` widens the key with the enzyme's cut offsets so a
+    # NEOschizomer (same recognition sequence, different cleavage point —
+    # XmaI/SmaI, Acc65I/KpnI, ApaI/PspOMI, NheI/BmtI, KasI/NarI, AatII/ZraI,
+    # SacI/Eco53kI) is no longer swallowed by whichever of the pair the catalog
+    # happens to list first. They are NOT interchangeable — they leave
+    # different overhangs — so a query surface must see both. The map leaves it
+    # False and keeps one bar per span.
+    placed: set[tuple] = set()
     site_of: dict[str, str] = {
         entry[0]: entry[1] for entry in _state._scan_catalog_hook()
     }
+    cuts_of: dict[str, tuple] = {
+        entry[0]: (entry[3], entry[4]) for entry in _state._scan_catalog_hook()
+    } if distinct_cuts else {}
     # When a custom enzyme list is active, the user has hand-picked
     # the set — surface every hit of those enzymes regardless of
     # cut-count. The `unique_only` filter is a discovery aid for the
@@ -1918,9 +1944,11 @@ def _scan_restriction_sites_impl(
         # part of the key so genuinely-different enzymes (different
         # recognition patterns) with accidental position overlap stay
         # independent.
-        site_key = site_of.get(name, "")
+        site_key: tuple = (site_of.get(name, ""),)
+        if distinct_cuts:
+            site_key += cuts_of.get(name, ())
         positions = {
-            (h["start"], h["end"], site_key) for h in hits
+            (h["start"], h["end"]) + site_key for h in hits
             if h["type"] == "resite" and h.get("label")
         }
         if positions & placed:
@@ -1952,9 +1980,63 @@ def _scan_restriction_sites_impl(
 # out, and let a caller's typo fail loudly instead of scanning nothing.
 
 
+def _enzyme_alias_table() -> "dict[str, str]":
+    """The commercial-synonym table (`_ENZYME_ALIASES`, dataaccess L1) —
+    ``{alias_name: catalog_name}``. Empty when the hub hasn't registered the
+    hook yet (import order) so resolution degrades to catalog-only rather
+    than raising."""
+    try:
+        return _state._enzyme_aliases_hook() or {}
+    except Exception:                       # pragma: no cover - hook absent
+        return {}
+
+
+def _enzyme_resolve_one(name: str) -> "tuple[str, str] | None":
+    """Resolve one requested enzyme name to ``(catalog_name, display_name)``,
+    or ``None`` when nothing in the catalog or the synonym table matches.
+
+    `catalog_name` is what to SCAN with; `display_name` is what to REPORT the
+    hits under — they differ only for a commercial synonym, where the caller
+    asked for a name the catalog files under another (``"Eco31I"`` →
+    ``("BsaI", "Eco31I")``). Reporting a synonym's hits under the catalog's
+    spelling would leave the obvious ``[s for s in sites if s["enzyme"] ==
+    "Eco31I"]`` empty, which is the same silent-zero this resolver exists to
+    kill.
+
+    Order is catalog-exact → catalog-case-insensitive → synonym table, so a
+    user-added custom enzyme always beats a built-in synonym of the same
+    name. Never fuzzy-matches: ``BsaI`` and ``BsaXI`` are different enzymes."""
+    want = str(name).strip()
+    if not want:
+        return None
+    try:
+        catalog = _state._all_enzymes_hook() or {}
+    except Exception:                       # pragma: no cover - hook absent
+        catalog = {}
+    if want in catalog:
+        return (want, want)
+    lowered = {n.lower(): n for n in catalog}
+    hit = lowered.get(want.lower())
+    if hit is not None:
+        return (hit, hit)
+    aliases = _enzyme_alias_table()
+    alias_lower = {a.lower(): a for a in aliases}
+    alias_key = alias_lower.get(want.lower())
+    if alias_key is None:
+        return None
+    target = aliases.get(alias_key)
+    # A synonym pointing at a name the catalog no longer carries is a data
+    # bug, not a caller error — fail as "unknown" rather than scanning with a
+    # name that resolves to nothing. `test_alias_targets_exist` pins it.
+    if not target or target not in catalog:
+        return None
+    return (target, alias_key)
+
+
 def _enzyme_signature(name: str) -> "tuple[str, int, int] | None":
     """``(recognition_site, fwd_cut, rev_cut)`` for `name`, or ``None`` when
-    the combined catalog (built-in ∪ user custom) doesn't know it.
+    neither the combined catalog (built-in ∪ user custom) nor the commercial-
+    synonym table knows it.
 
     Two enzymes sharing a signature are isoschizomers: they recognise the
     same sequence and cleave at the same offsets, so no scan can tell them
@@ -1964,6 +2046,9 @@ def _enzyme_signature(name: str) -> "tuple[str, int, int] | None":
     except Exception:                       # pragma: no cover - hook absent
         return None
     entry = catalog.get(name)
+    if not entry:
+        resolved = _enzyme_resolve_one(name)
+        entry = catalog.get(resolved[0]) if resolved else None
     if not entry:
         return None
     try:
@@ -1975,11 +2060,14 @@ def _enzyme_signature(name: str) -> "tuple[str, int, int] | None":
 
 
 def _enzyme_aliases(name: str) -> "list[str]":
-    """Every catalog name that cuts EXACTLY like `name`, `name` included.
+    """Every NAME that cuts EXACTLY like `name` — catalog entries plus the
+    commercial synonyms in `_ENZYME_ALIASES` — `name` itself included.
 
-    ``_enzyme_aliases("BsmBI") -> ["BsmBI", "BsmBI-v2", "Esp3I"]``. Returns
-    ``[name]`` for an enzyme with no isoschizomer and ``[]`` for one the
-    catalog doesn't know."""
+    ``_enzyme_aliases("BsmBI") -> ["BsmBI", "BsmBI-v2", "Esp3I"]``;
+    ``_enzyme_aliases("BsaI") -> ["BsaI", "BspTNI", "Eco31I"]``. Returns
+    ``[name]`` for an enzyme with no other spelling and ``[]`` for one nothing
+    knows. NEOschizomers are deliberately absent: SmaI is not an alias of
+    XmaI, it is a different cut."""
     sig = _enzyme_signature(name)
     if sig is None:
         return []
@@ -1987,9 +2075,10 @@ def _enzyme_aliases(name: str) -> "list[str]":
         catalog = _state._all_enzymes_hook() or {}
     except Exception:                       # pragma: no cover - hook absent
         return [name]
-    return sorted(
-        n for n in catalog if _enzyme_signature(n) == sig
-    )
+    out = {n for n in catalog if _enzyme_signature(n) == sig}
+    out |= {a for a, target in _enzyme_alias_table().items()
+            if target in catalog and _enzyme_signature(target) == sig}
+    return sorted(out)
 
 
 # How many unrecognised names get near-miss suggestions computed for them.
@@ -2011,20 +2100,22 @@ def _resolve_enzyme_names(
     Matching is exact first, then case-insensitive — ``"bsai"`` and
     ``"BSAI"`` both resolve to ``"BsaI"``, because enzyme capitalisation is
     a REBASE convention nobody types correctly by hand and getting it wrong
-    otherwise silently scans nothing. It deliberately does NOT fuzzy-match:
-    ``BsaI`` and ``BsaXI`` are different enzymes and guessing between them
-    would be the exact wrong-answer failure this function exists to prevent.
-    Near misses come back as `suggestions` for the caller's error message."""
+    otherwise silently scans nothing — then the commercial-synonym table, so
+    ``"Eco31I"`` (Thermo's name for BsaI) resolves instead of coming back as
+    an unrecognised name. It deliberately does NOT fuzzy-match: ``BsaI`` and
+    ``BsaXI`` are different enzymes and guessing between them would be the
+    exact wrong-answer failure this function exists to prevent. Near misses
+    come back as `suggestions` for the caller's error message."""
     try:
         catalog = _state._all_enzymes_hook() or {}
     except Exception:                       # pragma: no cover - hook absent
         catalog = {}
-    lowered = {n.lower(): n for n in catalog}
     resolved: list[str] = []
     unknown: list[tuple[str, list[str]]] = []
     for raw in names:
         want = str(raw).strip()
-        hit = want if want in catalog else lowered.get(want.lower())
+        match = _enzyme_resolve_one(want)
+        hit = match[0] if match is not None else None
         if hit is None:
             # Suggestions are bounded: `difflib.get_close_matches` is O(catalog)
             # per name, so a payload carrying thousands of bad names would burn
@@ -2033,8 +2124,12 @@ def _resolve_enzyme_names(
             near: "list[str]" = []
             if len(unknown) < _RESOLVE_SUGGEST_LIMIT:
                 import difflib
+                # Synonyms are in the suggestion pool too — a mistyped
+                # "Eco31l" should be told about "Eco31I", not sent to the
+                # nearest unrelated catalog name.
                 near = difflib.get_close_matches(
-                    want[:64], list(catalog), n=3, cutoff=0.6)
+                    want[:64], list(catalog) + list(_enzyme_alias_table()),
+                    n=3, cutoff=0.6)
             unknown.append((want, near))
         elif hit not in resolved:
             resolved.append(hit)
@@ -2248,17 +2343,26 @@ def _split_features_at_cuts(features: list[dict], n: int,
     # caller can rejoin them if it cares about origin-spanning
     # annotations on the result.
     expanded: list[dict] = []
-    for f in features:
+    for i, f in enumerate(features):
         try:
             fs = int(f.get("start", 0))
             fe = int(f.get("end",   0))
         except (TypeError, ValueError):
             continue
         if circular and fe < fs and 0 <= fe and fs <= n:
+            # `_wrap_origin_group` pairs the two halves back up. Without an id
+            # a product carrying several origin-spanning features can't tell
+            # whose head goes with whose tail — see
+            # `_rejoin_origin_split_features` (cloning L3), which is what
+            # turns them back into ONE feature when the ligated product puts
+            # them side by side again.
+            gid = f"w{i}"
             expanded.append({**f, "start": fs, "end": n,
-                              "_wrap_origin_split": "tail"})
+                              "_wrap_origin_split": "tail",
+                              "_wrap_origin_group": gid})
             expanded.append({**f, "start": 0, "end": fe,
-                              "_wrap_origin_split": "head"})
+                              "_wrap_origin_split": "head",
+                              "_wrap_origin_group": gid})
         else:
             expanded.append(f)
     features = expanded

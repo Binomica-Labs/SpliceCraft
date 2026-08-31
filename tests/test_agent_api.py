@@ -2009,6 +2009,171 @@ class TestGoldenGate:
         assert r["result"]["ok"] is False and r["result"]["errors"]
 
 
+class TestGoldenGateMultiCutVector:
+    """2026-08-26 report #2: a destination vector carrying BACKGROUND enzyme
+    sites is cut into more than two pieces, and the simulator assumed exactly
+    one backbone fragment. It answered "the overhangs don't chain… check that
+    adjacent parts share a 4 nt overhang" — pointing at parts that were fine,
+    which is where the reporter lost the most time in a day's work."""
+
+    HALF = "GGGGCCCCAAAATTTT" * 4
+
+    @staticmethod
+    def _cassette(oh5, body, oh3):
+        return "GGTCTC" + "A" + oh5 + body + oh3 + "A" + "GAGACC"
+
+    def _parts(self):
+        return (self._cassette("GGAG", "ATGAAACCCGGGTTTACGT" * 2, "AATG"),
+                self._cassette("AATG", "TTGCATGCATGCTAGCTAG" * 2, "CGCT"))
+
+    def _plain_vector(self):
+        return self._cassette("CGCT", "GGGGCCCCAAAATTTT" * 8, "GGAG")
+
+    def _split_vector(self):
+        """Same backbone, one extra BsaI site inside it — so the backbone is
+        released as TWO pieces joined by a new TTAC overhang."""
+        return self._cassette(
+            "CGCT", self.HALF + "GGTCTC" + "T" + "TTAC" + self.HALF, "GGAG")
+
+    def test_a_three_piece_vector_still_assembles(self):
+        A, B = self._parts()
+        r = sc._h_simulate_golden_gate(
+            None, {"parts": [A, B], "vector": self._split_vector()})
+        assert r["ok"] is True, r["result"]["errors"]
+        res = r["result"]
+        assert res["n_vector_fragments"] == 3
+        assert res["n_vector_fragments_used"] == 2
+        assert res["n_vector_sites"] == 3
+
+    def test_the_product_keeps_every_piece_of_the_backbone(self):
+        """Not just "it closed" — the extra vector fragment has to BE in the
+        product, or the sim quietly built a different plasmid."""
+        A, B = self._parts()
+        r = sc._h_simulate_golden_gate(
+            None, {"parts": [A, B], "vector": self._split_vector()})
+        prod = r["result"]["product_seq"]
+        doubled = prod + prod              # circular: allow the join to wrap
+        for body in ("ATGAAACCCGGGTTTACGT", "TTGCATGCATGCTAGCTAG", self.HALF):
+            assert body in doubled, body
+        # Both halves of the split backbone, not one of them twice.
+        assert doubled.count(self.HALF) >= 2
+
+    def test_it_equals_the_undivided_vector_plus_the_extra_bases(self):
+        """The background site adds `GGTCTC`+`T`+`TTAC` (11 bp) to the
+        backbone and nothing else — an independent check on the product size
+        that doesn't just re-run the assembler."""
+        A, B = self._parts()
+        plain = sc._h_simulate_golden_gate(
+            None, {"parts": [A, B], "vector": self._plain_vector()})
+        split = sc._h_simulate_golden_gate(
+            None, {"parts": [A, B], "vector": self._split_vector()})
+        assert split["result"]["length"] - plain["result"]["length"] == 11
+
+    def test_a_two_piece_vector_reports_one_fragment_used(self):
+        A, B = self._parts()
+        res = sc._h_simulate_golden_gate(
+            None, {"parts": [A, B], "vector": self._plain_vector()})["result"]
+        assert res["n_vector_fragments"] == 2
+        assert res["n_vector_fragments_used"] == 1      # the stuffer drops out
+
+    def test_failure_shows_the_vector_cuts_and_every_overhang(self):
+        """The fix the report asked for: say what was cut and what the ends
+        ARE, instead of asserting the parts are at fault."""
+        A, _ = self._parts()
+        bad = self._cassette("AATG", "TTGCATGCATGCTAGCTAG" * 2, "TTTT")
+        r = sc._h_simulate_golden_gate(
+            None, {"parts": [A, bad], "vector": self._split_vector()})
+        res = r["result"]
+        assert r["ok"] is False
+        assert res["n_vector_sites"] == 3 and res["n_vector_fragments"] == 3
+        assert len(res["vector_cut_bp"]) == 3
+        err = res["errors"][0]
+        assert "cut 3×" in err
+        assert "GGAG→AATG" in err and "AATG→TTTT" in err   # the dangling end
+        assert res["part_overhangs"] == ["GGAG→AATG", "AATG→TTTT"]
+
+    def test_ambiguous_overhangs_are_reported_not_silently_picked(self):
+        """Two parts that can swap places make TWO different circles. Picking
+        one and saying nothing is the wrong-answer shape this batch is
+        about."""
+        A = self._cassette("GGAG", "AAACCCGGGTTTACGT" * 2, "AATG")
+        B = self._cassette("AATG", "TTGCATGCATGCTAGCT" * 2, "AATG")
+        C = self._cassette("AATG", "GGTTAACCGGTTAACC" * 2, "AATG")
+        D = self._cassette("AATG", "TTAACCGGTTAACCGG" * 2, "CGCT")
+        r = sc._h_simulate_golden_gate(
+            None, {"parts": [A, B, C, D], "vector": self._plain_vector()})
+        assert any("different circles" in w
+                   for w in r["result"]["warnings"]), r["result"]["warnings"]
+
+    def test_a_synonym_names_the_assembly_enzyme(self):
+        """The engines key on catalog names, so `Esp3I` (or `esp3i`) has to be
+        resolved here or the reaction is simulated with an enzyme that cuts
+        nothing — a dry run that answers about the wrong chemistry."""
+        def cas(a, b, c):
+            return "CGTCTC" + "A" + a + b + c + "A" + "GAGACG"   # BsmBI/Esp3I
+        A = cas("GGAG", "ATGAAACCCTTTACGT" * 2, "AATG")
+        B = cas("AATG", "TTGCATGCATGCTAGC" * 2, "CGCT")
+        V = cas("CGCT", "GGGGCCCCAAAATTTT" * 8, "GGAG")
+        lengths = set()
+        for spelling in ("BsmBI", "Esp3I", "esp3i"):
+            r = sc._h_simulate_golden_gate(
+                None, {"parts": [A, B], "vector": V, "enzyme": spelling})
+            assert r["ok"] is True, (spelling, r["result"]["errors"])
+            lengths.add(r["result"]["length"])
+        assert len(lengths) == 1
+
+    def test_an_explosive_overhang_set_is_bounded_and_says_unknown(self):
+        """Many fragments sharing one overhang make the number of possible
+        orders factorial. The search is capped — and an exhausted search must
+        NOT be reported as "this design can't be built", because it isn't the
+        same answer."""
+        parts = [self._cassette("AAAA", "ACGTTGCAACGTTGCA" * 2 + "ACGT" * (i % 4),
+                                "AAAA") for i in range(20)]
+        parts.append(self._cassette("AAAA", "TTGGCCAATTGGCCAA" * 2, "TTTA"))
+        vec = self._cassette("CCCC", "GGGGCCCCAAAATTTT" * 8, "AAAA")
+        r = sc._h_simulate_golden_gate(None, {"parts": parts, "vector": vec})
+        assert r["ok"] is False
+        err = r["result"]["errors"][0]
+        assert "step limit" in err
+        assert "UNKNOWN" in err
+
+    def test_a_capped_ambiguity_count_says_at_least(self):
+        """The enumeration stops at `_GG_MAX_SOLUTIONS` per seed, so the tally
+        is a floor. Reporting a cap as an exact number is the quiet kind of
+        inaccuracy this batch exists to remove."""
+        import splicecraft_cloning as scl
+        # A blunt-cutting Type IIS: every released end is blunt, so every
+        # fragment ligates to every other and the orderings explode.
+        sc._save_custom_enzymes([{"name": "BluntIISx", "site": "GGTCTC",
+                                  "fwd_cut": 9, "rev_cut": 9}])
+        sc._rebuild_scan_catalog()
+        try:
+            def cas(body):
+                return "GGTCTC" + "AAA" + body + "TTT" + "GAGACC"
+            parts = [cas("ACGTTGCAACGTTGCA" * 2 + "ACGT" * (i % 3))
+                     for i in range(12)]
+            vec = cas("GGGGCCCCAAAATTTT" * 8)
+            r = sc._h_simulate_golden_gate(
+                None, {"parts": parts, "vector": vec, "enzyme": "BluntIISx"})
+            warns = r["result"]["warnings"]
+            assert any("At least" in w and "different circles" in w
+                       for w in warns), warns
+        finally:
+            sc._save_custom_enzymes([])
+            sc._rebuild_scan_catalog()
+
+    def test_the_assemble_endpoint_saves_the_multi_piece_product(self):
+        A, B = self._parts()
+        r = sc._h_golden_gate_assemble(
+            None, {"parts": [A, B], "vector": self._split_vector(),
+                   "product_name": "gg-split"})
+        assert r["ok"] and r["saved_name"] == "gg-split"
+        ent = next(e for e in sc._load_library() if e["name"] == "gg-split")
+        rec = sc._gb_text_to_record(ent["gb_text"])
+        assert rec.annotations.get("topology") == "circular"
+        assert self.HALF in (str(rec.seq).upper() * 2)
+
+
 class TestReplaceSequenceSizeCap:
     """Sweep #32 adversarial audit: `_h_replace_sequence` used
     to be capped only on the input `bases` field (1 MB via
@@ -6226,6 +6391,91 @@ def _app_for(seq):
     return MockApp(record=_circ(seq))
 
 
+class TestCommercialSynonymsOverTheApi:
+    """2026-08-26 report #1, one layer out from [INV-187]: the isoschizomers
+    already IN the catalog resolved, but the names people actually buy —
+    Thermo's Eco31I/LguI/AarI — did not, so `{"enzymes": ["Eco31I"]}` came
+    back `400` on an enzyme SpliceCraft knows perfectly well."""
+
+    # GGTCTC at 4 (BsaI/Eco31I), GCTCTTC at 50 (SapI/BspQI/LguI).
+    SEQ = "AAAA" + "GGTCTC" + "A" * 40 + "GCTCTTC" + "T" * 40
+
+    def _app(self):
+        return MockApp(record=_circ(self.SEQ))
+
+    def test_a_synonym_finds_the_sites(self):
+        r = sc._h_list_restriction_sites(self._app(), {"enzyme": "Eco31I"})
+        assert [s["start"] for s in r["sites"]] == [4], r
+
+    def test_rows_are_labelled_with_the_name_you_asked_for(self):
+        """Reporting `BsaI` to someone who asked for `Eco31I` would leave the
+        obvious `s["enzyme"] == "Eco31I"` filter empty — the same silent zero
+        one layer down."""
+        r = sc._h_list_restriction_sites(self._app(), {"enzyme": "Eco31I"})
+        assert [s["enzyme"] for s in r["sites"]] == ["Eco31I"]
+        assert r["enzymes_scanned"] == ["Eco31I"]
+        # …and the answer still says which catalog enzyme that IS.
+        assert "BsaI" in r["equivalent_enzymes"]
+
+    def test_synonym_and_catalog_name_together_both_report(self):
+        r = sc._h_list_restriction_sites(
+            self._app(), {"enzymes": ["Eco31I", "BsaI"]})
+        assert {s["enzyme"] for s in r["sites"]} == {"Eco31I", "BsaI"}
+        assert {s["start"] for s in r["sites"]} == {4}
+
+    def test_lgui_reaches_the_sapi_site(self):
+        r = sc._h_list_restriction_sites(self._app(), {"enzyme": "LguI"})
+        assert [s["start"] for s in r["sites"]] == [50], r
+        assert r["sites"][0]["site"] == "GCTCTTC"
+
+    def test_digest_says_what_a_synonym_became(self):
+        """`cuts[].enzyme` carries the catalog name, so the mapping has to be
+        visible or the caller reads "my enzyme didn't cut"."""
+        r = sc._h_digest(None, {"sequence": self.SEQ, "enzymes": ["Eco31I"],
+                                "circular": False})
+        assert not isinstance(r, tuple), r
+        assert r["resolved_enzymes"] == {"Eco31I": "BsaI"}
+        assert [c["enzyme"] for c in r["cuts"]] == ["BsaI"]
+
+    def test_digest_omits_the_mapping_when_nothing_was_renamed(self):
+        r = sc._h_digest(None, {"sequence": self.SEQ, "enzymes": ["BsaI"],
+                                "circular": False})
+        assert "resolved_enzymes" not in r
+
+
+class TestNeoschizomersOverTheApi:
+    """Same report: XmaI and SmaI read the same six bases and leave different
+    ends, and the endpoint was inheriting the MAP's one-bar-per-span collapse,
+    so naming both returned one."""
+
+    SEQ = "AAAA" + "CCCGGG" + "T" * 50 + "GGTACC" + "A" * 50
+
+    def _app(self):
+        return MockApp(record=_circ(self.SEQ))
+
+    def test_both_neoschizomers_report_with_their_own_cut(self):
+        r = sc._h_list_restriction_sites(
+            self._app(), {"enzymes": ["XmaI", "SmaI"]})
+        cuts = {s["enzyme"]: s["cut_bp"] for s in r["sites"]}
+        assert set(cuts) == {"XmaI", "SmaI"}
+        assert cuts["XmaI"] == 4 + 1          # C^CCGGG
+        assert cuts["SmaI"] == 4 + 3          # CCC^GGG (blunt)
+
+    def test_acc65i_and_kpni_both_report(self):
+        r = sc._h_list_restriction_sites(
+            self._app(), {"enzymes": ["Acc65I", "KpnI"]})
+        cuts = {s["enzyme"]: s["cut_bp"] for s in r["sites"]}
+        assert set(cuts) == {"Acc65I", "KpnI"}
+        assert cuts["Acc65I"] == 60 + 1       # G^GTACC
+        assert cuts["KpnI"] == 60 + 5         # GGTAC^C
+
+    def test_a_neoschizomer_is_not_offered_as_equivalent(self):
+        """`equivalent_enzymes` means "this answer already covers it". SmaI
+        does NOT cover XmaI — different overhang."""
+        r = sc._h_list_restriction_sites(self._app(), {"enzyme": "XmaI"})
+        assert "SmaI" not in (r.get("equivalent_enzymes") or [])
+
+
 class TestListEnzymes:
     """Report #6: cut offsets weren't reachable, so a script verifying digest
     fragment sizes had to hardcode `SalI G^TCGAC = 1` and `KpnI GGTAC^C = 5`
@@ -6265,7 +6515,9 @@ class TestListEnzymes:
     def test_type_iis_flag_and_aliases(self):
         assert self._get("BsaI")["type_iis"] is True
         assert self._get("EcoRI")["type_iis"] is False
-        assert self._get("BsaI")["aliases"] == ["BspTNI"]
+        # Catalog isoschizomer + the commercial synonym (`_ENZYME_ALIASES`) —
+        # a caller who buys "Eco31I" has to be able to see it IS this row.
+        assert self._get("BsaI")["aliases"] == ["BspTNI", "Eco31I"]
 
     def test_unknown_name_400_with_suggestion(self):
         out = sc._h_list_enzymes(None, {"names": ["Bsa1"]})
@@ -6572,13 +6824,25 @@ class TestEnzymeInputHardening:
             self._app(), {"enzymes": ["EcoRI"] * 500})
         assert not isinstance(ok, tuple)
 
-    def test_a_huge_name_is_clipped_out_of_the_error(self):
+    def test_a_huge_name_is_refused_on_shape_and_never_echoed(self):
         """A payload can carry a megabyte string; echoing it verbatim turns a
-        validation error into a megabyte response."""
-        out = sc._h_list_restriction_sites(self._app(), {"enzyme": "X" * 100_000})
+        validation error into a megabyte response. It is now refused on SHAPE
+        (no enzyme name is over 64 characters) rather than lowercased, hashed
+        and difflib'd on its way to "unknown enzyme" — but the property that
+        matters is unchanged: none of it comes back."""
+        huge = "X" * 100_000
+        out = sc._h_list_restriction_sites(self._app(), {"enzyme": huge})
         assert isinstance(out, tuple) and out[1] == 400
         assert len(out[0]["error"]) < 500
-        assert all(len(n) <= 65 for n in out[0]["unknown_enzymes"])
+        assert "64" in out[0]["error"]
+        assert huge[:200] not in json.dumps(out[0])
+
+    def test_a_64_char_name_still_reaches_the_unknown_path(self):
+        """The shape gate must not swallow the near-miss machinery for names
+        that are merely wrong rather than absurd."""
+        out = sc._h_list_restriction_sites(self._app(), {"enzyme": "X" * 64})
+        assert isinstance(out, tuple) and out[1] == 400
+        assert out[0]["unknown_enzymes"] == ["X" * 64]
 
     def test_many_unknowns_report_a_true_total_not_a_truncated_one(self):
         out = sc._h_list_restriction_sites(

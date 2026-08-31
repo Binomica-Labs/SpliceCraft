@@ -59,7 +59,7 @@ from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_picker, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
-from splicecraft_biology import (_digest_with_enzymes, _enzyme_aliases, _enzyme_cuts, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
+from splicecraft_biology import (_digest_with_enzymes, _enzyme_aliases, _enzyme_cuts, _enzyme_resolve_one, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
 from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _build_synthesis_l0_fragment, _design_gb_primers, _entry_vector_acceptor_overhangs, _grammar_position_by_type, _l0_part_from_syn_fragment)
 from splicecraft_dataaccess import (_active_enzyme_allowed_set, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
 from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member)
@@ -4849,9 +4849,14 @@ def _agent_golden_gate_inputs(payload):
     if verr:
         return None, None, None, ({"error": f"'vector': {verr}"}, 400)
     enzyme = _sanitize_label(payload.get("enzyme") or "BsaI", max_len=40)
-    if enzyme not in _state._all_enzymes_hook():
+    # Resolve case + commercial synonyms the same way every other enzyme
+    # input does — the digest engines key on the CATALOG spelling, so
+    # `Eco31I` (Thermo's BsaI) has to become `BsaI` here or the reaction is
+    # simulated with an enzyme that cuts nothing.
+    match = _enzyme_resolve_one(enzyme)
+    if match is None:
         return None, None, None, ({"error": f"unknown enzyme {enzyme!r}"}, 400)
-    return clean, vseq, enzyme, None
+    return clean, vseq, match[0], None
 
 
 @_agent_endpoint("simulate-golden-gate")
@@ -4863,12 +4868,26 @@ def _h_simulate_golden_gate(app, payload):
     BbsI / SapI / Esp3I) and chains the released fragments by their 4 nt
     overhangs into a circular product — parts may be in ANY order, the
     overhangs set the order. Each part must release exactly one fragment
-    (flank it with two inward enzyme sites); the vector contributes its
-    backbone. The ``result`` carries ``{ok, product_seq, length, n_parts,
-    order, junctions:[{overhang}], n_residual_sites, warnings, errors}`` —
-    `warnings` flags a non-unique junction overhang (ambiguous assembly) or a
-    residual enzyme site (it would be re-cut). Read-only — pair with
-    `golden-gate-assemble` to save."""
+    (flank it with two inward enzyme sites).
+
+    **The vector may be cut more than twice.** A destination plasmid carrying
+    background enzyme sites is released as several pieces, and the real
+    one-pot reaction puts ALL of them back around the parts; the design stays
+    determinate as long as the overhangs are unique. Every released vector
+    piece goes into the chain, and ``n_vector_fragments`` /
+    ``n_vector_fragments_used`` say how many there were and how many the
+    product kept.
+
+    The ``result`` carries ``{ok, product_seq, length, n_parts, order,
+    junctions:[{overhang}], n_residual_sites, n_vector_sites,
+    n_vector_fragments, n_vector_fragments_used, vector_cut_bp, warnings,
+    errors}`` — `warnings` flags a non-unique junction overhang, more than
+    one circle that can form from the same fragments, or a residual enzyme
+    site (it would be re-cut). When nothing closes, the error lists the
+    vector's cut positions and EVERY fragment's two overhangs (plus
+    ``vector_fragment_overhangs`` / ``part_overhangs``) so the dangling one
+    is visible, instead of asserting the parts are at fault. Read-only —
+    pair with `golden-gate-assemble` to save."""
     parts, vseq, enzyme, err = _agent_golden_gate_inputs(payload)
     if err is not None:
         return err
@@ -5010,10 +5029,13 @@ def _h_scrub_plasmid(app, payload):
     ``seq`` is given, pass ``features`` (a list of ``{type,start,end,strand,
     codon_start?,transl_table?}`` dicts) to protect overlapping CDSes —
     WITHOUT them every site is treated as non-coding and a coding site could
-    change a protein. ``enzymes`` is a list of names (default BsaI/Esp3I/BbsI);
-    ``overlap`` is ``"improved"`` (default) or ``"classic"``; ``codon_taxid``
-    (a registered codon-usage table id) makes coding cures prefer that host's
-    frequent synonymous codons.
+    change a protein. ``enzymes`` is a list of names (default BsaI/Esp3I/BbsI)
+    — matched case-insensitively, commercial synonyms accepted (``Eco31I`` is
+    ``BsaI``), and an unrecognised name is a **400**, never a scrub that
+    quietly removes nothing and reports `ok: true` with an empty
+    ``sites_removed``; ``overlap`` is ``"improved"`` (default) or
+    ``"classic"``; ``codon_taxid`` (a registered codon-usage table id) makes
+    coding cures prefer that host's frequent synonymous codons.
 
     ``method`` picks the re-circularization route: ``"quikchange"`` (default —
     one whole-plasmid amplicon that self-circularises) or ``"golden_braid"``
@@ -5051,8 +5073,24 @@ def _h_scrub_plasmid(app, payload):
     if len(seq) > 1_000_000:
         return ({"error": "'seq' exceeds the 1 Mbp cap"}, 413)
     enzymes = payload.get("enzymes")
-    if enzymes is not None and not isinstance(enzymes, list):
-        return ({"error": "'enzymes' must be a list of enzyme names"}, 400)
+    if enzymes is not None:
+        # `_scrub_resolve_sites` SKIPS a name the catalog doesn't know, so an
+        # unrecognised (or merely mis-cased, or supplier-named) enzyme used to
+        # scrub nothing and answer `ok: true, sites_removed: []` — which reads
+        # as "your plasmid is already clean". Same vacuous pass
+        # `list-restriction-sites` refuses, in the endpoint where being wrong
+        # costs the most. [INV-189]
+        if (shape_err := _agent_check_enzyme_list(enzymes)) is not None:
+            return shape_err
+        resolved_enz, unknown_enz = _resolve_enzyme_names(enzymes)
+        if unknown_enz:
+            return _agent_unknown_enzyme_error(
+                unknown_enz, hint=" — call 'list-enzymes' for the catalog")
+        if not resolved_enz:
+            return ({"error":
+                      "'enzymes' is empty — omit the key to scrub the "
+                      "default set (BsaI / Esp3I / BbsI)"}, 400)
+        enzymes = resolved_enz
     overlap = payload.get("overlap", "improved")
     if overlap not in ("improved", "classic"):
         return ({"error": "'overlap' must be 'improved' or 'classic'"}, 400)
@@ -5104,6 +5142,10 @@ def _h_scrub_plasmid(app, payload):
             "n_fragments": plan.get("n_fragments", 0),
             "fragments": plan.get("fragments", []),
             "verified": plan.get("verified", False),
+            # Longest homopolymer run in the CURED sequence. The cure scorer
+            # avoids lengthening one, but where every silent option does, the
+            # caller has to be able to see it rather than assert it by hand.
+            "max_homopolymer_run": plan.get("max_homopolymer_run", 0),
             "warnings": plan.get("warnings", []),
             "errors": plan.get("errors", []),
         }
@@ -5118,6 +5160,7 @@ def _h_scrub_plasmid(app, payload):
         "sites_skipped": plan.get("sites_skipped", []),
         "n_rounds": plan.get("n_rounds", 0),
         "rounds": rounds,
+        "max_homopolymer_run": plan.get("max_homopolymer_run", 0),
         "warnings": plan.get("warnings", []),
     }
 
@@ -6167,10 +6210,23 @@ def _h_list_restriction_sites(app, payload):
     readable; asking for a name on the losing side of that collapse used to
     return nothing. Named enzymes now go into the scan as the hand-picked
     set, and every hit is reported under each requested spelling.
-    `equivalent_enzymes` lists the catalog names that cut identically but
-    weren't asked for. Note that `min_length` does not apply to an explicit
-    `enzymes` list (a hand-picked short cutter is kept) — passing both
-    returns a `warnings` entry saying so."""
+    `equivalent_enzymes` lists the names that cut identically but weren't
+    asked for.
+
+    **Commercial synonyms resolve too.** The same enzyme is sold under
+    different names by different suppliers — Thermo's `Eco31I` is NEB's
+    `BsaI`, `LguI` is `SapI`, `AarI` is `PaqCI` — and the scan now accepts
+    either. Hits come back labelled with the name YOU asked for.
+
+    **NEOschizomers stay apart.** XmaI (`C^CCGGG`) and SmaI (`CCC^GGG`) read
+    the same six bases and leave different ends, so they are NOT
+    interchangeable and this endpoint reports both — even though the plasmid
+    map deliberately draws one bar for the pair. Same for Acc65I/KpnI,
+    ApaI/PspOMI, NheI/BmtI, KasI/NarI, AatII/ZraI, SacI/Eco53kI.
+
+    Note that `min_length` does not apply to an explicit `enzymes` list (a
+    hand-picked short cutter is kept) — passing both returns a `warnings`
+    entry saying so."""
     rec = getattr(app, "_current_record", None)
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
@@ -6258,20 +6314,40 @@ def _h_list_restriction_sites(app, payload):
     else:
         allowed = None
 
+    # `distinct_cuts=True`: this is a QUERY, so a NEOschizomer must not be
+    # swallowed by the render's one-bar-per-span collapse. XmaI (`C^CCGGG`)
+    # and SmaI (`CCC^GGG`) recognise the same six bases and leave DIFFERENT
+    # ends, so answering `{"enzymes": ["XmaI", "SmaI"]}` with only whichever
+    # the catalog lists first reads as "no XmaI site" on a plasmid that has
+    # one. Same family as the isoschizomer loss [INV-187] fixed; the map keeps
+    # collapsing (default False) because there one bar per span is the point.
     sites = _scan_restriction_sites(
         seq, min_recognition_len=min_len,
         unique_only=unique, circular=is_circular,
-        allowed_enzymes=allowed,
+        allowed_enzymes=allowed, distinct_cuts=True,
     )
 
     # Re-expand the collapse for the names the caller actually asked about:
     # the scan emits ONE label per (span, recognition site), so a request
     # naming both BsmBI and Esp3I comes back labelled BsmBI only. Report the
     # hit under every requested name that cuts identically — the names
-    # differ, the biology does not.
+    # differ, the biology does not. `display` is what the CALLER typed (its
+    # canonical spelling): a commercial synonym scans under its catalog
+    # target, and reporting `BsaI` rows to someone who asked for `Eco31I`
+    # would leave their `s["enzyme"] == "Eco31I"` filter empty — the same
+    # silent zero one layer down.
     want_by_sig: "dict[tuple | None, list[str]]" = {}
-    for nm in resolved:
-        want_by_sig.setdefault(_enzyme_signature(nm), []).append(nm)
+    display_names: "list[str]" = []
+    for raw in (enzymes or []):
+        match = _enzyme_resolve_one(raw)
+        if match is None:                   # already 400'd above
+            continue
+        catalog_name, display = match
+        names = want_by_sig.setdefault(_enzyme_signature(catalog_name), [])
+        if display not in names:
+            names.append(display)
+        if display not in display_names:
+            display_names.append(display)
 
     out = []
     for s in sites:
@@ -6317,12 +6393,16 @@ def _h_list_restriction_sites(app, payload):
 
     resp: dict = {"sites": out, "count": len(out)}
     if resolved:
-        resp["enzymes_scanned"] = resolved
-        # Names in the catalog that cut identically to a requested one. A
-        # zero-site answer is only trustworthy if the caller knows which
-        # spellings it covered.
+        # Report the spellings the ROWS are labelled with — for a commercial
+        # synonym that is the caller's own name, and the catalog's name for it
+        # then shows up under `equivalent_enzymes` (so `Eco31I` → scanned
+        # Eco31I, equivalent BsaI/BspTNI: the answer says what it looked for
+        # AND what that enzyme is otherwise called).
+        resp["enzymes_scanned"] = display_names or resolved
+        # Names that cut identically to a requested one. A zero-site answer is
+        # only trustworthy if the caller knows which spellings it covered.
         eq = sorted({a for nm in resolved for a in _enzyme_aliases(nm)}
-                    - set(resolved))
+                    - set(display_names or resolved))
         if eq:
             resp["equivalent_enzymes"] = eq
     if warnings:
@@ -6419,6 +6499,10 @@ def _agent_transcript_feature_dicts(rec) -> "list[dict]":
 # from becoming a megabyte response when the payload carries a huge string.
 _AGENT_MAX_ENZYME_NAMES = 500
 _AGENT_NAME_ECHO_MAX = 64
+# Longest an enzyme NAME may be. The catalog's longest is 10 characters and
+# `create-custom-enzyme` caps at 40; this is the shape gate that stops a
+# multi-megabyte string being lowercased and hashed on its way to "unknown".
+_AGENT_MAX_ENZYME_NAME_LEN = 64
 
 
 def _agent_unknown_enzyme_error(unknown, *, field: str = "enzymes",
@@ -6461,6 +6545,13 @@ def _agent_check_enzyme_list(names, *, field: str = "enzymes"):
                           f"(max {_AGENT_MAX_ENZYME_NAMES})"}, 400)
     if not all(isinstance(e, str) for e in names):
         return ({"error": f"'{field}' must contain only strings"}, 400)
+    # No enzyme name is anywhere near this long (the longest in the catalog is
+    # 10 characters, and a custom one is capped at 40), so a longer string is
+    # a payload error — refuse it on SHAPE rather than lowercasing and hashing
+    # a megabyte on the way to "unknown enzyme".
+    if any(len(e) > _AGENT_MAX_ENZYME_NAME_LEN for e in names):
+        return ({"error": f"an enzyme name in '{field}' exceeds "
+                          f"{_AGENT_MAX_ENZYME_NAME_LEN} characters"}, 400)
     return None
 
 
@@ -6815,6 +6906,10 @@ def _h_digest(app, payload):
         marks a free end of a linear input). ``seq`` is added per fragment
         only when ``include_fragment_seq`` is set.
       * ``n_cuts``, ``n_fragments``, ``circular``, ``unknown_enzymes``.
+      * ``resolved_enzymes`` — present only when a requested name is a
+        commercial synonym (Thermo's ``Eco31I`` is NEB's ``BsaI``, ``LguI``
+        is ``SapI``, ``AarI`` is ``PaqCI``): ``{asked: catalog_name}``, so
+        the name in ``cuts[].enzyme`` can be traced back to the one you sent.
     """
     raw = (payload.get("sequence")
            if payload.get("sequence") not in (None, "")
@@ -6892,7 +6987,7 @@ def _h_digest(app, payload):
             entry["seq"] = top_seq
         frags_out.append(entry)
 
-    return {
+    out: dict = {
         "cuts":            cuts_out,
         "fragments":       frags_out,
         "n_cuts":          len(cuts_out),
@@ -6900,6 +6995,18 @@ def _h_digest(app, payload):
         "circular":        circular,
         "unknown_enzymes": unknown,
     }
+    # `cuts[].enzyme` carries the CATALOG name (the engines key on it), so a
+    # caller who digested with a commercial synonym would find their own
+    # spelling nowhere in the answer and read that as "it didn't cut". Say
+    # which name each one became.
+    renamed = {}
+    for raw in enzymes:
+        match = _enzyme_resolve_one(raw)
+        if match is not None and match[0] != match[1]:
+            renamed[match[1]] = match[0]
+    if renamed:
+        out["resolved_enzymes"] = renamed
+    return out
 
 
 @_agent_endpoint("diff-plasmid")

@@ -23,6 +23,8 @@ which synonymous codon the scorer happens to pick):
 """
 from __future__ import annotations
 
+import pytest
+
 import splicecraft as sc
 
 
@@ -358,6 +360,75 @@ class TestScrubQCPrimers:
         assert sc._scrub_cluster_span([10, 12], 100) == (10, 12)
         s, e = sc._scrub_cluster_span([2, 98], 100)
         assert (s, e) == (98, 2)        # wraps: end < start
+
+
+class TestPrimerFreeEnergyUnits:
+    """2026-08-26 report #3: `scrub-plasmid` reported `hairpin_dg: -738.3`
+    and `homodimer_dg: -4993.7`. primer3 answers in CALORIES/mol; every
+    oligo spec sheet and QC rule of thumb is in KILOcalories, so the numbers
+    were 1000× off and unusable as a gate (and read as catastrophic if you
+    took the unit at face value)."""
+
+    # A GC-clamped stem-loop and a self-complementary oligo: both fold.
+    HAIRPIN = "GCGCGCGCTTTTGCGCGCGC"
+
+    def test_hairpin_dg_is_kcal_per_mole(self):
+        primer3 = pytest.importorskip("primer3")
+        raw = primer3.calc_hairpin(self.HAIRPIN, **sc._MUT_P3).dg
+        assert sc._mut_hairpin_dg(self.HAIRPIN) == pytest.approx(raw / 1000.0)
+
+    def test_homodimer_dg_is_kcal_per_mole(self):
+        primer3 = pytest.importorskip("primer3")
+        raw = primer3.calc_homodimer(self.HAIRPIN, **sc._MUT_P3).dg
+        assert sc._mut_homodimer_dg(self.HAIRPIN) == pytest.approx(raw / 1000.0)
+
+    def test_a_real_folding_oligo_lands_in_the_published_range(self):
+        """The check the reporter actually wanted: an oligo that folds should
+        read as a few kcal/mol, not a few thousand of anything."""
+        pytest.importorskip("primer3")
+        for fn in (sc._mut_hairpin_dg, sc._mut_homodimer_dg):
+            dg = fn(self.HAIRPIN)
+            assert dg is not None
+            assert -40.0 < dg < 0.0, f"{fn.__name__} = {dg}"
+
+    def test_scrub_rounds_report_kcal_and_say_so(self):
+        seq = _one_site_template(120)
+        plan = sc._scrub_design(seq, [], ["BsaI"])
+        qc = sc._scrub_qc_primers(plan["cured_seq"],
+                                  plan["clusters"][0]["positions"])
+        assert "error" not in qc, qc.get("error")
+        assert qc["dg_units"] == "kcal/mol"
+        for key in ("hairpin_dg", "homodimer_dg"):
+            assert qc[key] is None or -40.0 <= qc[key] <= 5.0, (key, qc[key])
+
+    def test_unmeasurable_dg_is_none_not_zero(self, monkeypatch):
+        """Zero is the BEST possible ΔG, so a failed measurement reported as
+        0.0 makes every QC gate pass on a primer nobody checked. Patched in
+        `splicecraft_primer`'s own namespace — that is where the moved
+        biophysics reads it."""
+        import splicecraft_primer as sp
+        sp._mut_thermo_cache_clear()
+        monkeypatch.setattr(sp, "_MUT_P3", {"bogus_kwarg": 1})
+        try:
+            assert sc._mut_hairpin_dg("ACGTACGTACGTACGTACGT") is None
+            assert sc._mut_homodimer_dg("ACGTACGTACGTACGTACGT") is None
+        finally:
+            sp._mut_thermo_cache_clear()
+
+    def test_an_unmeasured_pair_is_warned_about(self, monkeypatch):
+        import splicecraft_primer as sp
+        sp._mut_thermo_cache_clear()
+        monkeypatch.setattr(sp, "_MUT_P3", {"bogus_kwarg": 1})
+        try:
+            seq = _one_site_template(120)
+            plan = sc._scrub_design(seq, [], ["BsaI"])
+            qc = sc._scrub_qc_primers(plan["cured_seq"],
+                                      plan["clusters"][0]["positions"])
+            assert qc["hairpin_dg"] is None and qc["homodimer_dg"] is None
+            assert any("NOT secondary-structure checked" in w
+                       for w in qc["warnings"]), qc["warnings"]
+        finally:
+            sp._mut_thermo_cache_clear()
 
 
 # ── MutagenizeModal "Scrub" tab (UI wiring) ──────────────────────────────────
@@ -830,6 +901,36 @@ class TestScrubEndpoint:
     def test_missing_seq_no_record_400(self):
         res = sc._h_scrub_plasmid(None, {})
         assert isinstance(res, tuple) and res[1] == 400
+
+    def test_unknown_enzyme_is_400_not_a_clean_bill_of_health(self):
+        """`_scrub_resolve_sites` SKIPS a name the catalog doesn't know, so a
+        typo used to scrub nothing and answer `ok: true` with an empty
+        `sites_removed` — which reads as "already clean" on a plasmid that
+        isn't. [INV-189]"""
+        seq, _rec = _record_with_bsai()
+        res = sc._h_scrub_plasmid(None, {"seq": seq,
+                                         "enzymes": ["BsaI", "Bsa1"]})
+        assert isinstance(res, tuple) and res[1] == 400, res
+        assert res[0]["unknown_enzymes"] == ["Bsa1"]
+        assert "BsaI" in res[0]["error"]           # near-miss suggestion
+
+    def test_empty_enzyme_list_is_400(self):
+        seq, _rec = _record_with_bsai()
+        res = sc._h_scrub_plasmid(None, {"seq": seq, "enzymes": []})
+        assert isinstance(res, tuple) and res[1] == 400
+
+    def test_case_and_synonym_names_scrub_the_same_sites(self):
+        seq, _rec = _record_with_bsai()
+        removed = []
+        for spelling in ("BsaI", "bsai", "Eco31I"):
+            res = sc._h_scrub_plasmid(None, {"seq": seq,
+                                             "enzymes": [spelling]})
+            assert not isinstance(res, tuple), (spelling, res)
+            assert res["ok"] is True
+            removed.append((res["cured_seq"], len(res["sites_removed"])))
+        assert removed[0] == removed[1] == removed[2]
+        assert removed[0][1] == 1
+
 
     def test_bad_overlap_400(self):
         res = sc._h_scrub_plasmid(None, {"seq": "ACGT" * 30, "overlap": "x"})
@@ -1508,3 +1609,108 @@ class TestScrubSourceAnnotation:
             assert "SCRUB-" in (src.get("gb_text") or "")
             # no underscores forced into the source display name (INV-98)
             assert "_" not in (src.get("name") or "")
+
+
+class TestCureDoesNotLengthenHomopolymers:
+    """2026-08-26 field report: curing `GGAAAAA GAAGAC GTT` (a BpiI site in
+    pTRBO's 35S enhancer) by G→A spells `GGAAAAAAAAGAC` — an 8×A run — where
+    the equally valid A→G at the fourth base leaves the longest run at 5.
+
+    Both are single transitions with the same GC delta, so the score
+    separated them only by the lexicographic determinism tie-break, and `A`
+    sorts before `G`. Long runs are synthesis- and sequencing-hard, and the
+    reporter's site sat in a TANDEM-duplicated enhancer, so the bad choice
+    landed twice."""
+
+    PAD = "CTGACGTAAGGGATGACGCACAATCCCACTATCCTTCGCAAGACCCTTCC"
+
+    @staticmethod
+    def _longest(seq):
+        best = run = 0
+        prev = ""
+        for ch in seq:
+            run = run + 1 if ch == prev else 1
+            prev = ch
+            best = max(best, run)
+        return best
+
+    def _cure(self, core, enzyme="BbsI"):
+        seq = self.PAD + core + self.PAD
+        plan = sc._scrub_design(seq, [], [enzyme], circular=False)
+        assert plan["ok"] and plan["sites_removed"], plan["warnings"]
+        return seq, plan
+
+    def test_the_reported_case(self):
+        seq, plan = self._cure("GGAAAAA" + "GAAGAC" + "GTT")
+        cured = plan["cured_seq"]
+        assert "GAAGAC" not in cured and "GTCTTC" not in cured   # site gone
+        assert self._longest(cured) <= self._longest(seq)
+        assert "AAAAAAAA" not in cured                            # the 8×A
+
+    def test_a_run_on_the_other_side_too(self):
+        seq, plan = self._cure("TTG" + "GAAGAC" + "AAAAAGG")
+        assert self._longest(plan["cured_seq"]) <= self._longest(seq)
+
+    def test_it_generalises_past_bbsi(self):
+        seq, plan = self._cure("GGTTTTT" + "GGTCTC" + "AAAAAGG", enzyme="BsaI")
+        assert self._longest(plan["cured_seq"]) <= self._longest(seq)
+
+    def test_a_site_spanning_the_origin(self):
+        """The window is circular — a run that meets the edit across bp 0 has
+        to count, or the origin becomes a blind spot."""
+        seq = "AGACGTT" + self.PAD * 2 + "AAAAAGA"
+        plan = sc._scrub_design(seq, [], ["BbsI"], circular=True)
+        assert plan["sites_removed"], plan["warnings"]
+        dbl_before = seq + seq[:20]
+        dbl_after = plan["cured_seq"] + plan["cured_seq"][:20]
+        assert self._longest(dbl_after) <= max(self._longest(dbl_before), 5)
+
+    def test_the_term_outranks_the_lexicographic_tiebreak(self):
+        """Directly: with the homopolymer term neutralised the OLD choice
+        comes back, which is what proves this test isn't vacuous."""
+        import splicecraft_primer as sp
+        seq = self.PAD + "GGAAAAA" + "GAAGAC" + "GTT" + self.PAD
+        new = sc._scrub_design(seq, [], ["BbsI"], circular=False)["cured_seq"]
+        old_free = sp._SCRUB_HOMOPOLYMER_FREE
+        try:
+            sp._SCRUB_HOMOPOLYMER_FREE = 10 ** 6      # term can never fire
+            old = sc._scrub_design(seq, [], ["BbsI"],
+                                   circular=False)["cured_seq"]
+        finally:
+            sp._SCRUB_HOMOPOLYMER_FREE = old_free
+        assert "AAAAAAAA" in old, "fixture no longer reproduces the bug"
+        assert "AAAAAAAA" not in new
+
+    def test_it_is_measured_relative_to_what_was_there(self):
+        """A cure inside a pre-existing long run must not be penalised for a
+        run it inherited — otherwise the scorer would refuse the only silent
+        option available in an AT-rich region."""
+        seq = self.PAD + "A" * 9 + "GAAGAC" + "A" * 9 + self.PAD
+        plan = sc._scrub_design(seq, [], ["BbsI"], circular=False)
+        assert plan["ok"] and plan["sites_removed"]
+        assert plan["max_homopolymer_run"] >= 9
+
+    def test_max_run_is_reported_and_never_silently_worse(self):
+        seq = self.PAD + "GGAAAAA" + "GAAGAC" + "GTT" + self.PAD
+        r = sc._h_scrub_plasmid(None, {"seq": seq, "features": [],
+                                       "enzymes": ["BbsI"], "circular": False})
+        assert not isinstance(r, tuple), r
+        assert r["max_homopolymer_run"] == self._longest(r["cured_seq"])
+        # Nothing was made worse here, so no homopolymer warning.
+        assert not any("homopolymer" in w for w in r["warnings"]), r["warnings"]
+
+
+class TestScrubLongestRun:
+    def test_edges(self):
+        import splicecraft_primer as sp
+        assert sp._scrub_longest_run("") == 0
+        assert sp._scrub_longest_run("A") == 1
+        assert sp._scrub_longest_run("ACGT") == 1
+        assert sp._scrub_longest_run("AACCCGT") == 3
+        assert sp._scrub_longest_run("TTTTTT") == 6
+
+    def test_an_all_one_base_plasmid_never_reports_a_run_longer_than_itself(self):
+        """The circular measurement doubles a head slice; without the cap an
+        all-A plasmid would report a run longer than the molecule."""
+        plan = sc._scrub_design("A" * 80, [], ["BsaI"], circular=True)
+        assert plan["max_homopolymer_run"] <= 80

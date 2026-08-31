@@ -99,7 +99,8 @@ Drive the restriction overlay — all sites, unique cutters, 6+/4+ bp, or just
 the Golden Braid connectors. Multi-cutters wear a live **superscript
 cut-count** (EcoRI², BsaI³) that ticks down as you edit a site out. Build named
 **enzyme collections** from the 200+ NEB catalog plus your own customs; the
-active collection scopes every scan.
+active collection scopes every scan. Ask by whichever **name your supplier
+uses** — Eco31I finds BsaI's sites, LguI finds SapI's, AarI finds PaqCI's.
 
 ### Features
 

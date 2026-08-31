@@ -42,13 +42,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.56"
+__version__ = "1.2.57"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-08-24"
+_RELEASE_DATE = "2026-08-30"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -4955,6 +4955,7 @@ _LANE_PALETTE: list[str] = [
 # ── GB grammar/enzyme data + accessors moved to splicecraft_dataaccess (Phase D)
 from splicecraft_dataaccess import (  # noqa: E402
     _NEB_ENZYMES as _NEB_ENZYMES,
+    _ENZYME_ALIASES as _ENZYME_ALIASES,
     _GB_L0_PARTS as _GB_L0_PARTS,
     _GB_TYPE_COLORS as _GB_TYPE_COLORS,
     _GB_POSITIONS as _GB_POSITIONS,
@@ -5336,6 +5337,8 @@ from splicecraft_biology import (  # noqa: E402
     _span_in_span     as _span_in_span,
     _enzyme_signature as _enzyme_signature,
     _enzyme_aliases   as _enzyme_aliases,
+    _enzyme_alias_table as _enzyme_alias_table,
+    _enzyme_resolve_one as _enzyme_resolve_one,
     _resolve_enzyme_names as _resolve_enzyme_names,
     _RESOLVE_SUGGEST_LIMIT as _RESOLVE_SUGGEST_LIMIT,
     _IUPAC_RE         as _IUPAC_RE,
@@ -5893,6 +5896,7 @@ _rebuild_scan_catalog()
 # scanner reads these through `_state` getters registered here at import (Phase D).
 _state._scan_catalog_hook = lambda: _SCAN_CATALOG
 _state._all_enzymes_hook = _all_enzymes
+_state._enzyme_aliases_hook = lambda: _ENZYME_ALIASES
 
 
 # Per-record restriction-scan cache. Keyed by `(hash(seq), min_len,
@@ -8643,6 +8647,7 @@ from splicecraft_cloning import (  # noqa: E402
     _gibson_record_from_result as _gibson_record_from_result,
     # Traditional (restriction) cloning simulation [INV-127]
     _label_disrupted_split_features as _label_disrupted_split_features,
+    _rejoin_origin_split_features as _rejoin_origin_split_features,
     _ends_compatible as _ends_compatible,
     _ligate_fragments as _ligate_fragments,
     _close_circular as _close_circular,

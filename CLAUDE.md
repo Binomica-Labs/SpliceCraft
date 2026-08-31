@@ -108,7 +108,7 @@ The long-form rules and subsystem deep-dives live in split files. **Each entry h
 
 | File | Holds | Grep when touching |
 |---|---|---|
-| `docs/invariants.md` | `[PIT-01]`…`[PIT-39]` known pitfalls; `[INV-36]`…`[INV-134]` sweep history; `[PREFS]` settings; `[ARCH]` pointers; `[CONV]` conventions; `[SISTER]` ScriptoScope; `[RECIPE]` new-feature playbook | bare-except, wrap features, cache contracts, agent endpoints, master delete, synthesis/protein, collision modals, settings persistence, NEW FEATURE checklists |
+| `docs/invariants.md` | `[PIT-01]`…`[PIT-39]` known pitfalls; `[INV-36]`…`[INV-189]` sweep history; `[PREFS]` settings; `[ARCH]` pointers; `[CONV]` conventions; `[SISTER]` ScriptoScope; `[RECIPE]` new-feature playbook | bare-except, wrap features, cache contracts, agent endpoints, master delete, synthesis/protein, collision modals, settings persistence, NEW FEATURE checklists |
 | `docs/subsystems.md` | `[SUB-plasmidsaurus]`, `[SUB-experiments]`, `[SUB-gels]` | sequencing zip ingestion, lab notebook, gel snapshots |
 | `docs/architecture.md` | Single-file rationale, test pyramid, concurrency model, observability | high-level structural decisions |
 | `docs/PLATFORMS.md` | Supported OS / terminal matrix | cross-platform behaviour, terminal capability checks |

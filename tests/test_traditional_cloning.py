@@ -3256,3 +3256,199 @@ class TestMarkerLabelsHardening:
     def test_duplicates_collapse(self):
         frag = _frag(100, ["AmpR", "AmpR", "AmpR"])
         assert sc._fragment_backbone_marker_labels(frag) == ["AmpR"]
+
+
+class TestOriginSpanningFeatureSurvivesTheClone:
+    """2026-08-26 report #4 (the reporter's prediction that
+    `carry_annotations` had the same origin-wrap hole as `list-features`,
+    which it did).
+
+    A feature that wraps bp 0 is stored `end < start` and `_split_features_
+    at_cuts` HAS to halve it at the origin before slotting. Nothing put the
+    halves back, so a 25 bp T-DNA right border nowhere near the cloning site
+    came out of the clone as two adjacent 12 bp features with the same name —
+    bases right, annotation saying the border was in pieces, which is exactly
+    what an "is my border intact" check looks at."""
+
+    PRE  = "TTGACCATGCATGGCCTAAG" * 5     # 100, holds bp 0
+    MID  = "ACGTTAAGCCTTAAGGCCAA" * 3     # 60, between the two cuts
+    POST = "AGGCCTTACGTACGTTAAGC" * 5     # 100
+
+    def _vector(self):
+        return self.PRE + "GAATTC" + self.MID + "GGATCC" + self.POST
+
+    def _record(self, seq):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        n = len(seq)
+        rec = SeqRecord(Seq(seq), id="vecW", name="vecW",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        border = SeqFeature(
+            CompoundLocation([FeatureLocation(n - 20, n, 1),
+                              FeatureLocation(0, 20, 1)]), type="misc_feature")
+        border.qualifiers["label"] = ["RB border"]
+        kan = SeqFeature(FeatureLocation(40, 90, 1), type="CDS")
+        kan.qualifiers["label"] = ["KanR"]
+        rec.features = [border, kan]
+        return rec
+
+    def _clone(self):
+        vec = self._vector()
+        sc._save_library([{"name": "vecW", "id": "vecW",
+                           "gb_text": sc._record_to_gb_text(
+                               self._record(vec))}])
+        ins = "GAATTC" + "ACGTACGTAAGGCCTTAACC" * 4 + "GGATCC"
+        r = sc._h_traditional_clone(None, {
+            "vector_seq": vec, "insert_seq": ins,
+            "vector_enzymes": ["EcoRI", "BamHI"],
+            "insert_enzymes": ["EcoRI", "BamHI"],
+            "vector_circular": True, "carry_annotations": True,
+            "vector_name": "vecW", "product_name": "clonedW"})
+        assert not isinstance(r, tuple), r
+        ent = next(e for e in sc._load_library() if e["name"] == r["saved_name"])
+        return vec, sc._gb_text_to_record(ent["gb_text"])
+
+    def test_the_border_comes_through_as_one_feature(self):
+        _vec, rec = self._clone()
+        borders = [f for f in rec.features
+                   if (f.qualifiers.get("label") or [""])[0] == "RB border"]
+        assert len(borders) == 1, [
+            (f.qualifiers.get("label"), sc._feat_bounds(f, len(rec.seq)))
+            for f in rec.features]
+
+    def test_and_it_still_spells_the_original_bases(self):
+        """The coordinates being tidy is not the point — the annotated span
+        has to be the same 40 bases the vector had."""
+        vec, rec = self._clone()
+        n_v, total = len(vec), len(rec.seq)
+        want = vec[n_v - 20:] + vec[:20]
+        border = next(f for f in rec.features
+                      if (f.qualifiers.get("label") or [""])[0] == "RB border")
+        s, e, _strand = sc._feat_bounds(border, total)
+        got = (str(rec.seq[s:] + rec.seq[:e]) if e < s
+               else str(rec.seq[s:e]))
+        assert got == want
+        assert sc._feat_len(s, e, total) == 40
+
+    def test_a_border_the_cloning_really_cut_stays_two_pieces(self):
+        """The rejoin must not paper over a genuine disruption: when a cut
+        lands INSIDE the wrapping feature, two flanking pieces IS the truth,
+        and the surviving half is labelled disrupted."""
+        vec = "GAATTC" + self.PRE + "GGATCC" + self.POST   # EcoRI cuts at bp 1
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        n = len(vec)
+        rec = SeqRecord(Seq(vec), id="vecX", name="vecX",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        border = SeqFeature(
+            CompoundLocation([FeatureLocation(n - 12, n, 1),
+                              FeatureLocation(0, 4, 1)]), type="misc_feature")
+        border.qualifiers["label"] = ["RB border"]
+        rec.features = [border]
+        sc._save_library([{"name": "vecX", "id": "vecX",
+                           "gb_text": sc._record_to_gb_text(rec)}])
+        ins = "GAATTC" + "ACGTACGTAAGGCCTTAACC" * 4 + "GGATCC"
+        r = sc._h_traditional_clone(None, {
+            "vector_seq": vec, "insert_seq": ins,
+            "vector_enzymes": ["EcoRI", "BamHI"],
+            "insert_enzymes": ["EcoRI", "BamHI"],
+            "vector_circular": True, "carry_annotations": True,
+            "vector_name": "vecX", "product_name": "clonedX",
+            "vector_frag_idx": 0})
+        assert not isinstance(r, tuple), r
+        ent = next(e for e in sc._load_library() if e["name"] == r["saved_name"])
+        prod = sc._gb_text_to_record(ent["gb_text"])
+        labels = [(f.qualifiers.get("label") or [""])[0] for f in prod.features]
+        assert any("RB border" in lb and "(disrupted)" in lb for lb in labels), \
+            labels
+
+
+class TestRejoinOriginSplitFeatures:
+    """Unit-level cover for `_rejoin_origin_split_features` — the branches the
+    end-to-end clone test can't reach on demand."""
+
+    @staticmethod
+    def _half(gid, which, start, end, label="RB border"):
+        return {"start": start, "end": end, "strand": 1,
+                "type": "misc_feature", "label": label,
+                "_wrap_origin_split": which, "_wrap_origin_group": gid}
+
+    def test_adjacent_halves_merge(self):
+        feats = [self._half("w0", "tail", 85, 105),
+                 self._half("w0", "head", 105, 125)]
+        out = sc._rejoin_origin_split_features(feats, 292)
+        assert len(out) == 1
+        assert (out[0]["start"], out[0]["end"]) == (85, 125)
+        # Tags are consumed — a rejoined feature is no longer "split".
+        assert "_wrap_origin_split" not in out[0]
+        assert "_wrap_origin_group" not in out[0]
+
+    def test_halves_meeting_at_the_products_own_origin_stay_a_wrap(self):
+        """Ligation can land the pieces either side of bp 0 of the NEW
+        molecule; then the rejoined feature wraps, `end < start` — the same
+        shape it had on the vector (sacred invariant #8)."""
+        feats = [self._half("w0", "tail", 280, 292),
+                 self._half("w0", "head", 0, 8)]
+        out = sc._rejoin_origin_split_features(feats, 292)
+        assert len(out) == 1
+        assert (out[0]["start"], out[0]["end"]) == (280, 8)
+        assert sc._feat_len(280, 8, 292) == 20
+
+    def test_separated_halves_are_left_alone(self):
+        """Cloning that genuinely pulled the two apart must keep reporting
+        two pieces — merging them would invent a feature spanning an insert
+        that was dropped in between."""
+        feats = [self._half("w0", "tail", 10, 30),
+                 self._half("w0", "head", 200, 220)]
+        out = sc._rejoin_origin_split_features(feats, 292)
+        assert len(out) == 2
+
+    def test_two_wrapping_features_do_not_cross_pair(self):
+        """The group id is what stops one feature's head merging onto
+        another's tail — the failure a bare head/tail tag couldn't prevent."""
+        feats = [self._half("w0", "tail", 0, 10, "RB"),
+                 self._half("w1", "head", 10, 20, "LB"),
+                 self._half("w0", "head", 40, 50, "RB"),
+                 self._half("w1", "tail", 50, 60, "LB")]
+        out = sc._rejoin_origin_split_features(feats, 100)
+        spans = sorted((f["start"], f["end"]) for f in out)
+        assert spans == [(0, 10), (10, 20), (40, 50), (50, 60)]
+
+    def test_untagged_features_pass_through_untouched(self):
+        feats = [{"start": 1, "end": 2, "type": "CDS", "label": "x"}]
+        assert sc._rejoin_origin_split_features(feats, 100) == feats
+
+    def test_a_three_way_split_is_left_alone(self):
+        """A half that was cut AGAIN gives the group three members. Merging
+        two of them would invent a span across the piece that was excised —
+        so an ambiguous group is not merged at all."""
+        feats = [self._half("w0", "tail", 0, 10),
+                 self._half("w0", "head", 10, 20),
+                 self._half("w0", "head", 20, 30)]
+        assert len(sc._rejoin_origin_split_features(feats, 100)) == 3
+
+    def test_a_lone_half_passes_through(self):
+        """The other half went onto the fragment that was discarded — one
+        piece is the truth."""
+        feats = [self._half("w0", "tail", 0, 10)]
+        out = sc._rejoin_origin_split_features(feats, 100)
+        assert len(out) == 1 and out[0]["_wrap_origin_split"] == "tail"
+
+    def test_opposite_strands_never_merge(self):
+        a = self._half("w0", "tail", 0, 10)
+        b = self._half("w0", "head", 10, 20)
+        b["strand"] = -1
+        assert len(sc._rejoin_origin_split_features([a, b], 100)) == 2
+
+    def test_a_non_integer_coordinate_does_not_raise(self):
+        """A hand-edited GenBank or a caller-built feature list can carry a
+        fuzzy coordinate; it must drop out of the merge, not out of the
+        cloning run."""
+        a = self._half("w0", "tail", 0, 10)
+        b = self._half("w0", "head", 10, 20)
+        a["start"] = "<1"
+        assert len(sc._rejoin_origin_split_features([a, b], 100)) == 2

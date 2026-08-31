@@ -14,6 +14,76 @@
 
 ---
 
+## [1.2.57] — 2026-08-30
+
+### Bug fixes
+
+- **Enzymes sold under another name couldn't be found.** The same restriction
+  enzyme is sold under different names by different suppliers — **Eco31I** is
+  **BsaI**, **LguI** is **SapI**, **AarI** is **PaqCI**, **BveI** is
+  **BspMI**, **TspMI** is **XmaI** — and asking for one SpliceCraft didn't
+  list came back as an unrecognised name, on an enzyme it knows perfectly
+  well. Thirty-nine of the names people actually order now resolve, and your
+  sites come back labelled with the name you asked for. Where two enzymes
+  read the same bases but cut in *different* places they stay separate, since
+  they leave different ends: **Acc65I** (`G^GTACC`) has been added alongside
+  KpnI as its own enzyme rather than treated as another word for it.
+- **Two enzymes that cut the same site differently reported as one.** XmaI
+  and SmaI both recognise `CCCGGG` but cut it in different places — one
+  leaves a sticky end, the other is blunt. The plasmid map deliberately draws
+  a single bar there so sites don't stack up, and the scripting API was
+  reading its answer off that drawing, so asking about both returned only
+  one. Now it reports both, with each enzyme's real cut position. Same for
+  Acc65I/KpnI, ApaI/PspOMI, NheI/BmtI, KasI/NarI, AatII/ZraI and
+  SacI/Eco53kI. The map is unchanged.
+- **Golden Gate simulation blamed the parts for a problem with the vector.**
+  If the destination plasmid carried a stray site for the assembly enzyme it
+  got cut into more than two pieces, which is fine — a real one-pot reaction
+  puts all of them back around the inserts — but the simulator assumed the
+  backbone was a single piece and reported "the overhangs don't chain, check
+  that adjacent parts share a 4 nt overhang". The parts were never the
+  problem. Multi-piece backbones now assemble, and when a reaction genuinely
+  can't close, the message shows its working: how many times the vector was
+  cut and where, and every fragment's two ends, so the one with no partner is
+  visible. If more than one arrangement could form, you're told rather than
+  handed one of them — and if many fragments share an overhang, the search is
+  cut off with an honest "unknown" rather than grinding through an
+  astronomical number of orderings or claiming the design can't be built.
+- **Primer hairpin and self-dimer energies were a thousand times too large.**
+  They came back as `-738` and `-4993` where an oligo's real values are
+  single digits — reported in calories where the whole field, and every rule
+  of thumb you'd compare them against, uses kilocalories. They're now in
+  kcal/mol, each result says so, and the figure quoted for a primer pair is
+  the worse of the two rather than the better one. If the calculation can't
+  run at all you get a blank and a warning instead of a zero, which used to
+  read as a perfect score.
+- **Site cures could stretch a run of identical bases.** Removing a
+  restriction site sometimes has two equally silent single-base fixes, and
+  the one SpliceCraft picked could butt onto an existing run — curing
+  `GGAAAAA GAAGAC` produced `GGAAAAAAAAGAC`, eight A's in a row, where the
+  other choice left the longest run at five. Long runs are hard to synthesise
+  and hard to sequence, and when the site sits in a repeated element (a
+  tandem 2×35S enhancer, say) the same bad choice lands once per copy. Cures
+  now prefer the option that doesn't lengthen a run, ranked above the
+  codon-usage preference. Every plan reports `max_homopolymer_run`, and if no
+  silent alternative avoided lengthening one, it says so instead of leaving
+  you to check.
+- **A misspelt enzyme made `scrub-plasmid` report a clean plasmid.** Names it
+  didn't recognise were quietly skipped, so a typo (or an enzyme entered in
+  the wrong capitalisation, or under a supplier's name) scrubbed nothing and
+  reported success with no sites removed — which reads as "already clean" on
+  a plasmid that isn't. Unrecognised names are now a clear error, and
+  `bsai` / `Eco31I` work like `BsaI`.
+- **A feature crossing the start of the plasmid came out of a clone in two
+  pieces.** Carrying annotations through a restriction clone splits every
+  origin-crossing feature in half while the plasmid is cut open — necessary —
+  but nothing put them back together afterwards. A T-DNA border or marker
+  nowhere near the cloning site arrived as two adjacent features with the
+  same name, which reads as a broken border. They're rejoined now, unless the
+  cloning really did separate them.
+
+---
+
 ## [1.2.56] — 2026-08-24
 
 ### Bug fixes

@@ -1800,6 +1800,12 @@ _NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
     "XhoI":      ("CTCGAG",       1,  5),  # C^TCGAG   / GAGCT^C     5' overhang
     "SalI":      ("GTCGAC",       1,  5),  # G^TCGAC   / CAGCT^G     5' overhang
     "KpnI":      ("GGTACC",       5,  1),  # GGTAC^C   / G^GTACC     3' overhang
+    # Acc65I is KpnI's NEOschizomer, not a synonym: same GGTACC, cut on the
+    # OTHER side of the tetramer, so it leaves a 4-nt 5' overhang where KpnI
+    # leaves a 3' one. It gets a real catalog entry (an alias to KpnI would
+    # hand back the wrong overhang) — Asp718I is its true synonym and lives in
+    # `_ENZYME_ALIASES`.
+    "Acc65I":    ("GGTACC",       1,  5),  # G^GTACC   / CCATG^G     5' overhang
     "SacI":      ("GAGCTC",       5,  1),  # GAGCT^C   / G^AGCTC     3' overhang
     "SacII":     ("CCGCGG",       4,  2),  # CCGC^GG   / CC^GCGG     3' overhang
     "SpeI":      ("ACTAGT",       1,  5),  # A^CTAGT   / TGATC^A     5' overhang
@@ -2017,6 +2023,69 @@ _NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
     "SphI-HF":   ("GCATGC",       5,  1),
     "TaqI-v2":   ("TCGA",         1,  3),
     "XhoI-HF":   ("CTCGAG",       1,  5),
+}
+
+
+# ── Commercial synonyms: alias → the `_NEB_ENZYMES` name that IS this enzyme ──
+#
+# The same specificity is sold under different names by different suppliers —
+# Thermo/Fermentas ship BsaI as **Eco31I**, SapI as **LguI**, PaqCI as
+# **AarI** — and a scan that only knows one spelling answers "no sites" for the
+# other. That is the [INV-187] failure shape: a safety check that CANNOT fail.
+# Rather than duplicate every synonym into `_NEB_ENZYMES` (which would make the
+# per-enzyme scan ~20% slower for zero new biology), the resolver consults this
+# table AFTER the catalog, so a user-added custom enzyme of the same name still
+# wins.
+#
+# HARD RULE: an entry here must cut IDENTICALLY to its target — same
+# recognition sequence AND same offsets. A NEOschizomer (same site, different
+# cut: Acc65I/KpnI, XmaI/SmaI, ApaI/PspOMI, NheI/BmtI, KasI/NarI, AatII/ZraI,
+# SacI/Eco53kI) is a DIFFERENT enzyme leaving a DIFFERENT overhang and gets its
+# own `_NEB_ENZYMES` entry instead. Aliasing one would be the confidently-wrong
+# answer this table exists to prevent — pinned by
+# `test_dna_sanity.py::TestEnzymeNameResolution`.
+_ENZYME_ALIASES: dict[str, str] = {
+    # ── Type IIS — the modular-cloning names ──────────────────────────────────
+    "AarI":      "PaqCI",     # CACCTGC(4/8)   Thermo
+    "BveI":      "BspMI",     # ACCTGC(4/8)    Thermo (= BfuAI)
+    "Eam1104I":  "EarI",      # CTCTTC(1/4)    Thermo (= Ksp632I)
+    "Eco31I":    "BsaI",      # GGTCTC(1/5)    Thermo
+    "LguI":      "SapI",      # GCTCTTC(1/4)   Thermo (= BspQI)
+    # ── Type IIP — true isoschizomers of a catalog entry ──────────────────────
+    "Alw44I":    "ApaLI",     # G^TGCAC        Thermo
+    "Asp718I":   "Acc65I",    # G^GTACC        Roche
+    "BcuI":      "SpeI",      # A^CTAGT        Thermo
+    "BshTI":     "AgeI",      # A^CCGGT        Thermo
+    "Bsp119I":   "BstBI",     # TT^CGAA        Thermo (= AsuII)
+    "Bsp120I":   "PspOMI",    # G^GGCCC        Thermo
+    "Bsp1407I":  "BsrGI",     # T^GTACA        Thermo
+    "BspDI":     "ClaI",      # AT^CGAT        NEB
+    "BspTI":     "AflII",     # C^TTAAG        Thermo
+    "Bst1107I":  "BstZ17I",   # GTA^TAC        Thermo
+    "Bsu15I":    "ClaI",      # AT^CGAT        Thermo
+    "Cfr9I":     "XmaI",      # C^CCGGG        Thermo
+    "Cfr42I":    "SacII",     # CCGC^GG        Thermo (= KspI)
+    "Ecl136II":  "Eco53kI",   # GAG^CTC        Thermo (= EcoICRI)
+    "Eco32I":    "EcoRV",     # GAT^ATC        Thermo
+    "Eco72I":    "PmlI",      # CAC^GTG        Thermo
+    "Eco91I":    "BstEII",    # G^GTNACC       Thermo (= BstPI)
+    "Eco105I":   "SnaBI",     # TAC^GTA        Thermo
+    "Eco147I":   "StuI",      # AGG^CCT        Thermo (= AatI)
+    "Kpn2I":     "BspEI",     # T^CCGGA        Thermo
+    "MlsI":      "MscI",      # TGG^CCA        Thermo
+    "Mph1103I":  "NsiI",      # ATGCA^T        Thermo
+    "MssI":      "PmeI",      # GTTT^AAAC      Thermo
+    "NdeII":     "DpnII",     # ^GATC          (= MboI / Sau3AI)
+    "PaeI":      "SphI",      # GCATG^C        Thermo
+    "PauI":      "BssHII",    # G^CGCGC        Thermo
+    "PdmI":      "XmnI",      # GAANN^NNTTC    Thermo
+    "Pfl23II":   "BsiWI",     # C^GTACG        Thermo (= SplI)
+    "Psp1406I":  "AclI",      # AA^CGTT        Thermo
+    "SgsI":      "AscI",      # GG^CGCGCC      Thermo
+    "SmiI":      "SwaI",      # ATTT^AAAT      Thermo
+    "SstI":      "SacI",      # GAGCT^C        classic
+    "SstII":     "SacII",     # CCGC^GG        classic
+    "TspMI":     "XmaI",      # C^CCGGG        NEB
 }
 
 

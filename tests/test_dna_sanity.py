@@ -2250,3 +2250,106 @@ class TestEnzymeNameResolution:
         names = list(sc._all_enzymes())
         resolved, unknown = sc._resolve_enzyme_names(names)
         assert unknown == [] and resolved == names
+
+
+class TestCommercialSynonyms:
+    """`_ENZYME_ALIASES` — the same enzyme is sold under different names, and
+    a scan that only knows one of them answers "no sites" for the other
+    (2026-08-26 agent field report #1, the [INV-187] failure shape one layer
+    out: a safety check that CANNOT fail)."""
+
+    # (synonym, the catalog name it IS)
+    KNOWN = [("Eco31I", "BsaI"), ("LguI", "SapI"), ("AarI", "PaqCI"),
+             ("BveI", "BspMI"), ("TspMI", "XmaI"), ("Asp718I", "Acc65I"),
+             ("SstI", "SacI"), ("MssI", "PmeI")]
+
+    def test_alias_targets_all_exist_in_the_catalog(self):
+        """A synonym pointing at a name the catalog dropped would resolve to
+        nothing — the silent zero this table exists to remove."""
+        catalog = sc._all_enzymes()
+        missing = {a: t for a, t in sc._ENZYME_ALIASES.items()
+                   if t not in catalog}
+        assert missing == {}
+
+    def test_no_alias_shadows_a_real_catalog_entry(self):
+        """A name in BOTH places is ambiguous; the catalog must be the only
+        home for a name that has its own cut offsets."""
+        catalog = sc._all_enzymes()
+        assert [a for a in sc._ENZYME_ALIASES if a in catalog] == []
+
+    def test_a_synonym_cuts_exactly_like_its_target(self):
+        """HARD RULE for this table: same recognition sequence AND same
+        offsets. A neoschizomer aliased to its partner would hand back the
+        wrong overhang, which is worse than not knowing the name."""
+        for alias, target in sc._ENZYME_ALIASES.items():
+            assert sc._enzyme_signature(alias) == sc._enzyme_signature(target), \
+                f"{alias} does not cut like {target}"
+
+    @pytest.mark.parametrize("alias,target", KNOWN)
+    def test_named_synonyms_resolve(self, alias, target):
+        resolved, unknown = sc._resolve_enzyme_names([alias])
+        assert unknown == [] and resolved == [target]
+
+    def test_synonyms_resolve_case_insensitively(self):
+        resolved, unknown = sc._resolve_enzyme_names(["eco31i", "LGUI"])
+        assert unknown == [] and resolved == ["BsaI", "SapI"]
+
+    def test_aliases_list_reports_the_synonym(self):
+        assert "Eco31I" in sc._enzyme_aliases("BsaI")
+        assert "BsaI" in sc._enzyme_aliases("Eco31I")
+
+    def test_a_neoschizomer_is_not_an_alias(self):
+        """SmaI is not another name for XmaI — it is another cut. Aliasing
+        them would report a blunt end where a CCGG overhang is."""
+        assert "SmaI" not in sc._enzyme_aliases("XmaI")
+        assert "KpnI" not in sc._enzyme_aliases("Acc65I")
+        assert sc._enzyme_signature("XmaI") != sc._enzyme_signature("SmaI")
+        assert sc._enzyme_signature("Acc65I") != sc._enzyme_signature("KpnI")
+
+    def test_acc65i_leaves_the_five_prime_overhang(self):
+        """Acc65I `G^GTACC` vs KpnI `GGTAC^C`: same six bases, opposite
+        overhang. Verified through the digest engine, not the table."""
+        seq = "TTTTTTTTTT" + "GGTACC" + "AAAAAAAAAA"
+        acc = sc._enzyme_cuts(seq, ["Acc65I"], circular=False)[0]
+        kpn = sc._enzyme_cuts(seq, ["KpnI"], circular=False)[0]
+        assert acc["kind"] == "5'" and kpn["kind"] == "3'"
+        assert acc["overhang_seq"] == kpn["overhang_seq"] == "GTAC"
+        assert acc["top"] == 11 and kpn["top"] == 15
+
+    def test_a_synonym_typo_still_fails_loudly(self):
+        _resolved, unknown = sc._resolve_enzyme_names(["Eco31l"])
+        assert [w for w, _ in unknown] == ["Eco31l"]
+        assert "Eco31I" in dict(unknown)["Eco31l"]
+
+
+class TestNeoschizomerScanCollapse:
+    """The map collapses one bar per recognition span; a QUERY must not
+    inherit that, because two enzymes reading the same bases at different
+    offsets leave DIFFERENT ends ([INV-187], 2026-08-26 report #1)."""
+
+    SEQ = "ATGCATGCAT" * 6 + "CCCGGG" + "ATGCATGCAT" * 6
+
+    def test_map_scan_still_shows_one_bar(self):
+        hits = sc._scan_restriction_sites(self.SEQ, 6, False, True)
+        names = {h["label"] for h in hits
+                 if h["type"] == "resite" and h.get("label")}
+        assert ("XmaI" in names) != ("SmaI" in names)
+
+    def test_query_scan_shows_both_with_their_own_cuts(self):
+        hits = sc._scan_restriction_sites(self.SEQ, 6, False, True,
+                                          distinct_cuts=True)
+        cuts = {h["label"]: h.get("top_cut_bp") for h in hits
+                if h["type"] == "resite" and h.get("label")
+                and h["label"] in ("XmaI", "SmaI")}
+        assert set(cuts) == {"XmaI", "SmaI"}
+        assert cuts["XmaI"] != cuts["SmaI"]     # C^CCGGG vs CCC^GGG
+
+    def test_the_two_scan_modes_do_not_share_a_cache_slot(self):
+        """Both keys must live in `_RESTR_SCAN_CACHE` independently — a
+        shared slot would serve the map's collapsed answer to a query."""
+        sc._state._RESTR_SCAN_CACHE.clear()
+        a = sc._scan_restriction_sites(self.SEQ, 6, False, True)
+        b = sc._scan_restriction_sites(self.SEQ, 6, False, True,
+                                       distinct_cuts=True)
+        assert len(b) > len(a)
+        assert sc._scan_restriction_sites(self.SEQ, 6, False, True) == a

@@ -386,6 +386,10 @@ def _scanner_hook_unregistered():
 
 _scan_catalog_hook: "_Callable[[], list]" = _scanner_hook_unregistered
 _all_enzymes_hook: "_Callable[[], dict]" = _scanner_hook_unregistered
+# Commercial-synonym table (`_ENZYME_ALIASES`, dataaccess L1) — alias name →
+# the catalog name that IS that enzyme. Read by the L0 name resolver so
+# "Eco31I" finds BsaI's sites instead of answering `count: 0` ([INV-187]).
+_enzyme_aliases_hook: "_Callable[[], dict]" = _scanner_hook_unregistered
 # Resolver returning a CDS translation (single-letter AA string). The hub-side
 # `_translate_cds` selects its genetic-code table via `_codon_table_for` (in
 # splicecraft_codon, L2) AND has callers spread across the hub (ORF finder, CDS

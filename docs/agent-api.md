@@ -171,7 +171,14 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   golden-gate-assemble / simulate-golden-gate (Type IIS — BsaI /
   BsmBI / BbsI / SapI / Esp3I — overhang-directed N-part assembly: parts in
   any order, chained by their 4-nt overhangs into a circle, with a
-  unique-overhang + no-residual-site fidelity check),
+  unique-overhang + no-residual-site fidelity check. **The vector may be cut
+  more than twice** — a destination plasmid with background enzyme sites is
+  released as several pieces and all of them go back into the circle, which
+  `n_vector_fragments` / `n_vector_fragments_used` / `vector_cut_bp` report.
+  When nothing closes, the error names the vector's cut positions and every
+  fragment's two overhangs (`CGCT→TTAC, …`) so you can see which end has no
+  partner, instead of being pointed at parts that were fine; more than one
+  possible circle is warned about rather than silently picked),
   lint-synthesis (an "is it safe to order + assemble?" pre-flight over a bare
   `sequence` or a library `id`/`name`: internal Type IIS sites, extreme
   overall + windowed GC, long homopolymer runs, tandem repeats, degenerate
@@ -185,7 +192,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   primer pair per locus) or `"golden_braid"` (split into BsaI-tailed
   fragments that Golden-Gate back together; force-cures every BsaI site,
   returns per-fragment primers + native junction overhangs + a digest+ligate
-  `verified` flag)), design-gb-part (Golden Braid / MoClo domestication
+  `verified` flag). Cures prefer the silent option that does NOT lengthen a
+  homopolymer run — ranked above the codon-usage tie-break, because a run
+  long enough to stall synthesis is a hard failure and a rarer synonymous
+  codon is not; `max_homopolymer_run` comes back on every plan, with a
+  warning when no alternative avoided lengthening one. Each QuikChange round
+  reports `hairpin_dg` /
+  `homodimer_dg` in **kcal/mol** (`dg_units` says so), taking the worse of
+  the two primers so the number works as a gate; `null` means it could not be
+  measured — never "no structure" — and the round carries a warning saying
+  the pair is not secondary-structure checked), design-gb-part (Golden Braid / MoClo domestication
   primers; pass `check_entry_vector:true` — plus optional `entry_vector_role`
   for a Golden-Braid role — to validate at DESIGN time that the part's
   overhangs actually match the configured entry vector's acceptor, so a
@@ -268,7 +284,14 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   recognition site and cut (BsmBI / Esp3I / BsmBI-v2, BsaI / BspTNI, EcoRI /
   EcoRI-HF) onto one label so the map stays readable, so the endpoint
   re-expands it and reports `equivalent_enzymes` telling you which other
-  spellings the answer already covers. Two further refusals exist for the same
+  spellings the answer already covers. **Commercial synonyms resolve too** —
+  the same enzyme is sold under different names (Thermo's `Eco31I` is NEB's
+  `BsaI`, `LguI` is `SapI`, `AarI` is `PaqCI`, `Asp718I` is `Acc65I`), and
+  hits come back labelled with the name YOU asked for. **NEOschizomers stay
+  apart**: XmaI (`C^CCGGG`) and SmaI (`CCC^GGG`) read the same six bases and
+  leave different ends, so this endpoint reports both even though the plasmid
+  map draws one bar for the pair — same for Acc65I/KpnI, ApaI/PspOMI,
+  NheI/BmtI, KasI/NarI, AatII/ZraI, SacI/Eco53kI. Two further refusals exist for the same
   reason — both would otherwise return a confident `count: 0`: a `min_length`
   longer than the longest recognition site in the catalog (a units mix-up —
   `min_length` is in BASE PAIRS), and an `enzymes` list longer than 500 names
@@ -277,10 +300,12 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   the cuts + resulting fragments with their **overhangs** — overhang-aware
   QC for a Golden-Braid / restriction junction without loading the
   sequence onto the canvas; `circular` defaults true, a singular `enzyme`
-  is accepted, names are matched case-insensitively so `bsai` cuts, and names
-  the catalog genuinely doesn't know are reported under `unknown_enzymes`
-  rather than silently dropped — this endpoint reports rather than refuses, so
-  a long list still returns the cuts it can make).
+  is accepted, names are matched case-insensitively so `bsai` cuts,
+  commercial synonyms resolve (Thermo's `Eco31I` is NEB's `BsaI`) with
+  `resolved_enzymes` reporting what each one became, and names the catalog
+  genuinely doesn't know are reported under `unknown_enzymes` rather than
+  silently dropped — this endpoint reports rather than refuses, so a long
+  list still returns the cuts it can make).
 - **Transcripts** — `predict-transcript` reconstructs the MATURE mRNA of an
   annotated transcription unit on the loaded record and scores translation
   initiation on it. Pick the unit with `promoter` / `cds` / `terminator` (a

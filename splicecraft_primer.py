@@ -196,34 +196,55 @@ def _mut_tm(seq: str) -> float:
     return val
 
 
-def _mut_hairpin_dg(seq: str) -> float:
+# primer3-py reports every ΔG in CALORIES per mole. Oligo literature, every
+# supplier's spec sheet and every QC rule of thumb ("reject below −9 kcal/mol")
+# are in KILOcalories, so the raw number is 1000× what a reader expects: a
+# perfectly ordinary hairpin came back as `-738.3` and an ordinary self-dimer
+# as `-4993.7`, which is unusable as a gate and reads as catastrophic if you
+# take the unit at face value. Convert once, here, so every caller and every
+# reported field is in kcal/mol (2026-08-26 agent field report #3).
+_CAL_PER_KCAL = 1000.0
+
+
+def _mut_hairpin_dg(seq: str) -> "float | None":
+    """Hairpin ΔG in **kcal/mol** (negative = more stable), or ``None`` when
+    it could not be computed.
+
+    ``None`` rather than ``0.0``: zero is the BEST possible value, so a
+    missing primer3 would make every QC gate pass on a primer nobody
+    measured. Callers that only rank treat it as no penalty; callers that
+    REPORT it must pass the None through."""
     hit = _MUT_HAIRPIN_CACHE.get(seq)
     if hit is not None:
         return hit
     try:
         import primer3
-        val = primer3.calc_hairpin(seq, **_MUT_P3).dg  # type: ignore[arg-type]
+        val = (primer3.calc_hairpin(seq, **_MUT_P3).dg  # type: ignore[arg-type]
+               / _CAL_PER_KCAL)
     except Exception:
         _log.exception(
             "_mut_hairpin_dg: primer3.calc_hairpin raised on %d-mer; "
-            "returning 0.0 (no secondary-structure penalty)", len(seq))
-        return 0.0
+            "reporting None (not measured)", len(seq))
+        return None
     _mut_thermo_cache_put(_MUT_HAIRPIN_CACHE, seq, val)
     return val
 
 
-def _mut_homodimer_dg(seq: str) -> float:
+def _mut_homodimer_dg(seq: str) -> "float | None":
+    """Self-dimer ΔG in **kcal/mol**, or ``None`` when it could not be
+    computed — see `_mut_hairpin_dg` for why not 0.0."""
     hit = _MUT_HOMODIMER_CACHE.get(seq)
     if hit is not None:
         return hit
     try:
         import primer3
-        val = primer3.calc_homodimer(seq, **_MUT_P3).dg  # type: ignore[arg-type]
+        val = (primer3.calc_homodimer(seq, **_MUT_P3).dg  # type: ignore[arg-type]
+               / _CAL_PER_KCAL)
     except Exception:
         _log.exception(
             "_mut_homodimer_dg: primer3.calc_homodimer raised on "
-            "%d-mer; returning 0.0", len(seq))
-        return 0.0
+            "%d-mer; reporting None (not measured)", len(seq))
+        return None
     _mut_thermo_cache_put(_MUT_HOMODIMER_CACHE, seq, val)
     return val
 
@@ -240,11 +261,13 @@ def _mut_ends_gc(seq: str) -> bool:
 def _mut_score_outer(anneal: str, target_tm: float = 60.0) -> float:
     t  = _mut_tm(anneal)
     gc = _mut_gc_pct(anneal)
-    hp = _mut_hairpin_dg(anneal)
+    # ΔG is kcal/mol; an unmeasurable one scores as no penalty (ranking only —
+    # the REPORTED field keeps the None so a QC gate can't pass vacuously).
+    hp = _mut_hairpin_dg(anneal) or 0.0
     return (
         abs(t - target_tm) * 2.0
         + (0 if _mut_ends_gc(anneal) else 4.0)
-        + max(0, -hp - 1000) / 400.0
+        + max(0.0, -hp - 1.0) / 0.4
         + abs(gc - 50) * 0.1
     )
 
@@ -1050,18 +1073,24 @@ def _mut_design_inner(dna: str, mut_pos_1: int, mut_aa: str, wt_aa: str,
                 continue
             hp = _mut_hairpin_dg(fwd)
             hd = _mut_homodimer_dg(fwd)
+            # kcal/mol; None (not measured) scores as no penalty but is
+            # reported verbatim below.
             score = (
                 abs(t - TM_TARGET) * 2.0
                 + (0 if _mut_ends_gc(fwd) else 4.0)
-                + max(0, -hp - 1000) / 400.0
-                + max(0, -hd - 2000) / 400.0
+                + max(0.0, -(hp or 0.0) - 1.0) / 0.4
+                + max(0.0, -(hd or 0.0) - 2.0) / 0.4
                 + abs(gc - 50) * 0.1
                 - (len(fwd) * 0.15 if abs(t - TM_TARGET) <= 1.0 else 0)
             )
             candidates.append({
                 "fwd": fwd, "rev": _mut_revcomp(fwd),
                 "tm": t, "gc": gc, "length": len(fwd),
-                "hairpin_dg": hp, "homodimer_dg": hd, "score": score, "lo": lo,
+                # kcal/mol (None = not measured); see `_mut_hairpin_dg`.
+                "hairpin_dg": None if hp is None else round(hp, 2),
+                "homodimer_dg": None if hd is None else round(hd, 2),
+                "dg_units": "kcal/mol",
+                "score": score, "lo": lo,
             })
 
     if not candidates:
@@ -1173,6 +1202,41 @@ _SCRUB_PRIMER_FOOTPRINT = 30
 # base isn't free. Beyond this we report the site as un-scrubbable rather
 # than mangling a long stretch.
 _SCRUB_MAX_CHANGES = 3
+
+# Homopolymer hygiene for a cure (2026-08-26 field report). A single-base
+# swap that happens to butt onto an existing run can LENGTHEN it — curing
+# `GGAAAAA GAAGAC` by G→A spells `GGAAAAAAAAGAC`, an 8×A run, where the
+# equally valid A→G at the third base spells `GGAAAAA GAGGAC` and leaves the
+# longest run at 5. Both are single transitions with the same GC delta, so
+# the old score separated them only by the lexicographic determinism
+# tie-break — and `A` sorts before `G`, so the run-extending cure won every
+# time. Long runs are a synthesis and sequencing hazard (slippage), and the
+# report's case doubled it: the site sat in a TANDEM-duplicated 35S enhancer,
+# so the same bad choice landed twice.
+#
+# `_SCRUB_HOMOPOLYMER_FREE` is the run length a cure may reach for free.
+# Scoring is RELATIVE to what was already there, so a cure is never blamed
+# for a run it didn't make — only for making one longer.
+_SCRUB_HOMOPOLYMER_FREE = 5
+# How far either side of the site to look. A run is only interesting where it
+# meets the edit, and this bounds the per-candidate cost.
+_SCRUB_HOMOPOLYMER_FLANK = 15
+
+
+def _scrub_longest_run(window: str) -> int:
+    """Longest single-base homopolymer run in `window` (0 for empty).
+
+    Local to the scrub engine (L2) rather than reusing seqanalysis'
+    `_lint_homopolymer_runs` (L3) — L2 cannot import upward, and this needs
+    one integer per candidate, not a list of annotated findings."""
+    best = run = 0
+    prev = ""
+    for ch in window:
+        run = run + 1 if ch == prev else 1
+        prev = ch
+        if run > best:
+            best = run
+    return best
 
 
 def _circ_window(seq: str, start: int, length: int, n: int) -> str:
@@ -1375,10 +1439,16 @@ def _scrub_one_site(seq: str, target: dict, feats: list,
     silently. A candidate is accepted only if it (1) destroys this
     instance, (3) leaves every overlapping CDS's protein unchanged, and
     (2) introduces no new forbidden site near the edit. Among the accepted,
-    the score prefers: fewest changes → not touching annotated bases →
-    (when `codon_frac` is given) the host-frequent synonymous codon →
-    transitions over transversions → GC-neutral → lexicographic
-    (deterministic, so the same plasmid always cures the same way).
+    the score prefers: fewest changes → not touching annotated bases → not
+    LENGTHENING a homopolymer run past `_SCRUB_HOMOPOLYMER_FREE` → (when
+    `codon_frac` is given) the host-frequent synonymous codon → transitions
+    over transversions → GC-neutral → lexicographic (deterministic, so the
+    same plasmid always cures the same way).
+
+    The homopolymer term ranks above codon usage on purpose: a run long
+    enough to stall synthesis is a hard failure, a slightly rarer synonymous
+    codon is a soft cost. It is measured RELATIVE to the sequence that was
+    already there, so a cure is never penalised for a run it inherited.
 
     `codon_frac` (``{codon: usage_fraction}``) is a TIE-BREAK ONLY: synonymy
     is already guaranteed by check (3), so even a wrong frame map could only
@@ -1407,6 +1477,13 @@ def _scrub_one_site(seq: str, target: dict, feats: list,
     fwd_site = forward[target["enzyme"]]
     pat_f = _iupac_pattern(fwd_site)
     pat_r = _iupac_pattern(_rc(fwd_site))
+    # Homopolymer baseline: the same window, measured on the UNEDITED
+    # sequence. Scoring the delta (not the absolute run) is what keeps a cure
+    # inside an existing poly-A tract from being scored as if it made it.
+    hp_start = (target["rec_start"] - _SCRUB_HOMOPOLYMER_FLANK) % n if n else 0
+    hp_len = min(site_len + 2 * _SCRUB_HOMOPOLYMER_FLANK, n) if n else 0
+    hp_before = max(_scrub_longest_run(_circ_window(seq, hp_start, hp_len, n))
+                    if hp_len else 0, _SCRUB_HOMOPOLYMER_FREE)
     best: "tuple | None" = None
     for k in range(1, max_changes + 1):
         for combo in combinations(positions, k):
@@ -1446,9 +1523,18 @@ def _scrub_one_site(seq: str, target: dict, feats: list,
                                  if st == -1 else
                                  "".join(test[p] for p in trip))
                         freq += (codon_frac or {}).get(codon, 0.0)
+                # How much longer this cure makes the longest local run than
+                # it already was. 0 for almost every cure — it only bites
+                # where a swap butts onto a run, which is exactly the case
+                # the plain lexicographic tie-break used to get wrong.
+                hp_cost = 0
+                if hp_len:
+                    hp_cost = max(0, _scrub_longest_run(
+                        _circ_window(test, hp_start, hp_len, n)) - hp_before)
                 score = (
                     k,
                     sum(1 for g in combo if g in annotated),
+                    hp_cost,
                     -round(freq, 6),
                     sum(1 for j in range(k)
                         if not _scrub_is_transition(seq[combo[j]], repl[j])),
@@ -1605,6 +1691,30 @@ def _scrub_design(seq: str, feats: "list | None" = None,
             "strand": t["strand"], "region": "?",
             "reason": "could not be removed without side effects"})
 
+    # Homopolymer report. The scorer PREFERS a cure that doesn't lengthen a
+    # run, but on a site where every silent option extends one it still has to
+    # pick something — and that is precisely the case a reader must be told
+    # about, because a long run is a synthesis/sequencing hazard and it can
+    # land twice when the site sits in a tandem repeat (2026-08-26 field
+    # report). Measured on the whole molecule so the answer is the same one a
+    # vendor's pre-flight would give, not a window-local approximation.
+    def _whole_run(s: str) -> int:
+        # A run can cross the origin on a circular molecule, so measure on a
+        # doubled head — capped at `n`, or an all-one-base plasmid would
+        # report a run longer than itself.
+        probe = s + s[:_SCRUB_HOMOPOLYMER_FLANK] if circular else s
+        return min(_scrub_longest_run(probe), n)
+
+    hp_before = _whole_run(seq)
+    hp_after = _whole_run(cured)
+    result["max_homopolymer_run"] = hp_after
+    if result["edits"] and hp_after > max(hp_before, _SCRUB_HOMOPOLYMER_FREE):
+        result["warnings"].append(
+            f"The cure lengthens a homopolymer run to {hp_after}×"
+            f" (was {hp_before}×) — no silent alternative avoided it. Long "
+            "runs are synthesis- and sequencing-hard; if this site sits in a "
+            "repeated element the run is introduced once per copy.")
+
     clusters = _scrub_cluster_edits([e["pos"] for e in result["edits"]], n)
     result["clusters"] = [{"positions": c} for c in clusters]
     result["n_rounds"] = len(clusters)
@@ -1689,7 +1799,12 @@ def _scrub_qc_primers(cured_seq: str, positions: list, *,
     default) or "classic" (full overlap). Returns a result dict with
     fwd_seq/rev_seq + their template coords, Tm/GC, overlap length, mismatch
     count and any warnings — or one carrying an `error` string when no
-    acceptable pair fits."""
+    acceptable pair fits.
+
+    `hairpin_dg` / `homodimer_dg` are in **kcal/mol** (`dg_units` says so),
+    reporting the WORSE of the two primers so the number can be used as a
+    gate; ``None`` means primer3 couldn't measure it, which is warned about
+    rather than passed off as a clean result."""
     n = len(cured_seq)
     res: dict = {"round": round_no, "positions": sorted(positions),
                  "warnings": []}
@@ -1762,8 +1877,16 @@ def _scrub_qc_primers(cured_seq: str, positions: list, *,
      tm_f, tm_r, gc_f, gc_r, ov_len) = best
     mm_f = _count_mm(fwd_start, fwd_len)
     mm_r = _count_mm(rev_start, rev_len)
-    hp = min(_mut_hairpin_dg(fwd), _mut_hairpin_dg(rev))
-    dim = max(_mut_homodimer_dg(fwd), _mut_homodimer_dg(rev))
+    # kcal/mol. Worst of the pair: the most stable hairpin (most negative)
+    # and the least stable self-dimer is NOT what we want — take the most
+    # negative of each. `None` (not measured) drops out of the comparison
+    # rather than winning it as a 0.0.
+    hp_vals = [v for v in (_mut_hairpin_dg(fwd), _mut_hairpin_dg(rev))
+               if v is not None]
+    dim_vals = [v for v in (_mut_homodimer_dg(fwd), _mut_homodimer_dg(rev))
+                if v is not None]
+    hp = min(hp_vals) if hp_vals else None
+    dim = min(dim_vals) if dim_vals else None
     res.update({
         "fwd_seq": fwd, "rev_seq": rev,
         "fwd_start": fwd_start, "fwd_len": fwd_len, "fwd_strand": 1,
@@ -1773,7 +1896,12 @@ def _scrub_qc_primers(cured_seq: str, positions: list, *,
         "rev_tm_qc": round(_scrub_qc_tm(rev, mm_r), 1),
         "fwd_gc": round(gc_f, 1), "rev_gc": round(gc_r, 1),
         "overlap_len": ov_len, "n_mismatch": mm_f,
-        "hairpin_dg": round(hp, 1), "homodimer_dg": round(dim, 1),
+        # ΔG in kcal/mol — the WORST (most negative) of the two primers, so
+        # the field can be used as a gate. `None` means primer3 couldn't
+        # measure it, never "no structure".
+        "hairpin_dg": None if hp is None else round(hp, 2),
+        "homodimer_dg": None if dim is None else round(dim, 2),
+        "dg_units": "kcal/mol",
         "overlap_style": "classic" if overlap == "classic" else "improved",
     })
     if not _mut_ends_gc(fwd) or not _mut_ends_gc(rev):
@@ -1782,8 +1910,16 @@ def _scrub_qc_primers(cured_seq: str, positions: list, *,
         res["warnings"].append(
             f"QuikChange Tm below the 78 °C guideline "
             f"(min {min(res['fwd_tm_qc'], res['rev_tm_qc'])} °C).")
-    if hp < -9000 or dim < -9000:
+    if (hp is not None and hp < -9.0) or (dim is not None and dim < -9.0):
         res["warnings"].append("Strong predicted hairpin/dimer.")
+    if hp is None or dim is None:
+        # Say so rather than letting a missing measurement read as a clean
+        # one — an absent hairpin/dimer number is not a good hairpin/dimer
+        # number.
+        res["warnings"].append(
+            "Hairpin/self-dimer ΔG could not be computed (primer3 "
+            "unavailable) — these primers are NOT secondary-structure "
+            "checked.")
     return res
 
 
