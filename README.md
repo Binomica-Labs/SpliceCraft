@@ -168,7 +168,9 @@ toolkit and a plant toolkit never get mixed up.
 The assembly bench: Traditional, Gibson, Golden Braid, MoClo, or your own
 grammar, driven by a 4-source part picker. Every assembly lands as one library
 entry carrying every parent feature forward, so you can trace a finished L3
-construct back to its L0 parts. Deleted something by mistake? **`u`** brings it
+construct back to its L0 parts. A cloning site the ligation puts back together
+reads as intact rather than broken in two, and each junction's sticky overhang
+is labelled with the bases that actually anneal there. Deleted something by mistake? **`u`** brings it
 back — the last 100 deletions of the session are undoable.
 
 Ordered a synthetic fragment and it arrived? **New Part from Syn Frag** *runs

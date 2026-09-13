@@ -14,6 +14,101 @@
 
 ---
 
+## [1.2.58] — 2026-09-12
+
+### Bug fixes
+
+- **A cloning site the ligation puts back together was labelled
+  "disrupted".** Cutting with EcoRI and KpnI and ligating rebuilds both
+  sites — that's the whole point of a directional clone. But the cut falls
+  inside the annotated site, so the vector contributed the `G` and the
+  insert the `AATTC`, and the product's map showed two adjacent broken
+  halves that together spell `GAATTC`, at a site the enzyme still cuts. An
+  "is my cloning site intact" check read that as destroyed. A site the
+  ligation regenerates is now one whole feature again. A feature the
+  cloning genuinely broke is still marked disrupted — including the classic
+  lacZ knockout, where the halves end up nowhere near each other.
+- **The ligation overhang was labelled with the wrong four bases.** Each
+  junction gets a small light-blue feature naming the sticky overhang that
+  annealed there. It was measured as a fixed window either side of the join,
+  which is only correct for an enzyme that cuts dead centre. EcoRI's `AATT`
+  came out labelled `TGAA` and KpnI's `GTAC` came out `ACCG` — both two
+  bases off, and both naming a sequence that isn't the overhang. The span
+  now follows the enzyme's own geometry, so the label always names the
+  bases it sits on. A blunt-cutting enzyme leaves no overhang and no longer
+  gets a feature for one.
+- **A junction cut by two interchangeable enzymes was reported as
+  uncuttable.** When two enzymes cut the identical position — EcoRI and
+  EcoRI-HF, or DpnII/Sau3AI/MboI — SpliceCraft records the single cut under
+  both names. The junction check then couldn't find "EcoRI/EcoRI-HF" in its
+  enzyme list and concluded that no parent enzyme could re-cut the joint, on
+  a junction EcoRI cuts perfectly well.
+- **Exporting GenBank failed on a feature with no arrow.** An arrowless or
+  double-stranded feature was stored internally in a way GenBank cannot
+  write back identically, so the export refused the file to avoid losing
+  the arrow setting — while saving the same plasmid to the library worked
+  fine. Saving and reloading was the accidental workaround. Both arrow
+  types now store the form that round-trips, so the export just works.
+  A double-stranded feature also used to come back forward-facing after a
+  save and reload.
+- **Ligation overhangs on a saved clone pointed forward.** The little
+  overhang features are meant to be arrowless. On every saved
+  restriction-cloning and Gibson product they were being written as
+  forward-pointing instead.
+- **The scripting API refused colours it had just handed out.** Reading a
+  feature drawn in the app gave back a terminal palette colour such as
+  `color(160)`, and writing that same value to another plasmid was rejected
+  as invalid — so copying features between records worked for some and
+  failed for others in the same pass. The writer now takes either form.
+- **Transferring annotations duplicated every restriction site.** A
+  palindromic feature reads the same on both strands, so the search found
+  it twice and proposed the same span twice with opposite arrows.
+- **Reverse-orientation clones put every carried annotation on the wrong
+  bases.** Cutting with a single enzyme leaves both ends of the insert the
+  same shape, and in that case the reverse-orientation product shifted
+  every feature it carried by four bases. The labels kept their length, so
+  nothing looked wrong. Mixed two-enzyme clones were unaffected, which is
+  why this went unnoticed. Found by fuzzing the simulator against the
+  actual bases under each annotation.
+- **A feature broken by the cloning could still read as whole.** A site
+  straddling the plasmid's start position whose other half left with the
+  discarded fragment came through labelled as an intact site while covering
+  only part of it. Anything measurably shorter than it was in the parent is
+  now marked as disrupted.
+- **Carrying annotations onto a clone turned arrowless features forward.**
+  Arrowless and double-stranded parent features arrived on the product as
+  plain forward arrows. Both now survive intact.
+
+### New features
+
+- **Golden Gate products can keep their parts' annotations.** A one-pot
+  Type IIS assembly saved a correct sequence with no features at all, and
+  there was no good way to add them afterwards. Name each part and the
+  destination vector and the assembly now carries their own annotations
+  onto the product, mapped through the same simulated digest and ligation
+  that builds the sequence. The dry run shows the same map before you save.
+- **Cloning can source annotations from any collection.** Carrying a
+  vector's and insert's features onto a clone only looked in the active
+  collection, so two parents filed apart meant creating a temporary
+  collection, copying both in, cloning, moving the product out and deleting
+  the staging collection. Both names are now found wherever they live, with
+  `vector_collection` / `insert_collection` to disambiguate.
+- **Annotation transfer says what it skipped.** The default 30 bp minimum
+  match length silently drops promoters, operators, RBSs, overhangs and
+  restriction sites before searching, so a low transfer count looked like a
+  mismatch when it was the threshold. The response now reports how many
+  features were considered, how many fell below the minimum, and how many
+  simply weren't found.
+
+### Hardening
+
+- A clone that can only carry half its annotations still reports success,
+  which is the right default — but the per-side outcome is now a top-level
+  field instead of a note buried in a warnings list, and a new strict
+  option turns a skipped side into an outright error.
+
+---
+
 ## [1.2.57] — 2026-08-30
 
 ### Bug fixes

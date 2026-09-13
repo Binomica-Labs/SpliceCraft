@@ -116,7 +116,12 @@ What you can do without leaving the terminal.
   with three insert sources (current plasmid, library entry, free-form
   PCR product). 2-enzyme directional cuts produce both forward and
   reverse-orientation products; non-ligatable orientations are flagged
-  rather than silently dropped. Save the simulated product back to the
+  rather than silently dropped. Each junction's sticky overhang is
+  annotated at the bases that actually anneal there, derived from the
+  enzyme's own 5'/3' geometry, and a cloning site the ligation
+  regenerates comes back as one intact feature instead of two halves
+  marked "(disrupted)" — a feature the cloning genuinely broke still is.
+  Save the simulated product back to the
   library with full **construction-history XML** (`<HistoryTree>`
   matching the popular commercial editor's format) so the lineage of
   multi-step builds is preserved across import/export.

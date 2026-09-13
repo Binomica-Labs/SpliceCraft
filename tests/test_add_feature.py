@@ -277,9 +277,18 @@ class TestAnnotateWithFeature:
             assert int(parts[1].end)   == 5
 
     async def test_strand_zero_accepted(self, tiny_record, isolated_library):
-        """Arrowless / unknown-strand annotations (strand=0) should
-        round-trip through `_annotate_with_feature` without crashing —
-        BioPython needs `strand=None` for that case."""
+        """Arrowless / unknown-strand annotations (strand=0) round-trip
+        through `_annotate_with_feature` as BioPython strand **0**, not
+        None.
+
+        This is load-bearing, not cosmetic: BioPython accepts both and
+        every SpliceCraft consumer reads them identically, but only 0
+        survives a GenBank round-trip. A `None` is written as a plain
+        location and read back as 0, so `_export_genbank_to_path`'s
+        signature guard correctly refused to export any record holding one
+        — which is how `add-feature {"strand": 0}` could succeed and the
+        next `export-genbank` 500 (agent field report 2026-09-12). The
+        export assertion below is the real regression guard."""
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
@@ -289,10 +298,14 @@ class TestAnnotateWithFeature:
                 "strand": 0, "qualifiers": {},
             })
             last = app._current_record.features[-1]
-            # FeatureLocation(strand=None) → location.strand == None
-            assert last.location.strand is None
+            assert last.location.strand == 0
             assert int(last.location.start) == 0
             assert int(last.location.end)   == 10
+            # The point of 0-not-None: the record stays exportable.
+            import tempfile, pathlib as _pl
+            out = _pl.Path(tempfile.mkdtemp()) / "arrowless.gb"
+            sc._export_genbank_to_path(app._current_record, out)
+            assert out.exists()
 
     async def test_color_in_entry_writes_apeinfo_qualifiers(
         self, tiny_record, isolated_library,
@@ -411,9 +424,10 @@ class TestAnnotateWithFeature:
                 "strand": 2, "qualifiers": {},
             })
             last = app._current_record.features[-1]
-            # BioPython strand is None (since 2 isn't representable),
-            # but the SpliceCraft qualifier records the intent.
-            assert last.location.strand is None
+            # BioPython strand is 0 (2 isn't representable there) and the
+            # SpliceCraft qualifier records the intent. 0 rather than None
+            # so the record still exports — see `test_strand_zero_accepted`.
+            assert last.location.strand == 0
             assert last.qualifiers.get("SpliceCraft_strand") == [
                 "double",
             ]
@@ -462,7 +476,7 @@ class TestAnnotateWithFeature:
             assert last.qualifiers.get("SpliceCraft_strand") == [
                 "double",
             ]
-            assert last.location.strand is None
+            assert last.location.strand == 0
 
     async def test_color_does_not_clobber_user_qualifiers(
         self, tiny_record, isolated_library,
@@ -2346,9 +2360,10 @@ class TestAnnotateGroup:
             new_feats = app._current_record.features[-4:]
             by_label = {f.qualifiers["label"][0]: f
                          for f in new_feats}
-            # Arrowless members: BioPython strand None.
-            assert by_label["GCGC pad"].location.strand is None
-            assert by_label["N"].location.strand is None
+            # Arrowless members: BioPython strand 0 (never None — that is
+            # the one value a GenBank round-trip can't preserve).
+            assert by_label["GCGC pad"].location.strand == 0
+            assert by_label["N"].location.strand == 0
             # Forward members: BioPython strand 1.
             assert by_label["Esp3I"].location.strand == 1
             assert by_label["AATG"].location.strand == 1
@@ -2513,7 +2528,7 @@ class TestAnnotateGroup:
                               "strand": 2}],
             })
             last = app._current_record.features[-1]
-            assert last.location.strand is None
+            assert last.location.strand == 0
             assert last.qualifiers.get("SpliceCraft_strand") == [
                 "double",
             ]

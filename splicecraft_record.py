@@ -92,24 +92,42 @@ def _arrowless_encode_features(features):
 
 def _arrowless_decode_features(record):
     """Inverse of `_arrowless_encode_features`, applied to a freshly-parsed
-    record we own: any feature tagged ``SpliceCraft_strand=["none"]`` has its
+    record we own: a feature tagged ``SpliceCraft_strand=["none"]`` has its
     location strand restored to 0 (arrowless) and the marker stripped, so the
     live record is both faithful (location.strand == 0) and clean (no leftover
     marker to confuse a later edit or re-export). The strand setter propagates
     to every part of a compound/wrap location. Mutates in place; returns the
-    record."""
+    record.
+
+    ``SpliceCraft_strand=["double"]`` (the SpliceCraft-only "both arrows"
+    convention) gets its strand restored to 0 as well but **keeps** the
+    marker — that is what `PlasmidMap._parse` reads to promote the render
+    back to strand 2. Without this the strand half of the round-trip was
+    lossy in a way the marker hid: the writer emitted a plain location for
+    the record's BioPython strand 0/None, the reader handed back `1`, and a
+    double-stranded feature came home pointing FORWARD while still carrying
+    a "double" marker. Because the marker drives the render, the map looked
+    right and only `_export_genbank_to_path`'s signature guard noticed —
+    refusing to export any record holding a double-stranded feature (agent
+    field report 2026-09-12, found while tracing the strand-0 export trap)."""
     for f in getattr(record, "features", None) or []:
         quals = getattr(f, "qualifiers", None)
         if not isinstance(quals, dict):
             continue
         q = quals.get(_SC_STRAND_QUAL)
-        if isinstance(q, list) and q and str(q[0]).strip().lower() == "none":
-            loc = getattr(f, "location", None)
-            if loc is not None:
-                try:
-                    loc.strand = 0
-                except (AttributeError, ValueError, TypeError):
-                    pass
+        if not (isinstance(q, list) and q):
+            continue
+        marker = str(q[0]).strip().lower()
+        if marker not in ("none", "double"):
+            continue
+        loc = getattr(f, "location", None)
+        if loc is not None:
+            try:
+                loc.strand = 0
+            except (AttributeError, ValueError, TypeError):
+                pass
+        if marker == "none":
+            # "double" is a live render instruction, not an encode artefact.
             quals.pop(_SC_STRAND_QUAL, None)
     return record
 

@@ -80,7 +80,11 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   flow), get / set sequence, add / update / delete features (with the full
   arrow type — forward ▶ / reverse ◀ / arrowless / double-stranded ◀▶ —
   plus colour and arbitrary GenBank qualifiers, matching the Insert/Edit
-  Feature dialog; `add-features` inserts MANY at once under one lock + one
+  Feature dialog. **Colour takes whatever `list-features` reports** — hex
+  (`#1f77b4`) or the terminal-palette form a GUI-drawn feature stores
+  (`color(160)`), normalised to hex on the way in, so a read-features /
+  write-features loop round-trips instead of refusing its own reader's
+  output; `add-features` inserts MANY at once under one lock + one
   dirty-check), list features (`features`, alias `list-features`), find ORFs
   (length cutoff in AMINO ACIDS —
   `min_aa`; `min_length`/`min_bp` are rejected so a bp-vs-aa mix-up can't
@@ -167,11 +171,30 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   own features onto the ligated product — split at the cuts and shifted to
   product coordinates — so the clone isn't feature-bare; a side whose passed
   sequence doesn't exactly match its named entry is reported in
-  `carry_warnings` rather than mis-placed),
+  `carry_warnings` rather than mis-placed. Both names resolve **across every
+  collection** (pin either with `vector_collection` / `insert_collection`;
+  `409` on a genuine ambiguity), so a backbone and an insert filed apart
+  need no staging copy. **Check the per-side `carried`
+  `{vector, insert, any}`** — a skipped side otherwise reads as `ok: true`
+  with half the annotations missing; `carry_strict:true` makes that skip a
+  `422` instead. A restriction site the ligation REGENERATES (the normal
+  outcome at a directional clone's junctions) comes back as one intact
+  feature, not two `(disrupted)` halves, and each junction's sticky overhang
+  is annotated at the bases that actually anneal),
   golden-gate-assemble / simulate-golden-gate (Type IIS — BsaI /
   BsmBI / BbsI / SapI / Esp3I — overhang-directed N-part assembly: parts in
   any order, chained by their 4-nt overhangs into a circle, with a
-  unique-overhang + no-residual-site fidelity check. **The vector may be cut
+  unique-overhang + no-residual-site fidelity check. Pass
+  `carry_annotations:true` with each part / the vector given as
+  `{sequence, name, collection?}` to get an ANNOTATED product: each named
+  entry's own features are slotted onto its released fragment by the digest
+  and shifted into product coordinates by the chaining ligation, so the
+  feature map falls out of the same simulation that built the sequence.
+  `simulate-golden-gate` accepts the same payload, so a preview shows the
+  same map the save will store. Per-input `carried`
+  `{vector, parts: [...], any}` plus `carry_warnings` say what landed;
+  `carry_strict:true` turns a sequence mismatch into a `422`. Omit the flag
+  and the product saves feature-bare as before. **The vector may be cut
   more than twice** — a destination plasmid with background enzyme sites is
   released as several pieces and all of them go back into the circle, which
   `n_vector_fragments` / `n_vector_fragments_used` / `vector_cut_bp` report.
@@ -741,6 +764,18 @@ ambiguous key across collections returns `409`. So a backbone in a
 non-active collection transfers onto the loaded record without a temp copy.
 To apply (not preview) pass `apply: true` — or the legacy `dry_run: false`;
 the default is a dry run.
+
+**Read the `skipped` block.** The response carries
+`skipped: {min_len, considered, below_min_len, shortest_skipped_len,
+no_sequence_match}`, because the default `min_len` of 30 drops every
+promoter, operator, RBS, fusion overhang and restriction site *before* the
+search runs — so a small `count` usually means the threshold, not a
+mismatch. Lowering `min_len` picks those up at the cost of short features
+matching in many places. For "same backbone, one block swapped" prefer
+`carry_annotations` on the assembly endpoint, which maps coordinates
+instead of searching sequence. A palindromic feature (any restriction
+site) is searched forward only — scanning both strands used to emit the
+identical span twice with opposite arrows.
 
 `list-library` lists the active-collection library by default; pass
 `{collection}` to scope it to any one collection's plasmids without

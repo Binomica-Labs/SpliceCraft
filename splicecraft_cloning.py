@@ -39,7 +39,8 @@ if TYPE_CHECKING:  # annotation-only; the real Bio import is lazy, inside the fn
 
 import splicecraft_state as _state
 from splicecraft_biology import (
-    _digest_with_enzymes, _enzyme_cuts, _forbidden_hit_set, _fragments_from_cuts,
+    _digest_with_enzymes, _enzyme_cuts, _enzyme_signature, _feat_len,
+    _forbidden_hit_set, _fragments_from_cuts,
     _iupac_pattern, _rc, _slice_circular,
 )
 from splicecraft_codon import _codon_fix_mutation_positions, _codon_fix_sites  # L2
@@ -889,7 +890,16 @@ def _gibson_record_from_result(result: dict, *, name: str) -> "SeqRecord | None"
         try:
             s = int(f.get("start", 0))
             e = int(f.get("end",   0))
-            strand = int(f.get("strand", 1) or 1)
+            _raw_strand = f.get("strand", 1)
+            # `or 1` here used to turn strand **0** into 1: the ligation
+            # overhang features this very module emits are deliberately
+            # arrowless (strand 0, light blue), and every simulated
+            # traditional-clone / Gibson product saved them pointing
+            # FORWARD (agent field report 2026-09-12). 0 is a real strand
+            # value, not a falsy default; only None/"" fall back to +1.
+            strand = 1 if _raw_strand in (None, "") else int(_raw_strand)
+            if strand not in (-1, 0, 1, 2):
+                strand = 1
         except (TypeError, ValueError):
             continue
         if s == e or n == 0:
@@ -906,6 +916,12 @@ def _gibson_record_from_result(result: dict, *, name: str) -> "SeqRecord | None"
         note = f.get("note")
         if note:
             quals["note"] = [str(note)]
+        # `2` (double-stranded, ◀▶) is a SpliceCraft-only convention with no
+        # BioPython strand; it rides a qualifier that `PlasmidMap._parse`
+        # promotes back to 2. Without re-emitting it here, a double-stranded
+        # parent feature came off an assembly as plain arrowless.
+        if strand == 2:
+            quals["SpliceCraft_strand"] = ["double"]
         # Re-emit the primer sequence so an inherited primer_bind renders
         # bound bases + 5' flap on the Gibson product (not a plain bar) —
         # `_record_features` carried it through the assembly.
@@ -914,7 +930,7 @@ def _gibson_record_from_result(result: dict, *, name: str) -> "SeqRecord | None"
             quals["primer_seq"] = [_normalize_primer_seq(ps)]
         # Wrap features split via `_feature_location`, which orders a
         # minus-strand origin-wrap's halves 5'→3' (see its docstring).
-        loc = _feature_location(s, e, n, strand)
+        loc = _feature_location(s, e, n, 0 if strand == 2 else strand)
         if loc is None:
             continue
         rec.features.append(SeqFeature(loc, type=ftype, qualifiers=quals))
@@ -926,7 +942,8 @@ def _gibson_record_from_result(result: dict, *, name: str) -> "SeqRecord | None"
 # the product). Enzyme catalog via _state._all_enzymes_hook.
 
 def _label_disrupted_split_features(features: "list[dict]",
-                                     enzymes: "list[str] | None" = None) -> None:
+                                     enzymes: "list[str] | None" = None,
+                                     *, total: int = 0) -> None:
     """In-place: a feature split across a cloning cut (tagged ``_split`` head/
     tail by `_split_features_at_cuts`) had a cut site land INSIDE it — e.g.
     cloning into lacZα's MCS knocks the gene out. Mark each surviving half as
@@ -934,17 +951,45 @@ def _label_disrupted_split_features(features: "list[dict]",
     naming the cut enzyme(s), so the product shows the broken feature as two
     flanking pieces instead of an intact one. Render-only — coords untouched.
     Idempotent (skips a half already marked); leaves un-split features (the
-    carried-over insert annotations) alone."""
+    carried-over insert annotations) alone.
+
+    ``total`` (the product length) enables the second, stronger test: a
+    feature carrying ``_split_full_len`` that now covers FEWER bases than it
+    did in its parent is partial, whatever its tags say. That catches the
+    piece the ``_split`` tag cannot see — an origin-split half is tagged
+    ``_wrap_origin_split``, not ``_split``, because no cut fell inside IT,
+    so a 6 bp KpnI site straddling bp 0 whose other half left with the
+    discarded fragment came through the clone labelled plain ``KpnI`` while
+    covering only ``GGTAC``. A 5-base "KpnI site" reads as intact and is
+    not (found by property fuzz, 2026-09-12; present since the origin-split
+    handling landed)."""
     enz = sorted({e for e in (enzymes or []) if e})
     where = f" ({'/'.join(enz)} cut site inside it)" if enz else ""
+
+    def _is_short(f: dict) -> bool:
+        """True when the piece covers less than its pre-cut length. Never
+        raises: a hand-edited feature list can carry junk in any field, and
+        a cloning run must not die on an annotation it can't measure."""
+        if total <= 0:
+            return False
+        try:
+            full = int(f.get("_split_full_len") or 0)
+            if full <= 0:
+                return False
+            return _feat_len(int(f["start"]), int(f["end"]), total) < full
+        except (KeyError, TypeError, ValueError):
+            return False
+
     for f in features:
         # head/tail = split across fragments; whole = cut(s) inside it but the
         # remnant stayed in one fragment (an excised middle, e.g. a lacZ MCS);
         # mid = this whole fragment lies INSIDE the feature, so it was cut on
         # BOTH sides — disrupted by definition (the excised lacZ-MCS stuffer
         # itself, which endpoint-slotting used to drop entirely).
+        if f.get("_disrupted"):
+            continue
         if (f.get("_split") not in ("head", "tail", "whole", "mid")
-                or f.get("_disrupted")):
+                and not _is_short(f)):
             continue
         base = str(f.get("label") or f.get("type") or "feature")
         if "(disrupted)" not in base:
@@ -1006,9 +1051,19 @@ def _rejoin_origin_split_features(features: "list[dict]",
             start, end = b_s, a_e
         else:
             continue                        # genuinely separated — leave it
+        # Contiguous is necessary but NOT sufficient: when a cut also fell
+        # inside one half, the piece that reached this product can be short,
+        # and merging it produced a feature that LOOKED whole while covering
+        # fewer bases than its parent (a 6 bp KpnI site coming through as a
+        # 5 bp "KpnI"). Merge only when the halves reconstitute the pre-cut
+        # length; otherwise leave them for the disrupted pass.
+        full = int(a.get("_split_full_len") or b.get("_split_full_len") or 0)
+        if full > 0 and _feat_len(start, end, total) != full:
+            continue
         keep = a if a.get("_wrap_origin_split") == "tail" else b
         rejoined = {k: v for k, v in keep.items()
-                    if k not in ("_wrap_origin_split", "_wrap_origin_group")}
+                    if k not in ("_wrap_origin_split", "_wrap_origin_group",
+                                  "_split", "_split_full_len")}
         rejoined["start"], rejoined["end"] = start, end
         replacements.append(rejoined)
         merged_ids |= {id(a), id(b)}
@@ -1016,6 +1071,136 @@ def _rejoin_origin_split_features(features: "list[dict]",
     if not replacements:
         return list(features)
     out = [f for f in features if id(f) not in merged_ids]
+    out.extend(replacements)
+    return out
+
+
+def _rejoin_cut_split_features(features: "list[dict]", total: int,
+                                *, top_seq: str = "") -> "list[dict]":
+    """Put back together a feature the CLONING CUT halved, when the ligated
+    product reassembled it. Sibling of `_rejoin_origin_split_features` — same
+    symptom, the other split.
+
+    A cut that lands inside an annotated feature makes two pieces (tagged
+    ``_split`` head/tail/mid by `_split_features_at_cuts`), and the pieces
+    ride into the product on different fragments. For the cloning site
+    ITSELF that is the normal, intended outcome: a directional EcoRI + KpnI
+    clone regenerates both sites, the vector contributing ``G`` and the
+    insert ``AATTC``. They arrive as two separate feature dicts from two
+    different parents, nothing merged them, and the disrupted pass then
+    tagged BOTH — so a product whose EcoRI site is intact and uniquely
+    cuttable showed ``EcoRI (disrupted)`` twice, which is exactly what an
+    "is my cloning site still there" check reads as destroyed (agent field
+    report 2026-09-12).
+
+    A run of pieces is merged only when it is PROVABLY whole again:
+
+      * contiguous in the product (each ``end == next.start``), including
+        across the product origin, which is where the closing junction's
+        site lands;
+      * same label, type and strand;
+      * the covered length equals ``_split_full_len``, the length the
+        feature had before the cut — so the lacZα case (cut twice, stuffer
+        excised, the halves NOT adjacent) stays disrupted, and so does a
+        self-ligation that puts two halves together but short;
+      * and when the label names an enzyme whose recognition site is the
+        same length as the merged span, the bases must actually spell that
+        site (forward or reverse-complement). A mis-annotated site cannot
+        talk its way to "intact".
+
+    Anything still in pieces is left exactly as it was, for
+    `_label_disrupted_split_features` to mark. Returns a new list."""
+    total = int(total)
+    if total <= 0:
+        return list(features or [])
+
+    def _full_len(f) -> int:
+        """The feature's pre-cut length, or 0 when it can't be measured.
+        Never raises: a hand-edited GenBank can put anything in a field,
+        and an unmeasurable annotation must drop out of the merge rather
+        than take the cloning run with it."""
+        try:
+            return int(f.get("_split_full_len") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    cand = [f for f in (features or [])
+            if isinstance(f, dict)
+            and f.get("_split") in ("head", "tail", "mid")
+            and not f.get("_disrupted")
+            and _full_len(f) > 0]
+    if len(cand) < 2:
+        return list(features or [])
+
+    groups: "dict[tuple, list[dict]]" = {}
+    for f in cand:
+        try:
+            # Force the coordinate conversion here so a fuzzy bound (a
+            # hand-edited GenBank, a caller-built feature list) drops out
+            # of the MERGE rather than out of the cloning run.
+            _ = int(f["start"]) + int(f["end"])
+            strand_raw = f.get("strand", 1)
+            key = (str(f.get("label") or f.get("type") or ""),
+                   str(f.get("type") or ""),
+                   # 0 and None both mean "no direction" — same group.
+                   0 if strand_raw is None else int(strand_raw),
+                   _full_len(f))
+        except (KeyError, TypeError, ValueError):
+            continue
+        groups.setdefault(key, []).append(f)
+
+    merged_ids: "set[int]" = set()
+    replacements: "list[dict]" = []
+    for (label, _ftype, _strand, full_len), pieces in groups.items():
+        if len(pieces) < 2:
+            continue
+        pieces = sorted(pieces, key=lambda d: (int(d["start"]), int(d["end"])))
+        runs: "list[list[dict]]" = []
+        cur = [pieces[0]]
+        for nxt in pieces[1:]:
+            if int(cur[-1]["end"]) == int(nxt["start"]):
+                cur.append(nxt)
+            else:
+                runs.append(cur)
+                cur = [nxt]
+        runs.append(cur)
+        # A run that finishes exactly at the product's end continues into the
+        # one that starts at 0 — the closing junction's site is split there.
+        if (len(runs) > 1 and int(runs[-1][-1]["end"]) == total
+                and int(runs[0][0]["start"]) == 0):
+            runs[0] = runs[-1] + runs[0]
+            runs.pop()
+        for run in runs:
+            if len(run) < 2:
+                continue
+            covered = sum(_feat_len(int(x["start"]), int(x["end"]), total)
+                           for x in run)
+            if covered != full_len:
+                continue
+            start, end = int(run[0]["start"]), int(run[-1]["end"])
+            if start == end:
+                continue
+            if top_seq:
+                bases = (top_seq[start:end] if end > start
+                          else top_seq[start:] + top_seq[:end]).upper()
+                sig = _enzyme_signature(
+                    label.replace("(disrupted)", "").strip())
+                if sig is not None and len(sig[0]) == len(bases):
+                    site = sig[0].upper()
+                    if not (_iupac_pattern(site).fullmatch(bases)
+                            or _iupac_pattern(_rc(site)).fullmatch(bases)):
+                        continue
+            rejoined = {k: v for k, v in run[0].items()
+                         if k not in ("_split", "_split_full_len",
+                                      "_wrap_origin_split",
+                                      "_wrap_origin_group")}
+            rejoined["start"], rejoined["end"] = start, end
+            replacements.append(rejoined)
+            merged_ids |= {id(x) for x in run}
+
+    if not replacements:
+        return list(features or [])
+    out = [f for f in (features or []) if id(f) not in merged_ids]
     out.extend(replacements)
     return out
 
@@ -1135,10 +1320,21 @@ def _simulate_traditional_cloning(insert_frag: dict,
     # this BEFORE the disrupted pass — a rejoined feature was never disrupted.
     fwd_feats = _rejoin_origin_split_features(fwd_feats, len(fwd_seq))
     rev_feats = _rejoin_origin_split_features(rev_feats, len(rev_seq))
+    # The CLONING CUT halves features too, and a directional clone
+    # REGENERATES the site it cut — the vector's `G` plus the insert's
+    # `AATTC` is an intact, cuttable EcoRI site. Put those runs back together
+    # before the disrupted pass, for the same reason as the origin one: a
+    # feature the ligation reassembled was never disrupted.
+    fwd_feats = _rejoin_cut_split_features(fwd_feats, len(fwd_seq),
+                                            top_seq=fwd_seq)
+    rev_feats = _rejoin_cut_split_features(rev_feats, len(rev_seq),
+                                            top_seq=rev_seq)
     # A cut site that fell inside a vector feature (e.g. cloning into lacZα's
     # MCS) split it into two halves — surface that as "(disrupted)".
-    _label_disrupted_split_features(fwd_feats, _junction_enz)
-    _label_disrupted_split_features(rev_feats, _junction_enz)
+    _label_disrupted_split_features(fwd_feats, _junction_enz,
+                                     total=len(fwd_seq))
+    _label_disrupted_split_features(rev_feats, _junction_enz,
+                                     total=len(rev_seq))
 
     if fwd_compat and rev_compat:
         warnings.append(
@@ -1171,6 +1367,85 @@ def _simulate_traditional_cloning(insert_frag: dict,
     }
 
 
+def _junction_enzyme_names(*raw: str) -> "list[str]":
+    """Split junction enzyme fields into individual catalog names, in order,
+    without duplicates.
+
+    `_enzyme_cuts` COLLAPSES coincident cuts: two enzymes that sever the
+    identical phosphodiester bond — isoschizomers (EcoRI / EcoRI-HF) or the
+    GATC trio (DpnII / Sau3AI / MboI) — make ONE physical cut and are
+    recorded on the fragment end as the composite ``"EcoRI/EcoRI-HF"``. A
+    consumer that looks THAT up in the catalog finds nothing, so every
+    enzyme "fails to resolve" and the junction is reported as an idempotent
+    scar — for a junction EcoRI cuts perfectly well. Splitting here is what
+    makes the composite a list of real enzymes again."""
+    out: "list[str]" = []
+    for field in raw:
+        for part in str(field or "").split("/"):
+            part = part.strip()
+            if part and part not in out:
+                out.append(part)
+    return out
+
+
+def _junction_overhang_span(pos: int, total: int,
+                             enz_names: "list[str]") -> "tuple[int, int] | None":
+    """Absolute ``(start, end)`` of the sticky overhang ligated at a junction,
+    or None when there isn't one (a blunt join, or no resolvable enzyme).
+    ``end < start`` means the span crosses the product origin (the dict wrap
+    convention, sacred invariant #8); ``end == total`` is a plain span that
+    finishes exactly at the origin.
+
+    ``pos`` is where the DOWNSTREAM fragment's ``top_seq`` starts in the
+    product (``total`` for the closing junction of a circle).
+
+    **Geometry, not a fixed window.** Fragment ``top_seq`` carries the
+    overhang bases at whichever end the overhang sits on the TOP strand —
+    5' at the left, 3' at the right (see `_rc_fragment`'s convention note).
+    So a 5' overhang occupies ``[pos, pos + L)`` (it arrived with the
+    downstream fragment) and a 3' overhang occupies ``[pos - L, pos)`` (it
+    came in on the upstream one). The old code tagged a hardcoded ``pos ± 2``,
+    which is only ever right for a centre-symmetric cut: EcoRI (``G^AATTC``,
+    4 nt 5' overhang ``AATT``) got a span two bases upstream of the real
+    overhang and was therefore LABELLED with the wrong four bases, as was
+    KpnI's 3' ``GTAC`` in the other direction (agent field report
+    2026-09-12). Length and 5'/3' geometry are properties of the enzyme even
+    for Type IIS (whose overhang SEQUENCE depends on flanking bases), so
+    they come from the catalog signature."""
+    total = int(total)
+    if total <= 0:
+        return None
+    kind = ""
+    length = 0
+    for name in enz_names:
+        sig = _enzyme_signature(name)
+        if sig is None:
+            continue
+        _site, fwd_cut, rev_cut = sig
+        length = abs(int(fwd_cut) - int(rev_cut))
+        if length == 0:
+            kind = "blunt"
+        else:
+            kind = "5'" if int(fwd_cut) < int(rev_cut) else "3'"
+        break
+    if not kind or kind == "blunt" or length <= 0 or length > total:
+        return None
+    pos_mod = int(pos) % total
+    if kind == "5'":
+        start, end = pos_mod, pos_mod + length
+    else:
+        start, end = pos_mod - length, pos_mod
+    if start < 0:
+        start += total
+    if end > total:
+        end -= total
+    if end == 0:
+        end = total          # finishes ON the origin — not a wrap
+    if start == end:
+        return None
+    return (start, end)
+
+
 def _classify_junction(left_enz: str, right_enz: str,
                           context_top: str,
                           *, context_left_offset: int = 6) -> dict:
@@ -1200,19 +1475,18 @@ def _classify_junction(left_enz: str, right_enz: str,
     BamHI/BamHI (re-cuttable), BamHI/BglII (scar), and
     BsaI-Type-IIS junctions all classify correctly.
     """
-    enzymes = []
-    if left_enz:
-        enzymes.append(left_enz)
-    if right_enz and right_enz != left_enz:
-        enzymes.append(right_enz)
-    catalog = _state._all_enzymes_hook()
+    # Split composite fields ("EcoRI/EcoRI-HF" — coincident cuts are
+    # collapsed onto one fragment end) so each real enzyme is resolved;
+    # looking the composite up whole found nothing and reported a
+    # re-cuttable junction as an uncuttable scar.
+    enzymes = _junction_enzyme_names(left_enz, right_enz)
     re_cuttable: list[str] = []
     ctx = context_top.upper()
     for ename in enzymes:
-        spec = catalog.get(ename)
-        if spec is None:
+        sig = _enzyme_signature(ename)
+        if sig is None:
             continue
-        site = spec[0].upper()
+        site = sig[0].upper()
         if not site:
             continue
         pat = _iupac_pattern(site)
@@ -1234,7 +1508,7 @@ def _classify_junction(left_enz: str, right_enz: str,
                               f"re-cuttable junction"),
         }
     # No parent enzyme site survives → idempotent scar.
-    pair = f"{left_enz}/{right_enz}" if left_enz != right_enz else left_enz
+    pair = "/".join(enzymes) if enzymes else (left_enz or right_enz or "")
     return {
         "scar":        True,
         "re_cuttable": [],
@@ -1440,42 +1714,36 @@ def _annotate_scars_on_product(
                 window_r = min(total, pos + 6)
                 context = top[window_l:window_r]
                 ctx_left_offset = pos - window_l
+            enz_names = _junction_enzyme_names(j["left_enz"], j["right_enz"])
             cls = _classify_junction(
                 j["left_enz"], j["right_enz"], context,
                 context_left_offset=ctx_left_offset,
             )
             warnings.append(f"Junction {j['label']}: {cls['label']}")
-            # Tag the 4 bp ligation OVERHANG — light-blue, arrowless (strand
-            # 0) — instead of labelling the junction a "LIGATION SCAR" (the
-            # user wanted scars left as-is in the sequence, not annotated; the
+            # Tag the ligation OVERHANG — light-blue, arrowless (strand 0) —
+            # instead of labelling the junction a "LIGATION SCAR" (the user
+            # wanted scars left as-is in the sequence, not annotated; the
             # re-cuttable / scar classification still rides the warnings
-            # above). The ORIGIN junction's overhang straddles the
-            # linearisation point, so tag it as a wrap feature (end < start →
-            # CompoundLocation on save) — a full 4 bp, not the 2 bp head a
-            # flat [0,2) clamp gives (review F6).
-            if pos >= total or pos == 0:
-                if total >= 4:
-                    feats.append({
-                        "start":  total - 2,
-                        "end":    2,
-                        "strand": 0,
-                        "type":   "misc_feature",
-                        "label":  (top[total - 2:total] + top[:2]).upper()
-                                  or "overhang",
-                        "color":  "#ADD8E6",
-                    })
+            # above). The span comes from the enzyme's own 5'/3' geometry and
+            # overhang length via `_junction_overhang_span`, so the label
+            # names the bases that actually anneal; a blunt junction has no
+            # overhang and gets no feature. An overhang straddling the
+            # linearisation point is emitted as a wrap feature (end < start →
+            # CompoundLocation on save) rather than a clamped head.
+            span = _junction_overhang_span(pos, total, enz_names)
+            if span is None:
                 continue
-            feat_s = max(0, pos - 2)
-            feat_e = min(total, pos + 2)
-            if feat_e > feat_s:
-                feats.append({
-                    "start":  feat_s,
-                    "end":    feat_e,
-                    "strand": 0,
-                    "type":   "misc_feature",
-                    "label":  top[feat_s:feat_e].upper() or "overhang",
-                    "color":  "#ADD8E6",
-                })
+            feat_s, feat_e = span
+            oh_bases = (top[feat_s:feat_e] if feat_e > feat_s
+                         else top[feat_s:] + top[:feat_e])
+            feats.append({
+                "start":  feat_s,
+                "end":    feat_e,
+                "strand": 0,
+                "type":   "misc_feature",
+                "label":  oh_bases.upper() or "overhang",
+                "color":  "#ADD8E6",
+            })
 
     _annotate_orient(result.get("forward", {}), reverse=False)
     _annotate_orient(result.get("reverse", {}), reverse=True)
@@ -1590,12 +1858,38 @@ def _rc_fragment(frag: dict) -> dict:
         # the new top's length so out-of-range features (those in
         # the stripped-off old overhang region) collapse to a valid
         # zero-length slice rather than negative coords.
-        new_start_raw = (n - fe) - left_strip + new_left_extra_len
-        new_end_raw   = (n - fs) - left_strip + new_left_extra_len
+        #
+        # The offset is `right_strip`, NOT `left_strip`. `new_top` is
+        # `new_left_extra + _rc(top[left_strip : n - right_strip]) +
+        # new_right_extra`, so an old-top base at `i` lands at
+        # `new_left_extra_len + (n - right_strip - 1 - i)` — it is the
+        # bases taken off the RIGHT that move the origin of the flipped
+        # frame. The two strips are equal whenever the ends differ in
+        # kind (5'/3' strips both, 3'/5' strips neither), which is why
+        # the mixed-enzyme clones everyone tests with were correct and
+        # the bug hid: a SINGLE-enzyme insert has two ends of the SAME
+        # kind, so 5'/5' displaced every carried feature 4 bp early and
+        # 3'/3' displaced it 4 bp late — right length, wrong bases, only
+        # in the REVERSE orientation (property fuzz, 2026-09-12).
+        new_start_raw = (n - fe) - right_strip + new_left_extra_len
+        new_end_raw   = (n - fs) - right_strip + new_left_extra_len
         new_f = dict(f)
         new_f["start"]  = max(0, min(new_n, new_start_raw))
         new_f["end"]    = max(0, min(new_n, new_end_raw))
         new_f["strand"] = -int(f.get("strand", 1) or 0) or 0
+        # The clamp is not free. An overhang that was on the TOP strand
+        # before the flip is on the BOTTOM strand after it, so its bases
+        # leave `top_seq` — and a feature that reached into them loses
+        # those bases here. It stays in the molecule; it just cannot be
+        # expressed in the new frame. Record the pre-clamp length so the
+        # disrupted pass can say so: a CDS that started 3 bp after a cut
+        # used to come out of the REVERSE orientation one base short and
+        # read as complete, while the forward orientation of the same
+        # clone was exact (found by property fuzz 2026-09-12; the
+        # asymmetry predates it).
+        if ((new_f["end"] - new_f["start"])
+                != (new_end_raw - new_start_raw)):
+            new_f.setdefault("_split_full_len", max(0, fe - fs))
         flipped_feats.append(new_f)
     return {
         "top_seq":      new_top,
@@ -2135,12 +2429,22 @@ def _assemble_scrub_amplicons_real(amplicon_specs: list, *,
 # Gate). [INV-127: the design IS the product — a real digest + ligation.]
 
 
-def _gg_released_bodies(seq: str, enzyme: str, *, circular: bool) -> list[dict]:
+def _gg_released_bodies(seq: str, enzyme: str, *, circular: bool,
+                         features: "list[dict] | None" = None,
+                         source_label: str = "") -> list[dict]:
     """Digest `seq` with `enzyme` and return only the fragments cut on BOTH
     ends — the released part body / vector backbone with two sticky overhangs
     (the off-cut end stubs each keep one ``linear`` molecule-terminus edge and
-    fall away). Mirrors `_assemble_scrub_amplicons_real`'s body selection."""
-    frags = _digest_with_enzymes(seq, [enzyme], circular=circular)
+    fall away). Mirrors `_assemble_scrub_amplicons_real`'s body selection.
+
+    `features` (in `seq` coordinates) ride along into the released
+    fragments in FRAGMENT-local coordinates — which is all
+    `carry_annotations` on a one-pot assembly needs, because
+    `_ligate_fragments` then shifts them into product coordinates as it
+    chains. Features on a stub that falls away are dropped with it."""
+    frags = _digest_with_enzymes(seq, [enzyme], circular=circular,
+                                  features=features,
+                                  source_label=source_label)
     return [f for f in frags
             if f.get("left", {}).get("kind") != "linear"
             and f.get("right", {}).get("kind") != "linear"]
@@ -2242,7 +2546,10 @@ def _gg_close_chain(seed: dict, required: list[dict], optional: list[dict],
 
 
 def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
-                          enzyme: str = _SCRUB_GB_ENZYME) -> dict:
+                          enzyme: str = _SCRUB_GB_ENZYME,
+                          part_features: "list[list[dict]] | None" = None,
+                          vector_features: "list[dict] | None" = None,
+                          ) -> dict:
     """Simulate a Golden Gate / MoClo (Type IIS) one-pot assembly.
 
     Digests each part in `part_seqs` and the destination `vector_seq` with
@@ -2253,7 +2560,17 @@ def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
     ``{ok, product_seq, length, circular, n_parts, enzyme, order,
        junctions:[{overhang}], n_residual_sites, n_vector_sites,
        n_vector_fragments, n_vector_fragments_used, vector_cut_bp,
-       warnings, errors}``
+       features, warnings, errors}``
+
+    Pass `vector_features` and per-part `part_features` (each in ITS OWN
+    parent's coordinates, positionally matched to `part_seqs`) to get an
+    ANNOTATED product: the digest slots them onto the released fragments
+    and the chaining ligation shifts them into product coordinates, so the
+    feature map falls out of the same simulation that built the sequence
+    rather than a second sequence-similarity pass. `features` is
+    ``[]`` when nothing was supplied. A feature the digest halved and the
+    ligation put back together is rejoined; one left genuinely in pieces
+    is labelled ``(disrupted)``.
 
     **The vector does not have to be cut exactly twice.** A destination
     plasmid carrying background `enzyme` sites is cut into several pieces and
@@ -2282,11 +2599,13 @@ def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
     if not part_seqs:
         return {"ok": False, "errors": ["no parts supplied"], "warnings": []}
 
+    part_feats = list(part_features or [])
     part_frags: list[dict] = []
     for i, ps in enumerate(part_seqs):
         try:
-            bodies = _gg_released_bodies((ps or "").upper(), enzyme,
-                                         circular=False)
+            bodies = _gg_released_bodies(
+                (ps or "").upper(), enzyme, circular=False,
+                features=(part_feats[i] if i < len(part_feats) else None))
         except Exception as exc:               # pragma: no cover - defensive
             return {"ok": False, "warnings": [],
                     "errors": [f"part {i + 1}: digest failed: {exc}"]}
@@ -2299,7 +2618,8 @@ def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
 
     vec_seq_u = (vector_seq or "").upper()
     try:
-        vec_bodies = _gg_released_bodies(vec_seq_u, enzyme, circular=True)
+        vec_bodies = _gg_released_bodies(vec_seq_u, enzyme, circular=True,
+                                          features=vector_features)
         vec_cuts = _enzyme_cuts(vec_seq_u, [enzyme], circular=True)
     except Exception as exc:                   # pragma: no cover - defensive
         return {"ok": False, "warnings": [],
@@ -2436,10 +2756,22 @@ def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
             f"{len(residual)} residual {enzyme} site(s) in the product — it "
             f"would be re-cut during the one-pot reaction; domesticate them "
             f"out of the parts first.")
+    prod_feats = [dict(f) for f in (closed.get("features") or [])]
+    if prod_feats:
+        n_prod = len(product)
+        # Same two passes the traditional-cloning engine runs, for the same
+        # reasons: a feature halved at the origin or at a cut and put back
+        # together by the ligation is ONE feature again (and was never
+        # disrupted); whatever is still in pieces gets labelled.
+        prod_feats = _rejoin_origin_split_features(prod_feats, n_prod)
+        prod_feats = _rejoin_cut_split_features(prod_feats, n_prod,
+                                                 top_seq=product)
+        _label_disrupted_split_features(prod_feats, [enzyme], total=n_prod)
     return {
         "ok":              True,
         "product_seq":     product,
         "length":          len(product),
+        "features":        prod_feats,
         "circular":        True,
         "n_parts":         len(part_frags),
         "enzyme":          enzyme,

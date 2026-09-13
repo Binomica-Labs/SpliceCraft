@@ -1796,10 +1796,18 @@ class TestSimulateTraditionalCloningMulti:
             f"features: {feats!r}"
         )
 
-    def test_origin_junction_overhang_is_4bp_wrap(self):
-        """The closing junction at the origin tags a FULL 4 bp overhang as a
-        wrap feature (end < start → CompoundLocation on save), not the 2 bp
-        head a flat [0,2) clamp gives (adversarial review F6)."""
+    def test_junction_overhang_spans_the_real_overhang(self):
+        """Every junction tags a FULL-length overhang at the bases that
+        actually anneal — derived from the enzyme's 5'/3' geometry, not a
+        fixed window around the junction point (adversarial review F6 for
+        the length; agent field report 2026-09-12 for the position).
+
+        Both enzymes here leave 5' overhangs, which ride in on the
+        DOWNSTREAM fragment's top strand — so each overhang starts AT its
+        junction: the vector-insert join at bp 48 tags the insert's first
+        4 bases, and the closing join (pos == total) tags the vector's
+        first 4. The old code tagged `pos ± 2`, which put the span two
+        bases off and therefore LABELLED it with the wrong sequence."""
         vec = {"top_seq": "AAAATTTT" * 6, "left": {"enzyme": "EcoRI"},
                "right": {"enzyme": "BamHI"}}
         ins = [{"top_seq": "C" * 24, "left": {"enzyme": "BamHI"},
@@ -1809,10 +1817,46 @@ class TestSimulateTraditionalCloningMulti:
                "reverse": {"top_seq": prod, "features": [], "compatible": True},
                "warnings": []}
         sc._annotate_scars_on_product(res, ins, vec)
-        wrap = [f for f in res["forward"]["features"] if f["start"] > f["end"]]
-        assert wrap, f"no origin wrap overhang: {res['forward']['features']!r}"
-        assert len(wrap[0]["label"]) == 4
-        assert wrap[0]["color"] == "#ADD8E6" and wrap[0]["strand"] == 0
+        ohs = sorted((f for f in res["forward"]["features"]
+                       if f.get("color") == "#ADD8E6"),
+                      key=lambda f: f["start"])
+        assert len(ohs) == 2, res["forward"]["features"]
+        for f in ohs:
+            assert f["strand"] == 0
+            assert len(f["label"]) == 4
+            # THE invariant: the label names the bases at the tagged span.
+            s, e = f["start"], f["end"]
+            bases = prod[s:e] if e > s else prod[s:] + prod[:e]
+            assert f["label"] == bases.upper(), (f, bases)
+        assert (ohs[0]["start"], ohs[0]["end"]) == (0, 4)     # closing join
+        assert (ohs[1]["start"], ohs[1]["end"]) == (48, 52)   # vec-insert
+
+    def test_overhang_span_follows_enzyme_geometry(self):
+        """Unit cover for `_junction_overhang_span`: a 5' overhang sits
+        AFTER the top-strand cut, a 3' overhang BEFORE it, and a blunt
+        cut has no overhang to tag at all."""
+        assert sc._junction_overhang_span(24, 48, ["EcoRI"]) == (24, 28)
+        assert sc._junction_overhang_span(24, 48, ["KpnI"])  == (20, 24)
+        assert sc._junction_overhang_span(24, 48, ["SmaI"])  is None
+        # A closing junction (pos == total) resolves through the origin
+        # without wrapping: 5' takes the head, 3' the tail.
+        assert sc._junction_overhang_span(48, 48, ["EcoRI"]) == (0, 4)
+        assert sc._junction_overhang_span(48, 48, ["KpnI"])  == (44, 48)
+        assert sc._junction_overhang_span(24, 48, ["NoSuchEnzyme"]) is None
+
+    def test_composite_isoschizomer_junction_is_not_a_scar(self):
+        """`_enzyme_cuts` collapses two enzymes that sever the identical
+        bond onto one fragment end as "EcoRI/EcoRI-HF". Looking THAT up in
+        the catalog found nothing, so every parent enzyme "failed to
+        resolve" and a junction EcoRI cuts perfectly well was reported as
+        an idempotent scar."""
+        cls = sc._classify_junction("EcoRI/EcoRI-HF", "EcoRI/EcoRI-HF",
+                                     "TTTTTTGAATTCTTTTTT",
+                                     context_left_offset=6)
+        assert cls["scar"] is False
+        assert "EcoRI" in cls["re_cuttable"]
+        assert sc._junction_enzyme_names("EcoRI/EcoRI-HF", "EcoRI") == [
+            "EcoRI", "EcoRI-HF"]
 
     def test_pcr_insert_carries_features_to_product(self):
         """A PCR / Clone-region insert's own features must reach the cloned
@@ -3452,3 +3496,349 @@ class TestRejoinOriginSplitFeatures:
         b = self._half("w0", "head", 10, 20)
         a["start"] = "<1"
         assert len(sc._rejoin_origin_split_features([a, b], 100)) == 2
+
+
+
+
+class TestRcFragmentKeepsFeatureBases:
+    """Flipping a fragment must not move its annotations off their DNA.
+
+    `_rc_fragment` rebuilds `top_seq` as
+    ``new_left_extra + rc(top[left_strip : n - right_strip]) +
+    new_right_extra``, so the flipped frame's origin is set by what came
+    off the RIGHT. The coordinate map subtracted ``left_strip`` instead.
+    The two are equal whenever the ends differ in kind — 5'/3' strips
+    both, 3'/5' strips neither — which is every mixed-enzyme directional
+    clone, so the bug hid there. A SINGLE-enzyme insert has two ends of
+    the SAME kind: 5'/5' displaced every carried feature 4 bp early and
+    3'/3' displaced it 4 bp late. Right length, wrong bases, REVERSE
+    orientation only (property fuzz, 2026-09-12; present since the
+    convention-aware rebuild landed 2026-05-23)."""
+
+    @staticmethod
+    def _mid_fragment(enz_left, enz_right):
+        body = "ACGTTGCAAGGCCTTAACGGTTCCAAGGTTCCAAGGTTCCAA"
+        cat = sc._all_enzymes()
+        seq = ("TTTT" + cat[enz_left][0].upper() + body
+                + cat[enz_right][0].upper() + "TTTT")
+        frags, err = sc._excise_fragment_pair(
+            seq, sorted({enz_left, enz_right}), circular=True)
+        assert err is None, err
+        return [f for f in frags if len(f["top_seq"]) >= 16]
+
+    @pytest.mark.parametrize("pair", [
+        ("EcoRI", "EcoRI"),      # 5' / 5'  — a single-enzyme clone
+        ("KpnI",  "KpnI"),       # 3' / 3'
+        ("EcoRI", "KpnI"),       # 5' / 3'
+        ("KpnI",  "EcoRI"),      # 3' / 5'
+    ])
+    def test_flip_preserves_the_bases_under_every_feature(self, pair):
+        for frag in self._mid_fragment(*pair):
+            top = frag["top_seq"]
+            s0, e0 = 6, len(top) - 6
+            probe = dict(frag)
+            probe["features"] = [{"start": s0, "end": e0, "strand": 1,
+                                   "type": "CDS", "label": "probe"}]
+            rc = sc._rc_fragment(probe)
+            nf = rc["features"][0]
+            got = rc["top_seq"][nf["start"]:nf["end"]]
+            assert got == sc._rc(top[s0:e0]), (
+                f"{frag['left'].get('kind')}/{frag['right'].get('kind')}: "
+                f"annotation moved off its DNA")
+
+    def test_single_enzyme_reverse_clone_keeps_its_payload_bases(self):
+        """End to end, the case a single-enzyme clone actually hits."""
+        pad = lambda n, c: c * n
+        payload = "ATGAAACCCGGGTTTACGTACGTTTGCATGCA"
+        vec = pad(40, "C") + "GAATTC" + pad(60, "G") + "GAATTC" + pad(40, "T")
+        ins = pad(20, "A") + "GAATTC" + payload + "GAATTC" + pad(20, "T")
+        inf = [{"start": ins.index(payload),
+                "end": ins.index(payload) + len(payload),
+                "strand": 1, "type": "CDS", "label": "payload"}]
+        vfr, e1 = sc._excise_fragment_pair(vec, ["EcoRI"], circular=True)
+        ifr, e2 = sc._excise_fragment_pair(ins, ["EcoRI"], circular=True,
+                                            features=inf)
+        assert e1 is None and e2 is None
+        cassette = min(ifr, key=lambda f: len(f["top_seq"]))
+        backbone = max(vfr, key=lambda f: len(f["top_seq"]))
+        res = sc._simulate_traditional_cloning(cassette, backbone)
+        for orient in ("forward", "reverse"):
+            prod = res[orient]
+            if not prod.get("compatible"):
+                continue
+            top = prod["top_seq"]
+            hit = [f for f in prod["features"]
+                    if str(f.get("label", "")).startswith("payload")]
+            assert hit, f"{orient}: payload not carried"
+            f = hit[0]
+            got = (top[f["start"]:f["end"]] if f["end"] > f["start"]
+                    else top[f["start"]:] + top[:f["end"]])
+            assert got in (payload, sc._rc(payload)), (
+                f"{orient}: payload annotation covers {got!r}")
+
+
+class TestPartialPieceNeverReadsIntact:
+    """A piece that covers fewer bases than its parent must say so.
+
+    The `_split` tag cannot see every partial: an origin-split half is
+    tagged `_wrap_origin_split`, not `_split`, because no cut fell inside
+    IT. So a 6 bp KpnI site straddling bp 0, whose other half left with
+    the discarded fragment, came through the clone labelled plain `KpnI`
+    while covering only `GGTAC` (property fuzz, 2026-09-12)."""
+
+    def test_origin_half_left_behind_is_marked_disrupted(self):
+        pad = lambda n, c: c * n
+        body = pad(25, "A") + "GAGCTC" + pad(110, "T")
+        vec = "TACC" + body + "GG"          # KpnI GGTACC wraps 145..4
+        assert len(vec) == 147
+        assert vec[145:] + vec[:4] == "GGTACC"
+        ins = (pad(14, "C") + "GAGCTC" + pad(98, "G") + "GGTACC"
+               + pad(32, "C"))
+        vf = [{"start": 145, "end": 4, "strand": 1,
+                "type": "misc_feature", "label": "KpnI"},
+               {"start": vec.index("GAGCTC"), "end": vec.index("GAGCTC") + 6,
+                "strand": 1, "type": "misc_feature", "label": "SacI"}]
+        inf = [{"start": ins.index("GGTACC"), "end": ins.index("GGTACC") + 6,
+                 "strand": 1, "type": "misc_feature", "label": "KpnI"},
+                {"start": ins.index("GAGCTC"), "end": ins.index("GAGCTC") + 6,
+                 "strand": 1, "type": "misc_feature", "label": "SacI"}]
+        vfr, e1 = sc._excise_fragment_pair(vec, ["KpnI", "SacI"],
+                                            circular=True, features=vf)
+        ifr, e2 = sc._excise_fragment_pair(ins, ["KpnI", "SacI"],
+                                            circular=True, features=inf)
+        assert e1 is None and e2 is None
+        seen_partial = 0
+        for vfrag in vfr:
+            for ifrag in ifr:
+                res = sc._simulate_traditional_cloning(ifrag, vfrag)
+                sc._annotate_scars_on_product(res, [ifrag], vfrag)
+                for orient in ("forward", "reverse"):
+                    prod = res[orient]
+                    if not prod.get("compatible"):
+                        continue
+                    top = prod["top_seq"]
+                    for f in prod["features"]:
+                        if f.get("color") == "#ADD8E6":
+                            continue
+                        lbl = str(f.get("label") or "")
+                        if not lbl.startswith(("KpnI", "SacI")):
+                            continue
+                        n = sc._feat_len(f["start"], f["end"], len(top))
+                        if n < 6:
+                            seen_partial += 1
+                            assert "(disrupted)" in lbl, (
+                                f"{lbl!r} covers {n} of 6 bases but reads "
+                                f"as an intact site")
+        assert seen_partial, "fixture no longer produces a partial half"
+
+    def test_a_whole_site_is_still_not_marked(self):
+        """The guard must not over-tag: an intact site stays intact."""
+        feats = [{"start": 10, "end": 16, "strand": 1, "type": "misc_feature",
+                   "label": "EcoRI", "_split_full_len": 6}]
+        sc._label_disrupted_split_features(feats, ["EcoRI"], total=100)
+        assert feats[0]["label"] == "EcoRI"
+
+    def test_total_omitted_keeps_the_old_behaviour(self):
+        """Callers that don't pass `total` get exactly the `_split` rule."""
+        feats = [{"start": 10, "end": 13, "strand": 1, "type": "misc_feature",
+                   "label": "EcoRI", "_split_full_len": 6}]
+        sc._label_disrupted_split_features(feats, ["EcoRI"])
+        assert feats[0]["label"] == "EcoRI"
+        sc._label_disrupted_split_features(feats, ["EcoRI"], total=100)
+        assert feats[0]["label"] == "EcoRI (disrupted)"
+
+
+
+class TestCloningAnnotationInputHardening:
+    """A hand-edited GenBank, a caller-built feature list or a `.dna` with
+    junk in a qualifier must make the annotation drop out of the merge, not
+    take the cloning run down with it."""
+
+    JUNK = [
+        [],
+        [{}],
+        [{"start": 1}],
+        [{"start": "a", "end": "b", "_split": "head", "_split_full_len": 2}],
+        [{"start": 0, "end": 5, "_split": "head", "_split_full_len": -3}],
+        [{"start": 0, "end": 5, "_split": "head", "_split_full_len": "big"}],
+        [{"start": 0, "end": 5, "_split": "head", "_split_full_len": 10 ** 9}],
+        [{"start": 0, "end": 5, "_split": "head", "_split_full_len": 5,
+          "label": None, "strand": None}] * 2,
+    ]
+
+    @pytest.mark.parametrize("feats", JUNK)
+    def test_rejoin_never_raises(self, feats):
+        out = sc._rejoin_cut_split_features(list(feats), 10,
+                                             top_seq="ACGTACGTAC")
+        assert isinstance(out, list)
+
+    @pytest.mark.parametrize("feats", JUNK)
+    def test_disrupted_labeller_never_raises(self, feats):
+        sc._label_disrupted_split_features(
+            [dict(f) for f in feats], ["EcoRI"], total=10)
+
+    @pytest.mark.parametrize("args", [
+        (0, 0, []), (5, 10, [""]), (-5, 10, ["EcoRI"]), (10, 10, ["EcoRI"]),
+        (10, 2, ["EcoRI"]), (10, 10, [None]), (10, 10, ["x" * 5000]),
+        (10 ** 9, 10, ["EcoRI"]),
+    ])
+    def test_overhang_span_never_raises(self, args):
+        got = sc._junction_overhang_span(*args)
+        assert got is None or (isinstance(got, tuple) and len(got) == 2)
+
+    @pytest.mark.parametrize("raw", ["", None, "///", "x" * 10000])
+    def test_junction_enzyme_names_never_raises(self, raw):
+        assert isinstance(sc._junction_enzyme_names(raw), list)
+
+class TestRejoinCutSplitFeatures:
+    """A restriction site that the ligation REGENERATES must read as intact.
+
+    Agent field report 2026-09-12: a directional EcoRI + KpnI clone with
+    `carry_annotations` came out carrying
+
+        1617..1617  misc_feature  EcoRI (disrupted)
+        1618..1622  misc_feature  EcoRI (disrupted)
+
+    — two contiguous halves that together spell GAATTC, at a site EcoRI
+    cuts, in a product where it is unique. The vector contributes the `G`
+    and the insert the `AATTC`; they arrive as two feature dicts from two
+    different parents, nothing merged them, and the disrupted pass tagged
+    both. "Is my cloning site still there" reads that as destroyed.
+
+    The sibling `_rejoin_origin_split_features` had already solved the
+    same symptom for the ORIGIN split; this is the cut split.
+    """
+
+    @staticmethod
+    def _piece(label, split, start, end, full, **kw):
+        d = {"start": start, "end": end, "strand": 1, "type": "misc_feature",
+             "label": label, "_split": split, "_split_full_len": full}
+        d.update(kw)
+        return d
+
+    def test_regenerated_site_becomes_one_intact_feature(self):
+        top = "TTTT" + "GAATTC" + "TTTT"
+        feats = [self._piece("EcoRI", "head", 4, 5, 6),
+                 self._piece("EcoRI", "tail", 5, 10, 6)]
+        out = sc._rejoin_cut_split_features(feats, len(top), top_seq=top)
+        assert len(out) == 1
+        assert (out[0]["start"], out[0]["end"]) == (4, 10)
+        assert "_split" not in out[0] and "_split_full_len" not in out[0]
+        # And the disrupted pass must now leave it alone.
+        sc._label_disrupted_split_features(out, ["EcoRI"])
+        assert out[0]["label"] == "EcoRI"
+
+    def test_site_regenerated_across_the_product_origin(self):
+        """The CLOSING junction's site is split at bp 0 — the common case
+        for the second enzyme in a directional clone."""
+        top = "GTACC" + "TTTTTT" + "G"          # GGTACC wraps: 11..1
+        feats = [self._piece("KpnI", "head", 11, 12, 6),
+                 self._piece("KpnI", "tail", 0, 5, 6)]
+        out = sc._rejoin_cut_split_features(feats, len(top), top_seq=top)
+        assert len(out) == 1
+        assert (out[0]["start"], out[0]["end"]) == (11, 5)
+        assert sc._feat_len(11, 5, len(top)) == 6
+
+    def test_short_reassembly_is_not_merged(self):
+        """Contiguous but covering LESS than the original length — a
+        self-ligation that dropped the excised middle. Still disrupted."""
+        top = "A" * 40
+        feats = [self._piece("lacZa", "head", 0, 5, 30),
+                 self._piece("lacZa", "tail", 5, 12, 30)]
+        out = sc._rejoin_cut_split_features(feats, len(top), top_seq=top)
+        assert len(out) == 2
+
+    def test_separated_halves_are_not_merged(self):
+        """The insert sits between them — which is what happened to it."""
+        top = "A" * 60
+        feats = [self._piece("lacZa", "head", 0, 10, 20),
+                 self._piece("lacZa", "tail", 40, 50, 20)]
+        assert len(sc._rejoin_cut_split_features(
+            feats, len(top), top_seq=top)) == 2
+
+    def test_bases_must_actually_spell_the_enzyme_site(self):
+        """Right length, contiguous, same label — but the bases are not
+        GAATTC. A mis-annotated site cannot talk its way to intact."""
+        top = "GGTTTTAAAA"
+        feats = [self._piece("EcoRI", "head", 0, 2, 6),
+                 self._piece("EcoRI", "tail", 2, 6, 6)]
+        assert len(sc._rejoin_cut_split_features(
+            feats, len(top), top_seq=top)) == 2
+
+    def test_different_labels_never_merge(self):
+        top = "TTTT" + "GAATTC" + "TTTT"
+        feats = [self._piece("EcoRI", "head", 4, 5, 6),
+                 self._piece("BamHI", "tail", 5, 10, 6)]
+        assert len(sc._rejoin_cut_split_features(
+            feats, len(top), top_seq=top)) == 2
+
+    def test_opposite_strands_never_merge(self):
+        top = "TTTT" + "GAATTC" + "TTTT"
+        feats = [self._piece("EcoRI", "head", 4, 5, 6),
+                 self._piece("EcoRI", "tail", 5, 10, 6, strand=-1)]
+        assert len(sc._rejoin_cut_split_features(
+            feats, len(top), top_seq=top)) == 2
+
+    def test_whole_and_untagged_pieces_pass_through(self):
+        """`_split="whole"` means a cut fell inside and the remnant rode in
+        one fragment — genuinely disrupted, never a rejoin candidate."""
+        top = "A" * 40
+        feats = [{"start": 0, "end": 10, "strand": 1, "type": "CDS",
+                   "label": "g", "_split": "whole"},
+                  {"start": 10, "end": 20, "strand": 1, "type": "CDS",
+                   "label": "g", "_split": "whole"},
+                  {"start": 25, "end": 30, "strand": 1, "type": "CDS",
+                   "label": "plain"}]
+        out = sc._rejoin_cut_split_features(feats, len(top), top_seq=top)
+        assert len(out) == 3
+
+    def test_a_non_integer_coordinate_does_not_raise(self):
+        top = "TTTT" + "GAATTC" + "TTTT"
+        a = self._piece("EcoRI", "head", 4, 5, 6)
+        b = self._piece("EcoRI", "tail", 5, 10, 6)
+        a["start"] = "<1"
+        assert len(sc._rejoin_cut_split_features(
+            [a, b], len(top), top_seq=top)) == 2
+
+    def test_end_to_end_directional_clone_keeps_both_sites_intact(self):
+        """The reported case, through the real digest + ligation."""
+        pad = lambda n, c: c * n
+        vec = (pad(40, "C") + "GAATTC" + pad(30, "T") + "GGTACC"
+               + pad(60, "G"))
+        vec_feats = [
+            {"start": 40, "end": 46, "strand": 1, "type": "misc_feature",
+             "label": "EcoRI"},
+            {"start": 76, "end": 82, "strand": 1, "type": "misc_feature",
+             "label": "KpnI"},
+        ]
+        ins = (pad(20, "A") + "GAATTC" + pad(50, "C") + "GGTACC"
+               + pad(25, "T"))
+        ins_feats = [
+            {"start": 20, "end": 26, "strand": 1, "type": "misc_feature",
+             "label": "EcoRI"},
+            {"start": 76, "end": 82, "strand": 1, "type": "misc_feature",
+             "label": "KpnI"},
+            {"start": 26, "end": 76, "strand": 1, "type": "CDS",
+             "label": "payload"},
+        ]
+        vfr, verr = sc._excise_fragment_pair(
+            vec, ["EcoRI", "KpnI"], circular=True, features=vec_feats)
+        ifr, ierr = sc._excise_fragment_pair(
+            ins, ["EcoRI", "KpnI"], circular=True, features=ins_feats)
+        assert verr is None and ierr is None
+        res = sc._simulate_traditional_cloning(ifr[0], vfr[1])
+        fwd = res["forward"]
+        assert fwd["compatible"] is True
+        top = fwd["top_seq"]
+        labels = [f["label"] for f in fwd["features"]]
+        assert "EcoRI" in labels and "KpnI" in labels
+        assert not any("(disrupted)" in str(x) for x in labels), labels
+        by_label = {f["label"]: f for f in fwd["features"]}
+        for enz, site in (("EcoRI", "GAATTC"), ("KpnI", "GGTACC")):
+            f = by_label[enz]
+            s0, e0 = f["start"], f["end"]
+            bases = top[s0:e0] if e0 > s0 else top[s0:] + top[:e0]
+            assert bases == site, (enz, bases)
+            # and the enzyme really does still cut the product there
+            cuts = sc._enzyme_cuts(top, [enz], circular=True)
+            assert len(cuts) == 1, (enz, cuts)

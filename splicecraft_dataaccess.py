@@ -1722,6 +1722,45 @@ def _find_library_entry_by_name(entry_name: str) -> "dict | None":
     return None
 
 
+def _agent_scan_library_for_key(key, coll_name=None):
+    """Every ``(collection_name, entry_clone)`` whose stored ``name`` or
+    ``id`` equals ``key``. When ``coll_name`` is given only that
+    collection is scanned. Each hit is a read-only deep clone (callers
+    mutate freely); the whole walk is held under ``_cache_lock`` for a
+    coherent snapshot. Underpins the cross-collection ``load-entry``
+    resolution (snag #8/#10).
+
+    Lives in dataaccess L1 (moved from the hub 2026-09-12) because it is
+    pure data access with no app coupling, and the agent sibling's
+    ``carry_annotations`` resolution needs it: sourcing features through
+    the active-mirror finders meant a vector in one collection and an
+    insert in another could not be named in the same `traditional-clone`
+    call, forcing a staging-collection dance (agent field report)."""
+    hits: "list[tuple[str, dict]]" = []
+    active = _get_active_collection_name()
+    with _state._cache_lock:
+        for c in _iter_collections_readonly():
+            cname = c.get("name") or ""
+            if coll_name is not None and cname != coll_name:
+                continue
+            # For the ACTIVE collection read the live mirror
+            # (`_iter_library_readonly`) rather than the `_load_collections`
+            # snapshot: the mutation endpoints (rename-plasmid /
+            # set-plasmid-status / delete-from-library) write through the
+            # mirror via `_save_library`, and the collections cache can lag
+            # it within a session — so a just-renamed entry must be read
+            # from the mirror or it 404s. Non-active collections aren't
+            # touched by the mirror, so their snapshot view is coherent.
+            entries = (_iter_library_readonly() if cname == active
+                       else (c.get("plasmids") or []))
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                if e.get("name") == key or e.get("id") == key:
+                    hits.append((cname, _typed_clone(e)))
+    return hits
+
+
 def _iter_collections_readonly() -> list[dict]:
     """Read-only view of the collections cache — returns the cached list
     directly without cloning. Callers MUST NOT mutate any returned dict

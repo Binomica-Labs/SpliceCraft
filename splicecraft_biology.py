@@ -2357,12 +2357,20 @@ def _split_features_at_cuts(features: list[dict], n: int,
             # turns them back into ONE feature when the ligated product puts
             # them side by side again.
             gid = f"w{i}"
+            # `_split_full_len` records the ORIGINAL feature's wrap-aware
+            # length, which is what lets a downstream rejoin prove a
+            # reassembled feature is whole again (see
+            # `_rejoin_cut_split_features`). Stamp it from the pre-expansion
+            # coordinates — after halving, neither piece knows the whole.
+            _full = _feat_len(fs, fe, n)
             expanded.append({**f, "start": fs, "end": n,
                               "_wrap_origin_split": "tail",
-                              "_wrap_origin_group": gid})
+                              "_wrap_origin_group": gid,
+                              "_split_full_len": _full})
             expanded.append({**f, "start": 0, "end": fe,
                               "_wrap_origin_split": "head",
-                              "_wrap_origin_group": gid})
+                              "_wrap_origin_group": gid,
+                              "_split_full_len": _full})
         else:
             expanded.append(f)
     features = expanded
@@ -2449,6 +2457,15 @@ def _split_features_at_cuts(features: list[dict], n: int,
                 # Fragment lies wholly INSIDE the feature. `_fragments_from_cuts`
                 # clamps the piece to the fragment's full extent.
                 piece["_split"] = "mid"
+            if piece.get("_split") in ("head", "tail", "mid"):
+                # How long the feature was BEFORE the cut split it. A ligated
+                # product that puts contiguous pieces back together covering
+                # exactly this many bases has reassembled the feature — which
+                # is how `_rejoin_cut_split_features` (cloning L3) tells an
+                # intact restriction site rebuilt by the ligation apart from
+                # a genuinely broken gene.
+                piece.setdefault("_split_full_len",
+                                  int(f.get("_split_full_len") or (e - s)))
             out.setdefault(i, []).append(piece)
     return out
 

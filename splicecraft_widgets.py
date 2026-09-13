@@ -1,14 +1,13 @@
 """Self-contained Textual widget primitives (layer 3).
 
 `_InstantPressButton` (fires Pressed on mouse-down, used by StrandPickerModal)
-and the xterm-256 color grid (`_XtermColorGrid` + its `_xterm_index_to_hex` /
-`_ANSI16_HEX` palette helpers, used by ColorPickerModal). Pure Textual/Rich
-widgets -- no dependency on hub state, persistence, or any other splicecraft
-module.
+and the xterm-256 color grid (`_XtermColorGrid`, used by ColorPickerModal --
+its `_xterm_index_to_hex` / `_ANSI16_HEX` palette helpers live in util L0 now
+and are re-exported here). Pure Textual/Rich widgets -- no dependency on hub
+state or persistence.
 """
 from __future__ import annotations
 
-import functools as _functools
 import re
 
 from rich.text import Text
@@ -18,7 +17,9 @@ from textual.widgets import Button, DataTable, DirectoryTree, Input, Static
 
 from splicecraft_logging import _log
 from splicecraft_util import (
+    _ANSI16_HEX as _ANSI16_HEX,
     _DEFAULT_TYPE_COLORS, _FASTA_EXTS, _is_fasta_path, _is_seq_zip_path, _natural_sort_key,
+    _xterm_index_to_hex as _xterm_index_to_hex,
 )
 from splicecraft_dataaccess import _load_feature_colors
 
@@ -50,38 +51,6 @@ class _InstantPressButton(Button):
             return
         event.stop()
         self.post_message(self.Pressed(self))
-
-
-_ANSI16_HEX: list[str] = [
-    "#000000", "#800000", "#008000", "#808000",
-    "#000080", "#800080", "#008080", "#C0C0C0",
-    "#808080", "#FF0000", "#00FF00", "#FFFF00",
-    "#0000FF", "#FF00FF", "#00FFFF", "#FFFFFF",
-]
-
-
-@_functools.lru_cache(maxsize=256)
-def _xterm_index_to_hex(idx: int) -> str:
-    """Convert an xterm-256 color index (0..255) to the closest 24-bit RGB
-    hex. Matches the xterm default palette — terminals may remap these but
-    the vast majority follow the spec. Cube levels use the canonical
-    ``[0, 95, 135, 175, 215, 255]`` ramp; grayscale uses
-    ``8 + 10 * k`` for k in 0..23.
-
-    LRU-cached at maxsize=256 (entire palette) — `_XtermColorGrid.render`
-    calls this 256× per mount and the output is deterministic."""
-    idx = max(0, min(255, int(idx)))
-    if idx < 16:
-        return _ANSI16_HEX[idx]
-    if idx < 232:
-        n = idx - 16
-        levels = (0, 95, 135, 175, 215, 255)
-        r = levels[(n // 36) % 6]
-        g = levels[(n // 6)  % 6]
-        b = levels[ n        % 6]
-        return f"#{r:02X}{g:02X}{b:02X}"
-    v = 8 + 10 * (idx - 232)
-    return f"#{v:02X}{v:02X}{v:02X}"
 
 
 class _XtermColorGrid(Static):

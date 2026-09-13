@@ -42,13 +42,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.57"
+__version__ = "1.2.58"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-08-30"
+_RELEASE_DATE = "2026-09-12"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -4105,6 +4105,7 @@ from splicecraft_dataaccess import (  # noqa: E402
     _iter_library_readonly as _iter_library_readonly,
     _find_library_entry_by_id as _find_library_entry_by_id,
     _find_library_entry_by_name as _find_library_entry_by_name,
+    _agent_scan_library_for_key as _agent_scan_library_for_key,
     _iter_collections_readonly as _iter_collections_readonly,
     _get_active_collection_name as _get_active_collection_name,
     _set_active_collection_name as _set_active_collection_name,
@@ -8648,6 +8649,9 @@ from splicecraft_cloning import (  # noqa: E402
     # Traditional (restriction) cloning simulation [INV-127]
     _label_disrupted_split_features as _label_disrupted_split_features,
     _rejoin_origin_split_features as _rejoin_origin_split_features,
+    _rejoin_cut_split_features as _rejoin_cut_split_features,
+    _junction_enzyme_names as _junction_enzyme_names,
+    _junction_overhang_span as _junction_overhang_span,
     _ends_compatible as _ends_compatible,
     _ligate_fragments as _ligate_fragments,
     _close_circular as _close_circular,
@@ -9926,7 +9930,8 @@ def _feature_bases(rec_seq: str, feat: dict, n: int) -> str:
 
 @_timed("op.annotation_transfer")
 def _find_annotation_transfers(source_rec, target_rec, *,
-                                  min_len: int = _ANNOT_TRANSFER_MIN_LEN
+                                  min_len: int = _ANNOT_TRANSFER_MIN_LEN,
+                                  stats: "dict | None" = None,
                                   ) -> list[dict]:
     """For every feature in `source_rec` whose sequence appears
     verbatim in `target_rec` (forward or reverse-complement), return
@@ -9944,6 +9949,20 @@ def _find_annotation_transfers(source_rec, target_rec, *,
     sites generate noise (an 18-mer hits any random ~1 kb sequence
     by chance); the use case is propagating CDS / origin / regulatory
     annotations where match length comfortably exceeds 30 bp.
+
+    Pass a dict as `stats` to learn what was LEFT OUT and why:
+    ``{considered, skipped_below_min_len, shortest_skipped_len,
+    unmatched}``. The default `min_len` of 30 silently drops every
+    promoter, operator, RBS, fusion overhang and restriction site — in
+    synthetic biology, most of what the caller wants — and the response
+    showed only a small `count`, with no hint that 18 of 24 features were
+    never searched for at all (agent field report 2026-09-12).
+
+    A feature whose bases are their OWN reverse complement (any
+    palindromic restriction site) is searched on the forward strand only:
+    scanning both strands finds the identical span twice and emitted two
+    transfers for it — same label, same coordinates, opposite arrows —
+    which is sacred invariant #1's double-count one layer out.
     """
     src_seq = str(source_rec.seq).upper()
     tgt_seq = str(target_rec.seq).upper()
@@ -9967,6 +9986,11 @@ def _find_annotation_transfers(source_rec, target_rec, *,
 
     transfers: list[dict] = []
     seen_target_spans: set[tuple[int, int, int]] = set()
+    _st = stats if isinstance(stats, dict) else None
+    if _st is not None:
+        for _k in ("considered", "skipped_below_min_len",
+                    "shortest_skipped_len", "unmatched"):
+            _st.setdefault(_k, 0)
 
     for feat in source_rec.features:
         try:
@@ -9990,7 +10014,15 @@ def _find_annotation_transfers(source_rec, target_rec, *,
             {"start": f_start, "end": f_end, "strand": f_strand},
             n_src,
         )
+        if _st is not None:
+            _st["considered"] += 1
         if len(feat_bases) < min_len:
+            if _st is not None:
+                _st["skipped_below_min_len"] += 1
+                _prev = int(_st.get("shortest_skipped_len") or 0)
+                _st["shortest_skipped_len"] = (
+                    len(feat_bases) if not _prev
+                    else min(_prev, len(feat_bases)))
             continue
         # Pull a display label off the qualifiers — same precedence
         # `_record_features` and `AlignmentScreen._body_text` use.
@@ -10011,10 +10043,20 @@ def _find_annotation_transfers(source_rec, target_rec, *,
         # target is found at the right (forward, wrap) coords.
         # `rc_tgt_seq` was hoisted above the outer loop (sweep #25).
         feat_len = len(feat_bases)
+        n_before_feat = len(transfers)
         scan_seqs = [
             (tgt_seq + (tgt_seq[: feat_len - 1] if is_circular else ""), 1),
             (rc_tgt_seq + (rc_tgt_seq[: feat_len - 1] if is_circular else ""), -1),
         ]
+        # Self-complementary bases (every palindromic restriction site) match
+        # their own reverse complement, so the minus-strand scan re-finds the
+        # SAME span and the (span, strand) dedupe key can't collapse the pair:
+        # one `KpnI` on the source became two identical-span transfers with
+        # opposite arrows. "It matches the minus strand too" carries no
+        # information for a palindrome — forward only, exactly as sacred
+        # invariant #1 requires of the restriction scanner.
+        if feat_bases == _rc(feat_bases):
+            scan_seqs = scan_seqs[:1]
 
         for scan_seq, t_strand in scan_seqs:
             start_idx = 0
@@ -10077,6 +10119,8 @@ def _find_annotation_transfers(source_rec, target_rec, *,
                     "length":         feat_len,
                     "qualifiers":     qual_dict,
                 })
+        if _st is not None and len(transfers) == n_before_feat:
+            _st["unmatched"] += 1
 
     transfers.sort(key=lambda x: (-x["length"], x["target_start"]))
     return transfers
@@ -11422,6 +11466,7 @@ from splicecraft_util import (  # noqa: E402
     _MAX_COLLECTION_NAME_LEN as _MAX_COLLECTION_NAME_LEN,
     _normalize_dna_for_align as _normalize_dna_for_align,
     _safe_color_for_picker as _safe_color_for_picker,
+    _safe_color_for_write as _safe_color_for_write,
     _check_export_extension as _check_export_extension,
     _normalize_collection_name as _normalize_collection_name,
 )
@@ -51280,8 +51325,10 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
 # Standard 16 ANSI colors as rendered by most terminals. These are the only
 # colors guaranteed on an 8/16-color terminal; truecolor hex will be
 # approximated to the nearest ANSI on such terminals by Rich.
-# The xterm-256 color grid + palette helpers live in splicecraft_widgets
-# (layer 3). Re-exported so the hub's color-picker call sites resolve unchanged.
+# The xterm-256 color GRID widget lives in splicecraft_widgets (layer 3); its
+# `_xterm_index_to_hex` / `_ANSI16_HEX` palette helpers moved down to util L0
+# (the L0 colour validators need them) and widgets re-exports them, so this
+# one import still resolves every hub colour-picker call site unchanged.
 from splicecraft_widgets import (  # noqa: E402
     _ANSI16_HEX as _ANSI16_HEX,
     _xterm_index_to_hex as _xterm_index_to_hex,
@@ -94327,6 +94374,8 @@ from splicecraft_agent import (  # noqa: E402  (registers endpoints into _state.
     _agent_traditional_cloning_candidates as _agent_traditional_cloning_candidates,
     _h_simulate_traditional_cloning as _h_simulate_traditional_cloning,
     _agent_golden_gate_inputs as _agent_golden_gate_inputs,
+    _agent_gg_carry_features as _agent_gg_carry_features,
+    _agent_resolve_carry_entry as _agent_resolve_carry_entry,
     _h_simulate_golden_gate as _h_simulate_golden_gate,
     _h_get_sequence as _h_get_sequence,
     _h_fold_rna as _h_fold_rna,
@@ -96547,38 +96596,6 @@ def _h_load_file(app, payload):
     }
 
 
-def _agent_scan_library_for_key(key, coll_name=None):
-    """Every ``(collection_name, entry_clone)`` whose stored ``name`` or
-    ``id`` equals ``key``. When ``coll_name`` is given only that
-    collection is scanned. Each hit is a read-only deep clone (callers
-    mutate freely); the whole walk is held under ``_cache_lock`` for a
-    coherent snapshot. Underpins the cross-collection ``load-entry``
-    resolution (snag #8/#10)."""
-    hits: "list[tuple[str, dict]]" = []
-    active = _get_active_collection_name()
-    with _cache_lock:
-        for c in _iter_collections_readonly():
-            cname = c.get("name") or ""
-            if coll_name is not None and cname != coll_name:
-                continue
-            # For the ACTIVE collection read the live mirror
-            # (`_iter_library_readonly`) rather than the `_load_collections`
-            # snapshot: the mutation endpoints (rename-plasmid /
-            # set-plasmid-status / delete-from-library) write through the
-            # mirror via `_save_library`, and the collections cache can lag
-            # it within a session — so a just-renamed entry must be read
-            # from the mirror or it 404s. Non-active collections aren't
-            # touched by the mirror, so their snapshot view is coherent.
-            entries = (_iter_library_readonly() if cname == active
-                       else (c.get("plasmids") or []))
-            for e in entries:
-                if not isinstance(e, dict):
-                    continue
-                if e.get("name") == key or e.get("id") == key:
-                    hits.append((cname, _typed_clone(e)))
-    return hits
-
-
 @_agent_endpoint("load-entry", write=True)
 def _h_load_entry(app, payload):
     """Load a plasmid library entry by name or id.
@@ -97028,9 +97045,13 @@ def _h_add_feature(app, payload):
       (◀), ``0`` = arrowless (no head), ``2`` = double-stranded (◀▶, a
       SpliceCraft convention persisted via a ``SpliceCraft_strand``
       qualifier so it round-trips). Defaults to ``1``.
-    * ``color`` — hex (``#1f77b4`` / ``#abc``); stored as
-      ``ApEinfo_fwdcolor``/``ApEinfo_revcolor`` so it round-trips through
-      ``.gb`` AND drives the in-app render colour.
+    * ``color`` — hex (``#1f77b4`` / ``#abc``) OR a terminal-palette ref
+      (``color(160)``, 0-255), which is what `list-features` reports for a
+      GUI-drawn feature; a ref is normalised to its xterm hex on the way in,
+      so read-features/write-features round-trips (agent field report
+      2026-09-12 — the hex-only writer used to 400 on the reader's own
+      output). Stored as ``ApEinfo_fwdcolor``/``ApEinfo_revcolor`` so it
+      round-trips through ``.gb`` AND drives the in-app render colour.
     * ``qualifiers`` — an optional object of extra GenBank qualifiers
       (e.g. ``{"gene": "bla", "note": "…"}``); values may be a string or
       list of strings. ``label`` is set from ``label`` if absent.
@@ -97057,10 +97078,11 @@ def _h_add_feature(app, payload):
                   "0 (arrowless), or 2 (double-stranded ◀▶)"}, 400)
     color = None
     if payload.get("color") not in (None, ""):
-        color = _safe_color_for_picker(payload.get("color"))
+        color = _safe_color_for_write(payload.get("color"))
         if color is None:
             return ({"error":
-                      "invalid 'color' (expected hex #RGB or #RRGGBB)"}, 400)
+                      "invalid 'color' (expected hex #RGB / #RRGGBB, "
+                      "or a terminal palette ref color(0)-color(255))"}, 400)
     quals, qerr = _agent_sanitize_qualifiers(payload.get("qualifiers"))
     if qerr is not None:
         return ({"error": qerr}, 400)
@@ -97165,7 +97187,7 @@ def _h_add_features(app, payload):
                       f"0 (arrowless), or 2 (◀▶)"}, 400)
         color = None
         if fb.get("color") not in (None, ""):
-            color = _safe_color_for_picker(fb.get("color"))
+            color = _safe_color_for_write(fb.get("color"))
             if color is None:
                 return ({"error":
                           f"features[{idx}]: invalid 'color' "
@@ -97598,10 +97620,11 @@ def _h_update_feature(app, payload):
     set_color = "color" in payload
     new_color = None
     if set_color and payload.get("color") not in (None, ""):
-        new_color = _safe_color_for_picker(payload.get("color"))
+        new_color = _safe_color_for_write(payload.get("color"))
         if new_color is None:
             return ({"error":
-                      "invalid 'color' (expected hex #RGB or #RRGGBB)"}, 400)
+                      "invalid 'color' (expected hex #RGB / #RRGGBB, "
+                      "or a terminal palette ref color(0)-color(255))"}, 400)
     new_quals = None
     if "qualifiers" in payload:
         new_quals, qerr = _agent_sanitize_qualifiers(payload.get("qualifiers"))
@@ -97692,7 +97715,9 @@ def _h_update_feature(app, payload):
             target.qualifiers.setdefault("label", [str(new_label)])
             target.qualifiers["label"] = [str(new_label)]
         if new_strand is not None:
-            biop_strand = new_strand if new_strand in (-1, 1) else None
+            biop_strand = new_strand if new_strand in (-1, 1) else 0  # 0, never None:
+            # None is the one strand GenBank can't round-trip (see
+            # `_annotate_with_feature_impl`).
             from Bio.SeqFeature import FeatureLocation, CompoundLocation
             loc = target.location
             if isinstance(loc, CompoundLocation):
@@ -98031,7 +98056,22 @@ def _h_transfer_annotations(app, payload):
     (active first); pass ``source_collection`` to pin the search to one,
     so a backbone in a non-active collection transfers without a temp
     copy. An ambiguous key across collections returns 409. Returns
-    ``{transfers: [...], applied: bool, count: int}``.
+    ``{transfers: [...], applied: bool, count: int, skipped: {...}}``.
+
+    ``skipped`` accounts for what did NOT transfer:
+    ``{min_len, considered, below_min_len, shortest_skipped_len,
+    no_sequence_match}``. Read it — the default ``min_len`` of 30 drops
+    every promoter, operator, RBS, fusion overhang and restriction site
+    before the search runs, so a small ``count`` usually means the
+    threshold and not a mismatch. Lower ``min_len`` to pick those up, at
+    the cost of short features matching in many places (a 4 nt overhang
+    label hits everywhere); for "same backbone, one block swapped" prefer
+    ``carry_annotations`` on the assembly endpoint, which maps coordinates
+    instead of searching sequence.
+
+    A palindromic feature (any restriction site) is searched on the forward
+    strand only — scanning both strands found the identical span twice and
+    emitted it as two transfers with opposite arrows.
 
     Stale-canvas guard (audit sweep #4 2026-05-15): captures
     `_record_load_counter` at handler entry and returns ``409`` if
@@ -99998,7 +100038,17 @@ def _h_traditional_clone(app, payload):
         entry is skipped (reported in ``carry_warnings`` — rotation-matching
         isn't attempted, so coordinates can't be mis-placed). Requires at least
         one of ``vector_name`` / ``insert_name`` (else 400); an unknown name is
-        404. The response echoes ``annotations_carried`` + ``carry_warnings``.
+        404. The response echoes ``annotations_carried``, per-side
+        ``carried: {vector, insert, any}`` and ``carry_warnings`` — check
+        ``carried``, since a skipped side otherwise reads as ``ok: true``
+        with half the annotations missing.
+      * ``carry_strict?: bool = false`` — turn that soft skip into a 422
+        instead of a warning.
+      * ``vector_collection?`` / ``insert_collection?`` — pin either name's
+        lookup to one collection. By default both resolve across EVERY
+        collection (active first, 409 on a genuine ambiguity), so a
+        backbone and an insert filed in different collections need no
+        staging copy.
 
     When the digest + ligation yields EXACTLY ONE compatible product it's
     saved automatically. When more than one is compatible — a palindromic
@@ -100175,6 +100225,7 @@ def _h_traditional_clone(app, payload):
             "length":          product["length"],
             "insert":          info["insert"],
             "annotations_carried": info.get("annotations_carried", False),
+            "carried":             info.get("carried", {}),
             "carry_warnings":      info.get("carry_warnings", [])}
     if auto_pick is not None:
         # Say WHICH choice was made for you and on what evidence — an
@@ -100201,15 +100252,27 @@ def _h_golden_gate_assemble(app, payload):
     non-unique junction overhang, a residual enzyme site) ride along in
     ``result.warnings``. [INV-127: the design IS the product.]
 
-    **The saved product carries NO features.** Unlike `traditional-clone`
-    there is no ``carry_annotations`` here — the assembler works on bare
-    part sequences and has no library entry to source features from, so the
-    entry lands with ``n_feats: 0``. Passing ``carry_annotations`` is a 400
-    rather than a silent no-op, because a feature-bare construct that was
-    expected to be annotated looks identical to an annotated one until you
-    open it. To annotate the product, follow up with `transfer-annotations`
-    from the parent, or use `assemble-into-entry-vector` for a grammar-aware
-    assembly that keeps part features."""
+    **Annotations: pass ``carry_annotations: true``.** Each part and the
+    vector may be given as ``{sequence, name?, collection?}`` (the spec
+    shape already used for lineage); every spec that names a library entry
+    has that entry's OWN features lifted onto the product, mapped through
+    the same digest + ligation that built the sequence — so the feature map
+    is a result of the simulation, not a second similarity pass. Names
+    resolve across EVERY collection (409 on a genuine ambiguity). A spec
+    whose passed sequence doesn't EXACTLY match its named entry is skipped
+    with a warning, never mis-placed ([INV-127]); ``carry_strict: true``
+    makes that a 422 instead. The response carries per-input
+    ``carried: {vector, parts: [...], any}`` and ``carry_warnings`` —
+    check ``carried``, because a skipped input otherwise reads as
+    ``ok: true`` with a feature-bare product. Omit ``carry_annotations``
+    and the product saves with ``n_feats: 0`` as before.
+
+    (Until 2026-09-12 there was no way to get an annotated one-pot product:
+    this endpoint 400'd on ``carry_annotations`` and pointed at
+    `transfer-annotations`, whose sequence-similarity model is the wrong
+    instrument here and whose 30 bp floor drops every promoter, RBS and
+    fusion overhang, or at `assemble-into-entry-vector`, which needs a
+    grammar-registered entry vector that a custom UPD acceptor is not.)"""
     guard = _agent_dirty_guard(app, payload)
     if guard is not None:
         return guard
@@ -100217,7 +100280,9 @@ def _h_golden_gate_assemble(app, payload):
     # instead of ignoring it. `enzyme` IS accepted here, `carry_annotations`
     # is not.
     if (derr := _agent_reject_dangerous_unknowns(
-            payload, {"parts", "vector", "enzyme", "product_name"})) is not None:
+            payload, {"parts", "vector", "enzyme", "product_name",
+                      "carry_annotations", "carry_strict", "vector_name",
+                      "vector_collection"})) is not None:
         return derr
     parts, vseq, enzyme, err = _agent_golden_gate_inputs(payload)
     if err is not None:
@@ -100225,8 +100290,14 @@ def _h_golden_gate_assemble(app, payload):
     # `err is None` ⇒ the other three are populated; assert so pyright narrows
     # them off the (… | None) union the helper's tuple return widens to.
     assert parts is not None and vseq is not None and enzyme is not None
+    (part_feats, vec_feats, carry_warnings,
+     carried, carry_err) = _agent_gg_carry_features(payload, parts, vseq)
+    if carry_err is not None:
+        return carry_err
     try:
-        result = _simulate_golden_gate(parts, vseq, enzyme=enzyme)
+        result = _simulate_golden_gate(
+            parts, vseq, enzyme=enzyme,
+            part_features=part_feats, vector_features=vec_feats)
     except Exception as exc:
         _log.exception("agent golden-gate-assemble: assembler failed")
         return ({"error": f"assembler failed: {_scrub_path(str(exc))}"}, 500)
@@ -100234,7 +100305,8 @@ def _h_golden_gate_assemble(app, payload):
         return ({"error": "Golden Gate assembly failed; see 'result' for "
                   "details", "result": result}, 422)
     fake_result = {"success": True, "product_seq": result["product_seq"],
-                   "features": [], "circular": True}
+                   "features": result.get("features") or [],
+                   "circular": True}
     base_name = _sanitize_label(payload.get("product_name"),
                                   max_len=80) or "goldengate"
     rec = _gibson_record_from_result(fake_result, name=base_name)
@@ -100286,6 +100358,10 @@ def _h_golden_gate_assemble(app, payload):
     else:
         _agent_refresh_library_panel(app)
     return {"ok": True, "saved_name": name, "saved_id": name,
+            "n_feats": entry["n_feats"],
+            "carried": carried,
+            "annotations_carried": bool((carried or {}).get("any")),
+            "carry_warnings": carry_warnings,
             "result": result}
 
 
@@ -112595,7 +112671,9 @@ NcbiTaxonPickerModal { align: center middle; }
             # qualifier, save→load would silently collapse strand=2
             # → strand=0 (arrowless) because BioPython has no
             # representation for the "both arrows" state.
-            biop_strand = new_str if new_str in (-1, 1) else None
+            biop_strand = new_str if new_str in (-1, 1) else 0  # 0, never None:
+            # None is the one strand GenBank can't round-trip (see
+            # `_annotate_with_feature_impl`).
             from Bio.SeqFeature import FeatureLocation, CompoundLocation
             loc = target.location
             if isinstance(loc, CompoundLocation):
@@ -112743,8 +112821,8 @@ NcbiTaxonPickerModal { align: center middle; }
             abs_s = t_start + m["rel_start"]
             abs_e = t_start + m["rel_end"]
             biop_strand = (
-                m["strand"] if m["strand"] in (-1, 1) else None
-            )
+                m["strand"] if m["strand"] in (-1, 1) else 0
+            )   # 0, never None — see `_annotate_with_feature_impl`
             loc = FeatureLocation(abs_s, abs_e, strand=biop_strand)
             quals: dict = {
                 k: list(v) if isinstance(v, (list, tuple)) else [v]
@@ -112929,8 +113007,8 @@ NcbiTaxonPickerModal { align: center middle; }
             abs_s = anchor_start + int(m["rel_start"])
             abs_e = anchor_start + int(m["rel_end"])
             biop_strand = (
-                m["strand"] if m["strand"] in (-1, 1) else None
-            )
+                m["strand"] if m["strand"] in (-1, 1) else 0
+            )   # 0, never None — see `_annotate_with_feature_impl`
             loc = FeatureLocation(abs_s, abs_e, strand=biop_strand)
             quals: dict = {
                 k: list(v) if isinstance(v, (list, tuple)) else [v]
@@ -113308,7 +113386,9 @@ NcbiTaxonPickerModal { align: center middle; }
             if clean:
                 target.qualifiers["primer_seq"] = [clean]
         if new_str is not None and new_str in (-1, 0, 1):
-            biop_strand = new_str if new_str in (-1, 1) else None
+            biop_strand = new_str if new_str in (-1, 1) else 0  # 0, never None:
+            # None is the one strand GenBank can't round-trip (see
+            # `_annotate_with_feature_impl`).
             from Bio.SeqFeature import FeatureLocation, CompoundLocation
             loc = target.location
             if isinstance(loc, CompoundLocation):
@@ -115589,10 +115669,21 @@ NcbiTaxonPickerModal { align: center middle; }
             strand = 1
         if strand not in (-1, 0, 1, 2):
             strand = 1
-        # `2` (double-stranded) is a SpliceCraft-only convention; map
-        # to None on the BioPython side since CompoundLocation parts
-        # require ±1 / 0 / None.
-        biop_strand = strand if strand in (-1, 1) else None
+        # `0` (arrowless) and `2` (double-stranded) have no GenBank
+        # direction, so both map to BioPython strand **0** — NOT None.
+        # None is the one strand value a GenBank round-trip cannot
+        # preserve: the writer emits a plain location and the reader hands
+        # back `0` (arrowless) or `1` (forward), so a `None`-strand feature
+        # fails `_export_genbank_to_path`'s signature guard with "has no
+        # strand" while the identical feature at strand 0 exports fine.
+        # That mismatch is what made `add-feature {"strand": 0}` succeed and
+        # the next `export-genbank` 500 (agent field report 2026-09-12);
+        # `save` + reload "fixed" it precisely because the reload
+        # normalised None to 0. Both conventions still ride the
+        # `SpliceCraft_strand` qualifier for the render (`_parse` promotes
+        # "double" back to 2), and both consumers already read BioPython 0
+        # and None identically.
+        biop_strand = strand if strand in (-1, 1) else 0
         loc = _feature_location(start, end, n, biop_strand)
         if loc is None:
             # Unreachable: `end == start` already raised above. Kept as a
@@ -115839,8 +115930,8 @@ NcbiTaxonPickerModal { align: center middle; }
                 abs_e = raw_e
                 member_wraps = False
             biop_strand = (
-                m["strand"] if m["strand"] in (-1, 1) else None
-            )
+                m["strand"] if m["strand"] in (-1, 1) else 0
+            )   # 0, never None — see `_annotate_with_feature_impl`
             if member_wraps:
                 loc = CompoundLocation([
                     FeatureLocation(abs_s, n, strand=biop_strand),

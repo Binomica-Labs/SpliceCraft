@@ -56,12 +56,12 @@ from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq,
                                 _topology_from_gb_text)
 from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript)
-from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_picker, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
+from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
 from splicecraft_biology import (_digest_with_enzymes, _enzyme_aliases, _enzyme_cuts, _enzyme_resolve_one, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
 from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _build_synthesis_l0_fragment, _design_gb_primers, _entry_vector_acceptor_overhangs, _grammar_position_by_type, _l0_part_from_syn_fragment)
-from splicecraft_dataaccess import (_active_enzyme_allowed_set, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
+from splicecraft_dataaccess import (_active_enzyme_allowed_set, _agent_scan_library_for_key, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
 from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member)
 from splicecraft_gels import (_AGAROSE_CHOICES, _GEL_HEIGHT_MAX, _GEL_HEIGHT_MIN, _GEL_LANE_WIDTH_MAX, _GEL_LANE_WIDTH_MIN, _GEL_MAX_LANES, _agarose_mobility, _gel_bands_for_lane, _render_gel_image)
 from splicecraft_persistence import (_safe_save_json_mirror)
@@ -2869,10 +2869,11 @@ def _h_set_feature_color(app, payload):
     clear = bool(payload.get("clear")) or payload.get("color") in (None, "")
     color = None
     if not clear:
-        color = _safe_color_for_picker(payload.get("color"))
+        color = _safe_color_for_write(payload.get("color"))
         if color is None:
             return ({"error":
-                      "invalid 'color' (expected hex #RGB or #RRGGBB)"}, 400)
+                      "invalid 'color' (expected hex #RGB / #RRGGBB, "
+                      "or a terminal palette ref color(0)-color(255))"}, 400)
     # RMW under the cache lock so a concurrent colour edit can't clobber.
     with _state._cache_lock:
         mapping = _load_feature_colors()
@@ -4453,6 +4454,9 @@ def _h_simulate_gibson(app, payload):
     return {"ok": bool(result.get("success")), "result": result}
 
 
+_SC_STRAND_QUAL_CARRY = "SpliceCraft_strand"
+
+
 def _agent_carry_feature_dicts(rec) -> "list[dict]":
     """Convert a SeqRecord's annotations into the simple
     ``{start, end, strand, type, label, color}`` dicts the traditional-cloning
@@ -4472,7 +4476,17 @@ def _agent_carry_feature_dicts(rec) -> "list[dict]":
         s, e, strand = bounds
         quals = getattr(f, "qualifiers", {}) or {}
         label = (quals.get("label") or quals.get("product") or [f.type])[0]
-        d = {"start": int(s), "end": int(e), "strand": int(strand or 1),
+        # `int(strand or 1)` turned every ARROWLESS parent feature into a
+        # forward-pointing one on the clone: 0 is a real strand value, not
+        # a falsy default. The double-stranded convention rides a
+        # qualifier rather than the location, so read it back to the dict
+        # model's `2` or it degrades to arrowless here (2026-09-12).
+        sc_q = quals.get(_SC_STRAND_QUAL_CARRY)
+        dict_strand = 0 if strand is None else int(strand)
+        if (isinstance(sc_q, list) and sc_q
+                and str(sc_q[0]).strip().lower() == "double"):
+            dict_strand = 2
+        d = {"start": int(s), "end": int(e), "strand": dict_strand,
              "type": f.type, "label": str(label)[:200]}
         color = (quals.get("ApEinfo_fwdcolor") or [""])[0] or ""
         if color:
@@ -4491,74 +4505,147 @@ def _agent_carry_clean_bases(seq: str) -> str:
     return "".join(c for c in (seq or "").upper() if c in "ACGTRYWSMKBDHVN")
 
 
+def _agent_resolve_carry_entry(name, coll_in, which):
+    """Resolve ``name`` to ONE library entry for a ``carry_annotations``
+    source, searching EVERY collection (active first) the way `load-entry`
+    and `transfer-annotations` do. Returns ``(entry, None)`` or
+    ``(None, (err, status))``.
+
+    Was active-collection-only, via the `_find_library_entry_by_*`
+    mirror finders. A vector in one collection and an insert in another
+    therefore could not be named in the same `traditional-clone` call, so
+    the caller had to create a staging collection, copy both parents in,
+    clone, move the product out and delete the staging collection (agent
+    field report 2026-09-12). `transfer-annotations` already resolved
+    across collections and its docstring argued the case."""
+    coll: "str | None" = None
+    if coll_in not in (None, ""):
+        coll = _normalize_collection_name(coll_in)
+        if coll is None:
+            return None, ({"error": f"invalid {which}_collection"}, 400)
+        if not any(isinstance(c, dict) and c.get("name") == coll
+                    for c in _iter_collections_readonly()):
+            return None, ({"error":
+                            f"no collection named {coll!r}"}, 404)
+    hits = _agent_scan_library_for_key(name, coll)
+    if not hits and coll is None:
+        # Live active-mirror fallback: a fresh/minimal state can hold the
+        # entry in the mirror without a materialised collection for the
+        # scan to walk (same fallback `transfer-annotations` keeps).
+        fb = (_find_library_entry_by_id(name)
+              or _find_library_entry_by_name(name))
+        if fb is not None:
+            hits = [(_get_active_collection_name() or "", fb)]
+    if not hits:
+        where = (f" in collection {coll!r}" if coll else " in any collection")
+        return None, ({"error": f"no library entry named {name!r}{where} to "
+                                f"carry {which} annotations from"}, 404)
+    if len(hits) > 1:
+        active = _get_active_collection_name()
+        active_hits = [h for h in hits if h[0] == active]
+        if len(active_hits) == 1:
+            hits = active_hits
+        else:
+            holders = sorted({h[0] for h in hits})
+            return None, ({"error":
+                            f"{name!r} matches entries in multiple "
+                            f"collections ({', '.join(holders)}) — pass "
+                            f"{{\"{which}_collection\": \"…\"}} to "
+                            f"disambiguate",
+                            "collections": holders}, 409)
+    return hits[0][1], None
+
+
 def _agent_carry_source_features(payload, vec_seq, ins_seq):
     """Source feature dicts for ``carry_annotations`` on `traditional-clone`
     from the ``vector_name`` / ``insert_name`` library entries the caller
     already passes for lineage. Returns
-    ``(vec_feats, ins_feats, warnings, carried_any, err)`` where ``err`` is
-    ``(dict, status)`` or None. A no-op (empty lists) unless
-    ``carry_annotations`` is set.
+    ``(vec_feats, ins_feats, warnings, carried, err)`` where ``carried`` is
+    ``{"vector": bool, "insert": bool, "any": bool}`` and ``err`` is
+    ``(dict, status)`` or None. A no-op unless ``carry_annotations`` is set.
+
+    Names resolve across EVERY collection (pass ``vector_collection`` /
+    ``insert_collection`` to pin one; 409 on a genuine ambiguity), so a
+    backbone and an insert filed apart need no staging copy.
 
     Fail-loud where it matters (agent-API feedback — never a silent ok:true):
       * ``carry_annotations:true`` with NEITHER name → 400 (nothing to source
         from).
       * A named entry that doesn't resolve → 404 (the caller named a
         non-existent entry).
-    Soft-skip (reported in ``warnings``, never corrupts coordinates):
+    Soft-skip (reported in ``warnings`` AND in the per-side ``carried``
+    flags, never corrupts coordinates):
       * A named entry whose stored sequence doesn't EXACTLY match the passed
         seq — carrying rotated/edited coordinates would mis-place every feature
         ([INV-127] catastrophic-class), so that side is skipped with a warning.
-        Rotation-matching is intentionally NOT attempted."""
+        Rotation-matching is intentionally NOT attempted.
+
+    Pass ``carry_strict: true`` to turn that skip into a 422 instead. The
+    soft skip is right by default (half an annotation set beats none), but
+    it made the natural failure a call that answers ``ok: true`` with a
+    product missing half its features, signalled only inside a nested
+    ``warnings`` list — so a caller checking ``ok`` sails past it. The
+    per-side ``carried`` flags are the cheap check; ``carry_strict`` is the
+    loud one."""
     if not bool(payload.get("carry_annotations")):
-        return [], [], [], False, None
+        return [], [], [], {"vector": False, "insert": False, "any": False}, None
     vname = _sanitize_label(payload.get("vector_name"), max_len=200)
     iname = _sanitize_label(payload.get("insert_name"), max_len=200)
     if not vname and not iname:
-        return None, None, None, False, (
+        return None, None, None, None, (
             {"error": "carry_annotations:true needs 'vector_name' and/or "
                       "'insert_name' to source features from a saved library "
                       "entry"}, 400)
+    strict = bool(payload.get("carry_strict"))
     warnings: "list[str]" = []
-    carried = {"any": False}
+    carried = {"vector": False, "insert": False, "any": False}
 
     def _one(name, target_clean, which):
+        """-> (feats, err). Records the per-side outcome in `carried`."""
         if not name:
             return [], None
-        entry = (_find_library_entry_by_id(name)
-                 or _find_library_entry_by_name(name))
-        if entry is None:
-            return None, ({"error": f"no library entry named {name!r} to "
-                                    f"carry {which} annotations from"}, 404)
+        entry, err = _agent_resolve_carry_entry(
+            name, payload.get(f"{which}_collection"), which)
+        if err is not None:
+            return None, err
+        # `err is None` ⇒ the entry is populated; assert so pyright narrows
+        # it off the (dict | None) union the tuple return widens to.
+        assert entry is not None
+
+        def _skip(msg):
+            warnings.append(msg)
+            if strict:
+                return None, ({"error": msg, "carried": dict(carried)}, 422)
+            return [], None
+
         gb = entry.get("gb_text") or ""
         if not gb:
-            warnings.append(f"{which} entry {name!r} has no stored sequence; "
-                            "annotations not carried")
-            return [], None
+            return _skip(f"{which} entry {name!r} has no stored sequence; "
+                          "annotations not carried")
         try:
             rec = _gb_text_to_record(gb)
         except Exception:
-            warnings.append(f"{which} entry {name!r} could not be parsed; "
-                            "annotations not carried")
-            return [], None
+            return _skip(f"{which} entry {name!r} could not be parsed; "
+                          "annotations not carried")
         if _agent_carry_clean_bases(str(getattr(rec, "seq", "") or "")) \
                 != target_clean:
-            warnings.append(
+            return _skip(
                 f"{which}_seq doesn't match saved entry {name!r} "
                 "(rotation-matching not supported) — annotations not carried; "
                 "pass the entry's sequence verbatim")
-            return [], None
         feats = _agent_carry_feature_dicts(rec)
         if feats:
+            carried[which] = True
             carried["any"] = True
         return feats, None
 
     vec_feats, verr = _one(vname, _agent_carry_clean_bases(vec_seq), "vector")
     if verr is not None:
-        return None, None, None, False, verr
+        return None, None, None, None, verr
     ins_feats, ierr = _one(iname, _agent_carry_clean_bases(ins_seq), "insert")
     if ierr is not None:
-        return None, None, None, False, ierr
-    return vec_feats, ins_feats, warnings, carried["any"], None
+        return None, None, None, None, ierr
+    return vec_feats, ins_feats, warnings, carried, None
 
 
 def _agent_traditional_cloning_candidates(payload):
@@ -4621,7 +4708,7 @@ def _agent_traditional_cloning_candidates(payload):
     # `carry_annotations` is set — the engine already splits + shifts these onto
     # the product coordinates.
     (carry_vec_feats, carry_ins_feats, carry_warnings,
-     annotations_carried, carry_err) = _agent_carry_source_features(
+     carried_sides, carry_err) = _agent_carry_source_features(
         payload, vec_seq, ins_seq)
     if carry_err is not None:
         return None, carry_err
@@ -4713,7 +4800,11 @@ def _agent_traditional_cloning_candidates(payload):
         "products":           products,
         "incompatible":       incompatible,
         "carry_warnings":     carry_warnings,
-        "annotations_carried": annotations_carried,
+        # Per-side outcome, not just an any-of bool: a caller that checks
+        # `ok` alone must still be able to see that ONE parent's features
+        # were skipped (agent field report 2026-09-12).
+        "carried":             carried_sides,
+        "annotations_carried": bool((carried_sides or {}).get("any")),
     }, None)
 
 
@@ -4816,11 +4907,121 @@ def _h_simulate_traditional_cloning(app, payload):
             "products":            products,
             "incompatible":        info["incompatible"],
             "annotations_carried": info["annotations_carried"],
+            "carried":             info.get("carried", {}),
             "carry_warnings":      info["carry_warnings"],
             "ignored": _agent_ignored_keys(payload, {
                 "vector_seq", "vector_enzymes", "insert_seq",
                 "insert_enzymes", "vector_circular", "insert_circular",
-                "carry_annotations", "vector_name", "insert_name"})}
+                "carry_annotations", "carry_strict", "vector_name",
+                "insert_name", "vector_collection", "insert_collection"})}
+
+
+def _agent_gg_carry_features(payload, parts, vseq):
+    """Source per-part + vector feature dicts for ``carry_annotations`` on
+    `golden-gate-assemble`. Returns
+    ``(part_features, vector_features, warnings, carried, err)``.
+
+    Same contract as `_agent_carry_source_features` on `traditional-clone`,
+    one layer wider: each part and the vector may carry a ``name`` (the
+    spec shape ``{sequence, name?}`` already used for lineage) naming the
+    library entry to lift features from, resolved across EVERY collection
+    and gated on an EXACT sequence match so coordinates can never be
+    mis-placed. ``collection`` inside a part spec (or ``vector_collection``)
+    pins one.
+
+    Before this there was no supported way to get an annotated one-pot
+    product at all: the endpoint 400'd on ``carry_annotations`` and pointed
+    at `transfer-annotations` (sequence-similarity — wrong instrument, and
+    its 30 bp floor drops every promoter/RBS/overhang) or
+    `assemble-into-entry-vector` (needs a grammar-registered entry vector,
+    which a custom UPD acceptor is not). 26 saved one-pot products landed
+    with zero features (agent field report 2026-09-12)."""
+    if not bool(payload.get("carry_annotations")):
+        return None, None, [], {"vector": False, "parts": [], "any": False}, None
+    raw_parts = payload.get("parts") or []
+    strict = bool(payload.get("carry_strict"))
+    warnings: "list[str]" = []
+    carried = {"vector": False, "parts": [False] * len(parts), "any": False}
+    # Asking to carry annotations with nothing to carry them FROM is a
+    # caller error, not an empty result — same fail-loud rule
+    # `traditional-clone` applies to a missing vector_name/insert_name.
+    _named = [r for r in ([payload.get("vector")] + list(raw_parts))
+               if isinstance(r, dict) and str(r.get("name") or "").strip()]
+    if not _named and not str(payload.get("vector_name") or "").strip():
+        return None, None, None, None, (
+            {"error": "carry_annotations:true needs a 'name' on the vector "
+                      "and/or at least one part (pass each input as "
+                      '{"sequence": …, "name": "<library entry>"}) to source '
+                      "features from a saved library entry"}, 400)
+
+    def _spec(raw):
+        """-> (name, collection) from a part/vector spec."""
+        if isinstance(raw, dict):
+            nm = _sanitize_label(raw.get("name"), max_len=200)
+            return nm, raw.get("collection")
+        return "", None
+
+    def _one(name, coll_in, clean_seq, which):
+        if not name:
+            warnings.append(
+                f"{which} has no 'name' — pass {{\"sequence\": …, "
+                f"\"name\": \"<library entry>\"}} to carry its features")
+            return [], None
+        entry, err = _agent_resolve_carry_entry(name, coll_in, which)
+        if err is not None:
+            return None, err
+        # `err is None` ⇒ the entry is populated; assert so pyright narrows
+        # it off the (dict | None) union the tuple return widens to.
+        assert entry is not None
+
+        def _skip(msg):
+            warnings.append(msg)
+            if strict:
+                return None, ({"error": msg, "carried": dict(carried)}, 422)
+            return [], None
+
+        gb = entry.get("gb_text") or ""
+        if not gb:
+            return _skip(f"{which} entry {name!r} has no stored sequence; "
+                          "annotations not carried")
+        try:
+            rec = _gb_text_to_record(gb)
+        except Exception:
+            return _skip(f"{which} entry {name!r} could not be parsed; "
+                          "annotations not carried")
+        if _agent_carry_clean_bases(str(getattr(rec, "seq", "") or "")) \
+                != clean_seq:
+            return _skip(
+                f"{which} sequence doesn't match saved entry {name!r} "
+                "(rotation-matching not supported) — annotations not "
+                "carried; pass the entry's sequence verbatim")
+        return _agent_carry_feature_dicts(rec), None
+
+    vname, vcoll = _spec(payload.get("vector"))
+    if not vname:
+        vname = _sanitize_label(payload.get("vector_name"), max_len=200)
+        vcoll = payload.get("vector_collection")
+    vec_feats, err = _one(vname, vcoll, _agent_carry_clean_bases(vseq),
+                           "vector")
+    if err is not None:
+        return None, None, None, None, err
+    if vec_feats:
+        carried["vector"] = True
+        carried["any"] = True
+
+    part_feats: "list[list[dict]]" = []
+    for i, pseq in enumerate(parts):
+        raw = raw_parts[i] if i < len(raw_parts) else None
+        pname, pcoll = _spec(raw)
+        feats, err = _one(pname, pcoll,
+                           _agent_carry_clean_bases(pseq), f"part {i + 1}")
+        if err is not None:
+            return None, None, None, None, err
+        part_feats.append(feats or [])
+        if feats:
+            carried["parts"][i] = True
+            carried["any"] = True
+    return part_feats, vec_feats, warnings, carried, None
 
 
 def _agent_golden_gate_inputs(payload):
@@ -4887,13 +5088,26 @@ def _h_simulate_golden_gate(app, payload):
     vector's cut positions and EVERY fragment's two overhangs (plus
     ``vector_fragment_overhangs`` / ``part_overhangs``) so the dangling one
     is visible, instead of asserting the parts are at fault. Read-only —
-    pair with `golden-gate-assemble` to save."""
+    pair with `golden-gate-assemble` to save.
+
+    ``carry_annotations: true`` previews the product's FEATURE map too,
+    sourced from the ``name`` on each ``{sequence, name?}`` part / vector
+    spec, exactly as `golden-gate-assemble` saves it (``result.features``,
+    plus ``carried`` / ``carry_warnings``). The pair takes the same payload
+    on purpose: a preview that silently dropped the key would disagree with
+    the save that honoured it."""
     parts, vseq, enzyme, err = _agent_golden_gate_inputs(payload)
     if err is not None:
         return err
     assert parts is not None and vseq is not None and enzyme is not None
+    (part_feats, vec_feats, carry_warnings,
+     carried, carry_err) = _agent_gg_carry_features(payload, parts, vseq)
+    if carry_err is not None:
+        return carry_err
     try:
-        result = _simulate_golden_gate(parts, vseq, enzyme=enzyme)
+        result = _simulate_golden_gate(
+            parts, vseq, enzyme=enzyme,
+            part_features=part_feats, vector_features=vec_feats)
     except Exception as exc:
         _log.exception("agent simulate-golden-gate: assembler failed")
         return ({"error": f"assembler failed: {_scrub_path(str(exc))}"}, 500)
@@ -4906,8 +5120,12 @@ def _h_simulate_golden_gate(app, payload):
     # report #4). Still HTTP 200: the request was served, the reaction it
     # modelled is what failed. `errors`/`warnings` explain why.
     return {"ok": bool(result.get("ok")), "result": result,
-            "ignored": _agent_ignored_keys(payload,
-                                           {"parts", "vector", "enzyme"})}
+            "carried": carried, "carry_warnings": carry_warnings,
+            "annotations_carried": bool((carried or {}).get("any")),
+            "ignored": _agent_ignored_keys(
+                payload, {"parts", "vector", "enzyme", "carry_annotations",
+                           "carry_strict", "vector_name",
+                           "vector_collection"})}
 
 
 _AGENT_MUT_RE = re.compile(r"^([A-Z])(\d{1,5})([A-Z\*])$")
@@ -6477,7 +6695,9 @@ def _agent_transcript_feature_dicts(rec) -> "list[dict]":
         s, e, strand = bounds
         quals = getattr(f, "qualifiers", {}) or {}
         label = (quals.get("label") or quals.get("product") or [f.type])[0]
-        d = {"start": int(s), "end": int(e), "strand": int(strand or 1),
+        # 0 is a strand, not a falsy default — see `_agent_carry_feature_dicts`.
+        d = {"start": int(s), "end": int(e),
+             "strand": 0 if strand is None else int(strand),
              "type": f.type, "label": str(label)[:200]}
         if e >= s:                       # not a wrap — parts may be exons
             parts: "list[list[int]]" = []

@@ -566,6 +566,78 @@ def _safe_color_for_picker(raw) -> "str | None":
     return raw
 
 
+# ── xterm-256 palette (moved from widgets L3 so the L0 colour validators can
+# reach it — a pure index→hex formula has no widget dependency; widgets
+# re-exports it so `ColorPickerModal` / `_XtermColorGrid` call sites are
+# unchanged). ────────────────────────────────────────────────────────────────
+_ANSI16_HEX: list[str] = [
+    "#000000", "#800000", "#008000", "#808000",
+    "#000080", "#800080", "#008080", "#C0C0C0",
+    "#808080", "#FF0000", "#00FF00", "#FFFF00",
+    "#0000FF", "#FF00FF", "#00FFFF", "#FFFFFF",
+]
+
+
+@_functools.lru_cache(maxsize=256)
+def _xterm_index_to_hex(idx: int) -> str:
+    """Convert an xterm-256 color index (0..255) to the closest 24-bit RGB
+    hex. Matches the xterm default palette — terminals may remap these but
+    the vast majority follow the spec. Cube levels use the canonical
+    ``[0, 95, 135, 175, 215, 255]`` ramp; grayscale uses
+    ``8 + 10 * k`` for k in 0..23.
+
+    LRU-cached at maxsize=256 (entire palette) — `_XtermColorGrid.render`
+    calls this 256x per mount and the output is deterministic."""
+    idx = max(0, min(255, int(idx)))
+    if idx < 16:
+        return _ANSI16_HEX[idx]
+    if idx < 232:
+        n = idx - 16
+        levels = (0, 95, 135, 175, 215, 255)
+        r = levels[(n // 36) % 6]
+        g = levels[(n // 6)  % 6]
+        b = levels[ n        % 6]
+        return f"#{r:02X}{g:02X}{b:02X}"
+    v = 8 + 10 * (idx - 232)
+    return f"#{v:02X}{v:02X}{v:02X}"
+
+
+_PALETTE_REF_RE = re.compile(r"^color\(\s*(\d{1,3})\s*\)$", re.IGNORECASE)
+
+
+def _safe_color_for_write(raw) -> "str | None":
+    """Filter a raw colour for a WRITE path (agent `add-feature` /
+    `add-features` / `edit-feature` / `set-feature-color`), returning hex or
+    None when the value is unusable.
+
+    Wider than `_safe_color_for_picker` on purpose: it also accepts the
+    terminal-palette form ``color(N)`` (0..255) and normalises it to the
+    equivalent xterm hex. The reader (`list-features`) emits whatever the
+    record stores, and a GUI-drawn feature stores a palette ref — so a
+    hex-only writer refused the reader's own output, and the natural "read
+    the features, write them onto the other record" loop lost exactly the
+    GUI-drawn features while succeeding for the `.dna`-imported ones in the
+    same batch (agent field report, 2026-09-12). Whatever the reader emits,
+    the writer takes.
+
+    Normalising to hex rather than storing the ref verbatim keeps ONE colour
+    vocabulary downstream (`.dna` export, SVG/PNG map export, GenBank
+    `ApEinfo_fwdcolor`) and makes the round-trip STABLE: the next
+    `list-features` reports hex, which writes back byte-identically."""
+    if not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    m = _PALETTE_REF_RE.match(raw)
+    if m is not None:
+        idx = int(m.group(1))
+        if 0 <= idx <= 255:
+            return _xterm_index_to_hex(idx)
+        return None
+    return _safe_color_for_picker(raw)
+
+
 def _check_export_extension(path: Path, allowed: "tuple[str, ...]",
                               fmt: str) -> "str | None":
     """Enforce an extension whitelist on agent export targets. Without

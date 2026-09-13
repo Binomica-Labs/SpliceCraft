@@ -6649,10 +6649,21 @@ class TestSimulationOkReflectsTheOutcome:
 
 
 class TestGoldenGateAnnotationParity:
-    """Report #7: `golden-gate-assemble` has no `carry_annotations`. It saved
-    a feature-BARE product, and passing the flag was silently ignored — a
-    bare construct believed to be annotated looks identical to an annotated
-    one until you open it."""
+    """Report #7, now IMPLEMENTED (agent field report 2026-09-12).
+
+    `golden-gate-assemble` used to have no `carry_annotations` at all, so
+    every one-pot product saved feature-BARE and there was no supported way
+    to annotate one: the documented fallbacks were `transfer-annotations`
+    (sequence-similarity — the wrong instrument, and its 30 bp floor drops
+    every promoter, RBS and fusion overhang) and `assemble-into-entry-vector`
+    (needs a grammar-registered entry vector, which a custom UPD acceptor is
+    not). A reporter had 26 saved clones with 0 features each.
+
+    Carrying is now threaded through the SIMULATION — the digest slots each
+    parent's features onto its released fragment and the chaining ligation
+    shifts them into product coordinates — so the map is a result of the
+    same run that built the sequence, not a second guess at it.
+    """
 
     @staticmethod
     def _design():
@@ -6661,14 +6672,36 @@ class TestGoldenGateAnnotationParity:
                 cas("AATG", "TTGCATGCATGCTAGCTAG" * 2, "CGCT"),
                 cas("CGCT", "GGGGCCCCAAAATTTT" * 8, "GGAG"))
 
-    def test_carry_annotations_is_refused_not_ignored(self):
+    @staticmethod
+    def _seed(specs):
+        """Save `[(name, seq, [(label, start, end, type)])]` to the library."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature
+        entries = []
+        for name, seq, feats in specs:
+            rec = SeqRecord(Seq(seq), id=name, name=name)
+            rec.annotations.update(molecule_type="DNA", topology="linear")
+            for label, fs, fe, ftype in feats:
+                loc = sc._feature_location(fs, fe, len(seq), 1)
+                sf = SeqFeature(loc, type=ftype)
+                sf.qualifiers["label"] = [label]
+                rec.features.append(sf)
+            entries.append({"id": name, "name": name, "size": len(seq),
+                             "n_feats": len(rec.features), "source": "test",
+                             "added": "2026-09-12",
+                             "gb_text": sc._record_to_gb_text(rec)})
+        sc._save_library(entries)
+
+    def test_carry_annotations_with_no_names_is_refused_not_ignored(self):
+        """The flag still fails LOUD when there is nothing to source from —
+        an empty result would look identical to a successful carry."""
         A, B, V = self._design()
         out = sc._h_golden_gate_assemble(
             None, {"parts": [A, B], "vector": V, "product_name": "ggx",
                    "carry_annotations": True})
         assert isinstance(out, tuple) and out[1] == 400, out
-        assert "carry_annotations" in out[0]["error"]
-        # Nothing was saved.
+        assert "name" in out[0]["error"]
         assert not any(e["name"] == "ggx" for e in sc._load_library())
 
     def test_enzyme_is_still_accepted(self):
@@ -6679,9 +6712,8 @@ class TestGoldenGateAnnotationParity:
                    "enzyme": "BsaI"})
         assert r["saved_name"] == "gge"
 
-    def test_product_is_feature_bare_and_the_docstring_says_so(self):
-        """Pins the CURRENT truth so a future `carry_annotations` here has to
-        update both the behaviour and the promise."""
+    def test_product_is_feature_bare_without_the_flag(self):
+        """Omitting `carry_annotations` keeps the old behaviour exactly."""
         A, B, V = self._design()
         r = sc._h_golden_gate_assemble(
             None, {"parts": [A, B], "vector": V, "product_name": "ggbare"})
@@ -6689,8 +6721,96 @@ class TestGoldenGateAnnotationParity:
         assert ent["n_feats"] == 0
         rec = sc._gb_text_to_record(ent["gb_text"])
         assert [f for f in rec.features if f.type != "source"] == []
-        assert "carries NO features" in sc._h_golden_gate_assemble.__doc__
+        assert r["carried"] == {"vector": False, "parts": [], "any": False}
 
+    def test_named_inputs_carry_their_features_onto_the_product(self):
+        A, B, V = self._design()
+        a_body, b_body = "ATGAAACCCGGGTTTACGT" * 2, "TTGCATGCATGCTAGCTAG" * 2
+        v_body = "GGGGCCCCAAAATTTT" * 8
+        self._seed([
+            ("PART A", A, [("a-cds", A.index(a_body),
+                             A.index(a_body) + len(a_body), "CDS")]),
+            ("PART B", B, [("b-cds", B.index(b_body),
+                             B.index(b_body) + len(b_body), "CDS")]),
+            ("ACCEPTOR", V, [("acceptor-marker", V.index(v_body),
+                               V.index(v_body) + 40, "misc_feature")]),
+        ])
+        r = sc._h_golden_gate_assemble(None, {
+            "parts": [{"sequence": A, "name": "PART A"},
+                       {"sequence": B, "name": "PART B"}],
+            "vector": {"sequence": V, "name": "ACCEPTOR"},
+            "product_name": "ggannot", "carry_annotations": True,
+        })
+        assert not isinstance(r, tuple), r
+        assert r["carried"] == {"vector": True, "parts": [True, True],
+                                 "any": True}
+        assert r["carry_warnings"] == []
+        ent = next(e for e in sc._load_library() if e["name"] == "ggannot")
+        assert ent["n_feats"] >= 3
+        rec = sc._gb_text_to_record(ent["gb_text"])
+        prod = str(rec.seq)
+        got = {}
+        for f in rec.features:
+            if f.type == "source":
+                continue
+            label = (f.qualifiers.get("label") or ["?"])[0]
+            bounds = sc._feat_bounds(f, len(prod))
+            assert bounds is not None
+            fs, fe, _ = bounds
+            got[label] = (prod[fs:fe] if fe > fs else prod[fs:] + prod[:fe])
+        # THE assertion: a carried feature must cover its parent's own bases.
+        assert got.get("a-cds") == a_body, got
+        assert got.get("b-cds") == b_body, got
+        assert got.get("acceptor-marker") == v_body[:40], got
+
+    def test_mismatched_sequence_skips_that_input_and_says_which(self):
+        """A named entry whose sequence doesn't match is SKIPPED, never
+        mis-placed — and the skip is visible in `carried`, not only in a
+        nested warnings list."""
+        A, B, V = self._design()
+        self._seed([("PART A", A, []), ("ACCEPTOR", V, [])])
+        r = sc._h_golden_gate_assemble(None, {
+            # part 2 names PART A, whose sequence is NOT B's
+            "parts": [{"sequence": A, "name": "PART A"},
+                       {"sequence": B, "name": "PART A"}],
+            "vector": {"sequence": V, "name": "ACCEPTOR"},
+            "product_name": "ggskip", "carry_annotations": True,
+        })
+        assert not isinstance(r, tuple), r
+        assert r["carried"]["parts"][1] is False
+        assert any("doesn't match" in w for w in r["carry_warnings"])
+
+    def test_carry_strict_turns_the_skip_into_a_422(self):
+        A, B, V = self._design()
+        self._seed([("PART A", A, []), ("ACCEPTOR", V, [])])
+        out = sc._h_golden_gate_assemble(None, {
+            "parts": [{"sequence": A, "name": "PART A"},
+                       {"sequence": B, "name": "PART A"}],
+            "vector": {"sequence": V, "name": "ACCEPTOR"},
+            "product_name": "ggstrict", "carry_annotations": True,
+            "carry_strict": True,
+        })
+        assert isinstance(out, tuple) and out[1] == 422, out
+        assert not any(e["name"] == "ggstrict" for e in sc._load_library())
+
+    def test_dry_run_previews_the_same_feature_map(self):
+        """`simulate-golden-gate` takes the same payload — a preview that
+        dropped the key would disagree with the save that honoured it."""
+        A, B, V = self._design()
+        a_body = "ATGAAACCCGGGTTTACGT" * 2
+        self._seed([("PART A", A, [("a-cds", A.index(a_body),
+                                     A.index(a_body) + len(a_body), "CDS")]),
+                     ("PART B", B, []), ("ACCEPTOR", V, [])])
+        r = sc._h_simulate_golden_gate(None, {
+            "parts": [{"sequence": A, "name": "PART A"},
+                       {"sequence": B, "name": "PART B"}],
+            "vector": {"sequence": V, "name": "ACCEPTOR"},
+            "carry_annotations": True,
+        })
+        assert r["ok"] is True
+        labels = [f.get("label") for f in r["result"]["features"]]
+        assert "a-cds" in labels, r["result"]["features"]
+        assert "carry_annotations" not in (r.get("ignored") or [])
 
 class TestTraditionalCloneMarkerDefault:
     """Report #5: a directional two-enzyme digest leaves BOTH vector fragments
@@ -6802,6 +6922,217 @@ class TestTraditionalCloneMarkerDefault:
             <= set(r)
         assert str(r["vector_frag_idx"]) in r["vector_frag_pick_reason"]
 
+
+
+
+class TestCarryAcrossCollections:
+    """Report #7: `carry_annotations` resolved names through the ACTIVE
+    collection's mirror only, so a vector filed in one collection and an
+    insert in another could not be named in the same `traditional-clone`
+    call. The reporter had to create a staging collection, copy both
+    parents in, clone, move the product out and delete the staging
+    collection. `transfer-annotations` already resolved across every
+    collection and its own docstring argued the case."""
+
+    VECTOR = TestTraditionalCloning.VECTOR
+    INSERT = TestTraditionalCloning.INSERT
+
+    def _base(self):
+        return {"vector_seq": self.VECTOR,
+                "vector_enzymes": ["EcoRI", "BamHI"],
+                "insert_seq": self.INSERT,
+                "insert_enzymes": ["EcoRI", "BamHI"],
+                "vector_frag_idx": 0}
+
+    @staticmethod
+    def _entry(name, seq, feats):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq(seq), id=name[:16], name=name[:16],
+                        annotations={"molecule_type": "DNA",
+                                       "topology": "circular"})
+        for start, end, ftype, label in feats:
+            rec.features.append(SeqFeature(
+                FeatureLocation(start, end, strand=1), type=ftype,
+                qualifiers={"label": [label]}))
+        return {"id": name, "name": name, "size": len(seq),
+                "n_feats": len(feats), "added": "2026-09-12",
+                "gb_text": sc._record_to_gb_text(rec)}
+
+    def _seed_split(self):
+        """Vector in a NON-active collection, insert in the active one."""
+        # `cargo` must sit INSIDE the excised middle fragment [5, 29) —
+        # a feature straddling a cut is genuinely disrupted, which is a
+        # different test (see TestRejoinCutSplitFeatures).
+        ins_entry = self._entry("TheInsert", self.INSERT,
+                                 [(10, 28, "CDS", "cargo")])
+        vec_entry = self._entry("TheVector", self.VECTOR,
+                                 [(20, 190, "CDS", "AmpR")])
+        sc._save_library([ins_entry])
+        sc._save_collections([
+            {"name": sc._get_active_collection_name() or "Default",
+             "plasmids": [ins_entry]},
+            {"name": "Elsewhere", "plasmids": [vec_entry]},
+        ])
+
+    def test_names_resolve_across_collections(self, isolated_library):
+        self._seed_split()
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="xcoll", carry_annotations=True,
+            vector_name="TheVector", insert_name="TheInsert"))
+        assert not isinstance(r, tuple), r
+        assert r["carried"] == {"vector": True, "insert": True, "any": True}
+        assert r["carry_warnings"] == []
+        ent = next(e for e in sc._load_library() if e["name"] == "xcoll")
+        rec = sc._gb_text_to_record(ent["gb_text"])
+        labels = {(f.qualifiers.get("label") or ["?"])[0]
+                   for f in rec.features if f.type != "source"}
+        assert "AmpR" in labels and "cargo" in labels, labels
+
+    def test_collection_qualifier_pins_the_lookup(self, isolated_library):
+        self._seed_split()
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="xpin", carry_annotations=True,
+            vector_name="TheVector", vector_collection="Elsewhere",
+            insert_name="TheInsert"))
+        assert not isinstance(r, tuple), r
+        assert r["carried"]["vector"] is True
+
+    def test_wrong_collection_is_a_404_not_a_silent_skip(self,
+                                                           isolated_library):
+        self._seed_split()
+        out = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="x404", carry_annotations=True,
+            vector_name="TheVector",
+            vector_collection=sc._get_active_collection_name() or "Default"))
+        assert isinstance(out, tuple) and out[1] == 404, out
+
+    def test_unknown_collection_name_is_404(self, isolated_library):
+        self._seed_split()
+        out = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="xnc", carry_annotations=True,
+            vector_name="TheVector", vector_collection="NoSuchCollection"))
+        assert isinstance(out, tuple) and out[1] == 404, out
+
+    def test_a_skipped_side_is_visible_in_carried(self, isolated_library):
+        """The soft skip is right, but it used to be legible ONLY inside a
+        nested warnings list — so a caller checking `ok` sailed past a
+        product missing half its annotations."""
+        self._seed_split()
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="xhalf", carry_annotations=True,
+            vector_name="TheVector", insert_name="TheVector"))
+        assert not isinstance(r, tuple), r
+        assert r["carried"]["vector"] is True
+        assert r["carried"]["insert"] is False
+        assert any("doesn't match" in w for w in r["carry_warnings"])
+
+    def test_carry_strict_makes_the_skip_a_422(self, isolated_library):
+        self._seed_split()
+        out = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="xstrict", carry_annotations=True,
+            vector_name="TheVector", insert_name="TheVector",
+            carry_strict=True))
+        assert isinstance(out, tuple) and out[1] == 422, out
+        assert not any(e["name"] == "xstrict" for e in sc._load_library())
+
+
+
+
+class TestCarriedArrowTypesSurvive:
+    """`carry_annotations` built its feature dicts with
+    `int(strand or 1)`, so every ARROWLESS parent feature arrived on the
+    clone pointing FORWARD. 0 is a real strand, not a falsy default —
+    the same collapse that put forward arrows on the ligation overhangs
+    (2026-09-12). Double-stranded rides a qualifier rather than the
+    location, so it has to be read back explicitly or it degrades to
+    arrowless."""
+
+    @staticmethod
+    def _rec():
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature
+        rec = SeqRecord(Seq("ACGT" * 40), id="P", name="P")
+        rec.annotations.update(molecule_type="DNA", topology="circular")
+        for i, (strand, lbl, q) in enumerate((
+                (1, "fwd", {}), (-1, "rev", {}), (0, "arrowless", {}),
+                (0, "double", {"SpliceCraft_strand": ["double"]}))):
+            f = SeqFeature(sc._feature_location(10 + 25 * i, 30 + 25 * i,
+                                                 160, strand),
+                           type="misc_feature")
+            f.qualifiers = dict(label=[lbl], **q)
+            rec.features.append(f)
+        return rec
+
+    def test_every_arrow_type_reaches_the_dict_model(self):
+        import splicecraft_agent as sa
+        got = {d["label"]: d["strand"]
+                for d in sa._agent_carry_feature_dicts(self._rec())}
+        assert got == {"fwd": 1, "rev": -1, "arrowless": 0, "double": 2}
+
+    def test_every_arrow_type_survives_onto_the_product(self):
+        import splicecraft_agent as sa
+        dicts = sa._agent_carry_feature_dicts(self._rec())
+        out = sc._gibson_record_from_result(
+            {"success": True, "product_seq": "ACGT" * 40,
+             "features": dicts, "circular": True}, name="p")
+        assert out is not None
+        # What the MAP renders is the contract users see.
+        seen = {d["label"]: d["strand"] for d in
+                 sc.PlasmidMap._parse(sc.PlasmidMap.__new__(sc.PlasmidMap),
+                                       out)}
+        assert seen == {"fwd": 1, "rev": -1, "arrowless": 0, "double": 2}
+
+    def test_the_product_still_exports(self):
+        """Arrowless and double both store BioPython 0, so the record
+        stays writable — the other half of the 2026-09-12 strand fix."""
+        import splicecraft_agent as sa, tempfile, pathlib as _pl
+        dicts = sa._agent_carry_feature_dicts(self._rec())
+        out = sc._gibson_record_from_result(
+            {"success": True, "product_seq": "ACGT" * 40,
+             "features": dicts, "circular": True}, name="p")
+        target = _pl.Path(tempfile.mkdtemp()) / "carried.gb"
+        sc._export_genbank_to_path(out, target)
+        assert target.exists()
+
+class TestFeatureColourRoundTrip:
+    """Report #4: `list-features` emits a terminal-palette colour for any
+    GUI-drawn feature (`color(160)`), and `add-feature` refused it — so the
+    natural read-features/write-features loop silently lost exactly the
+    GUI-drawn features while succeeding for the `.dna`-imported ones in the
+    same batch. Whatever the reader emits, the writer takes."""
+
+    def test_palette_ref_is_accepted_and_normalised_to_hex(self):
+        assert sc._safe_color_for_write("color(160)") == "#D70000"
+        assert sc._safe_color_for_write("color( 33 )") == "#0087FF"
+        assert sc._safe_color_for_write("color(0)") == "#000000"
+        assert sc._safe_color_for_write("color(255)") == "#EEEEEE"
+
+    def test_hex_still_passes_through_untouched(self):
+        assert sc._safe_color_for_write("#1f77b4") == "#1f77b4"
+        assert sc._safe_color_for_write("#abc") == "#abc"
+
+    def test_junk_is_still_refused(self):
+        for bad in ("color(256)", "color(-1)", "color()", "colour(9)",
+                     "red", "#OLDCOL", "", None, 160):
+            assert sc._safe_color_for_write(bad) is None, bad
+
+    def test_the_gui_picker_validator_is_unchanged(self):
+        """`ColorPickerModal` must keep its hex-only contract — it assigns
+        the value to `styles.background`, which raises on a palette ref."""
+        assert sc._safe_color_for_picker("color(160)") is None
+        assert sc._safe_color_for_picker("#1f77b4") == "#1f77b4"
+
+    def test_normalised_hex_matches_the_map_renderer(self):
+        """The normalisation must agree with what the renderer would have
+        drawn, or a copied feature changes colour."""
+        import splicecraft_mapimage as smi
+        for idx in (0, 9, 33, 160, 226, 231, 232, 255):
+            hexed = sc._safe_color_for_write(f"color({idx})")
+            assert hexed is not None
+            assert smi._to_rgb(hexed) == smi._to_rgb(f"color({idx})"), idx
 
 class TestEnzymeInputHardening:
     """Edge-case sweep on the name-resolution surface added for report #1.

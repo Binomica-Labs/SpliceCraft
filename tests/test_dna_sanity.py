@@ -1986,6 +1986,64 @@ class TestAnnotationTransfer:
                         and t["target_strand"] == 1]
         assert len(full_matches) == 1
 
+    def test_palindromic_feature_transfers_once_not_twice(self):
+        """A palindromic feature (every restriction site) is its own reverse
+        complement, so the minus-strand scan re-finds the SAME span and the
+        (span, strand) dedupe key can't collapse the pair: one `KpnI` on the
+        source became two transfers at identical coordinates with opposite
+        arrows (agent field report 2026-09-12). Sacred invariant #1's
+        double-count, one layer out."""
+        tgt_seq = "AAAAAA" + "GGTACC" + "A" * 18
+        src = self._rec("TTTT" + "GGTACC" + "T" * 20,
+                         feats=[(4, 10, 1, "misc_feature", "KpnI")])
+        tgt = self._rec(tgt_seq)
+        out = sc._find_annotation_transfers(src, tgt, min_len=4)
+        kpn = [t for t in out if t["label"] == "KpnI"]
+        assert len(kpn) == 1, kpn
+        assert (kpn[0]["target_start"], kpn[0]["target_end"]) == (6, 12)
+        assert kpn[0]["target_strand"] == 1
+
+    def test_non_palindromic_reverse_match_is_still_found(self):
+        """The forward-only shortcut must apply ONLY to self-complementary
+        bases — an asymmetric feature present reverse-complemented on the
+        target still has to transfer, on strand -1."""
+        body = "ATGAAACCCGGGTTTACGTACGTTTGCA"
+        src = self._rec("TT" + body + "TT",
+                         feats=[(2, 2 + len(body), 1, "CDS", "asym")])
+        tgt = self._rec("CC" + sc._rc(body) + "CC")
+        out = sc._find_annotation_transfers(src, tgt, min_len=10)
+        asym = [t for t in out if t["label"] == "asym"]
+        assert len(asym) == 1 and asym[0]["target_strand"] == -1
+
+    def test_stats_report_what_min_len_dropped(self):
+        """A small `count` usually means the threshold, not a mismatch —
+        the caller could not tell those apart. At the default min_len of 30
+        every promoter / operator / RBS / overhang / restriction site is
+        dropped before the search even runs."""
+        body = "ATGAAACCCGGGTTTACGTACGTTTGCA" * 2
+        src = self._rec(
+            "TT" + body + "TT",
+            feats=[(2, 2 + len(body), 1, "CDS", "big"),
+                    (0, 6, 1, "misc_feature", "little")])
+        tgt = self._rec("GG" + body + "GG")
+        st = {}
+        out = sc._find_annotation_transfers(src, tgt, min_len=30, stats=st)
+        assert len(out) == 1
+        assert st["considered"] == 2
+        assert st["skipped_below_min_len"] == 1
+        assert st["shortest_skipped_len"] == 6
+        assert st["unmatched"] == 0
+
+    def test_stats_count_a_feature_that_simply_is_not_there(self):
+        body = "ATGAAACCCGGGTTTACGTACGTTTGCA" * 2
+        src = self._rec("TT" + body + "TT",
+                         feats=[(2, 2 + len(body), 1, "CDS", "big")])
+        st = {}
+        sc._find_annotation_transfers(
+            src, self._rec("C" * 120), min_len=30, stats=st)
+        assert st == {"considered": 1, "skipped_below_min_len": 0,
+                       "shortest_skipped_len": 0, "unmatched": 1}
+
 
 class TestCustomEnzymeListFilter:
     """`allowed_enzymes` parameter on `_scan_restriction_sites` (GH #13,

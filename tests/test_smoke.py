@@ -7473,13 +7473,20 @@ class TestShiftClickFeatureExtend:
                 f for f in app._current_record.features
                 if f.qualifiers.get("label") == ["seg2"]
             )
-            # BioPython's strand=None encodes "no strand" /
-            # arrowless. The `or 1` falsy-coercion bug turned
-            # this into strand=1 (forward) at save time.
-            assert seg2.location.strand is None, (
+            # Arrowless is BioPython strand **0** — NOT 1 (forward,
+            # which is what the `or 1` falsy-coercion bug produced)
+            # and NOT None (which SpliceCraft stored until
+            # 2026-09-12, the one strand value a GenBank round-trip
+            # cannot preserve — see `_annotate_with_feature_impl`).
+            assert seg2.location.strand == 0, (
                 f"per-row Arrowless pick was lost; seg2 strand "
-                f"= {seg2.location.strand} (expected None)"
+                f"= {seg2.location.strand} (expected 0)"
             )
+            # The point of 0-not-None: the record still exports.
+            import tempfile, pathlib as _pl
+            out = _pl.Path(tempfile.mkdtemp()) / "rows.gb"
+            sc._export_genbank_to_path(app._current_record, out)
+            assert out.exists()
 
     async def test_edit_modal_remove_row_to_one_member_persists(
             self, isolated_library):
