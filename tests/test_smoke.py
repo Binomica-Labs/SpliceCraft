@@ -4281,11 +4281,22 @@ class TestSearchInputWidget:
         from textual.app import App
         calls = []
 
+        # The debounce is deliberately LONGER than any plausible teardown,
+        # because both halves of this test are wall-clock assumptions and
+        # both flaked under a full `-n auto` suite (2026-05-14, again
+        # 2026-09-13 — the second one aborted a release). At 0.20 s a
+        # loaded box could spend the whole window between `value =` and
+        # the `run_test` exit, so the timer fired LEGITIMATELY while still
+        # mounted and the assertion read that as a post-unmount leak. The
+        # guarantee under test is "a PENDING tick is cancelled", so the
+        # window only has to outlast teardown — it never has to elapse.
+        DEBOUNCE_S = 30.0
+
         class _Harness(App):
             def compose(self):
                 yield sc._SearchInput(
                     id="harness-search",
-                    debounce_s=0.20,
+                    debounce_s=DEBOUNCE_S,
                     on_filter=lambda q: calls.append(q),
                 )
 
@@ -4296,19 +4307,30 @@ class TestSearchInputWidget:
             inp.value = "queued"
             # Setting `value` posts an `Input.Changed` message;
             # `on_input_changed` (where the timer is set) runs on
-            # the next event loop tick. Without this pause the
-            # assertion below races the dispatcher under heavy
-            # xdist load — the test flaked once on 2026-05-14
-            # during release.py. Pause keeps the assertion
-            # deterministic regardless of load.
+            # the next event loop tick. Two pauses, not one: a single
+            # tick raced the dispatcher under heavy xdist load.
             await pilot.pause()
-            assert inp._filter_timer is not None
+            await pilot.pause()
+            assert inp._filter_timer is not None, (
+                "debounce timer was never armed — the Input.Changed "
+                "dispatch has not landed yet"
+            )
+            timer = inp._filter_timer
         # `app.run_test` exits → on_unmount fires → timer cancelled.
-        # Extra wait past the original 0.20 s window — if the
-        # cancel didn't fire, the callback would land here.
+        # Nothing may fire afterwards, and the slot is wiped.
         await asyncio.sleep(0.30)
+        assert inp._filter_disabled is True
+        assert inp._filter_timer is None
         assert calls == [], (
             f"timer fired post-unmount: {calls}"
+        )
+        # Belt and braces: even hand-firing the cancelled timer's callback
+        # must not reach the filter — the `_fire_filter` gate is what
+        # covers a tick already DISPATCHED when unmount landed.
+        assert timer is not None
+        inp._fire_filter()
+        assert calls == [], (
+            f"_fire_filter ran against a disposed tree: {calls}"
         )
 
     async def test_teardown_value_change_cannot_rearm_the_debounce(self):

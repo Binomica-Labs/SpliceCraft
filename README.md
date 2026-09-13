@@ -170,7 +170,10 @@ grammar, driven by a 4-source part picker. Every assembly lands as one library
 entry carrying every parent feature forward, so you can trace a finished L3
 construct back to its L0 parts. A cloning site the ligation puts back together
 reads as intact rather than broken in two, and each junction's sticky overhang
-is labelled with the bases that actually anneal there. Deleted something by mistake? **`u`** brings it
+is labelled with the bases that actually anneal there. A **linear** donor — a
+stored fragment, a gBlock — clones like one: cutting it at both ends releases
+your insert and discards the two off-cut ends, the way you would on a gel.
+Deleted something by mistake? **`u`** brings it
 back — the last 100 deletions of the session are undoable.
 
 Ordered a synthetic fragment and it arrived? **New Part from Syn Frag** *runs

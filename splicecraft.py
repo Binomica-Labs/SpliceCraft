@@ -42,13 +42,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.58"
+__version__ = "1.2.59"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-09-12"
+_RELEASE_DATE = "2026-09-13"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -8665,6 +8665,9 @@ from splicecraft_cloning import (  # noqa: E402
     _enzyme_is_type_iis as _enzyme_is_type_iis,
     _excise_pcr_insert as _excise_pcr_insert,
     _excise_fragment_pair as _excise_fragment_pair,
+    _fragment_is_ligatable as _fragment_is_ligatable,
+    _ligatable_fragments as _ligatable_fragments,
+    _pick_linear_ligatable_fragment as _pick_linear_ligatable_fragment,
     # Golden-Braid (BsaI) fragment-based scrub [INV-127]
     _SCRUB_GB_ENZYME as _SCRUB_GB_ENZYME,
     _SCRUB_GB_SITE as _SCRUB_GB_SITE,
@@ -38103,10 +38106,17 @@ def _assembly_fragment_try_digests(
 ) -> "tuple[dict | None, str, object]":
     """Loop over candidate enzymes; return ``(insert_frag, chosen_enzyme, last_err)``.
 
-    `insert_frag` is None if no candidate produced a clean 2-fragment
-    digest with a pickable insert. `chosen_enzyme` is "" in that case.
-    `last_err` carries the most recent `_excise_fragment_pair` error
-    string so the caller can log it."""
+    `insert_frag` is None if no candidate produced a clean digest with a
+    pickable insert. `chosen_enzyme` is "" in that case. `last_err` carries
+    the most recent `_excise_fragment_pair` error string so the caller can
+    log it.
+
+    "Clean" means 2 fragments on a CIRCULAR source. A LINEAR one (a stored
+    `FRAG-…` part, a synthesised gBlock) cut twice yields THREE — payload
+    plus two off-cut ends — so the ligatable piece is resolved by
+    `_pick_linear_ligatable_fragment` instead. Before that, a linear part
+    source failed every candidate enzyme and the part just never
+    resolved."""
     last_err: object = None
     for enz in candidates:
         try:
@@ -38119,8 +38129,22 @@ def _assembly_fragment_try_digests(
             _log.exception("assembly_fragment: digest failed for %r",
                             source.get("name"))
             continue
-        if err is not None or len(frags) != 2:
+        if err is not None:
             last_err = err
+            continue
+        if not circular:
+            lin_frag, lin_err = _pick_linear_ligatable_fragment(
+                frags, [enz], what="part source")
+            if lin_frag is None:
+                last_err = lin_err
+                continue
+            return lin_frag, enz, last_err
+        if len(frags) != 2:
+            # `err` is None here (a non-2 circular digest only reaches this
+            # line when the engine raised no error), so record WHY rather
+            # than blanking the last real message.
+            last_err = (f"{enz}: {len(frags)} fragments from a circular "
+                        f"digest, need 2")
             continue
         # Pick the released-insert fragment via feature-aware selection
         # (rep_origin / antibiotic-resistance absent). Falls through to
@@ -38378,7 +38402,7 @@ def _assembly_fragment_from_source(
     plasmid_seq = str(rec.seq).upper()
     if not plasmid_seq:
         return None
-    topology = (rec.annotations.get("topology", "") or "").lower()
+    topology = (rec.annotations.get("topology", "") or "").strip().lower()
     circular = topology != "linear"
 
     src_features = _assembly_fragment_marshal_src_features(rec)
@@ -76140,7 +76164,13 @@ class TraditionalCloningPane(Vertical):
             mode = spec.get("mode", "plasmid")
             if mode == "plasmid":
                 frag_idx = spec.get("donor_frag_idx", -1)
-                if frag_idx == 0:
+                if self._source_is_linear(
+                        str(spec.get("source_entry_id") or "")):
+                    # Linear source — the ligatable piece is resolved, not
+                    # chosen, so there's no A/B to report (same "—" as the
+                    # single-fragment PCR / feature rows).
+                    frag_label = "—"
+                elif frag_idx == 0:
                     frag_label = "A"
                 elif frag_idx == 1:
                     frag_label = "B"
@@ -77207,6 +77237,9 @@ class TraditionalCloningPane(Vertical):
         except NoMatches:
             return
         self._edit_frags = None
+        # Both slots start usable — the linear branch below disables the
+        # second one, and that must not leak onto the next row selected.
+        r0.disabled = r1.disabled = False
         enzymes = []
         for k in ("enz_left", "enz_right"):
             e = str(spec.get(k) or "")
@@ -77222,6 +77255,35 @@ class TraditionalCloningPane(Vertical):
         if frags is None:
             r0.label = f"({err_msg or 'digest failed'})"
             r1.label = ""
+            return
+        if self._source_is_linear(spec.get("source_entry_id", "")):
+            # LINEAR source: N cuts → N+1 pieces, and only the piece cut on
+            # BOTH ends can ligate — the flanking ones carry the molecule's
+            # own termini and are the off-cuts you gel-purify away. So there
+            # is nothing to pick: report the resolved piece and disable the
+            # second slot rather than offering an unligatable off-cut.
+            picked, lin_err = _pick_linear_ligatable_fragment(
+                frags, enzymes,
+                what=("backbone fragment"
+                        if spec.get("role") == "backbone"
+                        else "donor fragment"),
+            )
+            if picked is None:
+                r0.label = f"({lin_err})"
+                r1.label = ""
+                return
+            self._edit_frags = [picked]
+            n_off = len(frags) - 1
+            r0.label = f"{len(picked.get('top_seq', '')):,} bp ★"
+            r1.label = (f"({n_off} off-cut{'' if n_off == 1 else 's'} "
+                          f"discarded)" if n_off else "")
+            r1.disabled = True
+            if r0.value and r1.value:
+                with self.prevent(RadioSet.Changed):
+                    r1.value = False
+            elif not r0.value:
+                with self.prevent(RadioSet.Changed):
+                    r0.value = True
             return
         if len(frags) != 2:
             r0.label = (f"(need exactly 2 fragments; "
@@ -77494,7 +77556,12 @@ class TraditionalCloningPane(Vertical):
         # mode, mirror the band index onto the spec's frag pick so
         # the radio toggles and the simulate path uses the same
         # fragment as the click.
-        if spec.get("mode") == "plasmid":
+        if spec.get("mode") == "plasmid" and not self._source_is_linear(
+                str(spec.get("source_entry_id") or "")):
+            # Circular only — on a linear source the band index spans the
+            # off-cuts too, and there is no choice to mirror anyway (the
+            # ligatable piece is resolved). Writing it would just desync the
+            # lane's Frag column from what Simulate actually uses.
             spec["donor_frag_idx"] = clicked_band_idx
             self._invalidate_results()
         # Moving the cursor fires `_on_lane_row_highlighted` which
@@ -77538,7 +77605,22 @@ class TraditionalCloningPane(Vertical):
         frags, _ = self._cached_digest(
             spec.get("source_entry_id", ""), enzymes,
         )
-        if frags is None or len(frags) != 2:
+        if frags is None:
+            return None
+        if self._source_is_linear(spec.get("source_entry_id", "")):
+            # Linear source — highlight the one ligatable piece (the payload
+            # band sitting between the two off-cuts), not a chosen index.
+            picked, _lin_err = _pick_linear_ligatable_fragment(
+                frags, enzymes,
+                what=("backbone fragment"
+                        if spec.get("role") == "backbone"
+                        else "donor fragment"),
+            )
+            if picked is None:
+                return None
+            return (self._edit_row_idx,
+                    next((i for i, f in enumerate(frags) if f is picked), 0))
+        if len(frags) != 2:
             return None
         # NOTE: don't use the `int(x or -1)` pattern — Python's truth
         # eval treats 0 as falsy, silently flipping the user's "pick
@@ -77943,8 +78025,14 @@ class TraditionalCloningPane(Vertical):
             "vec_enzymes": backbone_enz,
             "vec_name":    str(backbone.get("name") or "backbone"),
             # Backbone's user-picked fragment (-1 = auto-pick).
-            "vec_frag_idx": int(backbone.get("donor_frag_idx", -1)
-                                  or -1),
+            # NOT `int(x or -1)` — 0 is falsy in Python, so that form
+            # silently rewrote an explicit "fragment A" backbone pick into
+            # auto, and the auto-pick prefers the LARGER half. The override
+            # exists precisely for the case where the user wants the smaller
+            # one, so dropping it shipped a different plasmid than the one
+            # on screen. Same trap `_compute_highlight_band` documents.
+            "vec_frag_idx": (-1 if backbone.get("donor_frag_idx") is None
+                               else int(backbone.get("donor_frag_idx", -1))),
         }, None
 
     def _record_for_entry_id(self, entry_id: str) -> "SeqRecord | None":
@@ -77981,6 +78069,41 @@ class TraditionalCloningPane(Vertical):
         self._record_cache[entry_id] = rec
         return rec
 
+    @staticmethod
+    def _topology_of(rec) -> str:
+        """Normalised molecule topology — `"circular"`, `"linear"`, or `""`
+        when the record doesn't say.
+
+        Case- and whitespace-insensitive, matching the rule the map renderer
+        uses (`_rec_is_circular`, ~L14070). The five Constructor call sites
+        each rolled their own `annotations.get("topology", "") == "circular"`,
+        which is case-SENSITIVE: a record annotated `Circular` answered
+        "not circular" and was digested as a LINEAR molecule, splitting its
+        origin-spanning fragment into two unusable halves. That used to
+        surface as a visible "need exactly 2 fragments" refusal; once the
+        linear path started resolving a payload it would instead have cloned
+        the wrong piece silently."""
+        return str(
+            (getattr(rec, "annotations", {}) or {}).get("topology", "") or ""
+        ).strip().lower()
+
+    def _source_is_linear(self, entry_id: str) -> bool:
+        """True only when a lane row's source entry is EXPLICITLY annotated
+        linear — read through the memoised record cache, so this is a dict
+        hit after the first call.
+
+        Explicit is deliberate. A source that doesn't declare its topology
+        keeps the historical treatment (digested as linear, then refused by
+        the exactly-2 rule) rather than being silently resolved down the new
+        payload-plus-off-cuts path: the map draws an un-annotated record as a
+        CIRCLE, so quietly cloning it as a linear fragment would disagree
+        with what the user is looking at. Only a record that says `linear`
+        gets the linear model."""
+        rec = self._record_for_entry_id(entry_id)
+        if rec is None:
+            return False
+        return self._topology_of(rec) == "linear"
+
     def _cached_digest(self, entry_id: str,
                           enzymes: list[str],
                           ) -> "tuple[list[dict] | None, str]":
@@ -78003,9 +78126,7 @@ class TraditionalCloningPane(Vertical):
         if rec is None:
             return None, "source plasmid not found"
         seq = str(rec.seq).upper()
-        circular = (
-            (rec.annotations or {}).get("topology", "") == "circular"
-        )
+        circular = self._topology_of(rec) == "circular"
         feats = self._record_features(rec)
         try:
             frags, err = _excise_fragment_pair(
@@ -78236,13 +78357,17 @@ class TraditionalCloningPane(Vertical):
         ``insert_seq`` (Phase 2): when the chosen enzymes don't open the vector
         into exactly 2 fragments, suggest a pair that's both insert-safe AND
         cuts this vector once each — so the error names a way forward instead of
-        a dead end."""
+        a dead end.
+
+        A **LINEAR** backbone (a vector arm, a linearised fragment) is
+        resolved to its single two-cut piece instead — cutting a linear
+        molecule twice leaves three pieces, and the "exactly 2" rule is a
+        CIRCULAR-only invariant ([PIT-25])."""
         if rec is None:
             return None, "Pick a destination vector."
         seq = str(rec.seq).upper()
-        circular = (
-            (rec.annotations or {}).get("topology", "") == "circular"
-        )
+        topology = self._topology_of(rec)
+        circular = topology == "circular"
         feats = self._record_features(rec)
         frags, err = _excise_fragment_pair(
             seq, enzymes, circular=circular, features=feats,
@@ -78250,6 +78375,9 @@ class TraditionalCloningPane(Vertical):
         )
         if err is not None:
             return None, f"{err['error']} (vector){self._pair_hint(insert_seq, seq)}"
+        if topology == "linear":
+            return _pick_linear_ligatable_fragment(
+                frags, enzymes, what="backbone fragment")
         if len(frags) != 2:
             return None, (
                 f"Vector digest produced {len(frags)} fragments — "
@@ -78336,11 +78464,20 @@ class TraditionalCloningPane(Vertical):
         The explicit override lets the user veto the auto-pick when
         the heuristic guesses wrong (e.g. an insert that happens to
         carry a stray rep_origin annotation, or a carrier with
-        ambiguous markers)."""
+        ambiguous markers).
+
+        A **LINEAR** donor (a stored `FRAG-…` record, an imported
+        gBlock) takes neither the auto-pick nor the override: cutting
+        a linear molecule twice yields THREE pieces — the payload
+        plus the two off-cut ends — and only the payload is cut on
+        both ends, so it is resolved unambiguously by
+        `_pick_linear_ligatable_fragment` (same rule
+        `_excise_pcr_insert` applies to a PCR product)."""
         if rec is None:
             return None, "Pick an insert plasmid first."
         seq = str(rec.seq).upper()
-        circular = (rec.annotations or {}).get("topology", "") == "circular"
+        topology = self._topology_of(rec)
+        circular = topology == "circular"
         feats = self._record_features(rec)
         frags, err = _excise_fragment_pair(
             seq, enzymes, circular=circular, features=feats,
@@ -78348,6 +78485,9 @@ class TraditionalCloningPane(Vertical):
         )
         if err is not None:
             return None, err["error"]
+        if topology == "linear":
+            return _pick_linear_ligatable_fragment(
+                frags, enzymes, what="donor fragment")
         if len(frags) != 2:
             return None, (f"Need exactly 2 fragments after digest "
                             f"(got {len(frags)}). Pick different enzymes.")
@@ -78433,7 +78573,8 @@ class TraditionalCloningPane(Vertical):
         if rec is None:
             return None, "Pick a destination vector."
         seq = str(rec.seq).upper()
-        circular = (rec.annotations or {}).get("topology", "") == "circular"
+        topology = self._topology_of(rec)
+        circular = topology == "circular"
         feats = self._record_features(rec)
         frags, err = _excise_fragment_pair(
             seq, enzymes, circular=circular, features=feats,
@@ -78441,6 +78582,11 @@ class TraditionalCloningPane(Vertical):
         )
         if err is not None:
             return None, f"{err['error']} (vector)"
+        if topology == "linear":
+            # Linear vector (an arm / linearised backbone): three pieces from
+            # two cuts is normal — take the one cut on both ends.
+            return _pick_linear_ligatable_fragment(
+                frags, enzymes, what="backbone fragment")
         if len(frags) != 2:
             return None, (f"Vector digest produced {len(frags)} "
                             f"fragments — need exactly 2.")

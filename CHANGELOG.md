@@ -14,6 +14,50 @@
 
 ---
 
+## [1.2.59] — 2026-09-13
+
+### Bug fixes
+
+- **A linear fragment wouldn't clone: "need exactly 2 fragments; got 3".**
+  Putting a stored fragment into the Constructor's Traditional tab and
+  cutting it with a pair of enzymes — SalI and XhoI, say — was refused
+  outright, in the donor picker and again on Simulate. Cutting a linear
+  piece of DNA at both ends gives three pieces, not two: your insert, plus
+  the two little off-cut ends you'd throw away on a gel. SpliceCraft was
+  counting the pieces and expecting the two that only a circular plasmid can
+  give. It now does what you'd do at the bench and keeps the piece that was
+  cut at both ends. The two cases that really are a problem now say what's
+  wrong instead of quoting a number: cutting a linear fragment only once
+  leaves nothing with two cut ends, and an enzyme whose site sits inside
+  your insert would cut the insert in two. The same fix reaches the
+  Golden Braid and MoClo tabs, where a linear part source had been quietly
+  failing to resolve with no visible reason.
+- **The donor picker offered a piece that can't be ligated.** For a linear
+  source it now shows the one usable piece with its size, greys out the
+  second slot and says how many off-cuts were discarded, and the lane's
+  Frag column reads "—" because there's nothing to choose.
+- **Choosing the smaller half as your backbone was silently ignored.**
+  Picking fragment A in the backbone editor was thrown away on the way to
+  Simulate and replaced with the automatic guess, which prefers the larger
+  half. The override exists for exactly the case where the larger half is
+  the wrong one, so the saved plasmid could differ from the one shown on
+  screen.
+- **A plasmid whose topology was written "Circular" was cloned as if it
+  were a linear piece of DNA.** The Constructor compared the word exactly,
+  where the rest of the app ignores capitalisation, so a plasmid spelled any
+  way but all-lowercase had its origin-spanning half split into two
+  unusable pieces. All five places that ask now read topology the same way.
+  A record that doesn't say whether it's circular still asks you to sort it
+  out rather than guessing — the map draws it as a circle, so quietly
+  treating it as linear would contradict what you're looking at.
+
+### Hardening
+
+- The search box's debounce test no longer depends on wall-clock timing, so
+  a busy machine can't fail a release over it.
+
+---
+
 ## [1.2.58] — 2026-09-12
 
 ### Bug fixes

@@ -2151,6 +2151,85 @@ def _excise_fragment_pair(seq: str, enzyme_names: list[str], *,
     return fragments, None
 
 
+def _fragment_is_ligatable(frag: dict) -> bool:
+    """True when BOTH ends of `frag` came from an enzyme cut.
+
+    A `kind == "linear"` edge is the MOLECULE'S OWN terminus, not a cut — it
+    carries no overhang and `_ends_compatible` refuses it, so a piece with one
+    is a dead end in any ligation. On a circular digest every piece is
+    two-cut by construction; on a LINEAR one the two flanking pieces are the
+    off-cuts you gel-purify away at the bench.
+
+    No-raise on a malformed fragment (a non-dict, a `None` end) — a cloning
+    run must not die on a shape it can only answer "no" about, and "no" is
+    the safe answer: an unreadable end is not a proven cut."""
+    if not isinstance(frag, dict):
+        return False
+    left, right = frag.get("left"), frag.get("right")
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    return left.get("kind") != "linear" and right.get("kind") != "linear"
+
+
+def _ligatable_fragments(fragments: list[dict]) -> list[dict]:
+    """The pieces of a digest that can actually take part in a ligation —
+    i.e. cut on both ends. See `_fragment_is_ligatable`."""
+    return [f for f in (fragments or []) if _fragment_is_ligatable(f)]
+
+
+def _pick_linear_ligatable_fragment(fragments: list[dict],
+                                     enzyme_names: list[str],
+                                     *,
+                                     what: str = "fragment",
+                                    ) -> "tuple[dict | None, str | None]":
+    """Resolve the ONE usable piece of a **linear** source's digest. Returns
+    ``(fragment, None)`` or ``(None, error_message)``.
+
+    A linear molecule cut at N positions yields N+1 pieces, so the circular
+    world's "exactly 2 fragments" rule does not apply to it (that rule is
+    sacred for CIRCULAR sources only — see [PIT-25] and
+    `_excise_fragment_pair`, which correctly declines to enforce it on the
+    linear path). The piece that matters is the one flanked by two real cuts;
+    the two end pieces carry the molecule's own termini and are the bench's
+    gel-purified-away off-cuts. This is the same rule `_excise_pcr_insert`
+    applies to a PCR product, lifted so a STORED linear fragment (the
+    Domesticator's `FRAG-…` records, an imported gBlock, a linearised
+    backbone arm) behaves identically.
+
+    There is deliberately no "pick which one" here: with one cut per enzyme
+    exactly one piece has two cut ends. Two such pieces means an enzyme cuts
+    INSIDE the region — at the bench that clone fails, so it is refused by
+    name rather than silently resolved by size (the never-assume-the-smaller-
+    fragment rule)."""
+    fragments = [f for f in (fragments or []) if isinstance(f, dict)]
+    usable = _ligatable_fragments(fragments)
+    if len(usable) == 1:
+        return usable[0], None
+    names = ", ".join(dict.fromkeys(str(n) for n in (enzyme_names or []) if n)
+                      ) or "(none)"
+    if not usable:
+        n_cuts = sum(1 for f in fragments
+                      if isinstance(f.get("right"), dict)
+                      and f["right"].get("kind") != "linear")
+        return None, (
+            f"This {what} is LINEAR, so releasing a piece needs a cut at "
+            f"BOTH ends — {names} cut it {n_cuts} time(s), leaving every "
+            f"piece with one uncut end. Add an enzyme that cuts on the "
+            f"other side of the region you want.")
+    # >1 two-cut piece ⇒ a site sits inside the region.
+    counts: dict[str, int] = {}
+    for f in fragments:
+        right = f.get("right")
+        e = (right.get("enzyme") or "") if isinstance(right, dict) else ""
+        if e:
+            counts[e] = counts.get(e, 0) + 1
+    internal = [e for e, n in counts.items() if n > 1] or list(counts)
+    return None, (
+        f"{' / '.join(internal)} cuts INSIDE this {what} — the digest leaves "
+        f"{len(usable)} pieces with two cut ends, so the part you want would "
+        f"be cut in two. Pick an enzyme whose site isn't inside it.")
+
+
 # ═══ Golden-Braid (BsaI Type IIS) fragment-based scrub — moved from the hub ══
 # Cures sites by splitting at each cluster into BsaI-tailed PCR fragments that
 # Golden-Gate reassemble into the cured plasmid (real digest+ligate, verified).

@@ -3842,3 +3842,482 @@ class TestRejoinCutSplitFeatures:
             # and the enzyme really does still cut the product there
             cuts = sc._enzyme_cuts(top, [enz], circular=True)
             assert len(cuts) == 1, (enz, cuts)
+
+
+class TestLinearDonorThreeFragmentDigest:
+    """A LINEAR donor cut at both ends yields THREE pieces — the payload
+    plus the two off-cut ends — and the payload is the only one that can
+    ligate. Regression guard for 2026-09-13: the Constructor demanded
+    "exactly 2 fragments" from every source, which is a CIRCULAR-only
+    invariant ([PIT-25]), so a stored `FRAG-…` record flanked by SalI and
+    XhoI sites was refused with "need exactly 2 fragments; got 3" even
+    though the clone is routine at the bench.
+    """
+
+    @staticmethod
+    def _linear_rec(payload, lead="GGGGCC", tail="CCGGGG",
+                    site5="GTCGAC", site3="CTCGAG", feat=True):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        seq = lead + site5 + payload + site3 + tail
+        rec = SeqRecord(Seq(seq), id="FRAG1", name="FRAG1",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "linear"})
+        if feat:
+            s = len(lead) + len(site5)
+            rec.features = [SeqFeature(
+                FeatureLocation(s, s + len(payload), 1), type="CDS",
+                qualifiers={"label": ["payload"]})]
+        return rec
+
+    @staticmethod
+    def _pane():
+        return sc.TraditionalCloningPane.__new__(sc.TraditionalCloningPane)
+
+    def test_ligatable_fragments_drops_the_off_cuts(self):
+        """The engine itself already returns all three pieces; only the
+        two flanking ones carry a `linear` (uncut) end."""
+        payload = "ATG" + "GCTAGCTAGG" * 10 + "TAA"
+        seq = "GGGGCC" + "GTCGAC" + payload + "CTCGAG" + "CCGGGG"
+        frags, err = sc._excise_fragment_pair(
+            seq, ["SalI", "XhoI"], circular=False)
+        assert err is None
+        assert len(frags) == 3
+        usable = sc._ligatable_fragments(frags)
+        assert len(usable) == 1
+        assert usable[0] is frags[1]
+        assert usable[0]["top_seq"] == "TCGAC" + payload + "C"
+
+    def test_linear_donor_clones_instead_of_erroring(self):
+        """The reported case: SalI + XhoI on a linear FRAG entry."""
+        payload = "ATG" + "GCTAGCTAGG" * 10 + "TAA"
+        frag, err = self._pane()._build_insert_from_plasmid(
+            self._linear_rec(payload), ["SalI", "XhoI"])
+        assert err is None, f"linear donor still refused: {err}"
+        assert frag is not None
+        assert frag["top_seq"] == "TCGAC" + payload + "C"
+        assert frag["left"]["enzyme"] == "SalI"
+        assert frag["right"]["enzyme"] == "XhoI"
+        # SalI and XhoI both leave TCGA — that compatibility is the whole
+        # point of the pairing.
+        assert frag["left"]["overhang_seq"] == frag["right"]["overhang_seq"]
+
+    def test_payload_annotation_rides_onto_the_product_intact(self):
+        """The donor's own feature must land on the SAME BASES in the
+        ligated product (the 2026-09-12 displacement class)."""
+        payload = "ATG" + "GCTAGCTAGG" * 10 + "TAA"
+        pane = self._pane()
+        frag, err = pane._build_insert_from_plasmid(
+            self._linear_rec(payload), ["SalI", "XhoI"])
+        assert err is None
+        vec = ("GTCGAC" + "TTTTAAAACCCC" + "CTCGAG"
+               + "".join("ACGT"[(i * 7 + 3) % 4] for i in range(1200)))
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        vrec = SeqRecord(Seq(vec), id="pV", name="pV",
+                         annotations={"molecule_type": "DNA",
+                                      "topology": "circular"})
+        vfrag, verr = pane._build_vector_fragment_for_picker(
+            vrec, ["SalI", "XhoI"])
+        assert verr is None
+        res = sc._simulate_traditional_cloning_multi([frag], vfrag)
+        fwd = res["forward"]
+        assert fwd["compatible"] is True
+        assert payload in fwd["top_seq"]
+        assert len(fwd["top_seq"]) == len(vfrag["top_seq"]) + len(frag["top_seq"])
+        got = [f for f in fwd["features"] if f["label"] == "payload"]
+        assert len(got) == 1, [f["label"] for f in fwd["features"]]
+        f = got[0]
+        assert fwd["top_seq"][f["start"]:f["end"]] == payload
+
+    def test_one_enzyme_on_a_linear_donor_is_refused_by_name(self):
+        """One cut leaves every piece with an uncut end — nothing to
+        ligate. The message must say so rather than counting fragments."""
+        payload = "ATG" + "GCTAGCTAGG" * 10 + "TAA"
+        frag, err = self._pane()._build_insert_from_plasmid(
+            self._linear_rec(payload), ["SalI"])
+        assert frag is None
+        assert "LINEAR" in err and "BOTH ends" in err, err
+
+    def test_internal_site_on_a_linear_donor_is_refused_by_name(self):
+        """Two two-cut pieces means the enzyme cuts inside the region —
+        at the bench that clone fails, so it is never resolved by size
+        (the never-assume-the-smaller-fragment rule)."""
+        rec = self._linear_rec("AAAA" + "GTCGAC" + "TTTT", feat=False)
+        frag, err = self._pane()._build_insert_from_plasmid(
+            rec, ["SalI", "XhoI"])
+        assert frag is None
+        assert "SalI" in err and "INSIDE" in err, err
+
+    def test_linear_backbone_resolves_too(self):
+        """Same rule on the backbone side — a linearised vector arm."""
+        arm = "".join("ACGT"[(i * 5 + 1) % 4] for i in range(800))
+        rec = self._linear_rec(arm, feat=False)
+        frag, err = self._pane()._build_vector_fragment_for_picker(
+            rec, ["SalI", "XhoI"])
+        assert err is None, err
+        assert frag["top_seq"] == "TCGAC" + arm + "C"
+
+    def test_circular_donor_keeps_the_exactly_two_rule(self):
+        """[PIT-25] is untouched for circular sources: a 3-cut circular
+        digest is still ambiguous and still refused."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        seq = ("GAATTC" + "A" * 40 + "GAATTC" + "C" * 40
+               + "GAATTC" + "G" * 40)
+        rec = SeqRecord(Seq(seq), id="pC", name="pC",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        frag, err = self._pane()._build_insert_from_plasmid(rec, ["EcoRI"])
+        assert frag is None
+        assert "exactly 2" in err, err
+
+
+class TestBackboneFragmentOverrideSurvivesCollection:
+    """`_collect_simulate_inputs` snapshotted the backbone's fragment pick
+    with `int(x or -1)`. 0 is falsy in Python, so an explicit "fragment A"
+    backbone pick was silently rewritten to -1 (auto), and the backbone
+    auto-pick prefers the LARGER half — the override exists precisely for
+    the case where the user wants the smaller one. Regression guard for
+    2026-09-13; same trap `_compute_highlight_band` documents.
+    """
+
+    @staticmethod
+    def _pane_with(backbone_idx):
+        pane = sc.TraditionalCloningPane.__new__(sc.TraditionalCloningPane)
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ACGT" * 30), id="pV", name="pV",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        pane._record_cache = {"pV": rec}
+        pane._RECORD_CACHE_MAX = 32
+        backbone = {"source_entry_id": "pV", "name": "pV",
+                    "donor_frag_idx": backbone_idx}
+        return pane, backbone
+
+    @pytest.mark.parametrize("picked", [0, 1, -1])
+    def test_explicit_pick_reaches_the_worker(self, picked):
+        pane, backbone = self._pane_with(picked)
+        inputs, err = pane._collect_simulate_inputs([], backbone, ["EcoRI"])
+        assert err is None, err
+        assert inputs["vec_frag_idx"] == picked, (
+            f"backbone fragment pick {picked} was rewritten to "
+            f"{inputs['vec_frag_idx']}")
+
+    def test_missing_key_still_means_auto(self):
+        pane, backbone = self._pane_with(0)
+        backbone.pop("donor_frag_idx")
+        inputs, err = pane._collect_simulate_inputs([], backbone, ["EcoRI"])
+        assert err is None, err
+        assert inputs["vec_frag_idx"] == -1
+
+
+class TestLinearDonorInTheConstructorUI:
+    """The reported symptom, driven through the real Constructor: a linear
+    `FRAG-…` entry with SalI + XhoI sites showed
+    "(need exactly 2 fragments; got 3)" in the donor picker and refused to
+    Simulate. Regression guard for 2026-09-13.
+    """
+
+    @staticmethod
+    def _write_library():
+        import io
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        payload = "ATG" + "GCTAGCTAGG" * 12 + "TAA"
+        lin = "GGGGCC" + "GTCGAC" + payload + "CTCGAG" + "CCGGGG"
+        frag = SeqRecord(Seq(lin), id="FRAGLIN", name="FRAGLIN",
+                         annotations={"molecule_type": "DNA",
+                                      "topology": "linear"})
+        frag.features = [SeqFeature(
+            FeatureLocation(12, 12 + len(payload), 1), type="CDS",
+            qualifiers={"label": ["payload"]})]
+        vec = SeqRecord(
+            Seq("GTCGAC" + "TTTTAAAACCCC" + "CTCGAG"
+                + "".join("ACGT"[(i * 7 + 3) % 4] for i in range(600))),
+            id="pVECC", name="pVECC",
+            annotations={"molecule_type": "DNA", "topology": "circular"})
+        rows = []
+        for r in (frag, vec):
+            b = io.StringIO()
+            SeqIO.write(r, b, "genbank")
+            rows.append({"id": r.id, "name": r.id, "gb_text": b.getvalue(),
+                         "size": len(r.seq)})
+        sc._save_library(rows)
+        return payload
+
+    @staticmethod
+    async def _add_row(modal, pilot, name, e1, e2):
+        from textual.widgets import Select, DataTable, Button
+        entries = sorted(
+            (e for e in sc._load_library() if isinstance(e, dict)),
+            key=lambda e: sc._natural_sort_key(
+                e.get("name") or e.get("id") or ""))
+        row = next(i for i, e in enumerate(entries) if e.get("name") == name)
+        modal.query_one("#trad-source-table", DataTable).move_cursor(row=row)
+        await pilot.pause()
+        modal.query_one("#btn-trad-add-frag", Button).press()
+        await pilot.pause()
+        modal.query_one("#trad-edit-enz-1", Select).value = e1
+        await pilot.pause()
+        modal.query_one("#trad-edit-enz-2", Select).value = e2
+        await pilot.pause()
+
+    async def test_picker_resolves_the_payload_and_simulate_closes(
+            self, tiny_record, isolated_library):
+        from textual.widgets import TabbedContent, Button, RadioButton, Static
+        payload = self._write_library()
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            modal.query_one("#ctor-tabs", TabbedContent).active = \
+                "ctor-tab-traditional"
+            await pilot.pause(); await pilot.pause(0.05)
+            pane = modal.query_one("#ctor-trad-pane", sc.TraditionalCloningPane)
+            # Vector first (the first plasmid row becomes the backbone),
+            # then the linear fragment as the donor — the screenshot's lane.
+            await self._add_row(modal, pilot, "pVECC", "SalI", "XhoI")
+            await self._add_row(modal, pilot, "FRAGLIN", "SalI", "XhoI")
+            assert [s["role"] for s in pane._lane_inserts] == \
+                ["backbone", "donor"]
+            # The donor picker resolves the one ligatable piece instead of
+            # reporting a fragment count.
+            r0 = modal.query_one("#trad-edit-frag-0", RadioButton)
+            r1 = modal.query_one("#trad-edit-frag-1", RadioButton)
+            label0 = str(r0.label)
+            assert "need exactly 2" not in label0, label0
+            assert "132 bp" in label0, label0
+            assert r0.value is True
+            assert r1.disabled is True, "off-cut slot must not be selectable"
+            assert "off-cut" in str(r1.label), str(r1.label)
+            assert pane._edit_frags is not None and len(pane._edit_frags) == 1
+            # The lane's Frag column reports "—", not a stale A/B pick.
+            assert pane._lane_inserts[1].get("donor_frag_idx", -1) == -1
+            # Simulate through the real button → a closed plasmid carrying
+            # the payload.
+            modal.query_one("#btn-trad-simulate", Button).press()
+            await pilot.pause(); await pilot.pause(0.2)
+            results = str(
+                modal.query_one("#trad-results-text", Static).content)
+            assert isinstance(pane._fwd_product, dict), f"results: {results!r}"
+            assert pane._fwd_product["compatible"] is True, results
+            assert payload in pane._fwd_product["top_seq"]
+            got = [f for f in pane._fwd_product["features"]
+                   if f["label"] == "payload"]
+            assert len(got) == 1, [f["label"]
+                                   for f in pane._fwd_product["features"]]
+            f = got[0]
+            assert pane._fwd_product["top_seq"][f["start"]:f["end"]] == payload
+
+
+class TestLinearDonorHardening:
+    """Edge-case sweep of the 2026-09-13 linear-donor path: malformed
+    fragment lists, a topology the record spells differently, and the
+    un-annotated record that must keep its historical refusal rather than
+    be silently resolved down the new path.
+    """
+
+    @staticmethod
+    def _pane():
+        return sc.TraditionalCloningPane.__new__(sc.TraditionalCloningPane)
+
+    @staticmethod
+    def _rec(topology, seq=None):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        seq = seq or ("GGGG" + "GTCGAC" + "A" * 80 + "CTCGAG" + "GGGG")
+        rec = SeqRecord(Seq(seq), id="F", name="F")
+        rec.annotations = ({"molecule_type": "DNA"} if topology is None
+                           else {"molecule_type": "DNA", "topology": topology})
+        rec.features = []
+        return rec
+
+    @pytest.mark.parametrize("frags", [
+        [], [{}], [{"left": None, "right": None}], [{"left": {}, "right": {}}],
+        [None], ["not a dict"], [{"left": {"kind": "5'"}}],
+        [{"top_seq": None, "left": {"kind": "5'"}, "right": {"kind": "3'"}}],
+    ])
+    def test_helpers_never_raise_on_a_malformed_digest(self, frags):
+        """A cloning run must not die on a shape it can only answer "no"
+        about — the same no-raise standard [INV-190] set for the feature
+        helpers. An unreadable end is not a proven cut, so it isn't
+        ligatable."""
+        assert isinstance(sc._ligatable_fragments(frags), list)
+        frag, err = sc._pick_linear_ligatable_fragment(
+            frags, ["SalI"], what="donor fragment")
+        assert frag is None or isinstance(frag, dict)
+        assert frag is not None or isinstance(err, str)
+
+    @pytest.mark.parametrize("names", [[], [""], [None], ["SalI", "SalI"]])
+    def test_helpers_never_raise_on_degenerate_enzyme_names(self, names):
+        seq = "GGGG" + "GTCGAC" + "A" * 80 + "CTCGAG" + "GGGG"
+        frags, _ = sc._excise_fragment_pair(seq, ["SalI", "XhoI"],
+                                            circular=False)
+        frag, err = sc._pick_linear_ligatable_fragment(frags, names)
+        assert frag is not None and err is None
+
+    @pytest.mark.parametrize("spelling", ["linear", "LINEAR", "Linear",
+                                          " linear "])
+    def test_topology_is_read_case_insensitively(self, spelling):
+        """The map renderer has always lower-cased topology. The Constructor
+        compared it raw, so `Circular` read as "not circular" — which used to
+        surface as a visible "need exactly 2" refusal and, once the linear
+        path could resolve a payload, would have cloned the wrong piece
+        silently."""
+        frag, err = self._pane()._build_insert_from_plasmid(
+            self._rec(spelling), ["SalI", "XhoI"])
+        assert err is None, err
+        assert len(frag["top_seq"]) == 86
+
+    @pytest.mark.parametrize("spelling", ["circular", "CIRCULAR", "Circular"])
+    def test_a_circular_record_is_still_digested_circularly(self, spelling):
+        """Two fragments, and the origin-spanning one is a real candidate —
+        digesting it as linear would split that half into two unusable
+        pieces."""
+        pane = self._pane()
+        rec = self._rec(spelling)
+        a, erra = pane._build_insert_from_plasmid(rec, ["SalI", "XhoI"],
+                                                  donor_frag_idx=0)
+        b, errb = pane._build_insert_from_plasmid(rec, ["SalI", "XhoI"],
+                                                  donor_frag_idx=1)
+        assert erra is None and errb is None
+        assert sorted([len(a["top_seq"]), len(b["top_seq"])]) == [14, 86]
+
+    @pytest.mark.parametrize("topology", [None, "", "  ", "unknown"])
+    def test_an_undeclared_topology_keeps_its_historical_refusal(self,
+                                                                 topology):
+        """Only an EXPLICIT `linear` gets the linear model. The map draws an
+        un-annotated record as a CIRCLE, so quietly cloning it as a linear
+        fragment would disagree with what the user is looking at — it keeps
+        refusing, exactly as it did before the linear path existed."""
+        frag, err = self._pane()._build_insert_from_plasmid(
+            self._rec(topology), ["SalI", "XhoI"])
+        assert frag is None
+        assert "exactly 2" in err, err
+
+    @pytest.mark.parametrize("idx", [-1, 0, 1, 99])
+    def test_a_stale_fragment_pick_cannot_change_a_linear_donor(self, idx):
+        """There is nothing to choose on a linear source, so a leftover A/B
+        pick from a previous circular row must not select an off-cut."""
+        frag, err = self._pane()._build_insert_from_plasmid(
+            self._rec("linear"), ["SalI", "XhoI"], donor_frag_idx=idx)
+        assert err is None, err
+        assert len(frag["top_seq"]) == 86
+
+    def test_type_iis_works_on_a_linear_donor(self):
+        """`_excise_pcr_insert` refuses Type IIS because a recognition-only
+        primer tail can't encode an outside cut. A literal digest of a stored
+        linear fragment has no such limit."""
+        site = sc._state._all_enzymes_hook()["BsaI"][0]
+        seq = ("GGGGGGGGGG" + site + "AAAA" + "T" * 80
+               + sc._rc(site) + "GGGGGGGGGG")
+        frag, err = self._pane()._build_insert_from_plasmid(
+            self._rec("linear", seq), ["BsaI"])
+        assert err is None, err
+        assert frag["left"]["kind"] != "linear"
+        assert frag["right"]["kind"] != "linear"
+
+    def test_a_zero_length_piece_is_never_returned(self):
+        """Sites flush against the molecule's ends, or butted together,
+        still resolve to a real piece with two cut ends."""
+        for seq in ("GTCGAC" + "A" * 80 + "CTCGAG",
+                    "GGGG" + "GTCGAC" + "CTCGAG" + "GGGG",
+                    "GGGG" + "GTCGAC" + "A" + "CTCGAG" + "GGGG"):
+            frag, err = self._pane()._build_insert_from_plasmid(
+                self._rec("linear", seq), ["SalI", "XhoI"])
+            assert err is None, (seq, err)
+            assert len(frag["top_seq"]) > 0
+            assert frag["left"]["kind"] != "linear"
+            assert frag["right"]["kind"] != "linear"
+
+
+class TestFragmentPickerStateDoesNotLeakBetweenRows:
+    """The linear branch disables the second fragment radio. Selecting a
+    CIRCULAR row afterwards must get both slots back — a disabled radio that
+    leaks would silently remove the user's A/B choice on the next plasmid.
+    Regression guard for 2026-09-13.
+    """
+
+    @staticmethod
+    def _write_library():
+        import io
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        payload = "ATG" + "GCTAGCTAGG" * 12 + "TAA"
+        rows = []
+        for rid, seq, topo in (
+            ("FRAGLIN2",
+             "GGGGCC" + "GTCGAC" + payload + "CTCGAG" + "CCGGGG", "linear"),
+            ("pCIRC2",
+             "GTCGAC" + payload + "CTCGAG"
+             + "".join("ACGT"[(i * 7 + 3) % 4] for i in range(900)), "circular"),
+        ):
+            r = SeqRecord(Seq(seq), id=rid, name=rid,
+                          annotations={"molecule_type": "DNA",
+                                       "topology": topo})
+            b = io.StringIO()
+            SeqIO.write(r, b, "genbank")
+            rows.append({"id": rid, "name": rid, "gb_text": b.getvalue(),
+                         "size": len(seq)})
+        sc._save_library(rows)
+
+    async def test_disabled_slot_comes_back_on_a_circular_row(
+            self, tiny_record, isolated_library):
+        from textual.widgets import (TabbedContent, Select, DataTable,
+                                     Button, RadioButton)
+        self._write_library()
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            modal.query_one("#ctor-tabs", TabbedContent).active = \
+                "ctor-tab-traditional"
+            await pilot.pause(); await pilot.pause(0.05)
+            pane = modal.query_one("#ctor-trad-pane", sc.TraditionalCloningPane)
+            lt = modal.query_one("#trad-lane", DataTable)
+
+            async def add(name):
+                entries = sorted(
+                    (e for e in sc._load_library() if isinstance(e, dict)),
+                    key=lambda e: sc._natural_sort_key(e.get("name") or ""))
+                row = next(i for i, e in enumerate(entries)
+                           if e.get("name") == name)
+                modal.query_one("#trad-source-table",
+                                DataTable).move_cursor(row=row)
+                await pilot.pause()
+                modal.query_one("#btn-trad-add-frag", Button).press()
+                await pilot.pause()
+                modal.query_one("#trad-edit-enz-1", Select).value = "SalI"
+                await pilot.pause()
+                modal.query_one("#trad-edit-enz-2", Select).value = "XhoI"
+                await pilot.pause()
+
+            await add("pCIRC2")     # row 0 — becomes the backbone
+            await add("FRAGLIN2")   # row 1 — the linear donor
+            r1 = modal.query_one("#trad-edit-frag-1", RadioButton)
+            assert r1.disabled is True, "linear row should disable slot B"
+            # Park back on the circular row.
+            lt.move_cursor(row=0)
+            await pilot.pause(); await pilot.pause()
+            assert pane._edit_row_idx == 0
+            assert r1.disabled is False, (
+                "slot B stayed disabled on a circular row — the user's A/B "
+                "choice would be unreachable")
+            assert pane._edit_frags is not None and len(pane._edit_frags) == 2
+            assert "bp" in str(r1.label), str(r1.label)
+            # And back to the linear row disables it again.
+            lt.move_cursor(row=1)
+            await pilot.pause(); await pilot.pause()
+            assert r1.disabled is True
