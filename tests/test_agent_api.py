@@ -943,6 +943,58 @@ class TestTraditionalCloning:
         # Read response omits the verbose per-feature list.
         assert "features" not in r["products"][0]
 
+    def test_simulate_reports_self_ligation_per_product(self):
+        """[INV-192] Every compatible product carries the off-target report
+        for ITS backbone fragment. EcoRI + BamHI is directional: the vector's
+        two ends differ, the insert's two ends differ, nothing else closes —
+        so the report is clean and says why."""
+        r = sc._h_simulate_traditional_cloning(None, self._base())
+        assert r["ok"]
+        for p in r["products"]:
+            sl = p["self_ligation"]
+            assert isinstance(sl, dict)
+            assert sl["vector_self_closes"] is False
+            assert sl["clean"] is True and sl["risks"] == []
+            assert "don't match" in sl["clean_note"]
+            assert sl["orientation_ambiguous"] is False
+
+    def test_simulate_flags_compatible_cohesive_pair(self):
+        """[INV-192] SalI + XhoI both leave 5'-TCGA. The insert fits either
+        way round AND the empty backbone re-closes on itself — the report
+        must say so (severity high) and name the fix."""
+        vec = "GTCGAC" + "A" * 200 + "CTCGAG" + "C" * 60
+        ins = "GCGC" + "GTCGAC" + self.PAYLOAD + "CTCGAG" + "GCGC"
+        r = sc._h_simulate_traditional_cloning(None, {
+            "vector_seq": vec, "vector_enzymes": ["SalI", "XhoI"],
+            "insert_seq": ins, "insert_enzymes": ["SalI", "XhoI"]})
+        assert r["ok"] and r["products"]
+        for p in r["products"]:
+            sl = p["self_ligation"]
+            assert sl["vector_self_closes"] is True
+            assert sl["orientation_ambiguous"] is True
+            assert sl["clean"] is False
+            kinds = {k["kind"]: k for k in sl["risks"]}
+            assert kinds["vector_self_closure"]["severity"] == "high"
+            assert "rSAP/CIP" in kinds["vector_self_closure"]["advice"]
+            assert "double_insert" in kinds
+            # The re-closed SalI/XhoI joint is a scar neither enzyme re-cuts.
+            assert sl["vector_self_junction"]["scar"] is True
+
+    def test_clone_response_echoes_self_ligation(self):
+        """The write path returns the chosen product's report too, so an
+        agent saving a clone sees what else the plate will carry."""
+        b = self._base()
+        b["product_name"] = "clone-sl"
+        b["vector_frag_idx"] = 0
+        # Fragment 0's two overhangs come off the circle in the order that
+        # ligates in REVERSE — the ordinary mirrored-overhang case, not a
+        # fault ([INV-191]'s "only reverse ligates" note).
+        b["orientation"] = "reverse"
+        r = sc._h_traditional_clone(None, b)
+        assert isinstance(r, dict) and r.get("ok"), r
+        assert isinstance(r["self_ligation"], dict)
+        assert r["self_ligation"]["clean"] is True
+
     def test_simulate_bad_enzyme_400(self):
         b = self._base()
         b["vector_enzymes"] = ["NotAnEnzyme"]
@@ -4859,6 +4911,45 @@ class TestVerifyAgainstReads:
         assert r["ok"] and r["verdict"] == "match"
         assert r["reads"][0]["identity_pct"] == 100.0
         assert r["reads"][0]["passes"] is True
+        assert r["reads"][0]["inversions"] == []
+        assert r["summary"]["n_inverted"] == 0
+
+    def test_flipped_insert_gets_its_own_verdict(self):
+        """[INV-193] A read whose middle is cloned BACKWARDS scores like an
+        unrelated plasmid, so identity alone reported plain "mismatch" and
+        the caller couldn't separate "wrong construct" (start over) from
+        "right construct, wrong orientation" (re-screen colonies)."""
+        import random
+        rng = random.Random(2026)
+        head = "".join(rng.choices("ACGT", k=1500))
+        ins = "".join(rng.choices("ACGT", k=800))
+        tail = "".join(rng.choices("ACGT", k=1400))
+        ref = head + ins + tail
+        read = head + sc._rc(ins) + tail
+        r = sc._h_verify_against_reads(None, {
+            "reference": ref, "reads": [read], "circular": True})
+        assert r["ok"]
+        assert r["verdict"] == "inverted"
+        row = r["reads"][0]
+        assert row["passes"] is False          # it is NOT the design
+        assert row["inverted_bp"] == 800
+        seg = row["inversions"][0]
+        assert (seg["t_start"], seg["t_end"]) == (1500, 2300)
+        assert seg["identity_pct"] >= 99.0
+        assert r["summary"]["n_inverted"] == 1
+
+    def test_a_genuinely_wrong_read_still_reads_mismatch(self):
+        """The new verdict must not swallow the old one: a read that fails
+        for any reason OTHER than orientation is still a mismatch."""
+        import random
+        rng = random.Random(7)
+        ref = "".join(rng.choices("ACGT", k=2000))
+        r = sc._h_verify_against_reads(None, {
+            "reference": ref,
+            "reads": ["".join(rng.choices("ACGT", k=2000))],
+            "circular": True})
+        assert r["verdict"] == "mismatch"
+        assert r["reads"][0]["inversions"] == []
 
     def test_mismatch_read_flagged(self):
         r = self._verify([self._one_mismatch()])

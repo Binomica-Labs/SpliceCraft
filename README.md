@@ -173,6 +173,14 @@ reads as intact rather than broken in two, and each junction's sticky overhang
 is labelled with the bases that actually anneal there. A **linear** donor — a
 stored fragment, a gBlock — clones like one: cutting it at both ends releases
 your insert and discards the two off-cut ends, the way you would on a gel.
+Traditional cloning also answers the question the product alone can't: **what
+else will grow on the plate**. A backbone whose two ends match each other —
+one enzyme, two blunt cutters, or a pair like SalI and XhoI that both leave
+TCGA — closes with no insert at all, and that empty vector is where most empty
+colonies come from. Simulate flags it, says whether a diagnostic digest could
+even spot it, and names the fix. Double inserts, a shorter chain closing
+without the rest, and flipped or swapped fragments are listed too; a reaction
+with no such route says so outright.
 Deleted something by mistake? **`u`** brings it
 back — the last 100 deletions of the session are undoable.
 
@@ -193,11 +201,14 @@ or cite it as `&<gel>` in your notebook.
 
 Verify constructs against real reads. Drop in a Plasmidsaurus `.zip` or fetch a
 run straight from their API, then walk run → sample → target and **Align**: the
-read lands as a colored bar (blue match / red mismatch / gray gap) on the
-linear map — click it to jump the sequence panel to that exact spot. **Bulk
+read lands as a colored bar (blue match / red mismatch / gray gap / magenta
+inverted) on the linear map — click it to jump the sequence panel to that exact
+spot. A region that went in **backwards** is recognised as such instead of
+being written off as a bad alignment: SpliceCraft re-checks the parts that
+don't match against the reverse complement and marks the ones that do. **Bulk
 auto-align** matches a whole folder in one pass. The **Verification Report**
-grades every construct (✓ verified / ⚠ near / ~ partial / ✗ divergent), and a
-true sub-100% identity never rounds up to "100%".
+grades every construct (✓ verified / ⚠ near / ~ partial / ⇄ inverted /
+✗ divergent), and a true sub-100% identity never rounds up to "100%".
 
 ### Experiments
 

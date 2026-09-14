@@ -4772,6 +4772,12 @@ def _agent_traditional_cloning_candidates(payload):
                         "n_features": len(prod.get("features") or []),
                         "sequence":   top,
                         "features":   prod.get("features") or [],
+                        # Off-target closures for THIS vector fragment
+                        # (empty vector, double insert, …) — the same
+                        # report the Constructor shows [INV-192]. Per
+                        # product because it depends on which digest
+                        # fragment plays the backbone.
+                        "self_ligation": result.get("self_ligation"),
                     })
                 else:
                     incompatible.append(tag)
@@ -4888,9 +4894,20 @@ def _h_simulate_traditional_cloning(app, payload):
 
     EVERY (vector fragment × insert fragment × orientation) is tried; the
     response lists every COMPATIBLE product as ``{vector_frag_idx,
-    insert_frag_idx, orientation, length, n_features, sequence}`` (nothing is
-    picked by size). ``incompatible`` lists the combos whose sticky ends didn't
-    match. Read-only — pair with `traditional-clone` to save a chosen product."""
+    insert_frag_idx, orientation, length, n_features, sequence,
+    self_ligation}`` (nothing is picked by size). ``incompatible`` lists the
+    combos whose sticky ends didn't match.
+
+    ``self_ligation`` is the off-target report for that product's backbone
+    fragment: ``vector_self_closes`` (the empty vector re-circularises —
+    single-enzyme, blunt, or a compatible-cohesive pair such as SalI/XhoI;
+    with ``empty_vector_bp`` and the re-closed joint's ``vector_self_junction``
+    so you know whether a diagnostic digest linearises empty colonies),
+    ``double_insert`` (tandem / inverted two-copy inserts also close),
+    ``orientation_ambiguous``, and a ``risks`` list of ``{kind, severity,
+    message, advice}``; ``clean: true`` with a ``clean_note`` when nothing
+    off-target closes. Read-only — pair with `traditional-clone` to save a
+    chosen product."""
     info, err = _agent_traditional_cloning_candidates(payload)
     if err is not None:
         return err
@@ -7251,6 +7268,14 @@ def _h_diff_plasmid(app, payload):
                                ``picked_rotation == "query"``).
       * ``target_rotation``  — bp offset applied to the target (0 unless
                                ``picked_rotation == "target"``).
+      * ``inverted_segments`` — spans where the query matches the target's
+                               REVERSE COMPLEMENT (an insert cloned the
+                               wrong way round), each
+                               ``{t_start, t_end, q_start, q_end, length,
+                               identity_pct, forward_identity_pct}``.
+                               Forward alignment scores such a region like
+                               unrelated sequence, so identity alone reads
+                               it as plain divergence ([INV-193]).
       * ``query_rc``         — bool: was the query reverse-complemented
                                to find this alignment?
       * ``rotation_offset``  — back-compat field: equals
@@ -7367,10 +7392,20 @@ def _h_verify_against_reads(app, payload):
     the reference with the SAME rotation + RC-aware picker the Plasmidsaurus
     aligner and the UI use, and its identity% reported. Returns
     ``{ok, reference_len, n_reads, min_identity, verdict, circular,
-    reads:[{index, length, identity_pct, rc, passes}], summary:{mean, min, max,
-    n_pass, n_fail}}``. ``verdict`` is "match" when EVERY read ≥
-    ``min_identity``, else "mismatch" (failing reads flagged ``passes:false``).
-    Read-only, heavy — one alignment per read, capped at 200 reads."""
+    reads:[{index, length, identity_pct, rc, inversions, inverted_bp, passes}],
+    summary:{mean, min, max, n_pass, n_fail, n_inverted}}``.
+
+    ``verdict`` is "match" when EVERY read ≥ ``min_identity``; "inverted" when
+    every read that falls short does so because part of it matches the
+    reference BACKWARDS; else "mismatch" (failing reads flagged
+    ``passes:false``). ``inversions`` lists each such span as
+    ``{t_start, t_end, q_start, q_end, length, identity_pct,
+    forward_identity_pct}`` in reference coordinates — an insert cloned the
+    wrong way round otherwise scores like an unrelated plasmid, so identity
+    alone can't separate "wrong construct" from "right construct, wrong
+    orientation" ([INV-193]). ``rc`` means the WHOLE read aligned as the
+    reverse complement. Read-only, heavy — one alignment per read, capped at
+    200 reads."""
     mode = payload.get("mode", "global")
     if mode not in ("global", "local"):
         return ({"error": "'mode' must be 'global' or 'local'"}, 400)
@@ -7437,20 +7472,40 @@ def _h_verify_against_reads(app, payload):
         except Exception as exc:
             _log.exception("verify-against-reads: alignment raised")
             return ({"error": f"alignment failed: {_scrub_path(str(exc))}"}, 500)
+        # Inverted spans [INV-193] — a read whose insert went in backwards
+        # scores like an unrelated plasmid, so identity alone reports it as
+        # a plain mismatch and the caller cannot tell "wrong construct" from
+        # "right construct, wrong way round".
+        inv = [s for s in (res.get("inverted_segments") or [])
+               if isinstance(s, dict)]
         out_reads.append({"index": i, "length": len(rs), "identity_pct": ident,
                           "rc": bool(res.get("query_rc", False)),
+                          "inversions": inv,
+                          "inverted_bp": sum(
+                              max(0, int(s.get("length") or 0)) for s in inv),
                           "passes": ident >= min_identity})
     idents = [r["identity_pct"] for r in out_reads]
     n_pass = sum(1 for r in out_reads if r["passes"])
-    verdict = "match" if n_pass == len(out_reads) else "mismatch"
+    n_inverted = sum(1 for r in out_reads if r["inversions"])
+    # "inverted" is a THIRD verdict, not a flavour of mismatch: the bases are
+    # right and the orientation isn't, which is a different next step at the
+    # bench (re-screen colonies) from a failed build (start over). Only
+    # reported when every read that falls short does so for THAT reason.
+    if n_pass == len(out_reads):
+        verdict = "match"
+    elif n_inverted and all(r["passes"] or r["inversions"] for r in out_reads):
+        verdict = "inverted"
+    else:
+        verdict = "mismatch"
     _log_event("verify.reads.agent", n_reads=len(out_reads), verdict=verdict,
-               min_identity=min_identity, via="agent")
+               min_identity=min_identity, n_inverted=n_inverted, via="agent")
     return {"ok": True, "reference_len": len(ref_seq),
             "n_reads": len(out_reads), "min_identity": min_identity,
             "verdict": verdict, "circular": circular, "reads": out_reads,
             "summary": {"mean": round(sum(idents) / len(idents), 2),
                         "min": min(idents), "max": max(idents),
-                        "n_pass": n_pass, "n_fail": len(out_reads) - n_pass},
+                        "n_pass": n_pass, "n_fail": len(out_reads) - n_pass,
+                        "n_inverted": n_inverted},
             "ignored": _agent_ignored_keys(payload, {
                 "reference", "reference_id", "reference_name", "reads",
                 "circular", "mode", "min_identity"})}

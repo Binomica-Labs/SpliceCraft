@@ -1516,6 +1516,515 @@ def _classify_junction(left_enz: str, right_enz: str,
     }
 
 
+# ── Self-ligation / off-target ligation risk [INV-192] ──────────────────
+#
+# `_simulate_traditional_cloning` answers ONE question: can the intended
+# product (vector + the insert chain) close, and in which orientation? It
+# says nothing about the OTHER circles the same tube can make. The one that
+# matters most at the bench is the empty vector: a backbone whose two ends
+# match each other (a single-enzyme cut, a blunt cut, or a compatible-cohesive
+# pair such as SalI/XhoI — both leave 5'-TCGA) re-closes without any insert,
+# transforms far more efficiently than the two-junction product, and is the
+# dominant source of empty colonies. The analyser below enumerates the
+# off-target closures that TRANSFORM (every one contains the vector) from
+# fragment-END METADATA only — no sequences are concatenated — so it is
+# cheap enough to run on every Simulate and every agent dry-run.
+
+_SELF_LIGATION_MAX_LANE = 32     # above this, skip the multi-insert sweep
+_SELF_LIGATION_SUBSET_LANE = 12  # ≤ this many inserts: every ordered subset (2^N)
+_SELF_LIGATION_MAX_LISTED = 6    # cap on partial-product rows NAMED in a message
+# Cap on partial products KEPT in the report. A 12-insert lane cut with one
+# enzyme has 4,094 closing subsets — one fact, not 4,094, and shipping them
+# all bloats the agent response for nothing. The shortest are kept (a clone
+# missing most of the lane is the one you'd mistake for the real product)
+# and `partial_products_total` carries the true count.
+_SELF_LIGATION_MAX_PARTIALS = 24
+# Cap on repeated per-insert risk paragraphs (double-insert). Same rule the
+# backbone-marker warning already follows: a warning nobody reads is a
+# warning that doesn't work, so past this the count stands in for the rest.
+_SELF_LIGATION_MAX_RISK_ROWS = 3
+# Cap on fragment names listed inside one message before it says "+N more".
+_SELF_LIGATION_MAX_NAMES = 6
+
+
+def _frag_end(frag, side: str) -> "dict | None":
+    """The ``left`` / ``right`` end dict of a fragment, or None when the
+    fragment (or that end) can't be read. Never raises — an unreadable
+    end is not a proven ligation, and "no" is the safe answer for a risk
+    that would otherwise be reported on a malformed input ([INV-191])."""
+    if not isinstance(frag, dict) or side not in ("left", "right"):
+        return None
+    end = frag.get(side)
+    return end if isinstance(end, dict) else None
+
+
+def _ends_compatible_safe(end_a, end_b) -> bool:
+    """`_ends_compatible` that answers False instead of raising on a
+    missing / malformed end."""
+    if not isinstance(end_a, dict) or not isinstance(end_b, dict):
+        return False
+    try:
+        return bool(_ends_compatible(end_a, end_b))
+    except Exception:
+        return False
+
+
+def _end_rc(end) -> "dict | None":
+    """The same physical end seen from the other strand — exactly what
+    `_rc_fragment` stamps on the swapped side: same ``kind`` + ``enzyme``,
+    overhang reverse-complemented. Lets two fragments be tested end-to-END
+    (head-to-head / tail-to-tail) without building the flipped sequence."""
+    if not isinstance(end, dict):
+        return None
+    oh = str(end.get("overhang_seq") or "")
+    return {**end, "overhang_seq": _rc(oh) if oh else ""}
+
+
+def _frag_ends_rc(frag) -> "dict | None":
+    """Metadata-only reverse complement of a fragment: ``{left, right}``
+    of the flipped molecule (plus ``top_seq`` length carried as ``_len``
+    so product sizes can still be summed)."""
+    left, right = _frag_end(frag, "left"), _frag_end(frag, "right")
+    if left is None or right is None:
+        return None
+    return {"left": _end_rc(right), "right": _end_rc(left),
+            "_len": _frag_len_bp(frag), "source_label": frag.get("source_label", "")}
+
+
+def _frag_len_bp(frag) -> int:
+    """``len(top_seq)`` of a fragment, or its carried ``_len`` for a
+    metadata-only RC view; 0 when unreadable."""
+    if not isinstance(frag, dict):
+        return 0
+    if "_len" in frag:
+        try:
+            return max(0, int(frag["_len"]))
+        except (TypeError, ValueError):
+            return 0
+    top = frag.get("top_seq")
+    return len(top) if isinstance(top, str) else 0
+
+
+def _chain_closes_into_vector(vector_frag, chain: list) -> bool:
+    """Metadata-only closure test: does ``vector.right → chain[0].left →
+    … → chain[-1].right → vector.left`` ligate at every junction? An empty
+    chain asks whether the vector closes on itself."""
+    prev = _frag_end(vector_frag, "right")
+    if prev is None:
+        return False
+    for f in chain:
+        if not _ends_compatible_safe(prev, _frag_end(f, "left")):
+            return False
+        prev = _frag_end(f, "right")
+        if prev is None:
+            return False
+    return _ends_compatible_safe(prev, _frag_end(vector_frag, "left"))
+
+
+def _end_desc(end) -> str:
+    """Human label for a fragment end: ``SalI (5' TCGA)``, ``SmaI (blunt)``,
+    ``uncut end``."""
+    if not isinstance(end, dict):
+        return "?"
+    enz = str(end.get("enzyme") or "").strip()
+    kind = str(end.get("kind") or "").strip()
+    oh = str(end.get("overhang_seq") or "").strip().upper()
+    if kind == "linear":
+        return "uncut end"
+    if kind == "blunt":
+        return f"{enz} (blunt)" if enz else "blunt end"
+    if kind in ("5'", "3'") and oh:
+        return f"{enz} ({kind} {oh})" if enz else f"{kind} {oh} overhang"
+    return enz or "?"
+
+
+def _finish_clean_note(out: dict, v_left, v_right, n_inserts: int) -> None:
+    """Fill ``out["clean_note"]`` with WHAT WAS ACTUALLY CHECKED when no
+    off-target closure was found. Mutates in place; a no-op when risks were
+    reported (the risks speak for themselves).
+
+    Every clause is derived from a result the sweep recorded, never asserted
+    from the shape of the input. An earlier version read the insert's clause
+    off its two end LABELS and claimed "neither do the insert's ends" for a
+    SalI/XhoI insert — whose labels differ while the overhangs are identical.
+    A reassurance that can be wrong is worse than no reassurance."""
+    if not out.get("clean"):
+        return
+    if not isinstance(v_left, dict) or not isinstance(v_right, dict):
+        # Nothing readable to report on; leave the note empty rather than
+        # describe ends we couldn't parse.
+        return
+    parts = [f"the vector's ends don't match each other "
+             f"({_end_desc(v_right)} vs {_end_desc(v_left)})"]
+    if n_inserts == 0:
+        out["clean_note"] = parts[0] + "; no insert queued"
+        return
+    if not out.get("insert_self_closes"):
+        parts.append("no insert's ends match its own"
+                     if n_inserts > 1 else "and neither do the insert's")
+    if n_inserts > 1 and not (out.get("partial_products")
+                              or out.get("insert_flips")
+                              or out.get("insert_swaps")):
+        parts.append("no shorter, flipped or reordered chain closes")
+    if len(parts) == 1:
+        out["clean_note"] = parts[0]
+    elif len(parts) == 2 and parts[1].startswith("and "):
+        out["clean_note"] = f"{parts[0]} {parts[1]}"
+    else:
+        out["clean_note"] = ", ".join(parts[:-1]) + f", and {parts[-1]}"
+
+
+def _self_ligation_risks(insert_frags: list, vector_frag: dict) -> dict:
+    """Enumerate the off-target closures a traditional ligation can make
+    besides the intended product, from fragment-end metadata only.
+
+    Every fragment is double-stranded and can enter a ligation in either
+    orientation, so each is tested as itself AND as its metadata RC
+    (`_frag_ends_rc`). Only circles that contain the vector are listed —
+    an insert-only circle never transforms (it has no origin), though it
+    still consumes insert and is recorded in ``insert_self_closes``.
+
+    Returns ``{
+        vector_self_closes:   bool,   # the empty backbone re-closes
+        vector_self_junction: dict|None,   # `_classify_junction` of that joint
+        empty_vector_bp:      int,
+        vector_ends:          {left: str, right: str},   # `_end_desc`
+        insert_self_closes:   [i, …],  # 1-based inserts that circularise alone
+        double_insert:        {tandem: [i, …], inverted: [i, …]},
+        partial_products:     [{inserts: [i, …], flipped: bool, bp: int}, …],
+        partial_products_total: int,   # before the display cap
+        insert_flips:         [i, …],  # N>1: inserts that can invert in place
+        insert_swaps:         [[i, i+1], …],  # N>1: adjacent pairs that can swap
+        risks:  [{kind, severity: "high"|"medium", message, advice}, …],
+        clean:  bool,
+        clean_note: str,   # why nothing off-target closes (empty when not clean)
+        skipped: str,      # non-empty when the lane was too long to sweep
+    }``
+
+    Severity: ``high`` for a wrong circle that transforms as readily as the
+    product (empty vector, a partial chain); ``medium`` for one that also
+    transforms but needs two inserts to meet (double insert) or is an
+    orientation scramble (flip / swap).
+
+    **Scope: circles ONE vector copy can make.** Vector DIMERS are
+    deliberately not reported. Two backbone molecules meeting head-to-head
+    can join whenever an overhang is palindromic, and nearly every common
+    cutter leaves one (AATT, GATC, TCGA and AGCT all read the same
+    backwards) — so a dimer warning would fire on essentially every
+    ordinary directional clone, which is the definition of a warning nobody
+    reads. The clean line says "no self-ligation route FOUND" rather than
+    claiming nothing can form. The intended product's own
+    orientation ambiguity is NOT repeated here — the simulator's existing
+    "Ambiguous orientation" warning owns it; ``orientation_ambiguous`` is
+    stamped by the caller for structured consumers.
+
+    Never raises: a malformed fragment reads as "no proven closure", and
+    the junction classification degrades to None."""
+    inserts = [f for f in (insert_frags or []) if isinstance(f, dict)]
+    n = len(inserts)
+    out: dict = {
+        "vector_self_closes":   False,
+        "vector_self_junction": None,
+        "empty_vector_bp":      _frag_len_bp(vector_frag),
+        "vector_ends":          {"left":  _end_desc(_frag_end(vector_frag, "left")),
+                                 "right": _end_desc(_frag_end(vector_frag, "right"))},
+        "insert_self_closes":   [],
+        "double_insert":        {"tandem": [], "inverted": []},
+        "partial_products":     [],
+        "partial_products_total": 0,
+        "insert_flips":         [],
+        "insert_swaps":         [],
+        "risks":                [],
+        "clean":                True,
+        "clean_note":           "",
+        "skipped":              "",
+    }
+    risks: list[dict] = out["risks"]
+    v_left  = _frag_end(vector_frag, "left")
+    v_right = _frag_end(vector_frag, "right")
+
+    def _name(i: int) -> str:
+        lbl = str((inserts[i].get("source_label") or "")).strip()
+        return f"insert {i + 1}" + (f" ({lbl})" if lbl else "")
+
+    # ── 1. Empty vector: the backbone's own ends ligate ─────────────────
+    if _chain_closes_into_vector(vector_frag, []):
+        out["vector_self_closes"] = True
+        out["clean"] = False
+        cls = None
+        top = vector_frag.get("top_seq") if isinstance(vector_frag, dict) else None
+        if isinstance(top, str) and top and v_left is not None and v_right is not None:
+            try:
+                pre = top[max(0, len(top) - 6):]
+                post = top[:min(6, len(top))]
+                cls = _classify_junction(
+                    str(v_right.get("enzyme") or ""),
+                    str(v_left.get("enzyme") or ""),
+                    pre + post, context_left_offset=len(pre))
+            except Exception:
+                _log.debug("self-ligation: empty-vector junction classify "
+                           "failed", exc_info=True)
+                cls = None
+        out["vector_self_junction"] = cls
+        # `_chain_closes_into_vector` only says True when BOTH ends read as
+        # dicts, but say so explicitly rather than leaning on that: this is
+        # the one branch that dereferences them.
+        v_left = v_left if isinstance(v_left, dict) else {}
+        v_right = v_right if isinstance(v_right, dict) else {}
+        blunt = (str(v_left.get("kind") or "") == "blunt"
+                 and str(v_right.get("kind") or "") == "blunt")
+        how = (f"both ends are blunt ({_end_desc(v_right)} ↔ {_end_desc(v_left)})"
+               if blunt else
+               f"its two ends match each other ({_end_desc(v_right)} ↔ "
+               f"{_end_desc(v_left)})")
+        bp = out["empty_vector_bp"]
+        # A fragment with no readable `top_seq` measures 0; say "backbone"
+        # rather than "the 0 bp backbone", which reads like a bug.
+        bp_phrase = f"the {bp:,} bp backbone" if bp > 0 else "the backbone"
+        junction_note = ""
+        if isinstance(cls, dict):
+            if cls.get("re_cuttable"):
+                junction_note = (
+                    f"; an empty-vector colony re-cuts with "
+                    f"{'/'.join(cls['re_cuttable'])} at the re-closed joint, "
+                    f"so a diagnostic digest gives the bare "
+                    f"{f'{bp:,} bp ' if bp > 0 else ''}backbone")
+            else:
+                junction_note = (
+                    f"; the re-closed joint is a {cls.get('label') or 'scar'}, "
+                    f"so a diagnostic digest with the parent enzymes will NOT "
+                    f"linearise an empty-vector colony")
+        risks.append({
+            "kind":     "vector_self_closure",
+            "severity": "high",
+            "message":  (f"Vector re-closes on itself: {how}, so "
+                         f"{bp_phrase} circularises without an insert "
+                         f"— the classic empty-vector background"
+                         f"{junction_note}."),
+            "advice":   (("Dephosphorylate the vector (rSAP/CIP) before "
+                          "ligation — blunt ends always self-close — or "
+                          "switch to sticky-end enzymes that leave two "
+                          "different overhangs.")
+                         if blunt else
+                         ("Dephosphorylate the vector (rSAP/CIP) before "
+                          "ligation, or cut with two enzymes that leave "
+                          "different overhangs so the backbone cannot "
+                          "close on itself.")),
+        })
+
+    if n == 0:
+        _finish_clean_note(out, v_left, v_right, n)
+        return out
+    if n > _SELF_LIGATION_MAX_LANE:
+        out["skipped"] = (f"lane has {n} inserts — the multi-insert "
+                          f"off-target sweep is capped at "
+                          f"{_SELF_LIGATION_MAX_LANE}; only the empty-vector "
+                          f"check ran")
+        return out
+
+    # Metadata views of every insert, both strands.
+    fwd = inserts
+    rcs = [_frag_ends_rc(f) for f in inserts]
+    if any(r is None for r in rcs):
+        # An insert whose ends can't be read can't be swept honestly.
+        out["skipped"] = "an insert's ends could not be read; only the empty-vector check ran"
+        return out
+    rc_chain = [rcs[n - 1 - j] for j in range(n)]     # whole chain flipped
+
+    # ── 2. Inserts that circularise on their own (no vector) ────────────
+    for i, f in enumerate(fwd):
+        if _ends_compatible_safe(_frag_end(f, "right"), _frag_end(f, "left")):
+            out["insert_self_closes"].append(i + 1)
+
+    # ── 3. Double insert: one insert enters twice and the circle still closes
+    tandem: list[int] = []
+    inverted: list[int] = []
+    for chain, is_rc in ((fwd, False), (rc_chain, True)):
+        for j in range(n):
+            orig = (n - 1 - j) if is_rc else j
+            f = chain[j]
+            f_rc = _frag_ends_rc(f) if not is_rc else fwd[orig]
+            head, tail = chain[:j], chain[j + 1:]
+            if (orig + 1) not in tandem and \
+                    _chain_closes_into_vector(vector_frag, head + [f, f] + tail):
+                tandem.append(orig + 1)
+            if (orig + 1) not in inverted and f_rc is not None and (
+                    _chain_closes_into_vector(vector_frag, head + [f, f_rc] + tail)
+                    or _chain_closes_into_vector(vector_frag, head + [f_rc, f] + tail)):
+                inverted.append(orig + 1)
+    out["double_insert"] = {"tandem": sorted(tandem), "inverted": sorted(inverted)}
+    _dbl = sorted(set(tandem) | set(inverted))
+    if len(_dbl) > _SELF_LIGATION_MAX_RISK_ROWS:
+        out["clean"] = False
+        risks.append({
+            "kind":     "double_insert",
+            "severity": "medium",
+            "message":  (f"{len(_dbl)} of the lane's inserts can enter the "
+                         f"vector twice (their own two ends match each "
+                         f"other) — showing the first "
+                         f"{_SELF_LIGATION_MAX_RISK_ROWS}."),
+            "advice":   ("Give each junction its own overhang, or keep the "
+                         "insert:vector molar ratio low and screen clones."),
+        })
+    for i in _dbl[:_SELF_LIGATION_MAX_RISK_ROWS]:
+        modes = []
+        if i in tandem:
+            modes.append("tandem")
+        if i in inverted:
+            modes.append("inverted")
+        f = fwd[i - 1]
+        l_desc = _end_desc(_frag_end(f, "left"))
+        r_desc = _end_desc(_frag_end(f, "right"))
+        ends = (f"both ends {l_desc}" if l_desc == r_desc
+                else f"{l_desc} and {r_desc}")
+        alone = (" It also circularises on its own, which consumes insert "
+                 "without giving colonies." if i in out["insert_self_closes"]
+                 else "")
+        out["clean"] = False
+        risks.append({
+            "kind":     "double_insert",
+            "severity": "medium",
+            "message":  (f"Two copies of {_name(i - 1)} also close into the "
+                         f"vector ({' and '.join(modes)}): its ends match each "
+                         f"other ({ends}), so multi-insert clones can form."
+                         f"{alone}"),
+            "advice":   ("Keep the insert:vector molar ratio at or below 3:1 "
+                         "and screen colonies by diagnostic digest, colony PCR "
+                         "or sequencing."),
+        })
+
+    if n == 1:
+        _finish_clean_note(out, v_left, v_right, n)
+        return out
+
+    # ── 4. Partial assembly (N > 1): a proper SUBSET of the lane, in lane
+    #      order, closes into the vector. Subsets, not just contiguous runs:
+    #      the textbook three-way failure is the MIDDLE piece dropping out —
+    #      inserts 1 and 3 meet directly whenever the two junctions flanking
+    #      insert 2 use the same enzyme. Up to `_SELF_LIGATION_SUBSET_LANE`
+    #      inserts every ordered subset is tried (2^N); above that, the
+    #      contiguous runs plus every single-insert dropout.
+    vec_bp = _frag_len_bp(vector_frag)
+    partials: list[dict] = []
+    subsets: list[tuple[int, ...]] = []
+    if n <= _SELF_LIGATION_SUBSET_LANE:
+        for mask in range(1, (1 << n) - 1):
+            subsets.append(tuple(i for i in range(n) if mask & (1 << i)))
+    else:
+        seen: set = set()
+        for a in range(n):
+            for b in range(a + 1, n + 1):
+                if b - a < n:
+                    seen.add(tuple(range(a, b)))
+        for i in range(n):
+            seen.add(tuple(k for k in range(n) if k != i))
+        subsets = sorted(seen, key=lambda t: (len(t), t))
+    for idxs in subsets:
+        sub = [fwd[k] for k in idxs]
+        sub_rc = [rcs[k] for k in reversed(idxs)]
+        for chain, flipped in ((sub, False), (sub_rc, True)):
+            if _chain_closes_into_vector(vector_frag, chain):
+                partials.append({
+                    "inserts": [k + 1 for k in idxs],
+                    "flipped": flipped,
+                    "bp":      vec_bp + sum(_frag_len_bp(f) for f in sub),
+                })
+                break
+    partials.sort(key=lambda p: (len(p["inserts"]), p["inserts"]))
+    out["partial_products_total"] = len(partials)
+    out["partial_products"] = partials[:_SELF_LIGATION_MAX_PARTIALS]
+    if partials:
+        out["clean"] = False
+        shown = partials[:_SELF_LIGATION_MAX_LISTED]
+        descs = []
+        for p in shown:
+            ins = p["inserts"]
+            contiguous = ins == list(range(ins[0], ins[-1] + 1))
+            label = (f"insert {ins[0]}" if len(ins) == 1 else
+                     f"inserts {ins[0]}–{ins[-1]}" if contiguous else
+                     "inserts " + "+".join(str(i) for i in ins))
+            descs.append(f"{label}{' (flipped)' if p['flipped'] else ''} "
+                         f"→ {p['bp']:,} bp")
+        more = (f" (+{len(partials) - len(shown):,} more)"
+                if len(partials) > len(shown) else "")
+        risks.append({
+            "kind":     "partial_assembly",
+            "severity": "high",
+            "message":  (f"A shorter chain also closes into the vector, so "
+                         f"clones missing part of the lane can form: "
+                         f"{'; '.join(descs)}{more}."),
+            "advice":   ("Gel-purify the full-length insert chain before the "
+                         "vector ligation, or use enzymes with distinct "
+                         "overhangs at every junction so a truncated chain "
+                         "cannot close."),
+        })
+
+    # ── 5. Orientation scrambles (N > 1): a single insert flips in place,
+    #      or two neighbours swap ─────────────────────────────────────────
+    flips: list[int] = []
+    for i in range(n):
+        chain = fwd[:i] + [rcs[i]] + fwd[i + 1:]
+        if _chain_closes_into_vector(vector_frag, chain):
+            flips.append(i + 1)
+    out["insert_flips"] = flips
+    swaps: list[list[int]] = []
+    for i in range(n - 1):
+        chain = fwd[:i] + [fwd[i + 1], fwd[i]] + fwd[i + 2:]
+        if _chain_closes_into_vector(vector_frag, chain):
+            swaps.append([i + 1, i + 2])
+    out["insert_swaps"] = swaps
+    if flips:
+        out["clean"] = False
+        _shown = flips[:_SELF_LIGATION_MAX_NAMES]
+        names = ", ".join(_name(i - 1) for i in _shown)
+        if len(flips) > len(_shown):
+            names += f" and {len(flips) - len(_shown)} more"
+        risks.append({
+            "kind":     "insert_flip",
+            "severity": "medium",
+            "message":  (f"{names} can ligate in either orientation at "
+                         f"{'its' if len(flips) == 1 else 'their'} position: the "
+                         f"overhangs on both sides accept the flipped fragment."),
+            "advice":   ("Flank it with two enzymes that leave different, "
+                         "non-palindromic overhangs, or screen orientation by "
+                         "sequencing."),
+        })
+    if swaps:
+        out["clean"] = False
+        _sw = swaps[:_SELF_LIGATION_MAX_NAMES]
+        pairs = "; ".join(f"inserts {a} and {b}" for a, b in _sw)
+        if len(swaps) > len(_sw):
+            pairs += f"; and {len(swaps) - len(_sw)} more pair(s)"
+        risks.append({
+            "kind":     "insert_swap",
+            "severity": "medium",
+            "message":  (f"Neighbouring inserts can trade places and the "
+                         f"circle still closes ({pairs}), so the lane order "
+                         f"is not enforced by the chemistry."),
+            "advice":   ("Give each junction its own overhang (a different "
+                         "enzyme per junction), or assemble stepwise."),
+        })
+    _finish_clean_note(out, v_left, v_right, n)
+    return out
+
+
+def _attach_self_ligation(result: dict, insert_frags: list,
+                            vector_frag: dict) -> dict:
+    """Stamp ``result["self_ligation"]`` (see `_self_ligation_risks`) plus
+    ``orientation_ambiguous`` onto a simulator result. Never raises — a
+    failure here must not take the cloning result down with it; the
+    field is then absent and the UI renders nothing for it."""
+    try:
+        sl = _self_ligation_risks(insert_frags, vector_frag)
+        fwd_ok = bool((result.get("forward") or {}).get("compatible"))
+        rev_ok = bool((result.get("reverse") or {}).get("compatible"))
+        sl["orientation_ambiguous"] = fwd_ok and rev_ok
+        result["self_ligation"] = sl
+    except Exception:
+        _log.exception("self-ligation risk analysis failed")
+    return result
+
+
 @_timed("op.simulate_traditional_cloning_multi")
 def _simulate_traditional_cloning_multi(insert_frags: list[dict],
                                           vector_frag: dict) -> dict:
@@ -1532,22 +2041,27 @@ def _simulate_traditional_cloning_multi(insert_frags: list[dict],
 
     Returns the same shape as `_simulate_traditional_cloning`:
     ``{"forward": {...}, "reverse": {...}, "warnings": [...],
-       "errors": [...]}``.
+       "errors": [...]}`` — plus ``"self_ligation"`` (every return path,
+    [INV-192]): the off-target closures the same tube can make, from
+    `_self_ligation_risks`, with ``orientation_ambiguous`` stamped in.
+    The empty-vector check runs even when the intended product can't
+    close, because the backbone re-closing is real whether or not the
+    insert fits.
     """
     if not insert_frags:
         empty = {"top_seq": vector_frag.get("top_seq", ""),
                  "features": [], "compatible": False}
-        return {
+        return _attach_self_ligation({
             "forward":  empty,
             "reverse":  empty,
             "warnings": [],
             "errors":   ["No insert fragments queued for ligation."],
-        }
+        }, [], vector_frag)
     if len(insert_frags) == 1:
         result = _simulate_traditional_cloning(insert_frags[0],
                                                  vector_frag)
         _annotate_scars_on_product(result, insert_frags, vector_frag)
-        return result
+        return _attach_self_ligation(result, insert_frags, vector_frag)
     chained = insert_frags[0]
     # Record junction info as we chain so the scar annotator below
     # can locate each junction in the final product.
@@ -1562,7 +2076,7 @@ def _simulate_traditional_cloning_multi(insert_frags: list[dict],
             b_label = (insert_frags[i].get("source_label")
                         or f"fragment {i + 1}")
             empty = {"top_seq": "", "features": [], "compatible": False}
-            return {
+            return _attach_self_ligation({
                 "forward":  empty,
                 "reverse":  empty,
                 "warnings": [],
@@ -1572,7 +2086,7 @@ def _simulate_traditional_cloning_multi(insert_frags: list[dict],
                     f"(5' end). Check that adjacent fragments share an "
                     f"enzyme at the matching cut."
                 ],
-            }
+            }, insert_frags, vector_frag)
         junction_info.append({
             "label":       f"insert {i} ↔ insert {i + 1}",
             "left_enz":    left_enz_at_junc,
@@ -1583,7 +2097,7 @@ def _simulate_traditional_cloning_multi(insert_frags: list[dict],
     result = _simulate_traditional_cloning(chained, vector_frag)
     _annotate_scars_on_product(result, insert_frags, vector_frag,
                                   internal_junctions=junction_info)
-    return result
+    return _attach_self_ligation(result, insert_frags, vector_frag)
 
 
 def _annotate_scars_on_product(

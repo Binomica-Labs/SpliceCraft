@@ -14,6 +14,65 @@
 
 ---
 
+## [1.2.60] — 2026-09-14
+
+### New features
+
+- **The Constructor now tells you when your vector can close without the
+  insert.** Cut a backbone with one enzyme, with two blunt cutters, or with a
+  pair that leaves the same sticky ends — SalI and XhoI both leave TCGA — and
+  the empty backbone re-circularises on its own. It transforms more easily
+  than your intended clone, and it is where most empty colonies come from.
+  Simulate now says so in its own block, in red when it matters, and tells
+  you to dephosphorylate the vector or pick enzymes with different overhangs.
+  It also says whether a diagnostic digest would even spot an empty colony:
+  cutting with SalI and XhoI leaves a joint neither enzyme recognises, so an
+  empty vector stays stubbornly uncut, while a single-enzyme clone rebuilds
+  its own site and linearises. The ligation diagram carries a matching
+  "backbone re-closes without insert" badge before you even press Simulate.
+- **It also names the other clones the same tube makes.** Two copies of the
+  insert going in head-to-tail or head-to-head, a shorter chain of fragments
+  closing without the rest, an insert flipping in place, two neighbours
+  trading order — each is reported with what to do about it. Multi-fragment
+  lanes are checked as every ordered subset, so the classic failure where the
+  middle piece drops out and the outer two meet is caught by name.
+- **When nothing can go wrong, it says that too.** A clean reaction gets a
+  green "No self-ligation route" line naming which ends don't match, so an
+  empty warning list never has to be read as "not checked".
+- **A plasmid whose insert went in backwards is now recognised as exactly
+  that.** Aligning a sequencing read against such a construct used to grade it
+  "divergent" — the same verdict an unrelated plasmid gets — because comparing
+  a flipped region forwards looks like random sequence. SpliceCraft now
+  re-checks the poorly-matching stretches against the reverse complement, and
+  when they match, marks them: a magenta band on the map, a new "inverted"
+  grade in the Verification Report, the exact span and its identity in the
+  alignment view, and a warning in the toast. Works from a 60 bp flip up to
+  half the molecule, through a rotated origin, with mismatches inside the
+  flipped region, and when the flipped piece changed length — including a
+  flip that runs across the plasmid's origin, where the two halves land at
+  opposite ends of the comparison. A palindrome, a homopolymer run, a noisy
+  read and a plain deletion are all left alone.
+- **A read that aligns as the reverse complement now says so.** That was
+  already detected internally and never shown.
+- **Bulk auto-align flags the backwards ones.** Screening a plate of
+  candidate clones, the Note column now reads "800 bp inverted" for the ones
+  that went in the wrong way round. In the identity and mismatch columns a
+  flip looks like nothing but a bad read.
+
+### Agent API
+
+- `simulate-traditional-cloning` and `traditional-clone` return a
+  `self_ligation` report per product: whether the empty vector closes, how big
+  it would be, whether a diagnostic digest can see it, plus double-insert,
+  partial-assembly and orientation risks with severities and advice.
+- `verify-against-reads` gained a third verdict, `inverted`, for reads that
+  fail only because part of the construct is backwards — a different next step
+  from a build that simply failed. Each read carries `inversions` and
+  `inverted_bp`; the summary carries `n_inverted`.
+- `multi-align` rows and `diff-plasmid` results carry `inverted_segments`.
+
+---
+
 ## [1.2.59] — 2026-09-13
 
 ### Bug fixes

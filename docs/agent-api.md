@@ -162,7 +162,13 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 - **Design** — gibson-assemble, simulate-gibson, traditional-clone /
   simulate-traditional-cloning (restriction digest + ligation: excise the
   insert, digest the vector, try every vector-fragment × insert-fragment ×
-  orientation, and save the product — refuses to guess when more than one
+  orientation, and save the product. Each product carries a `self_ligation`
+  report — whether the EMPTY vector re-closes (a single-enzyme cut, a blunt
+  cut, or a compatible-cohesive pair such as SalI/XhoI, which both leave
+  TCGA), how big it would be, and whether a diagnostic digest can even see
+  it, plus double-insert / partial-assembly / orientation risks each with a
+  severity and the fix; `clean: true` carries a note naming which ends
+  disagree, so an empty risk list never reads as "not checked" — refuses to guess when more than one
   ligation is possible, pick with `vector_frag_idx` / `insert_frag_idx`. Pass
   `insert_circular:true` to cut a cassette OUT of a *plasmid* insert — e.g. an
   Ω multigene into a binary vector — so its two digest fragments are both
@@ -379,7 +385,12 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   verify-against-reads (the "I built X, I got reads back — do they match?"
   check: a bare or library-resolved `reference` vs a list of raw `reads`
   (Nanopore / Sanger / a consensus), each aligned rotation + RC-aware; returns
-  per-read identity% + a `match`/`mismatch` `verdict` against `min_identity`).
+  per-read identity% + a `match`/`inverted`/`mismatch` `verdict` against
+  `min_identity`. `inverted` is its own verdict because a construct built
+  BACKWARDS is a different next step from one that simply failed: each read
+  reports the spans matching the reference's reverse complement in
+  `inversions` + `inverted_bp`. `multi-align` rows and `diff-plasmid` carry
+  the same `inverted_segments`).
 - **History** — get-history returns the parsed `<HistoryTree>`
   lineage as nested JSON — the FULL per-node record, matching what the
   History tab shows: name / operation / length / topology / date /

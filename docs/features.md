@@ -116,7 +116,18 @@ What you can do without leaving the terminal.
   with three insert sources (current plasmid, library entry, free-form
   PCR product). 2-enzyme directional cuts produce both forward and
   reverse-orientation products; non-ligatable orientations are flagged
-  rather than silently dropped. Each junction's sticky overhang is
+  rather than silently dropped. **Self-ligation risk** is reported
+  alongside the product: a backbone whose two ends match each other —
+  one enzyme, two blunt cutters, or a compatible-cohesive pair such as
+  SalI and XhoI, which both leave TCGA — re-closes without any insert
+  and is the usual source of empty colonies. The report names the fix
+  (dephosphorylate, or pick different overhangs) and says whether a
+  diagnostic digest could even spot an empty-vector colony. It also
+  lists the other circles the tube can make: two inserts in tandem or
+  head-to-head, a shorter chain of fragments closing without the rest,
+  an insert flipping in place, neighbours swapping order. A reaction
+  with no off-target route says so explicitly, naming which ends
+  disagree, so silence never has to be read as "not checked". Each junction's sticky overhang is
   annotated at the bases that actually anneal there, derived from the
   enzyme's own 5'/3' geometry, and a cloning site the ligation
   regenerates comes back as one intact feature instead of two halves
@@ -212,6 +223,14 @@ What you can do without leaving the terminal.
   natural-sorted by `(collection, plasmid)` so `pBin2` lands before
   `pBin10`. One click opens the entry without manually switching
   collections.
+- **Inverted-region detection** — a construct whose insert went in
+  backwards used to align as plain divergence, because comparing a
+  flipped region forwards scores like random sequence. Poorly-matching
+  stretches are re-checked against the reverse complement; a stretch
+  that matches is marked as inverted on the linear map (magenta), given
+  its own grade in the Verification Report, and reported with its exact
+  span and identity. A read that aligns wholly as the reverse
+  complement is called out too.
 - **Pairwise alignment of sequencing runs** — File → Align sequencing
   run loads a Plasmidsaurus `.zip` (or any `.gbk` / `.gb`), pairwise-
   aligns it against the loaded plasmid, and renders a full-screen

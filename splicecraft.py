@@ -42,13 +42,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.59"
+__version__ = "1.2.60"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-09-13"
+_RELEASE_DATE = "2026-09-14"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -8660,6 +8660,19 @@ from splicecraft_cloning import (  # noqa: E402
     _simulate_traditional_cloning_multi as _simulate_traditional_cloning_multi,
     _annotate_scars_on_product as _annotate_scars_on_product,
     _rc_fragment as _rc_fragment,
+    # Self-ligation / off-target closure analyser [INV-192]
+    _self_ligation_risks as _self_ligation_risks,
+    _attach_self_ligation as _attach_self_ligation,
+    _chain_closes_into_vector as _chain_closes_into_vector,
+    _frag_ends_rc as _frag_ends_rc,
+    _end_rc as _end_rc,
+    _end_desc as _end_desc,
+    _SELF_LIGATION_MAX_LANE as _SELF_LIGATION_MAX_LANE,
+    _SELF_LIGATION_SUBSET_LANE as _SELF_LIGATION_SUBSET_LANE,
+    _SELF_LIGATION_MAX_LISTED as _SELF_LIGATION_MAX_LISTED,
+    _SELF_LIGATION_MAX_PARTIALS as _SELF_LIGATION_MAX_PARTIALS,
+    _SELF_LIGATION_MAX_RISK_ROWS as _SELF_LIGATION_MAX_RISK_ROWS,
+    _SELF_LIGATION_MAX_NAMES as _SELF_LIGATION_MAX_NAMES,
     # Fragment prep (build/excise the fragments the cloning sims consume)
     _make_synthetic_fragment as _make_synthetic_fragment,
     _enzyme_is_type_iis as _enzyme_is_type_iis,
@@ -11431,6 +11444,21 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
         # restored when canvas_axis="query"), so `aligned_t` is the
         # rotated target — its first non-gap is original bp `best_offset`.
         best_result["target_row_offset"] = best_offset % len(target_seq)
+    # Inverted segments [INV-193] — computed on the FINAL strings, after
+    # every frame shift above, so the spans are in the same coordinates the
+    # overlay segments land in. A read whose insert went in backwards is
+    # the construct you built, flipped; without this it scored like an
+    # unrelated plasmid and the whole span read as one red mismatch block.
+    # Never fatal: a probe failure leaves the field empty, which reads the
+    # same as "no inversion" and costs the caller nothing.
+    try:
+        best_result["inverted_segments"] = _alignment_inverted_segments(
+            best_result.get("aligned_q", ""),
+            best_result.get("aligned_t", ""),
+        )
+    except Exception:
+        _log.exception("rotation picker: inverted-segment probe raised")
+        best_result["inverted_segments"] = []
     return best_result
 
 
@@ -11963,6 +11991,476 @@ def _pairwise_align(query_seq: str, target_seq: str,
     }
 
 
+# ── Inverted-segment detection [INV-193] ───────────────────────────────────
+#
+# A plasmid whose insert went in BACKWARDS aligns perfectly everywhere except
+# across the insert, where forward alignment scores like random sequence
+# (~25% identity). The overlay painted that as one long red "mismatch" block
+# and the status badge read ✗ divergent — the same answer it gives for a
+# completely unrelated plasmid. The two are not the same result: an inverted
+# insert is the construct you built, flipped, and the read PROVES it by
+# matching the reverse complement over the same span.
+#
+# `_alignment_inverted_segments` re-tests every long non-matching block
+# against the reverse complement of the query bases in it. A block whose RC
+# identity is high AND clearly beats its forward identity is reported as an
+# inversion, with its span in BOTH frames so either overlay axis can paint
+# it. Everything else is left exactly as it was — this only ever RE-LABELS a
+# region the aligner had already given up on.
+
+# Shortest block worth re-testing. Below this, a "reverse complement match"
+# is mostly chance: a 4-base alphabet makes short RC hits common, and a
+# handful of bases is not an inversion anyone acts on.
+_INVERSION_MIN_BP = 30
+# RC identity a block must reach to be called inverted.
+_INVERSION_MIN_IDENTITY_PCT = 90.0
+# …AND it must beat the block's FORWARD identity by this margin. This is the
+# guard that kills the degenerate cases: a palindromic or near-palindromic
+# block is its own reverse complement, so it scores the same both ways and
+# is NOT an inversion (it's just a palindrome the aligner already handled).
+_INVERSION_MIN_MARGIN_PCT = 25.0
+# Per-column segmentation weights. A matching column scores
+# `-_INVERSION_COLUMN_PENALTY`, a non-matching one `1 - penalty`, so a slice
+# sums positive exactly when its non-match rate exceeds the penalty. 0.25 is
+# the baseline "this stretch is not simply a good alignment with a few
+# errors": a clean read runs ~1% and a noisy one ~5%.
+#
+# It is deliberately NOT set near the ~75% that a random forward comparison
+# of a flipped block would predict. An affine-gap aligner does not leave the
+# block alone — it spends gaps chasing the chance matches, which lifts the
+# measured match rate inside a real inversion to ~55% (measured on a 1,200 bp
+# flip: 45% non-matching columns, not 75%). Segmentation is therefore
+# generous and the REVERSE-COMPLEMENT test below is what actually decides;
+# a merely noisy region is found here and then rejected there.
+_INVERSION_COLUMN_PENALTY = 0.25
+# Minimum mean score a candidate block must carry — with the penalty above,
+# 0.05 means a non-match rate of at least 30%.
+_INVERSION_MIN_BLOCK_DENSITY = 0.05
+# Low-complexity guards. A homopolymer run vs its complement (AAAA…/TTTT…)
+# is a perfect RC match and means nothing biologically, so require real
+# sequence: at least 3 distinct bases, no single base dominating.
+_INVERSION_MIN_DISTINCT_BASES = 3
+_INVERSION_MAX_SINGLE_BASE_FRAC = 0.80
+# Work caps. Each sweep pass is one O(columns) scan; passes stop as soon as
+# the best remaining block falls under the length / density floor, so a
+# clean alignment costs exactly one pass.
+_INVERSION_MAX_BLOCKS = 8
+_INVERSION_MAX_REALIGN_BP = 20_000
+_INVERSION_REALIGN_BUDGET_BP = 200_000
+# Columns of slack when deciding whether a candidate block "touches" the
+# start or end of the alignment, for the origin-straddling wrap pass. Chance
+# matches at the very edge routinely shift the block in by one or two.
+_INVERSION_WRAP_EDGE_SLACK = 8
+
+
+def _block_identity_pct(a: str, b: str) -> float:
+    """IUPAC identity of two EQUAL-LENGTH ungapped blocks, as a
+    percentage over their length. 0.0 for empty or length-mismatched
+    input (callers use the aligner for that case)."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    hits = sum(1 for x, y in zip(a.upper(), b.upper())
+               if _iupac_compatible(x, y))
+    return 100.0 * hits / len(a)
+
+
+def _realign_identity_pct(a: str, b: str) -> float:
+    """Ungapped identity of two blocks via a real global alignment — the
+    path that survives a block boundary landing a few bp off, where a
+    positional compare would shift every base and read as noise. Returns
+    0.0 when either side is empty, the pair is over
+    `_INVERSION_MAX_REALIGN_BP`, or the aligner refuses: this feeds a
+    re-labelling decision, and "can't tell" must read as "not an
+    inversion" rather than raise."""
+    if not a or not b:
+        return 0.0
+    if max(len(a), len(b)) > _INVERSION_MAX_REALIGN_BP:
+        return 0.0
+    try:
+        r = _pairwise_align(a, b, mode="global")
+    except Exception:
+        _log.debug("inversion probe: block re-align failed (%d vs %d bp)",
+                   len(a), len(b), exc_info=True)
+        return 0.0
+    return float(r.get("ungapped_identity_pct", 0.0) or 0.0)
+
+
+def _block_is_informative(block: str) -> bool:
+    """True when a block carries enough sequence complexity for an RC
+    match to mean something (see the low-complexity guards above)."""
+    b = block.upper()
+    if len(b) < _INVERSION_MIN_BP:
+        return False
+    counts: "dict[str, int]" = {}
+    for ch in b:
+        counts[ch] = counts.get(ch, 0) + 1
+    if len(counts) < _INVERSION_MIN_DISTINCT_BASES:
+        return False
+    return max(counts.values()) / len(b) <= _INVERSION_MAX_SINGLE_BASE_FRAC
+
+
+def _max_scoring_segment(scores: "list[float]") -> "tuple[int, int, float] | None":
+    """Kadane: the contiguous ``[start, end)`` slice of ``scores`` with the
+    highest sum, or None when no slice sums above zero. Used to pull the
+    single most non-matching-dense region out of an alignment; the caller
+    masks it and re-runs to find the next one."""
+    best_sum = 0.0
+    best: "tuple[int, int, float] | None" = None
+    cur_sum = 0.0
+    cur_start = 0
+    for i, x in enumerate(scores):
+        if cur_sum <= 0.0:
+            cur_start = i
+            cur_sum = x
+        else:
+            cur_sum += x
+        if cur_sum > best_sum:
+            best_sum = cur_sum
+            best = (cur_start, i + 1, cur_sum)
+    return best
+
+
+def _alignment_inverted_segments(
+    aligned_q: str, aligned_t: str,
+    *, min_bp: int = _INVERSION_MIN_BP,
+    min_identity_pct: float = _INVERSION_MIN_IDENTITY_PCT,
+    min_margin_pct: float = _INVERSION_MIN_MARGIN_PCT,
+    max_blocks: int = _INVERSION_MAX_BLOCKS,
+) -> "list[dict]":
+    """Find spans where the query matches the REVERSE COMPLEMENT of the
+    target — an inverted insert, a flipped cassette, a region cloned
+    backwards.
+
+    Returns ``[{t_start, t_end, q_start, q_end, length, identity_pct,
+    forward_identity_pct}, …]`` ascending by ``t_start``, where
+    ``t_start``/``t_end`` are half-open target bp (non-gap positions of
+    ``aligned_t`` — the frame `_extract_variants_from_alignment` numbers
+    in) and ``q_start``/``q_end`` the same for the query. Empty when
+    nothing qualifies, which is the answer for an ordinary mismatched
+    read, so an empty list never means "not checked".
+
+    **Why blocks are found by SCORE, not by contiguous mismatch.** A
+    global aligner does not leave a flipped insert as one clean mismatch
+    run: forward-aligning a reverse-complemented region scores like random
+    sequence, so ~25% of its columns match BY CHANCE and chop the region
+    into runs a few bp long. Scanning for contiguous non-matching runs
+    therefore found nothing at all on the very case this exists for
+    (measured: a 1,200 bp inversion produced no run over 30 bp). Instead
+    each column scores against a baseline non-match rate
+    (`_INVERSION_COLUMN_PENALTY`) and the maximal-scoring slice is the
+    region whose match rate collapses relative to the rest, however the
+    chance matches fall. Each candidate is then masked and the sweep
+    repeats, so several independent inversions are all found.
+
+    A candidate is reported only when its reverse complement matches the
+    target well (``min_identity_pct``) AND beats its own forward identity
+    by ``min_margin_pct`` — the margin is what rejects a palindrome, which
+    scores the same in both directions. Low-complexity blocks are dropped
+    before either test.
+
+    **Origin-straddling inversions** get a second pass. A circular molecule
+    has no ends but the alignment does, so a flipped block crossing bp 0
+    arrives as two blocks at OPPOSITE ends of the strings — and neither one
+    matches the reverse complement of the bases under it, because each is
+    the RC of the OTHER half's region. Rejoined in circle order (the
+    string's tail block, then its head block) they are the original block
+    again, and one more RC test catches the event. Both halves are then
+    emitted, each carrying ``wrapped: True`` so a caller can count one
+    inversion rather than two.
+
+    Never raises: malformed / unequal-length input returns ``[]``."""
+    if not aligned_q or not aligned_t:
+        return []
+    if len(aligned_q) != len(aligned_t):
+        return []
+    try:
+        min_bp = max(1, int(min_bp))
+        max_blocks = max(0, int(max_blocks))
+    except (TypeError, ValueError):
+        min_bp, max_blocks = _INVERSION_MIN_BP, _INVERSION_MAX_BLOCKS
+    if not max_blocks:
+        return []
+    aq = aligned_q.upper()
+    at = aligned_t.upper()
+    n = len(aq)
+    # Per-column score + the column→bp maps for both axes, in one pass.
+    scores: "list[float]" = [0.0] * n
+    t_at: "list[int]" = [0] * (n + 1)
+    q_at: "list[int]" = [0] * (n + 1)
+    t_pos = q_pos = 0
+    for i in range(n):
+        t_at[i] = t_pos
+        q_at[i] = q_pos
+        cq, ct = aq[i], at[i]
+        matched = (cq != "-" and ct != "-" and _iupac_compatible(cq, ct))
+        scores[i] = (-_INVERSION_COLUMN_PENALTY if matched
+                     else 1.0 - _INVERSION_COLUMN_PENALTY)
+        if ct != "-":
+            t_pos += 1
+        if cq != "-":
+            q_pos += 1
+    t_at[n], q_at[n] = t_pos, q_pos
+    # Sweep out the candidate blocks first, then judge them — the wrap pass
+    # below needs to see the ones that were REJECTED individually.
+    candidates: "list[tuple[int, int, str, str]]" = []
+    for _ in range(max_blocks):
+        seg = _max_scoring_segment(scores)
+        if seg is None:
+            break
+        c_lo, c_hi, seg_score = seg
+        span_cols = c_hi - c_lo
+        if span_cols < min_bp:
+            break
+        if seg_score < span_cols * _INVERSION_MIN_BLOCK_DENSITY:
+            break
+        for i in range(c_lo, c_hi):      # mask, so it can't be re-found
+            scores[i] = -1e9
+        candidates.append((c_lo, c_hi,
+                           aq[c_lo:c_hi].replace("-", ""),
+                           at[c_lo:c_hi].replace("-", "")))
+    candidates.sort()
+    out: "list[dict]" = []
+    budget = [0]                          # realigned bp, shared by both passes
+
+    def _score_pair(q_block: str, t_block: str) -> "tuple[float, float]":
+        """(forward%, reverse-complement%) for one block pair."""
+        fwd_pct = rev_pct = 0.0
+        rc_block = _rc(q_block)
+        if len(q_block) == len(t_block):
+            fwd_pct = _block_identity_pct(q_block, t_block)
+            rev_pct = _block_identity_pct(rc_block, t_block)
+        if (rev_pct < min_identity_pct
+                and budget[0] < _INVERSION_REALIGN_BUDGET_BP):
+            # Either the blocks differ in length, or a positional compare
+            # fell short because the block boundary sits a few bp off the
+            # true inversion. Ask the aligner.
+            budget[0] += max(len(q_block), len(t_block))
+            rev_pct = max(rev_pct, _realign_identity_pct(rc_block, t_block))
+            fwd_pct = max(fwd_pct, _realign_identity_pct(q_block, t_block))
+        return fwd_pct, rev_pct
+
+    def _usable(q_block: str, t_block: str) -> bool:
+        return (len(q_block) >= min_bp and len(t_block) >= min_bp
+                and _block_is_informative(t_block)
+                and _block_is_informative(q_block))
+
+    def _emit(c_lo: int, c_hi: int, rev_pct: float, fwd_pct: float,
+              wrapped: bool = False) -> None:
+        entry = {
+            "t_start":              t_at[c_lo],
+            "t_end":                t_at[c_hi],
+            "q_start":              q_at[c_lo],
+            "q_end":                q_at[c_hi],
+            "length":               t_at[c_hi] - t_at[c_lo],
+            "identity_pct":         round(rev_pct, 2),
+            "forward_identity_pct": round(fwd_pct, 2),
+        }
+        if wrapped:
+            # Both halves of one inversion that straddles bp 0. Kept as two
+            # spans rather than a single `end < start` wrap span (sacred
+            # invariant #8's convention) because every overlay consumer
+            # walks half-open ascending ranges; `wrapped` says they are one
+            # biological event so a caller can report "1 inversion", not 2.
+            entry["wrapped"] = True
+        out.append(entry)
+
+    rejected: "list[tuple[int, int, str, str]]" = []
+    for c_lo, c_hi, q_block, t_block in candidates:
+        if not _usable(q_block, t_block):
+            rejected.append((c_lo, c_hi, q_block, t_block))
+            continue
+        fwd_pct, rev_pct = _score_pair(q_block, t_block)
+        if rev_pct < min_identity_pct or rev_pct - fwd_pct < min_margin_pct:
+            # Scores the same either way — a palindrome or a
+            # low-information block — or simply doesn't match backwards.
+            rejected.append((c_lo, c_hi, q_block, t_block))
+            continue
+        _emit(c_lo, c_hi, rev_pct, fwd_pct)
+    # ── Wrap pass: an inversion straddling the ORIGIN ───────────────────
+    # A circular molecule has no ends, but the alignment does. Flip a block
+    # that crosses bp 0 and its two halves land at OPPOSITE ends of the
+    # linear alignment — and neither half matches the reverse complement of
+    # the bases it sits on, because each is the RC of the OTHER half's
+    # region. Tested individually both fail; joined in circle order
+    # (tail-of-string, then head) they are the original block, so one more
+    # RC test catches the whole event.
+    if len(rejected) >= 2:
+        # "Touching the edge" allows a few columns of slack: ~25% of an
+        # inverted block's columns match by chance, so the maximal-scoring
+        # slice routinely starts one or two columns in from bp 0 (measured
+        # on real pUC19: the head block began at column 1, and a strict
+        # equality test found nothing).
+        head = next((c for c in rejected
+                     if c[0] <= _INVERSION_WRAP_EDGE_SLACK), None)
+        tail = next((c for c in reversed(rejected)
+                     if c[1] >= n - _INVERSION_WRAP_EDGE_SLACK), None)
+        if head is not None and tail is not None and head is not tail \
+                and tail[0] > head[1]:
+            # Anchor the joint block to the STRING edges, not to the
+            # candidates' trimmed bounds, so the two halves rejoin with no
+            # bases missing at the seam.
+            head_hi, tail_lo = head[1], tail[0]
+            joint_q = (aq[tail_lo:].replace("-", "")
+                       + aq[:head_hi].replace("-", ""))
+            joint_t = (at[tail_lo:].replace("-", "")
+                       + at[:head_hi].replace("-", ""))
+            if _usable(joint_q, joint_t):
+                fwd_pct, rev_pct = _score_pair(joint_q, joint_t)
+                if (rev_pct >= min_identity_pct
+                        and rev_pct - fwd_pct >= min_margin_pct):
+                    _emit(tail_lo, n, rev_pct, fwd_pct, wrapped=True)
+                    _emit(0, head_hi, rev_pct, fwd_pct, wrapped=True)
+    out.sort(key=lambda d: (d["t_start"], d["t_end"]))
+    return out
+
+
+def _inversion_note(result: dict, axis: str = "target") -> str:
+    """One-line plain-text note about an alignment's orientation findings,
+    for a toast / summary line. Empty when the read aligned forward with no
+    inverted block.
+
+    Covers BOTH orientation signals, because either one alone reads as a bad
+    alignment: a whole-read flip (`query_rc` — the picker aligned the
+    reverse complement, which is how a read assembled the other way round
+    reaches a clean score) and per-span inversions (`inverted_segments`)."""
+    if not isinstance(result, dict):
+        return ""
+    bits: "list[str]" = []
+    segs = _inverted_spans(result, axis)
+    if segs:
+        total = sum(e - s for s, e in segs)
+        n_events = _inverted_event_count(result)
+        bits.append(f"{n_events} inverted segment"
+                    f"{'' if n_events == 1 else 's'} ({total:,} bp)")
+    if result.get("query_rc"):
+        bits.append("read aligned as reverse complement")
+    return " · ".join(bits)
+
+
+def _inverted_spans(result: dict, axis: str = "target") -> "list[tuple[int, int]]":
+    """``[(start, end), …]`` of an alignment result's inverted segments in
+    the requested axis' coordinates. Empty (never raises) for a result
+    with no inversions or a malformed list — a stored alignment can carry
+    anything after a hand-edit."""
+    segs = (result or {}).get("inverted_segments") if isinstance(result, dict) else None
+    if not isinstance(segs, list):
+        return []
+    key_s, key_e = (("q_start", "q_end") if axis == "query"
+                    else ("t_start", "t_end"))
+    out: "list[tuple[int, int]]" = []
+    for seg in segs:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            s, e = int(seg.get(key_s, 0)), int(seg.get(key_e, 0))
+        except (TypeError, ValueError):
+            continue
+        if e > s >= 0:
+            out.append((s, e))
+    return out
+
+
+def _inverted_event_count(result: dict) -> int:
+    """How many inverted EVENTS an alignment found, not how many spans.
+
+    An inversion straddling the origin is emitted as two spans, both
+    carrying ``wrapped``, because every overlay consumer walks half-open
+    ascending ranges. It is still ONE flipped block, and reporting "2
+    inverted segments" for it would overstate what happened."""
+    segs = (result or {}).get("inverted_segments") if isinstance(result, dict) else None
+    if not isinstance(segs, list):
+        return 0
+    plain = sum(1 for s in segs if isinstance(s, dict) and not s.get("wrapped"))
+    wrapped = sum(1 for s in segs if isinstance(s, dict) and s.get("wrapped"))
+    # Wrapped spans come in pairs; round up so an odd count (a hand-edited
+    # store) still reports at least one.
+    return plain + (wrapped + 1) // 2
+
+
+def _inverted_bp(result: dict, axis: str = "target") -> int:
+    """Total bp covered by an alignment's inverted segments (union is not
+    needed — the detector emits disjoint runs)."""
+    return sum(e - s for s, e in _inverted_spans(result, axis))
+
+
+def _relabel_segments_inverted(
+    segments: "list[tuple[int, int, str]]",
+    spans: "list[tuple[int, int]]",
+) -> "list[tuple[int, int, str]]":
+    """Re-label every overlay segment (or part of one) that falls inside an
+    inverted span as state ``"inverted"``, splitting segments at the span
+    boundaries and coalescing adjacent same-state runs afterwards.
+
+    The WHOLE span is re-labelled, including the ~25% of columns that match
+    by chance inside a flipped block — those aren't real matches, and
+    leaving them blue would speckle the inverted region with "this part is
+    fine". Returns a new list; the input is untouched."""
+    if not spans or not segments:
+        return list(segments)
+    norm = sorted({(int(s), int(e)) for s, e in spans if int(e) > int(s)})
+    if not norm:
+        return list(segments)
+    pieces: "list[tuple[int, int, str]]" = []
+    for seg in segments:
+        try:
+            s, e, state = int(seg[0]), int(seg[1]), str(seg[2])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if e <= s:
+            continue
+        cuts = {s, e}
+        for a, b in norm:
+            if b <= s or a >= e:
+                continue
+            cuts.add(max(s, a))
+            cuts.add(min(e, b))
+        ordered = sorted(cuts)
+        for lo, hi in zip(ordered, ordered[1:]):
+            if hi <= lo:
+                continue
+            inside = any(a <= lo and hi <= b for a, b in norm)
+            pieces.append((lo, hi, "inverted" if inside else state))
+    merged: "list[tuple[int, int, str]]" = []
+    for lo, hi, state in pieces:
+        if merged and merged[-1][2] == state and merged[-1][1] == lo:
+            merged[-1] = (merged[-1][0], hi, state)
+        else:
+            merged.append((lo, hi, state))
+    return merged
+
+
+def _alignment_inverted_columns(
+    segments: "list[tuple[int, int, str]]",
+    view_s: int, view_e: int, bp_to_col,
+    col_lo_bound: int, col_hi_bound: int,
+) -> "set[int]":
+    """Columns the bar-mode overlay should paint as INVERTED. Mirrors
+    `_alignment_bar_columns`' degenerate-range handling so a short inverted
+    span still claims at least one column instead of vanishing at full
+    zoom-out. Pure — the bp→col mapping is a callable."""
+    cols: "set[int]" = set()
+    for seg in segments:
+        try:
+            seg_s, seg_e, state = seg[0], seg[1], seg[2]
+        except (IndexError, TypeError, ValueError):
+            continue
+        if state != "inverted":
+            continue
+        s = max(int(seg_s), view_s)
+        e = min(int(seg_e), view_e)
+        if s >= e:
+            continue
+        c0 = bp_to_col(s)
+        c1 = bp_to_col(e)
+        if c1 <= c0:
+            c1 = c0 + 1
+        c0 = max(col_lo_bound, c0)
+        c1 = min(col_hi_bound, c1)
+        for col in range(c0, c1):
+            cols.add(col)
+    return cols
+
+
 def _alignment_to_target_segments(
     aligned_q: str, aligned_t: str, t_start: int = 0,
 ) -> "list[tuple[int, int, str]]":
@@ -12165,7 +12663,11 @@ def _alignment_to_query_letters(
 # a difference is never hidden under a neighbouring match. mismatch (a
 # true SNP) outranks gap (an indel) outranks match — the user wants a
 # mismatched base to surface red "even if one bp".
-_ALIGN_STATE_PRIORITY = {"match": 0, "gap": 1, "mismatch": 2}
+# `inverted` outranks everything: a flipped block is the most specific
+# thing the overlay can say about a column, and collapsing it into the
+# surrounding mismatch run is exactly the wholesale "misalignment" reading
+# [INV-193] exists to stop.
+_ALIGN_STATE_PRIORITY = {"match": 0, "gap": 1, "mismatch": 2, "inverted": 3}
 
 
 def _alignment_bar_columns(
@@ -12243,7 +12745,11 @@ def _alignment_bar_column_shades(
     can pin it without a PlasmidMap.
     """
     acc: "dict[int, list[int]]" = {}
-    state_idx = {"match": 0, "mismatch": 1, "gap": 2}
+    # `inverted` counts in the MISMATCH slot: those bases genuinely don't
+    # match the target at that position, so the shade density stays honest.
+    # The inverted span is drawn on top with its own glyph + colour
+    # (`_alignment_inverted_columns`), which is what distinguishes it.
+    state_idx = {"match": 0, "mismatch": 1, "gap": 2, "inverted": 1}
     for seg in segments:
         try:
             seg_s, seg_e, state = seg[0], seg[1], seg[2]
@@ -12832,6 +13338,41 @@ def _deserialize_stored_alignment_args(
     # alignments lack it — default 0 (the unrotated case they were all
     # rendered as anyway).
     result.setdefault("target_row_offset", 0)
+    # `inverted_segments` (2026-09-14, [INV-193]): stored alignments written
+    # before the detector existed don't carry it. Default to empty — which
+    # reads as "aligned forward", the behaviour those alignments were
+    # rendered with — and drop any entry that isn't a well-formed span, so a
+    # hand-edited store can't paint a bogus inverted block over good bases.
+    raw_inv = result.get("inverted_segments")
+    if not isinstance(raw_inv, list):
+        if raw_inv is not None:
+            _log.warning(
+                "alignment hydrate: stored entry %r has non-list "
+                "inverted_segments=%r; dropping",
+                stored.get("label", "?"), type(raw_inv).__name__,
+            )
+        result["inverted_segments"] = []
+    else:
+        clean_inv: "list[dict]" = []
+        for seg in raw_inv:
+            if not isinstance(seg, dict):
+                continue
+            try:
+                t_s, t_e = int(seg.get("t_start", 0)), int(seg.get("t_end", 0))
+                q_s, q_e = int(seg.get("q_start", 0)), int(seg.get("q_end", 0))
+            except (TypeError, ValueError):
+                continue
+            if t_e <= t_s or t_s < 0 or q_e <= q_s or q_s < 0:
+                continue
+            clean_inv.append(seg)
+        if len(clean_inv) != len(raw_inv):
+            _log.warning(
+                "alignment hydrate: stored entry %r had %d malformed "
+                "inverted_segments; kept %d",
+                stored.get("label", "?"),
+                len(raw_inv) - len(clean_inv), len(clean_inv),
+            )
+        result["inverted_segments"] = clean_inv
     # INV-73 (2026-05-25): validate the rotation-picker fields against
     # their expected value space. A corrupted storage file (manual
     # edit / cross-version downgrade / partial write recovery) could
@@ -12956,9 +13497,9 @@ def _alignment_quality_status(
 
     Returns ``(code, glyph, color)`` where:
 
-      * ``code`` is one of ``"verified"`` / ``"near"`` / ``"partial"``
-        / ``"divergent"`` — for sort/filter consumers.
-      * ``glyph`` is a single rendered character (``✓`` / ``⚠`` /
+      * ``code`` is one of ``"verified"`` / ``"inverted"`` / ``"near"``
+        / ``"partial"`` / ``"divergent"`` — for sort/filter consumers.
+      * ``glyph`` is a single rendered character (``✓`` / ``⇄`` / ``⚠`` /
         ``~`` / ``✗``) for the LibraryPanel column cell.
       * ``color`` is the rich-style colour name (``"green"`` /
         ``"yellow"`` / ``"red"``).
@@ -12966,7 +13507,9 @@ def _alignment_quality_status(
     Thresholds use BOTH ungapped identity AND coverage% so a read that
     matches a sub-region perfectly (e.g. plasmidsaurus consensus of
     a different but related plasmid) doesn't false-positive as
-    ``verified``. ``n_gaps == 0`` is the strict invariant for ``✓`` —
+    ``verified``. ``inverted`` ([INV-193]) is decided before any of the
+    numeric tiers, because a flipped region fails them in a way that
+    describes it wrongly — see the comment at that branch. ``n_gaps == 0`` is the strict invariant for ``✓`` —
     even one indel demotes to ``⚠`` since indels are typically a
     bigger deal than SNPs for a cloning workflow.
     """
@@ -12990,6 +13533,18 @@ def _alignment_quality_status(
             and n_gaps <= _SEQ_STATUS_VERIFIED_MAX_GAPS
             and n_mismatch == 0):
         return ("verified", "✓", "green")
+    # An inverted block is a SPECIFIC answer, not a failed alignment
+    # [INV-193]: the read matches the reverse complement over that span, so
+    # the construct is the right sequence built BACKWARDS. Checked ahead of
+    # every remaining tier because it outranks all of them as a description:
+    # a big flip drags identity + coverage into `partial` / `divergent`
+    # (the verdict an unrelated plasmid gets), while a small one hides
+    # inside `near` as a handful of ordinary SNPs. Neither tells the user
+    # their insert went in the wrong way round. `verified` still wins above
+    # — and can't collide, since an inverted block always carries
+    # mismatches and `verified` demands zero.
+    if _inverted_spans(result):
+        return ("inverted", "⇄", "yellow")
     if (ungapped >= _SEQ_STATUS_NEAR_UNGAPPED_PCT
             and coverage_pct >= _SEQ_STATUS_NEAR_COVERAGE_PCT):
         return ("near", "⚠", "yellow")
@@ -13003,9 +13558,10 @@ def _alignment_quality_status(
 # overrules a "divergent" one, etc. Drives the per-entry summary in
 # `_library_entry_alignment_summary`.
 _SEQ_STATUS_PRIORITY = {
-    "verified":  3,
-    "near":      2,
-    "partial":   1,
+    "verified":  4,
+    "near":      3,
+    "partial":   2,
+    "inverted":  1,
     "divergent": 0,
 }
 
@@ -16399,7 +16955,8 @@ class PlasmidMap(Widget):
                     if s >= e:
                         continue
                     color = (
-                        "color(196)" if state == "mismatch"
+                        "color(201)" if state == "inverted"
+                        else "color(196)" if state == "mismatch"
                         else "color(240)" if state == "gap"
                         else "color(39)"
                     )
@@ -16451,6 +17008,17 @@ class PlasmidMap(Widget):
                         col, row, glyph,
                         f"{base_style} {shade_style}".strip(),
                     )
+                # Inverted spans paint LAST and in their own colour
+                # [INV-193]. The shade pass above counted those columns as
+                # mismatches (they are, base for base), which is the honest
+                # density — but "flipped" and "wrong" look identical in red,
+                # and telling them apart is the whole point. `◄` reads as
+                # "this runs the other way".
+                for col in _alignment_inverted_columns(
+                        align.get("segments", ()), view_s, view_e, bp_to_col,
+                        margin_l, margin_l + usable_w):
+                    canvas.put(col, row, "◄",
+                               f"{base_style} color(201)".strip())
 
             # Strand arrowhead at the right tip of the bar. All
             # registered alignments are forward against the target;
@@ -16495,6 +17063,7 @@ class PlasmidMap(Widget):
                         bg = (
                             "color(39)"  if st == "match"
                             else "color(196)" if st == "mismatch"
+                            else "color(201)" if st == "inverted"
                             else "color(240)"
                         )
                         # Always paint black-on-color regardless of
@@ -22847,7 +23416,7 @@ Click a CDS bar (or its amino-acid letters) and `Ctrl+C` copies the **protein** 
 | `Ctrl+P` | Primer design |
 | `Ctrl+B` | BLAST / HMMscan — **Local** (your library) + **Online** (NCBI BLAST · Pfam) |
 | `Ctrl+G` | Cloning-grammar editor (Golden Braid · MoClo · …) |
-| `Alt+A` | Align the current plasmid against library plasmids — each pick adds a row to the linear-map overlay (blue match · red mismatch · gray gap, with a coverage histogram). **Click a lane to jump the sequence panel to that spot** (centered + highlighted) so misaligned / to-be-edited bases are one click away. |
+| `Alt+A` | Align the current plasmid against library plasmids — each pick adds a row to the linear-map overlay (blue match · red mismatch · gray gap · magenta inverted, with a coverage histogram). A stretch that matches the other plasmid BACKWARDS is marked inverted rather than written off as mismatch. **Click a lane to jump the sequence panel to that spot** (centered + highlighted) so misaligned / to-be-edited bases are one click away. |
 | `Alt+L` | Open the Alignment Manager — the full pairwise-alignment detail view (per-base aligned strands) opens with **Enter** on a row. |
 | `Alt+Shift+A` | Clear every alignment row from the overlay |
 
@@ -59849,6 +60418,12 @@ class SequencingScreen(Screen):
                     f" · target frame shifted by "
                     f"{int(result.get('target_rotation') or 0):,} bp"
                 )
+            # Orientation findings [INV-193] — an inverted block or a
+            # whole-read flip is the headline when it happens, so it goes
+            # ahead of the rotation note and raises the toast's severity: a
+            # flipped insert read as a low identity score is exactly the
+            # "it just didn't align" reading this replaces.
+            inv_note = _inversion_note(result, "target")
             try:
                 self.app.notify(
                     f"Aligned {query_label} → {target_label} · "
@@ -59856,10 +60431,12 @@ class SequencingScreen(Screen):
                     f"({coverage_pct:.0f}% coverage) at "
                     f"{_format_identity_pct(ident_total)} identity "
                     f"({_format_identity_pct(ident_ungap)} in matched region)"
+                    f"{' · ⇄ ' + inv_note if inv_note else ''}"
                     f"{rot_note} · "
                     f"click read on map to inspect.",
                     title="Alignment added",
-                    severity="information", timeout=8,
+                    severity="warning" if inv_note else "information",
+                    timeout=10 if inv_note else 8,
                 )
             except Exception:
                 pass
@@ -60122,7 +60699,7 @@ class SequencingScreen(Screen):
     def _compute_bulk_quality(self, matches: "list[dict]") -> None:
         """Align each target-bearing sample against its proposed match,
         on the matcher worker thread, stashing the display summary
-        (`_aln` = ``{ident, mism, gaps}``) AND the full
+        (`_aln` = ``{ident, mism, gaps, inv, inv_bp}``) AND the full
         `_pick_best_rotation` result (`_aln_result`, reused verbatim by
         `_bulk_align_worker` so the commit never re-aligns) on each match
         dict. Progress ticks the bar the matcher phase already raised.
@@ -60181,6 +60758,12 @@ class SequencingScreen(Screen):
                     # Indel EVENTS (gap runs), matching the Verification
                     # Report's "Indels" — not gapped bp.
                     "gaps":  _alignment_indel_events(result),
+                    # Inverted blocks [INV-193]. A flipped clone shows up
+                    # here as a huge mismatch count, which reads as "bad
+                    # read" — the one thing a plate of candidate clones is
+                    # being screened FOR is which ones went in backwards.
+                    "inv":     _inverted_event_count(result),
+                    "inv_bp":  _inverted_bp(result, "target"),
                 }
                 m["_aln_result"] = result
             except Exception:
@@ -73154,7 +73737,37 @@ class AlignmentScreen(_OneShotDismissScreen, Screen):
             f"**Matches**: {r['n_matches']:,}  ·  "
             f"**Mismatches**: {r['n_mismatches']:,}  ·  "
             f"**Gaps**: {r['n_gaps']:,}"
+            + self._inversion_md()
         )
+
+    def _inversion_md(self) -> str:
+        """Markdown tail naming every reverse-complement span the detector
+        found ([INV-193]), plus a whole-read flip. Empty when the read
+        aligned forward throughout — the common case adds no line."""
+        r = self._result
+        raw_segs = r.get("inverted_segments")
+        segs: "list" = raw_segs if isinstance(raw_segs, list) else []
+        rows: "list[str]" = []
+        for s in segs[:8]:
+            if not isinstance(s, dict):
+                continue
+            try:
+                a, b = int(s.get("t_start", 0)), int(s.get("t_end", 0))
+            except (TypeError, ValueError):
+                continue
+            rows.append(f"{a:,}–{b:,} ({b - a:,} bp at "
+                        f"{float(s.get('identity_pct') or 0):.1f}% to the "
+                        f"reverse complement)")
+        out = ""
+        if rows:
+            more = f" _(+{len(segs) - len(rows)} more)_" if len(segs) > len(rows) else ""
+            out += ("  \n**⇄ Inverted**: " + "; ".join(rows) + more
+                    + "  \n_This region matches the reference backwards — "
+                    "the sequence is right, the orientation isn't._")
+        if r.get("query_rc"):
+            out += ("  \n**⇄ Whole read** aligned as the reverse "
+                    "complement of the reference.")
+        return out
 
     def _body_text(self, chunk_w: int) -> Text:
         """Render the alignment body as Rich Text. Three rows per
@@ -73592,6 +74205,19 @@ class BulkAlignConfirmModal(_OneShotDismissScreen, ModalScreen):
             name_cell = Text("—", style="dim")
         note = m.get("note") or m.get("method") or ""
         note_cell = Text(note, style="dim")
+        # Inverted blocks [INV-193] lead the Note cell. On a plate of
+        # candidate clones "which ones went in backwards" is the question
+        # being asked, and in the quality columns a flip looks like nothing
+        # but a large mismatch count.
+        _aln_row = m.get("_aln")
+        if isinstance(_aln_row, dict) and _aln_row.get("inv"):
+            _n_inv = int(_aln_row.get("inv") or 0)
+            _bp_inv = int(_aln_row.get("inv_bp") or 0)
+            note_cell = Text.assemble(
+                (f"⇄ {_bp_inv:,} bp inverted"
+                 + (f" ×{_n_inv}" if _n_inv > 1 else ""), "magenta bold"),
+                ((f"  {note}", "dim") if note else ("", "")),
+            )
         # Real alignment quality (filled by `_quality_align_worker`).
         # `_aln` is None until that row's align lands, then a dict (or
         # False on failure). Gated on action so the columns describe
@@ -73747,6 +74373,7 @@ class VerificationReportModal(_OneShotDismissScreen, ModalScreen):
             yield Static(
                 "One row per stored alignment in the active library. "
                 "[red]✗[/red] divergent (low identity), "
+                "[magenta]⇄[/magenta] inverted (a region matches backwards), "
                 "[yellow]⚠[/yellow] near-match (some SNPs / indels), "
                 "[yellow]~[/yellow] partial coverage, "
                 "[green]✓[/green] verified. "
@@ -73843,8 +74470,12 @@ class VerificationReportModal(_OneShotDismissScreen, ModalScreen):
                     "first_pos":  first_variant_pos,
                 })
         # Sort by status priority (worst first) so anomalies are on top.
+        # Worst first. `inverted` sits just above `divergent`: it IS a
+        # failed build, but one the report can name, so it belongs at the
+        # top of the list next to the reads that didn't match at all.
         priority_inv = {
-            "divergent": 0, "partial": 1, "near": 2, "verified": 3,
+            "divergent": 0, "inverted": 1, "partial": 2, "near": 3,
+            "verified": 4,
         }
         rows.sort(key=lambda r: (
             priority_inv.get(r["code"], 4), r["entry_name"].lower(),
@@ -73854,7 +74485,10 @@ class VerificationReportModal(_OneShotDismissScreen, ModalScreen):
     def _add_row(self, t: "DataTable", r: dict) -> None:
         plasmid_cell = Text(r["entry_name"])
         read_cell = Text(r["read_label"], style="dim")
-        seq_cell = Text(r["glyph"], style=f"{r['color']} bold")
+        seq_cell = Text(
+            r["glyph"],
+            style=("magenta bold" if r["code"] == "inverted"
+                   else f"{r['color']} bold"))
         ident_cell = Text(
             # Honest formatter: a sub-100% identity never rounds up to
             # "100%" and contradict the (green) colour tier.
@@ -73894,6 +74528,10 @@ class VerificationReportModal(_OneShotDismissScreen, ModalScreen):
             if counts.get("verified"):
                 parts.append(
                     f"[green]✓ {counts['verified']} verified[/green]"
+                )
+            if counts.get("inverted"):
+                parts.append(
+                    f"[magenta]⇄ {counts['inverted']} inverted[/magenta]"
                 )
             if counts.get("near"):
                 parts.append(
@@ -76756,6 +77394,17 @@ class TraditionalCloningPane(Vertical):
         if status_text:
             top_row.append(status_text, style=status_style)
             bot_row.append(" " * _cell_len(status_text))
+        # ─── ⟲ Backbone self-closure badge [INV-192]. The vector's own
+        # two ends ligate (single-enzyme, blunt, or a compatible-cohesive
+        # pair such as SalI/XhoI), so the empty backbone re-circularises
+        # without an insert. Decided by the SAME end-compatibility test
+        # the engine ligates with, so the badge and the post-Simulate risk
+        # block can't disagree. Pads bot_row by cell width like the
+        # status text above (ambiguous-width glyph).
+        if _chain_closes_into_vector(bb_frag, []):
+            badge = "   ⟲ backbone re-closes without insert"
+            top_row.append(badge, style="bold yellow")
+            bot_row.append(" " * _cell_len(badge))
         # ─── Color legend row (3rd line) ────────────────────────
         # Maps each lane row's color to its name + role so the
         # user can connect the puzzle pieces to the lane DataTable
@@ -78675,6 +79324,15 @@ class TraditionalCloningPane(Vertical):
         # RenamePlasmidModal's status line. The messages carry no intentional
         # markup of their own — the colour tags are added out here.
         from rich.markup import escape as _md_escape
+        # Self-ligation risk block [INV-192] — rendered as its OWN section,
+        # ahead of the junction warnings, because the empty-vector
+        # background is the single most common reason a "✓ ligates" clone
+        # comes back as empty colonies, and a line buried in the warning
+        # list didn't read as a different KIND of problem.
+        sl = outcome.get("self_ligation")
+        if isinstance(sl, dict):
+            lines.append("")
+            lines.extend(self._self_ligation_lines(sl))
         if outcome["warnings"]:
             lines.append("")
             for w in outcome["warnings"]:
@@ -78704,6 +79362,49 @@ class TraditionalCloningPane(Vertical):
         marker = "[green]✓ ligates[/]" if compat else "[red]✗ no ligation[/]"
         return (f"  {marker}  ·  {len(seq):,} bp  ·  "
                  f"{len(feats)} feature(s)")
+
+    @staticmethod
+    def _self_ligation_lines(sl: dict) -> list[str]:
+        """Rich-markup lines for the engine's ``self_ligation`` report
+        (`_self_ligation_risks`, [INV-192]). Three shapes:
+
+          * no risks → one green ``✓ No self-ligation route found`` line
+            with the engine's reason (which ends don't match), so "nothing
+            shown" never has to be read as "not checked". "found" is
+            deliberate: the sweep covers the circles ONE vector copy can
+            make, not vector dimers (see [INV-192]);
+          * any ``high`` risk (empty vector, partial chain) → a red
+            ``SELF-LIGATION RISK`` header;
+          * only ``medium`` risks → a yellow header.
+
+        Each risk is one ``✗``/``⚠`` line plus a dim ``→`` advice line. All
+        text is user-influenced (fragment labels) — escaped like the
+        warnings above."""
+        from rich.markup import escape as _md_escape
+        risks = [r for r in (sl.get("risks") or []) if isinstance(r, dict)]
+        skipped = str(sl.get("skipped") or "")
+        if not risks:
+            note = str(sl.get("clean_note") or "")
+            line = "[b green]✓ No self-ligation route found[/]"
+            if note:
+                line += f"[dim] — {_md_escape(note)}[/]"
+            out = [line]
+            if skipped:
+                out.append(f"  [dim yellow]⚠ {_md_escape(skipped)}[/]")
+            return out
+        high = any(r.get("severity") == "high" for r in risks)
+        out = ["[b red]⚠ SELF-LIGATION RISK[/]" if high
+               else "[b yellow]⚠ Self-ligation risk[/]"]
+        for r in risks:
+            glyph, col = (("✗", "red") if r.get("severity") == "high"
+                          else ("⚠", "yellow"))
+            out.append(f"  [{col}]{glyph} {_md_escape(str(r.get('message') or ''))}[/]")
+            adv = str(r.get("advice") or "")
+            if adv:
+                out.append(f"    [dim]→ {_md_escape(adv)}[/]")
+        if skipped:
+            out.append(f"  [dim yellow]⚠ {_md_escape(skipped)}[/]")
+        return out
 
     # ── Clear ────────────────────────────────────────────────────────────────
 
@@ -96995,8 +97696,13 @@ def _h_multi_align(app, payload):
     Returns one compact row per target — ``{name, identity_pct,
     ungapped_identity_pct, score, n_matches, n_mismatches, q_len, t_len,
     circular, picked_rotation, query_rotation, target_rotation,
-    query_rc}`` (or ``{name, error}`` for a target that couldn't be
-    resolved / aligned, so one bad target doesn't fail the batch). The
+    query_rc, inverted_segments}`` (or ``{name, error}`` for a target that
+    couldn't be resolved / aligned, so one bad target doesn't fail the
+    batch). ``inverted_segments`` names the spans that match the target's
+    REVERSE COMPLEMENT (``q_start``/``q_end`` in query coordinates,
+    ``t_start``/``t_end`` in the target's) — a region cloned the wrong way
+    round scores like unrelated sequence, so the identity column alone
+    can't distinguish it ([INV-193]). The
     gapped alignment STRINGS are omitted to keep the response small — use
     `diff-plasmid` for the full alignment (with strings) of a single
     pair. Capped at 20 targets, matching the picker."""
@@ -97110,6 +97816,12 @@ def _h_multi_align(app, payload):
             "query_rotation":        int(r.get("query_rotation") or 0),
             "target_rotation":       int(r.get("target_rotation") or 0),
             "query_rc":              bool(r.get("query_rc", False)),
+            # Spans of the QUERY that match this target backwards
+            # [INV-193] — without them an inverted insert looks like plain
+            # divergence in the identity column.
+            "inverted_segments":     [s for s in
+                                      (r.get("inverted_segments") or [])
+                                      if isinstance(s, dict)],
         })
     return {"ok": True, "query": q_name, "mode": mode, "alignments": out}
 
@@ -100372,7 +101084,11 @@ def _h_traditional_clone(app, payload):
             "insert":          info["insert"],
             "annotations_carried": info.get("annotations_carried", False),
             "carried":             info.get("carried", {}),
-            "carry_warnings":      info.get("carry_warnings", [])}
+            "carry_warnings":      info.get("carry_warnings", []),
+            # Off-target closures the same tube makes (empty vector, double
+            # insert…) — the saved product is the INTENDED circle; this says
+            # what else to expect on the plate [INV-192].
+            "self_ligation":       product.get("self_ligation")}
     if auto_pick is not None:
         # Say WHICH choice was made for you and on what evidence — an
         # automatic pick you can't see is the thing the 409 was protecting
@@ -110224,9 +110940,11 @@ NcbiTaxonPickerModal { align: center middle; }
                 )
             ident_ungap = result.get("ungapped_identity_pct",
                                       result.get("identity_pct", 0.0))
+            inv_note = _inversion_note(result, "query")
             self.notify(
                 f"Aligned {q_name} → {t_name} · "
-                f"{_format_identity_pct(ident_ungap)} identity (aligned region) · "
+                f"{_format_identity_pct(ident_ungap)} identity (aligned region)"
+                f"{' · ⇄ ' + inv_note if inv_note else ''} · "
                 f"click read on map to inspect.",
                 title="Alignment added",
                 severity="information", timeout=6,
@@ -110329,6 +111047,11 @@ NcbiTaxonPickerModal { align: center middle; }
             segs = _alignment_to_query_segments(aq, at)
         else:
             segs = _alignment_to_target_segments(aq, at)
+        # Re-label spans the detector proved are REVERSE-COMPLEMENT matches
+        # [INV-193] so the band paints them as their own state instead of one
+        # long red "mismatch" block indistinguishable from an unrelated
+        # plasmid. Spans are read in the render axis' own coordinates.
+        segs = _relabel_segments_inverted(segs, _inverted_spans(result, axis))
         if segs:
             t_lo = segs[0][0]
             t_hi = segs[-1][1]

@@ -4321,3 +4321,453 @@ class TestFragmentPickerStateDoesNotLeakBetweenRows:
             lt.move_cursor(row=1)
             await pilot.pause(); await pilot.pause()
             assert r1.disabled is True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Self-ligation / off-target closure analyser [INV-192]
+# ══════════════════════════════════════════════════════════════════════════════
+# `_simulate_traditional_cloning` only ever answered "can the INTENDED product
+# close?". The tube makes other circles too, and the one that matters is the
+# empty vector: a backbone whose two ends match each other (single-enzyme,
+# blunt, or a compatible-cohesive pair like SalI/XhoI — both leave 5'-TCGA)
+# re-closes with no insert and out-transforms the two-junction product.
+
+
+class TestSelfLigationRisks:
+    """`_self_ligation_risks` — enumerated from fragment-END metadata only,
+    so it runs on every Simulate."""
+
+    @staticmethod
+    def _vec(oh_left, oh_right, enz_left, enz_right, kind="5'"):
+        return {
+            "top_seq": "TGGCCCC" * 10,
+            "left":  {"overhang_seq": oh_left,  "kind": kind,
+                      "enzyme": enz_left},
+            "right": {"overhang_seq": oh_right, "kind": kind,
+                      "enzyme": enz_right},
+            "features": [], "source_label": "vec",
+        }
+
+    def test_salI_xhoI_empty_vector_is_high_severity(self):
+        """The reported case: SalI (G^TCGAC) and XhoI (C^TCGAG) leave the
+        SAME 5'-TCGA overhang, so the backbone's own two ends ligate."""
+        ins = sc._make_synthetic_fragment(
+            "GAGCATGAAACGGCCAAGTAA", enz_left="SalI", enz_right="XhoI",
+            source_label="ins")
+        sl = sc._self_ligation_risks(
+            [ins], self._vec("TCGA", "TCGA", "XhoI", "SalI"))
+        assert sl["vector_self_closes"] is True
+        assert sl["clean"] is False
+        risk = next(r for r in sl["risks"]
+                    if r["kind"] == "vector_self_closure")
+        assert risk["severity"] == "high"
+        assert "rSAP/CIP" in risk["advice"]
+        # It names the ends that made it possible, not just "self-ligation".
+        assert "SalI" in risk["message"] and "XhoI" in risk["message"]
+        assert "TCGA" in risk["message"]
+
+    def test_directional_pair_is_clean_and_says_why(self):
+        """EcoRI + BamHI leave different overhangs: nothing off-target
+        closes. The report must say so POSITIVELY — "no risks shown" would
+        otherwise be indistinguishable from "not checked"."""
+        ins = sc._make_synthetic_fragment(
+            "GAGCATGAAACGGCCAAGTAA", enz_left="EcoRI", enz_right="BamHI",
+            source_label="ins")
+        sl = sc._self_ligation_risks(
+            [ins], self._vec("GATC", "AATT", "BamHI", "EcoRI"))
+        assert sl["clean"] is True
+        assert sl["risks"] == []
+        assert sl["vector_self_closes"] is False
+        assert "don't match" in sl["clean_note"]
+        assert "EcoRI" in sl["clean_note"] and "BamHI" in sl["clean_note"]
+
+    def test_blunt_vector_self_closes_and_the_advice_says_blunt(self):
+        ins = sc._make_synthetic_fragment(
+            "GAGCATGAAACGGCCAAGTAA", enz_left="SmaI", enz_right="EcoRV",
+            source_label="ins")
+        sl = sc._self_ligation_risks(
+            [ins], self._vec("", "", "EcoRV", "SmaI", kind="blunt"))
+        risk = next(r for r in sl["risks"]
+                    if r["kind"] == "vector_self_closure")
+        assert "blunt" in risk["message"]
+        assert "blunt ends always self-close" in risk["advice"]
+
+    def test_single_enzyme_reports_double_insert_too(self):
+        """One enzyme at both ends: the insert's own ends match each other,
+        so two copies chain in — tandem AND inverted."""
+        ins = sc._make_synthetic_fragment(
+            "GAGCATGAAACGGCCAAGTAA", enz_left="EcoRI", enz_right="EcoRI",
+            source_label="ins")
+        sl = sc._self_ligation_risks(
+            [ins], self._vec("AATT", "AATT", "EcoRI", "EcoRI"))
+        assert sl["double_insert"]["tandem"] == [1]
+        assert sl["double_insert"]["inverted"] == [1]
+        assert sl["insert_self_closes"] == [1]
+        dbl = next(r for r in sl["risks"] if r["kind"] == "double_insert")
+        assert dbl["severity"] == "medium"
+
+    def test_empty_vector_junction_classified_as_scar_or_recuttable(self):
+        """The re-closed joint decides whether a diagnostic digest can even
+        SEE an empty-vector colony, so the message says which."""
+        # SalI/XhoI → hybrid GTCGAG, neither parent cuts it.
+        vec_sx = "GTCGAC" + "A" * 200 + "CTCGAG" + "C" * 60
+        frags, err = sc._excise_fragment_pair(
+            vec_sx, ["SalI", "XhoI"], circular=True, features=[],
+            source_label="v")
+        assert err is None
+        bb = max(frags, key=lambda f: len(f["top_seq"]))
+        ins = sc._make_synthetic_fragment(
+            "ATGAAACCCGGGTTTTAA", enz_left="SalI", enz_right="XhoI")
+        sl = sc._self_ligation_risks([ins], bb)
+        assert sl["vector_self_junction"]["scar"] is True
+        msg = next(r["message"] for r in sl["risks"]
+                   if r["kind"] == "vector_self_closure")
+        assert "will NOT linearise" in msg
+        # Ground truth: neither site survives in the re-closed circle.
+        closed = sc._close_circular(bb)
+        assert closed is not None
+        for enz in ("SalI", "XhoI"):
+            assert sc._enzyme_cuts(closed["top_seq"], [enz],
+                                   circular=True) == []
+        # EcoRI at both ends REGENERATES the site — the opposite advice.
+        vec_e = "GAATTC" + "A" * 200 + "GAATTC" + "C" * 60
+        frags_e, err_e = sc._excise_fragment_pair(
+            vec_e, ["EcoRI"], circular=True, features=[], source_label="v")
+        assert err_e is None
+        bb_e = max(frags_e, key=lambda f: len(f["top_seq"]))
+        sl_e = sc._self_ligation_risks([ins], bb_e)
+        assert sl_e["vector_self_junction"]["re_cuttable"] == ["EcoRI"]
+        msg_e = next(r["message"] for r in sl_e["risks"]
+                     if r["kind"] == "vector_self_closure")
+        assert "re-cuts with EcoRI" in msg_e
+        closed_e = sc._close_circular(bb_e)
+        assert len(sc._enzyme_cuts(closed_e["top_seq"], ["EcoRI"],
+                                   circular=True)) == 1
+
+    @staticmethod
+    def _backbone(seq, enzymes):
+        frags, err = sc._excise_fragment_pair(
+            seq, enzymes, circular=True, features=[], source_label="v")
+        assert err is None, err
+        return max(frags, key=lambda f: len(f["top_seq"]))
+
+    def test_three_prime_overhangs_self_close_and_mixed_kinds_do_not(self):
+        """Geometry, not just sequence: a 5' overhang cannot anneal to a
+        3' one, however the bases read."""
+        pad = "".join("ACGT"[(i * 5 + 1) % 4] for i in range(300))
+        # PstI twice — 3' TGCA at both ends, so the backbone re-closes.
+        bb = self._backbone("CTGCAG" + pad + "CTGCAG" + "TTTTGGGG", ["PstI"])
+        assert sc._self_ligation_risks([], bb)["vector_self_closes"] is True
+        # EcoRI (5') + PstI (3') — same length, opposite geometry, no route.
+        bb2 = self._backbone("GAATTC" + pad + "CTGCAG" + "TTTTGGGG",
+                             ["EcoRI", "PstI"])
+        assert sc._self_ligation_risks([], bb2)["vector_self_closes"] is False
+
+    def test_type_iis_vector_with_duplicate_overhangs_self_closes(self):
+        """A Golden-Gate acceptor is supposed to leave two DIFFERENT
+        non-palindromic overhangs. Design it with the same one twice and
+        the backbone re-closes — the Type IIS version of the same
+        mistake, caught by the same end test."""
+        pad = "".join("ACGT"[(i * 3 + 2) % 4] for i in range(300))
+        good = self._backbone(
+            "GGTCTCA" + "AATG" + pad + "GCTT" + "TGAGACC", ["BsaI"])
+        assert sc._self_ligation_risks([], good)["vector_self_closes"] is False
+        bad = self._backbone(
+            "GGTCTCA" + "AATG" + pad + "AATG" + "TGAGACC", ["BsaI"])
+        assert sc._self_ligation_risks([], bad)["vector_self_closes"] is True
+
+    def test_partial_assembly_finds_a_non_contiguous_dropout(self):
+        """The textbook three-way failure: the MIDDLE insert drops out and
+        1 and 3 meet directly, because the junctions flanking 2 share an
+        enzyme. Contiguous-run scanning alone would miss it."""
+        i1 = sc._make_synthetic_fragment(
+            "AAAA", enz_left="EcoRI", enz_right="BamHI", source_label="i1")
+        i2 = sc._make_synthetic_fragment(
+            "CCCC", enz_left="BamHI", enz_right="BamHI", source_label="i2")
+        i3 = sc._make_synthetic_fragment(
+            "GGGG", enz_left="BamHI", enz_right="NcoI", source_label="i3")
+        sl = sc._self_ligation_risks(
+            [i1, i2, i3], self._vec("CATG", "AATT", "NcoI", "EcoRI"))
+        assert [p["inserts"] for p in sl["partial_products"]] == [[1, 3]]
+        risk = next(r for r in sl["risks"] if r["kind"] == "partial_assembly")
+        assert risk["severity"] == "high"
+        assert "inserts 1+3" in risk["message"]
+
+    def test_distinct_overhangs_at_every_junction_stay_clean(self):
+        i1 = sc._make_synthetic_fragment(
+            "AAAA", enz_left="EcoRI", enz_right="BamHI", source_label="i1")
+        i2 = sc._make_synthetic_fragment(
+            "CCCC", enz_left="BamHI", enz_right="SalI", source_label="i2")
+        i3 = sc._make_synthetic_fragment(
+            "GGGG", enz_left="SalI", enz_right="NcoI", source_label="i3")
+        sl = sc._self_ligation_risks(
+            [i1, i2, i3], self._vec("CATG", "AATT", "NcoI", "EcoRI"))
+        assert sl["clean"] is True
+        assert sl["partial_products"] == []
+        assert sl["insert_flips"] == [] and sl["insert_swaps"] == []
+
+    def test_all_same_enzyme_lane_reports_flips_and_swaps(self):
+        frs = [sc._make_synthetic_fragment(
+            b * 4, enz_left="EcoRI", enz_right="EcoRI", source_label=f"i{n}")
+            for n, b in enumerate("ACG", start=1)]
+        sl = sc._self_ligation_risks(
+            frs, self._vec("AATT", "AATT", "EcoRI", "EcoRI"))
+        assert sl["insert_flips"] == [1, 2, 3]
+        assert sl["insert_swaps"] == [[1, 2], [2, 3]]
+        kinds = {r["kind"] for r in sl["risks"]}
+        assert {"vector_self_closure", "partial_assembly",
+                "insert_flip", "insert_swap"} <= kinds
+
+    def test_long_lane_skips_the_multi_insert_sweep_but_still_checks_vector(self):
+        """The sweep is capped; the empty-vector check is not, because the
+        backbone re-closing doesn't depend on lane length."""
+        n = sc._SELF_LIGATION_MAX_LANE + 1
+        frs = [sc._make_synthetic_fragment(
+            "ACGT", enz_left="EcoRI", enz_right="EcoRI", source_label=f"i{i}")
+            for i in range(n)]
+        sl = sc._self_ligation_risks(
+            frs, self._vec("AATT", "AATT", "EcoRI", "EcoRI"))
+        assert sl["skipped"]
+        assert sl["vector_self_closes"] is True
+        assert sl["partial_products"] == []
+
+    @pytest.mark.parametrize("frags,vec", [
+        ([], {}),
+        ([None], {"left": {}, "right": {}}),
+        ([{}], None),
+        (["nope"], {"left": None, "right": None}),
+        ([{"left": {"kind": "5'"}}], {"left": {"kind": "5'"}}),
+        (None, {"left": {"overhang_seq": "AATT", "kind": "5'"},
+                "right": {"overhang_seq": "AATT", "kind": "5'"}}),
+    ])
+    def test_never_raises_on_malformed_input(self, frags, vec):
+        """Same no-raise standard [INV-190]/[INV-191] set for the fragment
+        helpers: an unreadable end is not a proven ligation, so the honest
+        answer is "no risk found", never a traceback that kills the clone."""
+        out = sc._self_ligation_risks(frags, vec)
+        assert isinstance(out, dict)
+        assert isinstance(out["risks"], list)
+        assert isinstance(out["clean"], bool)
+
+    def test_clean_note_never_claims_an_untested_fact(self):
+        """A reassurance that can be wrong is worse than none. An earlier
+        version read the insert's clause off its two end LABELS and told a
+        SalI/XhoI insert "neither do the insert's ends" — whose labels
+        differ while the overhangs are identical."""
+        # Insert ends ARE mutually compatible (both TCGA) but the vector was
+        # cut with something else, so nothing off-target closes.
+        ins = sc._make_synthetic_fragment(
+            "ACGTACGTACGT", enz_left="SalI", enz_right="XhoI")
+        sl = sc._self_ligation_risks(
+            [ins], self._vec("AATT", "GATC", "EcoRI", "BamHI"))
+        assert sl["clean"] is True
+        assert sl["insert_self_closes"] == [1]
+        assert "insert" not in sl["clean_note"]
+        assert "vector's ends don't match" in sl["clean_note"]
+        # The honest version, where the insert really was checked clean.
+        ok = sc._make_synthetic_fragment(
+            "ACGTACGTACGT", enz_left="EcoRI", enz_right="BamHI")
+        note = sc._self_ligation_risks(
+            [ok], self._vec("GATC", "AATT", "BamHI", "EcoRI"))["clean_note"]
+        assert "neither do the insert's" in note
+
+    def test_clean_note_is_empty_when_the_vector_ends_are_unreadable(self):
+        sl = sc._self_ligation_risks(
+            [sc._make_synthetic_fragment("ACGT", enz_left="EcoRI",
+                                          enz_right="EcoRI")],
+            {"left": None, "right": None})
+        assert sl["clean_note"] == ""
+
+    def test_repeated_risks_and_partials_are_capped(self):
+        """A 12-insert lane cut with ONE enzyme has 4,094 closing subsets
+        and a double-insert risk for every row. Shipping all of them
+        bloats the agent response and buries the signal — the rule the
+        backbone-marker warning already follows."""
+        frs = [sc._make_synthetic_fragment(
+            "ACGTACGT", enz_left="EcoRI", enz_right="EcoRI",
+            source_label=f"i{i}") for i in range(12)]
+        sl = sc._self_ligation_risks(
+            frs, self._vec("AATT", "AATT", "EcoRI", "EcoRI"))
+        assert sl["partial_products_total"] == 4094
+        assert len(sl["partial_products"]) == sc._SELF_LIGATION_MAX_PARTIALS
+        # The kept ones are the SHORTEST chains — the clones most easily
+        # mistaken for the real product.
+        assert sl["partial_products"][0]["inserts"] == [1]
+        dbl = [r for r in sl["risks"] if r["kind"] == "double_insert"]
+        # One summary row naming the count, then the capped detail rows.
+        assert len(dbl) == sc._SELF_LIGATION_MAX_RISK_ROWS + 1
+        assert "12 of the lane's inserts" in dbl[0]["message"]
+        # Long name lists are truncated with a count, not printed in full.
+        flip = next(r for r in sl["risks"] if r["kind"] == "insert_flip")
+        assert "more" in flip["message"]
+
+    def test_degenerate_vector_does_not_claim_a_zero_bp_backbone(self):
+        """A fragment with no readable ``top_seq`` measures 0 bp; the
+        message must read as English, not as a bug."""
+        vec = {"left":  {"overhang_seq": "AATT", "kind": "5'",
+                         "enzyme": "EcoRI"},
+               "right": {"overhang_seq": "AATT", "kind": "5'",
+                         "enzyme": "EcoRI"},
+               "features": [], "source_label": "v"}
+        sl = sc._self_ligation_risks(
+            [sc._make_synthetic_fragment("ACGT", enz_left="EcoRI",
+                                          enz_right="EcoRI")], vec)
+        msg = sl["risks"][0]["message"]
+        assert "0 bp" not in msg
+        assert "the backbone circularises" in msg
+
+    def test_end_desc_labels_every_end_kind(self):
+        assert sc._end_desc({"enzyme": "SalI", "kind": "5'",
+                             "overhang_seq": "TCGA"}) == "SalI (5' TCGA)"
+        assert sc._end_desc({"enzyme": "SmaI", "kind": "blunt",
+                             "overhang_seq": ""}) == "SmaI (blunt)"
+        assert sc._end_desc({"kind": "linear"}) == "uncut end"
+        assert sc._end_desc(None) == "?"
+
+    def test_end_rc_is_the_same_end_from_the_other_strand(self):
+        end = {"enzyme": "SalI", "kind": "5'", "overhang_seq": "TCGA"}
+        flipped = sc._end_rc(end)
+        assert flipped["overhang_seq"] == sc._rc("TCGA")
+        assert flipped["kind"] == "5'" and flipped["enzyme"] == "SalI"
+
+
+class TestSelfLigationRidesEveryResult:
+    """Every `_simulate_traditional_cloning_multi` return path carries the
+    report — including the ones that fail, because the backbone re-closing
+    is real whether or not the insert fits."""
+
+    @staticmethod
+    def _vec(ol, orr, el, er):
+        return {"top_seq": "TGGCCCC" * 10,
+                "left":  {"overhang_seq": ol, "kind": "5'", "enzyme": el},
+                "right": {"overhang_seq": orr, "kind": "5'", "enzyme": er},
+                "features": [], "source_label": "vec"}
+
+    def test_empty_lane(self):
+        r = sc._simulate_traditional_cloning_multi(
+            [], self._vec("AATT", "AATT", "EcoRI", "EcoRI"))
+        assert r["self_ligation"]["vector_self_closes"] is True
+
+    def test_single_insert(self):
+        ins = sc._make_synthetic_fragment(
+            "ACGTACGT", enz_left="EcoRI", enz_right="EcoRI")
+        r = sc._simulate_traditional_cloning_multi(
+            [ins], self._vec("AATT", "AATT", "EcoRI", "EcoRI"))
+        assert r["self_ligation"]["orientation_ambiguous"] is True
+
+    def test_internal_junction_failure_still_reports(self):
+        i1 = sc._make_synthetic_fragment(
+            "AAAA", enz_left="EcoRI", enz_right="BamHI", source_label="i1")
+        i2 = sc._make_synthetic_fragment(
+            "CCCC", enz_left="SalI", enz_right="EcoRI", source_label="i2")
+        r = sc._simulate_traditional_cloning_multi(
+            [i1, i2], self._vec("AATT", "AATT", "EcoRI", "EcoRI"))
+        assert r["errors"]                      # the chain didn't ligate
+        assert r["self_ligation"]["vector_self_closes"] is True
+
+    def test_orientation_ambiguous_mirrors_the_engine(self):
+        ins = sc._make_synthetic_fragment(
+            "ACGTACGT", enz_left="EcoRI", enz_right="BamHI")
+        r = sc._simulate_traditional_cloning_multi(
+            [ins], self._vec("GATC", "AATT", "BamHI", "EcoRI"))
+        assert r["forward"]["compatible"] != r["reverse"]["compatible"]
+        assert r["self_ligation"]["orientation_ambiguous"] is False
+
+
+class TestSelfLigationInTheConstructorUI:
+    """The block the user actually reads, driven through the real pane."""
+
+    @staticmethod
+    def _lines(sl):
+        return sc.TraditionalCloningPane._self_ligation_lines(sl)
+
+    def test_clean_report_states_it_positively(self):
+        out = self._lines({"risks": [], "clean": True,
+                           "clean_note": "the ends don't match",
+                           "skipped": ""})
+        # "found" scopes the claim to what was swept — vector dimers are
+        # deliberately out of scope ([INV-192]), so an absolute "no
+        # self-ligation route" would overclaim.
+        assert any("No self-ligation route found" in ln for ln in out)
+        assert any("the ends don't match" in ln for ln in out)
+
+    def test_high_severity_gets_the_loud_header(self):
+        out = self._lines({
+            "risks": [{"kind": "vector_self_closure", "severity": "high",
+                       "message": "backbone re-closes", "advice": "use rSAP"}],
+            "clean": False, "clean_note": "", "skipped": ""})
+        assert "[b red]⚠ SELF-LIGATION RISK[/]" in out[0]
+        assert any("backbone re-closes" in ln for ln in out)
+        assert any("use rSAP" in ln for ln in out)
+
+    def test_medium_only_uses_the_quieter_header(self):
+        out = self._lines({
+            "risks": [{"kind": "double_insert", "severity": "medium",
+                       "message": "two copies fit", "advice": "screen"}],
+            "clean": False, "clean_note": "", "skipped": ""})
+        assert "yellow" in out[0] and "SELF-LIGATION RISK" not in out[0]
+
+    def test_markup_in_a_fragment_name_is_escaped(self):
+        """Lane names reach these strings. `Static` parses Rich markup, so
+        an ordinary label like "TU [draft]" would swallow the rest of the
+        line (or blank the pane) — same hygiene as the warnings block."""
+        out = self._lines({
+            "risks": [{"kind": "double_insert", "severity": "medium",
+                       "message": "insert 1 (TU [draft]) closes",
+                       "advice": "check [it]"}],
+            "clean": False, "clean_note": "", "skipped": ""})
+        joined = "\n".join(out)
+        assert r"TU \[draft]" in joined and r"\[it]" in joined
+
+    async def test_simulate_shows_the_risk_block(
+            self, tiny_record, isolated_library):
+        """End-to-end: a SalI/XhoI lane through the real Constructor must
+        surface the empty-vector warning in the results pane."""
+        import io
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from textual.widgets import TabbedContent, Button, Static
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+
+        payload = "ATG" + "GCTAGCTAGG" * 12 + "TAA"
+        frag = SeqRecord(
+            Seq("GGGGCC" + "GTCGAC" + payload + "CTCGAG" + "CCGGGG"),
+            id="FRAGSX", name="FRAGSX",
+            annotations={"molecule_type": "DNA", "topology": "linear"})
+        vec = SeqRecord(
+            Seq("GTCGAC" + "TTTTAAAACCCC" + "CTCGAG"
+                + "".join("ACGT"[(i * 7 + 3) % 4] for i in range(600))),
+            id="pVECSX", name="pVECSX",
+            annotations={"molecule_type": "DNA", "topology": "circular"})
+        rows = []
+        for r in (frag, vec):
+            b = io.StringIO()
+            SeqIO.write(r, b, "genbank")
+            rows.append({"id": r.id, "name": r.id, "gb_text": b.getvalue(),
+                         "size": len(r.seq)})
+        sc._save_library(rows)
+
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            modal.query_one("#ctor-tabs", TabbedContent).active = \
+                "ctor-tab-traditional"
+            await pilot.pause(); await pilot.pause(0.05)
+            pane = modal.query_one("#ctor-trad-pane", sc.TraditionalCloningPane)
+            add = TestLinearDonorInTheConstructorUI._add_row
+            await add(modal, pilot, "pVECSX", "SalI", "XhoI")
+            await add(modal, pilot, "FRAGSX", "SalI", "XhoI")
+            modal.query_one("#btn-trad-simulate", Button).press()
+            await pilot.pause(); await pilot.pause(0.2)
+            text = str(modal.query_one("#trad-results-text", Static).content)
+            assert "SELF-LIGATION RISK" in text, text
+            assert "circularises without an insert" in text, text
+            assert "rSAP/CIP" in text, text
+            # The puzzle diagram badges it too, from the same test the
+            # engine ligates with.
+            puzzle = str(modal.query_one("#trad-puzzle-view", Static).content)
+            assert "backbone re-closes without insert" in puzzle, puzzle

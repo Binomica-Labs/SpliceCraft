@@ -5353,7 +5353,7 @@ class TestVerificationReportModal:
             # depends on tiny_record length. Just check it's a
             # recognised status.
             assert row["code"] in (
-                "verified", "near", "partial", "divergent",
+                "verified", "near", "partial", "inverted", "divergent",
             )
 
     async def test_modal_skips_entries_with_no_alignments_by_default(
@@ -7338,3 +7338,449 @@ class TestLinearScrollbarDraw:
             geom, canvas = self._draw(view_s=view_s, view_e=view_s + 100)
             joined = " ".join(canvas._styles[geom[0]])
             assert "#808080" in joined and "#303030" in joined
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Inverted-segment detection [INV-193]
+# ═══════════════════════════════════════════════════════════════════════════════
+# A plasmid whose insert went in BACKWARDS used to score like an unrelated
+# plasmid: forward alignment of a flipped region matches ~25% by chance, so
+# the overlay painted one long red block and the badge read ✗ divergent. The
+# read PROVES the orientation by matching the reverse complement over that
+# span — these tests pin that it's found, bounded, and not over-claimed.
+
+
+def _rand_dna(n, seed):
+    import random
+    return "".join(random.Random(seed).choices("ACGT", k=n))
+
+
+class TestInvertedSegmentDetection:
+    def _align(self, query, target, circular=True):
+        return sc._pick_best_rotation(
+            query, target, is_circular=circular, mode="global",
+            canvas_axis="target")
+
+    def _spans(self, result):
+        return [(s["t_start"], s["t_end"])
+                for s in result["inverted_segments"]]
+
+    def test_flipped_insert_is_found_at_its_exact_span(self):
+        a, ins, b = _rand_dna(2500, 1), _rand_dna(1200, 2), _rand_dna(2000, 3)
+        ref = a + ins + b
+        read = a + sc._rc(ins) + b
+        r = self._align(read, ref)
+        assert self._spans(r) == [(2500, 3700)]
+        seg = r["inverted_segments"][0]
+        assert seg["identity_pct"] >= 99.0
+        # …and it is NOT a forward match, which is what makes it an inversion
+        # rather than a region the aligner simply handled.
+        assert seg["forward_identity_pct"] < 50.0
+        assert seg["length"] == 1200
+
+    def test_the_status_badge_says_inverted_not_divergent(self):
+        """The headline behaviour: before this, a flipped insert and an
+        unrelated plasmid produced the same verdict."""
+        a, ins, b = _rand_dna(2500, 4), _rand_dna(1200, 5), _rand_dna(2000, 6)
+        ref = a + ins + b
+        r = self._align(a + sc._rc(ins) + b, ref)
+        code, glyph, _ = sc._alignment_quality_status(r, len(ref))
+        assert (code, glyph) == ("inverted", "⇄")
+        # An unrelated plasmid of the same length still reads divergent.
+        r2 = self._align(_rand_dna(len(ref), 7), ref)
+        assert r2["inverted_segments"] == []
+        assert sc._alignment_quality_status(r2, len(ref))[0] == "divergent"
+
+    def test_small_flip_is_not_hidden_inside_a_near_match(self):
+        """A 60 bp flip leaves overall identity at ~99.6%, which used to
+        grade ⚠ near-match — indistinguishable from a few sequencing
+        errors, when in fact 60 bases are backwards."""
+        a, ins, b = _rand_dna(2500, 8), _rand_dna(1200, 9), _rand_dna(2000, 10)
+        ref = a + ins + b
+        read = a + ins[:600] + sc._rc(ins[600:660]) + ins[660:] + b
+        r = self._align(read, ref)
+        assert r["ungapped_identity_pct"] > 99.0
+        assert self._spans(r) == [(3100, 3160)]
+        assert sc._alignment_quality_status(r, len(ref))[0] == "inverted"
+
+    def test_two_independent_inversions_are_both_found(self):
+        a, i1 = _rand_dna(1500, 11), _rand_dna(800, 12)
+        mid, i2, b = _rand_dna(900, 13), _rand_dna(600, 14), _rand_dna(1400, 15)
+        ref = a + i1 + mid + i2 + b
+        r = self._align(a + sc._rc(i1) + mid + sc._rc(i2) + b, ref)
+        spans = self._spans(r)
+        assert len(spans) == 2
+        assert spans[0] == (1500, 2300)
+        assert abs(spans[1][0] - 3200) <= 5 and abs(spans[1][1] - 3800) <= 5
+
+    def test_survives_a_rotated_origin(self):
+        """Circular reads start anywhere. The detector runs on the FINAL
+        strings, after the picker's frame shifts, so the span lands in the
+        canvas plasmid's own coordinates either way."""
+        a, ins, b = _rand_dna(2500, 16), _rand_dna(1200, 17), _rand_dna(2000, 18)
+        ref = a + ins + b
+        flipped = a + sc._rc(ins) + b
+        rot = flipped[3111:] + flipped[:3111]
+        assert self._spans(self._align(rot, ref)) == [(2500, 3700)]
+
+    def test_survives_snps_inside_the_inverted_block(self):
+        a, ins, b = _rand_dna(1500, 19), _rand_dna(800, 20), _rand_dna(1400, 21)
+        ref = a + ins + b
+        flip = list(sc._rc(ins))
+        for p in (50, 200, 400, 600, 750):
+            flip[p] = {"A": "C", "C": "G", "G": "T", "T": "A"}[flip[p]]
+        r = self._align(a + "".join(flip) + b, ref)
+        assert self._spans(r) == [(1500, 2300)]
+        assert 98.0 <= r["inverted_segments"][0]["identity_pct"] < 100.0
+
+    def test_survives_a_length_mismatched_block(self):
+        """Flipped AND 40 bp short: a positional compare would shift every
+        base, so the detector falls back to a real re-align."""
+        a, ins, b = _rand_dna(1500, 22), _rand_dna(800, 23), _rand_dna(1400, 24)
+        ref = a + ins + b
+        r = self._align(a + sc._rc(ins)[:760] + b, ref)
+        assert len(self._spans(r)) == 1
+        assert self._spans(r)[0][0] == 1500
+
+    def test_inversion_at_the_origin(self):
+        i1, mid, b = _rand_dna(800, 25), _rand_dna(900, 26), _rand_dna(1400, 27)
+        ref = i1 + mid + b
+        assert self._spans(self._align(sc._rc(i1) + mid + b, ref)) == [(0, 800)]
+
+    @pytest.mark.parametrize("shape", [
+        "rotated", "rotated_rc", "ambiguous_bases", "partial", "noisy",
+    ])
+    def test_boundaries_hold_through_real_read_defects(self, shape):
+        """Real reads arrive rotated, sometimes assembled backwards, with
+        N calls, clipped, and noisy. The span must stay exact through all
+        of them, or the mark lands on the wrong bases."""
+        import random
+        rng = random.Random(50)
+        ref = _rand_dna(6000, 51)
+        s0, L = 2000, 900
+        read = ref[:s0] + sc._rc(ref[s0:s0 + L]) + ref[s0 + L:]
+        if shape == "rotated":
+            read = read[4321:] + read[:4321]
+        elif shape == "rotated_rc":
+            read = sc._rc(read[4321:] + read[:4321])
+        elif shape == "ambiguous_bases":
+            chars = list(read)
+            for p in rng.sample(range(len(chars)), 120):
+                chars[p] = "N"
+            read = "".join(chars)
+        elif shape == "partial":
+            read = read[800:5200]
+        elif shape == "noisy":
+            chars = list(read)
+            for p in rng.sample(range(len(chars)), 300):
+                chars[p] = rng.choice("ACGT")
+            read = "".join(chars)
+        r = self._align(read, ref)
+        assert self._spans(r) == [(s0, s0 + L)], shape
+        assert sc._alignment_quality_status(r, len(ref))[0] == "inverted"
+
+    def test_noisy_read_is_not_called_inverted(self):
+        """12% random substitutions across the whole read: plenty of
+        non-matching columns, but none of them match backwards."""
+        import random
+        t = _rand_dna(3000, 28)
+        q = list(t)
+        rng = random.Random(29)
+        for _ in range(int(len(q) * 0.12)):
+            q[rng.randrange(len(q))] = rng.choice("ACGT")
+        assert self._align("".join(q), t)["inverted_segments"] == []
+
+    def test_large_deletion_is_not_called_inverted(self):
+        a, ins, b = _rand_dna(1500, 30), _rand_dna(600, 31), _rand_dna(1400, 32)
+        ref = a + ins + b
+        assert self._align(a + b, ref)["inverted_segments"] == []
+
+    def test_palindrome_is_not_called_inverted(self):
+        """An AT-repeat block is its own reverse complement, so it scores
+        the same both ways — the margin guard is what rejects it."""
+        a, b = _rand_dna(1500, 33), _rand_dna(1400, 34)
+        pal = "ATATATATAT" * 6
+        ref = a + pal + b
+        assert self._align(a + sc._rc(pal) + b, ref)["inverted_segments"] == []
+
+    def test_homopolymer_swap_is_not_called_inverted(self):
+        """A40 → T40 is a perfect RC match and means nothing — the
+        low-complexity guard drops it before either identity test."""
+        a, b = _rand_dna(1500, 35), _rand_dna(1400, 36)
+        ref = a + "A" * 60 + b
+        assert self._align(a + "T" * 60 + b, ref)["inverted_segments"] == []
+
+    def test_identical_and_whole_read_rc_report_no_segment(self):
+        """A read that is wholly reverse-complemented is handled by the
+        picker's own RC candidate (`query_rc`), not by a segment — flagging
+        the entire molecule as "an inverted region" would be noise."""
+        ref = _rand_dna(4000, 37)
+        r_same = self._align(ref, ref)
+        assert r_same["inverted_segments"] == []
+        r_rc = self._align(sc._rc(ref), ref)
+        assert r_rc["query_rc"] is True
+        assert r_rc["inverted_segments"] == []
+        assert sc._alignment_quality_status(r_rc, len(ref))[0] == "verified"
+
+    def test_inversion_across_the_origin_is_found_as_one_event(self):
+        """A circular molecule has no ends but the alignment does. Flip a
+        block crossing bp 0 and its halves land at OPPOSITE ends of the
+        strings — and neither matches the reverse complement of the bases
+        under it, because each is the RC of the OTHER half's region. Only
+        rejoining them in circle order catches it."""
+        n = 3000
+        ref = _rand_dna(n, 43)
+        s0, L = 2700, 600            # runs 2700 → 300, across the origin
+        block = ref[s0:] + ref[:(s0 + L) % n]
+        flipped = sc._rc(block)
+        head_len = n - s0
+        read = (flipped[head_len:] + ref[(s0 + L) % n:s0]
+                + flipped[:head_len])
+        assert len(read) == n
+        r = self._align(read, ref)
+        segs = r["inverted_segments"]
+        assert len(segs) == 2, segs
+        assert all(s["wrapped"] is True for s in segs)
+        # The two halves the origin split it into, in target coordinates.
+        assert (segs[0]["t_start"], segs[0]["t_end"]) == (0, 300)
+        assert (segs[1]["t_start"], segs[1]["t_end"]) == (2700, 3000)
+        assert all(s["identity_pct"] >= 99.0 for s in segs)
+        assert sc._alignment_quality_status(r, n)[0] == "inverted"
+
+    def test_poor_blocks_at_both_ends_are_not_joined_into_a_false_wrap(self):
+        """The wrap pass joins the first and last blocks — so a read whose
+        two ends are simply WRONG (not flipped) must still fail the
+        reverse-complement test rather than be rejoined into a phantom
+        inversion."""
+        n = 3000
+        ref = _rand_dna(n, 44)
+        d = 300
+        read = _rand_dna(d, 45) + ref[d:n - d] + _rand_dna(d, 46)
+        assert self._align(read, ref)["inverted_segments"] == []
+
+    def test_wrapped_flag_is_absent_for_an_ordinary_inversion(self):
+        a, ins, b = _rand_dna(1500, 47), _rand_dna(700, 48), _rand_dna(1400, 49)
+        ref = a + ins + b
+        segs = self._align(a + sc._rc(ins) + b, ref)["inverted_segments"]
+        assert len(segs) == 1 and "wrapped" not in segs[0]
+
+    @pytest.mark.parametrize("aq,at", [
+        ("", ""), ("ACGT", ""), ("", "ACGT"), ("ACGT", "ACGTA"),
+        ("----", "ACGT"), ("ACGT", "----"), ("NNNN" * 20, "ACGT" * 20),
+    ])
+    def test_never_raises_on_degenerate_input(self, aq, at):
+        assert isinstance(sc._alignment_inverted_segments(aq, at), list)
+
+    def test_max_blocks_zero_short_circuits(self):
+        a, ins, b = _rand_dna(1500, 38), _rand_dna(800, 39), _rand_dna(1400, 40)
+        ref = a + ins + b
+        r = self._align(a + sc._rc(ins) + b, ref)
+        assert sc._alignment_inverted_segments(
+            r["aligned_q"], r["aligned_t"], max_blocks=0) == []
+
+    def test_detection_cost_is_bounded(self):
+        """The sweep is one O(columns) pass per candidate and stops as soon
+        as the best remaining block is too short or too dense-free, so a
+        clean alignment costs a single pass."""
+        import time
+        big = _rand_dna(20000, 41)
+        read = big[:8000] + sc._rc(big[8000:11000]) + big[11000:]
+        r = self._align(read, big)
+        t0 = time.perf_counter()
+        segs = sc._alignment_inverted_segments(r["aligned_q"], r["aligned_t"])
+        elapsed = time.perf_counter() - t0
+        assert len(segs) == 1 and segs[0]["length"] > 2900
+        assert elapsed < 2.0, f"detector took {elapsed:.2f}s on 20 kb"
+
+
+class TestInvertedSegmentHelpers:
+    def test_max_scoring_segment_picks_the_densest_run(self):
+        scores = [-1.0] * 10 + [1.0] * 5 + [-1.0] * 10
+        assert sc._max_scoring_segment(scores) == (10, 15, 5.0)
+        assert sc._max_scoring_segment([-1.0] * 10) is None
+        assert sc._max_scoring_segment([]) is None
+
+    def test_block_identity_pct(self):
+        assert sc._block_identity_pct("ACGT", "ACGT") == 100.0
+        assert sc._block_identity_pct("ACGT", "ACGA") == 75.0
+        assert sc._block_identity_pct("ACGT", "ACG") == 0.0
+        assert sc._block_identity_pct("", "") == 0.0
+        # IUPAC: N matches anything, so identity counting agrees with the
+        # aligner's own comparison rather than a raw `==`.
+        assert sc._block_identity_pct("NNNN", "ACGT") == 100.0
+
+    def test_block_is_informative_rejects_low_complexity(self):
+        assert sc._block_is_informative(_rand_dna(60, 42)) is True
+        assert sc._block_is_informative("A" * 60) is False
+        assert sc._block_is_informative("AT" * 30) is False      # 2 bases
+        assert sc._block_is_informative("ACGT") is False          # too short
+        assert sc._block_is_informative("A" * 55 + "CGTAC") is False  # 91% A
+
+    def test_relabel_segments_splits_and_coalesces(self):
+        segs = [(0, 100, "match"), (100, 300, "mismatch"),
+                (300, 400, "match")]
+        out = sc._relabel_segments_inverted(segs, [(150, 250)])
+        assert out == [(0, 100, "match"), (100, 150, "mismatch"),
+                       (150, 250, "inverted"), (250, 300, "mismatch"),
+                       (300, 400, "match")]
+
+    def test_relabel_covers_chance_matches_inside_the_block(self):
+        """~25% of an inverted block's columns match by chance. Leaving
+        those blue would speckle the region with "this part is fine"."""
+        segs = [(0, 50, "mismatch"), (50, 55, "match"), (55, 100, "mismatch")]
+        out = sc._relabel_segments_inverted(segs, [(0, 100)])
+        assert out == [(0, 100, "inverted")]
+
+    def test_relabel_is_a_noop_without_spans(self):
+        segs = [(0, 10, "match"), (10, 20, "mismatch")]
+        assert sc._relabel_segments_inverted(segs, []) == segs
+        assert sc._relabel_segments_inverted(segs, [(5, 5)]) == segs
+
+    def test_relabel_skips_malformed_rows(self):
+        out = sc._relabel_segments_inverted(
+            [(0, 10, "match"), (10,), None, (20, 15, "mismatch")],
+            [(0, 5)])
+        assert out == [(0, 5, "inverted"), (5, 10, "match")]
+
+    def test_inverted_columns_claims_at_least_one_column(self):
+        """A short inverted span must not vanish at full zoom-out — same
+        degenerate-range fix `_alignment_bar_columns` carries."""
+        binned = lambda bp: bp * 10 // 1000
+        cols = sc._alignment_inverted_columns(
+            [(500, 501, "inverted")], 0, 1000, binned, 0, 10)
+        assert cols == {5}
+        assert sc._alignment_inverted_columns(
+            [(0, 1000, "match")], 0, 1000, binned, 0, 10) == set()
+
+    def test_inverted_state_outranks_mismatch_in_column_collapse(self):
+        binned = lambda bp: bp * 10 // 1000
+        worst = sc._alignment_bar_columns(
+            [(0, 100, "mismatch"), (50, 60, "inverted")],
+            0, 1000, binned, 0, 10)
+        assert worst[0] == "inverted"
+
+    def test_inverted_counts_as_mismatch_for_shading(self):
+        """Those bases genuinely don't match at that position, so the shade
+        density stays honest; the distinct colour is painted on top."""
+        binned = lambda bp: bp * 10 // 1000
+        comp = sc._alignment_bar_column_shades(
+            [(0, 100, "inverted")], 0, 1000, binned, 0, 10)
+        assert comp[0] == (0, 100, 0)
+
+    def test_inversion_note_covers_both_orientation_signals(self):
+        note = sc._inversion_note({
+            "inverted_segments": [{"t_start": 10, "t_end": 110,
+                                   "q_start": 10, "q_end": 110}],
+            "query_rc": True})
+        assert "1 inverted segment (100 bp)" in note
+        assert "reverse complement" in note
+        assert sc._inversion_note({"inverted_segments": [],
+                                   "query_rc": False}) == ""
+        assert sc._inversion_note(None) == ""
+
+    def test_wrapped_pair_counts_as_one_event(self):
+        """An origin-straddling inversion is emitted as two spans because
+        every overlay consumer walks ascending half-open ranges. It is one
+        flipped block, and saying "2 inverted segments" overstates it."""
+        wrapped = {"inverted_segments": [
+            {"t_start": 0, "t_end": 300, "q_start": 0, "q_end": 300,
+             "wrapped": True},
+            {"t_start": 2700, "t_end": 3000, "q_start": 2700,
+             "q_end": 3000, "wrapped": True}]}
+        assert sc._inverted_event_count(wrapped) == 1
+        assert "1 inverted segment (600 bp)" in sc._inversion_note(wrapped)
+        plain = {"inverted_segments": [
+            {"t_start": 0, "t_end": 300, "q_start": 0, "q_end": 300},
+            {"t_start": 900, "t_end": 1200, "q_start": 900, "q_end": 1200}]}
+        assert sc._inverted_event_count(plain) == 2
+        assert "2 inverted segments" in sc._inversion_note(plain)
+        # A hand-edited store with an odd wrapped count still reports one.
+        assert sc._inverted_event_count({"inverted_segments": [
+            {"t_start": 0, "t_end": 9, "q_start": 0, "q_end": 9,
+             "wrapped": True}]}) == 1
+        for junk in (None, {}, {"inverted_segments": "x"},
+                     {"inverted_segments": [None, 5]}):
+            assert sc._inverted_event_count(junk) == 0
+
+    def test_inverted_spans_ignores_malformed_rows(self):
+        r = {"inverted_segments": [
+            {"t_start": 5, "t_end": 15, "q_start": 5, "q_end": 15},
+            {"t_start": 20, "t_end": 10}, "junk", {"t_start": "x"}, None]}
+        assert sc._inverted_spans(r) == [(5, 15)]
+        assert sc._inverted_spans({"inverted_segments": "nope"}) == []
+        assert sc._inverted_bp(r) == 10
+
+
+class TestInvertedSegmentsRoundTrip:
+    """Stored alignments carry the spans, and a hand-edited store can't
+    paint a bogus inverted block over good bases."""
+
+    def _stored(self, tiny_record, inv):
+        return {
+            "id": "inv-1", "label": "read", "query_label": "read",
+            "target_label": tiny_record.name, "target_id": tiny_record.id,
+            "target_gb_text": sc._record_to_gb_text(tiny_record),
+            "target_seq_hash": sc._alignment_target_hash(
+                str(tiny_record.seq)),
+            "axis": "target", "visible": True, "source": "sequencing",
+            "result": {"aligned_q": "ATGC", "aligned_t": "ATGC",
+                       "n_matches": 4, "n_mismatches": 0, "n_gaps": 0,
+                       "identity_pct": 100.0,
+                       "ungapped_identity_pct": 100.0,
+                       "inverted_segments": inv},
+        }
+
+    def test_legacy_entry_defaults_to_empty(self, tiny_record):
+        stored = self._stored(tiny_record, [])
+        stored["result"].pop("inverted_segments")
+        args = sc._deserialize_stored_alignment_args(stored)
+        assert args["result"]["inverted_segments"] == []
+
+    def test_well_formed_spans_survive(self, tiny_record):
+        seg = {"t_start": 1, "t_end": 3, "q_start": 1, "q_end": 3,
+               "length": 2, "identity_pct": 100.0}
+        args = sc._deserialize_stored_alignment_args(
+            self._stored(tiny_record, [seg]))
+        assert args["result"]["inverted_segments"] == [seg]
+
+    @pytest.mark.parametrize("bad", [
+        "not-a-list", 42,
+    ])
+    def test_non_list_is_dropped(self, tiny_record, bad):
+        args = sc._deserialize_stored_alignment_args(
+            self._stored(tiny_record, bad))
+        assert args["result"]["inverted_segments"] == []
+
+    def test_malformed_rows_are_filtered_out(self, tiny_record):
+        good = {"t_start": 1, "t_end": 3, "q_start": 1, "q_end": 3}
+        args = sc._deserialize_stored_alignment_args(self._stored(
+            tiny_record,
+            [good, {"t_start": 9, "t_end": 2, "q_start": 0, "q_end": 1},
+             {"t_start": -5, "t_end": 5, "q_start": 0, "q_end": 1},
+             "junk", None]))
+        assert args["result"]["inverted_segments"] == [good]
+
+    async def test_register_paints_the_span_as_inverted(
+            self, tiny_record, isolated_library):
+        """`_register_alignment` re-labels through the spans, so the band
+        renders the region in its own state rather than as mismatch."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            aq = "ACGT" * 10 + "TTTT" * 5 + "ACGT" * 10
+            at = "ACGT" * 10 + "AAAA" * 5 + "ACGT" * 10
+            entry = app._register_alignment(
+                name="r", query_label="r", target_label="t",
+                target_record=tiny_record,
+                result={"aligned_q": aq, "aligned_t": at,
+                        "identity_pct": 80.0,
+                        "inverted_segments": [
+                            {"t_start": 40, "t_end": 60,
+                             "q_start": 40, "q_end": 60}]},
+            )
+            assert entry is not None
+            states = {st for _s, _e, st in entry["segments"]}
+            assert "inverted" in states
+            inv = [(s, e) for s, e, st in entry["segments"]
+                   if st == "inverted"]
+            assert inv == [(40, 60)]
