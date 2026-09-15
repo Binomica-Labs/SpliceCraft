@@ -296,9 +296,15 @@ class TestWrapFeatureOriginEdgeInserts:
 
         wrap = _first_by_label(new_rec, "wrapCDS")
         assert isinstance(wrap.location, CompoundLocation)
-        parts = sorted((int(p.start), int(p.end)) for p in wrap.location.parts)
+        # Order matters: for a compound location the STORED order is the
+        # 5'->3' reading order, and a plus-strand wrap is stored tail-first.
+        # Asserting on a sorted() copy (as this did until the 2026-09-15
+        # audit) is blind to a rebuild that reverses the halves — which
+        # reads the right bases in the wrong order, i.e. a cyclically
+        # rotated protein everywhere outside SpliceCraft's own display.
+        parts = [(int(p.start), int(p.end)) for p in wrap.location.parts]
         # Head stays anchored at 0 (end 5 -> 15); tail shifts +10.
-        assert parts == [(0, 15), (105, 110)]
+        assert parts == [(105, 110), (0, 15)]
         # Downstream gene sits entirely after the insert → shifts +10.
         gene = _first_by_label(new_rec, "downstream")
         assert (int(gene.location.start), int(gene.location.end)) == (60, 80)
@@ -312,9 +318,10 @@ class TestWrapFeatureOriginEdgeInserts:
 
         wrap = _first_by_label(new_rec, "wrapCDS")
         assert isinstance(wrap.location, CompoundLocation)
-        parts = sorted((int(p.start), int(p.end)) for p in wrap.location.parts)
+        # Stored (reading) order, not sorted — see the bp-0 test above.
+        parts = [(int(p.start), int(p.end)) for p in wrap.location.parts]
         # Head unchanged; tail end grows to the new total (110).
-        assert parts == [(0, 5), (95, 110)]
+        assert parts == [(95, 110), (0, 5)]
 
 
 class TestRebuildEditEdgeCases:
@@ -330,8 +337,15 @@ class TestRebuildEditEdgeCases:
 
     def test_replace_trims_feature_overhanging_start(self):
         # Feature [40, 60); replace [50, 70) with 4 bp. The feature starts
-        # before the edit and ends inside it → head kept, new end is just
-        # past the inserted payload (s + ins_len = 54), NOT the old 60.
+        # before the edit and ends inside it → it keeps ONLY its own
+        # surviving bases [40, 50). The inserted payload is new sequence the
+        # feature never covered, so it must not be absorbed.
+        #
+        # 2026-09-15 audit: this used to assert (40, 54), i.e. the feature
+        # swallowing all 4 inserted bases — contradicting the sibling branch
+        # for a 5'-truncating replace, which deliberately starts the feature
+        # PAST the payload for exactly this reason. The assertion pinned the
+        # bug; the two branches now agree.
         rec = SeqRecord(Seq("A" * 100), id="T",
                         annotations={"molecule_type": "DNA"})
         rec.features.append(SeqFeature(
@@ -342,7 +356,8 @@ class TestRebuildEditEdgeCases:
         new_rec = app._rebuild_record_with_edit(
             new_seq, "replace", 50, 70, "C" * 4)
         f = _first_by_label(new_rec, "overhang")
-        assert (int(f.location.start), int(f.location.end)) == (40, 54)
+        assert (int(f.location.start), int(f.location.end)) == (40, 50)
+        assert str(f.extract(new_rec.seq)) == "A" * 10   # no payload bases
 
     def test_replace_consuming_whole_wrap_drops_feature(self):
         # Replace the entire molecule → both parts of the wrap feature are

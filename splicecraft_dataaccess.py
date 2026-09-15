@@ -26,7 +26,9 @@ from typing import Any as _Any, TypeVar as _TypeVar
 
 import splicecraft_state as _state
 from splicecraft_logging import _log, _log_event, _repr_for_log
-from splicecraft_persistence import _safe_load_json, _safe_save_json
+from splicecraft_persistence import (
+    _atomic_write_text, _safe_load_json, _safe_save_json,
+)
 from splicecraft_record import _gb_text_to_record
 from splicecraft_biology import _rc
 from splicecraft_util import _feat_label, _fuzzy_match, _natural_sort_key, _sanitize_gel_id, _sanitize_plasmid_status
@@ -1154,6 +1156,43 @@ def _load_library() -> list[dict]:
     return _typed_clone(_state._library_cache)
 
 
+def _mirror_dirty_path():
+    """Marker file recording that `plasmid_library.json` is AHEAD of the
+    active collection because a mirror write failed."""
+    return _state._DATA_DIR / ".mirror-dirty"
+
+
+def _mark_mirror_dirty(reason: str) -> None:
+    """Record that the library/collection mirror is out of sync.
+
+    Read at startup by `_restore_library_from_active_collection`, which then
+    refuses to overwrite the library from the (stale) collection. Best-effort:
+    if even this marker cannot be written we must not mask the original
+    failure the caller is about to raise."""
+    try:
+        _atomic_write_text(_mirror_dirty_path(), f"{reason}\n")
+        _log.error("Active-collection mirror FAILED (%s) — library.json is "
+                   "ahead of collections.json; startup will not overwrite it",
+                   reason)
+    except BaseException:                      # noqa: BLE001 - never mask
+        _log.exception("Could not write the mirror-dirty marker")
+
+
+def _clear_mirror_dirty() -> None:
+    """Drop the marker once the two files agree again."""
+    try:
+        _mirror_dirty_path().unlink(missing_ok=True)
+    except OSError:
+        _log.debug("Could not clear the mirror-dirty marker")
+
+
+def _mirror_is_dirty() -> bool:
+    try:
+        return _mirror_dirty_path().exists()
+    except OSError:
+        return False
+
+
 def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
     """Persist the live library + mirror it into the active collection.
     ``async_sync=True`` (LibraryPanel delete path) defers the mirror to a
@@ -1170,7 +1209,26 @@ def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
         # INSIDE the lock so the mirror file can't drift from library.json.
         _mirror = getattr(_state, "_sync_active_collection_plasmids_hook", None)
         if _mirror is not None:
-            _mirror(entries, async_write=async_sync)
+            try:
+                _mirror(entries, async_write=async_sync)
+                if not async_sync:
+                    # Both files agree again (the async path clears its own
+                    # marker when the worker's write lands).
+                    _clear_mirror_dirty()
+            except BaseException:
+                # `collections.json` is the SOURCE OF TRUTH at startup and
+                # `plasmid_library.json` is its mirror, so a library write
+                # that lands while the mirror write fails is not merely
+                # half-saved — the next launch's
+                # `_restore_library_from_active_collection` overwrites the
+                # good library from the stale collection and the entry is
+                # gone. The shrink guard does not fire (one entry is far
+                # under its threshold) and nothing is spilled. Mark the
+                # mirror dirty so startup refuses to overwrite, then let the
+                # caller see the failure.
+                _mark_mirror_dirty("library save could not mirror into the "
+                                   "active collection")
+                raise
     # Post-lock cache invalidations (primer-usage + bulk-align k-mer) — hub-side.
     _after = getattr(_state, "_after_library_save_hook", None)
     if _after is not None:

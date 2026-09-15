@@ -202,6 +202,12 @@ def _cassette_homopolymer_runs(dna: str, max_run: int) -> "list[dict]":
     return hits
 
 
+# Upper bound on repeat findings returned by `_cassette_internal_repeats`.
+# One repetitive cassette is one fact; the thousandth alignment of the same
+# poly-A tract adds nothing and costs memory.
+_CASSETTE_MAX_REPEAT_HITS = 500
+
+
 def _cassette_internal_repeats(dna: str, min_len: int,
                                exclude: "list[tuple[int, int]] | None" = None
                                ) -> "list[dict]":
@@ -218,7 +224,13 @@ def _cassette_internal_repeats(dna: str, min_len: int,
     that accidentally repeats against the promoter is still reported.
 
     Reports the maximal repeat per seed rather than every one of the
-    ``run - min_len + 1`` overlapping windows a naive k-mer sweep emits."""
+    ``run - min_len + 1`` overlapping windows a naive k-mer sweep emits.
+
+    Capped at ``_CASSETTE_MAX_REPEAT_HITS`` findings. Low-complexity input
+    (long poly-A / poly-T stretches, as in an AT-rich terminator pair) has a
+    genuinely enormous number of distinct alignments, and every one of them
+    is the same actionable fact: the cassette is repetitive. The cap keeps
+    the returned list — and the memory behind it — bounded."""
     n = len(dna)
     if min_len <= 0 or n < min_len * 2:
         return []
@@ -232,7 +244,10 @@ def _cassette_internal_repeats(dna: str, min_len: int,
         index.setdefault(dna[i:i + min_len], []).append(i)
 
     hits, seen = [], set()
+    cap = _CASSETTE_MAX_REPEAT_HITS
     for kmer, positions in index.items():
+        if len(hits) >= cap:
+            break
         if len(positions) > 1:
             first, second = positions[0], positions[1]
             if (first, second, 'direct') in seen:
@@ -252,19 +267,39 @@ def _cassette_internal_repeats(dna: str, min_len: int,
 
     rc = _rc(dna)
     for i in range(n - min_len + 1):
+        if len(hits) >= cap:
+            break
         window = rc[i:i + min_len]
-        for j in index.get(window, []):
-            # Map the RC coordinate back to the forward strand.
-            fwd = n - i - min_len
-            if fwd <= j:
-                continue
-            if (j, fwd, 'inverted') in seen:
-                continue
-            if _excluded(j, min_len) and _excluded(fwd, min_len):
-                continue
-            seen.add((j, fwd, 'inverted'))
-            hits.append({'kind': 'inverted', 'length': min_len,
-                         'positions': [j, fwd], 'seq_head': window})
+        # Map the RC coordinate back to the forward strand.
+        fwd = n - i - min_len
+        # FIRST matching copy only, exactly like the direct branch above.
+        # Iterating every position in the bucket made this quadratic in
+        # HITS, not merely in time: a 5 kb AT-rich cassette (poly-A and
+        # poly-T stretches, as in a NOS/OCS terminator pair) produced
+        # 5.3 million dicts — about a gigabyte inside the returned result.
+        j = next((p for p in index.get(window, ()) if p < fwd), None)
+        if j is None:
+            continue
+        if (j, fwd, 'inverted') in seen:
+            continue
+        # Extend right for the maximal run, mirroring the direct branch, so
+        # one hairpin is ONE finding at its REAL length. Reporting every
+        # inverted repeat as exactly `min_len` ranked a 100 bp direct repeat
+        # above a 1200 bp hairpin and told the user "1101 internal repeats"
+        # when there was one. Walking right along the forward copy walks
+        # LEFT along the reverse copy, hence the mirrored index.
+        run = min_len
+        while (j + run < fwd
+               and fwd + min_len - 1 - run >= 0
+               and dna[j + run] == _rc(dna[fwd + min_len - 1 - run])):
+            run += 1
+        if _excluded(j, run) and _excluded(fwd, min_len):
+            continue
+        # Every sub-window of the extended repeat is the SAME finding.
+        for off in range(run - min_len + 1):
+            seen.add((j + off, fwd - off, 'inverted'))
+        hits.append({'kind': 'inverted', 'length': run,
+                     'positions': [j, fwd], 'seq_head': window})
 
     hits.sort(key=lambda h: (-h['length'], h['positions'][0]))
     return hits
@@ -393,18 +428,25 @@ def _cassette_scrub_coding(dna: str, protein: str, raw: dict,
     "this motif was left because we gave up on correctness"."""
     fixes: "list[dict]" = []
     converged, used = False, 0
+    # Is there a stop codon on the end that ISN'T part of the protein? Only
+    # then may the scrub skip the last codon. A coding block that ends in a
+    # C-terminal tag has no stop at all, and hardcoding `True` made its last
+    # real codon unreachable — the pass then reported the residual motif as
+    # "cannot be removed without changing the protein", which was false.
+    has_stop = len(dna) // 3 > len(protein)
     for _ in range(max(1, int(rounds))):
         used += 1
         before = dna
         dna, site_fixes = _codon_fix_sites(
-            dna, protein, raw, targets, has_appended_stop=True,
+            dna, protein, raw, targets, has_appended_stop=has_stop,
             transl_table=transl_table)
         for fix in site_fixes:
             fixes.append({'pass': 'site', **(fix if isinstance(fix, dict)
                                              else {'detail': fix})})
         dna, gc_fixes = _codon_fix_gc_window(
             dna, protein, raw, window=gc_window, min_gc=gc_min, max_gc=gc_max,
-            sites=targets, has_appended_stop=True, transl_table=transl_table)
+            sites=targets, has_appended_stop=has_stop,
+            transl_table=transl_table)
         for fix in gc_fixes:
             fixes.append({'pass': 'gc', **(fix if isinstance(fix, dict)
                                            else {'detail': fix})})

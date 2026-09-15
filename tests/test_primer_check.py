@@ -207,14 +207,24 @@ class TestInsilicoPcrAmplicons:
         assert mine[0]["certainty"] < 100.0
 
     def test_one_tailed_primer_still_found(self):
-        # `_simulate_pcr` returns nothing when only ONE primer is tailed
-        # (its fallback needs BOTH to miss exact); ours still finds it.
+        # A pair where only ONE primer carries a 5' tail — a tailed cloning
+        # primer against a stock sequencing primer, the commonest geometry
+        # there is. Until the 2026-09-15 audit `_simulate_pcr` returned
+        # NOTHING here (its partial-binding fallback required BOTH primers to
+        # miss an exact match), so the two simulators disagreed on the same
+        # pair; this test asserted that disagreement. They now agree.
         fwd = "GGGGGCCCCC" + self.T[100:122]      # tailed
         rev = sc._rc(self.T[400:422])             # exact
-        assert sc._simulate_pcr(self.T, fwd, rev, circular=False) == []
         mine = self._mine(fwd, rev, circular=False)
         assert mine
-        assert mine[0]["length"] == (400 + 22) - (122 - len(fwd))
+        expected_len = (400 + 22) - (122 - len(fwd))
+        assert mine[0]["length"] == expected_len
+        sim = sc._simulate_pcr(self.T, fwd, rev, circular=False)
+        assert len(sim) == 1
+        assert sim[0]["length"] == expected_len
+        # The product carries the tail; the template arc under it is real.
+        assert sim[0]["amplicon_seq"].startswith(fwd)
+        assert sim[0]["amplicon_seq"].endswith(sc._rc(rev))
 
     def test_max_amplicon_filter(self):
         fwd = self.T[100:122]

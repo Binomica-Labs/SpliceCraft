@@ -558,7 +558,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--type", default="misc_feature",
                         help="GenBank feature type (CDS, promoter, …).")
     p_add.add_argument("--strand", type=int, default=1,
-                        choices=[-1, 0, 1],
+                        choices=[-1, 0, 1, 2],
                         help="1=forward (default), -1=reverse, 0=both.")
     p_add.add_argument("--force", action="store_true",
                         help="Override unsaved-changes guard.")
@@ -611,7 +611,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_updfeat.add_argument("--type",  default=None,
                              help="GenBank feature type (CDS, promoter, …).")
     p_updfeat.add_argument("--strand", type=int, default=None,
-                             choices=[-1, 0, 1])
+                             choices=[-1, 0, 1, 2])
     p_updfeat.add_argument("--force", action="store_true")
     p_updfeat.set_defaults(fn=cmd_update_feature)
 

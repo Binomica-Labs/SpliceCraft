@@ -426,11 +426,19 @@ class TestParser:
         assert "splicecraft" in captured.out.lower()
 
     def test_add_feature_strand_choices(self):
-        """--strand must be restricted to -1 / 0 / 1; bad values fail
-        argparse, not the server."""
+        """--strand accepts exactly the strand values the API does: -1 / 0 /
+        1 and SpliceCraft's double-stranded 2. Anything else fails argparse,
+        not the server.
+
+        2 was missing until the 2026-09-15 audit, so the sidecar refused a
+        value `add-feature` documents and accepts — a user could only get a
+        double-stranded feature through the raw `call` subcommand."""
         parser = cli._build_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args(["add-feature", "0", "10", "--strand", "2"])
+        assert parser.parse_args(
+            ["add-feature", "0", "10", "--strand", "2"]).strand == 2
+        for bad in ("3", "-2", "x"):
+            with pytest.raises(SystemExit):
+                parser.parse_args(["add-feature", "0", "10", "--strand", bad])
 
     def test_add_feature_defaults(self):
         parser = cli._build_parser()

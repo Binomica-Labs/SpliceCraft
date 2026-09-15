@@ -29,7 +29,8 @@ from splicecraft_persistence import (
 from splicecraft_biology import _rc
 from splicecraft_util import (
     _CONTROL_CHARS_RE, _DEFAULT_TYPE_COLORS, _feat_bounds, _is_windows_reserved_stem,
-    _natural_sort_key, _pick_single_record, _safe_xml_parse, _sanitize_label,
+    _natural_sort_key, _pick_single_record, _record_is_circular, _safe_xml_parse,
+    _sanitize_label,
 )
 from splicecraft_record import (
     _GB_LOCUS_NAME_MAX, _gb_text_to_record, _normalize_primer_seq, _record_to_gb_text,
@@ -1370,6 +1371,7 @@ def _build_commercialsaas_features_packet_from_record(record) -> bytes:
     (e.g., wrap features get 2 segments; spliced CDSes get one per
     exon)."""
     import xml.etree.ElementTree as _ET
+    _n_bases = len(getattr(record, "seq", "") or "")
     real_feats = [f for f in record.features if f.type != "source"]
     root = _ET.Element("Features",
                           nextValidID=str(len(real_feats)))
@@ -1394,10 +1396,11 @@ def _build_commercialsaas_features_packet_from_record(record) -> bytes:
         # renders. CommercialSaaS's library-wide colour map differs slightly,
         # but it gracefully accepts any 6-digit hex.
         color = _DEFAULT_TYPE_COLORS.get(feat.type or "", "#a6acb3")
-        # Segments: one per CompoundLocation part; one for simple.
-        for part in _commercialsaas_iter_location_parts(feat.location):
-            start_1based = int(part.start) + 1
-            end_1based   = int(part.end)
+        # Segments: one per CompoundLocation part; one for simple. An origin
+        # wrap collapses to a single inverted range — see
+        # `_commercialsaas_segment_ranges`.
+        for start_1based, end_1based in _commercialsaas_segment_ranges(
+                feat.location, _n_bases):
             _ET.SubElement(feat_el, "Segment", {
                 "range": f"{start_1based}-{end_1based}",
                 "color": color,
@@ -1594,15 +1597,48 @@ def _build_commercialsaas_primers_packet_default() -> bytes:
 
 
 def _commercialsaas_iter_location_parts(location):
-    """Yield `(start, end)` simple parts for a feature location.
+    """Yield the simple parts of a feature location, unsorted.
+
     Handles both `SimpleLocation` (single part) and `CompoundLocation`
-    (multi-part; emits one part per sub-location)."""
+    (multi-part; emits one part per sub-location). Callers that write
+    `<Segment>` elements should use `_commercialsaas_segment_ranges`, which
+    puts them in the order the `.dna` reader expects."""
     parts = getattr(location, "parts", None)
     if parts:
         for p in parts:
             yield p
     else:
         yield location
+
+
+def _commercialsaas_segment_ranges(location, total: int) -> "list[tuple[int, int]]":
+    """1-based inclusive ``(start, end)`` ranges for a feature's `<Segment>`
+    elements, in the order the `.dna` reader reconstructs correctly.
+
+    The reader APPENDS each segment for a forward feature and PREPENDS each
+    one for a reverse feature. Two shapes have to respect that, and both used
+    to come back WRONG:
+
+    * **Origin wrap** — emit TAIL first, then head. Appended, that is
+      ``[tail, head]``; prepended, it is ``[head, tail]`` — which is exactly
+      the part order Biopython holds for a plus- and a minus-strand wrap
+      respectively. Emitting Biopython's own order instead round-tripped the
+      plus strand by luck and swapped the halves of every minus-strand wrap.
+    * **Minus-strand multi-part** (a spliced CDS) — Biopython holds parts in
+      READING order, which on the minus strand runs high coordinate → low.
+      Emitting that order gave back reversed exons — a different protein from
+      a file claiming to be a round-trip — so these emit ASCENDING and let
+      the reader's prepend restore the reading order.
+    """
+    parts = list(getattr(location, "parts", None) or [location])
+    ordered = sorted(parts, key=lambda q: int(q.start))
+    if total > 0 and len(parts) == 2:
+        head, tail = ordered[0], ordered[-1]
+        if (int(head.start) == 0 and int(tail.end) == total
+                and int(head.end) < int(tail.start)):
+            return [(int(tail.start) + 1, int(tail.end)),
+                    (int(head.start) + 1, int(head.end))]
+    return [(int(p.start) + 1, int(p.end)) for p in ordered]
 
 
 @_timed("op.write_commercialsaas_dna")
@@ -2053,11 +2089,12 @@ def _augment_dna_record_from_packets(
     n = len(seq_str)
     today = _date.today().isoformat()
     primer_bind_entries: list[dict] = []
+    _circular = _record_is_circular(rec)
     for f in rec.features:
         if f.type != "primer_bind":
             continue
         try:
-            bounds = _feat_bounds(f, n)
+            bounds = _feat_bounds(f, n, circular=_circular)
         except (TypeError, ValueError, AttributeError):
             bounds = None
         if bounds is None:

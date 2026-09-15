@@ -75,6 +75,10 @@ _PYHMMER_AVAILABLE: bool = False
 # Migrated out of the hub; accessed `_state.<name>`. Not conftest-patched.
 _BLAST_CACHE_GENERATION: int = 0
 _DANGLING_ACTIVE_COLLECTION_NAME: "str | None" = None
+# Set when startup found the library/active-collection mirror marked
+# dirty and therefore REFUSED to overwrite the library from the
+# collection. Read + cleared once by `PlasmidApp.on_mount`.
+_MIRROR_DIRTY_RECOVERY_NAME: "str | None" = None
 _SPELLCHECK_ENGINE: "_Any | None" = None
 _WHATS_NEW_CACHE: "tuple[str, float, str] | None" = None  # (path, mtime, body_md)
 _collection_sync_pending: "tuple[str, list[dict]] | None" = None

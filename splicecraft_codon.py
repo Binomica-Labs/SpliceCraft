@@ -18,6 +18,7 @@ stop, no codon->AA mismatch.
 """
 from __future__ import annotations
 
+import math as _math
 import re
 from datetime import date as _date
 from pathlib import Path
@@ -260,21 +261,34 @@ def _parse_codon_tsv(text: str) -> dict:
     amino-acid column (1-letter, 3-letter, or ``*`` / ``Stop``) is
     validated against the standard code and otherwise derived from
     ``_CODON_GENETIC_CODE``. Rows whose first token isn't an ACGT/U codon
-    (headers), blank lines, and ``#`` comments are skipped. Counts may be
-    ints or floats (rounded); a fraction-only row (0..1) is scaled by
-    1000 so relative preference survives. ``U`` is accepted and folded to
-    ``T``.
+    (headers), blank lines, and ``#`` comments are skipped. ``U`` is
+    accepted and folded to ``T``.
+
+    **The count column and its scale are chosen ONCE FOR THE WHOLE FILE,**
+    never per row. Only relative weight within a synonymy family matters
+    downstream, so the requirement is that every row is transformed the
+    same way. Deciding per row is how a real "frequency per thousand"
+    table — where `15.3` and `25.0` sit side by side in one amino-acid
+    family, as public codon-usage table exports routinely do — got its decimal
+    rows multiplied by 1000 and its whole-numbered rows left alone,
+    putting them 1000× apart and INVERTING the host's codon preference.
+    The rule: prefer the right-most numeric column that is whole-numbered
+    in every row (a real count); otherwise take the last column and scale
+    it by 1000 when any row there is fractional.
 
     Raises ``ValueError`` with a readable message on a bad codon, a
-    non-numeric / negative count, an AA/codon mismatch, a duplicate
-    codon, or a file with zero usable rows — callers surface it in a
-    status line rather than crashing.
+    non-numeric / non-finite / negative count, an AA/codon mismatch, a
+    duplicate codon, or a file with zero usable rows — callers surface it
+    in a status line rather than crashing.
     """
     if not isinstance(text, str):
         raise ValueError("codon table must be text")
     if len(text) > _CODON_TSV_MAX_CHARS:
         raise ValueError("codon table is too large (1 MB cap)")
-    raw: "dict[str, tuple[str, int]]" = {}
+    # (lineno, codon, aa, [numeric values]) per accepted row — the count
+    # column and its scale are decided after the whole file is read.
+    rows: "list[tuple[int, str, str, list[float]]]" = []
+    seen_codons: "set[str]" = set()
     for lineno, line in enumerate(text.splitlines(), 1):
         s = line.strip()
         if not s or s.startswith("#"):
@@ -287,11 +301,11 @@ def _parse_codon_tsv(text: str) -> dict:
             continue   # header / non-codon row — skip silently
         if codon not in _CODON_GENETIC_CODE:
             raise ValueError(f"line {lineno}: {codon!r} is not a valid codon")
-        if codon in raw:
+        if codon in seen_codons:
             raise ValueError(f"line {lineno}: duplicate codon {codon!r}")
         expected_aa = _CODON_GENETIC_CODE[codon]
         aa_given: "str | None" = None
-        numeric: list[str] = []
+        numeric: list[float] = []
         for t in toks[1:]:
             tu = t.upper()
             if len(tu) == 1 and (tu in "ACDEFGHIKLMNPQRSTVWY" or tu in ("*", ".")):
@@ -306,10 +320,19 @@ def _parse_codon_tsv(text: str) -> dict:
                 aa_given = _CODON_TSV_AA3[tu]
             else:
                 try:
-                    float(t)
-                    numeric.append(t)
+                    v = float(t)
                 except ValueError:
-                    pass   # stray non-numeric, non-AA token — ignore
+                    continue   # stray non-numeric, non-AA token — ignore
+                if not _math.isfinite(v):
+                    # `inf` / `nan` / `1e400` parse as floats but blow up in
+                    # `int(round(...))` with OverflowError, which escapes the
+                    # Import-TSV modal's `except ValueError` handler and
+                    # crashes the screen. Refuse them in the parser's own
+                    # vocabulary instead.
+                    raise ValueError(
+                        f"line {lineno}: non-finite count {t!r} for {codon!r}"
+                    )
+                numeric.append(v)
         if aa_given is not None and aa_given != expected_aa:
             raise ValueError(
                 f"line {lineno}: codon {codon!r} encodes {expected_aa!r} "
@@ -319,17 +342,39 @@ def _parse_codon_tsv(text: str) -> dict:
             raise ValueError(
                 f"line {lineno}: no count/frequency column for {codon!r}"
             )
-        ints = [t for t in numeric if float(t) == int(float(t))]
-        count = (int(round(float(ints[-1]))) if ints
-                 else int(round(float(numeric[-1]) * 1000)))
-        if count < 0:
-            raise ValueError(f"line {lineno}: negative count for {codon!r}")
-        raw[codon] = (expected_aa, count)
-    if not raw:
+        seen_codons.add(codon)
+        rows.append((lineno, codon, expected_aa, numeric))
+
+    if not rows:
         raise ValueError(
             "no codon rows found — expected lines like 'GCT A 120' or "
             "'GCT 120' (codon then count)"
         )
+
+    # ── One scale for the whole file (see the docstring) ──────────────────
+    widths = {len(vals) for _l, _c, _a, vals in rows}
+    col = -1                      # right-most numeric column, per row
+    if len(widths) == 1:
+        width = widths.pop()
+        # Right-most column that is whole-numbered in EVERY row is a real
+        # count column (e.g. the `(1234)` occurrences beside a `0.28`
+        # fraction); anything left of it is a derived frequency.
+        for j in range(width - 1, -1, -1):
+            if all(vals[j] == int(vals[j]) for _l, _c, _a, vals in rows):
+                col = j
+                break
+    chosen = [vals[col] for _l, _c, _a, vals in rows]
+    # A fractional value anywhere in the chosen column means the column is a
+    # frequency (0..1 fractions, or per-thousand values like 15.3), so every
+    # row is scaled identically to keep the integer registry shape.
+    scale = 1000 if any(v != int(v) for v in chosen) else 1
+
+    raw: "dict[str, tuple[str, int]]" = {}
+    for (lineno, codon, expected_aa, vals) in rows:
+        count = int(round(vals[col] * scale))
+        if count < 0:
+            raise ValueError(f"line {lineno}: negative count for {codon!r}")
+        raw[codon] = (expected_aa, count)
     return raw
 
 
@@ -910,6 +955,37 @@ def _codon_fix_gc_window(dna: str, protein: str, raw: dict, *,
                 worst = (gap, key)
         return worst[1] if worst else None
 
+    maxlen = max((len(s) for s in forbidden), default=0)
+
+    def _local_violation(chars: list, codon_start: int) -> float:
+        """Total band violation over just the windows a swap at
+        ``codon_start`` can move. A 3-base change only shifts the GC count of
+        windows overlapping ``[codon_start, codon_start+3)``, so this is the
+        exact delta the global objective would see, at O(window) instead of
+        O(len(seq))."""
+        ln = len(chars)
+        w = min(window, ln)
+        if w <= 0 or ln < w:
+            return 0.0
+        k0 = max(0, codon_start - w + 1)
+        k1 = min(ln - w, codon_start + 2)
+        if k1 < k0:
+            return 0.0
+        run = sum(1 for b in chars[k0:k0 + w] if b in "GCgc")
+        tot = 0.0
+        for k in range(k0, k1 + 1):
+            if k > k0:
+                if chars[k - 1] in "GCgc":
+                    run -= 1
+                if chars[k + w - 1] in "GCgc":
+                    run += 1
+            pct = run / w * 100.0
+            if min_gc is not None and pct < min_gc:
+                tot += min_gc - pct
+            if max_gc is not None and pct > max_gc:
+                tot += pct - max_gc
+        return tot
+
     fixes: list[str] = []
     stuck: set = set()
     # One swap can only ever help one codon, so a codon-count budget bounds the
@@ -946,16 +1022,41 @@ def _codon_fix_gc_window(dna: str, protein: str, raw: dict, *,
         kmer_guard: set = avoid_kmers or set()
         check_kmers = bool(kmer_guard) and kmer_len > 0
         for _d, _f, codon_idx, codon_start, aa, current, alt in cands:
+            # The swap must STRICTLY reduce the band violation over the
+            # windows it can move. Without this the pass ping-pongs: a swap
+            # that rescues the current worst window pushes a neighbour out of
+            # band, that neighbour becomes the next worst and gets swapped
+            # back, and the pair trades places until the per-call budget runs
+            # out. The `stuck` set never caught it because a candidate WAS
+            # applied every round — the loop was busy, not converging. On a
+            # 1500-codon CDS that burned the full budget (1501 swaps, 2.6 s)
+            # and still left the sequence out of band; through the cassette's
+            # 20 rounds it was 30,029 swaps and 42 s.
+            before_v = _local_violation(dna_list, codon_start)
             dna_list[codon_start:codon_start + 3] = list(alt)
-            # `after` is O(n) to build — only materialise it when a guard
-            # actually reads it. In the common GC-only case (no forbidden
-            # sites, no repeat k-mers) neither branch runs, so we skip the
-            # rebuild entirely; building it unconditionally per candidate was
-            # the O(n²) that made a 6 kb CDS take seconds.
-            if forbidden and not (_forbidden_hit_set("".join(dna_list),
-                                                     forbidden) <= before_hits):
+            if _local_violation(dna_list, codon_start) >= before_v:
                 dna_list[codon_start:codon_start + 3] = list(current)
                 continue
+            # Forbidden-site guard, windowed exactly as `_codon_swap_ok`
+            # argues: a linear scan's hits differ only where they overlap the
+            # 3 changed bases, so comparing that band is equivalent to the
+            # full rescan this used to do per candidate (which was the
+            # dominant cost of the whole pass).
+            if forbidden:
+                a_lo = max(0, codon_start - maxlen + 1)
+                a_hi = codon_start + 3
+                s_hi = min(len(dna_list), a_hi + maxlen - 1)
+                sub = "".join(dna_list[a_lo:s_hi])
+                after_win = {
+                    (p, a_lo + off)
+                    for (p, off) in _forbidden_hit_set(sub, forbidden)
+                    if a_lo + off < a_hi
+                }
+                before_win = {(p, q) for (p, q) in before_hits
+                              if a_lo <= q < a_hi}
+                if after_win - before_win:
+                    dna_list[codon_start:codon_start + 3] = list(current)
+                    continue
             if check_kmers:
                 # Only windows overlapping the 3 bases we changed can be new,
                 # so test a local slice, not the whole sequence.
@@ -1154,7 +1255,21 @@ def _codon_forbidden_sites() -> "dict[str, str]":
 
 def _codon_cai(dna: str, raw: dict, *, transl_table: "int | None" = None) -> float:
     """Codon Adaptation Index (geometric mean of per-codon freq ÷ peak freq
-    of its amino-acid synonymy group). Skips stops and unknown codons.
+    of its amino-acid synonymy group).
+
+    Follows the standard definition: stops are excluded, and so are the
+    SINGLE-CODON families (Met, Trp under the standard code), whose weight is
+    1 by construction. Counting them added a `log(1) = 0` term to the sum
+    while still incrementing the divisor, pulling the geometric mean toward 1
+    — a Met/Trp-rich protein scored 0.77 where the standard definition gives
+    0.46. Family size is read from the GENETIC CODE, not from the usage
+    table, so a table missing some synonyms doesn't silently reclassify a
+    family as single-codon.
+
+    A codon ABSENT from the usage table is the rarest codon there is — an
+    observed frequency of zero — so it scores as such rather than being
+    skipped. Skipping it let a gene built entirely from codons the host never
+    uses score a perfect 1.0.
 
     ``transl_table`` labels codons by the target host's genetic code (default
     standard), so a reassigned codon is scored against the RIGHT synonymy group
@@ -1164,12 +1279,14 @@ def _codon_cai(dna: str, raw: dict, *, transl_table: "int | None" = None) -> flo
     gc = (_CODON_GENETIC_CODE if transl_table in (None, 1)
           else _codon_table_for(transl_table))
     aa_codons, codon_frac = _codon_build_aa_map(raw, genetic_code=gc)
+    fam_size: dict[str, int] = {}
+    for _c, _a in gc.items():
+        fam_size[_a] = fam_size.get(_a, 0) + 1
     w: list[float] = []
     for i in range(0, len(dna) - 2, 3):
         codon = dna[i:i + 3].upper()
-        entry = raw.get(codon)
         aa = gc.get(codon)
-        if not entry or aa is None or aa == "*":
+        if aa is None or aa == "*" or fam_size.get(aa, 0) < 2:
             continue
         peak = aa_codons[aa][0][1] if aa in aa_codons else 0.0
         if peak > 0:

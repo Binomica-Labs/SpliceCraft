@@ -90,11 +90,15 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   `min_aa`; `min_length`/`min_bp` are rejected so a bp-vs-aa mix-up can't
   silently return a default-length result. Each ORF carries `start`, `end`,
   `strand`, `length_aa`, `aa_seq`, plus `nt_len` — the exact coding length in
-  bases INCLUDING the stop codon — and `exceeds_one_lap`. **Take length from
+  bases INCLUDING the stop codon when there is one — `has_stop`, and
+  `exceeds_one_lap`. **Take length from
   `nt_len` / `length_aa`, never from `end - start`:** on a circular plasmid a
   frame can run a full lap or more without an in-frame stop, and no
   start/end pair on an n-bp circle can express that. Such an ORF sets
-  `exceeds_one_lap: true` and has its span pinned to the near-full circle),
+  `exceeds_one_lap: true` and has its span pinned to the near-full circle.
+  A frame with NO in-frame stop anywhere on the molecule sets
+  `has_stop: false`; for it every codon is a residue, so `nt_len` is
+  `length_aa * 3` rather than `(length_aa + 1) * 3`),
   `undo` / `redo` the last edit,
   `discard-changes` (revert the canvas to its library-stored copy / clear a
   stuck-dirty flag so the next load / new-plasmid proceeds without `force`),

@@ -56,7 +56,7 @@ from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq,
                                 _topology_from_gb_text)
 from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript)
-from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
+from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
 from splicecraft_biology import (_digest_with_enzymes, _enzyme_aliases, _enzyme_cuts, _enzyme_resolve_one, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
@@ -214,12 +214,20 @@ def _coerce_int(value, *, name: str = "value") -> "int | str":
     """
     import math as _m
     if isinstance(value, bool):
-        return int(value)
+        # `True` is not 1 for an API that takes coordinates and indices.
+        # Coercing it silently answered a different question than the caller
+        # asked, and `rbs-strength` already refused it — one policy, not two.
+        return f"{name!r} must be an integer, not a boolean"
     if isinstance(value, int):
         return value
     if isinstance(value, float):
         if not _m.isfinite(value):
             return f"{name!r} must be a finite number"
+        if value != int(value):
+            # Truncating 1.9 to 1 loses 0.9 bp and returns 200 OK, so a model
+            # that emits a fractional coordinate gets a wrong-by-one answer
+            # with no indication anything was adjusted.
+            return f"{name!r} must be a whole number, not {value!r}"
         return int(value)
     if isinstance(value, str):
         try:
@@ -227,6 +235,17 @@ def _coerce_int(value, *, name: str = "value") -> "int | str":
         except ValueError:
             return f"{name!r} must be an integer"
     return f"{name!r} must be an integer"
+
+
+def _agent_record_is_circular(app) -> bool:
+    """Topology of the record currently on the canvas.
+
+    Only an EXPLICIT `linear` annotation means linear, matching
+    `splicecraft_util._record_is_circular` and the app's own reading."""
+    rec = getattr(app, "_current_record", None)
+    return str(
+        (getattr(rec, "annotations", {}) or {}).get("topology", "")
+    ).strip().lower() != "linear"
 
 
 def _sanitize_bases(s: "str | None", *,
@@ -393,14 +412,26 @@ def _h_get_sequence(app, payload):
     seq = str(rec.seq).upper()
     n   = len(seq)
     try:
-        start = int(payload["start"])
-        end   = int(payload["end"])
+        if "start" not in payload or "end" not in payload:
+            raise KeyError("start/end")
+        start = _coerce_int(payload["start"], name="start")
+        end = _coerce_int(payload["end"], name="end")
     except (KeyError, ValueError, TypeError, OverflowError):
         return ({"error": "missing or invalid 'start'/'end'"}, 400)
+    if isinstance(start, str):
+        return ({"error": start}, 400)
+    if isinstance(end, str):
+        return ({"error": end}, 400)
     if not (0 <= start <= n) or not (0 <= end <= n):
         return ({"error": f"start/end out of range [0, {n}]"}, 400)
     if end >= start:
         sub = seq[start:end]
+    elif not _agent_record_is_circular(app):
+        # `end < start` means "wrap the origin", and a LINEAR molecule has no
+        # origin to wrap. Answering it anyway returned bases that do not exist
+        # as one contiguous span on that DNA.
+        return ({"error": "end < start means an origin wrap, but this record "
+                          "is linear — pass end >= start"}, 400)
     else:
         sub = seq[start:] + seq[:end]
     if bool(payload.get("bottom")):
@@ -1220,16 +1251,29 @@ def _h_optimize_protein(app, payload):
         dna = _codon_optimize(protein, entry["raw"], stops=stops,
                               transl_table=transl_table, mode=mode)
         body = protein.rstrip("*")
+        # Does `dna` actually END in a stop codon we appended? The scrub
+        # passes skip their last codon when it does, so that they never
+        # substitute a synthetic stop. Leaving that skip on for a STOP-FREE
+        # request (`stops=0`, e.g. a domain destined for a C-terminal fusion)
+        # made the last real codon unreachable: a forbidden site overlapping
+        # the C-terminus came back as "cannot be removed without changing the
+        # protein" when a plain synonymous swap was available. A residual Type
+        # IIS site at the C-terminus is exactly what kills a Golden Gate
+        # reaction, so the claim mattered.
+        n_stops = (len(protein) - len(body)) or max(0, int(stops))
+        has_stop = n_stops > 0
         fixes: list = []
         if scrub:
             dna, site_fixes = _codon_fix_sites(
                 dna, body, entry["raw"], sites=scrub,
+                has_appended_stop=has_stop,
                 transl_table=transl_table)
             fixes.extend(site_fixes)
         if refs:
             dna, rep_fixes = _codon_diversify(
                 dna, body, entry["raw"], refs, min_run=max_repeat,
-                sites=scrub or None, transl_table=transl_table)
+                sites=scrub or None, has_appended_stop=has_stop,
+                transl_table=transl_table)
             fixes.extend(rep_fixes)
         if bounds:
             # LAST, and guarded by BOTH the motif set and the repeat k-mers,
@@ -1239,7 +1283,8 @@ def _h_optimize_protein(app, payload):
             dna, gc_fixes = _codon_fix_gc_window(
                 dna, body, entry["raw"], window=gc_window,
                 min_gc=bounds.get("min_gc"), max_gc=bounds.get("max_gc"),
-                sites=scrub or None, transl_table=transl_table,
+                sites=scrub or None, has_appended_stop=has_stop,
+                transl_table=transl_table,
                 avoid_kmers=_codon_kmer_set(refs, max_repeat) if refs else None,
                 kmer_len=max_repeat if refs else 0)
             fixes.extend(gc_fixes)
@@ -4467,10 +4512,11 @@ def _agent_carry_feature_dicts(rec) -> "list[dict]":
     ``carry_annotations`` on `traditional-clone`."""
     out: "list[dict]" = []
     total = _seq_len(rec)
+    _circular = _record_is_circular(rec)
     for f in getattr(rec, "features", None) or []:
         if getattr(f, "type", "") == "source":
             continue
-        bounds = _feat_bounds(f, total)
+        bounds = _feat_bounds(f, total, circular=_circular)
         if bounds is None:
             continue
         s, e, strand = bounds
@@ -5216,11 +5262,12 @@ def _record_to_scrub_feats(record) -> "list[dict]":
     wrap-aware coordinates. CDS features carry their reading frame so the
     scrub stays protein-preserving without a mounted UI."""
     total = _seq_len(record)
+    circular = _record_is_circular(record)
     out: "list[dict]" = []
     for feat in getattr(record, "features", []) or []:
         if feat.type == "source":
             continue
-        b = _feat_bounds(feat, total)
+        b = _feat_bounds(feat, total, circular=circular)
         if b is None:
             continue
         start, end, strand = b
@@ -5229,11 +5276,33 @@ def _record_to_scrub_feats(record) -> "list[dict]":
         loc = getattr(feat, "location", None)
         try:
             from Bio.SeqFeature import CompoundLocation
-            # Spliced CDS (multi-part join beyond a 2-part origin wrap): pass
-            # exon parts so `_translate_cds` splices introns before checking
-            # synonymy.
-            if isinstance(loc, CompoundLocation) and len(loc.parts) > 2:
-                d["_exons"] = [(int(p.start), int(p.end)) for p in loc.parts]
+            # Spliced CDS: pass exon parts so `_translate_cds` splices introns
+            # out before checking that a scrub edit is synonymous.
+            #
+            # The test MUST mirror `PlasmidMap._parse` — a TWO-part join is the
+            # commonest spliced CDS there is (one intron), and the old
+            # `len(parts) > 2` gate skipped every one of them. The scrub then
+            # read exon 2 through the intron in a shifted frame and cheerfully
+            # accepted an edit that changes the real protein. Exclude only the
+            # shapes where the parts are not exons: an origin WRAP (the two
+            # halves are already encoded in start/end) and a CONTIGUOUS split
+            # (abutting parts — no intron, nothing spliced out).
+            if isinstance(loc, CompoundLocation) and len(loc.parts) >= 2:
+                parts = sorted(loc.parts, key=lambda p: int(p.start))
+                is_contiguous = all(
+                    int(parts[i].end) == int(parts[i + 1].start)
+                    for i in range(len(parts) - 1)
+                )
+                is_wrap = (
+                    circular and total > 0 and len(parts) == 2
+                    and int(parts[0].start) == 0
+                    and int(parts[-1].end) == total
+                    and int(parts[0].end) < int(parts[-1].start)
+                )
+                if not is_wrap and not is_contiguous:
+                    d["_exons"] = [
+                        (int(p.start), int(p.end)) for p in parts
+                    ]
         except (ImportError, TypeError, ValueError):
             pass
         if feat.type.upper() == "CDS":
@@ -6703,10 +6772,15 @@ def _agent_transcript_feature_dicts(rec) -> "list[dict]":
     bp 0 would be read as carrying an intron it doesn't have."""
     out: "list[dict]" = []
     total = _seq_len(rec)
+    # Topology matters here: on a LINEAR record the two-part shape that looks
+    # like an origin wrap is a spliced feature, and resolving it as a wrap
+    # suppressed the `parts` emit below — silently turning a spliced
+    # transcript into an unspliced one.
+    _circular = _record_is_circular(rec)
     for f in getattr(rec, "features", None) or []:
         if getattr(f, "type", "") == "source":
             continue
-        bounds = _feat_bounds(f, total)
+        bounds = _feat_bounds(f, total, circular=_circular)
         if bounds is None:
             continue
         s, e, strand = bounds

@@ -359,11 +359,37 @@ def _backup_filename_pattern(path: Path) -> str:
     referenced it; new code should use `_backup_filename_patterns`."""
     return _backup_filename_patterns(path)[0]
 
+def _backup_sort_key(name: str) -> "tuple":
+    """Oldest→newest ordering key for one backup filename.
+
+    The collision bump MUST be compared numerically. As a bare integer in
+    the name it sorts lexicographically — `.1 < .10 < .11 < .12 < .2` — so
+    once a file was saved more than nine times inside one wall-second, the
+    "newest" backup was bump 9: retention then pruned the genuinely newest
+    generations and the recovery chain restored a stale one. Reachable from
+    a bulk delete, a scripted agent loop, or repeated settings writes.
+    """
+    rest = name.split(".bak.", 1)[-1]
+    if rest.endswith(".gz"):
+        rest = rest[:-3]
+    parts = rest.split(".")
+    ts = parts[0]
+    bump = 0
+    if len(parts) > 1:
+        try:
+            bump = int(parts[1])
+        except (TypeError, ValueError):
+            bump = 0
+    return (ts, bump, name)
+
+
 def _iter_backups(path: Path) -> "list[Path]":
     """Return all timestamped backups for `path` across both glob
-    patterns, de-duplicated. Lexicographic sort works because the
-    timestamp `YYYYMMDD-HHMMSS` is the dominant ordering component and
-    collision-bumps (`.<N>`) sort after the base within the same second."""
+    patterns, de-duplicated, OLDEST FIRST — so `[-1]` is the newest and
+    `reversed(...)` walks newest→oldest, which is what every consumer
+    (retention, compression, the recovery chain, the save-time dedup)
+    assumes. Ordering comes from `_backup_sort_key`, never from the raw
+    filename."""
     seen: "dict[str, Path]" = {}
     for pat in _backup_filename_patterns(path):
         try:
@@ -371,7 +397,7 @@ def _iter_backups(path: Path) -> "list[Path]":
                 seen[p.name] = p
         except OSError:
             continue
-    return [seen[k] for k in sorted(seen.keys())]
+    return [seen[k] for k in sorted(seen.keys(), key=_backup_sort_key)]
 
 def _prune_backups(path: Path, keep: "int | None" = None) -> None:
     """Delete all but the most recent `keep` timestamped backups of
@@ -391,6 +417,10 @@ def _prune_backups(path: Path, keep: "int | None" = None) -> None:
     monkeypatch the module constants and observe the new values."""
     if keep is None:
         keep = _state._BACKUP_RETENTION_COUNT
+    # A retention of 0 would delete EVERY rotated backup (and a negative one
+    # all but the last), silently turning the rotation off. Always keep at
+    # least the newest generation.
+    keep = max(1, int(keep))
     candidates = _iter_backups(path)
     # Sort descending (newest first by lex-sortable timestamp), keep
     # the head, prune the tail.
@@ -792,6 +822,29 @@ def _refuse_unauthorized_write(path: Path, label: str) -> None:
         f"`_protect_user_data` fixture, and the agent HTTP server.)"
     )
 
+def _recovery_write_allowed(path: Path, label: str) -> bool:
+    """May `_safe_load_json`'s recovery path WRITE to the data dir?
+
+    Loading is supposed to be read-only, but the recovery chain mutates: it
+    renames a corrupt live file aside and rewrites it from a backup, and it
+    re-creates a missing main file. Those are data-dir writes, and they were
+    the one hole in the L2 chokepoint — `_safe_save_json` refuses an
+    unauthorised process on its first line, while a bare
+    `import splicecraft; _load_library()` could still rename and overwrite
+    live files. An unauthorised caller still gets its recovered entries back;
+    it just does not get to touch the disk."""
+    try:
+        _refuse_unauthorized_write(path, label)
+        return True
+    except RuntimeError:
+        _log.warning(
+            "%s: recovery for %s would write to the data dir, but writes are "
+            "not authorised in this process — returning the recovered entries "
+            "WITHOUT repairing the file on disk.", label, path.name,
+        )
+        return False
+
+
 def _refuse_unauthorized_delete(path: Path, label: str) -> None:
     """[INV-75, sweep #27] Mirror of `_refuse_unauthorized_write` for
     delete paths. Sweep #26 hardened the write chokepoint to cover
@@ -1041,7 +1094,12 @@ def _safe_save_json(path: Path, entries: list, label: str,
                     bump = 0
                     while bak_ts.exists():
                         bump += 1
-                        bak_ts = path.with_name(f"{path.name}.bak.{ts}.{bump}")
+                        # Zero-padded so the NAME also sorts correctly for
+                        # any external tool reading the directory; the
+                        # in-process ordering goes through `_backup_sort_key`,
+                        # which parses the bump either way.
+                        bak_ts = path.with_name(
+                            f"{path.name}.bak.{ts}.{bump:03d}")
                     try:
                         _atomic_write_bytes(bak_ts, existing)
                     except OSError as exc:
@@ -1322,7 +1380,7 @@ def _backup_info(path: Path) -> "dict | None":
         return {"n_entries": None, "mtime_str": ts,
                 "error": reason or "size/symlink check failed"}
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         return {"n_entries": None, "mtime_str": ts,
                 "error": f"parse failed: {exc}"}
@@ -1384,7 +1442,8 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
                 "%s: main file %s is missing but recovered %d entries from "
                 "backup %s.", label, path, len(_entries), _cand.name)
             try:
-                _atomic_write_bytes(path, _read_backup_bytes(_cand))
+                if _recovery_write_allowed(path, label):
+                    _atomic_write_bytes(path, _read_backup_bytes(_cand))
             except OSError:
                 _log.warning("Could not rewrite %s from backup %s",
                              path, _cand.name)
@@ -1407,7 +1466,7 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
     # Try the main file
     main_warning: "str | None" = None
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
         entries, shape_warn = _extract_entries(raw, label)
         if entries is not None:
             # If this file was written by a newer SpliceCraft, stash
@@ -1476,7 +1535,8 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
                         corrupt_aside = path.with_name(
                             f"{path.name}.corrupt-{corrupt_ts}.{bump}",
                         )
-                    path.rename(corrupt_aside)
+                    if _recovery_write_allowed(path, label):
+                        path.rename(corrupt_aside)
                 except OSError:
                     _log.warning(
                         "Could not preserve corrupt main file aside "
@@ -1491,7 +1551,8 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
                 # through `_atomic_write_bytes` (tempfile + replace +
                 # parent-dir fsync) preserves the recovery's guarantee.
                 try:
-                    _atomic_write_bytes(path, bak.read_bytes())
+                    if _recovery_write_allowed(path, label):
+                        _atomic_write_bytes(path, bak.read_bytes())
                 except OSError:
                     _log.warning(
                         "Could not rewrite main file %s from backup",
@@ -1539,7 +1600,7 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
                 bump += 1
                 corrupt_aside = path.with_name(
                     f"{path.name}.corrupt-{corrupt_ts}.{bump}")
-            if path.exists():
+            if path.exists() and _recovery_write_allowed(path, label):
                 path.rename(corrupt_aside)
         except OSError:
             _log.warning(
@@ -1547,7 +1608,8 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
                 "overwriting in place", path,
             )
         try:
-            _atomic_write_bytes(path, _read_backup_bytes(chain_bak))
+            if _recovery_write_allowed(path, label):
+                _atomic_write_bytes(path, _read_backup_bytes(chain_bak))
         except OSError:
             _log.warning(
                 "Could not rewrite main file %s from rotated backup", path,

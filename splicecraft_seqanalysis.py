@@ -78,13 +78,53 @@ def _find_orfs(seq: str, *,
         for frame in range(3):
             current_start = -1
             i = frame
+            # A CIRCULAR frame's scan window opens in the middle of the
+            # molecule, and starting with "no ORF open" silently asserts that
+            # a stop codon sits just before bp 0/1/2. It usually doesn't: an
+            # ORF crossing the origin is still open there, and the first ATG
+            # after the origin then opened a SECOND, shorter ORF sharing the
+            # real one's stop — a phantom gene nested inside a true one, whose
+            # presence and length depended on where the origin happened to
+            # sit. (Rotating a plasmid changed its ORF table; measured on
+            # 7/120 random circles.)
+            #
+            # So ASK whether the frame is open there, by walking one lap
+            # BACKWARD from the scan start: an in-frame stop first means the
+            # frame is closed and the next start codon really is a maximal
+            # start; a start codon first means an ORF is already open and the
+            # starts before the next stop are interior. Assuming "closed"
+            # invented the phantom; assuming "open" would lose a gene that
+            # begins at bp 0, which is where a re-origined plasmid usually
+            # puts its gene of interest.
+            primed = not circular
+            if circular:
+                j = frame + n - 3          # in-frame codon one lap back
+                while j >= frame:
+                    _c = scan_seq[j:j + 3]
+                    if _c in _STOP_CODONS:
+                        primed = True
+                        break
+                    if _c in starts:
+                        primed = False
+                        break
+                    j -= 3
+                else:
+                    primed = True          # frame carries neither — nothing open
+            saw_stop = False
             while i + 3 <= scan_n:
                 codon = scan_seq[i:i+3]
+                if not primed:
+                    if codon in _STOP_CODONS:
+                        primed = True
+                        saw_stop = True
+                    i += 3
+                    continue
                 if current_start < 0:
                     if codon in starts:
                         current_start = i
                 else:
                     if codon in _STOP_CODONS:
+                        saw_stop = True
                         aa_len = (i - current_start) // 3
                         # Drop ORFs whose start codon falls in the
                         # second copy of the doubled scan — they're
@@ -138,10 +178,65 @@ def _find_orfs(seq: str, *,
                             "length_aa": aa_len,
                             "nt_len":    nt_len,
                             "exceeds_one_lap": over_lap,
+                            "has_stop":  True,
                             "aa_seq":    aa_seq,
                         })
                         current_start = -1
                 i += 3
+
+            if circular and not saw_stop:
+                # This frame has NO in-frame stop anywhere on the molecule,
+                # so the reading frame runs right round the circle. The
+                # docstring has always promised such an ORF is reported with
+                # `exceeds_one_lap=True`, but it could never be emitted: an
+                # ORF is only ever appended from inside the stop branch, so a
+                # whole-plasmid reading frame came back as NO ORFs AT ALL —
+                # which reads as "clean". Reachable on ORF-only minicircles
+                # and synthetic constructs.
+                first_start = -1
+                j = frame
+                while j + 3 <= n:
+                    if scan_seq[j:j + 3] in starts:
+                        first_start = j
+                        break
+                    j += 3
+                if first_start >= 0:
+                    # Round UP to whole codons: the frame reads at least one
+                    # full lap, and on a molecule whose length is not a
+                    # multiple of 3 a lap is not a whole number of codons, so
+                    # rounding down would report an ORF flagged
+                    # `exceeds_one_lap` whose `nt_len` is SHORTER than the
+                    # molecule.
+                    lap_nt = ((n + 2) // 3) * 3
+                    lap_aa = lap_nt // 3           # no stop ⇒ all residues
+                    if lap_aa >= min_aa:
+                        _lap = scan_seq[:n]        # one lap of this strand
+                        nt_seq = "".join(
+                            _lap[(first_start + k) % n]
+                            for k in range(lap_nt)
+                        )
+                        aa_seq = "".join(
+                            _CODON_TABLE.get(nt_seq[k:k + 3], "?")
+                            for k in range(0, len(nt_seq), 3)
+                        )
+                        if strand == 1:
+                            o_s = first_start % n
+                        else:
+                            o_s = (n - (first_start + lap_nt)) % n
+                        orfs.append({
+                            "start":     o_s,
+                            "end":       (o_s - 1) % n,
+                            "strand":    strand,
+                            "length_aa": lap_aa,
+                            "nt_len":    lap_nt,
+                            "exceeds_one_lap": True,
+                            # No stop codon exists in this frame, so every
+                            # codon is a residue and `length_aa` is NOT one
+                            # less than `nt_len // 3` the way it is for a
+                            # stopped ORF.
+                            "has_stop":  False,
+                            "aa_seq":    aa_seq,
+                        })
 
     # Dedupe identical (start, end, strand) tuples — can happen when the
     # doubled-scan cycles past the origin and re-finds the same ORF, or
@@ -1282,8 +1377,15 @@ def _tx_map_span(gs: int, ge: int, a: int, total: int,
         return None
     off_s = (gs - a) % total
     off_e = (ge - a) % total
-    # A span ending exactly at the unit's end wraps its offset to 0.
-    if off_e == 0 and off_s != 0:
+    # `off_e == 0` means the span ends where the unit STARTS, which can only
+    # ALSO be the unit's end when the unit is a full lap — and a full-lap unit
+    # is rejected upstream as empty. Without the `pre_len == total` guard this
+    # fired on a feature that merely OVERLAPS the unit and returned the
+    # intersection, contradicting the documented contract ("None for a partial
+    # overlap, because half a feature mapped into a transcript is a coordinate
+    # lie") — and for a feature typed `intron` it spliced that overlap out of
+    # the message.
+    if off_e == 0 and off_s != 0 and pre_len == total:
         off_e = pre_len
     if off_s > pre_len or off_e > pre_len or off_s >= off_e:
         return None

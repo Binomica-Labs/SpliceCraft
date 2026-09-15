@@ -240,7 +240,7 @@ def _request_json(path: str, *, method: str = "GET", payload: "dict | None" = No
         raise BabsError(f"Ollama response exceeded {max_bytes // (1024*1024)} MB — aborted.")
     try:
         return json.loads(raw.decode("utf-8", "replace"))
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise BabsError(f"Ollama returned a non-JSON response: {exc}")
 
 
@@ -275,7 +275,7 @@ def _iter_ndjson(resp, *, cancel, max_total: int, max_line: int):
                 continue
             try:
                 obj = json.loads(line.decode("utf-8", "replace"))
-            except ValueError:
+            except (ValueError, RecursionError):
                 continue
             if isinstance(obj, dict):     # Ollama NDJSON is always objects; ignore stray scalars/arrays
                 yield obj
@@ -285,7 +285,7 @@ def _iter_ndjson(resp, *, cancel, max_total: int, max_line: int):
     if tail:
         try:
             obj = json.loads(tail.decode("utf-8", "replace"))
-        except ValueError:
+        except (ValueError, RecursionError):
             obj = None
         if isinstance(obj, dict):
             yield obj
@@ -525,7 +525,7 @@ def hf_search_gguf(query: str, *, limit: int = HF_SEARCH_LIMIT, opener=None,
         raise BabsError("HuggingFace response exceeded its size cap — aborted.")
     try:
         data = json.loads(raw.decode("utf-8", "replace"))
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise BabsError(f"HuggingFace returned a non-JSON response: {exc}")
     if not isinstance(data, list):
         return []
@@ -714,14 +714,46 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _BULLET_RE = re.compile(r"^(\s*)[-*+]\s+(.*)$")
 
 
+_INLINE_MD_RE = re.compile(r"\*\*(.+?)\*\*|`([^`]+)`")
+
+
+def _escape_no_dangling(text: str) -> str:
+    """Rich-escape `text`, guaranteeing it cannot swallow a tag that follows.
+
+    Rich reads ``\\[`` as a literal ``[``. So if an escaped run ends in an ODD
+    number of backslashes — which ordinary model prose does, e.g. ``\\**bold**``
+    or a LaTeX-ish fragment — the very next emitted ``[b]`` is eaten as text,
+    its ``[/b]`` becomes an orphan, and Rich raises MarkupError out of
+    `Static.update`. Doubling the trailing backslash keeps the text literal
+    AND leaves the following tag intact."""
+    out = _rich_escape(text)
+    trailing = len(out) - len(out.rstrip("\\"))
+    if trailing % 2:
+        out += "\\"
+    return out
+
+
 def _inline_md(s: str) -> str:
-    """Escape Rich metacharacters in a line, then re-introduce **bold** and
-    `code`. Order matters: escape FIRST (so user ``[1]`` shows literally), then
-    add real markup tags (``**`` / `` ` `` are untouched by rich.escape)."""
-    s = _rich_escape(s)
-    s = _BOLD_RE.sub(r"[b]\1[/b]", s)
-    s = _CODE_RE.sub(r"[cyan]\1[/cyan]", s)
-    return s
+    """Render one line's **bold** and `code` as Rich markup, escaping
+    everything else.
+
+    The match runs on the RAW line and each surrounding run is escaped
+    separately, so an escaped run can never be concatenated INTO an emitted
+    tag. Escaping the whole line first and substituting afterwards (the
+    previous approach) let a user backslash land immediately before an
+    injected ``[b]`` and destroy it — a crash on ordinary model output, not
+    just hostile input."""
+    out: list = []
+    last = 0
+    for m in _INLINE_MD_RE.finditer(s):
+        out.append(_escape_no_dangling(s[last:m.start()]))
+        if m.group(1) is not None:
+            out.append("[b]" + _escape_no_dangling(m.group(1)) + "[/b]")
+        else:
+            out.append("[cyan]" + _escape_no_dangling(m.group(2)) + "[/cyan]")
+        last = m.end()
+    out.append(_rich_escape(s[last:]))
+    return "".join(out)
 
 
 def md_to_rich(text: str) -> str:

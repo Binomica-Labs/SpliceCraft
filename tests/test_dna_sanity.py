@@ -1787,7 +1787,14 @@ class TestFindOrfs:
             n = rng.randint(150, 700)
             s = "".join(rng.choice("ACGT") for _ in range(n))
             for o in sc._find_orfs(s, min_aa=10, circular=True):
-                assert o["nt_len"] == (o["length_aa"] + 1) * 3
+                # `length_aa` EXCLUDES the stop, `nt_len` includes it — but
+                # only when there IS one. A frame with no in-frame stop
+                # anywhere on the molecule reports every codon as a residue
+                # (`has_stop: False`), so the +1 does not apply to it.
+                if o.get("has_stop", True):
+                    assert o["nt_len"] == (o["length_aa"] + 1) * 3
+                else:
+                    assert o["nt_len"] == o["length_aa"] * 3
                 assert o["nt_len"] == len(o["aa_seq"]) * 3
                 assert 0 <= o["start"] < n and 0 <= o["end"] <= n
                 if not o["exceeds_one_lap"]:

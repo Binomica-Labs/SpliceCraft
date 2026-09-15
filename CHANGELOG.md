@@ -14,6 +14,144 @@
 
 ---
 
+## [1.2.61] — 2026-09-15
+
+A full adversarial audit of the whole codebase — twelve parallel read-only
+reviews, every finding re-derived against an independent reference (Biopython,
+a brute-force re-implementation, or hand arithmetic) before anything was
+changed. 52 real defects fixed. No new features; this release is entirely
+correctness and robustness.
+
+### Bug fixes — your data
+
+- **Long feature names were being quietly rewritten every time you saved.** A
+  name of 51 characters or more with no spaces in it came back with a space
+  jammed inside: `Construct_optimized_for_expression_v2_final_long_name`
+  reloaded as `..._final_long_na me`. Because every plasmid is stored as
+  GenBank text, this fired on ordinary saves and on every load, and it also
+  made GenBank export refuse those plasmids outright.
+- **A save that reached the library but not its collection was thrown away at
+  the next launch.** The collection is the source of truth at startup, so a
+  disk-full or permission error on the collection write left you with one
+  error toast, the plasmid apparently saved, and the entry silently gone the
+  next time you opened SpliceCraft. The two files are now tracked as
+  disagreeing: the newer library file is kept, and a warning names the
+  collection that is behind.
+- **Master Delete never deleted a single log file.** Rotated logs carry your
+  plasmid, project, gel and synthesis names, so a wipe that promises to leave
+  nothing behind left those behind. They are removed now.
+- **Backup retention was deleting your newest backups.** Once a file was saved
+  more than nine times inside one second, the tenth, eleventh and twelfth
+  rotations sorted as older than the second, so housekeeping kept the ten
+  oldest and recovery restored a stale one.
+- **A plasmid library file with a missing field crashed SpliceCraft at
+  startup**, which put the whole library out of reach. Hand-repaired and
+  third-party-written library files now load.
+- **A file saved with a byte-order mark read as empty.**
+
+### Bug fixes — biology
+
+- **Open reading frames were being invented on circular plasmids.** Every
+  frame began by assuming a stop codon sat just before position 1, so a gene
+  crossing the origin was reported twice: once correctly, and once as a
+  shorter phantom nested inside it. Which one you saw, and how long it looked,
+  depended on where the origin happened to sit — so re-origining a plasmid
+  changed its ORF list. A frame with no stop anywhere now reports its
+  full-lap reading frame instead of reporting nothing at all.
+- **A spliced gene on a linear record was translated with its exons in the
+  wrong order.** The two-part location that means "wraps the origin" on a
+  circle means "two exons" on a linear molecule, and it was read as a wrap
+  either way, giving a cyclically rotated protein.
+- **Predict Transcript spliced out other genes' introns**, including introns
+  annotated on the opposite strand, producing a shorter message and a
+  different protein while still reporting success.
+- **Exporting to `.dna` and reading it back swapped the exons of every
+  minus-strand spliced gene**, and did the same to features crossing the
+  origin.
+- **Reverse-orientation clones reported every rebuilt restriction site as
+  destroyed.** Flipping the insert flips its annotations to the other strand,
+  and the two halves of one rebuilt site could then never be matched back up.
+- **A whole-molecule annotation vanished from a digest fragment** that crossed
+  the origin, and from the sequence panel as soon as you rotated the view.
+- **Editing over the end of a feature grafted the new bases onto it.**
+  Replacing a stretch that started inside a feature and ran past its end left
+  the feature claiming the inserted sequence as its own.
+- **Inserting at position 1, or at the very end, reversed the halves of a
+  feature that crosses the origin.** SpliceCraft's own display hid it; the
+  damage showed up in GenBank export, in translation, and in every other tool.
+- **Restriction sites at the very ends of a linear molecule were reported as
+  cutting**, with the enzyme's overhang attached to the wrong end.
+- **Deleting or renaming an annotation could hit a different one.** A feature
+  SpliceCraft could not draw was skipped by the map but still counted by the
+  delete and edit handlers, shifting every index after it.
+- **A GenBank file containing a `?` in a feature location crashed the load.**
+
+### Bug fixes — design tools
+
+- **The codon-table importer inverted your host's codon preference.** A
+  frequency-per-thousand table — the format the public codon-usage
+  databases hand you —
+  mixes values like `15.3` and `25.0` in one amino-acid family, and the two
+  were scaled 1000 apart, making the commonest codon look like the rarest.
+- **Codon adaptation index read too high**, because single-codon amino acids
+  were counted, and a gene built entirely from codons your host never uses
+  scored a perfect 1.0.
+- **A restriction site at the very end of a designed gene was reported as
+  impossible to remove** when a plain synonymous swap was available. A leftover
+  Type IIS site at the C-terminus is exactly what kills a Golden Gate reaction.
+- **The GC-window pass never converged.** It traded the same two codons back
+  and forth until it ran out of budget: a 1500-codon gene took 1501 swaps and
+  2.7 seconds and still came out of band. It now settles in 233 swaps and 0.13
+  seconds.
+- **The PCR simulator found nothing for a pair where only one primer carries a
+  tail** — a tailed cloning primer against a stock sequencing primer, the
+  commonest geometry there is — while Primer Check found the product. It also
+  reported the full length for a product crossing the origin while carrying a
+  sequence 20 bases short.
+- **Gibson refused any homology arm longer than 200 bp** with "no overlap".
+- **Restriction cloning refused every enzyme whose recognition site contains
+  an ambiguous base** — SfiI, BstXI, DraIII, BglI — blaming your sequence.
+- **A junction reported as re-cuttable when the site sat beside it**, not
+  across it.
+- **A mutation at codon 1 produced a design whose product is the wild type.**
+
+### Bug fixes — everything else
+
+- **The Babs chat tab crashed on ordinary answers.** Text containing a
+  backslash before bold markup destroyed the formatting, and once such an
+  answer was in the transcript the tab threw again every time you opened it.
+- **A generated robot protocol could point two different labware at one deck
+  slot** when their names differed only by a full-width character, which on
+  hardware means aspirating from the wrong plate with no error anywhere.
+  Protocols are now checked for validity before they can be uploaded.
+- **Exported map images drew a direction arrow on features that have no
+  direction**, and drew a minus-strand origin-crossing feature as a full
+  circle.
+- **A lab-notebook reference at the end of a sentence stored the full stop**,
+  so `@pUC19.` linked to nothing.
+- **An identity of 100% was shown for an alignment that had none to compute.**
+
+### Hardening
+
+- The agent API no longer answers an origin-wrap request on a linear record
+  with bases that are not contiguous on that molecule; it no longer silently
+  truncates a fractional coordinate or reads `true` as 1; a NUL byte and a
+  negative content-length now produce a clear refusal instead of a server
+  error or a request quietly running with default settings.
+- `find-orfs` responses carry `has_stop`, so a caller can tell a stop-free
+  reading frame from a normal one.
+- The command-line client accepts `--strand 2`, which the API has always
+  supported.
+- A document prefixed with a byte-order mark can no longer skip the XML entity
+  guard, and deeply nested JSON from a remote server is caught rather than
+  escaping as a stack overflow.
+- Loading a corrupt data file no longer repairs it on disk from a process that
+  has not opted in to data-dir writes.
+- Plasmid names are stripped of the same text-direction override characters
+  feature labels already were.
+
+---
+
 ## [1.2.60] — 2026-09-14
 
 ### New features

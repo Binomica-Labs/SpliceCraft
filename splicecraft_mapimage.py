@@ -702,14 +702,35 @@ def render_plasmid_map_png(feats: list, total: int, *, title: str = "",
 
 # ── Record → data extractors (for off-screen / bulk export) ──────────────────
 
-def _feat_bounds(feat, total: int) -> "tuple[int, int] | None":
+def _feat_bounds(feat, total: int, *,
+                 circular: bool = True) -> "tuple[int, int] | None":
     """Wrap-aware (start, end) for a Biopython SeqFeature, or None if it
-    can't be resolved. ``end`` may be < ``start`` (origin-crossing)."""
+    can't be resolved. ``end`` may be < ``start`` (origin-crossing).
+
+    The origin-wrap test matches `splicecraft_util._feat_bounds`: a TWO-part
+    location covering ``[0, x)`` and ``[y, total)`` is the wrap, whatever
+    order the parts are stored in. Reading `parts[0].start` / `parts[-1].end`
+    positionally got the plus strand right by luck (INSDC writes it
+    tail-first) and the MINUS strand wrong — Biopython reverses the parts of
+    a ``complement(join(...))``, so a minus-strand wrap came back as
+    ``(0, total)`` and drew as a full circle instead of its real arc.
+
+    ``circular=False`` skips the re-encoding: a linear molecule has no origin,
+    so that shape is a spliced feature there and flattens to outer bounds."""
     try:
         loc = feat.location
         if loc is None:
             return None
-        parts = list(getattr(loc, "parts", []) or [loc])
+        parts = sorted((getattr(loc, "parts", None) or [loc]),
+                       key=lambda p: int(p.start))
+        if (
+            circular
+            and total > 0 and len(parts) == 2
+            and int(parts[0].start) == 0
+            and int(parts[-1].end) == total
+            and int(parts[0].end) < int(parts[-1].start)
+        ):
+            return int(parts[-1].start), int(parts[0].end)
         start = int(parts[0].start)
         end = int(parts[-1].end)
     except (TypeError, ValueError, AttributeError, IndexError):
@@ -731,13 +752,16 @@ def _map_feats_from_record(record) -> "tuple[list[dict], int]":
     if record is None:
         return [], 0
     total = len(getattr(record, "seq", "") or "")
+    circular = str(
+        (getattr(record, "annotations", {}) or {}).get("topology", "")
+    ).strip().lower() != "linear"
     feats: list[dict] = []
     skip = {"source"}
     idx = 0
     for feat in getattr(record, "features", []) or []:
         if getattr(feat, "type", "") in skip:
             continue
-        bounds = _feat_bounds(feat, total)
+        bounds = _feat_bounds(feat, total, circular=circular)
         if bounds is None:
             continue
         start, end = bounds
@@ -753,7 +777,11 @@ def _map_feats_from_record(record) -> "tuple[list[dict], int]":
         feats.append({
             "type": getattr(feat, "type", "misc"),
             "start": start, "end": end,
-            "strand": 1 if strand is None else int(strand),
+            # 0, not 1: Biopython's `strand is None` means "no direction",
+            # and the on-screen path preserves it as 0 (arrowless). Coercing
+            # to 1 grew a direction arrowhead on exported PNG/SVG maps that
+            # the screen does not show.
+            "strand": 0 if strand is None else int(strand),
             "color": color or _FALLBACK_PALETTE[idx % len(_FALLBACK_PALETTE)],
             "label": _feat_label_full(feat),
         })

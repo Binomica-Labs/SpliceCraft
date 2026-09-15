@@ -357,6 +357,23 @@ def _gibson_overlap_len(a_seq: str, b_seq: str, *,
     for k in range(max_check, min_overlap - 1, -1):
         if a[-k:] == b[:k]:
             return k
+    # Nothing within the cap. The cap is a PROBE limit, not a biological one:
+    # when the designed arm is longer than it, no k <= cap can match (the
+    # cap-length suffix of `a` is an INTERIOR window of the arm, not its
+    # prefix), and the junction was rejected as "no overlap" — turning
+    # "overlap too long to probe" into "there is no overlap". Anchor on a
+    # seed from b's 5' end and verify the full suffix, longest first.
+    seed_len = min(32, len(b))
+    if seed_len >= min_overlap:
+        seed = b[:seed_len]
+        idx = a.find(seed)
+        while idx != -1:
+            k = len(a) - idx
+            if (k <= len(b) and k >= min_overlap
+                    and (full_match_safe or k < len(a))
+                    and a[-k:] == b[:k]):
+                return k
+            idx = a.find(seed, idx + 1)
     return 0
 
 
@@ -391,6 +408,9 @@ def _gibson_failure(circular: bool, errors: list[str],
     }
 
 
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
 def _gibson_normalize_fragments(
     fragments: list[dict],
 ) -> "tuple[list[dict] | None, str | None]":
@@ -415,9 +435,10 @@ def _gibson_normalize_fragments(
         # otherwise fail overlap detection against a T-notation neighbour
         # (and a downstream _rc would mangle the U, which has no entry in
         # the complement table). Main sequence-load paths already do this.
-        cleaned = "".join(
-            ch for ch in raw.upper().replace("U", "T") if not ch.isspace()
-        )
+        # `re.sub` over the whole string instead of a per-character genexp:
+        # the genexp made ~120k `str.isspace` calls for six 20 kb fragments
+        # and was half the cost of a Gibson simulation.
+        cleaned = _WHITESPACE_RE.sub("", raw.upper().replace("U", "T"))
         norm_fragments.append({
             "name":     str(f.get("name") or "?"),
             "sequence": cleaned,
@@ -1140,10 +1161,28 @@ def _rejoin_cut_split_features(features: "list[dict]", total: int,
             # of the MERGE rather than out of the cloning run.
             _ = int(f["start"]) + int(f["end"])
             strand_raw = f.get("strand", 1)
-            key = (str(f.get("label") or f.get("type") or ""),
+            _lbl = str(f.get("label") or f.get("type") or "")
+            # A RESTRICTION-SITE annotation groups ACROSS strands; everything
+            # else keeps strand in the key.
+            #
+            # In a reverse orientation `_rc_fragment` flips the insert's
+            # features to the opposite strand while the vector's keep theirs,
+            # so the two halves of one REGENERATED site carry different
+            # strands, never landed in the same group, and both shipped
+            # tagged "(disrupted)" — on a site that is demonstrably intact
+            # and unique in the product. ([INV-190] was only ever fixed for
+            # the forward orientation.) A site cannot be merged wrongly:
+            # below, a run must be CONTIGUOUS, cover exactly
+            # `_split_full_len`, and spell that enzyme's recognition sequence
+            # on one strand or the other. For a NON-enzyme label the base
+            # check cannot run, so opposite strands still never merge.
+            _cross_strand = _enzyme_signature(
+                _lbl.replace("(disrupted)", "").strip()) is not None
+            key = (_lbl,
                    str(f.get("type") or ""),
                    # 0 and None both mean "no direction" — same group.
-                   0 if strand_raw is None else int(strand_raw),
+                   0 if (_cross_strand or strand_raw is None)
+                   else int(strand_raw),
                    _full_len(f))
         except (KeyError, TypeError, ValueError):
             continue
@@ -1482,6 +1521,23 @@ def _classify_junction(left_enz: str, right_enz: str,
     enzymes = _junction_enzyme_names(left_enz, right_enz)
     re_cuttable: list[str] = []
     ctx = context_top.upper()
+    off = int(context_left_offset)
+
+    def _straddles(pat) -> bool:
+        """Does a match SPAN the junction itself?
+
+        `context_left_offset` says where the joint sits inside `ctx`. A site
+        lying entirely on one side of it is a pre-existing site in the parent
+        DNA, not a re-formed junction — reporting it as "re-cuttable" turned
+        an idempotent scar with a neighbouring parent site (the BioBrick
+        case this function exists to recognise) into a false "this junction
+        re-cuts". The offset was accepted and threaded from both call sites
+        but never actually used."""
+        for m in pat.finditer(ctx):
+            if m.start() < off < m.end():
+                return True
+        return False
+
     for ename in enzymes:
         sig = _enzyme_signature(ename)
         if sig is None:
@@ -1489,16 +1545,14 @@ def _classify_junction(left_enz: str, right_enz: str,
         site = sig[0].upper()
         if not site:
             continue
-        pat = _iupac_pattern(site)
-        if pat.search(ctx):
+        if _straddles(_iupac_pattern(site)):
             re_cuttable.append(ename)
             continue
         # Check the reverse complement too — asymmetric / Type IIS
         # enzymes can bind either strand and re-cut from the other
         # side. Palindromic sites are their own RC so a double-match
         # is fine.
-        rc_pat = _iupac_pattern(_rc(site))
-        if rc_pat.search(ctx):
+        if _straddles(_iupac_pattern(_rc(site))):
             re_cuttable.append(ename)
     if re_cuttable:
         return {
@@ -2404,6 +2458,19 @@ def _rc_fragment(frag: dict) -> dict:
         if ((new_f["end"] - new_f["start"])
                 != (new_end_raw - new_start_raw)):
             new_f.setdefault("_split_full_len", max(0, fe - fs))
+        if new_f["end"] <= new_f["start"] and fe > fs:
+            # The feature lay ENTIRELY in an overhang that left the top
+            # strand, so nothing of it survives in this frame. Emitting the
+            # collapsed zero-length span shipped a `start == end` feature that
+            # `_feature_location` refuses on save (so it silently vanished
+            # from the GenBank file) yet still appeared in the UI feature list
+            # and in the agent's `n_features`. Drop it and say so.
+            _log.info(
+                "RC fragment: dropped %r — its %d bp lie entirely in an "
+                "overhang that leaves the top strand on flip",
+                f.get("label") or f.get("type") or "?", fe - fs,
+            )
+            continue
         flipped_feats.append(new_f)
     return {
         "top_seq":      new_top,
@@ -2595,8 +2662,15 @@ def _excise_pcr_insert(seq: str, enz_left: str, enz_right: str, *,
 
     # 2) No fragment flanked by two cuts → the input is the BARE region (no
     #    tails). Wrap it the way tailed primers would and digest that.
-    site_l = catalog[enz_left][0].upper()
-    site_r = catalog[enz_right][0].upper()
+    # A DEGENERATE recognition string (SfiI `GGCCNNNNNGGCC`, BstXI, DraIII,
+    # BglI, PflMI, BsiHKAI …) is a PATTERN, not DNA. Wrapping the payload in
+    # the literal catalog string put `N`/`W`/`R` characters into the molecule,
+    # which no scanner matches — so the digest found nothing and the function
+    # blamed the user's sequence ("check the recognition sites") for every
+    # such enzyme. Instantiate an arbitrary concrete expansion; the flanks are
+    # discarded after the cut, so which one is immaterial.
+    site_l = _instantiate_iupac_site(catalog[enz_left][0].upper())
+    site_r = _instantiate_iupac_site(catalog[enz_right][0].upper())
     lead = len(pad) + len(site_l)
     wrapped = pad + site_l + cleaned + site_r + _rc(pad)
     w_feats = ([{**f,
@@ -2611,6 +2685,22 @@ def _excise_pcr_insert(seq: str, enz_left: str, enz_right: str, *,
         return None, _internal_site_err()
     return None, (f"Couldn't cut the PCR product with {enz_left} / "
                   f"{enz_right} — check the recognition sites.")
+
+
+# One concrete base per IUPAC code, for turning a degenerate recognition
+# PATTERN into a real DNA word that a scanner can actually match.
+_IUPAC_PICK = {
+    "A": "A", "C": "C", "G": "G", "T": "T", "U": "T",
+    "R": "A", "Y": "C", "S": "G", "W": "A", "K": "G", "M": "A",
+    "B": "C", "D": "A", "H": "A", "V": "A", "N": "A",
+}
+
+
+def _instantiate_iupac_site(site: str) -> str:
+    """Replace every ambiguity code in a recognition site with one concrete
+    base, so the result is DNA rather than a pattern. Already-concrete sites
+    come back unchanged."""
+    return "".join(_IUPAC_PICK.get(ch, ch) for ch in (site or "").upper())
 
 
 @_timed("op.excise_fragment_pair", threshold_ms=25)

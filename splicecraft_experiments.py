@@ -50,7 +50,7 @@ _EXPERIMENT_TAGS_MAX      = 20
 # stand-in. The captured id is still `m.group(1)` and the full
 # match (sigil + id) is still `m.group(0)`.
 _PLASMID_REF_RE = re.compile(
-    r"(?<![\w@])@(?=([A-Za-z][\w.\-]{0,63}))\1(?![;=])"
+    r"(?<![\w@])@(?=([A-Za-z](?:[\w.\-]{0,62}\w)?))\1(?![;=])"
 )
 
 # Action cross-reference token: `!<id>` inline anywhere in the body.
@@ -59,7 +59,7 @@ _PLASMID_REF_RE = re.compile(
 # next char to be a letter, while images require `[`. Same atomic-
 # group + trailing-reject hardening as the plasmid pattern (sweep #9).
 _ACTIONS_REF_RE = re.compile(
-    r"(?<![\w!])!(?=([A-Za-z][\w.\-]{0,63}))\1(?![;=])"
+    r"(?<![\w!])!(?=([A-Za-z](?:[\w.\-]{0,62}\w)?))\1(?![;=])"
 )
 
 # Gel cross-reference token: `&<id>` inline anywhere in the body
@@ -74,7 +74,7 @@ _ACTIONS_REF_RE = re.compile(
 # editor, and surfacing a misleading "no such gel" notify on
 # Ctrl+G click-through.
 _GEL_REF_RE = re.compile(
-    r"(?<![\w&])&(?=([A-Za-z][\w.\-]{0,63}))\1(?![;=])"
+    r"(?<![\w&])&(?=([A-Za-z](?:[\w.\-]{0,62}\w)?))\1(?![;=])"
 )
 
 # Filesystem-id constraint. Entry ids are mechanically generated as

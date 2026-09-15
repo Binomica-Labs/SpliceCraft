@@ -261,22 +261,37 @@ def _splice_pair_risk(seq: str, **kw) -> "list[dict]":
     sorted by combined score. `in_frame_loss` flags an excision that is a
     multiple of 3: those are the truly insidious ones, since they delete
     residues without frameshifting and the product may still be detected by an
-    antibody while being biologically wrong."""
+    antibody while being biologically wrong.
+
+    Splicing is STRAND-SPECIFIC, so a donor is only ever paired with an
+    acceptor on its OWN strand. `_splice_scan` reports both strands in
+    FORWARD coordinates, so on the minus strand the intron runs right to
+    left and the acceptor sits at the LOWER coordinate — its span is
+    measured the other way round. Measuring every combination in forward
+    coordinates (the pre-fix behaviour, reachable only via
+    ``both_strands=True``) invented plus-donor/minus-acceptor "introns"
+    that cannot splice, and discarded every genuine minus-strand pair,
+    whose forward-coordinate span is negative."""
     hits = _splice_scan(seq, **kw)
-    donors = sorted([h for h in hits if h["kind"] == "donor"],
-                    key=lambda h: h["position"])
-    acceptors = sorted([h for h in hits if h["kind"] == "acceptor"],
-                       key=lambda h: h["position"])
     pairs = []
-    for d in donors:
-        for a in acceptors:
-            span = a["position"] + 2 - d["position"]
-            if 60 <= span <= 3000:
-                pairs.append({
-                    "donor": d, "acceptor": a, "intron_len": span,
-                    "combined_score": round(d["score"] + a["score"], 3),
-                    "in_frame_loss": span % 3 == 0,
-                })
+    for strand in ("+", "-"):
+        donors = sorted([h for h in hits
+                         if h["kind"] == "donor" and h.get("strand", "+") == strand],
+                        key=lambda h: h["position"])
+        acceptors = sorted([h for h in hits
+                            if h["kind"] == "acceptor"
+                            and h.get("strand", "+") == strand],
+                           key=lambda h: h["position"])
+        for d in donors:
+            for a in acceptors:
+                span = (a["position"] + 2 - d["position"] if strand == "+"
+                        else d["position"] + 2 - a["position"])
+                if 60 <= span <= 3000:
+                    pairs.append({
+                        "donor": d, "acceptor": a, "intron_len": span,
+                        "combined_score": round(d["score"] + a["score"], 3),
+                        "in_frame_loss": span % 3 == 0,
+                    })
     pairs.sort(key=lambda p: -p["combined_score"])
     return pairs
 

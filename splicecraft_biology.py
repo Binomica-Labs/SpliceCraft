@@ -158,10 +158,19 @@ def _bp_in_span(bp: int, start: int, end: int,
     `_feat_len`, which reports it as 0 bp. Hand-rolling this as
     ``start <= bp < end`` is the single most common way to get a
     wrap-spanning feature wrong: it reports False for every base in a
-    T-DNA / marker / operon that happens to cross the origin."""
+    T-DNA / marker / operon that happens to cross the origin.
+
+    A FULL-LAP span — one whose length is an exact multiple of `total`,
+    e.g. the whole-molecule ``[0, total)`` a "backbone"/"vector"
+    annotation carries — contains every base. It must be detected BEFORE
+    the `% total` normalisation below, which maps ``end == total`` onto
+    ``0`` and would otherwise collapse the whole molecule into the empty
+    span ``start == end``."""
     if total is not None:
         if total <= 0:
             return False
+        if end != start and (end - start) % total == 0:
+            return True                     # full lap — contains every bp
         bp, start, end = bp % total, start % total, end % total
     return (start <= bp < end) if end >= start else (bp >= start or bp < end)
 
@@ -176,13 +185,25 @@ def _span_in_span(inner_start: int, inner_end: int,
     when its offset plus its own wrap-aware length still fits inside the
     outer's wrap-aware length. Both lengths come from `_feat_len` (sacred
     invariant #8), so containment can't disagree with the length the rest
-    of the app reports for the same feature."""
+    of the app reports for the same feature.
+
+    A FULL-LAP span (length an exact multiple of `total`, e.g. the
+    whole-molecule ``[0, total)`` of a "backbone" annotation) measures
+    `total`, not 0: the `% total` normalisation maps ``end == total`` onto
+    ``0``, which would otherwise read the whole molecule as an EMPTY span
+    that contains nothing — and, as an inner, as a mere point."""
     if total <= 0:
         return False
-    outer_len = _feat_len(outer_start % total, outer_end % total, total)
+
+    def _span_len(s: int, e: int) -> int:
+        if e != s and (e - s) % total == 0:
+            return total                   # full lap
+        return _feat_len(s % total, e % total, total)
+
+    outer_len = _span_len(outer_start, outer_end)
     if outer_len <= 0:
         return False                       # an empty outer contains nothing
-    inner_len = _feat_len(inner_start % total, inner_end % total, total)
+    inner_len = _span_len(inner_start, inner_end)
     offset = (inner_start - outer_start) % total
     if inner_len <= 0:
         # A zero-length inner is an insertion POINT: contained when the
@@ -1815,9 +1836,14 @@ def _scan_restriction_sites_impl(
             # to a phantom cut near the 3' end that doesn't biologically exist.
             # Mirror the reverse-strand guard below: drop the hit when a raw cut
             # falls outside the molecule. Circular molecules wrap correctly.
+            # `<= 0` / `>= n`, not `< 0` / `> n`: a cut landing exactly ON a
+            # linear molecule's end severs nothing (it would split off a
+            # zero-length fragment), and `_emit`'s `% n` then maps a cut at n
+            # onto 0 — attaching the enzyme's overhang to the WRONG END.
+            # Bio.Restriction reports no site for these; so do we now.
             if not circular and (
-                    (p + fwd_cut) < 0 or (p + fwd_cut) > n
-                    or (p + rev_cut) < 0 or (p + rev_cut) > n):
+                    (p + fwd_cut) <= 0 or (p + fwd_cut) >= n
+                    or (p + rev_cut) <= 0 or (p + rev_cut) >= n):
                 continue
             # ext_cut_bp: absolute cut position when cut falls outside recognition
             _ext = ((p + fwd_cut) % n) if (fwd_cut <= 0 or fwd_cut >= site_len) else None
@@ -1872,14 +1898,26 @@ def _scan_restriction_sites_impl(
                 _top_cut_raw = p + site_len - rev_cut
                 _bot_cut_raw = p + site_len - fwd_cut
                 if not circular and (
-                        _top_cut_raw < 0 or _top_cut_raw > n
-                        or _bot_cut_raw < 0 or _bot_cut_raw > n):
+                        _top_cut_raw <= 0 or _top_cut_raw >= n
+                        or _bot_cut_raw <= 0 or _bot_cut_raw >= n):
                     continue
                 _top_cut_bp = _top_cut_raw % n   # top-strand cut in fwd coords
                 _bot_cut_bp = _bot_cut_raw % n if n > 0 else 0
                 _top_cut_outside = ((_top_cut_bp - p) % n) >= site_len
                 _cc  = rev_cut_col if 0 <= rev_cut_col < site_len else None
                 _ext = _top_cut_bp if _top_cut_outside else None
+                # `_cc` is derived from the BOTTOM cut and `_ext` from the TOP
+                # one, so the "is it inside the recognition?" test is applied
+                # to a different cut than the column it guards. That leaves a
+                # hole: an enzyme whose top cut lands INSIDE the site while its
+                # bottom cut lands outside (fwd_cut > site_len and rev_cut > 0
+                # — BsrI, BsmI, BtsI, BsrDI, BtsCI, BtsIMutI) ends up with BOTH
+                # fields None, so a reverse-bound site of theirs draws no cut
+                # mark at all. Fall back to the bottom cut so every hit marks
+                # exactly one real cut; sites that already had a mark keep it
+                # exactly where it was.
+                if _cc is None and _ext is None:
+                    _ext = _bot_cut_bp
                 _emit_resite(hits, p, site_len, -1, color, name, _cc, _ext,
                              top_cut_bp=_top_cut_bp,
                              bottom_cut_bp=_bot_cut_bp)
@@ -2283,8 +2321,8 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
             # past the 5' end into a phantom 3'-end fragment boundary (mirrors
             # the restriction-overlay scan guard). Circular wraps correctly.
             if not circular and (
-                    (p + fwd_cut) < 0 or (p + fwd_cut) > n
-                    or (p + rev_cut) < 0 or (p + rev_cut) > n):
+                    (p + fwd_cut) <= 0 or (p + fwd_cut) >= n
+                    or (p + rev_cut) <= 0 or (p + rev_cut) >= n):
                 continue
             _emit(p + fwd_cut, p + rev_cut)
         if not is_pal:
@@ -2305,8 +2343,8 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
                 # (and the restriction-overlay reverse-strand guard) and drop
                 # it; circular molecules wrap correctly.
                 if not circular and (
-                        _rev_top_raw < 0 or _rev_top_raw > n
-                        or _rev_bot_raw < 0 or _rev_bot_raw > n):
+                        _rev_top_raw <= 0 or _rev_top_raw >= n
+                        or _rev_bot_raw <= 0 or _rev_bot_raw >= n):
                     continue
                 _emit(_rev_top_raw, _rev_bot_raw)
     return sorted(out.values(), key=lambda c: (c["top"], c["enzyme"]))
@@ -2356,7 +2394,16 @@ def _split_features_at_cuts(features: list[dict], n: int,
             # `_rejoin_origin_split_features` (cloning L3), which is what
             # turns them back into ONE feature when the ligated product puts
             # them side by side again.
-            gid = f"w{i}"
+            # Unique across SOURCES, not just within this feature list. The
+            # id used to be the feature's index in THIS call's list, and a
+            # vector and an insert are digested by separate calls that each
+            # index from 0 — so an origin-spanning feature at the same list
+            # position in both parents got the same id. The rejoin then saw
+            # four halves in one group, bailed out, and shipped both features
+            # as adjacent "(disrupted)" halves. Keying on the molecule length
+            # and the feature's own wrap coordinates keeps it deterministic
+            # (so a digest is still reproducible) while separating parents.
+            gid = f"w{n}:{fs}:{fe}:{i}"
             # `_split_full_len` records the ORIGINAL feature's wrap-aware
             # length, which is what lets a downstream rejoin prove a
             # reassembled feature is whole again (see
@@ -2580,12 +2627,22 @@ def _fragments_from_cuts(seq: str, cuts: list[dict], *,
                 # Clamp to fragment bounds.
                 new_s = max(0, min(new_s, frag_len))
                 new_e = max(0, min(new_e, frag_len))
-                if new_s > new_e:
+                if new_s > new_e or (new_s == new_e and fe != fs):
                     # The piece straddles this fragment's OWN 5'/3' ends. Only
                     # reachable on the single-cut circular digest (`a == b`),
                     # where the lone cut falls inside the feature. The fragment
                     # is LINEAR, so a `start > end` "wrap" is meaningless here —
                     # emit the two real pieces so no annotated base is lost.
+                    #
+                    # `new_s == new_e` with a NON-empty source feature is the
+                    # same straddle for the full-lap case: a whole-molecule
+                    # annotation (`[0, n)` — "backbone" / "vector") wraps all
+                    # the way round to its own start, and the modular map sends
+                    # both edges to the same local bp. Algebraically the only
+                    # non-empty span that can collapse this way is one of
+                    # length exactly `n`, so this can't swallow a real piece.
+                    # Pre-fix such a feature was emitted as a zero-length
+                    # marker and vanished from the fragment.
                     local_feats.append({**f, "start": new_s, "end": frag_len})
                     local_feats.append({**f, "start": 0,     "end": new_e})
                     continue

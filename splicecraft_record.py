@@ -5,8 +5,8 @@ parse/serialise records can import it instead of calling it bare on the hub. Thi
 is MISSION-CRITICAL (INV-98: the GenBank LOCUS must never carry the human/display
 name; the .dna + library round-trips depend on byte-faithful parse/serialise), so
 it moved as one self-contained unit with its own LRU parse cache. Biopython is
-imported lazily inside the two entry points (`from Bio import SeqIO`) exactly as
-in the hub. The SpliceCraft version stamped into the GenBank COMMENT is read from
+imported lazily inside the two entry points (the writer subclass and
+`SeqIO.read`) exactly as in the hub. The SpliceCraft version stamped into the GenBank COMMENT is read from
 `_state._sc_version` (the hub sets it from `__version__`, which must stay in
 splicecraft.py for release.py's bump regex). Re-exported by the hub so `sc.<name>`
 + every existing call site resolves unchanged.
@@ -78,6 +78,19 @@ def _arrowless_encode_features(features):
     for f in feats:
         loc = getattr(f, "location", None)
         strand = getattr(loc, "strand", None) if loc is not None else None
+        # A CompoundLocation whose PARTS disagree on strand also reports
+        # `.strand is None` — Biopython's way of saying "mixed", not
+        # "arrowless". Tagging it drove the decoder to force strand 0 onto
+        # every part, so a legal `join(11..50,complement(61..90))` came back
+        # with its second part no longer reverse-complemented and its
+        # extracted DNA silently changed. Only a location that is arrowless
+        # in EVERY part is arrowless.
+        if strand is None and loc is not None:
+            parts = getattr(loc, "parts", None)
+            if parts and not all(
+                    getattr(p, "strand", None) in (0, None) for p in parts):
+                out.append(f)
+                continue
         quals = getattr(f, "qualifiers", None) or {}
         if (strand in (0, None) and getattr(f, "type", "") != "source"
                 and _SC_STRAND_QUAL not in quals):
@@ -249,18 +262,28 @@ def _restore_display_name_from_comment(rec) -> None:
     name marker, stamp it onto ``rec._tui_display_name`` — UNLESS the caller
     already set one (e.g. load-file from a hyphen-rich filename, which is
     equally authoritative and should win when present). The marker is the
-    last line of our COMMENT stamp, so `(.+)` to the line end captures it;
-    a name long enough to have wrapped degrades to its first physical line
-    rather than being lost."""
+    LAST line of our COMMENT stamp, so everything after it — across however
+    many physical lines Biopython's 68-column COMMENT wrapping produced — is
+    the name, rejoined on single spaces. Keeping only the first physical line
+    silently truncated every display name past ~50 characters, and the next
+    save then re-stamped the truncation, making it permanent."""
     if getattr(rec, "_tui_display_name", None):
         return
     comment = (getattr(rec, "annotations", None) or {}).get("comment", "")
     if isinstance(comment, (list, tuple)):
         comment = "\n".join(str(x) for x in comment)
-    m = re.search(re.escape(_DISPLAY_NAME_MARKER) + r"\s*(.+)", str(comment or ""))
+    # `[ \t]*` not `\s*`: `\s` matches a NEWLINE, so a marker with an empty
+    # value swallowed the following comment line and restored it as the name.
+    m = re.search(re.escape(_DISPLAY_NAME_MARKER) + r"[ \t]*(.+)",
+                  str(comment or ""), re.S)
     if not m:
         return
-    name = m.group(1).splitlines()[0].strip()
+    # The marker is the LAST line of our COMMENT stamp, so everything after it
+    # belongs to the name. Biopython wraps COMMENT at 68 columns, so a name
+    # with spaces arrives split across physical lines; keeping only the first
+    # of them silently truncated every display name past ~50 characters (and
+    # then re-stamped the truncation, making it permanent).
+    name = " ".join(m.group(1).split())
     if name:
         try:
             rec._tui_display_name = name  # type: ignore[attr-defined]
@@ -316,7 +339,6 @@ def _record_to_gb_text(record) -> str:
     here so they survive the round-trip (`_arrowless_encode_features`); the
     parse side restores them. No-op when nothing is arrowless.
     """
-    from Bio import SeqIO
     anns = dict(getattr(record, "annotations", None) or {})
     anns.setdefault("molecule_type", "DNA")
     # Provenance: stamp which SpliceCraft version + date first wrote this file
@@ -371,8 +393,64 @@ def _record_to_gb_text(record) -> str:
     rec.features = _split_multiline_qualifiers(
         _arrowless_encode_features(getattr(record, "features", None)))
     buf = StringIO()
-    SeqIO.write(rec, buf, "genbank")
+    _unbreakable_genbank_writer(buf).write_file([rec])
     return buf.getvalue()
+
+
+def _unbreakable_genbank_writer(handle):
+    """A `GenBankWriter` that never HARD-BREAKS a whitespace-free qualifier
+    value, built lazily so Biopython stays a deferred import.
+
+    Biopython wraps a long qualifier at column 80. When the value contains a
+    space it breaks there, and its own parser rejoins the continuation on that
+    space — lossless. When the value contains NO space in reach it breaks
+    mid-token anyway, and the parser rejoins with a space that was never
+    there. The result is a silent, permanent mutation of user annotation on
+    every load: a 51-character label came back with a trailing space, and
+    `Construct_optimized_for_expression_v2_final_long_name` came back with a
+    space inside it. Because the library persists every plasmid as GenBank
+    text, this fired on ordinary saves, and `_export_genbank_to_path`'s
+    round-trip guard then REFUSED to export the record at all.
+
+    This writer instead breaks after the offending token (or, failing that,
+    emits the rest of the line whole). The lines it produces are longer than
+    80 columns, which INSDC discourages and every parser in practice accepts —
+    a strictly better trade than corrupting the value."""
+    from Bio.SeqIO.InsdcIO import GenBankWriter
+
+    class _Writer(GenBankWriter):
+        def _write_feature_qualifier(self, key, value=None, quote=None):
+            if value is None or not isinstance(value, str):
+                return super()._write_feature_qualifier(key, value, quote)
+            if " " in value:
+                # Breakable the normal way, but a single over-long token
+                # inside it can still trip the hard break — fall through to
+                # the safe path only when one actually would.
+                longest = max((len(t) for t in value.split(" ")), default=0)
+                if longest + self.QUALIFIER_INDENT + len(key) + 4 <= self.MAX_WIDTH:
+                    return super()._write_feature_qualifier(key, value, quote)
+            esc = value.replace('"', '""')
+            if quote is None:
+                quote = not (isinstance(value, int) or key in self.FTQUAL_NO_QUOTE)
+            line = (f'{self.QUALIFIER_INDENT_STR}/{key}="{esc}"' if quote
+                    else f"{self.QUALIFIER_INDENT_STR}/{key}={esc}")
+            while line.lstrip():
+                if len(line) <= self.MAX_WIDTH:
+                    self.handle.write(line + "\n")
+                    return
+                idx = line.rfind(" ", self.QUALIFIER_INDENT + 1, self.MAX_WIDTH + 1)
+                if idx <= self.QUALIFIER_INDENT:
+                    # No break point in reach — take the NEXT one instead of
+                    # splitting the token, and emit the remainder whole when
+                    # there is none.
+                    idx = line.find(" ", self.MAX_WIDTH)
+                    if idx == -1:
+                        self.handle.write(line + "\n")
+                        return
+                self.handle.write(line[:idx] + "\n")
+                line = self.QUALIFIER_INDENT_STR + line[idx:].lstrip()
+
+    return _Writer(handle)
 
 
 def _clone_cached_record(rec):

@@ -1850,8 +1850,14 @@ class TestSimulateTraditionalCloningMulti:
         the catalog found nothing, so every parent enzyme "failed to
         resolve" and a junction EcoRI cuts perfectly well was reported as
         an idempotent scar."""
+        # The context is built as [6 bases left of the joint][6 right], so
+        # the joint sits between index 5 and 6. A REGENERATED EcoRI site
+        # straddles it (G | AATTC), which is what the classifier now
+        # requires — the fixture used to start the site AT index 6, i.e.
+        # wholly on the right of the joint, which is a pre-existing
+        # neighbouring site rather than a re-formed junction.
         cls = sc._classify_junction("EcoRI/EcoRI-HF", "EcoRI/EcoRI-HF",
-                                     "TTTTTTGAATTCTTTTTT",
+                                     "TTTTTG" + "AATTCT",
                                      context_left_offset=6)
         assert cls["scar"] is False
         assert "EcoRI" in cls["re_cuttable"]
@@ -3772,12 +3778,30 @@ class TestRejoinCutSplitFeatures:
         assert len(sc._rejoin_cut_split_features(
             feats, len(top), top_seq=top)) == 2
 
-    def test_opposite_strands_never_merge(self):
+    def test_opposite_strands_merge_only_for_a_real_enzyme_site(self):
+        """A REVERSE-orientation clone flips the insert's features to the
+        opposite strand while the vector's keep theirs, so the two halves of
+        one REGENERATED site legitimately carry different strands. Refusing
+        to merge them (which this test used to assert) reported every
+        regenerated site in a reverse clone as destroyed — the [INV-190]
+        failure, fixed for the forward orientation only.
+
+        Cross-strand merging is allowed ONLY when the label resolves to a
+        known enzyme, because only then can the base check prove the run
+        really spells that site. A non-enzyme label still never merges
+        across strands."""
         top = "TTTT" + "GAATTC" + "TTTT"
         feats = [self._piece("EcoRI", "head", 4, 5, 6),
                  self._piece("EcoRI", "tail", 5, 10, 6, strand=-1)]
+        out = sc._rejoin_cut_split_features(feats, len(top), top_seq=top)
+        assert len(out) == 1
+        assert (int(out[0]["start"]), int(out[0]["end"])) == (4, 10)
+
+        # Same geometry, a label that is not an enzyme → still two pieces.
+        plain = [self._piece("myGene", "head", 4, 5, 6),
+                 self._piece("myGene", "tail", 5, 10, 6, strand=-1)]
         assert len(sc._rejoin_cut_split_features(
-            feats, len(top), top_seq=top)) == 2
+            plain, len(top), top_seq=top)) == 2
 
     def test_whole_and_untagged_pieces_pass_through(self):
         """`_split="whole"` means a cut fell inside and the remnant rode in

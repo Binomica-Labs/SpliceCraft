@@ -9,6 +9,7 @@ existing call site resolves unchanged.
 """
 from __future__ import annotations
 
+import math as _math
 import re
 import platform
 import functools as _functools
@@ -49,6 +50,12 @@ def _sanitize_path(p: "str | None") -> "Path | None":
     user, no trailing identifier) is allowed.
     """
     if not isinstance(p, str) or not p:
+        return None
+    if "\x00" in p:
+        # A NUL makes every downstream syscall raise a bare ValueError
+        # ("embedded null character in path") from inside os.stat / open,
+        # which escapes the callers' `except (OSError, ValueError)` shapes and
+        # surfaced as a 500 with a Python message instead of a 400.
         return None
     if p.startswith("~") and len(p) > 1 and p[1] not in ("/", "\\"):
         return None
@@ -278,6 +285,11 @@ def _format_identity_pct(pct: "float | int | None", *,
         v = float(pct)
     except (TypeError, ValueError):
         return "—"
+    if not _math.isfinite(v):
+        # `inf` (a divide-by-zero-derived identity) sailed through the
+        # `>= 100.0` fast path and rendered as "100%" — the exact lie this
+        # function exists to prevent — and `nan` rendered as "<100%".
+        return "—"
     # Use the SAME strict ``>= 100.0`` boundary as `_identity_pct_color`
     # so the number and the colour can never disagree about perfection.
     if v >= 100.0:
@@ -318,8 +330,17 @@ def _sanitize_plasmid_name(raw: str, *,
     # Whitespace control chars (\t \n \r \v \f) become spaces FIRST so
     # they don't silently fuse adjacent words after the control-strip
     # pass. e.g. ``"foo\tbar"`` becomes ``"foo bar"``, not ``"foobar"``.
+    # This MUST run before the control-character strip below, which would
+    # otherwise delete the tab outright and glue the words together.
     for ch in "\t\n\r\v\f":
         raw = raw.replace(ch, " ")
+    # Then strip the bidi overrides / C1 / zero-width characters
+    # `_sanitize_label` already removes. A stored name carrying U+202E
+    # visually REORDERS the DataTable cell and the `.gb` qualifier it is
+    # written into (Trojan-Source-style spoofing) and has no legitimate use
+    # in a plasmid name — the two sanitisers had drifted, and this one's
+    # docstring described an allowlist it did not implement.
+    raw = _CONTROL_CHARS_RE.sub("", raw)
     # Drop NUL + remaining C0 control chars (\x00–\x1F + \x7F) — these
     # never belong in a user-facing identifier and break naive
     # C-string handling in some downstream tools.
@@ -379,19 +400,36 @@ def _feature_location(start: int, end: int, total: int, strand):
     start, end, total = int(start), int(end), int(total)
     if end > start:
         return FeatureLocation(start, end, strand=strand)
+    if end == start:
+        # Degenerate span — checked FIRST. Tested after the ends-on-origin
+        # case below, `(0, 0)` fell into it and returned the WHOLE molecule,
+        # contradicting this function's own documented contract. `(50, 50)`
+        # returned None correctly, so the two disagreed.
+        return None
     if end == 0 and start < total:
         # Ends exactly ON the origin: a wrap with an empty head half.
         # `CompoundLocation` refuses a zero-length part, and the tail alone
         # already describes every base.
         return FeatureLocation(start, total, strand=strand)
-    if end == start:
-        return None
     tail = FeatureLocation(start, total, strand=strand)
     head = FeatureLocation(0, end, strand=strand)
     return CompoundLocation([head, tail] if strand == -1 else [tail, head])
 
 
-def _feat_bounds(feat, total: int) -> "tuple[int, int, int] | None":
+def _record_is_circular(record) -> bool:
+    """Topology of a Biopython record, read from its ``topology`` annotation.
+
+    Only an EXPLICIT ``linear`` annotation means linear — an unannotated
+    record keeps the circular default the whole app assumes for plasmids.
+    Pass the result as `_feat_bounds(..., circular=…)` so a two-part join on
+    a linear record reads as a SPLICE rather than an origin wrap."""
+    return str(
+        (getattr(record, "annotations", {}) or {}).get("topology", "")
+    ).strip().lower() != "linear"
+
+
+def _feat_bounds(feat, total: int, *,
+                 circular: "bool | None" = None) -> "tuple[int, int, int] | None":
     """Wrap-aware extraction of `(start, end, strand)` from a Biopython
     `SeqFeature`. The returned `(start, end)` follows the dict-feature
     convention: `end < start` signals an origin-spanning wrap; otherwise
@@ -402,6 +440,17 @@ def _feat_bounds(feat, total: int) -> "tuple[int, int, int] | None":
     `[0, ..)` and `[.., total)`, re-encodes as `(tail_start, head_end)`
     so callers can slice with `_slice_circular` and length with `_feat_len`.
     Other compound shapes flatten to outer bounds.
+
+    ``circular`` — pass ``False`` when the record's topology is known to be
+    LINEAR and the wrap re-encoding is skipped entirely. A linear molecule
+    has no origin to wrap around, so that same two-part shape is a SPLICED
+    feature: ``join(1..6,13..30)`` on a 30 bp linear record is exon1 +
+    exon2, and re-encoding it as ``(12, 6)`` made every consumer read exon2
+    before exon1 — a cyclically rotated protein. Pass ``None`` (the
+    default) when topology isn't known, which keeps the historical
+    circular reading. On a genuine circle the two shapes are ambiguous and
+    SpliceCraft's convention (see `_wrap_location`, which writes the INSDC
+    tail-first order) is that this shape IS the wrap.
 
     Callers that read `int(feat.location.start)` / `int(feat.location.end)`
     directly silently flatten wrap features (Biopython returns `min(part.start)`
@@ -428,7 +477,8 @@ def _feat_bounds(feat, total: int) -> "tuple[int, int, int] | None":
         try:
             parts = sorted(loc.parts, key=lambda p: int(p.start))
             if (
-                total > 0 and len(parts) == 2
+                circular is not False
+                and total > 0 and len(parts) == 2
                 and int(parts[0].start) == 0
                 and int(parts[-1].end) == total
                 and int(parts[0].end) < int(parts[-1].start)
@@ -1237,7 +1287,12 @@ def _safe_xml_parse(xml_data: str, *, allow_dtd: bool = False):
     n = len(xml_data)
     while i < n:
         c = xml_data[i]
-        if c in " \t\r\n":
+        # U+FEFF too: a BOM-prefixed document skipped straight past this
+        # prologue scan and reached expat with its DOCTYPE intact, so the
+        # DTD/ENTITY refusal below never ran. `_CONTROL_CHARS_RE` in this
+        # same module already treats U+FEFF as a control character — the
+        # two sanitisers had drifted.
+        if c in " \t\r\n\ufeff":
             i += 1
             continue
         # Comment: <!-- ... -->

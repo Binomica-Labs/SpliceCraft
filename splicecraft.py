@@ -42,13 +42,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.60"
+__version__ = "1.2.61"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-09-14"
+_RELEASE_DATE = "2026-09-15"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -4075,6 +4075,9 @@ def _ensure_library_cache_populated_and_migrated() -> None:
 from splicecraft_dataaccess import (  # noqa: E402
     _load_library as _load_library,
     _save_library as _save_library,
+    _mark_mirror_dirty as _mark_mirror_dirty,
+    _clear_mirror_dirty as _clear_mirror_dirty,
+    _mirror_is_dirty as _mirror_is_dirty,
     _load_collections as _load_collections,
     _save_collections as _save_collections,
     _load_model_collections as _load_model_collections,
@@ -4700,8 +4703,15 @@ def _drain_collection_sync_loop() -> None:
                     if c.get("name") == name:
                         c["plasmids"] = snapshot
                         _save_collections(colls)
+                        # The deferred mirror landed — the two files agree
+                        # again, so startup may restore from the collection.
+                        _clear_mirror_dirty()
                         break
         except (OSError, RuntimeError) as exc:
+            # Same hazard as the synchronous path: library.json is now ahead
+            # of collections.json, and startup restores FROM the collection.
+            # Mark it so the next launch refuses to overwrite.
+            _mark_mirror_dirty(f"async active-collection mirror ({name}) failed")
             _bg_notify_save_failure(
                 f"Active-collection mirror ({name})", exc,
             )
@@ -4864,8 +4874,12 @@ def _flush_pending_collection_sync(timeout_s: float = 5.0) -> None:
                     if c.get("name") == name:
                         c["plasmids"] = snapshot
                         _save_collections(colls)
+                        _clear_mirror_dirty()
                         break
         except (OSError, RuntimeError) as exc:
+            _mark_mirror_dirty(
+                f"shutdown flush of the active-collection mirror "
+                f"({name}) failed")
             _bg_notify_save_failure(f"Active-collection mirror ({name})", exc)
 
 
@@ -4896,6 +4910,19 @@ def _restore_library_from_active_collection() -> None:
         # Stash the NAME so the message is actionable ("Pick a
         # different collection from the library panel.").
         _state._DANGLING_ACTIVE_COLLECTION_NAME = name
+        return
+    if _mirror_is_dirty():
+        # A previous mirror write FAILED, so `plasmid_library.json` holds
+        # work that never reached `collections.json`. Overwriting it from
+        # the collection here is exactly how that work disappears — silently,
+        # one launch later, with no shrink-guard warning and no spill.
+        # Leave the library alone and tell the user.
+        _state._MIRROR_DIRTY_RECOVERY_NAME = name
+        _log.error(
+            "Active-collection mirror is marked dirty — NOT restoring "
+            "plasmid_library.json from collection %r; the library file is "
+            "the newer of the two.", name,
+        )
         return
     plasmids = [dict(p) for p in (coll.get("plasmids") or [])
                 if isinstance(p, dict)]
@@ -10862,6 +10889,13 @@ def _rotate_seq_record(record, offset: int, *, keep_source: bool = False):
         new_rec.features.append(SeqFeature(
             loc, type=f.type, qualifiers=dict(f.qualifiers or {}),
         ))
+    # Carry the `_tui_*` attributes, exactly as `_reverse_complement_record`
+    # does. Without this a re-origin silently reverted the plasmid's display
+    # name to the underscored LOCUS ([INV-98]), flipped the map back to
+    # circular, and dropped the source path — and every downstream consumer
+    # (title bar, add-to-library default, clone/PCR product names, bulk-export
+    # filenames) then used the LOCUS form.
+    _carry_tui_attrs(new_rec, record)
     return new_rec
 
 
@@ -14219,6 +14253,35 @@ def _linear_scrollbar_layout(
 
 # ── PlasmidMap widget ──────────────────────────────────────────────────────────
 
+def _feat_is_map_indexed(feat) -> bool:
+    """Does this feature occupy a slot in ``PlasmidMap._feats``?
+
+    THE single definition of "indexable", shared by `PlasmidMap._parse` (which
+    builds that list) and by every handler that resolves a map / sidebar index
+    back onto ``record.features`` by counting. The two used to disagree:
+    `_parse` skipped the synthetic ``source`` feature AND any feature whose
+    coordinates would not cast to int, while the handlers skipped only
+    ``source``. One skipped feature shifted every later index by one, so
+    Delete removed — and Edit relabelled — a DIFFERENT annotation than the one
+    the user clicked, while the toast named the clicked one.
+
+    A location of ``None`` counts as non-indexable too: Biopython returns that
+    for a ``?`` endpoint (``?..40``), and dereferencing ``.start`` on it raised
+    an AttributeError that `_parse`'s ``except (TypeError, ValueError)`` did
+    not catch — crashing the load of an otherwise readable file."""
+    if getattr(feat, "type", "") == "source":
+        return False
+    loc = getattr(feat, "location", None)
+    if loc is None:
+        return False
+    try:
+        int(loc.start)
+        int(loc.end)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return True
+
+
 class PlasmidMap(Widget):
     """
     Circular plasmid map.
@@ -14629,20 +14692,23 @@ class PlasmidMap(Widget):
         for feat in record.features:
             if feat.type in ("source",):
                 continue
-            # Biopython's UnknownPosition / BetweenPosition can't be cast to int.
-            # Skip such features with a log entry rather than crashing the whole
-            # import. Compound locations with fuzzy endpoints (e.g. `<100..200`)
-            # ARE castable, so this only catches genuinely unknown coords.
-            try:
-                start = int(feat.location.start)
-                end   = int(feat.location.end)
-            except (TypeError, ValueError):
+            # Biopython's UnknownPosition / BetweenPosition can't be cast to
+            # int, and a `?` endpoint comes back as `location = None`. Skip
+            # such features with a log entry rather than crashing the whole
+            # import. Compound locations with fuzzy endpoints (e.g.
+            # `<100..200`) ARE castable, so this only catches genuinely
+            # unknown coords. `_feat_is_map_indexed` is the SHARED definition
+            # every index-resolving handler uses, so a skip here can never
+            # desynchronise them from this list.
+            if not _feat_is_map_indexed(feat):
                 self._n_skipped += 1
                 _log.warning(
-                    "Skipped feature %s with non-integer coords (type=%s)",
+                    "Skipped feature %s with unusable coords (type=%s)",
                     _feat_label(feat), feat.type,
                 )
                 continue
+            start = int(feat.location.start)
+            end   = int(feat.location.end)
             # Preserve `strand == None` (BioPython's representation of
             # "no strand info" — what `_annotate_with_feature_impl`
             # stores when the user picks "Arrowless (▒)") by mapping
@@ -14695,8 +14761,16 @@ class PlasmidMap(Widget):
                     int(parts[i].end) == int(parts[i + 1].start)
                     for i in range(len(parts) - 1)
                 )
+                # A LINEAR record has no origin to wrap around, so this same
+                # two-part shape is a SPLICED feature there: `join(1..6,
+                # 13..30)` on a 30 bp linear record is exon1 + exon2, and
+                # re-encoding it as (12, 6) made `_translate_cds` read exon2
+                # before exon1 — a cyclically rotated protein — while also
+                # suppressing the `_exons` capture below. Mirrors the
+                # `circular=` gate in `_feat_bounds`.
                 is_wrap = (
-                    total > 0 and len(parts) == 2
+                    _rec_is_circular
+                    and total > 0 and len(parts) == 2
                     and int(parts[0].start) == 0
                     and int(parts[-1].end) == total
                     and int(parts[0].end) < int(parts[-1].start)
@@ -18796,7 +18870,15 @@ class LibraryPanel(Widget):
             name = entry.get("name") or entry.get("id") or "?"
             if not _fuzzy_match(flt, name):
                 continue
-            is_dirty = (entry["id"] == self._active_id and self._active_dirty)
+            # Every read of an entry field here is defensive, because a
+            # library file can legitimately arrive with fields missing: the
+            # id backfill explicitly SKIPS an entry it can't key, and the
+            # documented repair workflow edits this file by hand. A bare
+            # `entry["id"]` / `entry["size"]` turned such an entry into a
+            # KeyError inside `on_mount`, so the app died at STARTUP and the
+            # user's whole library became unreachable through the UI.
+            entry_id = str(entry.get("id") or entry.get("name") or "")
+            is_dirty = (entry_id == self._active_id and self._active_dirty)
             name_disp = ("*" + name) if is_dirty else name
             name_disp = name_disp[:name_inner]
             status = _sanitize_plasmid_status(entry.get("status"))
@@ -18808,7 +18890,6 @@ class LibraryPanel(Widget):
             # will be moved/copied by the next 'm'/'y' press. When
             # the row is BOTH marked AND has a status, the arrow
             # wins (mark is the more urgent signal).
-            entry_id = entry["id"]
             self._lib_full_names[entry_id] = name
             # Shared with the surgical Space update so a repopulate can't
             # disagree with an in-place mark flip. A mark outranks the status
@@ -18851,7 +18932,7 @@ class LibraryPanel(Widget):
                 name_cell,
                 status_cell,
                 seq_cell,
-                f"{entry['size']:,}",
+                f"{_coerce_int_or_zero(entry.get('size')):,}",
                 kind_cell,
                 key=entry_id,
             )
@@ -21606,8 +21687,18 @@ class SequencePanel(Widget):
             except (TypeError, ValueError):
                 continue
             new = dict(f)
-            new["start"] = (s - o) % n
-            new["end"]   = (e - o) % n
+            if s != e and (e - s) % n == 0:
+                # FULL-LAP feature (a whole-molecule "backbone" / "vector"
+                # annotation spanning [0, n)). Both edges map to the same
+                # rotated bp, which is the documented encoding for an EMPTY
+                # span — so the feature silently vanished from the sequence
+                # panel the moment the view was rotated, while still showing
+                # on the map and in the sidebar. A full lap covers everything
+                # in any frame, so leave it alone.
+                new["start"], new["end"] = s, e
+            else:
+                new["start"] = (s - o) % n
+                new["end"]   = (e - o) % n
             # Shift resite cut bp fields too. Pre-2026-05-08 only
             # `start` / `end` rotated; the absolute cut markers
             # (`top_cut_bp`, `bottom_cut_bp`, `ext_cut_bp`) stayed
@@ -90903,27 +90994,40 @@ def _simulate_pcr(
     used_partial_binding = False
     fwd_binding_len = len(fwd)
     rev_binding_len = len(rev_rc)
-    if not fwd_hits and not rev_rc_hits:
+    # Each primer resolves INDEPENDENTLY: exact first, else 3'-anchored
+    # partial. Gating both on "neither primer matched exactly" meant a pair
+    # where only ONE side carries a 5' tail — a tailed forward primer with a
+    # stock sequencing reverse primer, the commonest cloning geometry there
+    # is — returned NO amplicons at all, while the Primer Check screen found
+    # the product. The two simulators disagreed on the same pair.
+    _partial_floor = max(15, _PCR_MIN_PRIMER_LEN)
+    if not fwd_hits:
         # Forward primer: longest matching 3'-suffix of fwd against
         # search_seq. The annealing position is the template
         # position where that suffix starts.
         partial_fwd: "list[tuple[int, int]]" = (
-            _partial_3p_binding_positions(search_seq, fwd)
+            _partial_3p_binding_positions(search_seq, fwd,
+                                          min_binding=_partial_floor)
         )
+        if partial_fwd:
+            used_partial_binding = True
+            fwd_hits = [p for p, _k in partial_fwd]
+            fwd_binding_len = partial_fwd[0][1]
+    if not rev_rc_hits:
         # Reverse primer: longest matching 5'-prefix of rev_rc
-        # against search_seq.
+        # against search_seq. Same minimum binding length as the forward
+        # side — the floors used to differ by one base (15 vs 14), so a
+        # 14+15 bp pair amplified and the mirror-image 15+14 pair did not.
         partial_rev: "list[tuple[int, int]]" = []
-        for k in range(len(rev_rc), max(14, _PCR_MIN_PRIMER_LEN) - 1, -1):
+        for k in range(len(rev_rc), _partial_floor - 1, -1):
             prefix = rev_rc[:k]
             hits = _exact_match_positions(search_seq, prefix)
             if hits:
                 partial_rev = [(p, k) for p in hits]
                 break
-        if partial_fwd and partial_rev:
+        if partial_rev:
             used_partial_binding = True
-            fwd_hits = [p for p, _k in partial_fwd]
             rev_rc_hits = [p for p, _k in partial_rev]
-            fwd_binding_len = partial_fwd[0][1]
             rev_binding_len = partial_rev[0][1]
     if not fwd_hits or not rev_rc_hits:
         return []
@@ -90996,21 +91100,24 @@ def _simulate_pcr(
             # extends).
             if used_partial_binding:
                 body_start = fp + fwd_binding_len
-                if circular:
-                    if body_start >= n:
-                        body = search_seq[body_start:rp]
-                    elif rp >= n:
-                        body = seq[body_start:] + seq[:rp - n]
-                    else:
-                        body = seq[body_start:rp]
-                else:
-                    body = seq[body_start:rp]
+                # `search_seq` already spans n + max_amp on a circular
+                # template, so ONE slice covers every product including the
+                # ones that lap the origin. The hand-rolled `seq[a:] +
+                # seq[:rp - n]` split silently truncated any product whose
+                # reverse site sat more than one lap out.
+                body = (search_seq if circular else seq)[body_start:rp]
                 amplicon_seq = fwd + body + rev_rc
-            elif circular and wraps:
-                amplicon_seq = seq[fp:] + seq[:(rp + len(rev_rc)) - n]
+            elif circular:
+                # Same single-slice rule for the exact-match path. The old
+                # wrap branch built `seq[fp:] + seq[:(rp + len(rev_rc)) - n]`,
+                # whose second slice exceeds n — and so gets silently clipped
+                # by Python — as soon as the reverse site straddles the origin
+                # (inverse-PCR / whole-plasmid QuikChange geometry). The row
+                # then reported the full length while carrying a SHORT
+                # sequence, and saving the amplicon persisted the short one.
+                amplicon_seq = search_seq[fp:fp + length]
             else:
-                amplicon_seq = seq[fp:fp + length] if not circular else \
-                               search_seq[fp:fp + length]
+                amplicon_seq = seq[fp:fp + length]
 
             gc_pct = (sum(1 for c in amplicon_seq if c in "GC")
                       / max(1, len(amplicon_seq))) * 100.0
@@ -96832,6 +96939,12 @@ def _h_remember_fact(app, payload):
     fact = payload.get("fact")
     if not isinstance(fact, str) or not fact.strip():
         return ({"error": "missing or non-string 'fact'"}, 400)
+    if "\x00" in fact or (isinstance(payload.get("title"), str)
+                          and "\x00" in payload["title"]):
+        # A NUL reaches the filename the memory store derives from the text
+        # and raises a bare ValueError from inside open(), which escaped as a
+        # 500 with a Python message instead of a 400.
+        return ({"error": "'fact'/'title' must not contain a NUL byte"}, 400)
     fact = fact.strip()
     if len(fact) > 4000:
         return ({"error": "'fact' too long (max 4000 chars) - memories should be short"}, 400)
@@ -98412,7 +98525,7 @@ def _h_delete_feature(app, payload):
         seen = 0
         target_label = snap.get("label", "")
         for feat in new_record.features:
-            if feat.type == "source":
+            if not _feat_is_map_indexed(feat):
                 kept.append(feat)
                 continue
             if seen == idx:
@@ -98558,7 +98671,7 @@ def _h_update_feature(app, payload):
         seen = 0
         target = None
         for feat in new_record.features:
-            if feat.type == "source":
+            if not _feat_is_map_indexed(feat):
                 continue
             if seen == idx:
                 target = feat
@@ -98652,7 +98765,7 @@ def _h_get_feature(app, payload):
     quals: dict = {}
     seen = 0
     for feat in list(rec.features):
-        if feat.type == "source":
+        if not _feat_is_map_indexed(feat):
             continue
         if seen == idx:
             quals = {k: list(v) if isinstance(v, list) else v
@@ -102192,7 +102305,13 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
             return "__bad_body__"
-        if length <= 0:
+        if length < 0:
+            # A NEGATIVE Content-Length is malformed, not "no body". Treating
+            # it as an empty body silently discarded the real payload, so the
+            # request ran with default parameters and the caller was told it
+            # was missing a field it had actually sent.
+            return "__bad_body__"
+        if length == 0:
             return {}
         if length > self._MAX_BODY_BYTES:
             _log.warning("agent-api: oversized request body (%d bytes) "
@@ -103270,9 +103389,10 @@ class SearchController:
         try:
             sp = app.query_one("#seq-panel", SequencePanel)
             seq_len = len(sp._seq or "")
+            seq_sig = hash(sp._seq or "")
             cursor = int(getattr(sp, "_cursor_pos", -1))
         except (NoMatches, AttributeError, TypeError, ValueError):
-            seq_len, cursor = 0, -1
+            seq_len, seq_sig, cursor = 0, 0, -1
         start_idx = 0
         if cursor >= 0:
             for i, h in enumerate(hits):
@@ -103286,6 +103406,11 @@ class SearchController:
             "hits":         hits,
             "idx":          start_idx,
             "seq_len":      seq_len,
+            # Length alone does not identify the sequence: a same-length
+            # replace, a whole-record flip and a re-origin all preserve it.
+            # The stale guard passed for all three and `n` / `N` then landed
+            # the cursor on stored coordinates that now hold unrelated bases.
+            "seq_sig":      seq_sig,
         }
         _log_event(
             "app.find_sequence.result",
@@ -103315,7 +103440,9 @@ class SearchController:
             sp = app.query_one("#seq-panel", SequencePanel)
         except NoMatches:
             return
-        if len(sp._seq or "") != ss.get("seq_len"):
+        _cur = sp._seq or ""
+        if (len(_cur) != ss.get("seq_len")
+                or hash(_cur) != ss.get("seq_sig")):
             self._seq_search = None
             app.notify(
                 "The sequence changed since the last search — press Ctrl+F "
@@ -106721,7 +106848,16 @@ NcbiTaxonPickerModal { align: center middle; }
                 elif fs <= s and fe >= e:
                     new_fs, new_fe = fs, fe + delta
                 elif fs < s:
-                    new_fs, new_fe = fs, s + ins_len
+                    # The edit starts INSIDE the feature and runs past its
+                    # end (fs < s < fe < e). The feature keeps only its own
+                    # surviving bases `[fs, s)`. `s + ins_len` handed it the
+                    # whole inserted payload — bases that were never part of
+                    # it — which is exactly what the mirror branch below
+                    # refuses to do for a 5'-truncating edit. The two sides of
+                    # the same operation used to disagree, and every consumer
+                    # that reads the location (translation, export, fragment
+                    # prep, primer binding) saw the phantom bases.
+                    new_fs, new_fe = fs, s
                 else:
                     # 2026-05-27 (audit-2 seq H2): the edit starts at
                     # or before the feature's start (fs >= s) and
@@ -106762,9 +106898,14 @@ NcbiTaxonPickerModal { align: center middle; }
             loc = feat.location
             if isinstance(loc, CompoundLocation):
                 # Wrap-canonical-form preservation for origin-edge inserts.
-                parts_sorted = sorted(
-                    loc.parts, key=lambda p: int(p.start)
+                # `_sorted_idx[k]` = the STORED index of the k-th part in
+                # ascending-coordinate order, so a rebuilt location can be
+                # emitted back in stored (reading) order.
+                _sorted_idx = sorted(
+                    range(len(loc.parts)),
+                    key=lambda i: int(loc.parts[i].start),
                 )
+                parts_sorted = [loc.parts[i] for i in _sorted_idx]
                 # 2026-05-27 (audit-2 seq H1): accept 2+ parts so a
                 # multi-segment wrap (e.g. join(900..1000, 1..100,
                 # 200..300) imported from GenBank, post-rotation /
@@ -106785,39 +106926,51 @@ NcbiTaxonPickerModal { align: center middle; }
                     # Head: anchor stays at 0, end grows by ins_len.
                     # Middle parts (if any): shift by ins_len.
                     # Tail: shifts by ins_len (same as middles).
-                    new_parts = [
-                        FeatureLocation(
-                            0,
-                            int(parts_sorted[0].end) + ins_len,
-                            strand=getattr(
-                                parts_sorted[0], "strand", None,
-                            ),
-                        ),
-                    ]
-                    for part in parts_sorted[1:]:
-                        new_parts.append(FeatureLocation(
+                    #
+                    # Emitted in the location's STORED order, not ascending:
+                    # for a compound location the stored order IS the 5'→3'
+                    # reading order, and a plus-strand wrap is stored
+                    # tail-first. Rebuilding it ascending put the head first,
+                    # which reads out the right bases in the wrong order — a
+                    # cyclically rotated protein at every boundary that reads
+                    # the location directly (`SeqFeature.extract`, the
+                    # GenBank writer, every external tool). SpliceCraft's own
+                    # display hid it, because `_feat_bounds` recovers the same
+                    # `(start, end)` from either order.
+                    _by_idx: dict = {}
+                    _first = _sorted_idx[0]
+                    _by_idx[_first] = FeatureLocation(
+                        0,
+                        int(parts_sorted[0].end) + ins_len,
+                        strand=getattr(parts_sorted[0], "strand", None),
+                    )
+                    for _k, part in enumerate(parts_sorted[1:], start=1):
+                        _by_idx[_sorted_idx[_k]] = FeatureLocation(
                             int(part.start) + ins_len,
                             int(part.end)   + ins_len,
                             strand=getattr(part, "strand", None),
-                        ))
+                        )
+                    new_parts = [_by_idx[i] for i in range(len(loc.parts))]
                 elif is_wrap_canonical and s == src_total and ins_len > 0:
                     # Insert at the OLD total = the wrap-tail's
                     # endpoint. Head + any middle parts are unchanged;
                     # the tail's end grows by ins_len to span the new
                     # total. 2026-05-27 (audit-2 seq H1): support 2+
                     # parts (multi-segment wraps).
-                    new_parts = []
-                    for part in parts_sorted[:-1]:
-                        new_parts.append(FeatureLocation(
+                    # Stored order preserved — see the bp-0 branch above.
+                    _by_idx = {}
+                    for _k, part in enumerate(parts_sorted[:-1]):
+                        _by_idx[_sorted_idx[_k]] = FeatureLocation(
                             int(part.start), int(part.end),
                             strand=getattr(part, "strand", None),
-                        ))
+                        )
                     tail_part = parts_sorted[-1]
-                    new_parts.append(FeatureLocation(
+                    _by_idx[_sorted_idx[-1]] = FeatureLocation(
                         int(tail_part.start),
                         int(tail_part.end) + ins_len,
                         strand=getattr(tail_part, "strand", None),
-                    ))
+                    )
+                    new_parts = [_by_idx[i] for i in range(len(loc.parts))]
                 else:
                     new_parts = []
                     for part in loc.parts:
@@ -106882,7 +107035,7 @@ NcbiTaxonPickerModal { align: center middle; }
         )
         non_source_idx = 0
         for feat in src.features:
-            if feat.type == "source":
+            if not _feat_is_map_indexed(feat):
                 new_record.features.append(SeqFeature(
                     feat.location, type=feat.type,
                     qualifiers=deepcopy(feat.qualifiers),
@@ -107390,6 +107543,16 @@ NcbiTaxonPickerModal { align: center middle; }
                 f"another session. The library panel will look "
                 f"empty until you pick a different collection.",
                 severity="warning", timeout=12,
+            )
+        if _state._MIRROR_DIRTY_RECOVERY_NAME:
+            _mdirty = _state._MIRROR_DIRTY_RECOVERY_NAME
+            _state._MIRROR_DIRTY_RECOVERY_NAME = None
+            self.notify(
+                f"A previous save reached the plasmid library but NOT "
+                f"collection {_mdirty!r}. The library file is the newer of "
+                f"the two, so it was kept as-is. Re-save or re-pick the "
+                f"collection to sync them.",
+                severity="warning", timeout=20,
             )
         # Show the splash on top first; the rest of init runs underneath
         # while the user reads it. Skipped under `--no-splash` (and during
@@ -113246,7 +113409,7 @@ NcbiTaxonPickerModal { align: center middle; }
             seq_str = _CONTROL_CHARS_RE.sub("", seq_str)
             seen = 0
             for sf in rec.features:
-                if sf.type == "source":
+                if not _feat_is_map_indexed(sf):
                     continue
                 if seen == idx:
                     raw_notes = sf.qualifiers.get("note", []) or []
@@ -113498,7 +113661,7 @@ NcbiTaxonPickerModal { align: center middle; }
         seen = 0
         target = None
         for feat in new_record.features:
-            if feat.type == "source":
+            if not _feat_is_map_indexed(feat):
                 continue
             if seen == idx:
                 target = feat
@@ -113652,7 +113815,7 @@ NcbiTaxonPickerModal { align: center middle; }
         seen = 0
         target = None
         for f in new_record.features:
-            if f.type == "source":
+            if not _feat_is_map_indexed(f):
                 continue
             if seen == idx:
                 target = f
@@ -113735,7 +113898,7 @@ NcbiTaxonPickerModal { align: center middle; }
         kept: list = []
         seen = 0
         for f in new_record.features:
-            if f.type == "source":
+            if not _feat_is_map_indexed(f):
                 kept.append(f)
                 continue
             if seen != idx:
@@ -113920,7 +114083,7 @@ NcbiTaxonPickerModal { align: center middle; }
         seen = 0
         drop_set = set(group_idxs)
         for f in new_record.features:
-            if f.type == "source":
+            if not _feat_is_map_indexed(f):
                 kept.append(f)
                 continue
             if seen not in drop_set:
@@ -114228,7 +114391,7 @@ NcbiTaxonPickerModal { align: center middle; }
         seen = 0
         target = None
         for feat in new_record.features:
-            if feat.type == "source":
+            if not _feat_is_map_indexed(feat):
                 continue
             if seen == idx:
                 target = feat
@@ -116251,7 +116414,12 @@ NcbiTaxonPickerModal { align: center middle; }
 
         if sp._user_sel is not None:
             s, e = sp._user_sel
-            sub = seq[s:e].upper()
+            # A selection that crosses the origin is encoded `start > end`
+            # (Shift+Arrow past bp 0, a circular search hit, an AA click on a
+            # wrap CDS). The bare slice returned "" for those and the action
+            # bailed with "Selection is empty" — while Ctrl+C, Add Feature and
+            # the clone selection all handle the same encoding.
+            sub = (seq[s:e] if e >= s else seq[s:] + seq[:e]).upper()
             if not sub:
                 self.notify("Selection is empty.", severity="warning")
                 return

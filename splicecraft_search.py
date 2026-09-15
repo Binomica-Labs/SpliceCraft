@@ -706,7 +706,7 @@ def _hmmer_web_hmmscan(protein: str, max_hits: int,
         max_bytes=_HMMER_WEB_MAX_RESPONSE_BYTES)
     try:
         submit = json.loads(submit_text)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
         raise RuntimeError(
             "EBI HMMER returned an unparseable submit response.") from exc
     # Some deployments return hits inline on submit — short-circuit.
@@ -737,7 +737,7 @@ def _hmmer_web_hmmscan(protein: str, max_hits: int,
                 max_bytes=_HMMER_WEB_MAX_RESPONSE_BYTES)
             obj = json.loads(rtext)
             consecutive_fail = 0
-        except (RuntimeError, json.JSONDecodeError):
+        except (RuntimeError, json.JSONDecodeError, RecursionError):
             # 404-not-ready / transient flake — keep polling, but don't
             # spin forever against a persistent failure.
             consecutive_fail += 1
@@ -1950,7 +1950,7 @@ def _plasmidsaurus_oauth_token(client_id: str, client_secret: str,
         raise ValueError("Plasmidsaurus token response too large")
     try:
         token = json.loads(raw.decode("utf-8", "replace")).get("access_token")
-    except (ValueError, AttributeError) as exc:
+    except (ValueError, AttributeError, RecursionError) as exc:
         raise ValueError(
             "Plasmidsaurus token response wasn't valid JSON") from exc
     if not isinstance(token, str) or not token:
@@ -2011,7 +2011,7 @@ def _plasmidsaurus_api_get(path: str, token: str,
         raise ValueError("Plasmidsaurus API response too large")
     try:
         return json.loads(raw.decode("utf-8", "replace"))
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise ValueError(
             "Plasmidsaurus API response wasn't valid JSON") from exc
 
@@ -2293,7 +2293,7 @@ def _online_lookup_json(url: str, *, headers: "dict | None" = None,
                         max_bytes=_ONLINE_LOOKUP_MAX_RESPONSE_BYTES)
     try:
         return json.loads(body)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise RuntimeError(f"non-JSON response from server: {exc}")
 
 
@@ -2902,7 +2902,7 @@ def _patent_search(query: str, max_hits: int = 10,
                         max_bytes=_ONLINE_LOOKUP_MAX_RESPONSE_BYTES)
     try:
         data = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise RuntimeError(
             "Google Patents blocked the request (keyless search is "
             "rate-limited). Try again shortly, or set a PatentsView API key "

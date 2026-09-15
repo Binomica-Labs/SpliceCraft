@@ -845,8 +845,17 @@ def _master_delete_log_files() -> "list[Path]":
     rolls the active log into a fresh file naturally.
     """
     out: list[Path] = []
-    log_path = globals().get("_LOG_PATH")
-    if not log_path:
+    # `_LOG_PATH` lives in the HUB, not in this sibling's globals — the
+    # Phase-D extraction left this lookup reading a name that is never
+    # defined here, so it returned [] unconditionally and Master Delete
+    # removed no log file at all. `logs/` is also explicitly skipped by the
+    # residual sweep, so nothing else reached it: rotated logs carrying the
+    # user's plasmid / project / gel / synthesis NAMES survived a wipe that
+    # is supposed to leave nothing behind.
+    log_path = _state._resolve_data_attr_hook("_LOG_PATH")
+    if not isinstance(log_path, (str, Path)):
+        # The hook is typed `object` (it resolves an arbitrary data-dir attr
+        # by name), so narrow before handing it to `Path`.
         return out
     try:
         log_file = Path(log_path)

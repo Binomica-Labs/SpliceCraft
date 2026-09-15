@@ -289,8 +289,29 @@ def _ot2_entry_wells(entry: "dict[str, Any]") -> "list[str]":
 
 # ── Plan normalisation ──────────────────────────────────────────────────────────
 def _ot2_safe_var(label: str, prefix: str) -> str:
-    """A valid, collision-resistant Python identifier for an emitted variable."""
-    cleaned = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(label))
+    """A valid, collision-resistant Python identifier for an emitted variable.
+
+    ASCII alphanumerics only. `str.isalnum()` is true for the whole Unicode
+    letter/number space, and that broke the emitted protocol two ways:
+
+    * Python normalises identifiers with NFKC at compile time, so two labware
+      ids differing only by a compatibility-equivalent character (``src`` vs
+      the fullwidth ``ｓｒｃ``) became the SAME variable. The collision guard
+      compares the raw generated names, so it never fired: the second
+      `load_labware` rebound the first's name and every step aimed at the
+      first plate silently addressed the second. On hardware that is an
+      aspirate from the wrong plate, with no error anywhere.
+    * Characters that are alphanumeric but not identifier-legal (``² ³ ½ ①``
+      — the whole No/Nl category) produced a protocol that is a SyntaxError,
+      which SpliceCraft never compiles locally, so it surfaced only as an
+      opaque rejection from the robot.
+
+    Folding both to ``_`` makes equivalent ids collide as IDENTICAL strings,
+    which is exactly what the caller's de-dup is built to resolve."""
+    cleaned = "".join(
+        ch if ((ch.isascii() and ch.isalnum()) or ch == "_") else "_"
+        for ch in str(label)
+    )
     if not cleaned:
         cleaned = "x"
     if not prefix and cleaned[0].isdigit():
@@ -852,7 +873,20 @@ def _ot2_compile_protocol(plan: "dict[str, Any]") -> str:
         out.append("        [" + ", ".join(dsts) + "],")
         out.append(f"        new_tip={json.dumps(p['new_tip'])},")
         out.append("    )")
-    return "\n".join(out) + "\n"
+    src = "\n".join(out) + "\n"
+    # Self-check: the thing we are about to hand to a robot must at least be
+    # valid Python. Nothing else in the pipeline compiles it, so a codegen
+    # fault surfaced only as an opaque rejection from the robot's own
+    # analysis step, with no clue which field caused it.
+    try:
+        compile(src, "<ot2-protocol>", "exec")
+    except SyntaxError as exc:
+        raise OT2Error(
+            f"generated protocol is not valid Python (line {exc.lineno}): "
+            f"{exc.msg}. This is a SpliceCraft codegen fault — please report "
+            f"it with the plan that produced it."
+        ) from exc
+    return src
 
 
 def _ot2_plan_summary(plan: "dict[str, Any]") -> "dict[str, Any]":
@@ -1334,7 +1368,7 @@ def _ot2_request_json(host: str, path: str, *, method: str = "GET",
                        "on this network?") from exc
     try:
         return json.loads(body.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
         raise OT2Error(f"OT-2 {method} {path} returned non-JSON") from exc
 
 
@@ -1374,7 +1408,7 @@ def _ot2_request_multipart(host: str, path: str, *, filename: str, file_bytes: b
         raise OT2Error(f"cannot reach OT-2 at {host} ({exc})") from exc
     try:
         return json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
         raise OT2Error("OT-2 protocol upload returned non-JSON") from exc
 
 
