@@ -14,6 +14,24 @@
 
 ---
 
+## [1.2.62] — 2026-09-15
+
+### Bug fixes
+
+- **Predict Transcript still spliced out other genes' introns.** An `intron`
+  feature annotated on the opposite strand belongs to a gene transcribed the
+  other way and is not in your message, but it was removed from the transcript
+  anyway — returning a shorter mature mRNA and a different protein while
+  reporting success. This was listed as fixed in 1.2.61; the change did not
+  actually make it into that release. It now does, and an intron skipped for
+  this reason is named in the warnings.
+
+  A 5'UTR intron is deliberately still spliced: it sits outside the coding
+  sequence by definition, and the intronic upstream ATGs it removes are the
+  reason this feature exists.
+
+---
+
 ## [1.2.61] — 2026-09-15
 
 A full adversarial audit of the whole codebase — twelve parallel read-only

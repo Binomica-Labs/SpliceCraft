@@ -1667,6 +1667,30 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
     for f in feats:
         if str(f.get("type") or "").lower() != "intron":
             continue
+        # Splicing is STRAND-SPECIFIC: an `intron` feature annotated on the
+        # OPPOSITE strand belongs to a gene transcribed the other way and is
+        # not in this message. Matching on the feature type alone spliced it
+        # out anyway, returning a shorter mature mRNA and a different protein
+        # with `ok: True` and only a soft "the frame may have shifted"
+        # warning. Strand 0 / absent is "no direction recorded" and is
+        # accepted — refusing it would drop legitimately strandless
+        # annotations.
+        #
+        # Deliberately NOT also requiring the intron to lie inside the CDS:
+        # a genomic 5'UTR intron is the motivating case for this whole
+        # function ([INV-188] — the intronic upstream ATGs that splicing
+        # removes), and it sits entirely BEFORE the CDS.
+        _fs = f.get("strand")
+        try:
+            _fs = int(_fs) if _fs is not None else 0
+        except (TypeError, ValueError):
+            _fs = 0
+        if _fs not in (0, strand):
+            warnings.append(
+                f"ignored intron {str(f.get('label') or '?')!r}: it is "
+                f"annotated on the opposite strand, so it belongs to a gene "
+                f"transcribed the other way")
+            continue
         m = _to_tx(f.get("start"), f.get("end"))
         if m is None:
             continue
