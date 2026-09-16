@@ -106,7 +106,19 @@ uses** — Eco31I finds BsaI's sites, LguI finds SapI's, AarI finds PaqCI's.
 
 A library for your reusable annotations — promoters, RBSs, tags, CDSs. Capture
 a region off any plasmid, then drop it onto another to annotate or splice it
-in. **Ctrl+F** finds a subsequence fuzzily on both strands; **Ctrl+C** on a CDS
+in. It ships pre-loaded: **Presets** opens a catalogue of 116 common elements
+across 20 categories — AmpR, KanR and eight more markers, the pUC, p15A, f1,
+SV40, 2μ and R6Kγ origins, T7 through CMV, EF-1α, U6, GAL1 and 35S promoters,
+terminators and polyA signals, EGFP, mCherry and luciferase, His/FLAG/HA/Myc/V5
+tags, TEV and thrombin sites, loxP, FRT and attR. Search it, tick what you
+want, and copy it into your library. Every sequence was pulled out of a public
+GenBank record rather than typed from memory, and each entry cites the
+accession and how many independent submissions carry it byte-for-byte. Already have the plasmid
+open? **File ▸ Annotate from library + presets** draws its markers, origin,
+promoters and polylinker for you, on both strands and across the origin, with
+a preview before anything lands and one **Ctrl+Z** to take it all back. Pasting
+a new one instead? **New plasmid ▸ Annotate from library** does the same as you
+create it. **Ctrl+F** finds a subsequence fuzzily on both strands; **Ctrl+C** on a CDS
 copies the protein rather than the DNA. **Alt+Shift+R** flips the whole record
 end-for-end with every feature re-framed; **Alt+Shift+O** re-cuts a circular
 plasmid so the cursor becomes base 1 — a real, undoable edit, refused on a
@@ -143,7 +155,10 @@ by QuikChange or Golden Braid, really digesting and ligating each amplicon, so
 
 A gene-synthesis composer in three tabs. **DNA** is a scrolling linear editor
 with strand markers, feature stripes, live translation, feature-aware paste,
-click-to-highlight restriction sites, and zoom-to-overview. **Protein** fills
+click-to-highlight restriction sites, and zoom-to-overview. Its side panel lists
+your own snippets and the preset catalogue together, so a T7 promoter or a
+His tag is two keystrokes away; an inserted preset carries its GenBank
+accession into the annotation. **Protein** fills
 codons in from your chosen table as you type, with a built-in motif library
 (His6, FLAG, HA, TEV, P2A, NLS, +30) and a tabbed codon-table manager that
 builds tables from an NCBI genome, a local CDS file, Kazusa, or TSV.

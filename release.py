@@ -1313,6 +1313,16 @@ def _check_private_tokens() -> None:
 _LIBRARY_LEAK_STOPWORDS = {
     "adapter", "annotated", "antisense", "assembly", "backbone", "binary",
     "broken",
+    # 2026-09-15: the built-in feature-preset catalogue describes elements in
+    # plain scientific prose, which collided with five ride-along tokens — each
+    # appears in exactly ONE library name, and every one of those names carries
+    # other distinctive tokens that still trip the gate, so the private name
+    # stays detectable. They are ordinary vocabulary (two adjectives, a
+    # restriction enzyme, and the two words of a public virus name), and the
+    # text carrying them cannot be reworded without making it wrong:
+    # "Cauliflower mosaic virus 35S promoter" IS the name of the virus, and
+    # HindIII IS the end of the pUC19 polylinker.
+    "cauliflower", "constitutive", "hindiii", "inducible", "mosaic",
     "chloroplast", "chromosome", "circular", "cloning", "complete", "construct",
     "control", "default", "deleted", "digest", "domesticated", "downstream",
     "empty", "escherichia", "exonuclease", "flanks", "forward", "fragment",

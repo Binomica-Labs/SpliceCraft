@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.2.62"
+version         = "1.2.63"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -232,6 +232,9 @@ only-include = [
     "splicecraft_splice.py",
     "splicecraft_splice_model.py",
     "splicecraft_cassette.py",
+    # Curated built-in feature presets (read-only catalogue of common
+    # plasmid elements, verified against public GenBank records).
+    "splicecraft_presets.py",
     "CHANGELOG.md",
 ]
 
@@ -269,6 +272,9 @@ include = [
     "splicecraft_splice.py",
     "splicecraft_splice_model.py",
     "splicecraft_cassette.py",
+    # Curated built-in feature presets (read-only catalogue of common
+    # plasmid elements, verified against public GenBank records).
+    "splicecraft_presets.py",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",

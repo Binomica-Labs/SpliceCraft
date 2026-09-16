@@ -32,6 +32,7 @@ from splicecraft_persistence import (
 from splicecraft_record import _gb_text_to_record
 from splicecraft_biology import _rc
 from splicecraft_util import _feat_label, _fuzzy_match, _natural_sort_key, _sanitize_gel_id, _sanitize_plasmid_status
+from splicecraft_presets import _merge_presets_with_library
 
 # Immutable types `_typed_clone` returns as-is (no copy needed). Everything else
 # recurses (dict / list / tuple) or falls through to `deepcopy` for any
@@ -1443,6 +1444,23 @@ def _save_features(entries: list[dict]) -> None:
         _safe_save_json(_state._FEATURES_FILE, entries, "Feature library")
         _state._features_cache = _typed_clone(entries)
         _state._features_generation += 1
+
+
+def _load_features_with_presets() -> list[dict]:
+    """Return the READ-ONLY browse/scan view: the user's feature library plus
+    every built-in preset the user hasn't shadowed.
+
+    This is NOT a load accessor — it has no cache and no `_save_` counterpart,
+    and the result must never be handed to `_save_features`. Presets live in
+    `splicecraft_presets` (code), the user's own entries live in
+    `features.json`, and the two are only ever combined for display, search
+    and annotation scanning. A user entry with the same
+    ``(name, feature_type)`` as a preset REPLACES it in the view, so editing a
+    preset into your library doesn't double the row.
+
+    Preset rows carry ``preset=True``; user rows never do.
+    """
+    return _merge_presets_with_library(_load_features())
 
 
 # ── Protein collections ──────────────────────────────────────────────────────

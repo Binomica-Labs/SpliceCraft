@@ -49,6 +49,7 @@ _LAYER_RULES = [
     ("splicecraft_splice", 0),      # plant splice-site PWM scoring; imports logging L0 only
     ("splicecraft_splice_model", 0),  # generated PWM data, no imports (longest-prefix wins over _splice)
     ("splicecraft_cassette", 3),    # eukaryotic expression-cassette assembler; imports biology L0 + dataaccess L1
+    ("splicecraft_presets", 0),  # curated built-in feature presets: pure data, stdlib only
     ("splicecraft_cli_parser", 0),
     ("splicecraft_biology", 0),
     ("splicecraft_cli", 0),        # stdlib-only sidecar (standalone client)

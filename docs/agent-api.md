@@ -563,6 +563,29 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   delete-enzyme-collection; get / set-active-enzyme-collection.
 - **Feature library** — list / get / create / update /
   delete-feature-library (reusable annotation snippets).
+- **Feature presets** — `list-feature-presets` (the shipped, read-only
+  catalogue of common plasmid elements; `{category}` / `{search}` filter
+  it, `{include_sequence: true}` adds the bases, and the response also
+  returns the `categories` list), `get-feature-preset` `{name}` for one
+  full entry including its sequence and GenBank provenance, and
+  `import-feature-preset` `{name}` or `{names:[…]}` to copy presets into
+  the user's own feature library. An import replaces any entry with the
+  same `(name, feature_type)` and reports how many it `replaced`; an
+  unknown name makes the whole call a 404 and writes nothing, so a batch
+  is never half-applied. Presets are NOT part of `list-feature-library`,
+  which keeps returning only the user's own entries.
+  `annotate-from-presets` matches the LOADED record against the feature
+  library plus the catalogue, on both strands and across the origin, and is
+  a dry run by default like `transfer-annotations` — pass `{"apply": true}`
+  to append the features, `{"include_presets": false}` to scan only your own
+  entries. It reports `already_annotated` for matches the record already
+  carries under the same label over the same span, which are never offered
+  again, so re-running is a no-op rather than a second copy of everything.
+  Its `transfers` list is capped at `max_transfers` (default 500) so a
+  tandem-repeat sequence cannot return thousands of rows; `total_found` and
+  `truncated` report exactly what you are not being shown. `import-feature-preset`
+  takes `name` OR `names`, never both, and collapses repeats so `count` always
+  equals the number of entries the library gained.
 - **Primer collections** — list-primer-collections, create-primer-collection
   (the primer-side parallel to create-collection), rename-primer-collection,
   delete-primer-collection (the last collection can't be removed; the active

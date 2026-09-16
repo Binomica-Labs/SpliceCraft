@@ -48,6 +48,10 @@ from splicecraft_experiments import (_new_experiment_id, _normalise_experiment_e
 from splicecraft_fileio import (_PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
 from splicecraft_gels import (_new_gel_id, _normalise_gel_entry)
 from splicecraft_history import (_HISTORY_NODE_MAX_DEPTH, _HISTORY_NODE_MAX_NODES, _history_node_warnings)
+from splicecraft_presets import (
+    _find_preset, _preset_categories, _preset_features, _preset_matches,
+    _preset_to_library_entry,
+)
 from splicecraft_logging import (_log, _log_event)
 from splicecraft_net import (_sanitize_accession)
 from splicecraft_persistence import (_safe_file_size_check, _safe_load_json)
@@ -3797,6 +3801,155 @@ def _h_create_feature_library(app, payload):
             return err
     return {"ok": True, "name": f["name"],
             "feature_type": f["feature_type"]}
+
+
+@_agent_endpoint("list-feature-presets")
+def _h_list_feature_presets(app, payload):
+    """List the built-in feature presets — the shipped, GenBank-verified
+    catalogue of common plasmid elements (markers, origins, promoters,
+    terminators, polyA signals, reporters, tags, recombination sites).
+
+    Body (all optional): ``{category, search, include_sequence}``.
+    ``category`` must be one of the names in `categories`; ``search``
+    matches name / type / category / description / aliases. Sequences are
+    omitted unless ``include_sequence`` is true, because the full catalogue
+    is ~35 kb of bases — fetch one with `get-feature-preset` instead.
+
+    Presets are READ-ONLY and are NOT part of the user's feature library;
+    `list-feature-library` still returns only the user's own entries. Copy
+    one across with `import-feature-preset`."""
+    category = payload.get("category")
+    if category is not None and not isinstance(category, str):
+        return ({"error": "'category' must be a string"}, 400)
+    known = _preset_categories()
+    if category and category not in known:
+        return ({"error": (
+            f"unknown category {category!r}; known: {list(known)}"
+        )}, 400)
+    search = payload.get("search")
+    if search is not None and not isinstance(search, str):
+        return ({"error": "'search' must be a string"}, 400)
+    want_seq = payload.get("include_sequence", False)
+    if not isinstance(want_seq, bool):
+        # Strict, because it changes the response SHAPE. The sibling
+        # `annotate-from-presets` validates its boolean the same way; two
+        # endpoints in one family disagreeing about what a flag accepts is
+        # exactly what an agent trips over.
+        return ({"error": "'include_sequence' must be a boolean"}, 400)
+    rows = []
+    for p in _preset_features():
+        if category and p.get("category") != category:
+            continue
+        if search and not _preset_matches(p, search):
+            continue
+        row = {
+            "name":            p.get("name", ""),
+            "feature_type":    p.get("feature_type", ""),
+            "category":        p.get("category", ""),
+            "strand":          int(p.get("strand", 1)),
+            "color":           p.get("color", ""),
+            "sequence_length": len(p.get("sequence", "") or ""),
+            "description":     p.get("description", ""),
+            "source":          p.get("source", ""),
+            "aliases":         list(p.get("aliases") or []),
+        }
+        if want_seq:
+            row["sequence"] = p.get("sequence", "")
+        rows.append(row)
+    return {"ok": True, "presets": rows, "count": len(rows),
+            "categories": list(known)}
+
+
+@_agent_endpoint("get-feature-preset")
+def _h_get_feature_preset(app, payload):
+    """Fetch one built-in preset by name, including its bases. Body:
+    ``{name, feature_type?}``. Name match is exact but case-insensitive.
+    404 when there is no such preset."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing or non-string 'name'"}, 400)
+    ftype = payload.get("feature_type")
+    if ftype is not None and not isinstance(ftype, str):
+        return ({"error": "'feature_type' must be a string"}, 400)
+    preset = _find_preset(name, ftype)
+    if preset is None:
+        return ({"error": f"no preset named {name!r}"}, 404)
+    return {"ok": True, "preset": preset}
+
+
+@_agent_endpoint("import-feature-preset", write=True)
+def _h_import_feature_preset(app, payload):
+    """Copy one or more built-in presets into the user's feature library.
+
+    Body: ``{name}`` OR ``{names: [...]}`` — passing both is a 400 rather
+    than a silent choice. Repeats within ``names`` collapse to one import, so
+    ``count`` always equals the number of entries the library gained.
+    Each preset becomes an ordinary
+    library entry (provenance folded into ``qualifiers.note``), replacing
+    any existing entry with the same (name, feature_type) — the same
+    latest-write-wins rule `create-feature-library` uses on a rename.
+    404 if any requested name is unknown, and nothing is written in that
+    case: the import is all-or-nothing rather than half-applied."""
+    names = payload.get("names")
+    if names is not None and payload.get("name") is not None:
+        # Fail loud rather than pick one. A caller that sent both does not
+        # agree with itself about what to import, and silently honouring
+        # `names` while dropping `name` is the ignored-outcome-key footgun
+        # the agent API has been bitten by before.
+        return ({"error": "pass 'name' OR 'names', not both"}, 400)
+    if names is None:
+        one = payload.get("name")
+        if not isinstance(one, str) or not one.strip():
+            return ({"error": "missing 'name' or 'names'"}, 400)
+        names = [one]
+    if not isinstance(names, list) or not names:
+        return ({"error": "'names' must be a non-empty list of strings"}, 400)
+    if len(names) > 500:
+        return ({"error": "'names' capped at 500 entries per call"}, 400)
+    resolved: list[dict] = []
+    missing: list[str] = []
+    seen_keys: set = set()
+    for n in names:
+        if not isinstance(n, str) or not n.strip():
+            return ({"error": "every entry in 'names' must be a string"}, 400)
+        preset = _find_preset(n)
+        if preset is None:
+            missing.append(n)
+            continue
+        # De-duplicate on the resolved identity, not the spelling: "loxP"
+        # twice, or "loxP" and "LOXP", are one import. Without this the
+        # response reported `count: 2, replaced: 1` for a library that
+        # gained exactly one entry, which is a lie an agent would act on.
+        key = (preset.get("name"), preset.get("feature_type"))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        resolved.append(preset)
+    if missing:
+        return ({"error": f"unknown preset(s): {missing}"}, 404)
+    if not resolved:
+        return ({"error": "no presets to import"}, 400)
+    try:
+        new_entries = [_preset_to_library_entry(p) for p in resolved]
+    except (TypeError, ValueError) as exc:
+        return ({"error": f"could not convert preset: {exc}"}, 400)
+    # RMW under the cache lock so a concurrent feature write can't be lost.
+    with _state._cache_lock:
+        entries = _load_features()
+        replaced = 0
+        for entry in new_entries:
+            key = (entry.get("name"), entry.get("feature_type"))
+            before = len(entries)
+            entries = [e for e in entries
+                       if (e.get("name"), e.get("feature_type")) != key]
+            replaced += before - len(entries)
+            entries.append(entry)
+        if (err := _agent_save_or_500(
+                lambda: _save_features(entries),
+                "features")) is not None:
+            return err
+    return {"ok": True, "imported": [e["name"] for e in new_entries],
+            "count": len(new_entries), "replaced": replaced}
 
 
 @_agent_endpoint("update-feature-library", write=True)

@@ -37,9 +37,13 @@ from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, List
 
 import splicecraft_state as _state
 from splicecraft_cloning import _simulate_cloned_plasmid, _simulate_primed_amplicon
-from splicecraft_dataaccess import _BUILTIN_GRAMMARS, _all_grammars, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections, _search_collections_library
+from splicecraft_dataaccess import _BUILTIN_GRAMMARS, _all_grammars, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_features, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections, _search_collections_library
 from splicecraft_history import _CommercialSaaSHistoryNode, _history_consistency_summary, _history_detail_lines, _history_former_name, _history_node_warnings, _history_populate_tree, _history_protocol_renderable, _history_tree_label
 from splicecraft_logging import _log, _log_event
+from splicecraft_presets import (
+    _preset_categories, _preset_features, _preset_matches,
+    _preset_to_library_entry,
+)
 from splicecraft_util import _CONTROL_CHARS_RE, _PLASMID_STATUS_VALUES, _cursor_row_key, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _sanitize_label, _sanitize_plasmid_name, _sanitize_plasmid_status, _scrub_path, _validate_group_members
 from splicecraft_widgets import _DEFAULT_TYPE_COLORS, _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _HEX6_RE, _InstantPressButton, _PICKER_PLASMID_STYLE, _PLASMID_STATUS_COLORS, _SearchInput, _XtermColorGrid, _ZipAwareDirectoryTree, _markup_safe_color, _normalise_color_input, _xterm_index_to_hex
 
@@ -8435,3 +8439,315 @@ class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
             # resolving that to a library entry can pick the wrong molecule.
             self._seq if hist.element is self._root_node.element else "",
             enzymes=_state._all_enzymes_hook())))
+
+
+# ── Built-in feature-preset browser ───────────────────────────────────────────
+
+class FeaturePresetsModal(_OneShotDismissScreen, ModalScreen):
+    """Browse the shipped feature-preset catalogue and copy entries into the
+    user's own feature library.
+
+    Read-only over `splicecraft_presets`: nothing here mutates a preset, and
+    the modal never writes to disk. It dismisses with
+    ``{"action": "add", "entries": [<library entry>, ...]}`` (already run
+    through `_preset_to_library_entry`, so each is shaped exactly like an
+    `AddFeatureModal` save) or ``None`` on cancel. The CALLER decides how to
+    persist — `FeatureLibraryScreen` folds them into its unsaved buffer so
+    Ctrl+S is still the commit point, which keeps one save path rather than
+    two.
+
+    Rows are multi-selectable: Space (or the Select button) toggles the row's
+    check mark, so a user can tick six elements and add them in one go. The
+    "lib" flag marks a preset whose ``(name, feature_type)`` already exists in
+    the user's library, so adding it is visibly a REPLACE rather than a
+    surprise duplicate.
+    """
+
+    _blocks_undo: bool = True   # hosts an Input — keep app-level Ctrl+Z out
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("space",  "toggle_selection", "Select"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #fpre-dlg {
+        width: 132; height: 42;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #fpre-title {
+        height: 1; text-style: bold; color: $accent;
+        text-align: center; margin-bottom: 1;
+    }
+    #fpre-filters { height: 3; margin-bottom: 1; }
+    #fpre-search { width: 1fr; margin-right: 1; }
+    #fpre-cat { width: 34; }
+    #fpre-main { height: 1fr; }
+    #fpre-left { width: 2fr; margin-right: 1; }
+    #fpre-right { width: 1fr; }
+    #fpre-table { height: 1fr; }
+    #fpre-detail { height: 1fr; padding: 0 1; }
+    #fpre-status { height: 1; color: $text-muted; }
+    #fpre-btns { height: 3; margin-top: 1; align: right middle; }
+    #fpre-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Catalogue (deep-copied by `_preset_features`) + the user's library
+        # keys, read ONCE at construction. The modal is short-lived and the
+        # user cannot edit the library from inside it, so a re-read would only
+        # add a way for the table and the check marks to disagree.
+        self._presets: list[dict] = _preset_features()
+        try:
+            self._lib_keys: set = {
+                (e.get("name"), e.get("feature_type"))
+                for e in _load_features() if isinstance(e, dict)
+            }
+        except Exception:
+            _log.exception("FeaturePresetsModal: library read failed")
+            self._lib_keys = set()
+        # row_key -> preset. Row keys are the catalogue INDEX (stable across
+        # filter changes and immune to duplicate names), which is also what
+        # keeps the display sort and the cursor lookup from drifting apart
+        # ([PIT-33]) — the key IS the identity, so there is no second sort to
+        # get wrong.
+        self._rows: list[tuple[str, dict]] = []
+        self._selected: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="fpre-dlg"):
+            yield Static(
+                f" Feature presets — {len(self._presets)} built-in elements ",
+                id="fpre-title",
+            )
+            with Horizontal(id="fpre-filters"):
+                yield Input(placeholder="Search name / type / description / alias",
+                            id="fpre-search")
+                yield Select(
+                    [("All categories", "*")]
+                    + [(c, c) for c in _preset_categories()],
+                    value="*", allow_blank=False, id="fpre-cat",
+                )
+            with Horizontal(id="fpre-main"):
+                with Vertical(id="fpre-left"):
+                    yield DataTable(id="fpre-table", cursor_type="row",
+                                    zebra_stripes=True)
+                with Vertical(id="fpre-right"):
+                    yield Static("", id="fpre-detail", markup=True)
+            yield Static("", id="fpre-status")
+            with Horizontal(id="fpre-btns"):
+                yield Button("Select", id="btn-fpre-toggle")
+                yield Button("Select all shown", id="btn-fpre-all")
+                yield Button("Clear selection", id="btn-fpre-none")
+                yield Button("Add to library", id="btn-fpre-add",
+                             variant="primary")
+                yield Button("Close", id="btn-fpre-close")
+
+    def on_mount(self) -> None:
+        tbl = self.query_one("#fpre-table", DataTable)
+        tbl.add_columns(" ", "Name", "Type", "bp", "Category")
+        self._repopulate()
+        tbl.focus()
+
+    # ── rendering ────────────────────────────────────────────────────────────
+
+    def _visible(self) -> list[tuple[str, dict]]:
+        """Catalogue rows passing the current search + category filter, in
+        catalogue order (grouped by category, alphabetical within it)."""
+        try:
+            needle = self.query_one("#fpre-search", Input).value
+        except NoMatches:
+            needle = ""
+        try:
+            cat = self.query_one("#fpre-cat", Select).value
+        except NoMatches:
+            cat = "*"
+        out: list[tuple[str, dict]] = []
+        for i, p in enumerate(self._presets):
+            if cat not in ("*", Select.BLANK) and p.get("category") != cat:
+                continue
+            if not _preset_matches(p, needle):
+                continue
+            out.append((str(i), p))
+        return out
+
+    def _repopulate(self) -> None:
+        try:
+            tbl = self.query_one("#fpre-table", DataTable)
+        except NoMatches:
+            return
+        self._rows = self._visible()
+        tbl.clear()
+        for key, p in self._rows:
+            in_lib = (p.get("name"), p.get("feature_type")) in self._lib_keys
+            mark = "x" if key in self._selected else ("~" if in_lib else " ")
+            name = Text(str(p.get("name", "")),
+                        style=_markup_safe_color(str(p.get("color") or "")))
+            tbl.add_row(
+                mark, name,
+                str(p.get("feature_type", "")),
+                str(len(str(p.get("sequence", "") or ""))),
+                str(p.get("category", "")),
+                key=key,
+            )
+        self._refresh_status()
+        self._refresh_detail()
+
+    def _refresh_status(self) -> None:
+        try:
+            st = self.query_one("#fpre-status", Static)
+        except NoMatches:
+            return
+        # A tick survives a filter change on purpose — picking three markers,
+        # then switching category to pick an origin, is the point of the tick
+        # list. But a tick the current filter HIDES would otherwise be added
+        # invisibly, so say how many are off-screen rather than leaving the
+        # user to reconcile "9 rows" against "12 selected" on their own.
+        visible = {k for k, _p in self._rows}
+        hidden = len(self._selected - visible)
+        hidden_note = f" ({hidden} not shown)" if hidden else ""
+        st.update(
+            f"{len(self._rows)} shown · {len(self._selected)} ticked"
+            f"{hidden_note} · Space ticks a row · Esc closes · "
+            f"~ = already in your library (adding replaces it)"
+        )
+
+    def _current(self) -> "dict | None":
+        try:
+            tbl = self.query_one("#fpre-table", DataTable)
+        except NoMatches:
+            return None
+        key = _cursor_row_key(tbl)
+        if key is None:
+            return None
+        for k, p in self._rows:
+            if k == key:
+                return p
+        return None
+
+    def _refresh_detail(self) -> None:
+        try:
+            det = self.query_one("#fpre-detail", Static)
+        except NoMatches:
+            return
+        from rich.markup import escape as _esc
+        p = self._current()
+        if p is None:
+            det.update("[dim]No preset selected.[/dim]")
+            return
+        seq = str(p.get("sequence", "") or "")
+        head = seq[:60] + (" …" if len(seq) > 60 else "")
+        gc = 0
+        if seq:
+            gc = round(100.0 * sum(seq.count(b) for b in "GC") / len(seq), 1)
+        color = _markup_safe_color(str(p.get("color") or ""))
+        aliases = p.get("aliases")
+        alias_line = ""
+        if isinstance(aliases, list) and aliases:
+            alias_line = "\n[dim]Also known as:[/dim] " + ", ".join(
+                str(a) for a in aliases)
+        det.update(
+            f"[bold {color}]{_esc(str(p.get('name', '')))}[/]\n"
+            f"[dim]{_esc(str(p.get('feature_type', '')))} · "
+            f"{_esc(str(p.get('category', '')))} · "
+            f"{len(seq)} bp · {gc}% GC[/dim]\n\n"
+            f"{_esc(str(p.get('description', '')))}"
+            f"{alias_line}\n\n"
+            f"[dim]Source:[/dim] {_esc(str(p.get('source', '')))}\n\n"
+            f"[dim]5'[/dim] {head}"
+        )
+
+    # ── events ───────────────────────────────────────────────────────────────
+
+    @on(Input.Changed, "#fpre-search")
+    def _on_search(self, _) -> None:
+        self._repopulate()
+
+    @on(Select.Changed, "#fpre-cat")
+    def _on_cat(self, _) -> None:
+        self._repopulate()
+
+    @on(DataTable.RowHighlighted, "#fpre-table")
+    def _on_highlight(self, _) -> None:
+        self._refresh_detail()
+
+    # ── actions ──────────────────────────────────────────────────────────────
+
+    def action_toggle_selection(self) -> None:
+        """Flip the cursor row's tick. Named distinctly from Textual's base
+        ``DOMNode.action_toggle(attribute_name)``, which takes an argument —
+        overriding it with a different signature shadows a framework built-in
+        and trips ``reportIncompatibleMethodOverride``. Same reasoning as
+        ``MarkedMapImageExportModal.action_toggle_selection``."""
+        try:
+            tbl = self.query_one("#fpre-table", DataTable)
+        except NoMatches:
+            return
+        key = _cursor_row_key(tbl)
+        if key is None:
+            return
+        row = tbl.cursor_row
+        if key in self._selected:
+            self._selected.discard(key)
+        else:
+            self._selected.add(key)
+        self._repopulate()
+        # Keep the cursor where it was so Space-Space-Space walks the list.
+        try:
+            if 0 <= row < tbl.row_count:
+                tbl.move_cursor(row=row)
+        except Exception:
+            _log.exception("FeaturePresetsModal: cursor restore failed")
+
+    @on(Button.Pressed, "#btn-fpre-toggle")
+    def _toggle_btn(self, _) -> None:
+        self.action_toggle_selection()
+
+    @on(Button.Pressed, "#btn-fpre-all")
+    def _select_all(self, _) -> None:
+        self._selected.update(k for k, _p in self._rows)
+        self._repopulate()
+
+    @on(Button.Pressed, "#btn-fpre-none")
+    def _select_none(self, _) -> None:
+        self._selected.clear()
+        self._repopulate()
+
+    @on(Button.Pressed, "#btn-fpre-add")
+    def _add(self, _) -> None:
+        # Selection wins; with nothing ticked, add the highlighted row so the
+        # common "find one, add it" path is a single button press.
+        chosen: list[dict] = []
+        if self._selected:
+            by_key = {str(i): p for i, p in enumerate(self._presets)}
+            for k in sorted(self._selected, key=lambda x: int(x)):
+                p = by_key.get(k)
+                if p is not None:
+                    chosen.append(p)
+        else:
+            p = self._current()
+            if p is not None:
+                chosen.append(p)
+        if not chosen:
+            self.app.notify("Pick a preset first.", severity="information")
+            return
+        try:
+            entries = [_preset_to_library_entry(p) for p in chosen]
+        except (TypeError, ValueError):
+            _log.exception("FeaturePresetsModal: preset conversion failed")
+            self.app.notify("Could not convert that preset.",
+                            severity="error")
+            return
+        _log_event("feature.presets.add", count=len(entries))
+        self.dismiss({"action": "add", "entries": entries})
+
+    @on(Button.Pressed, "#btn-fpre-close")
+    def _close(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

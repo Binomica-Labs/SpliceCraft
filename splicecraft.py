@@ -42,13 +42,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.62"
+__version__ = "1.2.63"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-09-15"
+_RELEASE_DATE = "2026-09-16"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -1195,6 +1195,7 @@ from textual.worker import Worker, WorkerState  # noqa: E402
 # (zero bare hub-helper calls), so the sibling needs no hub import.
 from splicecraft_modals import (  # noqa: E402
     _OneShotDismissScreen as _OneShotDismissScreen,
+    FeaturePresetsModal as FeaturePresetsModal,
     EditSeqDialog as EditSeqDialog,
     MigrateDataModal as MigrateDataModal,
     DropdownScreen as DropdownScreen,
@@ -42586,7 +42587,29 @@ _GENBANK_FEATURE_TYPES: tuple = (
 # counter bump travels with them. The upsert/scan helpers stay hub-side.
 from splicecraft_dataaccess import (  # noqa: E402
     _load_features as _load_features,
+    _load_features_with_presets as _load_features_with_presets,
     _save_features as _save_features,
+)
+
+# ── Built-in feature presets (read-only catalogue) ──────────────────────────
+# A curated, GenBank-verified set of the elements that show up in nearly every
+# plasmid (markers, origins, promoters, terminators, polyA signals, reporters,
+# tags, recombination sites). SACRED: presets live in CODE and are never
+# written to `features.json`. `_load_features` stays the user's own library;
+# the two only meet in `_load_features_with_presets` (a read-only browse/scan
+# view) and `_preset_to_library_entry` (an explicit user-driven import).
+# See `splicecraft_presets`' module docstring for how each sequence was
+# sourced and verified.
+from splicecraft_presets import (  # noqa: E402
+    _FEATURE_PRESETS as _FEATURE_PRESETS,
+    _PRESET_CATEGORIES as _PRESET_CATEGORIES,
+    _PRESET_SCHEMA_VERSION as _PRESET_SCHEMA_VERSION,
+    _find_preset as _find_preset,
+    _merge_presets_with_library as _merge_presets_with_library,
+    _preset_categories as _preset_categories,
+    _preset_features as _preset_features,
+    _preset_matches as _preset_matches,
+    _preset_to_library_entry as _preset_to_library_entry,
 )
 
 
@@ -46992,12 +47015,122 @@ class FeatureEditModal(ModalScreen):
 _DEFAULT_LIB_ANNOT_MAX_HITS = 5_000
 
 
+_PRESET_ANNOT_MAX_TRANSFERS = 500
+"""Upper bound on how many matches one annotate-from-presets run offers.
+
+A real plasmid yields well under 30. The cap exists for the pathological
+shape: a sequence built of tandem repeats of a short element (measured — a
+tandem T7-promoter construct produced 4,000 matches in 48 ms), which would
+hand the user a preview table they cannot review and then staple 4,000
+features onto their record in one undo step. Truncation is reported to the
+caller, never silent — a preview that quietly shows half the answer is the
+failure shape this codebase keeps re-learning."""
+
+
+def _preset_annotation_transfers(record, *,
+                                 include_presets: bool = True,
+                                 max_transfers: int = _PRESET_ANNOT_MAX_TRANSFERS,
+                                 ) -> "tuple[list[dict], int, int]":
+    """Scan ``record``'s sequence against the feature library (+ the built-in
+    presets by default) and return
+    ``(transfers, n_already_annotated, n_total_found)`` in the shape
+    ``AnnotationTransferModal`` / ``_apply_annotation_transfers``
+    already speak — so the preview table, per-run accept, undo push, wrap
+    handling and record-swap guard all come for free instead of being
+    re-implemented for this one entry point.
+
+    Two coordinate conventions meet here and they disagree about wraps.
+    ``_annotate_seq_from_feature_library`` reports an origin-spanning hit as
+    ``end > len(seq)``; the transfer convention is ``target_end < target_start``
+    (`_apply_annotation_transfers` builds the CompoundLocation from that).
+    The ``end -= n`` below is that conversion — drop it and a wrapped marker
+    lands as a feature running off the end of the plasmid.
+
+    A hit is skipped when the record ALREADY carries a feature with the same
+    label over the same span: re-running on an annotated plasmid should be a
+    no-op, not a way to stack a second copy of every element. The count of
+    those is returned so the caller can say "12 found, 9 already there"
+    rather than silently showing three.
+
+    ``transfers`` is capped at ``max_transfers``; ``n_total_found`` is the
+    uncapped count so the caller can say how much it is NOT showing.
+    """
+    seq = str(getattr(record, "seq", "") or "").upper()
+    if not seq:
+        return [], 0, 0
+    n = len(seq)
+    circular = str(
+        (getattr(record, "annotations", None) or {}).get("topology", "")
+    ).lower() == "circular"
+    hits = _annotate_seq_from_feature_library(
+        seq, circular=circular, include_presets=include_presets,
+    )
+    # Spans already annotated under the same label, as (label, start, end).
+    existing: set[tuple[str, int, int]] = set()
+    for feat in (getattr(record, "features", None) or []):
+        # A record can carry a malformed feature (a hand-edited GenBank, a
+        # partially-parsed import). Narrow catch per [PIT-01] — this is not a
+        # worker body: `_feat_bounds` / `_feat_label` raise AttributeError on
+        # a non-feature and TypeError/ValueError on a location it cannot
+        # resolve. One bad feature must not cost the whole scan.
+        try:
+            bounds = _feat_bounds(feat, n)
+            if bounds is None:
+                # Documented return for a location with non-integer coords
+                # (UnknownPosition / BetweenPosition) — not an error, just a
+                # feature whose span can't be compared.
+                continue
+            f_s, f_e, _strand = bounds
+            existing.add((_feat_label(feat), int(f_s), int(f_e)))
+        except (AttributeError, TypeError, ValueError):
+            _log.warning("preset annotate: skipping unreadable feature")
+            continue
+    transfers: list[dict] = []
+    skipped = 0
+    total = 0
+    for h in hits:
+        start = int(h.get("start", 0))
+        end = int(h.get("end", 0))
+        if end > n:
+            end -= n                      # wrap: transfer convention
+        label = str(h.get("name", "") or "")
+        if (label, start, end) in existing:
+            skipped += 1
+            continue
+        total += 1
+        if len(transfers) >= max(1, int(max_transfers)):
+            # Keep counting so the caller can report the true total, but stop
+            # building rows the user could never review.
+            continue
+        quals = dict(h.get("qualifiers") or {})
+        quals.setdefault("label", [label])
+        color = h.get("color")
+        if color:
+            quals.setdefault("ApEinfo_fwdcolor", [str(color)])
+            quals.setdefault("ApEinfo_revcolor", [str(color)])
+        length = len(str(h.get("sequence", "") or ""))
+        transfers.append({
+            "label":         label,
+            "type":          str(h.get("feature_type", "") or "misc_feature"),
+            "source_start":  0,
+            "source_end":    length,
+            "source_strand": 1,
+            "target_start":  start,
+            "target_end":    end,
+            "target_strand": int(h.get("strand", 1) or 1),
+            "length":        length,
+            "qualifiers":    quals,
+        })
+    return transfers, skipped, total
+
+
 def _annotate_seq_from_feature_library(
     sequence: str,
     *,
     circular: bool = False,
     min_overlap: int = 12,
     max_hits: int = _DEFAULT_LIB_ANNOT_MAX_HITS,
+    include_presets: bool = False,
 ) -> "list[dict]":
     """Scan ``sequence`` for substring matches against the feature library
     on both strands. Returns a list of feature dicts with keys
@@ -47006,10 +47139,21 @@ def _annotate_seq_from_feature_library(
 
     Pure substring match (no mismatches, no gaps). Library entries shorter
     than ``min_overlap`` are skipped — short hits balloon false-positive
-    counts on a multi-kb paste. Wrap detection on circular templates is
+    counts on a multi-kb paste. A given ``(start, end, strand)`` is reported
+    ONCE even when several library entries share those bases, so a renamed
+    copy of an entry can't stack a second band over the same element. Wrap detection on circular templates is
     handled by appending ``seq[:max_lib_len]`` so a hit straddling 0 lands
     once with ``end > total`` and the caller can lower it back into the
     canonical range.
+
+    ``include_presets`` adds the built-in preset catalogue
+    (`splicecraft_presets`) to the scan, so a pasted sequence can be
+    annotated with common markers / origins / promoters even when the
+    user's own library is empty — the point of the presets. It defaults
+    to **False** so this helper's contract stays "scan MY library", and
+    every call site that wants the catalogue opts in visibly. A user
+    entry shadows a preset with the same ``(name, feature_type)``, so
+    turning it on can never displace the user's own annotation.
 
     The library is loaded once per call (caller's job to debounce); the
     forward/reverse-complement of each library entry is computed once and
@@ -47026,7 +47170,8 @@ def _annotate_seq_from_feature_library(
     n = len(seq_u)
     if n == 0:
         return []
-    entries = _load_features()
+    entries = (_load_features_with_presets() if include_presets
+               else _load_features())
     if not entries:
         return []
     # Pre-compute forward + RC for every library entry so the inner loop
@@ -47056,6 +47201,14 @@ def _annotate_seq_from_feature_library(
     scan_seq = seq_u + (seq_u[: longest - 1] if circular and longest > 1 else "")
     found: list[dict] = []
     seen_keys: set[tuple[str, int, int, int]] = set()
+    # Same-span guard. Two entries whose bases are byte-identical (the user
+    # imported a preset and renamed it, or keeps "AmpR" and "bla" as separate
+    # snippets) would otherwise BOTH claim the same stretch of DNA and the map
+    # would carry two stacked bands over one element. A span is a span: if two
+    # entries match at the same (start, end, strand) they matched the same
+    # substring, so only the first claim is kept. `entries` puts the user's own
+    # library ahead of the presets, so the user's chosen name always wins.
+    seen_spans: set[tuple[int, int, int]] = set()
     for entry in prepared:
         if len(found) >= max_hits:
             break
@@ -47064,14 +47217,27 @@ def _annotate_seq_from_feature_library(
         # Forward strand hits.
         i = scan_seq.find(s_fwd)
         while i != -1:
+            if i >= n:
+                # Hit lies wholly inside the appended wrap tail, which is a
+                # verbatim copy of `seq[:longest-1]` — so the SAME hit was
+                # already emitted at `i - n` during the pass over the real
+                # sequence. Only a hit that STARTS before the origin and
+                # runs past it is a genuine wrap. Without this guard the
+                # duplicate survives dedup (its `end` is not reduced modulo
+                # `n`, so the key differs) and every annotation on a plasmid
+                # short enough for the tail to reach it lands twice, the
+                # second copy with an `end` one full turn too large.
+                break
             start = i % n
             end = (i + slen)
             # Wrapped hit: store as compound (start..n) + (0..end-n) is
             # the SeqFeature concern; here we just record (start, end)
             # with end possibly > n so callers know to wrap it.
             key = (nm, start, end, 1)
-            if key not in seen_keys:
+            span = (start, end, 1 if lib_strand >= 0 else -1)
+            if key not in seen_keys and span not in seen_spans:
                 seen_keys.add(key)
+                seen_spans.add(span)
                 found.append({
                     "name": nm,
                     "feature_type": ftype,
@@ -47092,11 +47258,16 @@ def _annotate_seq_from_feature_library(
             continue
         i = scan_seq.find(s_rev)
         while i != -1:
+            if i >= n:
+                # Same wrap-tail duplicate guard as the forward pass above.
+                break
             start = i % n
             end = (i + slen)
             key = (nm, start, end, -1)
-            if key not in seen_keys:
+            span = (start, end, -1)
+            if key not in seen_keys and span not in seen_spans:
                 seen_keys.add(key)
+                seen_spans.add(span)
                 found.append({
                     "name": nm,
                     "feature_type": ftype,
@@ -48042,8 +48213,9 @@ class NewPlasmidModal(_OneShotDismissScreen, ModalScreen):
                 yield Button("Annotate from library",
                              id="btn-newplas-annot-lib",
                              tooltip=("Substring-match the pasted sequence "
-                                      "against your feature library; matched "
-                                      "entries become annotated features."))
+                                      "against your feature library AND the "
+                                      "built-in presets; matched entries "
+                                      "become annotated features."))
                 yield Button("Annotate via BLAST",
                              id="btn-newplas-annot-blast",
                              tooltip=("Run BLASTN against every plasmid in "
@@ -48168,7 +48340,7 @@ class NewPlasmidModal(_OneShotDismissScreen, ModalScreen):
             return
         try:
             hits = _annotate_seq_from_feature_library(
-                bases, circular=circular,
+                bases, circular=circular, include_presets=True,
             )
         except Exception as exc:
             _log.exception("library annotate scan failed")
@@ -52203,6 +52375,12 @@ class FeatureLibraryScreen(_OneShotDismissScreen, Screen):
     user can choose Save/Abandon/Cancel rather than silently losing
     work. Routes through ``_load_features`` / ``_save_features`` which
     enforce the schema envelope (sacred invariant #7).
+
+    Shows the USER's library only. The shipped preset catalogue is
+    reached through the **Presets** button (`p` → ``action_presets``),
+    which copies chosen entries into this screen's unsaved buffer —
+    presets live in code and must never be written to ``features.json``
+    as a side effect of browsing them ([INV-194]).
     """
 
     _blocks_undo: bool = True
@@ -52213,6 +52391,7 @@ class FeatureLibraryScreen(_OneShotDismissScreen, Screen):
         Binding("e",      "edit",      "Edit"),
         Binding("r",      "rename",    "Rename"),
         Binding("d",      "duplicate", "Duplicate"),
+        Binding("p",      "presets",   "Presets"),
         Binding("delete", "remove",    "Remove"),
         Binding("c",      "color",     "Color"),
         Binding("s",      "strand",    "Cycle Strand"),
@@ -52263,6 +52442,7 @@ class FeatureLibraryScreen(_OneShotDismissScreen, Screen):
                 yield Button("Edit",            id="btn-flib-edit")
                 yield Button("Rename",          id="btn-flib-rename")
                 yield Button("Duplicate",       id="btn-flib-dup")
+                yield Button("Presets",         id="btn-flib-presets")
                 yield Button("Delete",          id="btn-flib-remove",
                              variant="error")
                 yield Button("Color",           id="btn-flib-color")
@@ -52600,10 +52780,15 @@ class FeatureLibraryScreen(_OneShotDismissScreen, Screen):
             callback=_cb,
         )
 
-    def _upsert_entry(self, entry: dict, notice: str) -> None:
+    def _upsert_entry(self, entry: dict, notice: str,
+                      *, notify: bool = True) -> None:
         """Append ``entry`` (or replace the entry with the same
         (name, feature_type) key — "latest write wins"). Marks the new
         index dirty and updates the selection.
+
+        ``notify=False`` suppresses the per-entry toast so a bulk import
+        (the preset catalogue can add twenty entries at once) raises one
+        summary notification instead of twenty.
         """
         key = (entry.get("name"), entry.get("feature_type"))
         existing_idx = next(
@@ -52620,8 +52805,9 @@ class FeatureLibraryScreen(_OneShotDismissScreen, Screen):
             self._selected_index = len(self._entries) - 1
             self._mark_dirty(self._selected_index)
         self._repopulate_table()
-        self.app.notify(f"{notice} '{entry.get('name')}' (unsaved).",
-                        markup=False)
+        if notify:
+            self.app.notify(f"{notice} '{entry.get('name')}' (unsaved).",
+                            markup=False)
 
     def _replace_entry(self, target_idx: int, new_entry: dict) -> None:
         """Replace entry at ``target_idx``, deduping any other entry that
@@ -52646,6 +52832,41 @@ class FeatureLibraryScreen(_OneShotDismissScreen, Screen):
         self._repopulate_table()
         self.app.notify(f"Edited '{new_entry.get('name')}' (unsaved).",
                         markup=False)
+
+    @on(Button.Pressed, "#btn-flib-presets")
+    def _presets_btn(self, _) -> None: self.action_presets()
+
+    @_action_log("app.feature_library.presets")
+    def action_presets(self) -> None:
+        """Open the built-in preset catalogue and fold anything the user
+        picks into this screen's unsaved buffer.
+
+        Deliberately routed through `_upsert_entry` rather than a direct
+        `_save_features`: the screen already owns an unsaved-edit buffer,
+        and a modal that wrote straight to disk would leave that buffer
+        stale and let the next Ctrl+S overwrite the imported presets with
+        the pre-import list. One commit point, not two.
+        """
+        def _cb(result):
+            if not isinstance(result, dict):
+                return
+            entries = result.get("entries")
+            if not isinstance(entries, list) or not entries:
+                return
+            added = 0
+            for entry in entries:
+                if not isinstance(entry, dict) or not entry.get("name"):
+                    continue
+                self._upsert_entry(entry, notice="Added preset",
+                                   notify=(len(entries) == 1))
+                added += 1
+            if added > 1:
+                self.app.notify(
+                    f"Added {added} presets to the library (unsaved — "
+                    "press Ctrl+S to keep them).",
+                    markup=False,
+                )
+        self.app.push_screen(FeaturePresetsModal(), callback=_cb)
 
     @on(Button.Pressed, "#btn-flib-rename")
     def _rename_btn(self, _) -> None: self.action_rename()
@@ -68901,11 +69122,11 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                     )
             with Vertical(id="syn-featlib-pane"):
                 yield Static(
-                    "[b]Feature library[/b]",
+                    "[b]Feature library[/b]  [dim]+ presets[/]",
                     id="syn-featlib-title", markup=True,
                 )
                 yield Input(
-                    placeholder="filter by name or type",
+                    placeholder="filter by name, type or alias",
                     id="syn-featlib-search",
                 )
                 yield DataTable(
@@ -68945,7 +69166,9 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                     )
                 yield Static(
                     "[dim]Insert = sequence + annotation at cursor. "
-                    "Annotate = overlay onto current selection.[/]",
+                    "Annotate = overlay onto current selection. "
+                    "'pre' rows are built-in presets — Edit saves a "
+                    "copy into your library.[/]",
                     id="syn-featlib-hint", markup=True,
                 )
 
@@ -69388,7 +69611,11 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
             pass
         try:
             t = self.query_one("#syn-featlib-table", DataTable)
-            t.add_columns("Name", "Type", "bp")
+            # "Src" flags where the row came from: blank for the user's own
+            # library entries, "pre" for a built-in preset. Without it the
+            # user cannot tell which rows the Edit button will copy rather
+            # than edit in place.
+            t.add_columns("Name", "Type", "bp", "Src")
         except NoMatches:
             pass
         self._refresh_featlib_table()
@@ -70860,10 +71087,19 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
     # ── Feature library side panel ─────────────────────────────────────────
 
     def _refresh_featlib_table(self, *, filter_str: str = "") -> None:
-        """Repopulate the feature-library DataTable. Filters case-
-        insensitively against the entry's `name`, `feature_type`, and
-        `description`. Sorted natural by name so `mCherry` lands near
-        `mCherry-2`."""
+        """Repopulate the feature-library DataTable with the user's own
+        entries PLUS the built-in preset catalogue.
+
+        Filters case-insensitively against `name`, `feature_type`,
+        `description` and (for presets) `category` + `aliases`, so typing
+        "amp" or "ni-nta" finds the right row. Sorted natural by name so
+        `mCherry` lands near `mCherry-2`.
+
+        The merge is `_load_features_with_presets` — a READ-ONLY view. A
+        user entry shadows a preset of the same (name, feature_type), and
+        nothing in this panel ever writes the merged list back, so presets
+        can't leak into `features.json`.
+        """
         try:
             t = self.query_one("#syn-featlib-table", DataTable)
         except NoMatches:
@@ -70872,7 +71108,8 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         # screen could've landed new entries since we last looked. The
         # cost is one O(N) read; the user hits Refresh manually if they
         # need fresher state mid-edit.
-        entries = [e for e in _load_features() if isinstance(e, dict)]
+        entries = [e for e in _load_features_with_presets()
+                   if isinstance(e, dict)]
         entries.sort(key=lambda e: _natural_sort_key(
             (e.get("name") or "").lower()
         ))
@@ -70884,7 +71121,13 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
             desc = str(e.get("description", "") or "")
             seq = str(e.get("sequence", "") or "")
             if needle:
-                if (needle not in name.lower()
+                if e.get("preset"):
+                    # Presets get the richer match (category + aliases) so
+                    # "ni-nta" finds the His tag and "kanamycin" finds
+                    # every marker that confers it.
+                    if not _preset_matches(e, needle):
+                        continue
+                elif (needle not in name.lower()
                         and needle not in ftype.lower()
                         and needle not in desc.lower()):
                     continue
@@ -70898,7 +71141,8 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
             name = e.get("name", "") or ""
             ftype = e.get("feature_type", "") or ""
             bp = len((e.get("sequence", "") or "").replace(" ", ""))
-            t.add_row(name or "(unnamed)", ftype or "?", str(bp), key=key)
+            t.add_row(name or "(unnamed)", ftype or "?", str(bp),
+                      "pre" if e.get("preset") else "", key=key)
 
     @on(Input.Changed, "#syn-featlib-search")
     def _on_featlib_search(self, event: Input.Changed) -> None:
@@ -70934,6 +71178,9 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 "Pick an entry in the feature library first.",
                 severity="information",
             )
+            return
+        if entry.get("preset"):
+            self._featlib_edit_preset(entry)
             return
         # Find the entry's index in the persistent library by
         # (name, feature_type) — same key FeatureLibraryScreen uses.
@@ -70994,8 +71241,73 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
             callback=_cb,
         )
 
+    def _featlib_edit_preset(self, preset: dict) -> None:
+        """Edit a built-in preset by COPYING it into the user's library.
+
+        Presets live in code, never in `features.json`, so there is no
+        on-disk row to rewrite. Opening the usual `AddFeatureModal`
+        pre-filled with the preset and saving the result as a normal
+        library entry gives the user the edit they asked for without
+        pretending the catalogue is writable — the same copy-on-write
+        shape `_load_protein_motifs` uses for the built-in motifs.
+
+        The saved copy shadows the preset in every merged view (same
+        name + feature_type), so the row is replaced rather than doubled.
+        """
+        # `_featlib_selected_entry` already normalised the row (that is how
+        # the provenance note gets into an inserted feature), so converting a
+        # SECOND time here would read a `source` key that is no longer there
+        # and quietly hand the modal a note with the accession stripped out.
+        # Convert only a raw catalogue dict; otherwise just drop the flag.
+        try:
+            if "qualifiers" in preset:
+                prefill = {k: v for k, v in preset.items() if k != "preset"}
+            else:
+                prefill = _preset_to_library_entry(preset)
+        except (TypeError, ValueError):
+            _log.exception("synthesis: preset prefill failed")
+            self.app.notify("Could not open that preset.", severity="error")
+            return
+
+        def _cb(result):
+            if not isinstance(result, dict):
+                return
+            new_entry = result.get("entry")
+            if not isinstance(new_entry, dict) or not new_entry.get("name"):
+                return
+            current = _load_features()
+            key = (new_entry.get("name"), new_entry.get("feature_type"))
+            current = [e for e in current
+                       if (e.get("name"), e.get("feature_type")) != key]
+            current.append(new_entry)
+            try:
+                _save_features(current)
+            except (OSError, RuntimeError, ValueError) as exc:
+                _notify_save_failure(self.app, "Feature library", exc)
+                return
+            self._refresh_featlib_table()
+            _log_event(
+                "synthesis.featlib.preset_copy",
+                name=new_entry.get("name"),
+                type=new_entry.get("feature_type"),
+            )
+            self.app.notify(
+                f"Saved '{new_entry.get('name')}' into your feature "
+                "library (the built-in preset is unchanged).",
+                severity="information", markup=False,
+            )
+        self.app.push_screen(AddFeatureModal(prefill=prefill), callback=_cb)
+
     def _featlib_selected_entry(self) -> "dict | None":
-        """Resolve the highlighted feature-library row → entry dict."""
+        """Resolve the highlighted feature-library row → entry dict.
+
+        A preset row is normalised through `_preset_to_library_entry`
+        first, so every downstream consumer (insert / annotate) sees the
+        ordinary library-entry shape AND inherits the provenance note —
+        an element dropped into a construct records which GenBank record
+        its sequence came from. The `preset` flag is preserved so the
+        Edit path can still tell the two apart.
+        """
         try:
             t = self.query_one("#syn-featlib-table", DataTable)
         except NoMatches:
@@ -71010,8 +71322,17 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
             return None
         key_val = row_key.value if hasattr(row_key, "value") else str(row_key)
         for key, entry in self._featlib_rows:
-            if key == key_val:
+            if key != key_val:
+                continue
+            if not entry.get("preset"):
                 return entry
+            try:
+                normalised = _preset_to_library_entry(entry)
+            except (TypeError, ValueError):
+                _log.exception("synthesis: preset normalise failed")
+                return entry
+            normalised["preset"] = True
+            return normalised
         return None
 
     def _featlib_insert_selected(self, *, mode: str) -> None:
@@ -99192,6 +99513,110 @@ def _h_transfer_annotations(app, payload):
 
 
 
+@_agent_endpoint("annotate-from-presets", write=True)
+def _h_annotate_from_presets(app, payload):
+    """Annotate the LOADED record from the feature library and the built-in
+    preset catalogue by exact sequence match, on both strands and across the
+    origin on a circular record.
+
+    Body: ``{apply?: bool, dry_run?: bool, include_presets?: bool}``. Like
+    `transfer-annotations` this is a DRY RUN by default — it returns the
+    proposed features and changes nothing. Pass ``{"apply": true}`` to append
+    them. ``include_presets: false`` restricts the scan to the user's own
+    feature library.
+
+    The counterpart to `transfer-annotations`, which needs a source plasmid
+    you already have; this one needs nothing but the catalogue. Matching is
+    EXACT, so an allelic variant of an element will not be called — use
+    `blast` for near-identical hits.
+
+    Returns ``{transfers, applied, count, already_annotated, total_found,
+    truncated}``. ``already_annotated`` counts matches the record already
+    carries under the same label over the same span; those are never offered,
+    so re-running is a no-op rather than a way to stack a second copy of every
+    element. ``transfers`` is capped at ``max_transfers`` (default 500) for
+    the pathological tandem-repeat case; ``total_found`` is the uncapped count
+    and ``truncated`` says plainly whether you are seeing all of it.
+
+    Same stale-canvas guard as `transfer-annotations`: the record and its
+    load counter are captured together under one UI tick, and the apply step
+    returns 409 if the canvas moved on."""
+    if getattr(app, "_current_record", None) is None:
+        return ({"error": "no plasmid loaded"}, 422)
+
+    def _capture_target():
+        return {
+            "rec": app._current_record,
+            "counter": getattr(app, "_record_load_counter", 0),
+        }
+    cap = app.call_from_thread(_capture_target)
+    rec = cap["rec"]
+    entry_counter = cap["counter"]
+    include_presets = payload.get("include_presets", True)
+    if not isinstance(include_presets, bool):
+        return ({"error": "'include_presets' must be a boolean"}, 400)
+    apply_in = payload.get("apply")
+    if apply_in is None and "dry_run" not in payload:
+        # Same fail-loud-on-an-unrecognised-affirmative rule
+        # `transfer-annotations` uses: an agent that thinks it committed must
+        # not silently get a preview back.
+        for _syn in ("commit", "write", "persist"):
+            if payload.get(_syn):
+                return ({"error":
+                          f"{_syn!r} is not a recognised switch — pass "
+                          '{"apply": true} to apply (default is a dry run)'},
+                        400)
+    do_apply = (bool(apply_in) if apply_in is not None
+                else not bool(payload.get("dry_run", True)))
+    raw_max = payload.get("max_transfers", _PRESET_ANNOT_MAX_TRANSFERS)
+    max_transfers = _coerce_int(raw_max, name="max_transfers")
+    if isinstance(max_transfers, str):
+        return ({"error": max_transfers}, 400)
+    if max_transfers < 1:
+        return ({"error": "'max_transfers' must be >= 1"}, 400)
+    try:
+        transfers, already, total = _preset_annotation_transfers(
+            rec, include_presets=include_presets,
+            max_transfers=max_transfers,
+        )
+    except Exception as exc:
+        _log.exception("agent annotate-from-presets: scan failed")
+        return ({"error": f"scan failed: {_scrub_path(str(exc))}"}, 500)
+    if not do_apply or not transfers:
+        return {
+            "transfers":         transfers,
+            "applied":           False,
+            "count":             len(transfers),
+            "already_annotated": already,
+            "total_found":       total,
+            "truncated":         total > len(transfers),
+        }
+
+    def _apply():
+        guard = _agent_dirty_guard(app, payload)
+        if guard is not None:
+            return guard
+        if getattr(app, "_record_load_counter", 0) != entry_counter:
+            return ({"error": "record changed mid-flight; retry"}, 409)
+        try:
+            app._apply_annotation_transfers(transfers, rec)
+        except Exception as exc:
+            return ({"error": f"apply failed: {_scrub_path(str(exc))}"}, 500)
+        return None
+
+    err = app.call_from_thread(_apply)
+    if isinstance(err, tuple):
+        return err
+    return {
+        "transfers":         transfers,
+        "applied":           True,
+        "count":             len(transfers),
+        "already_annotated": already,
+        "total_found":       total,
+        "truncated":         total > len(transfers),
+    }
+
+
 # ── Plasmidsaurus alignment endpoints ──────────────────────────────────────────
 
 
@@ -103019,6 +103444,15 @@ _BUTTON_TOOLTIPS: "dict[str, str]" = {
     "btn-flib-edit": "Edit the selected library feature",
     "btn-flib-save": "Save changes to this library feature",
     "btn-flib-dup": "Duplicate the selected feature",
+    "btn-flib-presets": ("Browse the built-in preset catalogue and copy "
+                          "entries into your library"),
+    # ── Feature-preset browser ──
+    "btn-fpre-toggle": "Tick / untick the highlighted preset  [Space]",
+    "btn-fpre-all": "Tick every preset currently listed",
+    "btn-fpre-none": "Untick everything",
+    "btn-fpre-add": ("Copy the ticked presets into your feature library "
+                      "(the highlighted one if nothing is ticked)"),
+    "btn-fpre-close": "Close without copying anything  [Esc]",
     "btn-flib-remove": "Delete the selected feature",
     "btn-flib-rename": "Rename the selected feature",
     "btn-flib-color": "Pick a colour for the feature",
@@ -110826,6 +111260,106 @@ NcbiTaxonPickerModal { align: center middle; }
             callback=_on_source_picked,
         )
 
+    @_action_log("app.annotate_from_presets.trigger")
+    def action_annotate_from_presets(self) -> None:
+        """Annotate the LOADED plasmid from the feature library + the
+        built-in preset catalogue.
+
+        The counterpart to `action_transfer_annotations`, which needs a
+        source plasmid you already have. This one needs nothing: paste or
+        open an unknown vector and its markers, origin, promoters and
+        polylinker are matched straight out of the shipped catalogue.
+
+        Reuses the transfer preview / apply path wholesale, so the user
+        sees every proposed feature before anything lands, Ctrl+Z takes it
+        all back, and an agent-driven plasmid swap mid-flow is refused via
+        the `_record_load_counter` capture ([PIT-28]).
+        """
+        if self._current_record is None:
+            self.notify("No plasmid loaded — load one first.",
+                        severity="warning")
+            return
+        target_record = self._current_record
+        target_label = self._record_display_name(target_record) or "target"
+        entry_counter = self._record_load_counter
+
+        def _done(accepted):
+            if not accepted:
+                return
+            if self._record_load_counter != entry_counter:
+                self.notify(
+                    "Annotation dropped — active plasmid changed mid-flow.",
+                    severity="warning", timeout=6,
+                )
+                return
+            self._apply_annotation_transfers(accepted, target_record)
+
+        self.notify("Matching against the feature library + presets…",
+                    timeout=3)
+        self._preset_annotate_worker(target_record, target_label,
+                                     entry_counter, _done)
+
+    @work(thread=True, exclusive=True, group="preset_annotate")
+    def _preset_annotate_worker(self, target_record, target_label,
+                                entry_counter, done_cb) -> None:
+        """Off the UI thread: the catalogue scan is ~120 ms on a 200 kb
+        record (measured), well past the 50 ms the codebase treats as a
+        visible hitch. Mirrors `_annotation_transfer_worker`."""
+        try:
+            transfers, already, total = _preset_annotation_transfers(
+                target_record)
+        except Exception as exc:
+            _log.exception("preset annotation scan failed")
+            self.call_from_thread(
+                self.notify, f"Annotation scan failed: {exc}",
+                severity="error")
+            return
+        self.call_from_thread(
+            self._push_preset_annotate_modal,
+            target_label, transfers, already, total, entry_counter, done_cb)
+
+    def _push_preset_annotate_modal(self, target_label, transfers, already,
+                                    total, entry_counter, done_cb) -> None:
+        if self._record_load_counter != entry_counter:
+            self.notify(
+                "Annotation dropped — active plasmid changed mid-flow.",
+                severity="warning", timeout=6)
+            return
+        if not transfers:
+            self.notify(
+                (f"Nothing new to add — all {already} match(es) are already "
+                 f"annotated." ) if already else
+                "No feature library or preset sequence was found in this "
+                "plasmid. Matching is exact; try Annotate via BLAST for "
+                "near-identical hits.",
+                severity="information", timeout=8,
+            )
+            return
+        if already:
+            self.notify(
+                f"{already} match(es) already annotated — not offered again.",
+                severity="information", timeout=5,
+            )
+        if total > len(transfers):
+            # Say it out loud. A preview that quietly shows a fraction of the
+            # answer reads as the whole answer.
+            self.notify(
+                f"Showing the first {len(transfers):,} of {total:,} matches. "
+                "A sequence with this many repeats is better annotated from a "
+                "narrower library.",
+                severity="warning", timeout=10,
+            )
+        _log_event("annotate.presets.preview",
+                   found=len(transfers), already=already, total=total)
+        self.push_screen(
+            AnnotationTransferModal(
+                source_label="feature library + built-in presets",
+                target_label=target_label,
+                transfers=transfers,
+            ),
+            callback=self._guard_callback(done_cb, "Annotate from presets"),
+        )
+
     @work(thread=True, exclusive=True, group="annotation_transfer")
     def _annotation_transfer_worker(self, source_record, target_record,
                                       target_label, entry_counter,
@@ -115883,6 +116417,8 @@ NcbiTaxonPickerModal { align: center middle; }
                 ("Diff with another plasmid…",   "diff_plasmid"),
                 ("Find ORFs in this sequence…",  "find_orfs"),
                 ("Transfer annotations from…",   "transfer_annotations"),
+                ("Annotate from library + presets…",
+                                                  "annotate_from_presets"),
                 ("Send selection to cloning (Traditional / GB / MoClo / Gibson)…",
                                                   "send_selection_to_pipeline"),
                 ("Save  [^S]",                   "save"),

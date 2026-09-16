@@ -162,6 +162,7 @@ _MODAL_CASES = [
                                                  "sequence": "ATG", "strand": 1}],
                                                plasmid_name="demo")),
     ("AddFeatureModal",            lambda: sc.AddFeatureModal(selection_range=(0, 10))),
+    ("FeaturePresetsModal",        lambda: sc.FeaturePresetsModal()),
     ("AminoAcidPickerModal",       lambda: sc.AminoAcidPickerModal(42, "W")),
     ("NcbiTaxonPickerModal",       lambda: sc.NcbiTaxonPickerModal("")),
     ("SpeciesPickerModal",         lambda: sc.SpeciesPickerModal()),

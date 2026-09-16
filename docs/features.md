@@ -51,8 +51,15 @@ What you can do without leaving the terminal.
 ## Synthesis
 
 - **DNA synthesis composer** (`Synthesis → DNA`) — paste / type a
-  sequence target, set topology, then iteratively annotate using the
-  built-in feature library or motifs found via inline pattern match.
+  sequence target, set topology, then iteratively annotate using your
+  own feature library, the built-in preset catalogue (rows marked
+  `pre`), or motifs found via inline pattern match. **Insert** splices a
+  preset's bases at the cursor and annotates them in one step, carrying
+  the GenBank accession it came from into the feature's note, so a
+  construct built here records where each element originated.
+  **Annotate** overlays a preset onto the current selection without
+  changing any DNA. **Edit** on a preset saves an editable copy into
+  your library and leaves the shipped catalogue alone.
   Synthesised records save to the library with feature annotations,
   topology, and a `synthesised in SpliceCraft` provenance note.
 - **Protein synthesis composer** (`Synthesis → Protein`) — design at
@@ -332,6 +339,41 @@ What you can do without leaving the terminal.
   on-disk order so `pPart-2` sits next to `pPart-10` rather than
   scattered alphabetically; entry indices remain stable across the
   re-sort so dirty-edit markers don't desync.
+- **Built-in feature presets** (`Presets` in the Feature Library, or
+  `p`) — a shipped catalogue of 116 common plasmid elements across 20
+  categories: resistance markers (AmpR, KanR, NeoR, CmR, TetA, SpecR,
+  HygR, PuroR, BlastR, ZeoR), origins (pUC/pMB1, p15A, f1, SV40, 2μ,
+  CEN/ARS, R6Kγ, oriT), promoters for bacteria, mammalian cells, yeast
+  and plants (T7, T3, SP6, lac, tac, trc, pBAD, J23119, CMV, EF-1α,
+  PGK, U6, GAL1, 35S, NOS), terminators and polyA signals, reporters
+  (EGFP, sfGFP, mCherry, mRFP1, firefly luciferase, lacZ-α), affinity
+  tags and protease sites, 2A peptides, and recombination sites (loxP,
+  FRT, attR, attB, I-SceI). Browse with search and a category filter,
+  tick as many as you want, and copy them into your own library —
+  where they become ordinary entries you can rename, recolour or edit.
+  Every sequence was extracted from a public GenBank record rather
+  than typed from memory, and each entry cites the accession plus how
+  many independent submissions carry the identical sequence. Coding
+  entries were checked for a real reading frame. Presets live in the
+  program, never in your data directory, so they cost you nothing and
+  cannot be corrupted; an entry of your own with the same name and
+  type always replaces the preset in every list.
+- **Annotate the loaded plasmid** (`File → Annotate from library +
+  presets`) — matches the plasmid on screen against your own snippets and
+  the preset catalogue, on both strands and across the origin, then shows
+  every proposed feature before any of them land. One `Ctrl+Z` removes the
+  whole batch. An element the record already carries under the same name
+  and coordinates is not offered again, so re-running changes nothing. The
+  scan runs on a worker thread, so a 200 kb record doesn't stall the UI.
+- **Annotate a pasted sequence** — `Library → New plasmid` takes a
+  pasted sequence and its **Annotate from library** button
+  substring-matches it against your own snippets *and* the preset
+  catalogue on both strands, wrap-aware on a circular template, so a
+  freshly pasted vector comes back with its markers, origin, promoters
+  and polylinker already drawn. Matching is exact: a vector carrying an
+  allelic variant of an element (pGEX-4T-1's *bla* differs from the
+  preset at two bases) will not match, which is what **Annotate via
+  BLAST** is for.
 - **Bulk export collection** (`File → Export collection (bulk)…`) —
   pick a collection + format (GenBank / EMBL / FASTA / `.dna` /
   circular-map **PNG** / **SVG**) + a target folder. Each plasmid is

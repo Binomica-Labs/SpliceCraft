@@ -14,6 +14,100 @@
 
 ---
 
+## [1.2.63] — 2026-09-16
+
+### New features
+
+- **116 built-in feature presets, ready to annotate with.** The Feature
+  Library has a new **Presets** button (or press `p`) opening a catalogue of
+  the elements that turn up in nearly every plasmid: ten resistance markers,
+  eight origins of replication, promoters for bacteria, mammalian cells,
+  yeast and plants, terminators and polyA signals, reporters including EGFP,
+  mCherry and firefly luciferase, the His / FLAG / HA / Myc / V5 / Strep
+  tags, TEV and thrombin sites, 2A peptides, and loxP, FRT, attR and attB.
+  Search by name, type, description or common alias — typing "ni-nta" finds
+  the His tag — filter by category, tick as many as you like and copy them
+  into your own library, where they become ordinary entries you can rename,
+  recolour and edit. Nothing is written to your data directory until you
+  choose to import, and your own entry always replaces a preset of the same
+  name and type rather than sitting next to it.
+
+  Every sequence came out of a public GenBank record rather than being typed
+  from memory. Around 400 annotated vector records were indexed, and each
+  preset keeps the variant that the largest number of independent
+  submissions agree on byte-for-byte; the entry tells you the accession and
+  how many records carry it. Coding entries were checked for a genuine
+  reading frame. Three candidates were rejected or corrected during
+  curation, including a tdTomato whose public annotation silently ran
+  through a V5 tag, and an aadA gene that several records label "kanamycin
+  resistance" when it actually confers streptomycin and spectinomycin
+  resistance and no kanamycin resistance at all.
+
+- **Presets are in the Synthesis composer too.** The DNA tab's feature panel
+  now lists your own snippets and the preset catalogue side by side, with a
+  `pre` marker on the shipped rows. **Insert** splices a preset's bases at
+  the cursor and annotates them in one step, carrying the GenBank accession
+  into the feature's note so a construct records where each element came
+  from. **Edit** on a preset saves an editable copy into your library and
+  leaves the catalogue alone.
+
+- **Paste a vector, get a map.** `New plasmid`'s **Annotate from library**
+  now also matches the preset catalogue, so an unknown sequence comes back
+  with its marker, origin, promoters and polylinker already drawn, on both
+  strands and across the origin. Matching is exact, so a vector carrying an
+  allelic variant of an element will not match it — that is what **Annotate
+  via BLAST** is for.
+
+- **Annotate a plasmid you already have.** `File → Annotate from library +
+  presets` matches the loaded plasmid against your snippets and the whole
+  catalogue, on both strands and across the origin, and shows you every
+  proposed feature before anything lands. One `Ctrl+Z` takes them all back.
+  Elements the plasmid already carries under the same name and coordinates
+  are not offered again, so re-running it changes nothing.
+
+- **Four agent endpoints** — `list-feature-presets`, `get-feature-preset`,
+  `import-feature-preset` and `annotate-from-presets`. An import that names
+  an unknown preset is refused outright rather than half-applied, and
+  annotating is a dry run unless you pass `apply`.
+
+### Bug fixes
+
+- **Annotating a circular sequence drew every feature twice.** The scan
+  extends the sequence past its own end so a feature crossing the origin is
+  found in one piece, but a match found entirely inside that extension was
+  reported a second time, with an end coordinate one full turn too large.
+  On a pUC19-sized plasmid that meant twelve annotations where seven were
+  real. The extra copies are gone and genuine origin-spanning features are
+  unaffected.
+
+- **Two library entries with the same sequence stacked two bands on one
+  element.** If you imported a feature and renamed it, or kept the same
+  sequence under two names, both were drawn over the same stretch of DNA.
+  A stretch is now claimed once, and your own entry wins over a preset.
+
+- **One damaged row in your feature library no longer hides the rest.** If
+  `features.json` had been hand-edited or recovered in a damaged state, a row
+  whose name was not plain text could stop the Synthesis feature panel and the
+  whole annotate-from-presets scan from working at all. The bad row now costs
+  you that row; everything else still loads, and the row stays visible so you
+  can repair it.
+
+### Hardening
+
+- **Annotating a sequence made of tandem repeats is capped and says so.** A
+  construct built from hundreds of copies of one short element used to offer
+  every match at once, which is more than anyone can review and more features
+  than one undo should carry. You now see the first 500 with a clear note of
+  how many were found.
+
+- **Importing the same preset twice counts once.** Asking for a preset by two
+  spellings reported two imports for one new entry.
+
+- **Asking for both a single preset and a list is refused** rather than
+  quietly honouring one of them.
+
+---
+
 ## [1.2.62] — 2026-09-15
 
 ### Bug fixes
