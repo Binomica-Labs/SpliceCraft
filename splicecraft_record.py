@@ -20,6 +20,7 @@ from copy import copy as _shallow_copy
 from io import StringIO
 
 import splicecraft_state as _state
+from splicecraft_logging import _log
 
 
 _SC_STRAND_QUAL = "SpliceCraft_strand"
@@ -33,6 +34,61 @@ _GB_PARSE_CACHE_MAX = 16
 _GB_PARSE_CACHE_LOCK = threading.RLock()
 
 _GB_LOCUS_NAME_MAX = 28  # NCBI relaxed LOCUS name length (spec is 16)
+
+# The classic 80-column LOCUS line packs the name and the sequence length into
+# one 28-character field (name left-justified from column 13, length
+# right-justified ending at column 40), which is why NCBI's relaxation of the
+# 16-char name limit only stretches so far: as soon as
+# ``len(name) + len(str(bp)) > 27`` Biopython gives up on the fixed columns and
+# emits ``<name> <bp> bp ...`` instead. That line is LONGER than 80 characters
+# and every field after the length — units, molecule type, topology, division,
+# date — lands in the wrong column, so any reader that slices the LOCUS line
+# positionally (and plenty still do) reads garbage for the topology.
+# `_locus_name_cap` is what keeps us on the standard layout.
+_GB_LOCUS_NAME_FIELD = 28
+
+
+def _locus_name_cap(seq_len: int) -> int:
+    """Longest LOCUS name that still yields a column-conformant LOCUS line
+    for a record of ``seq_len`` bases.
+
+    Never returns less than 8 — a pathological length (>19 digits) would
+    otherwise shrink the name to nothing, and at that point the file is
+    already outside anything the format contemplates.
+    """
+    try:
+        digits = len(str(max(0, int(seq_len))))
+    except (TypeError, ValueError):
+        digits = 11
+    return max(8, min(_GB_LOCUS_NAME_MAX, _GB_LOCUS_NAME_FIELD - 1 - digits))
+
+
+# INSDC restricts the LOCUS name to letters, digits and underscore (NCBI also
+# tolerates `.` and `-` in practice). Anything else — the `+` in a construct
+# called "DEMO 33 MOD CDS+REPORTER", a `%` or `#` from a pasted name — is
+# folded to `_`. Only whitespace used to be folded, so a name with a `+` in it
+# put a `+` straight into the LOCUS.
+_LOCUS_BAD_CHARS_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _locus_name_for(record, *, cap: "int | None" = None) -> str:
+    """THE LOCUS name for `record`: sanitised to the INSDC character set and
+    truncated to the length that keeps the 80-column layout intact.
+
+    One function so the value the writer stamps and the value the display-name
+    COMMENT marker is compared against can never drift apart — when they did,
+    a name the LOCUS could not hold went unstamped and its truncation became
+    permanent. [INV-98]
+    """
+    if cap is None:
+        try:
+            cap = _locus_name_cap(len(record.seq))
+        except (AttributeError, TypeError):
+            cap = _GB_LOCUS_NAME_MAX
+    raw = str(getattr(record, "name", "") or "").strip()
+    if not raw:
+        raw = str(getattr(record, "id", "") or "").strip()
+    return _LOCUS_BAD_CHARS_RE.sub("_", raw)[:cap] or "PLASMID"
 
 
 def _normalize_primer_seq(raw: object) -> str:
@@ -168,8 +224,13 @@ def _repair_wrapped_primer_seqs(record):
     [primer display is catastrophic-class — project_primer_design_catastrophic]
     """
     for f in getattr(record, "features", None) or []:
-        if getattr(f, "type", "") != "primer_bind":
-            continue
+        # ANY feature type, not just `primer_bind`. SpliceCraft only writes
+        # `/primer_seq` onto a primer_bind, but a `.dna` / GenBank file from
+        # elsewhere can carry it anywhere, and a primer sequence is a primer
+        # sequence wherever it sits — whitespace in it is an artefact either
+        # way. Keying on the type left those unrepaired, which (once the
+        # writer started wrapping long `/primer_seq` values at 80 columns)
+        # made the export's round-trip guard refuse the file.
         quals = getattr(f, "qualifiers", None)
         if not isinstance(quals, dict):
             continue
@@ -325,6 +386,30 @@ def _topology_from_gb_text(gb_text, default: str = "circular") -> str:
     return default
 
 
+def _backfill_topology(rec, gb_text: str) -> None:
+    """In-place: set ``rec.annotations["topology"]`` from the LOCUS line when
+    Biopython left it unset.
+
+    Biopython reads the LOCUS topology POSITIONALLY (columns 56-63). Plenty of
+    real files — ApE's, older SnapGene exports, anything hand-edited — put the
+    same `circular` token in a slightly different column, and Biopython then
+    silently reports no topology at all. That is not cosmetic: the export path
+    defaults a topology-less record to **linear**, so loading one of those
+    files and exporting it turned a circular plasmid into a linear fragment for
+    every downstream tool, while SpliceCraft's own map (which reads the LOCUS
+    line by token, via `_topology_from_gb_text`) kept drawing it circular.
+
+    Only ever ADDS a value — an explicit annotation always wins, and a LOCUS
+    line carrying neither token is left alone rather than guessed at.
+    """
+    anns = getattr(rec, "annotations", None)
+    if not isinstance(anns, dict) or anns.get("topology"):
+        return
+    topo = _topology_from_gb_text(gb_text, default="")
+    if topo:
+        anns["topology"] = topo
+
+
 def _record_to_gb_text(record) -> str:
     """Serialize a SeqRecord to GenBank format text.
 
@@ -361,9 +446,14 @@ def _record_to_gb_text(record) -> str:
     # export to a `.gb` — so without this an exported construct re-imports
     # under the mangled LOCUS and needs a manual `rename-plasmid` every time.
     # The parse side (`_restore_display_name_from_comment`) reads it back onto
-    # `_tui_display_name`. Idempotent: never re-stamps on a round-trip, and
-    # only stamps when the display name actually differs from the LOCUS-safe
-    # name (no point otherwise). [INV-98]
+    # `_tui_display_name`. The marker simply MIRRORS `_tui_display_name`: it is
+    # rewritten when that changes (so a rename reaches the file), dropped when
+    # the LOCUS can carry the name unchanged, and left alone when the record
+    # has no display name at all — which keeps a round-trip idempotent. [INV-98]
+    try:
+        _locus_cap = _locus_name_cap(len(record.seq))
+    except (AttributeError, TypeError):
+        _locus_cap = _GB_LOCUS_NAME_MAX
     _disp = getattr(record, "_tui_display_name", None)
     if isinstance(_disp, str):
         _disp_clean = _disp.replace("\n", " ").replace("\r", " ").strip()
@@ -371,12 +461,28 @@ def _record_to_gb_text(record) -> str:
         if isinstance(_cur, (list, tuple)):
             _cur = "\n".join(str(x) for x in _cur)
         _cur = str(_cur or "")
-        _locus_form = re.sub(r"\s+", "_",
-                             str(getattr(record, "name", "") or "").strip())
-        if (_disp_clean and _disp_clean != _locus_form
-                and _DISPLAY_NAME_MARKER not in _cur):
+        # Compare against the FINAL locus form — sanitised AND truncated — not
+        # the raw `record.name`: a display name the LOCUS cannot hold verbatim
+        # but which happens to equal `record.name` used to skip the stamp, so
+        # the mangling the writer then applied was permanent and
+        # unrecoverable. [INV-98]
+        _locus_form = _locus_name_for(record, cap=_locus_cap)
+        # REWRITE the marker rather than skip when one is already there. The
+        # old "never re-stamp" rule kept the round-trip idempotent but made a
+        # RENAME invisible to the file: the entry had been saved once with
+        # `SpliceCraft-name: My Plasmid`, the user renamed it, and the marker
+        # still said the old name — so exporting (or re-importing) the entry
+        # brought the old name back. The marker is now simply whatever
+        # `_tui_display_name` says, and is dropped when the LOCUS can carry
+        # the name unchanged. Still idempotent: re-serialising a record whose
+        # marker already matches produces the same text.
+        _before, _sep, _ = _cur.partition(_DISPLAY_NAME_MARKER)
+        _head = _before.rstrip() if _sep else _cur
+        if _disp_clean and _disp_clean != _locus_form:
             _nm = f"{_DISPLAY_NAME_MARKER} {_disp_clean}"
-            anns["comment"] = f"{_cur}\n{_nm}".strip() if _cur else _nm
+            anns["comment"] = f"{_head}\n{_nm}".strip() if _head else _nm
+        elif _sep:
+            anns["comment"] = _head
     rec = _shallow_copy(record)
     rec.annotations = anns
     # The GenBank LOCUS line forbids whitespace and caps length — Biopython
@@ -384,17 +490,43 @@ def _record_to_gb_text(record) -> str:
     # breaks EVERY save + autosave (user-reported after a scrub Add-to-Map: a
     # spaced display name had leaked into `record.name`). The human/display
     # name lives in `_tui_display_name` + the library entry, NOT the LOCUS, so
-    # sanitise the LOCUS here on the COPY (never mutating the caller's record):
-    # collapse whitespace to `_`, fall back to the id, cap to the INSDC max.
-    _loc = re.sub(r"\s+", "_", str(getattr(rec, "name", "") or "").strip())
-    if not _loc:
-        _loc = re.sub(r"\s+", "_", str(getattr(rec, "id", "") or "").strip())
-    rec.name = _loc[:_GB_LOCUS_NAME_MAX] or "PLASMID"
+    # sanitise the LOCUS here on the COPY (never mutating the caller's record)
+    # via `_locus_name_for`, which folds whitespace AND every other character
+    # outside the INSDC set, falls back to the id, and applies the DYNAMIC cap
+    # (`_locus_name_cap`): the name and the sequence length share one
+    # 28-column field, so how much name fits depends on how many digits the
+    # length needs. Overflowing it makes Biopython abandon the fixed-column
+    # layout entirely — see `_locus_name_cap`.
+    rec.name = _locus_name_for(rec, cap=_locus_cap)
     rec.features = _split_multiline_qualifiers(
         _arrowless_encode_features(getattr(record, "features", None)))
     buf = StringIO()
     _unbreakable_genbank_writer(buf).write_file([rec])
     return buf.getvalue()
+
+
+# Qualifiers a long value may be HARD-BROKEN in, because whitespace in them is
+# never data:
+#
+#   * `/translation` — the case the standard itself names. NCBI wraps every
+#     protein translation mid-token, and Biopython's parser lists it in
+#     `FeatureValueCleaner.keys_to_process` precisely so the continuation
+#     rejoins with no separator. Refusing to break it is what produced
+#     7,132-character lines for SARS-CoV-2 ORF1ab.
+#   * `/primer_seq` — a vendor extension (not INSDC), and its value is a bare
+#     nucleotide string. `_normalize_primer_seq` strips whitespace from it on
+#     every read, so the break is lossless here; anything else reading it as a
+#     sequence will strip too. A 60-mer Gibson or mutagenesis primer overflows
+#     the line otherwise, which is far likelier to break a reader than a space
+#     in an oligo is to mislead one.
+#
+# Every OTHER qualifier rejoins with a space that was never in the data, which
+# is why `_unbreakable_genbank_writer` refuses to break those at all — see its
+# docstring for that trade.
+_HARD_BREAKABLE_QUALS: frozenset = frozenset({"translation", "primer_seq"})
+
+# Back-compat alias for the name this set shipped under.
+_NO_SPACE_REJOIN_QUALS = _HARD_BREAKABLE_QUALS
 
 
 def _unbreakable_genbank_writer(handle):
@@ -415,13 +547,37 @@ def _unbreakable_genbank_writer(handle):
     This writer instead breaks after the offending token (or, failing that,
     emits the rest of the line whole). The lines it produces are longer than
     80 columns, which INSDC discourages and every parser in practice accepts —
-    a strictly better trade than corrupting the value."""
+    a strictly better trade than corrupting the value.
+
+    EXCEPT for `/translation` and its kin (`_NO_SPACE_REJOIN_QUALS`), where the
+    rejoin inserts nothing, so the stock hard break is both lossless AND what
+    NCBI itself emits. Routing those through this writer's "never break" path
+    was a real regression: every record carrying a CDS translation — i.e. every
+    record NCBI serves — exported with the whole protein on one line, up to
+    7,132 characters for SARS-CoV-2 ORF1ab. `test_genbank_io.py` pins the
+    80-column result on a real translation."""
     from Bio.SeqIO.InsdcIO import GenBankWriter
 
     class _Writer(GenBankWriter):
         def _write_feature_qualifier(self, key, value=None, quote=None):
             if value is None or not isinstance(value, str):
                 return super()._write_feature_qualifier(key, value, quote)
+            if key in _HARD_BREAKABLE_QUALS:
+                # Lossless to hard-break — let the stock 80-column wrapper run.
+                return super()._write_feature_qualifier(key, value, quote)
+            if (quote is None and key in self.FTQUAL_NO_QUOTE
+                    and any(c.isspace() for c in value)):
+                # `/codon_start`, `/transl_table` and friends are written
+                # UNQUOTED because their values are bare tokens. When one of
+                # them somehow holds whitespace (a hand-edited file, a `.dna`
+                # import, an agent write), the unquoted form wraps into a
+                # continuation line the reader rejoins with a newline — so the
+                # value came back different and the export's round-trip guard
+                # refused the whole file. Quoting it costs nothing for a
+                # well-formed value (there is no whitespace to trigger this)
+                # and makes a malformed one survive instead of blocking the
+                # export.
+                quote = True
             if " " in value:
                 # Breakable the normal way, but a single over-long token
                 # inside it can still trip the hard break — fall through to
@@ -445,6 +601,16 @@ def _unbreakable_genbank_writer(handle):
                     # there is none.
                     idx = line.find(" ", self.MAX_WIDTH)
                     if idx == -1:
+                        # Deliberate, documented spec deviation. Log it so an
+                        # over-wide line in an exported file is traceable to
+                        # the qualifier that forced it rather than looking
+                        # like corruption.
+                        _log.warning(
+                            "GenBank: /%s value has no break point in reach; "
+                            "emitting a %d-column line (breaking it would add "
+                            "a space the reader cannot tell from real data)",
+                            key, len(line),
+                        )
                         self.handle.write(line + "\n")
                         return
                 self.handle.write(line[:idx] + "\n")
@@ -543,6 +709,7 @@ def _gb_text_to_record(text: str, *, cache: bool = True):
                 return _clone_cached_record(hit)
     from Bio import SeqIO
     rec = SeqIO.read(StringIO(text), "genbank")
+    _backfill_topology(rec, text)
     # SC-E: restore the human display name stamped into the COMMENT so it
     # survives the round-trip (the LOCUS is the underscored/truncated form).
     # Done before caching so every caller — load-entry, add-current, diff —

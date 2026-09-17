@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading as _threading
 from copy import copy as _shallow_copy
 from datetime import date as _date
 from pathlib import Path
@@ -30,11 +31,14 @@ from splicecraft_biology import _rc
 from splicecraft_util import (
     _CONTROL_CHARS_RE, _DEFAULT_TYPE_COLORS, _feat_bounds, _is_windows_reserved_stem,
     _natural_sort_key, _pick_single_record, _record_is_circular, _safe_xml_parse,
-    _sanitize_label,
+    _sanitize_label, _to_ascii_text,
 )
 from splicecraft_record import (
-    _GB_LOCUS_NAME_MAX, _gb_text_to_record, _normalize_primer_seq, _record_to_gb_text,
-    _restore_display_name_from_comment,
+    _arrowless_decode_features, _arrowless_encode_features,
+    _backfill_topology, _gb_text_to_record, _locus_name_cap, _locus_name_for,
+    _normalize_primer_seq,
+    _record_to_gb_text, _repair_wrapped_primer_seqs, _restore_display_name_from_comment,
+    _split_multiline_qualifiers,
 )
 from splicecraft_history import _CommercialSaaSHistoryNode, _history_human_dt
 from splicecraft_net import _NCBI_TIMEOUT_S, _sanitize_accession
@@ -72,11 +76,139 @@ _FASTQ_EXTS: frozenset[str] = frozenset({".fastq", ".fq"})
 _FASTQ_MAX_READS = 1000
 
 
+# INSDC feature-table naming rules (Feature Table Definition, section 3):
+# a feature KEY is at most 15 characters and a qualifier NAME at most 20, both
+# drawn from letters / digits / underscore / hyphen (plus `'` and `*`, which
+# appear in keys like `3'UTR` and `-10_signal`). Biopython warns about
+# violations but writes them anyway, and a key longer than 15 characters
+# actually EATS the space before the location column (its 21-char template is
+# truncated, not extended) — which turns the feature line into something no
+# reader can split. So the export path enforces the limits itself.
+_FT_NAME_OK_RE = re.compile(r"[^A-Za-z0-9_'*-]")
+_FT_KEY_MAX = 15
+_FT_QUALIFIER_NAME_MAX = 20
+
+
+def _insdc_feature_key(raw: object) -> str:
+    """Coerce a feature type to a legal INSDC feature key."""
+    s = _FT_NAME_OK_RE.sub("_", str(raw or "").strip()) or "misc_feature"
+    return s[:_FT_KEY_MAX]
+
+
+def _insdc_qualifier_name(raw: object) -> str:
+    """Coerce a qualifier name to a legal INSDC qualifier name."""
+    s = _FT_NAME_OK_RE.sub("_", str(raw or "").strip()) or "note"
+    return s[:_FT_QUALIFIER_NAME_MAX]
+
+
+def _ascii_features_for_insdc(features) -> "tuple[list, int]":
+    """Return ``(features, n_changed)`` — a features list whose types,
+    qualifier names and qualifier values are all legal 7-bit-ASCII INSDC,
+    with strand ``None`` canonicalised to ``0``.
+
+    Copy-on-write: a feature is only replaced (shallow copy + fresh qualifiers
+    dict) when it actually needs changing, so the common all-ASCII case
+    allocates nothing and returns the SAME list object. The caller's record is
+    never mutated — `_normalize_for_genbank` hands the result to a shallow
+    record copy.
+
+    The strand canonicalisation is what stops `_export_genbank_to_path`'s
+    round-trip guard from refusing a perfectly exportable record: a feature
+    built as ``FeatureLocation(a, b)`` carries strand ``None``, the arrowless
+    encoding round-trips it back as strand ``0`` (SpliceCraft's canonical
+    "no arrow"), and the signature comparison then flagged a divergence that
+    was really just two spellings of the same thing.
+    """
+    from Bio.SeqFeature import CompoundLocation, FeatureLocation
+
+    feats = list(features or [])
+    out: list = []
+    changed = 0
+    for f in feats:
+        new_type = _insdc_feature_key(getattr(f, "type", ""))
+        if new_type != (getattr(f, "type", "") or ""):
+            _log.warning(
+                "GenBank export: feature key %r is not a legal INSDC key "
+                "(<=%d chars, letters/digits/_-'*) — written as %r",
+                getattr(f, "type", ""), _FT_KEY_MAX, new_type,
+            )
+        quals = getattr(f, "qualifiers", None) or {}
+        new_quals: dict = {}
+        quals_changed = False
+        for k, v in quals.items():
+            nk = _insdc_qualifier_name(k)
+            if nk != k:
+                quals_changed = True
+            vals = v if isinstance(v, (list, tuple)) else [v]
+            nvals = []
+            for one in vals:
+                if isinstance(one, (int, float)) and not isinstance(one, bool):
+                    nvals.append(one)
+                    continue
+                nv = _to_ascii_text(one)
+                if nk == "primer_seq":
+                    # The reader canonicalises every `/primer_seq` through
+                    # `_normalize_primer_seq` (whitespace-stripped, upper-
+                    # cased) because a space in an oligo is always an artefact.
+                    # Doing the same here keeps the export's round-trip guard
+                    # from reading that canonicalisation as corruption — a
+                    # lower-case primer_seq used to block the export outright.
+                    nv = _normalize_primer_seq(nv)
+                if nv != one:
+                    quals_changed = True
+                nvals.append(nv)
+            # A name collision after sanitisation (`a/b` and `a-b` both fold to
+            # `a_b`) merges values rather than dropping one of them.
+            if nk in new_quals:
+                new_quals[nk] = list(new_quals[nk]) + nvals
+            else:
+                new_quals[nk] = nvals
+        loc = getattr(f, "location", None)
+        new_loc = None
+        if loc is not None and getattr(loc, "strand", 1) in (0, None):
+            parts = list(getattr(loc, "parts", None) or [loc])
+            if all(getattr(p, "strand", None) in (0, None) for p in parts):
+                # `source` is the one feature `_arrowless_encode_features`
+                # refuses to tag (a whole-record source row is never
+                # "arrowless", it's just unstranded boilerplate), so it comes
+                # back from the reader as +1 no matter what we write. Match
+                # that here rather than let the export's own round-trip guard
+                # report a divergence the user cannot act on.
+                _strand = 1 if new_type == "source" else 0
+                if _strand != getattr(loc, "strand", None):
+                    try:
+                        rebuilt = [FeatureLocation(p.start, p.end,
+                                                   strand=_strand)
+                                   for p in parts]
+                    except (TypeError, ValueError):
+                        # A fuzzy / unknown endpoint that will not rebuild;
+                        # leave the location exactly as it is and let the
+                        # round-trip guard speak for it.
+                        rebuilt = []
+                    if rebuilt:
+                        new_loc = (rebuilt[0] if len(rebuilt) == 1
+                                   else CompoundLocation(rebuilt))
+        if new_type == (getattr(f, "type", "") or "") and not quals_changed \
+                and new_loc is None:
+            out.append(f)
+            continue
+        nf = _shallow_copy(f)
+        nf.type = new_type
+        nf.qualifiers = new_quals
+        if new_loc is not None:
+            nf.location = new_loc
+        out.append(nf)
+        changed += 1
+    return (out if changed else feats), changed
+
+
 def _normalize_for_genbank(record):
-    """Return a shallow copy of `record` with NCBI-required fields filled in.
+    """Return a shallow copy of `record` with NCBI-required fields filled in
+    and every text field folded to the 7-bit ASCII an INSDC flat file may
+    carry (see `_to_ascii_text`).
 
     Idempotent — existing values are preserved. Only fills gaps. Caller's
-    record is never mutated.
+    record is never mutated (features are rebuilt copy-on-write).
     """
     from datetime import datetime as _dt
 
@@ -108,30 +240,78 @@ def _normalize_for_genbank(record):
     if not anns.get("taxonomy"):
         anns["taxonomy"] = ["other sequences", "artificial sequences"]
 
+    # 7-bit ASCII: the free-text header fields go through the same fold as the
+    # qualifier values. `taxonomy` / `accessions` / `keywords` are lists.
+    for _k in ("organism", "source", "comment", "molecule_type",
+               "data_file_division", "date"):
+        if isinstance(anns.get(_k), str):
+            anns[_k] = _to_ascii_text(anns[_k])
+    for _k in ("taxonomy", "accessions", "keywords"):
+        _v = anns.get(_k)
+        if isinstance(_v, (list, tuple)):
+            anns[_k] = [_to_ascii_text(x) if isinstance(x, str) else x
+                        for x in _v]
     rec.annotations = anns
+    # ...and the display name, because `_record_to_gb_text` stamps it into the
+    # COMMENT AFTER this normalisation runs. Folding only `anns["comment"]`
+    # left that one route open: a plasmid called "pCAMBIA beta-lactamase 37°C"
+    # put its degree sign straight into the exported file. Set on the COPY, so
+    # the caller's record — and the library — keep the name as typed.
+    _disp_in = getattr(rec, "_tui_display_name", None)
+    if isinstance(_disp_in, str):
+        rec._tui_display_name = _to_ascii_text(_disp_in)
 
-    # LOCUS name: spec is 16 chars; NCBI accepts up to 28 in practice.
-    # Biopython itself warns if >16 but does not fail.
+    # `_split_multiline_qualifiers` runs HERE, not just inside
+    # `_record_to_gb_text`, because the exporter's round-trip guard compares
+    # this record against the re-parsed file. GenBank cannot hold a newline
+    # inside one qualifier value, so the writer splits such a value into one
+    # qualifier per line — and the guard, comparing the UNSPLIT original,
+    # called that a divergence and REFUSED the export. A feature note typed
+    # with a single Enter (the everyday multi-paragraph lab note) was enough
+    # to make "Export GenBank" fail with an opaque "did not survive the
+    # round-trip". Splitting before the comparison makes both sides agree.
+    rec.features, _n_feat_fixed = _ascii_features_for_insdc(
+        _split_multiline_qualifiers(getattr(record, "features", None)))
+    if _n_feat_fixed:
+        _log.info(
+            "GenBank/EMBL export: %d feature(s) adjusted for the INSDC "
+            "feature table (7-bit ASCII text, legal key/qualifier names)",
+            _n_feat_fixed,
+        )
+
+    # LOCUS name: the cap is DYNAMIC because the name shares a 28-column field
+    # with the sequence length — see `_locus_name_cap`. Overflowing it makes
+    # Biopython drop the fixed-column layout and emit an >80-column LOCUS line
+    # whose topology / division / date land in the wrong columns.
     # 2026-05-27 (audit-3 M2): surface a log warning + notify when
     # truncation actually happens so the user knows the LOCUS no
     # longer matches their display name.
-    if rec.name and len(rec.name) > _GB_LOCUS_NAME_MAX:
-        original_name = rec.name
-        rec.name = rec.name[:_GB_LOCUS_NAME_MAX]
-        _log.warning(
-            "GenBank export: LOCUS name truncated from %d to %d chars: "
-            "%r → %r",
-            len(original_name), _GB_LOCUS_NAME_MAX,
-            original_name, rec.name,
-        )
+    _cap = _locus_name_cap(len(rec.seq) if getattr(rec, "seq", None) else 0)
     if not rec.name or rec.name == "<unknown name>":
-        rec.name = (rec.id or "PLASMID")[:_GB_LOCUS_NAME_MAX] or "PLASMID"
+        rec.name = rec.id or "PLASMID"
+    rec.name = _to_ascii_text(rec.name)
+    original_name = rec.name
+    # One sanitiser for both halves of the LOCUS contract (charset + cap) —
+    # `_record_to_gb_text` applies the same one, so what we warn about here is
+    # exactly what lands in the file.
+    rec.name = _locus_name_for(rec, cap=_cap)
+    if rec.name != original_name:
+        _log.warning(
+            "GenBank export: LOCUS name rewritten for the INSDC LOCUS field "
+            "(<=%d chars, letters/digits/_.-): %r → %r. The display name is "
+            "preserved in the library entry and stamped into the COMMENT.",
+            _cap, original_name, rec.name,
+        )
 
     if not rec.description or rec.description == "<unknown description>":
         rec.description = rec.name
+    else:
+        rec.description = _to_ascii_text(rec.description)
 
     if not rec.id or rec.id == "<unknown id>":
         rec.id = rec.name
+    else:
+        rec.id = _to_ascii_text(rec.id)
 
     return rec
 
@@ -181,7 +361,15 @@ def _export_genbank_to_path(record, path) -> dict:
     # before touching disk so a flatten-on-write surfaces as a
     # round-trip failure rather than silent corruption.
     def _feature_signature(feat) -> "tuple":
-        loc_str = str(getattr(feat, "location", "") or "")
+        # `getattr(...) or ""` looked harmless and was not: truth-testing a
+        # location calls `len()`, which calls `int()` on both endpoints, which
+        # raises TypeError for an `UnknownPosition` — the `?..100` a real
+        # GenBank file uses for an incomplete feature. Exporting such a record
+        # died with a raw TypeError before the guard ever ran. (It also made a
+        # zero-length location compare as the empty string, so two features at
+        # different zero-length positions looked identical.)
+        _loc = getattr(feat, "location", None)
+        loc_str = "" if _loc is None else str(_loc)
         ftype   = getattr(feat, "type", "") or ""
         quals   = getattr(feat, "qualifiers", None) or {}
         # Qualifier values are typically list[str]; sort by key
@@ -243,14 +431,34 @@ def _export_genbank_to_path(record, path) -> dict:
                 detail = (f": {_handle(bad)} moved "
                           f"({bad[1]} → {mate[1]})")
             else:
-                detail = (f": {_handle(bad)} did not survive the round-trip "
-                          f"— its type or qualifiers changed")
+                # Name the qualifier that actually changed. "its type or
+                # qualifiers changed" told the user nothing they could act on,
+                # so the only way to find the culprit was to bisect the
+                # feature table by hand.
+                mate2 = next((d for d in dst_only if d[0] == bad[0]
+                              and d[1] == bad[1]), None)
+                what = ""
+                if mate2 is not None:
+                    src_q, dst_q = dict(bad[2]), dict(mate2[2])
+                    diff = sorted(
+                        set(src_q) ^ set(dst_q)
+                        or {k for k in src_q if src_q[k] != dst_q.get(k)})
+                    if diff:
+                        k0 = diff[0]
+                        what = (f" — /{k0} changed "
+                                f"({src_q.get(k0)!r} → {dst_q.get(k0)!r})")
+                    else:
+                        what = f" — its type changed ({bad[0]} → {mate2[0]})"
+                detail = (f": {_handle(bad)} did not survive the round-trip"
+                          + (what or " — its type or qualifiers changed"))
         raise ValueError(
             f"export round-trip feature signature mismatch — "
             f"{len(src_only)} of {len(src_sigs)} features diverged{detail}"
         )
 
-    _atomic_write_text(p, text)
+    # `newline="\n"`: a GenBank file is an interchange format, so its line
+    # endings must not depend on which machine wrote it.
+    _atomic_write_text(p, text, newline="\n")
 
     _log.info(
         "Exported GenBank to %s (%d bp, %d features)",
@@ -270,7 +478,16 @@ def _record_to_gff3(record) -> str:
     features (origin-spanning `CompoundLocation`) become two
     same-ID rows joined by a shared `ID=...` attribute, the standard
     GFF3 convention for split features. Circular records carry
-    `Is_circular=true` on a synthesised top-level region row.
+    `Is_circular=true` on a synthesised top-level region row, which also
+    carries the `source` feature's qualifiers (organism / mol_type /
+    db_xref) the way NCBI's own GFF3 writer does — otherwise they are simply
+    dropped, since the `source` feature itself is folded into that row.
+
+    Qualifiers with no GFF3 equivalent ride a SINGLE `Note=` attribute as
+    comma-separated `key%3Dvalue` entries. GFF3 requires attribute tags to be
+    unique per line — repeating `Note=` (which is what a feature with two
+    unmapped qualifiers used to produce, i.e. nearly every real CDS) is
+    invalid, and parsers respond by keeping one and discarding the rest.
     """
     from urllib.parse import quote as _q
 
@@ -293,6 +510,19 @@ def _record_to_gff3(record) -> str:
     region_attrs = [f"ID={safe_seqid}"]
     if is_circular:
         region_attrs.append("Is_circular=true")
+    # Carry the `source` feature's qualifiers onto the region row (NCBI's own
+    # GFF3 does exactly this). The source feature is skipped below, so without
+    # this the organism / mol_type / db_xref simply vanished on export.
+    _src = next((f for f in (record.features or [])
+                 if getattr(f, "type", "") == "source"), None)
+    if _src is not None:
+        for _k, _vl in (getattr(_src, "qualifiers", None) or {}).items():
+            if _k in ("label",):
+                continue
+            _vl = _vl if isinstance(_vl, (list, tuple)) else [_vl]
+            _joined = ",".join(_q(str(x), safe="") for x in _vl)
+            if _joined:
+                region_attrs.append(f"{_q(str(_k), safe='')}={_joined}")
     if n:
         out.append("\t".join((
             safe_seqid, "SpliceCraft", "region",
@@ -302,7 +532,11 @@ def _record_to_gff3(record) -> str:
 
     auto_id = 0
     for feat in record.features:
-        ftype = (feat.type or "misc_feature").strip() or "misc_feature"
+        # Column 3 is a bare token (an SO term or accession): whitespace in it
+        # is unparseable for a reader that splits on runs of whitespace, and a
+        # literal tab would invent a tenth column outright.
+        ftype = re.sub(r"\s+", "_",
+                       (feat.type or "misc_feature").strip()) or "misc_feature"
         if ftype == "source":
             # Source features map to the synthetic `region` row above;
             # emitting both would double-list the whole-record span.
@@ -339,18 +573,29 @@ def _record_to_gff3(record) -> str:
             quals = feat.qualifiers
         except AttributeError:
             quals = {}
+        note_entries: list[str] = []
         for k, vlist in (quals or {}).items():
             if k in ("label",):
                 continue
             if not isinstance(vlist, list):
                 vlist = [str(vlist)]
-            joined = ",".join(_q(str(v), safe="") for v in vlist)
             if k in ("gene", "product"):
-                attr_parts.append(f"{k}={joined}")
+                attr_parts.append(
+                    f"{k}=" + ",".join(_q(str(v), safe="") for v in vlist))
             else:
                 # GFF3 spec is strict — treat any unknown qualifier as
-                # a Note (free-text). Multiple Notes get comma-joined.
-                attr_parts.append(f"Note={_q(k + '=' + ','.join(str(v) for v in vlist), safe='')}")
+                # a Note (free-text). One entry per VALUE, each with its key
+                # and value escaped INDEPENDENTLY: that keeps a literal comma
+                # inside a value (escaped to `%2C`) distinguishable from the
+                # comma that separates two values, which the old
+                # "escape the whole blob" encoding could not do — a single
+                # note reading "alpha,beta" re-imported as two notes.
+                for v in vlist:
+                    note_entries.append(
+                        f"{_q(str(k), safe='')}%3D{_q(str(v), safe='')}")
+        if note_entries:
+            # ONE Note attribute — a repeated tag is invalid GFF3.
+            attr_parts.append("Note=" + ",".join(note_entries))
         # Phase: CDS features default to 0 unless the qualifier
         # supplies a codon_start (1-based 1/2/3 → 0/1/2 phase).
         phase = "."
@@ -379,18 +624,40 @@ def _record_to_gff3(record) -> str:
         except AttributeError:
             parts_seq = []
         try:
-            is_wrap_canonical = (
-                len(parts_seq) == 2
-                and int(parts_seq[0].start) == 0
-                and int(parts_seq[-1].end) == len(record.seq)
-                and int(parts_seq[0].end) < int(parts_seq[-1].start)
+            _ends = {int(p.start) for p in parts_seq} | {
+                int(p.end) for p in parts_seq}
+            is_wrap = (
+                # Only a CIRCLE can wrap. On a linear molecule the identical
+                # two-part shape is a SPLICED feature — `join(1..6,13..30)` on
+                # a 30 bp linear record is exon 1 then exon 2 — and emitting
+                # it tail-first would hand every reader the exons in the wrong
+                # order. Same guard `_feat_bounds(circular=False)` applies.
+                is_circular
+                and len(parts_seq) == 2
+                and 0 in _ends and len(record.seq) in _ends
+                and min(int(p.start) for p in parts_seq) == 0
+                and max(int(p.end) for p in parts_seq) == len(record.seq)
+                and max(int(p.start) for p in parts_seq)
+                    > min(int(p.end) for p in parts_seq)
             )
         except (AttributeError, TypeError, ValueError):
-            is_wrap_canonical = False
-        if is_wrap_canonical:
-            # Tail first for + strand (biological 5'→3'); head first for - strand.
-            parts = ([parts_seq[-1], parts_seq[0]] if strand_int != -1
-                     else [parts_seq[0], parts_seq[-1]])
+            is_wrap = False
+        if is_wrap:
+            # Order by ROLE, not by declared position. A wrap arrives either
+            # way round: a GenBank `join(2500..2686,1..100)` parses to
+            # [tail, head] (declared order), while a programmatically-built
+            # CompoundLocation is usually [head, tail]. Keying off
+            # `parts_seq[0]` alone handled only the second, so every wrap that
+            # came from a GenBank file exported head-first — and re-imported
+            # with its two arcs SWAPPED, which for a CDS means a different
+            # protein. Sort the two arcs explicitly, then emit tail-first for
+            # the + strand (biological 5'→3') and head-first for the -.
+            # Detection now matches `_feat_bounds`, the codebase's canonical
+            # wrap resolver, which sorts before testing — the two used to
+            # disagree about the very same feature.
+            _head = min(parts_seq, key=lambda p: int(p.start))
+            _tail = max(parts_seq, key=lambda p: int(p.start))
+            parts = ([_tail, _head] if strand_int != -1 else [_head, _tail])
         else:
             try:
                 parts_sorted = sorted(parts_seq, key=lambda p: int(p.start))
@@ -398,6 +665,16 @@ def _record_to_gff3(record) -> str:
                 parts_sorted = parts_seq
             parts = (parts_sorted if strand_int != -1
                      else list(reversed(parts_sorted)))
+        # Per-part CDS phase. GFF3 defines phase as "the number of bases to
+        # remove from the BEGINNING OF THIS FEATURE to reach the first base of
+        # the next codon" — so each row of a split CDS gets its own value,
+        # derived from how many bases the preceding rows already contributed.
+        # Emitting the same phase on every part told every downstream
+        # translator to start each exon in frame 0.
+        _is_cds = phase != "."
+        _phase0 = int(phase) if _is_cds else 0
+        _coding = 0        # complete-codon bases emitted by earlier rows
+        _first_row = True
         for part in parts:
             try:
                 p_s = int(part.start)
@@ -406,6 +683,11 @@ def _record_to_gff3(record) -> str:
                 continue
             if p_e <= p_s:
                 continue
+            if _is_cds:
+                _ph = _phase0 if _first_row else (3 - (_coding % 3)) % 3
+                phase = str(_ph)
+                _coding += max(0, (p_e - p_s) - _ph)
+                _first_row = False
             # Per-part strand: a mixed-strand `CompoundLocation` has
             # `feat.location.strand == None` (Biopython returns None when
             # parts disagree), so the feature-level `gff_strand`
@@ -560,14 +842,18 @@ def _parse_gff3_text(text: str) -> dict:
                     is_circular = True
                 continue
             if k == "Note":
-                # `Note=key=value` round-trip (mirrors `_record_to_gff3`'s
-                # encoding for unknown qualifiers).
+                # `Note=key%3Dvalue,key%3Dvalue` round-trip (mirrors
+                # `_record_to_gff3`'s encoding for unknown qualifiers). Each
+                # comma-separated entry is ONE value: the writer escapes a
+                # literal comma inside a value as `%2C`, so re-splitting the
+                # decoded text would turn a note reading "alpha,beta" into two
+                # separate notes. (Files written before that encoding landed —
+                # and any hand-written `Note=free text` — still read fine:
+                # an entry with no `=` becomes a plain note.)
                 for v_one in vals:
                     if "=" in v_one:
                         nk, _, nv = v_one.partition("=")
-                        quals.setdefault(nk, []).extend(
-                            nv.split(",") if nv else [""]
-                        )
+                        quals.setdefault(nk, []).append(nv)
                     else:
                         quals.setdefault("note", []).append(v_one)
                 continue
@@ -686,7 +972,7 @@ def _gff3_path_to_record(path: str):
     )
     if not ok:
         raise ValueError(reason or "GFF3 file rejected")
-    text = _P(path).read_text(encoding="utf-8", errors="replace")
+    text = _read_text_tolerant(_P(path))
     parsed = _parse_gff3_text(text)
     if parsed["fasta_seq"] is None:
         raise ValueError(
@@ -728,7 +1014,7 @@ def _gff3_apply_to_loaded_record(record, path: str) -> int:
     )
     if not ok:
         raise ValueError(reason or "GFF3 file rejected")
-    text = _P(path).read_text(encoding="utf-8", errors="replace")
+    text = _read_text_tolerant(_P(path))
     parsed = _parse_gff3_text(text)
     if parsed["fasta_seq"] is not None:
         raise ValueError(
@@ -762,7 +1048,7 @@ def _export_gff_to_path(record, path) -> dict:
 
     p = _Path(path).expanduser()
     text = _record_to_gff3(record)
-    _atomic_write_text(p, text)
+    _atomic_write_text(p, text, newline="\n")
     _log.info(
         "Exported GFF3 to %s (%d bp, %d features)",
         p, len(record.seq),
@@ -776,6 +1062,20 @@ def _export_gff_to_path(record, path) -> dict:
     }
 
 
+# FASTA sequence-line width. The format has no hard limit, but essentially
+# every producer wraps — NCBI at 70, Biopython's own `SeqIO` writer at 60 —
+# and readers with fixed line buffers (older BLAST tooling, a good deal of
+# Perl/C in the wild) choke on a single multi-megabase line. 60 matches what
+# `SeqIO.write(..., "fasta")` would have emitted for the same record.
+_FASTA_LINE_WIDTH = 60
+
+# FASTA header: everything up to the first whitespace is the record ID, so a
+# newline ENDS the header and the rest of the "name" becomes sequence. A name
+# carrying one used to be written verbatim, silently prepending the tail of
+# the name to the exported bases.
+_FASTA_HEADER_BAD_RE = re.compile(r"[\r\n\t\x00-\x1f\x7f]+")
+
+
 def _export_fasta_to_path(name: str, sequence: str, path) -> dict:
     """Write `sequence` to `path` as a single-record FASTA. Atomic write.
 
@@ -783,36 +1083,92 @@ def _export_fasta_to_path(name: str, sequence: str, path) -> dict:
       ValueError  — empty name or empty sequence.
       OSError     — filesystem failures (write, replace, fsync).
 
-    The sequence is written on a single line (no hard-wrap at 80 chars);
-    that matches what Biopython's default SeqIO writer emits for us
-    elsewhere and keeps downstream `grep`/`awk` one-liners simple.
+    The header is sanitised (control characters — including the newline that
+    would otherwise split the record — collapse to a single space, and a
+    leading ``>`` is dropped since the writer supplies its own) and the
+    sequence is wrapped at `_FASTA_LINE_WIDTH`.
     """
     from pathlib import Path as _Path
 
-    header = (name or "").strip()
-    seq = (sequence or "").strip().upper()
+    header = _FASTA_HEADER_BAD_RE.sub(" ", str(name or "")).strip()
+    while header.startswith(">"):
+        header = header[1:].lstrip()
+    # A sequence is bases only: strip every whitespace character rather than
+    # just the ends, so a pasted multi-line or space-separated sequence writes
+    # as clean FASTA instead of carrying the spaces into the file.
+    seq = re.sub(r"\s+", "", str(sequence or "")).upper()
     if not header:
         raise ValueError("FASTA export needs a non-empty record name.")
     if not seq:
         raise ValueError("FASTA export needs a non-empty sequence.")
 
+    body = "\n".join(seq[i:i + _FASTA_LINE_WIDTH]
+                     for i in range(0, len(seq), _FASTA_LINE_WIDTH))
     p = _Path(path).expanduser()
-    _atomic_write_text(p, f">{header}\n{seq}\n")
+    _atomic_write_text(p, f">{header}\n{body}\n", newline="\n")
 
     _log.info("Exported FASTA to %s (%s, %d bp)", p, header, len(seq))
     return {"path": str(p), "bp": len(seq), "name": header}
+
+
+def _embl_fix_id_line(text: str) -> str:
+    """Fill the two ID-line fields Biopython leaves empty.
+
+    The ENA flat-file spec fixes the ID line as::
+
+        ID   <accession>; SV <version>; <topology>; <moltype>; <data class>; <division>; <length> BP.
+
+    Biopython hard-codes the data-class field as empty, and leaves ``SV``
+    empty too unless ``record.id`` happens to carry a ``.N`` suffix — so a
+    SpliceCraft construct exports as ``ID   pFoo; ; circular; DNA; ; SYN;
+    600 BP.`` with two of the seven fields blank. Readers that split the ID
+    line positionally then take the topology for the version. ``SV 1`` and
+    the ``STD`` (standard entry) data class are the correct values for an
+    ordinary annotated record; both are filled only when Biopython actually
+    left the field blank.
+    """
+    lines = text.split("\n")
+    if not lines or not lines[0].startswith("ID   "):
+        return text
+    fields = lines[0][5:].split(";")
+    if len(fields) != 7:
+        return text
+    if not fields[1].strip():
+        fields[1] = " SV 1"
+    if not fields[4].strip():
+        fields[4] = " STD"
+    lines[0] = "ID   " + ";".join(fields)
+    # `KW   ` (empty) is what Biopython writes for a record with no keywords;
+    # the spec's "no keywords" form is `KW   .`.
+    for i, ln in enumerate(lines[:40]):
+        if ln.rstrip() == "KW":
+            lines[i] = "KW   ."
+        elif ln == "KW   ":
+            lines[i] = "KW   ."
+    return "\n".join(lines)
 
 
 def _export_embl_to_path(record, path) -> dict:
     """Write `record` to `path` as EMBL flatfile via BioPython's SeqIO.
 
     EMBL is the European Nucleotide Archive's flatfile format — same
-    feature-table model as GenBank, different text layout. Round-trip
-    via SeqIO is straightforward; the writer preserves features,
-    qualifiers, and circular topology. Atomic write.
+    feature-table model as GenBank, different text layout. Atomic +
+    round-trip verified, exactly like the GenBank exporter.
+
+    The feature list goes through the SAME two pre-serialisation passes the
+    GenBank writer uses, because the EMBL writer shares Biopython's INSDC
+    feature-table machinery and therefore shares its two traps:
+
+      * `_split_multiline_qualifiers` — a ``/note`` holding a newline made
+        Biopython emit the continuation flush against column 0, which its own
+        parser then REJECTS. EMBL export produced an unloadable file for any
+        feature with a multi-paragraph note.
+      * `_arrowless_encode_features` — a strand-0 / strand-None feature has no
+        GenBank or EMBL location syntax, so without the marker it silently
+        came back FORWARD.
 
     Returns ``{path, bp, features}`` on success. Raises:
-      ValueError — record has no sequence.
+      ValueError — record has no sequence, or the round-trip check fails.
       OSError    — filesystem failures (write, replace, fsync).
     """
     from pathlib import Path as _Path
@@ -833,12 +1189,36 @@ def _export_embl_to_path(record, path) -> dict:
     # from inside Biopython's EMBL writer. EMBL's required-fields
     # set is a superset of GenBank's so the same normaliser covers it.
     normalized = _normalize_for_genbank(record)
+    # EMBL's AC / ID accession may not carry a space or a semicolon; Biopython
+    # raises a bare ValueError deep inside the writer otherwise. The LOCUS-safe
+    # name is always a legal accession, so fall back to it.
+    _acc = str(getattr(normalized, "id", "") or "")
+    if (not _acc) or " " in _acc or ";" in _acc:
+        normalized = _shallow_copy(normalized)
+        normalized.id = str(getattr(normalized, "name", "") or "") or "PLASMID"
+    serialisable = _shallow_copy(normalized)
+    serialisable.features = _split_multiline_qualifiers(
+        _arrowless_encode_features(getattr(normalized, "features", None)))
     buf = StringIO()
-    SeqIO.write([normalized], buf, "embl")
-    text = buf.getvalue()
+    SeqIO.write([serialisable], buf, "embl")
+    text = _embl_fix_id_line(buf.getvalue())
+
+    # Round-trip verify BEFORE touching the filesystem, so a failed export
+    # never leaves a corrupt .embl behind (mirrors `_export_genbank_to_path`).
+    try:
+        parsed = SeqIO.read(StringIO(text), "embl")
+    except Exception as exc:
+        raise ValueError(f"EMBL export round-trip parse failed: {exc}") from exc
+    if str(parsed.seq).upper() != str(normalized.seq).upper():
+        raise ValueError("EMBL export round-trip sequence mismatch")
+    if len(parsed.features) != len(serialisable.features):
+        raise ValueError(
+            f"EMBL export round-trip feature count mismatch "
+            f"({len(parsed.features)} vs {len(serialisable.features)})"
+        )
 
     p = _Path(path).expanduser()
-    _atomic_write_text(p, text)
+    _atomic_write_text(p, text, newline="\n")
 
     n_feats = len([f for f in (record.features or [])
                    if f.type != "source"])
@@ -894,7 +1274,12 @@ def _parse_fasta_single(path: str) -> tuple[str, str]:
     if not ok:
         raise ValueError(reason or "FASTA file rejected by size check.")
     try:
-        records = list(SeqIO.parse(path, "fasta"))
+        # Read + decode ourselves so a UTF-8 BOM (which would otherwise make
+        # the first `>` unrecognisable and the file look record-less) and a
+        # CP1252 description line both load — same tolerance as `load_genbank`.
+        from io import StringIO as _SIO
+        records = list(SeqIO.parse(_SIO(_read_text_tolerant(Path(path))),
+                                   "fasta"))
     except (OSError, ValueError) as exc:
         raise ValueError(f"Failed to read FASTA: {exc}") from exc
     if not records:
@@ -2460,12 +2845,21 @@ def _extract_gbk_member(zip_path: Path, member_name: str) -> str:
             fobj.close()
         except OSError:
             pass
-    # GenBank is ASCII per the spec; fall back to latin-1 only if a
-    # stray high-bit byte slipped in (some sequencer pipelines do).
+    # GenBank is ASCII per the spec; fall back to cp1252 (a Latin-1 superset)
+    # only if a stray high-bit byte slipped in — some sequencer pipelines do.
+    # `utf-8-sig` also strips a byte-order mark, which would otherwise hide the
+    # `LOCUS` keyword and make the member look like it holds no record at all.
+    # Same tolerance the on-disk readers get from `_read_text_tolerant`.
     try:
-        return raw.decode("utf-8")
+        text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
-        return raw.decode("latin-1", errors="replace")
+        try:
+            text = raw.decode("cp1252")
+        except (UnicodeDecodeError, LookupError):
+            text = raw.decode("utf-8", errors="replace")
+    if "\r" in text:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text
 
 
 # ── Plasmidsaurus run-zip structured parser ───────────────────────────────────
@@ -3408,6 +3802,41 @@ _DNA_AUGMENT_MAX_BYTES = 100 * 1024 * 1024  # 100 MB
 _BIOPYTHON_DNA_FMT = bytes.fromhex("736e617067656e65").decode("ascii")
 
 
+# Guards the `warnings.catch_warnings` block in `load_genbank` — see there.
+_PARSE_WARNINGS_LOCK = _threading.Lock()
+
+
+def _read_text_tolerant(p: "Path") -> str:
+    """Read a flat-file sequence format as text, coping with what real files
+    in the wild actually carry.
+
+    * ``utf-8-sig`` strips a leading BOM. A BOM in front of ``LOCUS`` makes
+      Biopython's scanner see a line that doesn't start a record at all.
+    * A byte sequence that isn't valid UTF-8 falls back to ``cp1252`` (a
+      superset of Latin-1 for the printable range), which is what a Windows
+      tool writing a non-ASCII author name or organism produces. Anything
+      still undecodable is replaced rather than raised on — a single odd byte
+      in a REFERENCE block must not cost the user the whole plasmid.
+    """
+    raw = p.read_bytes()
+    text = None
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            text = raw.decode(enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if text is None:
+        text = raw.decode("utf-8", errors="replace")
+    # Universal-newline translation, which `open()` in text mode would have
+    # done for us: CRLF (Windows) and lone CR (classic Mac, and some very old
+    # sequence tools) both become LF. Without it a CR-only file reads as ONE
+    # enormous line and no parser gets anywhere.
+    if "\r" in text:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text
+
+
 def _detect_plasmid_format(path: str) -> str:
     """Pick a Biopython SeqIO format key from a file path's extension.
 
@@ -3481,6 +3910,7 @@ def load_genbank(path: str):
     character device.
     """
     import struct
+    from io import StringIO as _StringIO
     from Bio import SeqIO
     from pathlib import Path as _P
     ok, reason = _safe_file_size_check(
@@ -3489,8 +3919,38 @@ def load_genbank(path: str):
     if not ok:
         raise ValueError(reason or "Plasmid file is unsafe to load")
     fmt = _detect_plasmid_format(path)
+    gb_source_text = ""
+    # Biopython WARNS rather than raises for a feature table it could only
+    # half-read — an over-indented key, a tab where the spec wants spaces, a
+    # location it could not parse. Those warnings used to vanish into the
+    # default filter, so a file with a tab-indented feature table imported
+    # silently WITH A GARBAGE FEATURE in it. Capture and log them: the record
+    # still loads (refusing would be worse), but the log now says what the
+    # parser had to guess at.
+    import warnings as _warnings
     try:
-        records = list(SeqIO.parse(path, fmt))
+        # `catch_warnings` swaps PROCESS-GLOBAL filter state, so two threads
+        # inside it at once can restore each other's snapshot and leak an
+        # `always` filter (or one thread's record list) into the other. The
+        # loader runs on worker threads — bulk import, the agent API — so
+        # serialise the block. Contention is nil: those callers parse one
+        # file at a time anyway.
+        with _PARSE_WARNINGS_LOCK, \
+                _warnings.catch_warnings(record=True) as _parse_warnings:
+            _warnings.simplefilter("always")
+            if fmt == _BIOPYTHON_DNA_FMT:
+                records = list(SeqIO.parse(path, fmt))
+            else:
+                # Decode the TEXT formats ourselves instead of letting SeqIO
+                # open the file, so two things other tools routinely produce
+                # stop being hard failures: a UTF-8 BOM (every Windows editor
+                # that "saves as UTF-8" writes one, and it makes the first line
+                # no longer start with `LOCUS`, so the parser reports "no
+                # records found"), and a Latin-1 / CP1252 file (an accented
+                # author name in a REFERENCE block used to surface as a raw
+                # UnicodeDecodeError traceback).
+                gb_source_text = _read_text_tolerant(_P(path))
+                records = list(SeqIO.parse(_StringIO(gb_source_text), fmt))
     except (ValueError, struct.error) as exc:
         # CommercialSaaS parser raises ValueError on most malformed files, but
         # Biopython's binary unpacking can also leak struct.error when a
@@ -3505,7 +3965,24 @@ def load_genbank(path: str):
                 f"version of the editor."
             ) from exc
         raise
+    for _w in _parse_warnings or ():
+        _log.warning("Parser warning for %s: %s", path,
+                     str(_w.message).replace("\n", " ")[:300])
     rec = _pick_single_record(records, path)
+
+    # The three post-parse repairs `_gb_text_to_record` applies to a record
+    # loaded FROM THE LIBRARY. Opening the very same record as a FILE skipped
+    # all of them, so a `.gb` SpliceCraft itself wrote came back subtly
+    # different depending on which door it walked through: an arrowless
+    # feature reloaded pointing FORWARD (with the encoding marker still stuck
+    # to it as a stray qualifier), and a long `/primer_seq` kept the space
+    # Biopython's wrap-rejoin invented — the phantom-gap bug, on a
+    # catastrophic-class surface. All three are no-ops when their marker is
+    # absent, so they are safe on any third-party file too.
+    if gb_source_text:
+        _backfill_topology(rec, gb_source_text)
+    _arrowless_decode_features(rec)
+    _repair_wrapped_primer_seqs(rec)
 
     # CommercialSaaS (and occasionally minimally-annotated GenBank) records
     # leave id/name as Biopython sentinels. Fall back to the filename

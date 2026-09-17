@@ -1172,16 +1172,32 @@ class TestLibraryRename:
             # gb_text now parses without raising; LOCUS carries the
             # sanitised form, NOT the old (pre-rename) LOCUS name.
             reloaded = sc._gb_text_to_record(match[0]["gb_text"])
-            assert reloaded.name == "DEMO_33_MOD_CDS_REPORTERR", (
+            # The LOCUS carries the sanitised + capped form. The cap is
+            # DYNAMIC — the name and the sequence length share one 28-column
+            # field — so compute it rather than hard-coding a width that only
+            # holds for one sequence size.
+            expected_locus = sc._locus_name_for(
+                type("R", (), {"name": new_name, "id": "", "seq": ""})(),
+                cap=sc._locus_name_cap(len(tiny_record.seq)),
+            )
+            assert reloaded.name == expected_locus, (
                 f"expected sanitised LOCUS name on rec; got {reloaded.name!r}"
             )
+            # ...and the FULL display name survives regardless, via the
+            # COMMENT marker, so nothing the user typed is lost to the LOCUS
+            # field's limits. [INV-98]
+            assert reloaded._tui_display_name == new_name
             # Belt-and-braces: the LOCUS line in raw text should also
             # carry the sanitised form (pre-fix it would be the OLD
             # LOCUS name from before the failed re-serialize).
             locus_line = match[0]["gb_text"].split("\n", 1)[0]
-            assert "DEMO_33_MOD_CDS_REPORTERR" in locus_line, (
+            assert expected_locus in locus_line, (
                 f"LOCUS line stale after rename: {locus_line!r}"
             )
+            assert "DEMO_33_MOD" in locus_line          # not the pre-rename one
+            # And the marker tracks the rename rather than pinning the name
+            # the entry was FIRST saved under.
+            assert f"SpliceCraft-name: {new_name}" in match[0]["gb_text"]
 
 
 class TestSaveKeepsLibraryNameAndFocus:

@@ -414,10 +414,10 @@ What you can do without leaving the terminal.
 
 | Format | Extensions | Import | Export | Preserves |
 |---|---|---|---|---|
-| GenBank | `.gb` / `.gbk` / `.genbank` | yes | yes | features, qualifiers, wrap topology |
-| EMBL | `.embl` | yes | yes | features, qualifiers, wrap topology |
+| GenBank | `.gb` / `.gbk` / `.genbank` | yes | yes | features, qualifiers, wrap topology, arrowless strand, display name (COMMENT marker) |
+| EMBL | `.embl` | yes | yes | features, qualifiers, wrap topology, arrowless strand |
 | CommercialSaaS `.dna` | `.dna` | yes | yes | features + colours + primers + construction history (round-trip) |
-| FASTA | `.fa` / `.fasta` / `.fna` / `.ffn` / `.frn` / `.fas` / `.mpfa` / `.faa` | yes | yes (sequence only) | sequence only |
+| FASTA | `.fa` / `.fasta` / `.fna` / `.ffn` / `.frn` / `.fas` / `.mpfa` / `.faa` | yes | yes (sequence only, wrapped at 60 columns) | sequence only |
 | Sanger trace | `.ab1` / `.abi` | yes | — | base-called sequence + Phred quality |
 | FASTQ multi-read | `.fastq` / `.fq` | yes (≤ 1000 reads per file) | — | one library entry per read |
 | GFF3 | `.gff` / `.gff3` | yes (standalone via `##FASTA`; or apply features to loaded canvas via `apply-gff3`) | yes | wrap features as same-`ID=` split rows; `Is_circular=true` on region row |
@@ -429,6 +429,29 @@ file writes route through `_atomic_write_text` / `_atomic_write_bytes`
 (tempfile + fsync + replace + symlink refusal). Bulk-import and
 single-file Open share one dispatch table so the agent CLI, GUI Open,
 and folder-import all accept the same set.
+
+**Conformance.** Every text format SpliceCraft writes is checked against
+its published specification — the NCBI GenBank flat-file layout and the
+INSDC Feature Table definition, the ENA EMBL ID line, GFF3 1.26, RFC 4180
+for CSV — by validators written from those specs rather than from the
+serialiser (`tests/test_format_conformance.py`). In practice that means:
+every line fits 80 columns and is 7-bit ASCII (non-ASCII text is
+transliterated on the way out, while the library keeps exactly what you
+typed); the LOCUS line keeps its classic column positions whatever your
+plasmid is called; CDS translations wrap the way NCBI wraps them; GFF3
+attribute tags are unique per line and an origin-spanning feature keeps
+its arcs in 5'→3' order; FASTA wraps at 60 columns; and files are written
+with LF line endings on every platform so a `.gb` from a Windows machine
+is byte-identical to one from a Mac. Names that the GenBank LOCUS field
+cannot hold (spaces, punctuation, anything long) are preserved in a
+`SpliceCraft-name:` COMMENT marker, so an exported plasmid re-imports
+under the name you gave it.
+
+On the way in, GenBank / EMBL / FASTA / GFF3 files are read tolerantly: a
+UTF-8 byte-order mark (what Windows editors add when they "save as
+UTF-8"), a CP1252-encoded author name, and CRLF or CR-only line endings
+all load rather than failing. Anything the parser had to guess at is
+written to the log.
 
 ## Experiments lab notebook
 

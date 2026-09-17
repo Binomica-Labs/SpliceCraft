@@ -42,13 +42,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.63"
+__version__ = "1.2.64"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-09-16"
+_RELEASE_DATE = "2026-09-17"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -1401,6 +1401,8 @@ from splicecraft_persistence import (  # noqa: E402
 
 # ── Notifier + formatters moved to splicecraft_util (Phase D) ───────────────
 from splicecraft_util import (  # noqa: E402
+    _to_ascii_text as _to_ascii_text,
+    _ASCII_SUBSTITUTIONS as _ASCII_SUBSTITUTIONS,
     _notify_save_failure as _notify_save_failure,
     _format_identity_pct as _format_identity_pct,
     _sanitize_plasmid_name as _sanitize_plasmid_name,
@@ -5519,6 +5521,11 @@ from splicecraft_fileio import (  # noqa: E402
     _FASTQ_EXTS as _FASTQ_EXTS,
     _FASTQ_MAX_READS as _FASTQ_MAX_READS,
     _normalize_for_genbank as _normalize_for_genbank,
+    _read_text_tolerant as _read_text_tolerant,
+    _insdc_feature_key as _insdc_feature_key,
+    _insdc_qualifier_name as _insdc_qualifier_name,
+    _embl_fix_id_line as _embl_fix_id_line,
+    _FASTA_LINE_WIDTH as _FASTA_LINE_WIDTH,
     _export_genbank_to_path as _export_genbank_to_path,
     _record_to_gff3 as _record_to_gff3,
     _parse_gff3_text as _parse_gff3_text,
@@ -9846,6 +9853,12 @@ from splicecraft_record import (  # noqa: E402
     _GB_PARSE_CACHE_MAX as _GB_PARSE_CACHE_MAX,
     _GB_PARSE_CACHE_LOCK as _GB_PARSE_CACHE_LOCK,
     _GB_LOCUS_NAME_MAX as _GB_LOCUS_NAME_MAX,
+    _GB_LOCUS_NAME_FIELD as _GB_LOCUS_NAME_FIELD,
+    _locus_name_cap as _locus_name_cap,
+    _locus_name_for as _locus_name_for,
+    _HARD_BREAKABLE_QUALS as _HARD_BREAKABLE_QUALS,
+    _NO_SPACE_REJOIN_QUALS as _NO_SPACE_REJOIN_QUALS,
+    _backfill_topology as _backfill_topology,
     _normalize_primer_seq as _normalize_primer_seq,
     _arrowless_encode_features as _arrowless_encode_features,
     _arrowless_decode_features as _arrowless_decode_features,
@@ -13665,7 +13678,9 @@ def _library_entry_alignment_summary(entry: dict) -> "dict | None":
 # record is never mutated (shallow copy with fresh annotations dict).
 #
 # Defaults chosen for a synthetic plasmid of unknown provenance:
-#   topology        = circular   (SpliceCraft only works on plasmids)
+#   topology        = linear     (2026-05-27 audit-3 H1 — a record with no
+#                                 explicit topology must NOT be silently
+#                                 re-labelled circular on its first save)
 #   molecule_type   = DNA
 #   data_file_division = SYN     (synthetic; matches what NCBI assigns to
 #                                 user-submitted plasmids)
@@ -13749,7 +13764,11 @@ def _export_primers_to_csv(primers: "list[dict]", path, *,
                 seq, len(seq), tm_str,
             ])
     p_out = _Path(path).expanduser()
-    _atomic_write_text(p_out, buf.getvalue())
+    # `newline=""`: `csv.writer` already terminates each row with the RFC 4180
+    # CRLF. Letting Python's text layer also translate that LF turned every
+    # row ending into `\r\r\n` on Windows, which spreadsheet importers read
+    # as an extra blank row between every primer.
+    _atomic_write_text(p_out, buf.getvalue(), newline="")
     _log.info("Exported %d primer(s) to CSV %s", len(rows), p_out)
     return {"path": str(p_out), "count": len(rows)}
 
@@ -13972,6 +13991,28 @@ def _safe_export_filename(name: str, ext: str) -> str:
     return f"{safe}.{ext}"
 
 
+def _gb_text_is_spec_clean(gb_text: str) -> bool:
+    """Cheap screen for stored GenBank text that can be copied to a `.gb`
+    file verbatim.
+
+    The library persists every plasmid as GenBank text, so a bulk export can
+    normally skip the parse+re-emit round trip and just write the stored
+    string. That shortcut is only safe while the stored string is itself
+    conformant — and text written by an older release may not be:
+    `/translation` values were emitted on one unbroken line (7,132 characters
+    for SARS-CoV-2 ORF1ab), and a `.dna` import could carry a non-ASCII note
+    straight through. Both are cheap to detect and neither can be fixed by
+    copying the bytes, so anything that trips this falls back to the full
+    `_export_genbank_to_path` path. Entries stay untouched on disk; the next
+    ordinary save rewrites them through the fixed writer.
+    """
+    if not isinstance(gb_text, str) or not gb_text:
+        return False
+    if not gb_text.isascii():
+        return False
+    return not any(len(line) > 80 for line in gb_text.splitlines())
+
+
 def _bulk_export_collection(collection_name: str,
                               fmt: str,
                               target_dir: "Path | str",
@@ -14058,7 +14099,18 @@ def _bulk_export_collection(collection_name: str,
                 gb_text = entry.get("gb_text") or ""
                 if not gb_text:
                     raise ValueError("entry has no gb_text payload")
-                _atomic_write_text(out_path, gb_text)
+                if _gb_text_is_spec_clean(gb_text):
+                    _atomic_write_text(out_path, gb_text, newline="\n")
+                else:
+                    # Stored text written by an older release (over-wide
+                    # `/translation` lines, non-ASCII notes from a `.dna`
+                    # import). Pay the re-serialise so the FILE we hand another
+                    # tool is conformant; the library entry itself is left
+                    # alone and gets fixed on its next save.
+                    _export_genbank_to_path(
+                        _gb_text_to_record(gb_text, cache=False),
+                        str(out_path),
+                    )
                 bp = entry.get("size", 0) or 0
             else:
                 gb_text = entry.get("gb_text") or ""
@@ -14071,8 +14123,11 @@ def _bulk_export_collection(collection_name: str,
                     summary = _export_embl_to_path(rec, str(out_path))
                     bp = summary.get("bp", 0)
                 elif fmt == "fasta":
+                    # The library DISPLAY name, not the underscored LOCUS
+                    # slug — same rule the png/svg branch below follows and
+                    # the one the GenBank LOCUS can't hold. [INV-98]
                     summary = _export_fasta_to_path(
-                        rec.name or rec.id or "plasmid",
+                        ent_name or rec.name or rec.id or "plasmid",
                         str(rec.seq),
                         str(out_path),
                     )
@@ -26815,8 +26870,13 @@ class OpenFileModal(ModalScreen):
                         or f"FASTA exceeds {_FASTA_MAX_BYTES:,} bytes."
                     )
                 from Bio import SeqIO
+                from io import StringIO as _SIO
                 try:
-                    parsed = list(SeqIO.parse(path, "fasta"))
+                    # `_read_text_tolerant`: a UTF-8 BOM (every Windows
+                    # "save as UTF-8") otherwise hides the first `>` and the
+                    # file reads as record-less.
+                    parsed = list(SeqIO.parse(
+                        _SIO(_read_text_tolerant(_Path(path))), "fasta"))
                 except (OSError, ValueError) as exc:
                     raise ValueError(
                         f"Failed to read FASTA: {exc}"
@@ -26873,7 +26933,9 @@ class OpenFileModal(ModalScreen):
                 if not ok:
                     raise ValueError(reason or "Plasmid file is unsafe to load")
                 try:
-                    gb_records = list(_SeqIO.parse(path, "genbank"))
+                    from io import StringIO as _SIO
+                    gb_records = list(_SeqIO.parse(
+                        _SIO(_read_text_tolerant(_Path(path))), "genbank"))
                 except (OSError, ValueError) as exc:
                     raise ValueError(
                         f"Could not parse GenBank file {path}: {exc}"
@@ -57986,14 +58048,19 @@ def _parse_protein_fasta_single(path: str) -> tuple[str, str]:
     suffix = (Path(path).suffix or "").lower()
     fmt = _PROTEIN_SEQ_FORMAT_BY_EXT.get(suffix, "fasta")
     records: list = []
+    from io import StringIO as _SIO
     try:
-        records = list(SeqIO.parse(path, fmt))
+        _txt = _read_text_tolerant(Path(path))
+    except OSError as exc:
+        raise ValueError(f"Could not read sequence file: {exc}") from exc
+    try:
+        records = list(SeqIO.parse(_SIO(_txt), fmt))
     except (OSError, ValueError):
         records = []
     # A .pep / .seq / non-FASTA file is often really FASTA — retry once.
     if not records and fmt != "fasta":
         try:
-            records = list(SeqIO.parse(path, "fasta"))
+            records = list(SeqIO.parse(_SIO(_txt), "fasta"))
         except (OSError, ValueError):
             records = []
     if records:
@@ -111165,8 +111232,12 @@ NcbiTaxonPickerModal { align: center middle; }
         if self._current_record is None:
             self.notify("No plasmid loaded.", severity="warning")
             return
-        name = self._current_record.name or self._current_record.id or "plasmid"
-        default = f"{name}.fa"
+        # The typed/display name, not the LOCUS slug — a FASTA header has no
+        # 16-character limit and no underscore rule to obey. [INV-98]
+        name = (self._record_display_name(self._current_record)
+                or self._current_record.name
+                or self._current_record.id or "plasmid")
+        default = f"{_safe_export_filename(name, 'fa')}"
 
         def _on_done(summary):
             if not summary:
@@ -116140,6 +116211,12 @@ NcbiTaxonPickerModal { align: center middle; }
                     rec.name = safe_locus or new_id[:_GB_LOCUS_NAME_MAX] \
                         or "PLASMID"
                     rec.id   = new_id   # track display name (post-2026-05-24)
+                    # Carry the TYPED name into the serialisation so the
+                    # `SpliceCraft-name:` COMMENT marker tracks the rename.
+                    # Without this the entry kept the marker it was first
+                    # saved with, and exporting a renamed plasmid handed out
+                    # a file that still claimed the old name. [INV-98]
+                    rec._tui_display_name = new_name
                     e["gb_text"] = _record_to_gb_text(rec)
                 except Exception:
                     _log.exception(

@@ -1576,3 +1576,115 @@ def _citation_text(version: str, released: str) -> str:
             "the\nrepository URL above."
         )
     return "\n".join(out)
+
+
+# ── INSDC 7-bit ASCII transliteration (GenBank / EMBL file export) ───────────
+#
+# GenBank and EMBL flat files are 7-bit ASCII: the INSDC Feature Table
+# definition fixes the legal character set for free text, and NCBI's own
+# submission tooling rejects anything outside it. SpliceCraft's *storage*
+# (JSON + the `gb_text` blob) is UTF-8 and must stay that way — a note the
+# user typed as "grow at 37 °C" should read back exactly like that in the
+# app. But the moment that record becomes a `.gb` / `.embl` FILE for another
+# tool, every non-ASCII byte is a liability: a reader that opens the file as
+# ASCII or Latin-1 either throws or silently mangles the text, and a
+# fixed-column reader miscounts the 80-character line (UTF-8 spends 2-4 bytes
+# on one character).
+#
+# Real, not hypothetical: the `.dna` files in `tests/` carry a `®` in a
+# feature note, straight from the commercial editor that wrote them.
+#
+# So the export path transliterates. `_ASCII_SUBSTITUTIONS` covers the symbols
+# that actually show up in molecular-biology annotation (µ, °, ±, Greek letters
+# used for gene/protein names, the typographic dashes and quotes every word
+# processor inserts); everything else goes through NFKD decomposition (which
+# turns "é" into "e" + a combining accent, then drops the accent) and, failing
+# that, becomes "?" so the loss is VISIBLE rather than silent.
+_ASCII_SUBSTITUTIONS: dict = {
+    "µ": "u", "μ": "u",           # micro sign / Greek mu
+    "°": " deg ", "±": "+/-",
+    "×": "x", "÷": "/",
+    "–": "-", "—": "-", "−": "-",   # en/em dash, minus
+    "‘": "'", "’": "'", "‚": "'",
+    "“": '"', "”": '"', "„": '"',
+    "…": "...", "•": "*", "·": ".",
+    "®": "(R)", "©": "(C)", "™": "(TM)",
+    "½": "1/2", "¼": "1/4", "¾": "3/4",
+    "′": "'", "″": '"',           # prime / double prime (5', 3')
+    " ": " ", " ": " ", " ": " ", "​": "",
+    "→": "->", "←": "<-", "⇒": "=>",
+    "≤": "<=", "≥": ">=", "≠": "!=", "≈": "~",
+    "Α": "Alpha", "α": "alpha", "Β": "Beta", "β": "beta",
+    "Γ": "Gamma", "γ": "gamma", "Δ": "Delta", "δ": "delta",
+    "Ε": "Epsilon", "ε": "epsilon", "Ζ": "Zeta", "ζ": "zeta",
+    "Η": "Eta", "η": "eta", "Θ": "Theta", "θ": "theta",
+    "Ι": "Iota", "ι": "iota", "Κ": "Kappa", "κ": "kappa",
+    "Λ": "Lambda", "λ": "lambda", "Μ": "Mu",
+    "Ν": "Nu", "ν": "nu", "Ξ": "Xi", "ξ": "xi",
+    "Π": "Pi", "π": "pi", "Ρ": "Rho", "ρ": "rho",
+    "Σ": "Sigma", "σ": "sigma", "ς": "sigma",
+    "Τ": "Tau", "τ": "tau", "Φ": "Phi", "φ": "phi",
+    "Χ": "Chi", "χ": "chi", "Ψ": "Psi", "ψ": "psi",
+    "Ω": "Omega", "ω": "omega",
+}
+
+
+def _to_ascii_text(s: object) -> str:
+    """Transliterate *s* to the 7-bit ASCII an INSDC flat file may carry.
+
+    Also folds TAB / CR / other C0 control characters to a space — a literal
+    tab inside a GenBank qualifier value is off-spec and breaks any reader
+    that counts columns.
+
+    Idempotent, and a no-op (returns the input unchanged) for text that is
+    already plain ASCII, which is the overwhelmingly common case. Non-string
+    input is coerced with ``str()`` so a caller mapping over mixed qualifier
+    values never has to pre-check.
+    """
+    if not isinstance(s, str):
+        s = "" if s is None else str(s)
+    if s.isascii() and not any(c < " " or c == "\x7f" for c in s):
+        return s
+    import unicodedata as _ud
+    out: list = []
+    # A few substitutions pad themselves with spaces so they read as words
+    # ("°" -> " deg "). When the text already had a space on that side, the
+    # padding would double it — "37 °C" becoming "37  deg C". Collapse only
+    # the space the substitution itself introduced; spacing the user typed
+    # elsewhere is left exactly as it is.
+    pad_pending = False
+
+    def _emit(chunk: str) -> None:
+        nonlocal pad_pending
+        if pad_pending and chunk.startswith(" "):
+            chunk = chunk.lstrip(" ")
+        elif chunk.startswith(" ") and out and out[-1].endswith(" "):
+            chunk = chunk.lstrip(" ")
+        if chunk:
+            out.append(chunk)
+            pad_pending = chunk.endswith(" ")
+
+    for ch in s:
+        if ch == "\n":
+            # Preserved: `_split_multiline_qualifiers` turns a newline into
+            # separate qualifier entries BEFORE serialisation, so a newline
+            # surviving to here means the caller wants it kept (e.g. the
+            # COMMENT block, which the writer re-wraps itself).
+            out.append(ch)
+            pad_pending = False
+            continue
+        if ch < " " or ch == "\x7f":
+            _emit(" ")
+            continue
+        if ch.isascii():
+            _emit(ch)
+            continue
+        sub = _ASCII_SUBSTITUTIONS.get(ch)
+        if sub is not None:
+            _emit(sub)
+            continue
+        folded = _ud.normalize("NFKD", ch)
+        folded = "".join(c for c in folded if not _ud.combining(c))
+        folded = folded.encode("ascii", "ignore").decode("ascii")
+        _emit(folded if folded else "?")
+    return "".join(out)

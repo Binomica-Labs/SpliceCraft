@@ -895,10 +895,37 @@ class TestNormalizeForGenbank:
         assert id(tiny_record.annotations) == before_id
 
     def test_truncates_long_locus_name(self, tiny_record):
-        """NCBI accepts LOCUS names up to 28 chars; longer must be truncated."""
+        """The LOCUS name cap is DYNAMIC: the name and the sequence length
+        share one 28-column field, so the longest name that still fits the
+        standard layout depends on how many digits the length needs. Cap it at
+        a flat 28 and Biopython abandons the fixed columns entirely, emitting
+        an >80-column LOCUS line whose topology / division / date land in the
+        wrong place."""
         tiny_record.name = "A" * 50
         normalized = sc._normalize_for_genbank(tiny_record)
-        assert len(normalized.name) == 28
+        cap = sc._locus_name_cap(len(tiny_record.seq))
+        assert len(normalized.name) == cap
+        assert cap <= 28
+        assert cap + len(str(len(tiny_record.seq))) <= 27
+
+    @pytest.mark.parametrize("bp", [10, 999, 2686, 50_000, 5_000_000])
+    @pytest.mark.parametrize("name_len", [4, 16, 17, 23, 24, 28, 60])
+    def test_locus_line_stays_column_conformant(self, bp, name_len):
+        """Whatever the name length and sequence size, the emitted LOCUS line
+        keeps the classic layout: <= 80 columns, `bp` at columns 42-43 and the
+        topology token at columns 56-63. A reader that slices those columns
+        (and plenty still do) must not get garbage."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ATGC" * (bp // 4 + 1))[:bp],
+                        id="X", name="P" * name_len, description="d")
+        rec.annotations.update(molecule_type="DNA", topology="circular",
+                               data_file_division="SYN")
+        line = sc._record_to_gb_text(rec).split("\n")[0]
+        assert len(line) <= 80, line
+        assert line[41:43] == "bp", line
+        assert line[55:63].strip() == "circular", line
+        assert line[64:67] == "SYN", line
 
     def test_fills_accessions_from_id(self, tiny_record):
         tiny_record.annotations.pop("accessions", None)
@@ -1018,59 +1045,108 @@ class TestExportGenBankToPath:
 
 class TestExportRoundTripDiagnostics:
     """The round-trip guard blocks a lossy export — but it has to say WHAT
-    to fix. It used to print raw signature tuples, which in the common case
-    (a `strand=None` feature) differ only by a `(?)` buried inside two
-    near-identical tuples."""
+    to fix. It used to print raw signature tuples, which is unreadable.
+
+    The divergence used here is an `UnknownPosition` endpoint (GenBank's
+    ``?..100``, which real records carry for a feature whose boundary is not
+    known). Biopython's writer maps it to ``<100``, which is a DIFFERENT
+    claim — "extends before here" rather than "not known" — so the guard is
+    right to refuse, and this is the one divergence that survives every
+    normalisation the export path applies."""
 
     @staticmethod
-    def _rec(strands):
+    def _rec(kinds):
+        """`kinds`: 1 / -1 for a plain stranded feature, "?" for one whose
+        start is an UnknownPosition."""
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
-        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.SeqFeature import (SeqFeature, FeatureLocation,
+                                    UnknownPosition)
         rec = SeqRecord(Seq("ATGC" * 80), id="DIAG", name="DIAG",
                         description="round-trip diagnostics")
         rec.annotations["molecule_type"] = "DNA"
         rec.annotations["topology"] = "circular"
-        rec.features = [
-            SeqFeature(FeatureLocation(10 + 20 * i, 30 + 20 * i, strand=s),
-                       type="CDS", qualifiers={"label": [f"feat{i}"]})
-            for i, s in enumerate(strands)
-        ]
+        feats = []
+        for i, k in enumerate(kinds):
+            start = UnknownPosition() if k == "?" else 10 + 20 * i
+            feats.append(SeqFeature(
+                FeatureLocation(start, 30 + 20 * i,
+                                strand=1 if k == "?" else k),
+                type="CDS", qualifiers={"label": [f"feat{i}"]}))
+        rec.features = feats
         return rec
 
-    def test_strandless_feature_is_named_with_the_fix(self, tmp_path):
-        rec = self._rec([None])
+    def test_diverged_feature_is_named(self, tmp_path):
         with pytest.raises(ValueError) as exc:
-            sc._export_genbank_to_path(rec, tmp_path / "out.gb")
+            sc._export_genbank_to_path(self._rec(["?"]), tmp_path / "out.gb")
         msg = str(exc.value)
-        assert "has no strand" in msg
         assert "'feat0'" in msg            # names the offending feature
-        assert "strand=1" in msg           # and how to fix it
-        assert "strand=-1" in msg
+        assert "moved" in msg              # and what happened to it
+        assert "UnknownPosition" in msg    # showing both spellings
 
-    def test_strandless_failure_leaves_no_file(self, tmp_path):
+    def test_divergence_leaves_no_file(self, tmp_path):
         """The round-trip runs BEFORE the target is touched."""
         out = tmp_path / "out.gb"
         with pytest.raises(ValueError):
-            sc._export_genbank_to_path(self._rec([None]), out)
+            sc._export_genbank_to_path(self._rec(["?"]), out)
         assert not out.exists()
 
     def test_one_bad_feature_reports_one_divergence(self, tmp_path):
         """Multiset diff, not a zip of two sorted lists: a single changed
         signature re-sorts, and the old zip then flagged every feature
         after it too — burying the one that actually moved."""
-        rec = self._rec([1, 1, None, -1, 1])
+        rec = self._rec([1, 1, "?", -1, 1])
         with pytest.raises(ValueError) as exc:
             sc._export_genbank_to_path(rec, tmp_path / "out.gb")
         msg = str(exc.value)
         assert "1 of 5 features diverged" in msg
-        assert "'feat2'" in msg            # the strandless one, not a neighbour
+        assert "'feat2'" in msg            # the bad one, not a neighbour
 
     def test_fully_stranded_record_exports_clean(self, tmp_path):
         """The guard must not fire on ordinary records."""
         out = tmp_path / "ok.gb"
         summary = sc._export_genbank_to_path(self._rec([1, -1, 1]), out)
         assert out.exists() and summary["features"] == 3
+
+    def test_strandless_feature_exports_as_arrowless(self, tmp_path):
+        """A `strand=None` feature is NOT a divergence. It is how every
+        `FeatureLocation(a, b)` built without an explicit strand arrives, the
+        arrowless encoding round-trips it faithfully as strand 0, and the
+        guard used to refuse the whole export over the two spellings of the
+        same thing — telling the user to go and set a strand by hand."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("ATGC" * 80), id="DIAG", name="DIAG", description="d")
+        rec.annotations.update(molecule_type="DNA", topology="circular")
+        rec.features = [SeqFeature(FeatureLocation(10, 100),
+                                   type="misc_feature",
+                                   qualifiers={"label": ["strandless"]})]
+        out = tmp_path / "arrowless.gb"
+        sc._export_genbank_to_path(rec, out)
+        back = sc.load_genbank(str(out))
+        assert back.features[0].location.strand == 0
+        assert "SpliceCraft_strand" not in back.features[0].qualifiers
+
+    def test_multiline_note_exports(self, tmp_path):
+        """A feature note typed with an Enter in it. GenBank cannot hold a
+        newline inside one qualifier value, so the writer splits it into one
+        qualifier per line — and the guard, comparing the UNSPLIT original,
+        used to call that a divergence and refuse the export outright."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("ATGC" * 80), id="DIAG", name="DIAG", description="d")
+        rec.annotations.update(molecule_type="DNA", topology="circular")
+        rec.features = [SeqFeature(
+            FeatureLocation(10, 100, strand=1), type="misc_feature",
+            qualifiers={"label": ["x"],
+                        "note": ["Grew overnight at 37C.\nColonies white."]})]
+        out = tmp_path / "note.gb"
+        sc._export_genbank_to_path(rec, out)
+        back = sc.load_genbank(str(out))
+        assert back.features[0].qualifiers["note"] == [
+            "Grew overnight at 37C.", "Colonies white."]
 
 
 class TestExportFastaToPath:

@@ -239,8 +239,22 @@ def _fsync_parent_dir(path: Path) -> None:
         except OSError:
             pass
 
-def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8",
+                       newline: "str | None" = None) -> None:
     """Atomically write *text* to *path* via ``tempfile`` + ``os.replace``.
+
+    ``newline`` is handed straight to :func:`open`. The default (``None``)
+    keeps Python's universal-newline translation, which turns every ``\n``
+    into ``os.linesep`` — right for a platform-native text file, WRONG for an
+    interchange format whose line endings are part of the contract. Two
+    callers pass it explicitly:
+
+      * the sequence-format exporters (``.gb`` / ``.embl`` / ``.gff3`` /
+        ``.fa``) pass ``"\n"``, so a GenBank file written on Windows is
+        byte-identical to the same file written on Linux;
+      * the CSV writer passes ``""``, because :mod:`csv` already emits the
+        RFC 4180 ``\r\n`` itself — translation on top of that produced
+        ``\r\r\n``, which spreadsheet importers read as blank rows.
 
     Guarantees: a concurrent crash leaves either the previous file intact
     or the new file in place — never a partial write. The parent
@@ -273,7 +287,7 @@ def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
     )
     try:
-        with os.fdopen(fd, "w", encoding=encoding) as fh:
+        with os.fdopen(fd, "w", encoding=encoding, newline=newline) as fh:
             fh.write(text)
             fh.flush()
             # 2026-05-27 (audit-2 H2): re-raise fsync failures. EIO /

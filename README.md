@@ -288,7 +288,11 @@ fault banner). Every bit of it is scriptable.
 **File** opens / fetches (NCBI) / saves / exports (GenBank · FASTA · GFF3 ·
 map image as PNG/SVG, one plasmid or a whole collection), bulk-imports a
 folder, and restores from backup; every GenBank it writes stamps a traceable
-`Created by SpliceCraft v…` COMMENT. It also hosts the **selection → cloning
+`Created by SpliceCraft v…` COMMENT. Exports are checked against the published
+format specs — the NCBI/INSDC GenBank layout, the ENA EMBL flat file, GFF3 1.26
+— by validators written from those documents, so what leaves SpliceCraft opens
+anywhere; and files arrive tolerantly, byte-order marks, Windows encodings and
+odd line endings included. It also hosts the **selection → cloning
 hub** (**Alt+Shift+P**): highlight any DNA and pick Traditional, Golden Braid /
 MoClo, or Gibson — each opens pre-loaded with the selection *and its features*.
 **Migrate Data** packages your entire setup into one checksum-verified `.zip`

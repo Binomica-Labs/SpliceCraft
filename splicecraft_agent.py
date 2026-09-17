@@ -6490,8 +6490,11 @@ def _h_export_fasta(app, payload):
     if err is not None:
         return ({"error": err}, 403)
     try:
+        # The DISPLAY name, not the underscored LOCUS slug — a FASTA header
+        # has neither the 16-character limit nor the no-space rule. [INV-98]
         result = _export_fasta_to_path(
-            rec.name or rec.id or "plasmid",
+            (getattr(rec, "_tui_display_name", None)
+             or rec.name or rec.id or "plasmid"),
             str(rec.seq),
             path,
         )

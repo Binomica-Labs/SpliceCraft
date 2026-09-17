@@ -14,6 +14,95 @@
 
 ---
 
+## [1.2.64] — 2026-09-17
+
+### Bug fixes
+
+- **Exported GenBank files no longer put a whole protein on one line.** Any
+  plasmid with a coding sequence that carries a translation — which is almost
+  everything you fetch from NCBI — was written out with the entire amino-acid
+  string as a single unbroken line, up to seven thousand characters wide. It
+  looked wrong in a text editor and would trip up stricter readers. Protein
+  translations now wrap at 80 columns exactly the way NCBI wraps them, with no
+  change to the sequence. This affected saved library entries too, so entries
+  rewrite themselves the next time you save.
+- **A plasmid whose name was longer than about 23 characters broke the LOCUS
+  line.** The name and the length share one fixed-width field, so a long name
+  pushed the topology, division and date out of position — a program reading
+  those by column got nonsense, and some would refuse the file. Long names are
+  now trimmed to what the line can hold, and the full name is still carried in
+  the file (and restored on re-import) through the `SpliceCraft-name:` comment.
+- **A feature note with a line break in it made "Export GenBank" fail.** Typing
+  Enter inside a note — an ordinary multi-paragraph lab note — produced
+  "did not survive the round-trip" and no file at all. It exports fine now, and
+  when the check does fire it names the qualifier that changed instead of
+  saying only that "something" did.
+- **A feature with no strand set could not be exported at all.** The export
+  refused the whole plasmid and told you to go and set a strand by hand, even
+  though such a feature round-trips perfectly as arrowless.
+- **A circular plasmid could be exported as linear.** Files written by ApE,
+  older SnapGene versions, or edited by hand often put `circular` a column or
+  two off where the strict layout expects it. SpliceCraft drew them circular
+  but wrote them out linear. The topology is now read from the LOCUS line
+  itself and survives the round trip.
+- **Opening a `.gb` file gave a slightly different plasmid than loading the
+  same record from your library.** Features drawn without an arrow came back
+  pointing forwards, and a long primer sequence came back with a phantom gap in
+  it. Both paths now agree.
+- **EMBL export could produce a file nothing could open.** A feature note with
+  a line break in it wrote a broken record, arrowless features silently flipped
+  to forward, and the ID line shipped with two of its seven fields blank. EMBL
+  export is now round-trip verified before the file is written, the same way
+  GenBank export always has been.
+- **GFF3 export was dropping annotation.** A feature with more than one extra
+  qualifier — nearly every real coding sequence — repeated the `Note` tag,
+  which the format forbids; readers keep one and discard the rest. It is now
+  one properly escaped `Note` per feature, a comma inside a note no longer
+  splits it into two notes on re-import, and a feature that crosses the origin
+  keeps its two arcs the right way round (they used to come back swapped, which
+  for a coding sequence means a different protein). Split coding sequences get
+  the correct reading frame on each row, and the source feature's organism and
+  molecule type are carried through instead of being dropped.
+- **FASTA export could corrupt the sequence.** A plasmid name containing a line
+  break ended the header early and pushed the rest of the name into the bases.
+  Names are cleaned now, the sequence wraps at 60 columns like every other
+  tool's FASTA, and the header uses the name you gave the plasmid rather than
+  the underscored GenBank identifier.
+- **Renaming a plasmid did not update the name stored inside its file.** An
+  entry renamed after it was first saved kept the original name in its comment
+  block, so exporting it — or re-importing that export — brought the old name
+  back.
+- **Primer order CSVs written on Windows had a blank row between every primer.**
+
+### Hardening
+
+- **Every text format is now checked against its published specification.**
+  GenBank, EMBL, GFF3 and CSV output is validated against the NCBI and INSDC
+  definitions, the ENA flat-file spec, GFF3 1.26 and RFC 4180 by checkers
+  written from those documents rather than from the code that writes the files.
+  Ten real NCBI records and 2,500 generated ones now export with no violations
+  and are byte-identical when exported a second time.
+- **Files are 7-bit ASCII on the way out.** A degree sign, a Greek letter or a
+  registered-trademark symbol in a note — all of which arrive from imported
+  `.dna` files — is transliterated when written to GenBank or EMBL, which those
+  formats require and which also keeps the line width honest. Your library
+  keeps exactly what you typed; only the exported file is converted.
+- **Files open that used to fail.** A UTF-8 byte-order mark (what Windows
+  editors add when they "save as UTF-8"), a Latin-1 encoded author name, and
+  old Mac line endings now load instead of erroring. Anything the parser had to
+  guess at is written to the log rather than passing silently — a file with
+  tabs in its feature table used to import with a junk feature and no warning.
+- **Line endings no longer depend on which machine wrote the file.** GenBank,
+  EMBL, GFF3 and FASTA exports use LF everywhere, so the same plasmid exported
+  on Windows and on Linux produces identical bytes.
+- Feature keys and qualifier names are held to the length and character limits
+  the format defines; an over-long key used to run into the location column and
+  make the line unreadable.
+- Exporting a record with an unknown feature boundary (`?` in a location) no
+  longer crashes with an internal error.
+
+---
+
 ## [1.2.63] — 2026-09-16
 
 ### New features
