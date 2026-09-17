@@ -528,6 +528,21 @@ _HARD_BREAKABLE_QUALS: frozenset = frozenset({"translation", "primer_seq"})
 # Back-compat alias for the name this set shipped under.
 _NO_SPACE_REJOIN_QUALS = _HARD_BREAKABLE_QUALS
 
+# HEADER tags BioPython writes with `_write_single_line` — no wrapping, just a
+# `BiopythonWarning` — even when the value is kilobytes long. `DBSOURCE` is the
+# one that actually carries such a value: every protein record NCBI serves puts
+# its whole xref list there (252 wrapped lines and 15,577 characters for
+# UniProt P69905/HBA_HUMAN), and we emitted all of it on ONE line. NCBI wraps
+# it with the standard 12-column continuation indent, so this writer does too.
+#
+# Deliberately NOT a blanket "wrap every header tag": `LOCUS` is a
+# FIXED-COLUMN line that must never be folded (invariant: the length ends at
+# column 40), and every other header field — DEFINITION, KEYWORDS, ACCESSION,
+# SOURCE, ORGANISM, taxonomy, COMMENT, CONTIG, REFERENCE/AUTHORS/TITLE/JOURNAL
+# — already routes through `_write_multi_line`/`_write_multi_entries` and was
+# measured at <=79 columns with a 1.3 kB value. [INV-196]
+_WRAPPABLE_HEADER_TAGS: frozenset = frozenset({"DBSOURCE"})
+
 
 def _unbreakable_genbank_writer(handle):
     """A `GenBankWriter` that never HARD-BREAKS a whitespace-free qualifier
@@ -559,6 +574,20 @@ def _unbreakable_genbank_writer(handle):
     from Bio.SeqIO.InsdcIO import GenBankWriter
 
     class _Writer(GenBankWriter):
+        def _write_single_line(self, tag, text):
+            # `_write_multi_line` would recurse back into here, so do the
+            # split inline and emit each piece through the BASE writer.
+            if (tag in _WRAPPABLE_HEADER_TAGS and isinstance(text, str)
+                    and len(text) > self.MAX_WIDTH - self.HEADER_WIDTH):
+                flat = text.replace("\n", " ")
+                lines = self._split_multi_line(
+                    flat, self.MAX_WIDTH - self.HEADER_WIDTH)
+                super()._write_single_line(tag, lines[0])
+                for _ln in lines[1:]:
+                    super()._write_single_line("", _ln)
+                return
+            return super()._write_single_line(tag, text)
+
         def _write_feature_qualifier(self, key, value=None, quote=None):
             if value is None or not isinstance(value, str):
                 return super()._write_feature_qualifier(key, value, quote)

@@ -447,6 +447,17 @@ cannot hold (spaces, punctuation, anything long) are preserved in a
 `SpliceCraft-name:` COMMENT marker, so an exported plasmid re-imports
 under the name you gave it.
 
+Passing our own validators is necessary and not sufficient, so every
+export is also re-read by software written by someone else: an independent
+GFF3 parser, an independent SnapGene `.dna` reader, and a different
+Biopython release than the bundled one. That is how the `.dna` writer is
+known to place every feature at the coordinates a third-party reader sees,
+origin-spanning features included, and it is what a corpus of 27 files
+written by other tools — NCBI nucleotide and protein records, European
+Nucleotide Archive files, a 4.6-million-base genome — is checked against
+on the way in. Protein records export too, with `aa` units and a wrapped
+DBSOURCE line the way NCBI publishes them.
+
 On the way in, GenBank / EMBL / FASTA / GFF3 files are read tolerantly: a
 UTF-8 byte-order mark (what Windows editors add when they "save as
 UTF-8"), a CP1252-encoded author name, and CRLF or CR-only line endings

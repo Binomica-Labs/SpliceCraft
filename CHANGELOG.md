@@ -14,6 +14,57 @@
 
 ---
 
+## [1.2.65] — 2026-09-17
+
+### Bug fixes
+
+- **A `.dna` file you opened could not be exported as GenBank.** Every
+  SnapGene-style `.dna` file that had a coding sequence in it — so, in
+  practice, all of them — failed "Export GenBank" with an opaque "did not
+  survive the round-trip" and wrote no file. The export itself had always been
+  correct; the safety check that compares the file against the record was
+  comparing a number against the text form of the same number and calling it a
+  difference. Opening a `.dna` and saving it as `.gb` now just works.
+- **Protein records could not be exported as GenBank either.** Anything
+  fetched as a protein, or any `.gp` file from NCBI, was refused by the same
+  check — a protein file has no strand column at all, and the exporter was
+  insisting on the one it uses for DNA. Protein export now works, and the
+  `aa` units and layout match what NCBI publishes.
+- **The DBSOURCE line in an exported protein record was written on one
+  enormous line.** Real protein records list every cross-reference there;
+  for haemoglobin that is over fifteen thousand characters, where NCBI wraps
+  the same content across 252 lines. It now wraps the way NCBI does, and the
+  content is unchanged.
+- **A plasmid with no annotations exported a `.dna` file that other software
+  could not open.** If the only feature was the whole-sequence `source` row —
+  which is the case for a bare NCBI plasmid record like pUC19 — the file
+  carried an empty feature table that made common third-party readers fail
+  before they reached the sequence. The empty table is simply left out now,
+  which is what a real featureless file does.
+- **Exporting to GFF3 and importing it back lost the organism.** The organism,
+  molecule type, strain and taxonomy cross-reference ride on the file's
+  whole-sequence row on the way out, exactly as NCBI writes them, and the
+  importer was discarding that row. They come back now. Applying a GFF3 as an
+  overlay onto a plasmid you already have open is unchanged — it still does not
+  add a whole-sequence feature.
+- **Handing a protein FASTA to an import that wants DNA said the wrong thing.**
+  The error read "Non-IUPAC characters in sequence: EFLPQ"; it now says it
+  looks like a protein sequence and asks for the nucleotide one.
+
+### Hardening
+
+- Every format SpliceCraft writes was re-checked against software that did not
+  come from this project: an independent GFF3 parser, an independent SnapGene
+  `.dna` reader, and a newer Biopython than the one bundled. The `.dna` writer
+  is now confirmed to place every feature at the same coordinates a third-party
+  reader sees, including features that wrap the origin.
+- Twenty-seven files written by other tools — NCBI nucleotide and protein
+  records, European Nucleotide Archive files, a 4.6-million-base genome with
+  9,285 features — were read in and compared against an independent parser.
+  Sequence, topology, every feature coordinate and every qualifier match.
+
+---
+
 ## [1.2.64] — 2026-09-17
 
 ### Bug fixes

@@ -101,7 +101,9 @@ def _insdc_qualifier_name(raw: object) -> str:
     return s[:_FT_QUALIFIER_NAME_MAX]
 
 
-def _ascii_features_for_insdc(features) -> "tuple[list, int]":
+def _ascii_features_for_insdc(
+    features, *, is_protein: bool = False,
+) -> "tuple[list, int]":
     """Return ``(features, n_changed)`` — a features list whose types,
     qualifier names and qualifier values are all legal 7-bit-ASCII INSDC,
     with strand ``None`` canonicalised to ``0``.
@@ -143,7 +145,21 @@ def _ascii_features_for_insdc(features) -> "tuple[list, int]":
             nvals = []
             for one in vals:
                 if isinstance(one, (int, float)) and not isinstance(one, bool):
-                    nvals.append(one)
+                    # A GenBank flat file has no NUMERIC qualifier value.
+                    # BioPython renders `1` and `"1"` identically for the
+                    # INSDC unquoted keys (/codon_start, /transl_table,
+                    # /number, ...) and the reader ALWAYS hands back a str,
+                    # so keeping the int made `_export_genbank_to_path`'s
+                    # round-trip guard compare `(1,)` against `('1',)` and
+                    # refuse a file that was perfectly fine. That blocked
+                    # GenBank export of EVERY `.dna` import, BioPython's
+                    # `.dna` parser being the one reader that yields ints
+                    # (`/codon_start=1` on any CDS was enough).
+                    # Stringifying also closes a quieter spec hole: an int
+                    # on a FREE-TEXT qualifier wrote UNQUOTED (`/note=1`),
+                    # and INSDC requires free text to be quoted. [INV-196]
+                    nvals.append(str(one))
+                    quals_changed = True
                     continue
                 nv = _to_ascii_text(one)
                 if nk == "primer_seq":
@@ -174,7 +190,18 @@ def _ascii_features_for_insdc(features) -> "tuple[list, int]":
                 # back from the reader as +1 no matter what we write. Match
                 # that here rather than let the export's own round-trip guard
                 # report a divergence the user cannot act on.
-                _strand = 1 if new_type == "source" else 0
+                #
+                # ...unless this is a PROTEIN flat file, which has no strand
+                # column at all: BioPython writes `source 1..N` and reads it
+                # back STRANDLESS, so stamping the nucleotide +1 here made
+                # the round-trip guard refuse EVERY protein record — an NCBI
+                # `.gp`, anything `fetch_protein` brought in. The measured
+                # rule is "protein reparses to None unless the location is
+                # `complement(...)`", and `complement` never reaches this
+                # branch (it is gated on strand in (0, None)). [INV-196]
+                _strand = 0
+                if new_type == "source":
+                    _strand = None if is_protein else 1
                 if _strand != getattr(loc, "strand", None):
                     try:
                         rebuilt = [FeatureLocation(p.start, p.end,
@@ -271,7 +298,9 @@ def _normalize_for_genbank(record):
     # to make "Export GenBank" fail with an opaque "did not survive the
     # round-trip". Splitting before the comparison makes both sides agree.
     rec.features, _n_feat_fixed = _ascii_features_for_insdc(
-        _split_multiline_qualifiers(getattr(record, "features", None)))
+        _split_multiline_qualifiers(getattr(record, "features", None)),
+        is_protein=(str(anns.get("molecule_type") or "").strip().lower()
+                    == "protein"))
     if _n_feat_fixed:
         _log.info(
             "GenBank/EMBL export: %d feature(s) adjusted for the INSDC "
@@ -735,6 +764,14 @@ def _parse_gff3_text(text: str) -> dict:
                             them into one CompoundLocation.
       * ``fasta_seq``    — sequence string from the inline ``##FASTA``
                             directive (if present), else None.
+      * ``region_qualifiers`` — the first ``region`` row's attributes, minus
+                            the bookkeeping ones (``ID`` / ``Is_circular``).
+                            `_record_to_gff3` folds the record's ``source``
+                            feature onto that row (NCBI's own convention), so
+                            this is where /organism, /mol_type, /strain and
+                            /db_xref live. Only the STANDALONE loader rebuilds
+                            a ``source`` feature from it — see
+                            `_gff3_path_to_record`.
 
     Coordinates are converted from GFF3 1-based inclusive to SpliceCraft
     0-based half-open. Raises ValueError on malformed input.
@@ -744,6 +781,7 @@ def _parse_gff3_text(text: str) -> dict:
     length = None
     is_circular = False
     features: list[dict] = []
+    region_quals: "dict | None" = None
     fasta_seq: "str | None" = None
     in_fasta = False
     fasta_buf: list[str] = []
@@ -861,6 +899,18 @@ def _parse_gff3_text(text: str) -> dict:
         if ftype == "region":
             if length is None:
                 length = end_1
+            # `_record_to_gff3` puts the record's `source` feature ON this row
+            # (GFF3's whole-sequence convention, matching NCBI's own writer),
+            # so discarding the row outright dropped /organism, /mol_type,
+            # /strain and /db_xref on EVERY GenBank -> GFF3 -> GenBank cycle —
+            # the writer carried them across deliberately and the reader threw
+            # them away. Keep the FIRST region row's attributes for the
+            # standalone loader to rebuild a `source` from. The canvas-overlay
+            # path still ignores them, because grafting a full-length `source`
+            # onto an already-loaded plasmid would be a spurious annotation.
+            # [INV-196]
+            if region_quals is None and quals:
+                region_quals = quals
             continue
         if ftype == "source":
             continue
@@ -882,6 +932,7 @@ def _parse_gff3_text(text: str) -> dict:
         "is_circular": is_circular,
         "features":    features,
         "fasta_seq":   fasta_seq,
+        "region_qualifiers": region_quals,
     }
 
 
@@ -985,6 +1036,16 @@ def _gff3_path_to_record(path: str):
     if total == 0:
         raise ValueError("GFF3 ##FASTA section is empty.")
     features = _gff3_features_to_biopython(parsed, total)
+    # Rebuild the `source` feature the region row was carrying, so a
+    # GenBank -> GFF3 -> GenBank cycle keeps the organism / mol_type / db_xref
+    # the writer put there. Only when the row actually had qualifiers: a
+    # hand-written GFF3 with a bare `region` row should not gain an empty
+    # `source`. First in the list, where GenBank puts it. [INV-196]
+    _region_q = parsed.get("region_qualifiers")
+    if _region_q:
+        from Bio.SeqFeature import SeqFeature as _SF, FeatureLocation as _FL
+        features = [_SF(_FL(0, total, strand=1), type="source",
+                        qualifiers=dict(_region_q))] + list(features)
     seqid = parsed["seqid"]
     rec = SeqRecord(Seq(seq), id=seqid, name=seqid,
                      description=f"Imported from GFF3: {_P(path).name}",
@@ -1296,6 +1357,21 @@ def _parse_fasta_single(path: str) -> tuple[str, str]:
     valid = set("ACGTURYMKSWBDHVN-X*")
     bad = sorted(set(seq) - valid)
     if bad:
+        # The everyday mistake on this path is handing a NUCLEOTIDE picker a
+        # PROTEIN FASTA (an NCBI `.faa`, a UniProt download). "Non-IUPAC
+        # characters in sequence: EFLPQ" is true and tells the user nothing
+        # actionable, so name the real problem whenever every offending letter
+        # is one of the amino-acid-only codes. [INV-196]
+        # Gated on LENGTH as well as alphabet: a short junk string like
+        # "ATGCZZZXQ" offends with only amino-acid letters too, and calling
+        # that a protein would be a worse answer than the generic message.
+        # Any real protein FASTA is comfortably longer than 20 residues.
+        if len(seq) >= 20 and set(bad) <= set("EFILPQZJO"):
+            raise ValueError(
+                "This looks like a protein sequence (found "
+                f"{''.join(bad[:8])}), but this import needs a nucleotide "
+                "FASTA. Provide the DNA/RNA sequence instead."
+            )
         raise ValueError(
             f"Non-IUPAC characters in sequence: {''.join(bad[:8])}"
         )
@@ -2053,7 +2129,18 @@ def _write_commercialsaas_dna_bytes(record, *,
     parts: list[bytes] = []
     parts.append(_build_commercialsaas_cookie_packet())
     parts.append(_build_commercialsaas_dna_packet(seq, circular=is_circ))
-    parts.append(_build_commercialsaas_features_packet_from_record(record))
+    # A record whose only feature is `source` has nothing to put in the
+    # 0x0A packet, and the empty `<Features nextValidID="0"/>` element that
+    # falls out is what real third-party readers choke on: the widely-used
+    # `snapgene_reader` raises `KeyError: 'Feature'` and never reaches the
+    # sequence, so NCBI pUC19 (L09137 — the accession in our own README)
+    # exported a `.dna` no other tool could open. Omitting the packet is
+    # what a featureless real file does, and BioPython's `.dna` reader plus
+    # our own `_augment_dna_record_from_packets` both already treat it as
+    # absent, so this is strictly more compatible. [INV-196]
+    if any(getattr(f, "type", "") != "source"
+           for f in (getattr(record, "features", None) or ())):
+        parts.append(_build_commercialsaas_features_packet_from_record(record))
     parts.append(_build_commercialsaas_notes_packet(record))
     # Default 0x08 AdditionalSequenceProperties — strand stickiness +
     # end modifications. Real files carry this even on circular
