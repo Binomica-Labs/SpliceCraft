@@ -35,10 +35,17 @@ from textual.events import Click, MouseDown, MouseMove, MouseUp
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, ListItem, ListView, RadioButton, RadioSet, Select, Static, TextArea, Tree
 
+from splicecraft_crispr import (
+    _CAS_VARIANTS, _design_guides, _guide_cloning_oligos,
+)
 import splicecraft_state as _state
 from splicecraft_cloning import _simulate_cloned_plasmid, _simulate_primed_amplicon
-from splicecraft_dataaccess import _BUILTIN_GRAMMARS, _all_grammars, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_features, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections, _search_collections_library
-from splicecraft_history import _CommercialSaaSHistoryNode, _history_consistency_summary, _history_detail_lines, _history_former_name, _history_node_warnings, _history_populate_tree, _history_protocol_renderable, _history_tree_label
+from splicecraft_dataaccess import _BUILTIN_GRAMMARS, _all_grammars, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_all_experiments, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_features, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections, _search_collections_library
+from splicecraft_experiments import (
+    _experiment_search, _experiment_search_terms, _experiment_snippet,
+    _experiments_referencing,
+)
+from splicecraft_history import _CommercialSaaSHistoryNode, _history_consistency_summary, _history_detail_lines, _history_former_name, _history_human_dt, _history_node_warnings, _history_populate_tree, _history_protocol_renderable, _history_tree_label
 from splicecraft_logging import _log, _log_event
 from splicecraft_presets import (
     _preset_categories, _preset_features, _preset_matches,
@@ -8267,6 +8274,252 @@ class LibrarySearchModal(_OneShotDismissScreen, ModalScreen):
         self.dismiss(None)
 
 
+class ExperimentSearchModal(_OneShotDismissScreen, ModalScreen):
+    """Cross-project notebook search — and the plasmid backlink view.
+
+    `ExperimentsScreen`'s filter box narrows the ACTIVE project; this
+    searches every project on disk. Exactly the split the plasmid side
+    already has (`LibraryPanel` filters the active collection,
+    `LibrarySearchModal` goes cross-collection), which is why this
+    mirrors that modal's shape rather than inventing a second one.
+
+    Two modes:
+      * plain — the query runs against every entry's title, tags and
+        body. `#tag` tokens filter by tag, so `#gibson failed` reads
+        "Gibson-tagged entries that mention failure".
+      * `backlink=(kind, id)` — opens on every entry whose body
+        references that object (`@plasmid` / `!action` / `&gel`), which
+        is what turns the `attached_*` xrefs from a write-only index
+        into the "what did I already write about this plasmid?"
+        answer. The query box then filters within that set.
+
+    Dismiss payload:
+      ``None``                  — cancelled
+      ``(project, entry_id)``   — caller switches project + opens it.
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next",   show=False),
+    ]
+
+    # Same 150 ms as `LibrarySearchModal` — a pass here deep-clones
+    # every project's entries and scans every body.
+    _LIVE_FILTER_DEBOUNCE_S = 0.15
+
+    # Rows shown at once. A notebook is smaller than a plasmid library,
+    # but an unfiltered open on a long-running project should still not
+    # try to paint thousands of rows.
+    _MAX_ROWS = 300
+
+    _KIND_SIGIL = {"plasmid": "@", "action": "!", "gel": "&"}
+
+    def __init__(self, *, initial_query: str = "",
+                 backlink: "tuple[str, str | list[str]] | None" = None
+                 ) -> None:
+        super().__init__()
+        self._initial_query = initial_query
+        self._backlink = backlink
+        self._matches: "list[tuple[str, dict]]" = []
+        self._filter_timer = None
+
+    def _title_text(self) -> str:
+        if self._backlink:
+            kind, ref = self._backlink
+            sigil = self._KIND_SIGIL.get(kind, "")
+            # `ref` may be a list of alternatives (entry id + display
+            # name); the title names the first, which is the one the
+            # caller considers canonical.
+            primary = ref if isinstance(ref, str) else (
+                next((r for r in ref if r), "") if ref else "")
+            return f" Notebook entries mentioning {sigil}{primary} "
+        return " Search notebook (across all projects) "
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="expsearch-box"):
+            yield Static(self._title_text(), id="expsearch-title")
+            yield Input(
+                value=self._initial_query,
+                placeholder="words that appear in the entry, or #tag…",
+                id="expsearch-input",
+            )
+            yield DataTable(id="expsearch-table",
+                            cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("", id="expsearch-status", markup=True)
+            with Horizontal(id="expsearch-btns"):
+                yield Button("Open", id="btn-expsearch-ok",
+                             variant="primary")
+                yield Button("Close", id="btn-expsearch-close")
+
+    def on_mount(self) -> None:
+        try:
+            t = self.query_one("#expsearch-table", DataTable)
+        except NoMatches:
+            return
+        t.add_columns("Updated", "Entry", "Project", "Match")
+        self._refresh()
+        try:
+            self.query_one("#expsearch-input", Input).focus()
+        except NoMatches:
+            pass
+
+    def _source_rows(self) -> "list[tuple[str, dict]]":
+        """`(project, entry)` pairs before the query is applied."""
+        rows = _iter_all_experiments()
+        if not self._backlink:
+            return rows
+        kind, ref = self._backlink
+        # Filter per project so the backlink answer keeps naming which
+        # project each hit lives in — `_experiments_referencing` takes a
+        # flat entry list, so run it per project and re-pair.
+        by_project: "dict[str, list[dict]]" = {}
+        for proj, e in rows:
+            by_project.setdefault(proj, []).append(e)
+        out: "list[tuple[str, dict]]" = []
+        for proj, entries in by_project.items():
+            try:
+                hits = _experiments_referencing(entries, ref, kind=kind)
+            except ValueError:
+                # Unknown kind — the caller passed something the
+                # extractors don't own. Show nothing rather than
+                # everything; the status line says so.
+                return []
+            out.extend((proj, e) for e in hits)
+        return out
+
+    def _refresh(self) -> None:
+        try:
+            inp = self.query_one("#expsearch-input", Input)
+            t   = self.query_one("#expsearch-table", DataTable)
+        except NoMatches:
+            return
+        query = (inp.value or "").strip()
+        if query == _SearchInput.PREFILL:
+            query = ""
+        rows = self._source_rows()
+        toks = query.split()
+        tags = [x[1:] for x in toks if x.startswith("#") and len(x) > 1]
+        terms_q = " ".join(x for x in toks if not x.startswith("#"))
+        if terms_q or tags:
+            # Search per project so the (project, entry) pairing survives
+            # — `_experiment_search` takes a flat list and returns the
+            # entries, which would otherwise have to be matched back by
+            # object identity. Re-sorted globally afterwards so the best
+            # match across every project comes first.
+            grouped: "dict[str, list[dict]]" = {}
+            for proj, e in rows:
+                grouped.setdefault(proj, []).append(e)
+            scored: "list[tuple[int, str, str, dict]]" = []
+            for proj, entries in grouped.items():
+                for h in _experiment_search(entries, terms_q, tags=tags):
+                    scored.append((h["score"],
+                                   h["entry"].get("updated_at") or "",
+                                   proj, h["entry"]))
+            scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
+            self._matches = [(proj, e) for _sc, _up, proj, e in scored]
+        else:
+            self._matches = sorted(
+                rows,
+                key=lambda pe: (pe[1].get("updated_at") or ""),
+                reverse=True,
+            )
+        self._matches = self._matches[: self._MAX_ROWS]
+        terms = _experiment_search_terms(terms_q)
+        t.clear()
+        for proj, e in self._matches:
+            # Universal slash-free date ("SEP 13 2026") — date-only, so
+            # pass the first 10 chars. Never ISO in the UI.
+            updated = _history_human_dt((e.get("updated_at") or "")[:10])
+            title = (e.get("title") or "").strip() or "(untitled)"
+            snippet = _experiment_snippet(e.get("body_md"), terms)
+            if not snippet:
+                tg = [x for x in (e.get("tags") or []) if isinstance(x, str)]
+                snippet = ("#" + " #".join(tg)) if tg else ""
+            t.add_row(
+                Text(updated, no_wrap=True),
+                Text(title, no_wrap=True, overflow="ellipsis"),
+                Text(proj, no_wrap=True, overflow="ellipsis"),
+                Text(snippet, no_wrap=True, overflow="ellipsis",
+                     style="dim"),
+                key=f"{proj}\x00{e.get('id') or ''}",
+            )
+        n = len(self._matches)
+        if n == 0:
+            msg = ("[yellow]Nothing references that yet.[/yellow]"
+                   if self._backlink and not query
+                   else "[yellow]No matches.[/yellow]")
+        else:
+            msg = (f"[dim]{n} "
+                   f"{'entry' if n == 1 else 'entries'}"
+                   + (" — refine to see more" if n >= self._MAX_ROWS
+                      else "") + "[/dim]")
+        try:
+            self.query_one("#expsearch-status", Static).update(msg)
+        except NoMatches:
+            pass
+
+    @on(Input.Changed, "#expsearch-input")
+    def _on_query_changed(self, _event: Input.Changed) -> None:
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+        self._filter_timer = self.set_timer(
+            self._LIVE_FILTER_DEBOUNCE_S, self._refresh,
+        )
+
+    def on_unmount(self) -> None:
+        """Stop a pending debounce — a timer that outlives the modal
+        refreshes unmounted widgets (the v1.2.48 re-arm class)."""
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+            self._filter_timer = None
+
+    def _commit(self, idx: int) -> None:
+        if 0 <= idx < len(self._matches):
+            proj, e = self._matches[idx]
+            eid = e.get("id") or ""
+            if eid:
+                self.dismiss((proj, eid))
+
+    @on(Input.Submitted, "#expsearch-input")
+    def _on_query_submitted(self, _event) -> None:
+        if not self._matches:
+            try:
+                self.app.notify("No matches — try different words.",
+                                severity="warning", timeout=4)
+            except Exception:
+                pass
+            return
+        try:
+            t = self.query_one("#expsearch-table", DataTable)
+        except NoMatches:
+            return
+        self._commit(t.cursor_row if t.cursor_row is not None else 0)
+
+    @on(Button.Pressed, "#btn-expsearch-ok")
+    def _ok_btn(self, _) -> None:
+        self._on_query_submitted(None)
+
+    @on(DataTable.RowSelected, "#expsearch-table")
+    def _row_selected(self, event: DataTable.RowSelected) -> None:
+        self._commit(event.cursor_row)
+
+    @on(Button.Pressed, "#btn-expsearch-close")
+    def _close_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
     """Construction-history viewer for a library plasmid.
 
@@ -8747,6 +9000,665 @@ class FeaturePresetsModal(_OneShotDismissScreen, ModalScreen):
 
     @on(Button.Pressed, "#btn-fpre-close")
     def _close(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class CrisprGuideModal(_OneShotDismissScreen, ModalScreen):
+    """Design CRISPR guides against the loaded plasmid (or any region of it).
+
+    App-free by construction: the caller hands in the sequence, the topology
+    and a label, so this class stays in the dependency-clean L4 set and can be
+    unit-tested without a `PlasmidApp`.
+
+    Dismisses with ``None`` on cancel, or one of:
+
+      * ``{"action": "oligos", "guide": <guide dict>, "oligos": {...}}`` —
+        the annealed cloning pair for the picked spacer.
+      * ``{"action": "annotate", "guide": <guide dict>}`` — caller adds the
+        protospacer to the record as a feature.
+
+    The off-target column is only populated when the user asks for it, and its
+    header says what was searched. That is deliberate: this program has no
+    genome index, so an empty off-target column must never be readable as
+    "this guide is specific" — see `splicecraft_crispr`'s module docstring.
+    """
+
+    _blocks_undo: bool = True   # hosts Inputs — keep app-level Ctrl+Z out
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #crispr-dlg {
+        width: 150; height: 44;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #crispr-title {
+        height: 1; text-style: bold; color: $accent;
+        text-align: center; margin-bottom: 1;
+    }
+    #crispr-note { height: 2; color: $text-muted; margin-bottom: 1; }
+    #crispr-controls { height: 3; margin-bottom: 1; }
+    #crispr-variant { width: 26; margin-right: 1; }
+    #crispr-from, #crispr-to { width: 12; margin-right: 1; }
+    #crispr-btn-design { margin-right: 1; }
+    #crispr-table { height: 1fr; }
+    #crispr-status { height: 2; color: $text-muted; }
+    #crispr-btns { height: 3; margin-top: 1; align: right middle; }
+    #crispr-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self, sequence: str, *, circular: bool = False,
+                 label: str = "plasmid") -> None:
+        super().__init__()
+        self._seq = (sequence or "").upper()
+        self._circular = bool(circular)
+        self._label = label or "plasmid"
+        self._guides: list = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="crispr-dlg"):
+            yield Static(f"CRISPR guides — {self._label} "
+                         f"({len(self._seq):,} bp"
+                         f"{', circular' if self._circular else ''})",
+                         id="crispr-title")
+            yield Static(
+                "Guides are triaged on named properties (GC window, Pol III "
+                "terminator, homopolymers, self-complementarity) — not an "
+                "efficiency score.\nOff-target search covers THIS plasmid "
+                "only; there is no genome-wide check here.",
+                id="crispr-note", markup=False,
+            )
+            with Horizontal(id="crispr-controls"):
+                yield Select(
+                    [(v["label"], k) for k, v in _CAS_VARIANTS.items()],
+                    value="spcas9", allow_blank=False, id="crispr-variant",
+                )
+                yield Input(placeholder="from bp", id="crispr-from",
+                            restrict=r"[0-9]*")
+                yield Input(placeholder="to bp", id="crispr-to",
+                            restrict=r"[0-9]*")
+                yield Button("Design", id="crispr-btn-design",
+                             variant="primary")
+                yield Button("Check off-targets", id="crispr-btn-offtarget")
+            yield DataTable(id="crispr-table", cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("", id="crispr-status", markup=True)
+            with Horizontal(id="crispr-btns"):
+                yield Button("Cloning oligos", id="crispr-btn-oligos",
+                             variant="success")
+                yield Button("Annotate on map", id="crispr-btn-annotate")
+                yield Button("Close", id="crispr-btn-close")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#crispr-table", DataTable)
+        t.add_columns("Spacer", "PAM", "Str", "Cut", "Tier", "GC%",
+                      "Off", "Concerns")
+        self._run_design(offtarget=False)
+
+    # ── design ────────────────────────────────────────────────────────────
+    def _region(self) -> "tuple[int, int] | None":
+        """The user's bp window, or None. Returns None (whole sequence) rather
+        than raising for a half-filled or inverted pair — the status line says
+        what was used, so a typo degrades to "all guides" instead of an error
+        dialog mid-design."""
+        try:
+            raw_a = (self.query_one("#crispr-from", Input).value or "").strip()
+            raw_b = (self.query_one("#crispr-to", Input).value or "").strip()
+        except NoMatches:
+            return None
+        if not raw_a or not raw_b:
+            return None
+        try:
+            a, b = int(raw_a), int(raw_b)
+        except ValueError:
+            return None
+        n = len(self._seq)
+        a = max(0, min(a, n))
+        b = max(0, min(b, n))
+        if a == b:
+            return None
+        if a > b and not self._circular:
+            a, b = b, a
+        return (a, b)
+
+    def _run_design(self, *, offtarget: bool) -> None:
+        variant = "spcas9"
+        try:
+            sel = self.query_one("#crispr-variant", Select).value
+            if isinstance(sel, str):
+                variant = sel
+        except NoMatches:
+            pass
+        region = self._region()
+        try:
+            res = _design_guides(
+                self._seq, variant=variant, circular=self._circular,
+                region=region,
+                offtarget_in=self._seq if offtarget else None,
+                limit=200,
+            )
+        except ValueError as exc:
+            self._set_status(f"[red]{exc}[/red]")
+            return
+        self._guides = res["guides"]
+        self._fill_table()
+        scope = (f" · off-targets searched over "
+                 f"{res['offtarget_searched_bp']:,} bp of this plasmid"
+                 if res["offtarget_searched_bp"] else
+                 " · off-targets NOT checked")
+        where = (f" in bp {region[0]:,}–{region[1]:,}" if region else "")
+        self._set_status(
+            f"{res['n_found']:,} {res['label']} site(s){where}"
+            f"{' (showing first 200)' if res['truncated'] else ''}{scope}."
+        )
+
+    def _fill_table(self) -> None:
+        try:
+            t = self.query_one("#crispr-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        for i, g in enumerate(self._guides):
+            s = g.get("score") or {}
+            tier = s.get("tier", "?")
+            colour = {"good": "green", "ok": "yellow"}.get(tier, "red")
+            off = g.get("n_offtargets")
+            t.add_row(
+                Text(g["guide"]),
+                Text(g["pam"], style="dim"),
+                Text("+" if g["strand"] == 1 else "−"),
+                Text(f"{g['cut_site']:,}"),
+                Text(tier, style=f"{colour} bold"),
+                Text(f"{s.get('gc_pct', 0):.0f}"),
+                Text("—" if off is None else str(off),
+                     style="dim" if off is None else
+                           ("red bold" if off else "green")),
+                Text("; ".join(s.get("flags") or []) or "clean",
+                     style="dim" if not s.get("flags") else ""),
+                key=str(i),
+            )
+        if self._guides:
+            t.move_cursor(row=0)
+
+    def _set_status(self, markup: str) -> None:
+        try:
+            self.query_one("#crispr-status", Static).update(markup)
+        except NoMatches:
+            pass
+
+    def _picked(self) -> "dict | None":
+        try:
+            t = self.query_one("#crispr-table", DataTable)
+        except NoMatches:
+            return None
+        if not self._guides:
+            return None
+        row = t.cursor_row
+        if row is None or not (0 <= row < len(self._guides)):
+            return None
+        return self._guides[row]
+
+    # ── handlers ──────────────────────────────────────────────────────────
+    @on(Button.Pressed, "#crispr-btn-design")
+    def _on_design(self, _) -> None:
+        self._run_design(offtarget=False)
+
+    @on(Button.Pressed, "#crispr-btn-offtarget")
+    def _on_offtarget(self, _) -> None:
+        self._set_status("Searching this plasmid for near-matches…")
+        self._run_design(offtarget=True)
+
+    @on(Select.Changed, "#crispr-variant")
+    def _on_variant(self, _) -> None:
+        self._run_design(offtarget=False)
+
+    @on(Button.Pressed, "#crispr-btn-oligos")
+    def _on_oligos(self, _) -> None:
+        g = self._picked()
+        if g is None:
+            self._set_status("[yellow]Pick a guide row first.[/yellow]")
+            return
+        try:
+            oligos = _guide_cloning_oligos(g["guide"])
+        except ValueError as exc:
+            self._set_status(f"[red]{exc}[/red]")
+            return
+        self.dismiss({"action": "oligos", "guide": g, "oligos": oligos})
+
+    @on(Button.Pressed, "#crispr-btn-annotate")
+    def _on_annotate(self, _) -> None:
+        g = self._picked()
+        if g is None:
+            self._set_status("[yellow]Pick a guide row first.[/yellow]")
+            return
+        self.dismiss({"action": "annotate", "guide": g})
+
+    @on(Button.Pressed, "#crispr-btn-close")
+    def _on_close(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ReadConsensusModal(_OneShotDismissScreen, ModalScreen):
+    """What all the reads on one plasmid agree about.
+
+    App-free: the caller hands in a `_multi_read_summary` dict and a label, so
+    this stays in the dependency-clean L4 set. Dismisses with ``None``, or
+    ``{"action": "goto", "pos": <bp>}`` when the user picks a variant row —
+    the caller jumps the sequence panel there.
+
+    Coverage is shown as prominently as the variant list on purpose: a plasmid
+    can read "100% identity" over the half that was sequenced, and a report
+    that leaves the unread part out is how a partial read passes as a full one.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #rcon-dlg {
+        width: 120; height: 36;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #rcon-title {
+        height: 1; text-style: bold; color: $accent;
+        text-align: center; margin-bottom: 1;
+    }
+    #rcon-verdict { height: 2; margin-bottom: 1; }
+    #rcon-cov { height: 3; margin-bottom: 1; color: $text-muted; }
+    #rcon-table { height: 1fr; }
+    #rcon-btns { height: 3; margin-top: 1; align: right middle; }
+    #rcon-btns Button { margin-right: 1; }
+    """
+
+    _VERDICT_STYLE = {
+        "confirmed":   ("red bold",    "changes confirmed by multiple reads"),
+        "single_read": ("yellow bold", "one read only, contradicted by another"),
+        "unconfirmed": ("yellow",      "not covered by a second read"),
+        "clean":       ("green bold",  "no differences where the reads looked"),
+        "no_reads":    ("dim",         "no reads aligned yet"),
+    }
+
+    def __init__(self, summary: dict, *, label: str = "plasmid",
+                 phrase: str = "") -> None:
+        super().__init__()
+        self._summary = summary if isinstance(summary, dict) else {}
+        self._label = label or "plasmid"
+        # The one-line phrase is passed IN rather than computed here: it lives
+        # beside the rollup hub-side, and L4 must not import the hub (cycle).
+        # Moving a pure formatter down a layer just to reach it would split the
+        # pair across modules for no gain.
+        self._phrase = phrase or ""
+        self._variants = list(self._summary.get("variants") or [])
+
+    def compose(self) -> ComposeResult:
+        s = self._summary
+        verdict = str(s.get("verdict", "no_reads"))
+        style, gloss = self._VERDICT_STYLE.get(verdict, ("dim", verdict))
+        with Vertical(id="rcon-dlg"):
+            yield Static(f"Read consensus — {self._label}", id="rcon-title")
+            yield Static(
+                f"[{style}]{verdict.replace('_', ' ').upper()}[/] — {gloss}\n"
+                f"{self._phrase}",
+                id="rcon-verdict", markup=True,
+            )
+            total = int(s.get("total_bp", 0) or 0)
+            uncov = s.get("uncovered_spans") or []
+            # Name the biggest hole rather than only a percentage: "88% covered"
+            # does not tell you whether the gap is scattered noise or 400 bp
+            # nobody read.
+            worst = max(uncov, key=lambda sp: sp[1] - sp[0]) if uncov else None
+            gap_note = (f" · largest unread stretch {worst[1] - worst[0]:,} bp "
+                        f"at {worst[0]:,}" if worst else " · fully covered")
+            yield Static(
+                f"{s.get('n_reads', 0)} read(s) · "
+                f"{s.get('covered_pct', 0)}% of {total:,} bp covered · "
+                f"{s.get('depth2_pct', 0)}% covered twice{gap_note}\n"
+                f"{len(uncov)} unread stretch(es)",
+                id="rcon-cov", markup=True,
+            )
+            yield DataTable(id="rcon-table", cursor_type="row",
+                            zebra_stripes=True)
+            with Horizontal(id="rcon-btns"):
+                yield Button("Go to variant", id="rcon-btn-goto",
+                             variant="primary")
+                yield Button("Close", id="rcon-btn-close")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#rcon-table", DataTable)
+        t.add_columns("bp", "Type", "Ref", "Alt", "Reads", "Depth",
+                      "Disagree", "Backed by Q")
+        for i, v in enumerate(self._variants):
+            support = int(v.get("support", 0) or 0)
+            contra = int(v.get("contradicted", 0) or 0)
+            style = ("red bold" if support >= int(
+                self._summary.get("min_support", 2) or 2)
+                else "yellow" if contra else "")
+            t.add_row(
+                Text(f"{int(v.get('target_pos', 0)):,}"),
+                Text(str(v.get("type", "?"))),
+                Text(str(v.get("ref", "")) or "—", style="dim"),
+                Text(str(v.get("alt", "")) or "—"),
+                Text(str(support), style=style),
+                Text(str(int(v.get("depth", 0) or 0))),
+                Text(str(contra), style="yellow" if contra else "dim"),
+                Text(str(int(v.get("confident_reads", 0) or 0)) or "0",
+                     style="dim"),
+                key=str(i),
+            )
+        if self._variants:
+            t.move_cursor(row=0)
+            t.focus()
+
+    @on(Button.Pressed, "#rcon-btn-goto")
+    def _on_goto(self, _) -> None:
+        try:
+            row = self.query_one("#rcon-table", DataTable).cursor_row
+        except NoMatches:
+            return
+        if row is None or not (0 <= row < len(self._variants)):
+            return
+        self.dismiss({"action": "goto",
+                      "pos": int(self._variants[row].get("target_pos", 0) or 0)})
+
+    @on(Button.Pressed, "#rcon-btn-close")
+    def _on_close(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ResidueEditModal(_OneShotDismissScreen, ModalScreen):
+    """Change one residue of an annotated CDS, on the plasmid.
+
+    The mapping from "residue 143" to three plasmid base pairs runs through
+    strand, /codon_start, introns and the origin, so this modal PREVIEWS the
+    resolved codon before anything is applied — that mapping is exactly where a
+    hand-done edit goes wrong, and seeing `CAT -> TGG at 177,178,179` is what
+    makes it checkable.
+
+    App-free: `planner` is a plain callable ``(cds_index, residue, to, codon)
+    -> plan dict`` supplied by the caller, so this class knows nothing about
+    `PlasmidApp`. Dismisses with ``None`` or
+    ``{"cds_index", "residue", "to", "codon"}``.
+    """
+
+    _blocks_undo: bool = True   # hosts Inputs
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #res-dlg {
+        width: 104; height: 30;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #res-title {
+        height: 1; text-style: bold; color: $accent;
+        text-align: center; margin-bottom: 1;
+    }
+    #res-row { height: 3; margin-bottom: 1; }
+    #res-cds { width: 42; margin-right: 1; }
+    #res-num { width: 14; margin-right: 1; }
+    #res-aa { width: 12; margin-right: 1; }
+    #res-codon { width: 16; }
+    #res-preview { height: 1fr; padding: 0 1; }
+    #res-btns { height: 3; margin-top: 1; align: right middle; }
+    #res-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self, cds_list, planner, *, label: str = "plasmid") -> None:
+        super().__init__()
+        self._cds = list(cds_list or [])
+        self._planner = planner
+        self._label = label or "plasmid"
+        self._plan: "dict | None" = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="res-dlg"):
+            yield Static(f"Edit a residue — {self._label}", id="res-title")
+            with Horizontal(id="res-row"):
+                yield Select(
+                    [(f"{c.get('label', 'CDS')} ({c.get('protein_len', 0)} aa)",
+                      c.get("index", 0)) for c in self._cds],
+                    value=(self._cds[0].get("index", 0) if self._cds
+                           else Select.BLANK),
+                    allow_blank=not self._cds, id="res-cds",
+                )
+                yield Input(placeholder="residue #", id="res-num",
+                            restrict=r"[0-9]*")
+                yield Input(placeholder="to (e.g. A)", id="res-aa",
+                            restrict=r"[A-Za-z\*]*", max_length=1)
+                yield Input(placeholder="codon (opt)", id="res-codon",
+                            restrict=r"[ACGTacgt]*", max_length=3)
+            yield Static("Pick a CDS, a residue number and the new amino acid.",
+                         id="res-preview", markup=True)
+            with Horizontal(id="res-btns"):
+                yield Button("Apply", id="res-btn-apply", variant="success")
+                yield Button("Cancel", id="res-btn-cancel")
+
+    # ── live preview ──────────────────────────────────────────────────────
+    def _request(self) -> "tuple | None":
+        try:
+            cds_index = self.query_one("#res-cds", Select).value
+            residue = (self.query_one("#res-num", Input).value or "").strip()
+            to_aa = (self.query_one("#res-aa", Input).value or "").strip()
+            codon = (self.query_one("#res-codon", Input).value or "").strip()
+        except NoMatches:
+            return None
+        if not isinstance(cds_index, int) or not residue or not to_aa:
+            return None
+        try:
+            return (cds_index, int(residue), to_aa.upper(),
+                    codon.upper() or None)
+        except ValueError:
+            return None
+
+    def _refresh_preview(self) -> None:
+        req = self._request()
+        if req is None:
+            self._plan = None
+            self._say("Pick a CDS, a residue number and the new amino acid.")
+            return
+        try:
+            plan = self._planner(*req)
+        except ValueError as exc:
+            self._plan = None
+            self._say(f"[red]{exc}[/red]")
+            return
+        except Exception:
+            self._plan = None
+            self._say("[red]Could not resolve that residue — see log.[/red]")
+            return
+        self._plan = plan
+        pos = ", ".join(f"{p:,}" for p in plan.get("positions") or [])
+        notes = []
+        if plan.get("silent"):
+            notes.append("[yellow]silent — same amino acid, different "
+                         "codon[/yellow]")
+        if plan.get("creates_stop"):
+            notes.append("[red]introduces a STOP — truncates the protein[/red]")
+        if plan.get("removes_stop"):
+            notes.append("[red]removes the STOP — read-through[/red]")
+        alts = ", ".join(
+            f"{a['codon']} ({a['fraction'] * 100:.0f}%)"
+            for a in (plan.get("alternatives") or [])[:5])
+        strand = "+" if plan.get("strand") == 1 else "−"
+        self._say(
+            f"[b]{plan.get('cds_label', 'CDS')}[/b] · {plan.get('protein_len', 0)} aa "
+            f"· {strand} strand · table {plan.get('transl_table', 1)}\n\n"
+            f"residue {plan.get('residue')}: "
+            f"[b]{plan.get('wt_aa')}[/b] → [b]{plan.get('new_aa')}[/b]\n"
+            f"codon  {plan.get('wt_codon')} → {plan.get('new_codon')}\n"
+            f"plasmid bp  {pos}\n\n"
+            + ("\n".join(notes) + "\n\n" if notes else "")
+            + (f"[dim]synonymous options: {alts}[/dim]" if alts else "")
+        )
+
+    def _say(self, markup: str) -> None:
+        try:
+            self.query_one("#res-preview", Static).update(markup)
+        except NoMatches:
+            pass
+
+    @on(Input.Changed, "#res-num")
+    @on(Input.Changed, "#res-aa")
+    @on(Input.Changed, "#res-codon")
+    def _on_changed(self, _event) -> None:
+        self._refresh_preview()
+
+    @on(Select.Changed, "#res-cds")
+    def _on_cds(self, _event) -> None:
+        self._refresh_preview()
+
+    @on(Button.Pressed, "#res-btn-apply")
+    def _on_apply(self, _) -> None:
+        req = self._request()
+        if req is None or self._plan is None:
+            self._say("[yellow]Nothing to apply yet.[/yellow]")
+            return
+        cds_index, residue, to_aa, codon = req
+        self.dismiss({"cds_index": cds_index, "residue": residue,
+                      "to": to_aa, "codon": codon})
+
+    @on(Button.Pressed, "#res-btn-cancel")
+    def _on_cancel(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PcrProgramModal(_OneShotDismissScreen, ModalScreen):
+    """The thermocycler program for a simulated PCR.
+
+    App-free: takes the product length, the primer Tms and a `builder` callable
+    ``(product_bp, tms, polymerase, cycles) -> (program, text)``. Dismisses with
+    ``None``, or ``{"action": "copy", "text": str}`` so the caller can route the
+    copy through its own clipboard-fallback chain rather than this modal
+    reaching for one.
+
+    Every number shows the rule behind it, because these are the polymerase
+    vendors' typical conditions applied to your product — a starting point, not
+    a prediction that the reaction works.
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #pcrp-dlg {
+        width: 92; height: 32;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #pcrp-title {
+        height: 1; text-style: bold; color: $accent;
+        text-align: center; margin-bottom: 1;
+    }
+    #pcrp-row { height: 3; margin-bottom: 1; }
+    #pcrp-pol { width: 26; margin-right: 1; }
+    #pcrp-cycles { width: 14; }
+    #pcrp-out { height: 1fr; padding: 0 1; }
+    #pcrp-btns { height: 3; margin-top: 1; align: right middle; }
+    #pcrp-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self, product_bp: int, primer_tms, builder, *,
+                 polymerases=(), label: str = "amplicon") -> None:
+        super().__init__()
+        self._bp = int(product_bp or 0)
+        self._tms = [t for t in (primer_tms or [])
+                     if isinstance(t, (int, float))]
+        self._builder = builder
+        self._polymerases = list(polymerases or [("Q5", "q5")])
+        self._label = label or "amplicon"
+        self._text = ""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pcrp-dlg"):
+            yield Static(f"Thermocycler program — {self._label} "
+                         f"({self._bp:,} bp)", id="pcrp-title")
+            with Horizontal(id="pcrp-row"):
+                yield Select(self._polymerases,
+                             value=self._polymerases[0][1],
+                             allow_blank=False, id="pcrp-pol")
+                yield Input("30", placeholder="cycles", id="pcrp-cycles",
+                            restrict=r"[0-9]*")
+            yield Static("", id="pcrp-out", markup=False)
+            with Horizontal(id="pcrp-btns"):
+                yield Button("Copy", id="pcrp-btn-copy", variant="primary")
+                yield Button("Close", id="pcrp-btn-close")
+
+    def on_mount(self) -> None:
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        try:
+            pol = self.query_one("#pcrp-pol", Select).value
+            cyc = (self.query_one("#pcrp-cycles", Input).value or "30").strip()
+        except NoMatches:
+            return
+        try:
+            cycles = int(cyc or 30)
+        except ValueError:
+            cycles = 30
+        try:
+            _prog, text = self._builder(self._bp, self._tms,
+                                        str(pol), cycles)
+        except ValueError as exc:
+            self._text = ""
+            self._say(str(exc))
+            return
+        self._text = text
+        self._say(text or "(no program)")
+
+    def _say(self, text: str) -> None:
+        try:
+            self.query_one("#pcrp-out", Static).update(text)
+        except NoMatches:
+            pass
+
+    @on(Select.Changed, "#pcrp-pol")
+    def _on_pol(self, _event) -> None:
+        self._rebuild()
+
+    @on(Input.Changed, "#pcrp-cycles")
+    def _on_cycles(self, _event) -> None:
+        self._rebuild()
+
+    @on(Button.Pressed, "#pcrp-btn-copy")
+    def _on_copy(self, _) -> None:
+        if not self._text:
+            return
+        self.dismiss({"action": "copy", "text": self._text})
+
+    @on(Button.Pressed, "#pcrp-btn-close")
+    def _on_close(self, _) -> None:
         self.dismiss(None)
 
     def action_cancel(self) -> None:

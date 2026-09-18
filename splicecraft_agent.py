@@ -43,11 +43,15 @@ from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _feat_len, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len, _span_in_span)
 from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi, _enzyme_is_type_iis)
 from splicecraft_codon import (_CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_cai, _codon_diversify, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
-from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
-from splicecraft_experiments import (_new_experiment_id, _normalise_experiment_entry, _sanitize_experiment_id)
+from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_all_experiments, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
+from splicecraft_experiments import (_EXPERIMENT_ACTIONS, _experiment_duplicate, _experiment_html_document, _experiment_markdown_document, _experiment_project_markdown, _experiment_ref_token_ok, _experiment_search, _experiment_snippet, _experiment_search_terms, _experiment_template_markdown, _experiments_referencing, _new_experiment_id, _normalise_experiment_entry, _protocol_steps_markdown, _sanitize_experiment_id)
 from splicecraft_fileio import (_PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
 from splicecraft_gels import (_new_gel_id, _normalise_gel_entry)
-from splicecraft_history import (_HISTORY_NODE_MAX_DEPTH, _HISTORY_NODE_MAX_NODES, _history_node_warnings)
+from splicecraft_history import (_HISTORY_NODE_MAX_DEPTH, _HISTORY_NODE_MAX_NODES, _history_build_steps, _history_node_warnings)
+from splicecraft_crispr import (  # noqa: E402
+    _CAS_VARIANTS, _cas_variant, _design_guides, _guide_cloning_oligos,
+    _guide_offtargets, _score_guide,
+)
 from splicecraft_presets import (
     _find_preset, _preset_categories, _preset_features, _preset_matches,
     _preset_to_library_entry,
@@ -995,6 +999,221 @@ def _h_find_orfs(app, payload):
         circular=is_circular,
     )
     return {"orfs": orfs, "count": len(orfs)}
+
+
+@_agent_endpoint("list-cas-variants")
+def _h_list_cas_variants(app, payload):
+    """The Cas nucleases ``design-guides`` supports. Returns
+    ``{variants: [{key, label, pam, pam_side, guide_len, cut_offsets, notes},
+    ...]}``.
+
+    Three distinct PAM GEOMETRIES rather than a long catalogue of near
+    duplicates — a short 3' PAM, a long degenerate 3' PAM, and a 5' PAM with a
+    staggered cut. Use `key` as the ``variant`` argument elsewhere."""
+    return {"variants": [
+        {"key": k, "label": v["label"], "pam": v["pam"],
+         "pam_side": v["pam_side"], "guide_len": v["guide_len"],
+         "cut_offsets": list(v["cut_offsets"]), "notes": v["notes"]}
+        for k, v in _CAS_VARIANTS.items()
+    ]}
+
+
+def _crispr_target_sequence(app, payload):
+    """Resolve the sequence to scan: an explicit ``sequence``, or the loaded
+    plasmid when none is given.
+
+    Returns ``(seq, is_circular, err_tuple)``. A raw ``sequence`` is treated as
+    LINEAR unless ``circular`` says otherwise, because a pasted exon is the
+    common case and silently wrapping it would invent guides across a junction
+    that does not exist.
+    """
+    raw = payload.get("sequence")
+    if raw is not None:
+        seq, err = _sanitize_bases(raw)
+        if err:
+            return ("", False, ({"error": err}, 400))
+        if not seq:
+            return ("", False, ({"error": "'sequence' is empty"}, 400))
+        return (seq, bool(payload.get("circular", False)), None)
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ("", False, ({"error": "no plasmid loaded and no 'sequence' "
+                                      "given"}, 422))
+    seq = str(rec.seq) if rec.seq is not None else ""
+    if not seq:
+        return ("", False, ({"error": "loaded plasmid has no sequence"}, 422))
+    anns = getattr(rec, "annotations", None) or {}
+    circ = (anns.get("topology") == "circular")
+    return (seq, bool(payload.get("circular", circ)), None)
+
+
+@_agent_endpoint("design-guides")
+def _h_design_guides(app, payload):
+    """CRISPR guide design over the loaded plasmid or a supplied sequence.
+
+    Body: ``{sequence?, circular?, variant?: "spcas9"|"sacas9"|"lbcas12a",
+    region?: [start, end], u6_driven?: bool, offtarget?: bool|str,
+    max_mismatch?: int, limit?: int}``.
+
+    Returns ``{variant, label, circular, n_found, guides: [...], truncated,
+    offtarget_searched_bp}``. Each guide carries its forward-frame coordinates,
+    strand, cut site, a `score` block of NAMED flags (not a fabricated
+    efficiency number) and, when off-target search ran, `offtargets`.
+
+    **`offtarget_searched_bp` is the honest scope of any off-target claim.**
+    `offtarget: true` searches the target sequence itself; pass a SEQUENCE
+    string to search something else (a host genome you hold). Omit it and no
+    off-target claim is made at all — `offtarget_searched_bp` is then 0, so a
+    caller cannot read silence as "clean". There is no genome-wide prediction
+    here and none is implied; see `splicecraft_crispr`'s module docstring.
+    """
+    seq, circ, err = _crispr_target_sequence(app, payload)
+    if err:
+        return err
+    variant = payload.get("variant", "spcas9")
+    try:
+        _cas_variant(variant)
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
+
+    region = payload.get("region")
+    if region is not None:
+        if (not isinstance(region, (list, tuple))) or len(region) != 2:
+            return ({"error": "'region' must be [start, end] (0-based, "
+                              "half-open)"}, 400)
+        raw_lo = _coerce_int(region[0], name="region[0]")
+        if isinstance(raw_lo, str):
+            return ({"error": raw_lo}, 400)
+        raw_hi = _coerce_int(region[1], name="region[1]")
+        if isinstance(raw_hi, str):
+            return ({"error": raw_hi}, 400)
+        lo, hi = int(raw_lo), int(raw_hi)
+        if lo < 0 or hi < 0 or lo > len(seq) or hi > len(seq):
+            return ({"error": f"'region' out of range for a {len(seq)} bp "
+                              f"sequence"}, 400)
+        if lo == hi:
+            return ({"error": "'region' is empty (start == end)"}, 400)
+        region = (lo, hi)
+
+    limit = _coerce_int(payload.get("limit", 50), name="limit")
+    if isinstance(limit, str):
+        return ({"error": limit}, 400)
+    if limit < 1:
+        return ({"error": "'limit' must be >= 1"}, 400)
+    mm = _coerce_int(payload.get("max_mismatch", 4), name="max_mismatch")
+    if isinstance(mm, str):
+        return ({"error": mm}, 400)
+    if not (0 <= mm <= 10):
+        return ({"error": "'max_mismatch' must be 0-10"}, 400)
+
+    ot = payload.get("offtarget")
+    ot_seq = None
+    if isinstance(ot, str) and ot.strip():
+        cleaned, ot_err = _sanitize_bases(ot)
+        if ot_err:
+            return ({"error": f"'offtarget': {ot_err}"}, 400)
+        ot_seq = cleaned
+    elif ot is True:
+        ot_seq = seq
+    try:
+        return _design_guides(
+            seq, variant=variant, circular=circ,
+            u6_driven=bool(payload.get("u6_driven", True)),
+            region=region, offtarget_in=ot_seq, max_mismatch=mm,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
+
+
+@_agent_endpoint("score-guide")
+def _h_score_guide(app, payload):
+    """Triage a spacer you already have. Body:
+    ``{guide: str, u6_driven?: bool}``.
+
+    Returns ``{guide, gc_pct, homopolymer, self_complement, starts_with_g,
+    flags, tier}``. `flags` names the mechanism behind each concern (a Pol III
+    terminator truncates the transcript; a homopolymer slips in synthesis) —
+    deliberately NOT an efficiency score, because a number that looks like one
+    and is not would be worse than no number."""
+    guide, err = _sanitize_bases(payload.get("guide"), max_len=200)
+    if err:
+        return ({"error": f"'guide': {err}"}, 400)
+    if not guide:
+        return ({"error": "'guide' is required"}, 400)
+    out = _score_guide(guide, u6_driven=bool(payload.get("u6_driven", True)))
+    out["guide"] = guide
+    return out
+
+
+@_agent_endpoint("guide-offtargets")
+def _h_guide_offtargets(app, payload):
+    """Mismatch-tolerant search for a spacer in a sequence. Body:
+    ``{guide: str, sequence?, circular?, variant?, max_mismatch?: int,
+    require_pam?: bool}``; `sequence` defaults to the loaded plasmid.
+
+    Returns ``{searched_bp, max_mismatch, require_pam, hits, truncated}``.
+    `searched_bp` bounds the claim — this searches WHAT YOU GAVE IT, never a
+    genome. `seed_mismatches` counts mismatches in the PAM-proximal bases,
+    where Cas9 tolerates them least, and hits are ordered most-dangerous
+    first."""
+    guide, err = _sanitize_bases(payload.get("guide"), max_len=200)
+    if err:
+        return ({"error": f"'guide': {err}"}, 400)
+    if not guide:
+        return ({"error": "'guide' is required"}, 400)
+    seq, circ, serr = _crispr_target_sequence(app, payload)
+    if serr:
+        return serr
+    variant = payload.get("variant", "spcas9")
+    try:
+        _cas_variant(variant)
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
+    mm = _coerce_int(payload.get("max_mismatch", 4), name="max_mismatch")
+    if isinstance(mm, str):
+        return ({"error": mm}, 400)
+    if not (0 <= mm <= 10):
+        return ({"error": "'max_mismatch' must be 0-10"}, 400)
+    return _guide_offtargets(
+        guide, seq, variant=variant, circular=circ, max_mismatch=mm,
+        require_pam=bool(payload.get("require_pam", True)),
+    )
+
+
+@_agent_endpoint("guide-cloning-oligos")
+def _h_guide_cloning_oligos(app, payload):
+    """The annealed oligo pair that clones a spacer into a Type IIS guide
+    vector. Body: ``{guide: str, top_prefix?, bottom_prefix?, add_g?: bool}``.
+
+    Returns ``{top, bottom, duplex, guide, added_g, overhang_top,
+    overhang_bottom}``. Body may override ``overhang_top`` / ``overhang_bottom``
+    (defaults are the BbsI pair from the pX330 / pSpCas9(BB) family most lab
+    guide vectors descend from; a BsmBI lentiCRISPR backbone wants different
+    ones).
+
+    The bottom oligo carries the complement of the transcription-start G as
+    well as of the spacer, so both oligos come out the same length and anneal
+    with no gap — writing it as `AAAC + rc(guide)` is the classic error.
+    `added_g` reports whether that G was added (a guide already starting with G
+    supplies its own)."""
+    guide, err = _sanitize_bases(payload.get("guide"), max_len=200)
+    if err:
+        return ({"error": f"'guide': {err}"}, 400)
+    if not guide:
+        return ({"error": "'guide' is required"}, 400)
+    kw = {}
+    for key in ("overhang_top", "overhang_bottom"):
+        if key in payload:
+            val, verr = _sanitize_bases(payload.get(key), max_len=40)
+            if verr:
+                return ({"error": f"{key!r}: {verr}"}, 400)
+            kw[key] = val
+    try:
+        return _guide_cloning_oligos(
+            guide, add_g=bool(payload.get("add_g", True)), **kw)
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
 
 
 @_agent_endpoint("list-codon-tables")
@@ -2837,6 +3056,7 @@ _AGENT_SETTINGS_ALLOWLIST: "dict[str, tuple]" = {
     "restr_custom_enzymes":  (_settings_validator_custom_enzymes_csv,    ""),
     "restr_use_custom_list": (_settings_validator_bool,                  False),
     "min_primer_binding":    (_settings_validator_int_range(1, 60),      15),
+    "sanger_min_phred":      (_settings_validator_int_range(0, 93),      20),
     "active_collection":     (_settings_validator_collection_name,       ""),
     "active_enzyme_collection": (_settings_validator_collection_name,     ""),
     "active_grammar":        (_settings_validator_grammar_id,            "gb_l0"),
@@ -7615,6 +7835,14 @@ def _h_verify_against_reads(app, payload):
     ``{reference | reference_id | reference_name, reads: [str, ...],
         circular?, mode?="global", min_identity?=99.0}``.
 
+    ``read_quality`` (optional) is a per-read list of per-base Phred arrays,
+    PARALLEL to ``reads`` — pass ``null`` for a read that has none. When given,
+    each read also gets a ``quality`` verdict splitting its differences into the
+    ones the read actually SUPPORTS and the ones sitting in unreliable
+    basecalls, and ``read_quality`` in the response carries them. Both ends of a
+    Sanger read are ragged, so without this a good clone can score as divergent
+    on instrument noise. ``min_phred`` (default 20) is the cutoff.
+
     ``reference`` is a bare sequence, OR resolve a saved plasmid via
     ``reference_id`` / ``reference_name`` (its stored topology sets
     ``circular`` unless you pass ``circular``). Each read in ``reads`` (bare
@@ -7688,7 +7916,37 @@ def _h_verify_against_reads(app, payload):
             return ({"error": f"reads[{i}] exceeds {_PAIRWISE_MAX_LEN:,} bp"},
                     413)
         clean_reads.append(rs)
+    # Per-read Phred arrays, parallel to `reads`. Validated up front so a
+    # malformed entry is a 400 naming the read rather than a traceback halfway
+    # through the alignment loop.
+    read_quals: list = []
+    rq = payload.get("read_quality")
+    if rq is not None:
+        if not isinstance(rq, list):
+            return ({"error": "'read_quality' must be a list parallel to "
+                              "'reads' (null for a read with no quality)"},
+                    400)
+        if len(rq) != len(reads):
+            return ({"error": f"'read_quality' has {len(rq)} entries for "
+                              f"{len(reads)} reads — they must be parallel"},
+                    400)
+        for qi, one in enumerate(rq):
+            if one is None:
+                read_quals.append(None)
+                continue
+            if not isinstance(one, list) or not all(
+                    isinstance(v, (int, float)) and not isinstance(v, bool)
+                    for v in one):
+                return ({"error": f"read_quality[{qi}] must be a list of "
+                                  f"numbers or null"}, 400)
+            read_quals.append([int(v) for v in one])
+    min_phred = _coerce_int(payload.get("min_phred", 20), name="min_phred")
+    if isinstance(min_phred, str):
+        return ({"error": min_phred}, 400)
+    if not (0 <= min_phred <= 93):
+        return ({"error": "'min_phred' must be 0-93"}, 400)
     out_reads = []
+    _consensus_inputs: list = []
     for i, rs in enumerate(clean_reads):
         try:
             res = _state._pick_best_rotation_hook(
@@ -7708,6 +7966,24 @@ def _h_verify_against_reads(app, payload):
         # "right construct, wrong way round".
         inv = [s for s in (res.get("inverted_segments") or [])
                if isinstance(s, dict)]
+        # Keep the alignment itself so the cross-read rollup below needs no
+        # second pass: one read agreeing with itself is not evidence, and the
+        # caller cannot combine per-read identities into per-variant support.
+        _entry = {"result": res, "axis": "target",
+                  "query_label": f"read {i + 1}"}
+        # Basecall quality, when the caller supplied it for this read. Computed
+        # HERE because the per-base array cannot be persisted anywhere — a
+        # library entry is `gb_text` — so it is consumed while in hand and
+        # reduced to a verdict the consensus can reuse.
+        one_q = read_quals[i] if i < len(read_quals) else None
+        if one_q:
+            try:
+                _entry["quality"] = _state._trace_verification_summary_hook(
+                    res.get("aligned_q") or "", res.get("aligned_t") or "",
+                    one_q, min_phred=min_phred)
+            except Exception:
+                _log.exception("verify-against-reads: quality summary failed")
+        _consensus_inputs.append(_entry)
         out_reads.append({"index": i, "length": len(rs), "identity_pct": ident,
                           "rc": bool(res.get("query_rc", False)),
                           "inversions": inv,
@@ -7736,9 +8012,17 @@ def _h_verify_against_reads(app, payload):
                         "min": min(idents), "max": max(idents),
                         "n_pass": n_pass, "n_fail": len(out_reads) - n_pass,
                         "n_inverted": n_inverted},
+            # Cross-read rollup: which differences the reads AGREE on, how much
+            # of the reference they actually covered, and what nobody read.
+            # Per-read identity cannot answer any of those — two reads at 99.9%
+            # might disagree about entirely different bases.
+            "consensus": _state._multi_read_summary_hook(
+                _consensus_inputs, len(ref_seq)),
+            "read_quality": [e.get("quality") for e in _consensus_inputs],
             "ignored": _agent_ignored_keys(payload, {
                 "reference", "reference_id", "reference_name", "reads",
-                "circular", "mode", "min_identity"})}
+                "circular", "mode", "min_identity", "read_quality",
+                "min_phred"})}
 
 
 @_agent_endpoint("align-plasmidsaurus-zip")
@@ -9812,6 +10096,379 @@ def _h_delete_experiment_project(app, payload):
     _log_event("project.deleted", name=name, via="agent",
                 promoted=promoted)
     return {"ok": True, "name": name, "promoted": promoted}
+
+
+# ── Notebook search / backlinks / protocol / export (2026-09-17) ────────────
+# The read side of the lab notebook. Until these landed, the `attached_*`
+# xrefs were rebuilt on every save and read by nothing, and the only way to
+# find an entry by its contents was to `get-experiment` each id in turn.
+
+def _agent_experiment_rows(payload) -> "tuple[list[tuple[str, dict]] | None, tuple | None]":
+    """`[(project, entry), …]` for the scope named in `payload`.
+
+    ``{project: "X"}`` scopes to one project, ``{all_projects: true}``
+    spans every project, and the default is the active project only —
+    the same scoping `list-experiments` uses, plus the cross-project
+    option the GUI's Ctrl+F search has.
+    """
+    if payload.get("all_projects"):
+        if payload.get("project"):
+            return None, ({"error": "pass 'project' or 'all_projects', "
+                                     "not both"}, 400)
+        return _iter_all_experiments(), None
+    src, perr = _agent_project_experiments_list(payload.get("project"))
+    if perr is not None:
+        return None, perr
+    assert src is not None
+    pname = payload.get("project") or (_get_active_project_name() or "")
+    return [(pname, e) for e in src], None
+
+
+def _agent_experiment_hit(project: str, entry: dict, *,
+                           fields=(), snippet: str = "") -> dict:
+    """Search-result row. Carries no `body_md` (a hit list of 1 MB bodies
+    is not a response) — `get-experiment` fetches the text."""
+    body = entry.get("body_md") or ""
+    return {
+        "id":         entry.get("id", ""),
+        "title":      entry.get("title", ""),
+        "project":    project,
+        "tags":       list(entry.get("tags") or []),
+        "created_at": entry.get("created_at", ""),
+        "updated_at": entry.get("updated_at", ""),
+        "body_bytes": len(body.encode("utf-8", errors="replace"))
+                      if isinstance(body, str) else 0,
+        "matched_in": list(fields),
+        "snippet":    snippet,
+    }
+
+
+@_agent_endpoint("search-experiments")
+def _h_search_experiments(app, payload):
+    """Full-text search across notebook entries. Body:
+    ``{query?: str, tags?: list[str], project?: str,
+       all_projects?: bool, limit?: int}``.
+
+    `query` terms must ALL appear, in the title, tags or body (AND
+    across terms, OR across fields) — so ``"gibson failed"`` finds the
+    Gibson entry that mentions failure without matching every entry
+    that says "gibson". `tags` narrows to entries carrying ALL the named
+    tags and works on its own, which is the "show me every Gibson entry"
+    browse. Returns `matched_in` (which fields hit) and a `snippet` of
+    body context per row; `body_md` itself comes from
+    ``get-experiment``."""
+    rows, err = _agent_experiment_rows(payload)
+    if err is not None:
+        return err
+    assert rows is not None
+    query = payload.get("query") or ""
+    if not isinstance(query, str):
+        return ({"error": "'query' must be a string"}, 400)
+    tags = payload.get("tags") or []
+    if not isinstance(tags, list):
+        return ({"error": "'tags' must be a list of strings"}, 400)
+    if not query.strip() and not tags:
+        return ({"error": "pass 'query' and/or 'tags'"}, 400)
+    limit = _coerce_int(payload.get("limit", 200), name="limit")
+    if isinstance(limit, str):
+        return ({"error": limit}, 400)
+    limit = max(1, min(2000, limit))
+    # Search per project so each hit keeps naming the project it came
+    # from, then re-rank globally (score, then recency).
+    grouped: "dict[str, list[dict]]" = {}
+    for proj, e in rows:
+        grouped.setdefault(proj, []).append(e)
+    scored: "list[tuple[int, str, str, dict, list]]" = []
+    for proj, entries in grouped.items():
+        for h in _experiment_search(entries, query, tags=tags):
+            scored.append((h["score"],
+                           h["entry"].get("updated_at") or "",
+                           proj, h["entry"], h["fields"]))
+    scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
+    terms = _experiment_search_terms(query)
+    out = [
+        _agent_experiment_hit(
+            proj, e, fields=fields,
+            snippet=_experiment_snippet(e.get("body_md"), terms),
+        )
+        for _sc, _up, proj, e, fields in scored[:limit]
+    ]
+    return {"experiments": out, "count": len(out),
+            "truncated": len(scored) > limit,
+            "scope": ("all" if payload.get("all_projects")
+                      else (payload.get("project")
+                            or _get_active_project_name() or ""))}
+
+
+@_agent_endpoint("experiment-backlinks")
+def _h_experiment_backlinks(app, payload):
+    """Which notebook entries reference an object — the reverse of the
+    `@plasmid` / `!action` / `&gel` body tags. Body:
+    ``{ref: str | list[str], kind?: "plasmid"|"action"|"gel",
+       project?: str, all_projects?: bool}``.
+
+    `ref` accepts a list so a plasmid can be asked for by BOTH its
+    library entry id and its display name: the GUI's `Plasmid ref`
+    button writes the id, while a hand-typed `@ref` is usually the name.
+    Matching is case-insensitive.
+
+    Refs are re-extracted from each body rather than read from the
+    stored `attached_*` xref — the xref is rebuilt on every save, but a
+    hand-edited `experiments.json` can carry a stale one, and answering
+    "nothing references that" when something does is the failure this
+    endpoint exists to prevent."""
+    ref = payload.get("ref")
+    refs = [ref] if isinstance(ref, str) else ref
+    if not isinstance(refs, list) or not any(
+            isinstance(r, str) and r.strip() for r in refs):
+        return ({"error": "missing 'ref' (string or list of strings)"}, 400)
+    kind = payload.get("kind") or "plasmid"
+    if kind not in ("plasmid", "action", "gel"):
+        return ({"error": "'kind' must be one of "
+                           "plasmid, action, gel"}, 400)
+    rows, err = _agent_experiment_rows(payload)
+    if err is not None:
+        return err
+    assert rows is not None
+    grouped: "dict[str, list[dict]]" = {}
+    for proj, e in rows:
+        grouped.setdefault(proj, []).append(e)
+    out: "list[dict]" = []
+    for proj, entries in grouped.items():
+        for e in _experiments_referencing(entries, refs, kind=kind):
+            out.append(_agent_experiment_hit(proj, e))
+    out.sort(key=lambda h: h.get("updated_at") or "", reverse=True)
+    return {"experiments": out, "count": len(out), "kind": kind,
+            "ref": [r for r in refs if isinstance(r, str) and r.strip()]}
+
+
+@_agent_endpoint("get-plasmid-protocol")
+def _h_get_plasmid_protocol(app, payload):
+    """A plasmid's recorded construction history as a bench protocol.
+    Body: ``{id: str, collection?: str}``.
+
+    Reads the same `_history_build_steps` the History viewer renders, so
+    the answer is what the program actually recorded doing — not a
+    reconstruction. Returns the structured `steps` AND a `markdown`
+    rendering ready to paste into a notebook entry.
+
+    Only names that resolve in the library become `@refs` in the
+    markdown; the rest stay inline code, so the protocol never plants a
+    dangling ref. Steps the program never saw — transformation,
+    miniprep, sequencing — are absent by construction; use
+    ``experiment-step-template`` for those."""
+    key = payload.get("id") or payload.get("name")
+    if not isinstance(key, str) or not key.strip():
+        return ({"error": "missing 'id'"}, 400)
+    key = key.strip()
+    coll = payload.get("collection")
+    if coll is not None and not isinstance(coll, str):
+        return ({"error": "'collection' must be a string"}, 400)
+    hits = _agent_scan_library_for_key(key, coll)
+    if not hits:
+        return ({"error": f"no library plasmid named {key!r}"
+                           + (f" in collection {coll!r}" if coll else "")},
+                404)
+    _coll_name, entry = hits[0]
+    name = entry.get("name") or key
+    history_xml = entry.get("history_xml")
+    if not history_xml:
+        return ({"error": f"no construction history recorded for {name!r}"},
+                404)
+    try:
+        root = _parse_commercialsaas_history(history_xml)
+    except ValueError as exc:
+        return ({"error": f"malformed history: {exc}"}, 422)
+    if root is None:
+        return ({"error": f"history for {name!r} is empty"}, 404)
+    steps = _history_build_steps(root)
+    known: "set[str]" = set()
+    for s in steps:
+        cands = [s.get("product"), s.get("backbone")]
+        cands += list(s.get("inputs") or [])
+        for c in cands:
+            if (isinstance(c, str) and c and c not in known
+                    and _experiment_ref_token_ok(c)
+                    and _agent_scan_library_for_key(c)):
+                known.add(c)
+    return {
+        "plasmid": name,
+        "collection": _coll_name,
+        "n_steps": len(steps),
+        "steps": [
+            {"op": s.get("op", ""), "product": s.get("product", ""),
+             "inputs": list(s.get("inputs") or []),
+             "backbone": s.get("backbone", ""),
+             "enzymes": list(s.get("enzymes") or []),
+             "where": s.get("where", ""),
+             "seq_len": s.get("seq_len", 0),
+             "circular": bool(s.get("circular"))}
+            for s in steps
+        ],
+        "markdown": _protocol_steps_markdown(
+            steps, product=name, known_ids=known),
+    }
+
+
+@_agent_endpoint("experiment-step-template")
+def _h_experiment_step_template(app, payload):
+    """A heading-per-step skeleton for the named bench actions. Body:
+    ``{actions: list[str], heading?: str}``.
+
+    The counterpart to ``get-plasmid-protocol``: that one emits what the
+    program DID, this one emits the steps you are ABOUT to do, as empty
+    headings carrying their `!action` tags in catalog order. Unknown
+    action ids are accepted (the catalog is curated, not enforced) and
+    titled by the id. Returns `markdown` to prepend/append to a body via
+    ``update-experiment``; ``list-experiment-actions`` names the
+    catalog."""
+    actions = payload.get("actions")
+    if not isinstance(actions, list) or not any(
+            isinstance(a, str) and a.strip() for a in actions):
+        return ({"error": "missing 'actions' (list of action ids)"}, 400)
+    heading = payload.get("heading") or ""
+    if not isinstance(heading, str):
+        return ({"error": "'heading' must be a string"}, 400)
+    picked = [a.strip() for a in actions
+              if isinstance(a, str) and a.strip()]
+    known = {row[1] for row in _EXPERIMENT_ACTIONS}
+    md = _experiment_template_markdown(
+        picked, _EXPERIMENT_ACTIONS, heading=heading,
+    )
+    return {"markdown": md, "actions": picked,
+            "unknown_actions": [a for a in picked if a not in known]}
+
+
+@_agent_endpoint("list-experiment-actions")
+def _h_list_experiment_actions(app, payload):
+    """The curated bench-action catalog behind the `!<id>` body tags —
+    `[{group, id, description}, …]`. Curated, not enforced: a body may
+    carry any `!my-step` tag that matches the ref pattern."""
+    return {"actions": [
+        {"group": g, "id": a, "description": d}
+        for g, a, d in _EXPERIMENT_ACTIONS
+    ], "count": len(_EXPERIMENT_ACTIONS)}
+
+
+@_agent_endpoint("export-experiment")
+def _h_export_experiment(app, payload):
+    """Render a notebook entry — or a whole project — as a document.
+    Body: ``{id?: str, project?: str, format?: "markdown"|"html"}``.
+
+    Returns the document TEXT rather than writing a file, so the caller
+    chooses the destination (and no agent path-safety check is needed).
+
+    Markdown copies each body verbatim — cross-ref sigils intact, so an
+    exported entry pastes back into a new one with working refs — and
+    adds a metadata header, a resolved References block and the
+    attachment list around it. HTML renders the documented markdown
+    subset into a standalone page with the stylesheet inlined.
+
+    Image attachments are referenced by their stored filename; the
+    bytes are not embedded (that is the GUI export's job, where the
+    attachment directory is at hand). Use ``get-experiment`` +
+    ``list-experiments`` for the raw fields."""
+    # Type-check BEFORE `.lower()`: `(payload.get("format") or "markdown")`
+    # passes a truthy non-string straight through, so `{"format": 1}` used
+    # to raise AttributeError — a 500 where a 400 belongs (found by
+    # junk-payload fuzzing, 2026-09-17).
+    fmt_raw = payload.get("format")
+    if fmt_raw is None or fmt_raw == "":
+        fmt_raw = "markdown"
+    if not isinstance(fmt_raw, str):
+        return ({"error": "'format' must be a string "
+                           "('markdown' or 'html')"}, 400)
+    fmt = fmt_raw.lower()
+    if fmt not in ("markdown", "md", "html"):
+        return ({"error": "'format' must be 'markdown' or 'html'"}, 400)
+    eid_in = payload.get("id")
+    src, perr = _agent_project_experiments_list(payload.get("project"))
+    if perr is not None:
+        return perr
+    assert src is not None
+    project = payload.get("project") or (_get_active_project_name() or "")
+    if eid_in is not None:
+        eid = _sanitize_experiment_id(eid_in)
+        if eid is None:
+            return ({"error": "invalid 'id'"}, 400)
+        entry = next((e for e in src if e.get("id") == eid), None)
+        if entry is None:
+            return ({"error": f"no experiment with id {eid!r}"
+                               + (f" in project {project!r}" if project
+                                  else "")}, 404)
+        entries = [entry]
+    else:
+        entries = sorted(src, key=lambda e: (e.get("updated_at") or ""),
+                          reverse=True)
+        if not entries:
+            return ({"error": "no entries to export"}, 404)
+    if fmt == "html":
+        text = _experiment_html_document(
+            entries,
+            title=(entries[0].get("title") if len(entries) == 1
+                    else project),
+            project=project,
+        )
+    elif len(entries) == 1:
+        text = _experiment_markdown_document(entries[0], project=project)
+    else:
+        text = _experiment_project_markdown(entries, project=project)
+    return {"format": "html" if fmt == "html" else "markdown",
+            "project": project, "n_entries": len(entries),
+            "bytes": len(text.encode("utf-8", errors="replace")),
+            "document": text}
+
+
+@_agent_endpoint("duplicate-experiment", write=True)
+def _h_duplicate_experiment(app, payload):
+    """Copy a notebook entry under a fresh id — "start from the write-up
+    I already have". Body: ``{id: str, title?: str}``.
+
+    Operates on the ACTIVE project only, and refuses a ``project`` key
+    rather than quietly duplicating whatever shares that id in the
+    active project: unlike `create-experiment`, this both READS and
+    WRITES, and doing that against a non-active project's stored entries
+    while the live mirror holds the active one is the desync `[INV-161]`
+    guards. Switch with ``set-active-experiment-project``, or duplicate
+    here and ``move-experiment`` the copy.
+
+    Image attachments are deliberately NOT copied: they live in a
+    per-entry directory keyed by entry id, so carrying the paths over
+    would point the copy into the ORIGINAL's directory — deleting either
+    entry would then break the other's images. `attachments_copied` is
+    always false and says so rather than leaving the caller to find
+    out."""
+    eid = _sanitize_experiment_id(payload.get("id"))
+    if eid is None:
+        return ({"error": "missing or invalid 'id'"}, 400)
+    if payload.get("project"):
+        return ({"error":
+                  "duplicate-experiment works on the ACTIVE project only — "
+                  "set-active-experiment-project first, or duplicate here "
+                  "and move-experiment the copy"}, 400)
+    title = payload.get("title")
+    if title is not None and not isinstance(title, str):
+        return ({"error": "'title' must be a string"}, 400)
+    # Sweep #26: RMW under `_state._cache_lock`.
+    with _state._cache_lock:
+        entries = _load_experiments()
+        src = next((e for e in entries if e.get("id") == eid), None)
+        if src is None:
+            return ({"error": f"no experiment with id {eid!r}"}, 404)
+        new_id = _new_experiment_id(
+            {i for i in (e.get("id") for e in entries)
+             if isinstance(i, str)})
+        copy = _experiment_duplicate(src, new_id=new_id, title=title)
+        entries.append(copy)
+        err = _agent_save_or_500(lambda: _save_experiments(entries),
+                                  "experiments")
+        if err:
+            return err
+    _log_event("experiments.duplicated", src=eid, eid=new_id, via="agent")
+    return {"ok": True, "id": new_id, "source_id": eid,
+            "title": copy.get("title", ""),
+            "attachments_copied": False,
+            "n_entries": len(entries)}
 
 
 @_agent_endpoint("get-enzyme-collection")

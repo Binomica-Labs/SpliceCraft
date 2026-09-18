@@ -2988,6 +2988,45 @@ def _find_project(name: str) -> "dict | None":
     return None
 
 
+def _iter_all_experiments() -> "list[tuple[str, dict]]":
+    """``[(project_name, entry), …]`` across EVERY experiment project.
+
+    The active project's entries are read from the live `experiments.json`
+    (`_load_experiments`), not from its stored copy inside
+    `experiment_projects.json`: `_save_experiments` writes the live file
+    first and mirrors into the project record via
+    `_sync_active_project_experiments`, so within a session the stored
+    copy can lag by one save. Reading the mirror for the active project
+    is the same rule `_agent_scan_library_for_key` follows for the
+    active collection — and the reason a just-edited entry is findable.
+
+    Underpins cross-project notebook search (`ExperimentSearchModal`,
+    `search-experiments`), which is to projects what
+    `_agent_scan_library_for_key` is to collections.
+    """
+    active = _get_active_project_name()
+    out: "list[tuple[str, dict]]" = []
+    seen_active = False
+    for p in _load_experiment_projects():
+        name = p.get("name") or ""
+        if name and name == active:
+            seen_active = True
+            entries = _load_experiments()
+        else:
+            entries = p.get("experiments") or []
+        for e in entries:
+            if isinstance(e, dict):
+                out.append((name, e))
+    if not seen_active:
+        # No project record matches the active pointer (first run before
+        # `_ensure_default_project`, or a hand-edited settings file). The
+        # live entries still exist and must still be searchable.
+        for e in _load_experiments():
+            if isinstance(e, dict):
+                out.append((active or "", e))
+    return out
+
+
 # ── OT-2 protocol library + custom-labware library ──────────────────────────────
 # Two single-file stores, each a list of named collections that EMBED their items
 # (saved protocol designs / custom Opentrons labware definitions) — the plasmid-

@@ -74,6 +74,27 @@ _FASTA_EXTS: frozenset[str] = frozenset({
 
 _SEQ_ZIP_EXTS: frozenset[str] = frozenset({".zip"})
 
+# Raster image suffixes. Lives at L0 because THREE layers need the same
+# answer and a mirrored copy would drift: the hub's notebook attach picker
+# + blob writer, and the experiments L1 exporters, which must emit
+# `![...]` / `<img>` for an image and a plain link for a trace or a
+# datasheet (an image tag around a `.ab1` renders as a broken-image box).
+_IMAGE_EXTS: tuple = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+                      ".tiff", ".tif")
+
+
+def _is_image_path(path: object) -> bool:
+    """True when `path` (str / Path / anything with `.suffix`) names a
+    raster image by extension. Extension-only on purpose — the callers
+    are deciding how to RENDER a reference, not validating bytes."""
+    try:
+        suffix = getattr(path, "suffix", None)
+        if suffix is None:
+            suffix = Path(str(path)).suffix
+    except (TypeError, ValueError):
+        return False
+    return str(suffix).lower() in _IMAGE_EXTS
+
 _CONTROL_CHARS_RE = re.compile(
     # C0 + DEL/C1 + surrogates + line/para separators AND the Unicode
     # DIRECTIONAL format controls - bidi embeddings/overrides (U+202A-202E),

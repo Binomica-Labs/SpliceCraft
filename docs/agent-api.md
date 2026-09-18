@@ -74,7 +74,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-~226 endpoints across:
+~252 endpoints across:
 
 - **Records** — `new-plasmid` (create from a raw sequence, the Ctrl+N
   flow), get / set sequence, add / update / delete features (with the full
@@ -609,13 +609,67 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 - **Experiments lab notebook** — list / get / create / update /
   delete experiment entries; move-experiment (relocate an entry to
   another project in one atomic call); attach-experiment-image (attach a
-  server-side image file + embed it in the entry body); list / create /
+  server-side file + embed it in the entry body — images AND data
+  attachments such as `.ab1` / `.csv` / `.pdf` / GenBank / FASTA; the
+  embedded reference is `![name](name)` for an image and `[name](name)`
+  for anything else, and the reply says which via `is_image`. The endpoint
+  keeps its `-image` name for compatibility); list / create /
   rename / delete projects; set active project (full notebook-layer CRUD).
   `create-experiment` / `list-experiments` / `delete-experiment` accept a
   `{project}` to file into / read / prune just that named project's own
   entries (a project is a real partition, not only for writes; deleting
   from the active project by name is refused — switch away first so the
   live mirror stays consistent).
+- **Notebook read side** (2026-09-17) — the counterpart to the
+  create/update/delete endpoints above, since nothing could previously
+  find an entry by its contents:
+  - `search-experiments` — `{query?, tags?, project?, all_projects?, limit?}`.
+    Query terms must ALL appear, in the title, tags or body (AND across
+    terms, OR across fields), so `"gibson failed"` finds the Gibson entry
+    that mentions failure rather than every entry that says "gibson".
+    `tags` narrows to entries carrying ALL the named tags and works on its
+    own (the "every Gibson entry" browse). Each hit carries `project`,
+    `matched_in` and a `snippet` of body context but **not** `body_md` —
+    fetch that with `get-experiment`. Passing neither query nor tags is a
+    400, not a dump of the notebook.
+  - `experiment-backlinks` — `{ref, kind?, project?, all_projects?}`, the
+    reverse of the `@plasmid` / `!action` / `&gel` body tags. `ref` takes a
+    **list** so a plasmid can be asked for by both its library entry id
+    (what the `Plasmid ref` button writes) and its display name (what a
+    hand-typed ref usually is). Case-insensitive, and refs are
+    re-extracted from each body rather than read from the stored
+    `attached_*` xref — a hand-edited `experiments.json` can carry a stale
+    index, and "nothing references that" when something does is the
+    failure this endpoint exists to prevent.
+  - `get-plasmid-protocol` — `{id, collection?}` → the plasmid's recorded
+    construction steps, structured **and** as `markdown` ready to paste
+    into an entry. Same `_history_build_steps` the History viewer renders,
+    so it is what was recorded, not a reconstruction; only names that
+    resolve in the library become `@refs`, so the markdown never plants a
+    dangling one. Steps the program never saw (transformation, miniprep,
+    sequencing) are absent by construction. 404 with no history, 422 on
+    malformed history.
+  - `experiment-step-template` — `{actions, heading?}` → a heading-per-step
+    skeleton carrying each `!action` tag, in catalog order. The forward
+    half of the pair: what you are about to do, rather than what was
+    recorded. Unknown action ids are accepted (the catalog is curated, not
+    enforced) and reported in `unknown_actions`.
+  - `list-experiment-actions` — the curated bench-action catalog behind the
+    `!<id>` tags, as `[{group, id, description}]`.
+  - `export-experiment` — `{id?, project?, format?}` → the document TEXT
+    (`markdown` or `html`), not a file, so the caller picks the
+    destination. Markdown keeps each body verbatim so an export pastes
+    back into a new entry with working refs; HTML is a standalone page
+    with the stylesheet inlined.
+  - `duplicate-experiment` — `{id, title?}`, a write. Image attachments are
+    **not** copied (they live in a per-entry directory keyed by entry id,
+    so carrying the paths over would point the copy into the original's
+    directory); `attachments_copied` is always false and says so. Works on
+    the **active** project only and refuses a `project` key rather than
+    duplicating whatever shares that id there — unlike
+    `create-experiment` it both reads and writes, and doing that against
+    a non-active project while the live mirror holds the active one is
+    the desync `set-active-experiment-project` exists to avoid.
 - **Gels** — list / get / create / update / delete saved gel
   snapshots (in addition to simulate-gel for one-shot runs).
 - **Protein motifs** — list (built-ins + user overrides),
@@ -743,6 +797,40 @@ before a client has a token, so they short-circuit the authenticated response
 pipeline; for `/tools`, mirroring its `doc_full` corpus under `data` would
 also needlessly double the API's largest response. Don't blindly read
 `resp["data"]` on these two — check by endpoint.
+
+- **CRISPR** — `list-cas-variants` (SpCas9 / SaCas9 / LbCas12a — three
+  distinct PAM geometries), `design-guides` (over the loaded plasmid or a
+  supplied `sequence`; `region` aims at an exon, `variant` picks the nuclease),
+  `score-guide`, `guide-offtargets`, `guide-cloning-oligos`. Guides come back in
+  FORWARD-strand coordinates with an explicit strand and cut site, wrap-aware on
+  a circular plasmid. **Two deliberate non-claims:** the triage reports NAMED
+  properties (GC window, Pol III terminator, homopolymers,
+  self-complementarity) and not a fabricated efficiency score; and off-target
+  search covers only what you hand it, with `offtarget_searched_bp` in every
+  response so silence can never read as "specific". There is no genome-wide
+  prediction here.
+- **Protein-level editing** — `plan-residue-edit` (what changing residue *n*
+  would do, without doing it) and `edit-residue` (do it). The residue is
+  resolved to its three plasmid base pairs through strand, `/codon_start`,
+  introns and the origin — the mapping you would otherwise do by hand — and the
+  codon is chosen from the active codon-usage table, with `alternatives` ranked
+  so you can pick one that avoids a site you care about. `silent`,
+  `creates_stop` and `removes_stop` are reported rather than refused.
+- **Reads + verification** — `read-consensus` combines every read STORED on a
+  plasmid: for each difference, how many reads that COVER that base show it and
+  how many looked and disagreed (`confirmed` / `single_read` / `unconfirmed` /
+  `clean`). `uncovered_spans` is part of the answer, because a plasmid can read
+  "100% identity" over the half that was sequenced. `verify-against-reads` takes
+  read SEQUENCES instead, and its optional `read_quality` (per-read Phred
+  arrays) splits each read's differences into the ones it supports and the ones
+  sitting in unreliable basecalls.
+- **Ordering + the bench** — `export-primers` writes an order sheet
+  (`generic` / `idt` / `plate` — row-major A1..A12 wells, rolling onto plate 2
+  past 96 oligos), closing the gap where only the GUI could order oligos.
+  `pcr-program` + `list-polymerases` give the thermocycler block for a product
+  length and primer Tms; every number carries the rule that produced it, and
+  with no Tm supplied the program says it is using a conventional default
+  instead of presenting an invented number as derived.
 
 ## Security posture
 

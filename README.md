@@ -212,6 +212,23 @@ amplicon or send it to a gel lane. Gels render at 0.5–4% on a real
 Helling–Goodman–Boyer mobility curve; stack lanes, save a gel to reload later,
 or cite it as `&<gel>` in your notebook.
 
+### CRISPR
+
+Scan the open plasmid for guide sites — SpCas9, SaCas9 or LbCas12a — and get
+ranked with the concerns named rather than scored: a `TTTT` that stops Pol III
+mid-transcript, a GC window out of range, a spacer that folds on itself. Pick one
+and the annealed cloning oligos land on your clipboard, with the 5' G added only
+when the spacer needs one. **It will not claim to check off-targets
+genome-wide** — that needs an index this program doesn't have, so it searches the
+plasmid in front of you and tells you how many base pairs that was. And there's
+no efficiency score, because a number that looked like one and wasn't would be
+worse than the flags you can check.
+
+`Alt+Shift+G` edits a *residue* and lets the DNA follow: pick a CDS, a residue
+number and the new amino acid, and the codon it resolves to is shown — through
+the strand, the reading frame offset, any introns and the origin — before
+anything changes.
+
 ### Sequencing
 
 Verify constructs against real reads. Drop in a Plasmidsaurus `.zip` or fetch a
@@ -225,12 +242,36 @@ auto-align** matches a whole folder in one pass. The **Verification Report**
 grades every construct (✓ verified / ⚠ near / ~ partial / ⇄ inverted /
 ✗ divergent), and a true sub-100% identity never rounds up to "100%".
 
+Drop in a Sanger `.ab1` and **Check against canvas** asks the question you
+actually care about: *is that mismatch real?* Both ends of every trace are
+unreliable, so SpliceCraft reads the basecall quality under each difference and
+reports "1 real change, 1 in unreliable basecalls" rather than a flat count —
+which is what stops a good clone reading as divergent because the chemistry ran
+out. A read with no recorded quality says so instead of guessing.
+
 ### Experiments
 
 A genuine lab notebook in markdown: a split-pane editor, entries grouped into
 **projects**, and live colored cross-references — type `@plasmid`, `!action`,
 or `&gel` and `Ctrl+G` jumps to the source. Attach images, previewed inline,
-and spellcheck with `F7`.
+and spellcheck with `F7`. Attachments are no longer images only — the
+`.ab1` the vendor sent, the plate-reader CSV, a supplier PDF all live with
+the entry, images previewing inline and everything else listing as a file.
+
+It reads back, too. The filter box narrows the open project as you type
+(`#tag` filters by tag); `Ctrl+F` searches **every** project — words that must
+all appear, in the title, the tags or the body, with the matching line shown
+beside each hit. From the other direction, `n` on a library row answers *what
+did I already write about this plasmid?* and opens those entries.
+
+**Protocol** pulls a plasmid's recorded build steps straight into the entry, so
+you stop retyping what the program already knows — and because it only writes
+steps that were actually recorded, there is no invented transformation in it.
+**Steps** does the opposite for work not yet done: pick the bench actions and
+you get a heading per step with its tag. **Copy** starts a new entry from one
+you already wrote. `Ctrl+E` exports an entry or a whole project to Markdown
+(the body verbatim, so it pastes back with its refs intact) or to a standalone
+HTML page with the stylesheet inlined, ready to print or send.
 
 ### History
 

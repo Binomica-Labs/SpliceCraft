@@ -14,6 +14,151 @@
 
 ---
 
+## [1.2.66] — 2026-09-17
+
+### New features
+
+- **CRISPR guide design.** A new **CRISPR** menu (`Alt+G`) scans the open
+  plasmid for guide sites and ranks them. Pick SpCas9, SaCas9 or LbCas12a, and
+  optionally a bp window to aim at one exon instead of the whole plasmid. Each
+  guide shows its strand, predicted cut site and the things that actually matter
+  — a `TTTT` that will stop Pol III mid-transcript, a GC window outside 40–70%,
+  a homopolymer run, a spacer that folds back on itself. Pick one and **Cloning
+  oligos** copies the annealed pair for a Type IIS guide vector (the 5' G is
+  added only when the spacer doesn't already start with one, and it says which
+  happened — that off-by-one is how the pair is usually got wrong). **Annotate on
+  map** drops the protospacer onto the plasmid.
+  Two things it deliberately won't do: there's no genome-wide off-target
+  prediction, because that needs a genome index this program doesn't have —
+  off-target search covers the plasmid in front of you and reports how many base
+  pairs it looked at, so "none found" can't be mistaken for "specific". And
+  there's no efficiency score, because a number that looked like a published
+  on-target model and wasn't would be worse than flags you can check yourself.
+- **Edit a residue and let the DNA follow** (`Alt+Shift+G`). Pick a CDS, a
+  residue number and the new amino acid. The codon it resolves to is shown
+  before anything changes — `CAT → TGG at 177, 178, 179` — because getting from
+  "residue 143" to three base pairs runs through the strand, the reading-frame
+  offset, any introns and the origin, and that's exactly where doing it by hand
+  goes wrong. The codon comes from your active codon-usage table with the
+  synonymous alternatives listed, so you can pick one that avoids a site you
+  care about. Silent changes are labelled silent; introducing or removing a stop
+  is called out. `Ctrl+Z` undoes it.
+- **"Do the reads agree?"** — **Combine reads** in the Verification Report rolls
+  up every read on a plasmid and asks, for each difference, how many reads that
+  cover that base show it and how many looked and disagreed. Two reads agreeing
+  is a mutation; one read showing it while another disagrees is almost always a
+  miscall. It also reports what nobody read — a plasmid can score "100%
+  identity" over the half that was sequenced, so the largest unread stretch is
+  named outright.
+- **Thermocycler programs.** After Run PCR in the Simulator, **Thermocycler
+  program** turns the result into the block you type into the machine: annealing
+  temperature from the primer Tms the simulation already measured, extension time
+  from the product length at your polymerase's own rate (Q5, Phusion or Taq),
+  and every number labelled with the rule behind it. With no Tm available it
+  anneals at a conventional 55 °C and says so rather than presenting a guess as
+  a calculation.
+- **Oligo order sheets can be plates.** Alongside the generic and IDT-bulk
+  layouts there's now a **plate** format — Plate / Well Position / Name /
+  Sequence, filled row-major the way vendor templates expect, rolling onto a
+  second plate past 96 oligos instead of quietly dropping the rest.
+
+- **The lab notebook reads back.** It could hold everything and find nothing:
+  the only way to locate an entry was to remember which one it was and scroll.
+  Now a filter box above the entries list narrows the open project as you type
+  — `#tag` filters by tag, and words compose with it, so `#gibson failed` is
+  "Gibson-tagged entries that mention failure". It shows *3 of 41*, so a filter
+  that hides everything reads as a filter rather than an empty notebook.
+  `Ctrl+F` searches **every** project: the words must all appear, in the title,
+  the tags or the body, and each hit shows which project it's in and the line
+  that matched. Picking one opens it, switching project on the way if it lives
+  somewhere else.
+- **"What did I already write about this plasmid?"** Press `n` on any library
+  row and you get the notebook entries that mention it. The notebook had been
+  keeping that cross-reference up to date on every save since the projects
+  refactor, and nothing had ever read it. It looks for the plasmid under both
+  the id the **Plasmid ref** button writes and the name you'd type by hand,
+  because finding half your notes is worse than finding none.
+- **Protocol — stop retyping what the program already knows.** The new
+  **Protocol** button pulls a plasmid's recorded build steps into the entry as
+  a numbered list, from the same history the History viewer shows. It only
+  writes steps that were actually recorded, and only tags an operation as
+  `!golden-gate` or `!pcr` when that's unambiguous — a line claiming a ligation
+  for what might have been a one-tube Golden Gate would be worse than one that
+  just says what happened. Plasmid names become clickable `@refs` only when
+  they really resolve in your library, so the inserted protocol never leaves a
+  ref pointing at nothing. Transformation, miniprep and sequencing aren't in
+  it: the program never saw them, and it says so rather than inventing them.
+- **Steps** is the other half — for work not yet done. Pick the bench actions
+  (space to toggle) and you get a heading per step carrying its tag, in the
+  order a protocol actually reads: design, PCR, digest, ligate, transform.
+  Headings and blank space only; it doesn't impose one lab's "Cells: / Plates:"
+  form on your notes.
+- **Copy** starts a new entry from one you already wrote. Attachments stay with
+  the original — they live in that entry's own folder, so copying the
+  references would have left two entries sharing images that either one could
+  delete. The app tells you that happened instead of leaving you to find out.
+- **Attachments are no longer images only.** A lab record accumulates more
+  than gel photos: the `.ab1` the sequencing vendor sent, the plate-reader
+  CSV, a supplier PDF. All of it now attaches to the entry — alongside
+  GenBank, FASTA, FASTQ, `.dna`, spreadsheets and zips — with the same 10 MB
+  per-file and 100 MB per-entry limits as before. Images still preview
+  inline; everything else lists as a file, and inserting one into the body
+  writes a plain link instead of an image tag (an image tag around a trace
+  is a broken-image box in every viewer, including the export).
+- **Export** (`Ctrl+E`) writes an entry, or a whole project, to a file.
+  Markdown keeps your body exactly as you wrote it, so an exported entry pastes
+  back into a new one with its `@`/`!`/`&` refs still working, and adds a
+  header, a resolved reference list and the attachments around it. HTML is a
+  standalone page — stylesheet inlined, images embedded, ready to print or
+  send. If the images are too large to embed it links them locally **and says
+  so**, rather than handing you a file that looks complete and arrives broken.
+
+### Agent API
+
+- **33 new endpoints, and every new feature above is reachable through the
+  side-door.** CRISPR (`design-guides`, `score-guide`, `guide-offtargets`,
+  `guide-cloning-oligos`, `list-cas-variants`), residue editing
+  (`plan-residue-edit` previews without applying, `edit-residue` applies),
+  read consensus (`read-consensus`), ordering (`export-primers` — the GUI could
+  order oligos and the agent could not), and the bench (`pcr-program`,
+  `list-polymerases`).
+- **`verify-against-reads` accepts per-read quality.** Pass `read_quality`
+  alongside `reads` and each read's differences are split into the ones it
+  supports and the ones sitting in unreliable basecalls — the same check the
+  Sanger tab does, now available without a GUI.
+- **The notebook's read side, too.** `search-experiments` (words that must all
+  appear, plus a tag filter, scoped to one project or across all of them),
+  `experiment-backlinks` (which entries reference a plasmid, action or gel),
+  `get-plasmid-protocol` (a plasmid's recorded build steps, structured and as
+  paste-ready markdown), `experiment-step-template`,
+  `list-experiment-actions`, `export-experiment` (returns the document text so
+  you choose where it goes) and `duplicate-experiment`. Search results carry
+  the matching line and which field hit, but not the body itself — fetch that
+  with `get-experiment` when you want it.
+
+- **Sanger traces: "is that mismatch real?"** Drop an `.ab1` on the Sequencing
+  screen and the new **Check against canvas** button compares it against the
+  plasmid you have open — and answers using the read's own per-base quality
+  scores, not just the alignment. Both ends of every Sanger read are unreliable
+  (the chemistry runs out), so a difference there is the instrument guessing
+  rather than a change in your DNA. Instead of a flat "37 mismatches" you get
+  *"2 real changes, 35 in unreliable basecalls"*, which is the number you'd
+  actually act on. Previously a perfectly good clone could be graded
+  ✗ divergent because of noise at the edge of a trace.
+- **The Verification Report has a "Real" column.** Alongside the raw SNP and
+  indel counts it now shows how many of them the read actually stands behind
+  (`2 (+35 noise)`). A read that carried no quality scores — an older
+  instrument, or a consensus FASTA — shows a dash rather than a verdict, because
+  "unknown" and "zero" are different answers. A trace that failed outright says
+  so instead of reporting a clean result over nothing.
+- **Settings → Sequencing → Min basecall quality.** The threshold that divides
+  a real difference from trace noise, defaulting to Phred 20 (one wrong base in
+  a hundred — the standard Sanger cutoff). Set it to 0 to trust every base
+  equally and see every mismatch as real. Also readable and settable through the
+  agent API.
+
+---
+
 ## [1.2.65] — 2026-09-17
 
 ### Bug fixes

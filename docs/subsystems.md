@@ -16,7 +16,8 @@ grep -ni 'experiment\|project\|gel' docs/subsystems.md
 | Tag | Topic keywords |
 |---|---|
 | `[SUB-plasmidsaurus]` | Plasmidsaurus zip ingestion; REST API download (sweep #29); pairwise alignment; SequencingScreen; sub-tabs |
-| `[SUB-experiments]` | Experiments lab-notebook; projects; cross-refs `@`/`!`/`&`; spellcheck; ImageAttachModal |
+| `[SUB-experiments]` | Experiments lab-notebook; projects; cross-refs `@`/`!`/`&`; spellcheck; ImageAttachModal; notebook search / backlinks / protocol / export / attachments |
+| `[SUB-crispr]` | CRISPR guide design: PAM scan, triage, off-target, cloning oligos |
 | `[SUB-gels]` | Gels; gels.json; GelLibraryModal; SimulatorScreen |
 | `[SUB-hmm-db]` | HMM database registry; Pfam-A / NCBIfam / custom URL download; `HmmDbCatalogModal`; `hmm_db_catalog.json`; pyhmmer hmmpress; cross-internet hardening |
 
@@ -112,6 +113,45 @@ modal smoke (fits 160×48).
 
 ---
 
+## [SUB-crispr] CRISPR guide design (1.2.66+, `[INV-198]`)
+
+`splicecraft_crispr` (L1, imports biology/logging L0 only). Entry: the **CRISPR**
+menu / `alt+g` → `CrisprGuideModal`; agent: `list-cas-variants` /
+`design-guides` / `score-guide` / `guide-offtargets` / `guide-cloning-oligos`.
+
+**Variants** (`_CAS_VARIANTS`) are three distinct PAM GEOMETRIES rather than a
+catalogue of near-duplicates: `spcas9` (NGG, 3', 20 nt, blunt 3 bp 5' of PAM),
+`sacas9` (NNGRRT, 3', 21 nt), `lbcas12a` (TTTV, **5'**, 23 nt, staggered cut).
+
+**Scanning** (`_find_guides`) reports everything in FORWARD-strand coordinates
+with an explicit `strand` (sacred #2). Reverse-strand sites are found by
+searching the forward strand for the reverse complement of the PAM — one less
+coordinate transform than mapping through an RC of the whole sequence. Circular
+records scan `seq + seq[:pad]` (sacred #6) and a site crossing bp 0 carries
+`wraps`. Overlap-preserving via biology's `_iter_match_starts`, because NGG sites
+overlap constantly and `re.finditer` would drop every second one. A protospacer
+containing an N is SKIPPED rather than emitted.
+
+**What it deliberately does not model.** `_guide_offtargets` searches the
+sequences the CALLER supplies and puts `searched_bp` in its own result, so "no
+off-targets" cannot be read as a genome-wide claim — there is no genome index and
+one is not faked. `_score_guide` returns NAMED flags (Pol III terminator, GC
+window, homopolymer run, self-complementarity, missing 5' G) plus a coarse
+good/ok/poor tier, NOT a trained efficiency number; a test asserts the words
+`efficiency` / `doench` / `score` are absent from its output.
+
+**Cloning oligos** (`_guide_cloning_oligos`): the bottom oligo is
+`overhang_bottom + rc(duplex)`, NOT `overhang_bottom + rc(guide)` — it has to
+carry the complement of the transcription-start G too, or the pair comes out 25
+and 24 nt and leaves a one-base gap. That missing C is the classic way the pX330
+pair is written down wrong, and it was a real bug caught by asserting the two
+oligos anneal. `add_g` gives the duplex exactly ONE 5' G (a guide already
+starting with G supplies its own) and reports which happened.
+
+GOTCHA: `_take_circular(seq, start, LENGTH)` is NOT biology's
+`_slice_circular(seq, start, END)`. Two contracts, two names on purpose; the
+crispr one is not re-exported on the hub.
+
 ## [SUB-plasmidsaurus] Plasmidsaurus ingestion + pairwise alignment (0.5.3+, sub-tabs 0.9.5+)
 
 Two-stage pipeline:
@@ -141,6 +181,8 @@ Entry: `Sequencing → Plasmidsaurus` on `SequencingScreen`. Nested `TabbedConte
 **Verification report (2026-05-24, `[INV-69]`):** `VerificationReportModal` collects every stored alignment across the active library, sorted by status priority (worst first: divergent → partial → near → verified). Per-row: plasmid name, read label, status badge (`_alignment_quality_status`), identity %, coverage %, # SNPs, # indels, source. Variants computed on-demand from `aligned_q`/`aligned_t` via `_extract_variants_from_alignment` (gap runs merged into single indel records). Click-row dismisses with `("open", entry_id, first_variant_pos)`; caller's `_jump_to_library_entry_at_pos` loads the plasmid + scrolls the seq-panel cursor to the first variant.
 
 **LibraryPanel "Seq" column (2026-05-24, `[INV-69]`):** new 3rd column shows per-entry sequencing badge: ✓ verified (green) / ⚠ near-match (yellow) / ~ partial (yellow) / ✗ divergent (red) / — none (dim). Driven by `_library_entry_alignment_summary` walking the entry's stored `alignments`. Updates incrementally via `LibraryPanel.refresh_seq_cell(entry_id)` from `_flush_active_alignments` and the AlignmentManagerModal save path — no full repopulate per alignment flush.
+
+**Basecall quality (2026-09-17, `[INV-197]`):** everything above reads an alignment on IDENTITY. `Sequencing → Sanger (.ab1) → Check against canvas` reads it a second way, on the read's per-base Phred: which discrepancies the trace actually supports. Canvas = reference, read = overlay (the Alt+A convention, so no target picker). Routes through the SAME `_align_worker` via a new optional `query_phred=`. Pure core lives hub-side next to `_extract_variants_from_alignment`: `_phred_is_recorded` / `_phred_trim_bounds` / `_alignment_query_positions` / `_alignment_target_columns` / `_variant_phred` / `_annotate_variants_with_quality` / `_trace_verification_summary` / `_trace_verdict_phrase`. The verdict is stored ON the alignment (`quality` key) because the trace record — and its per-base array — cannot survive in a `gb_text` library entry; `_serialize_alignment_for_storage` and `_hydrate_alignments_for_active` BOTH carry it, and the key is omitted rather than nulled when absent. `VerificationReportModal` shows it in the **Real** column. Threshold = persisted `sanger_min_phred` (default 20). Tests: `tests/test_trace_quality.py`.
 
 Hardening (0.9.4):
 * **Per-base TSV zip-bomb defence** — `_PLASMIDSAURUS_PERBASE_MAX_BYTES = 100 MB` two-layer cap (central-directory check + chunked `codecs.getincrementaldecoder` 64 KB).
@@ -204,9 +246,25 @@ Top-level (Menu → Experiments) → `ExperimentProjectsPickerModal` first (mirr
 **Filesystem invariants** (mirror .dna sidecar):
 * `_sanitize_experiment_id` rejects empty/NUL/`..`/`/`/`\`/shell metas/>64 chars.
 * `_experiment_attach_dir` walks FULL ancestor chain via `is_symlink()`. No `resolve()` divergence (would trip on macOS `/tmp` → `/private/tmp`).
-* `_save_experiment_image` via `_atomic_write_bytes`. Filename `img-<ts>-<rand>.<ext>`. Clipboard tmpfiles (prefix `_EXPERIMENT_CLIP_TMP_PREFIX = "exp-clip-"`) unlinked after bytes copied.
+* `_save_experiment_image` via `_atomic_write_bytes`. Filename `img-<ts>-<rand>.<ext>` for an image, `att-<ts>-<rand>.<ext>` for a data attachment. Clipboard tmpfiles (prefix `_EXPERIMENT_CLIP_TMP_PREFIX = "exp-clip-"`) unlinked after bytes copied.
+* **Attachments are no longer image-only (2026-09-17).** `_EXPERIMENT_DATA_EXTS` (traces `.ab1`/`.scf`, tabular `.csv`/`.tsv`/`.txt`, `.pdf`, sequence records `.gb`/`.fasta`/`.fastq`/`.dna`, `.xlsx`/`.zip`, …) + `_IMAGE_EXTS` = `_EXPERIMENT_ATTACH_EXTS`, which gates the picker (`_EXPERIMENT_ATTACH_FILE_FILTER` on `_ImagePickerTree` + `ImageAttachModal`), the blob writer and the agent endpoint. `_IMAGE_EXTS` stays image-ONLY and moved to **util L0** (with `_is_image_path`) because three layers need the same answer: the hub picker, and the experiments L1 exporters, which emit `![...]`/`<img>` for an image and a plain link (`download=`) for anything else — an image tag around a `.ab1` is a broken-image box in every renderer. Same split in `_insert_selected_attachment_into_body` and in `attach-experiment-image` (which keeps its name for compatibility and now returns `is_image`). Nothing here is ever PARSED by the notebook — attachments are stored/listed/linked/exported as opaque bytes — so the wider list adds no parsing surface, and the 10 MB / 100 MB caps are unchanged. Inline preview stays images (`_preview_attachment` already said "not an image; no preview").
 * `_save_experiments` takes `_cache_lock` for save+cache-reassign, then `_sync_active_project_experiments`.
 * `_persist_current` detects body-over-cap BEFORE save (notifies). Save path dedup-by-id replaces ALL matches.
+
+**The READ side (2026-09-17, `[INV-199]`).** Until this landed the notebook was write-only: `attached_plasmid_ids` / `attached_actions` / `attached_gel_ids` were rebuilt from the body on every save and read by NOTHING, `tags` were normalised and never surfaced, and `_render_plasmid_refs` sat with zero callers. The readers now live in the L1 sibling (pure, `catalog`/`steps` passed in by the caller):
+
+* **Search.** `_experiment_search_terms` / `_experiment_match_fields` / `_experiment_snippet` / `_experiment_search`. Substring-**AND** across terms, **OR** across title/tags/body — deliberately NOT the fuzzy subsequence match `LibrarySearchModal` uses, because a 1 MB body makes subsequence matching find the letters of "gibson" scattered over three paragraphs. Score: title 3 / tags 2 / body 1, ties by recency. Terms capped at `_EXPERIMENT_SEARCH_MAX_TERMS = 12`. **No criteria returns EVERYTHING** — it's a filter, and the `search-experiments` endpoint is the layer that 400s on it.
+* **Two-tier find, mirroring the plasmid side.** The `#exp-filter-input` box narrows the ACTIVE project (`_visible_entries`; `#tag` tokens filter by tag and compose with the query; `_update_filter_count` shows "3 of 41" so an over-narrow filter never reads as an empty notebook), debounced 150 ms and **cancelled in `on_unmount`** (the v1.2.48 post-unmount timer re-arm class). `Ctrl+F` → `ExperimentSearchModal` crosses every project. Exactly `LibraryPanel`-filters-active-collection :: `LibrarySearchModal`-goes-cross-collection.
+* **Backlinks.** `_experiments_referencing(entries, ref, kind=)` — the reverse of `@<id>`. **Re-extracts refs from the BODY** rather than trusting the stored xref: the xref is rebuilt on every save so they agree for anything the app wrote, but a hand-edited `experiments.json` can carry a stale one, and answering "nothing references that" when something does is the exact failure this exists to prevent. `ref` accepts a LIST because `action_insert_plasmid` writes the entry **id** while a hand-typed ref is usually the display **name** — `LibraryPanel`'s `n` key asks for both. Case-insensitive. An unknown `kind` **raises** (a silent `[]` would read as "no references").
+* **Cross-project iteration.** `_iter_all_experiments()` (dataaccess L1) → `[(project, entry), …]`, reading the ACTIVE project from the live `experiments.json` mirror rather than its stored copy in `experiment_projects.json` (which lags by one save) — the same rule `_agent_scan_library_for_key` follows for the active collection. Falls back to the live entries when no project record matches the active pointer.
+* **Protocol from history.** `_protocol_steps_markdown(steps, product=, known_ids=, action_refs=)` renders `_history_build_steps` output (the SAME data the History viewer's Protocol pane shows) as notebook markdown. Takes the step dicts, not a history root, so L1 needn't import history L2 — "callers supply the parts", as in `splicecraft_cassette`. Two hard rules: `_PROTOCOL_ACTION_BY_OP` maps only the **unambiguous** ops (Golden Gate / Gibson / HiFi→gibson / PCR / mutagenesis) onto `!action` tags and everything else keeps its verb with NO ref; and only names in `known_ids` (verified present in the library) become `@refs`, gated further by `_experiment_ref_token_ok` / `_EXPERIMENT_REF_ID_RE` so a display name with a space can't be emitted as `@pUC19` pointing at the wrong thing. Wet-lab steps the sim never saw (transform/miniprep/sanger) are absent by construction and the header says so.
+* **Step templates.** `_experiment_template_markdown(action_ids, catalog, heading=)` — heading per picked action, in **catalog** order (design → PCR → digest → ligate → transform), reached via `ActionsPickerModal(multi=True)` (space toggles, Insert reads "Insert (3)"). Headings + blank space only: a template that pre-writes "Cells: / Plates: / Colonies:" imposes one lab's form on every entry. Unknown ids accepted (the catalog is curated, not enforced).
+* **Duplication.** `_experiment_duplicate(entry, new_id=, title=)` — **`image_paths` deliberately NOT copied.** Attachment dirs are keyed by entry id, so carrying paths over would point the copy into the ORIGINAL's dir: deleting either would break the other's images and the 100 MB per-entry cap would be computed against a dir the copy doesn't own. The UI + endpoint both SAY attachments didn't come along.
+* **Export.** `_experiment_markdown_document` / `_experiment_project_markdown` / `_experiment_html_document` + `_experiment_reference_block`. The body is copied **VERBATIM** (sigils intact) so an export pastes back into a new entry with working refs — everything the export adds goes AROUND the body. `_markdown_subset_to_html` handles a **documented** subset (`_MARKDOWN_HTML_SUBSET`); input is HTML-escaped first, `_html_safe_url` allowlists http(s)/mailto/`#`/`data:image/`/relative and **drops `javascript:`** (an export is a file opened in a browser); a single newline is a **hard break** (the line breaks in a pasted colony count ARE the formatting) and `_italic_` is NOT italics (snake_case identifiers). `ExperimentExportModal` (hub-side, needs `_safe_export_filename`) writes the file on a worker and embeds images as `data:` URIs up to `_EXPERIMENT_EXPORT_EMBED_MAX_BYTES = 25 MB`, then **falls back to local paths and says so** rather than shipping a document that looks complete and breaks when emailed.
+* **`_activate_experiment_project(name)`** — THE one implementation of the atomic project switch, extracted from `ExperimentProjectsPickerModal._open` when the cross-project jump gained a second call site. Pointer in memory → FORCED sync settings flush → mirror write, reverting the pointer on failure, all under `_cache_lock` (adopted from the agent endpoint, which already held it). [INV-83, INV-161, sweep #9/#26/#27]. **The agent's `set-active-experiment-project` still carries its own copy** — it returns HTTP tuples and would need a `_state` hook to share this one.
+* **Agent parity:** `search-experiments`, `experiment-backlinks`, `get-plasmid-protocol`, `experiment-step-template`, `list-experiment-actions`, `export-experiment` (returns the document TEXT, not a file — the caller picks the destination, so no agent path check is needed), `duplicate-experiment` (the only `write=True` of the seven). `_EXPERIMENT_ACTIONS` moved hub → experiments L1 so the endpoint can read it.
+* **Hardening invariants.** `_as_str_list` is THE guard for every list-shaped entry field — a bare string yields `[]`, never its characters (a hand-edited `"tags": "gibson"` matched the tag `g`; `"image_paths": "img.png"` exported 7 bogus links). `_PROTOCOL_INPUT_MAX = 8` mirrors `_HISTORY_PROTOCOL_INPUT_MAX` (drift-guarded by a test) so a 200-part assembly doesn't emit one 2,500-char line. The template emits a `!<id>` tag ONLY when `_experiment_ref_token_ok` passes, so it never writes a tag the body extractor can't match. `_html_safe_url` refuses `//host` + `\\host` (scheme-inheriting URLs become outbound requests in an opened export). The export write is `_atomic_write_bytes` because its worker is `exclusive=True` and cancellable. `_experiments_referencing` RAISES TypeError on a non-str/list ref. Junk-payload fuzzing over all 8 notebook endpoints is a permanent test.
+* Tests: `tests/test_notebook_tools.py` (205).
 
 **Spellcheck.** pyspellchecker-backed (pure-Python English wordlist). F7 / "Spellcheck" → `_spellcheck_body(body_md)` masks non-prose markdown regions and tokenises via `_SPELLCHECK_WORD_RE` (alphabetic + apostrophe + hyphen, ≥2 chars). `SpellcheckModal`: Replace/Add-to-dict/Skip per row. Custom dict via `experiments_custom_dict` settings key; `_clear_spellcheck_engine` invalidates cached engine after add.
 

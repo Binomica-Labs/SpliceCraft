@@ -504,6 +504,8 @@ def _deferred_agent_hook_unregistered(*args, **kwargs):
         "a deferred-agent-handler hook was called before the hub registered it")
 _settings_flush_sync_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
 _pick_best_rotation_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+_multi_read_summary_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+_trace_verification_summary_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
 _reset_master_delete_cache_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
 _bulk_export_collection_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
 _blast_search_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered

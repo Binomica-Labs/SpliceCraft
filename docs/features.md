@@ -464,6 +464,92 @@ UTF-8"), a CP1252-encoded author name, and CRLF or CR-only line endings
 all load rather than failing. Anything the parser had to guess at is
 written to the log.
 
+### Is that mismatch real? (basecall quality)
+
+A Sanger read is unreliable at both ends — that is simply how the
+chemistry runs out — so a disagreement there is the instrument guessing,
+not a mutation in your plasmid. **Sequencing → Sanger (.ab1) → Check
+against canvas** compares the trace against whatever plasmid is loaded
+and answers on the read's own per-base quality scores: how many of the
+differences the read actually stands behind.
+
+The toast says it directly — *"1 real change, 1 in unreliable
+basecalls"* — and the Verification Report gains a **Real** column
+showing the same split (`2 (+35 noise)`). It also reports the usable
+window after end-trimming, so a read that failed outright says so
+instead of claiming a clean result over nothing.
+
+A read with no recorded quality (an older instrument, a consensus FASTA)
+shows an em-dash rather than a verdict: unknown and zero are different
+answers. The threshold lives in **Settings → Sequencing → Min basecall
+quality**, defaulting to Phred 20 (one wrong base in a hundred, the
+Sanger convention); set it to 0 to trust every base equally and see
+every mismatch as real.
+
+## CRISPR guides
+
+**CRISPR** on the menu (or `Alt+G`) scans whatever plasmid you have open for
+guide sites and ranks them. Pick the nuclease — SpCas9 (NGG), SaCas9
+(NNGRRT) or LbCas12a (TTTV, which sits on the *other* side of the spacer and
+cuts with a stagger) — and optionally a bp window to aim at one exon rather
+than the whole plasmid. Every guide comes back with its strand, the predicted
+cut position, and the concerns that matter, named rather than scored: a
+`TTTT` that will stop Pol III mid-transcript, a GC window outside 40–70%, a
+homopolymer run, a spacer that folds back on itself.
+
+**Two things it deliberately will not tell you.** There is no genome-wide
+off-target prediction — that needs a genome index this program does not have,
+and it will not pretend otherwise. **Check off-targets** searches the plasmid
+in front of you and says how many base pairs it looked at, so "none found"
+can never be mistaken for "specific". And there is no efficiency score:
+published on-target models are regressions over large screens, and a number
+that *looked* like one would be worse than the named flags you can check
+yourself.
+
+Pick a guide and **Cloning oligos** gives you the annealed pair for a Type IIS
+guide vector, copied to the clipboard — with a 5' G added for U6 only when the
+spacer does not already start with one, and said so, because that off-by-one is
+how the pair is usually got wrong. **Annotate on map** drops the protospacer
+onto the plasmid as a feature.
+
+## Editing a residue, not a base
+
+`Alt+Shift+G` changes an amino acid and lets the DNA follow. Pick a CDS, a
+residue number and the new residue, and the resolved codon is shown before
+anything happens — `CAT → TGG at 177, 178, 179` — because the mapping from
+"residue 143" to three base pairs runs through the strand, the `/codon_start`
+offset, any introns and the origin, and that is exactly where a hand-done edit
+goes wrong. The codon is chosen from your active codon-usage table, with the
+synonymous alternatives listed so you can pick one that avoids a site you care
+about. A silent change is allowed and labelled as silent; introducing or
+removing a stop is called out. `Ctrl+Z` undoes it.
+
+## Ordering and running it
+
+The primer export sheet now has a **plate** layout alongside the generic and
+IDT-bulk ones: Plate / Well Position / Name / Sequence, filled row-major the way
+vendor templates expect, rolling onto a second plate past 96 oligos instead of
+quietly dropping the rest.
+
+After **Run PCR** in the Simulator, **Thermocycler program** turns the result
+into the block you type into the machine — annealing temperature from the primer
+Tms the simulation already measured, extension time from the product length at
+your polymerase's own rate, and every number labelled with the rule that
+produced it. Pick Q5, Phusion or Taq. If no Tm is available it anneals at a
+conventional 55 °C and *says so*, rather than presenting a guess as a
+calculation.
+
+## Do the reads agree?
+
+One read agreeing with itself is not evidence. **Combine reads** in the
+Verification Report rolls up every read on a plasmid and asks, for each
+difference, how many reads that cover that base actually show it — and how many
+looked and disagreed. A change two reads agree on is a mutation; one read
+showing it while another covers the same base and disagrees is almost always a
+miscall. It also reports what nobody read: a plasmid can score "100% identity"
+over the half that was sequenced, and the largest unread stretch is named
+outright.
+
 ## Experiments lab notebook
 
 - **Projects layer** (`Menu → Experiments`) — named projects (e.g.
@@ -472,8 +558,14 @@ written to the log.
   launch wraps the user's existing experiments into a default
   project.
 - **Compose + Attachments** — per-entry markdown body (1 MB cap),
-  plus an image attachment grid. Win/Mac clipboard paste via
+  plus an attachment grid. Win/Mac clipboard paste via
   `Pillow.ImageGrab.grabclipboard()` (Linux/WSL disabled by Pillow).
+  Images preview inline; traces (`.ab1`), tabular exports
+  (`.csv`/`.tsv`/`.txt`), datasheets (`.pdf`), sequence records
+  (`.gb`/`.fasta`/`.fastq`/`.dna`) and `.xlsx`/`.zip` attach as files
+  and list without a preview. Caps unchanged at 10 MB per file and
+  100 MB per entry. Inserting a non-image into the body writes a plain
+  link rather than an image tag.
 - **Cross-refs** — `@<plasmid-id>` inlines a coloured chip linking
   to a library plasmid; `!<action-id>` references the curated
   `_EXPERIMENT_ACTIONS` catalog; `&<gel-id>` references a saved
@@ -481,6 +573,40 @@ written to the log.
   referenced entity.
 - **Spellcheck** (F7) — pyspellchecker-backed (pure-Python English
   wordlist) with markdown-aware masking. Custom dict per-user.
+- **Filter + cross-project search** — the filter box above the entries
+  list narrows the OPEN project as you type (`#tag` filters by tag and
+  composes with the words), showing "3 of 41" so an over-narrow filter
+  doesn't read as an empty notebook. `Ctrl+F` searches EVERY project:
+  terms must all appear, in the title, tags or body, and each hit shows
+  its project plus the matching line. Same two-tier split as the plasmid
+  side (library panel filters the active collection, `LibrarySearchModal`
+  goes cross-collection).
+- **Backlinks** — `n` on a library row lists the notebook entries that
+  mention that plasmid, and opens the one you pick (switching project
+  first if it lives elsewhere). Queries both the entry id and the display
+  name, since the `Plasmid ref` button writes the id while a hand-typed
+  `@ref` is usually the name.
+- **Protocol** — pulls a plasmid's recorded build steps into the entry as
+  numbered markdown, from the same data the History viewer's Protocol
+  pane shows. Only unambiguous operations become `!action` tags (Golden
+  Gate, Gibson, PCR, mutagenesis) and only names that resolve in the
+  library become `@refs`, so the inserted protocol never claims a bench
+  step that wasn't recorded or plants a ref that goes nowhere.
+  Transformation / miniprep / sequencing are absent by construction — the
+  simulation never saw them.
+- **Steps** — the forward half: pick bench actions (space to toggle) and
+  get a heading per step with its `!action` tag, in catalog order.
+  Headings and blank space only — no imposed "Cells: / Plates:" form.
+- **Copy** — duplicates the selected entry as a starting point.
+  Attachments are deliberately not carried over (they belong to the
+  original entry's directory) and the app says so.
+- **Export** (`Ctrl+E`) — one entry or the whole project, to Markdown or a
+  standalone HTML page. Markdown keeps the body verbatim so it pastes
+  back into a new entry with working refs, and adds a metadata header, a
+  resolved References block and the attachment list around it. HTML
+  inlines the stylesheet and embeds images up to 25 MB, falling back to
+  local paths *and saying so* rather than producing a file that looks
+  complete and breaks when sent.
 
 ## Gels
 

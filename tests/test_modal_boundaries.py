@@ -133,6 +133,58 @@ def _make_record():
 # Every modal listed here must be constructible without I/O.
 _MODAL_CASES = [
     ("BabsReembedModal",           lambda: sc.BabsReembedModal("qwen2.5:7b", "nomic-embed-text")),
+    ("CrisprGuideModal",           lambda: sc.CrisprGuideModal(
+                                               "ACGTACGTAGGT" * 40,
+                                               circular=True, label="pTest")),
+    ("ReadConsensusModal",         lambda: sc.ReadConsensusModal(
+                                               {"verdict": "confirmed",
+                                                "n_reads": 2, "total_bp": 3000,
+                                                "covered_pct": 91.2,
+                                                "depth2_pct": 44.0,
+                                                "min_support": 2,
+                                                "uncovered_spans": [(2600, 2900)],
+                                                "variants": [{
+                                                    "target_pos": 1234,
+                                                    "type": "snp", "ref": "C",
+                                                    "alt": "T", "support": 2,
+                                                    "depth": 2,
+                                                    "contradicted": 0,
+                                                    "confident_reads": 2}]},
+                                               label="pTest",
+                                               phrase="1 change confirmed")),
+    ("ResidueEditModal",           lambda: sc.ResidueEditModal(
+                                               [{"index": 0, "label": "ampR",
+                                                 "protein_len": 286}],
+                                               lambda *a: {
+                                                   "residue": 50, "wt_aa": "H",
+                                                   "new_aa": "W",
+                                                   "positions": [1, 2, 3],
+                                                   "wt_codon": "CAT",
+                                                   "new_codon": "TGG",
+                                                   "alternatives": [],
+                                                   "strand": 1,
+                                                   "silent": False,
+                                                   "creates_stop": False,
+                                                   "removes_stop": False,
+                                                   "writes": [],
+                                                   "cds_label": "ampR",
+                                                   "protein_len": 286,
+                                                   "transl_table": 1},
+                                               label="pTest")),
+    ("PcrProgramModal",            lambda: sc.PcrProgramModal(
+                                               3200, [62.1, 64.5],
+                                               lambda bp, tms, pol, cyc: (
+                                                   sc._pcr_program(
+                                                       bp, tms,
+                                                       polymerase=pol,
+                                                       cycles=cyc),
+                                                   sc._pcr_program_text(
+                                                       sc._pcr_program(
+                                                           bp, tms,
+                                                           polymerase=pol,
+                                                           cycles=cyc))),
+                                               polymerases=[("Q5", "q5")],
+                                               label="amp")),
     ("FetchModal",                 lambda: sc.FetchModal()),
     ("OpenFileModal",              lambda: sc.OpenFileModal()),
     ("ExportGenBankModal",         lambda: sc.ExportGenBankModal(_make_record())),

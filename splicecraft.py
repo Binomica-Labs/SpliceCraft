@@ -42,13 +42,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.65"
+__version__ = "1.2.66"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-09-17"
+_RELEASE_DATE = "2026-09-18"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -1195,6 +1195,10 @@ from textual.worker import Worker, WorkerState  # noqa: E402
 # (zero bare hub-helper calls), so the sibling needs no hub import.
 from splicecraft_modals import (  # noqa: E402
     _OneShotDismissScreen as _OneShotDismissScreen,
+    CrisprGuideModal as CrisprGuideModal,
+    ReadConsensusModal as ReadConsensusModal,
+    PcrProgramModal as PcrProgramModal,
+    ResidueEditModal as ResidueEditModal,
     FeaturePresetsModal as FeaturePresetsModal,
     EditSeqDialog as EditSeqDialog,
     MigrateDataModal as MigrateDataModal,
@@ -4100,6 +4104,7 @@ from splicecraft_dataaccess import (  # noqa: E402  (active-name getters/setters
     _get_active_project_name as _get_active_project_name,
     _set_active_project_name as _set_active_project_name,
     _find_project as _find_project,
+    _iter_all_experiments as _iter_all_experiments,
 )
 
 
@@ -5440,6 +5445,8 @@ from splicecraft_experiments import (  # noqa: E402
     _ACTIONS_REF_RE as _ACTIONS_REF_RE,
     _GEL_REF_RE as _GEL_REF_RE,
     _EXPERIMENT_ID_RE as _EXPERIMENT_ID_RE,
+    _EXPERIMENT_ACTIONS as _EXPERIMENT_ACTIONS,
+    _as_str_list as _as_str_list,
     _sanitize_experiment_id as _sanitize_experiment_id,
     _new_experiment_id as _new_experiment_id,
     _migrate_legacy_tag_format as _migrate_legacy_tag_format,
@@ -5447,6 +5454,33 @@ from splicecraft_experiments import (  # noqa: E402
     _extract_action_refs as _extract_action_refs,
     _extract_gel_refs as _extract_gel_refs,
     _normalise_experiment_entry as _normalise_experiment_entry,
+    # Notebook search / backlinks (2026-09-17). The `attached_*` xrefs were
+    # rebuilt on every save and read by nothing — these are the readers.
+    _EXPERIMENT_SEARCH_MAX_TERMS as _EXPERIMENT_SEARCH_MAX_TERMS,
+    _EXPERIMENT_SEARCH_SNIPPET as _EXPERIMENT_SEARCH_SNIPPET,
+    _experiment_search_terms as _experiment_search_terms,
+    _experiment_match_fields as _experiment_match_fields,
+    _experiment_snippet as _experiment_snippet,
+    _experiment_search as _experiment_search,
+    _EXPERIMENT_REF_EXTRACTORS as _EXPERIMENT_REF_EXTRACTORS,
+    _experiments_referencing as _experiments_referencing,
+    # Protocol-from-history + templates + duplication
+    _PROTOCOL_ACTION_BY_OP as _PROTOCOL_ACTION_BY_OP,
+    _PROTOCOL_INPUT_MAX as _PROTOCOL_INPUT_MAX,
+    _EXPERIMENT_REF_ID_RE as _EXPERIMENT_REF_ID_RE,
+    _experiment_ref_token_ok as _experiment_ref_token_ok,
+    _protocol_action_for_op as _protocol_action_for_op,
+    _protocol_steps_markdown as _protocol_steps_markdown,
+    _experiment_template_markdown as _experiment_template_markdown,
+    _experiment_duplicate as _experiment_duplicate,
+    # Export
+    _MARKDOWN_HTML_SUBSET as _MARKDOWN_HTML_SUBSET,
+    _html_safe_url as _html_safe_url,
+    _markdown_subset_to_html as _markdown_subset_to_html,
+    _experiment_reference_block as _experiment_reference_block,
+    _experiment_markdown_document as _experiment_markdown_document,
+    _experiment_project_markdown as _experiment_project_markdown,
+    _experiment_html_document as _experiment_html_document,
 )
 
 # User-data backup / restore / migrate engine (Phase D, L1) — re-exported so the
@@ -8150,6 +8184,299 @@ def _translate_cds(full_seq: str, start: int, end: int, strand: int,
     )
 
 
+# ── Protein-level editing: residue -> genomic coordinates ─────────────────────
+# `design-mutagenesis` and the Mutato screen already take `W140F` notation, but
+# only against a BARE CDS string the caller extracted itself. The hard part was
+# missing: mapping a residue of an ANNOTATED CDS back to the plasmid bases it
+# occupies, through strand, /codon_start, introns and the origin — and then
+# editing the plasmid rather than a detached string. Doing that by hand is where
+# the frame errors happen.
+#
+# These are the exact inverse of `_translate_cds` and deliberately mirror its
+# conventions step for step (concatenate exons ASCENDING, reverse-complement the
+# whole thing for the minus strand, then drop `codon_start - 1` bases). If that
+# function changes, `test_protein_edit.py` compares the two and fails.
+
+
+# The 20 one-letter residues, spelled out once. `*` (stop) is accepted
+# separately at each call site so "make this a stop" stays an explicit, visible
+# decision rather than something that slips through a character-class check.
+_PROTEIN_AA_LETTERS = "ACDEFGHIKLMNPQRSTVWY"
+
+
+def _comp_base(base: str) -> str:
+    """Complement ONE base, through the same `_IUPAC_COMP` table `_rc` uses.
+
+    A second hand-written complement map is how an ambiguity code eventually
+    gets complemented two different ways in one codebase (sacred #3), so this
+    borrows the existing table rather than declaring a dict.
+    """
+    return (base or "N").upper().translate(_IUPAC_COMP)[:1] or "N"
+
+
+def _cds_coding_positions(total: int, feat) -> "list[int]":
+    """The genomic bp of a CDS feature in READING order, after /codon_start.
+
+    Position *i* of the coding sequence came from `result[i]`, so a residue's
+    codon is `result[(r-1)*3 : (r-1)*3+3]` — three positions that may be
+    non-contiguous (an intron between them), descending (minus strand), or
+    split across bp 0 (an origin wrap).
+
+    A wrap and a spliced CDS are BOTH two-part `CompoundLocation`s, which is why
+    `_feat_bounds` decides which this is rather than the part order: trusting
+    declared order put every GenBank-parsed wrap's arcs in the wrong sequence
+    once already (`[INV-195]`), and here that would silently translate — and
+    edit — the wrong codon.
+    """
+    if total <= 0 or feat is None:
+        return []
+    try:
+        bounds = _feat_bounds(feat, total)
+    except (TypeError, ValueError):
+        return []
+    if bounds is None:
+        # `_feat_bounds` gives up on a location it cannot resolve (a fuzzy or
+        # unknown endpoint). No coding positions means no residue can be
+        # addressed, which is the honest answer.
+        return []
+    start, end, strand = bounds
+    loc = getattr(feat, "location", None)
+    if loc is None:
+        return []
+    raw_parts = getattr(loc, "parts", None)
+    parts = list(raw_parts) if raw_parts else [loc]
+    if end < start:
+        # Origin wrap: tail first, then head. `_feat_bounds` already resolved
+        # it as a wrap, so the part order is not consulted.
+        genomic = list(range(start, total)) + list(range(0, end))
+    elif len(parts) > 1:
+        # Spliced: `_translate_cds` concatenates exons in ASCENDING genomic
+        # order and reverse-complements afterwards for the minus strand, so
+        # ascending here is correct for BOTH strands.
+        spans = sorted((int(p.start), int(p.end)) for p in parts)
+        genomic = [bp for lo, hi in spans for bp in range(lo, hi)]
+    else:
+        genomic = list(range(start, end))
+    if strand == -1:
+        genomic.reverse()
+    offset = _cds_codon_start(feat) - 1
+    return genomic[offset:] if offset else genomic
+
+
+def _cds_codon_start(feat) -> int:
+    """The /codon_start qualifier, clamped to 1-3 (default 1)."""
+    quals = getattr(feat, "qualifiers", None) or {}
+    raw = quals.get("codon_start")
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if raw else 1
+    if raw is None:
+        return 1
+    try:
+        return max(1, min(3, int(str(raw).strip())))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _cds_transl_table(feat) -> int:
+    """The /transl_table qualifier (default 1, the standard code)."""
+    quals = getattr(feat, "qualifiers", None) or {}
+    raw = quals.get("transl_table")
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if raw else 1
+    if raw is None:
+        return 1
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 1
+
+
+def _residue_codon_positions(total: int, feat,
+                             residue: int) -> "list[int] | None":
+    """The three genomic bp of 1-based `residue`, in reading order.
+
+    None when the residue is outside the CDS or the codon is incomplete — a
+    partial trailing codon has no residue to edit, and returning two positions
+    would let a caller write a 2-base "codon".
+    """
+    pos = _cds_coding_positions(total, feat)
+    if residue < 1:
+        return None
+    i = (residue - 1) * 3
+    if i + 3 > len(pos):
+        return None
+    return pos[i:i + 3]
+
+
+def _codon_choices_for_aa(aa: str, *, taxid: "str | None" = None,
+                          transl_table: int = 1) -> "list[tuple[str, float]]":
+    """Codons encoding `aa`, best-used first, as ``[(codon, fraction), ...]``.
+
+    Ordered by the ACTIVE codon-usage table so the default pick is what the host
+    actually prefers rather than whichever codon sorts first alphabetically —
+    a synonymous choice is free, so there is no reason to make a bad one. Falls
+    back to the standard genetic code (equal fractions) when no usage table is
+    available, which keeps this usable on a fresh install.
+    """
+    want = (aa or "").upper()[:1]
+    if not want:
+        return []
+    raw = None
+    try:
+        entries = _codon_tables_load()
+        want_tax = str(taxid).strip() if taxid else ""
+        if not want_tax:
+            want_tax = str(_get_setting("active_codon_table", "") or "")
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            if want_tax and str(e.get("taxid", "")) != want_tax:
+                continue
+            raw = e.get("raw") or None
+            if raw:
+                break
+        if raw is None and entries and not want_tax:
+            raw = (entries[0] or {}).get("raw") or None
+    except Exception:
+        _log.exception("codon usage lookup failed for %r", taxid)
+        raw = None
+    if raw:
+        try:
+            aa_codons, _frac = _codon_build_aa_map(
+                raw, genetic_code=_codon_table_for(transl_table))
+            hits = list(aa_codons.get(want) or [])
+            if hits:
+                return hits
+        except Exception:
+            _log.exception("codon usage map failed for %r", taxid)
+    table = _codon_table_for(transl_table)
+    plain = sorted(c for c, a in table.items() if a == want)
+    if not plain:
+        return []
+    share = 1.0 / len(plain)
+    return [(c, share) for c in plain]
+
+
+def _protein_edit_plan(record, feat, residue: int, new_aa: str, *,
+                       taxid: "str | None" = None,
+                       codon: "str | None" = None) -> dict:
+    """What it would take to change `residue` of `feat` to `new_aa`.
+
+    Returns ``{residue, wt_aa, new_aa, positions, wt_codon, new_codon,
+    alternatives, strand, silent, creates_stop, removes_stop, writes,
+    cds_label, protein_len}``.
+
+    `writes` is ``[(genomic_bp, forward_base), ...]`` — the edit expressed as
+    FORWARD-strand single-base writes, which is what makes this safe on a minus
+    strand, across an intron and across the origin all at once: each coding
+    position is complemented independently instead of a span being reversed as a
+    unit. Span arithmetic is what goes wrong in this codebase's history.
+
+    Raises ValueError with an actionable message rather than returning a partial
+    plan — a half-formed edit to a coding sequence is worse than a refusal.
+    """
+    seq = str(getattr(record, "seq", "") or "")
+    total = len(seq)
+    if total == 0:
+        raise ValueError("record has no sequence")
+    want = (new_aa or "").upper()[:1]
+    if not want or (want not in _PROTEIN_AA_LETTERS and want != "*"):
+        raise ValueError(
+            f"{new_aa!r} is not an amino-acid letter (20 residues, or * for a "
+            f"stop)")
+    tt = _cds_transl_table(feat)
+    _maybe = _residue_codon_positions(total, feat, residue)
+    if _maybe is None:
+        n_aa = len(_cds_coding_positions(total, feat)) // 3
+        raise ValueError(
+            f"residue {residue} is outside this CDS (it codes {n_aa} complete "
+            f"residues)")
+    positions: "list[int]" = _maybe
+    _bounds = _feat_bounds(feat, total)
+    if _bounds is None:
+        raise ValueError(
+            "this CDS has a location that cannot be resolved (a fuzzy or "
+            "unknown endpoint), so no residue can be addressed")
+    strand = _bounds[2]
+    # Read the WT codon through the same per-position rule the write uses, so a
+    # disagreement between read and write is impossible by construction.
+    wt_codon = "".join(
+        (_comp_base(seq[p]) if strand == -1 else seq[p].upper())
+        for p in positions
+    )
+    table = _codon_table_for(tt)
+    wt_aa = table.get(wt_codon, "?")
+    alternatives = _codon_choices_for_aa(want, taxid=taxid, transl_table=tt)
+    if codon:
+        pick = codon.upper()
+        if len(pick) != 3 or any(c not in "ACGT" for c in pick):
+            raise ValueError(f"codon {codon!r} must be 3 unambiguous bases")
+        if table.get(pick) != want:
+            raise ValueError(
+                f"codon {pick} codes {table.get(pick, '?')!r}, not {want!r} "
+                f"under translation table {tt}")
+        new_codon = pick
+    elif alternatives:
+        new_codon = alternatives[0][0]
+    else:
+        raise ValueError(
+            f"no codon encodes {want!r} under translation table {tt}")
+    writes = [
+        (p, (_comp_base(b) if strand == -1 else b))
+        for p, b in zip(positions, new_codon)
+    ]
+    label = ""
+    for key in ("label", "gene", "product"):
+        vals = (getattr(feat, "qualifiers", None) or {}).get(key)
+        if vals:
+            label = str(vals[0])
+            break
+    return {
+        "residue":      int(residue),
+        "wt_aa":        wt_aa,
+        "new_aa":       want,
+        "positions":    list(positions),
+        "wt_codon":     wt_codon,
+        "new_codon":    new_codon,
+        "alternatives": [{"codon": c, "fraction": round(f, 4)}
+                         for c, f in alternatives[:8]],
+        "strand":       strand,
+        "silent":       wt_aa == want,
+        "creates_stop": want == "*" and wt_aa != "*",
+        "removes_stop": wt_aa == "*" and want != "*",
+        "writes":       writes,
+        "cds_label":    label or "CDS",
+        "protein_len":  len(_cds_coding_positions(total, feat)) // 3,
+        "transl_table": tt,
+    }
+
+
+def _apply_protein_edit(record, plan: dict):
+    """A copy of `record` with `plan["writes"]` applied. Never mutates in place.
+
+    A same-length substitution, so no feature moves and no location needs
+    rebuilding — which is exactly why this does NOT go through
+    `_rebuild_record_with_edit`: that path exists to shift features around an
+    indel, and running it for a 3-for-3 swap would be a no-op with more moving
+    parts. Sacred #9 is about wrap features surviving a LENGTH change; there
+    is none here.
+    """
+    seq = list(str(getattr(record, "seq", "") or ""))
+    if not seq:
+        raise ValueError("record has no sequence")
+    for pos, base in (plan or {}).get("writes") or ():
+        if not (0 <= int(pos) < len(seq)):
+            raise ValueError(
+                f"edit position {pos} is outside the {len(seq)} bp record")
+        seq[int(pos)] = str(base).upper()
+    from Bio.Seq import Seq as _Seq
+    from copy import copy as _shallow
+    out = _shallow(record)
+    out.seq = _Seq("".join(seq))
+    out.features = list(getattr(record, "features", None) or [])
+    return out
+
+
 # Hand the QuikChange-scrub engine (splicecraft_primer, L2) CDS translation
 # without an upward import: `_translate_cds` stays hub-side (its `_codon_table_for`
 # table dep + several hub callers), reached through this getter. Registered at
@@ -8466,12 +8793,14 @@ from splicecraft_util import (  # noqa: E402
     _NATURAL_SORT_KEY_CACHE as _NATURAL_SORT_KEY_CACHE,
     _NATURAL_SORT_CACHE_CAP as _NATURAL_SORT_CACHE_CAP,
     _FASTA_EXTS as _FASTA_EXTS,
+    _IMAGE_EXTS as _IMAGE_EXTS,
     _SEQ_ZIP_EXTS as _SEQ_ZIP_EXTS,
     _CONTROL_CHARS_RE as _CONTROL_CHARS_RE,
     _natural_sort_key as _natural_sort_key,
     _sanitize_label as _sanitize_label,
     _cursor_row_key as _cursor_row_key,
     _is_fasta_path as _is_fasta_path,
+    _is_image_path as _is_image_path,
     _is_seq_zip_path as _is_seq_zip_path,
     _split_default_export_path as _split_default_export_path,
 )
@@ -10309,6 +10638,699 @@ def _extract_variants_from_alignment(
         target_pos += 1
         i += 1
     return variants
+
+
+# ── Basecall-quality-aware read verification ──────────────────────────────────
+# Everything above interprets an alignment on IDENTITY alone: a mismatch is a
+# mismatch wherever it lands. A Sanger trace does not work that way. Both ends
+# of every read are ragged, and a disagreement there is the instrument guessing
+# rather than a mutation in the plasmid — so a good clone can score `divergent`
+# on trace noise, which is the single most expensive false alarm this app can
+# raise (you re-pick colonies for a week over it).
+#
+# `[INV-88]`'s "real quality columns" are ALIGNMENT quality — identity,
+# coverage, indel events. These helpers are the other axis: BASECALL quality,
+# the per-base Phred the reader already parses into
+# `letter_annotations["phred_quality"]` and the pipeline then dropped, because a
+# library entry persists as `gb_text` and GenBank cannot carry a per-base array.
+# Quality therefore has to be consumed while the trace record is still in hand
+# and the verdict stored on the ALIGNMENT, which is the only object that
+# outlives it.
+#
+# All four are pure: no app, no I/O, no record. Phred is indexed in QUERY bp
+# (the read), while variants are keyed on TARGET bp (the plasmid) — that
+# mapping is the whole risk here, so it is done by ONE walk shared by every
+# consumer rather than re-derived per call site. Getting two walks to disagree
+# about the same alignment is the bug shape this subsystem keeps producing
+# (`[INV-67]`, `[INV-87]`, `[INV-195]`).
+
+_PHRED_TRIM_WINDOW = 10            # bases per sliding window for end trimming
+_SANGER_MIN_PHRED_DEFAULT = 20     # Phred 20 = 1 wrong base in 100; the
+                                   # threshold every Sanger pipeline uses as
+                                   # the line between "read it" and "don't".
+_PHRED_MAX = 93                    # Sanger FASTQ ceiling (chr 126 - 33)
+
+
+def _phred_is_recorded(phred) -> bool:
+    """Did the instrument actually record per-base quality?
+
+    An ALL-ZERO array is not a terrible read, it is a read with no quality
+    channel — Phred 0 means "certainly wrong", and no basecaller assigns that
+    to every base of a sequence it just called. Real example in the wild:
+    Biopython's `Abi/310.ab1`, an older ABI 310 trace whose 868 bases all carry
+    0. Reporting that as "unusable" would tell the user their DNA is bad when
+    the truth is that this file cannot answer the question, so the two are kept
+    apart everywhere downstream.
+    """
+    quals = [q for q in (phred or []) if isinstance(q, (int, float))]
+    return bool(quals) and any(q > 0 for q in quals)
+
+
+def _phred_trim_bounds(
+    phred, *, min_phred: int = _SANGER_MIN_PHRED_DEFAULT,
+    window: int = _PHRED_TRIM_WINDOW,
+) -> "tuple[int, int]":
+    """The usable window of a read, as a half-open ``(start, end)`` in read bp.
+
+    Walks a sliding window in from each end and stops at the first window whose
+    MEAN Phred clears `min_phred` — the standard Sanger end-trim. A mean rather
+    than a per-base test on purpose: one bad base inside an otherwise clean
+    stretch should not end the read, and a single lucky base inside the ragged
+    tail should not extend it.
+
+    Returns ``(0, 0)`` when nothing clears the bar. That is the honest answer
+    for a failed trace and callers MUST treat it as "this read proves nothing"
+    — reporting 100% identity over an empty window would be the worst possible
+    output here. A read shorter than `window` is judged as one short window, so
+    a 30-base read is not silently discarded for being small.
+    """
+    quals = [q for q in (phred or []) if isinstance(q, (int, float))]
+    n = len(quals)
+    if n == 0:
+        return (0, 0)
+    w = max(1, min(int(window) or 1, n))
+    thr = float(min_phred)
+
+    def _mean(lo: int) -> float:
+        return sum(quals[lo:lo + w]) / float(w)
+
+    start = 0
+    while start + w <= n and _mean(start) < thr:
+        start += 1
+    if start + w > n:
+        # No window anywhere clears the bar.
+        return (0, 0)
+    end = n
+    while end - w >= start and _mean(end - w) < thr:
+        end -= 1
+    if end <= start:
+        return (0, 0)
+    return (start, end)
+
+
+def _alignment_query_positions(aligned_q: str, aligned_t: str) -> "list":
+    """One walk, shared by every quality consumer: for each alignment COLUMN,
+    the read bp sitting in it (``None`` for a gap in the read).
+
+    Paired with `_alignment_target_columns` below, this is the only place the
+    query-frame ↔ target-frame mapping is computed. Returns ``[]`` for a
+    degenerate pair (empty, or lengths disagreeing) exactly as
+    `_extract_variants_from_alignment` does, so the two never disagree about
+    what counts as a usable alignment.
+    """
+    if not aligned_q or not aligned_t or len(aligned_q) != len(aligned_t):
+        return []
+    out: list = []
+    qpos = 0
+    for ch in aligned_q:
+        if ch == "-":
+            out.append(None)
+        else:
+            out.append(qpos)
+            qpos += 1
+    return out
+
+
+def _alignment_target_columns(aligned_q: str, aligned_t: str) -> "dict":
+    """``{target_bp: column}`` for every non-gap position of `aligned_t`.
+
+    The inverse of the walk `_extract_variants_from_alignment` performs, so a
+    variant's ``target_pos`` can be turned back into the column it came from —
+    and from there into the read bp, and from there into a Phred score.
+    """
+    if not aligned_q or not aligned_t or len(aligned_q) != len(aligned_t):
+        return {}
+    out: dict = {}
+    tpos = 0
+    for col, ch in enumerate(aligned_t):
+        if ch != "-":
+            out[tpos] = col
+            tpos += 1
+    return out
+
+
+def _variant_phred(
+    variant: dict, aligned_q: str, aligned_t: str, phred,
+) -> "int | None":
+    """The read's Phred score backing one variant, or ``None`` when the read
+    carries no quality for it.
+
+    Per variant type, because "the confidence of this call" means a different
+    base in each case:
+
+      * ``snp``       — the read base sitting in that column.
+      * ``insertion`` — the WORST of the inserted read bases. An insertion is
+                        only as trustworthy as its shakiest base, and a spurious
+                        insertion is the classic Sanger artefact.
+      * ``deletion``  — the read has no base here at all, so confidence comes
+                        from the bases FLANKING the gap; the worst of the two.
+                        A deletion called between two Phred-8 bases is noise.
+
+    ``None`` (rather than 0) when the score cannot be determined, so "unknown
+    quality" and "known-terrible quality" stay distinguishable — collapsing
+    them would let a `.gbk` consensus with no quality array masquerade as a
+    failed trace.
+    """
+    quals = list(phred or [])
+    if not quals:
+        return None
+    col_q = _alignment_query_positions(aligned_q, aligned_t)
+    t2col = _alignment_target_columns(aligned_q, aligned_t)
+    if not col_q or not t2col:
+        return None
+
+    def _at(col: "int | None") -> "int | None":
+        if col is None or not (0 <= col < len(col_q)):
+            return None
+        qp = col_q[col]
+        if qp is None or not (0 <= qp < len(quals)):
+            return None
+        val = quals[qp]
+        return int(val) if isinstance(val, (int, float)) else None
+
+    vtype = variant.get("type")
+    tpos = variant.get("target_pos")
+    if not isinstance(tpos, int):
+        return None
+    length = variant.get("length")
+    length = int(length) if isinstance(length, int) and length > 0 else 1
+
+    if vtype == "snp":
+        return _at(t2col.get(tpos))
+    if vtype == "insertion":
+        # The inserted read bases occupy the gap-in-target columns immediately
+        # BEFORE the column holding `target_pos` (which is the target bp the
+        # insertion sits in front of). Walk back over them.
+        anchor = t2col.get(tpos)
+        if anchor is None:
+            # Insertion past the last target base — the columns run to the end.
+            anchor = len(col_q)
+        scores = []
+        col = anchor - 1
+        while col >= 0 and aligned_t[col] == "-" and len(scores) < length:
+            got = _at(col)
+            if got is not None:
+                scores.append(got)
+            col -= 1
+        return min(scores) if scores else None
+    if vtype == "deletion":
+        # Read is gapped across [tpos, tpos+length); confidence is the flanks.
+        first = t2col.get(tpos)
+        last = t2col.get(tpos + length - 1)
+        scores = []
+        if first is not None:
+            before = _at(first - 1) if first > 0 else None
+            if before is not None:
+                scores.append(before)
+        if last is not None:
+            after = _at(last + 1)
+            if after is not None:
+                scores.append(after)
+        return min(scores) if scores else None
+    return None
+
+
+def _annotate_variants_with_quality(
+    variants, aligned_q: str, aligned_t: str, phred,
+    *, min_phred: int = _SANGER_MIN_PHRED_DEFAULT,
+) -> "list[dict]":
+    """Copy of `variants` with ``phred`` and ``confident`` added to each.
+
+    ``confident`` is ``True`` / ``False`` / ``None`` (unknown), never a bare
+    bool, so a read with no quality array is reported as unproven rather than
+    quietly promoted to trustworthy. The ``truncated`` sentinel is passed
+    through untouched — it is a marker, not a call.
+
+    Non-mutating: the caller's list and dicts are left alone, because stored
+    alignment variants are re-read from the library and annotating in place
+    would write a threshold-dependent verdict into persisted data.
+    """
+    out: list[dict] = []
+    for v in (variants or []):
+        if not isinstance(v, dict):
+            continue
+        nv = dict(v)
+        if nv.get("type") == "truncated":
+            out.append(nv)
+            continue
+        score = _variant_phred(nv, aligned_q, aligned_t, phred)
+        nv["phred"] = score
+        nv["confident"] = (None if score is None
+                           else bool(score >= int(min_phred)))
+        out.append(nv)
+    return out
+
+
+def _trace_verification_summary(
+    aligned_q: str, aligned_t: str, phred,
+    *, min_phred: int = _SANGER_MIN_PHRED_DEFAULT,
+    variants=None,
+) -> dict:
+    """Read a trace-vs-plasmid alignment the way a bench scientist would.
+
+    Splits the discrepancies into the ones the read actually supports and the
+    ones that sit in unreliable basecalls, so the headline can be "2 real
+    changes" instead of "37 mismatches". Returns::
+
+        {has_quality, min_phred, mean_phred, pct_at_or_above,
+         trim_start, trim_end, usable_bp, read_bp,
+         n_snp, n_snp_confident, n_snp_lowq, n_snp_unknown,
+         n_indel, n_indel_confident, n_indel_lowq, n_indel_unknown,
+         n_confident, n_lowq, truncated, verdict}
+
+    ``verdict`` is deliberately coarse and never overrides
+    `_alignment_quality_status`'s persisted badge — it ANSWERS A DIFFERENT
+    QUESTION ("do I believe the differences?") and is reported alongside:
+
+      * ``"no_quality"``   — read carried no Phred array; nothing to add.
+      * ``"unusable"``     — no part of the read clears the threshold.
+      * ``"clean"``        — no confident discrepancy.
+      * ``"low_conf"``     — discrepancies exist but none is well-supported.
+      * ``"real_changes"`` — at least one discrepancy the read stands behind.
+    """
+    quals = ([q for q in (phred or []) if isinstance(q, (int, float))]
+             if _phred_is_recorded(phred) else [])
+    read_bp = len(quals)
+    thr = int(min_phred)
+    if variants is None:
+        variants = _extract_variants_from_alignment(aligned_q, aligned_t)
+    truncated = any(isinstance(v, dict) and v.get("type") == "truncated"
+                    for v in (variants or []))
+    ann = _annotate_variants_with_quality(
+        variants, aligned_q, aligned_t, quals, min_phred=thr)
+
+    def _tally(types) -> "tuple[int, int, int, int]":
+        rows = [v for v in ann if v.get("type") in types]
+        conf = sum(1 for v in rows if v.get("confident") is True)
+        low = sum(1 for v in rows if v.get("confident") is False)
+        unk = sum(1 for v in rows if v.get("confident") is None)
+        return (len(rows), conf, low, unk)
+
+    n_snp, snp_c, snp_l, snp_u = _tally(("snp",))
+    n_ind, ind_c, ind_l, ind_u = _tally(("insertion", "deletion"))
+    # WHICH variants the read backs, not just how many. The per-base Phred
+    # array cannot be persisted (a library entry is `gb_text`), so a later
+    # consumer — `_multi_read_summary`, combining several reads — has no way to
+    # re-derive per-variant confidence from the counts alone. Storing the
+    # positions is what lets the two features compose. Capped for the same
+    # reason `_extract_variants_from_alignment` caps: a divergent read must not
+    # write an unbounded list into the library entry.
+    _POS_CAP = 500
+    conf_pos = [int(v.get("target_pos", 0) or 0) for v in ann
+                if v.get("confident") is True][:_POS_CAP]
+    lowq_pos = [int(v.get("target_pos", 0) or 0) for v in ann
+                if v.get("confident") is False][:_POS_CAP]
+    start, end = _phred_trim_bounds(quals, min_phred=thr) if quals else (0, 0)
+    mean_phred = (sum(quals) / read_bp) if read_bp else 0.0
+    at_or_above = (sum(1 for q in quals if q >= thr) / read_bp * 100.0
+                   if read_bp else 0.0)
+
+    if not quals:
+        verdict = "no_quality"
+    elif end <= start:
+        verdict = "unusable"
+    elif (snp_c + ind_c) > 0:
+        verdict = "real_changes"
+    elif (snp_l + ind_l) > 0:
+        verdict = "low_conf"
+    else:
+        verdict = "clean"
+
+    return {
+        "has_quality":       bool(quals),
+        "min_phred":         thr,
+        "mean_phred":        round(mean_phred, 1),
+        "pct_at_or_above":   round(at_or_above, 1),
+        "trim_start":        start,
+        "trim_end":          end,
+        "usable_bp":         max(0, end - start),
+        "read_bp":           read_bp,
+        "n_snp":             n_snp,
+        "n_snp_confident":   snp_c,
+        "n_snp_lowq":        snp_l,
+        "n_snp_unknown":     snp_u,
+        "n_indel":           n_ind,
+        "n_indel_confident": ind_c,
+        "n_indel_lowq":      ind_l,
+        "n_indel_unknown":   ind_u,
+        "n_confident":        snp_c + ind_c,
+        "n_lowq":             snp_l + ind_l,
+        "confident_positions": conf_pos,
+        "lowq_positions":      lowq_pos,
+        "truncated":         truncated,
+        "verdict":           verdict,
+    }
+
+
+def _trace_verdict_phrase(summary: dict) -> str:
+    """One short clause describing a `_trace_verification_summary`, for a toast
+    or a table cell.
+
+    Deliberately leads with the number the user decides on. "37 mismatches" and
+    "2 real changes, 35 in unreliable basecalls" describe the SAME alignment and
+    point at opposite conclusions, and only the second one is actionable.
+    """
+    if not isinstance(summary, dict) or not summary.get("has_quality"):
+        return ""
+    thr = summary.get("min_phred", _SANGER_MIN_PHRED_DEFAULT)
+    verdict = summary.get("verdict")
+    conf = int(summary.get("n_confident", 0) or 0)
+    low = int(summary.get("n_lowq", 0) or 0)
+    if verdict == "unusable":
+        return (f"no usable read (nothing clears Phred {thr})")
+    if verdict == "clean":
+        usable = int(summary.get("usable_bp", 0) or 0)
+        return f"clean across {usable:,} usable bp"
+    plural = "" if low == 1 else "s"
+    if verdict == "low_conf":
+        return (f"{low} difference{plural}, none well-supported "
+                f"(all below Phred {thr})")
+    # real_changes
+    tail = f", {low} in unreliable basecalls" if low else ""
+    return (f"{conf} real change{'' if conf == 1 else 's'}{tail}")
+
+
+# ── Multi-read consensus ──────────────────────────────────────────────────────
+# One read agreeing with itself is not evidence. A plasmid normally gets two
+# Sanger reads (forward and reverse primer) or a whole nanopore pile, and each
+# one previously landed as its own overlay bar with its own verdict and no
+# combined answer — so a single-read artefact and a real mutation looked
+# identical in the report.
+#
+# The question these answer: for each difference, how many reads that COVER
+# that position show it, and how many cover it and do not? A variant two reads
+# agree on is a mutation; a variant one read shows while another covers the
+# same base and disagrees is almost always a miscall.
+#
+# Pure: they take the in-memory alignment entries (`_register_alignment`'s
+# dicts, or the stored ones) and a length. No app, no I/O.
+
+_MULTI_READ_MIN_SUPPORT = 2      # reads that must agree to call it confirmed
+_MULTI_READ_MAX_VARIANTS = 2000  # bound on the rollup for a divergent pile
+
+
+def _alignment_variants_in_axis(align: dict) -> "list[dict]":
+    """Variants of one alignment, numbered in the RENDER axis' frame.
+
+    `_extract_variants_from_alignment` numbers positions in its SECOND
+    argument's frame, so an `axis="query"` alignment (the Alt+\\ diff flow,
+    stored on the query plasmid's entry) has to pass the query string second.
+    Getting this backwards puts every variant of a diff alignment at the wrong
+    bp — the same axis trap `_collect_rows` documents.
+    """
+    result = align.get("result") or {}
+    aq = result.get("aligned_q") or align.get("aligned_q") or ""
+    at = result.get("aligned_t") or align.get("aligned_t") or ""
+    if not aq or not at:
+        return []
+    if align.get("axis", "target") == "query":
+        return _extract_variants_from_alignment(at, aq)
+    return _extract_variants_from_alignment(aq, at)
+
+
+def _read_segments(align: dict) -> "list[tuple[int, int, str]]":
+    """This alignment's render-axis segments, computing them when absent.
+
+    A STORED alignment carries only the aligned strings — `segments` is built at
+    register time and not persisted — so without this an agent endpoint or a
+    report reading straight off the library entry would see zero coverage for
+    every read, which reads as "nothing was sequenced" rather than "I did not
+    look".
+    """
+    segs = align.get("segments")
+    if segs:
+        return list(segs)
+    result = align.get("result") or {}
+    aq = result.get("aligned_q") or align.get("aligned_q") or ""
+    at = result.get("aligned_t") or align.get("aligned_t") or ""
+    if not aq or not at or len(aq) != len(at):
+        return []
+    return (_alignment_to_query_segments(aq, at)
+            if align.get("axis", "target") == "query"
+            else _alignment_to_target_segments(aq, at))
+
+
+def _read_covered_spans(align: dict) -> "list[tuple[int, int]]":
+    """Half-open spans where this read actually ALIGNED A BASE — the honest
+    answer to "what did we sequence?".
+
+    Excludes every ``gap`` segment, so an unsequenced stretch can never be
+    counted as agreement. That is the most dangerous error available in a
+    verification report, because it turns a plasmid nobody read past bp 800
+    into a fully confirmed construct.
+
+    This is deliberately NOT the read's hull: a short read against a long
+    target has astronomically many co-optimal placements under an
+    edit-distance aligner, and one was measured scattering a 200-mer into 160
+    fragments spread over 580 bp. Using the hull there would claim 580 bp of
+    coverage for 200 bp of data.
+    """
+    out: list[tuple[int, int]] = []
+    for seg in _read_segments(align):
+        try:
+            lo, hi, state = int(seg[0]), int(seg[1]), str(seg[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if state == "gap" or hi <= lo:
+            continue
+        out.append((lo, hi))
+    out.sort()
+    # Merge touching/overlapping spans so depth counting can't double-count one
+    # read at a segment boundary.
+    merged: list[tuple[int, int]] = []
+    for lo, hi in out:
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def _read_observed_extent(align: dict) -> "tuple[int, int] | None":
+    """First to last aligned base — the window this read can say ANYTHING about.
+
+    Used only to decide which variants belong to this read, never for coverage.
+    The difference matters in both directions:
+
+      * A global alignment pays gaps for everything outside a partial read, so
+        a 200 bp Sanger read on a 400 bp plasmid emits a 200 bp "deletion".
+        That is absence of data, not a variant, and the extent excludes it.
+      * An INTERNAL gap is the opposite: the read looked and says those bases
+        are missing, which is a real deletion, and it falls inside the extent
+        so it is still reported.
+    """
+    spans = _read_covered_spans(align)
+    if not spans:
+        return None
+    return (spans[0][0], spans[-1][1])
+
+
+def _read_depth_at(spans_per_read: "list[list[tuple[int, int]]]",
+                   pos: int) -> int:
+    """How many reads cover `pos`."""
+    n = 0
+    for spans in spans_per_read:
+        for lo, hi in spans:
+            if lo <= pos < hi:
+                n += 1
+                break
+    return n
+
+
+def _multi_read_summary(alignments, total: int, *,
+                        min_support: int = _MULTI_READ_MIN_SUPPORT) -> dict:
+    """Combine every read on one plasmid into a single answer.
+
+    Returns::
+
+        {n_reads, total_bp, covered_bp, covered_pct, depth2_bp, depth2_pct,
+         uncovered_spans, variants, n_confirmed, n_single_read, n_contradicted,
+         min_support, verdict}
+
+    Each variant: ``{target_pos, type, ref, alt, support, depth, contradicted,
+    reads, confident_reads}`` where `support` is the number of reads showing it,
+    `depth` the number covering that base at all, and `contradicted` =
+    `depth - support` (reads that looked and disagreed).
+
+    `verdict`:
+      * ``"no_reads"``   — nothing aligned yet.
+      * ``"clean"``      — no differences anywhere the reads looked.
+      * ``"confirmed"``  — at least one difference `min_support` reads agree on.
+      * ``"single_read"``— differences exist, none corroborated, and another
+                           read looked at that base and disagreed.
+      * ``"unconfirmed"``— differences exist but nothing else covers them, so
+                           they are neither corroborated nor refuted. The
+                           honest middle answer: "sequence it again" rather
+                           than a verdict the data cannot support.
+
+    `uncovered_spans` is reported because a plasmid can be "100% identity" over
+    the half that was read. Coverage is the other half of any verification
+    claim and leaving it out is how a partial read passes as a full one.
+    """
+    aligns = [a for a in (alignments or []) if isinstance(a, dict)]
+    n = max(0, int(total))
+    if not aligns or n == 0:
+        return {"n_reads": 0, "total_bp": n, "covered_bp": 0,
+                "covered_pct": 0.0, "depth2_bp": 0, "depth2_pct": 0.0,
+                "uncovered_spans": [(0, n)] if n else [],
+                "variants": [], "n_confirmed": 0, "n_single_read": 0,
+                "n_contradicted": 0, "min_support": int(min_support),
+                "verdict": "no_reads"}
+
+    spans_per_read = [_read_covered_spans(a) for a in aligns]
+    extents = [_read_observed_extent(a) for a in aligns]
+    # Per-bp depth via a sweep rather than a bp loop per read: a 200 kb
+    # plasmid with 30 reads is 6 M membership tests the naive way.
+    delta = [0] * (n + 1)
+    for spans in spans_per_read:
+        for lo, hi in spans:
+            lo = max(0, min(lo, n))
+            hi = max(0, min(hi, n))
+            if hi > lo:
+                delta[lo] += 1
+                delta[hi] -= 1
+    depth: list[int] = []
+    running = 0
+    for i in range(n):
+        running += delta[i]
+        depth.append(running)
+    covered = sum(1 for d in depth if d >= 1)
+    depth2 = sum(1 for d in depth if d >= 2)
+
+    uncovered: list[tuple[int, int]] = []
+    start = None
+    for i, d in enumerate(depth):
+        if d == 0 and start is None:
+            start = i
+        elif d != 0 and start is not None:
+            uncovered.append((start, i))
+            start = None
+    if start is not None:
+        uncovered.append((start, n))
+
+    # Variant support. Key on (pos, type, alt) so a C>T and a C>G at the same
+    # base stay separate calls rather than being merged into one "support 2".
+    buckets: dict = {}
+    # Confident-variant positions per read, from the stored trace-check verdict.
+    _conf_pos_for: dict = {}
+    for _i, _a in enumerate(aligns):
+        _q = _a.get("quality")
+        if isinstance(_q, dict):
+            _conf_pos_for[_i] = set(_q.get("confident_positions") or ())
+    for idx, (a, spans) in enumerate(zip(aligns, spans_per_read)):
+        label = (a.get("query_label") or a.get("name")
+                 or a.get("label") or f"read {idx + 1}")
+        qual = a.get("quality") if isinstance(a.get("quality"), dict) else None
+        # Only variants the read actually OBSERVED. Outside its extent a
+        # global alignment reports the unread remainder as one long deletion,
+        # and counting that would turn every partial Sanger read into a
+        # spurious structural variant.
+        extent = extents[idx]
+        for v in _alignment_variants_in_axis(a):
+            if v.get("type") == "truncated":
+                continue
+            pos = int(v.get("target_pos", 0) or 0)
+            if extent is not None and not (extent[0] <= pos < extent[1]):
+                continue
+            key = (pos, v.get("type"), v.get("alt", ""))
+            slot = buckets.setdefault(key, {
+                "target_pos": pos, "type": v.get("type"),
+                "ref": v.get("ref", ""), "alt": v.get("alt", ""),
+                "length": int(v.get("length", 1) or 1),
+                "reads": [], "confident_reads": 0,
+            })
+            slot["reads"].append(label)
+            # A read whose basecall quality backs this variant counts extra:
+            # two reads agreeing at Phred 60 is a different claim from two
+            # agreeing in each other's noise. Read from the positions the trace
+            # check STORED — the per-base Phred array cannot be persisted, so
+            # re-deriving this here is impossible and pretending otherwise
+            # (passing an empty array and reading the `None` it returns) would
+            # silently report every read as unconfident.
+            if qual and qual.get("has_quality") \
+                    and pos in _conf_pos_for.get(idx, ()): 
+                slot["confident_reads"] += 1
+            if len(buckets) >= _MULTI_READ_MAX_VARIANTS:
+                break
+
+    variants: list[dict] = []
+    for slot in buckets.values():
+        pos = slot["target_pos"]
+        d = depth[pos] if 0 <= pos < n else 0
+        support = len(slot["reads"])
+        variants.append({
+            "target_pos":      pos,
+            "type":            slot["type"],
+            "ref":             slot["ref"],
+            "alt":             slot["alt"],
+            "length":          slot["length"],
+            "support":         support,
+            "depth":           d,
+            "contradicted":    max(0, d - support),
+            "reads":           slot["reads"],
+            "confident_reads": slot["confident_reads"],
+        })
+    variants.sort(key=lambda v: (-v["support"], v["target_pos"]))
+
+    need = max(1, int(min_support))
+    n_conf = sum(1 for v in variants if v["support"] >= need)
+    n_contra = sum(1 for v in variants if v["contradicted"] > 0)
+    n_single = sum(1 for v in variants
+                   if v["support"] < need and v["contradicted"] > 0)
+    if not variants:
+        verdict = "clean"
+    elif n_conf:
+        verdict = "confirmed"
+    elif n_single:
+        verdict = "single_read"
+    else:
+        verdict = "unconfirmed"
+    return {
+        "n_reads":        len(aligns),
+        "total_bp":       n,
+        "covered_bp":     covered,
+        "covered_pct":    round(covered * 100.0 / n, 1) if n else 0.0,
+        "depth2_bp":      depth2,
+        "depth2_pct":     round(depth2 * 100.0 / n, 1) if n else 0.0,
+        "uncovered_spans": uncovered,
+        "variants":       variants,
+        "n_confirmed":    n_conf,
+        "n_single_read":  n_single,
+        "n_contradicted": n_contra,
+        "min_support":    need,
+        "verdict":        verdict,
+    }
+
+
+def _multi_read_phrase(summary: dict) -> str:
+    """One clause describing a `_multi_read_summary`, for a toast or a cell."""
+    if not isinstance(summary, dict):
+        return ""
+    v = summary.get("verdict")
+    # An unrecognised (or absent) verdict gets NO phrase. Falling through to the
+    # "unconfirmed" wording would describe an empty dict as "0 differences,
+    # sequence again to confirm" — a confident-sounding sentence about nothing.
+    if v not in ("no_reads", "clean", "confirmed", "single_read",
+                 "unconfirmed"):
+        return ""
+    nr = int(summary.get("n_reads", 0) or 0)
+    cov = summary.get("covered_pct", 0.0)
+    if v == "no_reads":
+        return "no reads aligned"
+    reads = f"{nr} read{'' if nr == 1 else 's'}"
+    if v == "clean":
+        return f"clean across {cov:.0f}% coverage from {reads}"
+    conf = int(summary.get("n_confirmed", 0) or 0)
+    if v == "confirmed":
+        return (f"{conf} change{'' if conf == 1 else 's'} confirmed by "
+                f"{summary.get('min_support', 2)}+ reads ({reads}, "
+                f"{cov:.0f}% coverage)")
+    n = len(summary.get("variants") or [])
+    if v == "single_read":
+        return (f"{n} difference{'' if n == 1 else 's'} seen by one read only "
+                f"and contradicted by another ({reads})")
+    return (f"{n} difference{'' if n == 1 else 's'}, none covered by a second "
+            f"read — sequence again to confirm ({reads}, {cov:.0f}% coverage)")
 
 
 def _normalize_for_match(name: str) -> str:
@@ -13064,7 +14086,17 @@ def _serialize_alignment_for_storage(
     # string preserved as-is (legacy alignments with non-uuid ids
     # round-trip cleanly; the audit's "validate as uuid4 hex" was
     # too strict and broke legacy data).
+    # Basecall-quality verdict, when the read had one. Stored because the
+    # trace file is gone by the time the Verification Report opens and the
+    # per-base Phred array can never live on the library entry — `gb_text`
+    # has nowhere to put it. Omitted entirely rather than written as `null`
+    # when absent, so the millions of `.gbk`-consensus alignments already on
+    # disk don't each grow a dead key.
+    quality = in_memory_entry.get("quality")
+    extra = ({"quality": dict(quality)}
+             if isinstance(quality, dict) and quality else {})
     return {
+        **extra,
         "id":              in_memory_entry.get("_stored_id") or _uuid.uuid4().hex,
         "label":           (
             in_memory_entry.get("_stored_label")
@@ -13692,6 +14724,208 @@ def _library_entry_alignment_summary(entry: dict) -> "dict | None":
 
 
 
+# ── Thermocycler programs ─────────────────────────────────────────────────────
+# The app designs primers and simulates the product, then the user retypes the
+# cycling conditions into a machine by hand. These build the program from the
+# design that is already on screen.
+#
+# HONESTY: these are the polymerase vendors' own typical conditions, arithmetic
+# applied to your product length and primer Tms — NOT a prediction that the
+# reaction will work. Annealing temperature especially is a starting point; a
+# stubborn template still wants a gradient. Every number a program emits carries
+# the rule that produced it so it can be checked rather than trusted.
+
+_POLYMERASES: "dict[str, dict]" = {
+    # Q5 first: it is the modern default for cloning, it is what `_pcr_program`
+    # defaults to, and dict order IS the order the picker shows — a UI whose
+    # first option disagreed with the function default would hand two callers
+    # different programs for the same reaction.
+    "q5": {
+        "label":        "Q5",
+        "denature_c":   98,
+        "init_s":       30,
+        "cycle_den_s":  10,
+        "extend_c":     72,
+        "s_per_kb":     30,
+        "final_s":      120,
+        "anneal_rule":  "lowest primer Tm + 3 °C (Tm > 65: anneal at 72)",
+        "anneal_delta": 3,
+    },
+    "phusion": {
+        "label":        "Phusion",
+        "denature_c":   98,
+        "init_s":       30,
+        "cycle_den_s":  10,
+        "extend_c":     72,
+        "s_per_kb":     30,         # 15-30 s/kb; the slower end for plasmids
+        "final_s":      300,
+        "anneal_rule":  "lowest primer Tm + 3 °C (Tm > 65: anneal at 72)",
+        "anneal_delta": 3,
+    },
+    "taq": {
+        "label":        "Taq",
+        "denature_c":   95,
+        "init_s":       120,        # Taq needs a longer soak to activate
+        "cycle_den_s":  30,
+        "extend_c":     72,
+        "s_per_kb":     60,         # ~1 kb/min
+        "final_s":      300,
+        "anneal_rule":  "lowest primer Tm − 5 °C",
+        "anneal_delta": -5,
+    },
+}
+_ANNEAL_MIN_C, _ANNEAL_MAX_C = 45, 72
+_PCR_MAX_CYCLES = 45
+
+
+def _polymerase_names() -> "list[str]":
+    return list(_POLYMERASES)
+
+
+def _pcr_program(product_bp: int, primer_tms, *,
+                 polymerase: str = "q5", cycles: int = 30,
+                 final_hold_c: "int | None" = 4) -> dict:
+    """A thermocycler program for one PCR.
+
+    Returns ``{polymerase, label, cycles, anneal_c, anneal_rule, extend_s,
+    product_bp, steps, total_minutes, notes}`` where each step is
+    ``{phase, temp_c, seconds, cycles, note}``.
+
+    Extension time comes from the product length at the polymerase's own rate,
+    rounded UP to the next 5 s — a reaction that is 4 s short of full extension
+    is a smeared band, and no thermocycler cares about the difference.
+
+    A two-step protocol is emitted (and said so in `notes`) when the annealing
+    temperature reaches the extension temperature, because a separate 72 °C
+    anneal step is just a longer extension.
+    """
+    key = str(polymerase or "").strip().lower()
+    pol = _POLYMERASES.get(key)
+    if pol is None:
+        raise ValueError(
+            f"unknown polymerase {polymerase!r}; choose one of "
+            f"{', '.join(sorted(_POLYMERASES))}")
+    bp = max(1, int(product_bp or 0))
+    # `cycles or 30` would turn an explicit 0 back into the DEFAULT, which is a
+    # silent substitution of a number the caller did not ask for. None means
+    # "unspecified"; 0 means the caller passed something unusable, and clamping
+    # it to 1 is predictable where resurrecting 30 is not.
+    n_cycles = 30 if cycles is None else int(cycles)
+    n_cycles = max(1, min(_PCR_MAX_CYCLES, n_cycles))
+    tms = [float(t) for t in (primer_tms or [])
+           if isinstance(t, (int, float))]
+    notes: list[str] = []
+    if tms:
+        anneal = int(round(min(tms) + pol["anneal_delta"]))
+        if pol["anneal_delta"] > 0 and min(tms) > 65:
+            anneal = pol["extend_c"]
+    else:
+        # No Tm to work from. 55 is the conventional blind starting point, and
+        # saying so is better than inventing a number that looks derived.
+        anneal = 55
+        notes.append("No primer Tm supplied — annealing at a conventional "
+                     "55 °C. Supply primer Tms for a derived temperature.")
+    clamped = max(_ANNEAL_MIN_C, min(_ANNEAL_MAX_C, anneal))
+    if clamped != anneal:
+        notes.append(f"Annealing clamped to {clamped} °C "
+                     f"(from {anneal} °C).")
+    anneal = clamped
+    extend_s = int(-(-(bp * pol["s_per_kb"]) // 1000))     # ceil
+    extend_s = max(10, int(-(-extend_s // 5)) * 5)          # round up to 5 s
+    two_step = anneal >= pol["extend_c"]
+    if two_step:
+        notes.append("Two-step protocol: the annealing temperature has reached "
+                     "the extension temperature, so the separate anneal step "
+                     "is folded into extension.")
+
+    steps: list[dict] = [
+        {"phase": "Initial denature", "temp_c": pol["denature_c"],
+         "seconds": pol["init_s"], "cycles": 1,
+         "note": "activates the polymerase"},
+        {"phase": "Denature", "temp_c": pol["denature_c"],
+         "seconds": pol["cycle_den_s"], "cycles": n_cycles, "note": ""},
+    ]
+    if not two_step:
+        steps.append({"phase": "Anneal", "temp_c": anneal, "seconds": 20,
+                      "cycles": n_cycles, "note": pol["anneal_rule"]})
+    steps.append({
+        "phase": "Extend", "temp_c": pol["extend_c"],
+        "seconds": extend_s, "cycles": n_cycles,
+        "note": f"{bp:,} bp at {pol['s_per_kb']} s/kb",
+    })
+    steps.append({"phase": "Final extension", "temp_c": pol["extend_c"],
+                  "seconds": pol["final_s"], "cycles": 1, "note": ""})
+    if final_hold_c is not None:
+        steps.append({"phase": "Hold", "temp_c": int(final_hold_c),
+                      "seconds": 0, "cycles": 1, "note": "until collected"})
+    total_s = sum(st["seconds"] * st["cycles"] for st in steps)
+    return {
+        "polymerase":    key,
+        "label":         pol["label"],
+        "cycles":        n_cycles,
+        "anneal_c":      anneal,
+        "anneal_rule":   pol["anneal_rule"] if tms else "conventional default",
+        "extend_s":      extend_s,
+        "product_bp":    bp,
+        "two_step":      two_step,
+        "steps":         steps,
+        "total_minutes": round(total_s / 60.0, 1),
+        "notes":         notes,
+    }
+
+
+def _pcr_program_text(program: dict) -> str:
+    """A thermocycler program as the block you type into the machine."""
+    if not isinstance(program, dict) or not program.get("steps"):
+        return ""
+    lines = [
+        f"PCR program — {program.get('label', '?')}, "
+        f"{program.get('product_bp', 0):,} bp product, "
+        f"{program.get('cycles', 0)} cycles",
+        f"anneal {program.get('anneal_c', 0)} C "
+        f"({program.get('anneal_rule', '')})",
+        "",
+    ]
+    for st in program["steps"]:
+        secs = int(st.get("seconds", 0) or 0)
+        dur = "hold" if secs == 0 else (
+            f"{secs // 60}:{secs % 60:02d}" if secs >= 60 else f"{secs} s")
+        rep = f" x{st['cycles']}" if int(st.get("cycles", 1) or 1) > 1 else ""
+        note = f"   ({st['note']})" if st.get("note") else ""
+        lines.append(f"  {st.get('phase', ''):<18} "
+                     f"{int(st.get('temp_c', 0)):>3} C  {dur:>7}{rep}{note}")
+    lines.append("")
+    lines.append(f"  approx {program.get('total_minutes', 0)} min total")
+    for n in (program.get("notes") or []):
+        lines.append(f"  note: {n}")
+    return "\n".join(lines)
+
+
+_PLATE_ROWS = "ABCDEFGH"
+_PLATE_COLS = 12
+_PLATE_SIZE = len(_PLATE_ROWS) * _PLATE_COLS      # 96
+
+
+def _plate_well_positions(n: int, *, rows: str = _PLATE_ROWS,
+                          cols: int = _PLATE_COLS) -> "list[tuple[int, str]]":
+    """``[(plate_number, well), ...]`` for `n` oligos, ROW-major (A1, A2, ...
+    A12, B1, ...).
+
+    Row-major because that is the fill order every synthesis vendor's plate
+    template assumes, and a plate delivered in the other order silently
+    transposes the whole set — the sort of error you discover at the bench, not
+    on the screen. Overflow rolls onto plate 2, 3, ... rather than truncating:
+    dropping oligo 97 without saying so would be worse than a second plate.
+    """
+    out: list[tuple[int, str]] = []
+    per = len(rows) * int(cols)
+    for i in range(max(0, int(n))):
+        plate, within = divmod(i, per)
+        r, c = divmod(within, int(cols))
+        out.append((plate + 1, f"{rows[r]}{c + 1}"))
+    return out
+
+
 def _export_primers_to_csv(primers: "list[dict]", path, *,
                            order_format: str = "generic",
                            scale: str = "25nm",
@@ -13709,6 +14943,10 @@ def _export_primers_to_csv(primers: "list[dict]", path, *,
         upload template. ``scale`` / ``purification`` fill those columns
         (defaults 25 nmole / standard desalting); a primer may override per-
         oligo via its own ``scale`` / ``purification`` keys.
+      * ``"plate"`` — ``Plate, Well Position, Name, Sequence`` for ordering a
+        plate of oligos rather than tubes. Row-major fill (A1..A12, B1..), and
+        more than 96 oligos roll onto plate 2, 3, ... rather than being
+        silently truncated.
 
     The stdlib csv writer quotes any field containing a comma / quote so the
     file stays valid for spreadsheet import. Primers with an empty sequence are
@@ -13722,7 +14960,7 @@ def _export_primers_to_csv(primers: "list[dict]", path, *,
     import io
     from pathlib import Path as _Path
 
-    if order_format not in ("generic", "idt"):
+    if order_format not in ("generic", "idt", "plate"):
         raise ValueError(
             f"unknown order_format {order_format!r} (expected "
             "'generic' or 'idt')")
@@ -13752,6 +14990,18 @@ def _export_primers_to_csv(primers: "list[dict]", path, *,
                 seq,
                 str(p.get("scale") or scale),
                 str(p.get("purification") or purification),
+            ])
+    elif order_format == "plate":
+        # Plate template — Plate, Well Position, Name, Sequence. Row-major fill
+        # (A1..A12, B1..), which is what every vendor's plate sheet assumes; a
+        # plate filled the other way round silently transposes the whole set.
+        writer.writerow(["Plate", "Well Position", "Name", "Sequence"])
+        wells = _plate_well_positions(len(rows))
+        for (plate_no, well), p in zip(wells, rows):
+            writer.writerow([
+                plate_no, well,
+                (str(p.get("name") or "").strip() or "primer"),
+                (p.get("sequence") or "").strip().upper(),
             ])
     else:
         writer.writerow(["Name", "Sequence", "Length", "Tm"])
@@ -18045,6 +19295,13 @@ class LibraryPanel(Widget):
                 show=False, priority=False),
         Binding("h", "request_history", "View history",
                 show=False, priority=False),
+        # `n` — the notebook entries that mention this row. The App also
+        # binds `n` (find-next) but without priority, so the panel wins
+        # while the library has focus. The reverse of `@<id>`: the
+        # `attached_plasmid_ids` xref has been rebuilt on every notebook
+        # save since 0.9.6 and nothing read it until now.
+        Binding("n", "request_notebook_refs", "Notebook entries",
+                show=False, priority=False),
         # Sweep #28: bulk-mark + move/copy across collections.
         Binding("space", "toggle_mark", "Cycle mark Ⓜ/Ⓒ",
                 show=False, priority=False),
@@ -18267,6 +19524,17 @@ class LibraryPanel(Widget):
         except NoMatches:
             return
         self.post_message(self.HistoryRequested(_cursor_row_key(t)))
+
+    def action_request_notebook_refs(self) -> None:
+        """`n` — which notebook entries mention the cursor row.
+        No-op in collections view (the cursor is on a collection)."""
+        if self._view_mode != "plasmids":
+            return
+        try:
+            t = self.query_one("#lib-table", DataTable)
+        except NoMatches:
+            return
+        self.post_message(self.NotebookRefsRequested(_cursor_row_key(t)))
 
     def action_request_status(self) -> None:
         """Posted up to the app, which opens `PlasmidStatusPickerModal`
@@ -18539,6 +19807,16 @@ class LibraryPanel(Widget):
         (or None if the cursor wasn't on a row); the app handler
         loads the entry, parses its `history_xml` if present, and
         pushes `HistoryViewerModal`."""
+        def __init__(self, entry_id: "str | None"):
+            self.entry_id = entry_id
+            super().__init__()
+
+    class NotebookRefsRequested(Message):
+        """User pressed `n` on a library row — show the notebook entries
+        that reference it. The app handler resolves the row's entry id +
+        display name and opens `ExperimentSearchModal` in backlink mode
+        (both spellings, since the `Plasmid ref` button writes the id
+        while a hand-typed `@ref` is usually the name)."""
         def __init__(self, entry_id: "str | None"):
             self.entry_id = entry_id
             super().__init__()
@@ -29761,6 +31039,24 @@ class SettingsModal(_OneShotDismissScreen, ModalScreen):
                     restrict=r"[0-9]*",
                 )
                 yield Button("Apply", id="set-min-primer-apply")
+            yield Static("Sequencing", classes="set-group-label")
+            yield Static(
+                "[dim]Below this Phred score a read's disagreement with the "
+                "plasmid is reported as trace noise, not a mutation. Both ends "
+                "of every Sanger read are unreliable, so this is what stops a "
+                "good clone reading as divergent. 20 = 1 wrong base in 100 "
+                "(the Sanger convention); 0 trusts every base equally.[/dim]",
+                classes="set-hint", markup=True,
+            )
+            with Horizontal(classes="set-row"):
+                yield Label("Min basecall quality (Phred):")
+                yield Input(
+                    value=str(getattr(app, "_sanger_min_phred",
+                                      _SANGER_MIN_PHRED_DEFAULT)),
+                    id="set-sanger-phred",
+                    restrict=r"[0-9]*",
+                )
+                yield Button("Apply", id="set-sanger-phred-apply")
             yield Static("Plasmidsaurus API", classes="set-group-label")
             yield Static(
                 "[dim]Credentials for ‘Fetch from Plasmidsaurus API’ "
@@ -30045,6 +31341,39 @@ class SettingsModal(_OneShotDismissScreen, ModalScreen):
         self._set_status("[green]Online-lookup API keys cleared.[/green]")
 
     # ── Min primer binding ────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#set-sanger-phred-apply")
+    def _on_sanger_phred_apply(self, _) -> None:
+        try:
+            inp = self.query_one("#set-sanger-phred", Input)
+        except NoMatches:
+            return
+        try:
+            val = int((inp.value or "").strip())
+        except ValueError:
+            self._set_status(
+                "[red]Min basecall quality must be an integer.[/red]"
+            )
+            return
+        if not (0 <= val <= _PHRED_MAX):
+            self._set_status(
+                f"[red]Min basecall quality must be 0–{_PHRED_MAX} "
+                f"(Phred).[/red]"
+            )
+            return
+        app = self.app
+        try:
+            app._sanger_min_phred = val          # type: ignore[attr-defined]
+            _set_setting("sanger_min_phred", val)
+        except Exception:
+            _log.exception("sanger min phred apply failed")
+            self._set_status("[red]Failed to apply — see log.[/red]")
+            return
+        self._set_status(
+            f"[green]Min basecall quality: Phred {val}"
+            + (" (every base trusted equally).[/green]" if val == 0
+               else f" (1 error in {10 ** (val / 10):,.0f}).[/green]")
+        )
 
     @on(Button.Pressed, "#set-min-primer-apply")
     def _on_min_primer_apply(self, _) -> None:
@@ -34717,7 +36046,8 @@ class MenuBar(Horizontal):
     # the action/modal/worker names stay `mutagenize` internally.
     MENUS = ["File", "Settings", "BLAST", "Enzymes", "Features", "Primers",
              "Mutato", "Synthesis", "Parts", "Constructor", "Simulator",
-             "Sequencing", "Experiments", "History", "AUTOLAB", "BABS"]
+             "CRISPR", "Sequencing", "Experiments", "History", "AUTOLAB",
+             "BABS"]
 
     def compose(self) -> ComposeResult:
         for name in self.MENUS:
@@ -34741,6 +36071,8 @@ class MenuBar(Horizontal):
             self.app.action_open_babs()  # type: ignore[attr-defined]
         elif name == "AUTOLAB":
             self.app.action_open_autolab()  # type: ignore[attr-defined]
+        elif name == "CRISPR":
+            self.app.action_open_crispr()  # type: ignore[attr-defined]
         else:
             self.app.open_menu(name, region.x, region.y + 1)  # type: ignore[attr-defined]
 
@@ -41215,6 +42547,7 @@ _SETTINGS_SCHEMA: "dict[str, tuple[tuple, object]]" = {
     "restr_custom_enzymes":    ((str,),                ""),
     "restr_use_custom_list":   ((bool,),               False),
     "min_primer_binding":      ((int,),                15),
+    "sanger_min_phred":        ((int,),                20),
     "show_connectors":         ((bool,),               False),
     "linear_layout":           ((bool,),               False),
     "active_collection":       ((str,),                ""),
@@ -42651,6 +43984,24 @@ from splicecraft_dataaccess import (  # noqa: E402
     _load_features as _load_features,
     _load_features_with_presets as _load_features_with_presets,
     _save_features as _save_features,
+)
+
+# ── CRISPR guide design ─────────────────────────────────────────────────────
+# PAM scanning (wrap-aware, forward-frame coordinates per sacred #2), guide
+# triage on NAMED mechanistic properties rather than a fabricated efficiency
+# score, mismatch-tolerant off-target search over sequences the CALLER supplies
+# (never a genome-wide claim), and the annealed oligo pair that clones a guide
+# into a Type IIS guide vector. See `splicecraft_crispr`'s module docstring for
+# what it deliberately does NOT model. [INV-198]
+from splicecraft_crispr import (  # noqa: E402
+    _CAS_VARIANTS as _CAS_VARIANTS,
+    _cas_variant as _cas_variant,
+    _cas_variant_names as _cas_variant_names,
+    _design_guides as _design_guides,
+    _find_guides as _find_guides,
+    _guide_cloning_oligos as _guide_cloning_oligos,
+    _guide_offtargets as _guide_offtargets,
+    _score_guide as _score_guide,
 )
 
 # ── Built-in feature presets (read-only catalogue) ──────────────────────────
@@ -58329,27 +59680,11 @@ _GEL_CHIP_COLOR     = "#FFB347"   # orange
 # as `@actions:<id>` into the body; the description is shown in the
 # picker only. Free-form action ids are accepted in the body too —
 # the catalog is for convenience, not enforcement.
-_EXPERIMENT_ACTIONS: tuple = (
-    ("Design",       "design",         "Design primers / vector / insert"),
-    ("PCR",          "pcr",            "Standard PCR amplification"),
-    ("PCR",          "soe-pcr",        "Splicing by overlap extension"),
-    ("PCR",          "colony-pcr",     "Colony screen by PCR"),
-    ("Modification", "mutagenesis",    "Site-directed mutagenesis"),
-    ("Restriction",  "digest",         "Restriction digestion"),
-    ("Restriction",  "ligate",         "Ligation"),
-    ("Restriction",  "dephosphorylate", "Dephosphorylation (rSAP/CIP)"),
-    ("Assembly",     "gibson",         "Gibson / NEBuilder assembly"),
-    ("Assembly",     "golden-gate",    "Golden Gate assembly"),
-    ("Assembly",     "moclo",          "MoClo assembly"),
-    ("Assembly",     "in-fusion",      "In-Fusion assembly"),
-    ("Purification", "miniprep",       "Plasmid miniprep"),
-    ("Purification", "gel-extract",    "Gel extraction"),
-    ("Purification", "pcr-cleanup",    "PCR cleanup"),
-    ("Biological",   "transform",      "Bacterial transformation"),
-    ("Biological",   "colony-pick",    "Colony picking"),
-    ("Validation",   "gel-check",      "Analytical gel electrophoresis"),
-    ("Validation",   "sanger-seq",     "Sanger sequencing"),
-)
+# `_EXPERIMENT_ACTIONS` moved to splicecraft_experiments (L1) — pure catalog
+# data, now read by three callers (the picker, the step-template builder,
+# and the agent's step-template endpoint). Re-exported with the rest of
+# the [SUB-experiments] core above, so `sc._EXPERIMENT_ACTIONS` and
+# `ActionsPickerModal`'s use resolve unchanged.
 
 def _experiment_attach_dir(entry_id: str, *, create: bool = False
                               ) -> "Path | None":
@@ -58584,6 +59919,74 @@ def _restore_experiments_from_active_project() -> None:
     _state._experiments_cache = None
 
 
+def _activate_experiment_project(name: str) -> "str | None":
+    """Make `name` the active experiment project. Returns `None` on
+    success, else a human-readable reason.
+
+    THE one implementation of the atomic project switch. Extracted from
+    `ExperimentProjectsPickerModal._open` (2026-09-17) when the
+    cross-project notebook search gained the ability to jump straight to
+    a hit in another project: a second copy of this ordering is exactly
+    the "two halves that disagree" failure — the pointer flush and the
+    mirror write have to happen in this order, and a mirror failure has
+    to revert the pointer, or the next `_save_experiments` clobbers the
+    project we just left.
+
+    Sweep #9 (2026-05-19) ordering rationale: pre-fix this set the
+    active pointer (an async daemon flush) and THEN wrote
+    `experiments.json`, so power loss between the two left settings.json
+    naming the OLD project while experiments.json held the NEW project's
+    entries — and the next UI save mirrored NEW entries into OLD,
+    silently overwriting it. The order below (pointer in memory → FORCED
+    synchronous settings flush → experiments write) makes a crash in the
+    window self-heal on next launch, because
+    `_restore_experiments_from_active_project` rebuilds the live file
+    from the active (NEW) project. A same-session mirror failure is
+    reverted here. [INV-83, INV-161, sweep #27]
+    """
+    if not isinstance(name, str) or not name:
+        return "No project selected."
+    # Sweep #26 rationale, adopted here from the agent endpoint (which
+    # already held it): the whole find-target → set-pointer → save →
+    # null-cache flow runs under `_cache_lock`, or a concurrent
+    # `_save_experiments` on another thread can reseat
+    # `_state._experiments_cache` between our write and our
+    # invalidation — leaving the cache holding the OTHER thread's
+    # entries, which the next `_load_experiments` would serve and mask
+    # the switch entirely. RLock, so the nested `_set_setting` /
+    # `_safe_save_json_mirror` re-entry is fine.
+    with _state._cache_lock:
+        target = _find_project(name)
+        if target is None:
+            return f"Project '{name}' not found."
+        raw_entries = target.get("experiments", [])
+        if not isinstance(raw_entries, list):
+            raw_entries = []
+        target_entries = [e for e in raw_entries if isinstance(e, dict)]
+        prev = _get_active_project_name()
+        _set_active_project_name(name)
+        _settings_flush_sync()
+        try:
+            # Bypass `_save_experiments` — that would re-mirror back into
+            # the project we just switched to (the project IS the source
+            # of truth in this direction). The mirror-swap helper exempts
+            # the write from the L3 shrink guard: the outgoing project's
+            # entries are intact in experiment_projects.json.
+            _safe_save_json_mirror(
+                _state._EXPERIMENTS_FILE, target_entries, "Experiments",
+            )
+        except (OSError, RuntimeError) as exc:
+            _set_active_project_name(prev)
+            _settings_flush_sync()
+            _log.warning("experiments: project switch to %r failed: %s",
+                          name, exc)
+            raise
+        # Invalidate the in-memory cache so the next reader sees the new
+        # project's entries (the file just changed underneath).
+        _state._experiments_cache = None
+    return None
+
+
 # ── Register the experiments hooks the dataaccess sibling fires ──────────────
 # `_migrate_legacy_tag_format` (shared with the editor body-readers) and the
 # synchronous active-project mirror `_sync_active_project_experiments` (whose
@@ -58620,8 +60023,37 @@ def _delete_experiment_attach_dir(entry_id: str) -> None:
                      d, exc)
 
 
-_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
-               ".tiff", ".tif")
+# `_IMAGE_EXTS` + `_is_image_path` moved to splicecraft_util (L0) so the
+# experiments L1 exporters share the one definition (they decide between
+# `![...]` and a plain link). Re-exported below with the other util names.
+
+# Non-image attachments (2026-09-17). Attachments were image-only, so the
+# files a bench record actually accumulates alongside the gel photo — the
+# trace the vendor sent, the plate-reader export, a supplier datasheet —
+# had nowhere to live even though the app parses `.ab1` natively
+# elsewhere. Kept as a SEPARATE tuple from `_IMAGE_EXTS` because only the
+# image list drives the inline rich-pixels preview and the `![...]`
+# markdown form; these get a plain link instead.
+#
+# Nothing here is ever PARSED by the notebook — attachments are stored,
+# listed, linked and exported as opaque bytes — so widening the list adds
+# no parsing surface. The per-file (10 MB) and per-entry (100 MB) caps are
+# unchanged and still bound the cost.
+_EXPERIMENT_DATA_EXTS = (
+    ".ab1", ".scf",                                  # Sanger traces
+    ".csv", ".tsv", ".txt", ".md", ".log",            # tabular / plain text
+    ".pdf",                                           # datasheets, reports
+    ".json", ".xml", ".yaml", ".yml",
+    ".gb", ".gbk", ".genbank", ".embl", ".dna",       # sequence records
+    ".fa", ".fasta", ".fastq", ".fq", ".gff", ".gff3",
+    ".xlsx", ".ods", ".zip",
+)
+
+# Everything the attach picker offers and `_save_experiment_image`
+# accepts. Order matters only for the extension lookup, which prefers an
+# exact match in either tuple and otherwise falls back to `.png` (the
+# clipboard-paste default).
+_EXPERIMENT_ATTACH_EXTS = _IMAGE_EXTS + _EXPERIMENT_DATA_EXTS
 
 
 def _save_experiment_image(entry_id: str, data: bytes,
@@ -58635,8 +60067,17 @@ def _save_experiment_image(entry_id: str, data: bytes,
     the per-entry cumulative cap (`_EXPERIMENT_DIR_MAX_BYTES`).
 
     `suggested_name` provides the file extension hint only; the on-disk
-    name is `img-<ts>-<rand>.<ext>` so concurrent attaches can't
-    collide. Defaults to `.png` if no recognised extension is supplied.
+    name is `img-<ts>-<rand>.<ext>` for an image and `att-<ts>-<rand>.<ext>`
+    for a data attachment (`_EXPERIMENT_DATA_EXTS`), so concurrent
+    attaches can't collide. Defaults to `.png` — and so to the `img-`
+    prefix — if no recognised extension is supplied, which is the
+    clipboard-paste path where there is no filename at all.
+
+    The two prefixes exist so the attachment list can tell at a glance
+    what will render inline and what will only link; the stored value in
+    `image_paths` is the bare filename either way, and every reader
+    (`_refresh_attachments`, the exporters) works off the extension
+    rather than the prefix.
     """
     if not isinstance(data, (bytes, bytearray)):
         return None
@@ -58663,12 +60104,13 @@ def _save_experiment_image(entry_id: str, data: bytes,
             sn = Path(suggested_name).name
             if sn and "." in sn:
                 cand = "." + sn.rsplit(".", 1)[1].lower()
-                if cand in _IMAGE_EXTS:
+                if cand in _EXPERIMENT_ATTACH_EXTS:
                     suffix = cand
         except (ValueError, IndexError):
             pass
     ts = _datetime.now().strftime("%Y%m%dT%H%M%S")
-    name = f"img-{ts}-{_uuid.uuid4().hex[:6]}{suffix}"
+    prefix = "att" if suffix in _EXPERIMENT_DATA_EXTS else "img"
+    name = f"{prefix}-{ts}-{_uuid.uuid4().hex[:6]}{suffix}"
     out = d / name
     # [INV-66 extension] L2 chokepoint covers experiment image bytes too.
     # Per-entry images can be 10 MB each up to 100 MB total; an
@@ -59779,6 +61221,13 @@ class SequencingScreen(Screen):
                               variant="primary", disabled=True)
                 yield Button("Add to library",
                               id="btn-sanger-add", disabled=True)
+                # The trace's per-base quality only exists while the parsed
+                # record is in hand — a library entry persists as `gb_text`
+                # and GenBank has nowhere to put a per-base array. So the
+                # quality-aware comparison has to start HERE, not after the
+                # read has been filed away.
+                yield Button("Check against canvas",
+                              id="btn-sanger-verify", disabled=True)
 
     @on(DirectoryTree.FileSelected, "#sanger-tree")
     def _on_sanger_picked(self, event) -> None:
@@ -59831,6 +61280,7 @@ class SequencingScreen(Screen):
         try:
             self.query_one("#btn-sanger-load", Button).disabled = False
             self.query_one("#btn-sanger-add", Button).disabled = False
+            self.query_one("#btn-sanger-verify", Button).disabled = False
         except NoMatches:
             pass
         self._sanger_record = rec
@@ -59846,6 +61296,60 @@ class SequencingScreen(Screen):
             _log.exception("Sanger load_into_canvas failed: %s", exc)
             return
         self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-sanger-verify")
+    def _sanger_verify(self, _) -> None:
+        """Compare the picked trace against the plasmid on the canvas.
+
+        Canvas = reference, read = overlay: the same convention as Alt+A and
+        the Plasmidsaurus flow, so there is nothing new for the user to learn
+        and no target picker to get wrong. Routes through the SAME
+        `_align_worker` as Plasmidsaurus — rotation picking, the three stale-
+        result guards, registration, the library flush and the linear-view pin
+        are all already correct there — and simply hands it the read's Phred
+        array, which is the one thing that flow never had.
+        """
+        rec = getattr(self, "_sanger_record", None)
+        if rec is None:
+            return
+        target = getattr(self.app, "_current_record", None)
+        if target is None or not len(getattr(target, "seq", "") or ""):
+            self._set_sanger_preview(
+                "[red]Nothing on the canvas to check against. Load the "
+                "plasmid this read came from first.[/red]"
+            )
+            return
+        read_seq = str(getattr(rec, "seq", "") or "")
+        if not read_seq:
+            self._set_sanger_preview("[red]That trace has no bases.[/red]")
+            return
+        phred = list((getattr(rec, "letter_annotations", None) or {})
+                     .get("phred_quality") or [])
+        target_label = PlasmidApp._record_display_name(target)
+        self._set_sanger_preview(
+            f"[yellow]Checking {_esc_md(rec.name or rec.id)} against "
+            f"{_esc_md(target_label)}…[/yellow]"
+        )
+        self._align_worker(
+            query_seq=read_seq,
+            target_seq=str(target.seq),
+            query_label=(rec.name or rec.id or "read"),
+            target_label=target_label,
+            target_record=target,
+            target_is_circular=(
+                (getattr(target, "annotations", None) or {}
+                 ).get("topology", "") or "").lower() == "circular",
+            entry_counter=getattr(self.app, "_record_load_counter", 0),
+            query_phred=phred,
+        )
+
+    def _set_sanger_preview(self, markup: str) -> None:
+        """Write to the Sanger preview pane, tolerating its absence (the pane
+        is only composed while that sub-tab has been built)."""
+        try:
+            self.query_one("#sanger-preview", Static).update(markup)
+        except NoMatches:
+            pass
 
     @on(Button.Pressed, "#btn-sanger-add")
     def _sanger_add_to_library(self, _) -> None:
@@ -60593,7 +62097,7 @@ class SequencingScreen(Screen):
     def _align_worker(self, *, query_seq: str, target_seq: str,
                        query_label: str, target_label: str,
                        target_record, target_is_circular: bool,
-                       entry_counter: int) -> None:
+                       entry_counter: int, query_phred=None) -> None:
         """Worker: run `_pairwise_align` off the UI thread, then load
         the target into the canvas and register the alignment as a
         blue overlay bar on its linear view. Inputs captured at entry;
@@ -60615,6 +62119,13 @@ class SequencingScreen(Screen):
         Also captures `_alignments_generation` so a user who hits
         Clear Alignments while the C-loop ran doesn't see this stale
         result reappear on the overlay band when the worker lands.
+
+        `query_phred` (optional) is the read's per-base Phred array — the
+        Sanger path has one, a Plasmidsaurus `.gbk` consensus does not. When
+        present, the alignment is scored a second way: which of its
+        discrepancies the read actually supports. That verdict is stored ON the
+        alignment because it is the only object that outlives the trace record
+        (a library entry is `gb_text`, which cannot hold a per-base array).
         """
         gen_at_entry = getattr(self.app, "_alignments_generation", 0)
         try:
@@ -60708,6 +62219,11 @@ class SequencingScreen(Screen):
                         "failed for %r", tgt_id,
                     )
                     return
+            # Bound BEFORE the try: `_register_alignment` can raise, and the
+            # quality note in the toast below reads this name. An unbound local
+            # there would turn a recoverable registration failure into a
+            # NameError that swallows the whole result.
+            registered_entry = None
             # Register on the linear-map overlay band instead of pushing
             # AlignmentScreen — clicking the lane jumps the seq panel to
             # that region (centered + highlighted); the full-screen
@@ -60735,6 +62251,33 @@ class SequencingScreen(Screen):
                 # entry.
                 if registered_entry is not None:
                     registered_entry["_stored_source"] = "sequencing"
+                    # Basecall-quality verdict, computed ONCE here and stored
+                    # on the alignment so the Verification Report + manager
+                    # modal can show "2 real changes, 35 noise" without
+                    # needing the trace file back. Threshold comes from the
+                    # live app setting so a user who changes it and re-checks
+                    # gets the new answer.
+                    if query_phred:
+                        try:
+                            registered_entry["quality"] = (
+                                _trace_verification_summary(
+                                    result.get("aligned_q", "") or "",
+                                    result.get("aligned_t", "") or "",
+                                    query_phred,
+                                    min_phred=int(getattr(
+                                        self.app, "_sanger_min_phred",
+                                        _SANGER_MIN_PHRED_DEFAULT)),
+                                )
+                            )
+                        except Exception:
+                            # A quality verdict is an ENHANCEMENT to the
+                            # alignment, never a precondition for it: if this
+                            # fails the alignment itself is still correct and
+                            # must still land.
+                            _log.exception(
+                                "trace quality summary failed for %r",
+                                query_label,
+                            )
                 flush = getattr(
                     self.app, "_flush_active_alignments", None,
                 )
@@ -60803,6 +62346,14 @@ class SequencingScreen(Screen):
             # flipped insert read as a low identity score is exactly the
             # "it just didn't align" reading this replaces.
             inv_note = _inversion_note(result, "target")
+            # Basecall-quality headline. This is the number the user actually
+            # decides on — "37 mismatches" and "2 real changes, 35 in unreliable
+            # basecalls" are the same alignment and opposite conclusions.
+            qual_note = ""
+            qsum = (registered_entry or {}).get("quality") \
+                if isinstance(registered_entry, dict) else None
+            if isinstance(qsum, dict) and qsum.get("has_quality"):
+                qual_note = " · " + _trace_verdict_phrase(qsum)
             try:
                 self.app.notify(
                     f"Aligned {query_label} → {target_label} · "
@@ -60811,6 +62362,7 @@ class SequencingScreen(Screen):
                     f"{_format_identity_pct(ident_total)} identity "
                     f"({_format_identity_pct(ident_ungap)} in matched region)"
                     f"{' · ⇄ ' + inv_note if inv_note else ''}"
+                    f"{qual_note}"
                     f"{rot_note} · "
                     f"click read on map to inspect.",
                     title="Alignment added",
@@ -61944,59 +63496,18 @@ class ExperimentProjectsPickerModal(_OneShotDismissScreen, ModalScreen):
         if not name:
             self._set_status("[red]No project selected.[/red]")
             return
-        if _find_project(name) is None:
-            self._set_status(f"[red]Project '{name}' not found.[/red]")
-            self._repopulate()
-            return
-        # Sweep #9 (2026-05-19): atomic project switch. Pre-fix
-        # ordering was `_set_active_project_name` (async daemon
-        # flush) THEN sync `_safe_save_json(_state._EXPERIMENTS_FILE)` —
-        # power loss in the window between the two writes left
-        # settings.json saying OLD project + experiments.json
-        # holding NEW project's entries. The next UI save would
-        # then mirror NEW entries into OLD project, silently
-        # overwriting OLD's data.
-        #
-        # New ordering: update active-pointer in memory, FORCE
-        # synchronous flush so disk-settings reflects the new
-        # active project, then write experiments. A crash between
-        # the flush and the experiments write self-heals on the
-        # NEXT LAUNCH: `_restore_experiments_from_active_project`
-        # rebuilds experiments.json from the active (NEW) project,
-        # so the stale OLD entries can't be mirrored back over NEW
-        # by the next `_save_experiments`. (A same-session mirror
-        # failure is reverted in the `except` below.)
-        target = _find_project(name)
-        raw_entries = (target or {}).get("experiments", [])
-        if not isinstance(raw_entries, list):
-            raw_entries = []
-        target_entries = [e for e in raw_entries if isinstance(e, dict)]
-        prev = _get_active_project_name()
-        _set_active_project_name(name)
-        _settings_flush_sync()
+        # The atomic switch (pointer flush → mirror write → revert on
+        # failure) lives in `_activate_experiment_project` so the
+        # cross-project search jump runs the identical protocol.
         try:
-            # Bypass `_save_experiments` here because that would
-            # re-mirror back into the project we just switched to
-            # (the project IS the source of truth in this
-            # direction). [INV-83, sweep #27]: mirror-swap helper
-            # exempts the write from the L3 shrink guard (the
-            # outgoing project's entries are intact in
-            # experiment_projects.json).
-            _safe_save_json_mirror(
-                _state._EXPERIMENTS_FILE, target_entries, "Experiments",
-            )
+            err = _activate_experiment_project(name)
         except (OSError, RuntimeError) as exc:
-            # Revert the pointer so active-name and experiments.json stay
-            # consistent — the desync would clobber the target project on the
-            # next save. [INV-161]
-            _set_active_project_name(prev)
-            _settings_flush_sync()
             _notify_save_failure(self.app, "Experiments", exc)
             return
-        # Invalidate the experiments in-memory cache so the next
-        # reader sees the new project's entries (file just changed
-        # underneath).
-        _state._experiments_cache = None
+        if err is not None:
+            self._set_status(f"[red]{err}[/red]")
+            self._repopulate()
+            return
         self.dismiss(name)
 
     @on(DataTable.RowSelected, "#projpick-table")
@@ -62386,11 +63897,17 @@ class ExperimentRenameModal(ModalScreen):
 # sees what `_save_experiment_image` will actually accept.
 _IMAGE_FILE_FILTER = set(_IMAGE_EXTS)
 
+# What the notebook's attach picker will show. Wider than
+# `_IMAGE_FILE_FILTER` since 2026-09-17 (traces / exports / datasheets);
+# `_IMAGE_FILE_FILTER` stays image-only because the clipboard-paste path
+# and the inline preview genuinely mean images.
+_EXPERIMENT_ATTACH_FILE_FILTER = set(_EXPERIMENT_ATTACH_EXTS)
+
 
 class _ImagePickerTree(DirectoryTree):
-    """DirectoryTree variant that hides non-image files. Inheriting
-    Textual's filter API (`filter_paths`) keeps the navigation native;
-    only the leaf filenames get filtered."""
+    """DirectoryTree variant that hides files the notebook can't attach.
+    Inheriting Textual's filter API (`filter_paths`) keeps the navigation
+    native; only the leaf filenames get filtered."""
 
     def filter_paths(self, paths):
         out = []
@@ -62399,7 +63916,7 @@ class _ImagePickerTree(DirectoryTree):
                 if p.is_dir():
                     out.append(p)
                     continue
-                if p.suffix.lower() in _IMAGE_FILE_FILTER:
+                if p.suffix.lower() in _EXPERIMENT_ATTACH_FILE_FILTER:
                     out.append(p)
             except OSError:
                 continue
@@ -62788,20 +64305,28 @@ class ActionsPickerModal(_OneShotDismissScreen, ModalScreen):
     when the user opens a `!<id>` tag, the picker scrolls to that
     row so the relevant action is highlighted on open.
 
+    `multi=True` (2026-09-17) turns the picker into the entry-template
+    chooser: space toggles rows, Insert returns the whole picked set.
+    Same catalog, same click-through row, one selection model more —
+    a second modal would have duplicated all of it.
+
     Dismiss payload:
-      ``None``  — cancelled (Esc / Cancel)
-      ``str``   — action id to insert into the body.
+      ``None``        — cancelled (Esc / Cancel)
+      ``str``         — action id to insert into the body
+      ``list[str]``   — with `multi=True`, every picked action id
     """
 
     _blocks_undo: bool = True
 
     BINDINGS = [
         Binding("escape", "cancel",         "Cancel"),
+        Binding("space",  "toggle_pick",    "Pick",   show=False),
         Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     def __init__(self, initial_action: "str | None" = None,
-                  *, inspect_only: bool = False) -> None:
+                  *, inspect_only: bool = False,
+                  multi: bool = False) -> None:
         super().__init__()
         self._initial_action = initial_action
         # Sweep #9 (2026-05-19): inspect_only flag for click-through
@@ -62809,6 +64334,8 @@ class ActionsPickerModal(_OneShotDismissScreen, ModalScreen):
         # pre-fix the Insert button was a silent no-op because no
         # callback was wired.
         self._inspect_only = inspect_only
+        self._multi = bool(multi) and not inspect_only
+        self._picked: "set[str]" = set()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="actpick-dlg"):
@@ -62821,6 +64348,15 @@ class ActionsPickerModal(_OneShotDismissScreen, ModalScreen):
                     "[b]!<id>[/b] tag click. Close and use the "
                     "[b]Action ref[/b] button in an experiment to "
                     "insert a tag.[/]",
+                    id="actpick-help", markup=True,
+                )
+            elif self._multi:
+                # Kept short: `#actpick-help` is a Label in a
+                # `width: 90` dialog, and a Label sizes to its content
+                # rather than wrapping — a longer string clips its tail.
+                yield Label(
+                    "[b]Space[/b] picks steps — each becomes a heading "
+                    "with its [b]!<id>[/b] tag.",
                     id="actpick-help", markup=True,
                 )
             else:
@@ -62839,20 +64375,74 @@ class ActionsPickerModal(_OneShotDismissScreen, ModalScreen):
 
     def on_mount(self) -> None:
         t = self.query_one("#actpick-table", DataTable)
-        t.add_columns("Category", "Action", "Description")
+        if self._multi:
+            t.add_columns("", "Category", "Action", "Description")
+        else:
+            t.add_columns("Category", "Action", "Description")
         cursor_row = 0
         for i, (category, action, desc) in enumerate(
             _EXPERIMENT_ACTIONS,
         ):
-            t.add_row(category, action, desc, key=action)
+            if self._multi:
+                t.add_row(" ", category, action, desc, key=action)
+            else:
+                t.add_row(category, action, desc, key=action)
             if self._initial_action and action == self._initial_action:
                 cursor_row = i
         if t.row_count:
             t.move_cursor(row=cursor_row)
         t.focus()
+        # Multi mode opens with nothing picked, so Insert must open
+        # DISABLED — otherwise pressing it hits the `if not self._picked:
+        # return` guard and reads as a dead button.
+        self._sync_multi_button()
+
+    def action_toggle_pick(self) -> None:
+        """Space — toggle the cursor row's pick mark (multi mode only)."""
+        if not self._multi:
+            return
+        try:
+            t = self.query_one("#actpick-table", DataTable)
+        except NoMatches:
+            return
+        action = _cursor_row_key(t)
+        if not action:
+            return
+        if action in self._picked:
+            self._picked.discard(action)
+            mark = " "
+        else:
+            self._picked.add(action)
+            mark = "✓"
+        try:
+            t.update_cell_at(_Coordinate(t.cursor_row, 0), mark)
+        except Exception:
+            # The ✓ is cosmetic — a failed repaint must not lose the pick,
+            # which lives in `self._picked`, not in the cell.
+            pass
+        self._sync_multi_button()
+
+    def _sync_multi_button(self) -> None:
+        """Insert reads "Insert (3)" in multi mode so the count is visible
+        without counting ✓ marks, and disables at zero — an empty pick
+        would otherwise insert an empty template."""
+        if not self._multi:
+            return
+        try:
+            btn = self.query_one("#btn-actpick-ok", Button)
+        except NoMatches:
+            return
+        n = len(self._picked)
+        btn.label = f"Insert ({n})" if n else "Insert"
+        btn.disabled = n == 0
 
     @on(Button.Pressed, "#btn-actpick-ok")
     def _ok(self, _) -> None:
+        if self._multi:
+            if not self._picked:
+                return
+            self.dismiss(sorted(self._picked))
+            return
         action = _cursor_row_key(
             self.query_one("#actpick-table", DataTable),
         )
@@ -62862,6 +64452,12 @@ class ActionsPickerModal(_OneShotDismissScreen, ModalScreen):
 
     @on(DataTable.RowSelected, "#actpick-table")
     def _row_selected(self, event) -> None:
+        # In multi mode Enter/click toggles instead of committing —
+        # committing on the first row selection would make it impossible
+        # to pick a second.
+        if self._multi:
+            self.action_toggle_pick()
+            return
         self._ok(None)
 
     @on(Button.Pressed, "#btn-actpick-cancel")
@@ -62870,6 +64466,334 @@ class ActionsPickerModal(_OneShotDismissScreen, ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+# Ceiling on bytes embedded as `data:` URIs in one export. The per-entry
+# attachment cap is 100 MB and a project holds many entries, so an
+# unbounded "embed images" on a whole-project HTML export could try to
+# build a multi-hundred-MB string in memory. Past this the export falls
+# back to absolute file paths and SAYS so — a silently half-embedded
+# document would look complete and break when moved.
+_EXPERIMENT_EXPORT_EMBED_MAX_BYTES = 25_000_000
+
+
+class ExperimentExportModal(ModalScreen):
+    """Write a notebook entry — or the whole project — to a file.
+
+    Markdown copies each body verbatim (cross-ref sigils intact, so an
+    exported entry can be pasted back into a new one and still carry
+    working `@`/`!`/`&` refs) and adds a metadata header, a resolved
+    References block and the attachment list around it. HTML renders the
+    documented markdown subset (`_MARKDOWN_HTML_SUBSET`) into a
+    standalone, print-ready page with the stylesheet inlined.
+
+    Dismisses with `{"path", "fmt", "n_entries", "embedded"}` or None.
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next",   show=False),
+    ]
+
+    def __init__(self, *, entry: "dict | None" = None,
+                  project: str = "") -> None:
+        super().__init__()
+        self._entry = entry
+        self._project = project or _DEFAULT_PROJECT_NAME
+        stem = ((entry or {}).get("title") or self._project or "notebook")
+        fallback = _safe_export_filename(str(stem), "md")
+        self._start_dir, self._default_filename = \
+            _split_default_export_path("", fallback)
+        self._selected_dir = self._start_dir
+        self._dismissed: bool = False
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="expexp-box"):
+            yield Static(" Export notebook ", id="expexp-title")
+            with Horizontal(id="expexp-selrow"):
+                scope_opts = [("Whole project", "project")]
+                if self._entry is not None:
+                    scope_opts.insert(0, ("This entry", "entry"))
+                yield Select(
+                    scope_opts,
+                    value="entry" if self._entry is not None else "project",
+                    allow_blank=False, id="expexp-scope",
+                )
+                yield Select(
+                    [("Markdown (.md)", "md"), ("HTML page (.html)", "html")],
+                    value="md", allow_blank=False, id="expexp-fmt",
+                )
+            yield Checkbox("Embed images in the file", value=True,
+                            id="expexp-embed")
+            yield Static(
+                "[dim]Markdown keeps the body exactly as written, so it "
+                "pastes back into a new entry with its refs intact. HTML "
+                "is a standalone page — stylesheet inlined, ready to "
+                "print.[/]",
+                id="expexp-hint", markup=True,
+            )
+            yield Static(f"Save in: [b]{self._selected_dir}[/b]",
+                          id="expexp-dir", markup=True)
+            yield _ExtensionAwareDirectoryTree(
+                self._start_dir,
+                highlight_map=_PLASMID_PICKER_HIGHLIGHT_MAP,
+                id="expexp-tree",
+            )
+            yield Label("Filename:")
+            yield Input(value=self._default_filename,
+                         placeholder="notebook.md", id="expexp-filename")
+            yield Static("", id="expexp-status", markup=True)
+            with Horizontal(id="expexp-btns"):
+                yield Button("Export", id="btn-expexp-export",
+                              variant="primary")
+                yield Button("Cancel", id="btn-expexp-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#expexp-tree",
+                            _ExtensionAwareDirectoryTree).focus()
+        except NoMatches:
+            pass
+
+    def _current_fmt(self) -> str:
+        try:
+            return "html" if self.query_one(
+                "#expexp-fmt", Select).value == "html" else "md"
+        except NoMatches:
+            return "md"
+
+    @on(Select.Changed, "#expexp-fmt")
+    def _fmt_changed(self, _event) -> None:
+        ext = ".html" if self._current_fmt() == "html" else ".md"
+        try:
+            inp = self.query_one("#expexp-filename", Input)
+        except NoMatches:
+            return
+        cur = inp.value.strip()
+        stem = cur[: cur.rfind(".")] if "." in cur else cur
+        inp.value = (stem or "notebook") + ext
+
+    @on(DirectoryTree.DirectorySelected, "#expexp-tree")
+    def _on_dir_selected(self, event) -> None:
+        self._selected_dir = str(event.path)
+        try:
+            self.query_one("#expexp-dir", Static).update(
+                f"Save in: [b]{self._selected_dir}[/b]")
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.FileSelected, "#expexp-tree")
+    def _on_file_selected(self, event) -> None:
+        p = Path(str(event.path))
+        self._selected_dir = str(p.parent)
+        try:
+            self.query_one("#expexp-dir", Static).update(
+                f"Save in: [b]{self._selected_dir}[/b]")
+            self.query_one("#expexp-filename", Input).value = p.name
+        except NoMatches:
+            pass
+
+    @on(Input.Submitted, "#expexp-filename")
+    def _submitted(self) -> None:
+        try:
+            self.query_one("#btn-expexp-export", Button).press()
+        except NoMatches:
+            pass
+
+    def _entries_for_scope(self) -> "list[dict]":
+        try:
+            scope = self.query_one("#expexp-scope", Select).value
+        except NoMatches:
+            scope = "project"
+        if scope == "entry" and self._entry is not None:
+            eid = self._entry.get("id")
+            # Re-read from disk so the export can't ship a stale copy of
+            # an entry that was saved after this modal opened.
+            fresh = next((e for e in _load_experiments()
+                          if e.get("id") == eid), None)
+            return [fresh or self._entry]
+        return sorted(_load_experiments(),
+                       key=lambda e: (e.get("updated_at") or ""),
+                       reverse=True)
+
+    def _image_srcs(self, entries: "list[dict]", *, embed: bool
+                     ) -> "tuple[dict[str, str], bool]":
+        """`({stored_path: src}, embedded)` for the export's images.
+
+        With `embed`, files are read and inlined as `data:` URIs up to
+        `_EXPERIMENT_EXPORT_EMBED_MAX_BYTES`; past the cap (or with embed
+        off, or on a read error) the src is the absolute path on this
+        machine, which keeps the document working here but not when
+        moved. The returned flag says which happened so the caller can
+        report it rather than let the user find out later.
+        """
+        import base64 as _b64
+        import mimetypes as _mt
+        out: "dict[str, str]" = {}
+        total = 0
+        embedded = bool(embed)
+        for e in entries:
+            eid = e.get("id") or ""
+            d = _experiment_attach_dir(eid, create=False)
+            if d is None or not d.is_dir():
+                continue
+            for rel in (e.get("image_paths") or []):
+                if not isinstance(rel, str) or not rel:
+                    continue
+                p = d / rel
+                try:
+                    if not p.is_file() or p.is_symlink():
+                        continue
+                except OSError:
+                    continue
+                out[rel] = str(p)
+                if not embed:
+                    continue
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    continue
+                if total + size > _EXPERIMENT_EXPORT_EMBED_MAX_BYTES:
+                    embedded = False
+                    continue
+                try:
+                    raw = p.read_bytes()
+                except OSError:
+                    # This one image stays a local path, so the document
+                    # is NOT fully self-contained — say so rather than
+                    # reporting a clean embed with one broken image in it.
+                    embedded = False
+                    continue
+                mime = _mt.guess_type(p.name)[0] or "image/png"
+                out[rel] = (f"data:{mime};base64,"
+                            + _b64.b64encode(raw).decode("ascii"))
+                total += size
+        return out, embedded
+
+    @on(Button.Pressed, "#btn-expexp-export")
+    def _do_export(self) -> None:
+        try:
+            inp = self.query_one("#expexp-filename", Input)
+            status = self.query_one("#expexp-status", Static)
+        except NoMatches:
+            return
+        filename = inp.value.strip()
+        if not filename:
+            status.update("[red]Enter a filename.[/red]")
+            return
+        fmt = self._current_fmt()
+        want = ".html" if fmt == "html" else ".md"
+        if not filename.lower().endswith(want):
+            status.update(f"[red]Filename must end in {want} for "
+                          f"{'HTML' if fmt == 'html' else 'Markdown'}."
+                          f"[/red]")
+            return
+        entries = self._entries_for_scope()
+        if not entries:
+            status.update("[red]Nothing to export.[/red]")
+            return
+        path = Path(self._selected_dir).expanduser() / filename
+        try:
+            embed = self.query_one("#expexp-embed", Checkbox).value
+        except NoMatches:
+            embed = True
+        status.update(f"[dim]Writing → {path}…[/dim]")
+        try:
+            self.query_one("#btn-expexp-export", Button).disabled = True
+        except NoMatches:
+            pass
+        self._export_worker(str(path), fmt, entries, bool(embed))
+
+    @work(thread=True, exclusive=True, group="experiment_export")
+    def _export_worker(self, path: str, fmt: str, entries: "list[dict]",
+                        embed: bool) -> None:
+        try:
+            srcs, embedded = self._image_srcs(entries, embed=embed)
+            stamp = _history_human_dt(_now_iso()[:10])
+            if fmt == "html":
+                text = _experiment_html_document(
+                    entries,
+                    title=(entries[0].get("title") if len(entries) == 1
+                            else self._project),
+                    project=self._project,
+                    image_srcs=srcs, generated_at=stamp,
+                )
+            elif len(entries) == 1:
+                text = _experiment_markdown_document(
+                    entries[0], project=self._project, image_srcs=srcs,
+                )
+            else:
+                text = _experiment_project_markdown(
+                    entries, project=self._project, image_srcs=srcs,
+                    generated_at=stamp,
+                )
+            # Atomic (temp + fsync + replace), like `export_plasmid_map`
+            # and every other user-path export: the worker is
+            # `exclusive=True` and gets CANCELLED if the modal closes or
+            # a second export starts, and a plain `write_text` interrupted
+            # mid-flight leaves a truncated file that still looks like a
+            # finished document.
+            _atomic_write_bytes(Path(path), text.encode("utf-8"))
+        except (OSError, ValueError) as exc:
+            _log.exception("Experiment export to %s failed", path)
+            self.app.call_from_thread(
+                self._on_failed,
+                f"[red]Could not write {path!r}: {exc}. Check the folder "
+                f"exists and is writable.[/red]")
+            return
+        except Exception as exc:   # defensive: a render bug must not hang
+            _log.exception("Experiment export render failed for %s", path)
+            self.app.call_from_thread(
+                self._on_failed, f"[red]Export failed: {exc}[/red]")
+            return
+        # `_scrub_path` per the logging convention — an export destination
+        # is a user path and carries a home directory / username.
+        _log_event("experiments.exported", path=_scrub_path(str(path)),
+                    fmt=fmt, n_entries=len(entries), embedded=embedded)
+        summary = {"path": path, "fmt": fmt,
+                    "n_entries": len(entries), "embedded": embedded}
+
+        def _finish() -> None:
+            if not self.is_mounted:
+                return
+            if embed and not embedded:
+                # Don't dismiss silently on a partial embed — the file is
+                # written but references local paths, which matters the
+                # moment it's emailed.
+                self._on_failed(
+                    f"[yellow]Written, but the images exceeded the "
+                    f"{_EXPERIMENT_EXPORT_EMBED_MAX_BYTES // 1_000_000} MB "
+                    f"embed limit and are linked by local path instead — "
+                    f"the file won't carry them to another machine."
+                    f"[/yellow]")
+                return
+            self._dismiss_once(summary)
+        self.app.call_from_thread(_finish)
+
+    def _on_failed(self, msg: str) -> None:
+        try:
+            self.query_one("#expexp-status", Static).update(msg)
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#btn-expexp-export", Button).disabled = False
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-expexp-cancel")
+    def _cancel_btn(self, _) -> None:
+        self._dismiss_once(None)
+
+    def action_cancel(self) -> None:
+        self._dismiss_once(None)
 
 
 class ImageAttachModal(_OneShotDismissScreen, ModalScreen):
@@ -62926,10 +64850,13 @@ class ImageAttachModal(_OneShotDismissScreen, ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="imgatt-dlg"):
-            yield Static(" Attach image ", id="imgatt-title")
+            yield Static(" Attach file ", id="imgatt-title")
             yield Static(
-                "[dim]Pick an image (PNG / JPG / GIF / BMP / WebP / "
-                "TIFF). Cap: 10 MB per file, 100 MB per entry.[/dim]",
+                "[dim]Images (PNG / JPG / GIF / BMP / WebP / TIFF) "
+                "preview inline; traces, exports and datasheets "
+                "(AB1 / CSV / TSV / TXT / PDF / GenBank / FASTA / "
+                "FASTQ / XLSX / ZIP) attach as files. Cap: 10 MB per "
+                "file, 100 MB per entry.[/dim]",
                 id="imgatt-hint", markup=True,
             )
             yield _ImagePickerTree(self._start, id="imgatt-tree")
@@ -62967,7 +64894,7 @@ class ImageAttachModal(_OneShotDismissScreen, ModalScreen):
             p = Path(event.path)
         except (TypeError, ValueError):
             return
-        if p.suffix.lower() not in _IMAGE_FILE_FILTER:
+        if p.suffix.lower() not in _EXPERIMENT_ATTACH_FILE_FILTER:
             return
         self._picked = str(p)
         try:
@@ -63316,10 +65243,16 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
         # Alt+I (not Ctrl+I): the Ctrl+I byte IS Tab (0x09), which Textual
         # delivers as "tab" — so `ctrl+i` never fired here and just moved
         # focus. [PIT-14] terminal-safe-shortcut rule.
-        Binding("alt+i", "attach_image",   "Attach image", show=True),
+        Binding("alt+i", "attach_image",   "Attach file",  show=True),
         Binding("ctrl+r", "insert_plasmid", "Plasmid ref",  show=True),
         Binding("ctrl+p", "open_projects",  "Projects",     show=True),
         Binding("ctrl+g", "go_to_tag",      "Open tag",     show=True),
+        # Screen bindings beat App-level ones even where the App declares
+        # `priority=True` (see PrimerDesignerScreen's snapshot re-declare),
+        # so Ctrl+F reaches this screen rather than the app's
+        # `find_sequence`. Ctrl+E mirrors BabsScreen's export key.
+        Binding("ctrl+f", "find_entries",   "Find",         show=True),
+        Binding("ctrl+e", "export_entry",   "Export",       show=True),
         Binding("f7",     "spellcheck",     "Spellcheck",   show=True),
     ]
 
@@ -63360,17 +65293,26 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
     #exp-tabs > TabPane { padding: 0 1; }
 
     /* ── Entries pane (permanent left side) ─────────────────── */
+    /* Filter narrows the ACTIVE project as you type; Ctrl+F's modal
+       searches every project. Same split as the plasmid side, where
+       LibraryPanel filters the active collection and
+       LibrarySearchModal goes cross-collection. */
+    #exp-filter-input { width: 1fr; height: 3; }
+    #exp-filter-count {
+        height: 1; color: $text-muted; padding: 0 1;
+    }
     #exp-entries-table {
         height: 1fr; min-height: 6;
         border: solid $primary-darken-2;
     }
     #exp-entries-btns-row1, #exp-entries-btns-row2,
-    #exp-entries-btns-row3 {
+    #exp-entries-btns-row3, #exp-entries-btns-row4 {
         height: 3; margin: 1 0; align: left middle;
     }
     #exp-entries-btns-row1 Button,
     #exp-entries-btns-row2 Button,
-    #exp-entries-btns-row3 Button {
+    #exp-entries-btns-row3 Button,
+    #exp-entries-btns-row4 Button {
         margin: 0 1; min-width: 10; width: 1fr;
     }
 
@@ -63388,12 +65330,29 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
     }
     #exp-title-input { width: 1fr; }
     #exp-tags-input  { width: 1fr; }
-    #exp-compose-hint { height: 1; color: $text-muted; margin-top: 1; }
+    /* `height: auto` (was 1) so the legend WRAPS instead of clipping —
+       at 1 row the line was already losing its tail on an 80-column
+       terminal, which silently hid whatever was written last.
+       `max-height: 3` keeps a very narrow terminal from letting the
+       hint eat the writing area. */
+    #exp-compose-hint {
+        height: auto; max-height: 3;
+        color: $text-muted; margin-top: 1;
+    }
     #exp-body {
         width: 100%; height: 1fr; min-height: 10; margin-top: 1;
         border: solid $primary-darken-2;
     }
-    #exp-compose-btns { height: 3; margin-top: 1; align: left middle; }
+    /* A HorizontalScroll, not a Horizontal: eight buttons at min-width
+       14 need ~120 columns and the right pane has ~64 on an 80-column
+       terminal, so the row panned rather than clipping Spellcheck off
+       the edge. Horizontal scrollbar forced to 0 — the row is 3 rows
+       tall and a visible bar would sit on the buttons and swallow
+       clicks (same reason as #menubar-scroll). */
+    #exp-compose-btns {
+        height: 3; margin-top: 1; align: left middle;
+        scrollbar-size: 0 0; scrollbar-size-horizontal: 0;
+    }
     #exp-compose-btns Button { margin-right: 1; min-width: 14; }
     #exp-dirty-flag {
         width: auto; height: 3; padding: 1 1; color: $warning;
@@ -63422,11 +65381,26 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
 
     _DEPENDENT_SUBTABS = ("exp-sub-compose", "exp-sub-attachments")
 
+    # Live-filter debounce, matching `LibrarySearchModal`.
+    _LIVE_FILTER_DEBOUNCE_S = 0.15
+
     def __init__(self, initial_entry_id: "str | None" = None) -> None:
         super().__init__()
         self._initial_entry_id = initial_entry_id
         self._current_entry: "dict | None" = None
         self._dirty: bool = False
+        self._filter_timer = None
+
+    def on_unmount(self) -> None:
+        """Cancel the pending filter debounce. A timer that survives the
+        screen fires `_refresh_entries_table` against unmounted widgets —
+        the post-unmount timer re-arm class of bug (v1.2.48)."""
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+            self._filter_timer = None
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         return True
@@ -63474,6 +65448,11 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
 
     def _compose_entries_pane(self) -> ComposeResult:
         with Vertical(id="exp-entries-pane"):
+            yield Input(
+                placeholder="filter (or #tag)",
+                id="exp-filter-input",
+            )
+            yield Static("", id="exp-filter-count", markup=True)
             yield DataTable(id="exp-entries-table",
                               cursor_type="row",
                               zebra_stripes=True)
@@ -63491,6 +65470,9 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
                               variant="error")
             with Horizontal(id="exp-entries-btns-row3"):
                 yield Button("Move", id="btn-exp-move")
+                yield Button("Copy", id="btn-exp-duplicate")
+            with Horizontal(id="exp-entries-btns-row4"):
+                yield Button("Find", id="btn-exp-find")
 
     def _compose_compose_pane(self) -> ComposeResult:
         with Vertical(id="exp-compose-pane"):
@@ -63505,21 +65487,25 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
                     id="exp-tags-input",
                 )
             yield Static(
-                "[dim]Markdown source. Cross-refs: "
-                "[b]`@<id>`[/b] plasmid, [b]`!<id>`[/b] action, "
-                "[b]`&<id>`[/b] gel. Insert via the "
-                "[b]Plasmid ref[/b] / [b]Action ref[/b] / "
-                "[b]Gel ref[/b] buttons or [b]^R[/b]. "
-                "[b]^G[/b] (or double-click) jumps to the tag's source.[/]",
+                # One row (`#exp-compose-hint { height: 1 }`), so it CLIPS
+                # rather than wrapping — every clause has to earn its
+                # width. The tag legend stays because the sigils are the
+                # one thing not discoverable from a button label; the
+                # insert-button names went because the buttons are right
+                # there, which is what made room for ^F / ^E.
+                "[dim]Markdown. Refs: [b]`@<id>`[/b] plasmid, "
+                "[b]`!<id>`[/b] action, [b]`&<id>`[/b] gel — insert with "
+                "the buttons below. [b]^G[/b] (or double-click) opens a "
+                "tag, [b]^F[/b] finds, [b]^E[/b] exports.[/]",
                 id="exp-compose-hint", markup=True,
             )
             yield _ExperimentMarkdownTextArea(
                 "", language="markdown", id="exp-body",
             )
-            with Horizontal(id="exp-compose-btns"):
+            with HorizontalScroll(id="exp-compose-btns"):
                 yield Button("Save", id="btn-exp-save",
                               variant="primary")
-                yield Button("Attach image",
+                yield Button("Attach file",
                               id="btn-exp-attach")
                 yield Button("Plasmid ref",
                               id="btn-exp-plasmid")
@@ -63527,15 +65513,21 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
                               id="btn-exp-actions")
                 yield Button("Gel ref",
                               id="btn-exp-gel")
+                yield Button("Steps",
+                              id="btn-exp-steps")
+                yield Button("Protocol",
+                              id="btn-exp-protocol")
                 yield Button("Spellcheck",
                               id="btn-exp-spellcheck")
+                yield Button("Export",
+                              id="btn-exp-export")
                 yield Static("", id="exp-dirty-flag")
 
     def _compose_attachments_pane(self) -> ComposeResult:
         with Vertical(id="exp-attach-pane"):
             yield Static(
-                "[dim]Attached images for the selected entry. Cap: "
-                "10 MB per image, 100 MB per entry.[/]",
+                "[dim]Attachments — images preview below, other files "
+                "list only. Cap: 10 MB per file, 100 MB per entry.[/]",
                 id="exp-attach-hint", markup=True,
             )
             yield DataTable(id="exp-attach-table",
@@ -63605,17 +65597,54 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
             return (updated, _natural_sort_key(title))
         return sorted(entries, key=_key, reverse=True)
 
+    # ─── Filter (narrows the ACTIVE project) ─────────────────────────────
+
+    def _current_filter(self) -> str:
+        try:
+            return self.query_one("#exp-filter-input", Input).value or ""
+        except NoMatches:
+            return ""
+
+    def _visible_entries(self) -> "list[dict]":
+        """Active-project entries after the filter box.
+
+        A bare word is a search term matched against title / tags / body;
+        a `#tag` token filters by tag. The two compose, so
+        `#gibson failed` is "every Gibson-tagged entry that mentions
+        failure" — which is the query a notebook actually gets asked.
+
+        Unfiltered returns `_sorted_entries()` untouched (newest first);
+        filtered hands back `_experiment_search` order, best match first.
+        """
+        entries = self._sorted_entries()
+        raw = self._current_filter().strip()
+        if not raw:
+            return entries
+        toks = raw.split()
+        tags = [t[1:] for t in toks if t.startswith("#") and len(t) > 1]
+        query = " ".join(t for t in toks if not t.startswith("#"))
+        if not query and not tags:
+            return entries
+        return [h["entry"] for h in
+                _experiment_search(entries, query, tags=tags)]
+
     def _refresh_entries_table(self) -> None:
         """Repopulate the entries list. Trimmed 2026-05-18 to two
         columns (Updated, Title) so a narrow left pane stays readable;
         long titles overflow into a horizontal scrollbar on the
-        DataTable rather than truncating with ellipsis."""
+        DataTable rather than truncating with ellipsis.
+
+        Rows are keyed by entry id, so the filter can drop rows without
+        breaking the sort/lookup symmetry of invariant #33 — every
+        selection path resolves the KEY against `_load_experiments()`
+        rather than indexing a parallel list.
+        """
         try:
             t = self.query_one("#exp-entries-table", DataTable)
         except NoMatches:
             return
         t.clear()
-        entries = self._sorted_entries()
+        entries = self._visible_entries()
         for e in entries:
             eid = e.get("id") or ""
             title = e.get("title") or "(untitled)"
@@ -63627,6 +65656,40 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
                 Text(title, no_wrap=True),
                 key=eid,
             )
+        self._update_filter_count(len(entries))
+
+    def _update_filter_count(self, shown: int) -> None:
+        """"3 of 41" under the filter box — so a filter that hides
+        everything reads as a filter, not an empty notebook."""
+        try:
+            lbl = self.query_one("#exp-filter-count", Static)
+        except NoMatches:
+            return
+        if not self._current_filter().strip():
+            noun = "entry" if shown == 1 else "entries"
+            lbl.update(f"[dim]{shown} {noun}[/dim]")
+            return
+        total = len(self._sorted_entries())
+        if shown == 0:
+            lbl.update(f"[yellow]no match[/yellow] [dim]of {total}[/dim]")
+        else:
+            lbl.update(f"[dim]{shown} of {total}[/dim]")
+
+    @on(Input.Changed, "#exp-filter-input")
+    def _on_filter_changed(self, _event: "Input.Changed") -> None:
+        """Debounced live filter. 150 ms coalesces a typing burst into one
+        pass — matching `LibrarySearchModal._LIVE_FILTER_DEBOUNCE_S`,
+        and worth more here because each pass deep-clones the project's
+        entries through `_load_experiments` and scans every body."""
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+            self._filter_timer = None
+        self._filter_timer = self.set_timer(
+            self._LIVE_FILTER_DEBOUNCE_S, self._refresh_entries_table,
+        )
 
     # ─── Compose loading / persistence ───────────────────────────────────
 
@@ -63938,6 +66001,26 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
     @on(Button.Pressed, "#btn-exp-move")
     def _on_btn_move(self, _ev) -> None:
         self._move_current_to_project()
+
+    @on(Button.Pressed, "#btn-exp-duplicate")
+    def _on_btn_duplicate(self, _ev) -> None:
+        self._duplicate_current()
+
+    @on(Button.Pressed, "#btn-exp-find")
+    def _on_btn_find(self, _ev) -> None:
+        self.action_find_entries()
+
+    @on(Button.Pressed, "#btn-exp-steps")
+    def _on_btn_steps(self, _ev) -> None:
+        self.action_insert_steps()
+
+    @on(Button.Pressed, "#btn-exp-protocol")
+    def _on_btn_protocol(self, _ev) -> None:
+        self.action_insert_protocol()
+
+    @on(Button.Pressed, "#btn-exp-export")
+    def _on_btn_export(self, _ev) -> None:
+        self.action_export_entry()
 
     @on(Button.Pressed, "#btn-exp-save")
     def _on_btn_save(self, _ev) -> None:
@@ -64520,6 +66603,267 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
                          ref=action_id)
         self.app.push_screen(ActionsPickerModal(), callback=_on_picked)
 
+    # ─── Cross-project find ──────────────────────────────────────────────
+
+    def action_find_entries(self) -> None:
+        """Ctrl+F — search every project and jump to the hit.
+
+        The filter box narrows the active project; this crosses projects,
+        switching the active one through `_activate_experiment_project`
+        (the same atomic protocol the projects picker uses) when the hit
+        lives elsewhere.
+        """
+        if self._dirty and self._current_entry is not None:
+            self._persist_current()
+
+        def _on_picked(payload) -> None:
+            if payload is None:
+                return
+            try:
+                project, eid = payload
+            except (TypeError, ValueError):
+                return
+            if not eid:
+                return
+            self._jump_to_entry(project, eid)
+        self.app.push_screen(ExperimentSearchModal(), callback=_on_picked)
+
+    def _jump_to_entry(self, project: str, eid: str) -> None:
+        """Open entry `eid`, switching to `project` first when needed."""
+        active = _get_active_project_name()
+        if project and project != active:
+            try:
+                err = _activate_experiment_project(project)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Experiments", exc)
+                return
+            if err is not None:
+                self.app.notify(err, severity="error", timeout=6)
+                return
+            try:
+                self.query_one("#exp-project-name", Static).update(
+                    self._format_project_label())
+            except NoMatches:
+                pass
+        # Clear the filter — a hit that the current filter would hide
+        # otherwise opens into a left pane that doesn't list it.
+        try:
+            self.query_one("#exp-filter-input", Input).value = ""
+        except NoMatches:
+            pass
+        self._refresh_entries_table()
+        for e in _load_experiments():
+            if e.get("id") == eid:
+                self._load_into_compose(e)
+                _log_event("experiments.jump", eid=eid, project=project)
+                return
+        self.app.notify("That entry is no longer there.",
+                         severity="warning")
+        self._clear_compose()
+
+    # ─── Duplicate as template ───────────────────────────────────────────
+
+    def _duplicate_current(self) -> None:
+        """Copy the selected entry under a new id — "start from the
+        write-up I already have". Attachments are deliberately not
+        copied (see `_experiment_duplicate`)."""
+        try:
+            t = self.query_one("#exp-entries-table", DataTable)
+        except NoMatches:
+            return
+        eid = _cursor_row_key(t) if t.row_count else None
+        if not eid:
+            self.app.notify("Pick an entry to copy first.",
+                             severity="warning")
+            return
+        if self._dirty and self._current_entry is not None:
+            self._persist_current()
+        entries = _load_experiments()
+        src = next((e for e in entries if e.get("id") == eid), None)
+        if src is None:
+            self.app.notify("That entry is no longer there.",
+                             severity="warning")
+            self._refresh_entries_table()
+            return
+        new_id = _new_experiment_id(
+            {i for i in (e.get("id") for e in entries)
+             if isinstance(i, str)})
+        copy = _experiment_duplicate(src, new_id=new_id)
+        entries.append(copy)
+        try:
+            _save_experiments(entries)
+        except OSError as exc:
+            _notify_save_failure(self.app, "Experiments", exc)
+            return
+        _log_event("experiments.duplicated", src=eid, eid=new_id)
+        had_images = bool(src.get("image_paths"))
+        self._refresh_entries_table()
+        self._load_into_compose(copy)
+        self.app.notify(
+            "Copied" + (" — attachments were not carried over (they "
+                        "belong to the original entry)" if had_images
+                        else "."),
+            severity="information", timeout=6 if had_images else 3,
+        )
+
+    # ─── Step skeleton (template) ────────────────────────────────────────
+
+    def action_insert_steps(self) -> None:
+        """Insert a heading-per-step skeleton for the picked actions.
+
+        The write-up half of the protocol pair: `action_insert_protocol`
+        emits what the program DID (and so can't invent a transformation
+        it never saw), while this emits the bench steps you are ABOUT to
+        do, as empty headings carrying their `!action` tags.
+        """
+        if self._current_entry is None:
+            self.app.notify("No entry selected.", severity="warning")
+            return
+
+        def _on_picked(payload) -> None:
+            if not payload or not isinstance(payload, list):
+                return
+            md = _experiment_template_markdown(
+                payload, _EXPERIMENT_ACTIONS,
+            )
+            if not md.strip():
+                return
+            try:
+                ta = self.query_one("#exp-body", TextArea)
+            except NoMatches:
+                return
+            ta.insert(md)
+            ta.focus()
+            self._mark_dirty(True)
+            _log_event("experiments.insert.steps",
+                        eid=self._current_entry.get("id")
+                             if self._current_entry else None,
+                        n=len(payload))
+        self.app.push_screen(
+            ActionsPickerModal(multi=True), callback=_on_picked,
+        )
+
+    # ─── Protocol from construction history ──────────────────────────────
+
+    def action_insert_protocol(self) -> None:
+        """Insert the picked plasmid's recorded build steps as markdown.
+
+        The steps come from the same `_history_build_steps` the History
+        viewer renders — the program already knows how the molecule was
+        made, and retyping that into the notebook by hand is what this
+        removes. Only names that really resolve in the library become
+        `@refs`; the rest stay inline code, so the protocol never plants
+        a dangling ref (see `_protocol_steps_markdown`).
+        """
+        if self._current_entry is None:
+            self.app.notify("No entry selected.", severity="warning")
+            return
+
+        def _on_picked(payload) -> None:
+            if payload is None:
+                return
+            try:
+                coll, entry_id = payload
+            except (TypeError, ValueError):
+                return
+            if not entry_id:
+                return
+            hits = _agent_scan_library_for_key(entry_id, coll)
+            entry = hits[0][1] if hits else None
+            if entry is None:
+                self.app.notify(f"Couldn't find {entry_id}.",
+                                 severity="warning")
+                return
+            name = entry.get("name") or entry_id
+            history_xml = entry.get("history_xml")
+            if not history_xml:
+                src = entry.get("source") or ""
+                self.app.notify(
+                    f"No construction history recorded for {name}."
+                    f"{_history_reopen_nudge(str(src))}",
+                    severity="information", timeout=6,
+                )
+                return
+            try:
+                root = _parse_commercialsaas_history(history_xml)
+            except ValueError as exc:
+                self.app.notify(f"Couldn't parse history: {exc}",
+                                 severity="error", timeout=8)
+                _log.warning("experiments: bad history_xml on %r: %s",
+                              name, exc)
+                return
+            if root is None:
+                self.app.notify(f"History for {name} is empty.",
+                                 severity="information")
+                return
+            steps = _history_build_steps(root)
+            # Which step names are real library entries — only those are
+            # safe to write as `@refs`.
+            known: "set[str]" = set()
+            for s in steps:
+                cands = [s.get("product"), s.get("backbone")]
+                cands += list(s.get("inputs") or [])
+                for c in cands:
+                    if (isinstance(c, str) and c and c not in known
+                            and _experiment_ref_token_ok(c)
+                            and _agent_scan_library_for_key(c)):
+                        known.add(c)
+            md = _protocol_steps_markdown(
+                steps, product=name, known_ids=known,
+            )
+            try:
+                ta = self.query_one("#exp-body", TextArea)
+            except NoMatches:
+                return
+            ta.insert(md)
+            ta.focus()
+            self._mark_dirty(True)
+            _log_event("experiments.insert.protocol",
+                        eid=self._current_entry.get("id")
+                             if self._current_entry else None,
+                        plasmid=name, n_steps=len(steps))
+            if not steps:
+                self.app.notify(
+                    f"{name} has a single history record — no build "
+                    f"steps to list.",
+                    severity="information", timeout=5,
+                )
+        self.app.push_screen(LibrarySearchModal(), callback=_on_picked)
+
+    # ─── Export ──────────────────────────────────────────────────────────
+
+    def action_export_entry(self) -> None:
+        """Ctrl+E — export this entry, or the whole project, to a
+        markdown or HTML file."""
+        entries = self._sorted_entries()
+        if not entries:
+            self.app.notify("Nothing to export yet.",
+                             severity="warning")
+            return
+        current = self._current_entry
+        if self._dirty and current is not None:
+            # Export reads from disk, so an unsaved buffer would export
+            # the previous text. Persist first (and say nothing — the
+            # dirty flag clearing is the feedback).
+            self._persist_current()
+            current = self._current_entry
+
+        def _done(result) -> None:
+            if isinstance(result, dict) and result.get("path"):
+                self.app.notify(
+                    f"Exported {result.get('n_entries', 0)} "
+                    f"{'entry' if result.get('n_entries') == 1 else 'entries'}"
+                    f" → {result['path']}",
+                    severity="information", timeout=8,
+                )
+        self.app.push_screen(
+            ExperimentExportModal(
+                entry=current,
+                project=_get_active_project_name() or _DEFAULT_PROJECT_NAME,
+            ),
+            callback=_done,
+        )
+
     def action_spellcheck(self) -> None:
         """Pyspellchecker-backed spellcheck for the active body. Masks
         non-prose markdown regions, tokenises, lists misspellings in a
@@ -64900,7 +67244,13 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
             ta = self.query_one("#exp-body", TextArea)
         except NoMatches:
             return
-        ta.text = ta.text + f"\n\n![{name}]({name})\n"
+        # `![...]` only for something that will actually render as an
+        # image. A trace or a datasheet gets a plain link, because an
+        # image tag around a `.ab1` shows a broken-image box in every
+        # renderer and in the HTML export.
+        is_image = Path(name).suffix.lower() in _IMAGE_FILE_FILTER
+        bang = "!" if is_image else ""
+        ta.text = ta.text + f"\n\n{bang}[{name}]({name})\n"
         self._mark_dirty(True)
         self._refresh_attachments()
         try:
@@ -74866,13 +77216,14 @@ class VerificationReportModal(_OneShotDismissScreen, ModalScreen):
             with Horizontal(id="vrm-btns"):
                 yield Button("Open in canvas",
                               id="btn-vrm-open", variant="primary")
+                yield Button("Combine reads", id="btn-vrm-consensus")
                 yield Button("Close", id="btn-vrm-close")
 
     def on_mount(self) -> None:
         t = self.query_one("#vrm-table", DataTable)
         t.add_columns(
             "Plasmid", "Read", "Seq",
-            "Identity", "Coverage", "SNPs", "Indels", "Source",
+            "Identity", "Coverage", "SNPs", "Indels", "Real", "Source",
         )
         self._collect_rows()
         for r in self._rows_data:
@@ -74933,7 +77284,23 @@ class VerificationReportModal(_OneShotDismissScreen, ModalScreen):
                 coverage_pct = _coverage_pct_from_result(
                     result, target_len,
                 )
+                # Basecall-quality verdict, stored at align time by the
+                # trace-checking flow (a `.gbk` consensus has none). Read it
+                # rather than recompute: the trace file is long gone by the
+                # time this report opens, and the per-base array never made it
+                # into the library entry because `gb_text` cannot hold one.
+                qsum = align.get("quality")
+                qsum = qsum if isinstance(qsum, dict) else None
                 rows.append({
+                    "quality":    qsum,
+                    # Raw alignment + the entry's full set, so "combine reads"
+                    # can roll them up without re-reading the library (the rows
+                    # are already derived, and re-deriving is how two halves
+                    # start disagreeing).
+                    "_align":     align,
+                    "_all_aligns": [a for a in (entry.get("alignments") or [])
+                                    if isinstance(a, dict)],
+                    "_total_bp":  target_len,
                     "entry_id":   entry.get("id") or "",
                     "entry_name": entry.get("name") or "?",
                     "read_label": align.get("label")
@@ -74983,6 +77350,25 @@ class VerificationReportModal(_OneShotDismissScreen, ModalScreen):
             Text(f"{r['n_indels']}", style="red")
             if r["n_indels"] else Text("0", style="dim")
         )
+        # "Real" = how many of the SNPs/indels the READ actually supports.
+        # An em-dash means the read carried no quality to judge with, which is
+        # NOT the same as zero — see `_phred_is_recorded`.
+        qsum = r.get("quality")
+        if isinstance(qsum, dict) and qsum.get("has_quality"):
+            n_conf = int(qsum.get("n_confident", 0) or 0)
+            n_low = int(qsum.get("n_lowq", 0) or 0)
+            if qsum.get("verdict") == "unusable":
+                real_cell = Text("unusable", style="red")
+            elif n_conf:
+                real_cell = Text(
+                    f"{n_conf}" + (f" (+{n_low} noise)" if n_low else ""),
+                    style="red bold")
+            elif n_low:
+                real_cell = Text(f"0 (+{n_low} noise)", style="green")
+            else:
+                real_cell = Text("0", style="green")
+        else:
+            real_cell = Text("—", style="dim")
         source_cell = Text(r["source"], style="dim")
         # Row key encodes (entry_id, first_variant_pos) so the open
         # handler can resolve both from the cursor row without a
@@ -74991,7 +77377,8 @@ class VerificationReportModal(_OneShotDismissScreen, ModalScreen):
         key = f"{r['entry_id']}|{r['first_pos']}"
         t.add_row(
             plasmid_cell, read_cell, seq_cell,
-            ident_cell, cov_cell, snp_cell, indel_cell, source_cell,
+            ident_cell, cov_cell, snp_cell, indel_cell, real_cell,
+            source_cell,
             key=key,
         )
 
@@ -75033,6 +77420,49 @@ class VerificationReportModal(_OneShotDismissScreen, ModalScreen):
     @on(DataTable.RowSelected, "#vrm-table")
     def _row_selected(self, _) -> None:
         self.action_open_row()
+
+    @on(Button.Pressed, "#btn-vrm-consensus")
+    def _consensus_btn(self, _) -> None:
+        """Roll up EVERY read on the cursor row's plasmid into one answer.
+
+        The report lists one row per read, which cannot say whether two reads
+        agree — so this pushes the combined view for the plasmid the cursor is
+        on. Pushed from inside the modal (rather than dismissing and letting the
+        caller do it) so closing the consensus returns to the report with the
+        cursor where it was.
+        """
+        try:
+            t = self.query_one("#vrm-table", DataTable)
+        except NoMatches:
+            return
+        row = t.cursor_row
+        if row is None or not (0 <= row < len(self._rows_data)):
+            self.app.notify("Select a row to combine that plasmid's reads.",
+                            severity="information", timeout=3)
+            return
+        r = self._rows_data[row]
+        aligns = r.get("_all_aligns") or []
+        total = int(r.get("_total_bp", 0) or 0)
+        summary = _multi_read_summary(aligns, total)
+        self.app.push_screen(ReadConsensusModal(
+            summary, label=r.get("entry_name") or "?",
+            phrase=_multi_read_phrase(summary),
+        ), self._consensus_result)
+
+    def _consensus_result(self, result) -> None:
+        """A variant picked in the consensus view jumps the report's caller to
+        that bp — same contract as clicking a report row."""
+        if isinstance(result, dict) and result.get("action") == "goto":
+            try:
+                t = self.query_one("#vrm-table", DataTable)
+                row = t.cursor_row
+                entry_id = (self._rows_data[row].get("entry_id")
+                            if row is not None
+                            and 0 <= row < len(self._rows_data) else "")
+            except NoMatches:
+                entry_id = ""
+            if entry_id:
+                self.dismiss(("open", entry_id, int(result.get("pos", 0) or 0)))
 
     @on(Button.Pressed, "#btn-vrm-open")
     def _open_btn(self, _) -> None:
@@ -87342,6 +89772,8 @@ class PrimerCsvExportModal(_OneShotDismissScreen, ModalScreen):
                                   value=True, id="pcsv-fmt-generic")
                 yield RadioButton("IDT bulk — Name / Sequence / Scale / Purity",
                                   id="pcsv-fmt-idt")
+                yield RadioButton("Plate — Plate / Well / Name / Sequence",
+                                  id="pcsv-fmt-plate")
             yield Static("", id="pcsv-status", markup=True)
             with Horizontal(id="pcsv-btns"):
                 yield Button("Export", id="btn-pcsv-ok", variant="primary")
@@ -87394,10 +89826,12 @@ class PrimerCsvExportModal(_OneShotDismissScreen, ModalScreen):
         if not fn.lower().endswith(".csv"):
             fn += ".csv"
         path = str(Path(self._selected_dir).expanduser() / fn)
+        # Index -> format, read from ONE table so adding a fourth layout can't
+        # desync the button order from the value written.
         fmt = "generic"
         try:
-            if self.query_one("#pcsv-format", RadioSet).pressed_index == 1:
-                fmt = "idt"
+            idx = self.query_one("#pcsv-format", RadioSet).pressed_index
+            fmt = {0: "generic", 1: "idt", 2: "plate"}.get(idx, "generic")
         except NoMatches:
             pass
         from rich.markup import escape as _esc
@@ -92421,6 +94855,8 @@ class SimulatorScreen(Screen):
                                   id="btn-sim-pcr-save")
                     yield Button("Send to Gel lane",
                                   id="btn-sim-pcr-togel")
+                    yield Button("Thermocycler program",
+                                  id="btn-sim-pcr-program")
                 yield Static("Enter forward + reverse primers, then click Run.",
                               id="sim-pcr-status")
                 table = DataTable(id="sim-pcr-table", cursor_type="row",
@@ -92622,6 +95058,61 @@ class SimulatorScreen(Screen):
             return
         tm = _primer_tm_safe(seq)
         lbl.update(f"Tm {tm:.1f}°C" if tm is not None else "Tm —")
+
+    @on(Button.Pressed, "#btn-sim-pcr-program")
+    def _pcr_program_btn(self, _) -> None:
+        """Cycling conditions for the SELECTED amplicon.
+
+        Built from the product length and the two primer Tms the simulation
+        already produced, so there is nothing to retype — which is the whole
+        point: the numbers a user copies by hand are the ones they get wrong.
+        """
+        amps = getattr(self, "_pcr_amplicons", None) or []
+        idx = int(getattr(self, "_selected_pcr_idx", -1))
+        if not amps or not (0 <= idx < len(amps)):
+            try:
+                self.query_one("#sim-pcr-status", Static).update(
+                    "[yellow]Run the PCR and pick an amplicon first.[/]")
+            except NoMatches:
+                pass
+            return
+        amp = amps[idx]
+        tms = [t for t in (amp.get("fwd_tm"), amp.get("rev_tm"))
+               if isinstance(t, (int, float))]
+
+        def _build(bp, tm_list, pol, cycles):
+            prog = _pcr_program(bp, tm_list, polymerase=pol, cycles=cycles)
+            return (prog, _pcr_program_text(prog))
+
+        self.app.push_screen(
+            PcrProgramModal(
+                int(amp.get("length", 0) or 0), tms, _build,
+                polymerases=[(_POLYMERASES[k]["label"], k)
+                             for k in _polymerase_names()],
+                # `_record_display_name` + `_current_record` live on
+                # PlasmidApp, NOT on this Screen — reaching for them via `self`
+                # was an AttributeError waiting for the first click, which
+                # pyright caught where the tests did not. `_loaded_name` is the
+                # display name this screen already holds, and it describes the
+                # TEMPLATE the amplicon came from, which is what the user wants
+                # on a cycling program anyway.
+                label=str(getattr(self, "_loaded_name", "") or "amplicon"),
+            ),
+            self._pcr_program_result,
+        )
+
+    def _pcr_program_result(self, result) -> None:
+        if not isinstance(result, dict) or result.get("action") != "copy":
+            return
+        mode, detail = _copy_to_clipboard_with_fallback(
+            self.app, str(result.get("text") or ""), "PCR program")
+        try:
+            self.app.notify(f"PCR program copied ({mode}).",
+                            severity="information", timeout=5)
+        except Exception:
+            pass
+        if detail is not None:
+            _log.info("PCR program written to %s", detail)
 
     @on(Button.Pressed, "#btn-sim-pcr-run")
     def _on_pcr_run(self, _) -> None:
@@ -93802,6 +96293,7 @@ class SplashScreen(_OneShotDismissScreen, ModalScreen):
 # ── More modals moved to splicecraft_modals (Phase D) ───────────────────────
 from splicecraft_modals import (  # noqa: E402
     LibrarySearchModal as LibrarySearchModal,
+    ExperimentSearchModal as ExperimentSearchModal,
 )
 
 
@@ -95689,6 +98181,11 @@ _AGENT_HANDLERS = _state._AGENT_HANDLERS
 # moved to splicecraft_agent reach these deep-coupled hub-side fns without a cycle.
 _state._settings_flush_sync_hook = _settings_flush_sync
 _state._pick_best_rotation_hook = _pick_best_rotation
+# Cross-read rollup for `verify-against-reads`: the interpretation lives beside
+# `_extract_variants_from_alignment` hub-side, the endpoint is in the agent
+# sibling, so it travels through a hook like the other deep engines.
+_state._multi_read_summary_hook = _multi_read_summary
+_state._trace_verification_summary_hook = _trace_verification_summary
 _state._reset_master_delete_cache_hook = _reset_master_delete_cache
 _state._bulk_export_collection_hook = _bulk_export_collection
 _state._blast_search_hook = _blast_search
@@ -98173,6 +100670,387 @@ def _h_redo(app, payload):
     return {"ok": True, **res}
 
 
+def _resolve_cds_feature(app, payload):
+    """Pick the CDS a residue-edit payload is talking about.
+
+    Returns ``(record, feat, err)``. Selection by ``cds`` (label / gene /
+    product, case-insensitive) or ``cds_index`` (index into the record's CDS
+    features). With neither, a record carrying exactly ONE CDS uses it; more
+    than one is an error listing the choices, because guessing which coding
+    sequence to mutate is not a recoverable mistake.
+    """
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return (None, None, ({"error": "no plasmid loaded"}, 422))
+    cds = [f for f in (getattr(rec, "features", None) or [])
+           if getattr(f, "type", "") == "CDS"]
+    if not cds:
+        return (None, None, ({"error": "this plasmid has no CDS features"},
+                             422))
+
+    def _labels(f):
+        q = getattr(f, "qualifiers", None) or {}
+        out = []
+        for key in ("label", "gene", "product"):
+            for v in (q.get(key) or []):
+                out.append(str(v))
+        return out
+
+    idx = payload.get("cds_index")
+    if idx is not None:
+        i = _coerce_int(idx, name="cds_index")
+        if isinstance(i, str):
+            return (None, None, ({"error": i}, 400))
+        if not (0 <= i < len(cds)):
+            return (None, None, ({"error": f"'cds_index' {i} out of range "
+                                           f"(0-{len(cds) - 1})"}, 400))
+        return (rec, cds[i], None)
+    name = payload.get("cds")
+    if isinstance(name, str) and name.strip():
+        want = name.strip().lower()
+        hits = [f for f in cds
+                if any(want == lb.lower() for lb in _labels(f))]
+        if not hits:
+            hits = [f for f in cds
+                    if any(want in lb.lower() for lb in _labels(f))]
+        if not hits:
+            avail = sorted({lb for f in cds for lb in _labels(f)})
+            return (None, None, ({"error": f"no CDS matching {name!r}; "
+                                           f"available: {avail}"}, 404))
+        if len(hits) > 1:
+            return (None, None, ({"error": f"{name!r} matches "
+                                           f"{len(hits)} CDS features — use "
+                                           f"'cds_index'"}, 400))
+        return (rec, hits[0], None)
+    if len(cds) == 1:
+        return (rec, cds[0], None)
+    avail = [{"index": i, "labels": _labels(f)} for i, f in enumerate(cds)]
+    return (None, None, ({"error": "this plasmid has several CDS features — "
+                                   "pass 'cds' or 'cds_index'",
+                          "choices": avail}, 400))
+
+
+@_agent_endpoint("export-primers", write=True)
+def _h_export_primers(app, payload):
+    """Write primers to a CSV order sheet. Body:
+    ``{path, format?: "generic"|"idt"|"plate", collection?, ids?, names?,
+    scale?, purification?}``.
+
+    Closes the gap where the only way to produce an order sheet was the GUI —
+    an agent that designed the primers could not order them.
+
+    `format`:
+      * ``generic`` — Name / Sequence / Length / Tm, and the only one that
+        re-imports through ``import-primers``.
+      * ``idt`` — the Bulk-Input template (Scale / Purification columns).
+      * ``plate`` — Plate / Well Position / Name / Sequence, row-major
+        (A1..A12, B1..), rolling onto plate 2 past 96 oligos rather than
+        truncating.
+
+    With no selector every primer in the active collection is written; `ids` /
+    `names` narrow it. Returns ``{ok, path, count, format}``."""
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    if path.suffix.lower() != ".csv":
+        return ({"error": "path must end in .csv"}, 400)
+    err = _check_agent_write_path(path)
+    if err is not None:
+        return ({"error": err}, 403)
+    fmt = str(payload.get("format") or "generic").strip().lower()
+    if fmt not in ("generic", "idt", "plate"):
+        return ({"error": f"unknown format {fmt!r}; choose generic, idt or "
+                          f"plate"}, 400)
+    try:
+        primers = _load_primers()
+    except Exception as exc:
+        return ({"error": f"could not read primers: {exc}"}, 500)
+    coll = payload.get("collection")
+    if isinstance(coll, str) and coll.strip():
+        want = coll.strip()
+        primers = [p for p in primers
+                   if str(p.get("collection", "")) == want]
+    ids = payload.get("ids")
+    if isinstance(ids, list) and ids:
+        keep = {str(i) for i in ids}
+        primers = [p for p in primers if str(p.get("id", "")) in keep]
+    names = payload.get("names")
+    if isinstance(names, list) and names:
+        keep_n = {str(n).lower() for n in names}
+        primers = [p for p in primers
+                   if str(p.get("name", "")).lower() in keep_n]
+    if not primers:
+        return ({"error": "no primers matched the selection"}, 404)
+    kw = {}
+    for key in ("scale", "purification"):
+        if isinstance(payload.get(key), str) and payload[key].strip():
+            kw[key] = payload[key].strip()
+    try:
+        result = _export_primers_to_csv(primers, path, order_format=fmt, **kw)
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
+    except OSError as exc:
+        return ({"error": f"export failed: {_scrub_path(str(exc))}"}, 500)
+    return {"ok": True, "format": fmt, **result}
+
+
+@_agent_endpoint("pcr-program")
+def _h_pcr_program(app, payload):
+    """A thermocycler program for one PCR. Body:
+    ``{product_bp, primer_tms?: [float, ...], primers?: [name|id, ...],
+    polymerase?: "q5"|"phusion"|"taq", cycles?: int, final_hold_c?: int|null}``.
+
+    Returns ``{polymerase, label, cycles, anneal_c, anneal_rule, extend_s,
+    product_bp, two_step, steps, total_minutes, notes, text}`` — `text` is the
+    block you type into the machine.
+
+    Give ``primers`` (names or ids from the library) to take the Tms from the
+    saved oligos, or ``primer_tms`` directly. With NEITHER, the program anneals
+    at a conventional 55 °C and SAYS SO in `notes` rather than presenting an
+    invented number as derived.
+
+    These are the polymerase vendors' own typical conditions applied to your
+    product length and Tms — a starting point, not a prediction that the
+    reaction will work. Each step carries the rule that produced it."""
+    bp = _coerce_int(payload.get("product_bp"), name="product_bp")
+    if isinstance(bp, str):
+        return ({"error": bp}, 400)
+    if bp < 1:
+        return ({"error": "'product_bp' must be >= 1"}, 400)
+    tms: list = []
+    raw_tms = payload.get("primer_tms")
+    if isinstance(raw_tms, list):
+        for t in raw_tms:
+            if isinstance(t, (int, float)) and not isinstance(t, bool):
+                tms.append(float(t))
+            else:
+                return ({"error": f"'primer_tms' entries must be numbers; "
+                                  f"got {t!r}"}, 400)
+    want = payload.get("primers")
+    if isinstance(want, list) and want:
+        try:
+            saved = _load_primers()
+        except Exception as exc:
+            return ({"error": f"could not read primers: {exc}"}, 500)
+        keys = {str(w).lower() for w in want}
+        missing = set(keys)
+        for p in saved:
+            for field in ("name", "id"):
+                val = str(p.get(field, "")).lower()
+                if val and val in keys:
+                    missing.discard(val)
+                    tm = p.get("tm")
+                    if isinstance(tm, (int, float)):
+                        tms.append(float(tm))
+                    break
+        if missing:
+            return ({"error": f"no saved primer named "
+                              f"{sorted(missing)[:4]}"}, 404)
+    cycles = _coerce_int(payload.get("cycles", 30), name="cycles")
+    if isinstance(cycles, str):
+        return ({"error": cycles}, 400)
+    hold = payload.get("final_hold_c", 4)
+    if hold is not None:
+        hold = _coerce_int(hold, name="final_hold_c")
+        if isinstance(hold, str):
+            return ({"error": hold}, 400)
+    try:
+        prog = _pcr_program(bp, tms,
+                            polymerase=payload.get("polymerase", "q5"),
+                            cycles=cycles, final_hold_c=hold)
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
+    prog["text"] = _pcr_program_text(prog)
+    return prog
+
+
+@_agent_endpoint("list-polymerases")
+def _h_list_polymerases(app, payload):
+    """The polymerases ``pcr-program`` knows. Returns
+    ``{polymerases: [{key, label, denature_c, extend_c, s_per_kb,
+    anneal_rule}, ...]}`` — the vendor-typical conditions each program is built
+    from, so you can see what a number came from."""
+    return {"polymerases": [
+        {"key": k, "label": v["label"], "denature_c": v["denature_c"],
+         "extend_c": v["extend_c"], "s_per_kb": v["s_per_kb"],
+         "anneal_rule": v["anneal_rule"]}
+        for k, v in _POLYMERASES.items()
+    ]}
+
+
+@_agent_endpoint("plan-residue-edit")
+def _h_plan_residue_edit(app, payload):
+    """What changing one residue of an annotated CDS would do — WITHOUT doing it.
+
+    Body: ``{residue: int, to: str, cds?|cds_index?, codon?, taxid?}``.
+
+    Returns the plan: ``{residue, wt_aa, new_aa, positions, wt_codon,
+    new_codon, alternatives, strand, silent, creates_stop, removes_stop, writes,
+    cds_label, protein_len, transl_table}``.
+
+    `positions` are the three PLASMID bp the codon occupies, resolved through
+    strand, /codon_start, introns and the origin — the mapping you would
+    otherwise do by hand, which is where frame errors come from. They may be
+    non-contiguous (intron), descending (minus strand) or split across bp 0.
+    `writes` expresses the change as forward-strand single-base writes.
+
+    `alternatives` lists the synonymous codons ranked by the active codon-usage
+    table, so you can pick one that avoids creating a site you care about."""
+    rec, feat, err = _resolve_cds_feature(app, payload)
+    if err:
+        return err
+    residue = _coerce_int(payload.get("residue"), name="residue")
+    if isinstance(residue, str):
+        return ({"error": residue}, 400)
+    to_aa = payload.get("to") or payload.get("new_aa")
+    if not isinstance(to_aa, str) or not to_aa.strip():
+        return ({"error": "'to' is required (an amino-acid letter, or * for a "
+                          "stop)"}, 400)
+    try:
+        plan = _protein_edit_plan(
+            rec, feat, residue, to_aa.strip(),
+            taxid=(payload.get("taxid") or None),
+            codon=(payload.get("codon") or None))
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
+    return plan
+
+
+@_agent_endpoint("edit-residue", write=True)
+def _h_edit_residue(app, payload):
+    """Change one residue of an annotated CDS ON THE PLASMID.
+
+    Same body as ``plan-residue-edit``, applied. Returns the plan plus
+    ``{applied: true, bp_changed}``.
+
+    The edit is a 3-for-3 substitution, so nothing shifts and every feature
+    keeps its coordinates. It IS undoable (Ctrl+Z on the canvas) because the
+    apply pushes an undo snapshot first.
+
+    A silent change (`silent: true`) is allowed and reported rather than
+    refused — swapping to a synonymous codon to remove a restriction site is a
+    real thing people do deliberately."""
+    rec, feat, err = _resolve_cds_feature(app, payload)
+    if err:
+        return err
+    residue = _coerce_int(payload.get("residue"), name="residue")
+    if isinstance(residue, str):
+        return ({"error": residue}, 400)
+    to_aa = payload.get("to") or payload.get("new_aa")
+    if not isinstance(to_aa, str) or not to_aa.strip():
+        return ({"error": "'to' is required (an amino-acid letter, or * for a "
+                          "stop)"}, 400)
+    try:
+        plan = _protein_edit_plan(
+            rec, feat, residue, to_aa.strip(),
+            taxid=(payload.get("taxid") or None),
+            codon=(payload.get("codon") or None))
+        new_rec = _apply_protein_edit(rec, plan)
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
+
+    def _apply():
+        app._push_undo()
+        app._apply_record(new_rec, clear_undo=False)
+        app._mark_dirty()
+
+    try:
+        caller = getattr(app, "call_from_thread", None)
+        if callable(caller):
+            caller(_apply)
+        else:
+            _apply()
+    except Exception as exc:
+        _log.exception("edit-residue apply failed")
+        return ({"error": f"apply failed: {exc}"}, 500)
+    # `_resolve_cds_feature` returns a record whenever it returns no error;
+    # spelled out so the contract is checked rather than assumed.
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    n_changed = sum(1 for p, b in plan["writes"]
+                    if str(rec.seq)[p].upper() != b.upper())
+    out = dict(plan)
+    out["applied"] = True
+    out["bp_changed"] = n_changed
+    _log_event("protein.residue_edited", cds=plan["cds_label"],
+               residue=plan["residue"], wt=plan["wt_aa"], new=plan["new_aa"],
+               bp_changed=n_changed, via="agent")
+    return out
+
+
+@_agent_endpoint("read-consensus")
+def _h_read_consensus(app, payload):
+    """Combine every sequencing read STORED on a plasmid into one answer.
+
+    Body: ``{id?|name?, min_support?: int}``. Omit the identifier to use the
+    loaded plasmid; otherwise the library entry's stored alignments are read
+    (cross-collection).
+
+    This is the rollup the Verification Report shows, and it answers what a
+    per-read identity list cannot: for each difference, **how many reads that
+    cover that base show it, and how many looked and disagreed**. Returns
+    ``{plasmid, n_reads, total_bp, covered_bp, covered_pct, depth2_bp,
+    depth2_pct, uncovered_spans, variants, n_confirmed, n_single_read,
+    n_contradicted, min_support, verdict, phrase}``.
+
+    `verdict` is ``confirmed`` (a difference `min_support`+ reads agree on),
+    ``single_read`` (one read shows it, another looked and disagreed — almost
+    always a miscall), ``unconfirmed`` (nothing else covers it, so sequence
+    again), ``clean``, or ``no_reads``.
+
+    **`uncovered_spans` is part of the answer, not a footnote.** A plasmid can
+    be "100% identity" over the half that was read, and leaving coverage out is
+    how a partial read passes as a full one. Use ``verify-against-reads`` when
+    you have read SEQUENCES to check rather than stored alignments."""
+    key_id = payload.get("id")
+    key_name = payload.get("name")
+    min_support = _coerce_int(payload.get("min_support", 2),
+                              name="min_support")
+    if isinstance(min_support, str):
+        return ({"error": min_support}, 400)
+    if min_support < 1:
+        return ({"error": "'min_support' must be >= 1"}, 400)
+
+    if key_id is None and key_name is None:
+        rec = getattr(app, "_current_record", None)
+        if rec is None:
+            return ({"error": "no plasmid loaded and no 'id' / 'name' given"},
+                    422)
+        aligns = list(getattr(app, "_alignments", None) or [])
+        total = len(rec.seq) if rec.seq is not None else 0
+        label = PlasmidApp._record_display_name(rec)
+    else:
+        entry = None
+        for e in _iter_library_readonly():
+            if not isinstance(e, dict):
+                continue
+            if key_id is not None and e.get("id") == key_id:
+                entry = e
+                break
+            if key_name is not None and e.get("name") == key_name:
+                entry = e
+                break
+        if entry is None:
+            return ({"error": f"no library entry matching "
+                              f"{key_id or key_name!r}"}, 404)
+        aligns = [a for a in (entry.get("alignments") or [])
+                  if isinstance(a, dict)]
+        label = entry.get("name") or entry.get("id") or "?"
+        # Length from the stored GenBank rather than re-deriving: an alignment's
+        # own `t_len` is the length at ALIGN time, which is not necessarily the
+        # length now if the plasmid was edited since.
+        total = 0
+        try:
+            total = len(_gb_text_to_record(entry.get("gb_text") or "").seq)
+        except Exception:
+            total = int(((aligns[0].get("result") or {}).get("t_len") or 0)
+                        if aligns else 0)
+    out = _multi_read_summary(aligns, total, min_support=min_support)
+    out["plasmid"] = label
+    out["phrase"] = _multi_read_phrase(out)
+    return out
+
+
 @_agent_endpoint("multi-align")
 def _h_multi_align(app, payload):
     """Pairwise-align a query against MULTIPLE targets at once — the batch
@@ -98329,18 +101207,24 @@ def _h_multi_align(app, payload):
 
 @_agent_endpoint("attach-experiment-image", write=True)
 def _h_attach_experiment_image(app, payload):
-    """Attach an image to a lab-notebook experiment and embed a markdown
+    """Attach a file to a lab-notebook experiment and embed a markdown
     reference in its body — the agent counterpart to the experiment
-    screen's "Attach image". Body: ``{experiment_id, path}``.
+    screen's "Attach file". Body: ``{experiment_id, path}``.
 
-    `path` is a SERVER-SIDE image file (``.png`` / ``.jpg`` / ``.gif`` / …)
-    the daemon can read — binary can't ride the JSON body, so the agent
-    drops the file somewhere readable and passes its path (same shape as
-    `load-file`). Enforces the same per-image (`_EXPERIMENT_IMAGE_MAX_BYTES`)
-    and per-entry cumulative caps the GUI does, and refuses symlinks /
-    non-image extensions. The saved image is appended to the entry body as
-    ``![name](name)`` so it renders in the notebook. Returns
-    ``{ok, experiment_id, filename}``."""
+    `path` is a SERVER-SIDE file the daemon can read — binary can't ride
+    the JSON body, so the agent drops the file somewhere readable and
+    passes its path (same shape as `load-file`). Images (``.png`` /
+    ``.jpg`` / …) and data attachments (``.ab1`` / ``.csv`` / ``.pdf`` /
+    GenBank / FASTA / …) are both accepted; see
+    `_EXPERIMENT_ATTACH_EXTS`. Enforces the same per-file
+    (`_EXPERIMENT_IMAGE_MAX_BYTES`) and per-entry cumulative caps the GUI
+    does, and refuses symlinks / unlisted extensions.
+
+    The reference appended to the body is ``![name](name)`` for an image
+    and ``[name](name)`` for anything else — an image tag around a `.ab1`
+    renders as a broken-image box. Returns
+    ``{ok, experiment_id, filename, is_image}``. The endpoint keeps its
+    ``attach-experiment-image`` name for compatibility."""
     eid = _sanitize_label(payload.get("experiment_id"), max_len=200)
     if not eid:
         return ({"error": "missing 'experiment_id'"}, 400)
@@ -98349,10 +101233,10 @@ def _h_attach_experiment_image(app, payload):
         return ({"error": "missing 'path'"}, 400)
     if not path.exists():
         return ({"error": "file rejected (see splicecraft log)"}, 400)
-    if path.suffix.lower() not in _IMAGE_EXTS:
+    if path.suffix.lower() not in _EXPERIMENT_ATTACH_EXTS:
         return ({"error":
-                  f"not an image file (expected one of "
-                  f"{sorted(_IMAGE_EXTS)})"}, 400)
+                  f"not an attachable file (expected one of "
+                  f"{sorted(_EXPERIMENT_ATTACH_EXTS)})"}, 400)
     ok, reason = _safe_file_size_check(path, _EXPERIMENT_IMAGE_MAX_BYTES,
                                         "experiment image")
     if not ok:
@@ -98378,13 +101262,16 @@ def _h_attach_experiment_image(app, payload):
                       "image attach failed — per-image or per-entry cap "
                       "exceeded, or write error (see splicecraft log)"}, 422)
         rel = saved.name
+        _bang = "!" if _is_image_path(rel) else ""
         entries[idx]["body_md"] = (
-            (entries[idx].get("body_md") or "") + f"\n\n![{rel}]({rel})\n")
+            (entries[idx].get("body_md") or "")
+            + f"\n\n{_bang}[{rel}]({rel})\n")
         entries[idx] = _normalise_experiment_entry(entries[idx], fresh=False)
         if (err := _agent_save_or_500(
                 lambda: _save_experiments(entries), "Experiments")) is not None:
             return err
     return {"ok": True, "experiment_id": eid, "filename": rel,
+            "is_image": _is_image_path(rel),
             "ignored": _agent_ignored_keys(
                 payload, {"experiment_id", "path"})}
 
@@ -103657,6 +106544,7 @@ _BUTTON_TOOLTIPS: "dict[str, str]" = {
     "btn-hmmdb-form-cancel": "Cancel",
     # ── Sequencing / alignment ──
     "btn-sanger-load": "Load the read onto the canvas",
+    "btn-sanger-verify": "Compare the read against the plasmid on the canvas",
     "btn-sanger-add": "Add the read to the library",
     "btn-align-go": "Align the read and open the target",
     "btn-bulk-align": "Auto-align every sample to its target",
@@ -103672,12 +106560,14 @@ _BUTTON_TOOLTIPS: "dict[str, str]" = {
     "btn-mam-cancel": "Cancel the alignment",
     "btn-view-report": "View the verification report",
     "btn-vrm-open": "Open this record on the canvas",
+    "btn-vrm-consensus": "Combine every read on this plasmid into one verdict",
     "btn-vrm-close": "Close the verification report",
     "btn-sequencing-close": "Close the sequencing panel",
     "btn-sl-load": "Load the selection",
     "btn-sl-cancel": "Cancel",
     # ── Simulator (PCR + gel) ──
     "btn-sim-pcr-run": "Run the PCR simulation",
+    "btn-sim-pcr-program": "Cycling conditions for the selected amplicon",
     "btn-sim-pcr-save": "Save the amplicon to the library",
     "btn-sim-pcr-togel": "Send the amplicon to a gel lane",
     "btn-sim-gel-run": "Run the virtual gel",
@@ -103697,7 +106587,7 @@ _BUTTON_TOOLTIPS: "dict[str, str]" = {
     "btn-exp-plasmid": "Insert a reference to a plasmid",
     "btn-exp-gel": "Insert a reference to a gel",
     "btn-exp-actions": "Insert a reference to an action",
-    "btn-exp-attach": "Attach an image to the entry",
+    "btn-exp-attach": "Attach a file to the entry",
     "btn-exp-attach-grid": "Attach the image",
     "btn-exp-insert-attach": "Insert the attachment into the body",
     "btn-exp-remove-attach": "Delete this attachment",
@@ -103779,6 +106669,16 @@ _BUTTON_TOOLTIPS: "dict[str, str]" = {
     "btn-ampsave-cancel": "Cancel saving the amplicon",
     "btn-actpick-ok": "Insert the selected action",
     "btn-actpick-cancel": "Cancel",
+    # ── Lab notebook (find / copy / protocol / export) ──
+    "btn-exp-find": "Search every project's entries (^F)",
+    "btn-exp-duplicate": "Copy this entry as a starting point",
+    "btn-exp-steps": "Insert empty headings for the steps you'll do",
+    "btn-exp-protocol": "Insert a plasmid's recorded build steps",
+    "btn-exp-export": "Export to Markdown or HTML (^E)",
+    "btn-expsearch-ok": "Open the selected entry",
+    "btn-expsearch-close": "Close",
+    "btn-expexp-export": "Write the file",
+    "btn-expexp-cancel": "Cancel exporting",
     "btn-aa-pick-cancel": "Cancel",
     "btn-pick-ok": "Use the selection",
     "btn-pick-cancel": "Cancel",
@@ -103808,6 +106708,7 @@ _BUTTON_TOOLTIPS: "dict[str, str]" = {
     "set-enzyme-collections": "Manage enzyme collections",
     "set-codon-tables": "Manage codon tables",
     "set-min-primer-apply": "Apply the minimum primer-binding length",
+    "set-sanger-phred-apply": "Apply the minimum basecall quality",
     "set-close": "Close Settings",
 }
 
@@ -104404,6 +107305,10 @@ class PlasmidApp(App):
     # `_apply_record` in `on_mount` rather than `_import_and_persist`.
     _preload_demo_record: "object | None" = None
     _source_path:   "str | None" = None   # file the current record was loaded from
+    # Basecall-quality floor for trace verification ([PREFS] step 1). Declared
+    # at class level so the agent API and a headless run — neither of which
+    # reaches `compose()` — still read a sane threshold instead of raising.
+    _sanger_min_phred: int = _SANGER_MIN_PHRED_DEFAULT
 
     # ── Record state lives in RecordController (self._record, Phase C) ───────
     # `_current_record` (loaded SeqRecord), `_record_load_counter` (the
@@ -104911,6 +107816,19 @@ LibrarySearchModal { align: center middle; }
 #libsearch-btns   { align: right middle;  height: 3; margin-top: 1; }
 #libsearch-btns Button { margin-right: 1; }
 
+/* ── Cross-project notebook search / plasmid backlinks ───── */
+ExperimentSearchModal { align: center middle; }
+#expsearch-box {
+    width: 110; max-width: 96%; height: 36; max-height: 92%;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#expsearch-title  { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; text-align: center; }
+#expsearch-input  { height: 3; }
+#expsearch-table  { height: 1fr; margin-top: 1; }
+#expsearch-status { height: 1; margin-top: 1; }
+#expsearch-btns   { align: right middle;  height: 3; margin-top: 1; }
+#expsearch-btns Button { margin-right: 1; }
+
 /* ── Parts Bin "Load Part" source picker ─────────────────── */
 LoadPartSourceModal { align: center middle; }
 #loadpart-box {
@@ -105113,7 +108031,27 @@ ActionsPickerModal { align: center middle; }
 #actpick-help   { color: $text-muted; height: auto; margin-bottom: 1; }
 #actpick-table  { height: 1fr; border: solid $primary-darken-2; }
 #actpick-btns   { align: right middle;  height: 3; margin-top: 1; }
-#actpick-btns Button { margin-right: 1; min-width: 10; }
+/* min-width 14, not 10: in multi mode Insert becomes "Insert (12)" and a
+   10-column button clipped it back to exactly "Insert" — the label was
+   right and the render was a lie. */
+#actpick-btns Button { margin-right: 1; min-width: 14; }
+
+/* ── Notebook export modal (markdown / standalone HTML) ──── */
+ExperimentExportModal { align: center middle; }
+#expexp-box {
+    width: 92; max-width: 96%; height: 34; max-height: 92%;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#expexp-title  { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; text-align: center; }
+#expexp-selrow { height: 3; }
+#expexp-selrow Select { width: 1fr; margin-right: 1; }
+#expexp-embed  { height: 3; }
+#expexp-hint   { color: $text-muted; height: auto; margin-bottom: 1; }
+#expexp-dir    { height: 1; color: $text-muted; }
+#expexp-tree   { height: 1fr; min-height: 6; border: solid $primary-darken-2; margin-top: 1; }
+#expexp-status { height: auto; margin-top: 1; }
+#expexp-btns   { align: right middle;  height: 3; margin-top: 1; }
+#expexp-btns Button { margin-right: 1; }
 
 /* ── Bulk move/copy target picker (sweep #28) ────────────── */
 MoveCopyToCollectionModal { align: center middle; }
@@ -106564,6 +109502,10 @@ NcbiTaxonPickerModal { align: center middle; }
         # terminals. alt+u ("aUtolab") is free + deliverable (unlike alt+b for
         # BABS, which Textual decodes as a readline word-motion). Bound to the
         # action directly. BABS stays palette-/click-reachable (ctrl+k "babs").
+        Binding("alt+g", "open_crispr",                     "CRISPR guides",
+                show=False),
+        Binding("alt+shift+g", "edit_residue",              "Edit residue",
+                show=False),
         Binding("alt+u", "open_autolab",                    "AUTOLAB",       show=False),
         Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=False),
         # Capture selection / highlighted feature → feature library.
@@ -106845,6 +109787,16 @@ NcbiTaxonPickerModal { align: center middle; }
         self._min_primer_binding = mpb if (
             isinstance(mpb, int) and 1 <= mpb <= 60
         ) else 15
+        # Basecall-quality floor for trace verification: the Phred below which
+        # a read's disagreement with the plasmid is treated as instrument noise
+        # rather than a mutation. 20 (1 error in 100) is the universal Sanger
+        # convention; 0 disables the split and reports every mismatch as real.
+        # Range-checked here for the same reason as above — a hand-edited
+        # settings file must not be able to smuggle in a nonsense floor.
+        smp = _get_setting("sanger_min_phred", _SANGER_MIN_PHRED_DEFAULT)
+        self._sanger_min_phred = smp if (
+            isinstance(smp, int) and 0 <= smp <= _PHRED_MAX
+        ) else _SANGER_MIN_PHRED_DEFAULT
         # `show_connectors` lives on both seq panel and map; can't
         # hydrate from compose() because the children haven't
         # composed yet — defer to on_mount via a saved class attr.
@@ -112240,6 +115192,14 @@ NcbiTaxonPickerModal { align: center middle; }
                 )
                 registered_entry["_stored_added"]   = stored.get("added", "")
                 registered_entry["_stored_label"]   = stored.get("label", "")
+                # Carry the stored basecall-quality verdict back onto the
+                # in-memory entry, or the next flush would drop it (the
+                # serialiser reads `quality` from the in-memory side) and the
+                # Verification Report would show an em-dash for a read that
+                # was checked. Both halves of a persisted field have to agree
+                # about it — the other direction is what this pair fixes.
+                if isinstance(stored.get("quality"), dict):
+                    registered_entry["quality"] = dict(stored["quality"])
                 registered += 1
         if registered:
             _log_event(
@@ -116022,6 +118982,62 @@ NcbiTaxonPickerModal { align: center middle; }
             n_landed=n_landed, n_renamed=renamed_count,
         )
 
+    @on(LibraryPanel.NotebookRefsRequested)
+    def _library_notebook_refs_requested(
+            self, event: "LibraryPanel.NotebookRefsRequested") -> None:
+        """`n` key on a library row → the notebook entries that mention
+        it, across every project.
+
+        Queries BOTH the entry id and the display name: `action_insert_plasmid`
+        writes `@<entry_id>`, but a ref typed by hand is almost always the
+        name, and a backlink view that misses half the notes is worse than
+        no backlink view.
+        """
+        if event.entry_id is None:
+            self.notify("Highlight a library row first.",
+                         severity="warning")
+            return
+        entry = _find_library_entry_by_id(event.entry_id)
+        if entry is None:
+            self.notify("Library entry not found.", severity="warning")
+            return
+        refs = [event.entry_id]
+        name = entry.get("name")
+        if isinstance(name, str) and name and name != event.entry_id:
+            refs.append(name)
+
+        def _on_picked(payload) -> None:
+            if payload is None:
+                return
+            try:
+                project, eid = payload
+            except (TypeError, ValueError):
+                return
+            if eid:
+                # Open the notebook ON that entry; the screen switches
+                # project itself if the hit lives in another one.
+                self._open_experiments_at(project, eid)
+        _log_event("experiments.backlinks.open", plasmid=event.entry_id)
+        self.push_screen(
+            ExperimentSearchModal(backlink=("plasmid", refs)),
+            callback=_on_picked,
+        )
+
+    def _open_experiments_at(self, project: str, eid: str) -> None:
+        """Open `ExperimentsScreen` on a specific entry, switching the
+        active project first when the entry lives in another one."""
+        active = _get_active_project_name()
+        if project and project != active:
+            try:
+                err = _activate_experiment_project(project)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self, "Experiments", exc)
+                return
+            if err is not None:
+                self.notify(err, severity="error", timeout=6)
+                return
+        self.push_screen(ExperimentsScreen(initial_entry_id=eid))
+
     @on(LibraryPanel.HistoryRequested)
     def _library_history_requested(self,
                                        event: "LibraryPanel.HistoryRequested"
@@ -116474,6 +119490,9 @@ NcbiTaxonPickerModal { align: center middle; }
             return
         if name == "AUTOLAB":
             self.action_open_autolab()
+            return
+        if name == "CRISPR":
+            self.action_open_crispr()
             return
 
         # ── Multi-action menus (dropdown) ──────────────────────────────────
@@ -118117,6 +121136,154 @@ NcbiTaxonPickerModal { align: center middle; }
             scr = BabsScreen()
             self._babs_screen = scr
         self.push_screen(scr)
+
+    @_action_log("app.protein_edit.open")
+    def action_edit_residue(self) -> None:
+        """Change a residue of an annotated CDS on the loaded plasmid.
+
+        The DNA follows: the residue is resolved to its three plasmid bases
+        through strand, /codon_start, introns and the origin, and the codon is
+        picked from the active codon-usage table. Undoable with Ctrl+Z.
+        """
+        rec = getattr(self, "_current_record", None)
+        if rec is None:
+            self.notify("Load a plasmid first.", severity="warning", timeout=5)
+            return
+        cds = [f for f in (getattr(rec, "features", None) or [])
+               if getattr(f, "type", "") == "CDS"]
+        if not cds:
+            self.notify(
+                "This plasmid has no CDS features — annotate the coding "
+                "sequence first and the residue numbering follows from it.",
+                severity="warning", timeout=8)
+            return
+        total = len(rec.seq)
+
+        def _label(f) -> str:
+            q = getattr(f, "qualifiers", None) or {}
+            for key in ("label", "gene", "product"):
+                if q.get(key):
+                    return str(q[key][0])
+            return "CDS"
+
+        cds_list = [{"index": i, "label": _label(f),
+                     "protein_len": len(_cds_coding_positions(total, f)) // 3}
+                    for i, f in enumerate(cds)]
+
+        def _planner(cds_index, residue, to_aa, codon):
+            """Closure the modal previews through — a plain callable, so the
+            modal stays app-free."""
+            return _protein_edit_plan(rec, cds[cds_index], residue, to_aa,
+                                      codon=codon)
+
+        self.push_screen(
+            ResidueEditModal(cds_list, _planner,
+                             label=self._record_display_name(rec)),
+            self._guard_callback(
+                lambda res: self._residue_edit_result(rec, cds, res),
+                "Residue edit"),
+        )
+
+    def _residue_edit_result(self, rec, cds, result) -> None:
+        """Apply a `ResidueEditModal` dismissal."""
+        if not isinstance(result, dict):
+            return
+        try:
+            feat = cds[int(result.get("cds_index", 0) or 0)]
+            plan = _protein_edit_plan(
+                rec, feat, int(result.get("residue", 0) or 0),
+                str(result.get("to", "")), codon=result.get("codon") or None)
+            new_rec = _apply_protein_edit(rec, plan)
+        except (ValueError, IndexError, TypeError) as exc:
+            self.notify(f"Could not apply: {exc}", severity="error", timeout=8)
+            return
+        # Undo BEFORE mutating, so Ctrl+Z brings the wild-type codon back.
+        self._push_undo()
+        self._apply_record(new_rec, clear_undo=False)
+        self._mark_dirty()
+        _log_event("protein.residue_edited", cds=plan["cds_label"],
+                   residue=plan["residue"], wt=plan["wt_aa"],
+                   new=plan["new_aa"], via="ui")
+        extra = " (silent)" if plan["silent"] else ""
+        if plan["creates_stop"]:
+            extra = " — introduces a STOP"
+        self._notify_success(
+            f"{plan['cds_label']} {plan['wt_aa']}{plan['residue']}"
+            f"{plan['new_aa']}: {plan['wt_codon']} → {plan['new_codon']}"
+            f"{extra}. Ctrl+Z to undo.", timeout=8)
+
+    @_action_log("app.crispr.open")
+    def action_open_crispr(self) -> None:
+        """CRISPR menu → guide design against the loaded plasmid.
+
+        Picking a row yields either the annealed cloning oligo pair or an
+        annotation of the protospacer on the map. The modal is app-free (it
+        takes the sequence, not the app), so the record is read HERE and the
+        result applied here — which also means a canvas swap while the modal is
+        open cannot silently annotate the wrong plasmid: `_guard_callback`
+        drops the edit ([INV-62])."""
+        rec = getattr(self, "_current_record", None)
+        if rec is None or not len(getattr(rec, "seq", "") or ""):
+            self.notify("Load a plasmid first — guide design needs a sequence.",
+                        severity="warning", timeout=6)
+            return
+        anns = getattr(rec, "annotations", None) or {}
+        modal = CrisprGuideModal(
+            str(rec.seq),
+            circular=(anns.get("topology") == "circular"),
+            label=self._record_display_name(rec),
+        )
+        self.push_screen(
+            modal, self._guard_callback(self._crispr_result, "Guide design"))
+
+    def _crispr_result(self, result) -> None:
+        """Apply a `CrisprGuideModal` dismissal."""
+        if not isinstance(result, dict):
+            return
+        guide = result.get("guide") or {}
+        action = result.get("action")
+        if action == "oligos":
+            o = result.get("oligos") or {}
+            # The oligos are what the user pastes into a vendor form, so they go
+            # to the clipboard AND stay on screen — a toast that vanishes is no
+            # use for a 25-mer you have to retype.
+            text = f"{o.get('top', '')}\n{o.get('bottom', '')}"
+            mode, detail = _copy_to_clipboard_with_fallback(
+                self, text, "guide oligos")
+            extra = " · a 5' G was added for U6" if o.get("added_g") else ""
+            self.notify(
+                f"top     {o.get('top', '')}\n"
+                f"bottom  {o.get('bottom', '')}\n"
+                f"[dim]{mode}{extra}[/dim]",
+                title="Guide cloning oligos", timeout=25,
+            )
+            if detail is not None:
+                _log.info("guide oligos written to %s", detail)
+            return
+        if action == "annotate":
+            rec = getattr(self, "_current_record", None)
+            if rec is None:
+                return
+            spacer = str(guide.get("guide", ""))
+            start = int(guide.get("start", 0) or 0)
+            end = int(guide.get("end", 0) or 0)
+            # `_apply_annotation_transfers` already owns the undo push, the
+            # wrap-aware CompoundLocation build and the `_apply_record`
+            # rebuild, so the guide rides in as a transfer rather than
+            # re-implementing any of that here ([RECIPE]).
+            self._apply_annotation_transfers([{
+                "target_start":  start,
+                "target_end":    end,
+                "target_strand": int(guide.get("strand", 1) or 1),
+                "type":          "misc_RNA",
+                "label":         f"sgRNA {spacer}",
+                "qualifiers": {
+                    "note": (f"CRISPR protospacer for "
+                             f"{guide.get('variant', '?')}; PAM "
+                             f"{guide.get('pam', '?')}; predicted cut at "
+                             f"{guide.get('cut_site', 0)}"),
+                },
+            }], rec)
 
     def action_open_autolab(self) -> None:
         """AUTOLAB menu → the Opentrons OT-2 plate-prep workbench: lay out a

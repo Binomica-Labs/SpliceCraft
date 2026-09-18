@@ -908,12 +908,26 @@ class TestAttachExperimentImage:
         assert sc._h_attach_experiment_image(None, {
             "experiment_id": "nope", "path": str(self._png(tmp_path))})[1] == 404
 
-    def test_non_image_rejected_400(self, tmp_path):
+    def test_unattachable_extension_rejected_400(self, tmp_path):
+        """Attachments widened past images 2026-09-17 (`[INV-199]`), so the
+        gate is `_EXPERIMENT_ATTACH_EXTS`, not `_IMAGE_EXTS` — but an
+        extension on neither list is still refused."""
         ce = sc._h_create_experiment(None, {"title": "E"})
-        txt = tmp_path / "x.txt"
-        txt.write_text("not an image")
+        bad = tmp_path / "payload.exe"
+        bad.write_bytes(b"MZ")
         assert sc._h_attach_experiment_image(None, {
-            "experiment_id": ce["id"], "path": str(txt)})[1] == 400
+            "experiment_id": ce["id"], "path": str(bad)})[1] == 400
+
+    def test_data_attachment_accepted(self, tmp_path):
+        """A `.txt`/`.csv`/`.ab1` used to 400 here; the notebook now takes
+        the trace and the plate-reader export too."""
+        ce = sc._h_create_experiment(None, {"title": "E"})
+        txt = tmp_path / "plate.csv"
+        txt.write_text("well,od\nA1,0.42\n")
+        out = sc._h_attach_experiment_image(None, {
+            "experiment_id": ce["id"], "path": str(txt)})
+        assert out["ok"] is True and out["is_image"] is False
+        assert out["filename"].endswith(".csv")
 
 
 class TestTraditionalCloning:
