@@ -46,7 +46,7 @@ dependencies = [
     # a wheel on every supported platform. Revisit the cap when a later
     # release re-adds Intel-mac wheels — `scripts/check_dep_wheels.py`
     # flags it if 1.86 ever loses coverage too.
-    "biopython>=1.86,<1.87",
+    "biopython>=1.86,<1.89",
     # edlib is the fast pairwise-alignment engine (bit-parallel Myers
     # edit distance) used by `_pairwise_align` / `_pick_best_rotation` —
     # ~90–600× faster than Biopython's DP on the long near-identical
