@@ -21,7 +21,43 @@ leaving its terminal.
 splicecraft --agent                  # default port 6701
 splicecraft --agent --agent-port 6800  # alternative port
 splicecraft --headless               # agent API only, NO terminal UI (CI / no-pty)
+splicecraft --agent --read-only      # attach ALONGSIDE a running GUI (reads only)
 ```
+
+### Attaching while the GUI is open (`--read-only`)
+
+The data dir is single-instance-locked for cache coherence, so an ordinary
+`--agent` launch **refuses to start** while the GUI holds it. That used to mean
+an agent could not look at the library at all during a session — and the way
+round it was hand-parsing `collections.json` and `plasmid_blobs/*.gb`, which is
+exactly what this API exists to prevent.
+
+`--read-only` attaches without taking the lock. It serves every endpoint
+`tools` reports as `write: false` and refuses every `write: true` one with
+**409**, naming the PID that holds the lock so you know what to quit:
+
+```json
+{"error": "endpoint 'add-current-to-library' writes, and this SpliceCraft is
+  attached --read-only while PID 4242 holds the data-dir lock. …",
+ "read_only": true, "endpoint": "add-current-to-library", "holder_pid": 4242}
+```
+
+It implies `--headless` (a second TUI over one data dir is what the lock
+prevents, and it would render caches that go stale the moment the GUI saves),
+and it publishes its port + token to **`agent_token.readonly`**, not
+`agent_token` — a guest must never repoint, or on quit delete, the host's
+side-door. `splicecraft-cli` prefers the host token and falls back to the
+guest, so `splicecraft-cli status` finds a read-only session with no flags;
+set `SPLICECRAFT_READ_ONLY=1` to pin the guest when both exist. If the default
+port is busy it walks the next few (a pinned `--agent-port` is never moved).
+
+Refusing writes is the *legible* half of the guarantee. The half that actually
+protects the data is that a read-only process never arms the save-authorisation
+chokepoint at all, so any `_save_*` reaching it raises — and for the same
+reason the launch-time collection / primer / parts-bin / project migrations are
+skipped rather than attempted. The process holding the lock owns those mirrors;
+the guest reads what the host wrote. Attaching leaves every data file
+byte-identical.
 
 `--headless` (alias `--agent-headless`, or env `SPLICECRAFT_HEADLESS=1`)
 runs the JSON API under Textual's headless driver — no pty required, so
@@ -275,7 +311,19 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   close; the L2→binary hop is a known engine gap), design-primers
   (Primer3 primer-pair design over a region: `detection` picks a
   diagnostic amplicon, `cloning` appends RE-site tails, `generic`
-  returns binding-only primers — no tails / overhangs), check-primer
+  returns binding-only primers — no tails / overhangs; and
+  `allele_specific`, which is anchored on a single `variant_pos` rather than a
+  region and pins the primer's **3'-terminal base** on the variant, because
+  that pinning IS allele-specific PCR — the other modes slide to whatever
+  window scores best, and the Golden-Gate SDM designers anchor the 5' end, so
+  neither can express it. Sweeps 18-27 bp and both orientations around the
+  fixed terminus; returns `specificity`, the 3'-seeded binding sites on the
+  template and on any named `off_targets`, because "this primer is
+  allele-specific" is a claim about where it does NOT bind. When the
+  discriminating base is A or T it SAYS there can be no GC clamp instead of
+  only scoring it down, and `destabilize` adds the conventional second
+  mismatch three bases from the 3' end — opt-in, since it changes the oligo
+  you order), check-primer
   (a SINGLE oligo vs a template: Tm, GC%, and every 3'-anchored binding
   site — both strands, wrap-aware on a circular template, the tail
   scored as mismatches — to confirm a designed primer binds exactly once
@@ -360,6 +408,83 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   never an empty list that would read as clean. `include_sequences: false`
   drops `pre_mrna` / `mature_mrna` / the UTR sequences and keeps the
   coordinates and verdicts, for a screening loop over a whole collection.
+- **Regulatory elements** — `scan-promoters` finds sigma-70 (-35 / spacer /
+  -10) promoters and `scan-terminators` finds intrinsic (Rho-independent)
+  terminators, on `{sequence | id | name}`, wrap-aware, with FORWARD-strand
+  coordinates for hits on either strand. A promoter hit carries both hexamers,
+  the spacer, the predicted `tss`, a `score` and its `components`; **the score
+  RANKS, it does not predict** — it is a composite of named parts with no
+  trained model behind it, good for "does this insert carry a cryptic promoter
+  and how does it compare with the others", not for a transcription rate. The
+  default `min_score` is calibrated rather than picked: 0.75 yields about one
+  chance hit per kb per strand, while real promoters from the built-in preset
+  catalogue score 0.69-1.00. A terminator hit carries the stem/loop/U-tract
+  geometry, a real Turner-2004 fold `dg`, and a coarse `efficiency` tier
+  (`strong` / `moderate` / `weak`) — never a percentage. **One hairpin is ONE
+  record:** overlapping stem/loop registers of the same structure are merged,
+  because a scan that reports each register separately turns one terminator
+  into twenty-odd. Rho-DEPENDENT termination is not modelled and is not
+  guessed at. `min_stem` and `min_u_tract` are bounded by the scanner's own
+  search limits: a floor above them could only ever return zero hits, and
+  "0 terminators" reads as "this construct has none" rather than "that filter
+  excluded every candidate", so it is refused with a 400.
+- **Transcription mapping** — `map-transcription` walks the circle from every
+  promoter to every CDS and answers **what ELSE transcribes this gene**. Body
+  `{id? | name?, include_predicted?=true, min_promoter_score?, max_distance?}`;
+  needs an annotated record, so a bare sequence is refused rather than silently
+  answered with no genes. Per gene: `reachable_from` — each promoter that
+  reaches it, the `distance_bp` around the circle, the `terminators_between`,
+  and a `readthrough` of `clear` / `attenuated` / `blocked`.
+  `predict-transcript` cannot answer this: it reconstructs ONE unit and needs
+  the promoter named. A plasmid is a circle, every promoter on it transcribes
+  until something stops it, and checking terminators DOWNSTREAM of a cassette —
+  the natural thing to do — cannot see a read-through, because the read-through
+  arrives from behind. **`silent` and `silent_in_host` are different claims and
+  the gap between them is the point:** `silent` means nothing is aimed at the
+  gene at all, `silent_in_host` means nothing the HOST polymerase can read
+  reaches it. A T7-only cassette is `silent_in_host` in a strain with no T7
+  RNAP — unless something else on the circle reads through into it, which is
+  exactly the case that looks like a mystery at the bench. Each promoter
+  carries `host_recognised` plus the `host_basis` that decided it.
+- **Read heterogeneity** — `analyse-read-heterogeneity` reports per-base
+  ALLELE FRACTIONS from raw reads: **is what I sequenced one thing?** Body
+  `{reference | reference_id | reference_name, reads_path (a FASTQ) | reads,
+  min_fraction?=0.01, min_phred?=20, max_reads?}`. `read-consensus` cannot
+  answer this — it reads the alignments STORED on a plasmid, and a
+  Plasmidsaurus consensus is one read, so depth is 1 everywhere and anything
+  below the consensus is invisible. A population of escapers each carrying a
+  different inactivating mutation, none dominant, consenses back to wild type
+  and reads as a clean clonal culture. Returns `positions` (each `{pos, ref,
+  alt, alt_reads, depth, fraction, mean_phred, contradicted}`) and a `verdict`
+  of `clonal` / `minor_variants` / `mixed`. **The denominator is every read
+  that COVERED the base**, including the ones that disagreed; observations
+  whose backing basecall is below `min_phred` are excluded and counted in
+  `n_filtered_low_quality`, because at 1% every instrument's error floor looks
+  like a sub-population. **A no-call is not an allele:** an `N` in a read means
+  the basecaller could not read that base, so those observations are excluded
+  and counted in `n_no_call_observations` rather than reported as a
+  sub-population — long reads carry N runs routinely, and counting them made a
+  single ordinary read turn a clonal culture into `mixed`.
+  The thresholds behind the verdict are echoed in
+  `thresholds` — they are conventions, not a calibrated model. Reads are
+  bounded by a `reads x reference length` work budget; whenever it bites,
+  `capped_by` and a warning say so rather than quietly changing every fraction.
+- **CDS codon analysis** — `analyse-cds` is the READ half of
+  `optimize-protein`, which until now only wrote. Body
+  `{sequence | id + feature, taxid?, rare_w?, ramp_codons?}`; returns
+  `n_codons`, `gc`, `gc3`, `cai`, `rare_pct`, `tandem_rare_runs`,
+  `worst_window` and `ramp`. `cai` comes from the same function
+  `optimize-protein` reports, against the same table, so the two are directly
+  comparable. `tandem_rare_runs` matters separately from `rare_pct` because
+  consecutive rare codons stall a ribosome far more than the same codons
+  scattered, and `ramp` reports the 5' end on its own because a deliberately
+  slow translational ramp there is normal — averaging it in flags healthy
+  designs and hides unhealthy bodies. **A spliced CDS is joined from its
+  exons** and a `/codon_start` of 2 or 3 is honoured, both reported in
+  `warnings`: reading a spliced gene as one contiguous block runs through its
+  introns, so every codon after the first is out of frame and every number is
+  then confidently wrong. An origin-WRAPPING CDS is a two-part location too
+  (sacred invariant #9) and is deliberately NOT read as spliced.
 - **Enzymes** — `list-enzymes` reads the COMBINED catalog (built-in NEB ∪
   your custom enzymes; `list-custom-enzymes` returns only the latter) with
   no sequence involved: recognition site, `fwd_cut` / `rev_cut` offsets,

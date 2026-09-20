@@ -165,6 +165,27 @@ _SAVES_AUTHORIZED: bool = False
 _SAVES_AUTHORIZED_REASON: str = ""
 
 
+# ── Read-only agent attach (`splicecraft --agent --read-only`) ────
+# Set by `main()` when the process was launched read-only so it can attach
+# to a data dir another SpliceCraft (typically the GUI) already holds the
+# lock on. Checked by `_agent_invoke`, which refuses every handler
+# registered `write=True` with a 409 naming the lock holder.
+#
+# This is the FRIENDLY gate — it answers with an actionable error instead of
+# a traceback. The gate that actually protects the data is the absence of
+# `_authorize_writes`: a read-only process never flips `_SAVES_AUTHORIZED`,
+# so `_refuse_unauthorized_write` raises on any `_save_*` that somehow got
+# past the 409 (a handler mis-registered `write=False`, or a read endpoint
+# that mutates as a side effect). Two independent layers, deliberately —
+# a read-only mode that relies on one flag being correct everywhere is a
+# mode that writes the day one endpoint is registered wrong.
+_AGENT_READ_ONLY: bool = False
+# PID of the process holding the data-dir lock when we attached read-only
+# (0 when the lock was free / unreadable). Reported in the 409 so the caller
+# knows WHICH process to quit to get write access back.
+_AGENT_READ_ONLY_HOLDER_PID: int = 0
+
+
 # ── Data directory (Phase B-prep) ──────────────────────────────────
 # The resolved user-data dir. COMPUTED by the hub at import time
 # (`_state._DATA_DIR = _user_data_dir()`); placeholder here so readers + the
@@ -506,6 +527,14 @@ _settings_flush_sync_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregis
 _pick_best_rotation_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
 _multi_read_summary_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
 _trace_verification_summary_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+# `analyse-read-heterogeneity` needs the per-variant walk and the per-variant
+# Phred lookup that `_multi_read_summary` uses internally, because it reports
+# an ALLELE FRACTION per position and a fraction is only meaningful next to the
+# basecall quality backing it. Both stay hub-side beside
+# `_extract_variants_from_alignment` (their other callers are hub-side) and
+# travel to the agent sibling through hooks, like the rest of the read engine.
+_alignment_variants_in_axis_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+_variant_phred_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
 _reset_master_delete_cache_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
 _bulk_export_collection_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
 _blast_search_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered

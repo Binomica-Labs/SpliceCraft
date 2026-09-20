@@ -42,13 +42,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.66"
+__version__ = "1.2.67"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-09-18"
+_RELEASE_DATE = "2026-09-19"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -2568,6 +2568,36 @@ def _release_data_dir_lock(fd: "int | None") -> None:
         # open file description and releases on close/exit, so a lingering file
         # is never a stuck lock.
         _log_event("lock.released")
+
+
+def _data_dir_lock_holder_pid(data_dir: "Path | None" = None) -> int:
+    """PID recorded in the data-dir lockfile, or 0 if there is none.
+
+    READ-ONLY and lock-free by construction: it opens the lockfile ``O_RDONLY``
+    and never flocks, creates, truncates or writes it. That matters — this runs
+    in `--read-only` mode, whose entire promise is that attaching changes
+    nothing on disk, and the ordinary `_acquire_data_dir_lock` path writes its
+    own PID stamp into the file it opens.
+
+    The PID is advisory: it is whatever the holder last stamped, so it can name
+    a process that has since exited (the lockfile is deliberately not unlinked
+    on release — see `_release_data_dir_lock`). It is used only to make the
+    read-only 409 actionable ("quit PID N"), never to decide whether the lock
+    is held, so a stale value costs a slightly wrong hint and nothing else.
+    """
+    if data_dir is None:
+        data_dir = _state._DATA_DIR
+    lockfile = Path(data_dir) / _DATA_DIR_LOCKFILE.name
+    try:
+        with open(lockfile, "r", encoding="utf-8", errors="replace") as fh:
+            first = fh.readline(64).strip()
+    except OSError:
+        return 0
+    try:
+        pid = int(first)
+    except ValueError:
+        return 0
+    return pid if pid > 0 else 0
 
 
 _ORPHAN_TMP_MIN_AGE_S = 3600   # 1 hour
@@ -5680,6 +5710,9 @@ from splicecraft_codon import (  # noqa: E402
     _codon_diversify as _codon_diversify,
     _codon_forbidden_sites as _codon_forbidden_sites,
     _codon_cai as _codon_cai,
+    _codon_relative_adaptiveness as _codon_relative_adaptiveness,
+    _CODON_RARE_W as _CODON_RARE_W,
+    _CODON_RAMP_CODONS as _CODON_RAMP_CODONS,
     _codon_gc as _codon_gc,
     _codon_gc3 as _codon_gc3,
     _CODON_GC3_LOW as _CODON_GC3_LOW,
@@ -5827,6 +5860,7 @@ from splicecraft_primer import (  # noqa: E402
     _PRIMER_CHECK_SEED_LEN as _PRIMER_CHECK_SEED_LEN,
     _PRIMER_CHECK_MAX_SITES as _PRIMER_CHECK_MAX_SITES,
     _primer_binding_sites as _primer_binding_sites,
+    _design_allele_specific_primer as _design_allele_specific_primer,
     _primer_check_confidence as _primer_check_confidence,
     _primer_tm as _primer_tm,
     _PRIMER_MAX_OLIGO_LEN as _PRIMER_MAX_OLIGO_LEN,
@@ -9101,6 +9135,7 @@ from splicecraft_seqanalysis import (  # noqa: E402
     _classify_part_from_plasmid as _classify_part_from_plasmid,
     _grammar_canonical_overhangs as _grammar_canonical_overhangs,
     _part_level_label as _part_level_label,
+    _map_transcription as _map_transcription,
 )
 
 
@@ -11172,6 +11207,7 @@ def _multi_read_summary(alignments, total: int, *,
     if not aligns or n == 0:
         return {"n_reads": 0, "total_bp": n, "covered_bp": 0,
                 "covered_pct": 0.0, "depth2_bp": 0, "depth2_pct": 0.0,
+                "mean_depth": 0.0, "max_depth": 0,
                 "uncovered_spans": [(0, n)] if n else [],
                 "variants": [], "n_confirmed": 0, "n_single_read": 0,
                 "n_contradicted": 0, "min_support": int(min_support),
@@ -11292,6 +11328,13 @@ def _multi_read_summary(alignments, total: int, *,
         "covered_pct":    round(covered * 100.0 / n, 1) if n else 0.0,
         "depth2_bp":      depth2,
         "depth2_pct":     round(depth2 * 100.0 / n, 1) if n else 0.0,
+        # Mean depth over the bases the reads actually REACHED, not over the
+        # whole molecule. Averaging in a completely unread half reports a deep
+        # pile as shallow, and depth is how a caller decides whether a 1%
+        # allele fraction was even observable — a question `covered_pct`
+        # cannot answer (100% coverage at depth 1 sees nothing sub-consensus).
+        "mean_depth":     (round(sum(depth) / covered, 2) if covered else 0.0),
+        "max_depth":      (max(depth) if depth else 0),
         "uncovered_spans": uncovered,
         "variants":       variants,
         "n_confirmed":    n_conf,
@@ -44002,6 +44045,19 @@ from splicecraft_crispr import (  # noqa: E402
     _guide_cloning_oligos as _guide_cloning_oligos,
     _guide_offtargets as _guide_offtargets,
     _score_guide as _score_guide,
+)
+
+# ── Bacterial regulatory-element scanners (L1) ─────────────────────────────
+# sigma-70 promoters and intrinsic (Rho-independent) terminators, both
+# wrap-aware and both reporting FORWARD-strand coordinates for hits on either
+# strand. `_map_transcription` (seqanalysis L3) walks the circle using both.
+from splicecraft_regulatory import (  # noqa: E402
+    _PROMOTER_MIN_SCORE as _PROMOTER_MIN_SCORE,
+    _TERM_MIN_STEM as _TERM_MIN_STEM,
+    _TERM_MIN_U_TRACT as _TERM_MIN_U_TRACT,
+    _scan_promoters as _scan_promoters,
+    _scan_terminators as _scan_terminators,
+    _score_promoter as _score_promoter,
 )
 
 # ── Built-in feature presets (read-only catalogue) ──────────────────────────
@@ -98170,6 +98226,18 @@ from socketserver import ThreadingMixIn
 _AGENT_API_HOST = "127.0.0.1"
 _AGENT_API_PORT_DEFAULT = 6701
 _state._AGENT_TOKEN_FILE = _state._DATA_DIR / "agent_token"
+# A `--read-only` attach publishes its (port, token) to a SEPARATE file.
+# It must not touch `agent_token`: that file belongs to whichever instance
+# holds the data dir, and a read-only session is by definition a guest. Writing
+# the shared path would repoint every `splicecraft-cli` call at the guest (which
+# refuses writes) and — worse — the guest's own shutdown unlinks its token file,
+# so quitting the read-only attach would silently delete the host's side-door.
+_AGENT_TOKEN_READONLY_NAME = "agent_token.readonly"
+# How many ports past the requested one a read-only attach may walk when the
+# user did not pin one. Small on purpose: enough to step over a host that is
+# already serving, short enough that a genuinely blocked range fails fast
+# instead of scanning into unrelated services.
+_AGENT_API_PORT_SCAN = 9
 
 # (handler_fn, write_bool) — write endpoints require token + dirty check.
 # Same-object alias; the canonical dict lives in _state so the splicecraft_agent
@@ -98186,6 +98254,8 @@ _state._pick_best_rotation_hook = _pick_best_rotation
 # sibling, so it travels through a hook like the other deep engines.
 _state._multi_read_summary_hook = _multi_read_summary
 _state._trace_verification_summary_hook = _trace_verification_summary
+_state._alignment_variants_in_axis_hook = _alignment_variants_in_axis
+_state._variant_phred_hook = _variant_phred
 _state._reset_master_delete_cache_hook = _reset_master_delete_cache
 _state._bulk_export_collection_hook = _bulk_export_collection
 _state._blast_search_hook = _blast_search
@@ -105314,6 +105384,13 @@ _AGENT_HEAVY_ENDPOINTS = frozenset({
     # ("blocks for a few seconds"); the operon assembler does it per gene. Cap
     # concurrency so a burst can't pin every ThreadingMixIn worker thread.
     "design-rbs", "assemble-operon",
+    # One rotation-aware alignment per read, over up to `_HETERO_READS_MAX`
+    # reads — the same cost shape as `verify-against-reads`, multiplied.
+    "analyse-read-heterogeneity",
+    # The terminator scan folds a hairpin per U-tract candidate (O(n³) Turner
+    # NN each), and `map-transcription` runs BOTH scans before walking the
+    # circle, so it is the heaviest of the three.
+    "scan-terminators", "map-transcription",
 })
 _AGENT_HEAVY_CONCURRENCY = max(2, (os.cpu_count() or 4) // 2)
 _AGENT_HEAVY_SEMAPHORE = threading.BoundedSemaphore(_AGENT_HEAVY_CONCURRENCY)
@@ -105616,6 +105693,27 @@ def _agent_invoke(app, name: str, body, *, source: str = "http"):
         return ({"error": f"unknown endpoint {name!r}",
                  "endpoints": sorted(_AGENT_HANDLERS)}, 404)
     fn, write = handler
+    if write and _state._AGENT_READ_ONLY:
+        # `--read-only` attach: refuse every mutation OUTRIGHT rather than
+        # queueing it. A queue would be a promise the mode cannot keep — the
+        # process holding the lock owns the caches, so a write applied later
+        # would be computed against state that has since moved.
+        #
+        # 409 Conflict, not 403: the request is well-formed and the caller is
+        # authorised; it conflicts with the CURRENT state of the resource (a
+        # lock held elsewhere). Quitting that process makes the same call work.
+        holder = _state._AGENT_READ_ONLY_HOLDER_PID
+        _log_event("agent.readonly.refused", endpoint=name, source=source,
+                   holder_pid=holder)
+        return ({"error": f"endpoint {name!r} writes, and this SpliceCraft is "
+                          f"attached --read-only"
+                          + (f" while PID {holder} holds the data-dir lock"
+                             if holder else "")
+                          + ". Quit that process and relaunch without "
+                            "--read-only to make changes.",
+                 "read_only": True,
+                 "endpoint": name,
+                 "holder_pid": holder or None}, 409)
     if not isinstance(body, dict):
         body = {}
     heavy = name in _AGENT_HEAVY_ENDPOINTS
@@ -106106,11 +106204,30 @@ def _start_agent_api(app, port: int = _AGENT_API_PORT_DEFAULT):
         return None
     import secrets as _secrets
     token = _secrets.token_urlsafe(32)
-    try:
-        srv = _AgentAPIServer((_AGENT_API_HOST, port), app, token)
-    except OSError as exc:
-        _log.exception("agent-api: failed to bind %s:%d (%s)",
-                       _AGENT_API_HOST, port, exc)
+    # A read-only guest must not fight the host for the default port. When the
+    # user did NOT pin one, walk a short range so attaching alongside a GUI
+    # that is itself serving `--agent` just works. An explicitly requested port
+    # is never silently moved — a caller who named a port wants that port, and
+    # answering on a different one is the "silence instead of refusal" shape.
+    candidates = [port]
+    if getattr(app, "_agent_api_auto_port", False):
+        candidates += [port + i for i in range(1, _AGENT_API_PORT_SCAN + 1)]
+    srv = None
+    _last_exc: "OSError | None" = None
+    for _cand in candidates:
+        try:
+            srv = _AgentAPIServer((_AGENT_API_HOST, _cand), app, token)
+            port = _cand
+            break
+        except OSError as exc:
+            _last_exc = exc
+            continue
+    if srv is None:
+        # `_log.error`, not `_log.exception` — we are outside the `except`
+        # block here, so there is no live exception for exc_info to capture.
+        _log.error("agent-api: failed to bind %s on port(s) %s (%s)",
+                   _AGENT_API_HOST,
+                   ", ".join(str(c) for c in candidates), _last_exc)
         return None
     try:
         _state._AGENT_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -109700,33 +109817,49 @@ NcbiTaxonPickerModal { align: center middle; }
         # LibraryPanel.on_mount, by which point the panel has already read
         # `active_collection` (None) and locked into the wrong view mode.
         # Both helpers are idempotent.
-        _ensure_default_collection()
-        _restore_library_from_active_collection()
-        # Same idempotent migration for primer collections — wraps any
-        # pre-existing flat `primers.json` entries into a "Main"
-        # collection on first launch; no-op afterwards. Same
-        # leaves→root mount-ordering rationale as plasmid collections.
-        _ensure_default_primer_collection()
-        _restore_primers_from_active_primer_collection()
-        # Same idempotent migration for parts bins — wraps legacy
-        # `parts_bin.json` into "Main Parts Bin" on first run; no-op
-        # afterwards. MUST run here (not on_mount) for the same
-        # leaves→root mount-ordering reason that collections do —
-        # children that read the active bin during mount would
-        # otherwise see no active bin.
-        _ensure_default_parts_bin()
-        # Rebuild parts_bin.json from the active bin (twin of the primer /
-        # library restores above) so an interrupted bin switch or move-part
-        # self-heals on relaunch instead of the next save clobbering it.
-        _restore_parts_bin_from_active_bin()
-        # Same idempotent migration for experiment projects — wraps
-        # any pre-existing flat `experiments.json` entries into a
-        # "Main Project" wrapper on first 0.9.7 launch; no-op
-        # afterwards. Mount-ordering rationale same as above —
-        # `ExperimentsScreen` reads the active project during mount.
-        _ensure_default_project()
-        # Rebuild experiments.json from the active project — same self-heal.
-        _restore_experiments_from_active_project()
+        #
+        # ALL of them are skipped on a `--read-only` attach. Every one either
+        # creates a default or REWRITES a live file from its active-collection
+        # mirror, and both are writes — which the L2 chokepoint correctly
+        # refuses, taking the whole launch down with it (caught by attaching
+        # to a locked data dir for real; no unit test reaches this path).
+        #
+        # Skipping is also the semantically right answer, not just the
+        # expedient one: the process that HOLDS the lock owns those mirrors.
+        # A guest that rebuilt `plasmid_library.json` from its own reading of
+        # `active_collection` would be writing over state the host is actively
+        # maintaining — the exact re-entrancy the mirror hardening exists to
+        # prevent ([INV-160]-[INV-164]). The guest reads what the host wrote.
+        if not _state._AGENT_READ_ONLY:
+            _ensure_default_collection()
+            _restore_library_from_active_collection()
+            # Same idempotent migration for primer collections — wraps any
+            # pre-existing flat `primers.json` entries into a "Main"
+            # collection on first launch; no-op afterwards. Same
+            # leaves→root mount-ordering rationale as plasmid collections.
+            _ensure_default_primer_collection()
+            _restore_primers_from_active_primer_collection()
+            # Same idempotent migration for parts bins — wraps legacy
+            # `parts_bin.json` into "Main Parts Bin" on first run; no-op
+            # afterwards. MUST run here (not on_mount) for the same
+            # leaves→root mount-ordering reason that collections do —
+            # children that read the active bin during mount would
+            # otherwise see no active bin.
+            _ensure_default_parts_bin()
+            # Rebuild parts_bin.json from the active bin (twin of the primer /
+            # library restores above) so an interrupted bin switch or
+            # move-part self-heals on relaunch instead of the next save
+            # clobbering it.
+            _restore_parts_bin_from_active_bin()
+            # Same idempotent migration for experiment projects — wraps
+            # any pre-existing flat `experiments.json` entries into a
+            # "Main Project" wrapper on first 0.9.7 launch; no-op
+            # afterwards. Mount-ordering rationale same as above —
+            # `ExperimentsScreen` reads the active project during mount.
+            _ensure_default_project()
+            # Rebuild experiments.json from the active project — same
+            # self-heal.
+            _restore_experiments_from_active_project()
         # Per-instance alignment list — class-level [] would be shared
         # across instances. Test fixtures (and a hypothetical future
         # multi-app process) must not leak alignment state between
@@ -110973,6 +111106,12 @@ NcbiTaxonPickerModal { align: center middle; }
         if port:
             self._agent_api_server = _start_agent_api(self, port)
             if self._agent_api_server is not None:
+                # Report the port actually BOUND, not the one requested — a
+                # read-only attach may have walked past a busy default.
+                try:
+                    port = int(self._agent_api_server.server_address[1])
+                except (AttributeError, IndexError, TypeError, ValueError):
+                    pass
                 self.notify(
                     f"Agent API on http://{_AGENT_API_HOST}:{port} — "
                     f"token at {_state._AGENT_TOKEN_FILE}",
@@ -122334,6 +122473,12 @@ def main():
                               help="Run the agent API with NO terminal UI "
                                    "(implies --agent-api; needs no pty — "
                                    "for CI / headless agent contexts).")
+    main_parser.add_argument("--read-only", "--readonly",
+                              action="store_true", dest="read_only",
+                              help="Attach the agent API to a data dir another "
+                                   "SpliceCraft already holds (e.g. the GUI). "
+                                   "Serves every read endpoint; refuses every "
+                                   "write with 409. Implies --agent --headless.")
 
     try:
         parsed, rest = main_parser.parse_known_args(sys.argv[1:])
@@ -122343,12 +122488,35 @@ def main():
         # already; just propagate the exit code.
         raise
 
+    # Read-only attach (`--agent --read-only`, blue field report #17). The
+    # data dir is normally single-instance-locked for cache coherence, which
+    # means an agent could not look at the library at all while the GUI was
+    # open — so a whole diagnostic session got done by hand-parsing
+    # `collections.json`, the exact thing the agent API exists to prevent.
+    #
+    # Read-only mode buys attach-while-locked by giving up every write, and it
+    # gives them up TWICE over: `_agent_invoke` 409s any handler registered
+    # `write=True`, and — below — this process never calls `_authorize_writes`,
+    # so the L2 chokepoint raises on any `_save_*` that somehow reaches it.
+    # The second layer is the one that actually protects the data; the first
+    # just makes the refusal legible.
+    read_only = bool(parsed.read_only)
+    env_read_only = os.environ.get("SPLICECRAFT_READ_ONLY", "").strip().lower()
+    if env_read_only in ("1", "true", "yes"):
+        read_only = True
+
     # L2 chokepoint (2026-05-22): authorise the data-dir writes the
     # real app needs. Done AFTER argv parsing so a `--version` /
     # `--help` invocation (which exits before touching files) doesn't
     # arm writes. Everything below — TUI launch, agent server, the
     # `logs` / `update` subcommands — can save to `_state._DATA_DIR`.
-    _authorize_writes(reason="PlasmidApp.main()")
+    #
+    # NOT armed in read-only mode: that omission IS the safety property, so it
+    # is expressed as "never authorised" rather than "authorised then guarded".
+    if not read_only:
+        _authorize_writes(reason="PlasmidApp.main()")
+    else:
+        _state._AGENT_READ_ONLY = True
 
     skip_splash = parsed.skip_splash
     enable_agent_api = parsed.agent_api
@@ -122372,6 +122540,19 @@ def main():
     if headless:
         enable_agent_api = True
         skip_splash = True
+    # `--read-only` implies a HEADLESS agent attach, deliberately. The mode
+    # exists so an agent can read a library the GUI is holding; a second TUI
+    # over the same data dir is precisely what the lock prevents, and it would
+    # render caches that go stale the moment the GUI saves — a read-only window
+    # showing confidently wrong data is worse than no window.
+    if read_only:
+        enable_agent_api = True
+        headless = True
+        skip_splash = True
+        # Publish to the guest token file so the host's `agent_token` is
+        # neither overwritten on start nor unlinked on quit.
+        _state._AGENT_TOKEN_FILE = (_state._DATA_DIR
+                                    / _AGENT_TOKEN_READONLY_NAME)
     # Auto-headless for a DETACHED --agent daemon (no controlling TTY): a daemon
     # is driven over the HTTP API and needs no input driver, and a non-TTY stdin
     # makes Textual's input thread busy-loop on immediate EOF and peg a core (the
@@ -122523,17 +122704,34 @@ def main():
     # data dir so a second instance bails out cleanly without
     # racing on the daily snapshot or the version stamp.
     _data_lock_fd = None
-    try:
-        _data_lock_fd, _ = _acquire_data_dir_lock()
-    except DataDirLockError as exc:
-        print(f"\n{exc}\n", file=sys.stderr)
-        _log.error("Refusing to launch: %s", exc)
-        sys.exit(1)
-    except OSError as exc:
-        # Read-only data dir, full disk, etc. Log + continue without
-        # the lock; the existing data-safety net still catches most
-        # corruption modes.
-        _log.warning("Could not acquire data-dir lock: %s", exc)
+    if read_only:
+        # Attach WITHOUT the lock — that is the whole point of the mode. We
+        # never take it (so we can't block the GUI from reclaiming it) and
+        # never stamp it (so attaching leaves the lockfile byte-identical).
+        # Record who holds it purely so the write-refusal can name them.
+        _state._AGENT_READ_ONLY_HOLDER_PID = _data_dir_lock_holder_pid()
+        _log.info("read-only attach: not taking the data-dir lock "
+                  "(holder PID %s); every write endpoint will 409.",
+                  _state._AGENT_READ_ONLY_HOLDER_PID or "none recorded")
+        _log_event("agent.readonly.attach",
+                   holder_pid=_state._AGENT_READ_ONLY_HOLDER_PID)
+    else:
+        try:
+            _data_lock_fd, _ = _acquire_data_dir_lock()
+        except DataDirLockError as exc:
+            print(f"\n{exc}\n", file=sys.stderr)
+            _log.error("Refusing to launch: %s", exc)
+            # Point the user at the way to get in anyway. The lock error is
+            # about WRITE coherence, and "you can still read it" is the most
+            # useful next step when what they wanted was to look at something.
+            print("To attach an agent for READING while that instance runs:\n"
+                  "  splicecraft --agent --read-only\n", file=sys.stderr)
+            sys.exit(1)
+        except OSError as exc:
+            # Read-only data dir, full disk, etc. Log + continue without
+            # the lock; the existing data-safety net still catches most
+            # corruption modes.
+            _log.warning("Could not acquire data-dir lock: %s", exc)
 
     # Orphan tempfile sweep — collect leftovers from previous runs that
     # were SIGKILL'd / OOM-killed / power-cycled between mkstemp and
@@ -122571,7 +122769,10 @@ def main():
     # surprised when fields they created in the newer version are
     # silently dropped on save. Best-effort: any I/O failure logs +
     # continues so a read-only data dir doesn't block startup.
-    _data_version_warning = _check_and_stamp_data_version()
+    # Skipped in read-only mode — it STAMPS the data dir, and a read-only
+    # attach that rewrites the version file is not read-only.
+    _data_version_warning = (None if read_only
+                             else _check_and_stamp_data_version())
     if _data_version_warning:
         print(f"⚠  {_data_version_warning}", file=sys.stderr, flush=True)
         _log.warning(_data_version_warning)
@@ -122619,6 +122820,18 @@ def main():
     # pilots; `_check_for_updates_worker` falls back to the historical
     # auto-dismissing toast when the modal is suppressed.
     app._skip_launch_update_modal = False
+    # Read-only attach: switch off every launch step that writes. Each of
+    # these would otherwise raise out of the L2 chokepoint (correctly, but as
+    # a startup traceback rather than a clean attach), and the point of the
+    # mode is that attaching is a no-op on disk.
+    if read_only:
+        app._skip_snapshot = True           # daily JSON snapshot → writes
+        app._skip_primer_dedupe_check = True  # can save a de-duped library
+        app._skip_update_check = True       # persists last-checked stamp
+        app._skip_launch_update_modal = True
+        # Only auto-walk the port when the user didn't name one.
+        app._agent_api_auto_port = (  # type: ignore[attr-defined]
+            parsed.agent_api_port is None)
     if enable_agent_api:
         app._agent_api_port = agent_port  # type: ignore[attr-defined]
     app._headless = headless  # type: ignore[attr-defined]

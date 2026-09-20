@@ -1276,13 +1276,47 @@ def _codon_cai(dna: str, raw: dict, *, transl_table: "int | None" = None) -> flo
     — pre-fix CAI keyed on the table's stored label, mis-scoring alt-code
     tables. Display-only; never affects an emitted sequence."""
     import math
+    w = [r["w"] for r in _codon_relative_adaptiveness(
+        dna, raw, transl_table=transl_table)]
+    if not w:
+        return 0.0
+    return math.exp(sum(math.log(max(v, 1e-10)) for v in w) / len(w))
+
+
+# A codon whose relative adaptiveness falls below this is "rare" for the host.
+# 0.2 is a widely used convention rather than a derived constant, and it is
+# reported alongside every rare-codon count so a caller can re-derive its own.
+_CODON_RARE_W = 0.2
+# Codons at the 5' end of a CDS, where a deliberately SLOW translational ramp
+# is normal and a low CAI is not a defect. Reported separately rather than
+# folded into the whole-CDS number, which would flag a healthy ramp as a
+# problem and hide a genuinely rare-codon-rich body behind a healthy average.
+_CODON_RAMP_CODONS = 50
+
+
+def _codon_relative_adaptiveness(
+        dna: str, raw: dict, *,
+        transl_table: "int | None" = None) -> "list[dict]":
+    """Per-codon relative adaptiveness ``w`` — the terms `_codon_cai` takes
+    the geometric mean of.
+
+    Returns ``[{index, codon, aa, w}, ...]`` for the codons that CONTRIBUTE to
+    CAI: stops and single-codon families (Met/Trp under the standard code) are
+    excluded, exactly as the standard definition requires and exactly as
+    `_codon_cai` does — because `_codon_cai` is now defined in terms of this
+    function. Keeping one implementation is deliberate: a second copy of this
+    arithmetic that drifted would let `analyse-cds` and `optimize-protein`
+    report different CAIs for the same sequence and host.
+
+    `index` is the CODON index (0-based), not the base offset.
+    """
     gc = (_CODON_GENETIC_CODE if transl_table in (None, 1)
           else _codon_table_for(transl_table))
     aa_codons, codon_frac = _codon_build_aa_map(raw, genetic_code=gc)
     fam_size: dict[str, int] = {}
     for _c, _a in gc.items():
         fam_size[_a] = fam_size.get(_a, 0) + 1
-    w: list[float] = []
+    out: "list[dict]" = []
     for i in range(0, len(dna) - 2, 3):
         codon = dna[i:i + 3].upper()
         aa = gc.get(codon)
@@ -1290,10 +1324,9 @@ def _codon_cai(dna: str, raw: dict, *, transl_table: "int | None" = None) -> flo
             continue
         peak = aa_codons[aa][0][1] if aa in aa_codons else 0.0
         if peak > 0:
-            w.append(codon_frac.get(codon, 0.0) / peak)
-    if not w:
-        return 0.0
-    return math.exp(sum(math.log(max(v, 1e-10)) for v in w) / len(w))
+            out.append({"index": i // 3, "codon": codon, "aa": aa,
+                        "w": codon_frac.get(codon, 0.0) / peak})
+    return out
 
 
 def _codon_gc(dna: str) -> float:

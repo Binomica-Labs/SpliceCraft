@@ -1959,3 +1959,142 @@ def _scrub_qc_verify(orig: str, cured: str, rounds: list, n: int) -> tuple:
         return False, ["QuikChange primers would not reconstitute the cured "
                        "plasmid exactly — a cure fell outside primer reach"]
     return True, []
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Allele-specific PCR (ARMS) primer design
+# ══════════════════════════════════════════════════════════════════════
+#
+# Allele-specific PCR IS the act of pinning the primer's 3'-terminal base on
+# the variant: a matched 3' end extends, a mismatched one does not. None of
+# the existing designers can express that. `_design_detection_primers` and
+# `_design_generic_primers` pick whatever window scores best and slide freely;
+# `_mut_design_fwd_anneal` / `_mut_design_rev_anneal` anchor the FIVE-prime end
+# (they build Golden-Gate SDM primers whose 5' tail carries the site), so they
+# are the wrong instrument entirely — sliding a 5'-anchored primer never fixes
+# which base lands last.
+#
+# So the 3' terminus is fixed first and the length swept around it, which is
+# the opposite of every other designer here.
+
+_AS_MIN_LEN = 18
+_AS_MAX_LEN = 27
+# ARMS convention: a deliberate second mismatch near the 3' end further
+# destabilises the mismatched duplex, so the discriminating primer fails to
+# extend more cleanly. Position 3 from the 3' end is the usual choice — close
+# enough to matter to the polymerase, far enough not to abolish the matched
+# duplex too. OPT-IN: it changes the primer you order, and a caller who did
+# not ask for a mismatch should not silently receive one.
+_AS_DESTAB_OFFSET = 3
+_AS_STRONG_CLAMP = frozenset("GC")
+
+
+def _as_complement(base: str) -> str:
+    return {"A": "T", "T": "A", "G": "C", "C": "G"}.get(base.upper(), "N")
+
+
+def _design_allele_specific_primer(
+        template: str, variant_pos: int, *,
+        alt_base: "str | None" = None,
+        orientation: str = "auto",
+        target_tm: float = 60.0,
+        destabilize: bool = False,
+        circular: bool = False) -> "dict | None":
+    """One allele-specific primer whose 3'-terminal base sits ON `variant_pos`.
+
+    `alt_base` is the allele the primer must be specific FOR; omit it to
+    target whatever the template already carries at that position.
+    `orientation` is ``"fwd"``, ``"rev"`` or ``"auto"`` (try both, keep the
+    better-scoring one). Lengths `_AS_MIN_LEN`..`_AS_MAX_LEN` are swept with
+    the 3' end PINNED — the length grows 5'-wards, never past the variant.
+
+    Returns ``{seq, orientation, length, tm, gc, score, three_prime_base,
+    gc_clamp, clamp_note, destabilized, destabilize_pos, binding_start,
+    binding_end, matches_template}`` or None when the template is too short on
+    the needed side.
+
+    ``gc_clamp`` is False when the discriminating base is A or T, and
+    ``clamp_note`` SAYS SO in words. That is not a scoring detail: an A/T 3'
+    terminus cannot form a strong clamp no matter how the rest of the primer
+    is chosen, and quietly ranking it lower would leave the caller wondering
+    why every candidate scored badly instead of telling them the allele itself
+    is the constraint.
+    """
+    t = (template or "").upper()
+    n = len(t)
+    if n == 0 or not (0 <= variant_pos < n):
+        return None
+    ref_base = t[variant_pos]
+    allele = (alt_base or ref_base).upper()
+    if allele not in "ACGT":
+        return None
+    want = ("fwd", "rev") if orientation == "auto" else (orientation,)
+    best = None
+    for orient in want:
+        for length in range(_AS_MIN_LEN, _AS_MAX_LEN + 1):
+            if orient == "fwd":
+                # 3' end AT the variant; the primer reads 5'->3' up to it.
+                start = variant_pos - length + 1
+                if start < 0:
+                    if not circular:
+                        continue
+                    seq = "".join(t[(start + i) % n] for i in range(length))
+                else:
+                    seq = t[start:variant_pos + 1]
+                seq = seq[:-1] + allele
+                b_start, b_end = (start % n), (variant_pos + 1)
+            else:
+                # Reverse primer: its 3' end anneals to the variant, so it is
+                # the reverse complement of the window STARTING at the variant.
+                end = variant_pos + length
+                if end > n:
+                    if not circular:
+                        continue
+                    win = "".join(t[(variant_pos + i) % n]
+                                  for i in range(length))
+                else:
+                    win = t[variant_pos:end]
+                win = allele + win[1:]
+                seq = _mut_revcomp(win)
+                b_start, b_end = variant_pos, (end % n if circular else end)
+            if len(seq) < _AS_MIN_LEN:
+                continue
+            destab_pos = None
+            if destabilize and len(seq) > _AS_DESTAB_OFFSET:
+                i = len(seq) - _AS_DESTAB_OFFSET
+                cur = seq[i]
+                # Any base other than the template's is a mismatch; pick a
+                # transversion, which destabilises more than a transition.
+                swap = {"A": "C", "C": "A", "G": "T", "T": "G"}.get(cur, cur)
+                seq = seq[:i] + swap + seq[i + 1:]
+                destab_pos = i
+            score = _mut_score_outer(seq, target_tm)
+            if best is None or score < best["score"]:
+                three = seq[-1]
+                best = {
+                    "seq": seq,
+                    "orientation": orient,
+                    "length": len(seq),
+                    "tm": _mut_tm(seq),
+                    "gc": _mut_gc_pct(seq),
+                    "score": score,
+                    "three_prime_base": three,
+                    "gc_clamp": three in _AS_STRONG_CLAMP,
+                    "clamp_note": (
+                        None if three in _AS_STRONG_CLAMP else
+                        f"the discriminating base is {three} — an A/T 3' "
+                        f"terminus cannot form a GC clamp, so this primer "
+                        f"relies on the mismatch alone for specificity. "
+                        f"Consider a destabilizing second mismatch "
+                        f"(destabilize: true) or a touchdown/higher "
+                        f"annealing temperature."),
+                    "destabilized": destab_pos is not None,
+                    "destabilize_pos": destab_pos,
+                    "binding_start": b_start,
+                    "binding_end": b_end,
+                    "matches_template": allele == ref_base,
+                    "ref_base": ref_base,
+                    "allele": allele,
+                    "variant_pos": variant_pos,
+                }
+    return best

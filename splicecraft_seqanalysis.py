@@ -1886,3 +1886,398 @@ def _tx_missing_anchor(prom, term) -> str:
     return (f"no {' or '.join(missing)} feature on the same strand as the CDS "
             "— annotate one, or pass tx_start + tx_end to bound the unit "
             "directly")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  map-transcription — what actually reaches each CDS, walking the circle
+# ══════════════════════════════════════════════════════════════════════
+#
+# `_predict_transcript` answers "what is the mature message of THIS unit",
+# and to do it the caller must already know which promoter drives the CDS.
+# That is the wrong shape for the question that costs real bench time:
+#
+#     what ELSE transcribes this gene?
+#
+# A plasmid is a circle with no ends. Every promoter on it transcribes until
+# something stops it, and on a construct with no designed insulators that can
+# be the whole way round. A T7-only cassette in a strain with no T7 RNAP is
+# supposed to be silent — and is not, if a resistance-marker promoter upstream
+# reads straight through the origin into the cargo. Checking terminators
+# DOWNSTREAM of a cassette, which is the natural thing to do, cannot see it;
+# the read-through arrives from behind.
+#
+# So this walks the circle in BOTH directions from every CDS and reports every
+# promoter that reaches it, the terminators in between, and how much of a
+# barrier those are.
+
+_TX_PROMOTER_TYPES = frozenset({
+    "promoter", "-35_signal", "-10_signal", "tata_signal", "minus_35_signal",
+    "minus_10_signal",
+})
+_TX_TERMINATOR_TYPES = frozenset({"terminator"})
+# Phage RNA polymerase promoters. These are NOT read by the host's sigma-70
+# holoenzyme, so a cassette driven only by one of them is silent in any strain
+# that does not carry the matching polymerase (a plain cloning strain with no
+# lambda-DE3 lysogen has no T7 RNAP at all). Recognised by label as a LAST
+# resort — the primary test is whether the promoter's own sequence contains a
+# sigma-70 match — because an annotation is the only evidence that a stretch of
+# DNA is "the T7 promoter" rather than an arbitrary 18-mer.
+_TX_PHAGE_PROMOTER_RE = re.compile(r"\b(t7|t3|sp6)\b", re.IGNORECASE)
+# Padding either side of an annotated promoter when re-scanning it for a
+# sigma-70 match: an annotation often covers only the core, and a -35 box can
+# sit a few bases outside the drawn feature.
+_TX_PROMOTER_CONTEXT_BP = 12
+_TX_CODING_TYPES = frozenset({"cds", "gene", "orf"})
+# A promoter further away than this from a CDS is still reported, but a plasmid
+# is circular so "reaches it" would otherwise be true of every promoter on the
+# molecule for every gene. The distance is reported per hit; callers filter.
+_TX_MAX_SCAN_FRACTION = 1.0     # the whole circle
+
+
+def _tx_norm_type(feat) -> str:
+    return str((feat or {}).get("type") or "").strip().lower()
+
+
+def _tx_feature_strand(feat) -> int:
+    try:
+        s = int((feat or {}).get("strand", 1) or 1)
+    except (TypeError, ValueError):
+        return 1
+    return -1 if s < 0 else 1
+
+
+def _tx_arc(frm: int, to: int, total: int) -> int:
+    """Forward distance from `frm` to `to` around a circle of `total` bp.
+
+    Always non-negative. This is the one piece of arithmetic the whole walk
+    rests on: reading it as `to - frm` puts every promoter that sits "behind"
+    the origin at a negative distance and drops it from the answer, which is
+    precisely the read-through this function exists to find.
+    """
+    if total <= 0:
+        return 0
+    return (to - frm) % total
+
+
+def _tx_promoter_fires_at(prom: dict, total: int,
+                          circular: bool = True) -> "tuple[int, int]":
+    """``(start_bp, direction)`` — where transcription begins and which way.
+
+    A ``+`` promoter fires from its 3' end rightwards; a ``-`` promoter fires
+    from its 5'-on-the-forward-strand end leftwards. Using the feature's
+    ``start`` for both would start minus-strand transcription at the wrong end
+    of the promoter and mis-order everything downstream of it.
+
+    The ``% total`` is applied ONLY when the molecule is circular. On a linear
+    one it is actively wrong: a promoter whose 3' end sits at the very end of
+    the sequence has ``end == total``, and wrapping that to 0 moves it to the
+    far left — which made it appear to reach genes that lie upstream of it,
+    on a molecule that has no way round.
+    """
+    s = int(prom.get("start", 0) or 0)
+    e = int(prom.get("end", 0) or 0)
+    strand = _tx_feature_strand(prom)
+    if total <= 0:
+        return 0, strand
+    raw = None
+    if "tss" in prom and prom.get("tss") is not None:
+        try:
+            raw = int(prom["tss"])
+        except (TypeError, ValueError):
+            raw = None
+    if raw is None:
+        raw = e if strand >= 0 else s
+    return ((raw % total) if circular else raw), strand
+
+
+def _tx_between(a: int, b: int, direction: int, total: int, pos: int,
+                circular: bool = True) -> bool:
+    """Is `pos` strictly on the stretch travelled from `a` to `b`?"""
+    if total <= 0:
+        return False
+    if not circular:
+        lo, hi = (a, b) if direction >= 0 else (b, a)
+        return lo < pos < hi
+    if direction >= 0:
+        span = _tx_arc(a, b, total)
+        off = _tx_arc(a, pos, total)
+    else:
+        span = _tx_arc(b, a, total)
+        off = _tx_arc(pos, a, total)
+    return 0 < off < span if span else False
+
+
+def _tx_readthrough_verdict(terms: "list[dict]") -> str:
+    """Coarse barrier call for the terminators lying between a promoter and a
+    CDS. Named tiers, never a percentage — the efficiency of an intrinsic
+    terminator in vivo depends on the polymerase, the strain and the growth
+    condition, and a number here would imply a model that does not exist."""
+    if not terms:
+        return "clear"
+    if any(str(t.get("efficiency") or "") == "strong" for t in terms):
+        return "blocked"
+    return "attenuated"
+
+
+def _tx_element_record(el: dict, source: str, kind: str) -> dict:
+    """One promoter / terminator, normalised for the report."""
+    out = {
+        "kind": kind,
+        "source": source,
+        "start": int(el.get("start", 0) or 0),
+        "end": int(el.get("end", 0) or 0),
+        "strand": _tx_feature_strand(el),
+        "label": str(el.get("label") or "") or None,
+    }
+    for k in ("score", "strength", "minus35", "minus10", "spacer", "tss",
+              "stem_len", "loop_len", "u_tract", "dg", "efficiency"):
+        if el.get(k) is not None:
+            out[k] = el[k]
+    return out
+
+
+def _tx_host_recognises(prom: dict, seq: str, total: int,
+                        min_score: "float | None") -> "tuple[bool, str]":
+    """Can the HOST's sigma-70 holoenzyme read this promoter?
+
+    Returns ``(recognised, basis)``. The test is the promoter's own SEQUENCE —
+    re-scanned with `_scan_promoters` over its span plus a little context —
+    because that is the actual determinant. The label is consulted only to
+    name a phage polymerase when the sequence test already came back negative,
+    so an unlabelled or oddly-named host promoter is still recognised on its
+    merits, and a feature labelled "T7 promoter" that genuinely contains a
+    sigma-70 match is still reported as host-readable.
+
+    This is the distinction that separates "the cassette is silent by design"
+    from "the cassette is silent in THIS strain" — and it is why a T7-only
+    construct pelleting colour in a strain with no T7 RNAP is a finding about
+    some OTHER promoter, not about T7.
+    """
+    try:
+        from splicecraft_regulatory import _scan_promoters
+    except Exception:
+        return True, "unknown (regulatory scan unavailable)"
+    s0 = int(prom.get("start", 0) or 0)
+    e0 = int(prom.get("end", 0) or 0)
+    pad = _TX_PROMOTER_CONTEXT_BP
+    if total <= 0:
+        return False, "empty sequence"
+    span_len = _tx_arc(s0, e0, total) or (e0 - s0)
+    a = (s0 - pad) % total
+    window_len = min(total, max(0, span_len) + 2 * pad)
+    window = "".join(seq[(a + i) % total] for i in range(window_len))
+    try:
+        hits = _scan_promoters(window, circular=False, both_strands=True,
+                               min_score=min_score)
+    except Exception:
+        _log.exception("map-transcription: host-recognition scan failed")
+        return True, "unknown (scan failed)"
+    if hits:
+        return True, f"sigma-70 match (score {hits[0]['score']})"
+    label = str(prom.get("label") or "")
+    m = _TX_PHAGE_PROMOTER_RE.search(label)
+    if m:
+        return False, f"{m.group(1).upper()} phage polymerase promoter"
+    return False, "no sigma-70 match in its own sequence"
+
+
+def _map_transcription(seq: str, features: "list[dict]", *,
+                       circular: bool = True,
+                       include_predicted: bool = True,
+                       min_promoter_score: "float | None" = None,
+                       max_distance: "int | None" = None) -> dict:
+    """Every promoter that can reach every CDS, walking the circle both ways.
+
+    `features` are dicts in ``list-features`` shape — ``{start, end, strand,
+    type, label}``. With `include_predicted`, scanned sigma-70 promoters and
+    intrinsic terminators (``splicecraft_regulatory``) are folded in beside the
+    annotated ones, each tagged ``source: "annotated" | "predicted"``.
+
+    Returns::
+
+        {ok, length, circular, n_promoters, n_terminators, n_cds,
+         promoters: [...], terminators: [...],
+         genes: [{cds, reachable_from: [...], n_sources, primary,
+                  silent, warnings}],
+         warnings: [...]}
+
+    Each entry of `reachable_from` is ``{promoter, distance_bp, direction,
+    terminators_between, readthrough}`` where `readthrough` is ``clear``
+    (nothing in the way), ``attenuated`` (only weak/moderate terminators) or
+    ``blocked`` (a strong one). `primary` is the nearest promoter whose
+    read-through is not ``blocked`` — the one most likely to actually drive
+    the gene.
+
+    ``silent`` is True only when NOTHING reaches the CDS unblocked. That is a
+    much stronger claim than "the designed promoter is inactive in this
+    strain", and the distinction is the entire point: a cassette can be silent
+    by design and expressed in fact.
+
+    **Promoters are matched by STRAND.** A ``+`` CDS can only be driven by a
+    ``+`` promoter lying upstream of it in forward order; a ``-`` CDS by a
+    ``-`` promoter at a higher coordinate. Distances are arc lengths around
+    the circle, so a promoter "behind" the origin is found at its true
+    distance rather than dropped.
+    """
+    warnings: "list[str]" = []
+    s = (seq or "").upper()
+    total = len(s)
+    if total == 0:
+        return {"ok": False, "error": "empty sequence", "length": 0,
+                "circular": bool(circular), "promoters": [], "terminators": [],
+                "genes": [], "warnings": ["empty sequence"],
+                "n_promoters": 0, "n_terminators": 0, "n_cds": 0}
+    feats = _tx_usable_features(features, warnings)
+    # Coordinates PAST the end of the molecule. Every position below is taken
+    # `% total`, which turns a feature at bp 50,000 on a 1,000 bp plasmid into
+    # one at bp 0 — a confident answer about a gene that is not where the
+    # caller thinks it is. The modulo stays (it is what makes the wrap-aware
+    # arithmetic work); doing it silently is the part that was wrong.
+    _over = sum(1 for f in feats
+                if not (0 <= int(f["start"]) <= total
+                        and 0 <= int(f["end"]) <= total))
+    if _over:
+        warnings.append(
+            f"{_over} feature(s) carry coordinates outside 0..{total} and were "
+            f"wrapped onto the molecule — check they belong to this record")
+
+    promoters: "list[dict]" = []
+    terminators: "list[dict]" = []
+    genes: "list[dict]" = []
+    for f in feats:
+        t = _tx_norm_type(f)
+        if t in _TX_PROMOTER_TYPES:
+            promoters.append(_tx_element_record(f, "annotated", "promoter"))
+        elif t in _TX_TERMINATOR_TYPES:
+            terminators.append(_tx_element_record(f, "annotated",
+                                                  "terminator"))
+        elif t in _TX_CODING_TYPES:
+            genes.append(f)
+
+    if include_predicted:
+        try:
+            from splicecraft_regulatory import (_scan_promoters,
+                                                _scan_terminators)
+            for p in _scan_promoters(s, circular=bool(circular),
+                                     min_score=min_promoter_score):
+                promoters.append(_tx_element_record(p, "predicted",
+                                                    "promoter"))
+            for tm in _scan_terminators(s, circular=bool(circular)):
+                terminators.append(_tx_element_record(tm, "predicted",
+                                                      "terminator"))
+        except Exception:
+            _log.exception("map-transcription: regulatory scan failed")
+            warnings.append("the predicted-element scan failed; only "
+                            "annotated promoters and terminators are included")
+
+    # Which promoters the HOST polymerase can actually read. A promoter found
+    # BY the sigma-70 scan is host-readable by construction; an annotated one
+    # has to be tested against its own sequence.
+    for prom in promoters:
+        if prom["source"] == "predicted":
+            prom["host_recognised"] = True
+            prom["host_basis"] = "sigma-70 scan hit"
+        else:
+            ok, basis = _tx_host_recognises(prom, s, total,
+                                            min_promoter_score)
+            prom["host_recognised"] = ok
+            prom["host_basis"] = basis
+
+    if not genes:
+        warnings.append("no CDS / gene features on this record — there is "
+                        "nothing for a promoter to reach")
+
+    span_cap = total if max_distance is None else max(0, int(max_distance))
+    out_genes: "list[dict]" = []
+    for g in genes:
+        g_start = int(g["start"]) % total
+        g_end = int(g["end"]) % total
+        g_strand = _tx_feature_strand(g)
+        # Where transcription must ARRIVE for this CDS to be transcribed: its
+        # 5' end on the strand it is read from.
+        target = g_start if g_strand >= 0 else g_end
+        reach: "list[dict]" = []
+        for prom in promoters:
+            if prom["strand"] != g_strand:
+                continue
+            fire, direction = _tx_promoter_fires_at(prom, total, circular)
+            if circular:
+                dist = (_tx_arc(fire, target, total) if direction >= 0
+                        else _tx_arc(target, fire, total))
+            else:
+                # LINEAR: there is no way round, so a promoter pointing away
+                # from the gene simply cannot reach it — a NEGATIVE distance,
+                # not a long way round. Computed directly rather than as an
+                # arc plus a filter, because an arc is never negative and the
+                # filter then has to reconstruct the sign it just discarded.
+                dist = ((target - fire) if direction >= 0
+                        else (fire - target))
+                if dist < 0:
+                    continue
+            if dist > span_cap:
+                continue
+            if dist == 0 and prom["start"] == g_start:
+                # The same feature annotated twice (a promoter drawn over the
+                # CDS start), not a promoter firing into it.
+                continue
+            between = [t for t in terminators
+                       if t["strand"] == g_strand
+                       and _tx_between(fire, target, direction, total,
+                                       int(t.get("start", 0)), circular)]
+            between.sort(key=lambda t: _tx_arc(fire, int(t["start"]), total)
+                         if direction >= 0
+                         else _tx_arc(int(t["start"]), fire, total))
+            reach.append({
+                "promoter": prom,
+                "distance_bp": dist,
+                "direction": "forward" if direction >= 0 else "reverse",
+                "terminators_between": between,
+                "readthrough": _tx_readthrough_verdict(between),
+            })
+        reach.sort(key=lambda r: (r["readthrough"] != "clear",
+                                  r["distance_bp"]))
+        unblocked = [r for r in reach if r["readthrough"] != "blocked"]
+        # The question that matters at the bench is not "is anything pointed
+        # at this gene" but "will it be transcribed in the strain I am using".
+        # A construct whose only promoter is a phage one is silent in a host
+        # with no phage polymerase — and NOT silent if something else on the
+        # circle reads through into it.
+        host_reach = [r for r in unblocked
+                      if r["promoter"].get("host_recognised")]
+        out_genes.append({
+            "cds": {"label": _feat_label_or(g), "start": g_start,
+                    "end": g_end, "strand": g_strand,
+                    "type": _tx_norm_type(g)},
+            "reachable_from": reach,
+            "n_sources": len(reach),
+            "n_unblocked": len(unblocked),
+            "primary": (unblocked[0] if unblocked else None),
+            "silent": not unblocked,
+            # Split out deliberately: `silent` answers "is anything aimed at
+            # it at all", `silent_in_host` answers "will a plain cloning
+            # strain express it". The two disagree exactly in the case that
+            # is worth knowing about.
+            "host_driven_by": host_reach,
+            "n_host_sources": len(host_reach),
+            "silent_in_host": not host_reach,
+            "host_primary": (host_reach[0] if host_reach else None),
+        })
+
+    _log_event("map.transcription", length=total, n_promoters=len(promoters),
+               n_terminators=len(terminators), n_cds=len(out_genes),
+               predicted=bool(include_predicted))
+    return {
+        "ok": True,
+        "length": total,
+        "circular": bool(circular),
+        "include_predicted": bool(include_predicted),
+        "n_promoters": len(promoters),
+        "n_terminators": len(terminators),
+        "n_cds": len(out_genes),
+        "promoters": sorted(promoters, key=lambda p: (p["start"],
+                                                      p["strand"])),
+        "terminators": sorted(terminators, key=lambda t: (t["start"],
+                                                          t["strand"])),
+        "genes": out_genes,
+        "warnings": warnings,
+    }

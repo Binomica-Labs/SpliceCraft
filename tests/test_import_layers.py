@@ -52,6 +52,8 @@ _LAYER_RULES = [
     ("splicecraft_presets", 0),  # curated built-in feature presets: pure data, stdlib only
     ("splicecraft_crispr", 1),      # CRISPR guide design: PAM scan + triage +
                                    # off-target + cloning oligos; imports biology/logging L0
+    ("splicecraft_regulatory", 1),  # sigma-70 promoter + intrinsic terminator
+                                   # scanners; imports biology/logging L0
     ("splicecraft_cli_parser", 0),
     ("splicecraft_biology", 0),
     ("splicecraft_cli", 0),        # stdlib-only sidecar (standalone client)

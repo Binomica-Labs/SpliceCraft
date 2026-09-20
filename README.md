@@ -249,6 +249,31 @@ reports "1 real change, 1 in unreliable basecalls" rather than a flat count —
 which is what stops a good clone reading as divergent because the chemistry ran
 out. A read with no recorded quality says so instead of guessing.
 
+Hand the API a raw **FASTQ** and it answers a different question: *is this
+culture one thing?* Per-base allele fractions across all the reads, so a
+sub-population shows up as "this base is 10% T" rather than being averaged
+away. It matters because a consensus is a single read — a population of
+escapers each carrying a different inactivating mutation, none of them
+dominant, consenses back to wild type and looks perfectly clean. Differences
+sitting in unreliable basecalls are excluded and counted separately, because at
+1% the instrument's own error floor looks like a sub-population.
+
+### Expression
+
+Two questions a plasmid map alone won't answer. **Where does transcription
+start and stop** — a σ70 promoter scan and an intrinsic-terminator scan, both
+wrap-aware, one record per hairpin. And **what else transcribes this gene**:
+SpliceCraft walks the circle from every promoter to every CDS and reports the
+ones that reach it, the terminators in between, and whether they actually stop
+anything. A plasmid is a circle with no ends, so checking the terminators
+*downstream* of a cassette — the natural thing to do — cannot see a read-through
+arriving from behind. It separates "nothing is aimed at this gene" from
+"nothing the **host** polymerase can read reaches it", which is the difference
+between a cassette that is silent by design and one that is silent in the
+strain you actually transformed. **Codon analysis** reads an existing CDS the
+way the optimiser writes one: GC3, CAI, rare-codon load, tandem rare runs, the
+worst window, and the 5' ramp on its own.
+
 ### Experiments
 
 A genuine lab notebook in markdown: a split-pane editor, entries grouped into
@@ -344,11 +369,14 @@ enzyme-collection, and codon-table editors.
 
 ### Scripting
 
-A 230+ endpoint localhost JSON API (`splicecraft --agent`, or `--headless` for
+A 260+ endpoint localhost JSON API (`splicecraft --agent`, or `--headless` for
 a no-UI server with a `/healthz` probe) and a stdlib-only CLI
 (`splicecraft-cli`, including a `call` passthrough to every endpoint) drive
-every workflow. `/tools` self-describes each endpoint's request schema. See
-[`docs/agent-api.md`](docs/agent-api.md) and [`docs/cli.md`](docs/cli.md).
+every workflow. `/tools` self-describes each endpoint's request schema.
+`--agent --read-only` attaches **alongside a running GUI** — every read answers,
+every write returns 409 naming the process holding the lock, and nothing on
+disk changes. See [`docs/agent-api.md`](docs/agent-api.md) and
+[`docs/cli.md`](docs/cli.md).
 
 ## Documentation
 

@@ -42,7 +42,7 @@ from splicecraft_dataaccess import (_load_custom_labware, _load_protocol_collect
 from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _feat_len, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len, _span_in_span)
 from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi, _enzyme_is_type_iis)
-from splicecraft_codon import (_CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_cai, _codon_diversify, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
+from splicecraft_codon import (_CODON_RAMP_CODONS, _CODON_RARE_W, _codon_relative_adaptiveness, _CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_cai, _codon_diversify, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
 from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_all_experiments, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
 from splicecraft_experiments import (_EXPERIMENT_ACTIONS, _experiment_duplicate, _experiment_html_document, _experiment_markdown_document, _experiment_project_markdown, _experiment_ref_token_ok, _experiment_search, _experiment_snippet, _experiment_search_terms, _experiment_template_markdown, _experiments_referencing, _new_experiment_id, _normalise_experiment_entry, _protocol_steps_markdown, _sanitize_experiment_id)
 from splicecraft_fileio import (_PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
@@ -63,17 +63,18 @@ from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_des
 from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq,
                                 _topology_from_gb_text)
 from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
-from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript)
+from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript, _map_transcription)
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
 from splicecraft_biology import (_digest_with_enzymes, _enzyme_aliases, _enzyme_cuts, _enzyme_resolve_one, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
 from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _build_synthesis_l0_fragment, _design_gb_primers, _entry_vector_acceptor_overhangs, _grammar_position_by_type, _l0_part_from_syn_fragment)
 from splicecraft_dataaccess import (_active_enzyme_allowed_set, _agent_scan_library_for_key, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
-from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member)
+from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member, _fastq_path_to_records)
 from splicecraft_gels import (_AGAROSE_CHOICES, _GEL_HEIGHT_MAX, _GEL_HEIGHT_MIN, _GEL_LANE_WIDTH_MAX, _GEL_LANE_WIDTH_MIN, _GEL_MAX_LANES, _agarose_mobility, _gel_bands_for_lane, _render_gel_image)
 from splicecraft_persistence import (_safe_save_json_mirror)
-from splicecraft_primer import (_design_cloning_primers_raw, _design_detection_primers, _design_generic_primers, _primer_binding_sites, _primer_check_confidence, _primer_tm)
+from splicecraft_regulatory import (_PROMOTER_MIN_SCORE, _TERM_MAX_STEM, _TERM_MIN_STEM, _TERM_MIN_U_TRACT, _TERM_U_TRACT_WINDOW, _scan_promoters, _scan_terminators)
+from splicecraft_primer import (_AS_MIN_LEN, _design_allele_specific_primer, _design_cloning_primers_raw, _design_detection_primers, _design_generic_primers, _primer_binding_sites, _primer_check_confidence, _primer_tm)
 
 
 def _custom_enzyme_meta(name: str) -> "dict | None":
@@ -1214,6 +1215,275 @@ def _h_guide_cloning_oligos(app, payload):
             guide, add_g=bool(payload.get("add_g", True)), **kw)
     except ValueError as exc:
         return ({"error": str(exc)}, 400)
+
+
+@_agent_endpoint("analyse-cds")
+def _h_analyse_cds(app, payload):
+    """Read the codon usage of an EXISTING CDS — the read half of
+    ``optimize-protein``, which until now only wrote.
+
+    Body: ``{sequence | id | name, feature?, taxid?, transl_table?,
+    rare_w?, ramp_codons?}``. Pass a bare coding ``sequence``, or name a saved
+    plasmid with ``id`` / ``name`` plus the CDS ``feature`` label (omit
+    ``feature`` and the record's only CDS is used). ``taxid`` picks the codon
+    table; the active table is used otherwise, falling back to E. coli K12.
+
+    Returns ``{ok, source, cds_label, length_bp, n_codons, gc, gc3, cai,
+    rare_pct, n_rare, tandem_rare_runs, worst_window, ramp, table, warnings}``.
+
+      * ``cai`` is computed by the SAME function ``optimize-protein`` reports,
+        against the same table, so the two can be compared directly.
+      * ``rare_pct`` counts codons whose relative adaptiveness is below
+        ``rare_w`` (default 0.2, echoed in the response — it is a convention,
+        not a derived constant).
+      * ``tandem_rare_runs`` lists consecutive rare codons, which stall a
+        ribosome far more than the same codons scattered; a run is where the
+        cost actually lands, and a percentage alone hides them.
+      * ``worst_window`` is the lowest-CAI stretch, so a locally terrible
+        region inside a healthy average is visible.
+      * ``ramp`` reports the 5' end separately — a deliberately slow
+        translational ramp there is normal, and averaging it into the whole
+        gene flags healthy designs and hides unhealthy bodies.
+
+    Read-only. Nothing about the sequence is changed or saved."""
+    warnings: "list[str]" = []
+    raw_seq = payload.get("sequence")
+    cds_label = None
+    if isinstance(raw_seq, str) and raw_seq.strip():
+        dna, err = _sanitize_bases(raw_seq)
+        if err:
+            return ({"error": f"'sequence' rejected: {err}"}, 400)
+        source = "sequence"
+    else:
+        key = _sanitize_label(payload.get("id") or payload.get("name"),
+                              max_len=200)
+        if not key:
+            return ({"error": "provide 'sequence' (a CDS) or 'id' / 'name' "
+                              "naming a saved plasmid"}, 400)
+        entry = (_find_library_entry_by_id(key)
+                 or _find_library_entry_by_name(key))
+        if entry is None:
+            return ({"error": f"no library entry named {key!r}"}, 404)
+        try:
+            rec = _gb_text_to_record(entry.get("gb_text") or "")
+        except Exception as exc:
+            return ({"error": f"couldn't parse {key!r}: "
+                              f"{_scrub_path(str(exc))}"}, 500)
+        seq = str(getattr(rec, "seq", "") or "")
+        total = len(seq)
+        circular = _record_is_circular(rec)
+        want = _sanitize_label(payload.get("feature"), max_len=200)
+        cands = []
+        for feat in (getattr(rec, "features", []) or []):
+            if str(getattr(feat, "type", "")).upper() != "CDS":
+                continue
+            lbl = _feat_label(feat) or ""
+            if want and want.lower() not in lbl.lower():
+                continue
+            b = _feat_bounds(feat, total, circular=circular)
+            if b is None:
+                continue
+            cands.append((lbl, b, feat))
+        if not cands:
+            return ({"error": (f"no CDS feature matching {want!r} on {key!r}"
+                               if want else
+                               f"no CDS feature on {key!r}")}, 404)
+        if len(cands) > 1:
+            return ({"error": f"{len(cands)} CDS features match — pass "
+                              f"'feature' to pick one: "
+                              f"{sorted(c[0] or '(unlabelled)' for c in cands)}"},
+                    400)
+        cds_label, (fs, fe, fstrand), cds_feat = cands[0]
+        # ── Exons, not the outer span ────────────────────────────────
+        # A SPLICED CDS read as one contiguous block runs straight through
+        # its introns: every codon after the first intron is out of frame and
+        # the GC3 / CAI / rare-codon numbers are then confidently wrong for a
+        # gene the caller believes was measured. Reconstruct the coding
+        # sequence from the exons instead.
+        #
+        # The wrap-vs-splice test is the SAME one `_agent_transcript_feature_dicts`
+        # uses — an origin-WRAPPING feature is also a two-part compound
+        # location (sacred invariant #9), and reading its parts as exons would
+        # invent an intron spanning the backbone. `e >= s` means `_feat_bounds`
+        # did not already resolve the location as a wrap.
+        exons: "list[tuple[int, int]]" = []
+        if fe >= fs:
+            for part in (getattr(getattr(cds_feat, "location", None),
+                                 "parts", None) or []):
+                try:
+                    exons.append((int(part.start), int(part.end)))
+                except (TypeError, ValueError, AttributeError):
+                    exons = []
+                    break
+        if len(exons) > 1:
+            # Plus-strand order, then reverse-complement as a whole for a
+            # minus-strand gene — which is what `complement(join(...))` means.
+            exons.sort()
+            dna = "".join(seq[a:b] for a, b in exons)
+            if len(dna) != (fe - fs):
+                warnings.append(
+                    f"spliced CDS — {len(exons)} exons joined "
+                    f"({len(dna)} bp); the {(fe - fs) - len(dna)} bp of "
+                    f"intron between them are not counted")
+        else:
+            dna = (seq[fs:fe] if fe >= fs else seq[fs:] + seq[:fe])
+        if (fstrand or 1) < 0:
+            dna = _rc(dna)
+        # ── /codon_start ─────────────────────────────────────────────
+        # A CDS whose coding frame begins 1 or 2 bases into the feature (a
+        # partial 5' end) reads in the WRONG FRAME otherwise — every codon,
+        # and so every number in the answer, shifted by one base.
+        cs_quals = getattr(cds_feat, "qualifiers", None) or {}
+        cs_raw = (cs_quals.get("codon_start") or ["1"])[0]
+        try:
+            codon_start = int(str(cs_raw).strip())
+        except (TypeError, ValueError):
+            codon_start = 1
+        if codon_start in (2, 3):
+            dna = dna[codon_start - 1:]
+            warnings.append(
+                f"/codon_start={codon_start} — the first {codon_start - 1} "
+                f"base(s) are outside the reading frame and were trimmed")
+        source = f"{key}:{cds_label or 'CDS'}"
+
+    if len(dna) < 3:
+        return ({"error": "sequence is shorter than one codon"}, 422)
+    if len(dna) % 3:
+        warnings.append(f"length {len(dna)} is not a multiple of 3 — the "
+                        f"trailing {len(dna) % 3} base(s) are ignored")
+
+    # ── codon table ──────────────────────────────────────────────────
+    taxid = _sanitize_label(payload.get("taxid"), max_len=40)
+    if not taxid:
+        taxid = str(_get_setting("active_codon_table", "") or "").strip()
+    table = _codon_tables_get(taxid) if taxid else None
+    if table is None:
+        if taxid:
+            return ({"error": f"no codon table with taxid {taxid!r}; call "
+                              f"list-codon-tables"}, 404)
+        tables = _codon_tables_load()
+        table = tables[0] if tables else None
+        if table is None:
+            return ({"error": "no codon tables installed; call "
+                              "add-codon-table"}, 422)
+        warnings.append(f"no active codon table set — used "
+                        f"{table.get('name') or table.get('taxid')}")
+    raw = table.get("codons") or table.get("raw") or {}
+    if not raw:
+        return ({"error": f"codon table {table.get('name')!r} has no usage "
+                          f"data"}, 422)
+    tt = payload.get("transl_table")
+    if tt is not None:
+        tt = _coerce_int(tt, name="transl_table")
+        if isinstance(tt, str):
+            return ({"error": tt}, 400)
+
+    try:
+        rare_w = float(payload.get("rare_w", _CODON_RARE_W))
+    except (TypeError, ValueError):
+        return ({"error": "'rare_w' must be a number"}, 400)
+    if not (0.0 < rare_w <= 1.0):
+        return ({"error": "'rare_w' must be in (0, 1]"}, 400)
+    ramp_n = _coerce_int(payload.get("ramp_codons", _CODON_RAMP_CODONS),
+                         name="ramp_codons")
+    if isinstance(ramp_n, str):
+        return ({"error": ramp_n}, 400)
+    if ramp_n < 0:
+        return ({"error": "'ramp_codons' must be >= 0"}, 400)
+
+    try:
+        weights = _codon_relative_adaptiveness(dna, raw, transl_table=tt)
+        cai = _codon_cai(dna, raw, transl_table=tt)
+    except Exception as exc:
+        _log.exception("analyse-cds: codon scoring failed")
+        return ({"error": f"codon analysis failed: "
+                          f"{_scrub_path(str(exc))}"}, 500)
+
+    rare = [w for w in weights if w["w"] < rare_w]
+    # Tandem runs — consecutive CONTRIBUTING codons that are all rare. Indices
+    # come from `_codon_relative_adaptiveness`, which skips stops and
+    # single-codon families, so adjacency is judged on that list rather than on
+    # raw codon index: a Met between two rare codons does not break the run in
+    # any way a ribosome experiences.
+    runs: "list[dict]" = []
+    run_start = None
+    for pos, w in enumerate(weights):
+        is_rare = w["w"] < rare_w
+        if is_rare and run_start is None:
+            run_start = pos
+        elif not is_rare and run_start is not None:
+            if pos - run_start >= 2:
+                runs.append({"start_codon": weights[run_start]["index"],
+                             "length": pos - run_start,
+                             "codons": [x["codon"]
+                                        for x in weights[run_start:pos]]})
+            run_start = None
+    if run_start is not None and len(weights) - run_start >= 2:
+        runs.append({"start_codon": weights[run_start]["index"],
+                     "length": len(weights) - run_start,
+                     "codons": [x["codon"] for x in weights[run_start:]]})
+    runs.sort(key=lambda r: -r["length"])
+
+    # Worst CAI window — a local collapse hidden inside a healthy average.
+    import math as _math
+    win = min(30, len(weights))
+    worst = None
+    if win >= 5:
+        logs = [_math.log(max(x["w"], 1e-10)) for x in weights]
+        acc = 0.0
+        for i in range(len(logs)):
+            acc += logs[i]
+            if i >= win:
+                acc -= logs[i - win]
+            if i >= win - 1:
+                val = _math.exp(acc / win)
+                if worst is None or val < worst[0]:
+                    worst = (val, weights[i - win + 1]["index"],
+                             weights[i]["index"])
+
+    ramp = None
+    if ramp_n and len(weights) > ramp_n:
+        head = [_math.log(max(x["w"], 1e-10)) for x in weights[:ramp_n]]
+        tail = [_math.log(max(x["w"], 1e-10)) for x in weights[ramp_n:]]
+        ramp = {
+            "codons": ramp_n,
+            "cai_first": round(_math.exp(sum(head) / len(head)), 4),
+            "cai_rest": round(_math.exp(sum(tail) / len(tail)), 4),
+        }
+        ramp["slower_than_body"] = ramp["cai_first"] < ramp["cai_rest"]
+
+    n_codons = len(dna) // 3
+    _log_event("analyse.cds", n_codons=n_codons, cai=round(cai, 3),
+               taxid=table.get("taxid"), via="agent")
+    return {
+        "ok": True,
+        "source": source,
+        "cds_label": cds_label,
+        "length_bp": len(dna),
+        "n_codons": n_codons,
+        "n_scored_codons": len(weights),
+        "gc": round(_codon_gc(dna), 2),
+        "gc3": round(_codon_gc3(dna), 2),
+        "cai": round(cai, 4),
+        "rare_w": rare_w,
+        "n_rare": len(rare),
+        "rare_pct": (round(len(rare) * 100.0 / len(weights), 2)
+                     if weights else 0.0),
+        "rare_codons": [{"index": r["index"], "codon": r["codon"],
+                         "aa": r["aa"], "w": round(r["w"], 4)}
+                        for r in rare[:200]],
+        "tandem_rare_runs": runs[:50],
+        "worst_window": ({"cai": round(worst[0], 4),
+                          "start_codon": worst[1],
+                          "end_codon": worst[2],
+                          "window_codons": win} if worst else None),
+        "ramp": ramp,
+        "table": {"name": table.get("name"), "taxid": table.get("taxid")},
+        "warnings": warnings,
+        "ignored": _agent_ignored_keys(payload, {
+            "sequence", "id", "name", "feature", "taxid", "transl_table",
+            "rare_w", "ramp_codons"}),
+    }
 
 
 @_agent_endpoint("list-codon-tables")
@@ -7242,6 +7512,299 @@ def _agent_check_enzyme_list(names, *, field: str = "enzymes"):
     return None
 
 
+def _agent_resolve_scan_target(app, payload, *, want_record: bool = False):
+    """Resolve the molecule a regulatory scan runs over.
+
+    Returns ``(seq, circular, record_or_None, label, None)`` or
+    ``("", True, None, "", (error_dict, status))``.
+
+    As with `_agent_resolve_read_reference`, the error path carries sentinels
+    rather than ``None`` so the success values keep concrete types; the fifth
+    element is the one every caller checks.
+
+    Accepts a bare ``sequence``, a saved plasmid by ``id`` / ``name``, or —
+    when neither is given — the currently loaded record. `want_record` makes a
+    bare sequence an error, because a scan that needs FEATURES cannot get them
+    from loose bases and silently scanning with an empty feature list would
+    report every gene as absent rather than saying the input was wrong.
+    """
+    raw = payload.get("sequence")
+    if isinstance(raw, str) and raw.strip():
+        if want_record:
+            return ("", True, None, "",
+                    ({"error": "this endpoint needs annotations — pass 'id' "
+                               "or 'name' for a saved plasmid, or load one, "
+                               "rather than a bare 'sequence'"}, 400))
+        seq, err = _sanitize_bases(raw)
+        if err:
+            return ("", True, None, "",
+                    ({"error": f"'sequence' rejected: {err}"}, 400))
+        circ = payload.get("circular")
+        return (seq, (True if circ is None else bool(circ)), None,
+                "sequence", None)
+    key = _sanitize_label(payload.get("id") or payload.get("name"),
+                          max_len=200)
+    if key:
+        entry = (_find_library_entry_by_id(key)
+                 or _find_library_entry_by_name(key))
+        if entry is None:
+            return ("", True, None, "",
+                    ({"error": f"no library entry named {key!r}"}, 404))
+        try:
+            rec = _gb_text_to_record(entry.get("gb_text") or "")
+        except Exception as exc:
+            return ("", True, None, "",
+                    ({"error": f"couldn't parse {key!r}: "
+                               f"{_scrub_path(str(exc))}"}, 500))
+        label = entry.get("name") or key
+    else:
+        rec = getattr(app, "_current_record", None)
+        if rec is None:
+            return ("", True, None, "",
+                    ({"error": "no plasmid loaded and no 'id' / 'name' / "
+                               "'sequence' given"}, 422))
+        # Same resolution order as `PlasmidApp._record_display_name`, which
+        # is hub-side and so out of reach here: the TYPED display name first,
+        # LOCUS only as a fallback. Never `record.name` alone — the LOCUS is
+        # a sanitised, underscore-bearing 28-column field, not the name the
+        # user gave the plasmid ([INV-98]).
+        label = (_sanitize_label(getattr(rec, "_tui_display_name", None),
+                                 max_len=200)
+                 or _sanitize_label(getattr(rec, "name", None), max_len=200)
+                 or _sanitize_label(getattr(rec, "id", None), max_len=200)
+                 or "?")
+    seq = str(getattr(rec, "seq", "") or "")
+    if not seq:
+        return ("", True, None, "",
+                ({"error": f"{label!r} has no sequence"}, 422))
+    if len(seq) > _PAIRWISE_MAX_LEN:
+        return ("", True, None, "",
+                ({"error": f"{label!r} exceeds {_PAIRWISE_MAX_LEN:,} bp"},
+                 413))
+    circ_override = payload.get("circular")
+    circular = (_record_is_circular(rec) if circ_override is None
+                else bool(circ_override))
+    return (seq, circular, rec, label, None)
+
+
+@_agent_endpoint("scan-promoters")
+def _h_scan_promoters(app, payload):
+    """Scan for sigma-70 (-35 / spacer / -10) promoters.
+
+    Body: ``{sequence | id | name, circular?, both_strands?=true,
+    min_score?=0.75, limit?}``. Coordinates are FORWARD-strand and 0-based for
+    hits on either strand; on a circular molecule a promoter spanning the
+    origin is found at its real start.
+
+    Each hit: ``{start, end, strand, minus35, minus35_start, spacer, minus10,
+    minus10_start, tss, score, strength, components, model}``.
+
+    **`score` ranks, it does not predict.** It is a composite of named
+    components — how well each hexamer matches the consensus weighted by which
+    positions are conserved, the spacer geometry, and an extended -10 bonus —
+    and `components` breaks it out so a caller can show its working. There is
+    no trained model behind it and it is not a transcription rate. What it IS
+    good for is the question that gets asked: "does this insert carry a
+    cryptic promoter, and how does it compare with the others?"
+
+    `min_score` is calibrated rather than arbitrary: at the 0.75 default,
+    random DNA yields about one hit per kb per strand, while real promoters
+    from the built-in preset catalogue score 0.69-1.00 (median 0.77). Raise it
+    to 0.90 for unambiguous promoters only (~1 chance hit per 50 kb); lower it
+    to hunt weak ones and expect the noise. Read-only."""
+    seq, circular, _rec, label, err = _agent_resolve_scan_target(app, payload)
+    if err is not None:
+        return err
+    both = payload.get("both_strands")
+    both = True if both is None else bool(both)
+    min_score = payload.get("min_score")
+    if min_score is not None:
+        try:
+            min_score = float(min_score)
+        except (TypeError, ValueError):
+            return ({"error": "'min_score' must be a number"}, 400)
+        if not (0.0 <= min_score <= 1.0):
+            return ({"error": "'min_score' must be in [0, 1]"}, 400)
+    limit = _coerce_int(payload.get("limit", 500), name="limit")
+    if isinstance(limit, str):
+        return ({"error": limit}, 400)
+    if limit < 1:
+        return ({"error": "'limit' must be >= 1"}, 400)
+    try:
+        hits = _scan_promoters(seq, circular=circular, both_strands=both,
+                               min_score=min_score)
+    except Exception as exc:
+        _log.exception("scan-promoters failed")
+        return ({"error": f"scan failed: {_scrub_path(str(exc))}"}, 500)
+    _log_event("scan.promoters", length=len(seq), n_hits=len(hits),
+               via="agent")
+    return {"ok": True, "plasmid": label, "length": len(seq),
+            "circular": circular, "both_strands": both,
+            "min_score": (_PROMOTER_MIN_SCORE if min_score is None
+                          else min_score),
+            "n_hits": len(hits), "truncated": len(hits) > limit,
+            "hits": hits[:limit],
+            "ignored": _agent_ignored_keys(payload, {
+                "sequence", "id", "name", "circular", "both_strands",
+                "min_score", "limit"})}
+
+
+@_agent_endpoint("scan-terminators")
+def _h_scan_terminators(app, payload):
+    """Scan for intrinsic (Rho-independent) terminators: a stem-loop followed
+    by a U-tract.
+
+    Body: ``{sequence | id | name, circular?, both_strands?=true, min_stem?=5,
+    min_u_tract?=4, limit?}``. Coordinates are FORWARD-strand and 0-based for
+    hits on either strand.
+
+    Each hit: ``{start, end, strand, hairpin_start, hairpin_end, stem_len,
+    loop_len, u_tract, u_tract_start, dg, efficiency}``.
+
+    **ONE RECORD PER HAIRPIN.** Overlapping stem/loop registers of the same
+    structure are merged to the best one — a scan that reports every register
+    separately turns a single hairpin into twenty-odd "terminators", which is
+    worse than not scanning.
+
+    ``dg`` is a real Turner-2004 fold of the hairpin in kcal/mol (``null`` if
+    it could not be folded), not a heuristic. ``efficiency`` is a coarse named
+    tier — ``strong`` / ``moderate`` / ``weak`` — calibrated so that `strong`
+    covers every real intrinsic terminator in the built-in preset catalogue
+    (rrnB T1, T7 Tphi, lambda t0, T7Te, BBa_B1008: dg -12.1 to -31.3) while
+    random DNA reaches it about once per 25 kb. Never a percentage: how well a
+    terminator works in vivo depends on the polymerase and the strain.
+
+    Rho-DEPENDENT termination is not modelled and is not attempted — it has no
+    hairpin signature to scan for. Read-only."""
+    seq, circular, _rec, label, err = _agent_resolve_scan_target(app, payload)
+    if err is not None:
+        return err
+    both = payload.get("both_strands")
+    both = True if both is None else bool(both)
+    min_stem = _coerce_int(payload.get("min_stem", _TERM_MIN_STEM),
+                           name="min_stem")
+    if isinstance(min_stem, str):
+        return ({"error": min_stem}, 400)
+    # The ceilings are the scanner's own search bounds, not round numbers. A
+    # `min_stem` above `_TERM_MAX_STEM` (or a `min_u_tract` past the window the
+    # tract is measured in) can only ever return zero hits — and "0 terminators"
+    # reads as "this construct has no terminator", not as "that filter excluded
+    # every candidate there is". Same vacuous-pass refusal as an out-of-range
+    # `min_length` on `list-restriction-sites`.
+    if not (2 <= min_stem <= _TERM_MAX_STEM):
+        return ({"error": f"'min_stem' must be 2-{_TERM_MAX_STEM} — the "
+                          f"scanner searches stems up to {_TERM_MAX_STEM} bp, "
+                          f"so a higher floor would report zero terminators "
+                          f"for every sequence"}, 400)
+    min_u = _coerce_int(payload.get("min_u_tract", _TERM_MIN_U_TRACT),
+                        name="min_u_tract")
+    if isinstance(min_u, str):
+        return ({"error": min_u}, 400)
+    if not (1 <= min_u <= _TERM_U_TRACT_WINDOW):
+        return ({"error": f"'min_u_tract' must be 1-{_TERM_U_TRACT_WINDOW} — "
+                          f"the U-tract is measured over a "
+                          f"{_TERM_U_TRACT_WINDOW}-base window, so a higher "
+                          f"floor would report zero terminators for every "
+                          f"sequence"}, 400)
+    limit = _coerce_int(payload.get("limit", 500), name="limit")
+    if isinstance(limit, str):
+        return ({"error": limit}, 400)
+    if limit < 1:
+        return ({"error": "'limit' must be >= 1"}, 400)
+    try:
+        hits = _scan_terminators(seq, circular=circular, both_strands=both,
+                                 min_stem=min_stem, min_u_tract=min_u)
+    except Exception as exc:
+        _log.exception("scan-terminators failed")
+        return ({"error": f"scan failed: {_scrub_path(str(exc))}"}, 500)
+    _log_event("scan.terminators", length=len(seq), n_hits=len(hits),
+               via="agent")
+    return {"ok": True, "plasmid": label, "length": len(seq),
+            "circular": circular, "both_strands": both,
+            "min_stem": min_stem, "min_u_tract": min_u,
+            "n_hits": len(hits), "truncated": len(hits) > limit,
+            "hits": hits[:limit],
+            "ignored": _agent_ignored_keys(payload, {
+                "sequence", "id", "name", "circular", "both_strands",
+                "min_stem", "min_u_tract", "limit"})}
+
+
+@_agent_endpoint("map-transcription")
+def _h_map_transcription(app, payload):
+    """Walk the circle from every promoter to every CDS — "what ELSE
+    transcribes this gene?"
+
+    Body: ``{id? | name?, circular?, include_predicted?=true,
+    min_promoter_score?, max_distance?}``. Omit `id`/`name` to use the loaded
+    plasmid. Needs an annotated record (CDS features), so a bare sequence is
+    refused rather than silently answered with no genes.
+
+    **Why this is not `predict-transcript`.** That endpoint reconstructs the
+    mature message of ONE unit, and to do it the caller must already name the
+    promoter driving the CDS. It therefore cannot answer the question that
+    costs bench time: a plasmid is a circle, every promoter on it transcribes
+    until something stops it, and on a construct with no designed insulators
+    that can be the whole way round. Checking terminators DOWNSTREAM of a
+    cassette — the natural thing to do — cannot see a read-through, because
+    the read-through arrives from behind.
+
+    Returns ``{ok, length, circular, n_promoters, n_terminators, n_cds,
+    promoters, terminators, genes, warnings}``. Per gene: ``reachable_from``
+    (each ``{promoter, distance_bp, direction, terminators_between,
+    readthrough}``), ``primary``, ``silent``, plus ``host_driven_by`` /
+    ``silent_in_host`` / ``host_primary``.
+
+    ``readthrough`` is ``clear`` / ``attenuated`` / ``blocked`` — a coarse
+    named call over the terminators in the way, never a percentage.
+
+    **`silent` and `silent_in_host` are different claims and the gap between
+    them is the point.** `silent` means nothing at all is aimed at the gene.
+    `silent_in_host` means nothing the HOST polymerase can read reaches it —
+    so a T7-only cassette is `silent_in_host` in a strain with no T7 RNAP,
+    UNLESS something else on the circle reads through into it, which is
+    exactly the case that looks like a mystery at the bench. Each promoter
+    carries ``host_recognised`` with the ``host_basis`` that decided it.
+
+    With `include_predicted` (default true), scanned sigma-70 promoters and
+    intrinsic terminators are folded in beside the annotated ones, each tagged
+    ``source``. Read-only, heavy."""
+    seq, circular, rec, label, err = _agent_resolve_scan_target(
+        app, payload, want_record=True)
+    if err is not None:
+        return err
+    inc = payload.get("include_predicted")
+    inc = True if inc is None else bool(inc)
+    min_score = payload.get("min_promoter_score")
+    if min_score is not None:
+        try:
+            min_score = float(min_score)
+        except (TypeError, ValueError):
+            return ({"error": "'min_promoter_score' must be a number"}, 400)
+        if not (0.0 <= min_score <= 1.0):
+            return ({"error": "'min_promoter_score' must be in [0, 1]"}, 400)
+    max_distance = payload.get("max_distance")
+    if max_distance is not None:
+        max_distance = _coerce_int(max_distance, name="max_distance")
+        if isinstance(max_distance, str):
+            return ({"error": max_distance}, 400)
+        if max_distance < 1:
+            return ({"error": "'max_distance' must be >= 1"}, 400)
+    feats = _agent_transcript_feature_dicts(rec)
+    try:
+        out = _map_transcription(seq, feats, circular=circular,
+                                 include_predicted=inc,
+                                 min_promoter_score=min_score,
+                                 max_distance=max_distance)
+    except Exception as exc:
+        _log.exception("map-transcription failed")
+        return ({"error": f"map failed: {_scrub_path(str(exc))}"}, 500)
+    out["plasmid"] = label
+    out["ignored"] = _agent_ignored_keys(payload, {
+        "id", "name", "circular", "include_predicted", "min_promoter_score",
+        "max_distance", "host"})
+    return out
+
+
 @_agent_endpoint("predict-transcript")
 def _h_predict_transcript(app, payload):
     """Reconstruct the MATURE mRNA of an annotated transcription unit on the
@@ -7828,6 +8391,62 @@ def _h_diff_plasmid(app, payload):
 _VERIFY_READS_MAX = 200   # one alignment per read — cap the batch size
 
 
+def _agent_resolve_read_reference(payload):
+    """Resolve the reference a read-comparison endpoint works against.
+
+    Returns ``(ref_seq, circular, None)`` on success, or
+    ``("", True, (error_dict, status))`` to return straight to the caller.
+
+    The error path carries harmless SENTINELS rather than ``None`` so the
+    success values keep their concrete types. A caller that checks the third
+    element (as every caller does) never reads them, and typing them
+    ``str | None`` would force an assert at each callsite to say something the
+    control flow already guarantees.
+
+    Accepts a bare ``reference`` sequence, or ``reference_id`` /
+    ``reference_name`` naming a saved plasmid (whose stored topology then sets
+    ``circular`` unless the body overrides it). Shared by
+    `verify-against-reads` and `analyse-read-heterogeneity` rather than copied:
+    two resolvers that disagree about what ``circular`` defaults to would make
+    the same reads answer differently depending on which endpoint asked, and a
+    wrong topology silently re-frames every coordinate in the answer.
+    """
+    circular_override = payload.get("circular")
+    circular = bool(circular_override) if circular_override is not None else True
+    ref_raw = payload.get("reference")
+    if isinstance(ref_raw, str) and ref_raw.strip():
+        ref_seq, e = _sanitize_bases(ref_raw)
+        if e:
+            return ("", True, ({"error": f"'reference' rejected: {e}"}, 400))
+    else:
+        key = _sanitize_label(payload.get("reference_id")
+                              or payload.get("reference_name"), max_len=200)
+        if not key:
+            return ("", True,
+                    ({"error": "provide 'reference' (a sequence) or "
+                               "'reference_id' / 'reference_name'"}, 400))
+        entry = (_find_library_entry_by_id(key)
+                 or _find_library_entry_by_name(key))
+        if entry is None:
+            return ("", True,
+                    ({"error": f"no library entry named {key!r}"}, 404))
+        try:
+            rec = _gb_text_to_record(entry.get("gb_text") or "")
+        except Exception as exc:
+            return ("", True,
+                    ({"error": f"couldn't parse {key!r}: "
+                               f"{_scrub_path(str(exc))}"}, 500))
+        ref_seq = str(getattr(rec, "seq", "") or "")
+        if circular_override is None:
+            circular = (rec.annotations.get("topology") or "").lower() != "linear"
+    if not ref_seq:
+        return ("", True, ({"error": "reference sequence is empty"}, 422))
+    if len(ref_seq) > _PAIRWISE_MAX_LEN:
+        return ("", True,
+                ({"error": f"reference exceeds {_PAIRWISE_MAX_LEN:,} bp"}, 413))
+    return (ref_seq, circular, None)
+
+
 @_agent_endpoint("verify-against-reads")
 def _h_verify_against_reads(app, payload):
     """Verify a designed construct against sequencing reads — the "I built X, I
@@ -7873,35 +8492,9 @@ def _h_verify_against_reads(app, payload):
         return ({"error": "'min_identity' must be a number"}, 400)
     if not (0.0 <= min_identity <= 100.0):
         return ({"error": "'min_identity' must be in [0, 100]"}, 400)
-    circular_override = payload.get("circular")
-    circular = bool(circular_override) if circular_override is not None else True
-    ref_raw = payload.get("reference")
-    if isinstance(ref_raw, str) and ref_raw.strip():
-        ref_seq, e = _sanitize_bases(ref_raw)
-        if e:
-            return ({"error": f"'reference' rejected: {e}"}, 400)
-    else:
-        key = _sanitize_label(payload.get("reference_id")
-                              or payload.get("reference_name"), max_len=200)
-        if not key:
-            return ({"error": "provide 'reference' (a sequence) or "
-                              "'reference_id' / 'reference_name'"}, 400)
-        entry = (_find_library_entry_by_id(key)
-                 or _find_library_entry_by_name(key))
-        if entry is None:
-            return ({"error": f"no library entry named {key!r}"}, 404)
-        try:
-            rec = _gb_text_to_record(entry.get("gb_text") or "")
-        except Exception as exc:
-            return ({"error":
-                      f"couldn't parse {key!r}: {_scrub_path(str(exc))}"}, 500)
-        ref_seq = str(getattr(rec, "seq", "") or "")
-        if circular_override is None:
-            circular = (rec.annotations.get("topology") or "").lower() != "linear"
-    if not ref_seq:
-        return ({"error": "reference sequence is empty"}, 422)
-    if len(ref_seq) > _PAIRWISE_MAX_LEN:
-        return ({"error": f"reference exceeds {_PAIRWISE_MAX_LEN:,} bp"}, 413)
+    ref_seq, circular, ref_err = _agent_resolve_read_reference(payload)
+    if ref_err is not None:
+        return ref_err
     reads = payload.get("reads")
     if not isinstance(reads, list) or not reads:
         return ({"error": "'reads' must be a non-empty list of sequences"}, 400)
@@ -8023,6 +8616,356 @@ def _h_verify_against_reads(app, payload):
                 "reference", "reference_id", "reference_name", "reads",
                 "circular", "mode", "min_identity", "read_quality",
                 "min_phred"})}
+
+
+# ── Sub-consensus read heterogeneity ──────────────────────────────────
+# `read-consensus` answers "do my reads agree with each other", and
+# `verify-against-reads` answers "do my reads match the design". Neither
+# answers "is what I sequenced ONE thing" — a consensus is a single read, so a
+# population of escapers each carrying a different inactivating mutation,
+# none of them dominant, consenses back to wild type and reads as clean.
+_HETERO_READS_MAX = 400          # one full alignment per read — bound the batch
+# A read count alone does NOT bound the work: the rotation-aware aligner costs
+# roughly 0.18 s per read against a 3 kb reference and 4.5 s against 30 kb
+# (measured), so 400 reads on a 30 kb molecule is half an hour in ONE request
+# — long enough to pin a worker thread past any client timeout. The real
+# budget is reads x reference length, and it is enforced rather than hoped for.
+#
+# 1,000,000 bp-reads works out to ~330 reads on a 3 kb plasmid, ~100 on 10 kb
+# and ~33 on 30 kb, each landing in the 60-150 s range. `max_reads` can only
+# LOWER this, never raise it; a caller who needs more depth on a large
+# molecule subsamples and calls again. Whenever the budget bites, the response
+# says so in `capped_by` and in a warning — a quietly truncated read set would
+# change every allele fraction in the answer without saying why.
+_HETERO_WORK_BUDGET_BP = 1_000_000
+_HETERO_MIN_FRACTION_DEFAULT = 0.01     # 1% — below this is basecall noise
+# A position this much of the population disagrees at is not a "minor" variant
+# any more; the sample is substantially not one thing.
+_HETERO_MIXED_FRACTION = 0.25
+# …or this many distinct positions carry a real sub-population. This is the
+# escaper signature specifically: many different mutations, no single dominant
+# one, which is invisible to any per-position majority test.
+_HETERO_MIXED_MIN_POSITIONS = 5
+
+
+@_agent_endpoint("analyse-read-heterogeneity")
+def _h_analyse_read_heterogeneity(app, payload):
+    """Per-base ALLELE FRACTIONS from raw reads — "is this culture one thing?"
+
+    Body: ``{reference | reference_id | reference_name,
+    reads_path | reads: [str, ...], read_quality?, min_fraction?=0.01,
+    min_phred?=20, max_reads?, circular?, mode?="global"}``.
+
+    `reads_path` points at a FASTQ (`.fastq` / `.fq`); its per-base Phred
+    arrays are read straight off the file, which is the normal way to call
+    this. `reads` passes sequences inline instead, with optional parallel
+    `read_quality` arrays — the same shape `verify-against-reads` takes.
+
+    **Why this is not `read-consensus`.** That endpoint reads the alignments
+    STORED on a plasmid, and a Plasmidsaurus consensus is one read: depth 1
+    everywhere, so anything below the consensus is invisible. A heterogeneous
+    population — many different mutations, none dominant — consenses to wild
+    type and reads as a clean, clonal culture. Only the raw reads carry that
+    signal, and only as a FRACTION: `alt_reads / depth`.
+
+    Returns ``{ok, reference_len, n_reads, reads_source, circular, mean_depth,
+    covered_bp, covered_pct, uncovered_spans, verdict, positions, thresholds,
+    n_positions, n_filtered_low_quality, dropped_reads}`` where each entry of
+    `positions` is ``{pos, type, ref, alt, alt_reads, depth, fraction,
+    mean_phred, contradicted}``, sorted by descending fraction.
+
+    `verdict` is:
+      * ``clonal`` — nothing above `min_fraction`; the reads are one sequence.
+      * ``minor_variants`` — a sub-population exists but is small and focal.
+      * ``mixed`` — a position at/above 25% of the reads, OR 5+ distinct
+        positions carrying real sub-populations (the escaper signature).
+      * ``no_reads`` — nothing aligned.
+
+    **`fraction`'s denominator is every read that COVERED the base**, including
+    the ones that disagreed, so a variant inside a region only two reads reached
+    cannot read as 100%. `mean_phred` is the mean basecall quality of the reads
+    SUPPORTING the call; observations whose backing basecall is below
+    `min_phred` are excluded from `alt_reads` and counted in
+    `n_filtered_low_quality`, because at 1% every instrument's error floor
+    otherwise looks like a sub-population. An observation with no quality at
+    all is counted (unknown is not the same as bad).
+
+    The thresholds that produced `verdict` are echoed in `thresholds` — they
+    are conventions, not a calibrated model, and a caller re-deriving its own
+    call from `positions` should be able to see exactly what these were.
+    Read-only, heavy — one alignment per read."""
+    ref_seq, circular, ref_err = _agent_resolve_read_reference(payload)
+    if ref_err is not None:
+        return ref_err
+    mode = payload.get("mode", "global")
+    if mode not in ("global", "local"):
+        return ({"error": "'mode' must be 'global' or 'local'"}, 400)
+    try:
+        min_fraction = float(payload.get("min_fraction",
+                                         _HETERO_MIN_FRACTION_DEFAULT))
+    except (TypeError, ValueError):
+        return ({"error": "'min_fraction' must be a number"}, 400)
+    if not (0.0 < min_fraction <= 1.0):
+        return ({"error": "'min_fraction' must be in (0, 1]"}, 400)
+    min_phred = _coerce_int(payload.get("min_phred", 20), name="min_phred")
+    if isinstance(min_phred, str):
+        return ({"error": min_phred}, 400)
+    if not (0 <= min_phred <= 93):
+        return ({"error": "'min_phred' must be 0-93"}, 400)
+    max_reads = _coerce_int(payload.get("max_reads", _HETERO_READS_MAX),
+                            name="max_reads")
+    if isinstance(max_reads, str):
+        return ({"error": max_reads}, 400)
+    if not (1 <= max_reads <= _HETERO_READS_MAX):
+        return ({"error": f"'max_reads' must be 1-{_HETERO_READS_MAX}"}, 400)
+    # Work budget — see `_HETERO_WORK_BUDGET_BP`. Applied here so it bounds
+    # BOTH read sources, and only ever downwards.
+    budget_reads = max(1, _HETERO_WORK_BUDGET_BP // max(1, len(ref_seq)))
+    capped_by = None
+    if budget_reads < max_reads:
+        max_reads = budget_reads
+        capped_by = "work_budget"
+    elif payload.get("max_reads") is not None:
+        capped_by = "max_reads"
+
+    # ── Reads: a FASTQ on disk, or inline sequences ──────────────────
+    reads_path = payload.get("reads_path")
+    inline = payload.get("reads")
+    if reads_path is not None and inline is not None:
+        return ({"error": "pass 'reads_path' OR 'reads', not both"}, 400)
+    seqs: "list[str]" = []
+    quals: "list" = []
+    dropped: "list[dict]" = []
+    if reads_path is not None:
+        p = _sanitize_path(reads_path)
+        if p is None:
+            return ({"error": "'reads_path' is not a usable path"}, 400)
+        if not p.exists():
+            return ({"error": f"no such file: {_scrub_path(str(p))}"}, 404)
+        if p.suffix.lower() not in (".fastq", ".fq"):
+            return ({"error": f"'reads_path' must be .fastq / .fq "
+                              f"(got {p.suffix or 'no extension'!r}). Per-base "
+                              f"quality is what separates a real 1% variant "
+                              f"from the instrument's error floor, and only "
+                              f"FASTQ carries it."}, 400)
+        try:
+            recs = _fastq_path_to_records(str(p))
+        except ValueError as exc:
+            return ({"error": f"could not read FASTQ: "
+                              f"{_scrub_path(str(exc))}"}, 400)
+        except OSError as exc:
+            return ({"error": f"could not read FASTQ: "
+                              f"{_scrub_path(str(exc))}"}, 500)
+        source = "fastq"
+        for i, rec in enumerate(recs[:max_reads]):
+            rs, e = _sanitize_bases(str(getattr(rec, "seq", "") or ""))
+            if e or not rs:
+                dropped.append({"index": i, "reason": e or "empty"})
+                continue
+            if len(rs) > _PAIRWISE_MAX_LEN:
+                dropped.append({"index": i, "reason": "over length cap"})
+                continue
+            seqs.append(rs)
+            q = (getattr(rec, "letter_annotations", {}) or {}).get(
+                "phred_quality")
+            quals.append([int(v) for v in q] if q else None)
+        n_available = len(recs)
+    else:
+        if not isinstance(inline, list) or not inline:
+            return ({"error": "provide 'reads_path' (a FASTQ) or 'reads' "
+                              "(a non-empty list of sequences)"}, 400)
+        source = "inline"
+        rq = payload.get("read_quality")
+        if rq is not None:
+            if not isinstance(rq, list):
+                return ({"error": "'read_quality' must be a list parallel to "
+                                  "'reads' (null for a read with no quality)"},
+                        400)
+            if len(rq) != len(inline):
+                return ({"error": f"'read_quality' has {len(rq)} entries for "
+                                  f"{len(inline)} reads — they must be "
+                                  f"parallel"}, 400)
+        for i, r in enumerate(inline[:max_reads]):
+            rs, e = _sanitize_bases(r if isinstance(r, str) else "")
+            if e or not rs:
+                return ({"error": f"reads[{i}] rejected: {e or 'empty'}"}, 400)
+            if len(rs) > _PAIRWISE_MAX_LEN:
+                return ({"error": f"reads[{i}] exceeds "
+                                  f"{_PAIRWISE_MAX_LEN:,} bp"}, 413)
+            seqs.append(rs)
+            one = rq[i] if isinstance(rq, list) and i < len(rq) else None
+            if one is None:
+                quals.append(None)
+                continue
+            if not isinstance(one, list) or not all(
+                    isinstance(v, (int, float)) and not isinstance(v, bool)
+                    for v in one):
+                return ({"error": f"read_quality[{i}] must be a list of "
+                                  f"numbers or null"}, 400)
+            quals.append([int(v) for v in one])
+        n_available = len(inline)
+
+    thresholds = {"min_fraction": min_fraction, "min_phred": min_phred,
+                  "mixed_fraction": _HETERO_MIXED_FRACTION,
+                  "mixed_min_positions": _HETERO_MIXED_MIN_POSITIONS}
+    hetero_warnings: "list[str]" = []
+    if n_available > max_reads:
+        hetero_warnings.append(
+            f"{n_available} reads available but only {max_reads} were used"
+            + (f" — the {_HETERO_WORK_BUDGET_BP:,} bp-read work budget allows "
+               f"{max_reads} against a {len(ref_seq):,} bp reference. Every "
+               f"fraction below is computed from those {max_reads} reads."
+               if capped_by == "work_budget"
+               else f" ('max_reads'). Every fraction below is computed from "
+                    f"those {max_reads} reads."))
+    if dropped:
+        hetero_warnings.append(f"{len(dropped)} read(s) were unusable and "
+                               f"excluded; see 'dropped_reads'")
+    base = {"ok": True, "reference_len": len(ref_seq), "circular": circular,
+            "reads_source": source, "reads_available": n_available,
+            "max_reads": max_reads, "capped_by": capped_by,
+            "work_budget_bp": _HETERO_WORK_BUDGET_BP,
+            "warnings": hetero_warnings,
+            "thresholds": thresholds,
+            "dropped_reads": dropped,
+            "ignored": _agent_ignored_keys(payload, {
+                "reference", "reference_id", "reference_name", "reads",
+                "reads_path", "read_quality", "min_fraction", "min_phred",
+                "max_reads", "circular", "mode"})}
+    if not seqs:
+        return {**base, "n_reads": 0, "mean_depth": 0.0, "covered_bp": 0,
+                "covered_pct": 0.0,
+                "uncovered_spans": [[0, len(ref_seq)]] if ref_seq else [],
+                "verdict": "no_reads", "positions": [], "n_positions": 0,
+                "n_filtered_low_quality": 0, "n_no_call_observations": 0}
+
+    # ── Align every read, then reuse the cross-read rollup ───────────
+    aligned: "list[dict]" = []
+    for i, rs in enumerate(seqs):
+        try:
+            res = _state._pick_best_rotation_hook(
+                rs, ref_seq, is_circular=circular, mode=mode,
+                canvas_axis="target")
+        except ValueError as exc:
+            return ({"error": f"reads[{i}] alignment rejected: {exc}"}, 400)
+        except Exception as exc:
+            _log.exception("analyse-read-heterogeneity: alignment raised")
+            return ({"error": f"alignment failed: "
+                              f"{_scrub_path(str(exc))}"}, 500)
+        aligned.append({"result": res, "axis": "target",
+                        "query_label": f"read {i + 1}"})
+    # `_multi_read_summary` owns the per-bp depth sweep, the coverage and the
+    # uncovered spans — the denominator of every fraction below. Reused rather
+    # than re-derived: a second depth sweep that disagreed with the one
+    # `read-consensus` reports would make the two endpoints contradict each
+    # other about the same reads.
+    roll = _state._multi_read_summary_hook(aligned, len(ref_seq))
+    depth_of = {(int(v["target_pos"]), v["type"], v.get("alt", "")): v
+                for v in (roll.get("variants") or [])}
+
+    # ── Quality-filtered per-position tally ──────────────────────────
+    # Support is recounted HERE rather than taken from the rollup because a
+    # fraction is only as meaningful as the basecalls behind it: at 1% the
+    # error floor of every instrument looks like a sub-population.
+    tally: dict = {}
+    n_filtered = 0
+    n_no_call = 0
+    for i, entry in enumerate(aligned):
+        res = entry["result"]
+        aq = res.get("aligned_q") or ""
+        at = res.get("aligned_t") or ""
+        q = quals[i] if i < len(quals) else None
+        for v in _state._alignment_variants_in_axis_hook(entry):
+            if v.get("type") == "truncated":
+                continue
+            key = (int(v.get("target_pos", 0) or 0), v.get("type"),
+                   v.get("alt", ""))
+            if key not in depth_of:
+                # Outside the read's observed extent — the rollup already
+                # excluded it (a global alignment reports the unread remainder
+                # as one long deletion). Honour that same decision.
+                continue
+            # A NO-CALL IS NOT AN ALLELE. A basecaller that emits `N` is saying
+            # it could not read that base, and counting it as a difference
+            # turns one ordinary read with a ten-base N run into a ten-position
+            # "10% sub-population" and the whole sample into `mixed`. Real
+            # long-read data carries N runs routinely, so this fired on almost
+            # every genuine dataset. An ambiguity code in the REFERENCE is the
+            # same problem from the other side: every read then looks variant
+            # against a base the reference does not actually specify.
+            # Counted, not silently dropped — ambiguous coverage is a fact
+            # about the data the caller should see.
+            _alt = str(v.get("alt", "") or "")
+            _ref = str(v.get("ref", "") or "")
+            if (_alt and any(c not in "ACGT" for c in _alt)) or \
+                    (_ref and any(c not in "ACGT" for c in _ref)):
+                n_no_call += 1
+                continue
+            ph = None
+            if q:
+                try:
+                    ph = _state._variant_phred_hook(v, aq, at, q)
+                except Exception:
+                    _log.exception("analyse-read-heterogeneity: phred lookup "
+                                   "failed")
+                    ph = None
+            if ph is not None and ph < min_phred:
+                n_filtered += 1
+                continue
+            slot = tally.setdefault(key, {"n": 0, "phred_sum": 0,
+                                          "phred_n": 0})
+            slot["n"] += 1
+            if ph is not None:
+                slot["phred_sum"] += ph
+                slot["phred_n"] += 1
+
+    positions: "list[dict]" = []
+    for key, slot in tally.items():
+        pos, vtype, alt = key
+        ref_v = depth_of[key]
+        d = int(ref_v.get("depth") or 0)
+        if d <= 0:
+            continue
+        frac = slot["n"] / d
+        if frac < min_fraction:
+            continue
+        positions.append({
+            "pos":          pos,
+            "type":         vtype,
+            "ref":          ref_v.get("ref", ""),
+            "alt":          alt,
+            "alt_reads":    slot["n"],
+            "depth":        d,
+            "fraction":     round(frac, 4),
+            "contradicted": max(0, d - slot["n"]),
+            "mean_phred":   (round(slot["phred_sum"] / slot["phred_n"], 1)
+                             if slot["phred_n"] else None),
+        })
+    positions.sort(key=lambda p: (-p["fraction"], p["pos"]))
+
+    n_pos = len(positions)
+    if not n_pos:
+        verdict = "clonal"
+    elif (any(p["fraction"] >= _HETERO_MIXED_FRACTION for p in positions)
+            or n_pos >= _HETERO_MIXED_MIN_POSITIONS):
+        verdict = "mixed"
+    else:
+        verdict = "minor_variants"
+
+    total_bp = int(roll.get("total_bp") or len(ref_seq))
+    covered_bp = int(roll.get("covered_bp") or 0)
+    _log_event("analyse.heterogeneity", n_reads=len(seqs), verdict=verdict,
+               n_positions=n_pos, source=source, via="agent")
+    return {**base, "n_reads": len(seqs),
+            "mean_depth": roll.get("mean_depth", 0.0),
+            "max_depth": roll.get("max_depth", 0),
+            "covered_bp": covered_bp,
+            "covered_pct": roll.get("covered_pct", 0.0),
+            "uncovered_spans": roll.get("uncovered_spans") or [],
+            "total_bp": total_bp,
+            "verdict": verdict, "positions": positions, "n_positions": n_pos,
+            "n_filtered_low_quality": n_filtered,
+            "n_no_call_observations": n_no_call}
 
 
 @_agent_endpoint("align-plasmidsaurus-zip")
@@ -9637,6 +10580,196 @@ def _h_design_synthesis_fragment(app, payload):
     return {"ok": True, "result": result}
 
 
+_AS_OFF_TARGET_MAX = 20          # named off-target templates per call
+_AS_SEED_LEN = 12                # 3'-anchor length for a binding call
+
+
+def _agent_design_allele_specific(template: str, payload):
+    """`design-primers` with ``mode: "allele_specific"``.
+
+    Body: ``{template, variant_pos, alt_base?, orientation?="auto",
+    partner_primer?, off_targets?, target_tm?=60, destabilize?=false,
+    circular?=false}``.
+
+    Designs the DISCRIMINATING primer — the one whose 3'-terminal base sits on
+    the variant — and reports how specific it actually is. ``off_targets`` is
+    ``{name: sequence}`` (or a list of ``{name, sequence}``); every template
+    given, plus the main one, is searched for 3'-seeded binding sites, because
+    "this primer is allele-specific" is a claim about where it does NOT bind
+    and cannot be made from the primer alone.
+
+    ``partner_primer`` is the common (non-discriminating) primer of the pair;
+    when given, its binding sites are reported too and the expected product
+    size is computed.
+    """
+    variant_pos = _coerce_int(payload.get("variant_pos"), name="variant_pos")
+    if isinstance(variant_pos, str):
+        return ({"error": variant_pos}, 400)
+    n = len(template)
+    if not (0 <= variant_pos < n):
+        return ({"error": f"'variant_pos' {variant_pos} out of range for a "
+                          f"{n}-bp template"}, 400)
+    alt_raw = payload.get("alt_base")
+    alt_base = None
+    if alt_raw is not None:
+        if not isinstance(alt_raw, str) or len(alt_raw.strip()) != 1 \
+                or alt_raw.strip().upper() not in "ACGT":
+            return ({"error": "'alt_base' must be a single A/C/G/T base"}, 400)
+        alt_base = alt_raw.strip().upper()
+    orientation = payload.get("orientation", "auto")
+    if orientation not in ("auto", "fwd", "rev"):
+        return ({"error": "'orientation' must be 'auto', 'fwd' or 'rev'"}, 400)
+    try:
+        target_tm = float(payload.get("target_tm", 60.0))
+    except (TypeError, ValueError):
+        return ({"error": "'target_tm' must be a number"}, 400)
+    if not (40.0 <= target_tm <= 90.0):
+        return ({"error": "'target_tm' must be in [40, 90] °C"}, 400)
+    circular = bool(payload.get("circular", False))
+    destabilize = bool(payload.get("destabilize", False))
+
+    best = _design_allele_specific_primer(
+        template, variant_pos, alt_base=alt_base, orientation=orientation,
+        target_tm=target_tm, destabilize=destabilize, circular=circular)
+    if best is None:
+        return ({"error": f"could not place an allele-specific primer at "
+                          f"{variant_pos} — the template has fewer than "
+                          f"{_AS_MIN_LEN} bases on the needed side (pass "
+                          f"circular: true if it wraps)"}, 422)
+
+    # ── Specificity: where ELSE does this 3' end anchor? ─────────────
+    off_raw = payload.get("off_targets")
+    templates: "list[tuple[str, str]]" = [("template", template)]
+    if off_raw is not None:
+        items = []
+        if isinstance(off_raw, dict):
+            items = list(off_raw.items())
+        elif isinstance(off_raw, list):
+            for e in off_raw:
+                if not isinstance(e, dict):
+                    return ({"error": "'off_targets' list entries must be "
+                                      "{name, sequence} objects"}, 400)
+                items.append((e.get("name"), e.get("sequence")))
+        else:
+            return ({"error": "'off_targets' must be {name: sequence} or a "
+                              "list of {name, sequence}"}, 400)
+        if len(items) > _AS_OFF_TARGET_MAX:
+            return ({"error": f"too many off_targets (max "
+                              f"{_AS_OFF_TARGET_MAX})"}, 413)
+        for nm, sq in items:
+            nm = _sanitize_label(nm, max_len=120) or "?"
+            clean, err = _sanitize_bases(sq if isinstance(sq, str) else "")
+            if err or not clean:
+                return ({"error": f"off_target {nm!r} rejected: "
+                                  f"{err or 'empty'}"}, 400)
+            if len(clean) > _PAIRWISE_MAX_LEN:
+                return ({"error": f"off_target {nm!r} exceeds "
+                                  f"{_PAIRWISE_MAX_LEN:,} bp"}, 413)
+            templates.append((nm, clean))
+
+    def _covers(site, pos, total):
+        """Does this footprint span `pos`, wrapping if circular?"""
+        if total <= 0:
+            return False
+        off = (pos - site["foot_start"]) % total
+        return off < site["length"]
+
+    specificity: "list[dict]" = []
+    n_intended = 0
+    n_off = 0
+    for name, seq in templates:
+        try:
+            sites = _primer_binding_sites(best["seq"], seq, len(seq),
+                                          circular=circular,
+                                          seed_len=_AS_SEED_LEN)
+        except ValueError as exc:
+            return ({"error": f"binding check on {name!r} failed: {exc}"}, 400)
+        rows = []
+        for s in sites:
+            # The INTENDED site is the one on the main template whose
+            # footprint covers the variant. Everything else with a full 3'
+            # seed is a specificity risk, because the seed is precisely what
+            # allele-specific PCR stakes its discrimination on.
+            intended = (name == "template"
+                        and _covers(s, variant_pos, len(seq)))
+            if intended:
+                n_intended += 1
+            else:
+                n_off += 1
+            rows.append({"strand": s["strand"], "start": s["foot_start"],
+                         "ident_pct": s["ident_pct"],
+                         "mismatches": s["mismatches"],
+                         "intended": intended})
+        specificity.append({"name": name, "n_sites": len(sites),
+                            "sites": rows[:10]})
+    # A primer carrying the NON-reference allele should NOT exact-seed on the
+    # reference template — that failure to bind IS the discrimination, so it
+    # is reported as a property rather than as a missing site.
+    discriminates = (n_intended == 0) and not best["matches_template"]
+    n_extra = n_off
+
+    partner = None
+    partner_raw = payload.get("partner_primer")
+    if partner_raw is not None:
+        pseq, err = _sanitize_bases(partner_raw
+                                    if isinstance(partner_raw, str) else "")
+        if err or not pseq:
+            return ({"error": f"'partner_primer' rejected: "
+                              f"{err or 'empty'}"}, 400)
+        try:
+            psites = _primer_binding_sites(pseq, template, n,
+                                           circular=circular,
+                                           seed_len=_AS_SEED_LEN)
+        except ValueError as exc:
+            return ({"error": f"'partner_primer' check failed: {exc}"}, 400)
+        product = None
+        if psites:
+            p0 = psites[0]
+            if best["orientation"] == "fwd" and p0["strand"] == -1:
+                product = (p0["foot_start"] + p0["length"]
+                           - best["binding_start"]) % (n or 1)
+            elif best["orientation"] == "rev" and p0["strand"] == 1:
+                product = (best["binding_end"] - p0["foot_start"]) % (n or 1)
+        partner = {
+            "seq": pseq, "tm": _primer_tm_safe(pseq),
+            "n_sites": len(psites),
+            "strand": (psites[0]["strand"] if psites else None),
+            "product_size": product,
+        }
+
+    warnings: "list[str]" = []
+    if best["clamp_note"]:
+        warnings.append(best["clamp_note"])
+    if n_extra > 0:
+        warnings.append(f"{n_extra} additional 3'-seeded binding site(s) "
+                        f"found — allele specificity depends on the 3' end "
+                        f"being unique, so check the `specificity` block "
+                        f"before ordering")
+    if best["matches_template"] and alt_base is not None:
+        warnings.append(f"'alt_base' {best['allele']} is the base the "
+                        f"template already carries at {variant_pos} — this "
+                        f"primer is specific for the REFERENCE allele")
+
+    _log_event("primers.allele_specific", variant_pos=variant_pos,
+               orientation=best["orientation"], gc_clamp=best["gc_clamp"],
+               n_off_targets=len(templates) - 1, via="agent")
+    return {"ok": True, "mode": "allele_specific", "result": best,
+            "specificity": specificity, "partner": partner,
+            "gc_clamp": best["gc_clamp"], "clamp_note": best["clamp_note"],
+            # `discriminates` True means the primer's 3' seed does NOT match
+            # the reference template — the intended behaviour for a primer
+            # designed against a non-reference allele, and the thing a caller
+            # would otherwise have to infer from an empty site list.
+            "discriminates": discriminates,
+            "n_intended_sites": n_intended,
+            "n_offtarget_sites": n_off,
+            "warnings": warnings,
+            "ignored": _agent_ignored_keys(payload, {
+                "template", "sequence", "mode", "variant_pos", "alt_base",
+                "orientation", "partner_primer", "off_targets", "target_tm",
+                "destabilize", "circular"})}
+
+
 @_agent_endpoint("design-primers")
 def _h_design_primers(app, payload):
     """Primer-pair design over a target region. Body:
@@ -9673,6 +10806,11 @@ def _h_design_primers(app, payload):
     if len(template_clean) > _PAIRWISE_MAX_LEN:
         return ({"error": f"'template' exceeds "
                   f"{_PAIRWISE_MAX_LEN:,} bp cap"}, 413)
+    # Allele-specific is dispatched BEFORE start/end are parsed: it is anchored
+    # on a single base, not a region, so requiring a region it never uses would
+    # be a mandatory parameter with no meaning.
+    if payload.get("mode") == "allele_specific":
+        return _agent_design_allele_specific(template_clean, payload)
     start = _coerce_int(payload.get("start"), name="start")
     if isinstance(start, str):
         return ({"error": start}, 400)
@@ -9684,9 +10822,10 @@ def _h_design_primers(app, payload):
         return ({"error": f"start/end out of range for "
                   f"{n}-bp template"}, 400)
     mode = payload.get("mode", "detection")
-    if mode not in ("cloning", "detection", "generic"):
+    if mode not in ("cloning", "detection", "generic", "allele_specific"):
         return ({"error":
-                  "'mode' must be 'cloning', 'detection', or 'generic'"},
+                  "'mode' must be 'cloning', 'detection', 'generic', or "
+                  "'allele_specific'"},
                 400)
     target_tm = payload.get("target_tm", 60.0)
     try:

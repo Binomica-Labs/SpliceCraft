@@ -14,6 +14,99 @@
 
 ---
 
+## [1.2.67] — 2026-09-19
+
+### New features
+
+- **Attach an agent while the app is open.** `splicecraft --agent --read-only`
+  now connects to a data directory another SpliceCraft already has open,
+  instead of refusing to start. Every read works — the library, collections,
+  sequences, digests, simulations, alignments. Anything that would change data
+  is refused with a clear message naming the process you'd need to quit. It
+  publishes its connection details to a separate file, so it can't take over
+  (or, on quit, delete) the main session's, and `splicecraft-cli` finds it with
+  no extra flags. Attaching leaves every file on disk untouched, byte for byte.
+  The old "another instance is already running" message now points at this.
+
+- **Is this culture one thing?** Hand the API a FASTQ and it reports per-base
+  allele fractions across all the reads — "this base is 10% T" — rather than
+  the single answer a consensus gives. This is the difference between a clone
+  that under-performs and a culture that has been taken over by escapers: a
+  population carrying many different inactivating mutations, none of them
+  dominant, averages back to wild type and reads as perfectly clean. Verdicts
+  are `clonal`, `minor_variants` or `mixed`. Differences sitting in unreliable
+  basecalls are excluded and counted separately, because at 1% every
+  instrument's error floor looks like a sub-population.
+
+- **What else transcribes this gene?** SpliceCraft now walks the whole circle
+  from every promoter to every CDS and reports the ones that reach it, the
+  terminators in between, and whether those actually stop anything. A plasmid
+  has no ends, so checking the terminators *downstream* of a cassette — the
+  natural thing to do — cannot see a read-through arriving from behind. It also
+  separates "nothing is aimed at this gene" from "nothing the **host**
+  polymerase can read reaches it", which is the difference between a cassette
+  that is silent by design and one that is silent in the strain you actually
+  transformed.
+
+- **Promoter and terminator scanners.** A σ70 promoter scan (−35 / spacer /
+  −10, with the predicted start site) and an intrinsic terminator scan (stem,
+  loop, U-tract, folding energy), both wrap-aware and both reporting positions
+  on the forward strand whichever strand the element is on. **One hairpin is
+  one record** — overlapping registers of the same stem-loop are merged, so a
+  single terminator can't be reported twenty times. The reporting thresholds
+  were set by measuring: real promoters and terminators from the built-in
+  preset catalogue on one side, random sequence on the other. The promoter
+  score is for **ranking** candidates against each other, and says so; it is
+  not a predicted transcription rate.
+
+- **Codon analysis of an existing CDS.** The codon optimiser could only write;
+  now it can read. Point it at a sequence or a saved plasmid's CDS and get GC,
+  GC3, CAI, rare-codon load, runs of consecutive rare codons, the worst stretch
+  in the gene, and the 5' end scored on its own (a slow start is normal, and
+  averaging it in hides a genuinely slow body). The CAI comes from the same
+  code the optimiser reports, so the two numbers are directly comparable.
+
+- **Allele-specific primers.** `design-primers` gained an `allele_specific`
+  mode that pins the primer's 3'-terminal base on a variant — which is what
+  allele-specific PCR *is*. The existing modes slide to whatever window scores
+  best and the site-directed designers anchor the other end, so neither could
+  express it. It checks where else the primer's 3' end would anchor, including
+  on other templates you name, and when the discriminating base is A or T it
+  says there can be no GC clamp rather than just scoring the primer lower.
+
+### Hardening
+
+- **A basecaller's `N` is no longer counted as a mutation.** One ordinary read
+  carrying a run of no-calls used to turn a clonal culture into "mixed" — it
+  reported each unreadable base as a 10% sub-population. Long reads carry those
+  runs routinely, so this affected almost any real dataset. They're now
+  excluded and counted separately, and a genuine variant alongside them is
+  still found.
+- **Codon analysis now reads the real coding sequence.** A spliced CDS was read
+  straight through its introns, so every codon after the first one was out of
+  frame and the GC3, CAI and rare-codon figures were wrong for a gene you'd
+  been told was measured. Exons are joined now, on either strand, and a
+  `/codon_start` of 2 or 3 is honoured instead of silently shifting the frame.
+  Both are stated in the results. A feature that merely crosses the origin is
+  correctly *not* treated as spliced.
+- **A terminator filter that can never match is refused rather than answered
+  with "none found".** Asking for a stem longer than the scanner searches for
+  returned zero terminators for every sequence, which reads as "this construct
+  has none" instead of "that filter excluded everything".
+- **Annotations pointing outside the molecule are flagged.** Transcription
+  mapping wraps them onto the sequence to keep the circular arithmetic working;
+  it now says it did, instead of quietly answering about a gene that isn't
+  where you think it is.
+- Read-heterogeneity runs are bounded by a reads × reference-length budget, so
+  a large molecule with a deep read pile can't park a request for half an hour.
+  When the budget applies, the response says so — a quietly shortened read set
+  would change every fraction in the answer without explaining why.
+- The promoter and terminator scans, the transcription map and the
+  heterogeneity analysis are all rate-limited alongside the other heavy
+  operations.
+
+---
+
 ## [1.2.66] — 2026-09-17
 
 ### New features

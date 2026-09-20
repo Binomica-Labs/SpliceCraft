@@ -3408,3 +3408,251 @@ class TestHegBuilder:
         assert r2 is None and x2 is None          # no usable ACGT CDS
         r3, _, x3 = sc._file_build_codon_table(str(prot.with_name("x.fna")), "bogus")
         assert r3 is None and x3 is None
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  analyse-cds — the READ half of the optimizer
+# ══════════════════════════════════════════════════════════════════════
+#
+# `optimize-protein` wrote and nothing read: comparing two existing clones
+# on GC3 / CAI / rare-codon load meant re-deriving all three by hand from
+# `_CODON_BUILTIN_K12`. The numbers matter — they are what eliminates codon
+# usage as the explanation for a phenotype difference — so the endpoint must
+# report exactly what the optimizer's own CAI reports, not a second opinion.
+
+_GFP_AA = ("MSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTTGKLPVPWPTLVT"
+           "TLTYGVQCFSRYPDHMKQHDFFKSAMPEGYVQERTIFFKDDGNYKTRAEVKFEGDTLVNRIE"
+           "LKGIDFKEDGNILGHKLEYN")
+
+
+def _k12_raw():
+    return sc._codon_tables_load()[0]["raw"]
+
+
+def _extreme_cds(pick):
+    """A CDS built entirely from each residue's most- (or least-) used
+    synonym, so CAI has a known direction without asserting a magic number."""
+    aa_codons, _frac = sc._codon_build_aa_map(_k12_raw())
+    return "".join(aa_codons[a][pick][0] for a in _GFP_AA if a in aa_codons)
+
+
+def _analyse(body):
+    return sc._state._AGENT_HANDLERS["analyse-cds"][0](None, body)
+
+
+class TestAnalyseCds:
+
+    def test_max_cai_construction_scores_near_one_with_no_rare_codons(self):
+        res = _analyse({"sequence": _extreme_cds(0)})
+        assert res["ok"]
+        assert res["cai"] > 0.9
+        assert res["n_rare"] == 0
+        assert res["tandem_rare_runs"] == []
+
+    def test_worst_synonym_construction_scores_lower_and_finds_runs(self):
+        best = _analyse({"sequence": _extreme_cds(0)})
+        worst = _analyse({"sequence": _extreme_cds(-1)})
+        assert worst["cai"] < best["cai"]
+        assert worst["rare_pct"] > best["rare_pct"]
+        assert worst["tandem_rare_runs"], "consecutive rare codons not found"
+
+    def test_it_reports_the_same_cai_as_optimize_protein(self):
+        """Two numbers for the same sequence and host would be the
+        'two halves that disagree' shape. They share one implementation."""
+        opt = sc._state._AGENT_HANDLERS["optimize-protein"][0](
+            None, {"protein": _GFP_AA, "mode": "max_cai"})
+        back = _analyse({"sequence": opt["dna"]})
+        assert back["cai"] == pytest.approx(float(opt["cai"]), abs=0.001)
+
+    def test_gc_and_gc3_match_the_pure_helpers(self):
+        dna = _extreme_cds(0)
+        res = _analyse({"sequence": dna})
+        assert res["gc"] == pytest.approx(round(sc._codon_gc(dna), 2))
+        assert res["gc3"] == pytest.approx(round(sc._codon_gc3(dna), 2))
+
+    def test_the_rare_threshold_is_echoed_because_it_is_a_convention(self):
+        res = _analyse({"sequence": _extreme_cds(-1), "rare_w": 0.3})
+        assert res["rare_w"] == 0.3
+        loose = _analyse({"sequence": _extreme_cds(-1), "rare_w": 0.05})
+        assert loose["n_rare"] <= res["n_rare"]
+
+    def test_worst_window_finds_a_local_collapse_inside_a_healthy_average(self):
+        """A percentage over a whole gene hides a locally terrible stretch."""
+        good = _extreme_cds(0)
+        bad = _extreme_cds(-1)
+        mixed = good[:300] + bad[:150] + good[300:]
+        res = _analyse({"sequence": mixed})
+        assert res["worst_window"] is not None
+        assert res["worst_window"]["cai"] < res["cai"]
+
+    def test_ramp_reports_the_five_prime_end_separately(self):
+        """A slow 5' ramp is normal; averaging it in flags healthy designs."""
+        res = _analyse({"sequence": _extreme_cds(0), "ramp_codons": 30})
+        assert res["ramp"]["codons"] == 30
+        assert res["ramp"]["cai_first"] == pytest.approx(1.0, abs=0.01)
+        assert res["ramp"]["slower_than_body"] is False
+
+    def test_a_non_multiple_of_three_warns_rather_than_failing(self):
+        res = _analyse({"sequence": _extreme_cds(0) + "AT"})
+        assert res["ok"]
+        assert any("multiple of 3" in w for w in res["warnings"])
+
+    @pytest.mark.parametrize("body,code", [
+        ({}, 400),                                       # no source
+        ({"sequence": "AT"}, 422),                       # under one codon
+        ({"sequence": "ATGAAA", "rare_w": 0}, 400),
+        ({"sequence": "ATGAAA", "rare_w": 9}, 400),
+        ({"sequence": "ATGAAA", "ramp_codons": -1}, 400),
+        ({"sequence": "ATGAAA", "taxid": "999999999"}, 404),
+        ({"name": "no such plasmid at all"}, 404),
+    ])
+    def test_bad_input_is_refused_with_a_reason(self, body, code):
+        res = _analyse(body)
+        assert isinstance(res, tuple) and res[1] == code, res
+
+    def test_it_is_registered_read_only(self):
+        assert sc._state._AGENT_HANDLERS["analyse-cds"][1] is False
+
+
+class TestRelativeAdaptiveness:
+    """`_codon_relative_adaptiveness` is the single source `_codon_cai` is now
+    defined in terms of — a second copy that drifted would let the optimizer
+    and the analyser disagree about the same sequence."""
+
+    def test_cai_is_the_geometric_mean_of_the_reported_weights(self):
+        import math
+        dna = _extreme_cds(-1)
+        raw = _k12_raw()
+        ws = [r["w"] for r in sc._codon_relative_adaptiveness(dna, raw)]
+        expect = math.exp(sum(math.log(max(v, 1e-10)) for v in ws) / len(ws))
+        assert sc._codon_cai(dna, raw) == pytest.approx(expect)
+
+    def test_stops_and_single_codon_families_are_excluded(self):
+        """The standard definition. Counting Met/Trp adds a log(1)=0 term
+        while still incrementing the divisor, pulling CAI toward 1."""
+        raw = _k12_raw()
+        got = sc._codon_relative_adaptiveness("ATGTGGAAATAA", raw)
+        assert [r["codon"] for r in got] == ["AAA"]
+
+    def test_index_is_the_codon_index_not_the_base_offset(self):
+        raw = _k12_raw()
+        got = sc._codon_relative_adaptiveness("AAAGAAAAA", raw)
+        assert [r["index"] for r in got] == [0, 1, 2]
+
+    def test_empty_and_partial_input(self):
+        raw = _k12_raw()
+        assert sc._codon_relative_adaptiveness("", raw) == []
+        assert sc._codon_relative_adaptiveness("AT", raw) == []
+
+
+class TestAnalyseCdsReadsTheRealCodingSequence:
+    """Hardening regressions — each of these returned a confident WRONG number.
+
+    A spliced CDS read as one contiguous block runs through its introns: every
+    codon after the first one is out of frame, so GC3 / CAI / rare-codon load
+    are all wrong for a gene the caller believes was measured. A `/codon_start`
+    of 2 or 3 shifts the whole reading frame the same way.
+    """
+
+    _CDS = "ATGAAACGTGAAGCTTTACAGGATGTTCTGAAATCTGGTTAA"      # 42 nt, 14 codons
+    _INTRON = "GTAAGT" + "T" * 40 + "TTGCAG"
+
+    def _spliced_record(self, minus=False):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, SimpleLocation, CompoundLocation
+        ex1, ex2 = self._CDS[:21], self._CDS[21:]
+        body = ex1 + self._INTRON + ex2
+        plus = "CCCC" + (_rc_str(body) if minus else body) + "CCCC"
+        rec = SeqRecord(Seq(plus), id="s", name="s")
+        rec.annotations["molecule_type"] = "DNA"
+        strand = -1 if minus else 1
+        if minus:
+            a_s, a_e = 4, 4 + len(ex2)
+            b_s, b_e = a_e + len(self._INTRON), a_e + len(self._INTRON) + len(ex1)
+        else:
+            a_s, a_e = 4, 4 + len(ex1)
+            b_s, b_e = a_e + len(self._INTRON), a_e + len(self._INTRON) + len(ex2)
+        loc = CompoundLocation([SimpleLocation(a_s, a_e, strand),
+                                SimpleLocation(b_s, b_e, strand)])
+        rec.features = [SeqFeature(loc, type="CDS",
+                                   qualifiers={"label": ["g"]})]
+        return rec
+
+    def _analyse_record(self, rec, name):
+        sc._save_library([{"id": name, "name": name,
+                           "gb_text": sc._record_to_gb_text(rec)}])
+        return sc._state._AGENT_HANDLERS["analyse-cds"][0](
+            None, {"name": name, "feature": "g"})
+
+    @pytest.mark.parametrize("minus", [False, True])
+    def test_a_spliced_cds_is_joined_from_its_exons(self, minus):
+        res = self._analyse_record(self._spliced_record(minus),
+                                   f"spl-{int(minus)}")
+        assert not isinstance(res, tuple), res
+        assert res["length_bp"] == len(self._CDS)
+        assert res["n_codons"] == len(self._CDS) // 3
+        assert any("spliced CDS" in w for w in res["warnings"])
+
+    @pytest.mark.parametrize("minus", [False, True])
+    def test_the_joined_sequence_is_the_real_protein(self, minus):
+        """Checked against Biopython, not against our own join."""
+        from Bio.Seq import Seq
+        rec = self._spliced_record(minus)
+        res = self._analyse_record(rec, f"spl2-{int(minus)}")
+        plus = str(rec.seq)
+        parts = sorted((int(p.start), int(p.end))
+                       for p in rec.features[0].location.parts)
+        joined = "".join(plus[a:b] for a, b in parts)
+        if minus:
+            joined = _rc_str(joined)
+        assert joined == self._CDS
+        assert str(Seq(joined).translate()) == "MKREALQDVLKSG*"
+        assert res["length_bp"] == len(joined)
+
+    def test_an_unspliced_cds_is_unchanged_and_says_nothing(self):
+        """The splice path must not fire on an ordinary single-exon CDS."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, SimpleLocation
+        rec = SeqRecord(Seq("CCCC" + self._CDS + "CCCC"), id="p", name="p")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.features = [SeqFeature(SimpleLocation(4, 4 + len(self._CDS), 1),
+                                   type="CDS", qualifiers={"label": ["g"]})]
+        res = self._analyse_record(rec, "plain-cds")
+        assert res["length_bp"] == len(self._CDS)
+        assert not any("spliced" in w for w in res["warnings"])
+
+    @pytest.mark.parametrize("codon_start,trimmed", [(1, 0), (2, 1), (3, 2)])
+    def test_codon_start_shifts_the_reading_frame(self, codon_start, trimmed):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, SimpleLocation
+        body = "GG" + self._CDS
+        rec = SeqRecord(Seq(body), id="c", name="c")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.features = [SeqFeature(
+            SimpleLocation(0, len(body), 1), type="CDS",
+            qualifiers={"label": ["g"], "codon_start": [str(codon_start)]})]
+        res = self._analyse_record(rec, f"cs-{codon_start}")
+        assert res["length_bp"] == len(body) - trimmed
+        if trimmed:
+            assert any("codon_start" in w for w in res["warnings"])
+        else:
+            assert not any("codon_start" in w for w in res["warnings"])
+
+    def test_a_malformed_codon_start_falls_back_to_frame_one(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, SimpleLocation
+        rec = SeqRecord(Seq(self._CDS), id="b", name="b")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.features = [SeqFeature(
+            SimpleLocation(0, len(self._CDS), 1), type="CDS",
+            qualifiers={"label": ["g"], "codon_start": ["banana"]})]
+        res = self._analyse_record(rec, "cs-bad")
+        assert res["length_bp"] == len(self._CDS)
+
+
+def _rc_str(s: str) -> str:
+    return s.translate(str.maketrans("ACGT", "TGCA"))[::-1]

@@ -38,6 +38,10 @@ from pathlib import Path
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 6701
 TOKEN_FILENAME = "agent_token"
+# Published by `splicecraft --agent --read-only` (an attach to a data dir
+# another instance holds). Kept separate from TOKEN_FILENAME so a guest can
+# never repoint — or, on quit, delete — the host's side-door.
+READONLY_TOKEN_FILENAME = "agent_token.readonly"
 
 
 def _data_dir() -> Path:
@@ -60,7 +64,25 @@ def _data_dir() -> Path:
 
 
 def _token_file() -> Path:
-    return _data_dir() / TOKEN_FILENAME
+    """The token file to talk to.
+
+    Normally `agent_token`, written by whichever instance holds the data dir.
+    A `splicecraft --agent --read-only` attach is a GUEST on a data dir some
+    other process owns, so it publishes to `agent_token.readonly` instead and
+    leaves the host's file alone. Prefer the host; fall back to the guest when
+    no host has published, so `splicecraft-cli status` finds a read-only
+    session with no extra flags. `SPLICECRAFT_READ_ONLY=1` pins the guest file
+    explicitly for when both are present and you want the read-only one.
+    """
+    d = _data_dir()
+    primary = d / TOKEN_FILENAME
+    guest = d / READONLY_TOKEN_FILENAME
+    if os.environ.get("SPLICECRAFT_READ_ONLY", "").strip().lower() in (
+            "1", "true", "yes"):
+        return guest
+    if not primary.exists() and guest.exists():
+        return guest
+    return primary
 
 
 _CLI_TOKEN_FILE_MAX_BYTES = 1024
@@ -78,7 +100,9 @@ def _read_session() -> tuple[str, int, str]:
         sys.exit(
             f"No SpliceCraft session found.\n"
             f"  Expected token file: {f}\n"
-            f"  Start the GUI with: splicecraft --agent"
+            f"  Start the GUI with: splicecraft --agent\n"
+            f"  Already have one open? Attach read-only alongside it:\n"
+            f"    splicecraft --agent --read-only"
         )
     # Sweep #25 (2026-05-23): `lstat` not `stat` — `f.stat()`
     # follows symlinks. A pre-placed symlink at the token path

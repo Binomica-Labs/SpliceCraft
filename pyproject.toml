@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.2.66"
+version         = "1.2.67"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -238,6 +238,9 @@ only-include = [
     # CRISPR guide design: PAM scanning, guide triage, off-target search
     # within supplied sequences, cloning oligos.
     "splicecraft_crispr.py",
+    # Bacterial regulatory-element scanners: sigma-70 promoters and
+    # intrinsic (Rho-independent) terminators, both wrap-aware.
+    "splicecraft_regulatory.py",
     "CHANGELOG.md",
 ]
 
@@ -281,6 +284,9 @@ include = [
     # CRISPR guide design: PAM scanning, guide triage, off-target search
     # within supplied sequences, cloning oligos.
     "splicecraft_crispr.py",
+    # Bacterial regulatory-element scanners: sigma-70 promoters and
+    # intrinsic (Rho-independent) terminators, both wrap-aware.
+    "splicecraft_regulatory.py",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
