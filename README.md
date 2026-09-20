@@ -256,7 +256,12 @@ away. It matters because a consensus is a single read — a population of
 escapers each carrying a different inactivating mutation, none of them
 dominant, consenses back to wild type and looks perfectly clean. Differences
 sitting in unreliable basecalls are excluded and counted separately, because at
-1% the instrument's own error floor looks like a sub-population.
+1% the instrument's own error floor looks like a sub-population. Tell it the platform —
+nanopore, Illumina or Sanger — and the noise floor matches the instrument;
+homopolymer indels are shown but don't get a vote, because every sequencer
+miscalls run length. The verdict reads the *shape* of the distribution rather
+than counting positions, so one clone's platform noise doesn't masquerade as a
+mixed culture.
 
 ### Expression
 

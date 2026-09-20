@@ -203,6 +203,37 @@ def _check_agent_write_path(path: Path) -> "str | None":
     return None
 
 
+def _coerce_bool(value, *, name: str = "value") -> "bool | str":
+    """Type-safe bool coercion for agent-API JSON payloads.
+
+    Returns the bool on success, or a human-readable error message (string) on
+    failure — the same `value | str` shape as `_coerce_int`, so an
+    `isinstance(result, str)` guard narrows it.
+
+    A bare `bool(value)` is the trap this exists to close: `bool("false")` is
+    True, so a caller passing the STRING "false" — which shell-built JSON and
+    hand-edited config do constantly — silently gets the opposite of what they
+    asked for. That is merely untidy for a cosmetic flag and dangerous for a
+    flag like `homopolymer_filter`, whose whole purpose is to let someone turn
+    OFF a filter that could otherwise hide the variant they are hunting.
+
+    Accepts real booleans, the usual textual spellings, and 0/1. Refuses
+    anything else rather than guessing.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "yes", "on", "1"):
+            return True
+        if v in ("false", "no", "off", "0"):
+            return False
+    return (f"'{name}' must be true or false "
+            f"(got {type(value).__name__} {value!r})")
+
+
 def _coerce_int(value, *, name: str = "value") -> "int | str":
     """Type-safe int coercion for agent-API JSON payloads.
 
@@ -7616,7 +7647,12 @@ def _h_scan_promoters(app, payload):
     if err is not None:
         return err
     both = payload.get("both_strands")
-    both = True if both is None else bool(both)
+    if both is None:
+        both = True
+    else:
+        both = _coerce_bool(both, name="both_strands")
+        if isinstance(both, str):
+            return ({"error": both}, 400)
     min_score = payload.get("min_score")
     if min_score is not None:
         try:
@@ -7680,7 +7716,12 @@ def _h_scan_terminators(app, payload):
     if err is not None:
         return err
     both = payload.get("both_strands")
-    both = True if both is None else bool(both)
+    if both is None:
+        both = True
+    else:
+        both = _coerce_bool(both, name="both_strands")
+        if isinstance(both, str):
+            return ({"error": both}, 400)
     min_stem = _coerce_int(payload.get("min_stem", _TERM_MIN_STEM),
                            name="min_stem")
     if isinstance(min_stem, str):
@@ -7773,7 +7814,12 @@ def _h_map_transcription(app, payload):
     if err is not None:
         return err
     inc = payload.get("include_predicted")
-    inc = True if inc is None else bool(inc)
+    if inc is None:
+        inc = True
+    else:
+        inc = _coerce_bool(inc, name="include_predicted")
+        if isinstance(inc, str):
+            return ({"error": inc}, 400)
     min_score = payload.get("min_promoter_score")
     if min_score is not None:
         try:
@@ -8642,10 +8688,184 @@ _HETERO_MIN_FRACTION_DEFAULT = 0.01     # 1% — below this is basecall noise
 # A position this much of the population disagrees at is not a "minor" variant
 # any more; the sample is substantially not one thing.
 _HETERO_MIXED_FRACTION = 0.25
-# …or this many distinct positions carry a real sub-population. This is the
-# escaper signature specifically: many different mutations, no single dominant
-# one, which is invisible to any per-position majority test.
-_HETERO_MIXED_MIN_POSITIONS = 5
+
+# ── Platform noise, and why the verdict cannot be a COUNT ─────────────
+# The first cut called `mixed` when 5+ positions cleared 1%. Measured against a
+# simulated but realistic CLONAL nanopore run (30 reads, 3 kb, homopolymer-
+# biased indels), that rule produced: verdict `mixed`, 1,347 positions, 78% of
+# them inside a homopolymer, 72% indels, top fraction 0.304 — i.e. it cleared
+# the count rule AND the 0.25 dominant-fraction rule, on a sample that was one
+# clone. A heterogeneity call that says `mixed` for every long-read dataset is
+# worth exactly as much as one that always says `clean`.
+#
+# Two things fix it, and both are about the SHAPE of the evidence:
+#
+#   1. HOMOPOLYMER CONTEXT. Nanopore miscalls run LENGTH, so indels pile into
+#      homopolymers. Those observations are still REPORTED (a real frameshift
+#      can live in a homopolymer, and hiding it would be worse), flagged
+#      `context: "homopolymer"` — they just don't get a vote, because the
+#      platform cannot distinguish them from its own error mode.
+#   2. DISTRIBUTION SHAPE, not a count. A genuine sub-population is a
+#      HAPLOTYPE: every read from the escaper carries ALL of that clone's
+#      differences, so those positions share one fraction and appear as a MODE.
+#      Platform noise is independent per position and decays monotonically from
+#      the floor. So the test is "is there a bump", not "are there many".
+_HETERO_PLATFORMS = ("ont", "illumina", "sanger", "unknown")
+# Per-platform defaults: (noise_floor, homopolymer_filter).
+# `noise_floor` is the fraction below which a call does not get a VOTE in the
+# verdict. It is not `min_fraction` — that still controls what is REPORTED, so
+# lowering the reporting floor never silently changes the verdict.
+_HETERO_PLATFORM_PROFILE = {
+    # Long reads: ~1-2% substitution but heavy homopolymer indel noise, which
+    # on a 30x pile reaches 20-30% at individual positions.
+    "ont":      (0.10, True),
+    # Short reads: substitutions dominate, indels are rare and homopolymer
+    # slippage is far less severe.
+    "illumina": (0.02, False),
+    # Few reads, ragged ends already handled by `min_phred`; slippage exists
+    # but a Sanger pile is too shallow for a fraction to mean much below 5%.
+    "sanger":   (0.05, False),
+    # Caller did not say. A homopolymer INDEL is a suspect call on every
+    # platform — all three slip in runs, long reads just far more — so it is
+    # muted here too rather than letting an undeclared nanopore run read
+    # `mixed` on its own error mode. Nothing is hidden: those calls are still
+    # in `positions` with `context: "homopolymer"`, counted in
+    # `n_muted_homopolymer`, and a warning fires when muting removed anything.
+    # Screening for a frameshift IN a homopolymer tract is the one case that
+    # wants `homopolymer_filter: false`, and the warning says so.
+    "unknown":  (0.05, True),
+}
+# Homopolymer run length at which a platform starts miscalling it.
+_HETERO_HOMOPOLYMER_MIN_RUN = 4
+# Shape test. Fractions above the noise floor are binned; noise decays
+# monotonically, a haplotype makes a bump. A bin must beat the one below it by
+# this many observations to count as a mode rather than binning jitter.
+_HETERO_SHAPE_BIN = 0.05
+_HETERO_MODE_MIN_EXCESS = 2
+# A mode of one position is not a mode.
+_HETERO_MODE_MIN_POSITIONS = 2
+
+
+def _hetero_homopolymer_run(seq: str, pos: int, *, circular: bool) -> int:
+    """Length of the homopolymer run the reference carries AT `pos`.
+
+    1 for an isolated base, 0 for an out-of-range or ambiguous one. Walks both
+    ways from `pos`, wrapping on a circular molecule (a run straddling the
+    origin is still one run) and bounded by the sequence length so a
+    single-base molecule cannot loop forever.
+    """
+    n = len(seq)
+    if n == 0 or not (0 <= pos < n):
+        return 0
+    b = seq[pos]
+    if b not in "ACGT":
+        return 0
+    run = 1
+    i = pos
+    while run < n:
+        j = i - 1
+        if j < 0:
+            if not circular:
+                break
+            j = n - 1
+        if seq[j] != b:
+            break
+        run += 1
+        i = j
+    i = pos
+    while run < n:
+        j = i + 1
+        if j >= n:
+            if not circular:
+                break
+            j = 0
+        if seq[j] != b:
+            break
+        run += 1
+        i = j
+    return run
+
+
+def _hetero_homopolymer_context(seq: str, pos: int, *, circular: bool,
+                                min_run: int) -> int:
+    """Longest homopolymer run touching `pos` or either neighbour, else 0.
+
+    The neighbours matter: a run-length miscall reports its indel at the run's
+    EDGE as often as inside it, so testing only `pos` misses half of them.
+    """
+    n = len(seq)
+    if n == 0:
+        return 0
+    best = 0
+    for d in (-1, 0, 1):
+        p = pos + d
+        if circular:
+            p %= n
+        elif not (0 <= p < n):
+            continue
+        best = max(best, _hetero_homopolymer_run(seq, p, circular=circular))
+    return best if best >= min_run else 0
+
+
+def _hetero_shape(fractions: "list[float]", floor: float = 0.0,
+                  max_fraction: "float | None" = None) -> dict:
+    """Is this distribution a decaying noise tail, or does it carry a MODE?
+
+    Returns ``{n, max_fraction, bins, monotonic_decay, mode_fraction}``.
+
+    Independent per-position error decays monotonically away from the floor.
+    A real sub-population is linked — every read of the escaper carries all of
+    its differences — so its positions share one fraction and stack into a bin
+    that stands ABOVE the bin below it. `mode_fraction` is the centre of the
+    lowest such bin, or None when the distribution just decays.
+
+    **`fractions` must include the calls BELOW the noise floor**, because they
+    are the baseline the mode is judged against. Binning only the above-floor
+    calls makes the first bin empty by construction, so anything just above
+    the floor looks like a mode standing over nothing — which made a clonal
+    nanopore pile read `mixed` on its own substitution noise. Conversely,
+    discarding the sub-floor tail loses the decay that tells eight escaper
+    mutations sharing one fraction apart from a noise skirt.
+
+    A mode is only honoured at or above `floor`: below it, a bump is noise
+    structure, not a sub-population worth reporting. `max_fraction` reports
+    the VOTING maximum when one is supplied, since that is what the dominant
+    test keys on.
+    """
+    if not fractions:
+        return {"n": 0, "max_fraction": round(float(max_fraction or 0.0), 4),
+                "max_observed_fraction": 0.0,
+                "bins": [], "monotonic_decay": True, "mode_fraction": None}
+    top = max(fractions)
+    n_bins = max(1, int(top / _HETERO_SHAPE_BIN) + 1)
+    counts = [0] * n_bins
+    for f in fractions:
+        counts[min(n_bins - 1, max(0, int(f / _HETERO_SHAPE_BIN)))] += 1
+    mode = None
+    for i in range(1, n_bins):
+        # A bin's centre can sit past 1.0 for the topmost bin (a fraction of
+        # exactly 1.0 lands in [1.00, 1.05)), and a reported "mode_fraction"
+        # above 1 is not a fraction. Clamp to the bin's own upper edge.
+        centre = min(1.0, (i + 0.5) * _HETERO_SHAPE_BIN)
+        if centre < floor:
+            continue
+        if (counts[i] >= _HETERO_MODE_MIN_POSITIONS
+                and counts[i] - counts[i - 1] >= _HETERO_MODE_MIN_EXCESS):
+            mode = round(centre, 4)
+            break
+    bins = [{"from": round(i * _HETERO_SHAPE_BIN, 4),
+             "to": round(min(1.0, (i + 1) * _HETERO_SHAPE_BIN), 4),
+             "n": counts[i]} for i in range(n_bins)]
+    return {"n": len(fractions),
+            # The VOTING maximum — what the dominant test keys on — alongside
+            # the maximum actually present in the binned baseline. Reporting
+            # only the former left `max_fraction: 0.0` sitting next to
+            # populated bins, which a caller cannot reconcile.
+            "max_fraction": round(float(top if max_fraction is None
+                                        else max_fraction), 4),
+            "max_observed_fraction": round(float(top), 4),
+            "bins": bins,
+            "monotonic_decay": mode is None, "mode_fraction": mode}
 
 
 @_agent_endpoint("analyse-read-heterogeneity")
@@ -8712,6 +8932,37 @@ def _h_analyse_read_heterogeneity(app, payload):
         return ({"error": min_phred}, 400)
     if not (0 <= min_phred <= 93):
         return ({"error": "'min_phred' must be 0-93"}, 400)
+    platform = payload.get("platform", "unknown")
+    if not isinstance(platform, str) or \
+            platform.strip().lower() not in _HETERO_PLATFORMS:
+        return ({"error": f"'platform' must be one of "
+                          f"{', '.join(_HETERO_PLATFORMS)}"}, 400)
+    platform = platform.strip().lower()
+    _default_floor, _default_hp = _HETERO_PLATFORM_PROFILE[platform]
+    noise_floor = payload.get("noise_floor")
+    if noise_floor is None:
+        noise_floor = _default_floor
+    else:
+        try:
+            noise_floor = float(noise_floor)
+        except (TypeError, ValueError):
+            return ({"error": "'noise_floor' must be a number"}, 400)
+        if not (0.0 <= noise_floor <= 1.0):
+            return ({"error": "'noise_floor' must be in [0, 1]"}, 400)
+    hp_filter = payload.get("homopolymer_filter")
+    if hp_filter is None:
+        hp_filter = _default_hp
+    else:
+        hp_filter = _coerce_bool(hp_filter, name="homopolymer_filter")
+        if isinstance(hp_filter, str):
+            return ({"error": hp_filter}, 400)
+    hp_min_run = _coerce_int(
+        payload.get("homopolymer_min_run", _HETERO_HOMOPOLYMER_MIN_RUN),
+        name="homopolymer_min_run")
+    if isinstance(hp_min_run, str):
+        return ({"error": hp_min_run}, 400)
+    if not (2 <= hp_min_run <= 50):
+        return ({"error": "'homopolymer_min_run' must be 2-50"}, 400)
     max_reads = _coerce_int(payload.get("max_reads", _HETERO_READS_MAX),
                             name="max_reads")
     if isinstance(max_reads, str):
@@ -8807,7 +9058,10 @@ def _h_analyse_read_heterogeneity(app, payload):
 
     thresholds = {"min_fraction": min_fraction, "min_phred": min_phred,
                   "mixed_fraction": _HETERO_MIXED_FRACTION,
-                  "mixed_min_positions": _HETERO_MIXED_MIN_POSITIONS}
+                  "platform": platform, "noise_floor": noise_floor,
+                  "homopolymer_filter": hp_filter,
+                  "homopolymer_min_run": hp_min_run,
+                  "shape_bin": _HETERO_SHAPE_BIN}
     hetero_warnings: "list[str]" = []
     if n_available > max_reads:
         hetero_warnings.append(
@@ -8831,13 +9085,17 @@ def _h_analyse_read_heterogeneity(app, payload):
             "ignored": _agent_ignored_keys(payload, {
                 "reference", "reference_id", "reference_name", "reads",
                 "reads_path", "read_quality", "min_fraction", "min_phred",
-                "max_reads", "circular", "mode"})}
+                "max_reads", "circular", "mode", "platform", "noise_floor",
+                "homopolymer_filter", "homopolymer_min_run"})}
     if not seqs:
         return {**base, "n_reads": 0, "mean_depth": 0.0, "covered_bp": 0,
                 "covered_pct": 0.0,
                 "uncovered_spans": [[0, len(ref_seq)]] if ref_seq else [],
                 "verdict": "no_reads", "positions": [], "n_positions": 0,
-                "n_filtered_low_quality": 0, "n_no_call_observations": 0}
+                "n_filtered_low_quality": 0, "n_no_call_observations": 0,
+                "n_counted_in_verdict": 0, "n_muted_homopolymer": 0,
+                "n_below_noise_floor": 0, "platform": platform,
+                "distribution": _hetero_shape([])}
 
     # ── Align every read, then reuse the cross-read rollup ───────────
     aligned: "list[dict]" = []
@@ -8929,6 +9187,15 @@ def _h_analyse_read_heterogeneity(app, payload):
         frac = slot["n"] / d
         if frac < min_fraction:
             continue
+        # Homopolymer context. Reported for EVERY call so a caller can see it
+        # regardless of platform; it only removes a vote when the filter is on
+        # AND the call is an indel, which is the error mode it describes. A
+        # SUBSTITUTION inside a homopolymer is not a run-length miscall and
+        # keeps its vote.
+        hp_len = _hetero_homopolymer_context(ref_seq, pos, circular=circular,
+                                             min_run=hp_min_run)
+        is_indel = vtype != "snp"
+        muted = bool(hp_filter and hp_len and is_indel)
         positions.append({
             "pos":          pos,
             "type":         vtype,
@@ -8940,17 +9207,90 @@ def _h_analyse_read_heterogeneity(app, payload):
             "contradicted": max(0, d - slot["n"]),
             "mean_phred":   (round(slot["phred_sum"] / slot["phred_n"], 1)
                              if slot["phred_n"] else None),
+            "context":      ("homopolymer" if hp_len else None),
+            "homopolymer_len": hp_len or None,
+            # Whether this call got a VOTE in the verdict, and if not, WHY.
+            # Reported per position so "why is this mixed / not mixed" is
+            # answerable from the response alone rather than by re-deriving
+            # the thresholds. The homopolymer filter is checked first because
+            # it is the reason a caller can turn off.
+            "counted_in_verdict": bool(not muted and frac >= noise_floor),
+            "muted_by": ("homopolymer" if muted
+                         else "noise_floor" if frac < noise_floor
+                         else None),
         })
     positions.sort(key=lambda p: (-p["fraction"], p["pos"]))
 
     n_pos = len(positions)
-    if not n_pos:
+    # ── Verdict: SHAPE, not count ────────────────────────────────────
+    # Only calls that earned a vote are judged. `mixed` needs either one
+    # substantial sub-population (a position at/above `mixed_fraction`) or a
+    # MODE in the distribution — a bin standing above the one below it, which
+    # is what a linked haplotype looks like and what independent per-position
+    # error does not. A long decaying tail of low-fraction calls is platform
+    # noise no matter how many entries it has.
+    voting = [p for p in positions if p["counted_in_verdict"]]
+    # The shape baseline is every call the platform filter did NOT mute —
+    # including the sub-floor tail, which is what makes a decay recognisable
+    # as a decay. Homopolymer-muted calls are left out: they are the
+    # instrument's error mode, and letting them pad the low bins would mask a
+    # real cluster sitting just above them.
+    shape = _hetero_shape(
+        [p["fraction"] for p in positions if p["muted_by"] != "homopolymer"],
+        noise_floor,
+        max_fraction=max((p["fraction"] for p in voting), default=0.0))
+    n_muted_hp = sum(1 for p in positions if p["muted_by"] == "homopolymer")
+    n_below_floor = sum(1 for p in positions
+                        if p["muted_by"] == "noise_floor")
+    if not voting:
         verdict = "clonal"
-    elif (any(p["fraction"] >= _HETERO_MIXED_FRACTION for p in positions)
-            or n_pos >= _HETERO_MIXED_MIN_POSITIONS):
+    elif (shape["max_fraction"] >= _HETERO_MIXED_FRACTION
+            or shape["mode_fraction"] is not None):
         verdict = "mixed"
     else:
         verdict = "minor_variants"
+
+    # Muting is never silent: it is the one thing that can turn a genuinely
+    # mixed sample into `clonal`, and a frameshift escaper in a polyA tract is
+    # exactly the case that lives in a homopolymer.
+    if n_muted_hp:
+        hetero_warnings.append(
+            f"{n_muted_hp} indel call(s) inside a homopolymer run were "
+            f"reported but NOT counted towards the verdict — every platform "
+            f"miscalls run length, long reads most of all. They are in "
+            f"`positions` with context 'homopolymer'. If you are screening "
+            f"for a frameshift INSIDE a homopolymer tract, re-run with "
+            f"homopolymer_filter: false.")
+    # The noise floor is the other way a real sub-population can vanish, and
+    # it fails in the DANGEROUS direction: a false `mixed` costs a re-screen,
+    # a false `clonal` lets an escaper through. So whenever the floor removed
+    # something and the answer was not `mixed`, say what the biggest excluded
+    # call was — that is the number that tells a caller whether anything
+    # worth looking at was dropped.
+    if n_below_floor and verdict != "mixed":
+        _top_cut = max((p["fraction"] for p in positions
+                        if p["muted_by"] == "noise_floor"), default=0.0)
+        hetero_warnings.append(
+            f"{n_below_floor} call(s) were reported but fell below the "
+            f"{noise_floor:g} noise floor for platform '{platform}' and did "
+            f"not count towards the verdict — the highest was {_top_cut:g}. "
+            f"If this is short-read data, pass platform: \"illumina\" (floor "
+            f"{_HETERO_PLATFORM_PROFILE['illumina'][0]:g}) or set "
+            f"noise_floor explicitly.")
+    # The nanopore signature, measured rather than assumed: if most calls are
+    # indels sitting in homopolymers, this is long-read data and the caller
+    # should say so — the platform profile changes the noise floor, and an
+    # undeclared run gets judged against a floor built for short reads.
+    if platform == "unknown" and n_pos >= 20:
+        _sig = sum(1 for p in positions
+                   if p["type"] != "snp" and p["context"] == "homopolymer")
+        if _sig >= 0.5 * n_pos:
+            hetero_warnings.append(
+                f"{_sig * 100 // n_pos}% of the calls are indels inside "
+                f"homopolymers — the signature of long-read data. Pass "
+                f"platform: \"ont\" so the noise floor matches the "
+                f"instrument; judged as 'unknown' this verdict may overstate "
+                f"heterogeneity.")
 
     total_bp = int(roll.get("total_bp") or len(ref_seq))
     covered_bp = int(roll.get("covered_bp") or 0)
@@ -8965,7 +9305,13 @@ def _h_analyse_read_heterogeneity(app, payload):
             "total_bp": total_bp,
             "verdict": verdict, "positions": positions, "n_positions": n_pos,
             "n_filtered_low_quality": n_filtered,
-            "n_no_call_observations": n_no_call}
+            "n_no_call_observations": n_no_call,
+            # The verdict's working, so it can be checked rather than trusted.
+            "n_counted_in_verdict": len(voting),
+            "n_muted_homopolymer": n_muted_hp,
+            "n_below_noise_floor": n_below_floor,
+            "distribution": shape,
+            "platform": platform}
 
 
 @_agent_endpoint("align-plasmidsaurus-zip")

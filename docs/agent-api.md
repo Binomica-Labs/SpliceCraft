@@ -449,7 +449,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 - **Read heterogeneity** — `analyse-read-heterogeneity` reports per-base
   ALLELE FRACTIONS from raw reads: **is what I sequenced one thing?** Body
   `{reference | reference_id | reference_name, reads_path (a FASTQ) | reads,
-  min_fraction?=0.01, min_phred?=20, max_reads?}`. `read-consensus` cannot
+  platform?="unknown", min_fraction?=0.01, min_phred?=20, noise_floor?,
+  homopolymer_filter?, max_reads?}`.
+
+  **Pass `platform`** — `ont` / `illumina` / `sanger`. It sets the noise floor
+  (the fraction below which a call gets no vote in the verdict, distinct from
+  `min_fraction`, which controls what is *reported*) and whether homopolymer
+  indels are muted. Judged as `unknown`, a nanopore run is measured against a
+  floor built for short reads; the response warns when the data carries the
+  long-read signature (most calls being indels inside homopolymers) and names
+  the share that led it to say so. `read-consensus` cannot
   answer this — it reads the alignments STORED on a plasmid, and a
   Plasmidsaurus consensus is one read, so depth is 1 everywhere and anything
   below the consensus is invisible. A population of escapers each carrying a
@@ -469,6 +478,36 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   `thresholds` — they are conventions, not a calibrated model. Reads are
   bounded by a `reads x reference length` work budget; whenever it bites,
   `capped_by` and a warning say so rather than quietly changing every fraction.
+
+  **The verdict keys off the SHAPE of the distribution, not a count.** A count
+  rule ("5+ positions above 1%") calls every long-read dataset `mixed`:
+  measured against a simulated clonal nanopore run it gave 1,347 positions,
+  78% inside homopolymers, top fraction 0.30 — clearing both the count rule
+  and the dominant-fraction rule on a single clone. A verdict that always says
+  `mixed` is worth what one that always says `clean` is worth. So `mixed` now
+  needs either one substantial sub-population (a position at/above
+  `mixed_fraction`) or a MODE — a bin standing above the one below it, which
+  is what a linked haplotype produces, because every read of an escaper
+  carries all of that clone's differences at one shared fraction. Independent
+  per-position error decays instead. `distribution` returns the bins,
+  `monotonic_decay` and `mode_fraction` so the verdict can be checked rather
+  than trusted, and each position carries `counted_in_verdict` plus `muted_by`
+  (`homopolymer` / `noise_floor` / null) so "why did this not count" is
+  answerable from the response alone.
+
+  **Homopolymer indels are reported but do not vote** (on by default; every
+  platform miscalls run length, long reads most of all). They stay in
+  `positions` tagged `context: "homopolymer"` with `homopolymer_len`, are
+  counted in `n_muted_homopolymer`, and a warning fires whenever muting
+  removed anything — because a real frameshift escaper can live in a polyA
+  tract, and that is the one case wanting `homopolymer_filter: false`. A
+  SUBSTITUTION inside a homopolymer is not a run-length miscall and keeps its
+  vote. Whenever the noise floor drops a call and the answer is not
+  `mixed`, a warning names the highest fraction it excluded — the floor fails
+  in the dangerous direction (a false `mixed` costs a re-screen; a false
+  `clonal` lets an escaper through), so it is never silent. Boolean fields are
+  validated rather than coerced: `bool("false")` is True, and a flag whose
+  whole purpose is turning a filter OFF must not invert on a string.
 - **CDS codon analysis** — `analyse-cds` is the READ half of
   `optimize-protein`, which until now only wrote. Body
   `{sequence | id + feature, taxid?, rare_w?, ramp_codons?}`; returns

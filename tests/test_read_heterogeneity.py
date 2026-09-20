@@ -23,6 +23,7 @@ import random
 import pytest
 
 import splicecraft as sc
+import splicecraft_agent as _ag
 
 
 def _rand(n: int, seed: int) -> str:
@@ -179,7 +180,8 @@ class TestAlleleFractions:
                     {"reference": REF, "reads_path": fq, "circular": False})
         t = res["thresholds"]
         assert set(t) == {"min_fraction", "min_phred", "mixed_fraction",
-                          "mixed_min_positions"}
+                          "platform", "noise_floor", "homopolymer_filter",
+                          "homopolymer_min_run", "shape_bin"}
 
     def test_uncovered_spans_are_part_of_the_answer(self, tmp_path):
         """A plasmid can be clonal over the half that was read."""
@@ -423,3 +425,422 @@ class TestReadOnlyTokenFile:
         # …unless the guest is pinned explicitly.
         monkeypatch.setenv("SPLICECRAFT_READ_ONLY", "1")
         assert cli._token_file().name == cli.READONLY_TOKEN_FILENAME
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Platform noise — the verdict must not cry wolf on long reads
+# ══════════════════════════════════════════════════════════════════════
+#
+# FIELD REPORT (2026-09-20): "its verdict will call every nanopore dataset
+# mixed — it did for all four clones here, including the one that obviously
+# expresses." Measured against a simulated clonal ONT run the first rule gave
+# `mixed`, 1,347 positions, 78% inside homopolymers, top fraction 0.304 — so
+# it cleared BOTH the count rule and the 0.25 dominant rule on one clone.
+#
+# The simulator below is deliberately built from the instrument's known error
+# MODE (run-length miscalls in homopolymers), not from anything in the
+# implementation, so it is an independent check rather than a restatement.
+
+def _hp_reference(n: int, seed: int) -> str:
+    """A reference with realistic homopolymer content — plasmids are full of
+    them, and that is precisely where long reads fail."""
+    r = random.Random(seed)
+    out: "list[str]" = []
+    while len(out) < n:
+        b = r.choice("ACGT")
+        x = r.random()
+        run = 4 if x < 0.10 else 5 if x < 0.16 else 6 if x < 0.19 else 1
+        out.extend([b] * run)
+    return "".join(out[:n])
+
+
+def _ont_read(ref: str, rng, *, sub=0.010, hp_indel=0.14, indel=0.004) -> str:
+    """One nanopore-like read: substitutions are rare, run-length miscalls in
+    homopolymers are not."""
+    out: "list[str]" = []
+    i, n = 0, len(ref)
+    while i < n:
+        b = ref[i]
+        j = i
+        while j < n and ref[j] == b:
+            j += 1
+        run = j - i
+        if run >= 4:
+            delta = rng.choice([-1, -1, -2, 1]) if rng.random() < hp_indel else 0
+            out.append(b * max(1, run + delta))
+            i = j
+            continue
+        if rng.random() < indel:
+            if rng.random() < 0.5:
+                i += 1
+                continue
+            out.append(b + rng.choice("ACGT"))
+            i += 1
+            continue
+        out.append(rng.choice([c for c in "ACGT" if c != b])
+                   if rng.random() < sub else b)
+        i += 1
+    return "".join(out)
+
+
+_ONT_REF = _hp_reference(3000, 11)
+_ONT_SITES = [310, 720, 1180, 1590, 2040, 2610]
+_ONT_ESCAPER = "".join(
+    _TRANSVERSION[c] if i in _ONT_SITES else c
+    for i, c in enumerate(_ONT_REF))
+
+
+def _ont_fastq(tmp_path, name, pick, n=30, seed=5):
+    """`n` nanopore-like reads at Q15, each from the template `pick(i)`."""
+    rng = random.Random(seed)
+    reads = [_ont_read(pick(i), rng) for i in range(n)]
+    p = tmp_path / name
+    p.write_text("".join(
+        f"@r{i}\n{s}\n+\n{chr(33 + 15) * len(s)}\n"
+        for i, s in enumerate(reads)))
+    return str(p)
+
+
+class TestPlatformNoise:
+
+    def test_a_clonal_nanopore_run_is_not_called_mixed(self, tmp_path):
+        """THE regression. One clone, platform noise only.
+
+        `mixed` is the claim that must not be made. Whether the residue reads
+        `clonal` or `minor_variants` depends on how much substitution noise
+        clears the floor at this depth, and calling that out as "some
+        low-level signal, not a sub-population" is honest either way."""
+        fq = _ont_fastq(tmp_path, "clonal.fastq", lambda i: _ONT_REF)
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": _ONT_REF, "reads_path": fq,
+                     "circular": False, "min_phred": 0, "platform": "ont"})
+        assert res["verdict"] != "mixed", (
+            f"{res['n_counted_in_verdict']} voting calls, max "
+            f"{res['distribution']['max_fraction']}, "
+            f"mode {res['distribution']['mode_fraction']}")
+
+    def test_a_modern_accuracy_nanopore_run_reads_clonal(self, tmp_path):
+        """At R10-era accuracy there is nothing left above the floor at all."""
+        rng = random.Random(21)
+        reads = [_ont_read(_ONT_REF, rng, sub=0.002, hp_indel=0.10)
+                 for _ in range(30)]
+        fq = _write_fastq(tmp_path, "r10.fastq", reads, phred=20)
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": _ONT_REF, "reads_path": fq,
+                     "circular": False, "min_phred": 0, "platform": "ont"})
+        assert res["verdict"] == "clonal", (
+            f"{res['verdict']}: {res['n_counted_in_verdict']} voting, max "
+            f"{res['distribution']['max_fraction']}")
+
+    def test_an_undeclared_nanopore_run_at_least_stops_saying_mixed(
+            self, tmp_path):
+        """Without `platform` the shape test alone must still refuse to call
+        platform noise a sub-population."""
+        fq = _ont_fastq(tmp_path, "undeclared.fastq", lambda i: _ONT_REF)
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": _ONT_REF, "reads_path": fq,
+                     "circular": False, "min_phred": 0})
+        assert res["verdict"] != "mixed"
+
+    def test_it_says_to_declare_the_platform_when_the_data_looks_long_read(
+            self, tmp_path):
+        """Measured, not assumed: the signature is the share of calls that are
+        indels inside homopolymers."""
+        fq = _ont_fastq(tmp_path, "sig.fastq", lambda i: _ONT_REF)
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": _ONT_REF, "reads_path": fq,
+                     "circular": False, "min_phred": 0})
+        assert any('platform: "ont"' in w for w in res["warnings"])
+
+    @pytest.mark.parametrize("n_escaper,label", [(9, "30%"), (15, "50%")])
+    def test_a_genuine_sub_population_is_still_called_mixed(
+            self, tmp_path, n_escaper, label):
+        """The other half. Over-filtering would make the endpoint useless in
+        the opposite direction — a linked haplotype must still surface."""
+        fq = _ont_fastq(
+            tmp_path, f"esc{n_escaper}.fastq",
+            lambda i: _ONT_ESCAPER if i < n_escaper else _ONT_REF, seed=6)
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": _ONT_REF, "reads_path": fq,
+                     "circular": False, "min_phred": 0, "platform": "ont"})
+        assert res["verdict"] == "mixed", label
+
+    def test_the_escaper_sites_are_reported_even_when_not_counted(
+            self, tmp_path):
+        fq = _ont_fastq(tmp_path, "esc-sites.fastq",
+                        lambda i: _ONT_ESCAPER if i < 9 else _ONT_REF, seed=6)
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": _ONT_REF, "reads_path": fq,
+                     "circular": False, "min_phred": 0, "platform": "ont"})
+        seen = {p["pos"] for p in res["positions"]}
+        assert len(seen & set(_ONT_SITES)) >= 4
+
+
+class TestHomopolymerContext:
+
+    def test_homopolymer_indels_are_reported_but_not_counted(self, tmp_path):
+        fq = _ont_fastq(tmp_path, "hp.fastq", lambda i: _ONT_REF)
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": _ONT_REF, "reads_path": fq,
+                     "circular": False, "min_phred": 0, "platform": "ont"})
+        muted = [p for p in res["positions"]
+                 if p["muted_by"] == "homopolymer"]
+        assert muted, "no homopolymer indels muted on a nanopore pile"
+        assert res["n_muted_homopolymer"] == len(muted)
+        # Reported, not hidden — a real frameshift can live in a homopolymer.
+        for p in muted:
+            assert p["context"] == "homopolymer"
+            assert p["homopolymer_len"] >= 4
+            assert p["counted_in_verdict"] is False
+
+    def test_muting_is_never_silent(self, tmp_path):
+        fq = _ont_fastq(tmp_path, "warn.fastq", lambda i: _ONT_REF)
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": _ONT_REF, "reads_path": fq,
+                     "circular": False, "min_phred": 0, "platform": "ont"})
+        assert any("homopolymer_filter: false" in w for w in res["warnings"])
+
+    def test_the_escape_hatch_restores_every_call(self, tmp_path):
+        fq = _ont_fastq(tmp_path, "hatch.fastq", lambda i: _ONT_REF)
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": _ONT_REF, "reads_path": fq,
+                     "circular": False, "min_phred": 0, "platform": "ont",
+                     "homopolymer_filter": False})
+        assert res["n_muted_homopolymer"] == 0
+
+    def test_a_substitution_in_a_homopolymer_keeps_its_vote(self):
+        """The filter describes a run-LENGTH miscall. A substitution inside a
+        run is not that, and muting it would hide real point mutations in
+        every AT-rich stretch."""
+        ref = "GGGG" + "A" * 8 + "CCCC" + _rand(200, 3)
+        alt = ref[:6] + "T" + ref[7:]          # SNP inside the A-run
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": ref, "reads": [alt] * 3 + [ref] * 7,
+                     "circular": False, "platform": "ont",
+                     "min_fraction": 0.05})
+        hit = [p for p in res["positions"] if p["pos"] == 6]
+        assert hit, res["positions"]
+        assert hit[0]["context"] == "homopolymer"
+        assert hit[0]["muted_by"] != "homopolymer"
+
+    @pytest.mark.parametrize("seq,pos,expect", [
+        ("ACGT", 0, 1),
+        ("AAAA", 2, 4),
+        ("GAAAAG", 3, 4),
+        ("N" * 5, 2, 0),
+    ])
+    def test_run_length_is_measured_correctly(self, seq, pos, expect):
+        assert _ag._hetero_homopolymer_run(seq, pos, circular=False) == expect
+
+    def test_a_run_across_the_origin_is_one_run(self):
+        """A circular molecule has no ends, so a homopolymer straddling bp 0
+        must not read as two short ones."""
+        seq = "AAA" + "CGTCGT" * 5 + "AAAA"
+        assert _ag._hetero_homopolymer_run(seq, 0, circular=True) == 7
+        assert _ag._hetero_homopolymer_run(seq, 0, circular=False) == 3
+
+
+class TestDistributionShape:
+
+    def test_a_decaying_tail_has_no_mode(self):
+        """Independent per-position error: many low, progressively fewer high,
+        and nothing near the dominant threshold. Note the sub-floor calls are
+        part of the input — they ARE the baseline the shape is judged
+        against."""
+        decay = [0.12] + [0.08] * 3 + [0.05] * 10 + [0.03] * 30
+        out = _ag._hetero_shape(decay, 0.05)
+        assert out["mode_fraction"] is None
+        assert out["monotonic_decay"] is True
+
+    def test_a_cluster_above_the_noise_is_a_mode(self):
+        """A linked haplotype: every read of the escaper carries all of its
+        differences, so those positions share one fraction."""
+        noise = [0.02] * 30 + [0.01] * 40
+        cluster = [0.30, 0.31, 0.29, 0.30]
+        out = _ag._hetero_shape(noise + cluster, 0.05)
+        assert out["mode_fraction"] is not None
+        assert 0.25 <= out["mode_fraction"] <= 0.35
+
+    def test_a_bump_below_the_noise_floor_is_not_a_mode(self):
+        out = _ag._hetero_shape([0.01] * 2 + [0.03] * 9, 0.10)
+        assert out["mode_fraction"] is None
+
+    def test_empty_input(self):
+        out = _ag._hetero_shape([], 0.05)
+        assert out["n"] == 0 and out["mode_fraction"] is None
+
+
+class TestPlatformInput:
+
+    @pytest.mark.parametrize("body,code", [
+        ({"platform": "nanopore"}, 400),
+        ({"platform": 1}, 400),
+        ({"noise_floor": -1}, 400),
+        ({"noise_floor": 2}, 400),
+        ({"noise_floor": "x"}, 400),
+        ({"homopolymer_min_run": 1}, 400),
+        ({"homopolymer_min_run": 99}, 400),
+    ])
+    def test_bad_platform_input_is_refused(self, body, code):
+        payload = {"reference": REF, "reads": [REF], "circular": False}
+        payload.update(body)
+        res = _call("analyse-read-heterogeneity", payload)
+        assert isinstance(res, tuple) and res[1] == code, res
+
+    @pytest.mark.parametrize("plat", ["ont", "illumina", "sanger", "unknown"])
+    def test_every_platform_is_accepted_and_echoed(self, plat):
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": REF, "reads": [REF] * 4, "circular": False,
+                     "platform": plat})
+        assert res["platform"] == plat
+        assert res["thresholds"]["platform"] == plat
+        assert res["thresholds"]["noise_floor"] > 0
+
+    def test_noise_floor_is_separate_from_min_fraction(self):
+        """`min_fraction` controls what is REPORTED, `noise_floor` what gets a
+        VOTE — so lowering the reporting floor can never silently change the
+        verdict."""
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": REF, "reads": [MUT] + [REF] * 9,
+                     "circular": False, "min_fraction": 0.01,
+                     "noise_floor": 0.5})
+        assert any(p["pos"] == SNP_POS for p in res["positions"])
+        assert res["n_counted_in_verdict"] == 0
+        assert res["verdict"] == "clonal"
+
+
+class TestHardeningRegressions:
+    """Defects found by an adversarial sweep of the platform/shape work.
+
+    All four were silent: the endpoint answered, and the answer was wrong or
+    unreconcilable with its own output.
+    """
+
+    def test_a_string_false_does_not_turn_the_filter_on(self):
+        """`bool("false")` is True. Shell-built JSON and hand-edited config
+        pass strings constantly, and this particular flag is the documented
+        escape for finding a frameshift INSIDE a homopolymer — silently
+        inverting it hides the variant the caller is hunting."""
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": REF, "reads": [MUT] * 3 + [REF] * 7,
+                     "circular": False, "platform": "ont",
+                     "homopolymer_filter": "false"})
+        assert res["thresholds"]["homopolymer_filter"] is False
+
+    @pytest.mark.parametrize("value,expect", [
+        (True, True), (False, False), ("true", True), ("FALSE", False),
+        ("yes", True), ("off", False), (1, True), (0, False),
+    ])
+    def test_the_bool_coercer_accepts_the_usual_spellings(self, value, expect):
+        assert _ag._coerce_bool(value, name="x") is expect
+
+    @pytest.mark.parametrize("value", ["maybe", "", 2, -1, 3.5, [], {}, None])
+    def test_the_bool_coercer_refuses_anything_ambiguous(self, value):
+        out = _ag._coerce_bool(value, name="x")
+        assert isinstance(out, str) and "must be true or false" in out
+
+    @pytest.mark.parametrize("key", ["homopolymer_filter"])
+    def test_an_ambiguous_boolean_is_a_400(self, key):
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": REF, "reads": [REF], "circular": False,
+                     key: "maybe"})
+        assert isinstance(res, tuple) and res[1] == 400
+
+    def test_a_call_lost_to_the_noise_floor_is_never_silent(self):
+        """The floor fails in the DANGEROUS direction — a false `mixed` costs
+        a re-screen, a false `clonal` lets an escaper through. A genuine 3%
+        variant at the default platform is excluded, so the reply has to say
+        so and name what it dropped."""
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": REF, "reads": [MUT] * 3 + [REF] * 97,
+                     "circular": False})
+        assert res["verdict"] == "clonal"
+        assert res["n_below_noise_floor"] >= 1
+        warn = [w for w in res["warnings"] if "noise floor" in w]
+        assert warn, res["warnings"]
+        assert "0.03" in warn[0]            # names the excluded fraction
+        assert "illumina" in warn[0]        # and the actionable next step
+
+    def test_declaring_the_platform_recovers_that_variant(self):
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": REF, "reads": [MUT] * 3 + [REF] * 97,
+                     "circular": False, "platform": "illumina"})
+        hit = [p for p in res["positions"] if p["pos"] == SNP_POS]
+        assert hit and hit[0]["counted_in_verdict"] is True
+
+    def test_no_floor_warning_when_nothing_was_dropped(self):
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": REF, "reads": [REF] * 10,
+                     "circular": False})
+        assert not any("noise floor" in w for w in res["warnings"])
+
+    def test_max_fraction_cannot_contradict_its_own_bins(self):
+        """`max_fraction` is the VOTING maximum, so it reads 0.0 when nothing
+        votes — which sat next to populated bins with no way to reconcile the
+        two. The observed maximum is reported alongside it."""
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": REF, "reads": [MUT] * 3 + [REF] * 97,
+                     "circular": False, "noise_floor": 0.9})
+        d = res["distribution"]
+        assert d["max_fraction"] == 0.0
+        assert d["max_observed_fraction"] > 0.0
+        assert d["max_observed_fraction"] <= max(b["to"] for b in d["bins"])
+
+    def test_a_mode_is_never_reported_above_one(self):
+        """A fraction of exactly 1.0 lands in the [1.00, 1.05) bin, whose
+        centre is 1.025 — and a 'mode_fraction' above 1 is not a fraction."""
+        out = _ag._hetero_shape([1.0] * 4, 0.05)
+        assert out["mode_fraction"] is not None
+        assert out["mode_fraction"] <= 1.0
+        assert all(b["to"] <= 1.0 for b in out["bins"])
+
+    def test_every_reported_call_is_accounted_for_exactly_once(self):
+        """counted + muted-by-homopolymer + muted-by-floor must partition the
+        reported calls — otherwise one of the three counts is lying."""
+        ref = "GGGG" + "A" * 8 + "CCCC" + _rand(300, 4)
+        dele = ref[:6] + ref[7:]
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": ref, "reads": [dele] + [ref] * 39,
+                     "circular": False, "platform": "ont",
+                     "min_fraction": 0.01})
+        assert (res["n_counted_in_verdict"] + res["n_muted_homopolymer"]
+                + res["n_below_noise_floor"]) == res["n_positions"]
+
+    def test_homopolymer_takes_precedence_over_the_floor_in_muted_by(self):
+        ref = "GGGG" + "A" * 8 + "CCCC" + _rand(300, 4)
+        dele = ref[:6] + ref[7:]
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": ref, "reads": [dele] + [ref] * 39,
+                     "circular": False, "platform": "ont",
+                     "min_fraction": 0.01})
+        hp = [p for p in res["positions"] if p["context"] == "homopolymer"]
+        assert hp, res["positions"]
+        # Below the 0.10 ONT floor AND in a homopolymer — the reason a caller
+        # can act on is the filter, so that is the one reported.
+        assert hp[0]["fraction"] < 0.10
+        assert hp[0]["muted_by"] == "homopolymer"
+
+    def test_an_origin_spanning_homopolymer_is_seen_as_one_run(self):
+        circ = "AAA" + _rand(300, 7) + "AAAA"
+        assert _ag._hetero_homopolymer_context(
+            circ, 0, circular=True, min_run=4) == 7
+        assert _ag._hetero_homopolymer_context(
+            circ, 0, circular=False, min_run=4) == 0
+
+    def test_an_all_n_read_does_not_crash_or_vote(self):
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": REF, "reads": ["N" * len(REF), REF, REF],
+                     "circular": False})
+        assert res["verdict"] == "clonal"
+        assert res["n_no_call_observations"] > 0
+
+    def test_every_call_muted_leaves_an_empty_distribution(self):
+        ref = "GGGG" + "A" * 8 + "CCCC" + _rand(300, 4)
+        dele = ref[:6] + ref[7:]
+        res = _call("analyse-read-heterogeneity",
+                    {"reference": ref, "reads": [dele] * 20 + [ref] * 20,
+                     "circular": False, "platform": "ont",
+                     "min_fraction": 0.01})
+        assert res["verdict"] == "clonal"
+        assert res["distribution"]["n"] == 0
+        assert res["distribution"]["mode_fraction"] is None

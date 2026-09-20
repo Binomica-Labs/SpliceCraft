@@ -14,6 +14,56 @@
 
 ---
 
+## [1.2.68] — 2026-09-20
+
+### Bug fixes
+
+- **Heterogeneity no longer calls every nanopore run "mixed".** The verdict
+  counted positions, and long-read data trips any count: measured against a
+  simulated *single-clone* nanopore run it reported 1,347 differences, 78% of
+  them inside homopolymers, and called the sample mixed. A verdict that always
+  says "mixed" is worth exactly what one that always says "clean" is worth.
+  Three changes fix it:
+  - **Tell it the platform.** A new `platform` setting — nanopore, Illumina or
+    Sanger — matches the noise floor to the instrument. Left unset, the reply
+    now warns when the data carries the long-read signature and says what
+    share of the calls led it to think so.
+  - **Homopolymer indels are shown but don't vote.** Every sequencer miscalls
+    the length of a run of identical bases. Those differences are still listed,
+    tagged, and counted, but they no longer decide the verdict — with a warning
+    whenever that happened, and a switch to turn it off if you're specifically
+    hunting a frameshift inside a homopolymer tract. A *substitution* inside a
+    run still counts; it isn't a run-length miscall.
+  - **The verdict reads the shape of the data, not the number of differences.**
+    A real sub-population is one clone, so its differences all sit at the same
+    fraction and show up as a bump. Instrument noise spreads out and tails off.
+    The reply now returns the distribution it judged, so you can check the call
+    rather than take it on trust, and every difference says whether it counted
+    and, if not, why.
+
+  A genuinely mixed culture — a 30% escaper clone, or a 50/50 of two clones —
+  still reads "mixed", which is the half that matters.
+
+### Hardening
+
+- **A difference dropped for being below the noise floor now says so.** That
+  threshold fails in the direction that matters: wrongly calling a sample mixed
+  costs you a re-screen, wrongly calling it clean lets an escaper through. A
+  genuine 3% variant was being excluded silently when the platform wasn't
+  declared; the reply now names the highest fraction it set aside and what to
+  pass to keep it.
+- **`homopolymer_filter: "false"` no longer means true.** Passing the word
+  "false" as text — which shell-built JSON does constantly — silently switched
+  the filter *on*, i.e. the exact opposite of the request, on the one setting
+  that exists to stop a frameshift in a homopolymer being hidden. All the new
+  true/false settings now accept the usual spellings and refuse anything
+  ambiguous instead of guessing.
+- The reported distribution can no longer contradict itself: it carries both
+  the highest counted fraction and the highest observed one, and a peak is
+  never reported as a fraction above 100%.
+
+---
+
 ## [1.2.67] — 2026-09-19
 
 ### New features
