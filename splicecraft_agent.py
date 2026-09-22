@@ -4962,8 +4962,13 @@ def _h_get_history(app, payload):
 def _h_check_primer(app, payload):
     """Check ONE primer against a template: melting temp, GC%, and every
     3'-anchored binding site (both strands, wrap-aware on a circular
-    template). Body: ``{primer, template, circular?: bool = true,
+    template). Body: ``{primer, template?, circular?: bool = true,
     min_identity?: float = 0, max_sites?: int = 50}``.
+
+    `template` defaults to the LOADED plasmid (with its own topology). With
+    no template and nothing loaded, the melting temperature and GC% are
+    still returned — `binds` is then null and a `note` says binding was not
+    checked — so "what is this primer's Tm?" never needs a sequence.
 
     The read-only analog of the GUI "Primer Check" tab for a single
     oligo: `simulate-pcr` needs a PAIR; this answers "does this one
@@ -4983,15 +4988,35 @@ def _h_check_primer(app, payload):
     primer_raw = payload.get("primer")
     if not isinstance(primer_raw, str) or not primer_raw.strip():
         return ({"error": "missing or non-string 'primer'"}, 400)
-    template_raw = payload.get("template") or payload.get("sequence")
-    if not isinstance(template_raw, str) or not template_raw.strip():
-        return ({"error": "missing or non-string 'template'"}, 400)
+    template_raw = payload.get("template")
+    if template_raw is None:
+        template_raw = payload.get("sequence")
+    if template_raw is not None and not isinstance(template_raw, str):
+        return ({"error": "'template' must be a string"}, 400)
     _iupac = "ACGTRYWSMKBDHVN"
     primer = "".join(ch for ch in primer_raw.upper() if ch in _iupac)
     if not primer:
         return ({"error": "no IUPAC bases in 'primer'"}, 400)
     if len(primer) > 1000:
         return ({"error": "'primer' too long (max 1000 bp)"}, 413)
+    loaded_default = False
+    if template_raw is None or not template_raw.strip():
+        rec = getattr(app, "_current_record", None)
+        loaded = str(getattr(rec, "seq", "") or "") if rec is not None else ""
+        if not loaded:
+            gc = sum(1 for c in primer if c in "GCS")
+            return {
+                "ok": True, "primer": primer, "length": len(primer),
+                "tm": _primer_tm(primer),
+                "gc_pct": round(100.0 * gc / len(primer), 1),
+                "binds": None, "n_sites": 0, "sites": [],
+                "note": "no template given and no plasmid loaded — melting "
+                        "temperature and GC% only; binding was not checked",
+            }
+        template_raw = loaded
+        loaded_default = True
+        if payload.get("circular") is None:
+            payload = {**payload, "circular": _record_is_circular(rec)}
     template = "".join(ch for ch in template_raw.upper() if ch in _iupac)
     if not template:
         return ({"error": "no IUPAC bases in 'template'"}, 400)
@@ -5044,6 +5069,7 @@ def _h_check_primer(app, payload):
         "binds":         bool(out_sites),
         "best_identity": best,
         "sites":         out_sites,
+        **({"template": "the loaded plasmid"} if loaded_default else {}),
     }
 
 

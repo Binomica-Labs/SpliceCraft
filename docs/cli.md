@@ -76,7 +76,7 @@ Most subcommands support `--json` for machine-readable output and
 `--force` to override unsaved-changes guards.
 
 The named subcommands above cover the common path, but the running
-session exposes ~179 endpoints (the authoritative live list is whatever the `tools` endpoint returns). `call` reaches **any** of them with the
+session exposes ~267 endpoints (the authoritative live list is whatever the `tools` endpoint returns). `call` reaches **any** of them with the
 same auth / host / port plumbing, so there's no need to hand-roll HTTP:
 
 ```bash

@@ -659,6 +659,7 @@ nothing leaves the machine. Streaming markdown, `<think>` reasoning
 hidden by default, a **context lifebar**, a copy-pasteable transcript
 (`Ctrl+E` exports to markdown), and slash commands (`/help`, `/model`,
 `/system`, `/temp`, `/reset`, `/retry`, `/agent`, `/autonomy`,
+`/agentmodel`, `/agentprotocol`,
 `/recall`, `/ingest`, `/learn`, `/forget`, `/remember`, `/memory`).
 
 - **Agent mode** — Babs calls the same endpoints the `--agent` API
@@ -667,10 +668,44 @@ hidden by default, a **context lifebar**, a copy-pasteable transcript
   every write (a multi-step workflow lists all its changes and is
   approved once); `/autonomy auto` runs unattended, `readonly`
   forbids writes. Whole-library wipes are never reachable, and
-  **physical robot motion always asks first, even in `auto`**. Agent
+  **physical robot motion always asks first, even in `auto`**. Once a
+  turn has read anything from the internet (a web page, search results,
+  a remote database record), **changes to your data ask first even in
+  `auto`** — including saving a memory — because text from the web can
+  try to steer her; the prompt says why it is asking. Agent
   turns run on a fast tool-capable model (qwen2.5:7b default) while
   ordinary chat stays on your chosen model — override with
-  `/agentmodel <name>|chat|auto`.
+  `/agentmodel <name>|chat|auto`. A model **without native tool
+  calling** still works: Babs switches it to one JSON action per step,
+  a shape Ollama enforces, so it can't invent a tool
+  (`/agentprotocol auto|native|json` pins either mode). Web pages,
+  search results and papers she reads are handed to the model as data,
+  never as instructions. A long tool result is shortened with a note
+  saying what was left out, and when a long task outgrows the model's
+  context window the oldest tool results are set aside first, so the
+  original request is never lost. If she runs out of tool steps she
+  tells you what she did and what is left rather than stopping cold, and
+  if a change she tried failed, the turn ends with a warning naming it —
+  however confident her answer sounds.
+- **One-call plasmid tools** — *plasmid overview* (every feature and
+  every enzyme that cuts once, with where each cut lands), *find a
+  feature by name* (coordinates, sequence and protein, forgiving about
+  spelling and Greek letters) and *amplify a feature* (PCR primers
+  checked to bind exactly where designed, across the origin and on
+  either strand) and *add a feature* (positions exactly as you say them —
+  "bases 100 to 200" — converted to SpliceCraft's coordinates in code).
+  Also agent endpoints: `plasmid-overview`, `find-feature`,
+  `amplify-feature`.
+- **Fast on a CPU** — the open plasmid's description rides in the
+  conversation instead of Babs's instructions, so after an edit the
+  model reuses its cached prompt instead of re-reading all of it
+  (measured on a CPU-only laptop: 255 s → 14 s before she starts
+  answering), and the model stays loaded for 30 minutes between
+  messages rather than Ollama's default 5.
+- **Test bench** — from a source checkout, `python scripts/babs_eval.py`
+  runs eight everyday requests through the real agent against your local
+  models and grades the answers, to compare models, protocols or prompt
+  changes. Runs in a throwaway sandbox; slow on a CPU (minutes per task).
 - **Corpus grounding** — with **Corpus** on, answers are grounded in
   the Babs research corpus with cited sources, folded into the turn
   inside a token budget scaled to the model's real context window.
@@ -753,7 +788,7 @@ details. In short:
 
 - **Agent API** (`splicecraft --agent`) exposes a localhost JSON API
   with bearer-token auth, covering every GUI action external AI
-  agents need. ~234 endpoints; symlink-guarded write paths;
+  agents need. ~267 endpoints; symlink-guarded write paths;
   length/range/shape validation at the boundary.
 - **`splicecraft-cli`** — stdlib-only sidecar (~50 ms cold start)
   that reads connection details from the running session's token

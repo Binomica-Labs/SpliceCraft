@@ -191,6 +191,12 @@ _AGENT_READ_ONLY_HOLDER_PID: int = 0
 # (`_state._DATA_DIR = _user_data_dir()`); placeholder here so readers + the
 # conftest sandbox patch resolve it. Everything path-related hangs off this.
 _DATA_DIR: Path = None  # type: ignore[assignment]
+# Set at import by the hub's `_user_data_dir` when `$XDG_DATA_HOME` is not an
+# absolute path (platformdirs >= 4.11 ignores it; older releases resolved it
+# against the working directory) AND a SpliceCraft data dir still sits at that
+# old location. Read + cleared once by `PlasmidApp.on_mount`, which shows it as
+# a warning — the same hand-off `_DANGLING_ACTIVE_COLLECTION_NAME` uses.
+_DATA_DIR_NOTICE: "str | None" = None
 # `_DNA_ORIGINALS_DIR` — the .dna CommercialSaaS-roundtrip sidecar dir (a
 # `_DATA_DIR`-derived sub-dir). Migrated here (Phase D, the fileio-extraction
 # prerequisite) so the fileio sibling can reach it without an upward hub import;

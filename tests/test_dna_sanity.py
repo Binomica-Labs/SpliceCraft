@@ -256,7 +256,8 @@ class TestNEBEnzymesAgreeWithBioPython:
     cut pattern with their parent, but BioPython doesn't always carry them)."""
 
     @pytest.fixture(scope="class")
-    def biopy(self):
+    @classmethod    # pytest 9.1 deprecates class-scoped fixtures as instance methods
+    def biopy(cls):
         import Bio.Restriction as R
         return R
 

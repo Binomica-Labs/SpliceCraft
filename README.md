@@ -29,7 +29,7 @@ come from real cloning, and so do the fixes.
 - **Fast and local.** No Electron, no web app, no login. `pipx install splicecraft` and you're designing in seconds.
 - **It does the whole job.** View → edit → design → clone → simulate → verify → document — one tool that understands how those steps connect.
 - **It guards your data like it's irreplaceable** (because it is — see below).
-- **It's scriptable.** A 230+ endpoint local API and a stdlib CLI let an agent or a shell script drive every workflow.
+- **It's scriptable.** A 260+ endpoint local API and a stdlib CLI let an agent or a shell script drive every workflow.
 
 ## Quick start
 
@@ -336,7 +336,12 @@ research corpus with cited sources, grown by the built-in **paper scraper** and
 topic-focused **Learn** crawls, or by indexing **your own library** into a pack
 that is private by construction. Online database lookups (FPbase, UniProt,
 Europe PMC, NCBI, patents) stay off until you tick the setting, and even then
-only your query string is sent — never your sequence.
+only your query string is sent — never your sequence. Whatever she reads online
+is treated as data, never as instructions, and once she has read something from
+the web, even hands-off mode asks before she changes your data. Any local model
+works: one without native tool calling gets a JSON protocol that Ollama
+enforces, and — from a source checkout — `scripts/babs_eval.py` grades your models on
+everyday tasks.
 
 Needs Ollama running locally; `splicecraft babs-setup` bootstraps the engine in
 one command. Details: [`docs/features.md`](docs/features.md).

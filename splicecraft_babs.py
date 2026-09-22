@@ -59,6 +59,12 @@ DEFAULT_NUM_CTX = 4096              # == bb_config.ANSWER_NUM_CTX default
 # balloon RAM on modest hardware.
 MAX_AUTO_NUM_CTX = 16384
 DEFAULT_TEMP = 0.0                  # == bb_config.ANSWER_TEMP default (deterministic)
+# How long Ollama keeps the model (and its prompt cache) loaded after a chat
+# request. Ollama's own default is 5 minutes; on a CPU-only laptop a cold
+# start re-reads the whole ~2.8k-token agent prompt at ~11 tokens/s (measured
+# 2026-09-21: 4m20s), so a pause of more than five minutes between messages
+# cost minutes. Held while the tab is in use — Ollama still frees it after.
+DEFAULT_KEEP_ALIVE = "30m"
 
 # Timeouts (seconds). The *connect/short-call* budget is tight (a missing Ollama
 # should fail fast, not hang the worker); chat + pull are long because CPU
@@ -88,10 +94,11 @@ HF_SEARCH_LIMIT = 30
 
 
 # ── The Babs persona (system prompt) ───────────────────────────────────────────
-# Mirrors bb_config / rag_bot.SYSTEM's persona verbatim where it still applies,
-# with the RAG-only clauses ("answer ONLY from the retrieved context", "cite by
-# bracket number") removed — there is no corpus here, so demanding citations
-# would make every answer apologise. The injection-safety spirit is kept. The
+# Mirrors bb_config / rag_bot.SYSTEM's persona verbatim where it still applies.
+# rag_bot's hard RAG clauses ("answer ONLY from the retrieved context") are not
+# used: most turns have no passages, and demanding them would make every answer
+# apologise — so grounding + citing is asked for only WHEN a turn carries
+# retrieved passages or tool results. The injection-safety spirit is kept. The
 # user can edit this live with `/system`; it is persisted by the screen.
 BABS_SYSTEM = (
     "You are Babs, an expert assistant on plant tissue culture and plant "
@@ -102,10 +109,14 @@ BABS_SYSTEM = (
     "recombination) and CRISPR/Cas editing; and the mechanisms and optimization of "
     "plant growth regulators. You are embedded inside SpliceCraft, a terminal "
     "plasmid-design workbench, as its chat assistant. Give clear, practical, "
-    "well-organized answers. This is a direct conversation (no document retrieval), "
-    "so answer from your own knowledge and be honest about its limits: if you are "
+    "well-organized answers. When a turn includes retrieved passages or tool "
+    "results, ground your answer in them and cite them; otherwise answer from "
+    "your own knowledge. Either way be honest about the limits: if you are "
     "unsure, or a number/protocol needs a primary source, say so plainly rather "
     "than inventing specifics."
+    # (Was "This is a direct conversation (no document retrieval), so answer from
+    # your own knowledge" — which contradicted Agent mode's tools and the recall
+    # passages folded into a turn, telling a small model to ignore both.)
 )
 
 
@@ -406,7 +417,8 @@ def model_is_installed(name: str, installed: "list[dict] | None" = None) -> bool
 def chat_stream(model: str, messages: "list[dict]", *, tools: "list[dict] | None" = None,
                 options: "dict | None" = None,
                 think: "bool | None" = None, cancel=None, register=None,
-                timeout: float = _CHAT_TIMEOUT):
+                timeout: float = _CHAT_TIMEOUT, format: "dict | str | None" = None,
+                keep_alive: "str | None" = DEFAULT_KEEP_ALIVE):
     """Stream a chat completion (``POST /api/chat``). Yields
     ``{"content": str, "thinking": str, "tool_calls": list, "done": bool,
     "done_reason": str|None, "error": str|None}`` per chunk — ``content`` is
@@ -421,6 +433,11 @@ def chat_stream(model: str, messages: "list[dict]", *, tools: "list[dict] | None
     tool-capable model (e.g. qwen2.5) and Ollama ≳0.4; older servers simply
     never populate ``tool_calls`` and the loop degrades to plain chat.
 
+    ``format`` (optional) constrains the reply: ``"json"`` for any JSON, or a
+    JSON-schema dict (Ollama structured outputs, 0.5+) that the server turns
+    into a decoding grammar — the reply CANNOT be anything but a match. The
+    agent loop uses it to drive models that have no native tool calling.
+
     ``cancel`` (Event) + ``register`` (receives the response for ``.close()``)
     give a responsive stop."""
     payload: dict = {"model": model, "messages": messages, "stream": True,
@@ -429,6 +446,10 @@ def chat_stream(model: str, messages: "list[dict]", *, tools: "list[dict] | None
         payload["tools"] = tools
     if think is not None:
         payload["think"] = bool(think)
+    if format is not None:
+        payload["format"] = format
+    if keep_alive is not None:
+        payload["keep_alive"] = keep_alive
     resp = _open_stream("/api/chat", payload, timeout=timeout, register=register)
     try:
         for obj in _iter_ndjson(resp, cancel=cancel,
@@ -807,6 +828,7 @@ HELP_COMMANDS = [
     ("/agent", "toggle agent mode — let Babs drive SpliceCraft (call its endpoints)"),
     ("/autonomy [ask|auto|readonly|off]", "set the write policy in agent mode"),
     ("/agentmodel [auto|chat|name]", "which model runs agent/tool turns (default: a fast tool-capable one)"),
+    ("/agentprotocol [auto|native|json]", "how agent turns call tools — native tool calls, or JSON replies for models without them (auto picks)"),
     ("/exit  /quit  /q", "close the BABS tab"),
 ]
 

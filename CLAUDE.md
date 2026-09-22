@@ -96,6 +96,7 @@ python3 splicecraft.py L09137                # fetch pUC19 from NCBI
 python3 splicecraft.py myplasmid.gb          # local GenBank (.gb/.gbk/.dna)
 python3 -m pytest -n auto -q                 # full suite (~5–6 min on 8 cores)
 python3 -m pytest tests/test_dna_sanity.py   # biology only (<2 s, fast inner loop)
+python3 scripts/babs_eval.py                 # live Babs agent bench vs local Ollama — sandboxed; MINUTES per task on CPU (see [INV-204])
 ./release.py X.Y.Z                           # bump, test, build, tag, push (PyPI via OIDC)
 ```
 

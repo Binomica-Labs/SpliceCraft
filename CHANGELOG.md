@@ -14,6 +14,123 @@
 
 ---
 
+## [1.2.69] — 2026-09-21
+
+### New features
+
+- **Babs works with any local model.** A model without native tool calling
+  used to ignore its tools in Agent mode and just chat, so Babs never
+  touched the app. She now asks Ollama what each model can do, and gives a
+  model without tools a JSON reply format that Ollama enforces — so it can't
+  invent a tool — while tool-capable models keep native tool calls.
+  `/agentprotocol auto|native|json` pins either mode.
+- **Three one-call plasmid tools, for Babs and the agent API.** *Plasmid
+  overview* (every feature, and every enzyme that cuts the plasmid once with
+  the feature each cut lands in), *find a feature by name* (exact
+  coordinates, its sequence and — for a CDS — its protein; forgiving about
+  case, spaces and Greek letters, so "lacZ alpha" finds "LacZ-α") and
+  *amplify a feature* (PCR primers for a named feature, each checked to bind
+  exactly where designed, across the origin and on either strand, and saying
+  which primer carries the start codon of a reverse-strand gene). A small
+  model used to chain several calls and copy coordinates between them — the
+  step where it slipped. Endpoints: `plasmid-overview`, `find-feature`,
+  `amplify-feature`.
+- **A test bench for Babs.** `python scripts/babs_eval.py` runs eight
+  everyday requests (find a gene, enzymes that cut once, a protein's first
+  residues, primers, adding a feature, a primer's Tm, …) through the real
+  agent against your local models and grades every answer, to compare
+  models, protocols and prompt changes instead of guessing. It runs in a
+  throwaway sandbox and can't touch your library or Babs's memory. Its
+  first run on qwen2.5:7b scored 6/8 (native tool calls) and 5/8 (JSON);
+  the fixes it drove — listed below — took both to **8/8 in about half the
+  time**.
+- **When Babs runs out of tool steps she says where she got to** — what she
+  did, what she found and what's left — instead of stopping with "[reached
+  the tool-call limit]".
+- **Babs adds features the way you describe them.** "Add a feature at bases
+  100 to 200" now lands on bases 100–200: a new add-feature tool takes
+  positions as people say them and converts them itself (the model used to
+  pass your numbers straight into a 0-based field and miss by one).
+- **`check-primer` no longer needs a template.** It checks against the open
+  plasmid by default, and with nothing open still gives the melting
+  temperature and GC% — so "what's the Tm of this primer?" is one call, and
+  Babs is told never to estimate a Tm herself (on the bench she once
+  answered 80 °C for a 60 °C primer).
+- **The plasmid overview groups the enzymes that cut once by the feature
+  they cut in**, so "which enzymes cut once inside AmpR?" is a lookup
+  instead of a filter over every cutter.
+
+### Faster
+
+- **Babs starts answering much sooner after you change the plasmid.** The
+  open plasmid's description moved out of her instructions into the
+  conversation, so the model reuses the prompt it has already read instead
+  of re-reading all of it. Measured on a CPU-only laptop: **255 s → 14 s**
+  before the first word after an edit.
+- **The model stays loaded for 30 minutes between messages** (Ollama's
+  default is 5), so a pause doesn't cost a multi-minute reload on machines
+  without a GPU.
+
+### Bug fixes
+
+- **Babs could only see a fifth of what she can do.** Her list of SpliceCraft
+  actions was cut off after the first 51 of 264 (alphabetically up to
+  `delete-gel`), mid-line and with no sign anything was missing — which is
+  why she once couldn't find the FPbase search. She now gets the complete
+  list, plus a keyword search that also reads what each action does.
+- **Long tool results no longer reach Babs cut in half.** A big result is
+  shortened properly — lists keep their first items, long text is trimmed,
+  and a note says what was left out and how to ask for the rest.
+- **A tool call the model typed out as text now runs**, instead of ending
+  the turn with raw JSON as Babs's answer.
+- **Misspelled action names work or get a suggestion.** `get_sequence` runs
+  `get-sequence`; a near miss gets "did you mean …".
+- **Babs no longer gets stuck repeating the same call** until her step
+  budget runs out.
+- **Long tasks keep your original request.** When a turn outgrew the model's
+  context window, Ollama silently dropped the start of the conversation —
+  your question included. The oldest tool results are now set aside first.
+- **Agent turns on a different model use that model's context window**
+  (it was sized for your chat model), and Babs warns when a model's window
+  is too small to run the agent at all.
+- **Babs tells you when a change she tried didn't go through.** A small
+  model will report success regardless — on the bench one said a feature
+  had been "added and renamed" after the rename had failed. The turn now
+  ends with a warning naming any change that failed and wasn't retried
+  successfully.
+- **`add-feature` and `update-feature` no longer ignore `name`.** A feature
+  sent with `name` instead of `label` was saved without any name at all
+  while the caller reported the name it asked for; `name` now works as a
+  synonym.
+- **Babs's instructions no longer contradict each other.** She was told
+  "no document retrieval — answer from memory" even with tools and recalled
+  papers in hand.
+- **Running the test suite no longer overwrites your SpliceCraft log.** The
+  tests wrote into your real log, and every run (including every release)
+  pushed your actual history out of it.
+- **A relative `XDG_DATA_HOME` no longer hides your library silently.** The
+  updated platformdirs ignores a data path that isn't absolute (the XDG
+  spec requires it), so a library kept under one — for example
+  `~/.data` set in `/etc/environment`, where `~` is never expanded — would
+  have looked empty. SpliceCraft now finds the old folder and tells you
+  where it is, in the app and in the terminal. Nothing is moved.
+
+### Hardening
+
+- **Web content can't steer Babs into changing your data.** Anything she
+  reads from the internet is handed to the model as data, never as
+  instructions, and once a turn has read something online, changes to your
+  data — including saving a memory — ask first even in hands-off (`auto`)
+  mode. The prompt says why it's asking.
+- **Dependencies refreshed**: primer3-py 2.3.1 (fixes out-of-bounds reads
+  in primer melting-temperature calculations), pyhmmer 0.12.3 (fixes a
+  crash), platformdirs 4.11, and current test and build tools. biopython
+  stays on 1.86 because 1.87 and later ship no Intel-Mac wheel (the test
+  suite passes on 1.88 too), and pyspellchecker stays on 0.8.0 for
+  conda-forge.
+
+---
+
 ## [1.2.68] — 2026-09-20
 
 ### Bug fixes

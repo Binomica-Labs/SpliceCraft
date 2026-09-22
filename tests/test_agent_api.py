@@ -6119,11 +6119,31 @@ class TestCheckPrimer:
 
     def test_missing_args_400(self):
         assert sc._h_check_primer(None, {})[1] == 400
-        assert sc._h_check_primer(None, {"primer": "ACGTACGT"})[1] == 400
         assert sc._h_check_primer(None, {"primer": "ZZZ",
                                          "template": _PRIMER_TMPL})[1] == 400
         assert sc._h_check_primer(None, {"primer": "ACGTACGT",
                                          "template": "ZZZ"})[1] == 400
+        assert sc._h_check_primer(None, {"primer": "ACGTACGT",
+                                         "template": 42})[1] == 400
+
+    def test_no_template_and_nothing_loaded_still_gives_tm(self):
+        # "What's this primer's Tm?" must never need a sequence: the bench
+        # caught a 7B inventing a formula (80 °C for a 60 °C primer) after
+        # check-primer refused it for want of a template.
+        r = sc._h_check_primer(None, {"primer": "ACGTACGTTTGGCCAAGTGA"})
+        assert r["tm"] == sc._primer_tm("ACGTACGTTTGGCCAAGTGA")
+        assert r["gc_pct"] == 50.0 and r["binds"] is None and "note" in r
+
+    def test_template_defaults_to_the_loaded_plasmid(self):
+        from types import SimpleNamespace
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        fwd = _PRIMER_TMPL[40:62]
+        rec = SeqRecord(Seq(_PRIMER_TMPL), id="t")
+        rec.annotations["topology"] = "linear"
+        r = sc._h_check_primer(SimpleNamespace(_current_record=rec), {"primer": fwd})
+        assert r["template"] == "the loaded plasmid" and r["circular"] is False
+        assert r["binds"] and any(s["foot_start"] == 40 for s in r["sites"])
 
     def test_forward_site_exact(self):
         fwd = _PRIMER_TMPL[40:62]

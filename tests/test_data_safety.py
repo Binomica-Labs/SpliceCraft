@@ -1830,3 +1830,125 @@ class TestPreUpdateSnapshotTableDate:
     def test_no_snapshots_renders_nothing(self):
         import splicecraft_backup as bk
         assert bk._format_pre_update_snapshot_table([]) == ""
+
+
+class TestRelativeXdgDataHome:
+    """platformdirs 4.11 follows the XDG spec and IGNORES a non-absolute
+    `$XDG_DATA_HOME`; 4.10 resolved it against the working directory. So a
+    user whose library lived under such a path (a relative value, or a `~/…`
+    that /etc/environment or a systemd unit never expanded) would upgrade and
+    find an empty library. `_legacy_relative_xdg_notice` finds the old dir and
+    says where it is — it never moves or deletes anything."""
+
+    @staticmethod
+    def _old_library(root: Path, xdg_value: str) -> Path:
+        d = root / xdg_value.strip() / "splicecraft"
+        d.mkdir(parents=True)
+        (d / "plasmid_library.json").write_text("{}", encoding="utf-8")
+        return d
+
+    def test_unset_is_silent(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+        assert sc._legacy_relative_xdg_notice(tmp_path / "new") is None
+
+    def test_absolute_value_is_silent(self, tmp_path, monkeypatch):
+        self._old_library(tmp_path, "abs")
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "abs"))
+        assert sc._legacy_relative_xdg_notice(tmp_path / "new") is None
+
+    def test_relative_value_names_both_paths(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        old = self._old_library(tmp_path, "rel/data")
+        monkeypatch.setenv("XDG_DATA_HOME", "rel/data")
+        new = tmp_path / "home" / ".local" / "share" / "splicecraft"
+        msg = sc._legacy_relative_xdg_notice(new)
+        assert msg is not None
+        assert str(old.resolve()) in msg and str(new) in msg
+        assert f"SPLICECRAFT_DATA_DIR={old.resolve()}" in msg
+
+    def test_unexpanded_tilde_is_found(self, tmp_path, monkeypatch):
+        # `XDG_DATA_HOME=~/xd` from a file nothing shell-expands: platformdirs
+        # < 4.11 used the literal `~` as a directory under the cwd.
+        monkeypatch.chdir(tmp_path)
+        old = self._old_library(tmp_path, "~/xd")
+        monkeypatch.setenv("XDG_DATA_HOME", "~/xd")
+        msg = sc._legacy_relative_xdg_notice(tmp_path / "new")
+        assert msg is not None and str(old.resolve()) in msg
+
+    def test_padding_is_stripped_like_platformdirs_did(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        old = self._old_library(tmp_path, "padded")
+        monkeypatch.setenv("XDG_DATA_HOME", "  padded  ")
+        msg = sc._legacy_relative_xdg_notice(tmp_path / "new")
+        assert msg is not None and str(old.resolve()) in msg
+
+    def test_dir_without_splicecraft_data_is_silent(self, tmp_path, monkeypatch):
+        # A folder that merely happens to be called `splicecraft` (e.g. a
+        # source checkout) is not a library — no false alarm.
+        monkeypatch.chdir(tmp_path)
+        d = tmp_path / "rel" / "splicecraft"
+        d.mkdir(parents=True)
+        (d / "README.md").write_text("not a library", encoding="utf-8")
+        monkeypatch.setenv("XDG_DATA_HOME", "rel")
+        assert sc._legacy_relative_xdg_notice(tmp_path / "new") is None
+
+    def test_same_directory_is_silent(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        old = self._old_library(tmp_path, "rel")
+        monkeypatch.setenv("XDG_DATA_HOME", "rel")
+        assert sc._legacy_relative_xdg_notice(old) is None
+
+    def test_windows_is_silent(self, tmp_path, monkeypatch):
+        # platformdirs never reads XDG variables on Windows.
+        import sys as _sys
+        monkeypatch.chdir(tmp_path)
+        self._old_library(tmp_path, "rel")
+        monkeypatch.setenv("XDG_DATA_HOME", "rel")
+        monkeypatch.setattr(_sys, "platform", "win32")
+        assert sc._legacy_relative_xdg_notice(tmp_path / "new") is None
+
+    def test_user_data_dir_end_to_end(self, tmp_path, monkeypatch, capsys):
+        """Through the INSTALLED platformdirs: the relative value is ignored,
+        the default is used, and the notice is both printed and staged for
+        the TUI. Also a tripwire — if a platformdirs release went back to
+        honouring relative paths, the resolved dir would be the old one."""
+        home = tmp_path / "home"
+        home.mkdir()
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        old = self._old_library(cwd, "rel")
+        monkeypatch.chdir(cwd)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("XDG_DATA_HOME", "rel")
+        monkeypatch.delenv("SPLICECRAFT_DATA_DIR", raising=False)
+        monkeypatch.setattr(sc, "_DEMO_MODE", None)
+        monkeypatch.setattr(sc._state, "_DATA_DIR_NOTICE", None)
+        got = sc._user_data_dir()
+        assert got.resolve() != old.resolve()
+        assert home.resolve() in got.resolve().parents
+        assert sc._state._DATA_DIR_NOTICE is not None
+        assert str(old.resolve()) in sc._state._DATA_DIR_NOTICE
+        assert str(old.resolve()) in capsys.readouterr().err
+
+    async def test_on_mount_shows_and_clears_the_notice(self, monkeypatch):
+        calls: list[tuple[str, dict]] = []
+        real_notify = sc.PlasmidApp.notify
+
+        def _record(self, message, *a, **kw):
+            calls.append((str(message), kw))
+            return real_notify(self, message, *a, **kw)
+
+        monkeypatch.setattr(sc.PlasmidApp, "notify", _record)
+        monkeypatch.setattr(
+            sc, "fetch_genbank",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no net")),
+        )
+        monkeypatch.setattr(sc._state, "_DATA_DIR_NOTICE",
+                            "library found at /old/place")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+        hits = [kw for msg, kw in calls if "library found at /old/place" in msg]
+        assert len(hits) == 1, calls
+        assert hits[0].get("severity") == "warning"
+        assert sc._state._DATA_DIR_NOTICE is None

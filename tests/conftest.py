@@ -11,12 +11,45 @@ If you add a new persistence file to splicecraft.py, you MUST add it
 to the _DATA_FILES list in _protect_user_data below — the
 `test_no_real_files_touched` smoke test will fail otherwise.
 """
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+# Keep the suite's log lines OUT of the user's real log. `splicecraft` fixes
+# `_LOG_PATH` when it is first imported — while test modules are collected,
+# i.e. after this file loads — so the redirect has to happen here at import
+# time; a fixture would be too late. Without it every run wrote into
+# <data dir>/logs/splicecraft.log, and the size-based rotation pushed the
+# user's real history out of all four backups (and xdist workers rotated the
+# same file concurrently). One temp dir per session — the controller makes it
+# and xdist workers inherit it through the environment — and one file per
+# process inside it, so no two processes rotate the same file. An explicit
+# $SPLICECRAFT_LOG still wins, for anyone debugging a test run on purpose.
+_TEST_LOG_DIR_ENV = "_SPLICECRAFT_TEST_LOG_DIR"
+if os.environ.get(_TEST_LOG_DIR_ENV) or not os.environ.get("SPLICECRAFT_LOG", "").strip():
+    _log_dir = os.environ.get(_TEST_LOG_DIR_ENV) or tempfile.mkdtemp(
+        prefix="splicecraft-test-log-")
+    os.environ[_TEST_LOG_DIR_ENV] = _log_dir
+    os.environ["SPLICECRAFT_LOG"] = os.path.join(
+        _log_dir, f"splicecraft-{os.environ.get('PYTEST_XDIST_WORKER', 'main')}.log")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Remove this session's temp logs after a clean run; keep them after a
+    failure, when they are worth reading. Only the controller (the process that
+    made the dir — xdist workers share it) removes it, and only a dir this file
+    created (/tmp is RAM-backed on many distros, so they'd pile up until reboot)."""
+    if os.environ.get("PYTEST_XDIST_WORKER") or exitstatus != 0:
+        return
+    log_dir = os.environ.get(_TEST_LOG_DIR_ENV, "")
+    if os.path.basename(log_dir).startswith("splicecraft-test-log-"):
+        import shutil
+        shutil.rmtree(log_dir, ignore_errors=True)
 
 import pytest
 

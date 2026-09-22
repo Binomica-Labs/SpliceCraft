@@ -110,7 +110,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-~252 endpoints across:
+~267 endpoints across:
 
 - **Records** — `new-plasmid` (create from a raw sequence, the Ctrl+N
   flow), get / set sequence, add / update / delete features (with the full
@@ -121,7 +121,8 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   (`color(160)`), normalised to hex on the way in, so a read-features /
   write-features loop round-trips instead of refusing its own reader's
   output; `add-features` inserts MANY at once under one lock + one
-  dirty-check), list features (`features`, alias `list-features`), find ORFs
+  dirty-check; `name` is accepted as a synonym of `label` on add-feature and
+  update-feature), list features (`features`, alias `list-features`), find ORFs
   (length cutoff in AMINO ACIDS —
   `min_aa`; `min_length`/`min_bp` are rejected so a bp-vs-aa mix-up can't
   silently return a default-length result. Each ORF carries `start`, `end`,
@@ -140,6 +141,27 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   stuck-dirty flag so the next load / new-plasmid proceeds without `force`),
   transfer annotations, apply GFF3 features to the loaded record
   (`apply-gff3`).
+- **Workflows (one call each)** — `plasmid-overview` (the loaded plasmid's
+  name, length, topology, every feature, and every enzyme that cuts it exactly
+  once with the feature(s) that cut lands in); `find-feature` `{name, type?,
+  max_seq?}` (a feature by NAME — forgiving of case, spacing, hyphens and Greek
+  letters, best match first — with its coordinates both ways: 0-based
+  end-exclusive `start`/`end` as every endpoint takes them, plus 1-based
+  `start_1based`/`end_1based`; its own sequence 5'→3' on its strand, spliced
+  parts joined; and for a CDS the translation of the bases as they stand, with
+  `translation_matches_annotation` when the file carries a /translation);
+  `amplify-feature` `{name | idx, type?, target_tm?}` (binding-only PCR primers
+  that amplify one feature end to end — across the origin and on either
+  strand — then locate each primer on the whole plasmid: `binds_as_designed`,
+  `other_sites` ≥80% that could misprime, and `primer_at_feature_start`, which
+  for a − strand feature is the REVERSE primer). `plasmid-overview`'s
+  `unique_cutters` is grouped by the feature each cut falls in —
+  `{label: [{enzyme, cut_bp}]}`, plus "(outside every feature)", with
+  `unique_cutter_count` alongside — so "which enzymes cut once inside X" is
+  a lookup. An ambiguous name is a 409
+  listing candidates to pick by `idx`. All read-only; they exist so a client
+  gets exact numbers without chaining endpoints and copying coordinates
+  between them.
 - **Files** — load (chromosome-scale safe via the path-based loader;
   supports `.gb` / `.gbk` / `.genbank` / `.dna` / `.embl` /
   FASTA / `.ab1` / single-record `.fastq` / `.gff3`),
@@ -327,7 +349,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   (a SINGLE oligo vs a template: Tm, GC%, and every 3'-anchored binding
   site — both strands, wrap-aware on a circular template, the tail
   scored as mismatches — to confirm a designed primer binds exactly once
-  before saving), optimize-protein
+  before saving; `template` defaults to the LOADED plasmid with its own
+  topology, and with no template and nothing loaded it still returns the
+  Tm and GC% with `binds: null` and a `note`), optimize-protein
   (codon-optimise an AA sequence to a chosen table; optional `stops`
   0–3 appends that many stop codons, and a trailing `*` run in the
   protein is honored as-is and overrides it; optional `transl_table`

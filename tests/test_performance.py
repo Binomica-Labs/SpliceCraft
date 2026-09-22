@@ -142,6 +142,13 @@ class TestIUPACPatternCachePerformance:
         """Warm cache must be strictly faster than cold (regex compile).
         Guards against an accidental cache-bypass refactor."""
         sc._PATTERN_CACHE.clear()
+        # `re` keeps its OWN compile cache. Under xdist an earlier test in this
+        # worker has already compiled every NEB site, so without a purge the
+        # "cold" pass is a second cache hit (~0.75 ms vs ~0.14 ms warm) and
+        # one scheduler preemption on a loaded machine flips the comparison.
+        # Purged, cold is a real compile (~9 ms) — the thing this test means.
+        import re as _re
+        _re.purge()
 
         t0 = time.perf_counter()
         for name, (site, _, _) in sc._NEB_ENZYMES.items():

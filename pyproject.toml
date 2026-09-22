@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling>=1.29"]
+requires = ["hatchling>=1.32.4"]
 build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.2.68"
+version         = "1.2.69"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -33,7 +33,7 @@ classifiers = [
 ]
 dependencies = [
     # Pin floors track the versions the test suite is verified
-    # against (refreshed 2026-07-11 to current PyPI latest). End-user
+    # against (refreshed 2026-09-21 to current PyPI latest). End-user
     # `pipx install splicecraft` pulls the matching minimum so
     # behaviour matches what shipped.
     "textual>=8.2.8",
@@ -46,6 +46,13 @@ dependencies = [
     # a wheel on every supported platform. Revisit the cap when a later
     # release re-adds Intel-mac wheels — `scripts/check_dep_wheels.py`
     # flags it if 1.86 ever loses coverage too.
+    # Re-checked 2026-09-21: 1.88 (Aug 2026) still ships no x86_64 macOS
+    # wheel, so the cap holds. Nothing is lost by holding: 1.87's CVE fix
+    # (CVE-2025-68463) is in `Bio.Entrez.Parser`, which only
+    # `Entrez.read`/`Entrez.parse` reach — SpliceCraft calls `Entrez.efetch`
+    # and reads the raw text — and 1.88's fix is in `Bio.Nexus`, unused
+    # here. The suite passes against 1.88 too, so lifting the cap later is
+    # a packaging decision, not a porting job.
     "biopython>=1.86,<1.87",
     # edlib is the fast pairwise-alignment engine (bit-parallel Myers
     # edit distance) used by `_pairwise_align` / `_pick_best_rotation` —
@@ -59,7 +66,8 @@ dependencies = [
     # build. edlib is now a pure TURBO over a capable built-in engine —
     # non-load-bearing — not the difference between fast and unusably slow.
     #
-    # Marker (2026-06-05): edlib is UNMAINTAINED (last release 2022) and
+    # Marker (2026-06-05): edlib is UNMAINTAINED (last release 1.3.9.post1,
+    # Sept 2024 — a wheel-only re-release of 1.3.9) and
     # ships wheels only for x86_64 (Linux + macOS) + macOS arm64
     # (universal2), and only for cp310–cp313 — there is NO Linux-aarch64
     # wheel and NO wheel for any Python ≥ 3.14, and there never will be.
@@ -77,28 +85,51 @@ dependencies = [
     # only if edlib is ever revived with newer wheels.
     # `scripts/check_dep_wheels.py` (which checks through cp314) enforces
     # that this marker stays in sync with edlib's real wheel coverage.
-    "edlib>=1.3.9; (platform_machine == 'x86_64' or platform_machine == 'arm64') and python_version < '3.14'",
-    "primer3-py>=2.3.0",
-    "platformdirs>=4.10.0",
+    # Floor is `.post1`, not 1.3.9: plain 1.3.9 has no arm64 wheel and no
+    # cp312/cp313 wheel of any kind — the universal2 + cp312/cp313 wheels
+    # this marker relies on only exist in .post1.
+    "edlib>=1.3.9.post1; (platform_machine == 'x86_64' or platform_machine == 'arm64') and python_version < '3.14'",
+    # 2.3.1 (2026-09-06) fixes out-of-bounds reads in the bundled Primer3 C
+    # engine — `oligotm` on short sequences and the lookup tables on
+    # non-ASCII input — plus a heap overflow in intron-list parsing, and stops
+    # `design_primers` mutating the caller's `global_args` dict. Primer
+    # design is catastrophic-class, so the floor sits at the fixed release.
+    "primer3-py>=2.3.1",
+    # 4.11 (2026-09) follows the XDG spec and IGNORES a non-absolute
+    # `$XDG_DATA_HOME` (a relative path, or a `~/…` nothing expanded) that
+    # 4.10 honoured relative to the working directory. A library that
+    # lived at such a path would appear to vanish, so `_user_data_dir`
+    # detects that case and says where the old data is — see
+    # `_legacy_relative_xdg_notice`.
+    "platformdirs>=4.11.11",
     # pyhmmer powers the BLAST modal's BLASTN (nhmmer), BLASTP (phmmer),
     # and HMMscan tiers — pure-Python bindings to HMMER 3 with no
     # external C-library install required (the wheels ship the HMMER
     # source compiled in). The pure-Python BLAST fallback also runs
     # without pyhmmer for very short queries.
     #
-    # POSIX-only marker (added 2026-05-29): pyhmmer publishes only
-    # manylinux/macosx wheels and HMMER's C core does NOT build on
-    # native Windows — upstream states "non-UNIX operating systems
-    # (such as Windows) are not supported by HMMER." As an unconditional
-    # hard dep it broke `pipx install splicecraft` for native-Windows
-    # users entirely ("No matching distribution found"). The marker
-    # keeps it a hard dep everywhere it CAN install — Linux, macOS, and
+    # POSIX-only marker (added 2026-05-29): HMMER's C core does not build
+    # on native Windows with the Microsoft toolchain — upstream states
+    # "non-UNIX operating systems (such as Windows) are not supported by
+    # HMMER." As an unconditional hard dep it broke `pipx install
+    # splicecraft` for native-Windows users entirely ("No matching
+    # distribution found").
+    # Re-checked 2026-09-21: pyhmmer HAS shipped MinGW-built win_amd64
+    # wheels since 0.12.0 (cp310, cp311, cp312-abi3), but upstream labels
+    # them EXPERIMENTAL and warns that some Easel errors "may be uncaught
+    # and cause a system exit" — i.e. take the whole TUI down with no
+    # Python exception to catch. Until that is verified on real Windows
+    # the marker stays; a native-Windows user who wants HMMscan anyway can
+    # `pip install pyhmmer` into the same environment, since the import is
+    # optional (`_PYHMMER_AVAILABLE`). 0.12.2 fixed a segfault in
+    # `HMM.__eq__`; 0.12.3 fixed the `plan7.pyi` stub that pyright reads.
+    # The marker keeps it a hard dep everywhere it CAN install — Linux, macOS, and
     # WSL (which reports as sys_platform == 'linux') — so no existing
     # user loses HMMscan, and omits it ONLY on native Windows. There the
     # app degrades gracefully: BLASTN/BLASTP fall back to the pure-Python
     # engine and the HMMscan button shows a "run under WSL2" hint
     # (gated by `_PYHMMER_AVAILABLE` → `_handle_hmmscan_request`).
-    "pyhmmer>=0.12.1; sys_platform != 'win32'",
+    "pyhmmer>=0.12.3; sys_platform != 'win32'",
     # Experiments lab-notebook deps (added 2026-05-18 with the
     # Experiments toolbar). All three are pure-Python wheels with no
     # external system shell-outs:
@@ -119,29 +150,29 @@ dependencies = [
     # linux-64: {MatchSpec("pyspellchecker[version='>=0.9.0']")}`.
     # `pipx install splicecraft` still resolves to whatever's
     # latest on PyPI (currently 0.9.0). Revisit when conda-forge
-    # publishes 0.9.x — re-checked 2026-06-01 (full dep-bump sweep):
-    # conda-forge STILL caps at 0.8.0, so this floor is deliberately
-    # held back from "latest" while everything else moves up.
+    # publishes 0.9.x — re-checked 2026-06-01 and again 2026-09-21 (full
+    # dep-bump sweeps): conda-forge STILL caps at 0.8.0, so this floor is
+    # deliberately held back from "latest" while everything else moves up.
     "pyspellchecker>=0.8.0",
     "rich-pixels>=3.0.1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=9.0.3",
+    "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-xdist>=3.8.0",
-    "hypothesis>=6.155.1",
+    "hypothesis>=6.168.0",
     # Parses CITATION.cff for real in tests/test_citation.py. A YAML syntax
     # error there breaks GitHub's "Cite this repository" button in public and
     # the regex readers cannot see it; without this dep that test silently
     # skips. Dev-only -- never a runtime or conda run dependency.
-    "pyyaml>=6.0.2",
+    "pyyaml>=6.0.3",
     # Mirror the runtime edlib dep so CI exercises the fast-aligner path
     # (not just the Biopython fallback). Wheel-(arch × Python)-gated,
     # matching above.
-    "edlib>=1.3.9; (platform_machine == 'x86_64' or platform_machine == 'arm64') and python_version < '3.14'",
-    "build>=1.5.0",
+    "edlib>=1.3.9.post1; (platform_machine == 'x86_64' or platform_machine == 'arm64') and python_version < '3.14'",
+    "build>=1.6.1",
     # Floor-pinned at 7.0.0 (2026-08-15): hatchling 1.32 emits
     # `Metadata-Version: 2.5`, which twine 6.x rejects as invalid even though
     # PyPI accepts it. An older twine fails `twine check` at the very end of a
@@ -149,7 +180,7 @@ dev = [
     "twine>=7.0.0",
     # Linters / type-checkers / coverage — mirror what CI runs
     # so local + CI behaviour stays in step (see test.yml).
-    "ruff>=0.15.15",
+    "ruff>=0.16.8",
     # `pyright` is floor-pinned at the most recent release. The dev
     # / CI install ALWAYS pulls latest via PYRIGHT_PYTHON_FORCE_VERSION
     # (set in test.yml + recommended for local). The pip-resolved
@@ -158,8 +189,8 @@ dev = [
     # upgrades the wrapper itself (`_upgrade_pyright`) before the lint
     # gate runs, so the floor here tracks what a release last used
     # rather than drifting years behind it.
-    "pyright>=1.1.411",
-    "coverage>=7.14.1",
+    "pyright>=1.1.414",
+    "coverage>=7.16.1",
 ]
 
 [project.urls]

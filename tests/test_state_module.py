@@ -55,7 +55,7 @@ _MIGRATED = [
     # Phase A2c: the save-authorization chokepoint flag
     "_SAVES_AUTHORIZED", "_SAVES_AUTHORIZED_REASON",
     # Phase B-prep: the data directory + the persisted-file path constants
-    "_DATA_DIR",
+    "_DATA_DIR", "_DATA_DIR_NOTICE",
     "_AGENT_TOKEN_FILE", "_CODON_TABLES_FILE", "_COLLECTIONS_FILE",
     "_CUSTOM_ENZYMES_FILE", "_DATA_VERSION_FILE", "_ENTRY_VECTORS_FILE",
     "_ENZYME_COLLECTIONS_FILE", "_EXPERIMENTS_FILE", "_EXPERIMENT_PROJECTS_FILE",

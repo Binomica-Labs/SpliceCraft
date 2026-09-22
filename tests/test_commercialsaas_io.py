@@ -1881,7 +1881,8 @@ class TestWriterCorpusRoundTrip:
     validation step; this is the BioPython-level smoke test."""
 
     @pytest.fixture(scope="class")
-    def corpus_files(self):
+    @classmethod    # pytest 9.1 deprecates class-scoped fixtures as instance methods
+    def corpus_files(cls):
         samples = sorted(_SAMPLE_DIR.glob("*.dna"))
         # Cap each file at 500 KB to keep the test fast (the full
         # corpus has chromosome dumps; round-trip on those is real
