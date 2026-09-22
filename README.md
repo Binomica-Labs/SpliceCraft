@@ -329,7 +329,9 @@ commands, and a copy-pasteable transcript (**Ctrl+E** exports it).
 Flip **Agent** on and Babs can *drive SpliceCraft herself*, calling the same
 endpoints the `--agent` API exposes — read the plasmid, design primers, run a
 digest, clone, manage the library, even drive the OT-2 — with everything
-showing up live in the app. She **asks before every write** by default;
+showing up live in the app, and if a change you asked for failed or never ran,
+the turn ends by saying so, whatever her answer claims. She **asks before every
+write** by default;
 destructive whole-library wipes are never reachable, and **physical robot
 motion always asks first**. Turn **Corpus** on and answers come grounded in a
 research corpus with cited sources, grown by the built-in **paper scraper** and

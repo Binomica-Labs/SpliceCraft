@@ -102,6 +102,8 @@ class Truth:
     amp_protein10: str
     sequence: str
     primer_tm: float
+    digest_pair: "tuple[str, str]"    # two once-cutters well apart, for `digest`
+    digest_sizes: "list[int]"         # the fragments they give, largest first
 
 
 PRIMER_FOR_TM = "ACGTACGTTTGGCCAAGTGA"
@@ -121,11 +123,19 @@ def compute_truth(sc, app) -> Truth:
     in_amp = {e for e in unique
               if sc._bp_in_span(cuts[e], amp["start"], amp["end"], n)}
     aa = sc._h_find_feature(app, {"name": "AmpR"})["matches"][0]["translation"]
+    seq = str(app._current_record.seq).upper()
+    # Two once-cutters at least 300 bp apart both ways, picked by name so the
+    # choice is stable; the sizes come from SpliceCraft's own digest.
+    pair = next((a, b) for a in sorted(unique) for b in sorted(unique)
+                if a < b and 300 <= (cuts[b] - cuts[a]) % n <= n - 300)
+    digest = sc._AGENT_HANDLERS["digest"][0](
+        app, {"sequence": seq, "enzymes": list(pair), "circular": True})
+    sizes = sorted((int(f["length"]) for f in digest["fragments"]), reverse=True)
     return Truth(name=PLASMID_NAME, length=n, rows=rows, unique=unique,
                  multi={e for e, k in counts.items() if k > 1},
-                 unique_in_amp=in_amp, amp_protein10=aa[:10],
-                 sequence=str(app._current_record.seq).upper(),
-                 primer_tm=float(sc._primer_tm(PRIMER_FOR_TM)))
+                 unique_in_amp=in_amp, amp_protein10=aa[:10], sequence=seq,
+                 primer_tm=float(sc._primer_tm(PRIMER_FOR_TM)),
+                 digest_pair=pair, digest_sizes=sizes)
 
 
 # ── graders: (answer, record-after, truth) → (passed, detail) ─────────────────
@@ -195,9 +205,9 @@ def grade_primers(answer, _rec, t: Truth):
     return fwd and rev, f"forward={fwd} reverse={rev} ({len(oligos)} oligo(s) quoted)"
 
 
-def grade_add_feature(_answer, rec, _t: Truth):
+def grade_add_feature(_answer, after, _t: Truth):
     hits = []
-    for f in getattr(rec, "features", []) or []:
+    for f in getattr(after.get("record"), "features", []) or []:
         lab = (f.qualifiers.get("label") or [""])[0] if f.qualifiers else ""
         if str(lab).strip().lower() == "test site":
             hits.append((int(f.location.start), int(f.location.end)))
@@ -210,6 +220,38 @@ def grade_primer_tm(answer, _rec, t: Truth):
     nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", answer or "")]
     ok = any(abs(x - t.primer_tm) <= 1.0 for x in nums)
     return ok, f"want {t.primer_tm:.1f} °C ±1"
+
+
+def grade_digest(answer, _after, t: Truth):
+    nums = _ints(answer)
+    found = [s for s in t.digest_sizes if s in nums]
+    return (len(found) == len(t.digest_sizes),
+            f"sizes {t.digest_sizes} with {' + '.join(t.digest_pair)}; found {found}")
+
+
+def grade_save_primers(_answer, after, t: Truth):
+    def key(name) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    saved = {key(p.get("name")): str(p.get("sequence") or "").upper()
+             for p in after.get("primers") or [] if isinstance(p, dict)}
+    fwd, rev = saved.get("cmrf"), saved.get("cmrr")
+    if not fwd or not rev:
+        return False, f"saved primers: {sorted(saved)[:6]} (want CmR-F and CmR-R)"
+    cm = t.rows["CmR"]
+    s, e = cm["start"], cm["end"]
+
+    def rc(x):
+        return x.translate(str.maketrans("ACGT", "TGCA"))[::-1]
+
+    def left(o):                      # anneals at CmR's leftmost base (top strand)
+        return len(o) >= 16 and t.sequence[s:s + len(o)] == o
+
+    def right(o):                     # anneals at CmR's rightmost base (bottom strand)
+        return len(o) >= 16 and rc(t.sequence[e - len(o):e]) == o
+    # Which one a person calls "F" for a − strand gene varies; either way the
+    # pair must be the two ends of CmR.
+    ok = (left(fwd) and right(rev)) or (left(rev) and right(fwd))
+    return ok, f"CmR-F {len(fwd)} nt, CmR-R {len(rev)} nt — bind CmR's two ends: {ok}"
 
 
 @dataclass
@@ -238,6 +280,13 @@ TASKS = [
                         "200 of this plasmid.", "auto", grade_add_feature),
     Task("primer_tm", f"What is the melting temperature of the primer {PRIMER_FOR_TM}?",
          "readonly", grade_primer_tm),
+    # Added after the first round: a 7B summed cut positions itself instead of
+    # digesting, and designed primers it was asked to SAVE and stopped there.
+    Task("digest", "If I cut this plasmid with {e1} and {e2} together, what fragment "
+                   "sizes do I get?", "readonly", grade_digest),
+    Task("save_primers", "Design PCR primers that amplify the CmR gene and save both "
+                         "to my primer library, named CmR-F and CmR-R.", "auto",
+         grade_save_primers),
 ]
 
 
@@ -253,6 +302,8 @@ class Result:
     answer: str = ""
     error: str = ""
     step_errors: "list[str]" = field(default_factory=list)
+    calls: "list[str]" = field(default_factory=list)   # each call with its arguments
+    notes: "list[str]" = field(default_factory=list)   # ⚠ warnings + announce nudges
 
 
 # ── the runner ────────────────────────────────────────────────────────────────
@@ -264,6 +315,8 @@ async def run_task(sc, task: Task, model: str, protocol: str, *, timeout_s: floa
     app = sc.PlasmidApp()
     steps: "list[str]" = []
     step_errors: "list[str]" = []
+    calls: "list[str]" = []
+    notes: "list[str]" = []
     async with app.run_test(size=(200, 50)) as pilot:
         for _ in range(6):
             await pilot.pause()
@@ -273,6 +326,13 @@ async def run_task(sc, task: Task, model: str, protocol: str, *, timeout_s: floa
         app._apply_record(rec)
         for _ in range(6):
             await pilot.pause()
+        # Every task starts from the same empty primer library. The sandbox is
+        # shared by the whole run, and a save is refused (409) when the SAME
+        # sequence is already filed — so without this, the second protocol's
+        # save_primers found the first one's primers, "passed" on them, and
+        # measured nothing.
+        sc._save_primers([])
+        assert sc._load_primers() == [], "could not reset the primer library"
         truth = compute_truth(sc, app)
         app.action_open_babs()
         for _ in range(6):
@@ -289,6 +349,8 @@ async def run_task(sc, task: Task, model: str, protocol: str, *, timeout_s: floa
         def spy(tc):                               # observe, never alter
             label = sc._babs_tool_call_label(tc)
             steps.append(label)
+            calls.append(f"{sc._babs_tool_call_name(tc)} "
+                         f"{json.dumps(sc._babs_tool_call_args(tc), default=str)[:240]}")
             result = real_run(tc)
             err = result.get("error") if isinstance(result, dict) else None
             if not err and isinstance(result, dict) and isinstance(result.get("result"), dict):
@@ -297,6 +359,13 @@ async def run_task(sc, task: Task, model: str, protocol: str, *, timeout_s: floa
                 step_errors.append(f"{label}: {str(err)[:120]}")
             return result
         scr._run_tool_call = spy
+        real_note = scr._sys_note
+
+        def note_spy(text):                        # what the loop told the user
+            if "⚠" in str(text) or "go ahead" in str(text):   # warnings + the nudge
+                notes.append(str(text)[:240])
+            return real_note(text)
+        scr._sys_note = note_spy
         errors: "list[str]" = []
         real_finalize = scr._finalize
 
@@ -306,7 +375,8 @@ async def run_task(sc, task: Task, model: str, protocol: str, *, timeout_s: floa
             return real_finalize(query, display, answer, err, stopped)
         scr._finalize = finalize_spy
         t0 = time.monotonic()
-        scr.query_one("#babs-input", Input).value = task.prompt
+        scr.query_one("#babs-input", Input).value = task.prompt.format(
+            e1=truth.digest_pair[0], e2=truth.digest_pair[1])
         scr._submit_current()
         while scr._generating and time.monotonic() - t0 < timeout_s:
             await asyncio.sleep(0.5)
@@ -323,10 +393,11 @@ async def run_task(sc, task: Task, model: str, protocol: str, *, timeout_s: floa
         answer = (scr._history[-1]["content"]
                   if scr._history and scr._history[-1].get("role") == "assistant"
                   else "")
-        passed, detail = task.grade(answer, app._current_record, truth)
+        after = {"record": app._current_record, "primers": sc._load_primers()}
+        passed, detail = task.grade(answer, after, truth)
         error = "timed out" if timed_out else "; ".join(errors)[:300]
         return Result(task.key, model, protocol, bool(passed), detail, round(seconds, 1),
-                      steps, answer[:2000], error, step_errors)
+                      steps, answer[:2000], error, step_errors, calls, notes)
 
 
 def _num_ctx_for(sc, model: str) -> int:
@@ -352,6 +423,8 @@ async def run_suite(sc, models, protocols, tasks, *, timeout_s: float, log=print
                     f"{r.steps[:6]} · {r.detail}{' · ' + r.error if r.error else ''}")
                 for e in r.step_errors[:4]:
                     log(f"      step failed — {e}")
+                for n in r.notes[:2]:
+                    log(f"      noted — {n}")
                 results.append(r)
     return results
 

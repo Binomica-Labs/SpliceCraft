@@ -56,6 +56,28 @@ async def test_fixture_supports_every_task(truth):
     assert truth.unique_in_amp, "cutters_in_gene needs a unique cutter inside AmpR"
     assert truth.amp_protein10.startswith("M") and len(truth.amp_protein10) == 10
     assert 40.0 < truth.primer_tm < 80.0
+    a, b = truth.digest_pair
+    assert a in truth.unique and b in truth.unique and a != b
+    assert len(truth.digest_sizes) == 2 and sum(truth.digest_sizes) == truth.length
+    assert min(truth.digest_sizes) >= 300
+    for task in bench.TASKS:                      # every prompt fills cleanly
+        task.prompt.format(e1=a, e2=b)
+
+
+async def test_digest_truth_matches_an_independent_digest(truth):
+    """The bench's digest sizes come from SpliceCraft's own `digest`. Check them
+    against Biopython's restriction module, so the bench can never agree with
+    a bug in the thing it grades."""
+    from Bio import Restriction
+    from Bio.Seq import Seq
+    seq = Seq(truth.sequence)
+    cuts = []
+    for name in truth.digest_pair:
+        hits = getattr(Restriction, name).search(seq, linear=False)
+        assert len(hits) == 1, (name, hits)
+        cuts.append(hits[0] - 1)   # 1-based first base after the cut → 0-based
+    d = (cuts[1] - cuts[0]) % truth.length
+    assert sorted(truth.digest_sizes) == sorted([d, truth.length - d])
 
 
 async def test_graders_pass_right_and_fail_wrong(truth):
@@ -92,6 +114,27 @@ async def test_graders_pass_right_and_fail_wrong(truth):
         assert grade(wrong, None, t)[0] is False, (grade.__name__, wrong)
 
 
+async def test_digest_and_save_primer_graders_both_ways(truth):
+    t = truth
+    big, small = t.digest_sizes
+    assert bench.grade_digest(f"You get {big:,} bp and {small} bp.", None, t)[0]
+    assert not bench.grade_digest(f"You get {big} bp and {small + 1} bp.", None, t)[0]
+    cm = t.rows["CmR"]
+    left = t.sequence[cm["start"]: cm["start"] + 20]
+    right = _rc(t.sequence[cm["end"] - 20: cm["end"]])
+    ok = {"primers": [{"name": "CmR-F", "sequence": left},
+                      {"name": "CmR-R", "sequence": right}]}
+    swapped = {"primers": [{"name": "cmr f", "sequence": right},
+                           {"name": "CMR_R", "sequence": left}]}
+    wrong_end = {"primers": [{"name": "CmR-F", "sequence": left},
+                             {"name": "CmR-R", "sequence": left}]}
+    missing = {"primers": [{"name": "CmR-F", "sequence": left}]}
+    assert bench.grade_save_primers("", ok, t)[0]
+    assert bench.grade_save_primers("", swapped, t)[0]       # F/R naming may vary
+    assert not bench.grade_save_primers("", wrong_end, t)[0]
+    assert not bench.grade_save_primers("", missing, t)[0]
+
+
 def test_add_feature_grader_is_exact_about_the_one_based_range():
     from Bio.Seq import Seq
     from Bio.SeqFeature import FeatureLocation, SeqFeature
@@ -102,14 +145,14 @@ def test_add_feature_grader_is_exact_about_the_one_based_range():
         r.features = [SeqFeature(FeatureLocation(a, b), type="misc_feature",
                                  qualifiers={"label": ["Test Site"]})]
         return r
-    assert bench.grade_add_feature("", rec_with(99, 200), None)[0] is True
+    assert bench.grade_add_feature("", {"record": rec_with(99, 200)}, None)[0] is True
     for off_by_one in ((100, 200), (100, 201), (99, 201)):
-        assert bench.grade_add_feature("", rec_with(*off_by_one), None)[0] is False
+        assert bench.grade_add_feature("", {"record": rec_with(*off_by_one)}, None)[0] is False
 
 
 def test_task_keys_are_unique_and_graded():
     keys = [t.key for t in bench.TASKS]
-    assert len(keys) == len(set(keys)) == 8
+    assert len(keys) == len(set(keys)) == 10
     assert all(callable(t.grade) and t.autonomy in ("readonly", "auto", "ask")
                for t in bench.TASKS)
 

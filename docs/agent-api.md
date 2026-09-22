@@ -148,8 +148,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   letters, best match first — with its coordinates both ways: 0-based
   end-exclusive `start`/`end` as every endpoint takes them, plus 1-based
   `start_1based`/`end_1based`; its own sequence 5'→3' on its strand, spliced
-  parts joined; and for a CDS the translation of the bases as they stand, with
-  `translation_matches_annotation` when the file carries a /translation);
+  parts joined; for a CDS the translation of the bases as they stand, with
+  `translation_matches_annotation` when the file carries a /translation; and
+  `unique_cutters_inside` — every enzyme that cuts the whole plasmid once with
+  that cut inside the feature, as `[{enzyme, cut_bp}]`);
   `amplify-feature` `{name | idx, type?, target_tm?}` (binding-only PCR primers
   that amplify one feature end to end — across the origin and on either
   strand — then locate each primer on the whole plasmid: `binds_as_designed`,
@@ -351,7 +353,13 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   scored as mismatches — to confirm a designed primer binds exactly once
   before saving; `template` defaults to the LOADED plasmid with its own
   topology, and with no template and nothing loaded it still returns the
-  Tm and GC% with `binds: null` and a `note`), optimize-protein
+  Tm and GC% with `binds: null` and a `note`; `sequence` is the template
+  when `primer` is given and the primer when it isn't — flagged
+  `primer_from: "sequence"`, refused past 1000 characters. Both are read
+  strictly: a FASTA header line, spacing, numbering and 5'/3' notation are
+  fine, but text mixed into the bases — a label (`kanR-R: ACGT…`), a second
+  FASTA record, a letter that is not a base — is a 400 rather than being
+  read as bases), optimize-protein
   (codon-optimise an AA sequence to a chosen table; optional `stops`
   0–3 appends that many stop codons, and a trailing `*` run in the
   protein is honored as-is and overrides it; optional `transl_table`
@@ -404,7 +412,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 - **Digest** — digest (cut a RAW sequence with named enzymes and report
   the cuts + resulting fragments with their **overhangs** — overhang-aware
   QC for a Golden-Braid / restriction junction without loading the
-  sequence onto the canvas; `circular` defaults true, a singular `enzyme`
+  sequence onto the canvas; with no `sequence` it digests the LOADED plasmid
+  with its own topology and says so in `sequence_from`; `circular` defaults
+  true for a raw sequence, a singular `enzyme`
   is accepted, names are matched case-insensitively so `bsai` cuts,
   commercial synonyms resolve (Thermo's `Eco31I` is NEB's `BsaI`) with
   `resolved_enzymes` reporting what each one became, and names the catalog

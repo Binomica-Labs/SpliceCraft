@@ -157,6 +157,24 @@ async def test_translation_disagreement_with_annotation_is_reported():
         assert m["translation_matches_annotation"] is False
 
 
+async def test_find_feature_lists_every_once_cutter_inside_it():
+    app = sc.PlasmidApp()
+    async with app.run_test(size=_TERM) as pilot:
+        await _loaded_app(pilot, app)
+        full = sc._h_list_restriction_sites(app, {})
+        counts: dict = {}
+        cuts: dict = {}
+        for s in full["sites"]:
+            counts[s["enzyme"]] = counts.get(s["enzyme"], 0) + 1
+            cuts[s["enzyme"]] = s["cut_bp"]
+        for label in ("geneA", "geneB", "wrapGene"):
+            m = sc._h_find_feature(app, {"name": label})["matches"][0]
+            got = {c["enzyme"] for c in m["unique_cutters_inside"]}
+            want = {e for e, k in counts.items() if k == 1
+                    and sc._bp_in_span(cuts[e], m["start"], m["end"], _N)}
+            assert got == want, (label, got ^ want)
+
+
 # ── amplify-feature ───────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("label", ["geneA", "geneB", "wrapGene"])

@@ -4358,6 +4358,24 @@ class TestDigestHandler:
             assert c["overhang_seq"] == "AATT", c
             assert c["kind"] == "5'", c
 
+    def test_no_sequence_digests_the_loaded_plasmid_with_its_topology(self):
+        # "Cut THIS plasmid with …" must not need the whole sequence pasted into
+        # the call — for a small model that is minutes of generated bases.
+        from types import SimpleNamespace
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq(self.SEQ), id="p")
+        rec.annotations["topology"] = "linear"
+        r = sc._h_digest(SimpleNamespace(_current_record=rec), {"enzymes": ["EcoRI"]})
+        assert r["sequence_from"] == "the loaded plasmid"
+        assert r["circular"] is False and r["n_fragments"] == 3   # linear: N+1
+        same = sc._h_digest(None, {"sequence": self.SEQ, "enzymes": ["EcoRI"],
+                                   "circular": False})
+        assert [f["length"] for f in r["fragments"]] == [f["length"] for f in same["fragments"]]
+        assert "sequence_from" not in same                        # a raw body says nothing
+        missing = sc._h_digest(SimpleNamespace(_current_record=None), {"enzymes": ["EcoRI"]})
+        assert isinstance(missing, tuple) and missing[1] == 400
+
     def test_matches_real_engine(self):
         # Feedback "done when": the count matches `_enzyme_cuts`.
         r = sc._h_digest(None, {"sequence": self.SEQ, "enzymes": ["EcoRI"],
@@ -6133,6 +6151,54 @@ class TestCheckPrimer:
         r = sc._h_check_primer(None, {"primer": "ACGTACGTTTGGCCAAGTGA"})
         assert r["tm"] == sc._primer_tm("ACGTACGTTTGGCCAAGTGA")
         assert r["gc_pct"] == 50.0 and r["binds"] is None and "note" in r
+
+    def test_a_lone_sequence_is_the_primer_otherwise_the_template(self):
+        # The Babs bench: asked a primer's Tm, a 7B sent the oligo as
+        # `sequence` — which had only ever meant the TEMPLATE, so the call
+        # failed for want of a primer.
+        oligo = "ACGTACGTTTGGCCAAGTGA"
+        r = sc._h_check_primer(None, {"sequence": oligo})
+        assert r["primer"] == oligo and r["primer_from"] == "sequence"
+        assert r["tm"] == sc._primer_tm(oligo) and r["binds"] is None
+        fwd = _PRIMER_TMPL[40:62]
+        r2 = sc._h_check_primer(None, {"sequence": fwd, "template": _PRIMER_TMPL,
+                                       "circular": False})
+        assert r2["primer_from"] == "sequence" and r2["binds"]
+        # with `primer` given, `sequence` is still the template, as before
+        r3 = sc._h_check_primer(None, {"primer": fwd, "sequence": _PRIMER_TMPL,
+                                       "circular": False})
+        assert "primer_from" not in r3 and any(s["foot_start"] == 40 for s in r3["sites"])
+        # a lone sequence too long to be a primer is refused, not guessed at
+        err, code = sc._h_check_primer(None, {"sequence": "ACGT" * 300})
+        assert code == 400 and "lone 'sequence'" in err["error"]
+        assert sc._h_check_primer(None, {"sequence": "   "})[1] == 400
+        assert sc._h_check_primer(None, {"sequence": 7})[1] == 400
+
+    def test_text_mixed_into_the_bases_is_refused_not_read_as_bases(self):
+        # The old filter kept every IUPAC letter, so a label rode along as
+        # bases: "kanR-R: ACGT…" was checked as KANRRACGT… with a Tm to match.
+        oligo = "ACGTACGTTTGGCCAAGTGA"
+        for bad in (f"kanR-R: {oligo}", f"name={oligo}", f"primer F {oligo}",
+                    f"{oligo}U", "ACGT<b>ACGT"):
+            err, code = sc._h_check_primer(None, {"primer": bad})
+            assert code == 400 and "'primer'" in err["error"], bad
+        err, code = sc._h_check_primer(None, {"sequence": f"kanR-R: {oligo}"})
+        assert code == 400 and "'sequence'" in err["error"]
+        # notation, spacing, numbering and a FASTA header are not bases
+        for ok in (f">kanR-R\n{oligo}", f"5'-{oligo}-3'", "acgtacgttt ggccaagtga",
+                   f"1 {oligo.lower()}"):
+            assert sc._h_check_primer(None, {"primer": ok})["primer"] == oligo, ok
+
+    def test_a_fasta_template_keeps_its_coordinates(self):
+        fwd = _PRIMER_TMPL[40:62]
+        plain = sc._h_check_primer(None, {"primer": fwd, "template": _PRIMER_TMPL,
+                                          "circular": False})
+        fasta = sc._h_check_primer(None, {"primer": fwd, "circular": False,
+                                          "template": ">my plasmid (kanR)\n" + _PRIMER_TMPL})
+        assert fasta["sites"] == plain["sites"]                  # header added no bases
+        err, code = sc._h_check_primer(None, {"primer": fwd, "template":
+                                              f">a\n{_PRIMER_TMPL}\n>b\n{_PRIMER_TMPL}"})
+        assert code == 400 and "more than one FASTA record" in err["error"]
 
     def test_template_defaults_to_the_loaded_plasmid(self):
         from types import SimpleNamespace

@@ -4958,6 +4958,32 @@ def _h_get_history(app, payload):
     }
 
 
+# check-primer's bases, read STRICTLY. The old filter kept every IUPAC letter
+# and dropped the rest, so a label rode along as bases: "CmR-R: ATG…" was
+# checked as CMRRATG…, and a Tm for an oligo nobody ordered came back without
+# a word. Separators, primes and numbering can't be mistaken for bases and are
+# dropped; a FASTA header line is dropped whole; label punctuation, a second
+# FASTA record, or a letter that is not a base means text is mixed in — refused.
+_CHECK_PRIMER_IUPAC = frozenset("ACGTRYWSMKBDHVN")
+
+
+def _check_primer_bases(raw, what: str) -> "tuple[str, str | None]":
+    lines = str(raw).splitlines()
+    headers = [ln for ln in lines if ln.lstrip().startswith(">")]
+    if len(headers) > 1:
+        return "", f"'{what}' holds more than one FASTA record — pass one sequence"
+    text = "\n".join(ln for ln in lines if not ln.lstrip().startswith(">"))
+    if any(ch in text for ch in ":=<>"):
+        return "", (f"'{what}' looks like it carries a label — pass only the "
+                    f"bases")
+    bad = sorted({ch for ch in text.upper()
+                  if ch.isalpha() and ch not in _CHECK_PRIMER_IUPAC})
+    if bad:
+        return "", (f"'{what}' has letters that are not DNA bases "
+                    f"({''.join(bad)!r}) — pass only the sequence")
+    return "".join(ch for ch in text.upper() if ch in _CHECK_PRIMER_IUPAC), None
+
+
 @_agent_endpoint("check-primer")
 def _h_check_primer(app, payload):
     """Check ONE primer against a template: melting temp, GC%, and every
@@ -4969,6 +4995,11 @@ def _h_check_primer(app, payload):
     no template and nothing loaded, the melting temperature and GC% are
     still returned — `binds` is then null and a `note` says binding was not
     checked — so "what is this primer's Tm?" never needs a sequence.
+
+    `sequence` is read as the TEMPLATE when `primer` is given, and as the
+    PRIMER when it isn't (there is nothing to check without one — the
+    response then carries `primer_from: "sequence"`); a lone `sequence`
+    longer than 1000 characters is refused, not guessed at.
 
     The read-only analog of the GUI "Primer Check" tab for a single
     oligo: `simulate-pcr` needs a PAIR; this answers "does this one
@@ -4986,15 +5017,31 @@ def _h_check_primer(app, payload):
     0-based footprint start on the cleaned template; sites are
     best-first (highest identity)."""
     primer_raw = payload.get("primer")
+    template_raw = payload.get("template")
+    seq_raw = payload.get("sequence")
+    read_seq_as_primer = False
+    if primer_raw is None and isinstance(seq_raw, str) and seq_raw.strip():
+        # A lone `sequence` can only be the oligo — there is nothing to check
+        # without one — and it is what a caller (a local model on the Babs
+        # bench, twice) sends for "what's the Tm of ACGT…". Anything longer
+        # than a primer is refused rather than guessed at.
+        if len(seq_raw) > 1000:
+            return ({"error": "missing 'primer' — a lone 'sequence' is read as "
+                              f"the primer, and this one is {len(seq_raw)} "
+                              "characters; pass the oligo as 'primer' and a "
+                              "template as 'template'"}, 400)
+        primer_raw, read_seq_as_primer = seq_raw, True
     if not isinstance(primer_raw, str) or not primer_raw.strip():
         return ({"error": "missing or non-string 'primer'"}, 400)
-    template_raw = payload.get("template")
-    if template_raw is None:
-        template_raw = payload.get("sequence")
+    if template_raw is None and not read_seq_as_primer:
+        template_raw = seq_raw
     if template_raw is not None and not isinstance(template_raw, str):
         return ({"error": "'template' must be a string"}, 400)
     _iupac = "ACGTRYWSMKBDHVN"
-    primer = "".join(ch for ch in primer_raw.upper() if ch in _iupac)
+    primer, bad = _check_primer_bases(primer_raw,
+                                      "sequence" if read_seq_as_primer else "primer")
+    if bad:
+        return ({"error": bad}, 400)
     if not primer:
         return ({"error": "no IUPAC bases in 'primer'"}, 400)
     if len(primer) > 1000:
@@ -5012,12 +5059,19 @@ def _h_check_primer(app, payload):
                 "binds": None, "n_sites": 0, "sites": [],
                 "note": "no template given and no plasmid loaded — melting "
                         "temperature and GC% only; binding was not checked",
+                **({"primer_from": "sequence"} if read_seq_as_primer else {}),
             }
         template_raw = loaded
         loaded_default = True
         if payload.get("circular") is None:
             payload = {**payload, "circular": _record_is_circular(rec)}
-    template = "".join(ch for ch in template_raw.upper() if ch in _iupac)
+    if loaded_default:              # our own record: read it as always
+        template = "".join(ch for ch in template_raw.upper() if ch in _iupac)
+    else:
+        template, bad = _check_primer_bases(
+            template_raw, "template" if payload.get("template") is not None else "sequence")
+        if bad:
+            return ({"error": bad}, 400)
     if not template:
         return ({"error": "no IUPAC bases in 'template'"}, 400)
     if len(template) > _PAIRWISE_MAX_LEN:
@@ -5070,6 +5124,7 @@ def _h_check_primer(app, payload):
         "best_identity": best,
         "sites":         out_sites,
         **({"template": "the loaded plasmid"} if loaded_default else {}),
+        **({"primer_from": "sequence"} if read_seq_as_primer else {}),
     }
 
 
@@ -8208,6 +8263,9 @@ def _h_digest(app, payload):
              include_fragment_seq?=false}``.
 
     * ``sequence`` — IUPAC DNA, capped at 5 Mb (``seq`` accepted as alias).
+      Omitted → the LOADED plasmid, with its own topology unless
+      ``circular`` is given; the reply then carries
+      ``sequence_from: "the loaded plasmid"``.
     * ``enzymes`` — list of names from the combined catalog (built-in NEB ∪
       your custom enzymes); a singular ``enzyme`` string is accepted. Names
       the catalog doesn't know are reported under ``unknown_enzymes`` (and
@@ -8236,6 +8294,18 @@ def _h_digest(app, payload):
     raw = (payload.get("sequence")
            if payload.get("sequence") not in (None, "")
            else payload.get("seq"))
+    # No sequence → the LOADED plasmid, with its own topology. Otherwise the
+    # only way to digest "this plasmid" was to paste all of it into the call
+    # — for a small local model that is hundreds of generated tokens (minutes
+    # on a CPU) and a chance to garble every base of it.
+    from_loaded = False
+    if raw in (None, ""):
+        rec = getattr(app, "_current_record", None)
+        loaded = str(getattr(rec, "seq", "") or "") if rec is not None else ""
+        if loaded:
+            raw, from_loaded = loaded, True
+            if payload.get("circular") is None:
+                payload = {**payload, "circular": _record_is_circular(rec)}
     # `_sanitize_bases` enforces the cap (and IUPAC charset) itself — pass
     # the 5 Mb digest ceiling so it bounds the work (an HTTP caller is also
     # limited by the ~1 MiB JSON body cap upstream).
@@ -8245,7 +8315,8 @@ def _h_digest(app, payload):
         # 'sequence' — translate so the error names a key the agent sent.
         return ({"error": berr.replace("'bases'", "'sequence'")}, 400)
     if not bases:
-        return ({"error": "missing/empty 'sequence' (IUPAC DNA)"}, 400)
+        return ({"error": "missing/empty 'sequence' (IUPAC DNA), and no "
+                           "plasmid is loaded to digest instead"}, 400)
     enzymes = payload.get("enzymes")
     if enzymes is None and payload.get("enzyme") not in (None, ""):
         enzymes = payload.get("enzyme")
@@ -8328,6 +8399,8 @@ def _h_digest(app, payload):
             renamed[match[1]] = match[0]
     if renamed:
         out["resolved_enzymes"] = renamed
+    if from_loaded:
+        out["sequence_from"] = "the loaded plasmid"
     return out
 
 

@@ -998,6 +998,7 @@ class TestBabsAgentic:
                          "splicecraft_describe_endpoint", "splicecraft_call",
                          "splicecraft_plasmid_overview", "splicecraft_find_feature",
                          "splicecraft_amplify_feature", "splicecraft_add_feature",
+                         "splicecraft_digest",
                          "splicecraft_reference_lookup",
                          "splicecraft_recall_knowledge",
                          "splicecraft_search_online", "splicecraft_fetch_page",
@@ -1670,6 +1671,8 @@ async def _run_agent_turn(monkeypatch, steps: list, *, query: str = "go",
     # The on-mount window probe is a background worker; if it landed AFTER the
     # test set `_num_ctx` it would reset it. It is Ollama metadata I/O — stub it.
     monkeypatch.setattr(sc.BabsScreen, "_refresh_num_ctx", lambda self: None)
+    # No babs engine: the same prompt on every machine, and nothing shells ~/babs.
+    monkeypatch.setattr(sc, "_learn_resolve_babs_home", lambda: None)
     seen: list = []
     monkeypatch.setattr(B, "chat_stream", _scripted_chat(steps, seen, kwargs_seen))
     app = sc.PlasmidApp()
@@ -1943,10 +1946,12 @@ class TestBabsAgentRobustness:
             "name": "splicecraft_list_endpoints", "arguments": {"filter": f}}}]}
         res = [B.est_tokens(sc._babs_tool_result_text(sc._babs_list_endpoints({"filter": f})))
                for f in filters]
-        system = B.est_tokens(B.BABS_SYSTEM + sc._BABS_AGENT_PREAMBLE)
+        # The helper runs with no babs engine, so the lean prompt + tool list.
+        system = B.est_tokens(B.BABS_SYSTEM + sc._BABS_CTX_EXPLAINER
+                              + sc._babs_agent_preamble(False))
         wanted_budget = system + sum(res) - res[0] // 2
         num_ctx = int((wanted_budget
-                       + B.est_tokens(json.dumps(sc._babs_tool_manifest()))
+                       + B.est_tokens(json.dumps(sc._babs_tool_manifest(False)))
                        + sc._BABS_TURN_REPLY_RESERVE) / sc._BABS_TURN_CTX_SHARE) + 1
         steps = [call(f) for f in filters] + [{"content": "ok"}]
         seen, _scr = await _run_agent_turn(monkeypatch, steps, query="the task",
@@ -2012,6 +2017,7 @@ def _babs_hermetic(monkeypatch, *, show_meta=None):
     monkeypatch.setattr(sc.BabsScreen, "_recall_for_turn", lambda self, q: None)
     monkeypatch.setattr(sc, "_babs_memory_index", lambda: "")
     monkeypatch.setattr(sc.BabsScreen, "_refresh_num_ctx", lambda self: None)
+    monkeypatch.setattr(sc, "_learn_resolve_babs_home", lambda: None)
 
 
 def _tool_step(name: str, args: dict) -> dict:
@@ -2422,6 +2428,14 @@ class TestBabsBenchFindings:
                                            num_ctx=16384)
         assert any("did not go through" in n and "add-feature" in n for n in notes), notes
 
+    async def test_the_warning_counts_failed_calls_not_endpoints(self, monkeypatch):
+        notes = self._notes(monkeypatch)
+        bad = {"endpoint": "add-feature", "arguments": {"label": "x"}}   # both fail
+        steps = [_tool_step("splicecraft_batch", {"calls": [bad, bad]}),
+                 {"content": "Done."}]
+        await _run_agent_turn(monkeypatch, steps, autonomy="auto", num_ctx=16384)
+        assert any("2 change(s)" in n and "add-feature" in n for n in notes), notes
+
     async def test_a_fixed_retry_or_a_declined_write_is_not_announced(self, monkeypatch):
         notes = self._notes(monkeypatch)
         steps = [_tool_step("splicecraft_call", {"endpoint": "add-feature",
@@ -2449,6 +2463,34 @@ class TestBabsBenchFindings:
                               autonomy="ask", num_ctx=16384, prep=with_record)
         assert not any("did not go through" in n for n in notes), notes
 
+    def test_call_body_accepts_every_shape_a_model_sends(self):
+        B_ = sc._babs_call_body
+        assert B_({"endpoint": "e", "arguments": {"primer": "A"}}) == {"primer": "A"}
+        assert B_({"endpoint": "e", "arguments": '{"primer": "A"}'}) == {"primer": "A"}
+        assert B_({"endpoint": "e", "body": {"primer": "A"}}) == {"primer": "A"}
+        # flattened into the call itself (the bench, native protocol)
+        assert B_({"endpoint": "e", "primer": "A", "template": "T"}) == {"primer": "A",
+                                                                         "template": "T"}
+        # an explicit `arguments` wins on a clash; stray keys fill the rest
+        assert B_({"endpoint": "e", "arguments": {"primer": "A"}, "primer": "B",
+                   "template": "T"}) == {"primer": "A", "template": "T"}
+        assert B_({"endpoint": "e"}) == {} and B_({"endpoint": "e", "arguments": "no"}) == {}
+
+    def test_flattened_arguments_reach_the_endpoint(self):
+        scr = sc.BabsScreen()
+        seen: list = []
+        scr._dispatch_agent_endpoint = (lambda ep, body, **kw:
+                                        seen.append((ep, body)) or {"ok": 1})
+        scr._run_tool_call(_tool_step("splicecraft_call", {
+            "endpoint": "check-primer", "primer": "ACGTACGT"})["tool_calls"][0])
+        scr._autonomy = "auto"
+        scr._run_tool_call(_tool_step("splicecraft_batch", {"calls": [
+            {"endpoint": "check-primer", "primer": "CCCCGGGG"},
+            {"endpoint": "status", "arguments": {}}]})["tool_calls"][0])
+        assert seen == [("check-primer", {"primer": "ACGTACGT"}),
+                        ("check-primer", {"primer": "CCCCGGGG"}),
+                        ("status", {})]
+
     def test_write_outcomes_read_batches_per_call(self):
         res = {"results": [{"endpoint": "add-feature", "status": 200},
                            {"endpoint": "delete-feature", "error": "boom"},
@@ -2456,6 +2498,483 @@ class TestBabsBenchFindings:
                            {"endpoint": "create-primer", "error": "declined by the user (batch)."}]}
         assert sc._babs_write_outcomes([], res) == [("add-feature", False),
                                                     ("delete-feature", True)]
+
+
+class TestBabsDigestAndSave:
+    """The second bench round: a 7B added up cut positions itself instead of
+    finding `digest`, and designed primers it was asked to SAVE and stopped."""
+
+    def test_enzyme_list_accepts_what_models_send(self):
+        L = sc._babs_enzyme_list
+        assert L(["EcoRI", "BamHI"]) == ["EcoRI", "BamHI"]
+        assert L("EcoRI, BamHI") == ["EcoRI", "BamHI"]
+        assert L("EcoRI and BamHI") == ["EcoRI", "BamHI"]
+        assert L("EcoRI+BamHI; EcoRI") == ["EcoRI", "BamHI"]
+        assert L("EcoRI AND BamHI") == ["EcoRI", "BamHI"]         # any case
+        assert L("EcoRI/BamHI with XhoI") == ["EcoRI", "BamHI", "XhoI"]
+        assert L("EcoRI, ecori") == ["EcoRI"]                     # case-blind dedupe
+        assert L([3, None, "XhoI"]) == ["XhoI"]
+        assert L(None) == [] and L(5) == []
+        assert len(L(",".join(f"E{i}" for i in range(50)))) == 20
+
+    def test_digest_tool_routes_to_the_open_plasmid(self):
+        scr = sc.BabsScreen()
+        seen: list = []
+        scr._dispatch_agent_endpoint = lambda ep, body: seen.append((ep, body)) or {"ok": 1}
+        scr._run_tool_call(_tool_step("splicecraft_digest",
+                                      {"enzymes": "AatII and AccI"})["tool_calls"][0])
+        assert seen == [("digest", {"enzymes": ["AatII", "AccI"]})]
+        assert "error" in scr._run_tool_call(_tool_step("splicecraft_digest", {})
+                                             ["tool_calls"][0])
+        tc = _tool_step("splicecraft_digest", {"enzymes": ["A", "B"]})["tool_calls"][0]
+        assert sc._babs_tool_call_endpoints(tc) == ["digest"]
+        assert sc._babs_tool_call_label(tc) == "digest A+B"
+
+    @staticmethod
+    async def _app_with(pilot, app, rec):
+        app._apply_record(rec)
+        for _ in range(6):
+            await pilot.pause()
+
+    @staticmethod
+    def _record():
+        import random
+        from Bio.Seq import Seq
+        from Bio.SeqFeature import FeatureLocation, SeqFeature
+        from Bio.SeqRecord import SeqRecord
+        rng = random.Random(11)
+        seq = [rng.choice("ACGT") for _ in range(900)]
+        rec = SeqRecord(Seq("".join(seq)), id="pS", name="pS")
+        rec.annotations["topology"] = "circular"
+        rec.features = [SeqFeature(FeatureLocation(300, 480, strand=-1), type="CDS",
+                                   qualifiers={"label": ["kan"]})]
+        return rec
+
+    async def test_amplify_with_save_as_saves_both_named_by_feature_start(self, monkeypatch):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await self._app_with(pilot, app, self._record())
+            scr = await _babs_screen(pilot, app)
+            scr._autonomy = "auto"
+            out = await asyncio.to_thread(scr._amplify_and_save,
+                                          {"name": "kan", "save_as": ["kan-F", "kan-R"]})
+            await pilot.pause(); await pilot.pause()
+            assert out["status"] == 200 and out["saved"]["count"] == 2, out
+            design = out["result"]
+            saved = {p["name"]: p["sequence"] for p in sc._load_primers()}
+            # − strand: the primer at the feature's START is amplify's reverse one
+            assert design["primer_at_feature_start"] == "reverse"
+            assert saved["kan-F"] == design["reverse"]["seq"]
+            assert saved["kan-R"] == design["forward"]["seq"]
+            assert sc._babs_write_outcomes(["amplify-feature", "create-primer"], out) == [
+                ("create-primer", False), ("create-primer", False)]
+
+    async def test_bad_save_as_saves_nothing(self, monkeypatch):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await self._app_with(pilot, app, self._record())
+            scr = await _babs_screen(pilot, app)
+            scr._autonomy = "auto"
+            for bad in (["only-one"], "kan-F", ["a", ""], ["a", "b", "c"], [1, 2],
+                        ["kan-F", "KAN-F "]):             # the same name twice
+                out = await asyncio.to_thread(scr._amplify_and_save,
+                                              {"name": "kan", "save_as": bad})
+                assert "error" in out, bad
+            missing = await asyncio.to_thread(scr._amplify_and_save,
+                                              {"name": "nope", "save_as": ["a", "b"]})
+            assert missing.get("status") == 404 and "saved" not in missing
+            assert sc._load_primers() == []
+
+    def test_save_as_is_dropped_unless_the_user_asked_to_save(self):
+        D = sc._babs_drop_unrequested_save
+        tc = _tool_step("splicecraft_amplify_feature",
+                        {"name": "kan", "save_as": ["a", "b"]})["tool_calls"][0]
+        out, dropped = D(tc, "Design primers to amplify kan")
+        assert dropped and sc._babs_tool_call_args(out) == {"name": "kan"}
+        assert sc._babs_tool_call_args(tc)["save_as"] == ["a", "b"]   # the model's call as made
+        assert sc._babs_tool_call_endpoints(out) == ["amplify-feature"]
+        assert sc._babs_tool_call_label(out) == "amplify kan"
+        for asked in ("design primers for kan and save them as a and b",
+                      "put the pair in my primer library", "add them to my library",
+                      "Store both, please"):
+            assert D(tc, asked) == (tc, False), asked
+        assert D(tc, "design primers for kan, but don't save them")[1]      # negated
+        assert D(tc, "no need to store them")[1]
+        offer = "Here they are. Want me to save them to your primer library?"
+        assert D(tc, sc._babs_effective_request("yes please", offer)) == (tc, False)
+        assert D(tc, sc._babs_effective_request("yes", "Here they are."))[1]  # no offer
+        plain = _tool_step("splicecraft_amplify_feature", {"name": "kan"})["tool_calls"][0]
+        assert D(plain, "design primers") == (plain, False)
+        other = _tool_step("splicecraft_digest", {"enzymes": ["EcoRI"]})["tool_calls"][0]
+        assert D(other, "design") == (other, False)
+        as_text = {"function": {"name": "splicecraft_amplify_feature",
+                                "arguments": json.dumps({"name": "kan", "save_as": ["a", "b"]})}}
+        out2, dropped2 = D(as_text, "design primers")
+        assert dropped2 and sc._babs_tool_call_args(out2) == {"name": "kan"}
+
+    async def test_a_real_turn_saves_only_when_asked(self, monkeypatch):
+        call = _tool_step("splicecraft_amplify_feature",
+                          {"name": "kan", "save_as": ["kan-F", "kan-R"]})
+        prep = lambda scr: scr.app._apply_record(self._record())  # noqa: E731
+        seen, _scr = await _run_agent_turn(
+            monkeypatch, [call, {"content": "Here are your primers."}], autonomy="auto",
+            num_ctx=16384, prep=prep, query="Design primers to amplify kan")
+        assert sc._load_primers() == []                        # not asked → not saved
+        fed = _tool_msgs(seen[-1])
+        assert fed and "not_saved" in fed[-1]["content"], fed
+        await _run_agent_turn(
+            monkeypatch, [call, {"content": "Saved."}], autonomy="auto", num_ctx=16384,
+            prep=prep, query="Design primers to amplify kan and save both as kan-F and kan-R")
+        assert {p["name"] for p in sc._load_primers()} == {"kan-F", "kan-R"}
+
+    async def test_a_yes_to_her_offer_saves(self, monkeypatch):
+        """The not_saved note has her OFFER to save; the user's "yes" has no
+        save word in it, and must not be refused as an unasked save."""
+        call = _tool_step("splicecraft_amplify_feature",
+                          {"name": "kan", "save_as": ["kan-F", "kan-R"]})
+        steps = [call, {"content": "Here are the primers. Want me to save them "
+                                   "to your primer library?"},
+                 call, {"content": "Saved both."}]
+        seen: list = []
+        _babs_hermetic(monkeypatch)
+        monkeypatch.setattr(B, "chat_stream", _scripted_chat(steps, seen))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await self._app_with(pilot, app, self._record())
+            scr = await _babs_screen(pilot, app)
+            scr._agent_enabled = True
+            scr._autonomy = "auto"
+            scr._num_ctx = 16384
+            await _submit_and_wait(pilot, scr, "Design primers to amplify kan")
+            assert sc._load_primers() == []
+            await _submit_and_wait(pilot, scr, "yes")
+        assert {p["name"] for p in sc._load_primers()} == {"kan-F", "kan-R"}
+
+    def test_a_pair_that_does_not_bind_as_designed_is_not_saved(self):
+        scr = sc.BabsScreen()
+        calls: list = []
+        design = {"status": 200, "result": {
+            "feature": {"label": "kan"}, "primer_at_feature_start": "forward",
+            "forward": {"seq": "ACGTACGTACGTACGTAC", "binds_as_designed": True},
+            "reverse": {"seq": "TTGGCCAATTGGCCAATT", "binds_as_designed": False}}}
+        scr._dispatch_agent_endpoint = lambda ep, body, **kw: calls.append(ep) or design
+        scr._dispatch_agent_batch = lambda c: calls.append("batch") or {"results": []}
+        out = scr._amplify_and_save({"name": "kan", "save_as": ["a", "b"]})
+        assert calls == ["amplify-feature"]                       # nothing filed
+        assert "reverse" in out["saved"]["error"]
+        assert sc._babs_write_outcomes(["amplify-feature", "create-primer"], out) == [
+            ("create-primer", True)]
+
+    def test_amplify_with_save_is_a_write_for_the_turn_bookkeeping(self):
+        tc = _tool_step("splicecraft_amplify_feature",
+                        {"name": "kan", "save_as": ["a", "b"]})["tool_calls"][0]
+        assert sc._babs_tool_call_endpoints(tc) == ["amplify-feature", "create-primer"]
+        assert sc._babs_tool_call_label(tc) == "amplify kan + save"
+        plain = _tool_step("splicecraft_amplify_feature", {"name": "kan"})["tool_calls"][0]
+        assert sc._babs_tool_call_endpoints(plain) == ["amplify-feature"]
+
+
+class TestBabsUnactedChange:
+    """A turn asked for a change and nothing wrote. The failed-write warning
+    only covers writes that were TRIED; the bench caught a 7B that designed
+    primers it was asked to save, never tried to save them, and said it had."""
+
+    def test_instructions_count_questions_only_with_a_claim(self):
+        U = sc._babs_unacted_change
+        # instructions: counted whatever the reply says
+        assert U("Design primers for CmR and save both to my primer library", "Here they are")
+        assert U("Can you add a feature for bases 100 to 200?", "")
+        assert U("please label bases 5-9 as site", "")
+        assert U("Rename feature 3 to lacZ", "Renamed.")
+        # questions: only when the reply then claims a change was made
+        assert not U("how big is the insert?", "The insert is 1.2 kb.")
+        assert not U("What would happen if I remove AmpR?", "You would lose selection.")
+        assert not U("can I add a feature here?", "Yes, from the Features menu.")
+        assert not U("Show me how to save primers", "Use Save in the Primers tab.")
+        assert U("how do I save these primers?", "I saved them to your library.")
+        # lab nouns mid-sentence are not instructions; no change word at all
+        assert not U("What does the label on feature 2 say?", "It says lacZ.")
+        assert not U("Show me the size marker bands", "")
+        assert not U("what is the length of this plasmid?", "It is 2686 bp.")
+        assert not U("", "saved") and not U(None, None)
+        # negated clauses ask for nothing; "don't forget to" still does
+        assert not U("Design primers for kan but don't save them", "Here they are.")
+        assert U("Don't forget to save them as kan-F and kan-R", "")
+        # read per sentence: a question, then an instruction
+        assert U("What's its Tm? Save it as kan-F.", "It is 60 °C.")
+        # a yes to her question is a request for what she asked
+        E = sc._babs_effective_request
+        assert U(E("yes", "Shall I save them to your library?"), "")
+        assert U(E("sure, go ahead", "Do you want me to add it as a feature?"), "")
+        assert not U(E("yes", "It is 60 °C. Anything else?"), "Great.")
+
+    async def test_a_claimed_save_that_never_ran_is_announced(self, monkeypatch):
+        notes: list = []
+        monkeypatch.setattr(sc.BabsScreen, "_sys_note",
+                            lambda self, text: notes.append(str(text)))
+        steps = [_tool_step("splicecraft_list_endpoints", {}),
+                 {"content": "Both primers have been saved to your primer library."}]
+        await _run_agent_turn(monkeypatch, steps, autonomy="auto", num_ctx=16384,
+                              query="Design primers for kan and save both as kan-F and kan-R")
+        assert any("Nothing was changed this turn" in n for n in notes), notes
+        assert not any("did not go through" in n for n in notes), notes
+
+    async def test_no_note_when_the_change_ran_or_none_was_asked(self, monkeypatch):
+        notes: list = []
+        monkeypatch.setattr(sc.BabsScreen, "_sys_note",
+                            lambda self, text: notes.append(str(text)))
+
+        def with_record(scr):
+            from Bio.Seq import Seq
+            from Bio.SeqRecord import SeqRecord
+            rec = SeqRecord(Seq("ACGT" * 50), id="pU", name="pU")
+            rec.annotations["topology"] = "circular"
+            scr.app._apply_record(rec)
+        await _run_agent_turn(monkeypatch,
+                              [_tool_step("splicecraft_add_feature",
+                                          {"name": "x", "start": 1, "end": 30}),
+                               {"content": "Added x."}],
+                              autonomy="auto", num_ctx=16384, prep=with_record,
+                              query="Add a feature called x over bases 1 to 30")
+        assert not any("Nothing was changed" in n for n in notes), notes
+        await _run_agent_turn(monkeypatch, [{"content": "It is 200 bp."}],
+                              autonomy="auto", num_ctx=16384, prep=with_record,
+                              query="How long is the insert?")
+        assert not any("Nothing was changed" in n for n in notes), notes
+
+
+class TestBabsAnnouncedTool:
+    """A reply that ends the turn by ANNOUNCING a tool it never called. The
+    bench (JSON protocol, a primer's Tm): "we will use SpliceCraft's
+    `check-primer` tool. Let's go ahead and check it." — and the turn ended."""
+
+    def test_only_a_named_tool_announced_in_a_short_reply_counts(self):
+        A = lambda text: sc._babs_announced_tool(text, {"splicecraft_find_feature"})  # noqa: E731
+        assert A("To find the melting temperature, we will use SpliceCraft's "
+                 "`check-primer` tool. Let's go ahead and check it.") == "check-primer"
+        assert A("I'll call splicecraft_find_feature to locate it.") == "splicecraft_find_feature"
+        assert A("Let me run check_primer on it.") == "check-primer"      # spelling variant
+        # answers, offers and plain words are not announcements
+        assert A("The Tm is 60.2 °C, from check-primer.") is None
+        assert A("Let me know if you want me to run check-primer again.") is None
+        assert A("If you like, I can use amplify-feature to design primers.") is None
+        assert A("I'll digest it and report the sizes.") is None           # no NAME
+        assert A("I will check CmR-F against the plasmid.") is None        # not a tool
+        assert A("I'll use check-primer. " + "x" * 700) is None            # a long answer
+        assert A("") is None and A(None) is None
+
+    async def test_an_announced_call_is_asked_for_once_then_runs(self, monkeypatch):
+        notes: list = []
+        monkeypatch.setattr(sc.BabsScreen, "_sys_note",
+                            lambda self, text: notes.append(str(text)))
+        steps = [{"content": "We will use SpliceCraft's `check-primer` tool. "
+                             "Let's go ahead and check it."},
+                 _tool_step("splicecraft_call", {"endpoint": "check-primer", "arguments":
+                                                 {"primer": "ACGTACGTTTGGCCAAGTGA"}}),
+                 {"content": "The Tm is 60.2 °C."}]
+        seen, scr = await _run_agent_turn(monkeypatch, steps, num_ctx=16384,
+                                          query="What is the Tm of ACGTACGTTTGGCCAAGTGA?")
+        assert len(seen) == 3, [m[-1] for m in seen]
+        nudge = seen[1][-1]
+        assert nudge["role"] == "user" and "check-primer" in nudge["content"]
+        assert seen[1][-2]["role"] == "assistant"                 # her reply, kept
+        assert _tool_msgs(seen[2]), "the announced call never ran"
+        assert scr._history[-1]["content"] == "The Tm is 60.2 °C."
+        assert any("asking her to go ahead" in n for n in notes), notes
+
+    async def test_a_second_announcement_ends_the_turn(self, monkeypatch):
+        again = {"content": "I'll use check-primer now."}
+        seen, scr = await _run_agent_turn(monkeypatch, [again, again], num_ctx=16384)
+        assert len(seen) == 2
+        assert scr._history[-1]["content"] == "I'll use check-primer now."
+
+
+class TestBabsKnowledgeGating:
+    """Without the babs engine, the tools that shell it (corpus recall, curated
+    reference, memory) can only fail — the bench caught a 7B calling recall
+    there and telling the user to clone a repo. They, and their preamble
+    paragraphs, are left out; with babs the prompt is unchanged."""
+
+    _BABS_ONLY = {"splicecraft_reference_lookup", "splicecraft_recall_knowledge",
+                  "splicecraft_remember"}
+
+    def test_preamble_with_babs_is_unchanged_and_without_is_lean(self):
+        assert sc._babs_agent_preamble(True) == sc._BABS_AGENT_PREAMBLE
+        lean = sc._babs_agent_preamble(False)
+        for gone in (*self._BABS_ONLY, "ingest-url", "learn-start"):
+            assert gone not in lean, gone
+        for kept in ("SECURITY", "splicecraft_search_online",
+                     "splicecraft_amplify_feature", "check-primer"):
+            assert kept in lean, kept
+        assert B.est_tokens(lean) < B.est_tokens(sc._BABS_AGENT_PREAMBLE) - 300
+
+    def test_manifest_drops_exactly_the_babs_tools(self):
+        full = {t["function"]["name"] for t in sc._babs_tool_manifest(True)}
+        lean = {t["function"]["name"] for t in sc._babs_tool_manifest(False)}
+        assert full - lean == self._BABS_ONLY and lean < full
+
+    @pytest.mark.parametrize("knowledge", [True, False])
+    def test_every_tool_the_preamble_names_is_offered(self, knowledge):
+        import re as _re
+        offered = {t["function"]["name"] for t in sc._babs_tool_manifest(knowledge)}
+        named = set(_re.findall(r"splicecraft_[a-z_]+", sc._babs_agent_preamble(knowledge)))
+        assert named <= offered, named - offered
+
+    def test_availability_follows_the_resolver(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sc, "_learn_resolve_babs_home", lambda: tmp_path)
+        assert sc._babs_knowledge_available() is True
+        monkeypatch.setattr(sc, "_learn_resolve_babs_home", lambda: None)
+        assert sc._babs_knowledge_available() is False
+
+        def broken():
+            raise OSError("bad setting")
+        monkeypatch.setattr(sc, "_learn_resolve_babs_home", broken)
+        assert sc._babs_knowledge_available() is False
+
+    async def test_a_turn_without_babs_sends_the_lean_prompt_and_tools(self, monkeypatch):
+        kw: list = []
+        seen, _scr = await _run_agent_turn(monkeypatch, [{"content": "ok"}],
+                                           num_ctx=16384, kwargs_seen=kw)
+        names = {t["function"]["name"] for t in kw[0]["tools"]}
+        assert not (names & self._BABS_ONLY)
+        assert "splicecraft_recall_knowledge" not in seen[0][0]["content"]
+
+    async def test_a_turn_with_babs_keeps_everything(self, monkeypatch, tmp_path):
+        kw: list = []
+
+        def with_babs(scr):
+            monkeypatch.setattr(sc, "_learn_resolve_babs_home", lambda: tmp_path)
+        seen, _scr = await _run_agent_turn(monkeypatch, [{"content": "ok"}],
+                                           num_ctx=16384, kwargs_seen=kw, prep=with_babs)
+        names = {t["function"]["name"] for t in kw[0]["tools"]}
+        assert self._BABS_ONLY <= names
+        assert "splicecraft_recall_knowledge" in seen[0][0]["content"]
+
+
+class TestBabsJsonStreaming:
+    """In the JSON protocol the reply is a JSON object; its `answer` is now shown
+    AS it is written rather than all at once when the object closes."""
+
+    P = staticmethod(lambda buf, f="answer": sc._babs_json_partial_field(buf, f))
+
+    def test_partial_values_decode_as_far_as_they_have_arrived(self):
+        assert self.P('{"thought": "x", "action": "final", "arguments": {}') is None
+        assert self.P('{"answer": "') == ""
+        assert self.P('{"answer": "Hel') == "Hel"
+        assert self.P('{"answer": "Hello"}') == "Hello"
+        assert self.P('{"answer": "line\\nnext \\"q\\" tab\\t"') == 'line\nnext "q" tab\t'
+        assert self.P('{"answer": "caf\\u00e9 and more"') == "café and more"
+
+    def test_escapes_cut_by_the_chunk_boundary_wait_for_the_next_chunk(self):
+        assert self.P('{"answer": "ab\\') == "ab"
+        assert self.P('{"answer": "ab\\u00') == "ab"
+        # an emoji is two \u escapes; half of one must not render as garbage
+        half = '{"answer": "hi \\ud83d'
+        assert self.P(half) == "hi "
+        assert self.P(half + '\\ude00"') == "hi \U0001F600"
+
+    def test_every_prefix_shows_a_prefix_of_the_final_answer(self):
+        """Fuzz against json.loads itself: streaming may show LESS than the
+        final answer, never anything else — no half escapes, no stray quote,
+        no half of a surrogate pair — and the whole reply decodes exactly."""
+        import random
+        rng = random.Random(20260922)
+        alphabet = ['a', 'Z', ' ', '"', '\\', '/', '\n', '\t', 'é', '°', '→', '😀',
+                    '\u0001', '\\n', '{', '}', ':', ',', '\u2028']
+        for _ in range(400):
+            answer = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 24)))
+            thought = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 8)))
+            raw = json.dumps({"thought": thought, "action": "final", "arguments": {},
+                              "answer": answer}, ensure_ascii=rng.random() < 0.5)
+            assert self.P(raw) == answer, (raw, answer)
+            for cut in range(len(raw) + 1):
+                got = self.P(raw[:cut])
+                assert got is None or answer.startswith(got), (raw[:cut], got, answer)
+
+    def test_the_field_quoted_inside_another_value_is_not_the_field(self):
+        buf = '{"thought": "I will write \\"answer\\": \\"nope\\" later", "action": "fi'
+        assert self.P(buf) is None
+        assert self.P(buf, "thought").startswith('I will write "answer"')
+
+    async def test_json_turn_streams_the_answer_and_never_shows_raw_json(self, monkeypatch):
+        final = json.dumps({"thought": "done", "action": "final", "arguments": {},
+                            "answer": "The plasmid is circular and 2,400 bp long."})
+        renders: list = []
+        real_render = sc.BabsScreen._render_assistant
+
+        def spy(self, raw):
+            renders.append(raw)
+            return real_render(self, raw)
+        monkeypatch.setattr(sc.BabsScreen, "_render_assistant", spy)
+
+        def chunky_chat(model, messages, **kwargs):
+            for i in range(0, len(final), 7):              # 7-character chunks
+                time.sleep(0.01)                           # let the throttle pass
+                yield {"content": final[i:i + 7], "thinking": "", "tool_calls": [],
+                       "done": False, "done_reason": None, "error": None}
+            yield {"content": "", "thinking": "", "tool_calls": [], "done": True,
+                   "done_reason": "stop", "error": None}
+
+        _babs_hermetic(monkeypatch)
+        monkeypatch.setattr(B, "chat_stream", chunky_chat)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            scr = await _babs_screen(pilot, app)
+            scr._agent_enabled = True
+            scr._agent_protocol_pref = "json"
+            scr._num_ctx = 16384
+            await _submit_and_wait(pilot, scr, "how long is it?")
+        partial = [r for r in renders
+                   if r and r != "The plasmid is circular and 2,400 bp long."]
+        assert partial, renders                          # it streamed in pieces
+        assert all(r in "The plasmid is circular and 2,400 bp long." for r in partial)
+        assert not any('"action"' in r or '{"thought"' in r for r in renders), renders
+        assert scr._history[-1]["content"] == "The plasmid is circular and 2,400 bp long."
+
+
+    async def test_a_tool_steps_answer_is_never_shown(self, monkeypatch):
+        """The JSON shape asks a tool step for `"answer": ""`; a 7B may fill it
+        with a guess. That text is discarded, so it must never be rendered."""
+        tool = json.dumps({"thought": "look first", "action": "splicecraft_plasmid_overview",
+                           "arguments": {}, "answer": "It is probably 3 kb."})
+        final = json.dumps({"thought": "done", "action": "final", "arguments": {},
+                            "answer": "No plasmid is open."})
+        replies = iter([tool, final])
+        renders: list = []
+        real_render = sc.BabsScreen._render_assistant
+
+        def spy(self, raw):
+            renders.append(raw)
+            return real_render(self, raw)
+        monkeypatch.setattr(sc.BabsScreen, "_render_assistant", spy)
+
+        def chunky_chat(model, messages, **kwargs):
+            reply = next(replies, final)
+            for i in range(0, len(reply), 7):
+                time.sleep(0.09)         # past the 80 ms render throttle: every
+                                         # chunk renders, or the test proves nothing
+                yield {"content": reply[i:i + 7], "thinking": "", "tool_calls": [],
+                       "done": False, "done_reason": None, "error": None}
+            yield {"content": "", "thinking": "", "tool_calls": [], "done": True,
+                   "done_reason": "stop", "error": None}
+
+        _babs_hermetic(monkeypatch)
+        monkeypatch.setattr(B, "chat_stream", chunky_chat)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            scr = await _babs_screen(pilot, app)
+            scr._agent_enabled = True
+            scr._agent_protocol_pref = "json"
+            scr._num_ctx = 16384
+            await _submit_and_wait(pilot, scr, "how long is it?")
+        assert not any("probably" in (r or "") for r in renders), renders
+        assert any("No plasmid" in (r or "") for r in renders), renders
+        assert scr._history[-1]["content"] == "No plasmid is open."
 
 
 class TestBabsRecall:

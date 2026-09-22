@@ -677,25 +677,34 @@ hidden by default, a **context lifebar**, a copy-pasteable transcript
   ordinary chat stays on your chosen model — override with
   `/agentmodel <name>|chat|auto`. A model **without native tool
   calling** still works: Babs switches it to one JSON action per step,
-  a shape Ollama enforces, so it can't invent a tool
-  (`/agentprotocol auto|native|json` pins either mode). Web pages,
+  a shape Ollama enforces, so it can't invent a tool, and its answer
+  still streams as it's written (`/agentprotocol auto|native|json` pins
+  either mode). Without the Babs engine installed, the tools that need it
+  (corpus recall, reference tables, memory) are left out rather than
+  offered and left to fail. Web pages,
   search results and papers she reads are handed to the model as data,
   never as instructions. A long tool result is shortened with a note
   saying what was left out, and when a long task outgrows the model's
   context window the oldest tool results are set aside first, so the
   original request is never lost. If she runs out of tool steps she
   tells you what she did and what is left rather than stopping cold, and
-  if a change she tried failed, the turn ends with a warning naming it —
-  however confident her answer sounds.
+  if she ends a reply by announcing a tool she never called ("let's go
+  ahead and check it"), she is asked once to make the call. If
+  a change she tried failed, the turn ends with a warning naming it; if
+  you asked for a change and none ran at all, it ends with "Nothing was
+  changed this turn" — both from what actually ran, however confident
+  her answer sounds.
 - **One-call plasmid tools** — *plasmid overview* (every feature and
   every enzyme that cuts once, with where each cut lands), *find a
-  feature by name* (coordinates, sequence and protein, forgiving about
-  spelling and Greek letters) and *amplify a feature* (PCR primers
-  checked to bind exactly where designed, across the origin and on
-  either strand) and *add a feature* (positions exactly as you say them —
-  "bases 100 to 200" — converted to SpliceCraft's coordinates in code).
-  Also agent endpoints: `plasmid-overview`, `find-feature`,
-  `amplify-feature`.
+  feature by name* (coordinates, sequence, protein, and the enzymes that
+  cut once inside it; forgiving about spelling and Greek letters),
+  *amplify a feature* (PCR primers checked to bind exactly where
+  designed, across the origin and on either strand — and, asked to save
+  them, saved to the primer library under your names), *digest* (exact
+  fragment sizes for any set of enzymes on the open plasmid) and *add a
+  feature* (positions exactly as you say them — "bases 100 to 200" —
+  converted to SpliceCraft's coordinates in code). Also agent endpoints:
+  `plasmid-overview`, `find-feature`, `amplify-feature`, `digest`.
 - **Fast on a CPU** — the open plasmid's description rides in the
   conversation instead of Babs's instructions, so after an edit the
   model reuses its cached prompt instead of re-reading all of it
@@ -703,7 +712,7 @@ hidden by default, a **context lifebar**, a copy-pasteable transcript
   answering), and the model stays loaded for 30 minutes between
   messages rather than Ollama's default 5.
 - **Test bench** — from a source checkout, `python scripts/babs_eval.py`
-  runs eight everyday requests through the real agent against your local
+  runs ten everyday requests through the real agent against your local
   models and grades the answers, to compare models, protocols or prompt
   changes. Runs in a throwaway sandbox; slow on a CPU (minutes per task).
 - **Corpus grounding** — with **Corpus** on, answers are grounded in

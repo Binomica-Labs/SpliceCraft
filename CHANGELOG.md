@@ -14,6 +14,84 @@
 
 ---
 
+## [1.2.70] — 2026-09-22
+
+### New features
+
+- **Babs saves the primers she designs — when you ask.** "Design primers
+  for CmR and save them as CmR-F and CmR-R" now puts both in your primer
+  library, the first name on the primer at the gene's start whichever
+  strand the gene is on. On the test bench she used to design them, stop,
+  and say they were saved. Ask only for a design and nothing is filed: once
+  she could save, the model started saving every pair it designed, so the
+  save now runs only when your message asks for it.
+- **Babs digests the open plasmid in one step.** "What fragments do I get
+  with AatII and AccI?" returns the exact sizes; on the bench she added up
+  cut positions herself and got them wrong.
+- **Finding a feature also lists the enzymes that cut once inside it**, so
+  "which enzymes cut once in AmpR?" is answered by the call that finds
+  AmpR.
+- **`digest` works on the open plasmid.** With no `sequence` it digests the
+  loaded plasmid, with its own topology, instead of making the caller paste
+  every base into the request — which, for a local model, meant minutes of
+  typing and a chance to garble any of it.
+- **`check-primer` takes the oligo as `sequence` too.** Asked for a
+  primer's melting temperature, a local model sent it as `sequence` — which
+  only ever meant the template — and the call failed for want of a primer.
+  On its own, `sequence` is now the primer (the reply says so); alongside
+  `primer` it is still the template.
+- **Answers stream in the JSON reply mode too.** Models that use JSON
+  replies (those without native tool calling) used to show nothing until
+  the whole reply was written — on a CPU, a minute of spinner. The answer
+  now appears as it's written, and the raw JSON never shows.
+- **The Babs test bench has ten tasks**, adding a digest and
+  design-then-save primers, and each task now starts from an empty primer
+  library — the second model run used to find the first one's primers
+  already saved and pass on them. On qwen2.5:7b the final build scores
+  **10/10 with native tool calls and 10/10 with JSON replies**, about 15
+  minutes each on a CPU-only laptop.
+
+### Bug fixes
+
+- **Babs says when a change you asked for never happened.** Ask for a
+  change — save, add, rename, delete — and if none actually runs, the turn
+  ends with "Nothing was changed this turn", whatever her answer claims. A
+  small model will report a save it never attempted, and the existing
+  warning only covered changes that were tried and failed. It is decided
+  from what ran, not from her wording; a question ("how big is the
+  insert?") doesn't set it off.
+- **Babs no longer stops at "let's go ahead and check it".** A small model
+  would sometimes end its turn by announcing the tool it was about to use —
+  on the test bench, asked for a primer's melting temperature, it said it
+  would run the primer check and stopped there. When a reply announces a
+  named tool and ends, she is now asked once to actually make the call.
+- **Babs's calls no longer fail on how a small model wraps them.** Asked
+  a primer's Tm, the model put the primer beside the action's name instead
+  of inside its arguments, so the call ran with nothing to check and had to
+  be retried. Arguments are now picked up either way — for single calls and
+  for multi-step batches alike.
+- **`check-primer` no longer reads a label as bases.** It kept every letter
+  that could be a base and dropped the rest, so "kanR-R: ACGT…" was checked
+  as a primer starting KANRR — every letter of the label is also an IUPAC
+  base code — with a melting temperature to match and no warning. A label, a second FASTA record or a letter that isn't a base is
+  now refused with a message; a FASTA header, spacing, numbering and 5'/3'
+  notation are still fine, and a FASTA template keeps its coordinates.
+- **Babs's saves follow what you said, including "yes" and "don't".** A yes
+  to her offer to save now saves (it used to be refused as a save nobody
+  asked for), "design primers but don't save them" saves nothing, and she
+  won't file a primer that the design check couldn't place where it was
+  designed.
+- **The "didn't go through" warning counts every failed change.** Two
+  failed saves used to read as "1 change".
+- **Without the Babs research engine installed, Babs no longer offers tools
+  that can only fail.** Corpus recall, the curated reference tables and
+  memory all run through the engine; where it's missing they used to sit in
+  her tool list, and she'd call one and tell you to "clone the repository".
+  They're now left out (with the instructions about them), which also makes
+  every cold start faster. With the engine installed nothing changes.
+
+---
+
 ## [1.2.69] — 2026-09-21
 
 ### New features
