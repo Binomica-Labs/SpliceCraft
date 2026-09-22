@@ -481,8 +481,18 @@ def _read_backup_bytes(bak: Path) -> bytes:
     callers can fall through to the next backup."""
     if bak.name.endswith(".gz"):
         import gzip
-        with gzip.open(bak, "rb") as fh:
-            return fh.read()
+        # The size gate callers run sees only the COMPRESSED size; bound the
+        # decompressed read too so a crafted .gz can't expand without limit.
+        cap = int(_state._SAFE_LOAD_JSON_MAX_BYTES)
+        try:
+            with gzip.open(bak, "rb") as fh:
+                data = fh.read(cap + 1)
+        except (EOFError, gzip.BadGzipFile) as exc:
+            raise OSError(f"corrupt gzip backup {bak.name}: {exc}") from exc
+        if len(data) > cap:
+            raise OSError(f"gzip backup {bak.name} expands past the "
+                          f"{cap}-byte load cap")
+        return data
     return bak.read_bytes()
 
 def _compress_old_backups(path: Path) -> None:
@@ -735,7 +745,7 @@ def _expected_mirror_swap():
 
     Wrap any active-slot write whose data is mirrored in a sibling
     collections file — the four mirror pairs in `_safe_save_json_mirror`,
-    plus the active-collection switch via `_switch_active_collection_library`.
+    plus the active-collection switch via `_activate_collection`.
     The shrink guard then skips BOTH the redundant `lost_entries/` spill
     and the >90% catastrophic refusal, because the "dropped" entries are
     provably safe in the collections file. Refcounted; the decrement runs
@@ -1248,7 +1258,7 @@ def _safe_save_json(path: Path, entries: list, label: str,
             # refuse the write on a >90% shrink (the latent bug where a
             # big→tiny collection switch raised RuntimeError). See
             # `_expected_mirror_swap` / `_safe_save_json_mirror` /
-            # `_switch_active_collection_library`.
+            # `_activate_collection`.
             pass
         else:
             suspicious = (existing_count >= 5
@@ -1277,7 +1287,7 @@ def _safe_save_json(path: Path, entries: list, label: str,
                     f"backup, programmatic data wipe), wrap the call in "
                     f"`with splicecraft._allow_catastrophic_shrink():`. "
                     f"For an active-collection/bin/primer switch use "
-                    f"`_switch_active_collection_library` / "
+                    f"`_activate_collection` / "
                     f"`_safe_save_json_mirror` instead."
                 )
 
@@ -1394,8 +1404,12 @@ def _backup_info(path: Path) -> "dict | None":
         return {"n_entries": None, "mtime_str": ts,
                 "error": reason or "size/symlink check failed"}
     try:
-        raw = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError) as exc:
+        # `_read_backup_bytes`: launch housekeeping gzips every older
+        # generation, and a plain `read_text` on a `.gz` raised an uncaught
+        # UnicodeDecodeError that broke the whole backup listing (audit
+        # 2026-09-22).
+        raw = json.loads(_read_backup_bytes(path).decode("utf-8-sig"))
+    except (OSError, ValueError) as exc:
         return {"n_entries": None, "mtime_str": ts,
                 "error": f"parse failed: {exc}"}
     if isinstance(raw, list):

@@ -43,7 +43,7 @@ from xml.sax.saxutils import escape as _xml_escape
 
 import splicecraft_biology as _bio
 from splicecraft_logging import _log
-from splicecraft_util import _feat_label_full, _sanitize_label
+from splicecraft_util import _feat_label_full, _feature_traversal, _sanitize_label
 
 # ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -718,21 +718,16 @@ def _feat_bounds(feat, total: int, *,
     ``circular=False`` skips the re-encoding: a linear molecule has no origin,
     so that shape is a spliced feature there and flattens to outer bounds."""
     try:
-        loc = feat.location
-        if loc is None:
+        # One reading geometry for the whole app: `_feature_traversal` owns
+        # the wrap-vs-splice decision (declared part order = reading order),
+        # so the exported image can't disagree with the on-screen map.
+        trav = _feature_traversal(getattr(feat, "location", None), total,
+                                  circular=circular)
+        if trav is None:
             return None
-        parts = sorted((getattr(loc, "parts", None) or [loc]),
-                       key=lambda p: int(p.start))
-        if (
-            circular
-            and total > 0 and len(parts) == 2
-            and int(parts[0].start) == 0
-            and int(parts[-1].end) == total
-            and int(parts[0].end) < int(parts[-1].start)
-        ):
-            return int(parts[-1].start), int(parts[0].end)
-        start = int(parts[0].start)
-        end = int(parts[-1].end)
+        start, end = int(trav[0]), int(trav[1])
+        if end < start:
+            return start, end
     except (TypeError, ValueError, AttributeError, IndexError):
         return None
     if total > 0:

@@ -2037,7 +2037,8 @@ def _tx_element_record(el: dict, source: str, kind: str) -> dict:
 
 
 def _tx_host_recognises(prom: dict, seq: str, total: int,
-                        min_score: "float | None") -> "tuple[bool, str]":
+                        min_score: "float | None",
+                        circular: bool = True) -> "tuple[bool, str]":
     """Can the HOST's sigma-70 holoenzyme read this promoter?
 
     Returns ``(recognised, basis)``. The test is the promoter's own SEQUENCE —
@@ -2063,9 +2064,17 @@ def _tx_host_recognises(prom: dict, seq: str, total: int,
     if total <= 0:
         return False, "empty sequence"
     span_len = _tx_arc(s0, e0, total) or (e0 - s0)
-    a = (s0 - pad) % total
     window_len = min(total, max(0, span_len) + 2 * pad)
-    window = "".join(seq[(a + i) % total] for i in range(window_len))
+    if circular:
+        a = (s0 - pad) % total
+        window = "".join(seq[(a + i) % total] for i in range(window_len))
+    else:
+        # LINEAR: there is nothing before bp 0 or after the last base, so the
+        # context window is CLIPPED, not wrapped. Wrapping spliced the far end
+        # of the molecule onto the promoter and scored a -35/-10 pair that
+        # does not exist.
+        a = max(0, s0 - pad)
+        window = seq[a:min(total, a + window_len)]
     try:
         hits = _scan_promoters(window, circular=False, both_strands=True,
                                min_score=min_score)
@@ -2179,7 +2188,7 @@ def _map_transcription(seq: str, features: "list[dict]", *,
             prom["host_basis"] = "sigma-70 scan hit"
         else:
             ok, basis = _tx_host_recognises(prom, s, total,
-                                            min_promoter_score)
+                                            min_promoter_score, circular)
             prom["host_recognised"] = ok
             prom["host_basis"] = basis
 
@@ -2190,8 +2199,13 @@ def _map_transcription(seq: str, features: "list[dict]", *,
     span_cap = total if max_distance is None else max(0, int(max_distance))
     out_genes: "list[dict]" = []
     for g in genes:
-        g_start = int(g["start"]) % total
-        g_end = int(g["end"]) % total
+        # `% total` only on a CIRCLE. On a LINEAR molecule a gene ending at
+        # the very last base has `end == total`, and wrapping that to 0 put
+        # its 5' end (minus strand) at the far left — where every promoter
+        # upstream of it suddenly "reached" it (the same trap
+        # `_tx_promoter_fires_at` documents).
+        g_start = (int(g["start"]) % total) if circular else int(g["start"])
+        g_end = (int(g["end"]) % total) if circular else int(g["end"])
         g_strand = _tx_feature_strand(g)
         # Where transcription must ARRIVE for this CDS to be transcribed: its
         # 5' end on the strand it is read from.

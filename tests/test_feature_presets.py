@@ -41,8 +41,8 @@ _TERM = (160, 48)
 # this constant in the same commit; an accidental one fails loudly here.
 # Descriptions and colours are deliberately OUT of the digest — prose and
 # palette tweaks shouldn't need a test edit, but a base never changes silently.
-_CATALOGUE_DIGEST = "8aebb5ffd3b84ec364c459474673c64167e32d79652ac912005296b42450568e"
-_CATALOGUE_COUNT = 116
+_CATALOGUE_DIGEST = "42ddf2118880990def15d6d968b2073981e85bf5362f6bbcaba88a1b57f9ea44"
+_CATALOGUE_COUNT = 117
 
 
 def _catalogue_digest() -> str:

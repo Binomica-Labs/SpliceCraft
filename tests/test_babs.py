@@ -2035,7 +2035,8 @@ class TestBabsAgentSafetyAndProtocols:
         scr._autonomy = "auto"
         prompts: list = []
         monkeypatch.setattr(scr, "_ask_tool_approval",
-                            lambda ep, body, *, physical=False, tainted=False:
+                            lambda ep, body, *, physical=False, tainted=False,
+                            egress=False:
                             prompts.append((ep, tainted)) or False)
         monkeypatch.setattr(sc, "_agent_invoke", invoke)
         return scr, prompts
@@ -2061,7 +2062,7 @@ class TestBabsAgentSafetyAndProtocols:
             assert prompts == [("create-primer", True)]
             assert "declined" in out["error"]
 
-    async def test_a_failed_or_local_lookup_does_not_taint(self, monkeypatch):
+    async def test_a_failed_lookup_does_not_taint_but_recall_does(self, monkeypatch):
         _babs_hermetic(monkeypatch)
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
@@ -2069,10 +2070,12 @@ class TestBabsAgentSafetyAndProtocols:
             scr, prompts = await self._auto_screen(
                 pilot, app, monkeypatch, self._invoke({"web-search": 403}))
             scr._dispatch_agent_endpoint("web-search", {"query": "x"})    # refused
-            scr._dispatch_agent_endpoint("recall-knowledge", {"query": "x"})  # local
             assert scr._turn_tainted is False
             assert scr._dispatch_agent_endpoint("create-primer", {})["status"] == 200
             assert prompts == []
+            # Recalled passages are crawled text: the turn is tainted after.
+            scr._dispatch_agent_endpoint("recall-knowledge", {"query": "x"})
+            assert scr._turn_tainted is True
 
     async def test_ask_mode_marks_the_prompt_when_tainted(self, monkeypatch):
         _babs_hermetic(monkeypatch)
@@ -2082,6 +2085,9 @@ class TestBabsAgentSafetyAndProtocols:
             scr, prompts = await self._auto_screen(pilot, app, monkeypatch,
                                                    self._invoke({}))
             scr._autonomy = "ask"
+            # The user supplied the address, so reading it asks nothing — the
+            # point here is that the write AFTER it is flagged as tainted.
+            scr._turn_user_urls = sc._babs_urls_in("read https://x.org")
             scr._dispatch_agent_endpoint("create-primer", {})
             scr._dispatch_agent_endpoint("read-url", {"url": "https://x.org"})
             scr._dispatch_agent_endpoint("create-primer", {})
@@ -2117,7 +2123,10 @@ class TestBabsAgentSafetyAndProtocols:
         for ep in sc._BABS_TAINTING_ENDPOINTS:
             assert ep in sc._AGENT_HANDLERS, ep
         assert set(sc._BABS_SEARCH_SOURCES.values()) <= sc._BABS_TAINTING_ENDPOINTS
-        assert "recall-knowledge" not in sc._BABS_TAINTING_ENDPOINTS
+        # 2026-09-22 (user decision): recalled corpus passages are crawled
+        # papers and DO taint the turn, like any other outside text.
+        assert "recall-knowledge" in sc._BABS_TAINTING_ENDPOINTS
+        assert sc._BABS_UNTRUSTED_ENDPOINTS <= sc._BABS_TAINTING_ENDPOINTS
 
     async def test_approval_modals_explain_a_tainted_prompt(self):
         app = sc.PlasmidApp()

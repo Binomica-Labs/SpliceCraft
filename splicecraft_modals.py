@@ -51,7 +51,7 @@ from splicecraft_presets import (
     _preset_categories, _preset_features, _preset_matches,
     _preset_to_library_entry,
 )
-from splicecraft_util import _CONTROL_CHARS_RE, _PLASMID_STATUS_VALUES, _cursor_row_key, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _sanitize_label, _sanitize_plasmid_name, _sanitize_plasmid_status, _scrub_path, _validate_group_members
+from splicecraft_util import _CONTROL_CHARS_RE, _PLASMID_STATUS_VALUES, _cursor_row_key, _gb_text_is_circular, _markup_escape, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _sanitize_label, _sanitize_plasmid_name, _sanitize_plasmid_status, _scrub_path, _validate_group_members
 from splicecraft_widgets import _DEFAULT_TYPE_COLORS, _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _HEX6_RE, _InstantPressButton, _PICKER_PLASMID_STYLE, _PLASMID_STATUS_COLORS, _SearchInput, _XtermColorGrid, _ZipAwareDirectoryTree, _markup_safe_color, _normalise_color_input, _xterm_index_to_hex
 
 
@@ -3384,7 +3384,7 @@ class CollectionDeleteConfirmModal(ModalScreen):
         with Vertical(id="colldel-dlg"):
             yield Static(" Delete collection ", id="colldel-title")
             yield Static(
-                f"  Delete collection [bold]{self.coll_name}[/bold]?\n"
+                f"  Delete collection [bold]{_markup_escape(self.coll_name)}[/bold]?\n"
                 f"  ({self.n_plas} plasmid{plural})\n\n"
                 f"  [dim]A backup is written to\n"
                 f"  collections.json.bak before the change.[/dim]",
@@ -3451,7 +3451,7 @@ class ScaryDeleteConfirmModal(ModalScreen):
             yield Static(
                 f"\n  This will [bold red]permanently delete[/bold red] the "
                 f"collection\n"
-                f"  [bold]{self.coll_name}[/bold] and its "
+                f"  [bold]{_markup_escape(self.coll_name)}[/bold] and its "
                 f"[bold red]{self.n_plas} plasmid{plural}[/bold red].\n\n"
                 f"  [yellow]The plasmids inside will also be removed from\n"
                 f"  the library mirror.[/yellow]\n\n"
@@ -4502,6 +4502,10 @@ class FastaFilePickerModal(_OneShotDismissScreen, ModalScreen):
     are white so the user can scan a mixed directory quickly. The tree
     starts in ``start_path`` when given (and readable), else ``$HOME``."""
 
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -4697,6 +4701,10 @@ class GroupNamePromptModal(ModalScreen):
 class MigrateImportPickerModal(_OneShotDismissScreen, ModalScreen):
     """Browse for a SpliceCraft data ``.zip`` to import. ``.zip`` files
     are highlighted lime-green. Dismisses with the path or ``None``."""
+
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
 
     _blocks_undo: bool = True
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
@@ -5063,6 +5071,10 @@ class PrimerCsvImportModal(_OneShotDismissScreen, ModalScreen):
     Dismisses with the selected ``str`` path or ``None`` on cancel; the caller
     runs `_import_primers_from_csv` (which validates + reports skips)."""
 
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab", "app.focus_next", "Next", show=False),
@@ -5363,10 +5375,11 @@ class SynthesisLoadModal(_OneShotDismissScreen, ModalScreen):
             if not isinstance(e, dict):
                 continue
             gb_text = e.get("gb_text", "") or ""
-            # LOCUS line in GenBank carries the topology word; cheap
-            # substring test beats a full BioPython parse.
-            first_line = gb_text.split("\n", 1)[0] if gb_text else ""
-            if "linear" not in first_line.lower():
+            # Topology is a LOCUS FIELD, so match the whole TOKEN. The old
+            # substring test also matched the plasmid's NAME, so a CIRCULAR
+            # plasmid called "pLinear2" was offered as a synthesis fragment —
+            # and the editor saves what it loaded back LINEAR.
+            if _gb_text_is_circular(gb_text):
                 continue
             rows.append((
                 e.get("id", "") or "",

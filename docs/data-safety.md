@@ -43,7 +43,7 @@ For every save through `_safe_save_json` (the only sanctioned path):
    contents to another's, which legitimately shrinks it; the dropped
    entries are *not* lost (they live in the sibling `collections.json`
    / `*_collections.json`), so those writes go through
-   `_switch_active_collection_library` / `_safe_save_json_mirror`,
+   `_activate_collection` / `_safe_save_json_mirror`,
    which neither spill a redundant copy nor refuse a big shrink. (This
    also fixes a latent bug where switching from a large to a tiny
    collection could be refused outright.) The `lost_entries/` directory

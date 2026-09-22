@@ -359,8 +359,15 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   strictly: a FASTA header line, spacing, numbering and 5'/3' notation are
   fine, but text mixed into the bases — a label (`kanR-R: ACGT…`), a second
   FASTA record, a letter that is not a base — is a 400 rather than being
-  read as bases), optimize-protein
-  (codon-optimise an AA sequence to a chosen table; optional `stops`
+  read as bases. `U` IS a base here: a deoxyuridine primer is read as T for
+  binding and Tm, and the reply carries `read_u_as_t` so the reinterpretation
+  is never silent. A degenerate oligo gets a real nearest-neighbour `tm` —
+  its WEAKEST variant, which is what sets the anneal — plus `tm_range`
+  spanning the mix. Sites come back ranked, and `truncated` says whether
+  `max_sites` cut the list short), optimize-protein
+  (codon-optimise an AA sequence to a chosen table — `table` is a taxid
+  (integer or string) OR a table NAME, and one it cannot resolve is a `404`,
+  never a quiet fall-back to the E. coli default; optional `stops`
   0–3 appends that many stop codons, and a trailing `*` run in the
   protein is honored as-is and overrides it; optional `transl_table`
   is an NCBI genetic-code id — default 1 = standard — so a host with a
@@ -409,6 +416,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   longer than the longest recognition site in the catalog (a units mix-up —
   `min_length` is in BASE PAIRS), and an `enzymes` list longer than 500 names
   (which also bounds the near-miss search behind the error message).
+  Each hit also carries **`cuts`**: `false` marks a site sitting so close to
+  an end of a LINEAR molecule that the enzyme's cut falls outside it. The
+  recognition sequence is really there — and cuts as soon as the fragment is
+  in a vector — it simply severs nothing in this molecule; such sites used to
+  be dropped entirely, so a part with a BsaI site three bases from its end
+  answered `count: 0` and a scrub called it clean. A `warnings` entry names
+  them. When you rely on your **active enzyme collection** (the default),
+  `warnings` also names any enzyme in it the catalog does not know; a
+  collection whose names ALL fail now scans nothing and says so, rather than
+  silently widening to the whole catalog.
 - **Digest** — digest (cut a RAW sequence with named enzymes and report
   the cuts + resulting fragments with their **overhangs** — overhang-aware
   QC for a Golden-Braid / restriction junction without loading the

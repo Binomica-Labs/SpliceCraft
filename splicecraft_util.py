@@ -387,6 +387,54 @@ def _sanitize_plasmid_name(raw: str, *,
 
 
 # ── More pure helpers (moved from hub, Phase D) ─────────────────────────────
+# SpliceCraft's dict-model feature strands. 1 forward, -1 reverse, 0
+# arrowless (a real value — a ligation overhang, a cloning scar), 2 double
+# (◀▶). BioPython holds only ±1 / 0, so 2 rides in a `SpliceCraft_strand`
+# qualifier — see `_biopython_strand`.
+_FEATURE_STRANDS = (-1, 0, 1, 2)
+
+
+def _coerce_feature_strand(value, default: int = 1) -> int:
+    """One of -1 / 0 / 1 / 2 from a dict-model feature's ``strand``.
+
+    Exists because `int(f.get("strand", 1) or 1)` was written at a dozen
+    record-building call sites, and `or` treats strand **0** as absent: every
+    arrowless feature — the overhang and scar features the cloning simulators
+    emit — was stored pointing FORWARD. Only ``None`` / ``""`` / an
+    unparseable or out-of-range value falls back to `default`.
+    """
+    if value is None or value == "":
+        return int(default)
+    try:
+        s = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    return s if s in _FEATURE_STRANDS else int(default)
+
+
+def _biopython_strand(strand) -> int:
+    """The BioPython ``location.strand`` for a dict-model strand.
+
+    2 (double) has no BioPython equivalent — `FeatureLocation(strand=2)`
+    RAISES — so it stores as 0 and the ◀▶ arrowheads are recovered from the
+    `SpliceCraft_strand: ["double"]` qualifier (`_double_strand_qualifiers`).
+    0 rather than None deliberately: None is the one strand GenBank cannot
+    round-trip.
+    """
+    s = _coerce_feature_strand(strand)
+    return s if s in (-1, 1) else 0
+
+
+def _double_strand_qualifiers(quals: dict, strand) -> dict:
+    """Set or clear the `SpliceCraft_strand` marker on `quals` in place, so a
+    double-stranded feature survives a rebuild through BioPython."""
+    if _coerce_feature_strand(strand) == 2:
+        quals["SpliceCraft_strand"] = ["double"]
+    else:
+        quals.pop("SpliceCraft_strand", None)
+    return quals
+
+
 def _feature_location(start: int, end: int, total: int, strand):
     """Build the BioPython location for a dict-model feature `(start, end,
     strand)` on a molecule of `total` bp — the INVERSE of `_feat_bounds`.
@@ -449,6 +497,159 @@ def _record_is_circular(record) -> bool:
     ).strip().lower() != "linear"
 
 
+def _markup_escape(text) -> str:
+    """Escape user / file-derived text for a Rich/Textual MARKUP string.
+
+    A plasmid, collection or feature name is data, but interpolated into a
+    markup template it becomes markup: ``Cloning [old]`` rendered as
+    "Cloning ", ``Lab stock [/b]`` raised MarkupError at render time and
+    closed the app, and ``[@click=app.…]`` made a clickable action (audit
+    2026-09-22). Textual's own `escape` leaves a TRAILING backslash alone,
+    which then escapes the template's next tag — doubled here."""
+    from textual.markup import escape as _tx_escape
+    out = _tx_escape(str(text if text is not None else ""))
+    if out.endswith("\\") and (len(out) - len(out.rstrip("\\"))) % 2:
+        out += "\\"
+    return out
+
+
+def _markup_parses(text: str) -> bool:
+    """True when ``text`` is valid Textual markup (what a toast renders)."""
+    try:
+        from textual.content import Content
+        Content.from_markup(text)
+        return True
+    except Exception:
+        return False
+
+
+def _phred_in_alignment_frame(phred, result) -> list:
+    """A read's per-base Phred array re-ordered into the frame of
+    ``result["aligned_q"]`` — the read AS ALIGNED.
+
+    The rotation picker may reverse-complement the read (``query_rc``) and/or
+    rotate it (``query_rotation``) before aligning; every quality lookup
+    indexes the aligned read, but the Phred array arrives in the read's OWN
+    orientation. Using it raw read an unrelated base's quality for every
+    call on a reverse or rotated read — a Q50 SNP read as noise and a Q4 one
+    as "1 real change", a true 50/50 mixture came out clonal (audit
+    2026-09-22)."""
+    q = list(phred or [])
+    if not q or not isinstance(result, dict):
+        return q
+    if result.get("query_rc"):
+        q.reverse()
+    try:
+        rot = int(result.get("query_rotation") or 0)
+    except (TypeError, ValueError):
+        rot = 0
+    if rot:
+        rot %= len(q)
+        q = q[rot:] + q[:rot]
+    try:
+        shift = int(result.get("query_frame_shift") or 0)
+    except (TypeError, ValueError):
+        shift = 0
+    if shift:
+        # A target-rotation pick cut the alignment's columns back into the
+        # plasmid frame, which rotates the read inside `aligned_q` too.
+        shift %= len(q)
+        q = q[shift:] + q[:shift]
+    return q
+
+
+def _feature_traversal(loc, total: int, *,
+                       circular: "bool | None" = None):
+    """Forward-traversal geometry of a (possibly compound) Biopython location.
+
+    Returns ``(start, end, parts)`` — ``parts`` are the ``(s, e)`` spans in
+    FORWARD-strand traversal order beginning at ``start``, and ``end < start``
+    means the traversal crosses the origin — or ``None`` when a coordinate
+    doesn't resolve.
+
+    **Declared part order is reading order** (INSDC, and what Biopython's
+    `extract()` does): a plus-strand ``join(933..1113,50..233)`` on a circle
+    reads exon 1 at 933, runs through the origin, then exon 2 at 50. The old
+    shape-only readers sorted the parts, so any spliced gene whose transcript
+    crosses bp 0 — every one a re-origin inside the gene or its intron
+    produces — was flattened across the whole backbone or read with its exons
+    swapped: a wrong protein, and residue edits landing on the wrong codon
+    (audit 2026-09-22). Minus-strand parts are stored in reading order too
+    (descending), so their forward traversal is the reversed list.
+
+    Kept exactly as before, deliberately:
+      * a TWO-part location on a circle whose parts touch bp 0 and bp
+        ``total`` is the origin WRAP whatever its stored order — SpliceCraft
+        wrote minus-strand wraps ascending before [INV-183], and libraries
+        still hold them;
+      * linear records, mixed strands, and orders that would lap the circle
+        more than once fall back to the sorted outer bounds.
+    """
+    if loc is None:
+        return None
+    raw_parts = getattr(loc, "parts", None) or [loc]
+    try:
+        decl = [(int(p.start), int(p.end), getattr(p, "strand", None))
+                for p in raw_parts]
+    except (TypeError, ValueError):
+        return None
+    spans_sorted = sorted((s, e) for s, e, _ in decl)
+    if len(decl) == 1:
+        s, e, _ = decl[0]
+        return s, e, [(s, e)]
+    is_circ = circular is not False
+    # Legacy origin wrap (see docstring) — order-independent on purpose.
+    if (is_circ and total > 0 and len(decl) == 2
+            and spans_sorted[0][0] == 0 and spans_sorted[-1][1] == total
+            and spans_sorted[0][1] < spans_sorted[-1][0]):
+        head, tail = spans_sorted[0], spans_sorted[-1]
+        return tail[0], head[1], [tail, head]
+    fallback = (spans_sorted[0][0], spans_sorted[-1][1], spans_sorted)
+    strands = {st for _, _, st in decl}
+    if len(strands) > 1 or not is_circ or total <= 0:
+        return fallback
+    fwd = [(s, e) for s, e, _ in decl]
+    if strands == {-1}:
+        fwd.reverse()
+    backs = [i for i in range(len(fwd) - 1) if fwd[i + 1][0] < fwd[i][0]]
+    if not backs:
+        return fwd[0][0], fwd[-1][1], fwd
+    if len(backs) != 1:
+        return fallback
+    cut = backs[0] + 1
+    # One lap only: everything after the origin crossing must lie before
+    # the first part, else the order describes overlapping laps.
+    if max(e for _, e in fwd[cut:]) > fwd[0][0]:
+        return fallback
+    return fwd[0][0], fwd[-1][1], fwd
+
+
+def _restrand_location(loc, strand, total: int, *,
+                       circular: "bool | None" = None):
+    """Rebuild ``loc`` on ``strand`` (±1 / 0) keeping its GEOMETRY.
+
+    A compound location's stored order is its reading order, and the reading
+    order of the same exons is REVERSED on the other strand. The feature
+    editors used to swap the strand on every part in place, so flipping a
+    three-exon gene + → − left its parts ascending on the minus strand — a
+    different molecule to Biopython, every exporter and (via
+    `_feature_traversal`) SpliceCraft itself (audit 2026-09-22). Parts are
+    re-emitted from the forward traversal: reversed for −, as-is otherwise
+    (exactly how `_feature_location` orders a plain origin wrap)."""
+    from Bio.SeqFeature import CompoundLocation, FeatureLocation
+    parts = getattr(loc, "parts", None) or [loc]
+    if len(parts) < 2:
+        return FeatureLocation(int(loc.start), int(loc.end), strand=strand)
+    trav = _feature_traversal(loc, total, circular=circular)
+    spans = list(trav[2]) if trav else sorted(
+        (int(p.start), int(p.end)) for p in parts)
+    if strand == -1:
+        spans.reverse()
+    return CompoundLocation(
+        [FeatureLocation(a, b, strand=strand) for a, b in spans],
+        operator=getattr(loc, "operator", "join") or "join")
+
+
 def _feat_bounds(feat, total: int, *,
                  circular: "bool | None" = None) -> "tuple[int, int, int] | None":
     """Wrap-aware extraction of `(start, end, strand)` from a Biopython
@@ -495,21 +696,13 @@ def _feat_bounds(feat, total: int, *,
     except ImportError:
         CompoundLocation = None
     if CompoundLocation is not None and isinstance(loc, CompoundLocation):
-        try:
-            parts = sorted(loc.parts, key=lambda p: int(p.start))
-            if (
-                circular is not False
-                and total > 0 and len(parts) == 2
-                and int(parts[0].start) == 0
-                and int(parts[-1].end) == total
-                and int(parts[0].end) < int(parts[-1].start)
-            ):
-                # Origin wrap → (tail_start, head_end) so end < start.
-                return int(parts[-1].start), int(parts[0].end), strand
-            # Other compound shapes: outer bounds, lossy but oriented.
-            return int(parts[0].start), int(parts[-1].end), strand
-        except (TypeError, ValueError):
+        # Origin wrap → (tail_start, head_end) so end < start; a spliced
+        # feature whose DECLARED part order crosses the origin is a wrap too
+        # (see `_feature_traversal`); other compound shapes → outer bounds.
+        trav = _feature_traversal(loc, total, circular=circular)
+        if trav is None:
             return None
+        return trav[0], trav[1], strand
     try:
         return int(loc.start), int(loc.end), strand
     except (TypeError, ValueError):
@@ -826,6 +1019,38 @@ def _surface_placeholder_gene(s: str) -> str:
 
 
 # ── Primer-Tm + single-record-pick pure helpers (moved, Phase D) ────────────
+# Nearest-neighbour Tm is undefined for a degenerate oligo — primer3 refuses
+# any non-ACGT base — but the oligo is really a MIX, and its members' Tms are
+# bracketed by the weakest member (every ambiguity resolved to its A/T choice
+# where it has one) and the strongest (resolved to G/C). Anneal is set by the
+# weakest member, so that is the one number a caller should use. Until
+# 2026-09-22 a degenerate oligo fell through to the 2(A+T)+4(G+C) rule and was
+# reported as its Tm — ~8-12 °C away from any member's real Tm.
+_IUPAC_DEGENERATE = "NRYSWKMBDHV"
+_IUPAC_WEAKEST_BASE = str.maketrans(_IUPAC_DEGENERATE, "AATGATATAAA")
+_IUPAC_STRONGEST_BASE = str.maketrans(_IUPAC_DEGENERATE, "GGCCTGCGGCG")
+_IUPAC_DNA_CHARS = frozenset("ACGT" + _IUPAC_DEGENERATE)
+
+
+def _degenerate_tm_bracket(seq: str, **conditions) -> "tuple[float, float] | None":
+    """``(weakest, strongest)`` nearest-neighbour Tm of the members of a
+    DEGENERATE oligo, under primer3's defaults unless ``conditions`` override
+    them. ``None`` when ``seq`` is plain ACGT (use the ordinary Tm), carries a
+    non-IUPAC character, or primer3 is unavailable / refuses it."""
+    s = (seq or "").upper()
+    if not s or not (set(s) <= _IUPAC_DNA_CHARS) or set(s) <= set("ACGT"):
+        return None
+    try:
+        import primer3
+        lo = float(primer3.calc_tm(s.translate(_IUPAC_WEAKEST_BASE),
+                                   **conditions))
+        hi = float(primer3.calc_tm(s.translate(_IUPAC_STRONGEST_BASE),
+                                   **conditions))
+    except (ImportError, OSError, ValueError, RuntimeError, TypeError):
+        return None
+    return (min(lo, hi), max(lo, hi))
+
+
 @_functools.lru_cache(maxsize=512)
 def _primer_tm_safe(seq: str) -> "float | None":
     """Memoized, defensive primer3 Tm calculation. Returns None if
@@ -1210,10 +1435,20 @@ def _gb_text_is_circular(gb_text: "str | None") -> bool:
     """Cheap topology read from a GenBank record's LOCUS line, for the
     origin-history helpers. Returns False only when the LOCUS line
     explicitly says ``linear`` (PCR amplicons, synthesis fragments);
-    defaults to circular for the common plasmid case + unmarked text."""
+    defaults to circular for the common plasmid case + unmarked text.
+
+    Topology is a LOCUS FIELD, so it is matched as a whole token — a
+    substring test also matched the plasmid's own NAME, and an entry called
+    `pLinear2` (or `pUC19-linearized`) reported itself linear, which turns
+    the origin-wrap scan off (sacred #6) and mis-draws every primer that
+    binds across the origin. `_topology_from_gb_text` (record L1) is the same
+    rule; this one stays here because L0 cannot import L1."""
     if not gb_text:
         return True
-    return "linear" not in gb_text.split("\n", 1)[0].lower()
+    line = gb_text[:200].lstrip().split("\n", 1)[0]
+    if line[:5].upper() != "LOCUS":
+        return True
+    return "linear" not in {t.lower() for t in line.split()}
 
 
 def _esc_md(s: str) -> str:

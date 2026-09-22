@@ -46,15 +46,20 @@ class TestActivePointerFlushSync:
         # Verify the literal pairing is present somewhere.
         assert "_set_active_collection_name(name)" in src
         assert "_settings_flush_sync()" in src
-        # And the collection delete-promote path uses the same pair.
-        # Pre-sweep #11 the delete-promote path used `_set_active_*`
-        # alone with no flush.
-        # White-box: count flush sites under the panel — should be
-        # at least 2 (switch + promote).
-        n_flush = src.count("_settings_flush_sync()")
-        assert n_flush >= 2, (
-            f"expected ≥2 flush_sync calls in LibraryPanel, got {n_flush}"
-        )
+        # The delete-promote path now goes through the shared
+        # `_activate_collection` / `_deactivate_all_collections` helpers
+        # (audit 2026-09-22), which move the pointer AND flush it only after
+        # every write has landed. Pin both the delegation and the flush.
+        assert ("_activate_collection(new_active)" in src
+                and "_deactivate_all_collections()" in src)
+        for helper in (sc._activate_collection,
+                       sc._deactivate_all_collections):
+            hsrc = inspect.getsource(helper)
+            assert "_set_active_collection_name(" in hsrc
+            assert "_settings_flush_sync()" in hsrc
+            # the pointer moves only AFTER the live library write
+            assert (hsrc.index("_safe_save_json_mirror(")
+                    < hsrc.index("_set_active_collection_name("))
 
     def test_parts_bin_switch_calls_flush(self):
         import inspect

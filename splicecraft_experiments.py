@@ -917,8 +917,12 @@ _MD_OL_RE       = re.compile(r"^\s*\d+[.)]\s+(.*)$")
 _MD_QUOTE_RE    = re.compile(r"^\s*>\s?(.*)$")
 _MD_FENCE_RE    = re.compile(r"^\s*```+\s*([A-Za-z0-9_+-]*)\s*$")
 _MD_CODE_RE     = re.compile(r"`([^`\n]+)`")
-_MD_IMAGE_RE    = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
-_MD_LINK_RE     = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+# Alt / label text may not contain a bracket of either kind: allowing '['
+# let a label swallow a whole run of them, so a body of 20,000 '[' took
+# quadratic time to export, and it is exactly the shape of a link nested in
+# an image's alt text — which used to be rewritten INSIDE the <img> tag.
+_MD_IMAGE_RE    = re.compile(r"!\[([^\[\]]*)\]\(([^)\s]+)\)")
+_MD_LINK_RE     = re.compile(r"\[([^\[\]]+)\]\(([^)\s]+)\)")
 _MD_BOLD_RE     = re.compile(r"\*\*(\S(?:[^*]*\S)?)\*\*")
 # Only `*italic*`, never `_italic_`: a lab notebook is full of
 # snake_case identifiers and file names, and turning `pUC19_v2` into
@@ -937,7 +941,9 @@ def _html_safe_url(raw: object) -> str:
     """
     if not isinstance(raw, str):
         return ""
-    s = raw.strip()
+    # A browser's URL parser deletes tab / CR / LF anywhere in a URL, so
+    # "/\t/host" IS "//host": judge the string the browser will use.
+    s = re.sub(r"[\t\r\n]", "", raw).strip()
     if not s:
         return ""
     low = s.lower()
@@ -952,7 +958,10 @@ def _html_safe_url(raw: object) -> str:
     # already allowed above, so refusing these costs no capability and
     # makes "scheme-less means relative path" actually true. (Hardening
     # 2026-09-17.)
-    if s.startswith("//") or s.startswith("\\\\"):
+    # Browsers also read '\' as '/' in an http(s) URL, so "/\host" and
+    # "\/host" are protocol-relative too: any two leading slashes of either
+    # kind.
+    if len(s) >= 2 and s[0] in "/\\" and s[1] in "/\\":
         return ""
     # Scheme-less → relative path. A colon before the first slash means
     # some other scheme (javascript:, vbscript:, file:, splicecraft:).
@@ -962,24 +971,32 @@ def _html_safe_url(raw: object) -> str:
 
 
 def _md_inline_to_html(text: str) -> str:
-    """Inline markdown → HTML for one already-block-classified line."""
+    """Inline markdown → HTML for one already-block-classified line.
+
+    Every tag this emits is built from the RAW text, escaped exactly once,
+    and parked behind a placeholder until the end — so no later pass can
+    match inside a tag an earlier one produced. (Running the passes over the
+    already-escaped, already-rewritten line let a link nested in an image's
+    alt text be rewritten INSIDE the <img> tag, breaking out of the
+    attribute, and escaped every '&' in a URL twice.)"""
     from html import escape as _esc
-    out = _esc(text, quote=False)
-    # Code spans are extracted BEFORE bold/italic/link processing and
-    # restored last, so `**literal**` inside backticks stays literal.
     stash: "list[str]" = []
 
-    def _keep(m) -> str:
-        stash.append(m.group(1))
+    def _park(html: str) -> str:
+        stash.append(html)
         return f"\x00{len(stash) - 1}\x00"
-    out = _MD_CODE_RE.sub(_keep, out)
+    out = str(text).replace("\x00", "")
+    # Code spans first, so `**literal**` inside backticks stays literal.
+    out = _MD_CODE_RE.sub(
+        lambda m: _park(f"<code>{_esc(m.group(1), quote=False)}</code>"), out)
 
     def _img(m) -> str:
         src = _html_safe_url(m.group(2))
         alt = m.group(1)
         if not src:
-            return _esc(f"[image: {alt}]", quote=False)
-        return f'<img src="{_esc(src, quote=True)}" alt="{_esc(alt, quote=True)}">'
+            return _park(_esc(f"[image: {alt}]", quote=False))
+        return _park(f'<img src="{_esc(src, quote=True)}" '
+                     f'alt="{_esc(alt, quote=True)}">')
     out = _MD_IMAGE_RE.sub(_img, out)
 
     def _link(m) -> str:
@@ -987,14 +1004,15 @@ def _md_inline_to_html(text: str) -> str:
         label = m.group(1)
         if not href:
             return label
-        return (f'<a href="{_esc(href, quote=True)}" rel="noopener '
-                f'noreferrer">{label}</a>')
+        # Only the tags are parked; the label stays in the stream so it is
+        # escaped and can still carry bold / italic.
+        return (_park(f'<a href="{_esc(href, quote=True)}" rel="noopener '
+                      f'noreferrer">') + label + _park("</a>"))
     out = _MD_LINK_RE.sub(_link, out)
+    out = _esc(out, quote=False)
     out = _MD_BOLD_RE.sub(r"<strong>\1</strong>", out)
     out = _MD_ITALIC_RE.sub(r"<em>\1</em>", out)
-    for i, code in enumerate(stash):
-        out = out.replace(f"\x00{i}\x00", f"<code>{code}</code>")
-    return out
+    return re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m.group(1))], out)
 
 
 def _markdown_subset_to_html(md: object) -> str:

@@ -30,7 +30,7 @@ from splicecraft_persistence import (
     _atomic_write_text, _safe_load_json, _safe_save_json,
 )
 from splicecraft_record import _gb_text_to_record
-from splicecraft_biology import _rc
+from splicecraft_biology import _enzyme_resolve_one, _rc
 from splicecraft_util import _feat_label, _fuzzy_match, _natural_sort_key, _sanitize_gel_id, _sanitize_plasmid_status
 from splicecraft_presets import _merge_presets_with_library
 
@@ -1049,7 +1049,15 @@ def _save_primers(entries: list[dict]) -> None:
         # collections.json mirror, pitfall #10). Inside the lock so
         # the mirror file can't drift from the live file (sweep #10,
         # [INV-50]). _save_primer_collections re-acquires the RLock.
-        _sync_active_primer_collection_primers(deduped)
+        try:
+            _sync_active_primer_collection_primers(deduped)
+        except BaseException:
+            # primers.json already landed; the collection is now behind it,
+            # and the next launch restores primers.json FROM the collection.
+            _mark_mirror_dirty("primer save could not mirror into the "
+                               "active primer collection", "primers")
+            raise
+        _clear_mirror_dirty("primers")
 
 
 def _load_primer_collections() -> list[dict]:
@@ -1157,41 +1165,101 @@ def _load_library() -> list[dict]:
     return _typed_clone(_state._library_cache)
 
 
-def _mirror_dirty_path():
-    """Marker file recording that `plasmid_library.json` is AHEAD of the
-    active collection because a mirror write failed."""
-    return _state._DATA_DIR / ".mirror-dirty"
+# Every live-file ↔ container mirror pair: the live file the app edits and
+# the collection-style file that is the SOURCE OF TRUTH at startup.
+_MIRROR_KINDS: "tuple[str, ...]" = (
+    "library", "primers", "parts_bin", "experiments")
 
 
-def _mark_mirror_dirty(reason: str) -> None:
-    """Record that the library/collection mirror is out of sync.
+def _mirror_dirty_path(kind: str = "library"):
+    """Marker file recording that a LIVE file (`plasmid_library.json`,
+    `primers.json`, `parts_bin.json`, `experiments.json`) is AHEAD of its
+    active container because a mirror write failed. The library keeps its
+    historical name so an existing marker is still honoured."""
+    if kind not in _MIRROR_KINDS:
+        raise ValueError(f"unknown mirror kind {kind!r}")
+    name = ".mirror-dirty" if kind == "library" else f".mirror-dirty-{kind}"
+    return _state._DATA_DIR / name
 
-    Read at startup by `_restore_library_from_active_collection`, which then
-    refuses to overwrite the library from the (stale) collection. Best-effort:
-    if even this marker cannot be written we must not mask the original
-    failure the caller is about to raise."""
+
+def _mark_mirror_dirty(reason: str, kind: str = "library") -> None:
+    """Record that a live-file/container mirror is out of sync.
+
+    Read at startup by the `_restore_*_from_active_*` functions, which then
+    refuse to overwrite the live file from the (stale) container, and by the
+    container SWITCH paths, which push the live file into its container
+    before swapping. Only the library had this marker until the 2026-09-22
+    audit: a failed primer / parts-bin / notebook mirror was simply reverted
+    at the next launch — the startup restore rewrote the newer live file from
+    the stale container, and the work was gone. Best-effort: if even this
+    marker cannot be written we must not mask the original failure the
+    caller is about to raise."""
     try:
-        _atomic_write_text(_mirror_dirty_path(), f"{reason}\n")
-        _log.error("Active-collection mirror FAILED (%s) — library.json is "
-                   "ahead of collections.json; startup will not overwrite it",
-                   reason)
+        _atomic_write_text(_mirror_dirty_path(kind), f"{reason}\n")
+        _log.error("Active-%s mirror FAILED (%s) — the live file is ahead of "
+                   "its container; startup will not overwrite it",
+                   kind, reason)
     except BaseException:                      # noqa: BLE001 - never mask
-        _log.exception("Could not write the mirror-dirty marker")
+        _log.exception("Could not write the %s mirror-dirty marker", kind)
 
 
-def _clear_mirror_dirty() -> None:
+def _clear_mirror_dirty(kind: str = "library") -> None:
     """Drop the marker once the two files agree again."""
     try:
-        _mirror_dirty_path().unlink(missing_ok=True)
+        _mirror_dirty_path(kind).unlink(missing_ok=True)
     except OSError:
-        _log.debug("Could not clear the mirror-dirty marker")
+        _log.debug("Could not clear the %s mirror-dirty marker", kind)
 
 
-def _mirror_is_dirty() -> bool:
+def _mirror_is_dirty(kind: str = "library") -> bool:
     try:
-        return _mirror_dirty_path().exists()
+        return _mirror_dirty_path(kind).exists()
     except OSError:
         return False
+
+
+def _flush_dirty_mirror_before_switch(kind: str) -> None:
+    """Before a primer-collection / parts-bin / notebook-project SWITCH:
+    when a previous mirror write failed (`_mirror_is_dirty(kind)`), push the
+    live file into the OUTGOING container first. Every switch rewrites the
+    live file from the incoming container, so switching with the marker set
+    silently discarded the work the failed mirror never delivered (audit
+    2026-09-22). Raises RuntimeError — the caller refuses the switch — when
+    the push fails again. If the outgoing container no longer exists the
+    user deleted it, so there is nothing to push into and the marker is
+    moot. (The plasmid library has the fuller `_activate_collection`.)"""
+    if kind not in ("primers", "parts_bin", "experiments"):
+        raise ValueError(f"unknown mirror kind {kind!r}")
+    if not _mirror_is_dirty(kind):
+        return
+    if kind == "primers":
+        active = _get_active_primer_collection_name()
+        exists = bool(active) and any(
+            isinstance(c, dict) and c.get("name") == active
+            for c in _load_primer_collections())
+        save, load, label = _save_primers, _load_primers, "primer library"
+    elif kind == "parts_bin":
+        active = _get_active_parts_bin_name()
+        exists = bool(active) and _find_parts_bin(active) is not None
+        save, load, label = _save_parts_bin, _load_parts_bin, "parts bin"
+    else:
+        active = _get_active_project_name()
+        exists = bool(active) and _find_project(active) is not None
+        save, load, label = _save_experiments, _load_experiments, "lab notebook"
+    if not exists:
+        _clear_mirror_dirty(kind)
+        return
+    try:
+        save(load())
+    except BaseException as exc:
+        raise RuntimeError(
+            f"your latest {label} changes could not be saved into "
+            f"{active!r} ({exc}); the switch was cancelled so they are not "
+            f"lost") from exc
+    if _mirror_is_dirty(kind):
+        raise RuntimeError(
+            f"your latest {label} changes could not be saved into "
+            f"{active!r}; the switch was cancelled so they are not lost")
 
 
 def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
@@ -2054,7 +2122,7 @@ _NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
     # fwd/rev positions are still offsets from start of recognition seq.
     # For an n-bp recognition sequence cutting d1/d2 downstream:
     #   fwd = n + d1,  rev = n + d2
-    "BaeI":      ("ACNNNNGTAYC", -10,-15), # (10/15)…(12/7): upstream pair only — downstream cut not represented (11-bp recog)
+    "BaeI":      ("ACNNNNGTAYC", -10,-15), # (10/15)…(12/7): upstream pair here; the digest adds the downstream pair (biology `_TYPE_IIB_SECOND_CUT`)
     "BbsI":      ("GAAGAC",       8, 12),  # GAAGAC(2/6)  BpiI isoschizomer
     "BcoDI":     ("GTCTC",        6, 10),  # GTCTC(1/5)   BsaI 5-bp variant
     "BceAI":     ("ACGGC",       17, 19),  # ACGGC(12/14)            Type IIS far-cutter
@@ -2063,7 +2131,7 @@ _NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
     "BmrI":      ("ACTGGG",      11, 10),  # ACTGGG(5/4)             1-nt 3' overhang Type IIS
     "BpiI":      ("GAAGAC",       8, 12),  # BbsI isoschizomer
     "BsaI":      ("GGTCTC",       7, 11),  # GGTCTC(1/5)  Golden Gate workhorse
-    "BsaXI":     ("ACNNNNNCTCC", -9,-12),  # (9/12)…(10/7): upstream pair only — downstream cut not represented
+    "BsaXI":     ("ACNNNNNCTCC", -9,-12),  # (9/12)…(10/7): upstream pair here; the digest adds the downstream pair (biology `_TYPE_IIB_SECOND_CUT`)
     # BsbI removed 2026-05-11 (issue #14, a user): real REBASE id 329
     # but no commercial supplier — users can't actually buy or order this
     # enzyme. Showing it on the map suggests a digest option that doesn't
@@ -2926,27 +2994,51 @@ def _set_active_enzyme_collection_name(name: "str | None") -> None:
 def _active_enzyme_allowed_set() -> "frozenset[str] | None":
     """Resolve the enzyme allow-list for the active enzyme collection.
 
-    Returns ``None`` when no collection is active or the active one is
-    empty/missing — caller treats None as "scan the full master
-    catalog" (built-in NEB ∪ user-added custom enzymes). Filters
-    against `_state._all_enzymes_hook()` so a stale name in a collection (manually
-    edited JSON, deleted built-in, or a custom enzyme since removed)
-    never reaches the scanner."""
+    Returns ``None`` when no collection is active, or the active one is
+    missing or holds no names at all — caller treats None as "scan the full
+    master catalog" (built-in NEB ∪ user-added custom enzymes).
+
+    Names are resolved through `_enzyme_resolve_one`, so a collection stored
+    with a lower-case spelling (`bsai`) or a commercial synonym (`Eco31I`)
+    resolves to its catalog entry. Exact membership was the only test until
+    2026-09-22, and because an all-unresolved collection then returned
+    ``None``, a collection the user had carefully narrowed silently became
+    "scan EVERY enzyme" — the widest possible answer, presented as theirs.
+    A collection that names enzymes none of which resolve now returns the
+    EMPTY set (scan nothing); `_active_enzyme_unresolved()` names them so a
+    caller can say why."""
+    resolved, _unresolved = _active_enzyme_resolution()
+    return resolved
+
+
+def _active_enzyme_resolution() -> "tuple[frozenset[str] | None, list[str]]":
+    """``(allow_set_or_None, unresolved_names)`` for the active enzyme
+    collection — the detail behind `_active_enzyme_allowed_set`."""
     name = _get_active_enzyme_collection_name()
     if not name:
-        return None
+        return None, []
     coll = _find_enzyme_collection(name)
     if not coll:
-        return None
+        return None, []
     enzymes = coll.get("enzymes") or []
     if not isinstance(enzymes, list):
-        return None
-    known = _state._all_enzymes_hook()
-    parsed = frozenset(
-        n for n in enzymes
-        if isinstance(n, str) and n in known
-    )
-    return parsed or None
+        return None, []
+    wanted = [n for n in enzymes if isinstance(n, str) and n.strip()]
+    if not wanted:
+        return None, []
+    resolved: "set[str]" = set()
+    unresolved: "list[str]" = []
+    for n in wanted:
+        hit = _enzyme_resolve_one(n)
+        if hit is None:
+            unresolved.append(n)
+        else:
+            resolved.add(hit[0])
+    if unresolved:
+        _log.warning(
+            "enzyme collection %r names %d enzyme(s) the catalog does not "
+            "know: %s", name, len(unresolved), ", ".join(unresolved[:8]))
+    return frozenset(resolved), unresolved
 
 
 def _get_active_parts_bin_name() -> "str | None":

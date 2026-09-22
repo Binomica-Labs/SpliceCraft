@@ -1046,6 +1046,12 @@ class TestScrubToMap:
             rounds = [sc._scrub_qc_primers(plan["cured_seq"], c["positions"],
                                            round_no=i)
                       for i, c in enumerate(plan["clusters"], 1)]
+            # Mirror the worker: the QuikChange proof decides whether the
+            # primers may be saved / drawn at all (2026-09-22).
+            qv_ok, _qv = sc._scrub_qc_verify(plan["orig_seq"], plan["cured_seq"],
+                                             rounds, len(plan["cured_seq"]))
+            assert qv_ok
+            plan["verified"] = qv_ok
             modal._scrub_apply_result(plan, rounds)
             await pilot.pause()
             assert modal.query_one("#btn-scrub-tomap", sc.Button).disabled is False

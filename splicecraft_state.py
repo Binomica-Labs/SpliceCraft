@@ -79,6 +79,9 @@ _DANGLING_ACTIVE_COLLECTION_NAME: "str | None" = None
 # dirty and therefore REFUSED to overwrite the library from the
 # collection. Read + cleared once by `PlasmidApp.on_mount`.
 _MIRROR_DIRTY_RECOVERY_NAME: "str | None" = None
+# Same, for the primer / parts-bin / notebook mirrors (audit 2026-09-22):
+# the kinds whose startup restore was refused because the live file is newer.
+_MIRROR_DIRTY_RECOVERY_KINDS: "set[str]" = set()
 _SPELLCHECK_ENGINE: "_Any | None" = None
 _WHATS_NEW_CACHE: "tuple[str, float, str] | None" = None  # (path, mtime, body_md)
 _collection_sync_pending: "tuple[str, list[dict]] | None" = None
@@ -350,6 +353,10 @@ _NCBI_FETCH_LOCK = threading.Lock()
 # import window) just skips the side-effect — no save runs before registration,
 # and test_enzyme_collections guards the registration so a regression is loud.
 _after_custom_enzyme_save_hook: "_Callable[[], None] | None" = None
+# Hub `_h_set_active_collection` (the one guarded collection switch), reached
+# by agent `set-setting active_collection` so that key can't move the pointer
+# without the live library (audit 2026-09-22).
+_set_active_collection_endpoint_hook: "_Any" = None
 # Saving entry vectors busts the EV digest + acceptor-TU caches (a reconfigured
 # vector set changes which overhangs/stuffers match) — hub-side, via this hook.
 _after_entry_vectors_save_hook: "_Callable[[], None] | None" = None

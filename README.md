@@ -106,7 +106,7 @@ uses** — Eco31I finds BsaI's sites, LguI finds SapI's, AarI finds PaqCI's.
 
 A library for your reusable annotations — promoters, RBSs, tags, CDSs. Capture
 a region off any plasmid, then drop it onto another to annotate or splice it
-in. It ships pre-loaded: **Presets** opens a catalogue of 116 common elements
+in. It ships pre-loaded: **Presets** opens a catalogue of 117 common elements
 across 20 categories — AmpR, KanR and eight more markers, the pUC, p15A, f1,
 SV40, 2μ and R6Kγ origins, T7 through CMV, EF-1α, U6, GAL1 and 35S promoters,
 terminators and polyA signals, EGFP, mCherry and luciferase, His/FLAG/HA/Myc/V5

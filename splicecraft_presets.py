@@ -42,12 +42,17 @@ annotation. Both say so in ``source`` and neither is edited — only trimmed:
   N-terminal fusion. Only the GST open reading frame is kept.
 * ``TEV protease site`` — sliced out of a His6+TEV tag block.
 
-Curation caught two contaminated candidates that a from-memory dataset would
+Curation caught a contaminated candidate that a from-memory dataset would
 have shipped: a ``tdTomato`` whose annotation ran through a C-terminal V5 tag
-in every corpus record (dropped — no clean copy existed), and the ``aadA``
-gene, which several public records label "kanamycin resistance" although the
-protein is a streptomycin/spectinomycin adenylyltransferase and confers no
-kanamycin resistance at all. It is named correctly here.
+in every corpus record (dropped — no clean copy existed).
+
+Label-count consensus has one blind spot, and it shipped once: several public
+records label an APH(3')-IIIa kanamycin kinase "aadA (kanamycin resistance)".
+Counting labels made that the "aadA" winner, and the first catalogue named a
+kanamycin gene as the spectinomycin marker. The entry is now
+``KanR (aph(3')-IIIa)``, and ``SmR/SpecR (aadA)`` is a separately curated
+AadA1. The lesson is the guard: a resistance marker's identity is checked by
+TRANSLATING it and comparing the protein, never by its most common label.
 
 WHAT THIS MODULE IS NOT
 =======================
@@ -1415,19 +1420,29 @@ _FEATURE_PRESETS: list[dict] = [
                         "TGA",
     },
     {
-        "name":         "SmR/SpecR (aadA)",
+        # Re-identified 2026-09-22: this sequence was catalogued as aadA
+        # because public records LABEL it "aadA (kanamycin resistance)". The
+        # protein is 264/264 identical to APH(3')-IIIa (aphA-3, Tn1545) — a
+        # kinase with the APH catalytic loop (HGDxxxxN) and no
+        # nucleotidyltransferase motif — so the "kanamycin" half of that
+        # label was right and "aadA" was the error. Annotating from the old
+        # entry told users a kanamycin plasmid was spectinomycin-resistant.
+        "name":         "KanR (aph(3')-IIIa)",
         "feature_type": "CDS",
         "category":     "Resistance",
         "strand":       1,
         "color":        "#FF8C42",
-        "description":  "Aminoglycoside-3''-adenylyltransferase. Confers "
-                        "streptomycin AND spectinomycin resistance. Frequently "
-                        "mislabelled 'kanamycin resistance' in public records; "
-                        "the protein is aadA and does not confer kanamycin "
-                        "resistance.",
-        "source":       "GenBank PX048277.1; identical sequence annotated 'aadA "
-                        "(kanamycin resistance) gene' in 10 independent records",
-        "aliases":      ["spectinomycin", "streptomycin", "aadA"],
+        "description":  "Aminoglycoside 3'-phosphotransferase type IIIa "
+                        "(aphA-3, carried on the Gram-positive transposon "
+                        "Tn1545). Confers kanamycin and neomycin "
+                        "resistance. Public "
+                        "records frequently label this gene 'aadA'; it is a "
+                        "phosphotransferase, not the spectinomycin/"
+                        "streptomycin adenylyltransferase.",
+        "source":       "GenBank PX048277.1; identical sequence in 10+ "
+                        "independent records (mislabelled 'aadA' in several); "
+                        "protein 264/264 identical to APH(3')-IIIa",
+        "aliases":      ["aphA-3", "aph(3')-IIIa", "aph3-III"],
         "sequence":     "ATGGCTAAAATGAGAATATCACCGGAATTGAAAAAACTGATCGAAAAATACCGCTGCGTA"
                         "AAAGATACGGAAGGAATGTCTCCTGCTAAGGTATATAAGCTGGTGGGAGAAAATGAAAAC"
                         "CTATATTTAAAAATGACGGACAGCCGGTATAAAGGGACCACCTATGATGTGGAACGGGAA"
@@ -1442,6 +1457,38 @@ _FEATURE_PRESETS: list[dict] = [
                         "ATTGCCTTCTGCGTCCGGTCGATCAGGGAGGATATCGGGGAAGAACAGTATGTCGAGCTA"
                         "TTTTTTGACTTACTGGGGATCAAGCCTGATTGGGAGAAAATAAAATATTATATTTTACTG"
                         "GATGAATTGTTTTAG",
+    },
+    {
+        # Curated 2026-09-22 by the catalogue's own method (multi-accession
+        # consensus over NCBI vector records), with the protein checked
+        # against AadA1 — the label-count winner for "aadA" in the same
+        # corpus was the APH(3')-IIIa above, which is how the old entry went
+        # wrong.
+        "name":         "SmR/SpecR (aadA)",
+        "feature_type": "CDS",
+        "category":     "Resistance",
+        "strand":       1,
+        "color":        "#FF8C42",
+        "description":  "Aminoglycoside 3''-adenylyltransferase (aadA1, "
+                        "ANT(3'')-Ia). Confers streptomycin AND spectinomycin "
+                        "resistance; does not confer kanamycin resistance.",
+        "source":       "GenBank M60473.1; identical sequence in 6 independent "
+                        "records; protein 263/263 identical to AadA1",
+        "aliases":      ["spectinomycin", "streptomycin", "aadA", "aadA1"],
+        "sequence":     "ATGAGGGAAGCGGTGATCGCCGAAGTATCGACTCAACTATCAGAGGTAGTTGGCGTCATC"
+                        "GAGCGCCATCTCGAACCGACGTTGCTGGCCGTACATTTGTACGGCTCCGCAGTGGATGGC"
+                        "GGCCTGAAGCCACACAGTGATATTGATTTGCTGGTTACGGTGACCGTAAGGCTTGATGAA"
+                        "ACAACGCGGCGAGCTTTGATCAACGACCTTTTGGAAACTTCGGCTTCCCCTGGAGAGAGC"
+                        "GAGATTCTCCGCGCTGTAGAAGTCACCATTGTTGTGCACGACGACATCATTCCGTGGCGT"
+                        "TATCCAGCTAAGCGCGAACTGCAATTTGGAGAATGGCAGCGCAATGACATTCTTGCAGGT"
+                        "ATCTTCGAGCCAGCCACGATCGACATTGATCTGGCTATCTTGCTGACAAAAGCAAGAGAA"
+                        "CATAGCGTTGCCTTGGTAGGTCCAGCGGCGGAGGAACTCTTTGATCCGGTTCCTGAACAG"
+                        "GATCTATTTGAGGCGCTAAATGAAACCTTAACGCTATGGAACTCGCCGCCCGACTGGGCT"
+                        "GGCGATGAGCGAAATGTAGTGCTTACGTTGTCCCGCATTTGGTACAGCGCAGTAACCGGC"
+                        "AAAATCGCGCCGAAGGATGTCGCTGCCGACTGGGCAATGGAGCGCCTGCCGGCCCAGTAT"
+                        "CAGCCCGTCATACTTGAAGCTAGACAGGCTTATCTTGGACAAGAAGAAGATCGCTTGGCC"
+                        "TCGCGCGCAGATCAGTTGGAAGAATTTGTCCACTACGTGAAAGGCGAGATCACCAAGGTA"
+                        "GTCGGCAAATAA",
     },
     {
         "name":         "TetR/TetA (tetA)",

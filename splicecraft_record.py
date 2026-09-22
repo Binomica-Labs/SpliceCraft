@@ -571,10 +571,28 @@ def _unbreakable_genbank_writer(handle):
     record NCBI serves — exported with the whole protein on one line, up to
     7,132 characters for SARS-CoV-2 ORF1ab. `test_genbank_io.py` pins the
     80-column result on a real translation."""
-    from Bio.SeqIO.InsdcIO import GenBankWriter
+    return _unbreakable_insdc_writer(handle, "genbank")
 
-    class _Writer(GenBankWriter):
+
+def _unbreakable_embl_writer(handle):
+    """EMBL twin of `_unbreakable_genbank_writer`: the stock EMBL writer
+    splits a long token mid-word (a label ``…_v2_final_fix`` came back as
+    ``…_v2_final_ fix``, a URL gained a space) and breaks at the same unsafe
+    points — every rule above applies (audit 2026-09-22)."""
+    return _unbreakable_insdc_writer(handle, "embl")
+
+
+def _unbreakable_insdc_writer(handle, fmt: str = "genbank"):
+    """The safe-wrapping writer over Biopython's GenBank or EMBL writer.
+    See `_unbreakable_genbank_writer` for the rules."""
+    from Bio.SeqIO.InsdcIO import EmblWriter, GenBankWriter
+
+    _Base = EmblWriter if fmt == "embl" else GenBankWriter
+
+    class _Writer(_Base):  # type: ignore[valid-type,misc]
         def _write_single_line(self, tag, text):
+            if _Base is not GenBankWriter:
+                return super()._write_single_line(tag, text)
             # `_write_multi_line` would recurse back into here, so do the
             # split inline and emit each piece through the BASE writer.
             if (tag in _WRAPPABLE_HEADER_TAGS and isinstance(text, str)
@@ -607,28 +625,41 @@ def _unbreakable_genbank_writer(handle):
                 # and makes a malformed one survive instead of blocking the
                 # export.
                 quote = True
-            if " " in value:
-                # Breakable the normal way, but a single over-long token
-                # inside it can still trip the hard break — fall through to
-                # the safe path only when one actually would.
-                longest = max((len(t) for t in value.split(" ")), default=0)
-                if longest + self.QUALIFIER_INDENT + len(key) + 4 <= self.MAX_WIDTH:
-                    return super()._write_feature_qualifier(key, value, quote)
+            # EVERY breakable value goes through the loop below — the stock
+            # wrapper breaks at ANY space, and two of those break points do
+            # not survive the reader: one inside a run of spaces (the rejoin
+            # restores ONE space, so "Sanger.  Insert" lost a space on every
+            # save) and one whose continuation line starts with `/` (read as
+            # a NEW qualifier: `… "M13F" /M13R and T7 …` came back as two
+            # qualifiers). Both corrupted the stored library copy, then made
+            # the export refuse (audit 2026-09-22).
             esc = value.replace('"', '""')
             if quote is None:
                 quote = not (isinstance(value, int) or key in self.FTQUAL_NO_QUOTE)
             line = (f'{self.QUALIFIER_INDENT_STR}/{key}="{esc}"' if quote
                     else f"{self.QUALIFIER_INDENT_STR}/{key}={esc}")
+            def _safe(ln: str, i: int) -> bool:
+                # A break the reader rejoins EXACTLY: one space between two
+                # non-space characters, and the continuation must not open
+                # with `/` (a new qualifier to the parser).
+                return (0 < i < len(ln) - 1 and ln[i] == " "
+                        and ln[i - 1] != " " and ln[i + 1] not in " /")
+
             while line.lstrip():
                 if len(line) <= self.MAX_WIDTH:
                     self.handle.write(line + "\n")
                     return
-                idx = line.rfind(" ", self.QUALIFIER_INDENT + 1, self.MAX_WIDTH + 1)
+                idx = next((i for i in range(min(self.MAX_WIDTH,
+                                                 len(line) - 2),
+                                             self.QUALIFIER_INDENT, -1)
+                            if _safe(line, i)), -1)
                 if idx <= self.QUALIFIER_INDENT:
-                    # No break point in reach — take the NEXT one instead of
-                    # splitting the token, and emit the remainder whole when
-                    # there is none.
-                    idx = line.find(" ", self.MAX_WIDTH)
+                    # No safe break point in reach — take the NEXT one
+                    # instead of splitting the token, and emit the
+                    # remainder whole when there is none.
+                    idx = next((i for i in range(self.MAX_WIDTH + 1,
+                                                 len(line) - 1)
+                                if _safe(line, i)), -1)
                     if idx == -1:
                         # Deliberate, documented spec deviation. Log it so an
                         # over-wide line in an exported file is traceable to

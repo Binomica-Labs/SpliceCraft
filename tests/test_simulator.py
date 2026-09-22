@@ -290,13 +290,14 @@ class TestSimulatePcrInputValidation:
         # matches the template thousands of times (the pathological
         # "all-A primer on all-A tract" case) used to push the inner
         # O(N²) loop into multi-second territory. Now we cap each
-        # side's hit list at `_PCR_MAX_PRIMER_HITS` and refuse with
-        # an empty result if exceeded.
+        # side's hit list at `_PCR_MAX_PRIMER_HITS` and refuse.
+        # 2026-09-22: the refusal RAISES — an empty result read as "no
+        # amplicons, check orientation", the opposite of the truth.
         fwd = "A" * 12   # well below _PCR_MAX_PRIMER_LEN
         seq = "A" * (sc._PCR_MAX_PRIMER_HITS + 100)  # > cap hits
         rev = "T" * 12   # _rc = "A" * 12 — same blowup
-        amps = sc._simulate_pcr(seq, fwd, rev, max_amplicon=5000)
-        assert amps == []
+        with pytest.raises(ValueError, match="too repetitive"):
+            sc._simulate_pcr(seq, fwd, rev, max_amplicon=5000)
 
     def test_primer_hit_at_cap_still_runs(self):
         # Just BELOW the cap should not refuse — verifies the cap is a
@@ -539,16 +540,26 @@ class TestGelBandsForLane:
         assert bands == []
 
     def test_digest_unknown_enzyme(self):
-        # _digest_with_enzymes returns single uncut frag on unknown enzymes —
-        # but the resulting lane is still well-defined (one band = template).
-        # Defensive: should not crash.
+        # 2026-09-22: an unrecognised enzyme name used to draw the UNCUT
+        # template as one band — a picture of a digest nobody performed, and
+        # indistinguishable from a real single-cut lane. The lane is now left
+        # EMPTY (the GUI warns, the agent endpoint 400s).
         bands = sc._gel_bands_for_lane(
             {"source": "digest", "detail": "FakeEnzyme,AlsoFake"},
             template_seq="ATGC" * 100, template_circular=True,
             pcr_amplicon=None,
         )
-        # No matches → single uncut fragment
-        assert len(bands) == 1
+        assert bands == []
+
+    def test_digest_with_a_real_non_cutter_shows_the_uncut_circle(self):
+        # A KNOWN enzyme that simply doesn't cut is a real answer — and an
+        # uncut circle runs as supercoiled + nicked, not as a linear band.
+        bands = sc._gel_bands_for_lane(
+            {"source": "digest", "detail": "EcoRI"},
+            template_seq="ATGC" * 100, template_circular=True,
+            pcr_amplicon=None,
+        )
+        assert sorted(f for _bp, f in bands) == ["nicked", "supercoiled"]
 
     def test_pcr_amplicon_source(self):
         amp = {"length": 1234, "amplicon_seq": "ATGC" * 308 + "AT"}

@@ -43,7 +43,7 @@ from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _feat_len, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len, _span_in_span)
 from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi, _enzyme_is_type_iis)
 from splicecraft_codon import (_CODON_RAMP_CODONS, _CODON_RARE_W, _codon_relative_adaptiveness, _CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_cai, _codon_diversify, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
-from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_all_experiments, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
+from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _flush_dirty_mirror_before_switch, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_all_experiments, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
 from splicecraft_experiments import (_EXPERIMENT_ACTIONS, _experiment_duplicate, _experiment_html_document, _experiment_markdown_document, _experiment_project_markdown, _experiment_ref_token_ok, _experiment_search, _experiment_snippet, _experiment_search_terms, _experiment_template_markdown, _experiments_referencing, _new_experiment_id, _normalise_experiment_entry, _protocol_steps_markdown, _sanitize_experiment_id)
 from splicecraft_fileio import (_PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
 from splicecraft_gels import (_new_gel_id, _normalise_gel_entry)
@@ -64,14 +64,14 @@ from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq,
                                 _topology_from_gb_text)
 from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript, _map_transcription)
-from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
+from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _feature_traversal, _phred_in_alignment_frame, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _degenerate_tm_bracket, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
 from splicecraft_biology import (_digest_with_enzymes, _enzyme_aliases, _enzyme_cuts, _enzyme_resolve_one, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
 from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _build_synthesis_l0_fragment, _design_gb_primers, _entry_vector_acceptor_overhangs, _grammar_position_by_type, _l0_part_from_syn_fragment)
-from splicecraft_dataaccess import (_active_enzyme_allowed_set, _agent_scan_library_for_key, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
+from splicecraft_dataaccess import (_active_enzyme_resolution, _agent_scan_library_for_key, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
 from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member, _fastq_path_to_records)
-from splicecraft_gels import (_AGAROSE_CHOICES, _GEL_HEIGHT_MAX, _GEL_HEIGHT_MIN, _GEL_LANE_WIDTH_MAX, _GEL_LANE_WIDTH_MIN, _GEL_MAX_LANES, _agarose_mobility, _gel_bands_for_lane, _render_gel_image)
+from splicecraft_gels import (_AGAROSE_CHOICES, _GEL_HEIGHT_MAX, _GEL_HEIGHT_MIN, _GEL_LANE_WIDTH_MAX, _GEL_LANE_WIDTH_MIN, _GEL_MAX_LANES, _agarose_mobility, _gel_bands_for_lane, _gel_resolve_enzymes, _render_gel_image)
 from splicecraft_persistence import (_safe_save_json_mirror)
 from splicecraft_regulatory import (_PROMOTER_MIN_SCORE, _TERM_MAX_STEM, _TERM_MIN_STEM, _TERM_MIN_U_TRACT, _TERM_U_TRACT_WINDOW, _scan_promoters, _scan_terminators)
 from splicecraft_primer import (_AS_MIN_LEN, _design_allele_specific_primer, _design_cloning_primers_raw, _design_detection_primers, _design_generic_primers, _primer_binding_sites, _primer_check_confidence, _primer_tm)
@@ -234,6 +234,25 @@ def _coerce_bool(value, *, name: str = "value") -> "bool | str":
             f"(got {type(value).__name__} {value!r})")
 
 
+def _payload_bool(payload, key: str, default: bool) -> bool:
+    """Lenient, TYPED read of a boolean flag from an agent payload.
+
+    `bool(payload.get(key))` is the trap `_coerce_bool` documents: the STRING
+    ``"false"`` (shell-built JSON, a small LLM, a GET query string) is truthy,
+    so ``circular: "false"`` ran a circular analysis, ``bottom=false`` returned
+    the reverse complement, ``offtarget: "no"`` searched anyway (audit
+    2026-09-22). This reads the usual spellings the right way round and keeps
+    the historical truthiness for anything else, so no existing caller turns
+    into a 400."""
+    if not isinstance(payload, dict) or key not in payload:
+        return bool(default)
+    v = payload.get(key)
+    if v is None:
+        return bool(default)
+    got = _coerce_bool(v, name=key)
+    return got if isinstance(got, bool) else bool(v)
+
+
 def _coerce_int(value, *, name: str = "value") -> "int | str":
     """Type-safe int coercion for agent-API JSON payloads.
 
@@ -346,7 +365,7 @@ def _agent_dirty_guard(app, payload):
     (Writes are POST-only and the dispatcher parses only the JSON body
     for POST, so a ``?force=1`` query param is NOT honoured — pass
     ``{"force": true}`` in the body.)"""
-    if getattr(app, "_unsaved", False) and not bool(payload.get("force")):
+    if getattr(app, "_unsaved", False) and not _payload_bool(payload, "force", False):
         return ({"error":
                   "unsaved changes — pass {\"force\": true} to override",
                   "dirty": True}, 409)
@@ -474,13 +493,13 @@ def _h_get_sequence(app, payload):
                           "is linear — pass end >= start"}, 400)
     else:
         sub = seq[start:] + seq[:end]
-    if bool(payload.get("bottom")):
+    if _payload_bool(payload, "bottom", False):
         sub = _rc(sub)
     return {
         "ok":     True,
         "start":  start,
         "end":    end,
-        "bottom": bool(payload.get("bottom")),
+        "bottom": _payload_bool(payload, "bottom", False),
         "length": len(sub),
         "seq":    sub,
     }
@@ -721,9 +740,9 @@ def _h_export_map_image(app, payload):
     size = _coerce_int(payload.get("size", 1400), name="size")
     if isinstance(size, str):
         return ({"error": size}, 400)
-    show_labels = bool(payload.get("labels", True))
-    show_sites = bool(payload.get("sites", True))
-    transparent = bool(payload.get("transparent", False))
+    show_labels = _payload_bool(payload, "labels", True)
+    show_sites = _payload_bool(payload, "sites", True)
+    transparent = _payload_bool(payload, "transparent", False)
     title = str(getattr(rec, "_tui_display_name", None)
                 or getattr(rec, "name", "") or "")
     try:
@@ -925,7 +944,13 @@ def _h_lint_synthesis(app, payload):
     ``expect_cds`` — a clean full-length ORF. Returns ``{ok, score, warnings,
     stats}`` where ``score`` is 0-100 (100 = clean) and each ``warnings`` entry
     is ``{level, kind, message, start?, end?}``. Read-only."""
-    circular = bool(payload.get("circular", True))
+    if "enzymes" in payload and "forbidden_enzymes" not in payload:
+        # The parameter is `forbidden_enzymes`; `enzymes` was silently
+        # ignored and the lint answered score 100 with no warning — a clean
+        # bill of health for sites nobody checked (audit 2026-09-22).
+        return ({"error": "lint-synthesis takes 'forbidden_enzymes', not "
+                          "'enzymes' — nothing was checked"}, 400)
+    circular = _payload_bool(payload, "circular", True)
     raw_seq = payload.get("sequence")
     if isinstance(raw_seq, str) and raw_seq.strip():
         seq, e = _sanitize_bases(raw_seq)
@@ -974,7 +999,7 @@ def _h_lint_synthesis(app, payload):
         kwargs["forbidden_enzymes"] = tuple(fenz)
     try:
         result = _synthesis_lint(seq, circular=circular,
-                                 expect_cds=bool(payload.get("expect_cds")),
+                                 expect_cds=_payload_bool(payload, "expect_cds", False),
                                  **kwargs)
     except Exception as exc:
         _log.exception("agent lint-synthesis: lint failed")
@@ -1018,12 +1043,17 @@ def _h_find_orfs(app, payload):
         return ({"error": min_aa}, 400)
     if min_aa < 1:
         return ({"error": "'min_aa' must be ≥ 1"}, 400)
-    alt = bool(payload.get("include_alt_starts", False))
+    alt = _payload_bool(payload, "include_alt_starts", False)
     seq = str(rec.seq) if rec.seq is not None else ""
     if not seq:
         return {"orfs": [], "count": 0}
-    annotations = getattr(rec, "annotations", None) or {}
-    is_circular = annotations.get("topology") == "circular"
+    # `_record_is_circular`, not `== "circular"`: a record with NO topology
+    # annotation (a LOCUS line the writer left blank, most .dna imports) is a
+    # plasmid by default everywhere else in the app — the map already draws it
+    # circular. The equality test called it linear, so the map showed a site
+    # across the origin that this endpoint answered `count: 0` for (audit
+    # 2026-09-22).
+    is_circular = _record_is_circular(rec)
     orfs = _find_orfs(
         seq,
         min_aa=min_aa,
@@ -1066,7 +1096,7 @@ def _crispr_target_sequence(app, payload):
             return ("", False, ({"error": err}, 400))
         if not seq:
             return ("", False, ({"error": "'sequence' is empty"}, 400))
-        return (seq, bool(payload.get("circular", False)), None)
+        return (seq, _payload_bool(payload, "circular", False), None)
     rec = getattr(app, "_current_record", None)
     if rec is None:
         return ("", False, ({"error": "no plasmid loaded and no 'sequence' "
@@ -1074,9 +1104,8 @@ def _crispr_target_sequence(app, payload):
     seq = str(rec.seq) if rec.seq is not None else ""
     if not seq:
         return ("", False, ({"error": "loaded plasmid has no sequence"}, 422))
-    anns = getattr(rec, "annotations", None) or {}
-    circ = (anns.get("topology") == "circular")
-    return (seq, bool(payload.get("circular", circ)), None)
+    circ = _record_is_circular(rec)
+    return (seq, _payload_bool(payload, "circular", circ), None)
 
 
 @_agent_endpoint("design-guides")
@@ -1150,7 +1179,7 @@ def _h_design_guides(app, payload):
     try:
         return _design_guides(
             seq, variant=variant, circular=circ,
-            u6_driven=bool(payload.get("u6_driven", True)),
+            u6_driven=_payload_bool(payload, "u6_driven", True),
             region=region, offtarget_in=ot_seq, max_mismatch=mm,
             limit=limit,
         )
@@ -1173,7 +1202,7 @@ def _h_score_guide(app, payload):
         return ({"error": f"'guide': {err}"}, 400)
     if not guide:
         return ({"error": "'guide' is required"}, 400)
-    out = _score_guide(guide, u6_driven=bool(payload.get("u6_driven", True)))
+    out = _score_guide(guide, u6_driven=_payload_bool(payload, "u6_driven", True))
     out["guide"] = guide
     return out
 
@@ -1209,7 +1238,7 @@ def _h_guide_offtargets(app, payload):
         return ({"error": "'max_mismatch' must be 0-10"}, 400)
     return _guide_offtargets(
         guide, seq, variant=variant, circular=circ, max_mismatch=mm,
-        require_pam=bool(payload.get("require_pam", True)),
+        require_pam=_payload_bool(payload, "require_pam", True),
     )
 
 
@@ -1243,7 +1272,7 @@ def _h_guide_cloning_oligos(app, payload):
             kw[key] = val
     try:
         return _guide_cloning_oligos(
-            guide, add_g=bool(payload.get("add_g", True)), **kw)
+            guide, add_g=_payload_bool(payload, "add_g", True), **kw)
     except ValueError as exc:
         return ({"error": str(exc)}, 400)
 
@@ -1278,6 +1307,8 @@ def _h_analyse_cds(app, payload):
 
     Read-only. Nothing about the sequence is changed or saved."""
     warnings: "list[str]" = []
+    cds_feat = None
+    tt_source = "request"
     raw_seq = payload.get("sequence")
     cds_label = None
     if isinstance(raw_seq, str) and raw_seq.strip():
@@ -1337,24 +1368,22 @@ def _h_analyse_cds(app, payload):
         # location (sacred invariant #9), and reading its parts as exons would
         # invent an intron spanning the backbone. `e >= s` means `_feat_bounds`
         # did not already resolve the location as a wrap.
-        exons: "list[tuple[int, int]]" = []
-        if fe >= fs:
-            for part in (getattr(getattr(cds_feat, "location", None),
-                                 "parts", None) or []):
-                try:
-                    exons.append((int(part.start), int(part.end)))
-                except (TypeError, ValueError, AttributeError):
-                    exons = []
-                    break
+        # The spans come from `_feature_traversal`, the reader every CDS
+        # consumer shares: DECLARED part order is reading order, so a spliced
+        # gene whose transcript crosses bp 0 reads exon 1 first — `sort()`ing
+        # the exons here scored a rotated, frame-shifted sequence for it
+        # (audit 2026-09-22) — while the legacy two-part origin wrap is still
+        # read by shape.
+        trav = _feature_traversal(getattr(cds_feat, "location", None),
+                                  len(seq), circular=circular)
+        exons: "list[tuple[int, int]]" = list(trav[2]) if trav else []
         if len(exons) > 1:
-            # Plus-strand order, then reverse-complement as a whole for a
-            # minus-strand gene — which is what `complement(join(...))` means.
-            exons.sort()
             dna = "".join(seq[a:b] for a, b in exons)
-            if len(dna) != (fe - fs):
+            span = _feat_len(fs, fe, len(seq)) if fe != fs else len(dna)
+            if len(dna) != span:
                 warnings.append(
                     f"spliced CDS — {len(exons)} exons joined "
-                    f"({len(dna)} bp); the {(fe - fs) - len(dna)} bp of "
+                    f"({len(dna)} bp); the {span - len(dna)} bp of "
                     f"intron between them are not counted")
         else:
             dna = (seq[fs:fe] if fe >= fs else seq[fs:] + seq[:fe])
@@ -1408,6 +1437,17 @@ def _h_analyse_cds(app, payload):
         tt = _coerce_int(tt, name="transl_table")
         if isinstance(tt, str):
             return ({"error": tt}, 400)
+    elif cds_feat is not None:
+        # The CDS's OWN /transl_table, as every other CDS reader honours:
+        # ignoring it read a mitochondrial / ciliate gene's reassigned codons
+        # as stops and dropped them from scoring — a perfect CAI for an
+        # unadapted gene (audit 2026-09-22).
+        _tq = (getattr(cds_feat, "qualifiers", None) or {}).get("transl_table")
+        _tv = _tq[0] if isinstance(_tq, (list, tuple)) and _tq else _tq
+        _ti = _coerce_int(_tv, name="transl_table") if _tv not in (None, "") else None
+        if isinstance(_ti, int) and not isinstance(_ti, bool) and _ti > 0:
+            tt = _ti
+            tt_source = "feature"
 
     try:
         rare_w = float(payload.get("rare_w", _CODON_RARE_W))
@@ -1510,6 +1550,8 @@ def _h_analyse_cds(app, payload):
                           "window_codons": win} if worst else None),
         "ramp": ramp,
         "table": {"name": table.get("name"), "taxid": table.get("taxid")},
+        "transl_table": tt if tt is not None else 1,
+        "transl_table_source": (tt_source if tt is not None else "default"),
         "warnings": warnings,
         "ignored": _agent_ignored_keys(payload, {
             "sequence", "id", "name", "feature", "taxid", "transl_table",
@@ -1669,14 +1711,33 @@ def _h_optimize_protein(app, payload):
     if mode not in _CODON_MODES:
         return ({"error": f"'mode' must be one of "
                           f"{', '.join(repr(m) for m in _CODON_MODES)}"}, 400)
-    taxid = _sanitize_accession(payload.get("table")) or "83333"
+    # `table` is a taxid OR a table NAME. The sanitiser only passes the NCBI
+    # ACCESSION charset, so an integer taxid (83333, not "83333") and every
+    # name with a space or a dot ("E. coli K12", "Bacillus subtilis") came
+    # back None and fell through to the E. coli DEFAULT — the codon optimizer
+    # silently optimising for the wrong host, which is the one thing it must
+    # never do (audit 2026-09-22). A `table` that was ASKED FOR and cannot be
+    # resolved is now a 400, never a substitution.
+    table_raw = payload.get("table")
+    if table_raw is None or (isinstance(table_raw, str)
+                             and not table_raw.strip()):
+        taxid = "83333"
+    elif isinstance(table_raw, bool) or not isinstance(table_raw,
+                                                       (str, int)):
+        return ({"error": "'table' must be a taxid or a codon-table name"},
+                400)
+    else:
+        taxid = str(table_raw).strip()
+        if len(taxid) > 200:
+            return ({"error": "'table' is too long to be a taxid or a "
+                              "table name"}, 400)
     entry = _codon_tables_get(taxid)
     if entry is None:
         # Point at the ADD path too: only K12 ships, so "no table for my host"
         # is the expected first result, and a caller who only hears
         # "see list-codon-tables" concludes the host is unsupported and
         # hand-builds a table instead of fetching one.
-        return ({"error": f"no codon table with taxid {taxid!r}; "
+        return ({"error": f"no codon table with taxid or name {taxid!r}; "
                           f"see list-codon-tables, or add one with "
                           f"add-codon-table (source 'kazusa' fetches by "
                           f"taxid, 'genome' builds from an NCBI assembly, "
@@ -2573,6 +2634,12 @@ def _h_set_active_primer_collection(app, payload):
                 f"unknown primer collection {name!r}; "
                 f"valid: {sorted(n for n in valid_names if n)}"
             )}, 404)
+        # Push a previous failed mirror's work into the OUTGOING container
+        # before the live file is rewritten (audit 2026-09-22).
+        try:
+            _flush_dirty_mirror_before_switch("primers")
+        except RuntimeError as exc:
+            return ({"error": _scrub_path(str(exc))}, 500)
         prev = _get_active_primer_collection_name() or ""
         if (err := _agent_save_or_500(
                 lambda: _set_active_primer_collection_name(name or None),
@@ -3404,6 +3471,27 @@ def _h_set_setting(app, payload):
     cleaned, err = validator(payload.get("value"))
     if err is not None:
         return ({"error": f"{key!r}: {err}"}, 400)
+    if key == "active_collection":
+        # The pointer alone is not the switch: `plasmid_library.json` still
+        # held the OLD collection, so the next ordinary save mirrored those
+        # plasmids into the NEW active collection and erased what it held
+        # (audit 2026-09-22). Route through the one guarded switch.
+        if not cleaned:
+            return ({"error": "'active_collection' can't be cleared — an "
+                              "empty pointer orphans the live library; use "
+                              "set-active-collection {name}"}, 400)
+        switch = _state._set_active_collection_endpoint_hook
+        if switch is None:                        # pragma: no cover
+            return ({"error": "collection switching unavailable"}, 500)
+        body = {"name": cleaned}
+        if "force" in payload:
+            body["force"] = payload.get("force")
+        res = switch(app, body)
+        if isinstance(res, tuple):
+            return res
+        return {"ok": True, "key": key, "value": cleaned,
+                "switched": True, **{k: v for k, v in res.items()
+                                     if k not in ("ok",)}}
     _set_setting(key, cleaned)
     return {"ok": True, "key": key, "value": cleaned}
 
@@ -3436,7 +3524,7 @@ def _h_set_feature_color(app, payload):
     if not isinstance(ft_raw, str) or not ft_raw.strip():
         return ({"error": "missing or invalid 'feature_type'"}, 400)
     ft = _sanitize_feat_type(ft_raw)
-    clear = bool(payload.get("clear")) or payload.get("color") in (None, "")
+    clear = _payload_bool(payload, "clear", False) or payload.get("color") in (None, "")
     color = None
     if not clear:
         color = _safe_color_for_write(payload.get("color"))
@@ -3836,7 +3924,7 @@ def _h_make_l0_part_from_fragment(app, payload):
     # were linear is not an error — it happily "releases" whatever sits
     # between two sites, so pointing this at a plasmid (pUPD2 itself, say)
     # would file its stuffer as a part. Refuse by name instead.
-    if (frag_rec.annotations.get("topology") or "").lower() == "circular":
+    if _record_is_circular(frag_rec):
         return ({"error":
                   f"{entry.get('name') or frag_ref!r} is a circular plasmid, "
                   f"not a linear synthesis fragment — this builds a part from "
@@ -4578,7 +4666,7 @@ def _h_classify_part(app, payload):
     if len(seq_clean) > 1_000_000:
         return ({"error": "sequence exceeds 1 Mbp cap for classifier"},
                 413)
-    circular = bool(payload.get("circular", True))
+    circular = _payload_bool(payload, "circular", True)
     raw_feats = payload.get("features") or []
     if not isinstance(raw_feats, list):
         return ({"error": "'features' must be a list"}, 400)
@@ -4976,6 +5064,11 @@ def _check_primer_bases(raw, what: str) -> "tuple[str, str | None]":
     if any(ch in text for ch in ":=<>"):
         return "", (f"'{what}' looks like it carries a label — pass only the "
                     f"bases")
+    # dU pairs like dT: a USER-cloning primer carries deoxyuridine, and the
+    # binding matcher (`_normalize_dna_for_align`) already reads U as T — this
+    # was the one primer path that refused it. The caller is TOLD (the
+    # response carries `read_u_as_t`), so it is never a silent reinterpretation.
+    text = text.upper().replace("U", "T")
     bad = sorted({ch for ch in text.upper()
                   if ch.isalpha() and ch not in _CHECK_PRIMER_IUPAC})
     if bad:
@@ -5042,6 +5135,7 @@ def _h_check_primer(app, payload):
                                       "sequence" if read_seq_as_primer else "primer")
     if bad:
         return ({"error": bad}, 400)
+    had_u = "U" in str(primer_raw).upper()
     if not primer:
         return ({"error": "no IUPAC bases in 'primer'"}, 400)
     if len(primer) > 1000:
@@ -5077,7 +5171,7 @@ def _h_check_primer(app, payload):
     if len(template) > _PAIRWISE_MAX_LEN:
         return ({"error":
                   f"'template' exceeds {_PAIRWISE_MAX_LEN:,} bp cap"}, 413)
-    circular = bool(payload.get("circular", True))
+    circular = _payload_bool(payload, "circular", True)
     min_identity = payload.get("min_identity", 0.0)
     try:
         min_identity = float(min_identity)
@@ -5090,12 +5184,15 @@ def _h_check_primer(app, payload):
         return ({"error": max_sites}, 400)
     max_sites = max(1, min(max_sites, 500))
     try:
+        # One more than we show, so a capped list SAYS it is capped.
         sites = _primer_binding_sites(
             primer, template, len(template), circular=circular,
-            min_identity_pct=min_identity, max_sites=max_sites,
+            min_identity_pct=min_identity, max_sites=max_sites + 1,
         )
     except ValueError as exc:
         return ({"error": f"alignment failed: {_scrub_path(str(exc))}"}, 400)
+    truncated = len(sites) > max_sites
+    sites = sites[:max_sites]
     out_sites = []
     for s in sites:
         glyph, _color = _primer_check_confidence(s.get("ident_pct"))
@@ -5112,17 +5209,29 @@ def _h_check_primer(app, payload):
     gc = sum(1 for c in primer if c in "GCS")
     gc_pct = round(100.0 * gc / len(primer), 1)
     best = max((s["ident_pct"] for s in out_sites), default=None)
+    # A degenerate oligo is a mix: `tm` is its WEAKEST member's Tm (what the
+    # anneal must respect) and `tm_range` says how far the mix spreads.
+    bracket = _degenerate_tm_bracket(primer)
+    tm_extra = ({"tm_range": [round(bracket[0], 1), round(bracket[1], 1)],
+                 "tm_note": "degenerate oligo: tm is the weakest member's "
+                            "nearest-neighbour Tm; tm_range spans the mix"}
+                if bracket is not None else {})
     return {
         "ok":            True,
         "primer":        primer,
         "length":        len(primer),
         "tm":            _primer_tm(primer),
+        **tm_extra,
         "gc_pct":        gc_pct,
         "circular":      circular,
         "n_sites":       len(out_sites),
         "binds":         bool(out_sites),
         "best_identity": best,
         "sites":         out_sites,
+        "truncated":     truncated,
+        **({"read_u_as_t": True,
+            "note_u": "deoxyuridine (U) read as T for binding and Tm"}
+           if had_u else {}),
         **({"template": "the loaded plasmid"} if loaded_default else {}),
         **({"primer_from": "sequence"} if read_seq_as_primer else {}),
     }
@@ -5240,7 +5349,7 @@ def _h_simulate_gibson(app, payload):
                   f"[{_GIBSON_AGENT_MIN_FLOOR}, "
                   f"{_GIBSON_MAX_OVERLAP_BP}] (1-9 bp overlaps would "
                   f"accept biologically meaningless assemblies)"}, 400)
-    circular = bool(payload.get("circular", True))
+    circular = _payload_bool(payload, "circular", True)
     try:
         result = _simulate_gibson_assembly(
             cleaned, min_overlap=min_overlap, circular=circular,
@@ -5388,7 +5497,7 @@ def _agent_carry_source_features(payload, vec_seq, ins_seq):
     ``warnings`` list — so a caller checking ``ok`` sails past it. The
     per-side ``carried`` flags are the cheap check; ``carry_strict`` is the
     loud one."""
-    if not bool(payload.get("carry_annotations")):
+    if not _payload_bool(payload, "carry_annotations", False):
         return [], [], [], {"vector": False, "insert": False, "any": False}, None
     vname = _sanitize_label(payload.get("vector_name"), max_len=200)
     iname = _sanitize_label(payload.get("insert_name"), max_len=200)
@@ -5397,7 +5506,7 @@ def _agent_carry_source_features(payload, vec_seq, ins_seq):
             {"error": "carry_annotations:true needs 'vector_name' and/or "
                       "'insert_name' to source features from a saved library "
                       "entry"}, 400)
-    strict = bool(payload.get("carry_strict"))
+    strict = _payload_bool(payload, "carry_strict", False)
     warnings: "list[str]" = []
     carried = {"vector": False, "insert": False, "any": False}
 
@@ -5513,8 +5622,8 @@ def _agent_traditional_cloning_candidates(payload):
         payload, vec_seq, ins_seq)
     if carry_err is not None:
         return None, carry_err
-    vector_circular = bool(payload.get("vector_circular", True))
-    insert_circular = bool(payload.get("insert_circular", False))
+    vector_circular = _payload_bool(payload, "vector_circular", True)
+    insert_circular = _payload_bool(payload, "insert_circular", False)
     enz_l = ins_enz[0]
     enz_r = ins_enz[1] if len(ins_enz) > 1 else ins_enz[0]
     # 1) Build the candidate insert fragment(s).
@@ -5754,10 +5863,10 @@ def _agent_gg_carry_features(payload, parts, vseq):
     `assemble-into-entry-vector` (needs a grammar-registered entry vector,
     which a custom UPD acceptor is not). 26 saved one-pot products landed
     with zero features (agent field report 2026-09-12)."""
-    if not bool(payload.get("carry_annotations")):
+    if not _payload_bool(payload, "carry_annotations", False):
         return None, None, [], {"vector": False, "parts": [], "any": False}, None
     raw_parts = payload.get("parts") or []
-    strict = bool(payload.get("carry_strict"))
+    strict = _payload_bool(payload, "carry_strict", False)
     warnings: "list[str]" = []
     carried = {"vector": False, "parts": [False] * len(parts), "any": False}
     # Asking to carry annotations with nothing to carry them FROM is a
@@ -6043,21 +6152,18 @@ def _record_to_scrub_feats(record) -> "list[dict]":
             # halves are already encoded in start/end) and a CONTIGUOUS split
             # (abutting parts — no intron, nothing spliced out).
             if isinstance(loc, CompoundLocation) and len(loc.parts) >= 2:
-                parts = sorted(loc.parts, key=lambda p: int(p.start))
+                # Same geometry as `PlasmidMap._parse` (`_feature_traversal`):
+                # exons in FORWARD traversal order, so a spliced gene whose
+                # transcript crosses bp 0 is checked in its real frame.
+                trav = _feature_traversal(loc, total, circular=circular)
+                fwd = list(trav[2]) if trav else []
                 is_contiguous = all(
-                    int(parts[i].end) == int(parts[i + 1].start)
-                    for i in range(len(parts) - 1)
+                    fwd[i][1] == fwd[i + 1][0]
+                    or (fwd[i][1] == total and fwd[i + 1][0] == 0)
+                    for i in range(len(fwd) - 1)
                 )
-                is_wrap = (
-                    circular and total > 0 and len(parts) == 2
-                    and int(parts[0].start) == 0
-                    and int(parts[-1].end) == total
-                    and int(parts[0].end) < int(parts[-1].start)
-                )
-                if not is_wrap and not is_contiguous:
-                    d["_exons"] = [
-                        (int(p.start), int(p.end)) for p in parts
-                    ]
+                if len(fwd) >= 2 and not is_contiguous:
+                    d["_exons"] = [(int(a), int(b)) for a, b in fwd]
         except (ImportError, TypeError, ValueError):
             pass
         if feat.type.upper() == "CDS":
@@ -7176,7 +7282,7 @@ def _h_find_sequence(app, payload):
     if isinstance(max_hits, str):
         return ({"error": max_hits}, 400)
     max_hits = max(1, min(int(max_hits), 10000))
-    circular = (rec.annotations.get("topology") or "linear") == "circular"
+    circular = _record_is_circular(rec)
     extra = (len(q) - 1) if circular else 0
     search = (seq + seq[:extra]) if extra else seq
     hits: "list[dict]" = []
@@ -7228,7 +7334,7 @@ def _h_export_migrate_archive(app, payload):
     err = _check_agent_write_path(path)
     if err is not None:
         return ({"error": err}, 403)
-    include_hmm = bool(payload.get("include_hmm"))
+    include_hmm = _payload_bool(payload, "include_hmm", False)
     try:
         result = _export_migrate_archive(path, include_hmm=include_hmm)
     except OSError as exc:
@@ -7351,10 +7457,10 @@ def _h_list_restriction_sites(app, payload):
                   "this would report zero sites for every enzyme — check the "
                   "units (min_length is in BASE PAIRS)"}, 400)
     min_len = max(0, min_len)
-    unique = bool(payload.get("unique_only", False))
-    respect_active = bool(payload.get("respect_active_collection", True))
+    unique = _payload_bool(payload, "unique_only", False)
+    respect_active = _payload_bool(payload, "respect_active_collection", True)
     seq = str(rec.seq)
-    is_circular = rec.annotations.get("topology") == "circular"
+    is_circular = _record_is_circular(rec)
     warnings: "list[str]" = []
 
     # A hand-picked name list goes INTO the scan as `allowed_enzymes` rather
@@ -7372,7 +7478,17 @@ def _h_list_restriction_sites(app, payload):
                 "'min_length' does not apply when 'enzymes' is given — a "
                 "hand-picked list keeps short recognition sites")
     elif respect_active:
-        allowed = _active_enzyme_allowed_set()
+        allowed, _unres = _active_enzyme_resolution()
+        if _unres:
+            warnings.append(
+                f"the active enzyme collection names "
+                f"{len(_unres)} enzyme(s) the catalog does not know "
+                f"({', '.join(_unres[:5])}"
+                f"{' …' if len(_unres) > 5 else ''}) — they were not scanned")
+        if allowed is not None and not allowed:
+            warnings.append(
+                "the active enzyme collection resolved to NO known enzymes, "
+                "so nothing was scanned (it is not a full-catalog scan)")
     else:
         allowed = None
 
@@ -7442,6 +7558,9 @@ def _h_list_restriction_sites(app, payload):
                 "wraps":         bool(s.get("rec_start") is not None
                                       and s.get("end") == len(seq)
                                       and s.get("rec_end", 0) > 0),
+                # False for a site at the end of a LINEAR molecule whose cut
+                # falls past the end: the site is there, it cleaves nothing.
+                "cuts":          not s.get("cut_outside", False),
             })
 
     # `allowed_enzymes` deliberately overrides `unique_only` inside the
@@ -7453,6 +7572,14 @@ def _h_list_restriction_sites(app, payload):
             counts[r["enzyme"]] = counts.get(r["enzyme"], 0) + 1
         out = [r for r in out if counts[r["enzyme"]] == 1]
 
+    uncut = sorted({r["enzyme"] for r in out if not r["cuts"]})
+    if uncut:
+        warnings = list(warnings or [])
+        warnings.append(
+            f"{', '.join(uncut)}: a site sits so close to an end of this "
+            f"linear molecule that the cut falls outside it — the recognition "
+            f"sequence is present (and cuts once the fragment is cloned), but "
+            f"it cleaves nothing here (`cuts: false`)")
     resp: dict = {"sites": out, "count": len(out)}
     if resolved:
         # Report the spellings the ROWS are labelled with — for a commercial
@@ -8002,13 +8129,13 @@ def _h_predict_transcript(app, payload):
         result = _predict_transcript(
             str(rec.seq),
             _agent_transcript_feature_dicts(rec),
-            circular=(rec.annotations.get("topology") == "circular"),
+            circular=_record_is_circular(rec),
             promoter=payload.get("promoter"),
             cds=payload.get("cds"),
             terminator=payload.get("terminator"),
             tx_start=bounds.get("tx_start"),
             tx_end=bounds.get("tx_end"),
-            check_splice=bool(payload.get("check_splice", True)),
+            check_splice=_payload_bool(payload, "check_splice", True),
             min_uorf_aa=max(0, int(min_uorf_aa)),
         )
     except Exception as exc:
@@ -8085,8 +8212,8 @@ def _h_list_enzymes(app, payload):
     if isinstance(limit, str):
         return ({"error": limit}, 400)
     limit = max(1, min(int(limit), 2000))
-    type_iis_only = bool(payload.get("type_iis_only", False))
-    custom_only   = bool(payload.get("custom_only", False))
+    type_iis_only = _payload_bool(payload, "type_iis_only", False)
+    custom_only   = _payload_bool(payload, "custom_only", False)
     custom_names = {str(e.get("name")) for e in _load_custom_enzymes()
                     if isinstance(e, dict) and e.get("name")}
 
@@ -8330,8 +8457,8 @@ def _h_digest(app, payload):
         return ({"error": "too many enzymes (max 500)"}, 400)
     if not all(isinstance(e, str) and e for e in enzymes):
         return ({"error": "'enzymes' must contain only non-empty strings"}, 400)
-    circular = bool(payload.get("circular", True))
-    include_seq = bool(payload.get("include_fragment_seq", False))
+    circular = _payload_bool(payload, "circular", True)
+    include_seq = _payload_bool(payload, "include_fragment_seq", False)
 
     # Report names the catalog doesn't know (they contribute no cuts) so a
     # typo'd enzyme is visible instead of silently scanning nothing — the
@@ -8472,9 +8599,7 @@ def _h_diff_plasmid(app, payload):
     # with an explicit `circular` boolean.
     circ_raw = payload.get("circular")
     if circ_raw is None:
-        target_annotations = getattr(target_record, "annotations",
-                                       None) or {}
-        is_circular = (target_annotations.get("topology") == "circular")
+        is_circular = _record_is_circular(target_record)
     else:
         is_circular = bool(circ_raw)
     query_seq = str(rec.seq)
@@ -8714,6 +8839,8 @@ def _h_verify_against_reads(app, payload):
         # library entry is `gb_text` — so it is consumed while in hand and
         # reduced to a verdict the consensus can reuse.
         one_q = read_quals[i] if i < len(read_quals) else None
+        if one_q:
+            one_q = _phred_in_alignment_frame(one_q, res)
         if one_q:
             try:
                 _entry["quality"] = _state._trace_verification_summary_hook(
@@ -9099,7 +9226,7 @@ def _h_analyse_read_heterogeneity(app, payload):
                               f"from the instrument's error floor, and only "
                               f"FASTQ carries it."}, 400)
         try:
-            recs = _fastq_path_to_records(str(p))
+            recs = _fastq_path_to_records(str(p), max_reads=max_reads)
         except ValueError as exc:
             return ({"error": f"could not read FASTQ: "
                               f"{_scrub_path(str(exc))}"}, 400)
@@ -9216,7 +9343,8 @@ def _h_analyse_read_heterogeneity(app, payload):
     # than re-derived: a second depth sweep that disagreed with the one
     # `read-consensus` reports would make the two endpoints contradict each
     # other about the same reads.
-    roll = _state._multi_read_summary_hook(aligned, len(ref_seq))
+    roll = _state._multi_read_summary_hook(aligned, len(ref_seq),
+                                           circular=circular)
     depth_of = {(int(v["target_pos"]), v["type"], v.get("alt", "")): v
                 for v in (roll.get("variants") or [])}
 
@@ -9232,6 +9360,8 @@ def _h_analyse_read_heterogeneity(app, payload):
         aq = res.get("aligned_q") or ""
         at = res.get("aligned_t") or ""
         q = quals[i] if i < len(quals) else None
+        if q:
+            q = _phred_in_alignment_frame(q, res)
         for v in _state._alignment_variants_in_axis_hook(entry):
             if v.get("type") == "truncated":
                 continue
@@ -9283,7 +9413,15 @@ def _h_analyse_read_heterogeneity(app, payload):
         d = int(ref_v.get("depth") or 0)
         if d <= 0:
             continue
-        frac = slot["n"] / d
+        frac = min(1.0, slot["n"] / d)
+        # Heterogeneity is about the MINOR allele: a position where EVERY
+        # read carries the alt is a clone that differs from the reference,
+        # not a mixture. Judging the alt fraction called a perfectly clonal
+        # culture `mixed` whenever it carried one real change (audit
+        # 2026-09-22). `min_fraction` still filters by the alt fraction, so
+        # a fixed difference is reported — as `fixed`, outside the verdict.
+        minor = min(frac, 1.0 - frac)
+        fixed = frac >= 1.0 - noise_floor
         if frac < min_fraction:
             continue
         # Homopolymer context. Reported for EVERY call so a caller can see it
@@ -9303,6 +9441,8 @@ def _h_analyse_read_heterogeneity(app, payload):
             "alt_reads":    slot["n"],
             "depth":        d,
             "fraction":     round(frac, 4),
+            "minor_fraction": round(minor, 4),
+            "fixed":        fixed,
             "contradicted": max(0, d - slot["n"]),
             "mean_phred":   (round(slot["phred_sum"] / slot["phred_n"], 1)
                              if slot["phred_n"] else None),
@@ -9313,9 +9453,11 @@ def _h_analyse_read_heterogeneity(app, payload):
             # answerable from the response alone rather than by re-deriving
             # the thresholds. The homopolymer filter is checked first because
             # it is the reason a caller can turn off.
-            "counted_in_verdict": bool(not muted and frac >= noise_floor),
+            "counted_in_verdict": bool(not muted and not fixed
+                                       and minor >= noise_floor),
             "muted_by": ("homopolymer" if muted
-                         else "noise_floor" if frac < noise_floor
+                         else "fixed_difference" if fixed
+                         else "noise_floor" if minor < noise_floor
                          else None),
         })
     positions.sort(key=lambda p: (-p["fraction"], p["pos"]))
@@ -9335,9 +9477,21 @@ def _h_analyse_read_heterogeneity(app, payload):
     # instrument's error mode, and letting them pad the low bins would mask a
     # real cluster sitting just above them.
     shape = _hetero_shape(
-        [p["fraction"] for p in positions if p["muted_by"] != "homopolymer"],
+        [p["minor_fraction"] for p in positions
+         if p["muted_by"] not in ("homopolymer", "fixed_difference")],
         noise_floor,
-        max_fraction=max((p["fraction"] for p in voting), default=0.0))
+        max_fraction=max((p["minor_fraction"] for p in voting), default=0.0))
+    n_fixed = sum(1 for p in positions if p["muted_by"] == "fixed_difference")
+    if n_fixed:
+        hetero_warnings.append(
+            f"{n_fixed} position(s) differ from the reference in (nearly) "
+            f"every read — the culture is uniform there, but it is NOT the "
+            f"reference sequence. They are listed with fixed=true and do not "
+            f"count as heterogeneity.")
+    if roll.get("truncated"):
+        hetero_warnings.append(
+            "the per-variant table hit its cap — variants first seen after "
+            "that point were not tallied, so this answer may be incomplete")
     n_muted_hp = sum(1 for p in positions if p["muted_by"] == "homopolymer")
     n_below_floor = sum(1 for p in positions
                         if p["muted_by"] == "noise_floor")
@@ -9537,9 +9691,7 @@ def _h_align_plasmidsaurus_zip(app, payload):
     # Circular rotation: same auto-detect as `diff-plasmid`.
     circ_raw = payload.get("circular")
     if circ_raw is None:
-        target_annotations = getattr(target_record, "annotations",
-                                       None) or {}
-        is_circular = (target_annotations.get("topology") == "circular")
+        is_circular = _record_is_circular(target_record)
     else:
         is_circular = bool(circ_raw)
     # INV-72 (2026-05-25): use the same picker the UI uses. Pre-sweep
@@ -9668,7 +9820,7 @@ def _h_blast(app, payload):
         return ({"error": max_hits}, 400)
     max_hits = max(1, min(max_hits, 500))
 
-    six_frame = bool(payload.get("six_frame", False))
+    six_frame = _payload_bool(payload, "six_frame", False)
     backend = str(payload.get("backend") or "auto").lower()
     if backend not in ("auto", "pyhmmer", "pure"):
         return ({"error": "'backend' must be 'auto' / 'pyhmmer' / 'pure'"},
@@ -10234,6 +10386,12 @@ def _h_set_active_parts_bin(app, payload):
             return ({"error":
                       f"unknown parts bin {name!r}; "
                       f"valid: {sorted(v for v in valid if v)}"}, 404)
+        # Push a previous failed mirror's work into the OUTGOING container
+        # before the live file is rewritten (audit 2026-09-22).
+        try:
+            _flush_dirty_mirror_before_switch("parts_bin")
+        except RuntimeError as exc:
+            return ({"error": _scrub_path(str(exc))}, 500)
         prev = _get_active_parts_bin_name()
         _set_active_parts_bin_name(name)
         _state._settings_flush_sync_hook()
@@ -10523,10 +10681,14 @@ def _h_simulate_pcr(app, payload):
     if not (1 <= max_amp <= _PCR_AMPLICON_HARD_CAP):
         return ({"error": f"'max_amplicon' must be in "
                   f"[1, {_PCR_AMPLICON_HARD_CAP}]"}, 400)
-    circular = bool(payload.get("circular", True))
+    circular = _payload_bool(payload, "circular", True)
     try:
         amps = _state._simulate_pcr_hook(template, fwd_clean, rev_clean,
                               circular=circular, max_amplicon=max_amp)
+    except ValueError as exc:
+        # The simulator's refusals (a primer that binds thousands of times)
+        # are answers about THIS input, not server faults.
+        return ({"error": _scrub_path(str(exc))}, 422)
     except Exception as exc:
         _log.exception("agent simulate-pcr: simulator failed")
         return ({"error": f"simulator failed: {_scrub_path(str(exc))}"}, 500)
@@ -10597,6 +10759,17 @@ def _h_simulate_gel(app, payload):
         if len(detail) > 200:
             return ({"error": f"lanes[{i}].detail exceeds 200 chars"},
                     400)
+        if src.lower() == "digest":
+            # A typo'd enzyme used to draw the UNCUT template with ok:true —
+            # an answer to a digest nobody asked for.
+            _names, _unknown = _gel_resolve_enzymes(detail)
+            if _unknown:
+                return ({"error": f"lanes[{i}]: unknown enzyme(s) "
+                                  f"{', '.join(_unknown)} — see list-enzymes"},
+                        400)
+            if not _names:
+                return ({"error": f"lanes[{i}]: a digest lane needs at least "
+                                  f"one enzyme in 'detail'"}, 400)
         cleaned_lanes.append({
             "name":   name,
             "source": src.lower(),
@@ -10608,7 +10781,7 @@ def _h_simulate_gel(app, payload):
     if len(template) > _PCR_MAX_TEMPLATE_BP:
         return ({"error": f"'template_seq' exceeds "
                   f"{_PCR_MAX_TEMPLATE_BP:,} bp cap"}, 413)
-    template_circular = bool(payload.get("template_circular", True))
+    template_circular = _payload_bool(payload, "template_circular", True)
     pcr_amplicon = payload.get("pcr_amplicon")
     if pcr_amplicon is not None and not isinstance(pcr_amplicon, dict):
         return ({"error": "'pcr_amplicon' must be a dict or null"}, 400)
@@ -10636,7 +10809,7 @@ def _h_simulate_gel(app, payload):
         return ({"error": f"'lane_width' must be in "
                   f"[{_GEL_LANE_WIDTH_MIN}, "
                   f"{_GEL_LANE_WIDTH_MAX}]"}, 400)
-    include_image = bool(payload.get("include_image", False))
+    include_image = _payload_bool(payload, "include_image", False)
     # Compute per-lane bands + mobility.
     lane_results: list[dict] = []
     try:
@@ -11070,8 +11243,8 @@ def _agent_design_allele_specific(template: str, payload):
         return ({"error": "'target_tm' must be a number"}, 400)
     if not (40.0 <= target_tm <= 90.0):
         return ({"error": "'target_tm' must be in [40, 90] °C"}, 400)
-    circular = bool(payload.get("circular", False))
-    destabilize = bool(payload.get("destabilize", False))
+    circular = _payload_bool(payload, "circular", False)
+    destabilize = _payload_bool(payload, "destabilize", False)
 
     best = _design_allele_specific_primer(
         template, variant_pos, alt_base=alt_base, orientation=orientation,
@@ -11551,6 +11724,12 @@ def _h_set_active_experiment_project(app, payload):
         target = _find_project(name)
         if target is None:
             return ({"error": f"no project named {name!r}"}, 404)
+        # Push a previous failed mirror's work into the OUTGOING container
+        # before the live file is rewritten (audit 2026-09-22).
+        try:
+            _flush_dirty_mirror_before_switch("experiments")
+        except RuntimeError as exc:
+            return ({"error": _scrub_path(str(exc))}, 500)
         raw_entries = target.get("experiments") or []
         if not isinstance(raw_entries, list):
             raw_entries = []
@@ -12395,9 +12574,9 @@ def _h_ot2_run(app, payload):
     try:
         return _ot2._ot2_run_protocol(
             host, protocol,
-            confirm=bool(payload.get("confirm")),
-            poll=bool(payload.get("wait", True)),
-            stop_on_fault=bool(payload.get("stop_on_fault", True)),
+            confirm=_payload_bool(payload, "confirm", False),
+            poll=_payload_bool(payload, "wait", True),
+            stop_on_fault=_payload_bool(payload, "stop_on_fault", True),
             offset_plan=offset_plan,
         )
     except _ot2.OT2Error as exc:
@@ -12665,9 +12844,9 @@ def _h_ot2_position_check(app, payload):
         wells = None
     try:
         return _ot2._ot2_run_position_check(
-            host, plan, wells=wells, confirm=bool(payload.get("confirm")),
-            poll=bool(payload.get("wait", True)),
-            stop_on_fault=bool(payload.get("stop_on_fault", True)))
+            host, plan, wells=wells, confirm=_payload_bool(payload, "confirm", False),
+            poll=_payload_bool(payload, "wait", True),
+            stop_on_fault=_payload_bool(payload, "stop_on_fault", True))
     except _ot2.OT2Error as exc:
         return ({"error": str(exc)}, 502)
 

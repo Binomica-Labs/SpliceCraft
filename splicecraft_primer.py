@@ -46,7 +46,10 @@ from typing import Callable as _Callable
 
 import splicecraft_state as _state
 from splicecraft_logging import _log, _timed
-from splicecraft_util import _normalize_dna_for_align
+from splicecraft_util import (
+    _IUPAC_DNA_CHARS, _IUPAC_WEAKEST_BASE, _degenerate_tm_bracket,
+    _normalize_dna_for_align,
+)
 from splicecraft_biology import (
     _circ_slice, _forbidden_hit_set, _iupac_compatible, _iupac_pattern,
     _mut_revcomp, _rc, _scan_restriction_sites, _search_subsequence,
@@ -109,7 +112,14 @@ _MUT_BSAI_FWD_TAIL = "CCCC" + "GGTCTCA" + "AATG"   # 15 nt; AATG = A(extra)+ATG 
 _MUT_BSAI_REV_TAIL = "CCCC" + "GGTCTCA" + "AACG"   # 15 nt; AACG = revcomp(CGTT)
 
 
-_MUT_P3 = dict(mv_conc=50.0, dv_conc=1.5, dntp_conc=0.2, dna_conc=250.0)
+# ONE set of reaction conditions for every nearest-neighbour number the app
+# reports: primer3's own defaults (50 mM monovalent, 1.5 mM Mg2+, 0.6 mM dNTP,
+# 50 nM oligo) — the same conditions `_primer_tm`, `_pick_binding_region` and
+# the `.dna` import compute under. Until 2026-09-22 the mutagenesis designers
+# used 0.2 mM dNTP / 250 nM oligo instead, so the SAME oligo read 2-3 °C
+# higher on the mutagenesis screen than on Check Primer, and a PCR program
+# built from a stored mutagenesis Tm annealed that much too hot.
+_MUT_P3 = dict(mv_conc=50.0, dv_conc=1.5, dntp_conc=0.6, dna_conc=50.0)
 
 
 def _mut_parse(s: str) -> tuple:
@@ -176,6 +186,13 @@ def _mut_tm(seq: str) -> float:
         import primer3
         val = primer3.calc_tm(seq, **_MUT_P3)  # type: ignore[arg-type]
     except Exception:
+        # A degenerate window (a consensus N, a typed IUPAC code) is a MIX:
+        # rate it by its weakest member's nearest-neighbour Tm — the same
+        # scale as every clean window — before the crude rule below.
+        bracket = _degenerate_tm_bracket(seq, **_MUT_P3)
+        if bracket is not None:
+            _mut_thermo_cache_put(_MUT_TM_CACHE, seq, bracket[0])
+            return bracket[0]
         # Fall back to the crude 2×AT + 4×GC approximation when
         # primer3 is missing or raises (degenerate input, NaN config).
         # Log so a wave of failures shows up as one diagnosable
@@ -448,26 +465,36 @@ def _primer_binding_sites(
     seed = max(1, min(int(seed_len), L))
     anchor = P[-seed:]
     try:
-        # Exact 3'-anchor hits on BOTH strands, wrap-aware, via the tested
-        # matcher. A '+' hit is the 3' end of a FORWARD-role primer; a '-' hit
-        # (rc(anchor) on the top strand) is the 3' end of a REVERSE-role primer.
-        hits = _search_subsequence(
+        # Exact 3'-anchor hits, wrap-aware, via the tested matcher — as TWO
+        # single-strand searches, one per primer role: `anchor` on the top
+        # strand is the 3' end of a FORWARD-role primer, rc(anchor) on the top
+        # strand the 3' end of a REVERSE-role primer. One both-strand search
+        # is NOT equivalent: it skips the reverse pass for a palindromic query
+        # and collapses a '+' and '-' hit on one span into the '+', so a primer
+        # whose 3' seed is palindromic (a restriction site at the 3' end — the
+        # normal shape of a site-tailed primer with a short seed) never had its
+        # reverse-role site evaluated: a perfect reverse primer came back as a
+        # forward site 13 bp upstream at ~56 % identity.
+        fwd_hits = _search_subsequence(
             top, anchor, max_mismatches=0,
-            circular=circular, both_strands=True,
+            circular=circular, both_strands=False,
+        )
+        rev_hits = _search_subsequence(
+            top, _rc(anchor), max_mismatches=0,
+            circular=circular, both_strands=False,
         )
     except ValueError:
         return []
     iupac_ok = _iupac_compatible
     sites: "list[dict]" = []
     seen: "set[tuple[int, int]]" = set()
-    for h in hits:
-        hs, he, strand = h["start"], h["end"], h["strand"]
-        if strand == "+":
+    roles = [(h, 1) for h in fwd_hits] + [(h, -1) for h in rev_hits]
+    for h, s_strand in roles:
+        hs, he = h["start"], h["end"]
+        if s_strand == 1:
             foot_start = he - L           # 5' edge of the forward footprint
-            s_strand = 1
         else:
             foot_start = hs               # 3'/left edge of the reverse footprint
-            s_strand = -1
         if circular:
             window = _circ_slice(top, foot_start, L, total)
         else:
@@ -496,10 +523,13 @@ def _primer_binding_sites(
             "ident_pct":  ident,
             "mismatches": mm,
         })
-        if len(sites) >= max_sites:
-            break
-    sites.sort(key=lambda s: (-s["ident_pct"], s["foot_start"]))
-    return sites
+    # Rank THEN cap. Capping first kept the first `max_sites` sites in scan
+    # order and sorted those, so on a repeat-rich template the best site could
+    # be dropped and `best_identity` / "binds as designed" answered from the
+    # leftovers. A caller that needs to know about truncation asks for one
+    # more than it shows.
+    sites.sort(key=lambda s: (-s["ident_pct"], s["foot_start"], s["strand"]))
+    return sites[:max(0, int(max_sites))]
 
 
 def _primer_check_confidence(pct: "float | int | None") -> "tuple[str, str]":
@@ -537,6 +567,11 @@ def _primer_tm(seq: str) -> "float | None":
         import primer3
         return round(float(primer3.calc_tm(s)), 1)
     except Exception:
+        # Degenerate oligo → its weakest member's NN Tm (what the anneal must
+        # respect), not the 2+4 rule, which runs ~8-12 °C away from it.
+        bracket = _degenerate_tm_bracket(s)
+        if bracket is not None:
+            return round(bracket[0], 1)
         gc = sum(1 for c in s if c in "GC")
         at = sum(1 for c in s if c in "AT")
         # Degenerate/IUPAC bases → AT/GC midpoint (3) so a degenerate oligo
@@ -615,14 +650,18 @@ def _pick_binding_region(seq: str, target_tm: float = 60.0,
         # NB distinct name (see the two-separate-names note above): a
         # `def _tm(...)` here would re-declare the annotated binding and
         # pyright's `reportRedeclaration` fails the release lint gate.
+        # A degenerate prefix is rated by its WEAKEST member's NN Tm
+        # (ambiguity codes resolved to A/T where they allow it) — still the
+        # nearest-neighbour scale, so a window that reaches a consensus N no
+        # longer drops the whole design onto the 2+4 rule.
         def _tm_nn(s: str) -> float:
             try:
-                return float(_p3_tm(s))
+                return float(_p3_tm(s.upper().translate(_IUPAC_WEAKEST_BASE)))
             except (ValueError, OSError, RuntimeError, TypeError):
                 return _tm_fallback(s)
         _window = seq[:max_len].upper()
         _tm = (_tm_nn
-               if (_window and all(c in "ACGT" for c in _window))
+               if (_window and set(_window) <= _IUPAC_DNA_CHARS)
                else _tm_fallback)
 
     # Defensive init: if the caller forgot the len(seq) >= min_len guard,
@@ -1058,18 +1097,24 @@ def _mut_design_inner(dna: str, mut_pos_1: int, mut_aa: str, wt_aa: str,
     seq_len = len(mut_dna)
 
     candidates: list = []
+    # Why each window was turned down, so the error names the real dead end
+    # (the old message blamed the sequence ends for Tm / GC failures too).
+    rejected = {"length": 0, "tm": 0, "gc": 0}
     for left_ext in range(5, 28):
         for right_ext in range(5, 28):
             lo  = max(0, nt_start - left_ext)
             hi  = min(seq_len, nt_start + 3 + right_ext)
             fwd = mut_dna[lo:hi]
             if len(fwd) < 15 or len(fwd) > 58:
+                rejected["length"] += 1
                 continue
             t  = _mut_tm(fwd)
             gc = _mut_gc_pct(fwd)
             if not (TM_MIN <= t <= TM_MAX):
+                rejected["tm"] += 1
                 continue
             if not (GC_MIN <= gc <= GC_MAX):
+                rejected["gc"] += 1
                 continue
             hp = _mut_hairpin_dg(fwd)
             hd = _mut_homodimer_dg(fwd)
@@ -1094,9 +1139,18 @@ def _mut_design_inner(dna: str, mut_pos_1: int, mut_aa: str, wt_aa: str,
             })
 
     if not candidates:
+        worst = max(rejected, key=lambda k: rejected[k])
+        why = {
+            "length": "the mutation is too close to a sequence end to fit a "
+                      "15 nt primer around it",
+            "tm":     f"no window around it reaches a Tm of "
+                      f"{TM_MIN:.0f}-{TM_MAX:.0f} °C (too AT- or GC-rich)",
+            "gc":     f"no window around it has {GC_MIN:.0f}-{GC_MAX:.0f} % "
+                      f"GC",
+        }[worst]
         raise RuntimeError(
-            f"No valid inner primers found for {wt_aa}{mut_pos_1}{mut_aa}. "
-            "Mutation may be too close to sequence ends."
+            f"No valid inner primers found for {wt_aa}{mut_pos_1}{mut_aa}: "
+            f"{why}."
         )
 
     seen: dict = {}

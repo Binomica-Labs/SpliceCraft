@@ -42,7 +42,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.70"
+__version__ = "1.2.71"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
@@ -174,6 +174,16 @@ def _demo_active() -> bool:
 
 def _demo_is_web() -> bool:
     return _DEMO_MODE == "web"
+
+
+class _CompletedAwaitable:
+    """What a REFUSED `push_screen` returns: awaitable (``await`` yields None
+    at once) like the `AwaitMount` a real push returns, but — unlike a bare
+    coroutine — silent when the caller never awaits it, which is nearly every
+    caller."""
+
+    def __await__(self):
+        return iter(())
 
 
 def _demo_web_refuse(app, feature: str) -> bool:
@@ -1329,6 +1339,54 @@ def _from_rich_style_cached(cls, rich_style, console=None):
 _tstyle_mod.Style.from_rich_style = classmethod(  # type: ignore[assignment]
     _from_rich_style_cached,
 )
+
+# ── DataTable cells: a stray tag in DATA must not take the app down ─────────
+# Textual renders every plain-`str` DataTable cell through
+# `Text.from_markup`, at RENDER time. About sixty tables here show names that
+# come from files and user input (plasmid / collection / primer / sample /
+# feature names, Plasmidsaurus products, crawled paper titles), so a name
+# holding `[/b]` raised MarkupError out of the compositor and closed the app
+# (audit 2026-09-22). Cells that are not valid markup now render as the plain
+# text they are; the many cells that USE markup on purpose are unaffected.
+try:
+    from textual.widgets import _data_table as _tx_data_table
+    from rich.errors import MarkupError as _RichMarkupError
+    from rich.text import Text as _RichText
+    _orig_default_cell_formatter = _tx_data_table.default_cell_formatter
+
+    from rich.style import Style as _RichStyle
+
+    def _cell_markup_is_styling(text) -> bool:
+        """True when every tag Rich pulled out of a str cell is a real style —
+        i.e. the cell is the app's own `[green]✓[/]`-style markup. A plasmid,
+        primer or file name that merely CONTAINS brackets ("[alpha] clone",
+        "[@click=…]") parses as tags too, and its bracketed text then simply
+        vanished from the table (or became a click action). Such a cell is
+        shown literally instead."""
+        for span in text.spans:
+            st = span.style
+            if isinstance(st, str):
+                try:
+                    st = _RichStyle.parse(st)
+                except Exception:
+                    return False
+            if getattr(st, "link", None) or getattr(st, "meta", None):
+                return False
+        return True
+
+    def _safe_default_cell_formatter(obj, wrap: bool = True, height: int = 0):
+        try:
+            out = _orig_default_cell_formatter(obj, wrap, height)
+        except _RichMarkupError:
+            return _RichText(str(obj), no_wrap=not wrap, end="")
+        if (isinstance(obj, str) and isinstance(out, _RichText) and out.spans
+                and not _cell_markup_is_styling(out)):
+            return _RichText(obj, no_wrap=not wrap, end="")
+        return out
+
+    _tx_data_table.default_cell_formatter = _safe_default_cell_formatter
+except (ImportError, AttributeError):          # pragma: no cover - Textual API moved
+    pass
 
 from textual.widgets import (  # noqa: E402
     Button, Checkbox, DataTable, DirectoryTree, Footer, Header, Input, Label,
@@ -3563,6 +3621,19 @@ def _build_system_info() -> dict:
 
 
 @_timed("op.diagnostic_bundle")
+def _redact_sensitive_settings(obj):
+    """Deep copy of a parsed settings document with every
+    `_SENSITIVE_SETTING_KEYS` value replaced by ``"<redacted>"`` — at any
+    nesting depth, so a schema envelope or a future sub-dict can't hide one."""
+    if isinstance(obj, dict):
+        return {k: ("<redacted>" if k in _SENSITIVE_SETTING_KEYS
+                    and v not in (None, "") else _redact_sensitive_settings(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_sensitive_settings(v) for v in obj]
+    return obj
+
+
 def _create_diagnostic_bundle(out_path: "Path | None" = None) -> Path:
     """Pack logs + UI snapshots + sanitized settings + system info
     into a single ZIP. Returns the path to the saved bundle.
@@ -3638,14 +3709,28 @@ def _create_diagnostic_bundle(out_path: "Path | None" = None) -> Path:
             except OSError:
                 pass
 
-            # 3. Sanitized settings.json — strip absolute paths.
+            # 3. Sanitized settings.json — secret values redacted, absolute
+            #    paths stripped. The file was copied verbatim, so every
+            #    bundle a user attached to a bug report carried their
+            #    Plasmidsaurus client secret and web/patent API keys in
+            #    plaintext (audit 2026-09-22); the UI-snapshot path already
+            #    redacted the same keys. An unparseable file is left OUT
+            #    rather than shipped raw — raw text is exactly what leaks.
             try:
                 settings_path = _state._SETTINGS_FILE
                 if isinstance(settings_path, Path) and settings_path.is_file():
                     raw = settings_path.read_text(
                         encoding="utf-8", errors="replace",
                     )[:256 * 1024]
-                    zf.writestr("settings.json", _scrub_path(raw))
+                    try:
+                        parsed = json.loads(raw)
+                    except ValueError:
+                        zf.writestr("settings.json.unreadable.txt",
+                                    "settings.json could not be parsed; "
+                                    "omitted so no secret can leak.\n")
+                    else:
+                        zf.writestr("settings.json", _scrub_path(json.dumps(
+                            _redact_sensitive_settings(parsed), indent=2)))
             except OSError:
                 pass
 
@@ -3884,6 +3969,75 @@ _cache_lock = _state._cache_lock
 # finds nothing to change.
 
 
+_PLACEHOLDER_RECORD_IDS = frozenset({"", ".", "<unknown id>", "<unknown name>"})
+
+
+def _import_identity_fixup(record, taken: "set[str] | None" = None) -> "str | None":
+    """Give a record freshly LOADED from a file (or pasted) an id that cannot
+    silently replace an unrelated library entry. Returns the new id when it
+    changed one, else None.
+
+    `add_entry` treats "same id" as "same document, edited in place" and
+    replaces the stored entry without a prompt — right for re-saving what you
+    opened from the library, wrong for a file whose id the LOADER invented:
+    Biopython reads `VERSION .` as the id `"."` for every SnapGene-style
+    GenBank export, a FASTA header's first word (`contig_1`) is shared by
+    every assembler output, and `.dna` ids are the filename stem cut to 16
+    characters (`MyVectorLong_GFP_v1` and `…_v2` both → `MyVectorLong_GFP`).
+    Opening the second file deleted the first entry, and the newcomer even
+    inherited its name, status and history (audit 2026-09-22).
+
+    Kept as-is: an id that is new, and an id whose stored entry holds the
+    SAME sequence (re-importing the same plasmid updates it in place, as
+    before). Re-derived (display-name based, `_N` bumped, the same scheme
+    the launch backfill accepts): placeholder ids, and an id already used by
+    a DIFFERENT sequence. ``taken`` adds ids claimed earlier in one batch."""
+    rid = str(getattr(record, "id", "") or "").strip()
+    try:
+        seq = str(record.seq).upper()
+    except Exception:
+        return None
+    existing: "dict[str, dict]" = {}
+    for e in _iter_library_readonly():
+        if isinstance(e, dict):
+            existing[str(e.get("id") or "")] = e
+    claimed = set(existing) | set(taken or ())
+    placeholder = (rid in _PLACEHOLDER_RECORD_IDS
+                   or not re.search(r"[A-Za-z0-9]", rid))
+    clash = False
+    if not placeholder and taken and rid in taken:
+        clash = True
+    elif not placeholder and rid in existing:
+        prev = existing[rid]
+        same = False
+        try:
+            if int(prev.get("size") or -1) == len(seq):
+                same = str(_gb_text_to_record(
+                    prev.get("gb_text") or "").seq).upper() == seq
+        except Exception:
+            same = False
+        clash = not same
+    if not (placeholder or clash):
+        return None
+    try:
+        name = PlasmidApp._record_display_name(record)
+    except Exception:
+        name = str(getattr(record, "name", "") or "")
+    base = re.sub(r"[^A-Za-z0-9_]+", "_", str(name or "")).strip("_")
+    if not base or base in _PLACEHOLDER_RECORD_IDS:
+        base = "plasmid"
+    new_id = base
+    n = 2
+    while new_id in claimed:
+        new_id = f"{base}_{n}"
+        n += 1
+    _log.info("import: id %r would %s — using %r", rid,
+              "be a placeholder" if placeholder
+              else "replace a different library entry", new_id)
+    record.id = new_id
+    return new_id
+
+
 def _backfill_library_ids_match_names(
         entries: list[dict]) -> "tuple[list[dict], int]":
     """Enforce two invariants across library entries:
@@ -3904,11 +4058,25 @@ def _backfill_library_ids_match_names(
     returns `n_changed == 0` without touching disk.
 
     Disambiguation: when two distinct display names sanitise to the
-    same id (e.g. "DEMO 34" and "DEMO-34" both → "DEMO_34"), the
-    earlier-walked entry keeps the base id; later ones get a
-    `_2`/`_3` suffix. Order in the library is preservation order
-    (most-recent-first per `_persist_assembly`'s `insert(0, …)`),
-    so the most recently saved entry wins the bare id.
+    same id (e.g. "DEMO 34" and "DEMO-34" both → "DEMO_34"), one keeps
+    the base id and the rest get a `_2`/`_3` suffix.
+
+    **An id that already fits its name is never taken away** (audit
+    2026-09-22). The walk used to hand the bare id to whichever entry it
+    reached FIRST — and the library is stored newest-first — so importing
+    "pcDNA3.1(-)" next to an established "pcDNA3.1(+)" (id `pcDNA3_1`)
+    let the NEW entry, correctly created as `pcDNA3_1_2`, "upgrade" itself
+    to `pcDNA3_1` at the next launch; the established entry then kept
+    `pcDNA3_1` too because it already matched (`unique_id != cur_id`
+    short-circuited the collision check). Two entries, one id, persisted:
+    the library table raises DuplicateKey on mount, `_find_library_entry_
+    by_id` returns the wrong plasmid, and deleting one row removed both.
+    Now it runs in two passes: (1) every entry whose current id is its
+    desired id, or a `desired_N` bump of it, KEEPS that id unless an
+    earlier-added entry already holds it (oldest `added` date wins, ties
+    to the later list position = the older save); (2) only the remainder
+    — legacy ids that don't match their name, and the losers of an
+    existing duplicate — are re-derived, avoiding every id still in use.
 
     **Hardening (2026-05-24):**
       * **Per-entry try/except** so one corrupt entry doesn't abort
@@ -3921,20 +4089,15 @@ def _backfill_library_ids_match_names(
         update still lands; gb_text may show the old LOCUS until
         the next explicit save.
     """
-    existing_ids: set[str] = set()
     n_changed = 0
-    for e in entries:
+    # ── pass 0: trim names, derive each entry's desired id ────────────
+    # Per-entry guard wraps the field reads so a single malformed row
+    # (e.g. non-string id from hand-edited JSON) doesn't abort the whole
+    # walk — the migration exists to make legacy libraries usable.
+    rows: "list[list]" = []     # [list_idx, entry, cur_id, desired, name_changed]
+    for idx, e in enumerate(entries):
         if not isinstance(e, dict):
             continue
-        # Per-entry guard wraps the field-read + mutate steps so a
-        # single malformed row (e.g. non-string id from hand-edited
-        # JSON) doesn't abort the whole walk. The migration's whole
-        # purpose is to make legacy libraries usable; failing hard
-        # on row #5 of 80 would leave the other 75 stuck pre-
-        # migration. We use a sentinel-flag pattern instead of a
-        # try/except wrapping the entire body so the existing
-        # control flow (continues, conditional id update) keeps its
-        # original shape.
         try:
             raw_nm = e.get("name") or ""
             nm = str(raw_nm).strip()
@@ -3945,7 +4108,6 @@ def _backfill_library_ids_match_names(
                 "(non-dict-shaped name/id field)",
             )
             continue
-        # ── (1) name-trim arm ────────────────────────────────────
         # Whitespace-only diff counts as a change even when the id
         # already matches: the cascade-match in
         # `_request_plasmid_delete` does strict `==`, so a stale
@@ -3953,36 +4115,68 @@ def _backfill_library_ids_match_names(
         name_changed = (nm != raw_nm)
         if name_changed:
             e["name"] = nm
-        if not nm or not cur_id:
-            # Nothing to derive from; record the (possibly trimmed)
-            # state and move on. Pathological case but tolerated.
-            existing_ids.add(cur_id)
+        desired = (re.sub(r"[^A-Za-z0-9_]+", "_", nm).strip("_")
+                   if nm else "")
+        rows.append([idx, e, cur_id, desired, name_changed])
+
+    def _fits(cur: str, desired: str) -> bool:
+        if not cur:
+            return False
+        if not desired:
+            # Pathological name (empty / all punctuation): the current id
+            # is the entry's only handle, so it stays.
+            return True
+        return (cur == desired
+                or re.fullmatch(re.escape(desired) + r"_\d+", cur) is not None)
+
+    def _age_key(k: int):
+        # Oldest `added` first; an entry without a date sorts after dated
+        # ones; ties go to the LATER list position (the older save — the
+        # library is stored newest-first).
+        added = str(rows[k][1].get("added") or "")
+        return (0 if added else 1, added, -rows[k][0])
+
+    # ── pass 1: every id that already fits its name is kept ───────────
+    claimed: "set[str]" = set()
+    keep: "set[int]" = set()
+    for k in sorted(range(len(rows)), key=_age_key):
+        cur, desired = rows[k][2], rows[k][3]
+        if _fits(cur, desired) and cur not in claimed:
+            claimed.add(cur)
+            keep.add(k)
+
+    # ── pass 2: re-derive only what doesn't fit, avoiding every id in use
+    kept_ids = {rows[j][2] for j in keep}
+    for k, (idx, e, cur_id, desired, name_changed) in enumerate(rows):
+        if k in keep:
+            unique_id = cur_id
+        elif not desired and not cur_id:
+            # Nothing to derive from and no handle to keep — tolerated.
             if name_changed:
                 n_changed += 1
             continue
-        desired_id = re.sub(r"[^A-Za-z0-9_]+", "_", nm).strip("_")
-        if not desired_id:
-            # Pathological name (all non-alphanumeric); keep the
-            # current id so the entry remains addressable.
-            existing_ids.add(cur_id)
-            if name_changed:
-                n_changed += 1
-            continue
-        # ── (2) id-tracks-name arm ───────────────────────────────
-        unique_id = desired_id
-        suffix = 2
-        while unique_id in existing_ids and unique_id != cur_id:
-            unique_id = f"{desired_id}_{suffix}"
-            suffix += 1
+        else:
+            base = desired or cur_id
+            unique_id = base
+            suffix = 2
+            while unique_id in claimed:
+                unique_id = f"{base}_{suffix}"
+                suffix += 1
+            claimed.add(unique_id)
+            if cur_id and cur_id in kept_ids:
+                _log.warning(
+                    "library id backfill: entry %r shared id %r with "
+                    "another entry — renamed to %r", e.get("name"), cur_id,
+                    unique_id)
         id_changed = (unique_id != cur_id)
         if not (id_changed or name_changed):
-            existing_ids.add(cur_id)
             continue
         # Re-serialise gb_text's LOCUS line so a future gb-only
         # reader (CommercialSaaS export, agent endpoint that parses
         # gb_text directly) sees the same trimmed name + new id.
         # Failure is non-fatal — the JSON fields still land; gb_text
         # may show the old name until the next explicit save.
+        nm = str(e.get("name") or "")
         try:
             rec = _gb_text_to_record(e.get("gb_text", "") or "")
             safe_locus = (
@@ -3999,7 +4193,6 @@ def _backfill_library_ids_match_names(
             )
         if id_changed:
             e["id"] = unique_id
-        existing_ids.add(unique_id)
         n_changed += 1
     return entries, n_changed
 
@@ -4164,6 +4357,7 @@ from splicecraft_dataaccess import (  # noqa: E402
     _save_library as _save_library,
     _mark_mirror_dirty as _mark_mirror_dirty,
     _clear_mirror_dirty as _clear_mirror_dirty,
+    _flush_dirty_mirror_before_switch as _flush_dirty_mirror_before_switch,
     _mirror_is_dirty as _mirror_is_dirty,
     _load_collections as _load_collections,
     _save_collections as _save_collections,
@@ -4178,6 +4372,7 @@ from splicecraft_dataaccess import (  # noqa: E402  (active-name getters/setters
     _get_active_enzyme_collection_name as _get_active_enzyme_collection_name,
     _set_active_enzyme_collection_name as _set_active_enzyme_collection_name,
     _active_enzyme_allowed_set as _active_enzyme_allowed_set,
+    _active_enzyme_resolution as _active_enzyme_resolution,
     _get_active_parts_bin_name as _get_active_parts_bin_name,
     _set_active_parts_bin_name as _set_active_parts_bin_name,
     _find_parts_bin as _find_parts_bin,
@@ -4232,29 +4427,116 @@ def _after_library_save() -> None:
     _invalidate_library_kmer_cache()
 
 
-def _switch_active_collection_library(plasmids: list[dict]) -> None:
-    """Load a collection's `plasmids` into the live library as an
-    EXPECTED mirror swap (2026-06-03).
+def _flush_library_into_active_collection() -> None:
+    """Make sure the in-memory library has reached the collection it belongs
+    to — the CURRENT active one — before anything moves the pointer away.
 
-    Switching the active collection rewrites plasmid_library.json from
-    the OLD collection's plasmids to the NEW one's. That legitimately
-    shrinks the file — often by >50%, sometimes >90% (large → tiny
-    collection) — but the dropped plasmids are NOT lost: they remain in
-    `collections.json` under their collection's key. Wrapping
-    `_save_library` in `_expected_mirror_swap()` tells the shrink guard
-    so it:
-      * does NOT spill a redundant `lost_entries/` copy (the data is
-        mirrored — a ~150 MB write per switch was the cause of the 1.5 GB
-        residue), and
-      * does NOT refuse the write on a >90% shrink (the latent bug where
-        a big→tiny collection switch raised RuntimeError).
+    Two ways the collection could be behind (audit 2026-09-22):
+      * a mirror write failed earlier (the `.mirror-dirty` marker is set), so
+        `plasmid_library.json` holds work `collections.json` never got — and
+        switching overwrote that file with the next collection's plasmids;
+      * a library change is still in flight: `add_entry` / delete / rename
+        reseat the cache synchronously and persist from a WORKER, and a switch
+        a moment later replaced the cache before the worker ran, so the new
+        plasmid never reached its collection (or, landing between a worker's
+        library write and its mirror, was mirrored into the NEW collection).
+    Cheap when nothing is pending (one list equality, no clone, no I/O).
+    Raises RuntimeError naming the collection when the push fails — callers
+    refuse the switch rather than lose the change. Call with the pointer
+    still on the OUTGOING collection; takes `_cache_lock`."""
+    with _cache_lock:
+        name = _get_active_collection_name()
+        cache = _state._library_cache
+        if not name or cache is None:
+            return
+        target = None
+        for c in _iter_collections_readonly():
+            if isinstance(c, dict) and c.get("name") == name:
+                target = c
+                break
+        if target is None:
+            return          # dangling pointer — no collection to push into
+        if not _mirror_is_dirty() and (target.get("plasmids") or []) == cache:
+            return
+        try:
+            _save_library(_typed_clone(cache))
+        except BaseException as exc:
+            raise RuntimeError(
+                f"your latest plasmid-library changes could not be saved "
+                f"into collection {name!r} ({exc}); the switch was cancelled "
+                f"so they are not lost") from exc
 
-    This is the plasmid_library↔collections analogue of
-    `_safe_save_json_mirror` (which covers parts-bin / primers /
-    experiments). Grep this name to enumerate every active-collection
-    switch write."""
-    with _expected_mirror_swap():
-        _save_library(plasmids)
+
+def _activate_collection(name: str,
+                         plasmids: "list[dict] | None" = None) -> None:
+    """THE active-collection switch: make ``name`` active with ``plasmids``
+    (default: the collection's stored plasmids) as the live library.
+
+    Every step leaves a consistent state if the next one fails:
+      1. push the outgoing collection's in-memory state into it
+         (`_flush_library_into_active_collection`);
+      2. write ``plasmids`` into the target collection when they differ —
+         `collections.json` is the source of truth, and callers that build a
+         collection empty and fill it on activation relied on the old
+         re-mirror inside `_save_library` for exactly this;
+      3. write `plasmid_library.json` as an EXPECTED mirror swap (no
+         re-mirror — the collection already holds these plasmids);
+      4. only then move the pointer (flushed to disk) and reseat the cache.
+    Before this, callers moved the pointer FIRST and wrote through
+    `_save_library`, whose redundant mirror could fail AFTER the library file
+    landed; the agent then rolled the pointer back onto a library file that
+    already held the NEW collection's plasmids, and the next save clobbered
+    the OLD collection with them. All under `_cache_lock`, so no in-flight
+    save can interleave. Raises RuntimeError / OSError; nothing is half-done
+    from the pointer's point of view."""
+    if not isinstance(name, str) or not name:
+        raise ValueError("collection name required")
+    with _cache_lock:
+        _flush_library_into_active_collection()
+        target_ro = next((c for c in _iter_collections_readonly()
+                          if isinstance(c, dict) and c.get("name") == name),
+                         None)
+        if target_ro is None:
+            raise ValueError(f"no collection named {name!r}")
+        stored = [p for p in (target_ro.get("plasmids") or [])
+                  if isinstance(p, dict)]
+        if plasmids is None:
+            plasmids = _typed_clone(stored)
+        else:
+            plasmids = [p for p in plasmids if isinstance(p, dict)]
+            if stored != plasmids:
+                # Full (cloning) load only when the collection must change.
+                colls = _load_collections()
+                for c in colls:
+                    if isinstance(c, dict) and c.get("name") == name:
+                        c["plasmids"] = _typed_clone(plasmids)
+                        break
+                _save_collections(colls)
+        _safe_save_json_mirror(_state._LIBRARY_FILE, plasmids,
+                               "Plasmid library")
+        _set_active_collection_name(name)
+        _settings_flush_sync()
+        _state._library_cache = _typed_clone(plasmids)
+        _clear_mirror_dirty()
+    _after = getattr(_state, "_after_library_save_hook", None)
+    if _after is not None:
+        _after()
+
+
+def _deactivate_all_collections() -> None:
+    """The last collection was deleted: clear the pointer and empty the live
+    library as one step, under `_cache_lock` (the `_activate_collection`
+    counterpart for "no collection left"). The emptied plasmids are not lost
+    — they went with the collection the user chose to delete."""
+    with _cache_lock:
+        _safe_save_json_mirror(_state._LIBRARY_FILE, [], "Plasmid library")
+        _set_active_collection_name(None)
+        _settings_flush_sync()
+        _state._library_cache = []
+        _clear_mirror_dirty()
+    _after = getattr(_state, "_after_library_save_hook", None)
+    if _after is not None:
+        _after()
 
 
 def _authoritative_library_snapshot(fallback: "list[dict]") -> "list[dict]":
@@ -4700,7 +4982,16 @@ def _commit_library_entry_to_collection(entry: dict, collection: str,
 # ── Pure helpers moved to splicecraft_util (Phase D) ────────────────────────
 from splicecraft_util import (  # noqa: E402
     _feat_bounds as _feat_bounds,
+    _feature_traversal as _feature_traversal,
+    _phred_in_alignment_frame as _phred_in_alignment_frame,
+    _markup_escape as _markup_escape,
+    _markup_parses as _markup_parses,
+    _restrand_location as _restrand_location,
+    _record_is_circular as _record_is_circular,
     _feature_location as _feature_location,
+    _coerce_feature_strand as _coerce_feature_strand,
+    _biopython_strand as _biopython_strand,
+    _double_strand_qualifiers as _double_strand_qualifiers,
     _name_modal_result as _name_modal_result,
 )
 
@@ -5510,6 +5801,7 @@ from splicecraft_gels import (  # noqa: E402
     _normalise_gel_entry as _normalise_gel_entry,
     _agarose_mobility as _agarose_mobility,
     _gel_bands_for_lane as _gel_bands_for_lane,
+    _gel_resolve_enzymes as _gel_resolve_enzymes,
     _render_gel_image as _render_gel_image,
 )
 
@@ -6196,31 +6488,34 @@ def _build_resite_highlight(n: int, resite: dict) -> dict:
     top_cut  = resite.get("top_cut_bp", -1)
     bot_cut  = resite.get("bottom_cut_bp", -1)
     ext_cut  = resite.get("ext_cut_bp")
-    strand   = resite.get("strand", 1)
-    # Classify each external cut as a natural downstream/upstream extension
-    # vs. a wrap past the origin (see the SequencePanel history: a wrapped
-    # cut used to drag hi_start plasmid-wide on origin-adjacent Type IIS).
-    ext_cuts:  list[int] = []
-    wrap_cuts: list[int] = []
-    for cut in (top_cut, bot_cut, ext_cut):
-        if cut is None or cut < 0 or hi_start <= cut < hi_end:
-            continue
-        if strand >= 0 and cut < hi_start:
-            wrap_cuts.append(cut)
-        elif strand < 0 and cut >= hi_end:
-            wrap_cuts.append(cut)
-        else:
-            ext_cuts.append(cut)
-    for cut in ext_cuts:
-        if cut < hi_start:
-            hi_start = cut
-        elif cut > hi_end:
-            hi_end = min(cut, n)
-    if wrap_cuts:
-        if strand >= 0:
-            hi_end = max(wrap_cuts)
-        else:
-            hi_start = min(wrap_cuts)
+    # Extend toward each external cut along the SHORTER way round the circle.
+    # A cut is a few bp from its site, so the short way is the real footprint
+    # whichever side it is on and whether or not it crosses the origin (the
+    # span is then wrap-encoded, end < start). The old rule decided the side
+    # from the strand alone — "a forward-strand cut below the site must have
+    # wrapped past the origin" — true for Type IIS, false for an enzyme that
+    # cuts UPSTREAM of its site (BaeI / BsaXI), whose click highlight then ran
+    # the long way and lit up ~95 % of the plasmid (audit 2026-09-22).
+    max_down = 0
+    max_up = 0
+    if n > 0:
+        for cut in (top_cut, bot_cut, ext_cut):
+            if cut is None or cut < 0 or hi_start <= cut < hi_end:
+                continue
+            down = (cut - hi_end) % n          # bases past the site's end
+            up = (hi_start - cut) % n          # bases before the site's start
+            if down <= up:
+                max_down = max(max_down, down)
+            else:
+                max_up = max(max_up, up)
+    if max_down:
+        hi_end = hi_end + max_down
+        if hi_end > n:
+            hi_end -= n                        # wrapped past the origin
+    if max_up:
+        hi_start = hi_start - max_up
+        if hi_start < 0:
+            hi_start += n                      # wrapped before the origin
     return {
         "start":         hi_start,
         "end":           hi_end,
@@ -8298,7 +8593,8 @@ def _comp_base(base: str) -> str:
     return (base or "N").upper().translate(_IUPAC_COMP)[:1] or "N"
 
 
-def _cds_coding_positions(total: int, feat) -> "list[int]":
+def _cds_coding_positions(total: int, feat, *,
+                          circular: "bool | None" = None) -> "list[int]":
     """The genomic bp of a CDS feature in READING order, after /codon_start.
 
     Position *i* of the coding sequence came from `result[i]`, so a residue's
@@ -8306,42 +8602,32 @@ def _cds_coding_positions(total: int, feat) -> "list[int]":
     non-contiguous (an intron between them), descending (minus strand), or
     split across bp 0 (an origin wrap).
 
-    A wrap and a spliced CDS are BOTH two-part `CompoundLocation`s, which is why
-    `_feat_bounds` decides which this is rather than the part order: trusting
-    declared order put every GenBank-parsed wrap's arcs in the wrong sequence
-    once already (`[INV-195]`), and here that would silently translate — and
-    edit — the wrong codon.
+    The geometry comes from `_feature_traversal`, the one reader every CDS
+    consumer shares: the legacy two-part origin wrap is still decided by
+    SHAPE (trusting declared order there put GenBank-parsed wraps' arcs in the
+    wrong sequence once, `[INV-195]`), while every other compound location
+    follows its DECLARED order — so a spliced gene whose transcript crosses bp
+    0 (any re-origin inside the gene produces one) reads exon 1 first. Sorting
+    the parts here made `edit-residue` rewrite the wrong codon for every
+    residue of such a gene (audit 2026-09-22).
     """
     if total <= 0 or feat is None:
         return []
-    try:
-        bounds = _feat_bounds(feat, total)
-    except (TypeError, ValueError):
-        return []
-    if bounds is None:
-        # `_feat_bounds` gives up on a location it cannot resolve (a fuzzy or
-        # unknown endpoint). No coding positions means no residue can be
-        # addressed, which is the honest answer.
-        return []
-    start, end, strand = bounds
     loc = getattr(feat, "location", None)
     if loc is None:
         return []
-    raw_parts = getattr(loc, "parts", None)
-    parts = list(raw_parts) if raw_parts else [loc]
-    if end < start:
-        # Origin wrap: tail first, then head. `_feat_bounds` already resolved
-        # it as a wrap, so the part order is not consulted.
-        genomic = list(range(start, total)) + list(range(0, end))
-    elif len(parts) > 1:
-        # Spliced: `_translate_cds` concatenates exons in ASCENDING genomic
-        # order and reverse-complements afterwards for the minus strand, so
-        # ascending here is correct for BOTH strands.
-        spans = sorted((int(p.start), int(p.end)) for p in parts)
-        genomic = [bp for lo, hi in spans for bp in range(lo, hi)]
-    else:
-        genomic = list(range(start, end))
-    if strand == -1:
+    try:
+        trav = _feature_traversal(loc, total, circular=circular)
+    except (TypeError, ValueError):
+        return []
+    if trav is None:
+        # An unresolvable (fuzzy / unknown) endpoint: no coding positions
+        # means no residue can be addressed, which is the honest answer.
+        return []
+    _start, _end, spans = trav
+    genomic = [bp for lo, hi in spans for bp in range(lo, hi)]
+    raw_strand = getattr(loc, "strand", None)
+    if raw_strand == -1:
         genomic.reverse()
     offset = _cds_codon_start(feat) - 1
     return genomic[offset:] if offset else genomic
@@ -8376,14 +8662,16 @@ def _cds_transl_table(feat) -> int:
 
 
 def _residue_codon_positions(total: int, feat,
-                             residue: int) -> "list[int] | None":
+                             residue: int, *,
+                             circular: "bool | None" = None,
+                             ) -> "list[int] | None":
     """The three genomic bp of 1-based `residue`, in reading order.
 
     None when the residue is outside the CDS or the codon is incomplete — a
     partial trailing codon has no residue to edit, and returning two positions
     would let a caller write a 2-base "codon".
     """
-    pos = _cds_coding_positions(total, feat)
+    pos = _cds_coding_positions(total, feat, circular=circular)
     if residue < 1:
         return None
     i = (residue - 1) * 3
@@ -8441,6 +8729,26 @@ def _codon_choices_for_aa(aa: str, *, taxid: "str | None" = None,
     return [(c, share) for c in plain]
 
 
+_THREE_LETTER_AA: "dict[str, str]" = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q",
+    "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K",
+    "MET": "M", "PHE": "F", "PRO": "P", "SER": "S", "THR": "T", "TRP": "W",
+    "TYR": "Y", "VAL": "V", "TER": "*", "STOP": "*", "END": "*",
+}
+
+
+def _residue_code_to_letter(code) -> str:
+    """One-letter residue for a target given as ONE letter (`D`, `*`) or a
+    three-letter code (`Asp`, `Ter`/`Stop`), case-insensitive; ``""`` for
+    anything else. The planner used to keep only the first character, so
+    `Asp` edited to Ala, `Lys` to Leu, `Trp`/`Tyr` to Thr — nine of the
+    twenty codes wrote the wrong residue, answered 200 (audit 2026-09-22)."""
+    t = str(code or "").strip().upper()
+    if len(t) == 1:
+        return t
+    return _THREE_LETTER_AA.get(t, "")
+
+
 def _protein_edit_plan(record, feat, residue: int, new_aa: str, *,
                        taxid: "str | None" = None,
                        codon: "str | None" = None) -> dict:
@@ -8463,15 +8771,16 @@ def _protein_edit_plan(record, feat, residue: int, new_aa: str, *,
     total = len(seq)
     if total == 0:
         raise ValueError("record has no sequence")
-    want = (new_aa or "").upper()[:1]
+    want = _residue_code_to_letter(new_aa)
     if not want or (want not in _PROTEIN_AA_LETTERS and want != "*"):
         raise ValueError(
             f"{new_aa!r} is not an amino-acid letter (20 residues, or * for a "
             f"stop)")
     tt = _cds_transl_table(feat)
-    _maybe = _residue_codon_positions(total, feat, residue)
+    _circ = _record_is_circular(record)
+    _maybe = _residue_codon_positions(total, feat, residue, circular=_circ)
     if _maybe is None:
-        n_aa = len(_cds_coding_positions(total, feat)) // 3
+        n_aa = len(_cds_coding_positions(total, feat, circular=_circ)) // 3
         raise ValueError(
             f"residue {residue} is outside this CDS (it codes {n_aa} complete "
             f"residues)")
@@ -8491,8 +8800,11 @@ def _protein_edit_plan(record, feat, residue: int, new_aa: str, *,
     table = _codon_table_for(tt)
     wt_aa = table.get(wt_codon, "?")
     alternatives = _codon_choices_for_aa(want, taxid=taxid, transl_table=tt)
-    if codon:
-        pick = codon.upper()
+    if codon not in (None, ""):
+        if not isinstance(codon, str):
+            raise ValueError(f"codon must be a 3-base string, got "
+                             f"{type(codon).__name__}")
+        pick = codon.strip().upper()
         if len(pick) != 3 or any(c not in "ACGT" for c in pick):
             raise ValueError(f"codon {codon!r} must be 3 unambiguous bases")
         if table.get(pick) != want:
@@ -8530,7 +8842,8 @@ def _protein_edit_plan(record, feat, residue: int, new_aa: str, *,
         "removes_stop": wt_aa == "*" and want != "*",
         "writes":       writes,
         "cds_label":    label or "CDS",
-        "protein_len":  len(_cds_coding_positions(total, feat)) // 3,
+        "protein_len":  len(_cds_coding_positions(total, feat,
+                                                  circular=_circ)) // 3,
         "transl_table": tt,
     }
 
@@ -8974,6 +9287,7 @@ def _nice_tick(total: int) -> int:
 # ── Pure helpers moved to splicecraft_util (Phase D) ────────────────────────
 from splicecraft_util import (  # noqa: E402
     _primer_tm_safe as _primer_tm_safe,
+    _degenerate_tm_bracket as _degenerate_tm_bracket,
     _pick_single_record as _pick_single_record,
 )
 
@@ -9609,7 +9923,7 @@ def _build_clone_region_amplicon_entry(
             continue
         if s == e or not (0 <= s <= n and 0 <= e <= n):
             continue
-        strand = int(f.get("strand", 1) or 0) or 1
+        strand = _coerce_feature_strand(f.get("strand", 1))
         quals: dict = {"label": [str(f.get("label") or f.get("type")
                                       or "feat")]}
         color = f.get("color")
@@ -9626,11 +9940,12 @@ def _build_clone_region_amplicon_entry(
             quals["primer_seq"] = [_normalize_primer_seq(_ps)]
         # `_feature_location` owns the wrap split, including the part ORDER
         # a minus-strand origin-wrap needs so it exports as the right protein.
-        loc = _feature_location(s, e, n, strand)
+        loc = _feature_location(s, e, n, _biopython_strand(strand))
         if loc is None:
             continue
         rec.features.append(SeqFeature(
-            loc, type=str(f.get("type", "misc_feature")), qualifiers=quals))
+            loc, type=str(f.get("type", "misc_feature")),
+            qualifiers=_double_strand_qualifiers(quals, strand)))
     # Run primers → primer_bind features (full primer in /primer_seq, binding
     # re-derived from the amplicon). topology is "linear", so the helper never
     # synthesises an origin-spanning location.
@@ -10442,9 +10757,7 @@ def _find_annotation_transfers(source_rec, target_rec, *,
     if n_src == 0 or n_tgt == 0:
         return []
 
-    is_circular = (
-        (target_rec.annotations or {}).get("topology") == "circular"
-    )
+    is_circular = _record_is_circular(target_rec)
 
     # Sweep #25 (2026-05-23): hoist `_rc(tgt_seq)` outside the
     # per-feature loop. Pre-fix this fired once per source feature
@@ -10969,7 +11282,7 @@ def _annotate_variants_with_quality(
 def _trace_verification_summary(
     aligned_q: str, aligned_t: str, phred,
     *, min_phred: int = _SANGER_MIN_PHRED_DEFAULT,
-    variants=None,
+    variants=None, circular: bool = True,
 ) -> dict:
     """Read a trace-vs-plasmid alignment the way a bench scientist would.
 
@@ -11001,6 +11314,17 @@ def _trace_verification_summary(
         variants = _extract_variants_from_alignment(aligned_q, aligned_t)
     truncated = any(isinstance(v, dict) and v.get("type") == "truncated"
                     for v in (variants or []))
+    # Only what the read LOOKED AT: the plasmid outside its observed extent
+    # is absence of data, not a deletion. Counting the two unread ends made
+    # a perfect partial read say "2 real changes" (audit 2026-09-22).
+    _t_len = sum(1 for c in (aligned_t or "") if c != "-")
+    _extent = _extent_from_aligned_spans(
+        _aligned_target_spans(aligned_q, aligned_t), _t_len, circular)
+    if _extent:
+        variants = [v for v in (variants or [])
+                    if not isinstance(v, dict) or v.get("type") == "truncated"
+                    or _pos_in_spans(int(v.get("target_pos", 0) or 0),
+                                     _extent)]
     ann = _annotate_variants_with_quality(
         variants, aligned_q, aligned_t, quals, min_phred=thr)
 
@@ -11191,6 +11515,64 @@ def _read_covered_spans(align: dict) -> "list[tuple[int, int]]":
     return merged
 
 
+def _aligned_target_spans(aligned_q: str,
+                          aligned_t: str) -> "list[tuple[int, int]]":
+    """Half-open target spans where the read has an aligned BASE (match or
+    mismatch), from the gapped strings. Insertion columns don't advance the
+    target and don't break a span; deletion columns do."""
+    spans: "list[tuple[int, int]]" = []
+    tpos = 0
+    cur: "list[int] | None" = None
+    for cq, ct in zip(aligned_q or "", aligned_t or ""):
+        if ct == "-":
+            continue
+        if cq != "-":
+            if cur is not None and cur[1] == tpos:
+                cur[1] = tpos + 1
+            else:
+                if cur is not None:
+                    spans.append((cur[0], cur[1]))
+                cur = [tpos, tpos + 1]
+        elif cur is not None:
+            spans.append((cur[0], cur[1]))
+            cur = None
+        tpos += 1
+    if cur is not None:
+        spans.append((cur[0], cur[1]))
+    return spans
+
+
+def _extent_from_aligned_spans(spans, total: int,
+                               circular: bool = True) -> "list[tuple[int, int]]":
+    """The read's OBSERVED EXTENT — first to last aligned base, the short way
+    round a circle: one span, or two when the read crosses the origin.
+
+    On a circular plasmid the unread arc is the LARGEST gap between aligned
+    bases, which for a read spanning bp 0 is in the MIDDLE of the target
+    frame. The linear "first to last" hull made that unread arc the read's
+    extent, so a perfect 800 bp read across the origin reported the 2,200 bp
+    it never covered as a deletion (audit 2026-09-22)."""
+    spans = sorted((int(a), int(b)) for a, b in (spans or []) if b > a)
+    if not spans:
+        return []
+    if not circular or total <= 0 or len(spans) == 1:
+        return [(spans[0][0], spans[-1][1])]
+    # A read that covers (nearly) the whole circle has NO unread arc: every
+    # gap in it is a deletion it sequenced across, never "absence of data".
+    if sum(b - a for a, b in spans) >= _PARTIAL_READ_FRACTION * total:
+        return [(0, total)]
+    g, i = max((spans[k + 1][0] - spans[k][1], k)
+               for k in range(len(spans) - 1))
+    wrap_gap = (total - spans[-1][1]) + spans[0][0]
+    if wrap_gap >= g:
+        return [(spans[0][0], spans[-1][1])]
+    return [(spans[i + 1][0], total), (0, spans[i][1])]
+
+
+def _pos_in_spans(pos: int, spans) -> bool:
+    return any(lo <= pos < hi for lo, hi in (spans or ()))
+
+
 def _read_observed_extent(align: dict) -> "tuple[int, int] | None":
     """First to last aligned base — the window this read can say ANYTHING about.
 
@@ -11223,7 +11605,8 @@ def _read_depth_at(spans_per_read: "list[list[tuple[int, int]]]",
 
 
 def _multi_read_summary(alignments, total: int, *,
-                        min_support: int = _MULTI_READ_MIN_SUPPORT) -> dict:
+                        min_support: int = _MULTI_READ_MIN_SUPPORT,
+                        circular: bool = True) -> dict:
     """Combine every read on one plasmid into a single answer.
 
     Returns::
@@ -11264,7 +11647,15 @@ def _multi_read_summary(alignments, total: int, *,
                 "verdict": "no_reads"}
 
     spans_per_read = [_read_covered_spans(a) for a in aligns]
-    extents = [_read_observed_extent(a) for a in aligns]
+    # Observed extent per read (circular-aware; one or two spans). Variants
+    # outside it are unread plasmid, and DEPTH at a variant counts every read
+    # whose extent spans it — a read that carries a deletion has no aligned
+    # base there, so aligned-base depth left it out and a 10-of-20 deletion
+    # read as fraction 1.0, 18-of-20 as 9.0, 20-of-20 as depth 0 (dropped)
+    # (audit 2026-09-22).
+    extents = [_extent_from_aligned_spans(sp, n, circular)
+               for sp in spans_per_read]
+    truncated = False
     # Per-bp depth via a sweep rather than a bp loop per read: a 200 kb
     # plasmid with 30 reads is 6 M membership tests the naive way.
     delta = [0] * (n + 1)
@@ -11316,9 +11707,16 @@ def _multi_read_summary(alignments, total: int, *,
             if v.get("type") == "truncated":
                 continue
             pos = int(v.get("target_pos", 0) or 0)
-            if extent is not None and not (extent[0] <= pos < extent[1]):
+            if extent and not _pos_in_spans(pos, extent):
                 continue
             key = (pos, v.get("type"), v.get("alt", ""))
+            if key not in buckets and len(buckets) >= _MULTI_READ_MAX_VARIANTS:
+                # Cap NEW buckets only — every read still adds its support to
+                # the variants already tallied, and the answer SAYS it was
+                # capped. Breaking out of the read's loop counted each later
+                # read's real change as contradiction (audit 2026-09-22).
+                truncated = True
+                continue
             slot = buckets.setdefault(key, {
                 "target_pos": pos, "type": v.get("type"),
                 "ref": v.get("ref", ""), "alt": v.get("alt", ""),
@@ -11336,14 +11734,12 @@ def _multi_read_summary(alignments, total: int, *,
             if qual and qual.get("has_quality") \
                     and pos in _conf_pos_for.get(idx, ()): 
                 slot["confident_reads"] += 1
-            if len(buckets) >= _MULTI_READ_MAX_VARIANTS:
-                break
 
     variants: list[dict] = []
     for slot in buckets.values():
         pos = slot["target_pos"]
-        d = depth[pos] if 0 <= pos < n else 0
         support = len(slot["reads"])
+        d = max(support, sum(1 for ext in extents if _pos_in_spans(pos, ext)))
         variants.append({
             "target_pos":      pos,
             "type":            slot["type"],
@@ -11391,6 +11787,7 @@ def _multi_read_summary(alignments, total: int, *,
         "n_single_read":  n_single,
         "n_contradicted": n_contra,
         "min_support":    need,
+        "truncated":      truncated,
         "verdict":        verdict,
     }
 
@@ -12286,6 +12683,23 @@ def _rotate_aligned_to_original_target_frame(
     return new_q, new_t
 
 
+def _alignment_edge_gap_bp(aligned_q: str, aligned_t: str,
+                           edge: int = 64) -> int:
+    """One-sided gap columns within ``edge`` columns of EITHER end.
+
+    The strict terminal-tail count is blind to an origin offset the aligner
+    anchored with a chance match: a full-length read 29 bp off the reference
+    origin came back as base 1 matched, a 29 bp deletion, …, a 29 bp
+    insertion, last base matched — terminal tail 0, so no rotation was tried
+    and a perfect clone reported two 29 bp changes (audit 2026-09-22)."""
+    n = min(len(aligned_q or ""), len(aligned_t or ""))
+    if n == 0:
+        return 0
+    cols = set(range(min(edge, n))) | set(range(max(0, n - edge), n))
+    return sum(1 for i in cols
+               if (aligned_q[i] == "-") != (aligned_t[i] == "-"))
+
+
 def _alignment_terminal_tail_bp(aligned_q: str, aligned_t: str) -> int:
     """Total non-aligning bases at the 5' AND 3' ends of a gapped
     pairwise alignment — terminal columns where exactly one strand has
@@ -12436,7 +12850,7 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
     if _plain_cands:
         _best_plain = max(
             _plain_cands, key=lambda c: c[3].get("identity_pct", 0.0))
-        plain_tail_bp = _alignment_terminal_tail_bp(
+        plain_tail_bp = _alignment_edge_gap_bp(
             _best_plain[3].get("aligned_q", ""),
             _best_plain[3].get("aligned_t", ""),
         )
@@ -12446,10 +12860,29 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
     # rotation could fold in. The 80% threshold is empirical; the tail
     # trigger catches the high-identity-but-origin-offset case the
     # threshold can't see.
+    # The tail trigger speaks for FULL-LENGTH reads only: a partial read's
+    # unread plasmid is terminal gap by definition. And once it fires, a
+    # near-perfect plain alignment must NOT stop the search — a full read 5
+    # bp off the reference origin aligns at 99.6%, so the early stop won and
+    # a perfect clone read "2 real changes" (audit 2026-09-22).
+    tail_triggered = (
+        len(query_seq) >= _PARTIAL_READ_FRACTION * len(target_seq)
+        and plain_tail_bp >= _ROTATION_TAIL_TRIGGER_BP)
+
+    def _stop() -> bool:
+        for c in candidates:
+            r = c[3]
+            if r.get("identity_pct", 0.0) < _ROTATION_EARLY_STOP_PCT:
+                continue
+            if (not tail_triggered or _alignment_edge_gap_bp(
+                    r.get("aligned_q", ""), r.get("aligned_t", ""))
+                    < _ROTATION_TAIL_TRIGGER_BP):
+                return True
+        return False
+
     if (is_circular
-            and (plain_id < _ROTATION_TRY_THRESHOLD_PCT
-                 or plain_tail_bp >= _ROTATION_TAIL_TRIGGER_BP)
-            and not _good_enough()):
+            and (plain_id < _ROTATION_TRY_THRESHOLD_PCT or tail_triggered)
+            and not _stop()):
         # Rotation trials are run for BOTH orientations (fwd + RC)
         # when plain alignment in either orientation was below
         # threshold. Pre-fix the picker only tried rotation on
@@ -12460,7 +12893,7 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
         # gates on `_good_enough()` so once any candidate hits the
         # early-stop threshold we don't keep paying the C-loop.
         for rot_is_rc in (False, True):
-            if _good_enough():
+            if _stop():
                 break
             eff_query = rc_query_seq if rot_is_rc else query_seq
             if not eff_query:
@@ -12486,7 +12919,7 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
                     _log.exception(
                         "rotation picker: query-rotated align raised",
                     )
-            if _good_enough():
+            if _stop():
                 break
             # Target rotation: find a unique seed in query, locate
             # in target, rotate target so its origin aligns with
@@ -12569,13 +13002,31 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
     # rotation on the OTHER side leaves the canvas-axis frame intact.
     if (best_kind == "target" and best_offset
             and canvas_axis == "target"):
+        _old_q = best_result.get("aligned_q", "")
+        _old_t = best_result.get("aligned_t", "")
         new_q, new_t = _rotate_aligned_to_original_target_frame(
-            best_result.get("aligned_q", ""),
-            best_result.get("aligned_t", ""),
-            best_offset, len(target_seq),
+            _old_q, _old_t, best_offset, len(target_seq),
         )
         best_result["aligned_q"] = new_q
         best_result["aligned_t"] = new_t
+        # The column cut also ROTATES the read inside `aligned_q`: every
+        # read base left of the cut moved to the end. Record by how much, so
+        # `_phred_in_alignment_frame` can put each quality score back on its
+        # own base (audit 2026-09-22). Same cut arithmetic as
+        # `_rotate_aligned_to_original_target_frame`.
+        _tn = len(target_seq)
+        _cut_bp = (_tn - (best_offset % _tn)) % _tn if _tn else 0
+        _cnt = 0
+        _cut_col = 0
+        for _i, _c in enumerate(_old_t):
+            if _c == "-":
+                continue
+            if _cnt == _cut_bp:
+                _cut_col = _i
+                break
+            _cnt += 1
+        best_result["query_frame_shift"] = sum(
+            1 for _c in _old_q[:_cut_col] if _c != "-")
         # Target row restored to original frame ⇒ offset stays 0.
     elif (best_kind == "query" and best_offset
             and canvas_axis == "query"):
@@ -12638,7 +13089,9 @@ _ROTATION_TRY_THRESHOLD_PCT = 80.0
 # catch a few-dozen-bp offset, large enough to ignore 1-2 bp terminal
 # mismatch-as-gap noise. Added 2026-05-29 ("non-aligning bases at the
 # ends" report).
-_ROTATION_TAIL_TRIGGER_BP = 8
+# 2 (was 8): a 3 bp origin offset left 6 bp of tails and was reported as
+# a 3 bp deletion + insertion; one base each end is the smallest offset.
+_ROTATION_TAIL_TRIGGER_BP = 2
 
 # When any candidate's overall identity_pct crosses this threshold,
 # `_pick_best_rotation` stops attempting further candidates. 99.5%
@@ -12931,6 +13384,83 @@ def _myers_align_global(query: str, target: str) -> "tuple[str, str]":
     return _myers_align_core(query, target)
 
 
+# ── Partial reads: semi-global placement (audit 2026-09-22) ───────────────
+# A read shorter than its plasmid (a Sanger trace, a partial long read) must
+# be aligned END-TO-END over itself with the plasmid's ends FREE. The global
+# engines (edlib / the built-in Myers) are UNIT-COST: covering the unread
+# plasmid costs the same number of deletions however the read is laid down,
+# so "optimal" meant threading the read through the plasmid as a scattered
+# subsequence rather than paying for one mismatch. An 800 bp read with one SNP
+# came back as hundreds of phantom 1–18 bp deletions with the SNP gone; a
+# PERFECT partial read reported "488 real changes". Full-length reads (a
+# Plasmidsaurus consensus) stay on the fast global engine.
+_PARTIAL_READ_FRACTION = 0.95         # read shorter than this × plasmid
+_SEMIGLOBAL_MAX_CELLS = 60_000_000    # read × window DP cells, per call
+_SEMIGLOBAL_SEED_K = 16
+_SEMIGLOBAL_WINDOW_PAD = 300
+
+
+def _semiglobal_window(q: str, t: str) -> "tuple[int, int] | None":
+    """``[w0, w1)`` of plasmid ``t`` the read ``q`` most likely came from:
+    the best-voted k-mer diagonal, padded. None when no seed is shared."""
+    k = _SEMIGLOBAL_SEED_K
+    if len(q) < k or len(t) < k:
+        return None
+    index: "dict[str, list[int]]" = {}
+    for i in range(len(t) - k + 1):
+        hits = index.setdefault(t[i:i + k], [])
+        if len(hits) < 8:
+            hits.append(i)
+    from collections import Counter as _Counter
+    votes: "_Counter[int]" = _Counter()
+    step = max(1, (len(q) - k + 1) // 2000)
+    for j in range(0, len(q) - k + 1, step):
+        for i in index.get(q[j:j + k], ()):
+            votes[(i - j) // 64] += 1
+    if not votes:
+        return None
+    d = votes.most_common(1)[0][0] * 64
+    w0 = max(0, d - _SEMIGLOBAL_WINDOW_PAD)
+    w1 = min(len(t), d + len(q) + 64 + _SEMIGLOBAL_WINDOW_PAD)
+    return w0, w1
+
+
+def _semiglobal_align(q: str, t: str, *, match: float, mismatch: float,
+                      open_gap: float, extend_gap: float):
+    """Affine alignment of read ``q`` end-to-end against plasmid ``t`` with
+    the plasmid's unread ends free. Returns ``(aligned_q, aligned_t, aln)``
+    expanded to the FULL plasmid frame (unread plasmid = gaps in the read
+    row), the shape every alignment consumer already reads."""
+    from Bio.Align import PairwiseAligner
+    w0, w1 = 0, len(t)
+    if len(q) * len(t) > _SEMIGLOBAL_MAX_CELLS:
+        win = _semiglobal_window(q, t)
+        if win is None:
+            raise ValueError(
+                "the read shares no exact 16-bp stretch with the plasmid, so "
+                "it cannot be placed on it")
+        w0, w1 = win
+        if len(q) * (w1 - w0) > _SEMIGLOBAL_MAX_CELLS:
+            raise ValueError("read too long to place on this plasmid")
+    a = PairwiseAligner()
+    a.mode = "global"
+    a.match_score = match
+    a.mismatch_score = mismatch
+    a.open_gap_score = open_gap
+    a.extend_gap_score = extend_gap
+    # Gaps in the READ row before its first / after its last base = plasmid
+    # the read never covered: free. (Biopython calls those end insertions
+    # for `align(read, plasmid)`; verified against the scoring directly.)
+    a.end_insertion_score = 0.0
+    try:
+        aln = a.align(q, t[w0:w1])[0]
+    except (IndexError, StopIteration, ValueError, OverflowError) as exc:
+        raise ValueError(f"semi-global align failed: {exc}") from exc
+    aq, at = str(aln[0]), str(aln[1])
+    return ("-" * w0 + aq + "-" * (len(t) - w1),
+            t[:w0] + at + t[w1:], aln)
+
+
 @_timed("op.pairwise_align")
 def _pairwise_align(query_seq: str, target_seq: str,
                      *, mode: str = "global",
@@ -13003,7 +13533,11 @@ def _pairwise_align(query_seq: str, target_seq: str,
     bio_first = None
     aligned_q: "str | None" = None
     aligned_t: "str | None" = None
-    if _EDLIB_AVAILABLE and mode == "global":
+    if mode == "global" and len(q) < _PARTIAL_READ_FRACTION * len(t):
+        aligned_q, aligned_t, bio_first = _semiglobal_align(
+            q, t, match=match, mismatch=mismatch,
+            open_gap=open_gap, extend_gap=extend_gap)
+    if (aligned_q is None and _EDLIB_AVAILABLE and mode == "global"):
         try:
             aq, at = _edlib_align_global(q, t)
             # Round-trip guard: the ungapped rows MUST reconstruct the
@@ -15019,6 +15553,30 @@ def _plate_well_positions(n: int, *, rows: str = _PLATE_ROWS,
     return out
 
 
+# A spreadsheet treats a cell that starts with = + - @ (or a tab / CR that
+# hides one) as a FORMULA — so a primer named `=HYPERLINK(...)` in an order CSV
+# runs when the sheet is opened (CSV injection, OWASP). Names are free text a
+# user or a shared file supplies, so every free-text cell the order CSV writes
+# gets a leading apostrophe — the spreadsheet convention for "this is text" —
+# and the importer strips exactly that apostrophe back off, so the export ->
+# edit -> re-import round trip keeps names like "-10 box fwd" intact.
+_CSV_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_text_cell(value) -> str:
+    """Neutralise a free-text CSV cell against spreadsheet formula execution."""
+    text = str(value)
+    return ("'" + text) if text.startswith(_CSV_FORMULA_TRIGGERS) else text
+
+
+def _csv_text_cell_restore(value: str) -> str:
+    """Inverse of `_csv_text_cell` on import."""
+    if len(value) >= 2 and value[0] == "'" and \
+            value[1:].startswith(_CSV_FORMULA_TRIGGERS):
+        return value[1:]
+    return value
+
+
 def _export_primers_to_csv(primers: "list[dict]", path, *,
                            order_format: str = "generic",
                            scale: str = "25nm",
@@ -15056,7 +15614,7 @@ def _export_primers_to_csv(primers: "list[dict]", path, *,
     if order_format not in ("generic", "idt", "plate"):
         raise ValueError(
             f"unknown order_format {order_format!r} (expected "
-            "'generic' or 'idt')")
+            "'generic', 'idt' or 'plate')")
     rows = [p for p in (primers or []) if (p.get("sequence") or "").strip()]
     if not rows:
         raise ValueError("No primers to export.")
@@ -15079,10 +15637,10 @@ def _export_primers_to_csv(primers: "list[dict]", path, *,
         for p in rows:
             seq = (p.get("sequence") or "").strip().upper()
             writer.writerow([
-                (str(p.get("name") or "").strip() or "primer"),
+                _csv_text_cell(str(p.get("name") or "").strip() or "primer"),
                 seq,
-                str(p.get("scale") or scale),
-                str(p.get("purification") or purification),
+                _csv_text_cell(str(p.get("scale") or scale)),
+                _csv_text_cell(str(p.get("purification") or purification)),
             ])
     elif order_format == "plate":
         # Plate template — Plate, Well Position, Name, Sequence. Row-major fill
@@ -15093,7 +15651,7 @@ def _export_primers_to_csv(primers: "list[dict]", path, *,
         for (plate_no, well), p in zip(wells, rows):
             writer.writerow([
                 plate_no, well,
-                (str(p.get("name") or "").strip() or "primer"),
+                _csv_text_cell(str(p.get("name") or "").strip() or "primer"),
                 (p.get("sequence") or "").strip().upper(),
             ])
     else:
@@ -15103,7 +15661,7 @@ def _export_primers_to_csv(primers: "list[dict]", path, *,
             tm = p.get("tm")
             tm_str = f"{float(tm):.1f}" if isinstance(tm, (int, float)) else ""
             writer.writerow([
-                (str(p.get("name") or "").strip() or "primer"),
+                _csv_text_cell(str(p.get("name") or "").strip() or "primer"),
                 seq, len(seq), tm_str,
             ])
     p_out = _Path(path).expanduser()
@@ -15186,7 +15744,8 @@ def _import_primers_from_csv(path) -> dict:
     base_line = 2 if has_header else 1
     for off, row in enumerate(body):
         ln = base_line + off
-        name = (_sanitize_label(row[name_i], max_len=200)
+        name = (_sanitize_label(_csv_text_cell_restore(row[name_i].strip()),
+                                max_len=200)
                 if name_i < len(row) else "")
         seq = (row[seq_i].strip().upper() if seq_i < len(row) else "")
         if not seq:
@@ -16152,69 +16711,41 @@ class PlasmidMap(Widget):
             is_compound = (CompoundLocation is not None
                            and isinstance(feat.location, CompoundLocation))
             if is_compound:
-                parts = sorted(
-                    feat.location.parts,
-                    key=lambda p: int(p.start),
-                )
+                # ONE reading geometry (`_feature_traversal`): declared part
+                # order is reading order, so a spliced gene whose transcript
+                # crosses bp 0 is a WRAP with its exons in traversal order —
+                # sorting the parts flattened it across the backbone or read
+                # its exons swapped (audit 2026-09-22). `_exons` is kept in
+                # FORWARD traversal order; every consumer concatenates in
+                # list order (reverse-complementing the block on −). A
+                # contiguous compound (CommercialSaaS internals) is a plain
+                # span, and a span ending at `total` that resumes at 0 is the
+                # ordinary origin wrap.
+                trav = _feature_traversal(
+                    feat.location, total, circular=_rec_is_circular)
+                fwd: "list[tuple[int, int]]" = []
+                if trav is not None:
+                    start, end, fwd = trav
                 is_contiguous = all(
-                    int(parts[i].end) == int(parts[i + 1].start)
-                    for i in range(len(parts) - 1)
+                    fwd[i][1] == fwd[i + 1][0]
+                    or (fwd[i][1] == total and fwd[i + 1][0] == 0)
+                    for i in range(len(fwd) - 1)
                 )
-                # A LINEAR record has no origin to wrap around, so this same
-                # two-part shape is a SPLICED feature there: `join(1..6,
-                # 13..30)` on a 30 bp linear record is exon1 + exon2, and
-                # re-encoding it as (12, 6) made `_translate_cds` read exon2
-                # before exon1 — a cyclically rotated protein — while also
-                # suppressing the `_exons` capture below. Mirrors the
-                # `circular=` gate in `_feat_bounds`.
-                is_wrap = (
-                    _rec_is_circular
-                    and total > 0 and len(parts) == 2
-                    and int(parts[0].start) == 0
-                    and int(parts[-1].end) == total
-                    and int(parts[0].end) < int(parts[-1].start)
-                )
-                if is_wrap:
-                    # Origin-spanning wrap: head at [0, parts[0].end),
-                    # tail at [parts[-1].start, total). Represent as
-                    # start=tail, end=head so end<start signals wrap.
-                    start = int(parts[-1].start)
-                    end   = int(parts[0].end)
+                if end < start:
                     _log.info(
                         "Detected wrap feature %s (%d..%d → wraps origin)",
                         _feat_label(feat), start, end,
                     )
-                elif is_contiguous:
-                    # Adjacent sub-parts — outer bounds ARE the real span,
-                    # no info lost, no need to warn the user.
-                    pass
-                else:
+                if not is_contiguous:
                     self._n_flattened += 1
                     _log.info(
-                        "Flattened compound feature %s (%d..%d) to outer bounds",
+                        "Compound feature %s (%d..%d) drawn as its outer "
+                        "span; exons kept for translation",
                         _feat_label(feat), start, end,
                     )
-                # Intron-aware splice info (issue #9 from a user).
-                # For a multi-exon CDS like `join(100..200, 400..500)`,
-                # stash the exon list so `_translate_cds` and
-                # `_paint_cds_aa` can splice out introns before reading
-                # the codon table. Without this, the AA letters past the
-                # intron come out in the wrong reading frame whenever
-                # the intron length isn't a multiple of 3.
-                #
-                # Skipped for origin wraps (the existing wrap-encoding
-                # already encodes the two pieces in `start`/`end`) and
-                # for contiguous compound (no information is lost in
-                # flattening). Captured as half-open `(s, e)` tuples in
-                # ascending genomic order; strand handling happens at
-                # read time inside `_cds_aa_list`.
-                if not is_wrap and not is_contiguous and len(parts) >= 2:
-                    feat_exons = [
-                        (int(p.start), int(p.end)) for p in parts
-                    ]
+                if not is_contiguous and len(fwd) >= 2:
+                    feat_exons = [(int(a), int(b)) for a, b in fwd]
 
-            # Clamp coords that exceed the sequence length — rendering
-            # math assumes start, end ∈ [0, total].
             if total > 0:
                 clamped_start = max(0, min(start, total))
                 clamped_end   = max(0, min(end,   total))
@@ -20291,6 +20822,7 @@ class LibraryPanel(Widget):
         # of the entire cached library (hundreds of ms on a 1000-row
         # library with `gb_text` blobs) — fired on every Filter
         # keystroke. The caller has already loaded once at line 12861.
+        seen_row_keys: "set[str]" = set()
         for entry in sorted(lib_entries,
                              key=lambda e: _natural_sort_key(
                                  e.get("name") or e.get("id") or "")):
@@ -20305,6 +20837,17 @@ class LibraryPanel(Widget):
             # KeyError inside `on_mount`, so the app died at STARTUP and the
             # user's whole library became unreachable through the UI.
             entry_id = str(entry.get("id") or entry.get("name") or "")
+            if entry_id in seen_row_keys:
+                # Two entries sharing one id made `add_row(key=…)` raise
+                # DuplicateKey inside `on_mount` — the app died at startup.
+                # The launch backfill now de-duplicates ids (audit
+                # 2026-09-22); this belt keeps a duplicate that arrives some
+                # other way from taking the whole library table down.
+                _log.warning(
+                    "library table: skipped a second entry with id %r "
+                    "(duplicate ids — the next launch re-keys it)", entry_id)
+                continue
+            seen_row_keys.add(entry_id)
             is_dirty = (entry_id == self._active_id and self._active_dirty)
             name_disp = ("*" + name) if is_dirty else name
             name_disp = name_disp[:name_inner]
@@ -20425,7 +20968,8 @@ class LibraryPanel(Widget):
     # ── Plasmid view: existing flow + back button ──────────────────────────
 
     def add_entry(self, record, *, target_collection: "str | None" = None,
-                  replace_in_target: bool = False) -> bool:
+                  replace_in_target: bool = False,
+                  on_deferred_done=None) -> bool:
         """Serialize record and persist into the active collection.
 
         Returns True on a successful save (cache updated, disk write
@@ -20636,6 +21180,8 @@ class LibraryPanel(Widget):
                 "Plasmid save cancelled. Library unchanged.",
                 severity="warning",
             )
+            if on_deferred_done is not None:
+                on_deferred_done(False)
             _log_event(
                 "library.add.cancelled",
                 name=display_name, id=record.id,
@@ -20648,6 +21194,8 @@ class LibraryPanel(Widget):
                     "Skipped duplicate plasmid. Library unchanged.",
                     severity="warning",
                 )
+                if on_deferred_done is not None:
+                    on_deferred_done(False)
                 _log_event(
                     "library.add.skipped",
                     name=display_name, id=record.id,
@@ -20682,7 +21230,16 @@ class LibraryPanel(Widget):
                 name=display_name, id=record.id,
                 n_overwritten=len(replace_names),
             )
+            if on_deferred_done is not None:
+                on_deferred_done(True)
 
+        # The save is now WAITING on the user's collision choice — nothing
+        # has been written yet. Callers that mark the canvas clean, delete
+        # its crash-recovery copy, or quit must check `_last_add_deferred`
+        # (audit 2026-09-22: Save-and-quit exited here with the modal still
+        # open and the edits lost). `on_deferred_done(saved)` fires once the
+        # choice is made.
+        self._last_add_deferred = True
         _resolve_load_collisions(
             self.app, "plasmid", [new_entry], entries,
             name_key="name",
@@ -20773,7 +21330,15 @@ class LibraryPanel(Widget):
         # replace-by-id path (mirrors `add_entry`'s id-match branch);
         # they aren't routed through the modal flow.
         silent_replace_ids: set[str] = set()
+        batch_ids: "set[str]" = set()
         for record in records:
+            # Loader-invented ids (`.`, a FASTA header's `contig_1`) are
+            # shared by unrelated records — in the library AND within this
+            # one batch — so re-derive before the silent replace-by-id path
+            # below can drop an unrelated entry. [audit 2026-09-22]
+            _import_identity_fixup(record, taken=batch_ids)
+            if record.id:
+                batch_ids.add(str(record.id))
             try:
                 gb_text = _record_to_gb_text(record)
             except Exception:
@@ -21854,10 +22419,21 @@ class LibraryPanel(Widget):
         # pointer might still say OLD when the library mirror lands,
         # and the next mutation mirrors NEW data into OLD — silently
         # overwriting OLD's plasmids.
-        _set_active_collection_name(name)
-        _settings_flush_sync()
+        # Push the OUTGOING collection's in-memory state into it first: a
+        # plasmid added / deleted / renamed a moment ago is persisted by a
+        # worker, and replacing the cache before that worker ran dropped it
+        # (audit 2026-09-22). No-op (one list compare) when nothing pends.
+        try:
+            _flush_library_into_active_collection()
+        except RuntimeError as exc:
+            _log.exception("Collection switch refused")
+            self.app.notify(str(exc), severity="error", timeout=15)
+            return
         plasmids = [dict(p) for p in (coll.get("plasmids") or [])
                     if isinstance(p, dict)]
+        # Pointer + cache move together UNDER `_cache_lock`, so a save
+        # running on a worker thread sees either the old pair or the new
+        # pair — never the old cache mirrored into the new collection.
         # Update the in-memory cache synchronously so the panel
         # repopulate below sees the new state immediately. The disk
         # write fires asynchronously after the UI swap. Without this
@@ -21867,7 +22443,10 @@ class LibraryPanel(Widget):
         # collection mirror entirely — `plasmids` came FROM the
         # collection we just switched to, so mirroring back is a
         # no-op data-wise (still 156 MB of disk I/O if not skipped).
-        _state._library_cache = _typed_clone(plasmids)
+        with _cache_lock:
+            _set_active_collection_name(name)
+            _settings_flush_sync()
+            _state._library_cache = _typed_clone(plasmids)
         _clear_primer_cache = globals().get("_primer_usage_clear_cache")
         if _clear_primer_cache is not None:
             _clear_primer_cache()
@@ -21954,10 +22533,15 @@ class LibraryPanel(Widget):
             # (collections.json is the source-of-truth, the named
             # collection's `plasmids` is intact regardless of the
             # incoming list size). A switch to an empty collection
-            # would otherwise trip the L3 shrink guard.
-            _safe_save_json_mirror(
-                _state._LIBRARY_FILE, plasmids, "Plasmid library",
-            )
+            # would otherwise trip the L3 shrink guard. Write the LIVE
+            # cache, not the dispatch-time list: a plasmid added right
+            # after the switch must not be un-written by this worker.
+            with _cache_lock:
+                _safe_save_json_mirror(
+                    _state._LIBRARY_FILE,
+                    _authoritative_library_snapshot(plasmids),
+                    "Plasmid library",
+                )
         except (OSError, RuntimeError) as exc:
             _log.exception("Collection switch: library save failed")
             self.app.call_from_thread(
@@ -21984,6 +22568,9 @@ class LibraryPanel(Widget):
                 return
             plasmids: list[dict] = []
             description = ""
+            if folder is not None and _demo_web_refuse(self.app,
+                                                       "Importing a folder"):
+                folder = None
             if folder is not None:
                 # If the modal's worker already imported the folder
                 # (the new progress-bar path), reuse its cached
@@ -22122,17 +22709,12 @@ class LibraryPanel(Widget):
                     # OLD while the library holds the new collection's
                     # plasmids. Same fix sweep #9 landed on project
                     # delete-promote (line 42246).
-                    _set_active_collection_name(new_active)
-                    _settings_flush_sync()
-                    fallback_plasmids = [
-                        p for p in (
-                            (remaining[0].get("plasmids") if remaining
-                             else None) or []
-                        ) if isinstance(p, dict)
-                    ]
                     try:
-                        _switch_active_collection_library(fallback_plasmids)
-                    except (OSError, RuntimeError) as exc:
+                        if new_active:
+                            _activate_collection(new_active)
+                        else:
+                            _deactivate_all_collections()
+                    except (OSError, RuntimeError, ValueError) as exc:
                         _notify_save_failure(
                             self.app, "Plasmid library", exc)
                         return
@@ -23140,6 +23722,23 @@ class SequencePanel(Widget):
                 v = f.get(k)
                 if isinstance(v, int) and v >= 0:
                     new[k] = (v - o) % n
+            # Exons rotate with the feature (audit 2026-09-22): left in the
+            # absolute frame, `_cds_aa_list` sliced the ROTATED sequence with
+            # them and every intron-containing CDS showed a wrong protein as
+            # soon as the view origin moved. Traversal order is preserved;
+            # an exon straddling the new view origin splits in two.
+            exons = f.get("_exons")
+            if exons:
+                new_ex: "list[tuple[int, int]]" = []
+                for xs, xe in exons:
+                    a = (int(xs) - o) % n
+                    b = ((int(xe) - o - 1) % n) + 1
+                    if a < b:
+                        new_ex.append((a, b))
+                    else:
+                        new_ex.append((a, n))
+                        new_ex.append((0, b))
+                new["_exons"] = new_ex
             # Re-attach a primer's 5' flap to the ROTATED feature so it
             # travels WITH the primer across an origin rotation. Pre-fix
             # only start/end rotated; `_flap_start`/`_flap_end` stayed in
@@ -28050,6 +28649,10 @@ class OpenFileModal(ModalScreen):
     selection UI was swapped.
     """
 
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
+
     _blocks_undo: bool = True   # filename Input + record import
 
     BINDINGS = [
@@ -28593,6 +29196,10 @@ class ExportCommercialSaaSModal(ModalScreen):
     this modal.
     """
 
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
+
     BINDINGS = [
         Binding("escape", "cancel",         "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -28726,6 +29333,10 @@ class ExportGenBankModal(ModalScreen):
     (keys: path, bp, features) or None if cancelled. The caller is
     expected to show a notification on success.
     """
+
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
 
     _blocks_undo: bool = True   # filename Input editing
 
@@ -28909,6 +29520,10 @@ class GffExportModal(ModalScreen):
     extension validation + which serialiser fires.
     """
 
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
+
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
         Binding("tab",    "app.focus_next", "Next",   show=False),
@@ -29069,6 +29684,10 @@ class FastaExportModal(ModalScreen):
     (`path`, `bp`, `name`) or `None` if cancelled. Caller handles
     the success notification.
     """
+
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
 
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
@@ -29244,6 +29863,10 @@ class MapImageExportModal(ModalScreen):
     Dismisses with the `export_plasmid_map` summary dict (or None on
     cancel). SVG is a true vector (transparent background = no backing
     rect); PNG is rasterised at the chosen size. See `[INV-158]`."""
+
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
 
     _blocks_undo: bool = True
 
@@ -29458,6 +30081,10 @@ class MarkedMapImageExportModal(ModalScreen):
     on a worker thread with per-entry progress; failures are per-entry.
     Dismisses with the `_bulk_export_map_images` summary or None. See
     `[INV-158]`."""
+
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
 
     _blocks_undo: bool = True
 
@@ -31725,6 +32352,10 @@ class BulkExportCollectionModal(ModalScreen):
     don't want undo snapshots interleaving with bulk writes.
     """
 
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
+
     _blocks_undo: bool = True
 
     BINDINGS = [
@@ -31896,6 +32527,10 @@ class MigrateExportModal(_OneShotDismissScreen, ModalScreen):
     archive, and whether to also include the (large, re-downloadable)
     HMM databases. Dismisses with ``{dir, filename, include_hmm}`` or
     ``None``."""
+
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
 
     _blocks_undo: bool = True
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
@@ -33586,7 +34221,83 @@ _BABS_TAINTING_ENDPOINTS = frozenset({
     "read-url", "web-search", "wikipedia-search", "literature-search",
     "patent-search", "fpbase-search", "genbank-search", "uniprot-search",
     "blast-online", "hmmer-web", "fetch", "ingest-url",
+    # Not only the live internet (2026-09-22): recalled corpus passages are
+    # crawled papers, and a file loaded from disk carries whatever free text
+    # its author put in it. Either can steer the model as well as a web page.
+    "recall-knowledge", "learn-results", "load-file",
+}) | _BABS_UNTRUSTED_ENDPOINTS
+
+# Endpoints that fetch an arbitrary URL the model supplies. A URL the USER
+# typed, or one a search returned this turn, runs as asked; one the model
+# COMPOSED asks first in every autonomy mode, read-only included — reads are
+# exactly how a steered model would carry data OUT (the query string of an
+# address it made up), and taint only ever gated writes.
+_BABS_URL_EGRESS_ENDPOINTS = frozenset({"read-url", "ingest-url"})
+# Endpoints whose RESULTS count as the source of a URL the model may then open.
+_BABS_URL_SOURCE_ENDPOINTS = frozenset({
+    "web-search", "wikipedia-search", "literature-search", "patent-search",
+    "fpbase-search", "genbank-search", "uniprot-search", "reference-lookup",
 })
+_BABS_URL_RE = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
+_BABS_URL_TRAILING = ".,;:!?)]}>'\""
+
+
+def _babs_url_key(url: str) -> "tuple | None":
+    """Comparison key for URL provenance: scheme + host case-folded, trailing
+    punctuation / slash / fragment ignored — nothing that changes WHICH
+    resource the request reaches."""
+    from urllib.parse import urlsplit
+    u = str(url or "").strip().rstrip(_BABS_URL_TRAILING)
+    try:
+        sp = urlsplit(u)
+    except ValueError:
+        return None
+    if sp.scheme.lower() not in ("http", "https") or not sp.netloc:
+        return None
+    return (sp.scheme.lower(), sp.netloc.lower(),
+            sp.path.rstrip("/") or "/", sp.query)
+
+
+def _babs_urls_in(value, *, _depth: int = 0, _out=None) -> "set[tuple]":
+    """Every URL key in a string / nested JSON value (bounded walk)."""
+    out: "set[tuple]" = set() if _out is None else _out
+    if _depth > 8 or len(out) > 2000:
+        return out
+    if isinstance(value, str):
+        for m in _BABS_URL_RE.finditer(value[:200_000]):
+            k = _babs_url_key(m.group(0))
+            if k is not None:
+                out.add(k)
+    elif isinstance(value, dict):
+        for v in value.values():
+            _babs_urls_in(v, _depth=_depth + 1, _out=out)
+    elif isinstance(value, (list, tuple)):
+        for v in value[:500]:
+            _babs_urls_in(v, _depth=_depth + 1, _out=out)
+    return out
+
+
+def _babs_strip_context_block(text: str) -> str:
+    """A user message minus the app-added <splicecraft-context> block — that
+    block carries the open plasmid's description, i.e. FILE text, so a URL in
+    it is not one the user gave."""
+    t = str(text or "")
+    while True:
+        a = t.find(_BABS_CTX_OPEN)
+        if a < 0:
+            return t
+        b = t.find(_BABS_CTX_CLOSE, a)
+        if b < 0:
+            return t[:a]
+        t = t[:a] + t[b + len(_BABS_CTX_CLOSE):]
+
+
+# Shown when Babs wants to open an address nobody handed her.
+_BABS_EGRESS_NOTE = (
+    "[b $warning]Babs wrote this web address herself[/] — it was not in your "
+    "message or in a search result this turn. Opening it sends a request to "
+    "that site, and text she read earlier could be steering her to do it. "
+    "Allow it if it is what you asked for.")
 
 # Shown in an approval prompt that fired because the turn read live internet
 # content (under `auto` that is the ONLY reason a non-physical write asks).
@@ -33736,7 +34447,8 @@ class BabsToolApprovalModal(ModalScreen[bool]):
     """
 
     def __init__(self, endpoint: str, body: "dict | None",
-                 *, physical: bool = False, tainted: bool = False) -> None:
+                 *, physical: bool = False, tainted: bool = False,
+                 egress: bool = False) -> None:
         super().__init__()
         self._endpoint = endpoint
         self._body = body if isinstance(body, dict) else {}
@@ -33746,11 +34458,17 @@ class BabsToolApprovalModal(ModalScreen[bool]):
         # `tainted`: this turn already read live internet content, which is why
         # even hands-off mode is asking — say so, or the prompt looks like a bug.
         self._tainted = bool(tainted)
+        # `egress`: a fetch of a URL the model composed itself (not the user's,
+        # not a search result's) — asks in every mode, even for a read.
+        self._egress = bool(egress)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="bta-box"):
             if self._physical:
                 yield Static("[b $error]⚠ PHYSICAL ROBOT MOTION[/]  "
+                             f"[b]{_esc(self._endpoint)}[/b]", markup=True)
+            elif self._egress:
+                yield Static(f"[b $warning]Babs wants to open a web address:[/]  "
                              f"[b]{_esc(self._endpoint)}[/b]", markup=True)
             else:
                 yield Static(f"[b $warning]Babs wants to run a write:[/]  "
@@ -33760,12 +34478,18 @@ class BabsToolApprovalModal(ModalScreen[bool]):
             except Exception:
                 shown = str(self._body)[:1500]
             yield Static(f"[dim]{_esc(shown)}[/dim]", id="bta-args", markup=True)
-            if self._tainted:
+            if self._egress:
+                yield Static(_BABS_EGRESS_NOTE, markup=True)
+            elif self._tainted:
                 yield Static(_BABS_TAINT_NOTE, markup=True)
             if self._physical:
                 yield Static("[b $error]This MOVES the robot.[/] It runs even in "
                              "hands-off ([b]/autonomy auto[/b]) — physical motion "
                              "always asks first. Allow once, or deny.", markup=True)
+            elif self._egress:
+                yield Static("[dim]Addresses from your own message or from a "
+                             "search result open without asking, in every "
+                             "mode.[/dim]", markup=True)
             else:
                 yield Static("[dim]This changes your real data. Allow it once, or "
                              "deny. Switch to hands-off with [b]/autonomy auto[/b].[/dim]",
@@ -33989,6 +34713,11 @@ class BabsScreen(Screen):
         # Set once a tool call has brought LIVE internet content into the
         # current agentic turn; in `auto` autonomy it makes later writes ask.
         self._turn_tainted = False
+        # URL provenance for `_BABS_URL_EGRESS_ENDPOINTS`: addresses the USER
+        # wrote (this and earlier messages) and ones a search returned this
+        # turn. Anything else the model asks to open needs a human OK.
+        self._turn_user_urls: "set[tuple]" = set()
+        self._turn_search_urls: "set[tuple]" = set()
         # The plasmid-context block the model last SAW (it rides in a user
         # turn, not the system prompt — see `_turn_context_block`).
         self._last_ctx_sent: "str | None" = None
@@ -35084,11 +35813,22 @@ class BabsScreen(Screen):
         cancel = self._cancel
         msgs = list(messages)
         self._turn_tainted = False
+        self._turn_search_urls = set()
+        user_urls = _babs_urls_in(query)
+        for m in self._history:
+            if m.get("role") == "user":
+                _babs_urls_in(_babs_strip_context_block(
+                    str(m.get("content") or "")), _out=user_urls)
+        self._turn_user_urls = user_urls
         prev_reply = next((str(m.get("content") or "") for m in reversed(self._history)
                            if m.get("role") == "assistant"), "")
         request = _babs_effective_request(query, prev_reply)
         if recall and not (cancel is not None and cancel.is_set()):
-            self._apply_recall(query, msgs)
+            # Recalled passages ride in the opening message: crawled text is
+            # in the model's context from the first step, so the turn starts
+            # tainted exactly as if it had called recall-knowledge.
+            if self._apply_recall(query, msgs):
+                self._turn_tainted = True
         tools = _babs_tool_manifest(self._turn_knowledge)
         tool_names = {t["function"]["name"] for t in tools}
         # Agent turns may run on a faster model than chat (see _resolve_agent_model),
@@ -35563,6 +36303,19 @@ class BabsScreen(Screen):
         endpoint = resolved
         handler = _AGENT_HANDLERS[endpoint]
         write = handler[1]
+        egress_ok = False
+        if endpoint in _BABS_URL_EGRESS_ENDPOINTS:
+            url = str((body or {}).get("url") or "")
+            key = _babs_url_key(url) if url else None
+            known = key is not None and (key in self._turn_user_urls
+                                         or key in self._turn_search_urls)
+            if url and not known:
+                if not self._ask_tool_approval(endpoint, body,
+                                               tainted=self._turn_tainted,
+                                               egress=True):
+                    return {"error": "declined by the user: that web address was "
+                                     "not in their message or a search result."}
+                egress_ok = True   # one question per call, not two
         if write:
             mode = self._autonomy
             if mode == "readonly":
@@ -35580,7 +36333,7 @@ class BabsScreen(Screen):
                 and str((body or {}).get("action", "")).strip().lower()
                 in ("resume", "play"))
             tainted = self._turn_tainted
-            needs_ok = physical or (not pre_approved and (
+            needs_ok = physical or (not (pre_approved or egress_ok) and (
                 mode == "ask" or (mode == "auto" and tainted)))
             if needs_ok and not self._ask_tool_approval(
                     endpoint, body, physical=physical, tainted=tainted):
@@ -35593,6 +36346,9 @@ class BabsScreen(Screen):
         if (endpoint in _BABS_TAINTING_ENDPOINTS and isinstance(status, int)
                 and status < 400):
             self._turn_tainted = True
+        if (endpoint in _BABS_URL_SOURCE_ENDPOINTS and isinstance(status, int)
+                and status < 400):
+            _babs_urls_in(payload, _out=self._turn_search_urls)
         return {"status": status, "result": payload}
 
     def _amplify_and_save(self, args: dict) -> dict:
@@ -35714,7 +36470,8 @@ class BabsScreen(Screen):
         return {"results": results, "count": len(results)}
 
     def _ask_tool_approval(self, endpoint: str, body: dict,
-                           *, physical: bool = False, tainted: bool = False) -> bool:
+                           *, physical: bool = False, tainted: bool = False,
+                           egress: bool = False) -> bool:
         """Block the worker on a yes/no approval modal (autonomy='ask', ALWAYS
         for a ``physical`` robot-motion endpoint, and in 'auto' once the turn
         has read live internet content — ``tainted``, which the modal explains).
@@ -35726,7 +36483,7 @@ class BabsScreen(Screen):
         def _push() -> None:
             self._approval_modal_open = True
             m = BabsToolApprovalModal(endpoint, body, physical=physical,
-                                      tainted=tainted)
+                                      tainted=tainted, egress=egress)
             modal_ref["m"] = m
 
             def _cb(approved) -> None:
@@ -36361,7 +37118,10 @@ class BabsScreen(Screen):
             else:
                 status = _RText("not pulled", style="yellow")
                 size, params = "—", "—"
-            t.add_row(dot, ref, status, size, params)
+            # Plain Text cells: a DataTable parses a str cell as Rich markup,
+            # so a model ref / remote title holding "[x]" vanished (or, with
+            # "[/x]", took the table down).
+            t.add_row(dot, _RText(str(ref)), status, size, _RText(str(params)))
             self._model_refs.append(ref)
         if not self._model_refs:
             t.add_row(_RText("(empty — add a model below)", style="dim"), "", "", "", "")
@@ -36754,7 +37514,8 @@ class BabsScreen(Screen):
         h.clear()
         self._hf_names = []
         for m in res:
-            h.add_row(m["id"][:60], f"{m['downloads']:,}", str(m["likes"]))
+            h.add_row(_RText(str(m["id"])[:60]), f"{m['downloads']:,}",
+                      str(m["likes"]))
             self._hf_names.append(m["pull"])
         if not res:
             h.add_row(_RText("(no GGUF repos found)", style="dim"), "", "")
@@ -37185,7 +37946,8 @@ class BabsScreen(Screen):
         for j in self._jobs:
             tag = (_RText("running", style="green") if j.get("running")
                    else _RText("exited", style="dim"))
-            t.add_row(str(j["pid"]), j["kind"], j["label"], tag)
+            t.add_row(str(j["pid"]), _RText(str(j["kind"])),
+                      _RText(str(j["label"])), tag)
         if not self._jobs:
             t.add_row(_RText("(no jobs launched yet)", style="dim"), "", "", "")
 
@@ -37516,7 +38278,7 @@ class BabsScreen(Screen):
             score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "-"
             hop = d.get("hop")
             t.add_row(score_s, str(hop) if hop is not None else "",
-                      (d.get("title") or d.get("doc_id") or "")[:80])
+                      _RText(str(d.get("title") or d.get("doc_id") or "")[:80]))
         if not docs:
             t.add_row("-", "", _RText("(nothing kept yet — check back as it runs)", style="dim"))
         self._refresh_learn_status()
@@ -41069,17 +41831,17 @@ def _clone_part_build_seqrecord(
             continue
         if s == e:
             continue  # zero-length features have no biology
-        strand = int(f.get("strand", 1) or 1)
+        strand = _coerce_feature_strand(f.get("strand", 1))
         # Wrap features go through `_feature_location`, which owns both
         # halves' order (a minus-strand wrap reads head-first) and the
         # e == 0 / e == s edge cases CompoundLocation refuses.
         loc: "FeatureLocation | CompoundLocation | None" = _feature_location(
-            s, e, n_seq, strand)
+            s, e, n_seq, _biopython_strand(strand))
         if loc is None:
             continue
-        quals: dict = {
+        quals: dict = _double_strand_qualifiers({
             "label": [f.get("label") or f.get("type") or "feature"],
-        }
+        }, strand)
         if f.get("note"):
             quals["note"] = [str(f["note"])]
         # Re-emit the primer sequence so an inherited primer_bind renders its
@@ -42832,15 +43594,13 @@ def _attach_insert_feats_to_record(rec, insert: str,
             continue
         if e <= s:
             continue
-        try:
-            strand = int(f.get("strand", 1) or 1)
-        except (TypeError, ValueError):
-            strand = 1
-        quals = dict(f.get("qualifiers") or {})
+        strand = _coerce_feature_strand(f.get("strand", 1))
+        quals = _double_strand_qualifiers(dict(f.get("qualifiers") or {}),
+                                          strand)
         if f.get("label") and "label" not in quals:
             quals["label"] = [str(f.get("label"))]
         rec.features.append(
-            SeqFeature(FeatureLocation(s, e, strand=strand),
+            SeqFeature(FeatureLocation(s, e, strand=_biopython_strand(strand)),
                        type=str(f.get("type") or "misc_feature"),
                        qualifiers=quals))
         added += 1
@@ -43716,9 +44476,7 @@ def _detect_entry_vector_role(
     # library-entry dict (gb_text). The classifier needs both.
     if hasattr(record, "seq") and hasattr(record, "features"):
         seq = str(record.seq).upper()
-        circular = (
-            (record.annotations or {}).get("topology") == "circular"
-        )
+        circular = _record_is_circular(record)
         # Sweep #35 (2026-05-26): route through `_feat_bounds` so a
         # wrap-spanning CDS (CompoundLocation) is encoded as
         # `end < start` instead of the silent flatten BioPython does
@@ -44765,6 +45523,10 @@ def _switch_active_parts_bin(name: str) -> bool:
     target = _find_parts_bin(name)
     if target is None:
         return False
+    # A previous parts-bin mirror failure left parts_bin.json AHEAD of the
+    # outgoing bin: push it there before this switch rewrites the live file
+    # (raises RuntimeError → the caller notifies, nothing switched).
+    _flush_dirty_mirror_before_switch("parts_bin")
     prev = _get_active_parts_bin_name()
     _set_active_parts_bin_name(name)
     _settings_flush_sync()
@@ -44844,9 +45606,15 @@ def _sync_active_parts_bin_parts(entries: list[dict]) -> None:
             try:
                 _save_parts_bin_collections(bins)
             except (OSError, RuntimeError) as exc:
+                # parts_bin.json already landed and is now AHEAD of the bin;
+                # without the marker the next launch's restore reverts it.
+                _mark_mirror_dirty(
+                    f"parts-bin mirror ({name}) failed", "parts_bin")
                 _bg_notify_save_failure(
                     f"Active-parts-bin mirror ({name})", exc,
                 )
+            else:
+                _clear_mirror_dirty("parts_bin")
             return
 
 
@@ -45376,6 +46144,13 @@ def _restore_primers_from_active_primer_collection() -> None:
     coll = _find_primer_collection(name)
     if coll is None:
         return
+    if _mirror_is_dirty("primers"):
+        # A mirror write failed: primers.json holds work the collection never
+        # got. Restoring from the collection is how that work disappears.
+        _log.error("Primer mirror is marked dirty — NOT restoring "
+                   "primers.json from collection %r", name)
+        _state._MIRROR_DIRTY_RECOVERY_KINDS.add("primers")
+        return
     primers = [dict(p) for p in (coll.get("primers") or [])
                if isinstance(p, dict)]
     # [INV-83, sweep #27] Mirror-swap: primer_collections.json is the
@@ -45398,6 +46173,11 @@ def _restore_parts_bin_from_active_bin() -> None:
         return
     target = _find_parts_bin(name)
     if target is None:
+        return
+    if _mirror_is_dirty("parts_bin"):
+        _log.error("Parts-bin mirror is marked dirty — NOT restoring "
+                   "parts_bin.json from bin %r", name)
+        _state._MIRROR_DIRTY_RECOVERY_KINDS.add("parts_bin")
         return
     raw = target.get("parts", [])
     parts = [p for p in raw if isinstance(p, dict)] if isinstance(raw, list) else []
@@ -48184,7 +48964,7 @@ class AddFeatureModal(ModalScreen):
         self._color = col if isinstance(col, str) and col else None
         self._refresh_color_swatch()
         status.update(
-            f"[green]Imported '{entry.get('name', '?')}' — "
+            f"[green]Imported '{_markup_escape(str(entry.get('name', '?')))}' — "
             f"review and Save or Insert.[/green]"
         )
 
@@ -51251,23 +52031,25 @@ class NewPlasmidModal(_OneShotDismissScreen, ModalScreen):
         for f in (annotated_feats or []):
             start = int(f.get("start", 0))
             end   = int(f.get("end",   0))
-            strand = int(f.get("strand", 1)) or 1
+            strand = _coerce_feature_strand(f.get("strand", 1))
             if start < 0 or start >= n or end <= start:
                 continue
-            qualifiers = dict(f.get("qualifiers") or {})
+            qualifiers = _double_strand_qualifiers(
+                dict(f.get("qualifiers") or {}), strand)
             qualifiers.setdefault("label", [f.get("name", "")])
             color = f.get("color")
             if color:
                 qualifiers.setdefault("ApEinfo_revcolor", [color])
                 qualifiers.setdefault("ApEinfo_fwdcolor", [color])
+            _bp_strand = _biopython_strand(strand)
             if end > n:
                 # Wrap-around hit — split into two FeatureLocations.
                 loc = CompoundLocation([
-                    FeatureLocation(start, n, strand=strand),
-                    FeatureLocation(0,    (end - n), strand=strand),
+                    FeatureLocation(start, n, strand=_bp_strand),
+                    FeatureLocation(0,    (end - n), strand=_bp_strand),
                 ])
             else:
-                loc = FeatureLocation(start, end, strand=strand)
+                loc = FeatureLocation(start, end, strand=_bp_strand)
             rec.features.append(SeqFeature(
                 loc,
                 type=_sanitize_feat_type(f.get("feature_type", "")),
@@ -60753,8 +61535,9 @@ def _create_genbank_collection(name: str, records: list,
         "saved":       _date.today().isoformat(),
     })
     _save_collections(existing)
-    _set_active_collection_name(name)
-    _switch_active_collection_library(plasmids)
+    # Fills the new (empty) collection with `plasmids`, then makes it the
+    # live library — one guarded step (see `_activate_collection`).
+    _activate_collection(name, plasmids)
 
 
 def _create_fasta_collection(name: str, records: list, file_path: str) -> None:
@@ -60786,10 +61569,9 @@ def _create_fasta_collection(name: str, records: list, file_path: str) -> None:
         "saved":       _date.today().isoformat(),
     })
     _save_collections(existing)
-    _set_active_collection_name(name)
-    # Triggers `_sync_active_collection_plasmids` which mirrors the
-    # plasmids into the collection we just created.
-    _switch_active_collection_library(plasmids)
+    # Fills the new (empty) collection with `plasmids`, then makes it the
+    # live library — one guarded step (see `_activate_collection`).
+    _activate_collection(name, plasmids)
 
 
 # Plasmid file extensions excluding `.dna` — `_PLASMID_FILE_EXTS` keeps
@@ -60998,6 +61780,10 @@ class ProteinSeqFilePickerModal(_OneShotDismissScreen, ModalScreen):
     pick another. Dismisses with ``(path, record_id, aa_seq)`` on
     success, or ``None`` on Cancel / Escape.
     """
+
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
 
     # App-level Ctrl+Z would otherwise pop the canvas underneath while
     # the picker is open (mirrors OpenFileModal / the synthesis modals).
@@ -61432,9 +62218,13 @@ def _sync_active_project_experiments(entries: "list[dict]") -> None:
             try:
                 _save_experiment_projects(projs)
             except (OSError, RuntimeError) as exc:
+                _mark_mirror_dirty(
+                    f"notebook project mirror ({name}) failed", "experiments")
                 _bg_notify_save_failure(
                     f"Active-project mirror ({name})", exc,
                 )
+            else:
+                _clear_mirror_dirty("experiments")
             return
 
 
@@ -61453,6 +62243,11 @@ def _restore_experiments_from_active_project() -> None:
         return
     target = _find_project(name)
     if target is None:
+        return
+    if _mirror_is_dirty("experiments"):
+        _log.error("Notebook mirror is marked dirty — NOT restoring "
+                   "experiments.json from project %r", name)
+        _state._MIRROR_DIRTY_RECOVERY_KINDS.add("experiments")
         return
     raw = target.get("experiments", [])
     entries = [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
@@ -61507,6 +62302,13 @@ def _activate_experiment_project(name: str) -> "str | None":
         target = _find_project(name)
         if target is None:
             return f"Project '{name}' not found."
+        # A previous notebook mirror failure left experiments.json ahead of
+        # the outgoing project — push it there before the live file is
+        # rewritten from the incoming one (audit 2026-09-22).
+        try:
+            _flush_dirty_mirror_before_switch("experiments")
+        except RuntimeError as exc:
+            return str(exc)
         raw_entries = target.get("experiments", [])
         if not isinstance(raw_entries, list):
             raw_entries = []
@@ -62396,6 +63198,11 @@ class SequencingScreen(Screen):
     alignment dict so legacy callers chaining the result still work.
     """
 
+    # Browses the HOST filesystem (run zips / reads) — refused centrally in
+    # the web demo by `PlasmidApp.push_screen` ([INV-206]), on top of the
+    # `action_open_sequencing` gate.
+    _HOST_FILESYSTEM = True
+
     # App-level Ctrl+Z must not undo edits while the user is staging
     # an alignment (invariant #41 — modal Ctrl+Z opts out).
     _blocks_undo: bool = True
@@ -62884,9 +63691,7 @@ class SequencingScreen(Screen):
             query_label=(rec.name or rec.id or "read"),
             target_label=target_label,
             target_record=target,
-            target_is_circular=(
-                (getattr(target, "annotations", None) or {}
-                 ).get("topology", "") or "").lower() == "circular",
+            target_is_circular=_record_is_circular(target),
             entry_counter=getattr(self.app, "_record_load_counter", 0),
             query_phred=phred,
         )
@@ -63811,10 +64616,12 @@ class SequencingScreen(Screen):
                                 _trace_verification_summary(
                                     result.get("aligned_q", "") or "",
                                     result.get("aligned_t", "") or "",
-                                    query_phred,
+                                    _phred_in_alignment_frame(
+                                        query_phred, result),
                                     min_phred=int(getattr(
                                         self.app, "_sanger_min_phred",
                                         _SANGER_MIN_PHRED_DEFAULT)),
+                                    circular=bool(target_is_circular),
                                 )
                             )
                         except Exception:
@@ -64222,10 +65029,7 @@ class SequencingScreen(Screen):
                 query_rec = _gb_text_to_record(
                     _extract_gbk_member(self._zip_path, gbk_member))
                 target_rec = _gb_text_to_record(tgt_gb)
-                is_circular = (
-                    (target_rec.annotations or {})
-                    .get("topology", "").lower() == "circular"
-                )
+                is_circular = _record_is_circular(target_rec)
                 result = _pick_best_rotation(
                     str(query_rec.seq), str(target_rec.seq),
                     is_circular=is_circular,
@@ -66038,6 +66842,10 @@ class ExperimentExportModal(ModalScreen):
     Dismisses with `{"path", "fmt", "n_entries", "embedded"}` or None.
     """
 
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
+
     _blocks_undo: bool = True
 
     BINDINGS = [
@@ -66357,6 +67165,10 @@ class ImageAttachModal(_OneShotDismissScreen, ModalScreen):
     which our 'pure-Python' rule forbids. The Clipboard button is
     disabled on Linux. File-picker route works everywhere.
     """
+
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
 
     _blocks_undo: bool = True
 
@@ -68000,14 +68812,9 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
                     severity="warning",
                 )
                 return
-            _set_active_collection_name(coll_name)
-            plasmids = [
-                dict(p) for p in (coll.get("plasmids") or [])
-                if isinstance(p, dict)
-            ]
             try:
-                _switch_active_collection_library(plasmids)
-            except (OSError, ValueError) as exc:
+                _activate_collection(coll_name)
+            except (OSError, RuntimeError, ValueError) as exc:
                 _notify_save_failure(
                     self.app, "Plasmid library", exc,
                 )
@@ -72940,6 +73747,9 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         # "protein" — read from the TabbedContent's active id on
         # action dispatch.
         self._loaded_id:   "str | None" = None
+        # Record metadata the editor's (seq, feats) model can't hold, kept so
+        # a re-save doesn't strip it — see `_commit_save`.
+        self._loaded_meta: "dict | None" = None
         self._loaded_name: "str | None" = None
         # Collection the DNA fragment was last saved into (chosen at
         # save time). Re-saves route back here so the document doesn't
@@ -73544,6 +74354,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         }
         # Fresh, unsaved DNA fragment — Save will prompt for a library name.
         self._loaded_id = None
+        self._loaded_meta = None
         self._loaded_collection = None
         self._loaded_name = name
         self._saved_snapshot = ("", [])
@@ -74241,6 +75052,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 self._operon_layout_feats(self._operon_result))
         # Re-target the DNA tab as a fresh, unsaved document.
         self._loaded_id = None
+        self._loaded_meta = None
         self._loaded_name = "operon"
         self._loaded_collection = None
         self._dirty = True
@@ -74869,11 +75681,13 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 continue
             if not (0 <= s < e <= len(amplicon)):
                 continue
+            _fstrand = _coerce_feature_strand(f.get("strand", 1))
             rec.features.append(SeqFeature(
-                FeatureLocation(s, e, strand=int(f.get("strand", 1) or 1)),
+                FeatureLocation(s, e, strand=_biopython_strand(_fstrand)),
                 type=str(f.get("type") or "misc_feature"),
-                qualifiers={"label": [str(f.get("label")
-                                          or f.get("type") or "feat")]}))
+                qualifiers=_double_strand_qualifiers(
+                    {"label": [str(f.get("label")
+                                   or f.get("type") or "feat")]}, _fstrand)))
         # Bind the SOE primers to the PCR fragment, re-derived against the
         # amplicon — the SAME helper + binding the clone uses, so the fragment
         # and the clone show the same primers at the bases they anneal to.
@@ -76669,6 +77483,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 return
             ed.load("", [])
             self._loaded_id = None
+            self._loaded_meta = None
             self._loaded_collection = None
             self._loaded_name = None
             self._saved_snapshot = ("", [])
@@ -76734,13 +77549,37 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                              severity="warning")
             return
         seq = str(record.seq)
+        # The editor's feature model is ONE span per feature, so a spliced /
+        # multi-part location cannot be represented. Flattening it
+        # (`int(location.start)` … `int(location.end)`) silently turned an
+        # intron into coding sequence and re-saved it that way over the
+        # original entry (audit 2026-09-22). Refuse the load and name them.
+        _compound = sorted({
+            str((sf.qualifiers.get("label") or [sf.type])[0])
+            for sf in record.features
+            if sf.type != "source"
+            and len(getattr(sf.location, "parts", []) or []) > 1
+        })
+        if _compound:
+            self.app.notify(
+                f"'{entry.get('name') or eid}' has multi-part (spliced or "
+                f"origin-spanning) feature(s): {', '.join(_compound[:4])}"
+                + (" …" if len(_compound) > 4 else "")
+                + ". The synthesis editor holds one span per feature, so "
+                  "loading it would merge their parts. Edit it on the map "
+                  "instead.",
+                severity="error", timeout=12, markup=False)
+            return
         # Convert record.features → editor feat dicts. Reuse the same
         # shape `_build_seq_text` consumes (start, end, label, type,
         # color, qualifiers, strand).
         feats: list[dict] = []
         n = len(seq)
+        source_feature = None
         for sf in record.features:
             if sf.type == "source":
+                if source_feature is None:
+                    source_feature = sf
                 continue
             try:
                 s = int(sf.location.start)
@@ -76771,6 +77610,18 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         except NoMatches:
             return
         ed.load(seq, feats)
+        # Everything about the record the editor's (seq, feats) model does NOT
+        # hold — organism, COMMENT, references, the source feature. A re-save
+        # used to build a blank SeqRecord and drop all of it, so opening an
+        # imported fragment and pressing Ctrl+S stripped its provenance.
+        self._loaded_meta = {
+            "annotations": {k: v for k, v in
+                            (getattr(record, "annotations", {}) or {}).items()
+                            if k not in ("topology",)},
+            "description": str(getattr(record, "description", "") or ""),
+            "source":      source_feature,
+            "dbxrefs":     list(getattr(record, "dbxrefs", []) or []),
+        }
         self._loaded_id   = entry.get("id") or eid
         # Loaded from the active collection's library → re-saves target
         # active (None) unless the user later picks another via Save As.
@@ -76987,6 +77838,22 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 Seq(seq), id=eid, name=eid[:16],
                 description=f"Gene-synthesis fragment ({len(seq)} bp)",
             )
+            # Carry everything the editor's (seq, feats) model can't hold —
+            # organism, COMMENT, references, dbxrefs, the source feature —
+            # from the entry this document was LOADED from. Pre-fix, opening
+            # an imported fragment and pressing Ctrl+S rebuilt a blank record
+            # and stripped every one of them, over the original entry (audit
+            # 2026-09-22). A Save As copy keeps them too: it is the same
+            # molecule under a new name. A document started from scratch (New
+            # / operon / protein) has no metadata to carry — those paths clear
+            # `_loaded_meta`.
+            meta = getattr(self, "_loaded_meta", None)
+            carry_meta = isinstance(meta, dict)
+            if carry_meta:
+                rec.annotations.update(dict(meta.get("annotations") or {}))
+                if meta.get("description"):
+                    rec.description = str(meta["description"])
+                rec.dbxrefs = list(meta.get("dbxrefs") or [])
             rec.annotations["molecule_type"] = "DNA"
             rec.annotations["topology"]      = "linear"
             try:
@@ -77022,6 +77889,16 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 rec.features.append(
                     SeqFeature(loc, type=ftype, qualifiers=quals),
                 )
+            # The source feature too, but only if it still spans the whole
+            # molecule — an edit that changed the length invalidates it.
+            _src = (meta or {}).get("source") if carry_meta else None
+            if _src is not None:
+                try:
+                    if (int(_src.location.start) == 0
+                            and int(_src.location.end) == n):
+                        rec.features.insert(0, _src)
+                except (AttributeError, TypeError, ValueError):
+                    pass
             # Push through the standard library save path. With
             # `id == eid` already in the library, ``add_entry`` takes
             # the silent-replace branch (document model). With a new
@@ -77397,10 +78274,30 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                     )
                 except NoMatches:
                     return
+                # The editor stores 20 AA + '*'. Its `load` silently FILTERS
+                # anything else out, which SHORTENS the protein and shifts
+                # every residue after the first offender — the construct you
+                # then design and order is not the protein in the file. And an
+                # X / B / Z cannot be synthesised anyway: nobody can order DNA
+                # for an unknown residue. So refuse, and say exactly where
+                # (audit 2026-09-22; it used to load and mention a count).
+                unstorable = [(i + 1, c) for i, c in enumerate(seq)
+                              if c not in _PROTEIN_AA_ALPHABET]
+                if unstorable:
+                    codes = sorted({c for _i, c in unstorable})
+                    where = ", ".join(f"{c}{i}" for i, c in unstorable[:6])
+                    self.app.notify(
+                        f"'{name}' carries {len(unstorable):,} residue(s) the "
+                        f"editor cannot store ({', '.join(codes)}) at "
+                        f"{where}{' …' if len(unstorable) > 6 else ''}. "
+                        f"Loading it would drop them and renumber everything "
+                        f"after — resolve them in the file first.",
+                        severity="error", timeout=12, markup=False)
+                    _log_event("synthesis.protein.open_refused",
+                               name=name, aa=len(seq),
+                               unstorable=len(unstorable))
+                    return
                 requested = len(seq)
-                # `load` filters to the editor's 20-AA + '*' alphabet, so
-                # ambiguity / gap codes accepted at the file boundary get
-                # dropped here — surface the count so the load isn't silent.
                 pe.load(seq, feats=[])
                 self._stops_auto = True   # fresh protein → re-enable auto-track
                 self._sync_stops_selector_from_protein()  # load() posts no Changed
@@ -77420,14 +78317,8 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                         f"'{name}' had no residues the editor can store.",
                         severity="warning",
                     )
-                elif kept < requested:
-                    self.app.notify(
-                        f"Loaded {kept:,} aa from {name}; dropped "
-                        f"{requested - kept:,} non-standard residue(s) "
-                        "(X / B / Z / gaps the editor can't store).",
-                        severity="information",
-                    )
                 else:
+                    # `unstorable` was refused above, so kept == requested.
                     self.app.notify(
                         f"Loaded {kept:,} aa from {name}.",
                         severity="information",
@@ -77843,7 +78734,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 f_label = str(f.get("label") or f.get("type") or "motif")
                 f_type  = str(f.get("type") or "Motif")
                 f_color = str(f.get("color") or "")
-                f_strand = int(f.get("strand") or 1)
+                f_strand = _coerce_feature_strand(f.get("strand"))
                 f_quals = dict(f.get("qualifiers") or {})
                 # Preserve / set the label qualifier.
                 f_quals.setdefault("label", [f_label])
@@ -77864,7 +78755,7 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                     f_quals.setdefault("ApEinfo_revcolor", [f_color])
                 try:
                     f_loc = FeatureLocation(
-                        fs_bp, fe_bp, strand=f_strand or None,
+                        fs_bp, fe_bp, strand=_biopython_strand(f_strand),
                     )
                     rec.features.append(
                         SeqFeature(
@@ -83182,13 +84073,17 @@ class TraditionalCloningPane(Vertical):
 
         Case- and whitespace-insensitive, matching the rule the map renderer
         uses (`_rec_is_circular`, ~L14070). The five Constructor call sites
-        each rolled their own `annotations.get("topology", "") == "circular"`,
-        which is case-SENSITIVE: a record annotated `Circular` answered
+        each rolled their own case-SENSITIVE equality against the literal
+        "circular": a record annotated `Circular` answered
         "not circular" and was digested as a LINEAR molecule, splitting its
         origin-spanning fragment into two unusable halves. That used to
         surface as a visible "need exactly 2 fragments" refusal; once the
         linear path started resolving a payload it would instead have cloned
         the wrong piece silently."""
+        # Callers compare against "linear", NOT "circular": an UNANNOTATED
+        # record ("") is a plasmid by the app-wide default (see
+        # `_record_is_circular`), and testing for "circular" digested it as a
+        # linear molecule (audit 2026-09-22).
         return str(
             (getattr(rec, "annotations", {}) or {}).get("topology", "") or ""
         ).strip().lower()
@@ -83232,7 +84127,7 @@ class TraditionalCloningPane(Vertical):
         if rec is None:
             return None, "source plasmid not found"
         seq = str(rec.seq).upper()
-        circular = self._topology_of(rec) == "circular"
+        circular = self._topology_of(rec) != "linear"
         feats = self._record_features(rec)
         try:
             frags, err = _excise_fragment_pair(
@@ -83473,7 +84368,10 @@ class TraditionalCloningPane(Vertical):
             return None, "Pick a destination vector."
         seq = str(rec.seq).upper()
         topology = self._topology_of(rec)
-        circular = topology == "circular"
+        # An UNANNOTATED record is circular here, like everywhere else (the
+        # map already draws it as a circle): `== "circular"` digested it as a
+        # linear molecule and split its origin-spanning fragment in two.
+        circular = topology != "linear"
         feats = self._record_features(rec)
         frags, err = _excise_fragment_pair(
             seq, enzymes, circular=circular, features=feats,
@@ -83583,7 +84481,10 @@ class TraditionalCloningPane(Vertical):
             return None, "Pick an insert plasmid first."
         seq = str(rec.seq).upper()
         topology = self._topology_of(rec)
-        circular = topology == "circular"
+        # An UNANNOTATED record is circular here, like everywhere else (the
+        # map already draws it as a circle): `== "circular"` digested it as a
+        # linear molecule and split its origin-spanning fragment in two.
+        circular = topology != "linear"
         feats = self._record_features(rec)
         frags, err = _excise_fragment_pair(
             seq, enzymes, circular=circular, features=feats,
@@ -83680,7 +84581,10 @@ class TraditionalCloningPane(Vertical):
             return None, "Pick a destination vector."
         seq = str(rec.seq).upper()
         topology = self._topology_of(rec)
-        circular = topology == "circular"
+        # An UNANNOTATED record is circular here, like everywhere else (the
+        # map already draws it as a circle): `== "circular"` digested it as a
+        # linear molecule and split its origin-spanning fragment in two.
+        circular = topology != "linear"
         feats = self._record_features(rec)
         frags, err = _excise_fragment_pair(
             seq, enzymes, circular=circular, features=feats,
@@ -84031,7 +84935,7 @@ class TraditionalCloningPane(Vertical):
                 continue
             if not (0 <= s <= n_top and 0 <= e <= n_top):
                 continue
-            strand = int(f.get("strand", 1) or 0) or 1
+            strand = _coerce_feature_strand(f.get("strand", 1))
             qualifiers = {
                 "label": [str(f.get("label") or f.get("type") or "feat")],
             }
@@ -84055,7 +84959,8 @@ class TraditionalCloningPane(Vertical):
             # Origin-spanning (wrap) features survive the ligation join
             # instead of being silently dropped ([INV-44]); `_feature_location`
             # owns the split + the minus-strand half order.
-            loc = _feature_location(s, e, n_top, strand)
+            loc = _feature_location(s, e, n_top, _biopython_strand(strand))
+            _double_strand_qualifiers(qualifiers, strand)
             if loc is None:
                 continue
             rec.features.append(SeqFeature(
@@ -88904,6 +89809,9 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
         build (mirrors `_build_from_genome`, but offline — no network)."""
         if self._file_building:
             return
+        # A typed path is a read of the server's filesystem in the web demo.
+        if _demo_web_refuse(self.app, "Reading files from disk"):
+            return
         path = self.query_one("#sp-file-path", Input).value.strip()
         try:
             status = self.query_one("#sp-file-status", Static)
@@ -89668,7 +90576,7 @@ class MutagenizeModal(ModalScreen):
     ]
 
     def __init__(self, template_seq: str, feats: list, plasmid_name: str = "",
-                 *, show_tab: str = "soe"):
+                 *, show_tab: str = "soe", circular: bool = True):
         super().__init__()
         # Sweep #26 (2026-05-25): [INV-50] dismiss-once guard. Save +
         # cancel button + Esc + action_cancel are four exit paths that
@@ -89677,6 +90585,11 @@ class MutagenizeModal(ModalScreen):
         # Textual's underflow check.
         self._dismissed: bool = False
         self._template     = (template_seq or "").upper()
+        # The loaded record's topology. The site scrub re-circularises a
+        # plasmid, so it refuses a linear record instead of scanning it as
+        # a circle (phantom origin-spanning sites) and designing a
+        # circularising assembly for a molecule that isn't one.
+        self._template_circular = bool(circular)
         self._feats        = feats or []
         self._plasmid_name = plasmid_name
         self._outer:  "dict | None" = None
@@ -90654,6 +91567,11 @@ class MutagenizeModal(ModalScreen):
         if not self._template:
             status.update("[red]Load a plasmid first.[/red]")
             return
+        if not self._template_circular:
+            status.update("[red]This record is linear. The scrub rebuilds a "
+                          "circular plasmid (QuikChange or Golden Braid), so it "
+                          "only runs on a circular record.[/red]")
+            return
         names = _get_setting("codon_forbidden_enzymes", ["BsaI"])
         if not isinstance(names, list) or not names:
             status.update("[red]Pick at least one enzyme to remove "
@@ -90745,7 +91663,12 @@ class MutagenizeModal(ModalScreen):
                       ("#btn-scrub-tomap", ready))
         else:
             has_edits = bool(plan.get("edits"))
-            has_primers = any(not r.get("error") for r in rounds)
+            # Primers are only worth saving or drawing when the QuikChange
+            # proof held (the rounds, run as QuikChange, rebuild exactly the
+            # cured plasmid) — the panel already says "NOT verified — do not
+            # order" otherwise, and the buttons used to stay live beside it.
+            has_primers = (any(not r.get("error") for r in rounds)
+                           and plan.get("verified") is True)
             states = (("#btn-scrub-apply", has_edits),
                       ("#btn-scrub-saveprimers", has_primers),
                       ("#btn-scrub-tomap", has_primers))
@@ -91046,7 +91969,7 @@ class MutagenizeModal(ModalScreen):
             collection = payload.get("collection") or ""
             if not names or not collection:
                 return
-            if bool(payload.get("create")):
+            if _payload_bool(payload, "create", False):
                 try:
                     colls = _load_primer_collections()
                     colls.append({"name": collection, "description": "",
@@ -91276,6 +92199,10 @@ class PrimerCsvExportModal(_OneShotDismissScreen, ModalScreen):
     ``{"path", "count"}`` or ``None`` on cancel. Validation (a non-DNA oligo
     refuses the whole export) surfaces inline — catastrophic-class: never ship
     a malformed synthesis order."""
+
+    # Browses / reads / writes the HOST filesystem — refused centrally
+    # in the web demo by `PlasmidApp.push_screen` ([INV-206]).
+    _HOST_FILESYSTEM = True
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -93073,6 +94000,15 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             self._lib_view_mode = "primers"
             self._apply_lib_view_mode()
             return
+        # A previous primer mirror failure left primers.json ahead of the
+        # outgoing collection: push it there before the live file is
+        # rewritten from the incoming one, or refuse (audit 2026-09-22).
+        try:
+            _flush_dirty_mirror_before_switch("primers")
+        except RuntimeError as exc:
+            self.app.notify(str(exc), severity="error", timeout=15,
+                            markup=False)
+            return
         # Warn the user before silently discarding any star-marks from
         # the outgoing collection. `_refresh_library_table` clips
         # `_lib_selected` against the NEW collection's primer count
@@ -94459,7 +95395,7 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
                 return
             names = payload.get("names") or []
             collection = payload.get("collection") or ""
-            create = bool(payload.get("create"))
+            create = _payload_bool(payload, "create", False)
             if not names or not collection:
                 return
             # Push typed names back into the always-visible Inputs so
@@ -95404,9 +96340,20 @@ def _simulate_pcr(
     # Defence against the O(N²) double-loop blowup on pathologically
     # repetitive primers (e.g. an all-A primer on an A-rich template).
     # See `_PCR_MAX_PRIMER_HITS`.
+    #
+    # RAISE, don't return []: an empty list reads as "these primers don't
+    # amplify — check the orientation", which is the opposite of the truth
+    # (they bind thousands of times). Callers already turn ValueError into a
+    # visible message.
     if len(fwd_hits) > _PCR_MAX_PRIMER_HITS or \
             len(rev_rc_hits) > _PCR_MAX_PRIMER_HITS:
-        return []
+        which = ("forward" if len(fwd_hits) > _PCR_MAX_PRIMER_HITS
+                 else "reverse")
+        raise ValueError(
+            f"the {which} primer binds more than "
+            f"{_PCR_MAX_PRIMER_HITS:,} times on this template — too "
+            f"repetitive to simulate; it would not give a specific product"
+        )
 
     # Canonical fwd hits live in [0, n) on circular; the wrapped tail
     # is only for finding amplicons that extend past the origin.
@@ -97382,6 +98329,17 @@ class SimulatorScreen(Screen):
                               severity="error", markup=False)
             return
         image_widget.update(rt)
+        # A digest lane naming an enzyme the catalog doesn't know renders
+        # EMPTY (it used to show the uncut template as if nothing cut) — say
+        # which name, so an empty lane never reads as "no fragments".
+        unknown = sorted({u for lane in self._lanes
+                          if (lane.get("source") or "") == "digest"
+                          for u in _gel_resolve_enzymes(
+                              lane.get("detail") or "")[1]})
+        if unknown:
+            self.app.notify(
+                f"Unknown enzyme(s) in a digest lane: {', '.join(unknown)} — "
+                f"that lane is left empty.", severity="warning", markup=False)
         # Source-mix summary for the structured log: which lane kinds
         # the user rendered (no sequence content — privacy invariant #38).
         source_mix: dict[str, int] = {}
@@ -98821,10 +99779,13 @@ class RestoreFromBackupModal(ModalScreen):
             return None
         if not isinstance(attr, str):
             return None
-        # Resolve the attr name to the LIVE Path object on the module
-        # so tests' monkeypatch of `_state._LIBRARY_FILE` is respected.
-        import splicecraft as _sc
-        return getattr(_sc, attr, None)
+        # Resolve the attr name to the LIVE Path object so tests'
+        # monkeypatch of `_state._LIBRARY_FILE` is respected. The data paths
+        # moved to `_state` in the modularization; a bare `getattr` on the hub
+        # module found NONE of them, so every target read "Could not resolve
+        # target path" and GUI restore was dead (audit 2026-09-22).
+        v = _resolve_state_or_hub(attr)
+        return v if isinstance(v, Path) else None
 
     def _refresh_table(self) -> None:
         try:
@@ -99051,14 +100012,9 @@ class CollectionsModal(_OneShotDismissScreen, ModalScreen):
             return
         plasmids = [p for p in (coll.get("plasmids") or [])
                     if isinstance(p, dict)]
-        # Set active BEFORE the library write so the upcoming sync mirror
-        # targets the newly-selected collection. Since `plasmids` came
-        # from `coll`, the mirror writes the same content back — a true
-        # no-op only because we read `plasmids` before the mirror runs.
-        _set_active_collection_name(name)
         try:
-            _switch_active_collection_library(plasmids)
-        except (OSError, RuntimeError) as exc:
+            _activate_collection(name)
+        except (OSError, RuntimeError, ValueError) as exc:
             _notify_save_failure(self.app, "Plasmid library", exc)
             return
         self.dismiss({"loaded": name, "n_plasmids": len(plasmids)})
@@ -99127,17 +100083,27 @@ class NewCollectionModal(_OneShotDismissScreen, ModalScreen):
             yield Static(" New collection ", id="newcoll-title")
             yield Label("Name:")
             yield Input(placeholder="Collection name", id="newcoll-name")
-            yield Label("Bulk import from folder (optional):")
-            yield Static(
-                "[dim]Click a folder in the tree below; "
-                "leave unselected to create an empty collection.[/dim]",
-                id="newcoll-folder-hint", markup=True,
-            )
-            yield Static(
-                "[dim]No folder selected.[/dim]",
-                id="newcoll-folder-disp", markup=True,
-            )
-            yield DirectoryTree(self._start, id="newcoll-tree")
+            if _DEMO_MODE == "web":
+                # The web demo creates EMPTY collections only: the folder
+                # import is a browse of the server's filesystem ([INV-206]).
+                yield Static(
+                    "[dim]Folder import is disabled in the web demo — the "
+                    "collection is created empty.[/dim]",
+                    id="newcoll-folder-hint", markup=True,
+                )
+                yield Static("", id="newcoll-folder-disp", markup=True)
+            else:
+                yield Label("Bulk import from folder (optional):")
+                yield Static(
+                    "[dim]Click a folder in the tree below; "
+                    "leave unselected to create an empty collection.[/dim]",
+                    id="newcoll-folder-hint", markup=True,
+                )
+                yield Static(
+                    "[dim]No folder selected.[/dim]",
+                    id="newcoll-folder-disp", markup=True,
+                )
+                yield DirectoryTree(self._start, id="newcoll-tree")
             # Progress bar + ticker label, hidden until the user
             # commits an import. The bar's `total` is set on first
             # tick from the worker so it shows "X / Y" immediately
@@ -99169,6 +100135,8 @@ class NewCollectionModal(_OneShotDismissScreen, ModalScreen):
     @on(DirectoryTree.DirectorySelected)
     def _on_dir_selected(self, event) -> None:
         from rich.markup import escape as _esc
+        if _DEMO_MODE == "web":
+            return
         self._selected_folder = Path(event.path)
         # Escape the path so a folder named "[red]hack[/red]" renders
         # as the literal string instead of injecting style.
@@ -99770,6 +100738,7 @@ from splicecraft_agent import (  # noqa: E402  (registers endpoints into _state.
     _agent_dirty_guard as _agent_dirty_guard,
     _agent_ignored_keys as _agent_ignored_keys,
     _agent_reject_dangerous_unknowns as _agent_reject_dangerous_unknowns,
+    _payload_bool as _payload_bool,
     _agent_vector_backbone_flags as _agent_vector_backbone_flags,
     _agent_sanitize_qualifiers as _agent_sanitize_qualifiers,
     _agent_traditional_cloning_candidates as _agent_traditional_cloning_candidates,
@@ -101536,7 +102505,7 @@ def _h_recall_knowledge(app, payload):
     if isinstance(k, str):
         return ({"error": k}, 400)
     k = max(1, min(k, _RECALL_MAX_PASSAGES))
-    web = bool(payload.get("web", False))
+    web = _payload_bool(payload, "web", False)
     if web:
         refusal = _learn_online_refusal()
         if refusal:
@@ -101896,19 +102865,36 @@ def _agent_seqfeature_for_idx(rec, idx: int):
     return None
 
 
-def _agent_feature_parts(sf, row) -> "list[tuple[int, int]] | None":
-    """Ascending (start, end) parts of a SPLICED feature, or None for a simple
-    or origin-crossing one. A wrap is a two-part location as well; the row's
-    `wraps` flag has already resolved which it is, so it is trusted here."""
-    if sf is None or row.get("wraps"):
+def _agent_feature_parts(sf, row, rec=None) -> "list[tuple[int, int]] | None":
+    """Exons of a SPLICED feature in FORWARD traversal order (concatenate,
+    then reverse-complement for −), or None for a simple span or a plain
+    origin wrap. Uses `_feature_traversal`, so a spliced gene whose transcript
+    crosses bp 0 — which the row flags as `wraps` too — still gets its exons
+    (skipping every wrap made `find-feature` translate such a gene straight
+    through its introns; audit 2026-09-22)."""
+    if sf is None:
         return None
-    parts = getattr(getattr(sf, "location", None), "parts", None) or []
+    loc = getattr(sf, "location", None)
+    parts = getattr(loc, "parts", None) or []
     if len(parts) < 2:
         return None
-    try:
-        return sorted((int(p.start), int(p.end)) for p in parts)
-    except (TypeError, ValueError):
+    total = _seq_len(rec) if rec is not None else 0
+    circular = _record_is_circular(rec) if rec is not None else True
+    if total <= 0:
+        if row.get("wraps"):
+            return None
+        try:
+            return sorted((int(p.start), int(p.end)) for p in parts)
+        except (TypeError, ValueError):
+            return None
+    trav = _feature_traversal(loc, total, circular=circular)
+    if trav is None:
         return None
+    fwd = [(int(a), int(b)) for a, b in trav[2]]
+    contiguous = all(fwd[i][1] == fwd[i + 1][0]
+                     or (fwd[i][1] == total and fwd[i + 1][0] == 0)
+                     for i in range(len(fwd) - 1))
+    return None if contiguous or len(fwd) < 2 else fwd
 
 
 def _agent_feature_detail(rec, row, *, max_seq: int) -> dict:
@@ -101918,7 +102904,7 @@ def _agent_feature_detail(rec, row, *, max_seq: int) -> dict:
     start, end = int(row["start"]), int(row["end"])
     strand = -1 if row.get("strand") == -1 else 1
     sf = _agent_seqfeature_for_idx(rec, int(row.get("idx", -1)))
-    parts = _agent_feature_parts(sf, row)
+    parts = _agent_feature_parts(sf, row, rec)
     genomic = ("".join(seq[s:e] for s, e in parts) if parts
                else _slice_circular(seq, start, end))
     feat_seq = (_rc(genomic) if strand == -1 else genomic).upper()
@@ -102207,7 +103193,8 @@ def _h_amplify_feature(app, payload):
     if abs(float(fwd["tm"]) - float(rev["tm"])) > 5.0:
         warnings.append(f"primer Tms differ by "
                         f"{abs(float(fwd['tm']) - float(rev['tm'])):.1f} °C")
-    parts = _agent_feature_parts(_agent_seqfeature_for_idx(rec, int(row["idx"])), row)
+    parts = _agent_feature_parts(
+        _agent_seqfeature_for_idx(rec, int(row["idx"])), row, rec)
     if parts:
         warnings.append("spliced feature — the product is its genomic span, "
                         "introns included")
@@ -102324,7 +103311,7 @@ def _h_load_file(app, payload):
     # reported `st_size=0` and the subsequent `load_genbank` parse
     # consumed RAM until the kernel OOM-killed the worker. With
     # `lstat` + `S_ISREG` a symlink is now refused outright.
-    cap = (10 * 1024 * 1024 * 1024 if bool(payload.get("force"))
+    cap = (10 * 1024 * 1024 * 1024 if _payload_bool(payload, "force", False)
             else _BULK_IMPORT_MAX_BYTES)
     ok, reason = _safe_file_size_check(path, cap, "plasmid")
     if not ok:
@@ -102383,6 +103370,11 @@ def _h_load_file(app, payload):
         if not _id:
             return ({"error": "invalid 'id' (empty after sanitising)"}, 400)
         record.id = record.name = _id
+    else:
+        # No explicit id: the loader invented one (`.` / `contig_1` / a
+        # 16-char stem), and a later `save` would replace whatever library
+        # entry already holds it. [audit 2026-09-22]
+        _import_identity_fixup(record)
 
     def _apply():
         guard = _agent_dirty_guard(app, payload)
@@ -102542,7 +103534,7 @@ def _h_new_plasmid(app, payload):
         return ({"error": berr}, 400)
     if not bases:
         return ({"error": "'sequence' is empty after sanitising"}, 400)
-    circular = bool(payload.get("circular"))
+    circular = _payload_bool(payload, "circular", False)
     feats_raw = payload.get("features") or []
     if not isinstance(feats_raw, list):
         return ({"error": "'features' must be a list of dicts"}, 400)
@@ -102992,6 +103984,7 @@ def _h_read_consensus(app, payload):
                     422)
         aligns = list(getattr(app, "_alignments", None) or [])
         total = len(rec.seq) if rec.seq is not None else 0
+        _circ = _record_is_circular(rec)
         label = PlasmidApp._record_display_name(rec)
     else:
         entry = None
@@ -103010,6 +104003,8 @@ def _h_read_consensus(app, payload):
         aligns = [a for a in (entry.get("alignments") or [])
                   if isinstance(a, dict)]
         label = entry.get("name") or entry.get("id") or "?"
+        _circ = _topology_from_gb_text(entry.get("gb_text") or "",
+                                       default="circular") != "linear"
         # Length from the stored GenBank rather than re-deriving: an alignment's
         # own `t_len` is the length at ALIGN time, which is not necessarily the
         # length now if the plasmid was edited since.
@@ -103019,7 +104014,8 @@ def _h_read_consensus(app, payload):
         except Exception:
             total = int(((aligns[0].get("result") or {}).get("t_len") or 0)
                         if aligns else 0)
-    out = _multi_read_summary(aligns, total, min_support=min_support)
+    out = _multi_read_summary(aligns, total, min_support=min_support,
+                              circular=_circ)
     out["plasmid"] = label
     out["phrase"] = _multi_read_phrase(out)
     return out
@@ -103482,7 +104478,7 @@ def _h_save(app, payload):
     # Only a HOMELESS new record (no source file → a fetch or a purely
     # in-memory build) is gated. A file-backed record creating its first
     # library entry is the expected persist-on-save flow.
-    if is_new and not has_source and not bool(payload.get("create")):
+    if is_new and not has_source and not _payload_bool(payload, "create", False):
         return ({"error":
                   f"saving would CREATE a new library entry {display!r} in "
                   f"collection {active!r} — this record has no source file "
@@ -103635,6 +104631,14 @@ def _h_replace_sequence(app, payload):
             pm = app.query_one("#plasmid-map", PlasmidMap)
             app._push_undo()
             app._current_record = new_record
+            # The SEQUENCE changed, so every in-flight worker keyed on the old
+            # one — the restriction scan above all — must discard its result.
+            # Bumping the counter is how they know (the GUI edit path at
+            # `_apply_edit` has always done it; this one didn't, so a scan
+            # dispatched before the replace repainted the OLD sites onto the
+            # new bases). Safe here: this handler's own guard was checked one
+            # line up, against the counter captured with the snapshot.
+            app._record_load_counter += 1
             pm.load_record(new_record)
             app.query_one("#sidebar", FeatureSidebar).populate(pm._feats)
             # Restriction scan dispatched async — paints overlays as
@@ -103948,11 +104952,11 @@ def _h_update_feature(app, payload):
             from Bio.SeqFeature import FeatureLocation, CompoundLocation
             loc = target.location
             if isinstance(loc, CompoundLocation):
-                target.location = CompoundLocation([
-                    FeatureLocation(int(p.start), int(p.end),
-                                     strand=biop_strand)
-                    for p in loc.parts
-                ])
+                # Reading order reverses with the strand — `_restrand_
+                # location` keeps the exons' geometry (audit 2026-09-22).
+                target.location = _restrand_location(
+                    loc, biop_strand, len(new_record.seq),
+                    circular=_record_is_circular(new_record))
             else:
                 target.location = FeatureLocation(
                     int(loc.start), int(loc.end), strand=biop_strand,
@@ -104155,6 +105159,26 @@ def _h_apply_gff3(app, payload):
 
 
 
+def _agent_active_collection_only(payload, endpoint: str):
+    """400 when ``collection`` names a collection other than the ACTIVE one.
+
+    These endpoints act on the active collection's copy only. They used to
+    read no ``collection`` at all, so ``delete-from-library {name: "pUC19",
+    collection: "Archive"}`` answered 200 ``deleted: 1`` — having deleted the
+    ACTIVE collection's pUC19, not the one asked for (audit 2026-09-22).
+    Naming the active collection is accepted (it is what happens anyway)."""
+    want = payload.get("collection") if isinstance(payload, dict) else None
+    if want in (None, ""):
+        return None
+    active = _get_active_collection_name() or ""
+    if isinstance(want, str) and want.strip() == active:
+        return None
+    return ({"error": f"{endpoint} acts on the ACTIVE collection "
+                      f"({active!r}) only, but 'collection' is {want!r} — "
+                      f"switch first with set-active-collection, or omit "
+                      f"'collection'. Nothing was changed."}, 400)
+
+
 @_agent_endpoint("delete-from-library", write=True)
 def _h_delete_from_library(app, payload):
     """Remove a plasmid library entry by `name`. Body: ``{name}``.
@@ -104182,6 +105206,9 @@ def _h_delete_from_library(app, payload):
     over HTTP (see the Master Delete section's rationale and
     `test_master_delete.py::test_no_agent_endpoint_exposes_wipe`).
     """
+    _scope_err = _agent_active_collection_only(payload, "delete-from-library")
+    if _scope_err is not None:
+        return _scope_err
     name = _sanitize_label(payload.get("name"), max_len=200)
     if not name:
         return ({"error": "missing 'name'"}, 400)
@@ -104353,7 +105380,7 @@ def _h_transfer_annotations(app, payload):
                           '{"apply": true} to apply (default is a dry run)'},
                         400)
     do_apply = (bool(apply_in) if apply_in is not None
-                else not bool(payload.get("dry_run", True)))
+                else not _payload_bool(payload, "dry_run", True))
     # Cross-collection source resolution (agent-API feedback). The old
     # active-mirror finders (`_find_library_entry_by_*`) only saw the ACTIVE
     # collection, so transferring features FROM an entry in another
@@ -104502,7 +105529,7 @@ def _h_annotate_from_presets(app, payload):
                           '{"apply": true} to apply (default is a dry run)'},
                         400)
     do_apply = (bool(apply_in) if apply_in is not None
-                else not bool(payload.get("dry_run", True)))
+                else not _payload_bool(payload, "dry_run", True))
     raw_max = payload.get("max_transfers", _PRESET_ANNOT_MAX_TRANSFERS)
     max_transfers = _coerce_int(raw_max, name="max_transfers")
     if isinstance(max_transfers, str):
@@ -104993,7 +106020,9 @@ def _scan_dna_originals_for_history() -> "tuple[dict[str, tuple[int, str, str]],
             xml = _extract_commercialsaas_history_xml(data)
             if not xml:
                 continue
-            n = len(_ET.fromstring(xml).findall(".//Node"))
+            # Through the DTD-refusing parser: a .dna is a file from anywhere,
+            # and a raw fromstring expands a billion-laughs entity bomb.
+            n = len(_safe_xml_parse(xml).findall(".//Node"))
         except (OSError, ValueError, _ET.ParseError) as exc:
             _log.debug("history recovery: skipping %s: %s", p.name, exc)
             continue
@@ -105022,8 +106051,8 @@ def _history_node_count_of_xml(xml: str) -> int:
     if not xml:
         return 0
     try:
-        return len(_ET.fromstring(xml).findall(".//Node"))
-    except _ET.ParseError:
+        return len(_safe_xml_parse(xml).findall(".//Node"))
+    except (_ET.ParseError, ValueError):
         return 0
 
 
@@ -105574,20 +106603,18 @@ def _h_set_active_collection(app, payload):
         return ({"error": f"no collection named {name!r}"}, 404)
     plasmids = [dict(p) for p in (coll.get("plasmids") or [])
                  if isinstance(p, dict)]
-    # Set the active pointer FIRST in memory only; commit it after
-    # the library write succeeds so a save failure doesn't leave the
-    # active-collection setting pointing at content that isn't there.
-    prev_active = _get_active_collection_name()
-    _set_active_collection_name(name)
-    err = _agent_save_or_500(
-        lambda: _switch_active_collection_library(plasmids), "library")
+    # `_activate_collection` moves the pointer only AFTER every write has
+    # landed (and pushes the outgoing collection's pending state first), so
+    # a failure leaves the pointer on the collection the files still hold —
+    # no rollback onto a library file that already moved (audit 2026-09-22).
+    err = _agent_save_or_500(lambda: _activate_collection(name), "library")
     if err is not None:
-        # Roll back the active pointer so the next launch loads the
-        # collection whose content is actually on disk.
-        _set_active_collection_name(prev_active)
         return err
     app.call_from_thread(_agent_refresh_library_panel, app)
     return {"ok": True, "active": name, "n_plasmids": len(plasmids)}
+
+
+_state._set_active_collection_endpoint_hook = _h_set_active_collection
 
 
 @_agent_endpoint("bulk-import-folder", write=True)
@@ -105678,6 +106705,9 @@ def _h_set_plasmid_status(app, payload):
     via `_agent_save_or_500` so disk-write failures surface as
     ``500 {"error": "save failed for library: ..."}`` with the UI
     user also notified — the in-memory cache stays consistent."""
+    _scope_err = _agent_active_collection_only(payload, "set-plasmid-status")
+    if _scope_err is not None:
+        return _scope_err
     key = _sanitize_label(payload.get("name") or payload.get("id"),
                            max_len=200)
     if not key:
@@ -105738,6 +106768,9 @@ def _h_rename_plasmid(app, payload):
 
     Keys other than ``old``/``id``/``new``/``force`` are echoed under
     ``ignored`` (snag #14)."""
+    _scope_err = _agent_active_collection_only(payload, "rename-plasmid")
+    if _scope_err is not None:
+        return _scope_err
     key = _sanitize_label(payload.get("old") or payload.get("id"),
                            max_len=200)
     if not key:
@@ -105831,7 +106864,7 @@ def _h_set_entry_vector(app, payload):
     if not isinstance(gid, str) or not gid:
         return ({"error": "missing or non-string 'grammar_id'"}, 400)
 
-    if bool(payload.get("clear")):
+    if _payload_bool(payload, "clear", False):
         def _clear():
             _set_entry_vector(gid, None)
         if (err := _agent_save_or_500(
@@ -106316,7 +107349,7 @@ def _h_gibson_assemble(app, payload):
             # of the flat createDocument leaf an agent build used to get.
             "history_xml": _build_history_for_agent_assembly(
                 name=name, seq_len=_seq_len(rec),
-                circular=bool(payload.get("circular", True)),
+                circular=_payload_bool(payload, "circular", True),
                 manipulation="gibsonAssembly",
                 parents=[_agent_assembly_parent(f, f"F{i + 1}")
                          for i, f in enumerate(
@@ -106456,7 +107489,7 @@ def _h_traditional_clone(app, payload):
     if len(chosen) > 1 and vfi is None:
         flags, why = _agent_vector_backbone_flags(
             payload, info.get("vector_enzymes") or [],
-            bool(payload.get("vector_circular", True)))
+            _payload_bool(payload, "vector_circular", True))
         if flags:
             marked = {i for i, hit in enumerate(flags) if hit}
             candidates = {p["vector_frag_idx"] for p in chosen}
@@ -109247,7 +110280,10 @@ class RecordController:
             pass
         app._schedule_autosave()
 
-    def mark_clean(self) -> None:
+    def mark_clean(self, *, clear_autosave: bool = True) -> None:
+        """``clear_autosave=False`` for a fresh LOAD: showing a record is not
+        saving it, and the autosave on disk for that record is exactly what
+        the startup crash-recovery notice points the user at."""
         app = self.app
         self._unsaved = False
         if self.current:
@@ -109259,7 +110295,8 @@ class RecordController:
         except NoMatches:
             pass
         # Successful save / explicit clean → delete the recovery file
-        app._clear_autosave(self.current)
+        if clear_autosave:
+            app._clear_autosave(self.current)
 
 
 # ── Main app ───────────────────────────────────────────────────────────────────
@@ -112390,6 +113427,7 @@ NcbiTaxonPickerModal { align: center middle; }
         # lossy "outer bounds" branch and the feature rendered as the
         # backbone gap.
         src_total = len(src.seq) if hasattr(src, "seq") else 0
+        _src_circular = _record_is_circular(src)
 
         for feat in src.features:
             loc = feat.location
@@ -112411,10 +113449,25 @@ NcbiTaxonPickerModal { align: center middle; }
                 # they fell through to the generic per-part shift,
                 # which broke the canonical wrap (head's start no
                 # longer anchored at 0).
+                # Shape alone is not a wrap: a SPLICED gene whose first and
+                # last exons touch the two ends of the record is not one on a
+                # LINEAR molecule, and an insert at bp 0 must shift it whole —
+                # growing the "head" instead folded the new bases INTO the
+                # CDS (audit 2026-09-22). Canonical = circular AND the
+                # feature's own traversal runs from bp n straight on at bp 0.
+                _trav = (_feature_traversal(loc, src_total,
+                                            circular=_src_circular)
+                         if src_total > 0 else None)
+                _crosses_at_origin = bool(
+                    _trav is not None and _trav[1] < _trav[0] and any(
+                        _trav[2][i][1] == src_total
+                        and _trav[2][i + 1][0] == 0
+                        for i in range(len(_trav[2]) - 1)))
                 is_wrap_canonical = (
                     mode == "insert"
                     and src_total > 0
                     and len(parts_sorted) >= 2
+                    and _crosses_at_origin
                     and int(parts_sorted[0].start) == 0
                     and int(parts_sorted[-1].end) == src_total
                     and int(parts_sorted[0].end) < int(parts_sorted[-1].start)
@@ -113061,8 +114114,20 @@ NcbiTaxonPickerModal { align: center middle; }
             self.notify(
                 f"A previous save reached the plasmid library but NOT "
                 f"collection {_mdirty!r}. The library file is the newer of "
-                f"the two, so it was kept as-is. Re-save or re-pick the "
-                f"collection to sync them.",
+                f"the two, so it was kept as-is; your next save (or a "
+                f"collection switch) writes it through to the collection.",
+                severity="warning", timeout=20,
+            )
+        if _state._MIRROR_DIRTY_RECOVERY_KINDS:
+            _kinds = sorted(_state._MIRROR_DIRTY_RECOVERY_KINDS)
+            _state._MIRROR_DIRTY_RECOVERY_KINDS.clear()
+            _nice = {"primers": "primer library", "parts_bin": "parts bin",
+                     "experiments": "lab notebook"}
+            self.notify(
+                "A previous save of your "
+                + ", ".join(_nice.get(k, k) for k in _kinds)
+                + " did not reach its collection file. The newer copy was "
+                  "kept as-is; your next save there writes it through.",
                 severity="warning", timeout=20,
             )
         # Show the splash on top first; the rest of init runs underneath
@@ -114441,9 +115506,7 @@ NcbiTaxonPickerModal { align: center middle; }
                         "ctrl+up":    -lw,
                         "ctrl+down":   lw,
                     }[event.key]
-                    circular = (str((getattr(self._current_record,
-                                             "annotations", None) or {})
-                                    .get("topology", "")).lower() == "circular")
+                    circular = _record_is_circular(self._current_record)
                     if circular:
                         new_s = (s + delta) % n
                     else:
@@ -115059,6 +116122,11 @@ NcbiTaxonPickerModal { align: center middle; }
         saved_source = self._source_path
         self._apply_record(record, clear_undo=False)
         self._source_path = saved_source
+        # An in-place re-apply no longer marks the canvas clean on its own
+        # (that is what let an agent settings repaint erase unsaved edits);
+        # DISCARD is exactly the case where clean — and dropping the
+        # crash-recovery copy of the abandoned edits — is right.
+        self._mark_clean()
 
     def _notify_success(self, message: str, **kwargs) -> None:
         """Toast with the green success tint — for save/load/copy
@@ -115085,6 +116153,15 @@ NcbiTaxonPickerModal { align: center middle; }
         `_NOTIFY_DEFAULT_TIMEOUT_S` when the caller didn't specify
         one — pre-fix Textual defaulted to 5 s which felt sluggish."""
         kwargs.setdefault("timeout", self._NOTIFY_DEFAULT_TIMEOUT_S)
+        # Toast markup is parsed at RENDER time, so a user/file-derived name
+        # carrying `[/x]` raised MarkupError out of the compositor and closed
+        # the app — and `[@click=…]` made a clickable action (audit
+        # 2026-09-22). Nothing here uses action markup; anything that would
+        # not parse goes out as plain text instead of taking the app down.
+        if (kwargs.get("markup", True) and isinstance(message, str)
+                and "[" in message
+                and ("[@" in message or not _markup_parses(message))):
+            kwargs["markup"] = False
         if isinstance(self.screen, SplashScreen):
             if len(getattr(self, "_splash_notify_queue", [])) < 16:
                 self._splash_notify_queue.append((message, kwargs))
@@ -115271,7 +116348,20 @@ NcbiTaxonPickerModal { align: center middle; }
         # Always update the library entry (add or overwrite)
         try:
             lib = self.query_one("#library", LibraryPanel)
-            if not lib.add_entry(self._current_record):
+            lib._last_add_deferred = False
+            _rec_at_save = self._current_record
+
+            def _deferred_done(saved: bool) -> None:
+                # The collision choice landed. Only a real commit of the
+                # record still on the canvas makes it clean.
+                if saved and self._current_record is _rec_at_save:
+                    self._mark_clean()
+                    self._notify_success(
+                        f"Saved {self._record_display_name(_rec_at_save)} "
+                        f"to library")
+
+            if not lib.add_entry(self._current_record,
+                                 on_deferred_done=_deferred_done):
                 # OSError / RuntimeError → caught inside add_entry,
                 # which already fired _notify_save_failure for the
                 # user. Surface the failure to _do_save's caller so
@@ -115279,6 +116369,16 @@ NcbiTaxonPickerModal { align: center middle; }
                 _log_event("save.failed", target="library",
                             error="library save failed")
                 self._last_save_error = "library save failed"
+                return False
+            if getattr(lib, "_last_add_deferred", False):
+                # A name-collision prompt is open: NOTHING is saved yet.
+                # Report not-saved so quit / navigate / agent save stop
+                # here instead of discarding the edits.
+                _log_event("save.deferred", reason="name_collision_prompt")
+                self._last_save_error = (
+                    "a plasmid with this name is already in the library — "
+                    "choose overwrite / keep both in the prompt; nothing is "
+                    "saved until then")
                 return False
         except Exception as exc:
             _log.exception("Library update failed during save")
@@ -115387,6 +116487,7 @@ NcbiTaxonPickerModal { align: center middle; }
                 prev_gb = ""
                 prev_size = 0
                 found_prev = False
+                prev_entry: dict = {}
                 for e in entries:
                     if e.get("id") == record_id:
                         prev_status = _sanitize_plasmid_status(e.get("status"))
@@ -115394,6 +116495,7 @@ NcbiTaxonPickerModal { align: center middle; }
                         prev_history = str(e.get("history_xml") or "")
                         prev_gb = str(e.get("gb_text") or "")
                         prev_size = _coerce_int_or_zero(e.get("size"))
+                        prev_entry = deepcopy(e)
                         found_prev = True
                         break
                 entries = [e for e in entries if e.get("id") != record_id]
@@ -115440,6 +116542,36 @@ NcbiTaxonPickerModal { align: center middle; }
                 # drops lineage and every edit lands in the History tab. This
                 # path used to write NO history at all ("no history on clonings
                 # and mods").
+                # Carry everything about the entry this save does NOT own.
+                # The dict above is built from scratch, so a Ctrl+S on a
+                # plasmid used to DROP its `map_mode`, its stored sequencing
+                # `alignments`, its `kind` tag and its original `added` date —
+                # `LibraryPanel.add_entry` has always carried them, and the two
+                # save paths disagreed (audit 2026-09-22). The live record wins
+                # where it has an opinion; everything else survives.
+                _OWNED = {"name", "id", "size", "n_feats", "gb_text",
+                          "status", "history_xml"}
+                for k, v in prev_entry.items():
+                    if k not in _OWNED and k not in ("added",):
+                        new_entry.setdefault(k, v)
+                if prev_entry.get("added"):
+                    new_entry["added"] = prev_entry["added"]
+                if not getattr(record, "_tui_source", None) \
+                        and prev_entry.get("source"):
+                    new_entry["source"] = prev_entry["source"]
+                # A re-framed record (flip / re-origin) invalidates stored
+                # alignment coordinates — the same rule `add_entry` applies.
+                if getattr(record, "_sc_alignments_invalid", False):
+                    new_entry.pop("alignments", None)
+                _live_mode = str(
+                    getattr(record, "_tui_map_mode", "") or "").strip().lower()
+                if _live_mode in ("linear", "circular"):
+                    new_entry["map_mode"] = _live_mode
+                _live_kind = str(
+                    getattr(record, "_tui_kind", "") or "").strip().lower()
+                if _live_kind:
+                    new_entry["kind"] = _live_kind
+                new_entry.setdefault("kind", _derive_entry_kind(new_entry))
                 _apply_entry_construction_history(
                     new_entry, record, prev_history=prev_history,
                     prev_gb=prev_gb, prev_size=prev_size,
@@ -117853,13 +118985,9 @@ NcbiTaxonPickerModal { align: center middle; }
                         severity="warning",
                     )
                     return
-                _set_active_collection_name(coll_name)
-                plasmids = [dict(p)
-                            for p in (coll.get("plasmids") or [])
-                            if isinstance(p, dict)]
                 try:
-                    _switch_active_collection_library(plasmids)
-                except (OSError, ValueError) as exc:
+                    _activate_collection(coll_name)
+                except (OSError, RuntimeError, ValueError) as exc:
                     _notify_save_failure(self, "Plasmid library", exc)
                     return
                 # Tell the LibraryPanel so it repopulates against the
@@ -118022,6 +119150,8 @@ NcbiTaxonPickerModal { align: center middle; }
         # the record came from a local .gb file (it's stashed on the record
         # by load_genbank callers).
         source_path = getattr(record, "_tui_source", None)
+        # A loader-invented id must never land on an unrelated entry.
+        _import_identity_fixup(record)
         self._apply_record(record)
         if source_path is not None:
             self._source_path = source_path
@@ -118236,10 +119366,20 @@ NcbiTaxonPickerModal { align: center middle; }
             self.query_one("#library", LibraryPanel).set_active(record.id)
         except NoMatches:
             pass
-        self._mark_clean()
+        if clear_undo:
+            # A fresh load shows a saved/loaded state — clean, but WITHOUT
+            # deleting that record's crash-recovery file: it used to unlink
+            # the autosave of whatever was just opened, including the
+            # startup auto-load that runs right after the recovery notice
+            # told the user where to find it (audit 2026-09-22).
+            self._record.mark_clean(clear_autosave=False)
+        # `clear_undo=False` is an in-place change to the SAME record (a
+        # settings repaint, a primer add): the caller owns dirtiness. Marking
+        # clean here made an agent/Babs `set-setting` erase the unsaved
+        # flag — and the autosave — of edits the user never saved.
         self.notify(
             f"Loaded {record.name}  ({len(record.seq):,} bp, "
-            f"{len(pm._feats)} features)"
+            f"{len(pm._feats)} features)", markup=False,
         )
 
         # Restore any alignments stored on this library entry (visible
@@ -119332,11 +120472,11 @@ NcbiTaxonPickerModal { align: center middle; }
             from Bio.SeqFeature import FeatureLocation, CompoundLocation
             loc = target.location
             if isinstance(loc, CompoundLocation):
-                target.location = CompoundLocation([
-                    FeatureLocation(int(p.start), int(p.end),
-                                     strand=biop_strand)
-                    for p in loc.parts
-                ])
+                # Reading order reverses with the strand — `_restrand_
+                # location` keeps the exons' geometry (audit 2026-09-22).
+                target.location = _restrand_location(
+                    loc, biop_strand, len(new_record.seq),
+                    circular=_record_is_circular(new_record))
             else:
                 target.location = FeatureLocation(
                     int(loc.start), int(loc.end), strand=biop_strand,
@@ -120047,11 +121187,11 @@ NcbiTaxonPickerModal { align: center middle; }
             from Bio.SeqFeature import FeatureLocation, CompoundLocation
             loc = target.location
             if isinstance(loc, CompoundLocation):
-                target.location = CompoundLocation([
-                    FeatureLocation(int(p.start), int(p.end),
-                                     strand=biop_strand)
-                    for p in loc.parts
-                ])
+                # Reading order reverses with the strand — `_restrand_
+                # location` keeps the exons' geometry (audit 2026-09-22).
+                target.location = _restrand_location(
+                    loc, biop_strand, len(new_record.seq),
+                    circular=_record_is_circular(new_record))
             else:
                 target.location = FeatureLocation(
                     int(loc.start), int(loc.end), strand=biop_strand,
@@ -122554,15 +123694,10 @@ NcbiTaxonPickerModal { align: center middle; }
         n = _seq_len(self._current_record)
         if n <= 0:
             raise RuntimeError("Loaded record has zero length.")
-        # Topology — circular plasmids allow wrap; linear refuses.
-        try:
-            topology = str(
-                self._current_record.annotations.get("topology")
-                or "linear",
-            ).strip().lower()
-        except AttributeError:
-            topology = "linear"
-        is_circular = (topology == "circular")
+        # Topology — circular plasmids allow wrap; linear refuses. An
+        # unannotated record is circular (the app-wide default, see
+        # `_record_is_circular`); it used to default to LINEAR here alone.
+        is_circular = _record_is_circular(self._current_record)
         # Validate the group's members against its declared
         # sequence length. Defence-in-depth: callers may hand a
         # malformed entry, and we want the error here, not deep in
@@ -123225,7 +124360,8 @@ NcbiTaxonPickerModal { align: center middle; }
             return "CDS"
 
         cds_list = [{"index": i, "label": _label(f),
-                     "protein_len": len(_cds_coding_positions(total, f)) // 3}
+                     "protein_len": len(_cds_coding_positions(
+                         total, f, circular=_record_is_circular(rec))) // 3}
                     for i, f in enumerate(cds)]
 
         def _planner(cds_index, residue, to_aa, codon):
@@ -123285,10 +124421,9 @@ NcbiTaxonPickerModal { align: center middle; }
             self.notify("Load a plasmid first — guide design needs a sequence.",
                         severity="warning", timeout=6)
             return
-        anns = getattr(rec, "annotations", None) or {}
         modal = CrisprGuideModal(
             str(rec.seq),
-            circular=(anns.get("topology") == "circular"),
+            circular=_record_is_circular(rec),
             label=self._record_display_name(rec),
         )
         self.push_screen(
@@ -123771,8 +124906,16 @@ NcbiTaxonPickerModal { align: center middle; }
                 amp_entry, _get_active_collection_name() or "Default")
         except (OSError, RuntimeError) as exc:
             _notify_save_failure(self, "Plasmid library", exc)
-        except Exception:
+        except Exception as exc:
+            # The user NAMED this amplicon; a silent log line meant they went
+            # looking for it in the library and found nothing (a strand-2
+            # feature used to raise out of `FeatureLocation` right here).
             _log.exception("clone_region: amplicon library save failed")
+            self.notify(
+                f"The amplicon '{region_name}' could not be saved to the "
+                f"library ({type(exc).__name__}) — the design is still on the "
+                f"Constructor. See the log for details.",
+                severity="error", timeout=10, markup=False)
         # Panel refresh is isolated — a refresh hiccup must not mask (or be
         # mistaken for) a save failure now that the entry is on disk.
         if amp_saved:
@@ -123942,7 +125085,9 @@ NcbiTaxonPickerModal { align: center middle; }
             feats = self.query_one("#plasmid-map", PlasmidMap)._feats
         except NoMatches:
             pass
-        self.push_screen(MutagenizeModal(seq, feats, name))
+        self.push_screen(MutagenizeModal(
+            seq, feats, name,
+            circular=(_record_is_circular(rec) if rec is not None else True)))
 
     @_action_log("app.open.simulator")
     def action_open_simulator(self) -> None:
@@ -123994,6 +125139,28 @@ NcbiTaxonPickerModal { align: center middle; }
                 and isinstance(screen, self._WORKBENCH_TAB_TYPES))
 
     def push_screen(self, screen, *args, **kwargs):  # type: ignore[override]
+        # ── Web demo: no host-filesystem screens, whoever pushes them ──
+        # Gating each menu action one by one left ten ways in (a collection
+        # export, the Parts Bin / primer / notebook exporters, the new-
+        # collection folder import, the protein / FASTA / primer-CSV pickers).
+        # Every screen that browses, reads or writes host paths carries
+        # `_HOST_FILESYSTEM = True`, and this one chokepoint refuses them —
+        # `test_web_demo_refuses_every_host_filesystem_screen` enumerates the
+        # classes so a new picker can't slip past ([INV-206]).
+        if (not isinstance(screen, str)
+                and getattr(screen, "_HOST_FILESYSTEM", False)
+                and _demo_web_refuse(self, "Reading or writing files on the "
+                                           "server")):
+            _log.info("web demo: refused host-filesystem screen %s",
+                      type(screen).__name__)
+            callback = kwargs.get("callback", args[0] if args else None)
+            if callable(callback):
+                try:
+                    callback(None)
+                except Exception:
+                    _log.exception("web-demo refusal callback raised for %s",
+                                   type(screen).__name__)
+            return _CompletedAwaitable()
         # True-switch: opening a top-level workbench tab while already on
         # one closes the current tab FIRST, so the menu bar reads as a
         # flat tab bar instead of stacking screens without bound. The

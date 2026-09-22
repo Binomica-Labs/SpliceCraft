@@ -56,14 +56,29 @@ def _ip_is_non_public(addr) -> bool:
     metadata endpoint. We do that delegation ourselves so this security
     boundary never depends on the interpreter's exact point release."""
     def _flagged(a) -> bool:
+        # `not is_global` covers what the named predicates miss: the IANA
+        # special-purpose blocks that are neither "private" nor reserved —
+        # 100.64.0.0/10 shared address space (where some clouds, e.g.
+        # 100.100.100.200, put their metadata service), 192.0.0.0/24,
+        # 198.18.0.0/15 benchmarking, 64:ff9b:1::/48 local-use NAT64.
         return (a.is_private or a.is_loopback or a.is_link_local
-                or a.is_reserved or a.is_multicast or a.is_unspecified)
+                or a.is_reserved or a.is_multicast or a.is_unspecified
+                or not a.is_global)
     if _flagged(addr):
         return True
     for _attr in ("ipv4_mapped", "sixtofour"):
         embedded = getattr(addr, _attr, None)
         if embedded is not None and _flagged(embedded):
             return True
+    # NAT64 (64:ff9b::/96): IANA lists the well-known prefix as globally
+    # reachable, but the packet goes to the EMBEDDED IPv4 — 64:ff9b::a9fe:a9fe
+    # is 169.254.169.254. CPython currently files the whole prefix under
+    # `is_reserved`, so this is the backstop for the day it stops doing so.
+    if getattr(addr, "version", 4) == 6:
+        import ipaddress
+        if addr in ipaddress.ip_network("64:ff9b::/96"):
+            if _flagged(ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)):
+                return True
     teredo = getattr(addr, "teredo", None)   # (server_ip, client_ip) or None
     if teredo:
         for t in teredo:
@@ -93,6 +108,14 @@ def _assert_public_host(url: str) -> None:
     host = urlsplit(url).hostname
     if not host:
         raise urllib.error.URLError(f"no host in URL {url!r}")
+    # urllib percent-DECODES the host before it connects (Request.host is
+    # `unquote`d) while urlsplit hands us the raw text, so `a%2eb.example`
+    # would be vetted as one name and connected to as another. No real
+    # hostname carries a '%', and the one legitimate use — an IPv6 zone id —
+    # only ever names a link-local address this guard refuses anyway.
+    if "%" in host:
+        raise urllib.error.URLError(
+            f"refusing percent-encoded host {host!r}")
     try:
         infos = socket.getaddrinfo(host, None)
     except OSError as exc:
@@ -221,20 +244,33 @@ def _sanitize_accession(s: "str | None") -> "str | None":
 
 
 def _redact_url_credentials(url: str) -> str:
-    """Strip `user:pass@` from a URL for safe logging. Real-world
-    URLs never carry credentials for our two builtins, but a user's
-    custom URL might."""
+    """A URL made safe to LOG: `user:pass@` stripped, and the query string's
+    VALUES replaced by ``REDACTED`` (names kept, so a log still says which
+    parameters were sent).
+
+    The query is where the secrets actually live in practice: a pre-signed
+    download link (Plasmidsaurus results are served from one) carries its
+    `X-Amz-Signature` / `X-Amz-Credential` / security token there, and those
+    grant the file to anyone who reads the log — or the diagnostic bundle the
+    log ships in. Only the userinfo used to be scrubbed."""
     if not isinstance(url, str):
         return ""
     try:
-        from urllib.parse import urlparse, urlunparse
+        from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
         parts = urlparse(url)
         if parts.username or parts.password:
             netloc = parts.hostname or ""
             if parts.port:
                 netloc = f"{netloc}:{parts.port}"
-            scrubbed = parts._replace(netloc=netloc)
-            return urlunparse(scrubbed)
+            parts = parts._replace(netloc=netloc)
+        if parts.query:
+            pairs = parse_qsl(parts.query, keep_blank_values=True)
+            parts = parts._replace(query=urlencode(
+                [(k, "REDACTED") for k, _v in pairs] if pairs
+                else [("query", "REDACTED")]))
+        if parts.fragment:
+            parts = parts._replace(fragment="")
+        return urlunparse(parts)
     except (ValueError, AttributeError):
         pass
     return url

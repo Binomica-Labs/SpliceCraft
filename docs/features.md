@@ -340,7 +340,7 @@ What you can do without leaving the terminal.
   scattered alphabetically; entry indices remain stable across the
   re-sort so dirty-edit markers don't desync.
 - **Built-in feature presets** (`Presets` in the Feature Library, or
-  `p`) — a shipped catalogue of 116 common plasmid elements across 20
+  `p`) — a shipped catalogue of 117 common plasmid elements across 20
   categories: resistance markers (AmpR, KanR, NeoR, CmR, TetA, SpecR,
   HygR, PuroR, BlastR, ZeoR), origins (pUC/pMB1, p15A, f1, SV40, 2μ,
   CEN/ARS, R6Kγ, oriT), promoters for bacteria, mammalian cells, yeast

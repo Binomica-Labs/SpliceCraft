@@ -29,7 +29,8 @@ from splicecraft_persistence import (
 )
 from splicecraft_biology import _rc
 from splicecraft_util import (
-    _CONTROL_CHARS_RE, _DEFAULT_TYPE_COLORS, _feat_bounds, _is_windows_reserved_stem,
+    _CONTROL_CHARS_RE, _DEFAULT_TYPE_COLORS, _feat_bounds, _feature_traversal,
+    _is_windows_reserved_stem,
     _natural_sort_key, _pick_single_record, _record_is_circular, _safe_xml_parse,
     _sanitize_label, _to_ascii_text,
 )
@@ -525,9 +526,7 @@ def _record_to_gff3(record) -> str:
     # percent-encode anything outside `[A-Za-z0-9._:^*$@!+_?\-|]`.
     safe_seqid = _q(seqid, safe=".:_-")
     n = len(record.seq)
-    is_circular = (
-        (record.annotations or {}).get("topology", "").lower() == "circular"
-    )
+    is_circular = _record_is_circular(record)
 
     out: list[str] = []
     out.append("##gff-version 3")
@@ -652,41 +651,24 @@ def _record_to_gff3(record) -> str:
                               or [feat.location])
         except AttributeError:
             parts_seq = []
+        # READING order from `_feature_traversal` — the one geometry every
+        # SpliceCraft reader shares: forward traversal for +/0, reversed for
+        # −. A canonical origin wrap still comes out tail-first on + and
+        # head-first on − (the order the old role-sort produced), and a
+        # spliced gene whose transcript crosses bp 0 now keeps its exons in
+        # the order they are read instead of being sorted flat.
+        _trav = None
         try:
-            _ends = {int(p.start) for p in parts_seq} | {
-                int(p.end) for p in parts_seq}
-            is_wrap = (
-                # Only a CIRCLE can wrap. On a linear molecule the identical
-                # two-part shape is a SPLICED feature — `join(1..6,13..30)` on
-                # a 30 bp linear record is exon 1 then exon 2 — and emitting
-                # it tail-first would hand every reader the exons in the wrong
-                # order. Same guard `_feat_bounds(circular=False)` applies.
-                is_circular
-                and len(parts_seq) == 2
-                and 0 in _ends and len(record.seq) in _ends
-                and min(int(p.start) for p in parts_seq) == 0
-                and max(int(p.end) for p in parts_seq) == len(record.seq)
-                and max(int(p.start) for p in parts_seq)
-                    > min(int(p.end) for p in parts_seq)
-            )
+            _trav = _feature_traversal(feat.location, len(record.seq),
+                                       circular=is_circular)
         except (AttributeError, TypeError, ValueError):
-            is_wrap = False
-        if is_wrap:
-            # Order by ROLE, not by declared position. A wrap arrives either
-            # way round: a GenBank `join(2500..2686,1..100)` parses to
-            # [tail, head] (declared order), while a programmatically-built
-            # CompoundLocation is usually [head, tail]. Keying off
-            # `parts_seq[0]` alone handled only the second, so every wrap that
-            # came from a GenBank file exported head-first — and re-imported
-            # with its two arcs SWAPPED, which for a CDS means a different
-            # protein. Sort the two arcs explicitly, then emit tail-first for
-            # the + strand (biological 5'→3') and head-first for the -.
-            # Detection now matches `_feat_bounds`, the codebase's canonical
-            # wrap resolver, which sorts before testing — the two used to
-            # disagree about the very same feature.
-            _head = min(parts_seq, key=lambda p: int(p.start))
-            _tail = max(parts_seq, key=lambda p: int(p.start))
-            parts = ([_tail, _head] if strand_int != -1 else [_head, _tail])
+            _trav = None
+        if _trav is not None and len(parts_seq) > 1:
+            from Bio.SeqFeature import FeatureLocation as _FL
+            _st = {int(p.start): getattr(p, "strand", None) for p in parts_seq}
+            _fwd = [_FL(a, b, strand=_st.get(a, strand_int or None))
+                    for a, b in _trav[2]]
+            parts = list(reversed(_fwd)) if strand_int == -1 else _fwd
         else:
             try:
                 parts_sorted = sorted(parts_seq, key=lambda p: int(p.start))
@@ -705,17 +687,27 @@ def _record_to_gff3(record) -> str:
         _coding = 0        # complete-codon bases emitted by earlier rows
         _first_row = True
         for part in parts:
+            # `getattr` rather than `part.start`: `parts` holds either
+            # Biopython locations or the `FeatureLocation`s rebuilt from the
+            # traversal above, and their `start` is a `Position` the type
+            # checker won't call int() on.
             try:
-                p_s = int(part.start)
-                p_e = int(part.end)
+                p_s = int(getattr(part, "start", -1))
+                p_e = int(getattr(part, "end", -1))
             except (AttributeError, TypeError, ValueError):
                 continue
             if p_e <= p_s:
                 continue
             if _is_cds:
+                # phase_k = bases to drop from row k to reach a codon start:
+                # (3 − ((Σ earlier row lengths) − phase₀) mod 3) mod 3. Only
+                # the FIRST row's phase is skipped sequence — a later row's
+                # leading bases complete the previous codon and are coding.
+                # Subtracting every row's phase drifted the frame from the
+                # third exon on (audit 2026-09-22).
                 _ph = _phase0 if _first_row else (3 - (_coding % 3)) % 3
                 phase = str(_ph)
-                _coding += max(0, (p_e - p_s) - _ph)
+                _coding += (p_e - p_s) - (_phase0 if _first_row else 0)
                 _first_row = False
             # Per-part strand: a mixed-strand `CompoundLocation` has
             # `feat.location.strand == None` (Biopython returns None when
@@ -778,6 +770,7 @@ def _parse_gff3_text(text: str) -> dict:
     """
     from urllib.parse import unquote as _u
     seqid = None
+    seqids: "list[str]" = []          # every DISTINCT seqid, in file order
     length = None
     is_circular = False
     features: list[dict] = []
@@ -830,6 +823,11 @@ def _parse_gff3_text(text: str) -> dict:
         seq_col = _u(cols[0])
         if seqid is None:
             seqid = seq_col
+        if seq_col not in seqids:
+            # A GFF3 file may annotate MANY molecules (one per contig). The
+            # parser kept only the first seqid, so every row — whichever
+            # molecule it described — was applied to the one loaded record.
+            seqids.append(seq_col)
         ftype = cols[2].strip()
         try:
             start_1 = int(cols[3])
@@ -928,6 +926,9 @@ def _parse_gff3_text(text: str) -> dict:
 
     return {
         "seqid":       seqid or "plasmid",
+        # Every seqid the file mentions. More than one means it describes
+        # several molecules and a caller must say which one it wants.
+        "seqids":      seqids or ([seqid] if seqid else []),
         "length":      length,
         "is_circular": is_circular,
         "features":    features,
@@ -937,7 +938,7 @@ def _parse_gff3_text(text: str) -> dict:
 
 
 def _gff3_features_to_biopython(
-    parsed: dict, total: int,
+    parsed: dict, total: int, *, circular: "bool | None" = None,
 ) -> list:
     """Convert parsed GFF3 feature rows into BioPython SeqFeature
     objects. Same-`gff_id` rows are rejoined as a CompoundLocation
@@ -960,28 +961,119 @@ def _gff3_features_to_biopython(
 
     out: list = []
 
+    is_circ = (bool(parsed.get("is_circular")) if circular is None
+               else bool(circular))
+
+    def _row_spans(p) -> "list[tuple[int, int]] | None":
+        """Physical span(s) of one row. On a CIRCULAR landmark GFF3 1.26
+        writes an origin-crossing part as end = end + length; that is one
+        part in two pieces here, not an out-of-range row."""
+        s_, e_ = int(p["start_0"]), int(p["end"])
+        if s_ < 0 or e_ <= s_:
+            return None
+        if e_ <= total:
+            return [(s_, e_)]
+        if is_circ and total > 0 and e_ - s_ < total:
+            if s_ >= total:
+                return [(s_ - total, e_ - total)]
+            return [(s_, total), (0, e_ - total)]
+        return None
+
     def _make_loc(parts: list[dict], gid: str = ""):
-        # Build FeatureLocation per part, then merge into a
-        # CompoundLocation when there are 2+ parts (wrap features).
-        locs = []
+        """GFF3 rows carry no reading order and real files disagree: NCBI
+        and Ensembl list a minus-strand gene's CDS rows ASCENDING, SpliceCraft
+        writes them in reading order. Joining rows in file order read every
+        minus-strand spliced CDS from an NCBI GFF3 exon-last — a different
+        protein (audit 2026-09-22). The stored order below is the READING
+        order (Biopython/INSDC semantics): genomic order for +/0, reversed
+        for −, with a single wrap-around step kept when the rows describe an
+        origin-crossing traversal."""
+        spans: "list[tuple[int, int]]" = []
+        strands: set = set()
+        unwrapped: "list[tuple[int, int]]" = []
         for p in parts:
-            s, e = p["start_0"], p["end"]
-            if s < 0 or e > total or e <= s:
-                # Sweep #25: log instead of silent drop. Use INFO not
-                # WARNING so a noisy GFF3 (e.g. coordinates relative
-                # to a different reference) doesn't spam the log.
+            got = _row_spans(p)
+            if got is None:
                 _log.info(
                     "GFF3: dropping out-of-range feature %r "
                     "(type=%s start=%d end=%d total=%d)",
-                    gid or "(no-id)", p.get("type") or "?", s, e, total,
+                    gid or "(no-id)", p.get("type") or "?",
+                    p["start_0"], p["end"], total,
                 )
                 return None
-            locs.append(FeatureLocation(s, e, strand=p["strand"] or 0))
-        if not locs:
+            spans.extend(got)
+            unwrapped.append((int(p["start_0"]), int(p["end"])))
+            strands.add(p["strand"] or 0)
+        if not spans:
             return None
-        if len(locs) == 1:
-            return locs[0]
-        return CompoundLocation(locs)
+        if len(strands) > 1:
+            # Mixed strands (trans-splicing, rare but legal): no single
+            # reading direction to order by — keep the file's rows and each
+            # row's own strand rather than flattening them to none.
+            locs = []
+            for p in parts:
+                for a, b in _row_spans(p) or []:
+                    locs.append(FeatureLocation(a, b,
+                                                strand=p["strand"] or 0))
+            return locs[0] if len(locs) == 1 else CompoundLocation(locs)
+        strand = strands.pop()
+        if len(spans) == 1:
+            a, b = spans[0]
+            return FeatureLocation(a, b, strand=strand)
+        asc = sorted(spans)
+        if is_circ and any(e > total for _s, e in unwrapped):
+            # The file used GFF3's origin convention (end > length), so the
+            # UNWRAPPED starts give the traversal order unambiguously.
+            fwd = []
+            for us, ue in sorted(unwrapped):
+                if ue <= total:
+                    fwd.append((us, ue))
+                elif us >= total:
+                    fwd.append((us - total, ue - total))
+                else:
+                    fwd.extend([(us, total), (0, ue - total)])
+        elif (is_circ and total > 0 and len(spans) == 2
+              and asc[0][0] == 0 and asc[-1][1] == total
+              and asc[0][1] < asc[-1][0]):
+            # The canonical origin wrap, whichever order the rows came in —
+            # the same shape rule `_feature_traversal` keeps.
+            fwd = [asc[-1], asc[0]]
+        elif strand == -1:
+            if spans == asc or spans == list(reversed(asc)):
+                fwd = asc      # genomic (NCBI/Ensembl) or − reading order
+            else:
+                cand = list(reversed(spans))
+                backs = [k for k in range(len(cand) - 1)
+                         if cand[k + 1][0] < cand[k][0]]
+                fwd = cand if (is_circ and len(backs) == 1) else asc
+        else:
+            if spans == asc:
+                fwd = asc
+            else:
+                cand = list(spans)
+                backs = [k for k in range(len(cand) - 1)
+                         if cand[k + 1][0] < cand[k][0]]
+                fwd = cand if (is_circ and len(backs) == 1) else asc
+        ordered = list(reversed(fwd)) if strand == -1 else fwd
+        return CompoundLocation(
+            [FeatureLocation(a, b, strand=strand) for a, b in ordered])
+
+    def _codon_start_from_phase(parts: list[dict], feat) -> None:
+        if str(feat.type).upper() != "CDS" or "codon_start" in feat.qualifiers:
+            return
+        strand = -1 if all((p.get("strand") or 0) == -1 for p in parts) else 1
+        # 5'-most row: lowest start on +, highest end on −.
+        lead = (max(parts, key=lambda p: int(p["end"])) if strand == -1
+                else min(parts, key=lambda p: int(p["start_0"])))
+        ph = lead.get("phase")
+        try:
+            ph = int(ph) if ph not in (None, "", ".") else None
+        except (TypeError, ValueError):
+            ph = None
+        if ph in (1, 2):
+            # A phase-2 5'-partial CDS imported without /codon_start
+            # translated in the wrong frame (audit 2026-09-22).
+            feat.qualifiers["codon_start"] = [str(ph + 1)]
 
     for gid, parts in by_id.items():
         loc = _make_loc(parts, gid=gid)
@@ -990,6 +1082,7 @@ def _gff3_features_to_biopython(
         first = parts[0]
         feat = SeqFeature(loc, type=first["type"],
                             qualifiers=dict(first["qualifiers"]))
+        _codon_start_from_phase(parts, feat)
         out.append(feat)
     for f in no_id:
         loc = _make_loc([f], gid=f.get("type") or "")
@@ -997,6 +1090,7 @@ def _gff3_features_to_biopython(
             continue
         feat = SeqFeature(loc, type=f["type"],
                             qualifiers=dict(f["qualifiers"]))
+        _codon_start_from_phase([f], feat)
         out.append(feat)
     return out
 
@@ -1083,6 +1177,19 @@ def _gff3_apply_to_loaded_record(record, path: str) -> int:
             "standalone-import path so the imported plasmid isn't "
             "silently grafted onto the currently-loaded one."
         )
+    # A GFF3 may describe MANY molecules — one block of rows per contig, all
+    # in one file. Every row was applied to the one loaded record regardless
+    # of which molecule its seqid named, so importing a genome annotation put
+    # another contig's genes on this plasmid at this plasmid's coordinates.
+    seqids = [s for s in (parsed.get("seqids") or []) if s]
+    if len(seqids) > 1:
+        shown = ", ".join(seqids[:5]) + (" …" if len(seqids) > 5 else "")
+        raise ValueError(
+            f"GFF3 annotates {len(seqids)} different sequences ({shown}) — "
+            f"there is no way to tell which ones belong on the loaded "
+            f"plasmid. Split the file, or keep only the rows for this "
+            f"molecule."
+        )
     total = len(record.seq)
     parsed_len = parsed.get("length")
     if parsed_len and parsed_len != total:
@@ -1091,7 +1198,8 @@ def _gff3_apply_to_loaded_record(record, path: str) -> int:
             f"is {total:,} bp — coordinate frames don't match. Refusing "
             f"to apply features that would land at wrong positions."
         )
-    new_feats = _gff3_features_to_biopython(parsed, total)
+    new_feats = _gff3_features_to_biopython(
+        parsed, total, circular=_record_is_circular(record))
     record.features = list(record.features) + new_feats
     return len(new_feats)
 
@@ -1261,7 +1369,8 @@ def _export_embl_to_path(record, path) -> dict:
     serialisable.features = _split_multiline_qualifiers(
         _arrowless_encode_features(getattr(normalized, "features", None)))
     buf = StringIO()
-    SeqIO.write([serialisable], buf, "embl")
+    from splicecraft_record import _unbreakable_embl_writer
+    _unbreakable_embl_writer(buf).write_file([serialisable])
     text = _embl_fix_id_line(buf.getvalue())
 
     # Round-trip verify BEFORE touching the filesystem, so a failed export
@@ -1277,6 +1386,17 @@ def _export_embl_to_path(record, path) -> dict:
             f"EMBL export round-trip feature count mismatch "
             f"({len(parsed.features)} vs {len(serialisable.features)})"
         )
+    # The free-text qualifiers are exactly what a line-wrap can corrupt (a
+    # space inserted into a token, a split at an unsafe point) and what a
+    # sequence + count check cannot see (audit 2026-09-22).
+    for _i, (_a, _b) in enumerate(zip(serialisable.features, parsed.features)):
+        for _k in ("label", "note", "gene", "product"):
+            _va = [str(x) for x in ((_a.qualifiers or {}).get(_k) or [])]
+            _vb = [str(x) for x in ((_b.qualifiers or {}).get(_k) or [])]
+            if _va != _vb:
+                raise ValueError(
+                    f"EMBL export round-trip changed feature {_i + 1}'s "
+                    f"/{_k} ({_va[:1]!r} → {_vb[:1]!r})")
 
     p = _Path(path).expanduser()
     _atomic_write_text(p, text, newline="\n")
@@ -1453,7 +1573,36 @@ def _ab1_path_to_record(path: str):
     return rec
 
 
-def _fastq_path_to_records(path: str) -> "list":
+def _fastq_quality_format(path: str) -> str:
+    """``"fastq"`` (Phred+33) or ``"fastq-illumina"`` (Phred+64), sniffed from
+    the quality lines themselves.
+
+    Phred+64 (Illumina 1.3–1.7) decoded as Phred+33 turns every score 31
+    points too HIGH — Q2 junk reads as Q33 — which silently switched off the
+    read-quality filter the heterogeneity verdict depends on (audit
+    2026-09-22). A quality character below ``;`` exists only in Phred+33; one
+    above ``J`` with nothing below ``@`` only in Phred+64. The range both
+    encodings share keeps the modern Phred+33 default."""
+    lo, hi = 255, 0
+    try:
+        with open(path, "rb") as fh:
+            for i, line in enumerate(fh):
+                if i >= 40_000:
+                    break
+                if i % 4 == 3:
+                    q = line.rstrip(b"\r\n")
+                    if q:
+                        lo = min(lo, min(q))
+                        hi = max(hi, max(q))
+    except OSError:
+        return "fastq"
+    if lo >= 64 and hi > 74:
+        return "fastq-illumina"
+    return "fastq"
+
+
+def _fastq_path_to_records(path: str, *,
+                           max_reads: "int | None" = None) -> "list":
     """Parse a multi-read `.fastq` / `.fq` file into a list of
     `SeqRecord` objects. Each read becomes one record. Topology is
     forced to linear (reads are by definition linear fragments).
@@ -1489,14 +1638,24 @@ def _fastq_path_to_records(path: str) -> "list":
     # before a post-hoc len() check could fire. Breaking at the cap keeps peak
     # memory to _FASTQ_MAX_READS+1 records.
     records = []
+    fmt = _fastq_quality_format(path)
+    if fmt != "fastq":
+        _log.info("FASTQ %s: Phred+64 quality encoding detected",
+                  Path(path).name)
+    # ``max_reads`` = a SAMPLING caller (read-heterogeneity) that only ever
+    # uses the first N reads: stop there instead of refusing a real raw-read
+    # file for being larger than the library-import cap.
+    cap = int(max_reads) if max_reads else _FASTQ_MAX_READS
     try:
-        for rec in SeqIO.parse(path, "fastq"):
+        for rec in SeqIO.parse(path, fmt):
             records.append(rec)
+            if len(records) >= cap and max_reads:
+                break
             if len(records) > _FASTQ_MAX_READS:
                 break
     except (OSError, ValueError) as exc:
         raise ValueError(f"could not parse FASTQ: {exc}") from exc
-    if len(records) > _FASTQ_MAX_READS:
+    if not max_reads and len(records) > _FASTQ_MAX_READS:
         raise ValueError(
             f"FASTQ contains more than {_FASTQ_MAX_READS:,} reads; cap is "
             f"{_FASTQ_MAX_READS:,} per file. Split the file or use a "
@@ -1861,7 +2020,8 @@ def _build_commercialsaas_features_packet_from_record(record) -> bytes:
         # wrap collapses to a single inverted range — see
         # `_commercialsaas_segment_ranges`.
         for start_1based, end_1based in _commercialsaas_segment_ranges(
-                feat.location, _n_bases):
+                feat.location, _n_bases,
+                circular=_record_is_circular(record)):
             _ET.SubElement(feat_el, "Segment", {
                 "range": f"{start_1based}-{end_1based}",
                 "color": color,
@@ -2072,34 +2232,29 @@ def _commercialsaas_iter_location_parts(location):
         yield location
 
 
-def _commercialsaas_segment_ranges(location, total: int) -> "list[tuple[int, int]]":
+def _commercialsaas_segment_ranges(location, total: int, *,
+                                   circular: "bool | None" = None,
+                                   ) -> "list[tuple[int, int]]":
     """1-based inclusive ``(start, end)`` ranges for a feature's `<Segment>`
     elements, in the order the `.dna` reader reconstructs correctly.
 
     The reader APPENDS each segment for a forward feature and PREPENDS each
-    one for a reverse feature. Two shapes have to respect that, and both used
-    to come back WRONG:
-
-    * **Origin wrap** — emit TAIL first, then head. Appended, that is
-      ``[tail, head]``; prepended, it is ``[head, tail]`` — which is exactly
-      the part order Biopython holds for a plus- and a minus-strand wrap
-      respectively. Emitting Biopython's own order instead round-tripped the
-      plus strand by luck and swapped the halves of every minus-strand wrap.
-    * **Minus-strand multi-part** (a spliced CDS) — Biopython holds parts in
-      READING order, which on the minus strand runs high coordinate → low.
-      Emitting that order gave back reversed exons — a different protein from
-      a file claiming to be a round-trip — so these emit ASCENDING and let
-      the reader's prepend restore the reading order.
+    one for a reverse feature, and Biopython holds parts in READING order
+    (high → low on the minus strand). Both work out to one rule: emit the
+    segments in FORWARD-TRAVERSAL order (`_feature_traversal`). That is the
+    tail-then-head order an origin wrap needs on either strand, ascending
+    exons for a minus-strand spliced CDS — and, for a spliced gene whose
+    transcript crosses bp 0 (three or more parts, one of them past the
+    origin), the order that keeps its exons in sequence: sorting them put
+    the part after the origin first (audit 2026-09-22).
     """
     parts = list(getattr(location, "parts", None) or [location])
-    ordered = sorted(parts, key=lambda q: int(q.start))
-    if total > 0 and len(parts) == 2:
-        head, tail = ordered[0], ordered[-1]
-        if (int(head.start) == 0 and int(tail.end) == total
-                and int(head.end) < int(tail.start)):
-            return [(int(tail.start) + 1, int(tail.end)),
-                    (int(head.start) + 1, int(head.end))]
-    return [(int(p.start) + 1, int(p.end)) for p in ordered]
+    trav = _feature_traversal(location, total, circular=circular)
+    if trav is not None:
+        spans = trav[2]
+    else:
+        spans = sorted((int(q.start), int(q.end)) for q in parts)
+    return [(int(a) + 1, int(b)) for a, b in spans]
 
 
 @_timed("op.write_commercialsaas_dna")
@@ -2124,8 +2279,7 @@ def _write_commercialsaas_dna_bytes(record, *,
     seq = str(getattr(record, "seq", "") or "")
     if not seq:
         raise ValueError("record has empty sequence")
-    annotations = getattr(record, "annotations", None) or {}
-    is_circ = (annotations.get("topology", "") or "").lower() == "circular"
+    is_circ = _record_is_circular(record)
     parts: list[bytes] = []
     parts.append(_build_commercialsaas_cookie_packet())
     parts.append(_build_commercialsaas_dna_packet(seq, circular=is_circ))
@@ -3798,6 +3952,58 @@ def _delete_dna_original(entry_id: str) -> bool:
     return removed
 
 
+def _dna_record_signature(rec) -> tuple:
+    """What a `.dna` export must reproduce: sequence, topology and every
+    non-source feature (type, location parts in stored order + strand,
+    every qualifier). Order-insensitive over features."""
+    seq = str(getattr(rec, "seq", "") or "").upper()
+    topo = ("linear" if str((getattr(rec, "annotations", None) or {})
+                            .get("topology", "")).strip().lower() == "linear"
+            else "circular")
+    feats = []
+    for f in getattr(rec, "features", None) or []:
+        if getattr(f, "type", "") == "source":
+            continue
+        loc = getattr(f, "location", None)
+        parts = (getattr(loc, "parts", None) or [loc]) if loc is not None else []
+        pl = tuple((int(p.start), int(p.end), p.strand) for p in parts)
+        quals = tuple(sorted(
+            (str(k), tuple(str(x) for x in (v if isinstance(v, (list, tuple))
+                                            else [v])))
+            for k, v in (getattr(f, "qualifiers", None) or {}).items()))
+        feats.append((str(f.type), pl, quals))
+    return seq, topo, tuple(sorted(feats))
+
+
+def _dna_sidecar_matches_entry(original: bytes, entry: dict) -> bool:
+    """True only when the imported `.dna` sidecar still describes the entry
+    EXACTLY as it is now — same sequence, topology and features.
+
+    Splice mode used to reuse the sidecar unconditionally, so every edit
+    made after import (a base inserted, a feature added or renamed) was
+    silently dropped from the exported file: it came out byte-identical to
+    the ORIGINAL import (audit 2026-09-22). The sidecar is read back through
+    the same importer that created the entry and the same serialise → parse
+    round trip storage applies, so an unedited entry compares equal and any
+    divergence falls back to a from-scratch build. A false "differs" only
+    costs the exotic packets splice mode preserves; a false "same" loses
+    the user's edits, so every doubt answers False."""
+    import tempfile as _tempfile
+    try:
+        entry_rec = _gb_text_to_record(entry.get("gb_text") or "")
+        with _tempfile.TemporaryDirectory(prefix="sc-dna-cmp-") as td:
+            p = Path(td) / "sidecar.dna"
+            p.write_bytes(original)
+            side = load_genbank(str(p))
+        side_rt = _gb_text_to_record(_record_to_gb_text(side))
+        return _dna_record_signature(side_rt) == _dna_record_signature(entry_rec)
+    except Exception:
+        _log.exception("dna export: could not compare the import sidecar "
+                       "with entry %r; rebuilding from GenBank",
+                       entry.get("id"))
+        return False
+
+
 def _export_commercialsaas_dna(entry: dict, out_path: "Path | str") -> "str":
     """Write a `.dna` file for `entry`.
 
@@ -3826,6 +4032,9 @@ def _export_commercialsaas_dna(entry: dict, out_path: "Path | str") -> "str":
         raise ValueError("entry has no id; cannot resolve a path")
     original = _load_dna_original(eid)
     history_xml = entry.get("history_xml") or None
+    if original is not None and not _dna_sidecar_matches_entry(original, entry):
+        _log_event("dna_export.sidecar_stale", id=eid)
+        original = None
     if original is not None:
         # Splice mode: replace history packet, leave everything else
         # byte-identical.

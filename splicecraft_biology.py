@@ -1727,7 +1727,7 @@ def _scan_restriction_sites_impl(
 
     def _emit_resite(hits, p, site_len, strand, color, name,
                      cut_col, ext_cut_bp,
-                     top_cut_bp=-1, bottom_cut_bp=-1):
+                     top_cut_bp=-1, bottom_cut_bp=-1, cut_outside=False):
         """Emit one or two resite dicts depending on wrap. Labels only on the
         first piece so the map doesn't double-print. For wrapped sites, the
         cut_col / ext_cut_bp fields are only meaningful on the piece that
@@ -1743,6 +1743,11 @@ def _scan_restriction_sites_impl(
             "top_cut_bp":    top_cut_bp,
             "bottom_cut_bp": bottom_cut_bp,
         }
+        if cut_outside:
+            # A LINEAR molecule's end site whose cut falls past the end: the
+            # recognition sequence is really there (and cuts the moment the
+            # fragment is cloned into a vector), it just cleaves nothing HERE.
+            common["cut_outside"] = True
         if p + site_len <= n:
             hits.append({
                 "type":       "resite",
@@ -1841,9 +1846,16 @@ def _scan_restriction_sites_impl(
             # zero-length fragment), and `_emit`'s `% n` then maps a cut at n
             # onto 0 — attaching the enzyme's overhang to the WRONG END.
             # Bio.Restriction reports no site for these; so do we now.
+            #
+            # Only the CUT is dropped, not the site (2026-09-22): dropping the
+            # whole hit answered "no BsaI site" for a linear part carrying one
+            # 3 bp from its end — list-restriction-sites said 0 and a scrub
+            # reported the part clean with the site still in it.
             if not circular and (
                     (p + fwd_cut) <= 0 or (p + fwd_cut) >= n
                     or (p + rev_cut) <= 0 or (p + rev_cut) >= n):
+                _emit_resite(hits, p, site_len, 1, color, name, None, None,
+                             cut_outside=True)
                 continue
             # ext_cut_bp: absolute cut position when cut falls outside recognition
             _ext = ((p + fwd_cut) % n) if (fwd_cut <= 0 or fwd_cut >= site_len) else None
@@ -1900,6 +1912,9 @@ def _scan_restriction_sites_impl(
                 if not circular and (
                         _top_cut_raw <= 0 or _top_cut_raw >= n
                         or _bot_cut_raw <= 0 or _bot_cut_raw >= n):
+                    # Site kept, cut dropped — see the forward branch.
+                    _emit_resite(hits, p, site_len, -1, color, name, None,
+                                 None, cut_outside=True)
                     continue
                 _top_cut_bp = _top_cut_raw % n   # top-strand cut in fwd coords
                 _bot_cut_bp = _bot_cut_raw % n if n > 0 else 0
@@ -2212,6 +2227,20 @@ def _enzyme_cuts(seq: str, enzyme_names: list[str], *,
     return result
 
 
+# Type IIB enzymes cleave on BOTH sides of their site and excise a short
+# fragment. The catalog's (fwd_cut, rev_cut) holds ONE cut pair — the upstream
+# one for these — so a digest made one cut per site and every fragment next to
+# a site came out ~30 bp long, with the excised piece missing (2026-09-22). The
+# downstream pair lives here, keyed by (name, site) so a custom enzyme that
+# merely reuses one of these names keeps exactly the cuts its user defined.
+# Offsets follow the catalog convention: from the recognition START, top then
+# bottom strand. BaeI (10/15)ACNNNNGTAYC(12/7); BsaXI (9/12)ACNNNNNCTCC(10/7).
+_TYPE_IIB_SECOND_CUT: "dict[tuple[str, str], tuple[int, int]]" = {
+    ("BaeI",  "ACNNNNGTAYC"): (23, 18),
+    ("BsaXI", "ACNNNNNCTCC"): (21, 18),
+}
+
+
 def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
                         circular: bool = True) -> list[dict]:
     """Underlying scanner — see `_enzyme_cuts` for the cached entry
@@ -2314,39 +2343,46 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
                 "enzyme":       ename,
             }
 
+        pairs = [(fwd_cut, rev_cut)]
+        second = _TYPE_IIB_SECOND_CUT.get((ename, site_u))
+        if second is not None:
+            pairs.append(second)
         for p in _iter_match_starts(pat, scan_seq):
             if p >= n:
                 continue
-            # Linear molecules: skip a negative-cut enzyme whose cut would wrap
-            # past the 5' end into a phantom 3'-end fragment boundary (mirrors
-            # the restriction-overlay scan guard). Circular wraps correctly.
-            if not circular and (
-                    (p + fwd_cut) <= 0 or (p + fwd_cut) >= n
-                    or (p + rev_cut) <= 0 or (p + rev_cut) >= n):
-                continue
-            _emit(p + fwd_cut, p + rev_cut)
+            for f_cut, r_cut in pairs:
+                # Linear molecules: skip a cut that would wrap past an end
+                # into a phantom fragment boundary at the other end (mirrors
+                # the restriction-overlay scan guard). Circular wraps
+                # correctly. Checked per PAIR: a Type IIB site near an end
+                # still makes the cut that lands inside the molecule.
+                if not circular and (
+                        (p + f_cut) <= 0 or (p + f_cut) >= n
+                        or (p + r_cut) <= 0 or (p + r_cut) >= n):
+                    continue
+                _emit(p + f_cut, p + r_cut)
         if not is_pal:
             rc_pat = _iupac_pattern(rc_site)
             for p in _iter_match_starts(rc_pat, scan_seq):
                 if p >= n:
                     continue
-                # On a reverse-strand binding, the cut positions mirror
-                # around the recognition midpoint. Top cut on the bound
-                # site (= bottom strand of unbound) is `site_len - rev_cut`
-                # bases from the recognition's 5' end on the unbound
-                # forward strand; bottom cut is `site_len - fwd_cut`.
-                _rev_top_raw = p + site_len - rev_cut
-                _rev_bot_raw = p + site_len - fwd_cut
-                # Linear molecules: a reverse-strand Type IIS cut that falls
-                # past the 5' end would wrap via _emit's `% n` into a phantom
-                # 3'-end fragment boundary. Mirror the forward-path guard above
-                # (and the restriction-overlay reverse-strand guard) and drop
-                # it; circular molecules wrap correctly.
-                if not circular and (
-                        _rev_top_raw <= 0 or _rev_top_raw >= n
-                        or _rev_bot_raw <= 0 or _rev_bot_raw >= n):
-                    continue
-                _emit(_rev_top_raw, _rev_bot_raw)
+                for f_cut, r_cut in pairs:
+                    # On a reverse-strand binding, the cut positions mirror
+                    # around the recognition midpoint. Top cut on the bound
+                    # site (= bottom strand of unbound) is `site_len - r_cut`
+                    # bases from the recognition's 5' end on the unbound
+                    # forward strand; bottom cut is `site_len - f_cut`.
+                    _rev_top_raw = p + site_len - r_cut
+                    _rev_bot_raw = p + site_len - f_cut
+                    # Linear molecules: a reverse-strand Type IIS cut that
+                    # falls past an end would wrap via _emit's `% n` into a
+                    # phantom fragment boundary. Mirror the forward-path guard
+                    # above; circular molecules wrap correctly.
+                    if not circular and (
+                            _rev_top_raw <= 0 or _rev_top_raw >= n
+                            or _rev_bot_raw <= 0 or _rev_bot_raw >= n):
+                        continue
+                    _emit(_rev_top_raw, _rev_bot_raw)
     return sorted(out.values(), key=lambda c: (c["top"], c["enzyme"]))
 
 

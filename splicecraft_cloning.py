@@ -59,7 +59,9 @@ from splicecraft_history import (
 )
 from splicecraft_logging import _log, _timed
 from splicecraft_record import _gb_text_to_record, _normalize_primer_seq
-from splicecraft_util import _feature_location   # L0
+from splicecraft_util import (   # L0
+    _coerce_feature_strand, _feature_location,
+)
 
 
 def _serialize_commercialsaas_history(root: "_CommercialSaaSHistoryNode | None"
@@ -911,16 +913,13 @@ def _gibson_record_from_result(result: dict, *, name: str) -> "SeqRecord | None"
         try:
             s = int(f.get("start", 0))
             e = int(f.get("end",   0))
-            _raw_strand = f.get("strand", 1)
             # `or 1` here used to turn strand **0** into 1: the ligation
             # overhang features this very module emits are deliberately
             # arrowless (strand 0, light blue), and every simulated
             # traditional-clone / Gibson product saved them pointing
             # FORWARD (agent field report 2026-09-12). 0 is a real strand
             # value, not a falsy default; only None/"" fall back to +1.
-            strand = 1 if _raw_strand in (None, "") else int(_raw_strand)
-            if strand not in (-1, 0, 1, 2):
-                strand = 1
+            strand = _coerce_feature_strand(f.get("strand", 1))
         except (TypeError, ValueError):
             continue
         if s == e or n == 0:
@@ -2444,7 +2443,13 @@ def _rc_fragment(frag: dict) -> dict:
         new_f = dict(f)
         new_f["start"]  = max(0, min(new_n, new_start_raw))
         new_f["end"]    = max(0, min(new_n, new_end_raw))
-        new_f["strand"] = -int(f.get("strand", 1) or 0) or 0
+        # Only a DIRECTED strand flips. 0 (arrowless) and 2 (double) are
+        # orientation-free markers — the old `-int(...)` turned 2 into -2,
+        # which is not a strand at all, and the record builder then coerced
+        # it to FORWARD: every double-stranded feature in a reverse-
+        # orientation insert came out pointing right (audit 2026-09-22).
+        _old_strand = _coerce_feature_strand(f.get("strand", 1))
+        new_f["strand"] = -_old_strand if _old_strand in (-1, 1) else _old_strand
         # The clamp is not free. An overhang that was on the TOP strand
         # before the flip is on the BOTTOM strand after it, so its bases
         # leave `top_seq` — and a feature that reached into them loses
@@ -2577,6 +2582,12 @@ def _enzyme_is_type_iis(name: str) -> bool:
     return hi > len(site) or lo < 0
 
 
+# Largest total of bases a tailed PCR product can lose to its two off-cuts
+# (primer pad + the site bases outside each cut). Anything larger means the
+# "interior" piece came from sites INSIDE the user's region.
+_TAILED_PCR_OFFCUT_MAX_BP = 60
+
+
 @_timed("op.excise_pcr_insert", threshold_ms=25)
 def _excise_pcr_insert(seq: str, enz_left: str, enz_right: str, *,
                         features: "list[dict] | None" = None,
@@ -2656,7 +2667,19 @@ def _excise_pcr_insert(seq: str, enz_left: str, enz_right: str, *,
     # 1) Treat the input as a FULL PCR product first (tails already present).
     interior = _interior(cleaned, features)
     if len(interior) == 1:
-        return interior[0], None
+        frag = interior[0]
+        # "Already tailed" only when the two cuts sit at the TERMINI: a real
+        # tailed amplicon loses just its pad + the outside-the-cut site bases.
+        # A bare region that merely CONTAINS one site of each enzyme also
+        # digests to one interior piece — and that piece was returned as the
+        # insert, silently discarding the rest of the user's region (a
+        # 1,212 bp gene cloned as 406 bp; audit 2026-09-22). Large off-cuts
+        # mean the sites are inside the region: refuse, as the tailed path
+        # already did for the same biology.
+        offcut = len(cleaned) - len(frag.get("top_seq") or "")
+        if offcut <= _TAILED_PCR_OFFCUT_MAX_BP:
+            return frag, None
+        return None, _internal_site_err()
     if len(interior) > 1:
         return None, _internal_site_err()
 

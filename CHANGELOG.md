@@ -14,6 +14,125 @@
 
 ---
 
+## [1.2.71] — 2026-09-22
+
+A deep re-audit that re-derived every verdict an earlier pass had called
+settled. Roughly thirty fixes; the ones you are most likely to have hit come
+first.
+
+### Bug fixes
+
+- **A reverse primer whose 3' end sits in a restriction site was reported as
+  a bad forward primer.** Check Primer, `check-primer` and the primer-library
+  scan seeded on the oligo's 3' end in a way that skipped the reverse-strand
+  pass whenever that end reads the same both ways — the normal shape of a
+  cloning primer with a site in its tail. A primer that anneals perfectly came
+  back as a 56 %-identity hit 13 bp from where it really binds.
+- **A restriction site near the end of a linear fragment reported as absent.**
+  If the enzyme's cut fell past the end of the molecule the whole site was
+  dropped, so a part carrying a BsaI site three bases from its end listed no
+  sites at all — and a domestication scrub called it clean with the site still
+  in it. The site is listed now, marked as cutting nothing *here*; it still
+  cuts once the fragment goes into a vector.
+- **A gel lane with a mistyped enzyme drew the uncut plasmid as if it were the
+  digest.** `bsai`, `Eco31I` or `EcoR1` matched nothing and the lane showed one
+  full-length band — indistinguishable from a real single cut. Names are matched
+  properly now (case and trade synonyms included), an unknown one is refused,
+  and an enzyme that genuinely doesn't cut leaves the circle running as
+  supercoiled and nicked, not as a linear band.
+- **BaeI and BsaXI only cut on one side of their site.** These enzymes cut on
+  BOTH sides and excise a short piece; the digest made one cut per site, so
+  every neighbouring fragment came out about 30 bp long and the excised piece
+  vanished. Checked against Biopython on 600 random molecules.
+- **Melting temperatures differed between screens.** The mutagenesis designers
+  used different reaction conditions from everything else, so the same oligo
+  read 2–3 °C hotter in Mutato than in Check Primer, and a PCR program built
+  from a stored mutagenesis Tm annealed that much too hot. One set of
+  conditions everywhere now. A primer with an N or other ambiguity code also
+  gets a real nearest-neighbour temperature (its weakest variant) instead of a
+  rule-of-thumb estimate that could be 12 °C out.
+- **A plasmid whose file doesn't state its topology is a circle everywhere.**
+  The map drew it as a circle while roughly fifteen other places treated it as
+  linear — so the map showed a site across the origin that the same plasmid's
+  site list answered "none" for, and the Constructor digested it as a linear
+  molecule. Also fixed: a plasmid *named* something like "pLinear2" was read as
+  linear, because the name was being searched for the word.
+- **Ctrl+S dropped part of the library entry.** Saving from the canvas rebuilt
+  the entry from scratch, losing its map view mode, any stored sequencing
+  alignments, its kind tag and its original added date. The other save path had
+  always kept them.
+- **A named amplicon could silently fail to save.** A double-stranded feature
+  made the save raise, and the error was swallowed — the user who named it
+  found nothing in the library. Double-stranded and arrowless features now
+  survive every rebuild (they were also being turned into forward arrows in
+  reverse-orientation inserts), and a save that fails says so.
+- **The synthesis editor quietly rewrote what it loaded.** A spliced feature was
+  flattened into one span — turning an intron into coding sequence — and saved
+  back over the original entry, which also lost its organism, comment and
+  source. It refuses such an entry now and names the features; everything else
+  it loads keeps its provenance through a re-save. A protein file containing X,
+  B or Z residues is refused too, rather than dropping them and renumbering
+  every residue after.
+- **The codon optimizer could optimise for the wrong host.** Asking for a table
+  by name, or by a plain (unquoted) taxid, fell through to the E. coli default
+  instead of the host you asked for. It now resolves names and integers, and
+  refuses a table it cannot find.
+- **A plasmid name containing square brackets could hide text — or close the
+  app.** About sixty tables show names read from files; a name like
+  `[alpha] clone 3` lost its bracketed part, and one containing `[/b]` crashed
+  the display. Names now render exactly as written.
+- **A primer name that starts with `=`, `+`, `-` or `@` is no longer a formula.**
+  Exported order CSVs quoted such names as text, and the importer strips the
+  quoting back off, so a name like `-10 box fwd` survives a round trip.
+- **The simulator said "no amplicons — check orientation" when a primer bound
+  thousands of times.** It now says that is what happened.
+- **A GFF3 file covering several sequences can no longer be applied to one
+  plasmid.** Only the first sequence name was read, so every row — whichever
+  contig it described — landed on the open plasmid.
+- **An exported notebook could mangle a link inside an image caption**, and
+  doubled the `&` in every web address. Both fixed, and a few more address
+  spellings that a browser treats as external are now dropped.
+- **Sequence edits made through the agent API now invalidate work already in
+  flight**, so a restriction scan started before the edit can't repaint the old
+  sites over the new bases.
+- **`check-primer` accepts a dU-containing primer** (it reads U as T, and says
+  so) instead of refusing it.
+- **Transcription maps of linear molecules no longer wrap.** A gene ending on
+  the last base appeared to be reached by promoters that point away from it.
+- **Clicking a BaeI or BsaXI site highlighted most of the plasmid** instead of
+  its own cut footprint.
+- **The scrub's Save-primers and Draw-on-map buttons stay off until the design
+  is verified**, matching the "NOT verified — do not order" line beside them,
+  and the scrub refuses a linear record outright (it rebuilds a circle).
+- **A mislabelled resistance marker.** One shipped feature preset named `aadA`
+  is an APH(3')-IIIa kanamycin kinase — several public records label it that
+  way — so annotating from it told you a kanamycin plasmid was
+  spectinomycin-resistant. It is now `KanR (aph(3')-IIIa)`, and a separately
+  curated `SmR/SpecR (aadA)` has been added.
+
+### Hardening
+
+- **The web demo refuses host-filesystem screens centrally.** Ten ways in were
+  gated one at a time and as many were missed; every file browser, exporter and
+  importer is now refused in one place, with a test that fails if a new one is
+  added.
+- **Network fetches**: an address whose host is percent-encoded is refused (it
+  could be checked as one host and reached as another), and the blocked ranges
+  now cover the special-purpose blocks that aren't "private" but aren't public
+  either — including the one some clouds put their metadata service on.
+- **Pre-signed download links are no longer written to the log** (and therefore
+  no longer travel in a diagnostic bundle) with their signatures intact.
+- **Construction history in a `.dna` file is parsed with entity expansion off.**
+- **Generated OT-2 protocols** contain valid Python for every message, including
+  ones with emoji or a non-text value.
+- **Babs asks before opening a web address she wrote herself** — in every mode,
+  including read-only. An address from your message, or from a search she just
+  ran, opens without asking. Text she reads from your files and from her own
+  knowledge corpus now counts as outside text, so a change made after reading
+  one asks for your OK the same way a change after a web page does.
+
+---
+
 ## [1.2.70] — 2026-09-22
 
 ### New features

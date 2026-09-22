@@ -4248,9 +4248,12 @@ class TestSynthesisProteinOpenIntegration:
             assert scr._protein_loaded_id is None
             assert scr._protein_dirty is True
 
-    async def test_open_drops_ambiguity_codes(self, tmp_path):
-        # X is accepted by the file parser but the editor can't store it;
-        # it should be filtered out of the loaded buffer.
+    async def test_open_refuses_ambiguity_codes(self, tmp_path):
+        # X is accepted by the FILE parser but the editor can't store it.
+        # It used to be filtered out of the loaded buffer — which shortens
+        # the protein and renumbers every residue after it, so the construct
+        # you go on to design is not the one in the file (and nobody can
+        # order DNA for an unknown residue anyway). Refused since 2026-09-22.
         p = self._write_fasta(tmp_path, ">amb\nMKXMK\n", "amb.fasta")
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
@@ -4271,7 +4274,8 @@ class TestSynthesisProteinOpenIntegration:
             await pilot.pause()
             await pilot.pause()
             pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
-            assert pe.get_state()[0] == "MKMK"   # X dropped
+            assert pe.get_state()[0] == ""       # nothing loaded
+            assert scr._protein_loaded_name is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

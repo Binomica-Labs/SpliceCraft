@@ -66,7 +66,12 @@ _GEOMETRIES = [
     ("codon_start3 -", lambda n: (_cds(30, 330, -1, codon_start=3), None)),
     ("spliced +",      lambda n: (_spliced([(30, 180), (300, 450)], 1),
                                   [(30, 180), (300, 450)])),
-    ("spliced -",      lambda n: (_spliced([(30, 180), (300, 450)], -1),
+    # Minus-strand parts in READING order (descending) — what Biopython
+    # stores for `complement(join(31..180,301..450))`. The ascending list
+    # this fixture used is a DIFFERENT molecule to Biopython's `extract()`
+    # (rc(A)+rc(B), an origin-crossing reading); SpliceCraft now reads parts
+    # the way every exporter and external tool does (audit 2026-09-22).
+    ("spliced -",      lambda n: (_spliced([(300, 450), (30, 180)], -1),
                                   [(30, 180), (300, 450)])),
     ("wrap +",         lambda n: (_wrap(500, 200, 1, n), None)),
     ("wrap -",         lambda n: (_wrap(500, 200, -1, n), None)),

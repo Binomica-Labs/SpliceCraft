@@ -6178,8 +6178,13 @@ class TestCheckPrimer:
         # The old filter kept every IUPAC letter, so a label rode along as
         # bases: "kanR-R: ACGT…" was checked as KANRRACGT… with a Tm to match.
         oligo = "ACGTACGTTTGGCCAAGTGA"
+        # `{oligo}U` was here too until 2026-09-22: a USER-cloning primer
+        # really does carry deoxyuridine, the binding matcher already reads U
+        # as T, and check-primer was the one path that refused it. It is
+        # accepted now and the response says `read_u_as_t` — see
+        # `test_deoxyuridine_is_read_as_thymine_and_said_so`.
         for bad in (f"kanR-R: {oligo}", f"name={oligo}", f"primer F {oligo}",
-                    f"{oligo}U", "ACGT<b>ACGT"):
+                    f"{oligo}E", "ACGT<b>ACGT"):
             err, code = sc._h_check_primer(None, {"primer": bad})
             assert code == 400 and "'primer'" in err["error"], bad
         err, code = sc._h_check_primer(None, {"sequence": f"kanR-R: {oligo}"})

@@ -52,6 +52,7 @@ from splicecraft_persistence import (
     _iter_backups,
     _prune_backups,
     _prune_lost_entries,
+    _read_backup_bytes,
     _safe_file_size_check,
     _safe_save_json,
 )
@@ -1893,8 +1894,10 @@ def _restore_from_backup(target_path: Path, source_path: Path,
     if not ok:
         raise ValueError(reason or "backup file rejected")
     try:
-        raw = json.loads(source_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        # Gzipped generations are the norm (launch housekeeping compresses
+        # every older one) — read through the gzip-aware, size-capped reader.
+        raw = json.loads(_read_backup_bytes(source_path).decode("utf-8-sig"))
+    except (OSError, ValueError) as exc:
         raise ValueError(f"unreadable backup: {exc}") from exc
     # If the source backup carries a higher-than-current schema version,
     # stamp it under the *target* path so the subsequent `_safe_save_json`

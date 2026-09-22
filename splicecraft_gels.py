@@ -15,7 +15,9 @@ import uuid as _uuid
 
 from rich.text import Text
 
-from splicecraft_biology import _digest_with_enzymes
+from splicecraft_biology import (
+    _digest_with_enzymes, _enzyme_cuts, _enzyme_resolve_one,
+)
 from splicecraft_util import (
     _now_iso, _sanitize_gel_id, _sanitize_label, _sanitize_note,
 )
@@ -250,6 +252,26 @@ def _agarose_mobility(bp: int, gel_pct: float,
     return _GEL_EDGE_BAND - _GEL_EDGE_BAND * damped
 
 
+def _gel_resolve_enzymes(detail: str) -> "tuple[list[str], list[str]]":
+    """Split a lane's comma-separated enzyme text into ``(catalog_names,
+    unknown_names)`` — case-insensitive, commercial synonyms honoured
+    (``bsai`` / ``Eco31I`` → BsaI). The digest scan matches catalog names
+    EXACTLY, so passing the raw text through turned a lower-case or synonym
+    spelling into "no cuts"."""
+    resolved: "list[str]" = []
+    unknown: "list[str]" = []
+    for raw in str(detail or "").split(","):
+        name = raw.strip()
+        if not name:
+            continue
+        hit = _enzyme_resolve_one(name)
+        if hit is None:
+            unknown.append(name)
+        elif hit[0] not in resolved:
+            resolved.append(hit[0])
+    return resolved, unknown
+
+
 def _gel_bands_for_lane(
     lane:          dict,
     *,
@@ -287,10 +309,22 @@ def _gel_bands_for_lane(
     elif src == "digest":
         if not template_seq:
             return []
-        enz_list = [e.strip() for e in detail.split(",") if e.strip()]
-        if not enz_list:
+        enz_list, unknown = _gel_resolve_enzymes(detail)
+        if not enz_list or unknown:
+            # An unrecognised name is NOT "cuts nowhere": drawing the uncut
+            # template as the answer read as "this digest leaves one band".
+            # The lane stays empty; callers report `unknown` (see
+            # `_gel_resolve_enzymes`).
             return []
         try:
+            if not _enzyme_cuts(template_seq, enz_list,
+                                circular=template_circular):
+                # Nothing cuts. A circle stays a circle — supercoiled plus a
+                # nicked band, exactly like the uncut-plasmid lane — not a
+                # full-length LINEAR band, which runs somewhere else entirely.
+                n = len(template_seq)
+                return ([(n, "supercoiled"), (n, "nicked")]
+                        if template_circular else [(n, "linear")])
             frags = _digest_with_enzymes(template_seq, enz_list,
                                           circular=template_circular)
         except (ValueError, KeyError, RuntimeError):

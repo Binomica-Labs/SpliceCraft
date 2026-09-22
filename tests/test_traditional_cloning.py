@@ -4216,16 +4216,34 @@ class TestLinearDonorHardening:
         assert sorted([len(a["top_seq"]), len(b["top_seq"])]) == [14, 86]
 
     @pytest.mark.parametrize("topology", [None, "", "  ", "unknown"])
-    def test_an_undeclared_topology_keeps_its_historical_refusal(self,
-                                                                 topology):
-        """Only an EXPLICIT `linear` gets the linear model. The map draws an
-        un-annotated record as a CIRCLE, so quietly cloning it as a linear
-        fragment would disagree with what the user is looking at — it keeps
-        refusing, exactly as it did before the linear path existed."""
+    def test_an_undeclared_topology_is_digested_as_a_circle(self, topology):
+        """Only an EXPLICIT `linear` gets the linear model; everything else —
+        including a record that says nothing — is a circle.
+
+        This USED to refuse ("3 fragments — need exactly 2"), on the reasoning
+        that guessing is worse than stopping. Re-derived 2026-09-22: the guess
+        isn't a guess. `_record_is_circular` is the app-wide rule, the map
+        draws an un-annotated record as a CIRCLE, the sequence panel wraps it,
+        the restriction scan crosses its origin, and two of the five digest
+        call sites (`_assembly_fragment_*`, the Golden Gate vector check)
+        already read it that way. The Constructor was the outlier, and its
+        refusal named a fragment count the user could not reconcile with the
+        two fragments drawn on the map in front of them."""
+        rec = self._rec(topology)
+        a, erra = self._pane()._build_insert_from_plasmid(
+            rec, ["SalI", "XhoI"], donor_frag_idx=0)
+        b, errb = self._pane()._build_insert_from_plasmid(
+            rec, ["SalI", "XhoI"], donor_frag_idx=1)
+        assert erra is None and errb is None
+        assert sorted([len(a["top_seq"]), len(b["top_seq"])]) == [14, 86]
+
+    def test_a_declared_linear_donor_still_uses_the_linear_model(self):
+        """The other half of the rule: an explicit `linear` is never treated
+        as a circle — three pieces, and the two-cut middle one is the donor."""
         frag, err = self._pane()._build_insert_from_plasmid(
-            self._rec(topology), ["SalI", "XhoI"])
-        assert frag is None
-        assert "exactly 2" in err, err
+            self._rec("linear"), ["SalI", "XhoI"])
+        assert err is None, err
+        assert len(frag["top_seq"]) == 86
 
     @pytest.mark.parametrize("idx", [-1, 0, 1, 99])
     def test_a_stale_fragment_pick_cannot_change_a_linear_donor(self, idx):

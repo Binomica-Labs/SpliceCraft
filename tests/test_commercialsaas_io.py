@@ -51,6 +51,19 @@ def _make_minimal_dna(*packets: tuple[int, bytes]) -> bytes:
     return out
 
 
+def _gb_matching(seq: str, circular: bool = True) -> str:
+    """GenBank text for a library entry whose sequence matches a minimal
+    sidecar — every real entry carries `gb_text`, and splice-mode export only
+    reuses a sidecar that still describes the entry (audit 2026-09-22)."""
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    rec = SeqRecord(Seq(seq), id="x", name="x", description="x",
+                    annotations={"molecule_type": "DNA",
+                                 "topology": "circular" if circular
+                                 else "linear"})
+    return sc._record_to_gb_text(rec)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Packet iterator
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1362,7 +1375,7 @@ class TestExportCommercialSaaSDna:
                     'seqLen="100" circular="1" '
                     'operation="insertFragment"/></HistoryTree>')
         entry = {"id": "test_entry", "name": "test",
-                  "history_xml": new_xml}
+                  "history_xml": new_xml, "gb_text": _gb_matching("ATGC")}
         out_path = tmp_path / "exported.dna"
         result = sc._export_commercialsaas_dna(entry, out_path)
         assert result == str(out_path.resolve())
@@ -1382,7 +1395,8 @@ class TestExportCommercialSaaSDna:
         sc._save_dna_original("entry_no_hist", sidecar)
         # Entry has NO history_xml field — export should remove the
         # 0x07 packet entirely.
-        entry = {"id": "entry_no_hist", "name": "x"}
+        entry = {"id": "entry_no_hist", "name": "x",
+                  "gb_text": _gb_matching("ATGC")}
         out_path = tmp_path / "stripped.dna"
         sc._export_commercialsaas_dna(entry, out_path)
         assert sc._extract_commercialsaas_history_xml(out_path.read_bytes()) is None
@@ -1399,7 +1413,8 @@ class TestExportCommercialSaaSDna:
         sc._save_dna_original("weirdo", sidecar)
         new_xml = ("<HistoryTree><Node name='x' type='DNA' seqLen='4' "
                     "circular='1' operation='insertFragment'/></HistoryTree>")
-        entry = {"id": "weirdo", "name": "weirdo", "history_xml": new_xml}
+        entry = {"id": "weirdo", "name": "weirdo", "history_xml": new_xml,
+                  "gb_text": _gb_matching("ATGC")}
         out_path = tmp_path / "weirdo.dna"
         sc._export_commercialsaas_dna(entry, out_path)
         out_packets = {t: p for t, _l, p in

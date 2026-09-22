@@ -1647,18 +1647,23 @@ class TestMirrorSwapShrinkSuppression:
         spill_dir = tmp_path / "lost_entries"
         assert not spill_dir.exists() or not list(spill_dir.iterdir())
 
-    def test_switch_helper_arms_mirror_token(self, monkeypatch):
-        seen = {}
-
-        def _fake_save_library(plasmids, **kw):
-            seen["token"] = sc._mirror_swap_depth()
-            seen["plasmids"] = plasmids
-
-        monkeypatch.setattr(sc, "_save_library", _fake_save_library)
-        sc._switch_active_collection_library([{"id": "x"}])
-        assert seen["token"] >= 1                  # armed during the call
-        assert seen["plasmids"] == [{"id": "x"}]
-        assert sc._mirror_swap_depth() == 0          # released afterwards
+    def test_activate_collection_is_a_mirror_swap(self):
+        """A big→tiny collection switch rewrites the live library as an
+        EXPECTED mirror swap: no redundant `lost_entries/` spill, no >90%
+        catastrophic refusal (the dropped plasmids live on in collections)."""
+        big = [{"id": f"b{i}", "name": f"b{i}", "gb_text": ""}
+               for i in range(20)]
+        sc._save_collections([
+            {"name": "Big", "plasmids": big},
+            {"name": "Tiny", "plasmids": [{"id": "x", "name": "x",
+                                           "gb_text": ""}]}])
+        sc._activate_collection("Big")
+        sc._activate_collection("Tiny")
+        assert [e["id"] for e in sc._load_library()] == ["x"]
+        assert sc._get_active_collection_name() == "Tiny"
+        assert sc._mirror_swap_depth() == 0
+        spill = sc._state._DATA_DIR / "lost_entries"
+        assert not spill.exists() or not list(spill.iterdir())
 
 
 class TestBackupCompression:
