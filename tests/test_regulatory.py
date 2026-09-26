@@ -70,8 +70,14 @@ class TestPromoterScan:
     def test_tss_sits_downstream_of_the_minus10(self):
         seq = _rand(200, 2) + _PERFECT_PROMOTER + _rand(200, 3)
         top = reg._scan_promoters(seq, circular=False)[0]
-        # -35 start + 6 + spacer + the documented offset from the -10 5' end.
-        assert top["tss"] == 200 + 6 + 17 + 7
+        # The -10 hexamer sits at -12..-7 and the start is +1, so the TSS is 12
+        # bases past the hexamer's FIRST base — i.e. 7 past its last, which is
+        # the spacing the literature quotes. Written out from the textbook
+        # numbering rather than from the module's constant on purpose.
+        minus10_start = 200 + 6 + 17
+        assert top["minus10_start"] == minus10_start
+        assert top["tss"] == minus10_start + 12
+        assert top["tss"] == (minus10_start + 5) + 7   # same, from the 3' end
 
     def test_a_degraded_hexamer_scores_below_a_perfect_one(self):
         good = _rand(120, 4) + _PERFECT_PROMOTER + _rand(120, 5)

@@ -14,6 +14,341 @@
 
 ---
 
+## [1.3.0] — 2026-09-25
+
+A big one, hence 1.3. The tail of the 2026-09-22 audit, worked to the end —
+well over a hundred fixes. The previous release took everything that could
+put wrong biology in front of you; this one finishes the list, and it
+includes several ways a plasmid, or a whole collection, could be overwritten.
+Those come first. Every fix was then attacked twice more against outside
+references — the robot's own planner and pipette definitions, Biopython, a
+second `.dna` reader, the terminal toolkit's own markup parser, brute
+force — and what that turned up is folded in below.
+
+### New features
+
+- **A GTG or TTG start codon shows as Met when the file says it is one.**
+  lacI — in pET, pGEX and pMAL vectors — starts GTG, and its protein starts
+  M: an initiator tRNA reads a start codon as Met whatever it is. The
+  amino-acid lane, the protein copied with Ctrl+C and the residue editor
+  said V1 where the file, UniProt and the popular commercial plasmid editor
+  say M. Residue 1 now reads M, marked in red as that editor marks it, when the CDS's own annotation says so:
+  its `/translation` begins with M and matches the bases, or a
+  `/transl_except` declares Met there. Without that, a CDS keeps its first
+  codon's own amino acid, so a thrombin site annotated as a CDS still starts
+  with L. The agent's `find-feature` adds `protein` (the file's reading) and
+  `initiator` beside the unchanged `translation`.
+
+### Bug fixes
+
+- **Deleting a collection from the Collections dialog took one keypress** —
+  no confirmation, and the plasmid open on the canvas was cleared even with
+  unsaved edits. It now asks twice, as deleting one from the library panel
+  does, and keeps unsaved work open.
+
+- **Jumping from a primer to its plasmid in another collection could overwrite
+  that collection.** The jump moved only the active-collection pointer, so the
+  next save wrote the previous collection's plasmids over the new one's. It
+  now switches collections the way everything else does.
+- **Several ways of opening a plasmid replaced unsaved edits without asking.**
+  A Find result, a primer's go-to, the jump after saving a clone, the Sanger
+  loader, an alignment's plasmid and File → Open now ask first, as picking a
+  library row always did. Keeping your edits when a fetched or imported
+  plasmid arrives still saves it to the library — it just isn't opened.
+- **A restore from backup could be undone, overwrite a collection, or shrink
+  the library.** Restoring collections, primers, parts bins or notebook
+  projects was written back over by the next ordinary save. Restoring
+  settings — which name the active collection, primer library, parts bin and
+  notebook project — left what was open in place, so the next save wrote it
+  into whichever collection the restored settings named; work not yet saved
+  into its collection is now saved first, too. A settings backup naming a
+  collection, primer library, parts bin or project that no longer exists is
+  refused, with nothing changed, instead of pointing the app at nothing.
+  Restoring a "lost entries" backup replaced the whole file with just those
+  entries instead of adding them back — for every kind of data it holds.
+- **Plasmids saved while no collection was active were lost at the next
+  launch.** They — and primers in the same situation — are now kept in a
+  **Recovered plasmids** / **Recovered primers** collection, and you are told
+  (at the next launch, or straight away if it happens while you work).
+  Deleting the active collection, from the Collections dialog or through the
+  agent, now switches to another one.
+- **A plasmid moved between collections could be written back out of it** by
+  the next save when the second half of the move failed — and was reported as
+  failed when it had in fact been saved.
+- **A backup could be deleted the moment it was written.** Backups were
+  ordered by the time in their name, so two in one second, or a system clock
+  that stepped back, filed the newest as the oldest and retention pruned it.
+  Backups are numbered now.
+- **An edit made at the instant you pressed Ctrl+S could be marked saved
+  without being written.**
+- **A damaged stored copy of a plasmid's sequence was kept** over the good
+  copy being saved, and the plasmid then showed as unavailable.
+- **A Sanger read of your plasmid was reported as a mismatch.**
+  "Verify against reads" measured identity across the whole plasmid, so a
+  read covering 800 bp of a 5 kb construct scored about 16 % — under the
+  99 % default — and a perfect read came back as a failure. Identity is now
+  measured over the stretch of plasmid the read spans — a deletion or
+  insertion inside that stretch still counts against it — and a passing
+  partial read says plainly that it confirms the sequenced window only, not
+  the whole plasmid. A read too short to judge (under 20 aligned bases) says
+  so instead of passing.
+- **An N in a sequencing read counted differently on different screens** — as
+  coverage, as agreement, or as a change. Two reads sharing an N "confirmed" a
+  mutation, and a read of 300 N's verified at 100 %. An unreadable base is a
+  no-call everywhere now, and no longer counts toward read depth — which had
+  diluted a real 20 % minor variant into a "clonal" call.
+- **A local-mode read alignment reported positions offset by where the read
+  started aligning** — a SNP at bp 1,400 came back at bp 400, with the
+  uncovered spans shifted to match.
+- **An inversion across the origin was misreported** as a smaller flip, or
+  differently depending on how the plasmid happened to be rotated, and was
+  missed when only a short piece of it lay on one side of bp 0. A flip at
+  the very start or end of a read is reported where it is, no longer
+  reaching into plasmid the read never covered.
+- **A deletion in a run of identical bases spanning the origin was reported
+  as two different deletions**, and a read that started or ended inside the
+  run lost it. It is one event, supported by every read that shows it.
+- **Read heterogeneity counted a read that never reached a position as
+  evidence there** — one read's unsequenced end could stand in as support
+  for another read's deletion.
+- **Editing, re-origining or flipping a plasmid changed its features.** A
+  partial feature (`<1..>90`) became a complete one, a re-origin turned an
+  `order()` location into a `join()`, the record's database links (DBLINK)
+  were dropped, and a full-length `source` feature stopped short after an
+  insertion.
+- **A `.dna` file SpliceCraft wrote came back different.** Opening your own
+  export lost the plasmid's name, every custom feature colour, any text
+  between angle brackets (in a note or in the description), and which
+  features have no arrow.
+  A `.dna` from another editor keeps its arrowless features arrowless too, its
+  custom map label as the plasmid's name, and a colour changed there over the
+  one SpliceCraft originally wrote. Two features over the same bases no
+  longer trade notes on the way in.
+- **A construction history of same-length edits showed only the first one** —
+  the viewer, and a protocol built from it, hid the rest of the lineage.
+- **Construction history stopped loading after about 250 saves** — the
+  lineage of the plasmids you have worked on most.
+- **A guide whose target appears twice reported no off-targets.** The
+  second, identical cut site was being dropped along with the guide's own,
+  so the most dangerous case looked like the cleanest one. Off-target search
+  also stopped scanning the reverse strand entirely once its result cap
+  filled on the forward one, and ranked mismatches from the wrong end of
+  every reverse-strand hit. An LbCas12a guide cutting across the origin also
+  reported the wrong overhang.
+- **Checking CRISPR off-targets froze the app** — for about a minute and a half
+  on a 20 kb plasmid. The search runs in the background now.
+- **Custom labware made in AUTOLAB had its wells below the deck.** The form
+  asked for a well depth (40 mm for a tube rack) but never the labware's
+  height, and assumed 15 mm — so every custom tube rack it produced described
+  its wells 25 mm underneath the deck surface. The form now asks for the
+  height (deck to the top of the labware — it can't be worked out from the
+  wells), the confirmation shows where the well bottoms sit, and a saved
+  labware whose wells would sit below the deck is refused before a run.
+- **AUTOLAB's custom-labware form quietly used a default for a number it
+  couldn't read** — a well spacing typed `38,5` or `38.5 mm` built labware
+  with the default spacing. Every field is read strictly and a bad one is
+  named.
+- **A multichannel pipette was planned as if it had one channel.** A step
+  sent to row B of a 96-well plate would have lowered the last tip past the
+  plate's edge. Multichannel steps are checked well by well now — row A only
+  on a 96-well plate, rows A and B on a 384-well plate.
+- **Two custom labware named "Rack α" and "Rack β" were one labware type to
+  the robot**, the second driven with the first one's well geometry.
+- **A plan with a well written `a1` or `A01` passed every check, then the
+  robot refused it.** Wells are written the way the robot names them now.
+- **A distribute ran its source well dry before the last well.** The load
+  budget left out the extra liquid a distribute draws on every trip (the
+  pipette's minimum volume, blown out to the trash), and the plan's total
+  counted a distribute's per-well volume only once.
+- **A run that failed or was stopped showed as complete** — in green, over a
+  full progress bar. It now says the run ended early, and why.
+- **The pre-run pipette check ignored the pipette's generation.** A protocol
+  for a GEN2 pipette passed with a GEN1 attached and failed once the run had
+  started, while a GEN1 protocol was refused on the GEN2 pipette the robot
+  runs it on.
+- **AUTOLAB's cherry-pick and normalise accepted one plate as both source and
+  destination**, so a step could overwrite a sample a later step still had to
+  read.
+- **A tip rack that doesn't suit the pipette is caught before the run.** Tips
+  from another pipette's family (300 µL tips on a P20) can't be picked up
+  and are refused. Smaller tips of the right family (a P300 on 200 µL filter
+  tips) are a normal pairing and now say what they cost — and a distribute or
+  consolidate whose single trip won't fit the smaller tip is refused, because
+  the robot quietly ends such a step early and every well after that point
+  gets nothing.
+- **An exported plasmid could say "linear" for a plasmid drawn as a
+  circle.** A file with no topology line is a circle everywhere in
+  SpliceCraft; the exporter alone wrote `linear`, so every other tool read
+  your plasmid as a fragment. One more place also still read a plasmid
+  *named* like "pLinear2" as linear.
+- **An enzyme collection that matched nothing could return every site.** The
+  scan cache treated "this collection resolved to no usable enzyme" and "no
+  filter at all" as the same request, so which answer you got depended on
+  what had been scanned before.
+- **A restriction site was missed where your sequence carries an N.**
+  BstEII's site is `GGTNACC`; a sequence written `GGTNACC` did not match it,
+  because the ambiguity code was only understood on the enzyme's side. An
+  unknown base where the enzyme needs a specific one still does not match.
+- **Sites near a Dam or Dcm methylation target are now flagged** on the site
+  list, with the mechanism named. It reports only that a methylated base
+  falls inside the site — whether that blocks a given enzyme is per-enzyme
+  fact (BclI is blocked, BamHI and BglII are not, DpnI requires it), so the
+  note points at your supplier's table rather than guessing.
+- **On the map, a Type IIS site bound on the reverse strand put its cut tick a
+  few bases from the cut the sequence panel shows.**
+- **The transcription map reported every promoter start about 5 bp early**,
+  and treated a gene with no arrow as forward — so a gene driven by a
+  promoter on the other strand was reported as silent. A promoter or
+  terminator with no arrow is read forward and the report says so, instead
+  of driving or blocking nothing; and on a linear molecule a promoter at the
+  very end no longer "drives" a gene at the start.
+- **One terminator could be drawn as two**, depending on where the plasmid
+  happened to be rotated.
+- **A Golden Gate assembly was refused when a part was stored on the other
+  strand.** Fragments are double-stranded; the overhangs make the assembly
+  directional, not which strand the file was saved on.
+- **A Gibson overlap made of Ns was accepted as real homology**, and a
+  junction that matches far past the overlap you designed now says so — that
+  extra match is collapsed out of the downstream fragment.
+- **A digest could tag both halves of a vector as the backbone** when its
+  resistance marker was annotated across the origin, then fall back to
+  guessing by size.
+- **Building a part into a stub backbone now warns when a junction re-creates
+  a Type IIS site** — the part would be cut inside the very assembly it was
+  built for.
+- **A selenoprotein was flagged as having an internal stop.** A CDS that
+  declares its recoded codon (`/transl_except`) is read the way it declares,
+  including a codon split across the origin.
+- **An `@plasmid` note written as the plasmid's name said "No plasmid".**
+  Only the internal id was accepted. A tag followed by a semicolon
+  ("…transformed @pUC19; plated…") was not a tag at all, one longer than 64
+  characters was cut short and could open a different plasmid, and the Insert
+  button could write a tag nothing recognised for a plasmid whose id starts
+  with a digit — it uses the plasmid's name now, or says why it can't. A tag
+  that matches no plasmid suggests the closest names rather than guessing,
+  and one that matches plasmids in several collections asks which.
+- **Notebook exports contained no images.** Attachments were written to disk
+  and linked in the text, but never recorded on the entry, so the exporter
+  had nothing to embed. Each attachment now appears once and works, including
+  one saved under a Windows path; a data file written with image syntax is a
+  download link. A link whose address holds parentheses — as many DOIs do —
+  was cut at the first `)`; it is exported whole now.
+- **A notebook entry whose tags were stored as plain text showed them letter by
+  letter, or not at all** — and the next save kept the letters as tags, or
+  dropped them. Plain-text tags are read as a comma-separated list now.
+- **Notebook entries could sort out of order** around a daylight-saving change
+  or after travelling across time zones, and a numbered list that continued
+  after a paragraph restarted at 1 in an export.
+- **Opening a saved gel from the Gel Library closed the app**, and a saved gel
+  forgot the size of its PCR lanes — or its agarose percentage, when that
+  was one the menu doesn't list.
+- **A plasmid named with square brackets could close the app** from a
+  dialog. Table cells were fixed last release; this covers every other
+  place a name is shown. A notification no longer drops a bracketed word
+  either, and a name ending in a backslash no longer breaks a dialog's text.
+- **A carriage return inside a feature note made an exported file unreadable**
+  while the export reported success. Every kind of line break — including one
+  at the very end of a value — now splits it.
+- **A plasmid's name absorbed text another tool had added to the file's
+  COMMENT.**
+- **A GenBank file with no sequence (CONTIG only) crashed the app at launch.**
+  It is refused with a message now, as is a `.dna` feature with a missing or
+  impossible range.
+- **A protein file with annotated domains could not be exported at all.**
+- **A `Master Delete` left the deleted library in memory**, one keypress
+  from coming back.
+- **Two plasmids whose names differ only by accent composition** could
+  overwrite each other in a bulk export or a bulk map-image export.
+- **A GenBank date is no longer written in your system language**, and a
+  history date that never existed (FEB 30) is no longer shown as if it had.
+- Mutagenesis now names every reason it could not design a primer, instead
+  of reporting whichever was most common as if it were the only one — and no
+  longer blames the sequence ends for a dead end in the middle of a gene.
+- Recovering construction history from `.dna` files told you to narrow a large
+  scan with a filter that did not narrow it; the filter now limits what is
+  read, so a big set of files can be recovered collection by collection.
+- An out-of-range `--agent-port` is a usage error rather than a crash after
+  the window opens, and a corrupt `.dna` says so instead of showing a
+  traceback.
+
+### Hardening
+
+- **An agent call that did nothing no longer answers `ok: true`.** It
+  answers with an error status instead: 422 for `ot2-compile` of an invalid
+  plan, for `ot2-run` or `ot2-position-check` of a run that failed, stopped,
+  never started or could no longer be watched (never a status a client
+  retries on its own — a retry would move the robot again — and a run
+  SpliceCraft lost sight of is stopped first), and for a `domesticate-parts`
+  or `bulk-import-folder` batch where no item worked (the import also no
+  longer leaves an empty collection behind); 404 for a `delete-primers`,
+  `copy-plasmids` or `move-plasmids` that found nothing, 409 when the names
+  it was given were ambiguous; 500 for a `save` that failed (409 while a
+  name-clash prompt holds it). A batch where only some items worked answers
+  `ok: true` with `partial: true` and a warning for each item that didn't.
+- **An agent write naming a target it does not support is refused** instead
+  of acting on the active one. `delete-part` with a `parts_bin` deleted from
+  the ACTIVE bin; `traditional-clone`, which takes `vector_collection` /
+  `insert_collection`, saved into the active collection when sent a bare
+  `collection`. Each item of a batch is checked the same way, and an empty
+  or `null` value is not a target at all.
+- **Flags sent as text read the right way round.** `apply: "false"` wrote the
+  annotations it was asked only to preview, and `circular: "false"` analysed
+  a linear molecule as a circle.
+- **Read-heterogeneity reports every cap.** The default read limit is named
+  when it trims the reads, a FASTQ larger than the sample says how many reads
+  it holds, a custom noise floor no longer builds a `mixed` verdict out of
+  calls below it, and a fraction exactly on a histogram bin's edge lands in
+  that bin.
+- **Read-only agent sessions no longer delete each other's token.** Every
+  `--read-only` session publishes the same token file, so it holds the
+  newest session's token — and the first session to quit deleted it while
+  the other was still serving from it. A session now removes the file only
+  while it still holds its own token, and a read-only session can shut
+  itself down.
+- **Babs's approval dialog could hide part of the call it asked you to
+  approve.** Markup in a tool's arguments (a `[$background]` tag) was
+  applied rather than shown, so text could be made invisible. Arguments are
+  shown verbatim now, in the batch approval list too.
+- **An idempotency key reused with a different request is refused** rather
+  than replaying the first response — the one thing such a key exists to
+  prevent. A retry that only writes a number differently (`60`, `60.0`,
+  `6e1`) is still the same request.
+- **Every agent endpoint is documented.** `docs/agent-endpoints.md` is
+  generated from the code (267 endpoints; 144 were missing from the guide)
+  and a test fails if a new one is added without it. The security notes no
+  longer say reads are unauthenticated — they have not been for some time.
+- **A robot address must be on your own network**: a private or link-local
+  (USB) address, a Tailscale address, an address on this computer's own
+  network (campus networks often hand lab devices public addresses), a name
+  that resolves to one of those, or the address saved in AUTOLAB. A
+  cloud-metadata address is refused however it is written, as is one
+  carrying credentials, and a name is connected at the address that was
+  checked rather than looked up a second time.
+- A digest naming only unknown enzymes is refused instead of answering with
+  the uncut molecule; an agent residue edit that races a plasmid load is
+  refused instead of written over the newly loaded plasmid; a request body
+  sent with a transfer coding (chunked, gzip…), or over HTTP/1.0 without a
+  length, is refused instead of silently ignored; a qualifier name that GenBank cannot store is refused instead of
+  renamed on export; and a batch that failed reports `ok: false`.
+  `list-restriction-sites` takes its enzymes as a list or as a
+  comma-separated string, and `ot2-normalize` accepts one plate as both
+  source and destination when the destination wells you name hold no sample
+  and no diluent.
+- A `.dna` whose embedded feature, primer or notes block is over 32 MB is
+  refused before anything parses it, and SpliceCraft won't write a `.dna` it
+  couldn't read back — it asks you to export that plasmid as GenBank
+  instead. An exported SVG map stays a readable file whatever characters its
+  labels hold, and a pathological notebook entry no longer takes minutes to
+  export. A notebook exported as HTML can no longer load from another site
+  through a link that begins with an invisible control character, and a
+  backtick inside a link's address no longer breaks the link.
+- A read-only launch no longer writes to the data directory, a data file
+  recovered from backup is reported even when something else loaded it first,
+  and reading a setting no longer waits on a background save.
+- `simulate-gel` no longer fails on an impossible PCR length (`1e400`) or
+  draws a 1 bp band for `true`, and a toast with thousands of stray closing
+  tags no longer takes seconds to draw.
+
 ## [1.2.71] — 2026-09-22
 
 A deep re-audit that re-derived every verdict an earlier pass had called

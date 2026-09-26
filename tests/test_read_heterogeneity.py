@@ -262,14 +262,14 @@ class TestMeanDepth:
             aligns.append({"axis": "target", "result": {
                 "aligned_q": REF[:300], "aligned_t": REF[:300],
                 "t_start": 0, "t_end": 300, "identity_pct": 100.0}})
-        out = sc._multi_read_summary(aligns, len(REF))
+        out = sc._multi_read_summary(aligns, len(REF), circular=True)
         # Four reads over the same 300 bp: depth 4 there, 0 elsewhere.
         # Averaging over the whole 1200 bp would report 1.0.
         assert out["mean_depth"] == pytest.approx(4.0, abs=0.01)
         assert out["max_depth"] == 4
 
     def test_no_reads_reports_zero_not_a_crash(self):
-        out = sc._multi_read_summary([], 500)
+        out = sc._multi_read_summary([], 500, circular=True)
         assert out["mean_depth"] == 0.0
         assert out["max_depth"] == 0
 
@@ -290,7 +290,10 @@ class TestReadOnlyAttach:
         yield
 
     def test_every_write_endpoint_is_refused(self, read_only):
-        writes = [n for n, (_fn, w) in sc._state._AGENT_HANDLERS.items() if w]
+        # `shutdown` / `restart` end the GUEST process itself and touch no data,
+        # so a read-only guest may use them (audit 2026-09-22, AA12).
+        writes = [n for n, (_fn, w) in sc._state._AGENT_HANDLERS.items()
+                  if w and n not in ("shutdown", "restart")]
         assert writes, "no write endpoints registered — test is vacuous"
         for name in writes:
             payload, status = sc._agent_invoke(None, name, {})

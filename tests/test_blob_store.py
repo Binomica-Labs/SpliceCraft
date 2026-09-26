@@ -85,11 +85,14 @@ class TestBlobWriteRead:
 
     def test_write_idempotent_no_rewrite(self):
         ref1 = sc._blob_write(GB)
-        mtime1 = sc._blob_path(ref1).stat().st_mtime_ns
+        ino1 = sc._blob_path(ref1).stat().st_ino
         ref2 = sc._blob_write(GB)                  # identical content
         assert ref1 == ref2
-        # Immutable: the existing blob is left untouched (write skipped).
-        assert sc._blob_path(ref2).stat().st_mtime_ns == mtime1
+        # Immutable: the existing blob is not rewritten — an atomic rewrite
+        # replaces the inode. (Its mtime IS refreshed, deliberately: that is
+        # what keeps the orphan GC's grace window over a re-referenced blob.)
+        assert sc._blob_path(ref2).stat().st_ino == ino1
+        assert sc._blob_read(ref2) == GB
 
     def test_distinct_content_distinct_blobs(self):
         r1 = sc._blob_write(GB)

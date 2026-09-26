@@ -389,6 +389,35 @@ class TestAgentEndpoints:
         assert len(str(app._current_record.seq)) == len(before)
         assert app._unsaved is True
 
+    def test_a_load_right_after_the_read_is_not_overwritten(self):
+        """The handler runs on the agent's thread. It read the record FIRST and
+        captured the load counter after, so a GUI load landing between the two
+        was invisible to the stale check and the edit — computed from the
+        plasmid that had just been closed — was installed over the new one
+        (audit 2026-09-22)."""
+        import splicecraft_state as st
+        rec, other = self._rec_two_cds(), self._rec_two_cds()
+
+        class _RacingApp(self._App):
+            _record_load_counter = 0
+            installed = None
+            _reads = 0
+
+            @property
+            def _current_record(self):
+                self._reads += 1
+                if self._reads == 1:           # the GUI loads right after
+                    self._record_load_counter += 1
+                    return rec
+                return other
+
+            def _apply_record(self, rec, clear_undo=True):
+                self.installed = rec
+        app = _RacingApp()
+        fn, _w = st._AGENT_HANDLERS["edit-residue"]
+        body, code = fn(app, {"cds": "ampR", "residue": 50, "to": "W"})
+        assert code == 409 and app.installed is None
+
     def test_edit_refuses_a_bad_residue_without_touching_the_record(self):
         rec = self._rec_two_cds()
         before = str(rec.seq)

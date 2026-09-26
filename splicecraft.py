@@ -42,13 +42,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.2.71"
+__version__ = "1.3.0"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-09-22"
+_RELEASE_DATE = "2026-09-25"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -1388,6 +1388,79 @@ try:
 except (ImportError, AttributeError):          # pragma: no cover - Textual API moved
     pass
 
+# ── Static / Label content: the same class of crash, one layer over ─────────
+# `Static.update("…")` (and `Label`, which subclasses it) also parses its string
+# as markup at RENDER time. Confirm dialogs and status lines are built by
+# interpolating names straight from files — `Static(f"Delete {name}?")` — so a
+# plasmid called `pFoo[/b]` raised MarkupError out of the compositor and closed
+# the app, exactly as a table cell did, and `[@click=app.…]` installed a
+# clickable action in a dialog (audit 2026-09-22). The DataTable fix above
+# covered the ~60 table sites; this covers the ~167 Static/Label ones without
+# touching a single call site, so a NEW one cannot reintroduce the crash.
+#
+# Deliberately NOT escaping: the app's own `[green]✓[/]` markup must keep
+# working. A renderable that fails to parse, or whose tags are not real styles,
+# is shown as the literal text it is.
+try:
+    from textual import visual as _tx_visual
+    from textual.content import Content as _TxContent
+    from textual.markup import MarkupError as _TxMarkupError
+    _orig_visualize = _tx_visual.visualize
+
+    def _safe_markup_content(text: str, cls=_TxContent):
+        # Escape every bracket that is not a real style tag BEFORE parsing,
+        # so `[bold]pUC19 [v2][/bold]` keeps both the bold and the `[v2]`.
+        # Judging the parsed spans instead missed a bracketed name at the
+        # very END (`Delete pUC19 [v2]` makes an empty span Textual drops,
+        # so nothing looked wrong and `[v2]` vanished), and Rich's style
+        # parser took the theme's `[b $error]` for text. Plain text only
+        # when even that will not parse.
+        from splicecraft_util import _markup_escape_unstyled as _mu
+        fixed = _mu(text, validate=False)
+        if fixed is not None:
+            try:
+                return cls.from_markup(fixed)
+            except _TxMarkupError:
+                pass
+        return cls(text)                        # literal text, no crash
+
+    def _safe_visualize(widget, obj, markup: bool = True):
+        if markup and isinstance(obj, str) and "[" in obj:
+            return _safe_markup_content(obj)
+        return _orig_visualize(widget, obj, markup)
+
+    _tx_visual.visualize = _safe_visualize
+    # Modules that imported `visualize` BY VALUE keep the original, so the
+    # module attribute alone missed every one of them. `Static` was rebound
+    # first; the Select dropdown (`OptionList` prompts), `Widget._render` and
+    # the grid layout's width pass parse markup the same way, and a plasmid
+    # named `pFoo[/b]` in a Select still closed the app (round-2 hardening,
+    # 2026-09-25).
+    import sys as _tx_sys
+    for _tx_mod_name in ("textual.widgets._static", "textual.widgets._option_list",
+                         "textual.widget", "textual.layouts.grid"):
+        try:
+            __import__(_tx_mod_name)
+        except ImportError:                      # pragma: no cover
+            continue
+        _tx_mod = _tx_sys.modules.get(_tx_mod_name)
+        if getattr(_tx_mod, "visualize", None) is _orig_visualize:
+            setattr(_tx_mod, "visualize", _safe_visualize)
+
+    # Labels (Button, Checkbox, RadioButton, Tab, Collapsible, SelectionList)
+    # never pass through `visualize`: they call `Content.from_text`.
+    _orig_from_text = _TxContent.__dict__["from_text"].__func__
+
+    def _safe_from_text(cls, markup_content_or_text, markup: bool = True):
+        if (markup and isinstance(markup_content_or_text, str)
+                and "[" in markup_content_or_text):
+            return _safe_markup_content(markup_content_or_text, cls)
+        return _orig_from_text(cls, markup_content_or_text, markup)
+
+    _TxContent.from_text = classmethod(_safe_from_text)  # type: ignore[method-assign]
+except (ImportError, AttributeError, KeyError):  # pragma: no cover - Textual API moved
+    pass
+
 from textual.widgets import (  # noqa: E402
     Button, Checkbox, DataTable, DirectoryTree, Footer, Header, Input, Label,
     ListItem, ListView, ProgressBar, RadioButton, RadioSet, Select,  # noqa: F401
@@ -1519,6 +1592,7 @@ from splicecraft_util import (  # noqa: E402
     _format_identity_pct as _format_identity_pct,
     _sanitize_plasmid_name as _sanitize_plasmid_name,
     _now_iso as _now_iso,
+    _iso_instant as _iso_instant,  # order ISO stamps by time, not by string
     _now as _now,                # single time source (INV-78), relocated to L0
     _monotonic as _monotonic,    # elapsed-time clock (INV-78), relocated to L0
     _RUNTIME_PLATFORM as _RUNTIME_PLATFORM,  # once-at-import platform string (INV-36), L0
@@ -1562,9 +1636,10 @@ def _bg_notify_save_failure(label: str, exc: BaseException) -> None:
     Daemon-thread save workers (collection sync, parts-bin sync,
     settings flush) can't take an `app` parameter without threading
     it through every queue + closure; this helper fetches the live
-    app via `_LIVE_APP_REF` and marshals back to the UI thread via
-    `call_from_thread`. Safe to call from any thread; no-op if no
-    app is mounted (test contexts, post-shutdown).
+    app via `_LIVE_APP_REF` and POSTS the toast to the UI thread
+    (`_post_to_ui` — never `call_from_thread`, which blocks). Safe to
+    call from any thread; no-op if no app is mounted (test contexts,
+    post-shutdown).
 
     The corresponding caller pattern is::
 
@@ -1591,14 +1666,52 @@ def _bg_notify_save_failure(label: str, exc: BaseException) -> None:
             "background save failed for %s (app loop not running)", label
         )
         return
-    try:
-        app.call_from_thread(_notify_save_failure, app, label, exc)
-    except Exception:
-        # `call_from_thread` raises if the app loop has stopped (e.g.
-        # mid-shutdown between the `is_running` check above and the
-        # call here). The save failure has already been recorded
-        # via `_log.exception` inside `_notify_save_failure`.
+    # Posted, never waited for: the failing save may be running under
+    # `_cache_lock` (see `_post_to_ui`).
+    if not _post_to_ui(app, _notify_save_failure, app, label, exc):
         _log.exception("background save failed for %s", label)
+
+
+def _post_to_ui(app, fn, *args, **kwargs) -> bool:
+    """Run ``fn(*args, **kwargs)`` on the app's event loop WITHOUT waiting.
+
+    `App.call_from_thread` blocks until the callback has run. A thread that
+    holds `_cache_lock` while the UI thread waits for that same lock then
+    waits on the UI forever — an orphan-rescue toast sent from an agent
+    thread mid-switch hung the app that way (round-2 hardening,
+    2026-09-25). `call_later` only posts a message (thread-safe in Textual
+    8, from the UI thread or any other) and returns at once. False when it
+    could not be scheduled: no app, not running, or closing."""
+    if app is None or not getattr(app, "is_running", False):
+        return False
+    try:
+        return bool(app.call_later(fn, *args, **kwargs))
+    except Exception:
+        _log.exception("could not post %s to the UI",
+                       getattr(fn, "__name__", "a callback"))
+        return False
+
+
+def _announce_recovered_orphans(msg: str) -> None:
+    """Tell the user that plasmids or primers were kept in a "Recovered"
+    collection. Before launch finishes the notice waits on
+    `_state._RECOVERED_ORPHANS_NOTICE` for `on_mount`, which is up before any
+    toast can show; a rescue DURING a session — a switch or a delete that
+    found work in no collection — is toasted at once, because nothing reads
+    that list again and the user was never told."""
+    app = _LIVE_APP_REF.get()
+    if (app is None or not getattr(app, "is_running", False)
+            or not getattr(app, "_orphan_notices_drained", False)):
+        _state._RECOVERED_ORPHANS_NOTICE.append(msg)
+        return
+
+    def _show() -> None:
+        app.notify(msg, title="Nothing was lost", severity="warning",
+                   timeout=20, markup=False)
+    # Rescues run under `_cache_lock` (a switch, a flush, a restore), so the
+    # toast is posted, never waited for — see `_post_to_ui`.
+    if not _post_to_ui(app, _show):
+        _state._RECOVERED_ORPHANS_NOTICE.append(msg)
 
 
 # Backup-retention + lost-entries + read-back tunables (_state._BACKUP_RETENTION_COUNT,
@@ -1801,21 +1914,64 @@ def _blob_exists(gb_ref: str) -> bool:
         return False
 
 
+# Blob paths whose on-disk bytes this process has hashed and found to match
+# their name — `_blob_write` re-verifies an existing blob only once per path.
+_BLOB_VERIFIED_PATHS: "set[str]" = set()
+
+
+def _blob_existing_is_sound(path: Path, ref: str, size: int) -> bool:
+    """Does the blob already at ``path`` hold exactly the bytes ``ref`` names?
+    A size check every time (a truncated or half-written file fails it for the
+    price of a stat); a full re-hash once per path per session."""
+    key = str(path)
+    try:
+        if path.stat().st_size != size:
+            return False
+        if key in _BLOB_VERIFIED_PATHS:
+            return True
+        sound = _blob_hash_bytes(path.read_bytes()) == ref
+    except OSError:
+        return False
+    if sound:
+        _BLOB_VERIFIED_PATHS.add(key)
+    return sound
+
+
 def _blob_write(gb_text: str) -> str:
     """Persist `gb_text` as an immutable content-addressed blob; return its
-    ref (sha256 hex). Idempotent: an existing blob is correct by
-    construction (name == hash) so the write is skipped. New blobs are
-    written atomically THEN re-read + re-hashed; a mismatch unlinks the bad
-    file and raises so a corrupt write never becomes a trusted blob.
-    Raises ValueError/OSError on failure so callers ABORT rather than
-    reference a blob that isn't safely on disk."""
+    ref (sha256 hex). Idempotent: an existing blob whose bytes still match its
+    name is reused. New blobs are written atomically THEN re-read + re-hashed;
+    a mismatch unlinks the bad file and raises so a corrupt write never
+    becomes a trusted blob. Raises ValueError/OSError on failure so callers
+    ABORT rather than reference a blob that isn't safely on disk.
+
+    An EXISTING blob used to be trusted on sight ("correct by construction —
+    name == hash"). That holds for the write, not for what a disk, a sync
+    tool or a crash later does to the file: a truncated blob was kept, the
+    good text in hand thrown away, and every read after that verified the
+    hash, failed, and reported the sequence unavailable (audit 2026-09-22,
+    FM11). A damaged blob is now rewritten from the text being saved.
+
+    Reusing a blob also re-stamps its mtime. The orphan GC protects only
+    blobs younger than `_BLOB_GC_GRACE_SECONDS`, so re-saving text whose blob
+    had gone unreferenced (an undo back to an older version) left a window in
+    which a GC that had read the metadata a moment earlier quarantined the
+    blob the new entry was about to reference (D15)."""
     if not isinstance(gb_text, str):
         raise ValueError("gb_text must be a str")
     data = gb_text.encode("utf-8")
     ref = _blob_hash_bytes(data)
     path = _blob_path(ref)
     if path.is_file():
-        return ref
+        if _blob_existing_is_sound(path, ref, len(data)):
+            try:
+                os.utime(path, None)
+            except OSError:
+                pass
+            return ref
+        _log.warning("blob %s on disk does not match its name — rewriting it "
+                     "from the text being saved", ref)
+        _BLOB_VERIFIED_PATHS.discard(str(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_bytes(path, data)
     try:
@@ -2552,17 +2708,22 @@ def _acquire_data_dir_lock(
                     os.close(fd)
                 except OSError:
                     pass
-                # If WE just created the lockfile but couldn't flock
-                # it (rare race: a second instance won the lock between
-                # our open and our flock), don't leave a zero-byte
-                # lockfile behind. Only the creating process is allowed
-                # to clean up — otherwise we'd race-remove the holding
-                # process's metadata file.
+                # We do NOT unlink, even when WE created the file. Losing the
+                # flock means another instance won it on THIS inode — and it
+                # reached the file through the same path, so unlinking removes
+                # the path out from under a live holder. Its flock survives (the
+                # lock is on the inode), but the next launch then creates a FRESH
+                # lockfile and wins a flock on a DIFFERENT inode: two instances
+                # both believing they hold the data dir, which is the corruption
+                # this lock exists to prevent. Same inode race that kept the
+                # stale-lock reclaim from unlinking (sweep #25); tidiness is not
+                # worth it, and a zero-byte lockfile is harmless — the next
+                # launch opens and flocks it normally (audit 2026-09-22).
                 if we_created_lockfile:
-                    try:
-                        lockfile.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                    _log.info(
+                        "lost the flock race on a lockfile we created; leaving "
+                        "%s in place (unlinking it would race the winner's "
+                        "inode)", _scrub_path(str(lockfile)))
                 _log_event("lock.contended", path=_scrub_path(str(lockfile)),
                             held_by=held_by or "unknown")
                 hint = f" (held by PID {held_by})" if held_by else ""
@@ -4427,7 +4588,7 @@ def _after_library_save() -> None:
     _invalidate_library_kmer_cache()
 
 
-def _flush_library_into_active_collection() -> None:
+def _flush_library_into_active_collection(what: str = "switch") -> None:
     """Make sure the in-memory library has reached the collection it belongs
     to — the CURRENT active one — before anything moves the pointer away.
 
@@ -4447,15 +4608,28 @@ def _flush_library_into_active_collection() -> None:
     with _cache_lock:
         name = _get_active_collection_name()
         cache = _state._library_cache
-        if not name or cache is None:
+        if cache is None:
             return
         target = None
-        for c in _iter_collections_readonly():
-            if isinstance(c, dict) and c.get("name") == name:
-                target = c
-                break
+        if name:
+            for c in _iter_collections_readonly():
+                if isinstance(c, dict) and c.get("name") == name:
+                    target = c
+                    break
         if target is None:
-            return          # dangling pointer — no collection to push into
+            # No collection to push into (none active, or it was deleted by
+            # another session) — and the switch is about to overwrite the
+            # library. Keep what no collection holds (D10).
+            _rescue_orphan_library_entries(f"{what} with no active collection")
+            # Everything the library holds is now in SOME collection, so it no
+            # longer holds the only copy of anything. A dirty marker left set
+            # made the re-stage after a settings restore REFUSE, and the next
+            # save wrote this stale library into whatever collection the
+            # restored pointer named — over its own plasmids (round-2
+            # hardening, 2026-09-25).
+            if _mirror_is_dirty() and not _library_orphans():
+                _clear_mirror_dirty()
+            return
         if not _mirror_is_dirty() and (target.get("plasmids") or []) == cache:
             return
         try:
@@ -4463,12 +4637,13 @@ def _flush_library_into_active_collection() -> None:
         except BaseException as exc:
             raise RuntimeError(
                 f"your latest plasmid-library changes could not be saved "
-                f"into collection {name!r} ({exc}); the switch was cancelled "
+                f"into collection {name!r} ({exc}); the {what} was cancelled "
                 f"so they are not lost") from exc
 
 
 def _activate_collection(name: str,
-                         plasmids: "list[dict] | None" = None) -> None:
+                         plasmids: "list[dict] | None" = None, *,
+                         discard_outgoing: bool = False) -> None:
     """THE active-collection switch: make ``name`` active with ``plasmids``
     (default: the collection's stored plasmids) as the live library.
 
@@ -4492,7 +4667,11 @@ def _activate_collection(name: str,
     if not isinstance(name, str) or not name:
         raise ValueError("collection name required")
     with _cache_lock:
-        _flush_library_into_active_collection()
+        # `discard_outgoing`: the outgoing collection was just DELETED on
+        # purpose, so its plasmids — still in the library — are meant to go.
+        # Flushing (or rescuing them as orphans) would undo the delete.
+        if not discard_outgoing:
+            _flush_library_into_active_collection()
         target_ro = next((c for c in _iter_collections_readonly()
                           if isinstance(c, dict) and c.get("name") == name),
                          None)
@@ -4985,15 +5164,119 @@ from splicecraft_util import (  # noqa: E402
     _feature_traversal as _feature_traversal,
     _phred_in_alignment_frame as _phred_in_alignment_frame,
     _markup_escape as _markup_escape,
+    _markup_escape_unstyled as _markup_escape_unstyled,
     _markup_parses as _markup_parses,
     _restrand_location as _restrand_location,
     _record_is_circular as _record_is_circular,
+    _variant_group_key as _variant_group_key,
     _feature_location as _feature_location,
     _coerce_feature_strand as _coerce_feature_strand,
     _biopython_strand as _biopython_strand,
     _double_strand_qualifiers as _double_strand_qualifiers,
     _name_modal_result as _name_modal_result,
 )
+
+
+_RECOVERED_PLASMIDS_COLLECTION = "Recovered plasmids"
+_RECOVERED_PRIMERS_COLLECTION = "Recovered primers"
+
+
+def _library_orphans(lib: "list[dict] | None" = None) -> "list[dict]":
+    """Library entries that no collection holds AS THEY ARE: an id no
+    collection has, or one a collection has with different content. Matching
+    on the id alone called an edit "held" when the id also sat in some OTHER
+    collection, and the edit was lost at the next switch (round-2 hardening,
+    2026-09-25). A library entry and the collection copy it mirrors are
+    equal dicts, so a changed field — sequence, name, reads — is a change."""
+    if lib is None:
+        lib = [e for e in (_load_library() or []) if isinstance(e, dict)]
+    held: "dict[str, list[dict]]" = {}
+    recovered: "list[dict]" = []
+    for c in _iter_collections_readonly():
+        if not isinstance(c, dict):
+            continue
+        for pl in c.get("plasmids") or []:
+            if isinstance(pl, dict) and pl.get("id"):
+                held.setdefault(pl["id"], []).append(pl)
+                if c.get("name") == _RECOVERED_PLASMIDS_COLLECTION:
+                    recovered.append(pl)
+
+    def _is_held(e: dict) -> bool:
+        if e.get("id") and any(pl == e for pl in held.get(e["id"], ())):
+            return True
+        # A copy kept earlier under an id of its own (see the rescue).
+        return any(_same_but_id(pl, e) for pl in recovered)
+    return [e for e in lib if not _is_held(e)]
+
+
+def _same_but_id(a: dict, b: dict) -> bool:
+    """Two library entries equal in everything but their ``id``."""
+    keys = set(a) | set(b)
+    keys.discard("id")
+    return all(a.get(k) == b.get(k) for k in keys)
+
+
+def _rescue_orphan_library_entries(why: str) -> int:
+    """Keep every library entry that belongs to NO collection, by putting it
+    in the "Recovered plasmids" collection, before something overwrites the
+    library. Returns how many entries were added there.
+
+    `plasmid_library.json` mirrors the ACTIVE collection. With no collection
+    active (or the active one deleted by another session) it can hold plasmids
+    that exist nowhere else, and every way out of that state rewrites the
+    file: the launch adopts the first collection and restores the library
+    from it, and a switch writes the next collection over it. Both used to
+    discard the work; marking the mirror dirty (the first fix) was worse —
+    launch then kept the file and flushed it INTO the collection it had just
+    made active, replacing that collection's own plasmids (audit 2026-09-22,
+    D10). Nothing already held by a collection is touched."""
+    with _cache_lock:
+        try:
+            lib = [e for e in (_load_library() or []) if isinstance(e, dict)]
+        except Exception:
+            _log.exception("orphan rescue: could not read the library")
+            return 0
+        if not lib:
+            return 0
+        orphans = _library_orphans(lib)
+        if not orphans:
+            return 0
+        colls = _load_collections()
+        rec = next((c for c in colls if isinstance(c, dict)
+                    and c.get("name") == _RECOVERED_PLASMIDS_COLLECTION), None)
+        if rec is None:
+            rec = {"name": _RECOVERED_PLASMIDS_COLLECTION,
+                   "description": ("Plasmids found in the library but in no "
+                                   "collection — kept here rather than "
+                                   "overwritten"),
+                   "plasmids": [], "saved": _date.today().isoformat()}
+            colls.append(rec)
+        kept = [pl for pl in (rec.get("plasmids") or []) if isinstance(pl, dict)]
+        ids = {pl.get("id") for pl in kept}
+        added: "list[dict]" = []
+        for e in orphans:
+            if any(_same_but_id(pl, e) for pl in kept + added):
+                continue                         # already recovered as is
+            copy = _typed_clone(e)
+            if copy.get("id") in ids:
+                # An EDITED copy of a plasmid recovered earlier: keep both,
+                # under an id of its own (ids are unique within a collection).
+                base, n = str(copy.get("id")), 2
+                while f"{base}-{n}" in ids:
+                    n += 1
+                copy["id"] = f"{base}-{n}"
+            ids.add(copy.get("id"))
+            added.append(copy)
+        if not added:
+            return 0
+        rec["plasmids"] = kept + added
+        _save_collections(colls)
+    _log.warning("orphan rescue (%s): %d plasmid(s) in no collection kept in "
+                 "%r", why, len(added), _RECOVERED_PLASMIDS_COLLECTION)
+    _announce_recovered_orphans(
+        f"{len(added)} plasmid(s) that belonged to no collection were kept in "
+        f"the collection {_RECOVERED_PLASMIDS_COLLECTION!r}.")
+    return len(added)
 
 
 def _ensure_default_collection() -> None:
@@ -5007,6 +5290,9 @@ def _ensure_default_collection() -> None:
     colls = _load_collections()
     if colls:
         if not _get_active_collection_name():
+            # The library is about to be restored FROM the first collection;
+            # keep whatever it holds that no collection does (D10).
+            _rescue_orphan_library_entries("launch with no active collection")
             first = colls[0].get("name")
             if first:
                 _set_active_collection_name(first)
@@ -5106,13 +5392,17 @@ def _drain_collection_sync_loop() -> None:
 
 def _sync_active_collection_plasmids(
     entries: list[dict], *, async_write: bool = False,
-) -> None:
+) -> bool:
     """Mirror the live library's contents into the active collection so the
     on-disk collection record never drifts from the panel's view.
 
-    Silent no-op if no collection is active, or if the active name has
-    been deleted (e.g. user removed it via the manager) — the next
-    explicit Load/Save will re-establish a target.
+    Returns True when the entries were written (or, async, queued) into an
+    existing active collection; False — a no-op — when no collection is
+    active or the active name has been deleted. `_save_library` needs the
+    difference: a save that reached NO collection leaves the library file
+    holding work nothing else has, and clearing the dirty marker after it let
+    the next launch overwrite that work from whichever collection became
+    active (audit 2026-09-22, D10).
 
     Default is synchronous so existing callers (Constructor save,
     rename flows, tests that assert post-save state immediately) see
@@ -5128,7 +5418,7 @@ def _sync_active_collection_plasmids(
     """
     name = _get_active_collection_name()
     if not name:
-        return
+        return False
     if not async_write or _collection_sync_force_sync:
         # SYNC: the snapshot is consumed within this lock, and `_save_collections`
         # deep-clones on its cache reseat (`_state._collections_cache =
@@ -5155,13 +5445,13 @@ def _sync_active_collection_plasmids(
                     target_idx = i
                     break
             if target_idx is None:
-                return
+                return False
             new_colls = list(src)
             updated = _typed_clone(new_colls[target_idx])
             updated["plasmids"] = live
             new_colls[target_idx] = updated
             _save_collections(new_colls)
-        return
+        return True
     # ASYNC: the snapshot is queued and processed LATER by the background thread,
     # so it MUST be a deep clone taken NOW — the caller is free to keep mutating
     # `entries` (a follow-up CRUD on the same in-memory list) before the worker
@@ -5181,6 +5471,7 @@ def _sync_active_collection_plasmids(
             _state._collection_sync_thread.start()
     # Signal AFTER releasing the lock so the worker can grab it.
     _collection_sync_event.set()
+    return True
 
 
 # ── Register the library/collections hooks the dataaccess sibling fires ──────
@@ -5317,6 +5608,34 @@ def _restore_library_from_active_collection() -> None:
     # path) would leak into the cache and the next reader would see
     # stale-but-different-from-disk library entries.
     _state._library_cache = _typed_clone(plasmids)
+
+
+def _restage_library_mirror_after_commit(plasmids, what: str) -> "str | None":
+    """Bring the live library mirror — file AND cache — into line with the
+    ACTIVE collection's plasmids after a COMMITTED `collections.json` write
+    that changed it (a move or copy into or out of the active collection).
+    Returns None, or the reason the mirror FILE could not be written.
+
+    `collections.json` is the source of truth and its write has landed, so
+    the change has happened whatever follows. The cache is re-seated from the
+    committed plasmids either way, so this session's next library save writes
+    what the collection holds. A failed FILE write is left to the next launch,
+    which restores the mirror from the collection — which is exactly why this
+    must NOT mark the mirror dirty. "Dirty" tells launch the library file is
+    the NEWER copy; after a committed move it is the older one, and marking
+    it kept the pre-move view at launch and saved it back over the move. The
+    moves also used to clear the cache instead of re-seating it, so the next
+    in-session save re-read that same stale file (audit 2026-09-22, D9)."""
+    rows = [dict(p) for p in (plasmids or []) if isinstance(p, dict)]
+    reason = None
+    try:
+        _safe_save_json_mirror(_state._LIBRARY_FILE, rows, "Plasmid library")
+    except Exception as exc:
+        _log.exception("%s: the library mirror could not be re-staged after a "
+                       "committed collections write", what)
+        reason = _scrub_path(str(exc)) or type(exc).__name__
+    _state._library_cache = _typed_clone(rows)
+    return reason
 
 
 # ── Restriction sites ──────────────────────────────────────────────────────────
@@ -5742,6 +6061,15 @@ from splicecraft_biology import (  # noqa: E402
     _digest_with_enzymes as _digest_with_enzymes,
     _bp_in_span       as _bp_in_span,
     _span_in_span     as _span_in_span,
+    _covered_identity as _covered_identity,
+    _read_end_columns as _read_end_columns,
+    _read_extent_from_rows as _read_extent_from_rows,
+    _read_extent_for as _read_extent_for,
+    _read_is_clipped as _read_is_clipped,
+    _read_is_full_length as _read_is_full_length,
+    _PARTIAL_READ_FRACTION as _PARTIAL_READ_FRACTION,
+    _read_no_call_positions as _read_no_call_positions,
+    _span_full_lap_len as _span_full_lap_len,
     _enzyme_signature as _enzyme_signature,
     _enzyme_aliases   as _enzyme_aliases,
     _enzyme_alias_table as _enzyme_alias_table,
@@ -5799,11 +6127,26 @@ from splicecraft_gels import (  # noqa: E402
     _GEL_MAX_LANES as _GEL_MAX_LANES,
     _new_gel_id as _new_gel_id,
     _normalise_gel_entry as _normalise_gel_entry,
+    _gel_lane_pcr_bp as _gel_lane_pcr_bp,
     _agarose_mobility as _agarose_mobility,
     _gel_bands_for_lane as _gel_bands_for_lane,
     _gel_resolve_enzymes as _gel_resolve_enzymes,
     _render_gel_image as _render_gel_image,
 )
+
+
+def _agarose_menu(pct: float) -> "tuple[list[tuple[str, str]], str]":
+    """The Simulator's agarose menu for a gel at `pct`, and the value to
+    select in it: the standard choices, plus `pct` itself when it is not one
+    of them (a gel saved by the agent at 0.65%), so the menu shows the
+    percentage the gel is actually drawn at."""
+    opts = [(f"{g:.1f}%", str(g)) for g in _AGAROSE_CHOICES]
+    for g in _AGAROSE_CHOICES:
+        if abs(g - pct) < 1e-9:
+            return opts, str(g)
+    opts.append((f"{pct:g}%", str(pct)))
+    opts.sort(key=lambda o: float(o[1]))
+    return opts, str(pct)
 
 # The [SUB-experiments] entry-processing core (Phase D, L1) — re-exported so the
 # hub-side body-readers, notes rendering, agent endpoints + the
@@ -5819,6 +6162,7 @@ from splicecraft_experiments import (  # noqa: E402
     _EXPERIMENT_ID_RE as _EXPERIMENT_ID_RE,
     _EXPERIMENT_ACTIONS as _EXPERIMENT_ACTIONS,
     _as_str_list as _as_str_list,
+    _tag_values as _tag_values,
     _sanitize_experiment_id as _sanitize_experiment_id,
     _new_experiment_id as _new_experiment_id,
     _migrate_legacy_tag_format as _migrate_legacy_tag_format,
@@ -5911,6 +6255,9 @@ from splicecraft_backup import (  # noqa: E402
     # Settings -> Restore-from-backup (per-file recovery engine + labels)
     _list_recoverable_backups as _list_recoverable_backups,
     _restore_from_backup as _restore_from_backup,
+    _read_backup_entries as _read_backup_entries,
+    _merge_spilled_entries as _merge_spilled_entries,
+    _is_lost_entries_spill as _is_lost_entries_spill,
     _resolve_backup_label as _resolve_backup_label,
     _AGENT_BACKUP_LABELS as _AGENT_BACKUP_LABELS,
 )
@@ -5971,6 +6318,9 @@ from splicecraft_fileio import (  # noqa: E402
     _build_commercialsaas_notes_packet as _build_commercialsaas_notes_packet,
     _extract_commercialsaas_file_date as _extract_commercialsaas_file_date,
     _commercialsaas_feat_name as _commercialsaas_feat_name,
+    _commercialsaas_decode_text as _commercialsaas_decode_text,
+    _xml_legal_text as _xml_legal_text,
+    _commercialsaas_encode_text as _commercialsaas_encode_text,
     _build_commercialsaas_addprops_packet_default as _build_commercialsaas_addprops_packet_default,
     _build_commercialsaas_primers_packet_default as _build_commercialsaas_primers_packet_default,
     _commercialsaas_iter_location_parts as _commercialsaas_iter_location_parts,
@@ -6023,6 +6373,7 @@ from splicecraft_codon import (  # noqa: E402
     _CODON_TABLE as _CODON_TABLE,
     _CODON_TABLE_BY_ID as _CODON_TABLE_BY_ID,
     _codon_table_for as _codon_table_for,
+    _codon_start_codons_for as _codon_start_codons_for,
     _STOP_CODONS as _STOP_CODONS,
     _CODON_MODE_FREQUENCY as _CODON_MODE_FREQUENCY,
     _CODON_MODE_MAX_CAI as _CODON_MODE_MAX_CAI,
@@ -7060,6 +7411,19 @@ def _paint_cds_aa(arr: list[tuple[str, str]], f: dict,
     # string formatting.
     stop_sty = (f"reverse bold {_STOP_AA_COLOR}" if is_aa_active
                 else f"bold {_STOP_AA_COLOR}")
+    # Residue 1 read as the initiator Met on the annotation's word, not by the
+    # codon table (a GTG / TTG start): marked, as the commercial editor marks it, so an M
+    # over a GTG is visibly a convention and not a misread codon.
+    init_sty = ((f"reverse bold {_INIT_AA_COLOR}" if is_aa_active
+                 else f"bold {_INIT_AA_COLOR}")
+                if f.get("_init_m") else None)
+
+    def _aa_sty(ci: int, ch: str) -> str:
+        if ch == _STOP_AA_CHAR:
+            return stop_sty
+        if ci == 0 and init_sty:
+            return init_sty
+        return sty
     content_w = chunk_end - chunk_start
     # /codon_start offset (1/2/3 → 0/1/2 leading bases skipped). Applied
     # in CDS-5'-end direction so it shifts forward-strand AA letters
@@ -7080,10 +7444,7 @@ def _paint_cds_aa(arr: list[tuple[str, str]], f: dict,
                 col = aa_bp - chunk_start
                 if 0 <= col < content_w:
                     ch = aa_letters[ci]
-                    arr[col] = (
-                        ch,
-                        stop_sty if ch == _STOP_AA_CHAR else sty,
-                    )
+                    arr[col] = (ch, _aa_sty(ci, ch))
         return
     if orig_e >= orig_s:
         # Non-wrap: narrow the codon range whose midpoint can land in
@@ -7113,10 +7474,7 @@ def _paint_cds_aa(arr: list[tuple[str, str]], f: dict,
             col = aa_bp - chunk_start
             if 0 <= col < content_w:
                 ch = aa_letters[ci]
-                arr[col] = (
-                    ch,
-                    stop_sty if ch == _STOP_AA_CHAR else sty,
-                )
+                arr[col] = (ch, _aa_sty(ci, ch))
 
 
 def _render_packed_strand(result: "Text",
@@ -8467,8 +8825,11 @@ def _cds_aa_list(seq: str, f: dict) -> tuple[list[str], int, int]:
         tid = 1
     table_map = _codon_table_for(tid)
     exon_key = tuple(exons) if exons else None
+    # Residue 1 read as the initiator Met on the annotation's word
+    # (`_cds_initiator_source`, stamped by `PlasmidMap._parse`).
+    init_m = bool(f.get("_init_m"))
     # hash(seq) instead of id(seq) — see `_build_seq_inputs`.
-    key = (hash(seq), s, e, strand, exon_key, cs_offset, tid)
+    key = (hash(seq), s, e, strand, exon_key, cs_offset, tid, init_m)
     cached = _CDS_AA_CACHE.get(key)
     if cached is not None:
         return cached
@@ -8499,6 +8860,8 @@ def _cds_aa_list(seq: str, f: dict) -> tuple[list[str], int, int]:
         table_map.get(cds_seq[3*i:3*i+3], "?")
         for i in range(n_codons)
     ]
+    if init_m and aa_letters:
+        aa_letters[0] = "M"
     if len(_CDS_AA_CACHE) >= 64:
         _CDS_AA_CACHE.pop(next(iter(_CDS_AA_CACHE)))
     result = (aa_letters, cds_len, virt_e)
@@ -8799,6 +9162,33 @@ def _protein_edit_plan(record, feat, residue: int, new_aa: str, *,
     )
     table = _codon_table_for(tt)
     wt_aa = table.get(wt_codon, "?")
+    # What the annotation DECLARES this residue to be wins over the codon
+    # table: a selenocysteine at a UGA is `U`, not a stop — reading it as
+    # `*` planned the edit as "removes a stop" (audit 2026-09-22, C6).
+    _coding = _cds_coding_positions(total, feat, circular=_circ)
+
+    def _reads_as(r: int) -> str:
+        cod = "".join(
+            (_comp_base(seq[p]) if strand == -1 else seq[p].upper())
+            for p in _coding[(r - 1) * 3:(r - 1) * 3 + 3])
+        return table.get(cod, "?")
+    _quals = getattr(feat, "qualifiers", None) or {}
+    _declared = _transl_except_residues(
+        _quals.get("transl_except"), _coding, reads_as=_reads_as)
+    if residue in _declared:
+        wt_aa = _declared[residue]
+    # Residue 1 of a GTG / TTG-started CDS the annotation reads as Met (lacI)
+    # IS Met — the residue the AA lane shows and the protein has.
+    initiator = None
+    if residue == 1 and (_quals.get("translation")
+                         or _quals.get("transl_except")):
+        initiator = _cds_initiator_source(
+            _quals,
+            "".join(_reads_as(r) for r in range(1, len(_coding) // 3 + 1)),
+            first_codon=wt_codon, transl_table=tt,
+            codon_start=_cds_codon_start(feat), coding_positions=_coding)
+        if initiator:
+            wt_aa = "M"
     alternatives = _codon_choices_for_aa(want, taxid=taxid, transl_table=tt)
     if codon not in (None, ""):
         if not isinstance(codon, str):
@@ -8845,6 +9235,9 @@ def _protein_edit_plan(record, feat, residue: int, new_aa: str, *,
         "protein_len":  len(_cds_coding_positions(total, feat,
                                                   circular=_circ)) // 3,
         "transl_table": tt,
+        # Why residue 1 reads as Met although its codon does not
+        # ("translation" / "transl_except"), else None.
+        "initiator":    initiator,
     }
 
 
@@ -8904,6 +9297,8 @@ _state._translate_cds_hook = _translate_cds
 # branching per-letter.
 _STOP_AA_CHAR  = "*"
 _STOP_AA_COLOR = "red"
+# Residue 1 of a CDS whose own annotation reads its GTG / TTG start as Met.
+_INIT_AA_COLOR = "red"
 
 # Sweep #41 (2026-05-27): premature-stop warning glyph. Stamped on
 # a CDS's rendered label whenever its translation produces more
@@ -9393,9 +9788,12 @@ from splicecraft_cloning import (  # noqa: E402
     _PUPD2_BACKBONE_STUB as _PUPD2_BACKBONE_STUB,
     _simulate_primed_amplicon as _simulate_primed_amplicon,
     _simulate_cloned_plasmid as _simulate_cloned_plasmid,
+    _cloned_plasmid_regenerated_sites as _cloned_plasmid_regenerated_sites,
+    _gibson_overlap_definite_bases as _gibson_overlap_definite_bases,
     # Gibson assembly simulator [INV-85/86]
     _GIBSON_MIN_OVERLAP_BP as _GIBSON_MIN_OVERLAP_BP,
     _GIBSON_MAX_OVERLAP_BP as _GIBSON_MAX_OVERLAP_BP,
+    _GIB_LONG_OVERLAP_SLACK_BP as _GIB_LONG_OVERLAP_SLACK_BP,
     _gibson_overlap_len as _gibson_overlap_len,
     _gibson_failure as _gibson_failure,
     _gibson_normalize_fragments as _gibson_normalize_fragments,
@@ -10924,6 +11322,7 @@ _MAX_VARIANTS_PER_ALIGNMENT = 10_000
 def _extract_variants_from_alignment(
     aligned_q: str, aligned_t: str,
     *, max_variants: int = _MAX_VARIANTS_PER_ALIGNMENT,
+    circular: bool = False,
 ) -> "list[dict]":
     """Walk a pairwise alignment string pair and emit one variant
     record per discrepancy. Returns ``[{type, target_pos, length,
@@ -11024,7 +11423,14 @@ def _extract_variants_from_alignment(
                 "alt":        "".join(alt_chars),
             })
             continue
-        # Both non-gap.
+        # Both non-gap. A raw character comparison ON PURPOSE: an ambiguity code
+        # has to reach the caller as an OBSERVATION so ambiguous coverage stays
+        # visible (`analyse-read-heterogeneity` counts these as no-calls rather
+        # than votes — dropping them here would silently erase the fact that a
+        # position was unreadable). `iupac_compatible` says which kind it is, so
+        # a consumer asking "is this a real difference?" no longer has to
+        # re-derive it and cannot disagree with the map drawn from the same
+        # alignment (audit 2026-09-22).
         if ac.upper() != bc.upper():
             variants.append({
                 "type":       "snp",
@@ -11032,12 +11438,100 @@ def _extract_variants_from_alignment(
                 "length":     1,
                 "ref":        bc.upper(),
                 "alt":        ac.upper(),
+                "iupac_compatible": _iupac_compatible(ac.upper(), bc.upper()),
             })
         target_pos += 1
         i += 1
-    return variants
+    return _add_normalised_indel_positions(
+        variants, aligned_t.replace("-", "").upper(), circular=circular)
 
 
+def _add_normalised_indel_positions(variants: "list[dict]",
+                                    target: str, *,
+                                    circular: bool = False) -> "list[dict]":
+    """Add ``norm_pos`` / ``norm_ref`` / ``norm_alt``: each indel shifted as far
+    LEFT as it can go without changing the sequence it describes (the VCF
+    convention).
+
+    Inside a homopolymer or a tandem repeat an aligner may place a 1 bp deletion
+    at any position in the run, and two reads carrying the SAME deletion often
+    get different placements. The cross-read rollup keys variants by position, so
+    one deletion came back as several, each with a single read behind it —
+    support split exactly where a caller is deciding whether a variant is real
+    (audit 2026-09-22).
+
+    ``target_pos`` is left EXACTLY where the alignment put it, because that is
+    the column `_variant_phred` and `_annotate_variants_with_quality` look the
+    read's basecalls up by: the canonical position for grouping reads and the
+    actual position of the bases in this alignment are two different questions,
+    and collapsing them made the quality lookup miss its own variant.
+
+    Substitutions get no ``norm_pos``: they have one position by definition.
+
+    On a ``circular`` target the shift wraps: a homopolymer crossing bp 0 has
+    its start near the END of the sequence, and stopping at 0 filed one
+    deletion at two positions depending on where each read's aligner put it
+    (audit 2026-09-24). Bounded by one lap, so a run that IS the whole circle
+    cannot loop.
+    """
+    if not variants or not target:
+        return variants
+    n = len(target)
+    out: "list[dict]" = []
+    for v in variants:
+        kind = v.get("type")
+        try:
+            pos = int(v.get("target_pos", 0))
+        except (TypeError, ValueError):
+            out.append(v)
+            continue
+        if kind == "deletion":
+            length = len(str(v.get("ref") or ""))
+            # On a circle a deletion may cross bp 0 (one joined back from the
+            # two ends of the rows — `_merge_origin_split_indels`).
+            if (length <= 0 or length >= n
+                    or (not circular and pos + length > n)):
+                out.append(v)
+                continue
+            # A deletion can move left while the base before the run equals the
+            # last base OF the run — the deleted set is then the same bases.
+            if circular:
+                steps = 0
+                while (steps < n and target[(pos - 1) % n]
+                       == target[(pos + length - 1) % n]):
+                    pos = (pos - 1) % n
+                    steps += 1
+                ref = (target + target)[pos:pos + length]
+            else:
+                while pos > 0 and target[pos - 1] == target[pos + length - 1]:
+                    pos -= 1
+                ref = target[pos:pos + length]
+            out.append({**v, "norm_pos": pos, "norm_ref": ref, "norm_alt": ""})
+        elif kind == "insertion":
+            alt = str(v.get("alt") or "")
+            if not alt:
+                out.append(v)
+                continue
+            # An insertion sits BETWEEN pos-1 and pos; shifting it left rotates
+            # the inserted string so the resulting sequence is unchanged.
+            if circular:
+                steps = 0
+                while steps < n and alt[-1] == target[(pos - 1) % n]:
+                    pos = (pos - 1) % n
+                    alt = alt[-1] + alt[:-1]
+                    steps += 1
+                # After the last base IS before the first on a circle: one
+                # insertion at the origin was filed at n by some reads and at
+                # 0 by others, and grouped as two events.
+                pos %= n
+            else:
+                while pos > 0 and alt[-1] == target[pos - 1]:
+                    pos -= 1
+                    alt = alt[-1] + alt[:-1]
+            out.append({**v, "norm_pos": pos, "norm_ref": "", "norm_alt": alt})
+        else:
+            out.append(v)
+    return out
 # ── Basecall-quality-aware read verification ──────────────────────────────────
 # Everything above interprets an alignment on IDENTITY alone: a mismatch is a
 # mismatch wherever it lands. A Sanger trace does not work that way. Both ends
@@ -11282,7 +11776,7 @@ def _annotate_variants_with_quality(
 def _trace_verification_summary(
     aligned_q: str, aligned_t: str, phred,
     *, min_phred: int = _SANGER_MIN_PHRED_DEFAULT,
-    variants=None, circular: bool = True,
+    variants=None, circular: bool, frame_shift=0, clipped: bool = False,
 ) -> dict:
     """Read a trace-vs-plasmid alignment the way a bench scientist would.
 
@@ -11317,9 +11811,17 @@ def _trace_verification_summary(
     # Only what the read LOOKED AT: the plasmid outside its observed extent
     # is absence of data, not a deletion. Counting the two unread ends made
     # a perfect partial read say "2 real changes" (audit 2026-09-22).
+    # `circular` has no default: True judged a LINEAR reference as a circle
+    # wherever a caller left it out (the agent did), and a partial read's
+    # unread start came back as a confident deletion (round-2 hardening,
+    # 2026-09-25). `clipped`: a local alignment's soft-clipped read ends.
     _t_len = sum(1 for c in (aligned_t or "") if c != "-")
-    _extent = _extent_from_aligned_spans(
-        _aligned_target_spans(aligned_q, aligned_t), _t_len, circular)
+    _extent = (_read_extent_from_rows(aligned_q, aligned_t, _t_len,
+                                      frame_shift=frame_shift,
+                                      circular=circular, clipped=clipped)
+               or _extent_from_aligned_spans(
+                   _aligned_target_spans(aligned_q, aligned_t), _t_len,
+                   circular))
     if _extent:
         variants = [v for v in (variants or [])
                     if not isinstance(v, dict) or v.get("type") == "truncated"
@@ -11327,6 +11829,16 @@ def _trace_verification_summary(
                                      _extent)]
     ann = _annotate_variants_with_quality(
         variants, aligned_q, aligned_t, quals, min_phred=thr)
+    # An ambiguity code is not a CHANGE. `analyse-read-heterogeneity` already
+    # counts these as no-calls rather than votes; this tally did not, so an `N`
+    # in the read — or in the reference — made the verdict `real_changes` for a
+    # position nobody actually read differently, and the two halves of the app
+    # disagreed about the same alignment (audit 2026-09-22). Counted separately
+    # so the ambiguity stays visible instead of being silently dropped.
+    n_no_call = sum(1 for v in ann
+                    if v.get("type") == "snp" and v.get("iupac_compatible"))
+    ann = [v for v in ann
+           if not (v.get("type") == "snp" and v.get("iupac_compatible"))]
 
     def _tally(types) -> "tuple[int, int, int, int]":
         rows = [v for v in ann if v.get("type") in types]
@@ -11384,6 +11896,9 @@ def _trace_verification_summary(
         "n_indel_unknown":   ind_u,
         "n_confident":        snp_c + ind_c,
         "n_lowq":             snp_l + ind_l,
+        # Positions where an ambiguity code meant nothing could be called — not
+        # a change, and not agreement either.
+        "n_no_call":          n_no_call,
         "confident_positions": conf_pos,
         "lowq_positions":      lowq_pos,
         "truncated":         truncated,
@@ -11438,7 +11953,8 @@ _MULTI_READ_MIN_SUPPORT = 2      # reads that must agree to call it confirmed
 _MULTI_READ_MAX_VARIANTS = 2000  # bound on the rollup for a divergent pile
 
 
-def _alignment_variants_in_axis(align: dict) -> "list[dict]":
+def _alignment_variants_in_axis(align: dict, *,
+                                circular: bool = False) -> "list[dict]":
     """Variants of one alignment, numbered in the RENDER axis' frame.
 
     `_extract_variants_from_alignment` numbers positions in its SECOND
@@ -11453,8 +11969,93 @@ def _alignment_variants_in_axis(align: dict) -> "list[dict]":
     if not aq or not at:
         return []
     if align.get("axis", "target") == "query":
-        return _extract_variants_from_alignment(at, aq)
-    return _extract_variants_from_alignment(aq, at)
+        vs = _extract_variants_from_alignment(at, aq, circular=circular)
+        ref = aq
+    else:
+        vs = _extract_variants_from_alignment(aq, at, circular=circular)
+        ref = at
+    if circular:
+        vs = _merge_origin_split_indels(vs, ref.replace("-", "").upper())
+    return vs
+
+
+def _merge_origin_split_indels(variants: "list[dict]",
+                               target: str) -> "list[dict]":
+    """On a circle the rows begin and end at bp 0, so ONE indel crossing the
+    origin arrives as TWO: a piece at the start of the rows and a piece at
+    their end. Joined back into the single event it is. Keyed apart, both
+    halves normalised onto one position and the read was counted twice — a 50%
+    culture came back `clonal` — or one event's support was split between a
+    1 bp and a 2 bp key (round-2 hardening, 2026-09-25). A partial read's two
+    unread ends join the same way and stay outside its extent."""
+    n = len(target)
+    idx = [i for i, v in enumerate(variants) if isinstance(v, dict)
+           and v.get("type") in ("snp", "insertion", "deletion")]
+    if n <= 0 or len(idx) < 2:
+        return variants
+    i0, i1 = idx[0], idx[-1]
+    first, last = variants[i0], variants[i1]
+    kind = first.get("type")
+    if kind != last.get("type") or kind not in ("deletion", "insertion"):
+        return variants
+    p0, p1 = first.get("target_pos"), last.get("target_pos")
+    if (not isinstance(p0, int) or not isinstance(p1, int)
+            or isinstance(p0, bool) or isinstance(p1, bool)):
+        return variants
+    if kind == "deletion":
+        l0 = len(str(first.get("ref") or ""))
+        l1 = len(str(last.get("ref") or ""))
+        if p0 != 0 or l0 <= 0 or l1 <= 0 or l0 + l1 >= n or p1 + l1 > n:
+            return variants
+        # Each half may sit anywhere its repeat lets it slide: the head half
+        # as far LEFT across bp 0 as its normalised position, the tail half as
+        # far RIGHT as the bases allow — aligners split one event unevenly
+        # (1 bp before the seam, or 5 bp one base early). The halves are one
+        # deletion when the two ranges meet.
+        a = int(first.get("norm_pos", 0) or 0)
+        head_from = a if 0 < a < n else n          # 0 ≡ n: no shift at all
+        tail_end = p1 + l1
+        tail_max, steps = tail_end, 0
+        while steps < n and target[(tail_max - l1) % n] == target[tail_max % n]:
+            tail_max += 1
+            steps += 1
+        if max(tail_end, head_from) > min(tail_max, n):
+            return variants
+        joint = max(tail_end, head_from)
+        start = (joint - l1) % n
+        merged = {"type": "deletion", "target_pos": start,
+                  "length": l0 + l1,
+                  "ref": (target + target)[start:start + l0 + l1],
+                  "alt": ""}
+    else:
+        alt0, alt1 = str(first.get("alt") or ""), str(last.get("alt") or "")
+        if p0 != 0 or not alt0 or not alt1 or not (0 <= p1 <= n):
+            return variants
+        # An insertion slides while the base it moves past equals the one
+        # it rotates round: the tail half RIGHT from p1 toward bp 0, the head
+        # half LEFT from bp 0 (≡ n). They are one event when the ranges meet.
+        right, a1, r_max = p1, alt1, p1
+        reach_r = {p1: alt1}
+        while r_max < n and a1[0] == target[r_max]:
+            a1 = a1[1:] + a1[0]
+            r_max += 1
+            reach_r[r_max] = a1
+        a0, l_min = alt0, n
+        reach_l = {n: alt0}
+        while l_min > p1 and a0[-1] == target[(l_min - 1) % n]:
+            a0 = a0[-1] + a0[:-1]
+            l_min -= 1
+            reach_l[l_min] = a0
+        joint = max(right, l_min)
+        if joint > r_max or joint not in reach_r or joint not in reach_l:
+            return variants
+        merged = {"type": "insertion", "target_pos": joint,
+                  "length": len(alt1) + len(alt0), "ref": "",
+                  "alt": reach_r[joint] + reach_l[joint]}
+    merged = _add_normalised_indel_positions([merged], target,
+                                             circular=True)[0]
+    return [merged if j == i1 else v for j, v in enumerate(variants)
+            if j != i0]
 
 
 def _read_segments(align: dict) -> "list[tuple[int, int, str]]":
@@ -11495,14 +12096,40 @@ def _read_covered_spans(align: dict) -> "list[tuple[int, int]]":
     coverage for 200 bp of data.
     """
     out: list[tuple[int, int]] = []
-    for seg in _read_segments(align):
-        try:
-            lo, hi, state = int(seg[0]), int(seg[1]), str(seg[2])
-        except (TypeError, ValueError, IndexError):
-            continue
-        if state == "gap" or hi <= lo:
-            continue
-        out.append((lo, hi))
+    result = align.get("result") or {}
+    aq = result.get("aligned_q") or align.get("aligned_q") or ""
+    at = result.get("aligned_t") or align.get("aligned_t") or ""
+    if aq and at and len(aq) == len(at):
+        # From the rows, so a NO-CALL is not coverage: a read's `N` (any
+        # ambiguity code compatible with the reference) says nothing about the
+        # base under it, and counting it covered let one read's unreadable
+        # stretch "confirm" a region nobody read (audit 2026-09-22, R10).
+        read, ref = ((at, aq) if align.get("axis", "target") == "query"
+                     else (aq, at))
+        pos = 0
+        run_lo = None
+        for cr, cf in zip(read, ref):
+            if cf == "-":
+                continue                      # an insertion: no ref position
+            called = (cr != "-" and (cr.upper() in "ACGT"
+                                     or not _iupac_compatible(cr, cf)))
+            if called and run_lo is None:
+                run_lo = pos
+            elif not called and run_lo is not None:
+                out.append((run_lo, pos))
+                run_lo = None
+            pos += 1
+        if run_lo is not None:
+            out.append((run_lo, pos))
+    else:
+        for seg in _read_segments(align):
+            try:
+                lo, hi, state = int(seg[0]), int(seg[1]), str(seg[2])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if state == "gap" or hi <= lo:
+                continue
+            out.append((lo, hi))
     out.sort()
     # Merge touching/overlapping spans so depth counting can't double-count one
     # read at a segment boundary.
@@ -11573,6 +12200,17 @@ def _pos_in_spans(pos: int, spans) -> bool:
     return any(lo <= pos < hi for lo, hi in (spans or ()))
 
 
+def _variant_gate_pos(v: dict, n: int, circular: bool) -> int:
+    """The position that decides whether a read OBSERVED ``v``: its
+    ``target_pos`` — except that on a circle an insertion after the last base
+    (``target_pos == n``) sits where bp 0 does. Gated at ``n`` it fell
+    outside every read's extent, so a clonal insertion at the origin counted
+    only in the reads whose aligner filed it at 0 (round-2 hardening,
+    2026-09-25)."""
+    pos = int(v.get("target_pos", 0) or 0)
+    if circular and n > 0 and v.get("type") == "insertion":
+        return pos % n
+    return pos
 def _read_observed_extent(align: dict) -> "tuple[int, int] | None":
     """First to last aligned base — the window this read can say ANYTHING about.
 
@@ -11606,7 +12244,7 @@ def _read_depth_at(spans_per_read: "list[list[tuple[int, int]]]",
 
 def _multi_read_summary(alignments, total: int, *,
                         min_support: int = _MULTI_READ_MIN_SUPPORT,
-                        circular: bool = True) -> dict:
+                        circular: bool) -> dict:
     """Combine every read on one plasmid into a single answer.
 
     Returns::
@@ -11653,8 +12291,14 @@ def _multi_read_summary(alignments, total: int, *,
     # base there, so aligned-base depth left it out and a 10-of-20 deletion
     # read as fraction 1.0, 18-of-20 as 9.0, 20-of-20 as depth 0 (dropped)
     # (audit 2026-09-22).
-    extents = [_extent_from_aligned_spans(sp, n, circular)
-               for sp in spans_per_read]
+    def _extent_of(a, sp):
+        res = a.get("result") or a
+        if a.get("axis", "target") != "query":
+            ext = _read_extent_for(res, n, circular=circular)
+            if ext:
+                return ext
+        return _extent_from_aligned_spans(sp, n, circular)
+    extents = [_extent_of(a, sp) for a, sp in zip(aligns, spans_per_read)]
     truncated = False
     # Per-bp depth via a sweep rather than a bp loop per read: a 200 kb
     # plasmid with 30 reads is 6 M membership tests the naive way.
@@ -11703,13 +12347,40 @@ def _multi_read_summary(alignments, total: int, *,
         # and counting that would turn every partial Sanger read into a
         # spurious structural variant.
         extent = extents[idx]
-        for v in _alignment_variants_in_axis(a):
+        # ONE vote per read per event: the two halves of an indel split across
+        # the rows' ends normalise onto one key, and the read was counted
+        # twice — a 50% culture came back `clonal`, and one read "confirmed"
+        # its own variant (round-2 hardening, 2026-09-25).
+        seen_keys: set = set()
+        for v in _alignment_variants_in_axis(a, circular=circular):
             if v.get("type") == "truncated":
                 continue
-            pos = int(v.get("target_pos", 0) or 0)
-            if extent and not _pos_in_spans(pos, extent):
+            if v.get("type") == "snp" and v.get("iupac_compatible"):
+                # An `N` in a read, or a read base inside a reference IUPAC
+                # code (an NNK library site): an observation, never a change.
+                # Counting them made two reads with the same N "confirm" a
+                # mutation, and an NNK reference report "3 changes confirmed"
+                # (audit 2026-09-22, R10).
                 continue
-            key = (pos, v.get("type"), v.get("alt", ""))
+            if v.get("type") == "insertion" and any(
+                    c not in "ACGT" for c in str(v.get("alt") or "").upper()):
+                # A masked read end the aligner placed as an insertion: a run
+                # of `N`s is a no-call, not 30 inserted bases (heterogeneity
+                # already skips it; round-2 hardening, 2026-09-25).
+                continue
+            pos = int(v.get("target_pos", 0) or 0)
+            if extent and not _pos_in_spans(_variant_gate_pos(v, n, circular),
+                                            extent):
+                continue
+            # Group on the LEFT-NORMALISED coordinates. An aligner may place the
+            # same 1 bp deletion anywhere inside a homopolymer, so keying on the
+            # raw alignment position split one event across several buckets, each
+            # with a single read behind it — support fragmented exactly where a
+            # caller is deciding whether a variant is real (audit 2026-09-22).
+            key = _variant_group_key(v)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
             if key not in buckets and len(buckets) >= _MULTI_READ_MAX_VARIANTS:
                 # Cap NEW buckets only — every read still adds its support to
                 # the variants already tallied, and the answer SAYS it was
@@ -11718,8 +12389,13 @@ def _multi_read_summary(alignments, total: int, *,
                 truncated = True
                 continue
             slot = buckets.setdefault(key, {
-                "target_pos": pos, "type": v.get("type"),
-                "ref": v.get("ref", ""), "alt": v.get("alt", ""),
+                # The canonical position when there is one, so two reads that
+                # agree report ONE position rather than whichever read landed
+                # in the bucket first.
+                "target_pos": int(v.get("norm_pos", pos) or 0),
+                "type": v.get("type"),
+                "ref": v.get("norm_ref", v.get("ref", "")),
+                "alt": v.get("norm_alt", v.get("alt", "")),
                 "length": int(v.get("length", 1) or 1),
                 "reads": [], "confident_reads": 0,
             })
@@ -11735,11 +12411,23 @@ def _multi_read_summary(alignments, total: int, *,
                     and pos in _conf_pos_for.get(idx, ()): 
                 slot["confident_reads"] += 1
 
+    # A read with a NO-CALL at a position spans it but says nothing about it:
+    # counted in the depth, an `N` diluted a real 20% minor allele to 9%, under
+    # the noise floor, and the sample read as clonal (audit 2026-09-24).
+    def _nocalls(a):
+        res = a.get("result") or a
+        if a.get("axis", "target") == "query":
+            return set()
+        return _read_no_call_positions(res.get("aligned_q") or "",
+                                       res.get("aligned_t") or "")
+    nocalls = [_nocalls(a) for a in aligns]
     variants: list[dict] = []
     for slot in buckets.values():
         pos = slot["target_pos"]
         support = len(slot["reads"])
-        d = max(support, sum(1 for ext in extents if _pos_in_spans(pos, ext)))
+        d = max(support, sum(1 for i, ext in enumerate(extents)
+                             if _pos_in_spans(pos, ext)
+                             and pos not in nocalls[i]))
         variants.append({
             "target_pos":      pos,
             "type":            slot["type"],
@@ -12342,6 +13030,9 @@ def _rotate_seq_record(record, offset: int, *, keep_source: bool = False):
         name=getattr(record, "name", "") or "",
         description=getattr(record, "description", "") or "",
         annotations=dict(record.annotations or {}),
+        # DBLINK cross-references describe the molecule, not where its base 1
+        # sits; a re-origin keeps them (audit 2026-09-22, H10).
+        dbxrefs=list(getattr(record, "dbxrefs", None) or []),
     )
     for f in (record.features or []):
         if f.type == "source" and not keep_source:
@@ -12356,62 +13047,76 @@ def _rotate_seq_record(record, offset: int, *, keep_source: bool = False):
         parts_in = list(getattr(loc_in, "parts", None)
                         or ([loc_in] if loc_in is not None else []))
         try:
-            spans = [(int(p.start), int(p.end), p.strand) for p in parts_in]
+            # The last two fields are the ORIGINAL start / end positions, kept
+            # so a `<` / `>` partial marker lands on whichever new boundary it
+            # became (`_position_like`); a boundary the rotation creates — the
+            # new origin cutting a part in two — is exact (`None`).
+            spans = [(int(p.start), int(p.end), p.strand, p.start, p.end)
+                     for p in parts_in]
         except (TypeError, ValueError, AttributeError):
             # A position BioPython couldn't resolve to a plain int
             # (UnknownPosition / an external reference). We cannot rotate
             # what we cannot measure, and a guessed coordinate is worse
             # than an untouched one.
             spans = []
-        if not spans or any(a < 0 or b > n or b < a for a, b, _ in spans):
+        if not spans or any(a < 0 or b > n or b < a
+                            for a, b, _s, _ps, _pe in spans):
             new_rec.features.append(f)
             continue
         strand = spans[0][2]
-        if sum(b - a for a, b, _ in spans) >= n:
+        if sum(b - a for a, b, _s, _ps, _pe in spans) >= n:
             # Spans the whole record (the usual `source` case): there is no
             # meaningful place to break it, and the generic path below would
             # emit a degenerate two-part split at the new origin.
+            _ps0 = spans[0][3] if len(spans) == 1 else None
+            _pe0 = spans[0][4] if len(spans) == 1 else None
             new_rec.features.append(SeqFeature(
-                FeatureLocation(0, n, strand=strand),
+                FeatureLocation(_position_like(_ps0, 0),
+                                _position_like(_pe0, n), strand=strand),
                 type=f.type, qualifiers=dict(f.qualifiers or {}),
             ))
             continue
-        pieces: "list[tuple[int, int, _Any]]" = []
-        for a, b, pstrand in spans:
+        pieces: "list[tuple[int, int, _Any, _Any, _Any]]" = []
+        for a, b, pstrand, ps, pe in spans:
             if b == a:
                 continue
             na = (a - offset) % n
             nb = na + (b - a)
             if nb <= n:
-                pieces.append((na, nb, pstrand))
+                pieces.append((na, nb, pstrand, ps, pe))
                 continue
             # This part now straddles the new origin: split it. The half
             # holding the part's 5' end comes first — the tail for a plus
             # strand, the head for a minus one. See `_feature_location`.
-            split = [(na, n, pstrand), (0, nb - n, pstrand)]
+            split = [(na, n, pstrand, ps, None), (0, nb - n, pstrand, None, pe)]
             pieces.extend(split[::-1] if pstrand == -1 else split)
         if not pieces:
             continue
         # Re-join halves that became adjacent: a feature that used to wrap
         # the OLD origin is contiguous again once the rotation lands past
         # it, and leaving it split would draw a phantom intron.
-        merged: "list[tuple[int, int, _Any]]" = []
-        for pa, pb, pst in pieces:
+        merged: "list[tuple[int, int, _Any, _Any, _Any]]" = []
+        for pa, pb, pst, pps, ppe in pieces:
             if merged:
-                qa, qb, qst = merged[-1]
+                qa, qb, qst, qps, qpe = merged[-1]
                 if qst == pst and qb == pa:            # ascending contiguous
-                    merged[-1] = (qa, pb, qst)
+                    merged[-1] = (qa, pb, qst, qps, ppe)
                     continue
                 if qst == pst and pb == qa:            # descending (minus)
-                    merged[-1] = (pa, qb, qst)
+                    merged[-1] = (pa, qb, qst, pps, qpe)
                     continue
-            merged.append((pa, pb, pst))
-        if len(merged) == 1:
-            a, b, pst = merged[0]
-            loc = FeatureLocation(a, b, strand=pst)
+            merged.append((pa, pb, pst, pps, ppe))
+        _new_parts = [FeatureLocation(_position_like(ps, a),
+                                      _position_like(pe, b), strand=pst)
+                      for a, b, pst, ps, pe in merged]
+        if len(_new_parts) == 1:
+            loc = _new_parts[0]
         else:
+            # Keep the location's own operator: `order()` says "these parts,
+            # NOT joined", and a re-origin rebuilt it as `join()` (H10).
             loc = CompoundLocation(
-                [FeatureLocation(a, b, strand=pst) for a, b, pst in merged])
+                _new_parts,
+                operator=getattr(loc_in, "operator", "join") or "join")
         new_rec.features.append(SeqFeature(
             loc, type=f.type, qualifiers=dict(f.qualifiers or {}),
         ))
@@ -12468,6 +13173,9 @@ def _reverse_complement_record(record):
         name=getattr(record, "name", "") or "",
         description=getattr(record, "description", "") or "",
         annotations=dict(getattr(record, "annotations", None) or {}),
+        # The record's DBLINK cross-references describe the molecule, not a
+        # coordinate frame; a flip keeps them (audit 2026-09-22, H10).
+        dbxrefs=list(getattr(record, "dbxrefs", None) or []),
     )
     for f in (record.features or []):
         loc = getattr(f, "location", None)
@@ -12486,8 +13194,12 @@ def _reverse_complement_record(record):
                 # Out-of-range or inverted: same reasoning.
                 new_parts = []
                 break
+            # The old END becomes the new START, so a partial marker moves to
+            # the other end and flips direction: `<1..>90` → `complement(<n-89..>n)`.
             new_parts.append(FeatureLocation(
-                n - e, n - s, strand=_flip_feature_strand(p.strand)))
+                _position_mirrored(p.end, n - e),
+                _position_mirrored(p.start, n - s),
+                strand=_flip_feature_strand(p.strand)))
         if not new_parts:
             _log.warning(
                 "flip: skipped feature %r (%s) — location could not be "
@@ -12516,6 +13228,36 @@ def _flip_feature_strand(strand):
     if strand == -1:
         return 1
     return strand
+
+
+def _position_like(orig, value: int):
+    """``value`` as a position of the same PARTIAL kind as ``orig``: ``<``
+    (`BeforePosition`) or ``>`` (`AfterPosition`), else a plain int.
+
+    A partial boundary says the feature carries on past the end of the sequence
+    in hand — a 5'- or 3'-partial CDS. The edit, re-origin and flip rebuilds
+    made every location from plain integers, so `<1..>90` came back as a
+    complete ORF that starts and stops wherever the record happens to (audit
+    2026-09-22, H10). Within / between / one-of positions are vanishingly rare
+    on a plasmid and keep the exact value they always got."""
+    from Bio.SeqFeature import AfterPosition, BeforePosition
+    if isinstance(orig, BeforePosition):
+        return BeforePosition(value)
+    if isinstance(orig, AfterPosition):
+        return AfterPosition(value)
+    return value
+
+
+def _position_mirrored(orig, value: int):
+    """`_position_like` across a reverse complement: the low end of the old
+    frame becomes the high end of the new one, so ``<`` turns into ``>`` and
+    ``>`` into ``<`` — what Biopython's own `reverse_complement` does."""
+    from Bio.SeqFeature import AfterPosition, BeforePosition
+    if isinstance(orig, BeforePosition):
+        return AfterPosition(value)
+    if isinstance(orig, AfterPosition):
+        return BeforePosition(value)
+    return value
 
 
 def _rotate_aligned_to_original_query_frame(
@@ -13069,6 +13811,7 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
         best_result["inverted_segments"] = _alignment_inverted_segments(
             best_result.get("aligned_q", ""),
             best_result.get("aligned_t", ""),
+            frame_shift=best_result.get("query_frame_shift", 0),
         )
     except Exception:
         _log.exception("rotation picker: inverted-segment probe raised")
@@ -13394,7 +14137,8 @@ def _myers_align_global(query: str, target: str) -> "tuple[str, str]":
 # came back as hundreds of phantom 1–18 bp deletions with the SNP gone; a
 # PERFECT partial read reported "488 real changes". Full-length reads (a
 # Plasmidsaurus consensus) stay on the fast global engine.
-_PARTIAL_READ_FRACTION = 0.95         # read shorter than this × plasmid
+# `_PARTIAL_READ_FRACTION` (0.95, read shorter than this × plasmid) lives in
+# splicecraft_biology, where the read-extent rule uses it too.
 _SEMIGLOBAL_MAX_CELLS = 60_000_000    # read × window DP cells, per call
 _SEMIGLOBAL_SEED_K = 16
 _SEMIGLOBAL_WINDOW_PAD = 300
@@ -13603,6 +14347,7 @@ def _pairwise_align(query_seq: str, target_seq: str,
         )
     n_matches      = 0
     n_mismatches   = 0
+    n_no_calls     = 0
     n_gap_cols     = 0
     n_gap_opens_q  = 0
     n_gap_opens_t  = 0
@@ -13632,6 +14377,13 @@ def _pairwise_align(query_seq: str, target_seq: str,
         # (A/G) vs ``A`` is a match; ``R`` vs ``C`` is a mismatch.
         if _iupac_compatible(ch_q, ch_t):
             n_matches += 1
+            if ch_q.upper() not in "ACGT":
+                # A QUERY ambiguity code compatible with the target — an `N`
+                # in a read. Counted as a match (it is not a difference), but
+                # it is not evidence of agreement either: `n_no_calls` lets a
+                # caller judging a READ leave it out of coverage and identity
+                # (audit 2026-09-22, R10).
+                n_no_calls += 1
         else:
             n_mismatches += 1
     aligned_cols  = n_matches + n_mismatches + n_gap_cols
@@ -13657,6 +14409,39 @@ def _pairwise_align(query_seq: str, target_seq: str,
         score = (match * n_matches + mismatch * n_mismatches
                  + open_gap * n_gap_opens
                  + extend_gap * max(0, n_gap_cols - n_gap_opens))
+    local_spans: dict = {}
+    if mode == "local" and bio_first is not None:
+        # A LOCAL alignment's rows hold only the aligned stretch, but every
+        # consumer — variant calls, coverage, the overlay, the rotation
+        # picker's frame restore — maps a column to a base by counting
+        # non-gaps FROM 0. A SNP at plasmid bp 1400 in a read aligned from bp
+        # 1000 was reported at bp 400, and the uncovered span shifted with it
+        # (audit 2026-09-22, R5). The counts above stay LOCAL (that is what a
+        # local identity means); the rows get the target's unaligned flanks
+        # back as end gaps, exactly as the semi-global engine already does.
+        # The read's clipped ends are SOFT CLIPS — not aligned to anything —
+        # so they stay OUT of the rows (their extent is `local_q_span`). Put
+        # in, as overhang against target gaps, every consumer read a clipped
+        # prefix as an insertion before bp 0: a perfect Sanger read across the
+        # origin came back "unconfirmed" with a 250 bp insertion, and a clonal
+        # sample "mixed" (audit 2026-09-24).
+        try:
+            _co = bio_first.coordinates
+            if _co is None:
+                raise TypeError("the aligner returned none")
+            q0, q1 = int(_co[0][0]), int(_co[0][-1])
+            t0, t1 = int(_co[1][0]), int(_co[1][-1])
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"local alignment has no usable coordinates: {exc}") from exc
+        if not (0 <= q0 <= q1 <= len(q) and 0 <= t0 <= t1 <= len(t)):
+            raise ValueError("local alignment coordinates out of range")
+        aligned_q = "-" * t0 + aligned_q + "-" * (len(t) - t1)
+        aligned_t = t[:t0] + aligned_t + t[t1:]
+        if (aligned_q.replace("-", "") != q[q0:q1]
+                or aligned_t.replace("-", "") != t):
+            raise ValueError("local alignment failed its round-trip check")
+        local_spans = {"local_q_span": [q0, q1], "local_t_span": [t0, t1]}
     # `identity_pct` is gap-inclusive (BLAST convention). For global
     # alignment of length-mismatched pairs (e.g. a 200 bp insert vs a
     # 5 kb backbone) the denominator is dominated by gap columns and
@@ -13674,6 +14459,7 @@ def _pairwise_align(query_seq: str, target_seq: str,
         "aligned_t":             aligned_t,
         "n_matches":             n_matches,
         "n_mismatches":          n_mismatches,
+        "n_no_calls":            n_no_calls,
         "n_gap_cols":            n_gap_cols,
         "n_gap_opens_q":         n_gap_opens_q,
         "n_gap_opens_t":         n_gap_opens_t,
@@ -13685,6 +14471,7 @@ def _pairwise_align(query_seq: str, target_seq: str,
         "n_gaps":                n_gap_cols,
         "q_len":                 len(q),
         "t_len":                 len(t),
+        **local_spans,
     }
 
 
@@ -13747,7 +14534,16 @@ _INVERSION_REALIGN_BUDGET_BP = 200_000
 # Columns of slack when deciding whether a candidate block "touches" the
 # start or end of the alignment, for the origin-straddling wrap pass. Chance
 # matches at the very edge routinely shift the block in by one or two.
+#
+# The absolute figure is a FLOOR. How far a maximal-scoring slice trims in from
+# the edge grows with the block, because ~25% of an inverted block's columns
+# match by chance — so a fixed 8 made detection depend on where the file happens
+# to be rotated: the same inversion was found at one origin and missed at
+# another, which is the one thing a detector must never do (audit 2026-09-22).
+# `_INVERSION_WRAP_EDGE_FRACTION` of the joined block's own length is added, so
+# the criterion scales with the event rather than with the coordinate frame.
 _INVERSION_WRAP_EDGE_SLACK = 8
+_INVERSION_WRAP_EDGE_FRACTION = 0.05
 
 
 def _block_identity_pct(a: str, b: str) -> float:
@@ -13780,6 +14576,43 @@ def _realign_identity_pct(a: str, b: str) -> float:
                    len(a), len(b), exc_info=True)
         return 0.0
     return float(r.get("ungapped_identity_pct", 0.0) or 0.0)
+
+
+def _rc_aligned_offsets(q_block: str, t_block: str
+                        ) -> "tuple[int, int, int, int] | None":
+    """Where the reverse complement of ``q_block`` actually aligns inside
+    ``t_block``: ``(t_lo, t_hi, q_lo, q_hi)`` offsets into the two blocks
+    (``q`` in the block's own orientation), from a LOCAL alignment. None when
+    it cannot be said (empty, too long, the aligner refused).
+
+    A candidate block is the maximal-scoring slice of non-matching columns,
+    and that slice runs past the inversion into whatever does not match — the
+    end gaps beside a read end, or unread plasmid across bp 0. Reported as
+    found, a 30 bp flip at a read's start came back as 65 bp, 35 of them in
+    plasmid the read never covered (round-2 hardening, 2026-09-25). The
+    inverted bases are exactly where the reverse complement aligns."""
+    if not q_block or not t_block:
+        return None
+    if max(len(q_block), len(t_block)) > _INVERSION_MAX_REALIGN_BP:
+        return None
+    try:
+        r = _pairwise_align(_rc(q_block), t_block, mode="local")
+    except Exception:
+        _log.debug("inversion probe: span refine failed (%d vs %d bp)",
+                   len(q_block), len(t_block), exc_info=True)
+        return None
+    ts, qs = r.get("local_t_span"), r.get("local_q_span")
+    if not (isinstance(ts, (list, tuple)) and isinstance(qs, (list, tuple))):
+        return None
+    try:
+        t0, t1 = int(ts[0]), int(ts[1])
+        rq0, rq1 = int(qs[0]), int(qs[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    L = len(q_block)
+    if not (0 <= t0 < t1 <= len(t_block) and 0 <= rq0 < rq1 <= L):
+        return None
+    return t0, t1, L - rq1, L - rq0
 
 
 def _block_is_informative(block: str) -> bool:
@@ -13823,10 +14656,17 @@ def _alignment_inverted_segments(
     min_identity_pct: float = _INVERSION_MIN_IDENTITY_PCT,
     min_margin_pct: float = _INVERSION_MIN_MARGIN_PCT,
     max_blocks: int = _INVERSION_MAX_BLOCKS,
+    frame_shift=0,
 ) -> "list[dict]":
     """Find spans where the query matches the REVERSE COMPLEMENT of the
     target — an inverted insert, a flipped cassette, a region cloned
     backwards.
+
+    Only the read's own EXTENT is searched (``frame_shift`` as in
+    `_read_extent_from_rows`): the plasmid a partial read never reached is
+    gap columns, which scored as "not matching" — so the whole alignment came
+    back as one candidate and was realigned end to end, ~0.9 s for a 1 kb
+    Sanger read of a 10 kb plasmid, for nothing (audit 2026-09-24).
 
     Returns ``[{t_start, t_end, q_start, q_end, length, identity_pct,
     forward_identity_pct}, …]`` ascending by ``t_start``, where
@@ -13897,21 +14737,44 @@ def _alignment_inverted_segments(
         if cq != "-":
             q_pos += 1
     t_at[n], q_at[n] = t_pos, q_pos
+    # Absence of data is not evidence: mask the plasmid a partial read never
+    # reached, so no candidate spans it. Only a LARGE unread arc — the few gap
+    # columns where a full-length read's two ends meet are alignment, and an
+    # inversion can run straight across them — and never the `min_bp` columns
+    # beside either read end, where an inversion touching the end of the read
+    # is left in end gaps by the aligner. A block that grows into those
+    # columns past the inversion is trimmed back to where the read's reverse
+    # complement actually aligns (`_rc_aligned_offsets`, below).
+    _ends = _read_end_columns(aq, frame_shift)
+    if _ends is None:
+        return []
+    _first, _last = _ends
+    _unread = (_first - _last - 1) if _first > _last \
+        else _first + (n - 1 - _last)
+    if _unread > 2 * min_bp:
+        for j in range(min_bp + 1, _unread - min_bp + 1):
+            scores[(_last + j) % n] = -1e9
+    base_scores = list(scores)            # before the sweep masks candidates
     # Sweep out the candidate blocks first, then judge them — the wrap pass
     # below needs to see the ones that were REJECTED individually.
     candidates: "list[tuple[int, int, str, str]]" = []
-    for _ in range(max_blocks):
+    # A slice too short to be an inversion is set aside and the search goes
+    # on: stopping at it (the old `break`) missed any weaker inversion behind
+    # it. Bounded, so a read full of short noise runs cannot loop.
+    for _ in range(max_blocks * 8):
+        if len(candidates) >= max_blocks:
+            break
         seg = _max_scoring_segment(scores)
         if seg is None:
             break
         c_lo, c_hi, seg_score = seg
         span_cols = c_hi - c_lo
-        if span_cols < min_bp:
-            break
         if seg_score < span_cols * _INVERSION_MIN_BLOCK_DENSITY:
             break
         for i in range(c_lo, c_hi):      # mask, so it can't be re-found
             scores[i] = -1e9
+        if span_cols < min_bp:
+            continue
         candidates.append((c_lo, c_hi,
                            aq[c_lo:c_hi].replace("-", ""),
                            at[c_lo:c_hi].replace("-", "")))
@@ -13941,14 +14804,53 @@ def _alignment_inverted_segments(
                 and _block_is_informative(t_block)
                 and _block_is_informative(q_block))
 
+    def _refined(q_block: str, t_block: str
+                 ) -> "tuple[int, int, int, int] | None":
+        """`_rc_aligned_offsets`, kept only when it still describes an
+        inversion (at least `min_bp` on both axes) and within the realign
+        budget."""
+        if budget[0] >= _INVERSION_REALIGN_BUDGET_BP:
+            return None
+        budget[0] += max(len(q_block), len(t_block))
+        off = _rc_aligned_offsets(q_block, t_block)
+        if off is None:
+            return None
+        t0, t1, q0, q1 = off
+        # Trim a side only when it OVERREACHES: a local alignment stops a few
+        # bases short of the true ends on chance mismatches, and trimming that
+        # jitter cut a 5 bp half of an origin-straddling flip clean off. The
+        # overreach this exists for is tens of bases of unread plasmid.
+        slack = _INVERSION_WRAP_EDGE_SLACK
+        if t0 <= slack:
+            t0 = 0
+        if len(t_block) - t1 <= slack:
+            t1 = len(t_block)
+        if q0 <= slack:
+            q0 = 0
+        if len(q_block) - q1 <= slack:
+            q1 = len(q_block)
+        if t1 - t0 < min_bp or q1 - q0 < min_bp:
+            return None
+        return t0, t1, q0, q1
+
     def _emit(c_lo: int, c_hi: int, rev_pct: float, fwd_pct: float,
-              wrapped: bool = False) -> None:
+              wrapped: bool = False,
+              off: "tuple[int, int, int, int] | None" = None) -> None:
+        t_lo, t_hi = t_at[c_lo], t_at[c_hi]
+        q_lo, q_hi = q_at[c_lo], q_at[c_hi]
+        if off is not None:              # trimmed to what is inverted
+            t_lo, t_hi = t_at[c_lo] + off[0], t_at[c_lo] + off[1]
+            q_lo, q_hi = q_at[c_lo] + off[2], q_at[c_lo] + off[3]
+        _emit_at(t_lo, t_hi, q_lo, q_hi, rev_pct, fwd_pct, wrapped)
+
+    def _emit_at(t_lo: int, t_hi: int, q_lo: int, q_hi: int, rev_pct: float,
+                 fwd_pct: float, wrapped: bool = False) -> None:
         entry = {
-            "t_start":              t_at[c_lo],
-            "t_end":                t_at[c_hi],
-            "q_start":              q_at[c_lo],
-            "q_end":                q_at[c_hi],
-            "length":               t_at[c_hi] - t_at[c_lo],
+            "t_start":              t_lo,
+            "t_end":                t_hi,
+            "q_start":              q_lo,
+            "q_end":                q_hi,
+            "length":               t_hi - t_lo,
             "identity_pct":         round(rev_pct, 2),
             "forward_identity_pct": round(fwd_pct, 2),
         }
@@ -13962,6 +14864,7 @@ def _alignment_inverted_segments(
         out.append(entry)
 
     rejected: "list[tuple[int, int, str, str]]" = []
+    accepted: "dict[tuple[int, int], int]" = {}      # (c_lo, c_hi) -> out idx
     for c_lo, c_hi, q_block, t_block in candidates:
         if not _usable(q_block, t_block):
             rejected.append((c_lo, c_hi, q_block, t_block))
@@ -13972,7 +14875,8 @@ def _alignment_inverted_segments(
             # low-information block — or simply doesn't match backwards.
             rejected.append((c_lo, c_hi, q_block, t_block))
             continue
-        _emit(c_lo, c_hi, rev_pct, fwd_pct)
+        accepted[(c_lo, c_hi)] = len(out)
+        _emit(c_lo, c_hi, rev_pct, fwd_pct, off=_refined(q_block, t_block))
     # ── Wrap pass: an inversion straddling the ORIGIN ───────────────────
     # A circular molecule has no ends, but the alignment does. Flip a block
     # that crosses bp 0 and its two halves land at OPPOSITE ends of the
@@ -13981,18 +14885,95 @@ def _alignment_inverted_segments(
     # region. Tested individually both fail; joined in circle order
     # (tail-of-string, then head) they are the original block, so one more
     # RC test catches the whole event.
-    if len(rejected) >= 2:
+    # The EDGE candidates are considered whether or not they passed on their
+    # own. With unequal halves the bigger one can pass alone — part of it
+    # really is the reverse complement of what it sits on — and it was then
+    # reported as an inversion of its own while the smaller half, rejected,
+    # was never joined back: an 800 bp flip straddling the origin read as
+    # (0, 700), missing the last 100 bp, and a 1,200 bp one gave different
+    # answers at different rotations (audit 2026-09-22, R13). Two halves that
+    # BOTH pass on their own are two inversions, and are left alone.
+    # A half shorter than `min_bp` never becomes a candidate — the sweep stops
+    # at the first slice that short — so an origin-straddling flip with one
+    # short half had nothing to join, and was missed by 12-24 bp at some
+    # rotations and not others (audit 2026-09-24). When only one string edge
+    # has a candidate, the other half is the best-scoring run against the
+    # OPPOSITE edge; the joined block still has to pass the full RC test.
+    lo_edge, hi_edge = 0, n
+
+    def _near_edge(lo: int, hi: int, allow: int) -> bool:
+        """Is the stretch [lo, hi) between a block and an edge short enough —
+        or, a little longer, plainly NOT a forward alignment? ~25% of an
+        inverted block's columns match by chance, so its maximal-scoring
+        slice can start a handful of columns in (7 of 9 were measured on a
+        real case); a forward-aligned stretch there matches ~100%, or 90-95%
+        for a noisy nanopore read. The joint block's own RC test still has
+        to pass."""
+        width = hi - lo
+        if width <= allow:
+            return True
+        if width > allow + min_bp:
+            return False
+        matched = sum(1 for i in range(lo, hi)
+                      if aq[i] != "-" and at[i] != "-"
+                      and _iupac_compatible(aq[i], at[i]))
+        return matched <= 0.8 * width
+    if candidates:
+        _reach = min_bp + _INVERSION_WRAP_EDGE_SLACK
+        _head = min(candidates, key=lambda c: c[0])
+        _tail = max(candidates, key=lambda c: c[1])
+
+        def _edge_run(cols) -> "int | None":
+            """The end of the best-scoring run growing out of an edge (`cols`
+            walks inward from it), or None when none scores."""
+            best, best_at, run = 0.0, None, 0.0
+            for j in cols:
+                if base_scores[j] <= -1e8:
+                    break
+                run += base_scores[j]
+                if run > best:
+                    best, best_at = run, j
+            return best_at
+        def _allow(c) -> int:
+            # The same length-scaled slack the join below applies.
+            return max(_INVERSION_WRAP_EDGE_SLACK,
+                       int(_INVERSION_WRAP_EDGE_FRACTION
+                           * (c[1] - c[0] + _reach)))
+        head_touches = _near_edge(lo_edge, _head[0], _allow(_head))
+        tail_touches = _near_edge(_tail[1], hi_edge, _allow(_tail))
+        if head_touches and not tail_touches:
+            j = _edge_run(range(hi_edge - 1,
+                                max(_head[1], hi_edge - _reach) - 1, -1))
+            if j is not None and j > _head[1]:
+                candidates.append((j, hi_edge,
+                                   aq[j:hi_edge].replace("-", ""),
+                                   at[j:hi_edge].replace("-", "")))
+        elif tail_touches and not head_touches:
+            j = _edge_run(range(lo_edge, min(_tail[0], lo_edge + _reach)))
+            if j is not None and j + 1 < _tail[0]:
+                candidates.append((lo_edge, j + 1,
+                                   aq[lo_edge:j + 1].replace("-", ""),
+                                   at[lo_edge:j + 1].replace("-", "")))
+    if len(candidates) >= 2:
         # "Touching the edge" allows a few columns of slack: ~25% of an
         # inverted block's columns match by chance, so the maximal-scoring
         # slice routinely starts one or two columns in from bp 0 (measured
         # on real pUC19: the head block began at column 1, and a strict
         # equality test found nothing).
-        head = next((c for c in rejected
-                     if c[0] <= _INVERSION_WRAP_EDGE_SLACK), None)
-        tail = next((c for c in reversed(rejected)
-                     if c[1] >= n - _INVERSION_WRAP_EDGE_SLACK), None)
+        # The EXTREME candidates, then one rotation-insensitive test on how much
+        # they leave untouched at the seam: an absolute floor plus a fraction of
+        # the joined block's own length.
+        head = min(candidates, key=lambda c: c[0])
+        tail = max(candidates, key=lambda c: c[1])
+        both_passed = ((head[0], head[1]) in accepted
+                       and (tail[0], tail[1]) in accepted)
+        joint_cols = (hi_edge - tail[0]) + (head[1] - lo_edge)
+        edge_allow = max(_INVERSION_WRAP_EDGE_SLACK,
+                         int(_INVERSION_WRAP_EDGE_FRACTION * joint_cols))
+        touches_edges = (_near_edge(lo_edge, head[0], edge_allow)
+                         and _near_edge(tail[1], hi_edge, edge_allow))
         if head is not None and tail is not None and head is not tail \
-                and tail[0] > head[1]:
+                and tail[0] > head[1] and touches_edges and not both_passed:
             # Anchor the joint block to the STRING edges, not to the
             # candidates' trimmed bounds, so the two halves rejoin with no
             # bases missing at the seam.
@@ -14005,8 +14986,41 @@ def _alignment_inverted_segments(
                 fwd_pct, rev_pct = _score_pair(joint_q, joint_t)
                 if (rev_pct >= min_identity_pct
                         and rev_pct - fwd_pct >= min_margin_pct):
-                    _emit(tail_lo, n, rev_pct, fwd_pct, wrapped=True)
-                    _emit(0, head_hi, rev_pct, fwd_pct, wrapped=True)
+                    # The joined event replaces a half reported on its own.
+                    drop = {accepted[k] for k in ((head[0], head[1]),
+                                                  (tail[0], tail[1]))
+                            if k in accepted}
+                    if drop:
+                        out[:] = [e for i, e in enumerate(out)
+                                  if i not in drop]
+                    # Trim the joined block to where the reverse complement
+                    # aligns, then split it at bp 0 only if that part really
+                    # crosses it: joined with unread plasmid across the
+                    # origin, one half used to be reported where no read was.
+                    off = _refined(joint_q, joint_t)
+                    t_tail = t_at[n] - t_at[tail_lo]
+                    q_tail = q_at[n] - q_at[tail_lo]
+
+                    def _jt(k: int) -> int:          # joint → target bp
+                        return t_at[tail_lo] + k if k <= t_tail else k - t_tail
+
+                    def _jq(k: int) -> int:          # joint → read base
+                        return q_at[tail_lo] + k if k <= q_tail else k - q_tail
+                    if off is None:
+                        _emit(tail_lo, n, rev_pct, fwd_pct, wrapped=True)
+                        _emit(0, head_hi, rev_pct, fwd_pct, wrapped=True)
+                    elif off[1] <= t_tail or off[0] >= t_tail:
+                        # Wholly on one side of bp 0: one ordinary block.
+                        _emit_at(_jt(off[0]) % t_at[n], _jt(off[1]) or t_at[n],
+                                 _jq(off[2]), max(_jq(off[2]), _jq(off[3])),
+                                 rev_pct, fwd_pct)
+                    else:
+                        _emit_at(_jt(off[0]), t_at[n],
+                                 _jq(min(off[2], q_tail)), q_at[n],
+                                 rev_pct, fwd_pct, wrapped=True)
+                        _emit_at(0, off[1] - t_tail,
+                                 0, max(0, off[3] - q_tail),
+                                 rev_pct, fwd_pct, wrapped=True)
     out.sort(key=lambda d: (d["t_start"], d["t_end"]))
     return out
 
@@ -15149,9 +16163,12 @@ def _coverage_pct_from_result(result: dict, target_len: int) -> float:
     if not target_len or target_len <= 0:
         return 0.0
     try:
+        # A no-call (a read's `N`) is not coverage: the read could not say
+        # what is there (R10).
         aligned_bp = (
             int(result.get("n_matches", 0) or 0)
             + int(result.get("n_mismatches", 0) or 0)
+            - int(result.get("n_no_calls", 0) or 0)
         )
     except (TypeError, ValueError):
         return 0.0
@@ -15226,6 +16243,13 @@ def _alignment_quality_status(
     n_mismatch = int(result.get("n_mismatches", 0) or 0)
     n_gaps = int(result.get("n_gaps", 0) or 0)
     ungapped = float(result.get("ungapped_identity_pct", 0.0) or 0.0)
+    n_no_calls = int(result.get("n_no_calls", 0) or 0)
+    if n_no_calls > 0:
+        # Bases the read could not call are neither agreement nor coverage — a
+        # read of 300 `N`s earned ✓ "verified" at 100% (audit 2026-09-22, R10).
+        n_match = max(0, n_match - n_no_calls)
+        called = n_match + n_mismatch
+        ungapped = (100.0 * n_match / called) if called else 0.0
     # Defensive: negative values from a corrupted result dict would
     # make the coverage calc nonsensical and could let a `verified`
     # status fire on garbage. Treat any negative as divergent.
@@ -15912,7 +16936,42 @@ def _gb_text_is_spec_clean(gb_text: str) -> bool:
         return False
     if not gb_text.isascii():
         return False
-    return not any(len(line) > 80 for line in gb_text.splitlines())
+    # Any control character but the line feed is not GenBank. A CR or VT is a
+    # line break to most readers (so a CR inside a qualifier value split it
+    # mid-value and the copied file would not parse, while the export still
+    # reported 0 failures — audit 2026-09-22, FM10), and a tab is not a
+    # printable character. The full export path normalises all of them.
+    if _GB_FAST_PATH_CONTROL_RE.search(gb_text):
+        return False
+    return not any(len(line) > 80 for line in gb_text.split("\n"))
+
+
+_GB_FAST_PATH_CONTROL_RE = re.compile("[\x00-\x09\x0b-\x1f\x7f]")
+
+
+def _claim_export_filename(fname: str, used: "set[str]") -> str:
+    """`fname`, or the first of `stem_2.ext`, `stem_3.ext`, … that no earlier
+    file in this batch has claimed; records the claim in `used`.
+
+    Compared case-folded AND Unicode-NORMALISED: a case-insensitive
+    filesystem (APFS, NTFS) treats `pUC19.gb` and `PUC19.gb` as one file, and
+    one that stores names decomposed (macOS) treats "Plasmide\u0301" and
+    "Plasmidé" as one too — so two entries differing only by case or by
+    composition exported over each other (audit 2026-09-22). Shared by every
+    bulk exporter so they cannot drift apart again (the map-image one
+    compared case only)."""
+    import unicodedata as _unicodedata
+
+    def _key(name: str) -> str:
+        return _unicodedata.normalize("NFC", name).casefold()
+    if _key(fname) in used:
+        stem, _dot, suf = fname.rpartition(".")
+        bump = 2
+        while _key(f"{stem}_{bump}.{suf}") in used:
+            bump += 1
+        fname = f"{stem}_{bump}.{suf}"
+    used.add(_key(fname))
+    return fname
 
 
 def _bulk_export_collection(collection_name: str,
@@ -15975,17 +17034,8 @@ def _bulk_export_collection(collection_name: str,
         ent_name = entry.get("name") or entry.get("id") or "unnamed"
         ok = False
         try:
-            fname = _safe_export_filename(ent_name, ext)
-            if fname.casefold() in used_names_cf:
-                stem, _dot, suf = fname.rpartition(".")
-                bump = 2
-                while True:
-                    candidate = f"{stem}_{bump}.{suf}"
-                    if candidate.casefold() not in used_names_cf:
-                        fname = candidate
-                        break
-                    bump += 1
-            used_names_cf.add(fname.casefold())
+            fname = _claim_export_filename(
+                _safe_export_filename(ent_name, ext), used_names_cf)
             out_path = target / fname
 
             if fmt == "dna":
@@ -16106,14 +17156,8 @@ def _bulk_export_map_images(entries: "list[dict]", target_dir: "Path | str",
         ent_name = entry.get("name") or entry.get("id") or "unnamed"
         ok = False
         try:
-            fname = _safe_export_filename(ent_name, ext)
-            if fname.casefold() in used_names_cf:
-                stem, _dot, suf = fname.rpartition(".")
-                bump = 2
-                while f"{stem}_{bump}.{suf}".casefold() in used_names_cf:
-                    bump += 1
-                fname = f"{stem}_{bump}.{suf}"
-            used_names_cf.add(fname.casefold())
+            fname = _claim_export_filename(
+                _safe_export_filename(ent_name, ext), used_names_cf)
             out_path = target / fname
 
             gb_text = entry.get("gb_text") or ""
@@ -16872,9 +17916,23 @@ class PlasmidMap(Widget):
                         # applying the ">1 stop = broken" rule, so
                         # intentional multi-stop tails don't false-flag
                         # as frame-breaking. Internal stops still count.
+                        # A residue `/transl_except` DECLARES (a
+                        # selenocysteine read through a UGA, …) is not a
+                        # premature stop, whatever the codon says — the ⚠
+                        # badge fired on every correctly annotated
+                        # selenoprotein (audit 2026-09-22, C6).
+                        _declared = (
+                            _transl_except_residues(
+                                feat.qualifiers.get("transl_except"),
+                                _cds_coding_positions(
+                                    total, feat, circular=_rec_is_circular),
+                                reads_as=lambda r, _aa=aa_letters: (
+                                    _aa[r - 1] if 0 < r <= len(_aa)
+                                    else None))
+                            if feat.qualifiers.get("transl_except") else {})
                         n_total_stops = sum(
-                            1 for c in aa_letters
-                            if c == _STOP_AA_CHAR
+                            1 for _r, c in enumerate(aa_letters, start=1)
+                            if c == _STOP_AA_CHAR and _r not in _declared
                         )
                         i = len(aa_letters) - 1
                         trailing_run = 0
@@ -16888,6 +17946,26 @@ class PlasmidMap(Widget):
                             new_feat["_premature_stops"] = (
                                 n_stops_effective - 1
                             )
+                        # A GTG / TTG start the CDS's own annotation reads
+                        # as Met (lacI) shows as M, marked as the initiator
+                        # — only on the file's word, never on the codon
+                        # alone (`_cds_initiator_source`).
+                        if (aa_letters and aa_letters[0] != "M"
+                                and (feat.qualifiers.get("translation")
+                                     or feat.qualifiers.get("transl_except"))):
+                            _coding = _cds_coding_positions(
+                                total, feat, circular=_rec_is_circular)
+                            _init = _cds_initiator_source(
+                                feat.qualifiers, "".join(aa_letters),
+                                first_codon=_codon_of(
+                                    _seq_upper_for_cds, _coding[:3],
+                                    -1 if strand == -1 else 1),
+                                transl_table=tt_raw or 1,
+                                codon_start=(cs_raw if cs_raw in (2, 3)
+                                             else 1),
+                                coding_positions=_coding)
+                            if _init:
+                                new_feat["_init_m"] = _init
                     except Exception:  # noqa: BLE001
                         _log.exception(
                             "premature-stop count failed for %s",
@@ -22711,7 +23789,8 @@ class LibraryPanel(Widget):
                     # delete-promote (line 42246).
                     try:
                         if new_active:
-                            _activate_collection(new_active)
+                            _activate_collection(new_active,
+                                                 discard_outgoing=True)
                         else:
                             _deactivate_all_collections()
                     except (OSError, RuntimeError, ValueError) as exc:
@@ -22725,10 +23804,9 @@ class LibraryPanel(Widget):
                 cur = getattr(app, "_current_record", None)
                 if (cur is not None and getattr(cur, "id", None)
                         in deleted_ids):
-                    self.set_active(None)
-                    clear = getattr(app, "_clear_canvas", None)
-                    if callable(clear):
-                        clear()
+                    if _clear_canvas_of_deleted_collection(
+                            app, name, _get_active_collection_name() or ""):
+                        self.set_active(None)
                 self.app.notify(f"Deleted collection '{name}'.",
                                 markup=False)
 
@@ -26024,7 +27102,7 @@ class HistoryScreen(_OneShotDismissScreen, Screen):
         self._node_by_id: "dict[int, _CommercialSaaSHistoryNode]" = {}
 
     def compose(self) -> ComposeResult:
-        from rich.markup import escape as _esc
+        _esc = _markup_escape
         yield Static(f" Construction history — {_esc(self._title)} ",
                       id="hist-scr-title")
         n_nodes = _history_node_count(self._root_node)
@@ -27498,9 +28576,15 @@ def _reset_app_state_after_master_delete(app) -> None:
     """
     # Undo / redo stacks (loaded plasmid history) — never restore
     # plasmid state across a wipe.
+    #
+    # `_library_undo` belongs here too: it holds whole LIBRARY ENTRIES so a
+    # bulk delete can be undone in one press. Leaving it behind meant the
+    # entries the user just asked to be destroyed were still in memory and one
+    # keypress from being written back — a Master Delete that had not deleted
+    # them (audit 2026-09-22).
     for attr in ("_undo_stack", "_redo_stack",
                   "_stashed_undo_stacks", "_stashed_redo_stacks",
-                  "_stash_order"):
+                  "_stash_order", "_library_undo"):
         # Sweep #10 (2026-05-20): `except (AttributeError, Exception)`
         # collapses to just `except Exception:` because Exception
         # subsumes AttributeError — the tuple form was misleading and
@@ -30319,7 +31403,7 @@ class CustomEnzymeListModal(ModalScreen):
             return
         parts = [f"[green]{len(valid)} valid[/green]"]
         if dropped:
-            from rich.markup import escape as _esc
+            _esc = _markup_escape
             preview = ", ".join(_esc(n) for n in dropped[:5])
             more = f" …(+{len(dropped) - 5})" if len(dropped) > 5 else ""
             parts.append(
@@ -32725,7 +33809,13 @@ from splicecraft_dataaccess import (  # noqa: E402  (OT-2 protocol + custom-labw
 )
 import time  # noqa: E402  (hub otherwise aliases time as _time/_time_mod; BABS uses the bare name)
 import tempfile  # noqa: E402
-from rich.markup import escape as _esc  # noqa: E402
+# ONE escaper for every markup string: `_markup_escape` escapes EVERY `[`.
+# Rich's own `escape` leaves `[$var]` alone, which Textual reads as a
+# style — so a model-supplied `[$background]` inside a Babs approval
+# dialog rendered the rest of the arguments near-invisible, and Textual
+# never un-doubles the backslashes Rich's escape adds (round-2
+# hardening, 2026-09-25).
+_esc = _markup_escape  # noqa: E402
 from rich.text import Text as _RText  # noqa: E402  (DataTable cells render markup LITERALLY — styled cells must be Text)
 
 _BABS_LEVEL_COLOR = {"ok": "green", "warn": "yellow", "crit": "red"}
@@ -39078,6 +40168,13 @@ class AutolabScreen(Screen):
                         yield Input(value="9", id="autolab-lw-spacing", classes="autolab-slot")
                         yield Static("Depth", classes="autolab-label")
                         yield Input(value="40", id="autolab-lw-depth", classes="autolab-slot")
+                        # No default: where the wells sit depends on the whole
+                        # labware's height, which nothing else here can supply.
+                        yield Static("Height", classes="autolab-label")
+                        yield Input(placeholder="mm", id="autolab-lw-height",
+                                    classes="autolab-slot",
+                                    tooltip="Overall height in mm, deck to top "
+                                            "(with tubes in place for a rack)")
                         yield Static("uL/well", classes="autolab-label")
                         yield Input(value="1500", id="autolab-lw-vol", classes="autolab-slot")
                     with Horizontal(classes="autolab-row"):
@@ -39453,22 +40550,65 @@ class AutolabScreen(Screen):
             self.app.notify("Give the labware a name.", severity="warning")
             return
 
-        def _num(sel: str, d: float) -> float:
+        # Every number here places wells in space (well z = height − depth,
+        # x/y from the spacing), so each is parsed STRICTLY and a bad one is
+        # refused by name. A fallback to the default turned "38,5" into 40 mm
+        # (the tip 1.5 mm below the tube bottom) and "4,5" into a 9 mm pitch,
+        # with no message — only Height had been made strict (round-2
+        # hardening, 2026-09-25).
+        def _field(sel: str, label: str, unit: str, *,
+                   whole: bool = False) -> "float | None":
+            raw = self._val(sel).strip()
             try:
-                v = float(self._val(sel) or d)
-            except (ValueError, TypeError):
-                return d
-            return v if math.isfinite(v) else d
+                v = float(raw)
+            except ValueError:
+                v = float("nan")
+            if (not math.isfinite(v) or v <= 0
+                    or (whole and not float(v).is_integer())):
+                if not raw and label == "Height":
+                    self.app.notify(
+                        "Give the labware's overall height in mm — measured "
+                        "from the deck to its top, with tubes in place for a "
+                        "rack.", severity="warning")
+                else:
+                    self.app.notify(
+                        f"{label} must be {'a whole number' if whole else 'a number'}"
+                        f"{f' of {unit}' if unit else ''} greater than zero, "
+                        f"like {'4' if whole else '38.5'} — not {raw!r}.",
+                        severity="warning", markup=False)
+                return None
+            return v
 
-        rows, cols = int(_num("#autolab-lw-rows", 4)), int(_num("#autolab-lw-cols", 6))
-        definition = _ot2._ot2_build_labware_def(
-            name, rows, cols, category=self._val("#autolab-lw-cat", "tubeRack"),
-            spacing=_num("#autolab-lw-spacing", 9.0), depth=_num("#autolab-lw-depth", 40.0),
-            volume=_num("#autolab-lw-vol", 1500.0))
+        rows = _field("#autolab-lw-rows", "Rows", "", whole=True)
+        cols = _field("#autolab-lw-cols", "Cols", "", whole=True)
+        spacing = _field("#autolab-lw-spacing", "Spacing", "millimetres")
+        depth = _field("#autolab-lw-depth", "Depth", "millimetres")
+        # The overall height decides where every well bottom sits (height minus
+        # depth), and nothing else on the form can stand in for it: a guess put
+        # a tube rack's wells ~38 mm below the real tube bottoms (audit
+        # 2026-09-22). Required — it has no default at all.
+        height = _field("#autolab-lw-height", "Height", "millimetres")
+        volume = _field("#autolab-lw-vol", "uL/well", "microlitres")
+        if (rows is None or cols is None or spacing is None or depth is None
+                or height is None or volume is None):
+            return
+        rows, cols = int(rows), int(cols)
+        try:
+            definition = _ot2._ot2_build_labware_def(
+                name, rows, cols, category=self._val("#autolab-lw-cat", "tubeRack"),
+                spacing=spacing, depth=depth, volume=volume, z_dim=height)
+        except _ot2.OT2Error as exc:
+            self.app.notify(str(exc), severity="warning", markup=False)
+            return
         coll = self._val("#autolab-lw-coll", "Default").strip() or "Default"
         self._save_labware_to_library(coll, name, definition)
         self._refresh_labware_lib()
-        self.app.notify(f"Saved custom labware {name!r} ({rows}x{cols}) to {coll!r}.")
+        _z = next(iter((definition.get("wells") or {}).values()), {}).get("z")
+        self.app.notify(
+            f"Saved custom labware {name!r} ({rows}x{cols}) to {coll!r}"
+            + (f" — well bottoms {_z:g} mm above the deck. Analyse it on the "
+               f"robot before running." if isinstance(_z, (int, float)) else "."),
+            markup=False)
 
     def _delete_labware(self) -> None:
         try:
@@ -39855,6 +40995,22 @@ class AutolabScreen(Screen):
             return None
         return str(did), wells
 
+    def _refuse_same_plate(self, src_id, dst_id, what: str) -> bool:
+        """True — after telling the user — when the destination IS the source
+        plate. The destination wells are filled in order independently of the
+        source wells, so on one plate a step writes over a source well a later
+        step still has to read. The agent's `ot2-normalize` already refused
+        this; the GUI built the plan (audit 2026-09-22, S7)."""
+        if str(src_id).strip() != str(dst_id).strip():
+            return False
+        self.app.notify(
+            f"The destination is the source plate ({str(src_id).strip()}). A "
+            f"{what} reads each source well and fills the destination wells in "
+            f"order, so one plate for both would overwrite samples it has not "
+            f"picked up yet. Choose a second plate on the Deck tab.",
+            severity="error", markup=False)
+        return True
+
     def _cherry_pick(self) -> None:
         if self._bound_slot is None:
             self.app.notify("Bind a plate to a collection first.", severity="warning")
@@ -39864,6 +41020,8 @@ class AutolabScreen(Screen):
         if not src_id or dest is None:
             self.app.notify("Need a bound source plate + a destination plate (Deck tab).",
                             severity="warning")
+            return
+        if self._refuse_same_plate(src_id, dest[0], "cherry-pick"):
             return
         vol = self._read_num("#autolab-lib-vol")
         if vol is None or vol <= 0:
@@ -39922,6 +41080,8 @@ class AutolabScreen(Screen):
         if not src_id or dest is None:
             self.app.notify("Need a bound source plate + a destination plate (Deck tab).",
                             severity="warning")
+            return
+        if self._refuse_same_plate(src_id, dest[0], "normalise"):
             return
         conc = self._parse_concentrations()
         if not conc:
@@ -40234,7 +41394,7 @@ class AutolabScreen(Screen):
         try:
             # Re-check for an active run at the engine boundary — one may have
             # started between the button press and this worker running.
-            if _ot2._ot2_active_run(host):
+            if _ot2._ot2_active_run(host, strict=True):   # raises if it can't ask
                 self.app.call_from_thread(
                     self._mon, "[yellow]a run is active — not disengaging[/yellow]")
                 return
@@ -40530,7 +41690,7 @@ class AutolabScreen(Screen):
             pass
         s = _ot2._ot2_plan_summary(plan)
         self._mon(f"[green]compiled[/green] — {s['steps']} steps, "
-                  f"{s['total_volume_ul']} uL total, {s['tips_needed']} tips")
+                  f"{s['total_volume_ul']:g} uL total, {s['tips_needed']} tips")
         return proto
 
     # ── button dispatch ──────────────────────────────────────────────────────
@@ -41085,16 +42245,32 @@ class AutolabScreen(Screen):
             self._finish_run_progress(reason)
             self._hide_progress_bar()
             return
+        status = str(res.get("run_status") or "")
         if res.get("crashed"):
             self._set_crash_banner(res.get("faults") or ["run crashed"])
-            self._mon(f"[red]CRASH — run {_esc(str(res.get('run_status')))}[/red]")
+            self._mon(f"[red]CRASH — run {_esc(status)}[/red]")
             for f in (res.get("faults") or []):
                 self._mon(f"   [red]! {_esc(str(f))}[/red]")
-        else:
+        elif _ot2._ot2_run_outcome(res)[0]:
             self._set_crash_banner([])     # clear any stale banner
             self._fill_progress_bar()
-            self._mon(f"[green]run {_esc(str(res.get('run_status')))} — complete[/green]")
-        self._finish_run_progress(str(res.get("run_status") or "done"))
+            self._mon(f"[green]run {_esc(status)} — complete[/green]")
+        else:
+            # Ended `failed` / `stopped` with no fault reading. This used to
+            # print "run failed — complete" in green over a full progress
+            # bar. The bar is left where the run got to.
+            self._set_crash_banner([])
+            colour = "yellow" if status == "stopped" else "red"
+            self._mon(f"[{colour}]run {_esc(status)} — NOT complete"
+                      f"[/{colour}]")
+            for e in (res.get("run_errors") or []):
+                d = e.get("detail") if isinstance(e, dict) else e
+                self._mon(f"   [red]{_esc(str(d))}[/red]")
+            self.app.notify(
+                f"The OT-2 run {status} before it finished — check the deck "
+                f"before running it again.",
+                severity="warning" if status == "stopped" else "error")
+        self._finish_run_progress(status or "done")
 
     def action_close(self) -> None:
         self.app.pop_screen()
@@ -43908,6 +45084,15 @@ def _part_to_cloned_seqrecord(part: dict, *, allow_stub: bool = True):
     oh5 = part.get("oh5", "") or ""
     oh3 = part.get("oh3", "") or ""
     seq = _simulate_cloned_plasmid(insert, oh5, oh3, part.get("type", ""))
+    # The stub product can carry a Type IIS site FORMED at a junction (CL8);
+    # this builder is the save path's last resort and must not fail, so it
+    # records the fact rather than refusing.
+    _regen = _cloned_plasmid_regenerated_sites(seq, insert, oh5)
+    if _regen:
+        _log.warning("clone_sim: stub clone of %r has %s site(s) formed at a "
+                     "junction: %s", part.get("name"),
+                     ", ".join(sorted({d["enzyme"] for d in _regen})),
+                     [d["cut_bp"] for d in _regen])
 
     raw_name = part.get("name") or "part"
     safe_id  = re.sub(r"[^A-Za-z0-9_]", "_", raw_name) or "part"
@@ -45632,8 +46817,14 @@ def _reconcile_mirror_after_restore(target_path: "Path | str") -> None:
     the recovery UI reports success, then loses the data at restart. Writing the
     restored entries into the active collection here makes the recovery durable.
     MUST run after the restore's cache-bust so the `_load_*` below returns the
-    freshly-restored entries. Non-mirror targets (collections, features, gels,
-    custom_enzymes, …) are already the source of truth and are left untouched."""
+    freshly-restored entries.
+
+    The reverse holds for the SOURCE files (`collections.json` and its three
+    twins): restoring one leaves its mirror — and the mirror's cache — holding
+    the pre-restore active collection, which the next ordinary save then writes
+    back over the restore. Those re-stage the mirror from the restored file,
+    as a launch does. Everything else (features, gels, custom_enzymes, …) has
+    no mirror and is left untouched."""
     target = Path(target_path)
 
     def _is(attr: str) -> bool:
@@ -45661,6 +46852,54 @@ def _reconcile_mirror_after_restore(target_path: "Path | str") -> None:
                 # entries through, else the next project-open (or the mandatory
                 # projects picker) reverts the restore from the stale project.
                 _sync_active_project_experiments(_load_experiments())
+            elif _is("_COLLECTIONS_FILE"):
+                # The SOURCE of truth came back from the backup, but the
+                # library mirror and its cache still held the active collection
+                # as it was before — so the next ordinary library save wrote
+                # those stale plasmids straight back over the restored
+                # collection, and the entry the user had just recovered was
+                # gone again (audit 2026-09-22, D3). Re-stage the mirror from
+                # the restored file, exactly as a launch does.
+                name = _get_active_collection_name()
+                if name and _find_collection(name) is None:
+                    # The restored file has no collection by the active name:
+                    # the library file now holds the only copy of those
+                    # plasmids. Mark it so no launch overwrites it.
+                    _mark_mirror_dirty(
+                        f"collections.json was restored from a backup that has "
+                        f"no collection named {name!r}; the plasmid library "
+                        f"holds the only copy of its plasmids", kind="library")
+                else:
+                    _restore_library_from_active_collection()
+            elif _is("_PRIMER_COLLECTIONS_FILE"):
+                _restore_primers_from_active_primer_collection()
+            elif _is("_PARTS_BIN_COLLECTIONS_FILE"):
+                _restore_parts_bin_from_active_bin()
+            elif _is("_EXPERIMENT_PROJECTS_FILE"):
+                _restore_experiments_from_active_project()
+            elif _is("_SETTINGS_FILE"):
+                # settings.json holds the ACTIVE pointers of all four mirrors
+                # (plasmids, primers, parts bin, notebook project), so
+                # restoring it can move them while each live file still holds
+                # the OLD container's content — and the next save writes that
+                # into whatever the restored pointer names, the clobber
+                # [INV-160]-[INV-164] exist to prevent. The live files were
+                # pushed into their OUTGOING containers before the restore
+                # (`_prepare_mirrors_for_restore`), so each is re-staged from
+                # its restored pointer here exactly as a launch does: a pointer
+                # to no container leaves the live file alone. Never marked
+                # dirty — a dirty marker left for a pointer that names nothing
+                # made the next launch flush the library into the FIRST
+                # collection, over its own plasmids (audit 2026-09-24).
+                for _restage in (_restore_library_from_active_collection,
+                                 _restore_primers_from_active_primer_collection,
+                                 _restore_parts_bin_from_active_bin,
+                                 _restore_experiments_from_active_project):
+                    try:
+                        _restage()
+                    except Exception:
+                        _log.exception("settings restore: %s failed",
+                                       _restage.__name__)
     except Exception:
         _log.exception(
             "restore mirror-reconcile failed for %s — the restored mirror "
@@ -45668,9 +46907,77 @@ def _reconcile_mirror_after_restore(target_path: "Path | str") -> None:
         )
 
 
+# settings.json key → (what it points at, how to find one now, the file that
+# holds them) for the four ACTIVE pointers a settings restore moves.
+_RESTORE_POINTERS = (
+    ("active_collection", "plasmid collection", "collections"),
+    ("active_primer_collection", "primer collection", "primer_collections"),
+    ("active_parts_bin", "parts bin", "parts_bin_collections"),
+    ("active_project", "notebook project", "experiment_projects"),
+)
+
+
+def _restore_pointer_missing(key: str, value) -> bool:
+    finder = {"active_collection": _find_collection,
+              "active_primer_collection": _find_primer_collection,
+              "active_parts_bin": _find_parts_bin,
+              "active_project": _find_project}[key]
+    return isinstance(value, str) and bool(value) and finder(value) is None
+
+
+def _prepare_mirrors_for_restore(target_path: "Path | str",
+                                 source_path: "Path | str | None" = None) -> None:
+    """Before a restore of `settings.json` — which moves every mirror's ACTIVE
+    pointer at once — push each live file into the container it belongs to
+    NOW, exactly as a container switch does. Restoring first and re-staging
+    after (the first fix) discarded work a failed mirror write had left only
+    in the live file: the re-stage rewrote it from the stale container.
+    Primers that no collection holds are kept in "Recovered primers".
+
+    With ``source_path``, the backup's own pointers are checked first: one
+    that names a container that no longer exists is REFUSED. The re-stage can
+    only leave the live file alone for such a pointer, so work saved after the
+    restore went into a container that was never there — a notebook entry
+    lost at the next launch, a primer at the next switch (round-2 hardening,
+    2026-09-25). Raises RuntimeError naming the problem — the caller refuses
+    the restore and nothing has changed."""
+    try:
+        is_settings = Path(target_path) == Path(_state._SETTINGS_FILE)
+    except (TypeError, ValueError):
+        is_settings = False
+    if not is_settings:
+        return
+    with _state._cache_lock:
+        if source_path is not None:
+            try:
+                entries = _read_backup_entries(Path(source_path), "settings")
+            except ValueError as exc:
+                raise RuntimeError(f"the backup cannot be read ({exc})") from exc
+            values = {e.get("key"): e.get("value") for e in entries
+                      if isinstance(e, dict)}
+            for key, what, file_label in _RESTORE_POINTERS:
+                value = values.get(key)
+                if _restore_pointer_missing(key, value):
+                    raise RuntimeError(
+                        f"that backup makes {value!r} the active {what}, and "
+                        f"there is no {what} by that name now — restore "
+                        f"{file_label} from a matching backup first, or pick "
+                        f"another settings backup; nothing was changed")
+        _flush_library_into_active_collection("restore")
+        _prepare_primer_switch("settings restore", "restore")
+        for kind in ("parts_bin", "experiments"):
+            _flush_dirty_mirror_before_switch(kind, "restore")
+
+
 # Agents reach this hub-pinned reconcile (it drives the hub-side active-
 # collection mirror) via a `_state` hook, like the other agent→hub hooks.
 _state._reconcile_mirror_after_restore_hook = _reconcile_mirror_after_restore
+_state._prepare_mirrors_for_restore_hook = _prepare_mirrors_for_restore
+_state._rescue_orphan_primers_hook = lambda why: _rescue_orphan_primers(why)
+_state._prepare_primer_switch_hook = (
+    lambda why, what="switch": _prepare_primer_switch(why, what))
+# The robot address the user saved in AUTOLAB — see `_state._ot2_trusted_host_hook`.
+_state._ot2_trusted_host_hook = lambda: str(_get_setting("ot2_host", "") or "")
 
 
 # ── Register the parts_bin hooks the dataaccess sibling fires ────────────────
@@ -46119,6 +47426,9 @@ def _ensure_default_primer_collection() -> None:
     colls = _load_primer_collections()
     if colls:
         if not _get_active_primer_collection_name():
+            # `primers.json` is about to be restored from the first
+            # collection; keep what no collection holds first (D10).
+            _rescue_orphan_primers("launch with no active primer collection")
             first = colls[0].get("name")
             if first:
                 _set_active_primer_collection_name(first)
@@ -46131,6 +47441,84 @@ def _ensure_default_primer_collection() -> None:
         "saved":       _date.today().isoformat(),
     }])
     _set_active_primer_collection_name(_DEFAULT_PRIMER_COLLECTION_NAME)
+
+
+def _rescue_orphan_primers(why: str) -> int:
+    """`_rescue_orphan_library_entries` for the primer library: keep every
+    primer in `primers.json` that no primer collection holds (matched by
+    sequence — the primer library's own identity) in "Recovered primers",
+    before the launch restores `primers.json` from another collection. The
+    agent's ``""`` default primer collection mirrors into nothing, so its
+    primers existed in the live file alone and the next launch — which adopts
+    the first collection — overwrote them (audit 2026-09-22, D10)."""
+    with _cache_lock:
+        try:
+            live = [p for p in (_load_primers() or []) if isinstance(p, dict)]
+        except Exception:
+            _log.exception("orphan rescue: could not read the primer library")
+            return 0
+        if not live:
+            return 0
+
+        def _key(pr):
+            return _normalize_primer_seq(str(pr.get("sequence") or ""))
+
+        colls = _load_primer_collections()
+        held = {_key(pr) for c in colls if isinstance(c, dict)
+                for pr in (c.get("primers") or []) if isinstance(pr, dict)}
+        orphans = [pr for pr in live if _key(pr) and _key(pr) not in held]
+        if not orphans:
+            return 0
+        rec = next((c for c in colls if isinstance(c, dict)
+                    and c.get("name") == _RECOVERED_PRIMERS_COLLECTION), None)
+        if rec is None:
+            rec = {"name": _RECOVERED_PRIMERS_COLLECTION,
+                   "description": ("Primers found in the primer library but in "
+                                   "no collection — kept here rather than "
+                                   "overwritten"),
+                   "primers": [], "saved": _date.today().isoformat()}
+            colls.append(rec)
+        rec["primers"] = list(rec.get("primers") or []) + [
+            _typed_clone(pr) for pr in orphans]
+        _save_primer_collections(colls)
+    _log.warning("orphan rescue (%s): %d primer(s) in no collection kept in %r",
+                 why, len(orphans), _RECOVERED_PRIMERS_COLLECTION)
+    _announce_recovered_orphans(
+        f"{len(orphans)} primer(s) that belonged to no collection were kept in "
+        f"the primer collection {_RECOVERED_PRIMERS_COLLECTION!r}.")
+    return len(orphans)
+
+
+def _prepare_primer_switch(why: str, what: str = "switch") -> None:
+    """Everything the OUTGOING primer library needs before `primers.json` is
+    rewritten from another collection — the ONE step every primer-collection
+    switch runs, in the app and through the agent. Only the agent's switch had
+    it, and only for the "" default, so a click on another collection in the
+    Primers screen dropped primers that existed nowhere else (round-2
+    hardening, 2026-09-25):
+      * work a failed mirror write left in `primers.json` is pushed into the
+        outgoing collection first (`_flush_dirty_mirror_before_switch`;
+        raises RuntimeError — the caller refuses the switch);
+      * primers no collection holds — saved under the agent's "" default, or
+        while the pointer named a collection since deleted — are kept in
+        "Recovered primers" (`_rescue_orphan_primers`)."""
+    with _cache_lock:
+        _flush_dirty_mirror_before_switch("primers", what)
+        active = _get_active_primer_collection_name()
+        if not active or _find_primer_collection(active) is None:
+            _rescue_orphan_primers(why)
+
+
+def _prepare_primer_switch_or_notify(app) -> bool:
+    """`_prepare_primer_switch` for an in-app switch: False, after telling the
+    user, when the outgoing primer library could not be kept — the caller then
+    leaves everything as it was."""
+    try:
+        _prepare_primer_switch("switch of the active primer collection")
+    except (OSError, RuntimeError) as exc:
+        _notify_save_failure(app, "Primer library", exc)
+        return False
+    return True
 
 
 def _restore_primers_from_active_primer_collection() -> None:
@@ -54991,7 +56379,7 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
         so a malicious or odd qualifier (e.g. a `[red]` tag in a
         feature label) can't inject Rich markup into the results panel.
         """
-        from rich.markup import escape as _esc
+        _esc = _markup_escape
         if not hits:
             return (f"[dim]No {program.upper()} hits passed the score / "
                     f"identity filter on a {len(query):,}-letter query "
@@ -55528,7 +56916,7 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
             self._safe_online_status("[yellow]Search cancelled.[/yellow]")
             return
         if err is not None:
-            from rich.markup import escape as _esc
+            _esc = _markup_escape
             safe_err = _esc(_CONTROL_CHARS_RE.sub("", err))
             self._safe_online_status(f"[red]{safe_err}[/red]")
             return
@@ -55553,7 +56941,7 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
             self._safe_online_status("[yellow]Search cancelled.[/yellow]")
             return
         if err is not None:
-            from rich.markup import escape as _esc
+            _esc = _markup_escape
             safe_err = _esc(_CONTROL_CHARS_RE.sub("", err))
             self._safe_online_status(f"[red]{safe_err}[/red]")
             return
@@ -55635,7 +57023,7 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
         self._online_refresh_add_button()
         if not h:
             return
-        from rich.markup import escape as _esc
+        _esc = _markup_escape
         if "acc" in h:   # Pfam hit
             head = (f"[b]{_esc(str(h.get('acc', '')))}[/b]  "
                     f"{_esc(str(h.get('name', '')))}")
@@ -55793,7 +57181,7 @@ class BlastModal(_OneShotDismissScreen, ModalScreen):
         self._online_set_fetching(False)
         if not self.is_mounted:
             return
-        from rich.markup import escape as _esc
+        _esc = _markup_escape
         safe = _esc(_CONTROL_CHARS_RE.sub("", msg))
         self._safe_online_status(f"[red]Fetch failed: {safe}[/red]")
 
@@ -57003,7 +58391,7 @@ class GrammarEditorModal(_OneShotDismissScreen, ModalScreen):
         User-controlled strings (file paths, plasmid names) are run
         through `rich.markup.escape` so a name like `pUC[18]` can't
         accidentally trip Rich's markup parser."""
-        from rich.markup import escape as _esc
+        _esc = _markup_escape
         v = self._entry_vector
         if not isinstance(v, dict) or not v.get("name"):
             return "[dim](none assigned)[/dim]"
@@ -59588,6 +60976,21 @@ class PartsBinModal(_OneShotDismissScreen, Screen):
             seq = _simulate_cloned_plasmid(
                 r.get("sequence", "") or "",
                 r.get("oh5", ""), r.get("oh3", ""), r.get("type", ""),
+            )
+        # A junction can CREATE a Type IIS site that neither parent carried, so
+        # the part would not cut in the assembly it was built for. The designer
+        # refuses such a design; this path used to hand the sequence over with
+        # no mention of it (audit 2026-09-22).
+        regen = _cloned_plasmid_regenerated_sites(
+            seq, r.get("sequence", "") or "", r.get("oh5", "") or "")
+        if regen:
+            names = sorted({d["enzyme"] for d in regen})
+            self.app.notify(
+                f"Copied, but a {', '.join(names)} site forms at a junction of "
+                f"this clone ({len(regen)} cut"
+                f"{'' if len(regen) == 1 else 's'}) — the part would be cut in "
+                f"its own assembly. Re-domesticate to remove it.",
+                severity="warning", markup=False, timeout=12,
             )
         self._copy_and_notify(
             seq, "cloned plasmid", f"{len(seq)} bp circular",
@@ -63645,6 +65048,10 @@ class SequencingScreen(Screen):
         rec = getattr(self, "_sanger_record", None)
         if rec is None:
             return
+        # Replaces the canvas: offer unsaved edits first (H3). Re-entrant.
+        if not self.app._guard_unsaved_then(  # type: ignore[attr-defined]
+                "load the read into the canvas", lambda: self._sanger_load(_)):
+            return
         try:
             self.app._apply_record(rec)   # type: ignore[attr-defined]
         except Exception as exc:
@@ -64532,14 +65939,18 @@ class SequencingScreen(Screen):
             self.app.call_from_thread(_err)
             return
 
-        def _show():
+        def _show(_after_prompt: bool = False):
             # Stale-load guard: discard if user swapped plasmids while
             # the C-loop ran. Pre-fix the worker's push_screen happily
             # painted an alignment for the OLD record. NOTE: we may
             # ourselves swap the canvas to the picked target below,
             # which would bump the counter — so the check has to
-            # happen FIRST, before our own load.
-            if (getattr(self.app, "_record_load_counter", 0)
+            # happen FIRST, before our own load. Skipped on the re-entry
+            # after the unsaved-changes prompt below: a "Discard" answer
+            # reloads the canvas (bumping the counter) on the user's own
+            # say-so to go ahead with THIS result.
+            if (not _after_prompt
+                    and getattr(self.app, "_record_load_counter", 0)
                     != entry_counter):
                 return
             # Cancel guard: the C-loop can't be cancelled mid-flight,
@@ -64564,6 +65975,12 @@ class SequencingScreen(Screen):
             cur_id = getattr(current, "id", None) if current else None
             tgt_id = getattr(target_record, "id", None)
             if tgt_id and cur_id != tgt_id:
+                # Swapping to the target REPLACES the canvas: offer unsaved
+                # edits first (H3).
+                if not self.app._guard_unsaved_then(  # type: ignore[attr-defined]
+                        f"open `{tgt_id}` for the alignment",
+                        lambda: _show(_after_prompt=True)):
+                    return
                 try:
                     self.app._apply_record(target_record)  # type: ignore[attr-defined]
                 except Exception:
@@ -64622,6 +66039,9 @@ class SequencingScreen(Screen):
                                         self.app, "_sanger_min_phred",
                                         _SANGER_MIN_PHRED_DEFAULT)),
                                     circular=bool(target_is_circular),
+                                    frame_shift=result.get(
+                                        "query_frame_shift", 0),
+                                    clipped=_read_is_clipped(result),
                                 )
                             )
                         except Exception:
@@ -64788,6 +66208,11 @@ class SequencingScreen(Screen):
         Dismisses the SequencingScreen as a side effect so the
         canvas is fully visible after the load.
         """
+        # Replaces the canvas: offer unsaved edits first (H3). Re-entrant.
+        if not self.app._guard_unsaved_then(  # type: ignore[attr-defined]
+                f"open `{entry.get('name') or 'that plasmid'}`",
+                lambda: self._jump_to_library_entry_at_pos(entry, target_bp)):
+            return
         gb_text = entry.get("gb_text", "")
         if not gb_text:
             try:
@@ -65812,7 +67237,8 @@ class ExperimentProjectsPickerModal(_OneShotDismissScreen, ModalScreen):
                 if not isinstance(e, dict):
                     continue
                 up = e.get("updated_at") or ""
-                if up and up > last_activity:
+                if up and (not last_activity or _iso_instant(up)
+                           > _iso_instant(last_activity)):
                     last_activity = up
             last_activity = _history_human_dt(last_activity[:10]) or "—"
             is_active = (active and name == active)
@@ -66977,19 +68403,23 @@ class ExperimentExportModal(ModalScreen):
                           if e.get("id") == eid), None)
             return [fresh or self._entry]
         return sorted(_load_experiments(),
-                       key=lambda e: (e.get("updated_at") or ""),
+                       key=lambda e: _iso_instant(e.get("updated_at")),
                        reverse=True)
 
-    def _image_srcs(self, entries: "list[dict]", *, embed: bool
+    def _image_srcs(self, entries: "list[dict]", *, embed: bool,
+                    images_only: bool = False
                      ) -> "tuple[dict[str, str], bool]":
         """`({stored_path: src}, embedded)` for the export's images.
 
         With `embed`, files are read and inlined as `data:` URIs up to
         `_EXPERIMENT_EXPORT_EMBED_MAX_BYTES`; past the cap (or with embed
-        off, or on a read error) the src is the absolute path on this
+        off, or on a read error) the src is the file's `file:` URI on this
         machine, which keeps the document working here but not when
-        moved. The returned flag says which happened so the caller can
-        report it rather than let the user find out later.
+        moved. A URI, not the bare path: `C:\\…` read as a URL scheme and
+        was dropped from the HTML, and a space in the path broke the
+        markdown link (audit 2026-09-22). The returned flag says which
+        happened so the caller can report it rather than let the user find
+        out later.
         """
         import base64 as _b64
         import mimetypes as _mt
@@ -67010,8 +68440,18 @@ class ExperimentExportModal(ModalScreen):
                         continue
                 except OSError:
                     continue
-                out[rel] = str(p)
+                try:
+                    out[rel] = p.absolute().as_uri()
+                except ValueError:
+                    continue
                 if not embed:
+                    continue
+                if images_only and not _is_image_path(rel):
+                    # A markdown viewer renders `data:` only for an image; a
+                    # trace or CSV embedded that way was refused outright, so
+                    # Markdown keeps it as a local file (round-2 hardening) —
+                    # and the document is then not self-contained: say so.
+                    embedded = False
                     continue
                 try:
                     size = p.stat().st_size
@@ -67028,7 +68468,9 @@ class ExperimentExportModal(ModalScreen):
                     # reporting a clean embed with one broken image in it.
                     embedded = False
                     continue
-                mime = _mt.guess_type(p.name)[0] or "image/png"
+                # Unknown type → generic bytes. It used to default to
+                # image/png, labelling a trace or a CSV as a picture.
+                mime = _mt.guess_type(p.name)[0] or "application/octet-stream"
                 out[rel] = (f"data:{mime};base64,"
                             + _b64.b64encode(raw).decode("ascii"))
                 total += size
@@ -67072,7 +68514,8 @@ class ExperimentExportModal(ModalScreen):
     def _export_worker(self, path: str, fmt: str, entries: "list[dict]",
                         embed: bool) -> None:
         try:
-            srcs, embedded = self._image_srcs(entries, embed=embed)
+            srcs, embedded = self._image_srcs(entries, embed=embed,
+                                              images_only=fmt != "html")
             stamp = _history_human_dt(_now_iso()[:10])
             if fmt == "html":
                 text = _experiment_html_document(
@@ -67259,7 +68702,7 @@ class ImageAttachModal(_OneShotDismissScreen, ModalScreen):
         self._picked = str(p)
         try:
             self.query_one("#imgatt-selected", Static).update(
-                f"[accent]Selected:[/] {p.name}",
+                f"[$accent]Selected:[/] {_markup_escape(p.name)}",
             )
             self.query_one("#btn-imgatt-ok", Button).disabled = False
         except NoMatches:
@@ -67575,6 +69018,88 @@ class _ExperimentMarkdownTextArea(TextArea):
         )
 
 
+def _resolve_plasmid_ref(target_id: str) -> "tuple[dict | None, list[dict]]":
+    """Resolve a notebook `@plasmid` reference to ONE library entry.
+
+    Returns ``(chosen, matches)``: ``chosen`` is ``{collection, id}`` or None;
+    ``matches`` are the candidates, for the "which one did you mean" message
+    when nothing is chosen.
+
+    A reference comes in two spellings: the Insert button writes the entry ID,
+    a hand-typed one is usually the DISPLAY NAME. Every entry in every
+    collection is checked, in tiers — exact id, exact name, then each case
+    aside — and the first tier with any match decides: ONE match, or one in
+    the active collection, opens; several with none active is ambiguous and
+    opens nothing (the matches say where they are). Ids are unique only
+    WITHIN a collection, so the same id in two collections was opened from
+    whichever came first — silently (round-2 hardening, 2026-09-25) — and the
+    case-aside tier looked only at the first ten FUZZY hits, which could
+    miss the plasmid named. Fuzzy hits are only ever suggestions: the search
+    is a subsequence match, and its lone hit for `@pY` was pACYC184."""
+    active = _get_active_collection_name() or ""
+    want = str(target_id or "").strip()
+    want_cf = want.casefold()
+    tiers: "list[list[tuple[str, dict]]]" = [[], [], [], []]
+    for c in _iter_collections_readonly():
+        if not isinstance(c, dict):
+            continue
+        cname = str(c.get("name") or "")
+        for e in c.get("plasmids") or []:
+            if not isinstance(e, dict) or not e.get("id"):
+                continue
+            eid = str(e.get("id"))
+            nm = str(e.get("name") or "").strip()
+            if eid == want:
+                tiers[0].append((cname, e))
+            elif nm == want:
+                tiers[1].append((cname, e))
+            elif eid.casefold() == want_cf:
+                tiers[2].append((cname, e))
+            elif nm.casefold() == want_cf:
+                tiers[3].append((cname, e))
+    for pool in tiers:
+        if not pool:
+            continue
+        if len(pool) == 1 or any(c == active for c, _e in pool):
+            pool.sort(key=lambda h: h[0] != active)
+            coll, entry = pool[0]
+            return {"collection": coll, "id": entry.get("id")}, []
+        return None, [{"collection": c, "id": e.get("id"),
+                       "name": e.get("name")} for c, e in pool]
+    return None, _search_collections_library(want, limit=10)
+
+
+def _plasmid_ref_token(collection: str, entry_id: str) -> "str | None":
+    """The `@<token>` the notebook's Insert button writes for a library entry,
+    or None when no spelling of it can be a tag.
+
+    The id is used when it can be one. But `_make_entry_id` keeps a leading
+    digit ("35S-GFP") and a tag must start with a letter (so "@5pm" stays
+    prose), so the button wrote tags the editor never highlighted, Ctrl+G
+    never opened and backlinks never counted. The display name stands in when
+    IT is a valid tag that resolves back to this same entry."""
+    # Whatever is written must come BACK to this entry: an id is unique only
+    # within its collection, so the same id elsewhere made the button write a
+    # tag that opened another collection's copy (round-2 hardening).
+    target = {"collection": collection, "id": entry_id}
+    if (_experiment_ref_token_ok(entry_id)
+            and _resolve_plasmid_ref(entry_id)[0] == target):
+        return entry_id
+    name = None
+    for c in _iter_collections_readonly():
+        if (c.get("name") or "") != collection:
+            continue
+        name = next((e.get("name") for e in c.get("plasmids") or []
+                     if isinstance(e, dict) and e.get("id") == entry_id),
+                    None)
+        break
+    if isinstance(name, str) and _experiment_ref_token_ok(name):
+        chosen, _ = _resolve_plasmid_ref(name)
+        if chosen == {"collection": collection, "id": entry_id}:
+            return name
+    return None
+
+
 # ── ExperimentsScreen ────────────────────────────────────────────────────────
 
 class ExperimentsScreen(_OneShotDismissScreen, Screen):
@@ -67804,7 +69329,7 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
         name = _get_active_project_name() or _DEFAULT_PROJECT_NAME
         if len(name) > 60:
             name = name[:57] + "…"
-        return f"[bold]Project:[/bold] [accent]{name}[/accent]"
+        return f"[bold]Project:[/bold] [$accent]{_markup_escape(name)}[/]"
 
     def _compose_entries_pane(self) -> ComposeResult:
         with Vertical(id="exp-entries-pane"):
@@ -67952,9 +69477,9 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
         entries = _load_experiments()
 
         def _key(e: dict) -> tuple:
-            updated = e.get("updated_at") or ""
             title   = e.get("title") or ""
-            return (updated, _natural_sort_key(title))
+            return (_iso_instant(e.get("updated_at")),
+                    _natural_sort_key(title))
         return sorted(entries, key=_key, reverse=True)
 
     # ─── Filter (narrows the ACTIVE project) ─────────────────────────────
@@ -68061,7 +69586,7 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
             ).value = entry.get("title", "")
             self.query_one(
                 "#exp-tags-input", Input,
-            ).value = ", ".join(entry.get("tags") or [])
+            ).value = ", ".join(_tag_values(entry.get("tags")))
             ta = self.query_one("#exp-body", TextArea)
             ta.text = entry.get("body_md", "")
         except NoMatches:
@@ -68254,7 +69779,7 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
         half-blocks (works in any terminal — no kitty/sixel/iTerm graphics
         protocol). Non-image files and render failures show a short note.
         Best-effort: never raises into the UI."""
-        from rich.markup import escape as _esc
+        _esc = _markup_escape
         try:
             preview = self.query_one("#exp-attach-preview", Static)
         except NoMatches:
@@ -68627,6 +70152,17 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
             except OSError:
                 pass
         rel = saved.name
+        # Record the attachment ON THE ENTRY. The file was written and a markdown
+        # link inserted, but `image_paths` — which the exporters embed from and
+        # which `_experiment_duplicate` checks to warn that attachments are not
+        # copied — was never appended, so an exported notebook carried no images
+        # at all and the duplicate notice never appeared (audit 2026-09-22).
+        paths = self._current_entry.get("image_paths")
+        if not isinstance(paths, list):
+            paths = []
+        if rel not in paths:
+            paths.append(rel)
+        self._current_entry["image_paths"] = paths
         try:
             ta = self.query_one("#exp-body", TextArea)
             current = ta.text
@@ -68656,6 +70192,14 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
                 return
             if not entry_id:
                 return
+            token = _plasmid_ref_token(_coll, entry_id)
+            if token is None:
+                self.app.notify(
+                    f"{entry_id} can't be written as a tag: a tag starts "
+                    f"with a letter and holds only letters, digits, '.', "
+                    f"'-' or '_' (64 at most). Rename the plasmid to "
+                    f"reference it.", severity="warning", markup=False)
+                return
             try:
                 ta = self.query_one("#exp-body", TextArea)
             except NoMatches:
@@ -68663,7 +70207,7 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
             # Single-sigil tag format (2026-05-18): `@<id>` not
             # `@plasmid:<id>`. Trailing space + refocus so the user
             # can keep typing without clicking back into the body.
-            ta.insert(f"@{entry_id} ")
+            ta.insert(f"@{token} ")
             ta.focus()
             self._mark_dirty(True)
             _log_event("experiments.insert.plasmid_ref",
@@ -68745,17 +70289,36 @@ class ExperimentsScreen(_OneShotDismissScreen, Screen):
         `UnsavedNavigateModal` pattern the `LibraryPanel._btn_back`
         path uses (line 13900).
         """
-        matches = _search_collections_library(target_id, limit=10)
-        chosen = None
-        for m in matches:
-            if m.get("id") == target_id:
-                chosen = m
-                break
+        chosen, matches = _resolve_plasmid_ref(target_id)
         if chosen is None:
-            self.app.notify(
-                f"No plasmid `{target_id}` in any collection.",
-                severity="warning",
-            )
+            if matches:
+                names = ", ".join(
+                    f"{m.get('name') or m.get('id')} in "
+                    f"{m.get('collection') or 'the library'}"
+                    for m in matches[:5])
+                _want = target_id.strip().casefold()
+                if all(str(m.get("id") or "").casefold() == _want
+                       for m in matches):
+                    self.app.notify(
+                        f"`{target_id}` is in several collections ({names}) — "
+                        f"open the one you mean from the Library, or make its "
+                        f"collection active.", severity="warning",
+                        markup=False)
+                elif all(str(m.get("name") or "").strip().casefold() == _want
+                         for m in matches):
+                    self.app.notify(
+                        f"`{target_id}` matches several plasmids ({names}) — "
+                        f"use the exact id.", severity="warning", markup=False)
+                else:
+                    self.app.notify(
+                        f"No plasmid is named `{target_id}` — did you mean "
+                        f"{names}? Use the exact name or id.",
+                        severity="warning", markup=False)
+            else:
+                self.app.notify(
+                    f"No plasmid `{target_id}` in any collection.",
+                    severity="warning", markup=False,
+                )
             return
         coll_name = chosen.get("collection") or ""
         entry_id = chosen.get("id") or ""
@@ -75830,6 +77393,10 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         app = self.app
 
         def _focus() -> None:
+            # Replaces the canvas: offer unsaved edits first (H3). Re-entrant.
+            if not app._guard_unsaved_then(  # type: ignore[attr-defined]
+                    f"open the saved `{clone_name}`", _focus):
+                return
             try:
                 app._apply_record(clone_rec)  # type: ignore[attr-defined]
             except Exception:
@@ -79740,6 +81307,11 @@ class VerificationReportModal(_OneShotDismissScreen, ModalScreen):
                     "_all_aligns": [a for a in (entry.get("alignments") or [])
                                     if isinstance(a, dict)],
                     "_total_bp":  target_len,
+                    # The plasmid's own topology: judging a linear one as a
+                    # circle made a partial read's unread end a "deletion".
+                    "_circular":  _topology_from_gb_text(
+                        entry.get("gb_text") or "",
+                        default="circular") != "linear",
                     "entry_id":   entry.get("id") or "",
                     "entry_name": entry.get("name") or "?",
                     "read_label": align.get("label")
@@ -79882,7 +81454,8 @@ class VerificationReportModal(_OneShotDismissScreen, ModalScreen):
         r = self._rows_data[row]
         aligns = r.get("_all_aligns") or []
         total = int(r.get("_total_bp", 0) or 0)
-        summary = _multi_read_summary(aligns, total)
+        summary = _multi_read_summary(aligns, total,
+                                      circular=bool(r.get("_circular", True)))
         self.app.push_screen(ReadConsensusModal(
             summary, label=r.get("entry_name") or "?",
             phrase=_multi_read_phrase(summary),
@@ -80944,7 +82517,7 @@ class DomesticatorModal(ModalScreen):
         identically. User-controlled name strings go through
         `rich.markup.escape` so a custom vector named `pUPD[FFE-1]`
         renders literally rather than tripping Rich's parser."""
-        from rich.markup import escape as _esc
+        _esc = _markup_escape
         v = _get_entry_vector(grammar_id)
         prefix = "[bold]Entry vector:[/bold]  "
         if not isinstance(v, dict) or not v.get("name"):
@@ -81345,6 +82918,21 @@ class DomesticatorModal(ModalScreen):
                 insert, oh5, oh3, d["part_type"]),
             "grammar":     grammar_id,
         }
+        # A junction of the simulated clone can regenerate a Type IIS site that
+        # neither the insert nor the scrubbed stub carried — the part would then
+        # be cut inside the assembly it exists for. Surfaced here because the
+        # part is about to be SAVED (audit 2026-09-22).
+        _regen = _cloned_plasmid_regenerated_sites(
+            part["cloned_seq"], insert, oh5)
+        if _regen:
+            _names = sorted({x["enzyme"] for x in _regen})
+            self.app.notify(
+                f"Heads up — a {', '.join(_names)} site forms at a junction of "
+                f"the simulated clone for {part.get('name') or 'this part'}. "
+                f"The part body is clean; the site appears where the overhang "
+                f"meets it, so re-check the overhangs before ordering.",
+                severity="warning", markup=False, timeout=12,
+            )
         # Carry the design provenance (the exact template + region) so the
         # outer feature-stamp can rebase a codon-optimized insert's features at
         # the KNOWN offset when sequence anchoring fails. Transient — consumed +
@@ -84684,7 +86272,7 @@ class TraditionalCloningPane(Vertical):
         # raises MarkupError and blanks the pane). Same hygiene as
         # RenamePlasmidModal's status line. The messages carry no intentional
         # markup of their own — the colour tags are added out here.
-        from rich.markup import escape as _md_escape
+        _md_escape = _markup_escape
         # Self-ligation risk block [INV-192] — rendered as its OWN section,
         # ahead of the junction warnings, because the empty-vector
         # background is the single most common reason a "✓ ligates" clone
@@ -84741,7 +86329,7 @@ class TraditionalCloningPane(Vertical):
         Each risk is one ``✗``/``⚠`` line plus a dim ``→`` advice line. All
         text is user-influenced (fragment labels) — escaped like the
         warnings above."""
-        from rich.markup import escape as _md_escape
+        _md_escape = _markup_escape
         risks = [r for r in (sl.get("risks") or []) if isinstance(r, dict)]
         skipped = str(sl.get("skipped") or "")
         if not risks:
@@ -86118,7 +87706,7 @@ class GibsonAssemblyPane(Vertical):
         summary = self._design_homology_arms()
         if summary is None:
             return
-        armed, already, skipped = summary
+        armed, already, skipped, long_overlaps = summary
         self._invalidate_product()
         self._refresh_lane_table()
         self._refresh_overlap_view()
@@ -86146,6 +87734,17 @@ class GibsonAssemblyPane(Vertical):
                 f"{self._min_overlap()} bp minimum): "
                 + ", ".join(skipped[:3]) + (" …" if len(skipped) > 3 else "")
             )
+        if long_overlaps:
+            worst = max(o for _nm, o in long_overlaps)
+            parts.append(
+                f"{len(long_overlaps)} junction(s) already match further than "
+                f"the {self._min_overlap()} bp minimum (up to {worst} bp) — the "
+                f"assembly collapses the WHOLE match, so that much of "
+                + ", ".join(nm for nm, _o in long_overlaps[:3])
+                + (" …" if len(long_overlaps) > 3 else "")
+                + " comes off its 5' end. Trim the fragment if that is not the "
+                  "overlap you designed"
+            )
         if invalid:
             parts.append(
                 "but the assembly is still invalid — a fragment is too short to "
@@ -86155,10 +87754,12 @@ class GibsonAssemblyPane(Vertical):
             "Design overlaps — "
             + ("; ".join(parts) if parts else "nothing to do"),
             markup=False,
-            severity="warning" if (skipped or invalid) else "information",
+            severity=("warning" if (skipped or invalid or long_overlaps)
+                      else "information"),
         )
 
-    def _design_homology_arms(self) -> "tuple[int, int, list[str]] | None":
+    def _design_homology_arms(
+            self) -> "tuple[int, int, list[str], list[tuple[str, int]]] | None":
         """Append a 5' homology arm to each downstream lane fragment so
         every junction reaches `min_overlap`. The arm = the upstream
         fragment's 3'-terminal `min_overlap` bases (the standard Gibson
@@ -86175,8 +87776,11 @@ class GibsonAssemblyPane(Vertical):
         so the simulator can still re-merge it (worst case it shows as
         two pieces — the SEQUENCE is always exact).
 
-        Returns ``(armed, already_ok, skipped_names)``, or None when
-        there aren't two fragments to make a junction."""
+        Returns ``(armed, already_ok, skipped_names, long_overlaps)`` — the
+        last being ``[(fragment_name, measured_overlap_bp)]`` for junctions whose
+        ends match materially further than `min_overlap`, which the simulator
+        will collapse in full. None when there aren't two fragments to make a
+        junction."""
         lane = self._lane
         if len(lane) < 2:
             self.app.notify(
@@ -86207,13 +87811,26 @@ class GibsonAssemblyPane(Vertical):
             junctions.append((n - 1, 0))   # wrap: last 3' → first 5'
         armed = already = 0
         skipped: list[str] = []
+        long_overlaps: "list[tuple[str, int]]" = []
         for up_i, down_i in junctions:
             up_seq = lane[up_i].get("sequence") or ""
             down = lane[down_i]
             down_seq = down.get("sequence") or ""
-            if _gibson_overlap_len(up_seq, down_seq,
-                                     min_overlap=min_oh) >= min_oh:
+            found = _gibson_overlap_len(up_seq, down_seq, min_overlap=min_oh)
+            if found >= min_oh:
                 already += 1
+                # The simulator collapses the overlap it MEASURES, not the one
+                # the design asks for. Repetitive ends (a poly-A tail, a shared
+                # terminator, two fragments cut from the same parent) can match
+                # far past `min_overlap`, and every extra base collapses out of
+                # the downstream fragment's 5' end — silently, because this
+                # junction "already met" the requirement (audit 2026-09-22).
+                # Reported, not trimmed: `[project_audit_2026_07_18]` reverted
+                # subtracting the excess, because designed homology and a
+                # coincidental terminal identity are indistinguishable here.
+                if found >= min_oh + _GIB_LONG_OVERLAP_SLACK_BP:
+                    long_overlaps.append(
+                        (str(down.get("name") or "?"), found))
                 continue
             if len(up_seq) < min_oh:
                 skipped.append(str(down.get("name") or "?"))
@@ -86238,8 +87855,8 @@ class GibsonAssemblyPane(Vertical):
             armed += 1
         _log_event("gibson.design_arms", fragments=n, circular=circ,
                     min_overlap=min_oh, armed=armed, already=already,
-                    skipped=len(skipped))
-        return armed, already, skipped
+                    skipped=len(skipped), long_overlaps=len(long_overlaps))
+        return armed, already, skipped, long_overlaps
 
     @on(Button.Pressed, "#btn-gib-simulate")
     def _on_simulate(self, _: Button.Pressed) -> None:
@@ -88865,7 +90482,7 @@ class ConstructorModal(ModalScreen):
         so a long plasmid name like ``pUC57_with_long_descriptive_
         name`` would push the layout. Hard-cap at 16 chars with an
         ellipsis suffix so every label fits the same column."""
-        from rich.markup import escape as _esc
+        _esc = _markup_escape
         v = _get_entry_vector(gid, role)
         if isinstance(v, dict) and v.get("name"):
             nm = str(v.get("name") or "")
@@ -89027,7 +90644,7 @@ class ConstructorModal(ModalScreen):
         so a vector named `pUC[18]` renders literally rather than
         tripping Rich's markup lexer.
         """
-        from rich.markup import escape as _esc
+        _esc = _markup_escape
         role = self._backbones.get(gid, "") or ""
         v    = _get_entry_vector(gid, role) if role else None
         prefix = (
@@ -89600,7 +91217,7 @@ class SpeciesPickerModal(_OneShotDismissScreen, ModalScreen):
             chart.update("")
             meta.update("[red]That table could not be loaded.[/red]")
             return
-        from rich.markup import escape as _esc
+        _esc = _markup_escape
         raw = entry["raw"]
         # A registry table is always well-formed {codon: (aa, count)}, but
         # render defensively — a corrupt entry should show a message, never
@@ -91979,10 +93596,14 @@ class MutagenizeModal(ModalScreen):
                 except (OSError, RuntimeError) as exc:
                     _notify_save_failure(self.app, "Primer collections", exc)
                     return
+                if not _prepare_primer_switch_or_notify(self.app):
+                    return
                 _set_active_primer_collection_name(collection)
                 _settings_flush_sync()
                 _restore_primers_from_active_primer_collection()
             elif collection != active_coll:
+                if not _prepare_primer_switch_or_notify(self.app):
+                    return
                 _set_active_primer_collection_name(collection)
                 _settings_flush_sync()
                 # Re-point the live library at the switched-to collection before
@@ -92309,7 +93930,7 @@ class PrimerCsvExportModal(_OneShotDismissScreen, ModalScreen):
             fmt = {0: "generic", 1: "idt", 2: "plate"}.get(idx, "generic")
         except NoMatches:
             pass
-        from rich.markup import escape as _esc
+        _esc = _markup_escape
         try:
             summary = _export_primers_to_csv(self._primers, path,
                                              order_format=fmt)
@@ -93278,6 +94899,11 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
         to [start_bp, end_bp) (wrap-aware via `focus_span`). Mirrors
         `_jump_to_library_entry_at_pos`; dismisses this screen so the canvas
         is visible."""
+        # Replaces the canvas: offer unsaved edits first (H3). Re-entrant.
+        if not self.app._guard_unsaved_then(  # type: ignore[attr-defined]
+                f"open `{entry.get('name') or 'that plasmid'}`",
+                lambda: self._pc_open_entry(entry, start_bp, end_bp)):
+            return
         gb = entry.get("gb_text") or ""
         if not gb:
             try:
@@ -93768,6 +95394,7 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
                 # primers view — the user made it to put primers in it, so
                 # don't leave them in the collections list with the ✓ still on
                 # the old collection. Mirrors a collection-row switch.
+                _prepare_primer_switch("switch to a new primer collection")
                 _set_active_primer_collection_name(name)
                 _settings_flush_sync()
                 _restore_primers_from_active_primer_collection()
@@ -93960,6 +95587,9 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
                              if (c.get("name") or "") != cur]
                 if not remaining:
                     return
+                # The live library is rewritten from `remaining[0]` below;
+                # whatever it holds that no collection does is kept first.
+                _prepare_primer_switch("delete of a primer collection")
                 _save_primer_collections(remaining)
                 _set_active_primer_collection_name(
                     remaining[0].get("name") or "")
@@ -94002,12 +95632,9 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             return
         # A previous primer mirror failure left primers.json ahead of the
         # outgoing collection: push it there before the live file is
-        # rewritten from the incoming one, or refuse (audit 2026-09-22).
-        try:
-            _flush_dirty_mirror_before_switch("primers")
-        except RuntimeError as exc:
-            self.app.notify(str(exc), severity="error", timeout=15,
-                            markup=False)
+        # rewritten from the incoming one, or refuse (audit 2026-09-22) — and
+        # keep primers no collection holds (round-2 hardening, 2026-09-25).
+        if not _prepare_primer_switch_or_notify(self.app):
             return
         # Warn the user before silently discarding any star-marks from
         # the outgoing collection. `_refresh_library_table` clips
@@ -95426,12 +97053,16 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
                     return
                 # Activate the new collection so the upcoming
                 # `_save_primers` mirror lands in it.
+                if not _prepare_primer_switch_or_notify(self.app):
+                    return
                 _set_active_primer_collection_name(collection)
                 _settings_flush_sync()
                 _restore_primers_from_active_primer_collection()
             elif collection != active_coll:
                 # User picked an existing non-active collection.
                 # Switch active so the mirror writes there.
+                if not _prepare_primer_switch_or_notify(self.app):
+                    return
                 _set_active_primer_collection_name(collection)
                 _settings_flush_sync()
                 # Re-point the live library at the switched-to collection first,
@@ -97372,10 +99003,11 @@ class SimulatorScreen(Screen):
                 )
             with Horizontal(id="sim-gel-top-row"):
                 yield Label("Agarose %:")
+                _ag_opts, _ag_val = _agarose_menu(self._agarose_pct)
                 yield Select(
-                    [(f"{g:.1f}%", str(g)) for g in _AGAROSE_CHOICES],
+                    _ag_opts,
                     id="sim-gel-agarose",
-                    value=str(self._agarose_pct),
+                    value=_ag_val,
                     allow_blank=False,
                 )
             yield Static(
@@ -98077,7 +99709,7 @@ class SimulatorScreen(Screen):
         try:
             self._agarose_pct = float(str(event.value))
         except (TypeError, ValueError):
-            return
+            pass
 
     @on(Button.Pressed, "#btn-sim-gel-library")
     def _on_gel_library(self, _) -> None:
@@ -98108,11 +99740,18 @@ class SimulatorScreen(Screen):
             for ln in raw_lanes:
                 if not isinstance(ln, dict):
                     continue
-                restored.append({
+                lane = {
                     "name":   ln.get("name") or "",
                     "source": ln.get("source") or "empty",
                     "detail": ln.get("detail") or "",
-                })
+                }
+                # The frozen PCR size is the only record of which amplicon a
+                # `pcr` lane ran; without it the lane is re-sized from the
+                # primer pair's CURRENT amplicon.
+                _bp = _gel_lane_pcr_bp(ln.get("_pcr_bp"))
+                if _bp is not None:
+                    lane["_pcr_bp"] = _bp
+                restored.append(lane)
             if not restored:
                 self.app.notify(
                     f"Gel '{gel.get('name', gel_id)}' has no lanes "
@@ -98140,12 +99779,24 @@ class SimulatorScreen(Screen):
             except (TypeError, ValueError):
                 pass
             self._refresh_lane_rows()
-            # Bring the agarose Select in sync.
+            # Bring the agarose Select in sync. Its option VALUES are strings
+            # (`str(g)`), and assigning the float raised Textual's
+            # InvalidSelectValueError — which is not a ValueError — so loading
+            # any saved gel crashed the screen (found 2026-09-24). A saved
+            # percentage the menu does not offer (an agent gel at 0.65%) is
+            # added to it: shown as its nearest choice, the sync fired the
+            # change handler, which wrote 0.7 back, and the next save
+            # overwrote the gel's own value (round-2 hardening, 2026-09-25).
             try:
                 ag = self.query_one("#sim-gel-agarose", Select)
-                ag.value = self._agarose_pct
-            except (NoMatches, ValueError):
+                _ag_opts, _ag_val = _agarose_menu(self._agarose_pct)
+                with self.prevent(Select.Changed):
+                    ag.set_options(_ag_opts)
+                    ag.value = _ag_val
+            except NoMatches:
                 pass
+            except Exception:
+                _log.exception("gel library: could not sync the agarose menu")
             _log_event(
                 "gel.loaded", gid=gel_id,
                 name=gel.get("name", ""),
@@ -99859,6 +101510,27 @@ class RestoreFromBackupModal(ModalScreen):
              if attr == self.query_one("#restore-target", Select).value),
             "data file",
         )
+        # ONE critical section from the preparation to the reconcile, as in
+        # the agent's restore: a save landing between the restore and the
+        # re-stage wrote the old container's content into the restored one
+        # (round-2 hardening, 2026-09-25). RLock — each step re-enters.
+        with _cache_lock:
+            n = self._restore_locked(target, backup, target_label, status)
+        if n is None:
+            return
+        self._dismiss_once({
+            "target":      target_label,
+            "source_path": str(backup["source_path"]),
+            "n_entries":   n,
+        })
+
+    def _restore_locked(self, target, backup, target_label, status):
+        try:
+            _prepare_mirrors_for_restore(target, backup["source_path"])
+        except (RuntimeError, OSError) as exc:
+            status.update(f"[red]Restore refused: "
+                          f"{_markup_escape(str(exc))}[/red]")
+            return None
         try:
             n = _restore_from_backup(
                 target, Path(backup["source_path"]), target_label,
@@ -99866,9 +101538,9 @@ class RestoreFromBackupModal(ModalScreen):
         except (ValueError, OSError) as exc:
             _log.exception("Restore failed")
             status.update(
-                f"[red]Restore failed: {exc}[/red]"
+                f"[red]Restore failed: {_markup_escape(str(exc))}[/red]"
             )
-            return
+            return None
         # Bust EVERY persisted-state cache so the next read picks up
         # the restored state. Sweep #25 (2026-05-23) — drives the
         # enumeration from `_MASTER_DELETE_CACHE_ATTRS` (the canonical
@@ -99893,11 +101565,7 @@ class RestoreFromBackupModal(ModalScreen):
         # active collection on next launch unless the restore is written
         # through into that collection now — else the recovery silently undoes.
         _reconcile_mirror_after_restore(target)
-        self._dismiss_once({
-            "target":      target_label,
-            "source_path": str(backup["source_path"]),
-            "n_entries":   n,
-        })
+        return n
 
     @on(Button.Pressed, "#btn-restore-cancel")
     def _cancel_btn(self, _) -> None:
@@ -100021,28 +101689,102 @@ class CollectionsModal(_OneShotDismissScreen, ModalScreen):
 
     @on(Button.Pressed, "#btn-coll-del")
     def _delete(self, _) -> None:
+        """Delete the selected collection — after the same two confirmations
+        the library panel asks for. This dialog deleted a collection and every
+        plasmid in it on ONE press, with no question at all (round-2
+        hardening, 2026-09-25)."""
         status = self.query_one("#coll-status", Static)
         name = _cursor_row_key(self.query_one("#coll-table", DataTable))
         if not name:
             status.update("[red]No collection selected.[/red]")
             return
+        n_plas = len((_find_collection(name) or {}).get("plasmids") or [])
+
+        def _on_first(yes: "bool | None") -> None:
+            if not yes:
+                return
+
+            def _on_second(yes2: "bool | None") -> None:
+                if yes2:
+                    self._delete_confirmed(name)
+            self.app.push_screen(ScaryDeleteConfirmModal(name, n_plas),
+                                 callback=_on_second)
+        self.app.push_screen(CollectionDeleteConfirmModal(name, n_plas),
+                             callback=_on_first)
+
+    def _delete_confirmed(self, name: str) -> None:
+        status = self.query_one("#coll-status", Static)
+        deleted = _find_collection(name)
+        deleted_ids = {p.get("id") for p in ((deleted or {}).get("plasmids")
+                                             or []) if isinstance(p, dict)}
+        was_active = _get_active_collection_name() == name
         existing = [c for c in _load_collections() if c.get("name") != name]
         try:
             _save_collections(existing)
         except (OSError, RuntimeError) as exc:
             _notify_save_failure(self.app, "Collections", exc)
             return
+        if was_active:
+            # The same switch the library panel's Delete makes. Leaving the
+            # pointer on the deleted collection made the next switch find its
+            # plasmids in no collection and "rescue" them — the deleted
+            # collection came back as "Recovered plasmids" (audit 2026-09-24).
+            new_active = existing[0].get("name") if existing else None
+            try:
+                if new_active:
+                    _activate_collection(new_active, discard_outgoing=True)
+                else:
+                    _deactivate_all_collections()
+            except (OSError, RuntimeError, ValueError) as exc:
+                _notify_save_failure(self.app, "Plasmid library", exc)
+                return
+            self._switched_after_delete = (name, new_active or "")
+            cur = getattr(self.app, "_current_record", None)
+            if cur is not None and getattr(cur, "id", None) in deleted_ids:
+                _clear_canvas_of_deleted_collection(self.app, name,
+                                                    new_active or "")
         self._repopulate()
-        status.update(f"[dim]Deleted collection '{name}'.[/dim]")
+        status.update(f"[dim]Deleted collection '{_markup_escape(name)}'.[/dim]")
+
+    def _close_result(self):
+        """What closing reports: the collection a Delete switched to, so the
+        library panel shows it instead of the deleted one's rows."""
+        switched = getattr(self, "_switched_after_delete", None)
+        if not switched:
+            return None
+        deleted, now = switched
+        coll = _find_collection(now) if now else None
+        return {"loaded": now, "after_delete": deleted,
+                "n_plasmids": len((coll or {}).get("plasmids") or [])}
 
     @on(Button.Pressed, "#btn-coll-close")
     def _close_btn(self, _) -> None:
-        self.dismiss(None)
+        self.dismiss(self._close_result())
 
     def action_cancel(self) -> None:
-        self.dismiss(None)
+        self.dismiss(self._close_result())
 
 
+
+
+def _clear_canvas_of_deleted_collection(app, deleted: str, now: str) -> bool:
+    """The canvas's plasmid came from a collection just deleted: clear it —
+    unless it holds UNSAVED edits, which stay open with a notice instead.
+    Clearing them threw away work the user had not saved, with no prompt,
+    and the delete is past asking about (round-2 hardening, 2026-09-25).
+    Saving keeps it, in the collection now active. True when cleared."""
+    if getattr(app, "_unsaved", False):
+        where = f"'{now}'" if now else "the library"
+        app.notify(
+            f"The plasmid on the canvas came from '{deleted}' and has unsaved "
+            f"changes, so it stays open — save it to keep it (in {where}), or "
+            f"close it to let it go.", severity="warning", timeout=12,
+            markup=False)
+        return False
+    clear = getattr(app, "_clear_canvas", None)
+    if callable(clear):
+        clear()
+    return True
 
 
 class NewCollectionModal(_OneShotDismissScreen, ModalScreen):
@@ -100134,7 +101876,7 @@ class NewCollectionModal(_OneShotDismissScreen, ModalScreen):
 
     @on(DirectoryTree.DirectorySelected)
     def _on_dir_selected(self, event) -> None:
-        from rich.markup import escape as _esc
+        _esc = _markup_escape
         if _DEMO_MODE == "web":
             return
         self._selected_folder = Path(event.path)
@@ -100266,7 +102008,7 @@ class NewCollectionModal(_OneShotDismissScreen, ModalScreen):
         except NoMatches:
             pass
         try:
-            from rich.markup import escape as _esc
+            _esc = _markup_escape
             symbol = "ok  " if ok else "FAIL"
             self.query_one("#newcoll-progress-status", Static).update(
                 f"[dim]{symbol}  {_esc(fname)}  ({idx}/{total})[/]"
@@ -100275,7 +102017,7 @@ class NewCollectionModal(_OneShotDismissScreen, ModalScreen):
             pass
 
     def _on_import_error(self, msg: str) -> None:
-        from rich.markup import escape as _esc
+        _esc = _markup_escape
         self._importing = False
         try:
             self.query_one("#btn-newcoll-ok",    Button).disabled = False
@@ -100378,7 +102120,7 @@ class UpdateAvailableModal(ModalScreen):
         self._dismissed: bool = False
 
     def compose(self) -> ComposeResult:
-        from rich.markup import escape as _esc
+        _esc = _markup_escape
         # Defence-in-depth: re-validate the version string here, not
         # just at the call site. If `_validate_pin_version` exists in
         # this module use it; otherwise apply the canonical regex.
@@ -100738,7 +102480,10 @@ from splicecraft_agent import (  # noqa: E402  (registers endpoints into _state.
     _agent_dirty_guard as _agent_dirty_guard,
     _agent_ignored_keys as _agent_ignored_keys,
     _agent_reject_dangerous_unknowns as _agent_reject_dangerous_unknowns,
+    _agent_unread_routing_keys as _agent_unread_routing_keys,
+    _agent_payload_keys as _agent_payload_keys,
     _payload_bool as _payload_bool,
+    _coerce_bool as _coerce_bool,
     _agent_vector_backbone_flags as _agent_vector_backbone_flags,
     _agent_sanitize_qualifiers as _agent_sanitize_qualifiers,
     _agent_traditional_cloning_candidates as _agent_traditional_cloning_candidates,
@@ -102421,7 +104166,7 @@ def _h_reference_lookup(app, payload):
     if home is None:
         return ({"error": "Babs reference data not found - clone "
                  "github.com/ATinyGreenCell/babs to ~/babs or set $SPLICECRAFT_BABS_HOME"}, 400)
-    if payload.get("list_registries"):
+    if _payload_bool(payload, "list_registries", False):
         regs = _reference_registries(home)
         return {"registries": regs, "count": len(regs)}
     query = payload.get("query")
@@ -102897,6 +104642,249 @@ def _agent_feature_parts(sf, row, rec=None) -> "list[tuple[int, int]] | None":
     return None if contiguous or len(fwd) < 2 else fwd
 
 
+def _translation_agrees_with_annotation(
+        aa: str, annotated: str, *, first_codon: str = "",
+        transl_table: int = 1,
+        transl_except: "list | tuple | str | None" = None,
+        coding_positions: "list[int] | None" = None,
+) -> "tuple[bool, str]":
+    """Does our translation of the bases match the file's ``/translation``?
+
+    Returns ``(agrees, note)``. A plain string comparison answered "no" for two
+    ENTIRELY correct annotations (audit 2026-09-22), both of them INSDC
+    conventions rather than disagreements about the sequence:
+
+      * **An alternative initiator.** A CDS starting ``GTG`` / ``TTG`` / ``ATT``
+        is loaded with fMet, so the file says ``M`` where the codon encodes
+        ``V`` / ``L`` / ``I``. `_translate_cds` honestly reports the codon; the
+        convention lives here, and applies only when the first codon really is
+        an initiator for that translation table.
+      * **`/transl_except`.** A selenoprotein or pyrrolysine gene recodes one
+        stop as ``U`` / ``O``, which the file's translation shows and ours reads
+        as a premature ``*``. A position named in a `/transl_except` qualifier is
+        allowed to differ, and the note says so — rather than the whole CDS
+        coming back as a mismatch, which is how a genuine frameshift got the
+        same verdict as a correctly recoded stop.
+
+    Anything else is a real disagreement and still reports False.
+    """
+    ours = (aa or "").rstrip("*")
+    theirs = (annotated or "").strip().rstrip("*")
+    if ours == theirs:
+        return True, ""
+    notes: "list[str]" = []
+    # Initiator convention: only ever position 1, and only for a real start.
+    if (ours and theirs and len(ours) == len(theirs)
+            and ours[1:] == theirs[1:] and theirs[0] == "M"
+            and ours[0] != "M"
+            and (first_codon or "").upper()
+            in _codon_start_codons_for(transl_table)):
+        return True, (
+            f"first codon {first_codon.upper()} is an alternative initiator — "
+            f"translated as M in the file, as {ours[0]} by the codon table")
+    # /transl_except: the positions the file itself declares as exceptions.
+    excepted = _transl_except_positions(transl_except, coding_positions)
+    if excepted and len(ours) == len(theirs):
+        diff = [i + 1 for i, (a, b) in enumerate(zip(ours, theirs)) if a != b]
+        if diff and set(diff) <= excepted:
+            return True, (
+                "differs only at the /transl_except position(s) "
+                + ", ".join(str(d) for d in sorted(diff))
+                + " — a recoded residue the file declares")
+        notes.append(
+            "record carries /transl_except at "
+            + ", ".join(str(p) for p in sorted(excepted)))
+    return False, "; ".join(notes)
+
+
+# How much of a CDS's /translation must agree with its bases for its M at
+# residue 1 to be followed (`_cds_initiator_source`).
+_INITIATOR_CHECK_RESIDUES = 30
+
+
+def _cds_initiator_source(quals, aa: str, *, first_codon: str,
+                          transl_table: int = 1, codon_start: int = 1,
+                          coding_positions: "list[int] | None" = None,
+                          ) -> "str | None":
+    """Why residue 1 of a CDS is its initiator Met although the codon table
+    reads the first codon as something else — ``"transl_except"``,
+    ``"translation"`` — or None when it is not.
+
+    A GTG / TTG / CTG start is read by an initiator tRNA and loaded with
+    (f)Met, so lacI in pET / pGEX / pMAL begins ``MKPVT…`` while its first
+    codon reads V. That is decided by the CDS's OWN annotation, never by the
+    codon alone: CTG / TTG are start codons in the standard code, and a
+    thrombin or PreScission site annotated as a CDS starts with a Leu that
+    no ribosome initiates on. So M is shown only when:
+
+      * a ``/transl_except`` puts Met at residue 1, or
+      * the ``/translation`` starts with M, its N-terminus agrees with the
+        bases (`_INITIATOR_CHECK_RESIDUES` residues; a position a
+        ``/transl_except`` declares may differ), the frame starts at base 1
+        and the first codon is a start codon of the CDS's table. The
+        N-terminus, not the whole protein, is what ties the annotation to
+        THIS start: a ``/translation`` of another frame or start disagrees
+        within a few residues, while a mutation made downstream (nothing
+        rewrites ``/translation`` on an edit) leaves the start as it was.
+
+    `aa` is the codon-table translation (`_translate_cds`); `first_codon` its
+    first codon; `coding_positions` (`_cds_coding_positions`) maps a
+    ``/transl_except`` onto residues and is needed only when there is one.
+    """
+    ours = (aa or "").upper().rstrip("*")
+    if not ours or ours[0] == "M":
+        return None
+    quals = quals or {}
+    exc = quals.get("transl_except")
+    declared = (_transl_except_residues(exc, coding_positions)
+                if exc and coding_positions else {})
+    if declared.get(1) == "M":
+        return "transl_except"
+    if codon_start != 1 or ((first_codon or "").upper()
+                            not in _codon_start_codons_for(transl_table)):
+        return None
+    ann = quals.get("translation")
+    ann = ann[0] if isinstance(ann, (list, tuple)) and ann else ann
+    if not isinstance(ann, str):
+        return None
+    theirs = "".join(ann.split()).upper().rstrip("*")
+    if not theirs or theirs[0] != "M":
+        return None
+    for i in range(1, min(len(ours), len(theirs), _INITIATOR_CHECK_RESIDUES)):
+        if ours[i] != theirs[i] and declared.get(i + 1) != theirs[i]:
+            return None
+    return "translation"
+
+
+def _codon_of(seq: str, positions, strand: int) -> str:
+    """The codon at three coding `positions` (`_cds_coding_positions`), read
+    on the CDS's own strand."""
+    try:
+        return "".join((_comp_base(seq[p]) if strand == -1
+                        else seq[p].upper()) for p in positions)
+    except (IndexError, TypeError):
+        return ""
+
+
+_TRANSL_EXCEPT_RE = re.compile(
+    r"\(?\s*pos\s*:\s*(?:complement\s*\()?\s*(\d+)\s*(?:\.\.\s*(\d+))?",
+    re.I)
+# The whole `pos:` location — `100..102`, `complement(100..102)`, and the
+# `join(2999..3000,1..1)` INSDC writes for a codon split across bp 0 — and the
+# base ranges inside it.
+# The location group is BOUNDED: an INSDC location for one codon is a few
+# dozen characters, and an unbounded lazy `(.*?)` re-scanned the rest of a
+# crafted value from every `pos:` — 17.7 s for 80 KB, on the UI thread that
+# draws the map (round-2 hardening, 2026-09-25).
+_TRANSL_EXCEPT_POS_RE = re.compile(r"pos\s*:\s*(.{0,200}?)\s*,\s*aa\s*:", re.I | re.S)
+# A `/transl_except` value longer than this is not one; it is skipped.
+_TRANSL_EXCEPT_MAX_CHARS = 1000
+_TRANSL_EXCEPT_RANGE_RE = re.compile(r"(\d+)\s*(?:\.\.\s*(\d+))?")
+_TRANSL_EXCEPT_AA_RE = re.compile(r"aa\s*:\s*([A-Za-z]+)", re.I)
+# INSDC's `/transl_except` amino-acid vocabulary beyond the twenty.
+_TRANSL_EXCEPT_SPECIAL_AA = {"SEC": "U", "PYL": "O", "TERM": "*", "OTHER": "X"}
+
+
+def _transl_except_residues(raw, coding_positions,
+                            reads_as=None) -> "dict[int, str]":
+    """``{residue: one-letter}`` for every ``/transl_except`` that names a
+    residue of this CDS: ``Sec`` is ``U``, ``Pyl`` ``O``, ``TERM`` ``*``,
+    ``OTHER`` ``X``, the twenty by their usual letters. Positions are mapped
+    exactly as `_transl_except_positions` maps them (and nothing is returned
+    without `coding_positions`); an entry whose amino acid can't be read is
+    left out.
+
+    ``reads_as(residue)`` — what that residue's codon reads as NOW — keeps a
+    STALE qualifier out: a `/transl_except` is written in base coordinates
+    and nothing moves it when the plasmid is re-origined, flipped or edited
+    upstream, so after an insertion it named some other codon, and a Gln was
+    reported as the selenocysteine (round-2 hardening, 2026-09-25). A
+    selenocysteine or pyrrolysine is read through a STOP codon by definition,
+    so it is honoured only where the codon still reads as one."""
+    out: "dict[int, str]" = {}
+    if not raw or not coding_positions:
+        return out
+    for item in (raw if isinstance(raw, (list, tuple)) else [raw]):
+        if len(str(item)) > _TRANSL_EXCEPT_MAX_CHARS:
+            continue
+        m = _TRANSL_EXCEPT_AA_RE.search(str(item))
+        if not m:
+            continue
+        code = m.group(1).upper()
+        letter = (_TRANSL_EXCEPT_SPECIAL_AA.get(code)
+                  or _residue_code_to_letter(code))
+        if not letter:
+            continue
+        for residue in _transl_except_positions([item], coding_positions):
+            if (code in ("SEC", "PYL") and reads_as is not None
+                    and reads_as(residue) != _STOP_AA_CHAR):
+                continue
+            out[residue] = letter
+    return out
+
+
+def _transl_except_positions(
+        raw: "list | tuple | str | None",
+        coding_positions: "list[int] | None" = None) -> "set[int]":
+    """The 1-based RESIDUE positions a ``/transl_except`` qualifier names.
+
+    The qualifier is written in the RECORD's 1-based base coordinates —
+    ``(pos:1002..1004,aa:Sec)`` — so the span has to be mapped through the CDS's
+    own reading order (`_cds_coding_positions`) to reach a residue number.
+    Dividing the raw base number by three would be right only for a CDS that
+    starts at base 1 on the plus strand with no introns.
+
+    Without `coding_positions` this returns nothing. It only ever RELAXES a
+    comparison, so a guess is the one thing that could do harm: no map, no
+    exemption.
+    """
+    if not raw or not coding_positions:
+        return set()
+    index_of = {bp: i for i, bp in enumerate(coding_positions)}
+    items = raw if isinstance(raw, (list, tuple)) else [raw]
+    out: "set[int]" = set()
+    for item in items:
+        text = str(item)
+        if len(text) > _TRANSL_EXCEPT_MAX_CHARS:
+            continue
+        m = _TRANSL_EXCEPT_POS_RE.search(text)
+        loc = m.group(1) if m else None
+        if loc is None:
+            m = _TRANSL_EXCEPT_RE.search(text)
+            if not m:
+                continue
+            loc = m.group(0)
+        # Every base the location names, 1-based inclusive. A `join()` is the
+        # codon split across the origin — reading only its first range
+        # ignored it, and the selenoprotein still read as a stop.
+        bases: "list[int]" = []
+        for a, b in _TRANSL_EXCEPT_RANGE_RE.findall(loc):
+            try:
+                lo = int(a)
+                hi = int(b) if b else lo
+            except (TypeError, ValueError):
+                bases = []
+                break
+            if hi < lo:
+                lo, hi = hi, lo
+            if hi - lo > 2:
+                bases = []
+                break
+            bases.extend(range(lo, hi + 1))
+        # Only a complete codon (or the single base INSDC allows for a stop
+        # completed by polyadenylation) maps cleanly onto one residue.
+        if len(bases) not in (1, 3):
+            continue
+        idxs = [index_of.get(bp - 1) for bp in bases]
+        if any(i is None for i in idxs):
+            continue
+        residues = {int(i) // 3 for i in idxs if i is not None}
+        if len(residues) != 1:
+            continue
+        out.add(residues.pop() + 1)
+    return out
+
+
 def _agent_feature_detail(rec, row, *, max_seq: int) -> dict:
     """Coordinates (both conventions), strand-aware sequence and — for a CDS —
     the translation of the bases as they stand, for one feature row."""
@@ -102942,9 +104930,39 @@ def _agent_feature_detail(rec, row, *, max_seq: int) -> dict:
             out["translation"] = aa
             ann = quals.get("translation")
             ann = ann[0] if isinstance(ann, list) and ann else ann
+            exc = quals.get("transl_except") or []
+            coding = None
+            if exc and sf is not None:
+                try:
+                    coding = _cds_coding_positions(
+                        len(seq), sf,
+                        circular=_record_is_circular(rec))
+                except Exception:
+                    _log.exception("find-feature: /transl_except map "
+                                   "failed for %r", row.get("label"))
+                    coding = None
+            first_codon = feat_seq[
+                max(0, min(2, _q_int("codon_start", 1) - 1)):][:3]
             if isinstance(ann, str) and ann.strip():
-                out["translation_matches_annotation"] = (
-                    aa.rstrip("*") == ann.strip().rstrip("*"))
+                ok, note = _translation_agrees_with_annotation(
+                    aa, ann, first_codon=first_codon,
+                    transl_table=_q_int("transl_table", 1),
+                    transl_except=exc, coding_positions=coding)
+                out["translation_matches_annotation"] = ok
+                if note:
+                    out["translation_note"] = note
+            # `translation` stays the codon table's reading of the bases;
+            # `protein` is the protein as this CDS's annotation reads it — a
+            # GTG / TTG start it declares as Met is M, as the AA lane shows.
+            init = _cds_initiator_source(
+                quals, aa, first_codon=first_codon,
+                transl_table=_q_int("transl_table", 1),
+                codon_start=_q_int("codon_start", 1),
+                coding_positions=coding)
+            out["protein"] = "M" + aa[1:] if init else aa
+            if init:
+                out["initiator"] = {"codon": first_codon, "codon_reads": aa[0],
+                                    "declared_by": init}
     return out
 
 
@@ -103039,6 +105057,8 @@ def _h_plasmid_overview(app, payload):
             inside = [r.get("label") or r.get("type") for r in rows
                       if _bp_in_span(bp, int(r["start"]), int(r["end"]), total)]
             entry = {"enzyme": s.get("enzyme"), "cut_bp": bp}
+            if s.get("aliases"):
+                entry["aliases"] = s["aliases"]
             for label in inside or [_OVERVIEW_OUTSIDE]:
                 grouped.setdefault(str(label), []).append(entry)
     out = {
@@ -103100,7 +105120,11 @@ def _h_find_feature(app, payload):
     # "what can I cut my gene with?" answered where the model is already
     # looking (the bench saw a 7B list 5 of 13 after wandering the overview).
     cut_res = _h_list_restriction_sites(app, {"unique_only": True})
-    once = ([(s.get("enzyme"), s.get("cut_bp")) for s in cut_res.get("sites", [])
+    # `aliases` rides along: the scan labels one name per recognition site, so
+    # without them a caller hunting `Esp3I` reads a BsmBI-cut gene as uncuttable
+    # (audit 2026-09-22).
+    once = ([(s.get("enzyme"), s.get("cut_bp"), s.get("aliases") or [])
+             for s in cut_res.get("sites", [])
              if isinstance(s.get("cut_bp"), int) and s["cut_bp"] >= 0]
             if isinstance(cut_res, dict) else [])
     total = _seq_len(rec)
@@ -103109,7 +105133,9 @@ def _h_find_feature(app, payload):
         d = _agent_feature_detail(rec, r, max_seq=max_seq)
         d["match"] = kind[rk]
         d["unique_cutters_inside"] = [
-            {"enzyme": enz, "cut_bp": bp} for enz, bp in once
+            ({"enzyme": enz, "cut_bp": bp, "aliases": al} if al
+             else {"enzyme": enz, "cut_bp": bp})
+            for enz, bp, al in once
             if _bp_in_span(bp, int(r["start"]), int(r["end"]), total)]
         matches.append(d)
     out = {"query": name.strip(), "count": len(matches), "matches": matches,
@@ -103734,8 +105760,22 @@ def _h_export_primers(app, payload):
     coll = payload.get("collection")
     if isinstance(coll, str) and coll.strip():
         want = coll.strip()
-        primers = [p for p in primers
-                   if str(p.get("collection", "")) == want]
+        # Primers live INSIDE a collection in `primer_collections.json` — an
+        # entry carries no `collection` field of its own, so filtering on one
+        # matched nothing and every `collection`-scoped export answered 404 "no
+        # primers matched" (audit 2026-09-22). Read that collection's own list;
+        # `_load_primers()` above is the ACTIVE collection's mirror.
+        if want == (_get_active_primer_collection_name() or ""):
+            pass                      # already loaded: it IS the mirror
+        else:
+            match = next((c for c in _load_primer_collections()
+                          if str(c.get("name") or "") == want), None)
+            if match is None:
+                return ({"error": f"no primer collection named {want!r}",
+                         "collections": [str(c.get("name") or "") for c
+                                         in _load_primer_collections()]}, 404)
+            primers = [dict(p) for p in (match.get("primers") or [])
+                       if isinstance(p, dict)]
     ids = payload.get("ids")
     if isinstance(ids, list) and ids:
         keep = {str(i) for i in ids}
@@ -103896,6 +105936,17 @@ def _h_edit_residue(app, payload):
     A silent change (`silent: true`) is allowed and reported rather than
     refused — swapping to a synonymous codon to remove a restriction site is a
     real thing people do deliberately."""
+    # The record this edit is COMPUTED FROM. `_apply_record` bumps the counter,
+    # so if the canvas is replaced (a GUI load, another agent write) between here
+    # and the apply below, installing our rebuilt record would silently discard
+    # whatever arrived in between — an edit applied to a plasmid that is no
+    # longer open (audit 2026-09-22). Captured BEFORE the record is read, and
+    # re-checked on the UI thread: this handler runs on the agent's thread, and
+    # a load landing between the read and a capture taken after it would have
+    # been invisible to the re-check.
+    base_counter = getattr(app, "_record_load_counter", 0)
+    base_edit_token = int(getattr(getattr(app, "_record", None),
+                                  "_edit_token", 0))
     rec, feat, err = _resolve_cds_feature(app, payload)
     if err:
         return err
@@ -103915,7 +105966,14 @@ def _h_edit_residue(app, payload):
     except ValueError as exc:
         return ({"error": str(exc)}, 400)
 
+    stale: "list[bool]" = []
+
     def _apply():
+        if (getattr(app, "_record_load_counter", 0) != base_counter
+                or int(getattr(getattr(app, "_record", None),
+                               "_edit_token", 0)) != base_edit_token):
+            stale.append(True)
+            return
         app._push_undo()
         app._apply_record(new_rec, clear_undo=False)
         app._mark_dirty()
@@ -103929,6 +105987,11 @@ def _h_edit_residue(app, payload):
     except Exception as exc:
         _log.exception("edit-residue apply failed")
         return ({"error": f"apply failed: {exc}"}, 500)
+    if stale:
+        return ({"error": "the loaded plasmid changed while this edit was being "
+                          "computed, so applying it would have discarded that "
+                          "change. Nothing was modified — re-read the record "
+                          "and retry."}, 409)
     # `_resolve_cds_feature` returns a record whenever it returns no error;
     # spelled out so the contract is checked rather than assumed.
     if rec is None:
@@ -104129,7 +106192,7 @@ def _h_multi_align(app, payload):
         # target's own topology; else (raw sequence, no topology) assume
         # circular — the plasmid case, and rotation is identity-gated.
         if circ_override is not None:
-            is_circular = bool(circ_override)
+            is_circular = _payload_bool(payload, "circular", True)
         elif t_topo:
             is_circular = (t_topo == "circular")
         else:
@@ -104236,6 +106299,15 @@ def _h_attach_experiment_image(app, payload):
         entries[idx]["body_md"] = (
             (entries[idx].get("body_md") or "")
             + f"\n\n{_bang}[{rel}]({rel})\n")
+        # Same omission as the UI path: the file and the body link were written
+        # but `image_paths` was not, so the exporters embedded nothing
+        # (audit 2026-09-22).
+        _paths = entries[idx].get("image_paths")
+        if not isinstance(_paths, list):
+            _paths = []
+        if rel not in _paths:
+            _paths.append(rel)
+        entries[idx]["image_paths"] = _paths
         entries[idx] = _normalise_experiment_entry(entries[idx], fresh=False)
         if (err := _agent_save_or_500(
                 lambda: _save_experiments(entries), "Experiments")) is not None:
@@ -104509,6 +106581,14 @@ def _h_save(app, payload):
         # `_last_save_error` carries an OSError strerror with a path.
         reason = getattr(app, "_last_save_error", "") or "unknown error"
         out["error"] = _scrub_path(reason)
+        # Never a 200: `ok: false` under HTTP 200 was cached by the
+        # idempotency layer (a retry after freeing disk replayed the
+        # failure), `splicecraft-cli save` exited 0, and Babs counted it as a
+        # success (round-2 hardening, 2026-09-25). A name-collision prompt is
+        # waiting on the user — 409; anything else (a disk, a mount) is a
+        # server failure a retry may cure — 500, which is never cached.
+        return out, (409 if getattr(app, "_last_save_deferred", False)
+                     else 500)
     return out
 
 
@@ -105379,8 +107459,14 @@ def _h_transfer_annotations(app, payload):
                           f"{_syn!r} is not a recognised switch — pass "
                           '{"apply": true} to apply (default is a dry run)'},
                         400)
-    do_apply = (bool(apply_in) if apply_in is not None
-                else not _payload_bool(payload, "dry_run", True))
+    if apply_in is not None:
+        # STRICT: this flag decides whether the library is WRITTEN. `bool()`
+        # read the string "false" as true and applied (audit 2026-09-22).
+        do_apply = _coerce_bool(apply_in, name="apply")
+        if isinstance(do_apply, str):
+            return ({"error": do_apply}, 400)
+    else:
+        do_apply = not _payload_bool(payload, "dry_run", True)
     # Cross-collection source resolution (agent-API feedback). The old
     # active-mirror finders (`_find_library_entry_by_*`) only saw the ACTIVE
     # collection, so transferring features FROM an entry in another
@@ -105528,8 +107614,14 @@ def _h_annotate_from_presets(app, payload):
                           f"{_syn!r} is not a recognised switch — pass "
                           '{"apply": true} to apply (default is a dry run)'},
                         400)
-    do_apply = (bool(apply_in) if apply_in is not None
-                else not _payload_bool(payload, "dry_run", True))
+    if apply_in is not None:
+        # STRICT: this flag decides whether the library is WRITTEN. `bool()`
+        # read the string "false" as true and applied (audit 2026-09-22).
+        do_apply = _coerce_bool(apply_in, name="apply")
+        if isinstance(do_apply, str):
+            return ({"error": do_apply}, 400)
+    else:
+        do_apply = not _payload_bool(payload, "dry_run", True)
     raw_max = payload.get("max_transfers", _PRESET_ANNOT_MAX_TRANSFERS)
     max_transfers = _coerce_int(raw_max, name="max_transfers")
     if isinstance(max_transfers, str):
@@ -105860,6 +107952,7 @@ def _h_move_plasmid(app, payload):
                   f"plasmid already in {to_name!r} — nothing to move"}, 409)
     nm = match.get("name")
     mid = match.get("id")
+    mirror_warning = ""
     with _cache_lock:
         colls = _load_collections()
         src = next((c for c in colls
@@ -105909,23 +108002,32 @@ def _h_move_plasmid(app, payload):
         # (not `_save_library`) so a shrink (move OUT of active) can't trip
         # the L3 guard; the "missing" entry is safe in its new collection.
         active = _get_active_collection_name()
+        # The move is ALREADY COMMITTED at this point — `collections.json` is the
+        # source of truth and its write succeeded. A failure re-staging the live
+        # mirror must therefore not report the move as failed (it happened), and
+        # must not leave the mirror looking authoritative (the next save would
+        # write the pre-move view back into the active collection and undo it).
+        # Before the 2026-09-22 audit this write was unguarded: it raised out of
+        # the handler as a 500 saying the move failed, for a move that had.
+        _why = None
         if active == holder:
-            _safe_save_json_mirror(
-                _state._LIBRARY_FILE,
-                [p for p in new_src if isinstance(p, dict)],
-                "Plasmid library")
-            _state._library_cache = None
+            _why = _restage_library_mirror_after_commit(new_src, "move-plasmid")
         elif active == to_name:
-            _safe_save_json_mirror(
-                _state._LIBRARY_FILE,
-                [p for p in tgt_plasmids if isinstance(p, dict)],
-                "Plasmid library")
-            _state._library_cache = None
+            _why = _restage_library_mirror_after_commit(tgt_plasmids,
+                                                        "move-plasmid")
+        if _why:
+            mirror_warning = (
+                f"the move to {to_name!r} IS saved, but the library file could "
+                f"not be refreshed ({_why}). This session and the next launch "
+                f"both read the library from the saved collection.")
     if app is not None and hasattr(app, "call_from_thread"):
         app.call_from_thread(_agent_refresh_library_panel, app)
     _log_event("library.move", name=nm, src=holder, dst=to_name, via="agent")
-    return {"ok": True, "name": nm, "from": holder, "to": to_name,
-            "ignored": _agent_ignored_keys(payload, {"name", "id", "to", "from"})}
+    out = {"ok": True, "name": nm, "from": holder, "to": to_name,
+           "ignored": _agent_ignored_keys(payload, {"name", "id", "to", "from"})}
+    if mirror_warning:
+        out["warnings"] = [mirror_warning]
+    return out
 
 
 # ── Provenance recovery from saved `.dna` originals ────────────────────────
@@ -105981,7 +108083,8 @@ def _dna_sidecar_sequence(data: bytes) -> str:
     return ""
 
 
-def _scan_dna_originals_for_history() -> "tuple[dict[str, tuple[int, str, str]], str]":
+def _scan_dna_originals_for_history(wanted: "set[str] | None" = None
+                                    ) -> "tuple[dict[str, tuple[int, str, str]], str]":
     """``({sequence: (node_count, history_xml, filename)}, note)`` over every
     saved `.dna` original, keeping the RICHEST history per distinct sequence.
 
@@ -105995,7 +108098,13 @@ def _scan_dna_originals_for_history() -> "tuple[dict[str, tuple[int, str, str]],
     keeps each sequence AND its decompressed history in memory at once.
     ``note`` is "" for a complete scan, else a human-readable reason the
     scan stopped early; the caller MUST surface it, since a truncated scan
-    that finds nothing is indistinguishable from "nothing to recover"."""
+    that finds nothing is indistinguishable from "nothing to recover".
+
+    ``wanted``, when given, limits the index to those sequences. It is what
+    makes the budget note's advice true: the note tells the user to narrow
+    the run with a ``collection`` / ``name`` filter, but the filters used to
+    apply only AFTER the scan, so a filtered re-run hit the same budget on
+    the same files (audit 2026-09-22)."""
     import xml.etree.ElementTree as _ET
     index: "dict[str, tuple[int, str, str]]" = {}
     note = ""
@@ -106015,7 +108124,7 @@ def _scan_dna_originals_for_history() -> "tuple[dict[str, tuple[int, str, str]],
         try:
             data = p.read_bytes()
             seq = _dna_sidecar_sequence(data)
-            if not seq:
+            if not seq or (wanted is not None and seq not in wanted):
                 continue
             xml = _extract_commercialsaas_history_xml(data)
             if not xml:
@@ -106043,6 +108152,25 @@ def _scan_dna_originals_for_history() -> "tuple[dict[str, tuple[int, str, str]],
                 _log.warning("history recovery: %s", note)
                 break
     return index, note
+
+
+def _history_recover_wanted_seqs(coll_filter: "str | None",
+                                 name_filter: "str | None") -> "set[str]":
+    """The sequences of the plasmids a history recovery is scoped to — what
+    `_scan_dna_originals_for_history` needs to index, and nothing more."""
+    wanted: "set[str]" = set()
+    for c in _iter_collections_readonly():
+        if coll_filter is not None and (c.get("name") or "") != coll_filter:
+            continue
+        for e in (c.get("plasmids") or []):
+            if not isinstance(e, dict):
+                continue
+            if name_filter is not None and str(e.get("name") or "") != name_filter:
+                continue
+            seq = _gb_text_sequence(_rehydrate_entry(e).get("gb_text") or "")
+            if seq:
+                wanted.add(seq)
+    return wanted
 
 
 def _history_node_count_of_xml(xml: str) -> int:
@@ -106097,11 +108225,18 @@ def _h_recover_history_from_dna(app, payload):
     if guard is not None:
         return guard
 
-    index, scan_note = _scan_dna_originals_for_history()
+    index, scan_note = _scan_dna_originals_for_history(
+        _history_recover_wanted_seqs(coll_filter, name_filter))
     if not index:
-        return {"ok": True, "scanned_sidecars": 0, "updated": [],
-                "dry_run": dry_run, "truncated": bool(scan_note),
-                "note": scan_note or "no .dna originals with history found"}
+        scope = ("" if coll_filter is None and name_filter is None
+                 else " in the filtered scope")
+        return {"ok": True, "scanned_sidecars": 0, "updated_count": 0,
+                "updated": [], "dry_run": dry_run,
+                "truncated": bool(scan_note),
+                "note": scan_note or (f"no .dna original with a history "
+                                      f"matches a plasmid{scope}"),
+                "ignored": _agent_ignored_keys(
+                    payload, {"dry_run", "collection", "name"})}
 
     updated: "list[dict]" = []
     with _cache_lock:
@@ -106311,9 +108446,34 @@ def _h_copy_plasmids(app, payload):
     if copied_names:
         _log_event("library.copy_batch", n=len(copied_names),
                     dst=to_name, via="agent")
-    return {"ok": True, "copied": len(copied_names),
-            "copied_names": copied_names, "not_found": not_found,
-            "ambiguous": ambiguous, "conflict": conflict, "to": to_name}
+    return _agent_batch_outcome(
+        {"ok": True, "copied": len(copied_names),
+         "copied_names": copied_names, "not_found": not_found,
+         "ambiguous": ambiguous, "conflict": conflict, "to": to_name},
+        done=len(copied_names), verb="copied")
+
+
+def _agent_batch_outcome(out: dict, *, done: int, verb: str):
+    """The status of a name-list batch, from what it actually did: nothing
+    done is not a 2xx (409 when a name was ambiguous or collided — those
+    plasmids exist, so a retry cannot help; 404 when none were found), and a
+    batch that did some of it says ``partial`` with a warning per kind of
+    skip. `copy-plasmids` / `move-plasmids` answered ``ok: true`` for 0 of N,
+    and nothing flagged 1 of 2 (round-2 hardening, 2026-09-25)."""
+    skipped = [(k, out.get(k) or []) for k in ("not_found", "ambiguous",
+                                                "conflict")]
+    notes = [f"{len(v)} {k.replace('_', ' ')}: "
+             + ", ".join(map(str, v[:20])) for k, v in skipped if v]
+    if not done:
+        out["ok"] = False
+        out["error"] = (f"nothing was {verb}: " + "; ".join(notes)
+                        if notes else f"nothing was {verb}")
+        hard = bool(out.get("ambiguous") or out.get("conflict"))
+        return out, (409 if hard else 404)
+    if notes:
+        out["partial"] = True
+        out["warnings"] = list(out.get("warnings") or []) + notes
+    return out
 
 
 @_agent_endpoint("move-plasmids", write=True)
@@ -106341,6 +108501,7 @@ def _h_move_plasmids(app, payload):
     assert cleaned is not None     # err-guard above ⇒ keys validated
     moved_names, not_found, ambiguous, conflict = [], [], [], []
     touched_holders: "set[str]" = set()
+    mirror_warning = ""
     with _cache_lock:
         resolved, seen_keys = [], set()
         for key in cleaned:
@@ -106414,20 +108575,28 @@ def _h_move_plasmids(app, payload):
             if active and (active == to_name or active in touched_holders):
                 act = coll_by_name.get(active)
                 if act is not None:
-                    _safe_save_json_mirror(
-                        _state._LIBRARY_FILE,
-                        [p for p in (act.get("plasmids") or [])
-                         if isinstance(p, dict)],
-                        "Plasmid library")
-                    _state._library_cache = None
+                    # The move is committed; a mirror failure must neither
+                    # report it as failed nor let the stale view be saved back
+                    # over it (D9) — see the helper.
+                    _why = _restage_library_mirror_after_commit(
+                        act.get("plasmids") or [], "move-plasmids")
+                    if _why:
+                        mirror_warning = (
+                            f"the move IS saved, but the library file could not "
+                            f"be refreshed ({_why}). This session and the next "
+                            f"launch both read the library from the saved "
+                            f"collection.")
     if moved_names and app is not None and hasattr(app, "call_from_thread"):
         app.call_from_thread(_agent_refresh_library_panel, app)
     if moved_names:
         _log_event("library.move_batch", n=len(moved_names),
                     dst=to_name, via="agent")
-    return {"ok": True, "moved": len(moved_names),
-            "moved_names": moved_names, "not_found": not_found,
-            "ambiguous": ambiguous, "conflict": conflict, "to": to_name}
+    out = {"ok": True, "moved": len(moved_names),
+           "moved_names": moved_names, "not_found": not_found,
+           "ambiguous": ambiguous, "conflict": conflict, "to": to_name}
+    if mirror_warning:
+        out["warnings"] = [mirror_warning]
+    return _agent_batch_outcome(out, done=len(moved_names), verb="moved")
 
 
 @_agent_endpoint("create-collection", write=True)
@@ -106511,9 +108680,9 @@ def _h_create_collection(app, payload):
 @_agent_endpoint("delete-collection", write=True)
 def _h_delete_collection(app, payload):
     """Delete a collection by exact name. Body: ``{name}``. If the
-    deleted collection is the active one, the active pointer is
-    cleared and the panel returns to the collections-list view on
-    next render.
+    deleted collection is the active one, the next collection becomes
+    active (reported as ``active``), or — with none left — the library is
+    emptied: the same as the panel's delete.
 
     Save-failure contract (audit sweep #4): wraps `_save_collections`
     via `_agent_save_or_500` — ``500`` with explicit ``"save failed
@@ -106533,10 +108702,29 @@ def _h_delete_collection(app, payload):
         if (err := _agent_save_or_500(
                 lambda: _save_collections(remaining), "collections")) is not None:
             return err
+        new_active = None
         if _get_active_collection_name() == name:
-            _set_active_collection_name(None)
+            # Do what the GUI's delete does: make the next collection active
+            # (or, with none left, empty the library). Clearing only the
+            # pointer left the library mirroring NOTHING — every later save
+            # landed in `plasmid_library.json` alone, and the next launch
+            # restored the library from whichever collection it picked,
+            # discarding that work (audit 2026-09-22, D10).
+            new_active = (remaining[0].get("name") if remaining else None)
+            try:
+                if new_active:
+                    _activate_collection(new_active, discard_outgoing=True)
+                else:
+                    _deactivate_all_collections()
+            except (OSError, RuntimeError, ValueError) as exc:
+                return ({"error": f"deleted {name!r}, but could not switch "
+                                  f"to {new_active!r}: {_scrub_path(str(exc))}"},
+                        500)
     app.call_from_thread(_agent_refresh_library_panel, app)
-    return {"ok": True, "deleted": name, "n_remaining": len(remaining)}
+    out = {"ok": True, "deleted": name, "n_remaining": len(remaining)}
+    if new_active:
+        out["active"] = new_active
+    return out
 
 
 @_agent_endpoint("rename-collection", write=True)
@@ -106624,7 +108812,10 @@ def _h_bulk_import_folder(app, payload):
     The collection is created if missing, refused if it exists (use
     a second call to ``create-collection`` with the same name first to
     pre-create, or pick a unique target). Per-file failures are
-    isolated; the response carries a per-file summary.
+    isolated; the response carries a per-file summary. When NO file
+    imports (all failed, or none of the right type), nothing is created
+    and the answer is ``422 {ok: false, error, failures}`` — so the same
+    call can be retried once the folder is fixed.
 
     Save-failure contract (audit sweep #4): wraps `_save_collections`
     via `_agent_save_or_500` — a bulk import of 1000 plasmids that
@@ -106651,6 +108842,19 @@ def _h_bulk_import_folder(app, payload):
                           f"delete it first or pick a unique name"}, 409)
     # Parse files OUTSIDE the lock (slow I/O, touches no cache).
     entries, failures = _bulk_import_folder(folder)
+    if not entries:
+        # Nothing to import → create NOTHING. This used to add the empty
+        # collection anyway, so fixing the folder and retrying the same call
+        # was refused 409 "already exists" (audit 2026-09-22, AA8).
+        why = (f"{len(failures)} file(s) could not be read; see `failures`"
+               if failures else "it holds no .dna / .gb / .gbk / .genbank files")
+        return ({"ok": False,
+                 "error": f"nothing was imported from {folder} — {why}. "
+                          f"No collection was created.",
+                 "collection": name, "n_imported": 0,
+                 "n_failed": len(failures),
+                 "failures": [{"path": p.name, "reason": r}
+                              for p, r in failures[:25]]}, 422)
     # RMW under _cache_lock with the collision re-check INSIDE so two
     # concurrent imports (or a racing create-collection) can't both pass
     # the check and silently drop one collection — mirrors the
@@ -106670,7 +108874,11 @@ def _h_bulk_import_folder(app, payload):
                 lambda: _save_collections(colls), "collections")) is not None:
             return err
     app.call_from_thread(_agent_refresh_library_panel, app)
-    return {
+    # Something WAS imported, so this is a success with failures: `ok: true`,
+    # `partial: true` and the files that failed. Answering `ok: false` here (the
+    # first fix) dropped `data`, and a caller that retried got 409 — the
+    # collection it had been told failed already existed.
+    out = {
         "ok":         True,
         "collection": name,
         "n_imported": len(entries),
@@ -106678,6 +108886,11 @@ def _h_bulk_import_folder(app, payload):
         "failures":   [{"path": p.name, "reason": r}
                         for p, r in failures[:25]],
     }
+    if failures:
+        out["partial"] = True
+        out["warnings"] = [f"imported {len(entries)} file(s) but "
+                           f"{len(failures)} could not be read; see `failures`"]
+    return out
 
 
 # ── Search (Tier 2) ───────────────────────────────────────────────────────────
@@ -108000,6 +110213,17 @@ def _h_domesticate_parts(app, payload):
                             "error": f"parts[{idx}] must be an object"})
             continue
         nm = part.get("name")
+        # The dispatcher's routing-key check sees only the batch body, so each
+        # item gets it here: a per-part `enzyme` that `domesticate-part`
+        # refuses was silently ignored inside a batch.
+        unread = _agent_unread_routing_keys(_h_domesticate_part, part)
+        if unread:
+            results.append({"name": nm, "ok": False, "code": 400,
+                            "error": f"parts[{idx}]: domesticate-part does not "
+                                     f"accept {', '.join(map(repr, unread))} "
+                                     f"— it would act on its default target",
+                            "unsupported": unread})
+            continue
         # Reuse the single-part endpoint verbatim (no logic drift). force=True
         # skips its per-item dirty-guard — already checked once above.
         res = _h_domesticate_part(app, {**part, "force": True})
@@ -108016,8 +110240,24 @@ def _h_domesticate_parts(app, payload):
             results.append({"name": nm, "ok": False,
                             "error": err.get("error", "domestication failed"),
                             "code": code})
-    return {"ok": True, "built": built, "total": len(parts),
-            "results": results}
+    # `ok` reflects the OUTCOME, not "the request was understood". A batch that
+    # built 0 of 2 answered `ok: true` beside two failures, and a caller checking
+    # the envelope moved on believing its parts existed (audit 2026-09-22). A
+    # batch that built SOME is a success with failures — `ok: false` there made
+    # a caller retry the whole batch and build the good parts twice — and one
+    # that built none is a 422, so a status-checking caller sees it too.
+    n_failed = sum(1 for r in results if not r.get("ok"))
+    out = {"ok": built > 0, "built": built, "total": len(parts),
+           "failed": n_failed, "results": results}
+    if n_failed and built:
+        out["partial"] = True
+        out["warnings"] = [f"{n_failed} of {len(parts)} part(s) were not built "
+                           f"— see `results` for each one's reason"]
+    elif n_failed:
+        out["error"] = (f"none of the {len(parts)} part(s) were built — see "
+                        f"`results` for each one's reason")
+        return out, 422
+    return out
 
 
 @_agent_endpoint("assemble-into-entry-vector", write=True)
@@ -108335,6 +110575,12 @@ _AGENT_HEAVY_ENDPOINTS = frozenset({
     # NN each), and `map-transcription` runs BOTH scans before walking the
     # circle, so it is the heaviest of the three.
     "scan-terminators", "map-transcription",
+    # Off-target search is O(guides x molecule x 2 strands) — measured at ~40 s
+    # for a 20 kb record with `offtarget: true`, which is squarely heavy even
+    # though the scan itself is cheap. `guide-offtargets` is the same inner loop
+    # for one guide, and a raw `fold-rna` of a long window is the same O(n³)
+    # Turner evaluation the terminator scan is capped for (audit 2026-09-22).
+    "design-guides", "guide-offtargets", "fold-rna",
 })
 _AGENT_HEAVY_CONCURRENCY = max(2, (os.cpu_count() or 4) // 2)
 _AGENT_HEAVY_SEMAPHORE = threading.BoundedSemaphore(_AGENT_HEAVY_CONCURRENCY)
@@ -108403,24 +110649,37 @@ _AGENT_IDEMPOTENCY_MAX_ENTRIES = 1024   # hard cap so a malicious client
                                           # OOM the server.
 _AGENT_IDEMPOTENCY_KEY_MAX_LEN = 128
 # Each entry: ((endpoint, key) → (payload, status, expiry_monotonic_ts)).
-_AGENT_IDEMPOTENCY_CACHE: "dict[tuple[str, str], tuple[dict, int, float]]" = {}
+# (endpoint, key) -> (payload, status, expiry, hash of the request body).
+_AGENT_IDEMPOTENCY_CACHE: "dict[tuple[str, str], tuple[dict, int, float, str | None]]" = {}
 _AGENT_IDEMPOTENCY_LOCK = threading.Lock()
 
 
 def _agent_idempotency_get(endpoint: str,
-                             key: str
-                             ) -> "tuple[dict, int] | None":
+                             key: str,
+                             body_hash: "str | None" = None,
+                             ) -> "tuple[dict, int] | str | None":
     """Return `(payload, status)` for a prior response to this
-    (endpoint, key), or None on miss / expired."""
+    (endpoint, key), or None on miss / expired.
+
+    ``body_hash`` binds the key to the REQUEST it was first used with. A key
+    replayed with a DIFFERENT body used to be answered with the first call's
+    cached response, so the second operation never ran while the caller was
+    told it had (audit 2026-09-22) — the one failure mode an idempotency key
+    exists to prevent, inverted. A mismatch returns the ``"__conflict__"``
+    sentinel so the dispatcher can refuse instead of replaying.
+    """
     now = _monotonic()
     with _AGENT_IDEMPOTENCY_LOCK:
         hit = _AGENT_IDEMPOTENCY_CACHE.get((endpoint, key))
         if hit is None:
             return None
-        payload, status, expiry = hit
+        payload, status, expiry, seen_hash = hit
         if expiry < now:
             _AGENT_IDEMPOTENCY_CACHE.pop((endpoint, key), None)
             return None
+        if body_hash is not None and seen_hash is not None \
+                and body_hash != seen_hash:
+            return "__conflict__"
         return payload, status
 
 
@@ -108462,9 +110721,27 @@ def _agent_data_envelope(payload, status):
     return payload
 
 
+def _agent_json_canonical(value):
+    """``value`` with every integral float written as an int, recursively, so
+    one request's body hashes the same however its numbers were spelled:
+    `60`, `60.0` and `6e1` are one value to every endpoint, and a retry that
+    reformatted them was refused as a different request (409)."""
+    if isinstance(value, float) and value.is_integer() and abs(value) < 2 ** 53:
+        return int(value)
+    if isinstance(value, dict):
+        return {k: _agent_json_canonical(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_agent_json_canonical(v) for v in value]
+    return value
+
+
 def _agent_idempotency_put(endpoint: str, key: str,
-                             payload: dict, status: int) -> None:
-    """Cache the response for retries within the TTL window."""
+                             payload: dict, status: int,
+                             body_hash: "str | None" = None) -> None:
+    """Cache the response for retries within the TTL window.
+
+    ``body_hash`` is stored so a later replay can prove it is the SAME request
+    (see `_agent_idempotency_get`)."""
     now = _monotonic()
     expiry = now + _AGENT_IDEMPOTENCY_TTL_S
     with _AGENT_IDEMPOTENCY_LOCK:
@@ -108489,7 +110766,8 @@ def _agent_idempotency_put(endpoint: str, key: str,
                 _AGENT_IDEMPOTENCY_CACHE.pop(oldest_key, None)
             except StopIteration:
                 pass
-        _AGENT_IDEMPOTENCY_CACHE[ck] = (payload, status, expiry)
+        _AGENT_IDEMPOTENCY_CACHE[ck] = (payload, status, expiry,
+                                        body_hash)
 
 
 def _agent_idempotency_reset() -> None:
@@ -108637,7 +110915,11 @@ def _agent_invoke(app, name: str, body, *, source: str = "http"):
         return ({"error": f"unknown endpoint {name!r}",
                  "endpoints": sorted(_AGENT_HANDLERS)}, 404)
     fn, write = handler
-    if write and _state._AGENT_READ_ONLY:
+    # `shutdown` / `restart` end THIS process and touch no data, so a
+    # --read-only guest may use them on itself; refusing them told the caller
+    # to quit the process holding the lock (audit 2026-09-22, AA12).
+    if write and _state._AGENT_READ_ONLY and name not in ("shutdown",
+                                                          "restart"):
         # `--read-only` attach: refuse every mutation OUTRIGHT rather than
         # queueing it. A queue would be a promise the mode cannot keep — the
         # process holding the lock owns the caches, so a write applied later
@@ -108660,6 +110942,24 @@ def _agent_invoke(app, name: str, body, *, source: str = "http"):
                  "holder_pid": holder or None}, 409)
     if not isinstance(body, dict):
         body = {}
+    if write:
+        # A routing/selection key the handler provably never reads would be
+        # silently ignored — `delete-part {"parts_bin": "Archive"}` deleted
+        # from the ACTIVE bin (audit 2026-09-22, AA5). Refuse before anything
+        # runs. Endpoints whose reads can't be established are not checked
+        # here (see `_agent_payload_keys`).
+        unread = _agent_unread_routing_keys(fn, body)
+        if unread:
+            keys = ", ".join(repr(k) for k in unread)
+            _log_event("agent.routing_key_refused", endpoint=name,
+                       keys=unread, source=source)
+            return ({"error":
+                     f"endpoint {name!r} does not accept {keys} — "
+                     f"{'it' if len(unread) == 1 else 'they'} would change "
+                     f"WHERE or HOW the operation applies, but this endpoint "
+                     f"would ignore {'it' if len(unread) == 1 else 'them'} and "
+                     f"act on its default target. Nothing was changed.",
+                     "unsupported": unread}, 400)
     heavy = name in _AGENT_HEAVY_ENDPOINTS
     if heavy and not _AGENT_HEAVY_SEMAPHORE.acquire(blocking=False):
         _log_event("agent.heavy.busy", endpoint=name, source=source)
@@ -108722,6 +111022,29 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
         caller can fix their serialisation instead of hunting a
         "missing field" mystery.
         """
+        # A CHUNKED body carries no Content-Length, so the length below reads 0
+        # and the body was silently DISCARDED — the endpoint then ran with
+        # default parameters and answered 200, having done something other than
+        # what was asked (audit 2026-09-22). `http.server` cannot decode chunked
+        # transfer encoding, so the honest answer is to refuse it by name rather
+        # than to pretend the request was empty.
+        # ANY transfer coding, not only `chunked`: with `identity` or `gzip` and
+        # no Content-Length the body was discarded the same way (RFC 7230
+        # §3.3.3 makes such a request a 400 either way).
+        if (self.headers.get("Transfer-Encoding", "") or "").strip():
+            _log.warning("agent-api: refused a request body sent with a "
+                         "transfer coding")
+            return "__chunked_body__"
+        if (self.headers.get("Content-Length") is None
+                and str(getattr(self, "request_version", "")) == "HTTP/1.0"):
+            # HTTP/1.1 with no length and no transfer coding HAS no body, but
+            # an HTTP/1.0 body runs to the close of the connection. Read as
+            # empty, it was dropped and the endpoint ran on its defaults —
+            # "missing 'name'" for a name that was sent (round-2 hardening,
+            # 2026-09-25). Refused like a chunked body: send a length.
+            _log.warning("agent-api: refused an HTTP/1.0 request with no "
+                         "Content-Length")
+            return "__chunked_body__"
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
@@ -108821,7 +111144,17 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
         # `==` would expose to a local attacker probing the token
         # one byte at a time. Both sides are str (URL-safe base64),
         # so no encoding step needed.
-        return secrets.compare_digest(provided[7:], expected)
+        #
+        # ...but it REFUSES a str with non-ASCII characters
+        # (`TypeError: comparing strings with non-ASCII characters is not
+        # supported`), and that exception escaped the handler, so a request
+        # carrying a non-ASCII bearer token got no response at all instead of a
+        # 401 (audit 2026-09-22). The real token is URL-safe base64, so a
+        # non-ASCII one can never match — rejecting it up front leaks nothing.
+        candidate = provided[7:]
+        if not candidate.isascii():
+            return False
+        return secrets.compare_digest(candidate, expected)
 
     # Sweep #25 (2026-05-23): per-request socket timeout. Pre-fix a
     # slow-loris client holding `rfile.read(length)` open with a
@@ -108962,6 +111295,12 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
             return self._send(
                 {"error": "malformed JSON body"}, 400,
             )
+        if isinstance(body, str) and body == "__chunked_body__":
+            return self._send(
+                {"error": "a request body needs a Content-Length header — a "
+                          "Transfer-Encoding (chunked or otherwise), or an "
+                          "HTTP/1.0 body with no length, is not supported. "
+                          "Nothing was done (the body was NOT read)."}, 411)
         if not isinstance(body, dict):
             body = {}
         # Sweep #27 (INV-80): idempotency-key cache for write
@@ -108970,9 +111309,39 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
         idem_raw = self.headers.get("X-Idempotency-Key") or ""
         idem_key = (_agent_validate_idempotency_key(idem_raw)
                     if (write and idem_raw) else None)
+        # Bind the key to THIS request's body, so a key reused with different
+        # arguments is refused rather than answered with the first call's
+        # result (audit 2026-09-22).
+        idem_body_hash = None
         if idem_key is not None:
-            cached = _agent_idempotency_get(path_part, idem_key)
-            if cached is not None:
+            try:
+                import hashlib as _hashlib
+                idem_body_hash = _hashlib.sha256(
+                    json.dumps(_agent_json_canonical(body), sort_keys=True,
+                               default=str).encode("utf-8")).hexdigest()
+            except (RecursionError, ValueError, TypeError) as exc:
+                # A body that cannot be hashed cannot be bound to its key. It
+                # used to run with NO binding, so a later, different request
+                # under the same key replayed this one's result (round-2
+                # hardening, 2026-09-25).
+                _log.warning("agent-api: idempotency hash failed on %s: %s",
+                             path_part, type(exc).__name__)
+                return self._send(
+                    {"error": "the request body is too deeply nested to bind "
+                              "to its X-Idempotency-Key; nothing was done"},
+                    400)
+        if idem_key is not None:
+            cached = _agent_idempotency_get(path_part, idem_key,
+                                            idem_body_hash)
+            if cached == "__conflict__":
+                _log_event("agent.idempotent.conflict", endpoint=path_part)
+                return self._send(
+                    {"error": "this X-Idempotency-Key was already used on "
+                              f"{path_part} with a DIFFERENT body. Nothing was "
+                              "done — use a new key for a new request, or "
+                              "resend the original body to replay the first "
+                              "result."}, 409)
+            if cached is not None and not isinstance(cached, str):
                 payload, status = cached
                 # Tag the response so the caller can tell a replay
                 # from a fresh execution. Inject only if it doesn't
@@ -109060,7 +111429,8 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
         # transient failure for the whole TTL.
         if (idem_key is not None and isinstance(payload, dict)
                 and status < 500 and status != 409):
-            _agent_idempotency_put(path_part, idem_key, payload, status)
+            _agent_idempotency_put(path_part, idem_key, payload, status,
+                                   idem_body_hash)
         # Audit fix 2026-05-14: log every write endpoint's outcome at
         # INFO so a "an agent silently overwrote my library" report
         # has a forensic trail. Read endpoints stay at DEBUG (via
@@ -109229,8 +111599,22 @@ def _start_agent_api(app, port: int = _AGENT_API_PORT_DEFAULT):
         srv.server_close()
         return None
 
+    def _serve() -> None:
+        # Work out every handler's payload keys NOW, while the source on disk
+        # is the source that was imported. Done lazily, on each endpoint's
+        # first request, an update or `git pull` under a running server made
+        # `inspect.getsource` read the NEW file at the OLD line numbers: the
+        # routing guard switched itself off for most write endpoints and
+        # refused valid keys on others (round-2 hardening, 2026-09-25).
+        try:
+            for _entry in list(_state._AGENT_HANDLERS.values()):
+                _agent_payload_keys(_entry[0])
+        except Exception:
+            _log.exception("agent-api: payload-key warm-up failed")
+        srv.serve_forever()
+
     threading.Thread(
-        target=srv.serve_forever, daemon=True,
+        target=_serve, daemon=True,
         name="splicecraft-agent-api",
     ).start()
     _log.info("agent-api: serving on http://%s:%d (token in %s)",
@@ -109268,10 +111652,38 @@ def _stop_agent_api(srv) -> None:
         srv.server_close()
     except Exception:
         _log.exception("agent-api: shutdown failed")
-    try:
-        _state._AGENT_TOKEN_FILE.unlink(missing_ok=True)
-    except OSError:
-        pass
+    # Remove the token file THIS instance published — which for a `--read-only`
+    # attach is `agent_token.readonly`, not the shared `agent_token`. Unlinking
+    # the shared path unconditionally meant a guest's shutdown deleted the HOST's
+    # side-door (every later `splicecraft-cli` call then failed to find a token)
+    # while its own stale `.readonly` file was left behind pointing at a dead
+    # port — the exact pair of harms the separate filename exists to prevent
+    # (audit 2026-09-22).
+    #
+    # And only while it still holds THIS instance's token: read-only guests all
+    # publish `agent_token.readonly`, so the second guest overwrote the first
+    # one's file and the first to quit deleted the file the other was still
+    # serving from.
+    mine = getattr(srv, "_token", None)
+    for _tok in ({_state._AGENT_TOKEN_FILE.parent
+                  / _AGENT_TOKEN_READONLY_NAME}
+                 if _state._AGENT_READ_ONLY
+                 else {_state._AGENT_TOKEN_FILE}):
+        try:
+            lines = _tok.read_text(encoding="utf-8").splitlines()
+        except (OSError, ValueError):
+            # ValueError: a token file that is not UTF-8. This runs in
+            # `main()`'s shutdown `finally`, and a UnicodeDecodeError here
+            # skipped the settings flush, the collection flush and the lock
+            # release after it (round-2 hardening, 2026-09-25). Not ours to
+            # judge, so it is left alone.
+            continue
+        if mine and (len(lines) < 2 or lines[1].strip() != mine):
+            continue                       # another instance's token now
+        try:
+            _tok.unlink(missing_ok=True)
+        except OSError:
+            pass
     # Sweep #27 (MED-4 + INV-80): clear per-server state on shutdown
     # so the next server start (same-process re-launch, test fixtures)
     # begins with a clean slate.
@@ -109993,9 +112405,21 @@ class UndoController:
             return
         # Stash the outgoing plasmid's stacks if non-empty
         old_key = self._current_undo_key
-        if old_key is not None and (self._undo_stack or self._redo_stack):
+        # ...and its LIVE state when that holds edits nobody saved. Every load
+        # path now asks first (`_guard_unsaved_then`), so this is the net under
+        # one that does not: the stacks alone brought the user back to the
+        # SAVED version with the edits unreachable by undo or redo (H3). The
+        # live state goes on as a redo step, so Ctrl+Y on return restores it.
+        # A "Discard" answer marks the canvas clean before the load, so a
+        # deliberate discard is never revived here.
+        live = (self._live_snapshot()
+                if old_key is not None and getattr(self.app, "_unsaved", False)
+                else None)
+        if old_key is not None and (self._undo_stack or self._redo_stack
+                                    or live is not None):
             self._stashed_undo_stacks[old_key] = list(self._undo_stack)
-            self._stashed_redo_stacks[old_key] = list(self._redo_stack)
+            self._stashed_redo_stacks[old_key] = (
+                list(self._redo_stack) + ([live] if live is not None else []))
             if old_key in self._stash_order:
                 self._stash_order.remove(old_key)
             self._stash_order.append(old_key)
@@ -110013,6 +112437,18 @@ class UndoController:
             self._undo_stack = []
             self._redo_stack = []
         self._current_undo_key = new_key
+
+    def _live_snapshot(self):
+        """The canvas as it stands, in `push`'s snapshot shape — or None when
+        there is nothing to snapshot (no panel yet, no sequence, no record)."""
+        app = self.app
+        try:
+            sp = app.query_one("#seq-panel", SequencePanel)
+        except Exception:
+            return None
+        if not sp._seq or getattr(app, "_current_record", None) is None:
+            return None
+        return (sp._seq, sp._cursor_pos, deepcopy(app._current_record))
 
     def push(self) -> None:
         app = self.app
@@ -110270,6 +112706,13 @@ class RecordController:
     def mark_dirty(self) -> None:
         app = self.app
         self._unsaved = True
+        # Monotonic edit counter. Ctrl+S snapshots the record, writes it on a
+        # worker, then marks the app clean — so an edit made WHILE the write was
+        # in flight is not in the file and was nonetheless declared saved, and
+        # went missing at the next navigation with no prompt (audit 2026-09-22).
+        # The save compares this token across the write and only marks clean when
+        # nothing moved.
+        self._edit_token = int(getattr(self, "_edit_token", 0)) + 1
         if self.current:
             n = _seq_len(self.current)
             display = app._record_display_name(self.current)
@@ -113414,6 +115857,10 @@ NcbiTaxonPickerModal { align: center middle; }
             name=src.name,
             description=src.description,
             annotations=dict(src.annotations),
+            # An edit changes bases, not which database records describe the
+            # molecule: dropping these lost the DBLINK line on the next save
+            # (audit 2026-09-22, H10).
+            dbxrefs=list(getattr(src, "dbxrefs", None) or []),
         )
 
         # Detect canonical wrap form (`parts[0].start == 0` ∧
@@ -113431,6 +115878,19 @@ NcbiTaxonPickerModal { align: center middle; }
 
         for feat in src.features:
             loc = feat.location
+            if (feat.type == "source" and src_total > 0 and new_len > 0
+                    and not isinstance(loc, CompoundLocation)
+                    and int(loc.start) == 0 and int(loc.end) == src_total):
+                # The record's own `source` row covers the whole molecule, by
+                # definition. As an ordinary range it was left short of any
+                # bases prepended at 0 (shifted right past them) or appended at
+                # the end (untouched before them) — H10.
+                new_record.features.append(SeqFeature(
+                    FeatureLocation(0, new_len, strand=loc.strand),
+                    type=feat.type,
+                    qualifiers=deepcopy(feat.qualifiers),
+                ))
+                continue
             if isinstance(loc, CompoundLocation):
                 # Wrap-canonical-form preservation for origin-edge inserts.
                 # `_sorted_idx[k]` = the STORED index of the k-th part in
@@ -113490,14 +115950,16 @@ NcbiTaxonPickerModal { align: center middle; }
                     _by_idx: dict = {}
                     _first = _sorted_idx[0]
                     _by_idx[_first] = FeatureLocation(
-                        0,
-                        int(parts_sorted[0].end) + ins_len,
+                        _position_like(parts_sorted[0].start, 0),
+                        _position_like(parts_sorted[0].end,
+                                       int(parts_sorted[0].end) + ins_len),
                         strand=getattr(parts_sorted[0], "strand", None),
                     )
                     for _k, part in enumerate(parts_sorted[1:], start=1):
                         _by_idx[_sorted_idx[_k]] = FeatureLocation(
-                            int(part.start) + ins_len,
-                            int(part.end)   + ins_len,
+                            _position_like(part.start,
+                                           int(part.start) + ins_len),
+                            _position_like(part.end, int(part.end) + ins_len),
                             strand=getattr(part, "strand", None),
                         )
                     new_parts = [_by_idx[i] for i in range(len(loc.parts))]
@@ -113511,13 +115973,15 @@ NcbiTaxonPickerModal { align: center middle; }
                     _by_idx = {}
                     for _k, part in enumerate(parts_sorted[:-1]):
                         _by_idx[_sorted_idx[_k]] = FeatureLocation(
-                            int(part.start), int(part.end),
+                            _position_like(part.start, int(part.start)),
+                            _position_like(part.end, int(part.end)),
                             strand=getattr(part, "strand", None),
                         )
                     tail_part = parts_sorted[-1]
                     _by_idx[_sorted_idx[-1]] = FeatureLocation(
-                        int(tail_part.start),
-                        int(tail_part.end) + ins_len,
+                        _position_like(tail_part.start, int(tail_part.start)),
+                        _position_like(tail_part.end,
+                                       int(tail_part.end) + ins_len),
                         strand=getattr(tail_part, "strand", None),
                     )
                     new_parts = [_by_idx[i] for i in range(len(loc.parts))]
@@ -113529,7 +115993,8 @@ NcbiTaxonPickerModal { align: center middle; }
                             continue
                         n_fs, n_fe = shifted
                         new_parts.append(FeatureLocation(
-                            n_fs, n_fe,
+                            _position_like(part.start, n_fs),
+                            _position_like(part.end, n_fe),
                             strand=getattr(part, "strand", None),
                         ))
                 if not new_parts:
@@ -113546,8 +116011,11 @@ NcbiTaxonPickerModal { align: center middle; }
                 if shifted is None:
                     continue  # feature entirely consumed
                 n_fs, n_fe = shifted
+                # A `<` / `>` end stays partial wherever it moves: the feature
+                # still carries on past the sequence in hand (H10).
                 new_loc = FeatureLocation(
-                    n_fs, n_fe,
+                    _position_like(loc.start, n_fs),
+                    _position_like(loc.end, n_fe),
                     strand=getattr(loc, "strand", 1),
                 )
 
@@ -113582,6 +116050,7 @@ NcbiTaxonPickerModal { align: center middle; }
             name=src.name,
             description=src.description,
             annotations=dict(src.annotations),
+            dbxrefs=list(getattr(src, "dbxrefs", None) or []),
         )
         non_source_idx = 0
         for feat in src.features:
@@ -114091,6 +116560,15 @@ NcbiTaxonPickerModal { align: center middle; }
         # collection` stashed one. Pop the global, fire as a
         # warning notification (queues through the splash
         # screen the same way crash-recovery notifications do).
+        # From here on a rescue is toasted when it happens
+        # (`_announce_recovered_orphans`). Set BEFORE draining: the agent
+        # server is already up, and a rescue queued between the drain and the
+        # flag was never shown (round-2 hardening, 2026-09-25).
+        self._orphan_notices_drained = True
+        while _state._RECOVERED_ORPHANS_NOTICE:
+            self.notify(_state._RECOVERED_ORPHANS_NOTICE.pop(0),
+                        title="Nothing was lost", severity="warning",
+                        timeout=20, markup=False)
         if _state._DANGLING_ACTIVE_COLLECTION_NAME:
             dangling = _state._DANGLING_ACTIVE_COLLECTION_NAME
             _state._DANGLING_ACTIVE_COLLECTION_NAME = None
@@ -114204,20 +116682,33 @@ NcbiTaxonPickerModal { align: center middle; }
         # One-shot migrations driven by the launch flow. Idempotent
         # (no-op when the legacy CSV is absent or the legacy collection
         # already exists), so subsequent launches skip cleanly.
-        try:
-            _migrate_legacy_custom_enzyme_csv()
-        except Exception:
-            _log.exception("legacy custom-enzyme CSV migration failed")
-        try:
-            _migrate_parts_bin_markers_from_vector()
-        except Exception:
-            _log.exception("parts_bin marker re-detect migration failed")
+        #
+        # SKIPPED in read-only mode, for the same reason the collection mirrors
+        # are: a guest process does not own the data dir. Both of these WRITE —
+        # the enzyme migration saves a collection, the marker re-detect saves
+        # parts_bin.json and drops a `.markers_redetected` sentinel — so a
+        # `--read-only` launch was modifying the very files it promised not to
+        # touch, and the chokepoint's refusal came back as an unhandled
+        # RuntimeError on the sentinel write (audit 2026-09-22).
+        if _state._AGENT_READ_ONLY:
+            _log.info("read-only launch: skipping the one-shot data "
+                      "migrations (the lock holder owns them)")
+        else:
+            try:
+                _migrate_legacy_custom_enzyme_csv()
+            except Exception:
+                _log.exception("legacy custom-enzyme CSV migration failed")
+            try:
+                _migrate_parts_bin_markers_from_vector()
+            except Exception:
+                _log.exception("parts_bin marker re-detect migration failed")
         self._check_crash_recovery()
         # Migration to the collection-driven model already ran in compose
         # (so child panels see the correct active collection on mount).
         if self._preload_record is not None:
             def _load_preload():
-                self._import_and_persist(self._preload_record)
+                self._import_and_persist(self._preload_record,
+                                         prompt_unsaved=False)
             self.call_after_refresh(_load_preload)
         elif self._preload_demo_record is not None:
             # No-arg launch → display the synthetic demo plasmid as the
@@ -114354,6 +116845,7 @@ NcbiTaxonPickerModal { align: center middle; }
             "_PARTS_BIN_COLLECTIONS_FILE": "Parts-bin collections",
             "_FEATURE_COLORS_FILE":       "Feature colours",
         })
+        shown: "set[str]" = set()
         for attr in _USER_DATA_FILE_ATTRS:
             path = _resolve_state_or_hub(attr)
             if not isinstance(path, Path):
@@ -114361,7 +116853,17 @@ NcbiTaxonPickerModal { align: center middle; }
             label = attr_to_label.get(attr) or attr.lstrip("_").rstrip("_FILE").replace("_", " ").capitalize()
             _, warning = _safe_load_json(path, label)
             if warning:
+                shown.add(label)
                 self.notify(warning, severity="warning", timeout=12)
+        # Recoveries that happened EARLIER in the launch — a panel composing, a
+        # cache warm — rewrote their main file from the backup, so the loop above
+        # saw valid data and said nothing. The user still has to be told their
+        # library was corrupt and restored (audit 2026-09-22).
+        for label, message in list(_state._DATA_RECOVERIES):
+            if label in shown:
+                continue
+            shown.add(label)
+            self.notify(message, severity="warning", timeout=12)
 
     # ── Crash-recovery autosave ────────────────────────────────────────────────
 
@@ -114515,7 +117017,12 @@ NcbiTaxonPickerModal { align: center middle; }
                     # user's real crash-recovery dir.
                     _refuse_unauthorized_delete(p, "crash recovery (stale)")
                     p.unlink()
-                except OSError:
+                except (OSError, RuntimeError):
+                    # RuntimeError = the L2 chokepoint REFUSING the delete,
+                    # which is correct in `--read-only` mode. Housekeeping must
+                    # not be fatal: catching only OSError let that refusal
+                    # escape into `on_mount` and take the launch down with it
+                    # (audit 2026-09-22).
                     pass
             leftovers = [p for p in leftovers if p not in stale]
             if len(leftovers) > _CRASH_RECOVERY_MAX_FILES:
@@ -114527,15 +117034,19 @@ NcbiTaxonPickerModal { align: center middle; }
                             p, "crash recovery (over-cap)",
                         )
                         p.unlink()
-                    except OSError:
-                        pass
+                    except (OSError, RuntimeError):
+                        pass          # see the stale-prune note above
                 leftovers = sorted(_state._CRASH_RECOVERY_DIR.glob("*.gb"))
-        except OSError:
+        except (OSError, RuntimeError):
             _log.exception("crash-recovery prune failed")
         if not leftovers:
             # Clean directory: clear the seen-set so a future first-
             # time crash isn't silenced by a stale acknowledgement.
-            if _get_setting("crash_recovery_seen"):
+            # Not in a --read-only launch: that process may not write, and
+            # the refused save surfaced as a "Save failed" error (audit
+            # 2026-09-22, D12 follow-up). The owning process clears it.
+            if (_get_setting("crash_recovery_seen")
+                    and not _state._AGENT_READ_ONLY):
                 _set_setting("crash_recovery_seen", [])
             return
 
@@ -114608,7 +117119,8 @@ NcbiTaxonPickerModal { align: center middle; }
         )
         # Persist the full current set so future launches are quiet
         # unless something new lands on disk.
-        _set_setting("crash_recovery_seen", current_keys)
+        if not _state._AGENT_READ_ONLY:       # see the clear-path note above
+            _set_setting("crash_recovery_seen", current_keys)
 
     @work(thread=True, exclusive=True, group="pypi_update_check")
     def _check_for_updates_worker(self) -> None:
@@ -115088,6 +117600,11 @@ NcbiTaxonPickerModal { align: center middle; }
                 seq, f_s, f_e, strand, exons=exons, codon_start=cs,
                 transl_table=tt,
             ).rstrip("*")
+            # The same protein the AA lane shows: a start the annotation
+            # reads as Met (`_init_m`, stamped by `PlasmidMap._parse`) is
+            # copied as M, so the copy matches the file and UniProt.
+            if aa_feat.get("_init_m") and aa_str:
+                aa_str = "M" + aa_str[1:]
             # Route through the 4-tier helper so a clipboard-broken
             # SSH session still gets the AA string via the disk-fallback
             # tier (hardening item 37). Pre-fix this fell through to
@@ -116020,6 +118537,10 @@ NcbiTaxonPickerModal { align: center middle; }
         The focus half of the operon's `_native_focus_saved_clone`, lifted to
         the app so Scrub's Apply-cure save reuses the same behaviour."""
         def _focus() -> None:
+            # Loading the saved plasmid REPLACES the canvas: offer unsaved
+            # edits on whatever is there first (H3). Re-entrant.
+            if not self._guard_unsaved_then(f"open the saved `{name}`", _focus):
+                return
             try:
                 self._apply_record(clone_rec)
             except Exception:
@@ -116084,6 +118605,56 @@ NcbiTaxonPickerModal { align: center middle; }
 
     def _mark_clean(self) -> None:
         self._record.mark_clean()
+
+    def _guard_unsaved_then(self, what: str, action, on_cancel=None) -> bool:
+        """May the caller replace the canvas NOW? Ask first when it has unsaved
+        edits.
+
+        Returns True when nothing is unsaved — the CALLER goes on and does the
+        work itself; `action` is NOT run. Returns False when the decision was
+        deferred to `UnsavedNavigateModal`, whose three answers do what they
+        say: Save (then `action`, unless the save fails), Discard (revert, then
+        `action`), Cancel (nothing). Callers pass themselves as `action`
+        (`lambda: self._library_load(event)`) and re-enter once the edits are
+        saved or discarded, when this returns True and they fall straight
+        through.
+
+        It used to run `action` on the clean path as well. Every caller hands
+        in itself, so a clean canvas recursed until RecursionError: opening a
+        library row, fetching an accession or importing a file crashed the app
+        outright — and Textual's highlighted crash report over this module then
+        took minutes to render, which is how it hid as a "hung" test run.
+
+        ONE helper because the pattern was open-coded at some load sites and
+        MISSING at others: a library row-select, an import, a multi-FASTA load, a
+        find-plasmid jump, a primer or sequencing jump each replaced the canvas
+        outright, so edits the user had not saved were gone with no prompt
+        (audit 2026-09-22). `_apply_record`'s own autosave is a crash net, not a
+        substitute for asking.
+
+        `what` completes the sentence "You have unsaved changes. …" — e.g.
+        "open plasmid `pUC19`".
+
+        `on_cancel` runs when the user cancels — for an action that carries
+        something that must not be lost with the answer (an import).
+        """
+        if not getattr(self, "_unsaved", False) or self._current_record is None:
+            return True
+
+        def _on_response(result: "str | None") -> None:
+            if result == "save":
+                if self._do_save():
+                    action()
+                # A failed save leaves the user where they are, to retry.
+            elif result == "discard":
+                self._discard_changes()
+                action()
+            elif on_cancel is not None:
+                on_cancel()
+            # None → cancel: stay put, keep the edits.
+
+        self.push_screen(UnsavedNavigateModal(what), callback=_on_response)
+        return False
 
     def _discard_changes(self) -> None:
         """Revert the in-memory record to whatever the library has stored.
@@ -116155,13 +118726,19 @@ NcbiTaxonPickerModal { align: center middle; }
         kwargs.setdefault("timeout", self._NOTIFY_DEFAULT_TIMEOUT_S)
         # Toast markup is parsed at RENDER time, so a user/file-derived name
         # carrying `[/x]` raised MarkupError out of the compositor and closed
-        # the app — and `[@click=…]` made a clickable action (audit
-        # 2026-09-22). Nothing here uses action markup; anything that would
-        # not parse goes out as plain text instead of taking the app down.
+        # the app, `[@click=…]` made a clickable action, and a name like
+        # `pUC19 [v2]` parsed as a style tag and lost its bracketed text
+        # (audit 2026-09-22). Every bracketed run that is not a real style is
+        # escaped, so the app's own colours survive; a message that still
+        # would not parse goes out as plain text instead of taking the app
+        # down.
         if (kwargs.get("markup", True) and isinstance(message, str)
-                and "[" in message
-                and ("[@" in message or not _markup_parses(message))):
-            kwargs["markup"] = False
+                and "[" in message):
+            fixed = _markup_escape_unstyled(message)
+            if fixed is None:
+                kwargs["markup"] = False
+            else:
+                message = fixed
         if isinstance(self.screen, SplashScreen):
             if len(getattr(self, "_splash_notify_queue", [])) < 16:
                 self._splash_notify_queue.append((message, kwargs))
@@ -116229,9 +118806,12 @@ NcbiTaxonPickerModal { align: center middle; }
                 _fire_pending_update()
             self.push_screen(WhatsNewModal(__version__), _on_seen)
         else:
-            if seen != __version__:
+            if seen != __version__ and not _state._AGENT_READ_ONLY:
                 # Headless: record the version as seen WITHOUT the modal so it
-                # doesn't re-arm + spin on the next daemon restart.
+                # doesn't re-arm + spin on the next daemon restart. Never from
+                # a `--read-only` guest: it may not write the data dir, and
+                # the staged setting failed at its exit flush with an ERROR in
+                # the log on every API shutdown.
                 _set_setting("last_seen_version", __version__)
             _fire_pending_update()
 
@@ -116315,6 +118895,7 @@ NcbiTaxonPickerModal { align: center middle; }
         On failure, sets `self._last_save_error` to a short reason
         string so the agent-API caller can return a meaningful body
         instead of just `{"ok": false}`. Cleared on success."""
+        self._last_save_deferred = False
         if self._current_record is None:
             self.notify("Nothing to save.", severity="warning")
             _log_event("save.no_record")
@@ -116379,6 +118960,7 @@ NcbiTaxonPickerModal { align: center middle; }
                     "a plasmid with this name is already in the library — "
                     "choose overwrite / keep both in the prompt; nothing is "
                     "saved until then")
+                self._last_save_deferred = True
                 return False
         except Exception as exc:
             _log.exception("Library update failed during save")
@@ -116424,6 +119006,14 @@ NcbiTaxonPickerModal { align: center middle; }
         + `group="save"` collapse rapid Ctrl+S spam into a single
         in-flight save.
         """
+        # The edit token, read BEFORE the snapshot. `_finish` compares it, so an
+        # edit made while this write is in flight is not declared saved (audit
+        # 2026-09-22). Read after the deepcopy (the first fix), an edit landing
+        # DURING the copy moved the token first — the save then matched it and
+        # marked clean a file that did not hold that edit (H7). Read first, the
+        # worst case is an edit the snapshot did catch staying dirty: one extra
+        # save, never a lost edit.
+        token_at_snapshot = int(getattr(self._record, "_edit_token", 0))
         live_record = self._current_record
         if live_record is None:
             self.call_from_thread(
@@ -116600,9 +119190,20 @@ NcbiTaxonPickerModal { align: center middle; }
                     lib._repopulate_plasmids_keeping_view()
             except NoMatches:
                 pass
-            self._mark_clean()
-            _log_event("save.ok", source_path=_scrub_path(source_path or ""))
-            if source_path:
+            # Only mark clean when the record has not moved since the snapshot
+            # this write was built from. An edit that landed mid-write is NOT in
+            # the file, and saying "saved" about it is how it went missing.
+            moved = int(getattr(self._record, "_edit_token", 0)) != token_at_snapshot
+            if not moved:
+                self._mark_clean()
+            _log_event("save.ok", source_path=_scrub_path(source_path or ""),
+                       edited_during_write=moved)
+            if moved:
+                self._notify_success(
+                    f"Saved {record_name} to library — but you edited it while "
+                    f"the save was running, so those newer changes are still "
+                    f"unsaved. Press Ctrl+S again.", timeout=10)
+            elif source_path:
                 self._notify_success(f"Saved → {source_path}")
             else:
                 self._notify_success(f"Saved {record_name} to library")
@@ -116696,6 +119297,12 @@ NcbiTaxonPickerModal { align: center middle; }
         # visitor read the host filesystem (the OpenFileModal browses real
         # paths). The seeded demo plasmids are already in the library.
         if _demo_web_refuse(self, "Opening files from disk"):
+            return
+        # Opening a file replaces the canvas — offer unsaved edits BEFORE the
+        # picker (H3). Not after it: a multi-record FASTA creates and switches
+        # to a new collection inside the modal, so a "Save" answered afterwards
+        # would file the edited plasmid into that new collection.
+        if not self._guard_unsaved_then("open a file", self.action_open_file):
             return
         # Same auto-persist policy as fetch; _import_and_persist preserves
         # the record's _tui_source path for later "Save" operations.
@@ -118976,6 +121583,13 @@ NcbiTaxonPickerModal { align: center middle; }
             if not result:
                 return
             coll_name, entry_id = result
+            # Loading the match REPLACES the canvas: offer unsaved edits first,
+            # before the collection switch below too (H3). Re-entrant.
+            _cur = self._current_record
+            if not (_cur is not None and getattr(_cur, "id", None) == entry_id):
+                if not self._guard_unsaved_then(
+                        "open the plasmid you found", lambda: _on_done(result)):
+                    return
             # Switch active collection if the match isn't already in it.
             if coll_name != _get_active_collection_name():
                 coll = _find_collection(coll_name)
@@ -119134,7 +121748,8 @@ NcbiTaxonPickerModal { align: center middle; }
 
     # ── Central record loader ──────────────────────────────────────────────────
 
-    def _import_and_persist(self, record) -> None:
+    def _import_and_persist(self, record, *,
+                            prompt_unsaved: bool = True) -> None:
         """Apply a freshly-imported record to the UI AND save it to the library.
 
         Used by the three "user imported a plasmid" entry points — NCBI fetch,
@@ -119145,6 +121760,20 @@ NcbiTaxonPickerModal { align: center middle; }
         updates it in place rather than creating a duplicate.
         """
         if record is None:
+            return
+        # An import REPLACES what is on the canvas. Offer the unsaved edits
+        # first, exactly as a library row-select does (audit 2026-09-22): the
+        # user fetching an accession has not asked to lose the plasmid they were
+        # editing. Re-entrant via the modal callback.
+        #
+        # `prompt_unsaved=False` for the STARTUP preload (`splicecraft foo.gb`):
+        # the user launched the app with that file, and whatever the auto-load
+        # put on the canvas a moment earlier is not work of theirs to lose —
+        # prompting there would put a modal in front of every such launch.
+        if prompt_unsaved and not self._guard_unsaved_then(
+                f"load `{getattr(record, 'name', 'the new plasmid')}`",
+                lambda: self._import_and_persist(record),
+                on_cancel=lambda: self._persist_import_only(record)):
             return
         # _apply_record clears self._source_path; preserve the file path if
         # the record came from a local .gb file (it's stashed on the record
@@ -119180,6 +121809,43 @@ NcbiTaxonPickerModal { align: center middle; }
                 "Loaded record but could not save to library (see log).",
                 severity="warning",
             )
+
+    def _persist_import_only(self, record) -> None:
+        """An import whose "replace the canvas?" prompt was CANCELLED: the user
+        kept their edits on the canvas, not the import in the bin. Saved to
+        the library without loading it — the fetched or pasted plasmid was
+        otherwise kept nowhere (audit 2026-09-24)."""
+        if record is None:
+            return
+        _import_identity_fixup(record)
+        name = getattr(record, "name", "the new plasmid")
+
+        def _saved_note() -> None:
+            self.notify(f"Saved {name} to the library — the canvas still shows "
+                        f"your unsaved plasmid.", timeout=6, markup=False)
+
+        def _deferred_done(saved: bool) -> None:
+            if saved:
+                _saved_note()
+        try:
+            lib = self.query_one("#library", LibraryPanel)
+            lib._last_add_deferred = False
+            saved = lib.add_entry(record, on_deferred_done=_deferred_done)
+            # A name-collision prompt is open: NOTHING is saved yet, and its
+            # answer reports the outcome. Saying "Saved" now — then "Library
+            # unchanged" when the prompt was cancelled — told the user both
+            # (round-2 hardening, 2026-09-25).
+            deferred = bool(getattr(lib, "_last_add_deferred", False))
+        except Exception:
+            _log.exception("import kept after a cancelled load failed")
+            saved, deferred = False, False
+        if deferred:
+            return
+        if saved:
+            _saved_note()
+        else:
+            self.notify(f"Could not save {name} to the library (see log).",
+                        severity="warning", markup=False)
 
     # Above this size, render + restriction-scan + auto-translate
     # operations on the new record will visibly stutter. The user
@@ -121076,10 +123742,14 @@ NcbiTaxonPickerModal { align: center middle; }
                 except (OSError, RuntimeError) as exc:
                     _notify_save_failure(self, "Primer collections", exc)
                     return
+                if not _prepare_primer_switch_or_notify(self):
+                    return
                 _set_active_primer_collection_name(collection)
                 _settings_flush_sync()
                 _restore_primers_from_active_primer_collection()
             elif collection != active_coll:
+                if not _prepare_primer_switch_or_notify(self):
+                    return
                 _set_active_primer_collection_name(collection)
                 _settings_flush_sync()
                 # Re-point the live library at the switched-to collection BEFORE
@@ -121234,6 +123904,14 @@ NcbiTaxonPickerModal { align: center middle; }
         if (entry_id and self._current_record is not None
                 and getattr(self._current_record, "id", None) == entry_id):
             return
+        # Selecting a library row REPLACES the canvas, so unsaved edits have to
+        # be offered to the user first (audit 2026-09-22). Re-entrant: the modal
+        # callback calls this method again once the edits are saved or discarded,
+        # and by then `_unsaved` is clear so it falls straight through.
+        _label = str(event.entry.get("name") or entry_id or "that plasmid")
+        if not self._guard_unsaved_then(
+                f"open `{_label}`", lambda: self._library_load(event)):
+            return
         try:
             record = _gb_text_to_record(gb_text)
             # Stash the library entry's display name on the record so
@@ -121315,10 +123993,32 @@ NcbiTaxonPickerModal { align: center middle; }
         plasmid_id = (usage.get("plasmid_id") or "")
         start = int(usage.get("start") or 0)
         end = int(usage.get("end") or 0)
-        # Step 1: switch active collection.
+        # Loading another plasmid REPLACES the canvas: offer unsaved edits
+        # first, before anything (the active collection included) changes.
+        # Re-entrant through the modal, like every other load (H3).
+        _cur = self._current_record
+        if not (_cur is not None and plasmid_id
+                and getattr(_cur, "id", None) == plasmid_id):
+            if not self._guard_unsaved_then(
+                    f"open `{plasmid_id or 'that plasmid'}`",
+                    lambda: self._goto_primer_in_plasmid_inner(usage)):
+                return
+        # Step 1: switch active collection — through THE atomic switch. Moving
+        # only the pointer left `plasmid_library.json` holding the OLD
+        # collection's plasmids: the lookup below searched the wrong list, and
+        # the next library save wrote those plasmids into the collection just
+        # switched to, over its own (audit 2026-09-22 follow-up).
         current_coll = _get_active_collection_name()
         if coll and coll != current_coll:
-            _set_active_collection_name(coll)
+            try:
+                _activate_collection(coll)
+            except (ValueError, RuntimeError, OSError) as exc:
+                _log.exception("primer-goto: could not switch to %r", coll)
+                self.notify(
+                    f"Could not switch to collection {coll!r}: "
+                    f"{_scrub_path(str(exc))}", severity="error",
+                    markup=False)
+                return
             # Refresh LibraryPanel so the plasmid list reflects the
             # new active collection. Same flow as the collections-picker
             # callback uses.
@@ -121673,19 +124373,16 @@ NcbiTaxonPickerModal { align: center middle; }
                 _log.exception(
                     "status save: persist failed for %r", entry_id,
                 )
-                # Surface the failure on the UI thread.
+                # Surface the failure on the UI thread — POSTED, not
+                # `call_from_thread`: this thread still holds
+                # `_cache_lock`, and waiting on a UI thread that is itself
+                # waiting for the lock hangs both (`_post_to_ui`). The
+                # failure is already logged; the toast is best-effort.
                 def _err(_exc=exc):
                     _notify_save_failure(
                         self, "Plasmid library", _exc,
                     )
-                try:
-                    self.call_from_thread(_err)
-                except RuntimeError:
-                    # `call_from_thread` raises RuntimeError when the
-                    # app loop has stopped (shutdown race). Save
-                    # failure is already logged; the UI notification
-                    # is best-effort.
-                    pass
+                _post_to_ui(self, _err)
                 return
         # Refresh the cells from the now-persisted cache so the
         # display matches disk (covers the case where the optimistic
@@ -121929,6 +124626,7 @@ NcbiTaxonPickerModal { align: center middle; }
         # name collision" alone is what the user saw on 2026-07-25 before
         # deleting the renamed entries as presumed duplicates ([INV-167]).
         alt_count = 0
+        _mirror_why = None
         try:
             with _cache_lock:
                 colls = _load_collections()
@@ -122100,23 +124798,19 @@ NcbiTaxonPickerModal { align: center middle; }
                 # (smaller) source list. For COPY: target gained
                 # entries, but the user is still on source — no
                 # re-mirror needed unless active==target (rare).
+                #
+                # `collections.json` is committed at this point, so a mirror
+                # failure must not land in the "Move/copy failed" branch below
+                # (the move HAPPENED), nor leave the pre-move view in the cache
+                # for the next save to write back over it (D9) — the helper
+                # re-seats the cache from the committed collection either way.
                 active = _get_active_collection_name()
                 if active == source and mode == "move":
-                    new_src = colls[src_idx]["plasmids"]
-                    _safe_save_json_mirror(
-                        _state._LIBRARY_FILE,
-                        [e for e in new_src if isinstance(e, dict)],
-                        "Plasmid library",
-                    )
-                    _state._library_cache = None
+                    _mirror_why = _restage_library_mirror_after_commit(
+                        colls[src_idx]["plasmids"], "library move/copy")
                 elif active == target:
-                    _safe_save_json_mirror(
-                        _state._LIBRARY_FILE,
-                        [e for e in new_tgt_plasmids
-                         if isinstance(e, dict)],
-                        "Plasmid library",
-                    )
-                    _state._library_cache = None
+                    _mirror_why = _restage_library_mirror_after_commit(
+                        new_tgt_plasmids, "library move/copy")
         except (OSError, RuntimeError, ValueError) as exc:
             self.notify(
                 f"Move/copy failed: {_scrub_path(str(exc))}",
@@ -122131,6 +124825,12 @@ NcbiTaxonPickerModal { align: center middle; }
             )
             return
 
+        if _mirror_why:
+            self.notify(
+                f"The {mode} IS saved, but the library file could not be "
+                f"refreshed ({_mirror_why}). The library view is read from the "
+                f"saved collection.", severity="warning", timeout=12,
+                markup=False)
         # Clear marks + repopulate. `query_one` raises NoMatches if
         # the panel isn't composed yet (tests; some startup orders);
         # catching the broader `Exception` covers the case where
@@ -124247,6 +126947,21 @@ NcbiTaxonPickerModal { align: center middle; }
                 _panel._repopulate_collections()
         except NoMatches:
             pass
+        if isinstance(result, dict) and result.get("after_delete"):
+            # The active collection was deleted: the panel shows whatever
+            # became active (or nothing), never the deleted collection's rows.
+            try:
+                panel = self.query_one("#library", LibraryPanel)
+                panel._repopulate()
+            except NoMatches:
+                pass
+            now = result.get("loaded") or ""
+            self.notify(
+                f"Deleted collection '{result['after_delete']}' — "
+                + (f"now showing '{now}' ({result['n_plasmids']} plasmid(s))."
+                   if now else "no collection is active."),
+                timeout=10, markup=False)
+            return
         if not isinstance(result, dict) or not result.get("loaded"):
             return
         try:
@@ -125607,14 +128322,33 @@ def main():
     skip_splash = parsed.skip_splash
     enable_agent_api = parsed.agent_api
     agent_port = _AGENT_API_PORT_DEFAULT
+
+    def _valid_port(value: int) -> bool:
+        # A TCP port is 1-65535. An out-of-range value used to travel all the
+        # way to `bind()` and surface as an OverflowError raised INSIDE
+        # `on_mount` — after the UI had started, as a crash rather than as the
+        # usage error it is (audit 2026-09-22). Port 0 is excluded on purpose:
+        # the kernel would pick a random free port and nothing would tell the
+        # user which, so the API would be running at an address they cannot find.
+        return 1 <= value <= 65535
+
     if parsed.agent_api_port is not None:
+        if not _valid_port(parsed.agent_api_port):
+            main_parser.error(
+                f"--agent-api-port must be between 1 and 65535 "
+                f"(got {parsed.agent_api_port})")
         agent_port = parsed.agent_api_port
         enable_agent_api = True
     env_api = os.environ.get("SPLICECRAFT_AGENT_API", "").strip()
     if env_api and env_api.lower() not in ("0", "false", "no", ""):
         enable_agent_api = True
         if env_api.isdigit() and int(env_api) > 1:
-            agent_port = int(env_api)
+            want = int(env_api)
+            if not _valid_port(want):
+                main_parser.error(
+                    f"SPLICECRAFT_AGENT_API names port {want}, which is "
+                    f"outside 1-65535")
+            agent_port = want
     # Headless mode (snag #3): run the agent API with no Textual UI, so
     # CI / agent contexts don't need a pty (no more `script -qfc`
     # wrapping). It implies the agent API — a headless app with no API
@@ -126030,8 +128764,13 @@ def main():
         # Stop the agent-API HTTP server thread and remove the token
         # file. Defensive against double-call (server may already be
         # None if it failed to bind; `_stop_agent_api(None)` is a
-        # no-op).
-        _stop_agent_api(getattr(app, "_agent_api_server", None))
+        # no-op). Guarded: everything after this in the `finally` — the
+        # settings flush, the collection flush, the lock release — must run
+        # even when stopping the server does not.
+        try:
+            _stop_agent_api(getattr(app, "_agent_api_server", None))
+        except Exception:
+            _log.exception("agent-api: stop failed at shutdown")
         # Cancel any pending autosave timers Textual may have queued.
         # `App.exit()` triggers normal teardown, but if the user hit
         # the OS terminal kill signal a timer might still be pending

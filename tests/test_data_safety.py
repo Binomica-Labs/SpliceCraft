@@ -97,8 +97,10 @@ class TestSafeSaveJsonMultiGenBackup:
         sc._safe_save_json(p, [{"id": "v2"}], "test")
         # Legacy single-generation .bak still exists for back-compat.
         assert (tmp_path / "test.json.bak").exists()
-        # Plus at least one timestamped sibling.
-        timestamped = list(tmp_path.glob("test.json.bak.????????-??????"))
+        # Plus at least one timestamped sibling (`.bak.<ts>.g<generation>`
+        # since backups are ordered by generation — enumerate them the way
+        # every consumer does, not with a hand-written glob).
+        timestamped = sc._iter_backups(p)
         assert len(timestamped) >= 1
         # Both backups carry the same prior content.
         legacy = json.loads((tmp_path / "test.json.bak").read_text())
@@ -125,9 +127,7 @@ class TestSafeSaveJsonMultiGenBackup:
             )
         # Save once more — this triggers `_prune_backups`.
         sc._safe_save_json(p, [{"id": "live"}], "test")
-        survivors = sorted(p.parent.glob(
-            "test.json.bak.????????-??????"
-        ))
+        survivors = sc._iter_backups(p)
         # Retention is `keep`-most-recent (3). The most recent ones
         # are the highest timestamps including the one this call just
         # wrote, so the older synthetic backups beyond 3 are gone.

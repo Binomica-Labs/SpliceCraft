@@ -144,7 +144,10 @@ class TestRestoreCacheBustEnumeration:
         the sweep-#9 + original caches.
         """
         import inspect
-        src = inspect.getsource(sc.RestoreFromBackupModal._restore_btn)
+        # The restore itself runs in `_restore_locked`, under the one
+        # `_cache_lock` hold `_restore_btn` takes (round-2 hardening,
+        # 2026-09-25: the lock was released between the steps).
+        src = inspect.getsource(sc.RestoreFromBackupModal._restore_locked)
         assert "_MASTER_DELETE_CACHE_ATTRS" in src, (
             "RestoreFromBackupModal must iterate the canonical "
             "_MASTER_DELETE_CACHE_ATTRS tuple, not a hand-list"
@@ -187,7 +190,10 @@ class TestRestoreCacheBustEnumeration:
         # Cache-bust map: white-box check that every label in
         # `_AGENT_BACKUP_LABELS` is also reset by `_h_restore_backup`
         # so a restore doesn't leave a stale in-memory cache.
-        bust_src = inspect.getsource(sc._h_restore_backup)
+        # The bust runs in `_restore_backup_locked`, under the one
+        # `_cache_lock` hold `_h_restore_backup` takes (round-2 hardening).
+        import splicecraft_agent as _ag
+        bust_src = inspect.getsource(_ag._restore_backup_locked)
         bust_gaps = []
         for label in sc._AGENT_BACKUP_LABELS:
             # Each label appears as a dict key in the cache_attr map.

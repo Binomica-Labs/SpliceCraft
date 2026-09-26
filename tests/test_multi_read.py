@@ -53,13 +53,13 @@ def _partial(seq, lo, hi):
 class TestCoverage:
 
     def test_no_reads(self):
-        s = sc._multi_read_summary([], 600)
+        s = sc._multi_read_summary([], 600, circular=True)
         assert s["verdict"] == "no_reads"
         assert s["uncovered_spans"] == [(0, 600)]
 
     def test_one_full_read_covers_everything(self):
         p = _seq()
-        s = sc._multi_read_summary([_read(p, p, "r1")], len(p))
+        s = sc._multi_read_summary([_read(p, p, "r1")], len(p), circular=True)
         assert s["covered_pct"] == 100.0
         assert s["depth2_pct"] == 0.0
         assert s["uncovered_spans"] == []
@@ -71,7 +71,7 @@ class TestCoverage:
         p = _seq()
         reads = [_read(p, _partial(p, 0, 200), "fwd"),
                  _read(p, _partial(p, 400, 600), "rev")]
-        s = sc._multi_read_summary(reads, len(p))
+        s = sc._multi_read_summary(reads, len(p), circular=True)
         assert s["covered_pct"] < 100.0
         assert s["uncovered_spans"], "the unread middle must be reported"
         lo, hi = s["uncovered_spans"][0]
@@ -81,7 +81,7 @@ class TestCoverage:
         p = _seq()
         reads = [_read(p, _partial(p, 0, 400), "fwd"),
                  _read(p, _partial(p, 200, 600), "rev")]
-        s = sc._multi_read_summary(reads, len(p))
+        s = sc._multi_read_summary(reads, len(p), circular=True)
         assert s["depth2_bp"] > 0
         assert s["depth2_bp"] <= s["covered_bp"]
 
@@ -100,7 +100,7 @@ class TestVariantSupport:
         p = _seq()
         mutant = _mutate(p, 300)
         reads = [_read(p, mutant, "fwd"), _read(p, mutant, "rev")]
-        s = sc._multi_read_summary(reads, len(p))
+        s = sc._multi_read_summary(reads, len(p), circular=True)
         assert s["verdict"] == "confirmed"
         assert s["n_confirmed"] == 1
         v = s["variants"][0]
@@ -114,7 +114,7 @@ class TestVariantSupport:
         and disagrees."""
         p = _seq()
         reads = [_read(p, _mutate(p, 300), "fwd"), _read(p, p, "rev")]
-        s = sc._multi_read_summary(reads, len(p))
+        s = sc._multi_read_summary(reads, len(p), circular=True)
         assert s["verdict"] == "single_read"
         v = s["variants"][0]
         assert v["support"] == 1 and v["depth"] == 2
@@ -126,7 +126,7 @@ class TestVariantSupport:
         p = _seq()
         reads = [_read(p, _partial(_mutate(p, 100), 0, 200), "fwd"),
                  _read(p, _partial(p, 400, 600), "rev")]
-        s = sc._multi_read_summary(reads, len(p))
+        s = sc._multi_read_summary(reads, len(p), circular=True)
         assert s["verdict"] == "unconfirmed"
         v = s["variants"][0]
         assert v["support"] == 1 and v["contradicted"] == 0
@@ -140,7 +140,7 @@ class TestVariantSupport:
         alt2 = "T" if base != "T" else "C"
         reads = [_read(p, _mutate(p, 300, alt1), "r1"),
                  _read(p, _mutate(p, 300, alt2), "r2")]
-        s = sc._multi_read_summary(reads, len(p))
+        s = sc._multi_read_summary(reads, len(p), circular=True)
         at300 = [v for v in s["variants"] if v["target_pos"] == 300]
         assert len(at300) == 2
         assert all(v["support"] == 1 for v in at300)
@@ -151,16 +151,16 @@ class TestVariantSupport:
         m = _mutate(p, 300)
         reads = [_read(p, m, "r1"), _read(p, m, "r2")]
         assert sc._multi_read_summary(reads, len(p),
-                                      min_support=3)["verdict"] != "confirmed"
+                                      min_support=3, circular=True)["verdict"] != "confirmed"
         assert sc._multi_read_summary(reads, len(p),
-                                      min_support=2)["verdict"] == "confirmed"
+                                      min_support=2, circular=True)["verdict"] == "confirmed"
 
     def test_variants_sort_most_supported_first(self):
         p = _seq()
         m2 = _mutate(_mutate(p, 100), 300)
         reads = [_read(p, m2, "r1"), _read(p, m2, "r2"),
                  _read(p, _mutate(p, 500), "r3")]
-        s = sc._multi_read_summary(reads, len(p))
+        s = sc._multi_read_summary(reads, len(p), circular=True)
         supports = [v["support"] for v in s["variants"]]
         assert supports == sorted(supports, reverse=True)
 
@@ -174,14 +174,14 @@ class TestVariantSupport:
              "n_confident": 1, "n_lowq": 0, "min_phred": 20,
              "confident_positions": [300], "lowq_positions": []}
         reads = [_read(p, m, "fwd", quality=q), _read(p, m, "rev", quality=q)]
-        s = sc._multi_read_summary(reads, len(p))
+        s = sc._multi_read_summary(reads, len(p), circular=True)
         assert s["variants"][0]["confident_reads"] == 2
 
     def test_read_without_quality_contributes_no_confidence(self):
         p = _seq()
         m = _mutate(p, 300)
         reads = [_read(p, m, "fwd"), _read(p, m, "rev")]
-        assert s_v(sc._multi_read_summary(reads, len(p)))["confident_reads"] == 0
+        assert s_v(sc._multi_read_summary(reads, len(p), circular=True))["confident_reads"] == 0
 
 
 def s_v(summary):
@@ -216,13 +216,13 @@ class TestPhrase:
         p = _seq()
         m = _mutate(p, 300)
         s = sc._multi_read_summary([_read(p, m, "a"), _read(p, m, "b")],
-                                   len(p))
+                                   len(p), circular=True)
         txt = sc._multi_read_phrase(s)
         assert "confirmed" in txt and "2" in txt
 
     def test_phrase_for_no_reads(self):
         assert "no reads" in sc._multi_read_phrase(
-            sc._multi_read_summary([], 100))
+            sc._multi_read_summary([], 100, circular=True))
 
     def test_phrase_tolerates_junk(self):
         assert sc._multi_read_phrase(None) == ""      # type: ignore[arg-type]
@@ -268,7 +268,7 @@ class TestCoverageIsNotTheHull:
         400 bp plasmid is 50% coverage and zero variants, not one 200 bp
         deletion."""
         p = _seq(400, seed=11)
-        s = sc._multi_read_summary([_read(p, p[:200], "half")], len(p))
+        s = sc._multi_read_summary([_read(p, p[:200], "half")], len(p), circular=True)
         assert s["variants"] == []
         assert s["verdict"] == "clean"
         assert 40.0 <= s["covered_pct"] <= 60.0

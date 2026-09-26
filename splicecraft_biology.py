@@ -45,12 +45,47 @@ from splicecraft_util import _normalize_dna_for_align  # same-layer L0 (util doe
 # ── IUPAC + reverse complement ────────────────────────────────────────────
 
 
-_IUPAC_RE: dict[str, str] = {
-    "A": "A", "C": "C", "G": "G", "T": "T",
-    "R": "[AG]", "Y": "[CT]", "W": "[AT]", "S": "[CG]",
-    "M": "[AC]", "K": "[GT]", "B": "[CGT]", "D": "[AGT]",
-    "H": "[ACT]", "V": "[ACG]", "N": "[ACGT]",
+# The bases each IUPAC code stands for. ONE table, from which both the regex
+# classes and every subset test below are derived — a second hand-written map is
+# how one code ends up meaning two things in one codebase (sacred #3).
+_IUPAC_BASES: "dict[str, frozenset]" = {
+    "A": frozenset("A"), "C": frozenset("C"),
+    "G": frozenset("G"), "T": frozenset("T"),
+    "R": frozenset("AG"), "Y": frozenset("CT"),
+    "W": frozenset("AT"), "S": frozenset("CG"),
+    "M": frozenset("AC"), "K": frozenset("GT"),
+    "B": frozenset("CGT"), "D": frozenset("AGT"),
+    "H": frozenset("ACT"), "V": frozenset("ACG"),
+    "N": frozenset("ACGT"),
 }
+
+
+def _iupac_class_for(site_code: str) -> str:
+    """The regex class matching every SEQUENCE code a site code accepts.
+
+    A recognition-site code ``S`` is satisfied by a sequence code ``Q`` exactly
+    when ``bases(Q) ⊆ bases(S)`` — every base the sequence could be is one the
+    enzyme accepts. So site ``N`` accepts a literal ``N`` (and ``R``, ``W``, …),
+    while site ``A`` accepts only ``A``.
+
+    Until the 2026-09-22 audit the classes were written out as the site's own
+    base set (``N`` → ``[ACGT]``), which made the codes one-directional: a
+    sequence carrying ``GGTNACC`` did not match BstEII's ``GGTNACC``, because the
+    literal ``N`` in the sequence was not in ``[ACGT]``. The enzyme does not care
+    what that base is — that is what the ``N`` in its site MEANS — so the site
+    was reported absent from a sequence that certainly contains it.
+
+    The rule is deliberately CONSERVATIVE in the other direction: a sequence
+    ``N`` where the enzyme needs a specific base is NOT a match, because the base
+    might be anything. That keeps a run of ``N`` from manufacturing sites.
+    """
+    allowed = _IUPAC_BASES[site_code]
+    codes = "".join(sorted(c for c, bs in _IUPAC_BASES.items()
+                           if bs <= allowed))
+    return codes if len(codes) == 1 else f"[{codes}]"
+
+
+_IUPAC_RE: dict[str, str] = {c: _iupac_class_for(c) for c in _IUPAC_BASES}
 
 
 # Pattern cache (sacred invariant #4). Bounded LRU so a long-lived
@@ -175,6 +210,23 @@ def _bp_in_span(bp: int, start: int, end: int,
     return (start <= bp < end) if end >= start else (bp >= start or bp < end)
 
 
+def _span_full_lap_len(start: int, end: int, total: int) -> int:
+    """Wrap-aware length of ``[start, end)``, counting a FULL LAP as `total`.
+
+    `_feat_len` works on reduced coordinates, where ``end == total`` has already
+    become ``0`` — so a whole-molecule span measures 0 there, and a caller that
+    reduces before asking reads the entire plasmid as an empty span. Pass the
+    RAW pair here and the lap survives. Exposed (rather than staying a closure
+    inside `_span_in_span`) because `span-contains` needs to report the same
+    length it tests containment with (audit 2026-09-22).
+    """
+    if total <= 0:
+        return 0
+    if end != start and (end - start) % total == 0:
+        return total                       # full lap
+    return _feat_len(start % total, end % total, total)
+
+
 def _span_in_span(inner_start: int, inner_end: int,
                   outer_start: int, outer_end: int, total: int) -> bool:
     """Is the half-open span ``[inner_start, inner_end)`` wholly inside
@@ -196,14 +248,21 @@ def _span_in_span(inner_start: int, inner_end: int,
         return False
 
     def _span_len(s: int, e: int) -> int:
-        if e != s and (e - s) % total == 0:
-            return total                   # full lap
-        return _feat_len(s % total, e % total, total)
+        return _span_full_lap_len(s, e, total)
 
     outer_len = _span_len(outer_start, outer_end)
     if outer_len <= 0:
         return False                       # an empty outer contains nothing
     inner_len = _span_len(inner_start, inner_end)
+    if outer_len >= total:
+        # A full-lap outer covers every base, so containment is only a question
+        # of whether the inner itself fits on the molecule. The general
+        # `offset + inner_len <= outer_len` form cannot say this: a wrapping
+        # inner starting at bp 900 of 1,000 has offset 900, and 900 + its length
+        # exceeds `total` however short it is — so a whole-molecule annotation
+        # reported that it did not contain an origin-spanning feature drawn
+        # inside it (audit 2026-09-22).
+        return inner_len <= total
     offset = (inner_start - outer_start) % total
     if inner_len <= 0:
         # A zero-length inner is an insertion POINT: contained when the
@@ -1635,8 +1694,14 @@ def _scan_restriction_sites(
     # CPython interns the string hash on the first call, so subsequent
     # scans of the same seq are still O(1). Same fix applied to
     # `_ENZYME_CUTS_CACHE`.
+    # `is None` — NOT truthiness. An EMPTY allow-set means "this collection
+    # resolved to no usable enzyme, scan nothing", which the impl honours via
+    # `is not None`; folding it to None here made it share a cache slot with
+    # "no filter at all", so an empty set could be answered with the FULL
+    # catalog's sites (or vice versa, depending on call order) — the very
+    # confusion `_active_enzyme_allowed_set` was fixed to end (audit 2026-09-22).
     allowed_key = (
-        tuple(sorted(allowed_enzymes)) if allowed_enzymes else None
+        None if allowed_enzymes is None else tuple(sorted(allowed_enzymes))
     )
     # `len(seq)` is folded into the key so two different sequences can only
     # ever share a slot if they collide on BOTH `hash()` AND length — a strictly
@@ -1936,10 +2001,26 @@ def _scan_restriction_sites_impl(
                 _emit_resite(hits, p, site_len, -1, color, name, _cc, _ext,
                              top_cut_bp=_top_cut_bp,
                              bottom_cut_bp=_bot_cut_bp)
+                # The map's tick marks a base the sequence panel's arrow marks,
+                # so the two views give ONE answer to "where does this cut?".
+                # The panel draws at `start + cut_col` (the enzyme's own-strand
+                # cut, sacred invariant #2) and/or at `ext_cut_bp`. The TOP cut
+                # wins whenever the panel draws it too — every Type IIS site
+                # cutting outside its recognition, where the old bottom-cut
+                # tick sat 4 bp from the arrow. Otherwise the tick follows the
+                # arrow: pinning it to the top cut unconditionally (the first
+                # fix, audit 2026-09-22) moved it 2–4 bp off the arrow for
+                # BsmI, BsrI, BtsI, BseYI and five more, whose arrow marks the
+                # bottom cut. `top_cut_bp` / `bottom_cut_bp` stay on the site
+                # for anyone doing overhang arithmetic.
+                _marks = ([(p + _cc) % n] if _cc is not None else []) + (
+                    [_ext] if _ext is not None else [])
+                _tick = (_top_cut_bp if (_top_cut_bp in _marks or not _marks)
+                         else _marks[0])
                 hits.append({
                     "type":   "recut",
-                    "start":  _bot_cut_bp,
-                    "end":    _bot_cut_bp + 1,
+                    "start":  _tick,
+                    "end":    _tick + 1,
                     "strand": -1,
                     "color":  color,
                     "label":  name,
@@ -2137,6 +2218,96 @@ def _enzyme_aliases(name: str) -> "list[str]":
 # How many unrecognised names get near-miss suggestions computed for them.
 # Beyond this they are still reported, just without advice — see
 # `_resolve_enzyme_names`.
+# ── Dam / Dcm methylation context ────────────────────────────────────────────
+# E. coli's two housekeeping methyltransferases, which nearly every cloning
+# strain carries (dam+ dcm+ — DH5-alpha, TOP10, XL1-Blue, …). A plasmid grown in
+# one comes back methylated, and a digest that ignores that fails at the bench
+# for a reason nothing on screen explains.
+#
+#   Dam  methylates the ADENINE of GATC   -> N6-methyladenine
+#   Dcm  methylates the inner CYTOSINE of CCWGG -> 5-methylcytosine
+#
+# Both targets are their own reverse complement, so BOTH strands carry a
+# methylated base; the offsets below are the positions of those bases within the
+# target, in top-strand coordinates.
+#
+# WHAT THIS DELIBERATELY DOES NOT DO: claim which enzymes are blocked. That is a
+# per-enzyme, per-supplier property (some are blocked, some impaired, some
+# indifferent, a few REQUIRE methylation) and no such table is derivable from
+# sequence — inventing one is exactly how a preset ended up labelled `aadA`
+# while encoding a kanamycin kinase (`[INV-206]`). What IS derivable, and is all
+# that is reported, is whether a methylated base falls inside the recognition
+# site — the precondition for blocking. The user checks their supplier's table
+# from there.
+_METHYLATION_TARGETS: "tuple[tuple[str, str, tuple[int, ...]], ...]" = (
+    # (enzyme system, target pattern, offsets of the methylated bases)
+    ("Dam", "GATC", (1, 2)),
+    ("Dcm", "CCWGG", (1, 3)),
+)
+
+
+def _methylated_base_positions(seq: str, *,
+                               circular: bool = True) -> "dict[int, str]":
+    """Every base position Dam / Dcm would methylate on `seq`, both strands.
+
+    Returns ``{position: "Dam" | "Dcm" | "Dam+Dcm"}`` in forward-strand
+    coordinates (sacred #2). Wrap-aware on a circle (sacred #6).
+    """
+    s = (seq or "").upper()
+    n = len(s)
+    out: "dict[int, str]" = {}
+    if not n:
+        return out
+    for system, target, offsets in _METHYLATION_TARGETS:
+        tlen = len(target)
+        if n < tlen:
+            continue
+        pat = _iupac_pattern(target)
+        haystack = s + s[:tlen - 1] if circular else s
+        for p in _iter_match_starts(pat, haystack):
+            if p >= n:
+                continue
+            for off in offsets:
+                pos = (p + off) % n
+                prev = out.get(pos)
+                out[pos] = (system if prev is None or prev == system
+                            else "Dam+Dcm")
+    return out
+
+
+def _enzyme_site_methylation_targets(site: str) -> "list[str]":
+    """The methylase systems whose target is INSIDE this recognition site for
+    EVERY sequence that matches it — a property of the enzyme, not of a plasmid.
+
+    ``_enzyme_site_methylation_targets("TGATCA")`` (BclI) -> ``["Dam"]``;
+    ``_enzyme_site_methylation_targets("GAATTC")`` (EcoRI) -> ``[]``.
+
+    Uses the same subset rule `_iupac_pattern` scans with: a window of the site
+    matches the methylation target when every code in it is a SUBSET of the
+    target's, i.e. no sequence satisfying the site can avoid the target.
+
+    "Contains the target" is NOT "is blocked", and the name says target for that
+    reason. BamHI (``GGATCC``) and BglII (``AGATCT``) both contain ``GATC`` and
+    cut methylated DNA perfectly well; BclI does not; and DpnI REQUIRES the
+    methylation it contains. Which way it goes is per-enzyme laboratory fact, not
+    something sequence can answer — so this reports the precondition and leaves
+    the verdict to the supplier's table.
+    """
+    key = (site or "").upper()
+    if not key:
+        return []
+    found: "list[str]" = []
+    for system, target, _offsets in _METHYLATION_TARGETS:
+        tlen = len(target)
+        if len(key) < tlen:
+            continue
+        pat = _iupac_pattern(target)
+        if any(pat.fullmatch(key[i:i + tlen])
+               for i in range(len(key) - tlen + 1)):
+            found.append(system)
+    return found
+
+
 _RESOLVE_SUGGEST_LIMIT = 20
 
 
@@ -2826,6 +2997,206 @@ _IUPAC_BASE_SET: "dict[str, frozenset[str]]" = {
     "V": frozenset("ACG"),
     "N": frozenset("ACGT"),
 }
+
+
+def _read_end_columns(aligned_q: str,
+                      frame_shift: "int | None" = 0) -> "tuple[int, int] | None":
+    """``(first, last)``: the columns of the read's first and last base in READ
+    order, or None when the row holds no base.
+
+    The aligner placed the read as ONE contiguous block of columns; a frame
+    restore (`_pick_best_rotation`) then cut the rows back into the plasmid's
+    frame and moved `query_frame_shift` read bases to the end. So where the
+    read begins is known exactly — ``first > last`` when it wraps the row."""
+    cols = [i for i, c in enumerate(aligned_q or "") if c != "-"]
+    if not cols:
+        return None
+    try:
+        shift = int(frame_shift or 0)
+    except (TypeError, ValueError, OverflowError):   # a stored `inf`
+        shift = 0
+    k = (len(cols) - shift % len(cols)) % len(cols)
+    return cols[k], cols[k - 1]
+
+
+# A read covering at least this fraction of the plasmid is FULL-LENGTH. Used
+# by the rotation picker and the engine choice (hub) and by the read-extent
+# rule below: a full-length read on a circle has NO unread arc — a gap where
+# its end meets its start is a deletion it sequenced across.
+_PARTIAL_READ_FRACTION = 0.95
+
+
+def _read_is_clipped(result: dict) -> bool:
+    """Did a LOCAL alignment soft-clip read bases off its ends? They are kept
+    out of the rows (`local_q_span`), so the rows cannot show what the read
+    said there — and a gap at its seam is then no evidence of a deletion."""
+    span = result.get("local_q_span") if isinstance(result, dict) else None
+    if not span:
+        return False
+    try:
+        q0, q1 = int(span[0]), int(span[1])
+        q_len = int(result.get("q_len") or 0)
+    except (TypeError, ValueError, IndexError):
+        return False
+    return q0 > 0 or (q_len > 0 and q1 < q_len)
+
+
+def _read_extent_for(result: dict, total: int, *,
+                     circular: bool) -> "list[tuple[int, int]] | None":
+    """`_read_extent_from_rows` for an alignment RESULT — rows, frame shift
+    and local clipping read from the one place they live, so no caller can
+    leave one out. ``circular`` is required: a default of True judged a
+    linear reference as a circle wherever a caller forgot it, and the unread
+    start of a partial read on a linear molecule became a confident deletion
+    (round-2 hardening, 2026-09-25)."""
+    if not isinstance(result, dict):
+        return None
+    return _read_extent_from_rows(
+        result.get("aligned_q") or "", result.get("aligned_t") or "", total,
+        frame_shift=result.get("query_frame_shift", 0), circular=circular,
+        clipped=_read_is_clipped(result))
+
+
+def _read_extent_from_rows(aligned_q: str, aligned_t: str, total: int, *,
+                           frame_shift=0, circular: bool = False,
+                           clipped: bool = False
+                           ) -> "list[tuple[int, int]] | None":
+    """The read's extent in TARGET coordinates — its first base to its last in
+    READ order — straight from the alignment rows: one span, or two when the
+    rows were cut back into the plasmid's frame inside the read. None when the
+    rows cannot say (empty, mismatched, or no read base).
+
+    The span-based `_extent_from_aligned_spans` has to take the largest gap
+    for the unread arc, and for a full-length read carrying a 300 bp or 1 kb
+    deletion that gap IS the deletion — dropped as "unread", so a consensus
+    with the deletion in every read came back clean (audit 2026-09-24)."""
+    aq, at = str(aligned_q or ""), str(aligned_t or "")
+    if not aq or len(aq) != len(at) or total <= 0:
+        return None
+    ends = _read_end_columns(aq, frame_shift)
+    if ends is None:
+        return None
+    first, last = ends
+    tpos = [0] * (len(at) + 1)
+    for i, c in enumerate(at):
+        tpos[i + 1] = tpos[i] + (c != "-")
+    lo, hi = tpos[first], tpos[last + 1]
+    spans = ([(lo, max(lo, hi))] if first <= last
+             else [(lo, total), (0, hi)])
+    if circular and not clipped and _read_is_full_length(aq, at, total):
+        # A 1 bp deletion in a homopolymer ACROSS the read's own seam sits
+        # just past its last base, where "unread" and "deleted" look alike —
+        # and 11 of 15 full-length reads lost it (audit 2026-09-24).
+        return [(0, total)]
+    return spans
+
+
+def _read_is_full_length(aligned_q: str, aligned_t: str, total: int) -> bool:
+    """Does the read cover (nearly) the whole reference? Judged on the bases
+    it ALIGNED, never on its target span: the span counts the deletions it
+    carries, so a 92.7% partial read with a real 100 bp deletion passed as
+    full length and its unread arc came back as two more "deletions" (round-2
+    hardening, 2026-09-25)."""
+    if total <= 0:
+        return False
+    aligned = sum(1 for cq, ct in zip(aligned_q, aligned_t)
+                  if cq != "-" and ct != "-")
+    return aligned >= _PARTIAL_READ_FRACTION * total
+
+
+def _read_no_call_positions(aligned_q: str, aligned_t: str) -> "set[int]":
+    """Target positions where the read has a NO-CALL — an ambiguity code the
+    reference base is compatible with: the read could not say what is there,
+    so it is neither support, contradiction nor depth."""
+    out: "set[int]" = set()
+    pos = 0
+    for cq, ct in zip(aligned_q or "", aligned_t or ""):
+        if ct == "-":
+            continue
+        if (cq != "-" and cq.upper() not in "ACGT"
+                and _iupac_compatible(cq, ct)):
+            out.add(pos)
+        pos += 1
+    return out
+
+
+def _covered_identity(align: dict, total: "int | None" = None, *,
+                      circular: bool = False) -> "tuple[float, int]":
+    """``(identity_pct, covered_bp)`` over the read's own EXTENT — the
+    identity of what was sequenced.
+
+    `_pairwise_align`'s `identity_pct` is BLAST-style over every aligned column,
+    and in a semi-global alignment the bases a partial read never reached are
+    gap columns. So a PERFECT 800 bp Sanger read of a 5 kb plasmid scores ~16%,
+    and a `min_identity` of 99 calls it a mismatch — the alignment was taught
+    about partial reads and the metric was not (audit 2026-09-22).
+
+    The extent runs from the read's first base to its last. Only the
+    reference outside it is "unread"; INSIDE it every column counts — a
+    deletion the read spans and an insertion it carries are differences.
+    Skipping every gap column (the first fix) judged a read carrying a 300 bp
+    or 1 kb deletion on its substitutions alone and called it a match
+    (audit 2026-09-24). On a circle the rows may have been cut back into the
+    plasmid's frame (`query_frame_shift` read bases moved to the end), so the
+    extent can wrap; it is found from where the read's first base landed, not
+    guessed from the largest gap — which, for a full-length read, IS the
+    deletion.
+
+    Ambiguity-aware through `_iupac_compatible`, exactly as the full-alignment
+    figure is: an ``N`` compatible with the reference is a no-call — neither
+    coverage nor agreement, and an ``N`` the aligner placed as an INSERTION
+    (a masked read end) is no evidence either. ``covered_bp`` counts the
+    reference bases inside the extent (deletions included, no-calls not).
+    Returns ``(0.0, 0)`` when the read aligned no base at all, which the
+    caller must read as "no answer", never as agreement.
+
+    With ``total`` and ``circular``, a FULL-LENGTH read (the same rule
+    `_read_extent_from_rows` applies) is judged all the way round: the
+    reference between its last base and its first is a deletion it sequenced
+    across, not unread plasmid. Walking only first-to-last made a clone
+    missing 120 bp across the origin verify as a match while the consensus in
+    the same response listed the deletion (round-2 hardening, 2026-09-25)."""
+    aq = str(align.get("aligned_q") or "")
+    at = str(align.get("aligned_t") or "")
+    if not aq or not at or len(aq) != len(at):
+        return 0.0, 0
+    ends = _read_end_columns(aq, align.get("query_frame_shift"))
+    if ends is None:
+        return 0.0, 0
+    first, last = ends
+    whole = (bool(total) and circular and not _read_is_clipped(align)
+             and _read_is_full_length(aq, at, int(total or 0)))
+    if whole:
+        span = (list(range(first, len(aq))) + list(range(0, first)))
+    else:
+        span = (range(first, last + 1) if first <= last
+                else list(range(first, len(aq))) + list(range(0, last + 1)))
+    matches = compared = covered = 0
+    for i in span:
+        cq, ct = aq[i], at[i]
+        if cq == "-" and ct == "-":
+            continue
+        if cq == "-":                 # a deletion the read spans
+            compared += 1
+            covered += 1
+            continue
+        if ct == "-":                 # an insertion the read carries
+            if cq.upper() not in "ACGT":
+                continue              # a masked read end: no evidence
+            compared += 1
+            continue
+        compatible = _iupac_compatible(cq, ct)
+        if compatible and cq.upper() not in "ACGT":
+            # A no-call — the read's `N` — is neither coverage nor agreement:
+            # a read of 300 `N`s scored 100% over "2,000 bp covered" (R10).
+            continue
+        compared += 1
+        covered += 1
+        if compatible:
+            matches += 1
+    if not compared:
+        return 0.0, 0
+    return round(100.0 * matches / compared, 2), covered
 
 
 def _iupac_compatible(a: str, b: str) -> bool:

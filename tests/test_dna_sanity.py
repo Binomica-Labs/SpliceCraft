@@ -580,23 +580,36 @@ class TestRestrictionScan:
         assert len(cuts) == 1
         c = cuts[0]
         assert c["strand"] == -1
-        # Correct: p + site_len - fwd_cut = 10 + 6 - 7 = 9.
-        # Buggy:   p + site_len - 1 - fwd_cut = 10 + 6 - 1 - 7 = 8.
-        assert c["start"] == 9, (
-            f"Reverse-strand BsaI bottom-strand cut landed at "
-            f"{c['start']} (expected 9 — off-by-one regression?)"
-        )
 
-        # And the top-strand `ext_cut_bp` (rev_cut path in
-        # `_scan_restriction_sites`) should land at
-        # p + site_len - rev_cut = 10 + 6 - 11 = 5, NOT 4 (buggy).
         resites = [f for f in feats
                    if f.get("label") == "BsaI" and f.get("type") == "resite"]
         assert len(resites) == 1
-        assert resites[0]["ext_cut_bp"] == 5, (
-            f"Reverse-strand BsaI top-strand ext_cut_bp at "
-            f"{resites[0]['ext_cut_bp']} (expected 5 — off-by-one regression?)"
+        r = resites[0]
+
+        # The BOTTOM-strand cut is the off-by-one this test exists to guard:
+        # p + site_len - fwd_cut = 10 + 6 - 7 = 9 (the buggy formula gave 8).
+        # It now rides on the resite as `bottom_cut_bp` rather than being the
+        # position of the map's tick.
+        assert r["bottom_cut_bp"] == 9, (
+            f"Reverse-strand BsaI bottom-strand cut landed at "
+            f"{r['bottom_cut_bp']} (expected 9 — off-by-one regression?)"
         )
+        # And the top-strand cut lands at p + site_len - rev_cut
+        # = 10 + 6 - 11 = 5, NOT 4 (buggy).
+        assert r["ext_cut_bp"] == 5, (
+            f"Reverse-strand BsaI top-strand ext_cut_bp at "
+            f"{r['ext_cut_bp']} (expected 5 — off-by-one regression?)"
+        )
+        assert r["top_cut_bp"] == 5
+
+        # The TICK marks the TOP cut, like the forward branch and like the
+        # cut arrow the sequence panel draws from `ext_cut_bp`. Until the
+        # 2026-09-22 audit it marked the BOTTOM cut, so the map and the
+        # sequence panel pointed 4 bp apart at the same site (audit residual
+        # X10); this assertion is the reversal of that, deliberately.
+        assert c["start"] == r["ext_cut_bp"] == 5, (
+            f"map tick at {c['start']} but the sequence-panel cut arrow at "
+            f"{r['ext_cut_bp']} — the two must mark the same base")
 
     def test_unique_only_filter_excludes_multi_cutters(self):
         # Two EcoRI sites: unique_only=True should drop EcoRI entirely.

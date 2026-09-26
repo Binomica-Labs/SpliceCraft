@@ -372,11 +372,16 @@ class TestGeometry:
 
 # ── Client pure helpers ─────────────────────────────────────────────────────────
 class TestClientPure:
-    def test_base_url(self):
+    def test_base_url(self, monkeypatch):
+        import socket
+        # A NAME is connected to at the address that was checked, never
+        # re-resolved by the HTTP client (a second answer could be anything).
+        monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.60", 0))])
         assert ot2._ot2_base_url("192.168.1.56") == "http://192.168.1.56:31950"
-        assert ot2._ot2_base_url("opentrons.local:31950") == "http://opentrons.local:31950"
-        assert ot2._ot2_base_url("http://1.2.3.4:31950") == "http://1.2.3.4:31950"
-        assert ot2._ot2_base_url("1.2.3.4") == "http://1.2.3.4:31950"
+        assert ot2._ot2_base_url("opentrons.local:31950") == "http://192.168.1.60:31950"
+        assert ot2._ot2_base_url("http://10.1.2.3:31950") == "http://10.1.2.3:31950"
+        assert ot2._ot2_base_url("10.1.2.3") == "http://10.1.2.3:31950"
 
     def test_base_url_rejects_https_and_empty(self):
         with pytest.raises(ot2.OT2Error):
@@ -717,7 +722,10 @@ class TestAgentEndpoints:
     def test_compile_endpoint_reports_invalid(self):
         plan = _good_plan()
         plan["transfers"] = [{"from": "src:Z9", "to": "dst:A1", "volume": 50}]
-        res = self._handlers()["ot2-compile"][0](None, plan)
+        res, status = self._handlers()["ot2-compile"][0](None, plan)
+        # 422, not a 2xx: the CLI exits 0 on any 2xx, so an invalid plan
+        # answered 200 read as success (hardening 2026-09-24)
+        assert status == 422
         assert res["valid"] is False and "protocol" not in res and res["errors"]
 
     def test_host_required_guards(self):
@@ -893,6 +901,7 @@ class TestAutolabScreen:
             scr.query_one("#autolab-lw-name", Input).value = "My Rack"
             scr.query_one("#autolab-lw-rows", Input).value = "2"
             scr.query_one("#autolab-lw-cols", Input).value = "3"
+            scr.query_one("#autolab-lw-height", Input).value = "80"
             scr._create_labware()
             assert scr._find_custom_labware_def("My Rack") is not None
             scr._on_picker_result(6, {"action": "place", "labware": "custom:My Rack",
@@ -967,9 +976,12 @@ class TestAutolabScreen:
             scr.query_one("#autolab-lw-name", Input).value = "Weird"
             scr.query_one("#autolab-lw-rows", Input).value = "inf"
             scr.query_one("#autolab-lw-cols", Input).value = "nan"
-            scr._create_labware()
-            d = scr._find_custom_labware_def("Weird")
-            assert d is not None and all(math.isfinite(w["x"]) for w in d["wells"].values())
+            scr.query_one("#autolab-lw-height", Input).value = "80"
+            scr._create_labware()                  # must not crash
+            # Refused by name rather than built from silently substituted
+            # defaults (hardening 2026-09-25: every geometry field is strict).
+            assert scr._find_custom_labware_def("Weird") is None
+            assert math.isnan(float("nan"))
 
 
 class TestHardeningSweep2:
@@ -987,13 +999,13 @@ class TestHardeningSweep2:
         import math
         d = ot2._ot2_build_labware_def("X", float("inf"), float("nan"),
                                        spacing=float("inf"), depth=float("nan"),
-                                       volume=float("-inf"))
+                                       volume=float("-inf"), z_dim=20.0)
         assert len(d["wells"]) >= 1
         for w in d["wells"].values():
             assert all(math.isfinite(w[k]) for k in ("x", "y", "z", "depth", "diameter"))
-        assert len(ot2._ot2_build_labware_def("Z", 0, 0)["wells"]) == 1
+        assert len(ot2._ot2_build_labware_def("Z", 0, 0, z_dim=20.0)["wells"]) == 1
         rmax = len(ot2._ROW_LETTERS)
-        assert len(ot2._ot2_build_labware_def("B", 999, 999)["wells"]) == rmax * 99
+        assert len(ot2._ot2_build_labware_def("B", 999, 999, z_dim=20.0)["wells"]) == rmax * 99
 
     def test_deck_from_plan_survives_garbage_and_drops_bad_slots(self):
         # audit #3/#7: garbage types + out-of-range/trash slots don't crash or leak.
@@ -1043,7 +1055,7 @@ class TestRunControl:
         assert calls["path"] == "/runs/RUN9/actions"
 
     def test_run_control_no_active_run_raises(self, monkeypatch):
-        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: None)
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host, **k: None)
         with pytest.raises(ot2.OT2Error):
             ot2._ot2_run_control("h", "stop")
 
@@ -1168,7 +1180,9 @@ class TestPreflight:
                            "to": ["dst:A1", "dst:A2"], "volume": 40}]}
         s = ot2._ot2_plan_summary(plan)
         assert s["source_volumes"]["src:A1"] == 80.0
-        assert s["source_volumes"]["src:B1"] == 80.0   # 40 uL to each of 2 dests
+        # 40 uL to each of 2 dests, plus the 30 uL disposal volume a p300's
+        # one distribute trip also draws (and blows out to the trash)
+        assert s["source_volumes"]["src:B1"] == 110.0
         assert s["est_seconds"] > 0
 
     def test_source_volumes_legacy_transfers(self):
@@ -1202,12 +1216,12 @@ class TestOT2NewAgentEndpoints:
         assert H["ot2-run-control"][0](None, {"host": "1.2.3.4", "action": "frob"})[1] == 400
 
     def test_run_control_no_active_run_409(self, monkeypatch):
-        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: None)
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host, **k: None)
         r = self._handlers()["ot2-run-control"][0](None, {"host": "1.2.3.4", "action": "pause"})
         assert r[1] == 409
 
     def test_run_control_sends_action(self, monkeypatch):
-        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: "RUNZ")
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host, **k: "RUNZ")
         sent = {}
         monkeypatch.setattr(ot2, "_ot2_run_action",
                             lambda host, rid, action: sent.update(rid=rid, action=action) or {})
@@ -1593,6 +1607,9 @@ class TestCalibrationAgentEndpoints:
 
     def test_home_endpoint(self, monkeypatch):
         monkeypatch.setattr(ot2, "_ot2_home", lambda host: {"data": {}})
+        # Home first asks the robot what is running, and fails closed when it
+        # cannot (hardening 2026-09-25) — so the robot must answer "nothing".
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host, **k: None)
         assert self._h()["ot2-home"][0](None, {"host": "1.2.3.4"})["homed"]
         assert self._h()["ot2-home"][0](None, {})[1] == 400
 
@@ -1708,7 +1725,7 @@ class TestCalibrationMotionHardening:
 
     def test_agent_home_blocks_during_run(self, monkeypatch):
         import splicecraft as sc
-        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: "RUN1")
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host, **k: "RUN1")
         r = sc._AGENT_HANDLERS["ot2-home"][0](None, {"host": "1.2.3.4"})
         assert isinstance(r, tuple) and r[1] == 409
 
@@ -1789,11 +1806,12 @@ class TestDoorTelemetry:
 
 
 class TestPipetteMatch:
-    def test_base_strips_version_and_gen(self):
-        assert ot2._ot2_pipette_base("p300_single_v1.5") == "p300_single"
-        assert ot2._ot2_pipette_base("p20_single_gen2") == "p20_single"
-        assert ot2._ot2_pipette_base("p1000_single") == "p1000_single"
-        assert ot2._ot2_pipette_base(None) == ""
+    def test_name_keeps_the_generation_a_model_carries_in_its_version(self):
+        assert ot2._ot2_pipette_name("p300_single_v1.5") == "p300_single"
+        assert ot2._ot2_pipette_name("p300_single_v2.1") == "p300_single_gen2"
+        assert ot2._ot2_pipette_name("p20_single_gen2") == "p20_single_gen2"
+        assert ot2._ot2_pipette_name("p1000_single") == "p1000_single"
+        assert ot2._ot2_pipette_name(None) == ""
 
     def test_no_mismatch_when_matched(self):
         assert ot2._ot2_pipette_mismatch(
@@ -1804,7 +1822,7 @@ class TestPipetteMatch:
         m = ot2._ot2_pipette_mismatch(
             [{"mount": "left", "pipetteName": "p300_single"}],
             [{"mount": "left", "model": "p20_single_gen2"}])
-        assert len(m) == 1 and "p20_single is attached" in m[0]
+        assert len(m) == 1 and "p20_single_gen2 is attached" in m[0]
 
     def test_absent_mount_flagged(self):
         m = ot2._ot2_pipette_mismatch(
@@ -1891,8 +1909,11 @@ class TestRunGateInterlocks:
         stopped = []
         monkeypatch.setattr(ot2, "_ot2_stop_run", lambda host, rid: stopped.append(rid))
         monkeypatch.setattr(ot2, "_OT2_RUN_POLL_TIMEOUT", -1)   # already past deadline
-        with pytest.raises(ot2.OT2Error):
-            ot2._ot2_run_protocol("h", "print(1)", confirm=True)
+        # Reported, not raised: a raise is a retryable 5xx to the agent, and
+        # the retry would run the protocol again (hardening 2026-09-25).
+        res = ot2._ot2_run_protocol("h", "print(1)", confirm=True)
+        assert res["ran"] is True and res["crashed"] is True
+        assert "did not finish" in res["error"] and "stopped" in res["error"]
         assert stopped == ["R"]               # SAFETY: run halted, not left moving
 
 
@@ -1923,12 +1944,12 @@ class TestOT2ControlEndpoints:
         assert self._H()["ot2-lights"][0](None, {"host": "h"})["on"] is True
 
     def test_disengage_blocked_during_run(self, monkeypatch):
-        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: "R1")
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host, **k: "R1")
         r = self._H()["ot2-disengage"][0](None, {"host": "h"})
         assert isinstance(r, tuple) and r[1] == 409
 
     def test_disengage_calls_engine(self, monkeypatch):
-        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: None)
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host, **k: None)
         sent = {}
         monkeypatch.setattr(ot2, "_ot2_disengage",
                             lambda host, *, axes=None: sent.update(host=host, axes=axes))
@@ -2392,13 +2413,15 @@ class TestNewCodeHardening:
         monkeypatch.setattr(ot2, "_ot2_set_lights", lambda host, on: {"on": on})
         stopped = []
         monkeypatch.setattr(ot2, "_ot2_stop_run", lambda host, rid: stopped.append(rid))
-        with pytest.raises(ValueError):
-            ot2._ot2_run_protocol("h", "print(1)", confirm=True)
-        assert stopped == ["R"]        # SAFETY: run halted before the exception propagated
+        # Reported as a crashed run, not raised: a raise is a retryable 5xx to
+        # the agent, and the retry would run the protocol again (2026-09-25).
+        res = ot2._ot2_run_protocol("h", "print(1)", confirm=True)
+        assert res["crashed"] is True and "lost track" in res["error"]
+        assert stopped == ["R"]        # SAFETY: run halted, never left moving
 
     def test_disengage_validates_and_caps_axes(self, monkeypatch):
         import splicecraft as sc
-        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: None)
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host, **k: None)
         sent = {}
         monkeypatch.setattr(ot2, "_ot2_disengage",
                             lambda host, *, axes=None: sent.update(axes=axes))
@@ -2410,7 +2433,7 @@ class TestNewCodeHardening:
 
     def test_disengage_all_invalid_axes_defaults_all(self, monkeypatch):
         import splicecraft as sc
-        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: None)
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host, **k: None)
         sent = {}
         monkeypatch.setattr(ot2, "_ot2_disengage",
                             lambda host, *, axes=None: sent.update(axes=axes))

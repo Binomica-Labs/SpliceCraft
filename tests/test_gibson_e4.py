@@ -151,7 +151,7 @@ class TestGibsonArmDesigner:
             a = "GGATCCACAGTGACTTGGCATATCAGTCGAC"         # 31 bp
             b = "CCTTAAGGACATCATTGCCTAGGAATTCACG"          # 30 bp, no overlap
             pane._lane = [_frag("A", a), _frag("B", b)]
-            armed, already, skipped = pane._design_homology_arms()
+            armed, already, skipped, _long = pane._design_homology_arms()
             assert armed == 1 and not skipped
             r = sc._simulate_gibson_assembly(pane._lane, min_overlap=15,
                                               circular=False)
@@ -173,7 +173,7 @@ class TestGibsonArmDesigner:
             b = "TTAACCGGACATGCATTGCCTAGGAATTCAA"
             c = "CACACAGTGTGTAAAACCCCGGGGTTTTACG"
             pane._lane = [_frag("A", a), _frag("B", b), _frag("C", c)]
-            armed, already, skipped = pane._design_homology_arms()
+            armed, already, skipped, _long = pane._design_homology_arms()
             assert armed == 2 and not skipped   # 2 junctions in a 3-frag chain
             r = sc._simulate_gibson_assembly(pane._lane, min_overlap=15,
                                               circular=False)
@@ -226,7 +226,7 @@ class TestGibsonArmDesigner:
             await pilot.pause()
             pane = await self._mk(app, pilot)
             pane._lane = [_frag("short", "ACGTACGT"), _frag("B", "TTGG" * 12)]
-            armed, already, skipped = pane._design_homology_arms()
+            armed, already, skipped, _long = pane._design_homology_arms()
             assert armed == 0 and skipped == ["B"]
 
 
@@ -288,7 +288,7 @@ class TestGibsonE4RealPlasmid:
             pane._lane.append(_frag("insert", insert))
             pane.query_one("#gib-topo-circular", RadioButton).value = True
             pane.query_one("#gib-min-overlap", Input).value = "20"
-            armed, already, skipped = pane._design_homology_arms()
+            armed, already, skipped, _long = pane._design_homology_arms()
             assert not skipped
             r = sc._simulate_gibson_assembly(pane._lane, min_overlap=20,
                                               circular=True)
@@ -320,7 +320,7 @@ class TestGibsonArmHardening:
             bad = _frag("A", "ACGTACGT" * 10,
                         [{"start": "x", "end": "y", "label": "bad"}])
             pane._lane = [bad, _frag("B", "TTTTGGGG" * 10)]
-            armed, already, skipped = pane._design_homology_arms()   # must not raise
+            armed, already, skipped, _long = pane._design_homology_arms()   # must not raise
             assert isinstance(armed, int)
 
     @pytest.mark.asyncio

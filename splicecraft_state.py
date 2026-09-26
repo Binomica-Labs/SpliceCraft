@@ -75,6 +75,10 @@ _PYHMMER_AVAILABLE: bool = False
 # Migrated out of the hub; accessed `_state.<name>`. Not conftest-patched.
 _BLAST_CACHE_GENERATION: int = 0
 _DANGLING_ACTIVE_COLLECTION_NAME: "str | None" = None
+# One-shot startup notice: "N plasmids/primers that belonged to no collection
+# were kept in <collection>" — set by the hub's orphan rescue, shown by
+# `PlasmidApp.on_mount` (same hand-off as the dangling-collection name).
+_RECOVERED_ORPHANS_NOTICE: "list[str]" = []
 # Set when startup found the library/active-collection mirror marked
 # dirty and therefore REFUSED to overwrite the library from the
 # collection. Read + cleared once by `PlasmidApp.on_mount`.
@@ -304,6 +308,18 @@ _SAVE_READBACK_FULL_PARSE_MAX_BYTES: int = 8 * 1024 * 1024   # 8 MB
 # can't nuke data.
 _SAFE_LOAD_JSON_MAX_BYTES: int = 1024 * 1024 * 1024   # 1 GB
 
+# Every data-file recovery this process performed, appended by
+# `_safe_load_json` the moment it restores from a backup: ``[(label, message)]``.
+#
+# A recovery is reported to the user by the startup check, which calls
+# `_safe_load_json` again per file — and by then the file has been rewritten from
+# the backup, so the second call sees a VALID file and returns no warning. Any
+# load that happened earlier in launch (a panel composing, a cache warm) there-
+# fore swallowed the notice entirely, and the user was never told their library
+# had been corrupt and restored (audit 2026-09-22). Recording it at the point of
+# recovery makes the report independent of call order.
+_DATA_RECOVERIES: "list[tuple[str, str]]" = []
+
 # Daily pre-update snapshot subdir (under the data dir). The engine's
 # `_safe_load_json` reads this name to skip the snapshots tree when scanning
 # for backups; hub snapshot code owns the retention/size tunables.
@@ -368,6 +384,22 @@ _after_custom_grammars_save_hook: "_Callable[[], None] | None" = None
 # the next launch. The hub registers the reconcile here; agents reach it via this
 # hook (guarded getattr, so the import window is a safe no-op).
 _reconcile_mirror_after_restore_hook: "_Callable[[object], None] | None" = None
+# ...and BEFORE a restore of settings.json (which moves every mirror's active
+# pointer at once), the live files are pushed into their current containers.
+# Raises RuntimeError when that fails; the caller refuses the restore.
+_prepare_mirrors_for_restore_hook: "_Callable[[object], None] | None" = None
+# Keep primers.json entries that no primer collection holds (in "Recovered
+# primers") before something rewrites primers.json. Hub-registered.
+_rescue_orphan_primers_hook: "_Callable[[str], int] | None" = None
+# The ONE step every primer-collection switch runs first (hub
+# `_prepare_primer_switch`): push a failed mirror's work into the outgoing
+# collection and keep primers no collection holds. Hub-registered.
+_prepare_primer_switch_hook: "_Callable[..., None] | None" = None
+# The OT-2 address the USER saved in AUTOLAB (the `ot2_host` setting, which no
+# agent endpoint can write). The OT-2 client accepts that one address even when
+# it is public — a lab LAN can hand out public addresses — while an address an
+# agent supplies must be on this machine's own network. Hub-registered.
+_ot2_trusted_host_hook: "_Callable[[], str] | None" = None
 
 # ── Restriction-scanner runtime state (Phase D — the scanner + digest engine
 # move to splicecraft_biology; their caches + catalog access live here so the L0

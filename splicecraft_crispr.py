@@ -189,9 +189,12 @@ def _find_guides(sequence: str, *, variant: str = "spcas9",
     """Every protospacer+PAM site in `sequence`, both strands.
 
     Each hit: ``{guide, pam, strand, start, end, pam_start, pam_end, cut_site,
-    wraps, variant}`` — all coordinates 0-based, half-open, in the FORWARD
-    frame whatever the strand (sacred #2). `cut_site` is the top-strand nick
-    position in the forward frame.
+    cut_site_bottom, overhang, wraps, variant}`` — all coordinates 0-based,
+    half-open, in the FORWARD frame whatever the strand (sacred #2).
+    `cut_site` is the TOP-strand nick and `cut_site_bottom` the bottom-strand
+    one, both in the forward frame; they are equal for a blunt cutter. A
+    staggered cutter (LbCas12a) reports `overhang` as the signed nucleotide count
+    — positive for a 5' overhang, negative for a 3' one, 0 for blunt.
 
     Reverse-strand sites are found by searching for the reverse complement of
     the PAM on the forward strand, so no coordinate is ever mapped through an
@@ -216,7 +219,12 @@ def _find_guides(sequence: str, *, variant: str = "spcas9",
     fwd_pat = _iupac_pattern(pam)
     rev_pat = _iupac_pattern(_rc(pam))
     three_prime = v["pam_side"] == "3prime"
-    top_off, _bot_off = v["cut_offsets"]
+    # Offsets are measured on the GUIDE's own strand, so on a minus-strand site
+    # the "top" offset lands on the forward-frame BOTTOM strand and the two
+    # swap roles. A blunt cutter hides this (both offsets equal); LbCas12a does
+    # not, and until the 2026-09-22 audit a minus-strand LbCas12a guide reported
+    # its bottom-strand nick as `cut_site` and never reported the other one.
+    guide_off, other_off = v["cut_offsets"]
 
     out: list[dict] = []
     seen: set = set()
@@ -235,12 +243,29 @@ def _find_guides(sequence: str, *, variant: str = "spcas9",
         pam_seq = _take_circular(seq, pstart, plen)
         if strand == -1:
             pam_seq = _rc(pam_seq)
-        # Cut site, forward frame. On the minus strand the protospacer runs
-        # right-to-left, so the offset counts back from its forward END.
+        # Cut sites, forward frame. On the minus strand the protospacer runs
+        # right-to-left, so the offset counts back from its forward END — and
+        # the guide-strand nick is the one on the forward BOTTOM strand.
+        # A position wraps only on a circle: on a linear molecule a guide,
+        # PAM or stagger ending at the last base ENDS at n, and `% n` made a
+        # 5 bp stagger read as -62 (`cut_site_bottom` 0 against `cut_site`
+        # 62; round-2 hardening, 2026-09-25).
+        def _w(x: int) -> int:
+            return x % n if circular else x
         if strand == 1:
-            cut = (gstart + top_off) % n
+            cut = _w(gstart + guide_off)
+            cut_bottom = _w(gstart + other_off)
         else:
-            cut = (gstart + glen - top_off) % n
+            cut = _w(gstart + glen - other_off)
+            cut_bottom = _w(gstart + glen - guide_off)
+        # Signed overhang: >0 = 5' overhang (bottom nick right of top nick),
+        # <0 = 3' overhang, 0 = blunt. Reported so a caller cloning the cut
+        # product knows what ends it is ligating. On either strand the two
+        # nicks sit `other_off - guide_off` apart — a property of the enzyme,
+        # not of where the site is. Taken from the WRAPPED cut positions it
+        # came out as -115 instead of +5 for a site whose stagger straddles
+        # bp 0 (audit 2026-09-22, N9).
+        overhang = other_off - guide_off
         key = (gstart % n, strand)
         if key in seen:
             return
@@ -250,10 +275,12 @@ def _find_guides(sequence: str, *, variant: str = "spcas9",
             "pam":       pam_seq,
             "strand":    strand,
             "start":     gstart % n,
-            "end":       (gstart + glen) % n,
+            "end":       _w(gstart + glen),
             "pam_start": pstart % n,
-            "pam_end":   (pstart + plen) % n,
+            "pam_end":   _w(pstart + plen),
             "cut_site":  cut,
+            "cut_site_bottom": cut_bottom,
+            "overhang":  overhang,
             "wraps":     (gstart % n) + glen > n or (pstart % n) + plen > n,
             "variant":   str(variant).lower(),
         })
@@ -374,15 +401,23 @@ def _guide_offtargets(guide: str, sequence: str, *,
     pam_re = _iupac_pattern(pam)
     limit = max(0, int(max_mismatch))
     cap = max(1, int(max_hits))
-    # Seed = the PAM-proximal end of the spacer.
-    seed_slice = (slice(glen - _SEED_LEN, glen) if three_prime
-                  else slice(0, _SEED_LEN))
+    # Seed = the PAM-proximal end of the spacer, in the FORWARD frame the
+    # window is sliced in. `probe` is `_rc(guide)` on the minus strand, which
+    # puts the spacer's PAM-proximal end at index 0 — the opposite end from the
+    # plus strand. Using one slice for both measured the DISTAL end of every
+    # minus-strand hit and inverted the danger ranking (audit 2026-09-22).
+    seed_fwd = (slice(glen - _SEED_LEN, glen) if three_prime
+                else slice(0, _SEED_LEN))
+    seed_rev = (slice(0, _SEED_LEN) if three_prime
+                else slice(glen - _SEED_LEN, glen))
 
     hits: list[dict] = []
     truncated = False
     span = n if circular else n - glen + 1
     for strand in (1, -1):
         probe = g if strand == 1 else _rc(g)
+        seed_slice = seed_fwd if strand == 1 else seed_rev
+        strand_base = len(hits)
         for start in range(span):
             window = _take_circular(seq, start, glen) if circular \
                 else seq[start:start + glen]
@@ -419,12 +454,20 @@ def _guide_offtargets(guide: str, sequence: str, *,
                 "sequence": window if strand == 1 else _rc(window),
                 "pam": oriented, "pam_ok": pam_ok,
             })
-            if len(hits) >= cap:
+            if len(hits) - strand_base >= cap:
+                # Per-STRAND bail. Breaking the OUTER loop here (as this did
+                # until the 2026-09-22 audit) meant a plus strand that filled
+                # the cap left the minus strand entirely unscanned — silence
+                # reported as "no off-targets on that strand". Each strand now
+                # gets its own budget and the merged list is capped after the
+                # most-dangerous-first sort, so the hits that survive are the
+                # worst ones found rather than the first ones seen.
                 truncated = True
                 break
-        if truncated:
-            break
     hits.sort(key=lambda h: (h["seed_mismatches"], h["mismatches"], h["start"]))
+    if len(hits) > cap:
+        hits = hits[:cap]
+        truncated = True
     return {"searched_bp": n, "max_mismatch": limit,
             "require_pam": bool(require_pam), "hits": hits,
             "truncated": truncated}
@@ -514,7 +557,16 @@ def _design_guides(sequence: str, *, variant: str = "spcas9",
     if region:
         lo, hi = int(region[0]), int(region[1])
         n = len(seq) or 1
-        if circular and lo > hi:
+        if lo > hi:
+            if not circular:
+                # On a LINEAR molecule there is no arc from `lo` back round to
+                # `hi`, so the filter matched nothing and the caller was handed
+                # a confident "0 guides in your exon" (audit 2026-09-22). Say
+                # what is wrong instead.
+                raise ValueError(
+                    f"'region' start {lo} is past its end {hi}, and this "
+                    f"sequence is linear — only a circular molecule has a "
+                    f"region that wraps the origin")
             # Region wraps the origin.
             guides = [g for g in guides
                       if g["cut_site"] >= lo % n or g["cut_site"] < hi % n]
@@ -524,17 +576,34 @@ def _design_guides(sequence: str, *, variant: str = "spcas9",
         g["score"] = _score_guide(g["guide"], u6_driven=u6_driven)
     searched = 0
     if offtarget_in:
-        searched = len(offtarget_in)
+        # Compared in the case `seq` was normalised to: a lowercase copy of
+        # the guide's own molecule is still that molecule, and missing it
+        # reported every guide's own site as an off-target (and searched a
+        # circle as linear).
+        ot_seq = offtarget_in.upper()
+        searched = len(ot_seq)
+        same_molecule = ot_seq == seq
         for g in guides:
             ot = _guide_offtargets(
-                g["guide"], offtarget_in, variant=variant,
-                circular=circular and offtarget_in == seq,
+                g["guide"], ot_seq, variant=variant,
+                circular=circular and same_molecule,
                 max_mismatch=max_mismatch)
             # The guide's own site is a match against itself; a caller wants
-            # OTHER sites, so drop the exact on-target hit.
-            others = [h for h in ot["hits"] if h["mismatches"] > 0]
+            # OTHER sites, so drop the on-target hit — by its COORDINATES, not
+            # by "mismatches == 0". Dropping every perfect match (as this did
+            # until the 2026-09-22 audit) hid the case that matters most: a
+            # target duplicated elsewhere on the molecule — a repeated promoter,
+            # a two-copy cassette — cuts twice and reported `n_offtargets: 0`.
+            # And when the search sequence is NOT the guide's own molecule
+            # there is no on-target hit to drop at all.
+            others = [h for h in ot["hits"]
+                      if not (same_molecule
+                              and h["mismatches"] == 0
+                              and h["start"] == g["start"]
+                              and h["strand"] == g["strand"])]
             g["offtargets"] = others
             g["n_offtargets"] = len(others)
+            g["offtarget_truncated"] = bool(ot.get("truncated"))
     tier_rank = {"good": 0, "ok": 1, "poor": 2}
     guides.sort(key=lambda g: (
         tier_rank.get(g["score"]["tier"], 3),

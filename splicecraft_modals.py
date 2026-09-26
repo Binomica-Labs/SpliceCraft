@@ -24,7 +24,7 @@ import re
 from datetime import date as _date
 from pathlib import Path
 from rich.text import Text
-from textual import on
+from textual import on, work
 from textual.app import ComposeResult
 from textual.await_complete import AwaitComplete
 from textual.binding import Binding
@@ -39,11 +39,12 @@ from splicecraft_crispr import (
     _CAS_VARIANTS, _design_guides, _guide_cloning_oligos,
 )
 import splicecraft_state as _state
-from splicecraft_cloning import _simulate_cloned_plasmid, _simulate_primed_amplicon
+from splicecraft_cloning import (_cloned_plasmid_regenerated_sites,
+                                 _simulate_cloned_plasmid, _simulate_primed_amplicon)
 from splicecraft_dataaccess import _BUILTIN_GRAMMARS, _all_grammars, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_all_experiments, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_features, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections, _search_collections_library
 from splicecraft_experiments import (
-    _experiment_search, _experiment_search_terms, _experiment_snippet,
-    _experiments_referencing,
+    _tag_values, _experiment_search, _experiment_search_terms,
+    _experiment_snippet, _experiments_referencing,
 )
 from splicecraft_history import _CommercialSaaSHistoryNode, _history_consistency_summary, _history_detail_lines, _history_former_name, _history_human_dt, _history_node_warnings, _history_populate_tree, _history_protocol_renderable, _history_tree_label
 from splicecraft_logging import _log, _log_event
@@ -51,7 +52,7 @@ from splicecraft_presets import (
     _preset_categories, _preset_features, _preset_matches,
     _preset_to_library_entry,
 )
-from splicecraft_util import _CONTROL_CHARS_RE, _PLASMID_STATUS_VALUES, _cursor_row_key, _gb_text_is_circular, _markup_escape, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _sanitize_label, _sanitize_plasmid_name, _sanitize_plasmid_status, _scrub_path, _validate_group_members
+from splicecraft_util import _CONTROL_CHARS_RE, _PLASMID_STATUS_VALUES, _cursor_row_key, _iso_instant, _gb_text_is_circular, _markup_escape, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _sanitize_label, _sanitize_plasmid_name, _sanitize_plasmid_status, _scrub_path, _validate_group_members
 from splicecraft_widgets import _DEFAULT_TYPE_COLORS, _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _HEX6_RE, _InstantPressButton, _PICKER_PLASMID_STYLE, _PLASMID_STATUS_COLORS, _SearchInput, _XtermColorGrid, _ZipAwareDirectoryTree, _markup_safe_color, _normalise_color_input, _xterm_index_to_hex
 
 
@@ -1585,7 +1586,7 @@ class EditGrammarConfirmModal(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="gec-dlg"):
             yield Static(" Edit Grammar? ", id="gec-title")
-            from rich.markup import escape as _esc
+            from splicecraft_util import _markup_escape as _esc
             nm = _esc(self._grammar_name)
             if self._n_dependents > 0:
                 msg = (
@@ -1939,12 +1940,12 @@ class SpellcheckModal(_OneShotDismissScreen, ModalScreen):
             return
         if sugs:
             sug_widget.update(
-                f"[accent]Suggestions for '{word}':[/] "
-                f"{', '.join(sugs[:5])}",
+                f"[$accent]Suggestions for '{_markup_escape(word)}':[/] "
+                f"{_markup_escape(', '.join(sugs[:5]))}",
             )
         else:
             sug_widget.update(
-                f"[dim]No suggestions for '{word}'.[/]",
+                f"[dim]No suggestions for '{_markup_escape(word)}'.[/]",
             )
         for bid in ("btn-spell-replace", "btn-spell-add",
                     "btn-spell-skip"):
@@ -2776,7 +2777,7 @@ class _PrimerCollectionDeleteConfirmModal(_OneShotDismissScreen, ModalScreen):
         self._n = n_primers
 
     def compose(self) -> ComposeResult:
-        from rich.markup import escape as _esc
+        from splicecraft_util import _markup_escape as _esc
         plural = "" if self._n == 1 else "s"
         with Vertical(id="pcolldel-dlg"):
             yield Static(" Delete primer collection ", id="pcolldel-title")
@@ -3321,7 +3322,7 @@ class LargeFileConfirmModal(ModalScreen):
         self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
-        from rich.markup import escape as _esc
+        from splicecraft_util import _markup_escape as _esc
         with Vertical(id="lfc-dlg"):
             yield Static(" Large record — confirm load ", id="lfc-title")
             body  = f"  About to load:\n  [bold]{_esc(self.description)}[/]\n"
@@ -3824,7 +3825,7 @@ class RenamePlasmidModal(_OneShotDismissScreen, ModalScreen):
         self.entry_id     = entry_id
 
     def compose(self) -> ComposeResult:
-        from rich.markup import escape as _md_escape
+        from splicecraft_util import _markup_escape as _md_escape
         with Vertical(id="rename-dlg"):
             yield Static(" Rename plasmid ", id="rename-title")
             # Escape — `current_name` is user-controlled and Label
@@ -4028,7 +4029,7 @@ class PartsBinDeleteConfirmModal(_OneShotDismissScreen, ModalScreen):
         self._names = list(names)
 
     def compose(self) -> ComposeResult:
-        from rich.markup import escape as _esc
+        from splicecraft_util import _markup_escape as _esc
         n = len(self._names)
         # Preview: first three names with markup escaped — a part
         # called `[red]boom[/]` shouldn't reformat the dialog.
@@ -4139,7 +4140,7 @@ class ExactCopyConfirmModal(ModalScreen):
         self._dismissed: bool = False
 
     def compose(self) -> ComposeResult:
-        from rich.markup import escape as _esc
+        from splicecraft_util import _markup_escape as _esc
         n = len(self._names)
         preview = ", ".join(_esc(name) for name in self._names[:3])
         if n > 3:
@@ -4267,7 +4268,7 @@ class NameCollisionModal(ModalScreen):
         self._dismissed: bool = False
 
     def compose(self) -> ComposeResult:
-        from rich.markup import escape as _esc
+        from splicecraft_util import _markup_escape as _esc
         n = len(self._names)
         preview = ", ".join(_esc(name) for name in self._names[:3])
         if n > 3:
@@ -4412,7 +4413,7 @@ class LibraryDeleteConfirmModal(ModalScreen):
         # to confirm deleting "pUC19" — the wrong name, in the one
         # dialog where that matters most ([INV-167]). Bracketed text is
         # routine in NCBI-derived names (`[Candida] glabrata`).
-        from rich.markup import escape as _esc
+        from splicecraft_util import _markup_escape as _esc
         size_str = f" ({self.entry_size:,} bp)" if self.entry_size > 0 else ""
         # Answer "am I about to lose this sequence?" up front — a name
         # alone never settles it ([INV-167]).
@@ -5945,7 +5946,7 @@ class NamePlasmidModal(_OneShotDismissScreen, ModalScreen):
         # comes from `_sanitize_plasmid_name` which strips paths and
         # control chars BUT preserves `[`, `]`, `<`, `>`, `&` so the
         # display side has to escape.
-        from rich.markup import escape as _md_escape
+        from splicecraft_util import _markup_escape as _md_escape
         cleaned_safe = _md_escape(cleaned)
         # Detect leading / trailing whitespace separately from other
         # cleaning (illegal chars, length cap). Trailing whitespace
@@ -8100,6 +8101,21 @@ class PartEditModal(_OneShotDismissScreen, ModalScreen):
                 out["cloned_seq"] = _simulate_cloned_plasmid(
                     clean_seq, clean_oh5, clean_oh3, clean_ptype,
                 )
+                # An edit to the body or an overhang is exactly what can FORM a
+                # Type IIS site at a junction; the other two paths that build
+                # this product check for it, this one did not (CL8).
+                _regen = _cloned_plasmid_regenerated_sites(
+                    out["cloned_seq"], clean_seq, clean_oh5)
+                if _regen:
+                    _names = sorted({d["enzyme"] for d in _regen})
+                    try:
+                        self.app.notify(
+                            f"Saved, but a {', '.join(_names)} site forms at a "
+                            f"junction of this part's clone — it would be cut "
+                            f"in its own assembly. Re-domesticate to remove it.",
+                            severity="warning", markup=False, timeout=12)
+                    except Exception:
+                        pass
             else:
                 out.pop("primed_seq", None)
                 out.pop("cloned_seq", None)
@@ -8425,18 +8441,18 @@ class ExperimentSearchModal(_OneShotDismissScreen, ModalScreen):
             grouped: "dict[str, list[dict]]" = {}
             for proj, e in rows:
                 grouped.setdefault(proj, []).append(e)
-            scored: "list[tuple[int, str, str, dict]]" = []
+            scored: "list[tuple[int, float, str, dict]]" = []
             for proj, entries in grouped.items():
                 for h in _experiment_search(entries, terms_q, tags=tags):
                     scored.append((h["score"],
-                                   h["entry"].get("updated_at") or "",
+                                   _iso_instant(h["entry"].get("updated_at")),
                                    proj, h["entry"]))
             scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
             self._matches = [(proj, e) for _sc, _up, proj, e in scored]
         else:
             self._matches = sorted(
                 rows,
-                key=lambda pe: (pe[1].get("updated_at") or ""),
+                key=lambda pe: _iso_instant(pe[1].get("updated_at")),
                 reverse=True,
             )
         self._matches = self._matches[: self._MAX_ROWS]
@@ -8449,7 +8465,7 @@ class ExperimentSearchModal(_OneShotDismissScreen, ModalScreen):
             title = (e.get("title") or "").strip() or "(untitled)"
             snippet = _experiment_snippet(e.get("body_md"), terms)
             if not snippet:
-                tg = [x for x in (e.get("tags") or []) if isinstance(x, str)]
+                tg = _tag_values(e.get("tags"))
                 snippet = ("#" + " #".join(tg)) if tg else ""
             t.add_row(
                 Text(updated, no_wrap=True),
@@ -8608,7 +8624,7 @@ class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
         self._node_by_id: "dict[int, _CommercialSaaSHistoryNode]" = {}
 
     def compose(self) -> ComposeResult:
-        from rich.markup import escape as _esc
+        from splicecraft_util import _markup_escape as _esc
         with Vertical(id="hist-box"):
             yield Static(f" Construction history — {_esc(self._title)} ",
                           id="hist-title")
@@ -8900,7 +8916,7 @@ class FeaturePresetsModal(_OneShotDismissScreen, ModalScreen):
             det = self.query_one("#fpre-detail", Static)
         except NoMatches:
             return
-        from rich.markup import escape as _esc
+        from splicecraft_util import _markup_escape as _esc
         p = self._current()
         if p is None:
             det.update("[dim]No preset selected.[/dim]")
@@ -9075,6 +9091,11 @@ class CrisprGuideModal(_OneShotDismissScreen, ModalScreen):
         self._circular = bool(circular)
         self._label = label or "plasmid"
         self._guides: list = []
+        # Bumped by every design run: an off-target search that finishes
+        # after a newer design (another variant, another region) is dropped
+        # rather than written over it.
+        self._design_gen = 0
+        self._offtarget_gen: "int | None" = None   # the search in flight
 
     def compose(self) -> ComposeResult:
         with Vertical(id="crispr-dlg"):
@@ -9151,16 +9172,64 @@ class CrisprGuideModal(_OneShotDismissScreen, ModalScreen):
         except NoMatches:
             pass
         region = self._region()
+        self._design_gen += 1
+        gen = self._design_gen
+        if offtarget:
+            # The off-target pass runs the scan's inner loop once per guide:
+            # about a minute and a half on a 20 kb plasmid, and on the UI
+            # thread that froze the whole app for as long (audit 2026-09-22).
+            self._offtarget_gen = gen
+            self._set_offtarget_busy(True)
+            self._offtarget_worker(variant, region, gen)
+            return
         try:
             res = _design_guides(
                 self._seq, variant=variant, circular=self._circular,
-                region=region,
-                offtarget_in=self._seq if offtarget else None,
-                limit=200,
+                region=region, offtarget_in=None, limit=200,
             )
         except ValueError as exc:
             self._set_status(f"[red]{exc}[/red]")
             return
+        self._apply_design(res, region, gen)
+
+    @work(thread=True, exclusive=True, group="crispr_offtargets")
+    def _offtarget_worker(self, variant: str,
+                          region: "tuple[int, int] | None", gen: int) -> None:
+        from textual.worker import get_current_worker
+        try:
+            res = _design_guides(
+                self._seq, variant=variant, circular=self._circular,
+                region=region, offtarget_in=self._seq, limit=200,
+            )
+            err = None
+        except ValueError as exc:
+            res, err = None, str(exc)
+        if get_current_worker().is_cancelled:
+            return
+        self.app.call_from_thread(self._offtarget_done, res, err, region, gen)
+
+    def _offtarget_done(self, res: "dict | None", err: "str | None",
+                        region: "tuple[int, int] | None", gen: int) -> None:
+        if gen == self._offtarget_gen:
+            self._offtarget_gen = None
+            self._set_offtarget_busy(False)
+        if err is not None:
+            if gen == self._design_gen:
+                self._set_status(f"[red]{err}[/red]")
+            return
+        if res is not None:
+            self._apply_design(res, region, gen)
+
+    def _set_offtarget_busy(self, busy: bool) -> None:
+        try:
+            self.query_one("#crispr-btn-offtarget", Button).disabled = busy
+        except NoMatches:
+            pass
+
+    def _apply_design(self, res: dict, region: "tuple[int, int] | None",
+                      gen: int) -> None:
+        if gen != self._design_gen:
+            return          # a newer design replaced this one while it ran
         self._guides = res["guides"]
         self._fill_table()
         scope = (f" · off-targets searched over "
@@ -9505,6 +9574,10 @@ class ResidueEditModal(_OneShotDismissScreen, ModalScreen):
         self._plan = plan
         pos = ", ".join(f"{p:,}" for p in plan.get("positions") or [])
         notes = []
+        if plan.get("initiator"):
+            notes.append(f"[dim]residue 1 is the start codon: this CDS's "
+                         f"annotation reads its {plan.get('wt_codon')} as "
+                         f"Met[/dim]")
         if plan.get("silent"):
             notes.append("[yellow]silent — same amino acid, different "
                          "codon[/yellow]")

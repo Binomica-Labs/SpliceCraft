@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import socket
 import time
 import urllib.error
@@ -203,6 +204,21 @@ _OT2_PIPETTES: "dict[str, tuple[float, float, int]]" = {
     "p300_multi_gen2": (20.0, 300.0, 8),
 }
 
+# The tip sizes each pipette's nozzle takes (µL) — Opentrons' own pipette
+# definitions (`supportedTips`, opentrons-shared-data 9.1.2, OT-2 GEN1 = v1.x,
+# GEN2 = v2.x). A rack of another size does not seat on that nozzle at all.
+_OT2_PIPETTE_TIP_VOLUMES: "dict[str, frozenset[float]]" = {
+    "p10_single": frozenset({10.0}),
+    "p50_single": frozenset({50.0, 200.0, 300.0}),
+    "p300_single": frozenset({200.0, 300.0}),
+    "p1000_single": frozenset({1000.0}),
+    "p20_single_gen2": frozenset({10.0, 20.0}),
+    "p300_single_gen2": frozenset({200.0, 300.0}),
+    "p1000_single_gen2": frozenset({1000.0}),
+    "p20_multi_gen2": frozenset({10.0, 20.0}),
+    "p300_multi_gen2": frozenset({200.0, 300.0}),
+}
+
 _OT2_MOUNTS = ("left", "right")
 _OT2_NEW_TIP = ("always", "once", "never")
 # OT-2 deck: slots 1-11 hold labware; slot 12 is the fixed trash.
@@ -266,6 +282,55 @@ def _ot2_well_ok_entry(entry: "dict[str, Any]", well: str) -> "bool | None":
         cw = _ot2_custom_wells(definition)
         return None if cw is None else well.strip().upper() in cw
     return _ot2_well_ok(str(entry.get("labware", "")), well)
+
+
+def _ot2_canonical_well(entry: "dict[str, Any]", well: str) -> str:
+    """The spelling the robot files ``well`` under on this labware ENTRY.
+
+    The validator reads a well loosely (``a1``, ``A01``, a fullwidth digit all
+    parse as A1) but the robot looks wells up by their exact name, so the
+    compiled protocol wrote ``plate["a1"]`` for a plan SpliceCraft had called
+    valid and the robot's analysis refused it. A custom definition's own key is
+    used when one matches (its spelling is the authority); otherwise the
+    ``A1`` form. Anything that is not a well name is returned unchanged for
+    the validator to refuse."""
+    definition = entry.get("definition") if isinstance(entry, dict) else None
+    wells = definition.get("wells") if isinstance(definition, dict) else None
+    parsed = _ot2_parse_well(well)
+    canon = (f"{_ROW_LETTERS[parsed[0]]}{parsed[1]}" if parsed is not None
+             else None)
+    if isinstance(wells, dict) and wells:
+        if well in wells:
+            return well
+        for want in (well.strip().upper(), canon):
+            for k in wells:
+                if want is not None and str(k).upper() == want:
+                    return str(k)
+        return well
+    return canon if canon is not None else well
+
+
+def _ot2_canonicalize_refs(p: "dict[str, Any]") -> None:
+    """Rewrite every parsed well reference of a normalised plan to the robot's
+    spelling (see `_ot2_canonical_well`), so the validator, the compiled
+    protocol and the per-well load budget all name a well the same way.
+    References to unknown labware are left for the validator."""
+    lw = p["labware"]
+
+    def canon(ref: "tuple[str, str] | None") -> "tuple[str, str] | None":
+        if not ref or ref[0] not in lw:
+            return ref
+        return ref[0], _ot2_canonical_well(lw[ref[0]], ref[1])
+
+    for t in p["transfers"]:
+        t["_src"], t["_dst"] = canon(t["_src"]), canon(t["_dst"])
+    for s in p["steps"]:
+        for k in ("_src", "_dst", "_at"):
+            if k in s:
+                s[k] = canon(s[k])
+        for k in ("_srcs", "_dsts"):
+            if k in s:
+                s[k] = [canon(r) for r in s[k]]
 
 
 def _ot2_entry_wells(entry: "dict[str, Any]") -> "list[str]":
@@ -500,6 +565,45 @@ def _ot2_normalize_step(step: Any, default_new_tip: str) -> "dict[str, Any]":
     return s
 
 
+def _ot2_separate_load_names(labware: "dict[str, dict[str, Any]]") -> None:
+    """Give every DIFFERENT custom definition in a plan its own load name.
+
+    The robot files an embedded definition under namespace/loadName/version,
+    so two different definitions sharing a load name are one labware type to
+    it — the second rack would be driven with the first rack's well geometry.
+    Definitions saved before load names were made distinct (see
+    `_ot2_custom_load_name`) can still collide, so the later one is renamed
+    in the plan's OWN copy (the saved definition is untouched) and the entry
+    records ``renamed_load_name: [old, new]`` for the validator to report.
+    The same definition used twice is one type and is left alone. Idempotent:
+    a renamed plan re-normalises to itself."""
+    by_def: "dict[str, str]" = {}      # definition → the load name it gets
+    taken: "dict[tuple, str]" = {}     # (namespace, loadName, version) → def
+    for entry in labware.values():
+        d = entry.get("definition")
+        if not isinstance(d, dict):
+            continue
+        params = d.get("parameters")
+        if not isinstance(params, dict):
+            continue
+        ln = params.get("loadName")
+        if not isinstance(ln, str) or not ln:
+            continue
+        ns, ver = d.get("namespace"), d.get("version")
+        canon = json.dumps(d, sort_keys=True, default=str)
+        use = by_def.get(canon)
+        if use is None:
+            use, k = ln, 2
+            while taken.get((ns, use, ver), canon) != canon:
+                use, k = f"{ln}_{k}", k + 1
+            by_def[canon] = use
+            taken[(ns, use, ver)] = canon
+        if use != ln:
+            entry["definition"] = {**d, "parameters": {**params,
+                                                       "loadName": use}}
+            entry["renamed_load_name"] = [ln, use]
+
+
 def _ot2_normalize_plan(plan: "dict[str, Any]") -> "dict[str, Any]":
     """Coerce a raw plan dict into the canonical form the validator + compiler
     consume. Idempotent. Does NOT validate — that's ``_ot2_validate_plan``.
@@ -564,7 +668,10 @@ def _ot2_normalize_plan(plan: "dict[str, Any]") -> "dict[str, Any]":
             # labwareOffset; the compiler ignores it (offsets are a run-time input).
             if isinstance(lw.get("offset"), dict):
                 entry["offset"] = {k: lw["offset"].get(k) for k in ("x", "y", "z")}
+            if isinstance(lw.get("renamed_load_name"), list):
+                entry["renamed_load_name"] = list(lw["renamed_load_name"])
             labware[str(lid)] = entry
+    _ot2_separate_load_names(labware)
     p["labware"] = labware
 
     transfers: "list[dict[str, Any]]" = []
@@ -594,6 +701,7 @@ def _ot2_normalize_plan(plan: "dict[str, Any]") -> "dict[str, Any]":
     # normalised `steps` is [], would flip into steps mode on the second pass.
     p["uses_steps"] = (bool(plan.get("uses_steps")) if "uses_steps" in plan
                        else isinstance(steps_in, list))
+    _ot2_canonicalize_refs(p)
 
     new_tip = str(plan.get("new_tip", "always")).lower()
     p["new_tip"] = new_tip if new_tip in _OT2_NEW_TIP else "always"
@@ -666,6 +774,8 @@ def _ot2_validate_steps(p: "dict[str, Any]", spec: Any,
             verr, vwarn = _ot2_volume_errors(s.get("volume"), spec, pip, tag)
             errors += verr
             warnings += vwarn
+            if not verr:
+                errors += _ot2_tip_capacity_errors(p, s, spec, tag)
         elif st == "consolidate":
             if not s["_srcs"]:
                 errors.append(f"{tag}: 'from' must be a non-empty list of wells")
@@ -675,6 +785,8 @@ def _ot2_validate_steps(p: "dict[str, Any]", spec: Any,
             verr, vwarn = _ot2_volume_errors(s.get("volume"), spec, pip, tag)
             errors += verr
             warnings += vwarn
+            if not verr:
+                errors += _ot2_tip_capacity_errors(p, s, spec, tag)
         elif st == "mix":
             errors += _ot2_ref_errors(s["_at"], lw, tag, "at")
             verr, vwarn = _ot2_volume_errors(s.get("volume"), spec, pip, tag)
@@ -695,6 +807,132 @@ def _ot2_validate_steps(p: "dict[str, Any]", spec: Any,
             if not str(s.get("text", "")).strip():
                 warnings.append(f"{tag}: empty comment")
         # pause: an optional message — nothing to validate
+
+
+def _ot2_tiprack_volume(labware: str) -> "float | None":
+    """The tip volume a rack's Opentrons load name declares, in µL, or None.
+
+    Opentrons names every rack after its tips (``opentrons_96_tiprack_300ul``,
+    ``opentrons_96_filtertiprack_200ul``), so the size is recoverable without a
+    second table to keep in step with the catalog.
+    """
+    m = re.search(r"(\d+)ul", _ot2_resolve_labware(str(labware or "")).lower())
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _ot2_definition_geometry_issues(definition: "dict[str, Any]",
+                                    tag: str) -> "tuple[list[str], list[str]]":
+    """``(errors, warnings)`` for a custom labware definition's WELL HEIGHTS.
+
+    A well's ``z`` is the height of its bottom above the deck. Below zero the
+    pipette is driven into the deck — and that is exactly what SpliceCraft's
+    own builder produced for every tube rack before 2026-09-22 (a 40 mm well in
+    a labware it called 15 mm tall), so definitions still sitting in users'
+    libraries must be stopped here, before they reach the robot. A well that
+    reaches above the labware's own height is only suspicious (a tube standing
+    proud of its rack is real), so it warns."""
+    errors: "list[str]" = []
+    warnings: "list[str]" = []
+    wells = definition.get("wells")
+    if not isinstance(wells, dict):
+        return errors, warnings
+    dims = definition.get("dimensions")
+    raw_z = dims.get("zDimension") if isinstance(dims, dict) else None
+    zdim = (float(raw_z) if raw_z is not None and _ot2_num(raw_z)
+            else None)
+    below: "list[tuple[str, float]]" = []
+    above: "list[str]" = []
+    for name, w in wells.items():
+        if not isinstance(w, dict) or not _ot2_num(w.get("z")):
+            continue
+        z = float(w["z"])
+        if z < 0:
+            below.append((str(name), z))
+        elif (zdim is not None and _ot2_num(w.get("depth"))
+              and z + float(w["depth"]) > zdim + 1.0):
+            above.append(str(name))
+    if below:
+        name, z = below[0]
+        errors.append(
+            f"{tag} puts {len(below)} well bottom(s) BELOW the deck (e.g. "
+            f"{name} at {z:g} mm) — the pipette would be driven into the deck. "
+            f"Re-create it with its real overall height.")
+    if above:
+        warnings.append(
+            f"{tag}: {len(above)} well(s) reach above the labware's own height "
+            f"(e.g. {above[0]}) — check its height before running")
+    return errors, warnings
+
+
+def _ot2_working_volume(p: "dict[str, Any]", spec) -> "float | None":
+    """The most one aspirate can hold: the smaller of the pipette's maximum and
+    its tips' (None when the pipette is unknown)."""
+    if spec is None:
+        return None
+    caps = [v for v in (_ot2_tiprack_volume(str(t.get("labware") or ""))
+                        for t in p.get("tips") or []) if v]
+    return min([float(spec[1])] + caps)
+
+
+def _ot2_tip_capacity_errors(p: "dict[str, Any]", s: "dict[str, Any]", spec,
+                             tag: str) -> "list[str]":
+    """A distribute or consolidate whose per-well volume does not fit in one
+    tip. The Opentrons planner (`TransferPlan`, opentrons 9.1.2) splits these
+    against the PIPETTE's maximum but loads each trip against the TIP's, and
+    when one piece does not fit it ends the whole step — `if not asp_grouped:
+    break` — so every well from there on silently gets nothing. A transfer
+    splits against the tip and is fine. A distribute also carries its disposal
+    volume (the pipette's minimum) on every trip; a consolidate carries none."""
+    raw_vol = s.get("volume")
+    work = _ot2_working_volume(p, spec)
+    if (spec is None or work is None or work >= float(spec[1])
+            or raw_vol is None or not _ot2_num(raw_vol)):
+        return []
+    vol = float(raw_vol)
+    if vol <= 0:
+        return []
+    disposal = float(spec[0]) if s["type"] == "distribute" else 0.0
+    limit = work - disposal
+    # The pieces the planner will actually load: it cuts against the PIPETTE
+    # maximum (less the disposal volume), so a volume too big for the tip may
+    # still split into pieces that fit — 300 µL on a P300 with 200 µL tips
+    # goes as two 150 µL trips. Judging the whole volume against the tip
+    # refused plans the robot completes (round-2 hardening, 2026-09-25).
+    worst = max(_ot2_planner_pieces(vol, float(spec[1]) - disposal))
+    if worst + disposal <= work + 1e-9:
+        return []
+    beside = (f" beside the {disposal:g} µL disposal volume it carries"
+              if disposal else "")
+    cut = (f"the robot cuts {vol:g} µL into {worst:g} µL pieces, and one"
+           if worst < vol else f"{vol:g} µL per well")
+    return [f"{tag}: {cut} will not fit in one {work:g} µL tip{beside} — the "
+            f"robot ends a {s['type']} rather than split it further, so every "
+            f"well from this one on would get nothing. Keep each well at or "
+            f"under {max(limit, 0):g} µL, use larger tips, or use transfer "
+            f"steps."]
+
+
+def _ot2_planner_pieces(vol: float, max_piece: float) -> "list[float]":
+    """How Opentrons cuts one well's volume before loading trips —
+    `expand_for_volume_constraints` (opentrons 9.1.2): whole ``max_piece``
+    pieces while more than two remain, then the rest halved if it is still
+    over ``max_piece``."""
+    if max_piece <= 0:
+        return [vol]
+    pieces: "list[float]" = []
+    while vol > max_piece * 2:
+        pieces.append(max_piece)
+        vol -= max_piece
+    if vol > max_piece:
+        vol /= 2
+        pieces.append(vol)
+    pieces.append(vol)
+    return pieces
 
 
 def _ot2_validate_plan(plan: "dict[str, Any]") -> "dict[str, list[str]]":
@@ -742,11 +980,42 @@ def _ot2_validate_plan(plan: "dict[str, Any]") -> "dict[str, list[str]]":
                             "— the robot's analysis will validate it")
         elif t.get("labware") and _OT2_LABWARE[t["labware"]]["kind"] != "tiprack":
             errors.append(f"{t['labware']!r} is not a tip rack")
+        # Tip vs pipette. Which tips a nozzle takes is hardware fact, and
+        # Opentrons publishes it (`_OT2_PIPETTE_TIP_VOLUMES`): a P300 cannot pick
+        # up a 20 µL tip, while a P50 on 300 µL tips is its standard pairing —
+        # the "much larger than its range" guess flagged the second and passed
+        # the first. A SMALLER rack in the family (a P300 on 200 µL filter tips)
+        # is normal: every aspirate is capped at the tip, a transfer splits a
+        # larger volume into trips on its own, and the distribute / consolidate
+        # case, which does NOT split, is checked per step
+        # (`_ot2_tip_capacity_errors`).
+        tip_ul = _ot2_tiprack_volume(str(t.get("labware") or ""))
+        family = _OT2_PIPETTE_TIP_VOLUMES.get(p["pipette"])
+        if tip_ul is not None and family is not None and tip_ul not in family:
+            errors.append(
+                f"{t['labware']!r} holds {tip_ul:g} µL tips, which "
+                f"{p['pipette']!r} cannot pick up — it takes "
+                f"{' / '.join(f'{v:g}' for v in sorted(family))} µL tips")
+        elif tip_ul is not None and spec is not None and tip_ul < spec[1]:
+            warnings.append(
+                f"{t['labware']!r} holds {tip_ul:g} µL tips and "
+                f"{p['pipette']!r} draws up to {spec[1]:g} µL — each aspirate "
+                f"is limited to {tip_ul:g} µL: a transfer takes several trips "
+                f"for more, but a distribute or consolidate must fit each "
+                f"well's volume in one tip.")
 
     if needs_liquid and not p["labware"]:
         errors.append("no labware: add at least one entry to 'labware'")
     for lid, lw in p["labware"].items():
         _check_slot(lw.get("slot"), f"labware {lid!r}")
+        renamed = lw.get("renamed_load_name")
+        if isinstance(renamed, list) and len(renamed) == 2:
+            warnings.append(
+                f"custom labware (id {lid!r}) shares the load name "
+                f"{renamed[0]!r} with a DIFFERENT definition in this plan — it "
+                f"is loaded as {renamed[1]!r} here so the robot keeps the two "
+                f"apart. Re-save it under a distinct name to make this "
+                f"permanent.")
         if isinstance(lw.get("definition"), dict):
             # The definition is `repr()`-embedded into the emitted protocol —
             # refuse anything that wouldn't be a valid Python literal BEFORE
@@ -756,6 +1025,10 @@ def _ot2_validate_plan(plan: "dict[str, Any]") -> "dict[str, list[str]]":
             if _ot2_custom_wells(lw["definition"]) is None:
                 warnings.append(f"custom labware (id {lid!r}) declares no 'wells' — well "
                                 "checks skipped; the robot will validate it")
+            gerr, gwarn = _ot2_definition_geometry_issues(
+                lw["definition"], f"custom labware (id {lid!r})")
+            errors += gerr
+            warnings += gwarn
         elif lw.get("labware") and lw["labware"] not in _OT2_LABWARE:
             warnings.append(f"labware {lw['labware']!r} (id {lid!r}) not in the built-in "
                             "catalog — well checks skipped; the robot will validate it")
@@ -764,7 +1037,130 @@ def _ot2_validate_plan(plan: "dict[str, Any]") -> "dict[str, list[str]]":
         _ot2_validate_steps(p, spec, errors, warnings)
     else:
         _ot2_validate_transfers(p, spec, errors, warnings)
+    _ot2_validate_channels(p, spec, errors, warnings)
     return {"errors": errors, "warnings": warnings}
+
+
+def _ot2_labware_rows(entry: "dict[str, Any] | None") -> "int | None":
+    """How many rows a deck labware entry has, or None when unknown: a custom
+    definition's own wells, the built-in catalog, or a load name that says
+    ``384`` (every 384-well format is 16 × 24)."""
+    if not isinstance(entry, dict):
+        return None
+    definition = entry.get("definition")
+    if isinstance(definition, dict):
+        cw = _ot2_custom_wells(definition)
+        rows = {pw[0] for pw in (_ot2_parse_well(w) for w in (cw or ()))
+                if pw is not None}
+        return len(rows) or None
+    name = _ot2_resolve_labware(str(entry.get("labware", "")))
+    spec = _OT2_LABWARE.get(name)
+    if spec and "rows" in spec:
+        return int(spec["rows"])
+    if "_384_" in f"_{name}_":
+        return 16
+    return None
+
+
+def _ot2_multichannel_first_rows(n_rows: "int | None", channels: int) -> int:
+    """How many leading rows a multi-channel pipette's FIRST channel can sit in.
+
+    Its channels are 9 mm apart, one well-row apart on a 96-well plate — so
+    only row A — but TWO rows apart on a 384-well plate (4.5 mm rows), where A1
+    reaches A, C, … O and B1 reaches B, D, … P. Refusing row B there refused
+    half of every 384-well protocol. Unknown or irregular geometry keeps the
+    row-A-only rule."""
+    if not n_rows or channels <= 1 or n_rows % channels:
+        return 1
+    return max(1, n_rows // channels)
+
+
+def _ot2_multichannel_rows_for(entry: "dict[str, Any] | None",
+                               channels: int) -> int:
+    """The leading rows a multi-channel's first channel may target on one deck
+    labware entry.
+
+    Opentrons decides this from the labware's declared FORMAT, not its row
+    count: only ``384Standard`` lets the first channel sit in row B
+    (`_is_valid_row`). A custom 16-row plate is ``irregular`` — this module's
+    own builder writes that — so a transfer to its B1 fails the robot's
+    analysis, and a distribute or consolidate SILENTLY skips those wells and
+    their seven partners (round-2 hardening, checked against the real
+    opentrons 9.1.2 planner)."""
+    if isinstance(entry, dict) and isinstance(entry.get("definition"), dict):
+        params = entry["definition"].get("parameters")
+        fmt = str((params or {}).get("format") or "") if isinstance(params, dict) else ""
+        if fmt != "384Standard":
+            return 1
+    return _ot2_multichannel_first_rows(_ot2_labware_rows(entry), channels)
+
+
+def _ot2_validate_channels(p: "dict[str, Any]", spec, errors: list,
+                           warnings: list) -> None:
+    """Multi-channel pipettes address a whole COLUMN per command.
+
+    The Protocol API applies one command to all of a pipette's channels, so
+    ``pipette.transfer(v, plate["A1"], plate2["A1"])`` on an 8-channel pipette
+    moves A1-H1, not A1 — eight wells per step, from and to. The plan model is
+    per-well and said nothing about it, so a plate laid out well-by-well with a
+    multi selected did eight times the transfers it listed, and a well named
+    below the addressable rows ran the channels off the bottom of the labware
+    (audit 2026-09-22).
+
+    Reported rather than rewritten: a column-wise plan on a multi is a perfectly
+    good protocol, and guessing which the user meant would be worse than saying
+    what the robot will do. Only the list the compiler emits is checked — a
+    `steps` plan ignores a legacy `transfers` list it also carries.
+    """
+    channels = spec[2] if spec else 1
+    if channels <= 1:
+        return
+    refs: "list[tuple[str, str]]" = []
+    if p.get("uses_steps"):
+        for s in p.get("steps") or []:
+            for key in ("_src", "_dst", "_at"):
+                if s.get(key):
+                    refs.append(s[key])
+            for key in ("_srcs", "_dsts"):
+                refs.extend(r for r in (s.get(key) or []) if r)
+    else:
+        for t in p.get("transfers") or []:
+            for key in ("_src", "_dst"):
+                if t.get(key):
+                    refs.append(t[key])
+    labware = p.get("labware") or {}
+    off: "dict[str, int]" = {}          # "id:well" -> rows it may start in
+    # Once per labware, not per reference: a custom definition's rows are
+    # counted from its wells, and a big plan re-counted them for every well
+    # it named (30 s to validate a plan the robot takes 5 s to analyse).
+    rows_for: "dict[str, int]" = {}
+    for lid, well in refs:
+        parsed = _ot2_parse_well(str(well))
+        if parsed is None:
+            continue
+        allowed = rows_for.get(lid)
+        if allowed is None:
+            allowed = rows_for[lid] = _ot2_multichannel_rows_for(
+                labware.get(lid), channels)
+        if parsed[0] >= allowed:
+            off[f"{lid}:{well}"] = allowed
+    warnings.append(
+        f"{p['pipette']!r} has {channels} channels, so EVERY command moves a "
+        f"whole column ({channels} wells), not the single well named — this "
+        f"plan's steps each transfer {channels}× what they list. Use a "
+        f"single-channel pipette for well-by-well work.")
+    if off:
+        def _rows(n: int) -> str:
+            return "row A" if n == 1 else f"rows A-{_ROW_LETTERS[n - 1]}"
+        shown = sorted(off)
+        errors.append(
+            f"{p['pipette']!r} has {channels} channels and its first channel "
+            f"sits at the named well — "
+            + ", ".join(f"{r} ({_rows(off[r])} only)" for r in shown[:6])
+            + (" …" if len(shown) > 6 else "")
+            + " would run the remaining channels off the labware (a custom "
+              "labware counts as irregular to the robot, so only its row A "
+              "can take a multi-channel).")
 
 
 # ── The compiler ────────────────────────────────────────────────────────────────
@@ -920,7 +1316,21 @@ def _ot2_plan_summary(plan: "dict[str, Any]") -> "dict[str, Any]":
 
     if p["uses_steps"]:
         liquid = [s for s in p["steps"] if s["type"] in _OT2_LIQUID_STEPS]
-        total_vol = sum(s.get("volume") for s in liquid if _num(s.get("volume")))
+        # Liquid DELIVERED: a distribute's volume is per destination and a
+        # consolidate's per source, so each counts once per well it serves; a
+        # mix moves nothing. Summing the step volumes reported a 20 µL × 96
+        # distribute as 20 µL in total.
+        total_vol = 0.0
+        for s in liquid:
+            v = s.get("volume")
+            if not _num(v) or s["type"] == "mix":
+                continue
+            wells = (s.get("_dsts") if s["type"] == "distribute"
+                     else s.get("_srcs") if s["type"] == "consolidate"
+                     else None)
+            total_vol += v * (len([r for r in wells if r])
+                              if wells is not None else 1)
+        total_vol = round(total_vol, 4)
         n_steps = len(p["steps"])
         n_transfers = len([s for s in p["steps"] if s["type"] == "transfer"])
         tips_needed = len(liquid)   # each liquid step uses ~1 tip
@@ -969,10 +1379,40 @@ def _ot2_num(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
+def _ot2_distribute_disposal(p: "dict[str, Any]", vol: float, n: int) -> float:
+    """The liquid a ``distribute`` draws from its source ON TOP of what it
+    dispenses.
+
+    `pipette.distribute` defaults ``disposal_volume`` to the pipette's minimum
+    volume and aspirates it with every trip, then blows it out to the trash, so
+    a budget of ``volume × wells`` ran the source dry before the last well. A
+    trip holds as many dispenses as fit beside the disposal volume; a dispense
+    too big for one trip is split, each piece its own trip. The trip capacity is
+    the smaller of the pipette and its tips: that errs toward more trips, i.e.
+    toward loading enough."""
+    spec = _OT2_PIPETTES.get(p.get("pipette", ""))
+    if spec is None or n <= 0 or not (_ot2_num(vol) and vol > 0):
+        return 0.0
+    disposal, cap = float(spec[0]), float(spec[1])
+    tip_caps = [v for v in (_ot2_tiprack_volume(str(t.get("labware") or ""))
+                            for t in p.get("tips") or []) if v]
+    if tip_caps:
+        cap = min(cap, min(tip_caps))
+    room = cap - disposal
+    if room <= 0:
+        return disposal * n
+    if vol <= room:
+        trips = math.ceil(n / int(room // vol))
+    else:
+        trips = n * math.ceil(vol / room)
+    return disposal * trips
+
+
 def _ot2_source_volumes(p: "dict[str, Any]") -> "dict[str, float]":
     """Total µL drawn from each source well across the plan — the load budget.
     Keyed by ``labwareId:well``. A mix returns liquid to its own well, so it draws
-    nothing net and is skipped."""
+    nothing net and is skipped. A distribute also draws its disposal volume
+    (see `_ot2_distribute_disposal`)."""
     draws: "dict[str, float]" = {}
 
     def _add(ref: "tuple[str, str] | None", vol: Any) -> None:
@@ -988,7 +1428,10 @@ def _ot2_source_volumes(p: "dict[str, Any]") -> "dict[str, float]":
                 _add(s.get("_src"), s.get("volume"))
             elif st == "distribute":
                 n = len([r for r in (s.get("_dsts") or []) if r])
-                _add(s.get("_src"), (s.get("volume") or 0) * n if _ot2_num(s.get("volume")) else None)
+                vol = s.get("volume")
+                _add(s.get("_src"),
+                     vol * n + _ot2_distribute_disposal(p, vol, n)
+                     if _ot2_num(vol) else None)
             elif st == "consolidate":
                 for r in (s.get("_srcs") or []):
                     _add(r, s.get("volume"))
@@ -1133,7 +1576,15 @@ def _ot2_normalize_volumes(items: "list[dict[str, Any]]", *,
         rec.update(sample_ul=sample_r, diluent_ul=diluent_r,
                    achieved_ng=round(mass, 3),
                    achieved_conc=(round(mass / total, 4) if total > 0 else None),
-                   ok=True, warning=warn)
+                   ok=True,
+                   # `ok` means "a transfer was planned for this well" — it stays
+                   # True for a clamped row, because the user still wants the
+                   # best-effort transfer. `on_target` is the separate question
+                   # the caller was actually asking: did this row HIT the target?
+                   # Every miss above sets `warn`, and a program keying on `ok`
+                   # alone was told a clamped, under-target well was fine
+                   # (audit 2026-09-22).
+                   on_target=(warn is None), warning=warn)
         out.append(rec)
     return out
 
@@ -1247,12 +1698,40 @@ def _ot2_render_deck(plan: "dict[str, Any]") -> str:
     return "\n".join(lines)
 
 
+
+
+def _ot2_custom_load_name(name: str) -> str:
+    """The Opentrons `loadName` for a custom labware called `name`.
+
+    Must match `^[a-z0-9._]+$`: `str.isalnum()` is True for 'é', 'ß' and
+    CJK, so a non-ASCII name once went into the definition and the robot
+    rejected the upload with a schema error naming nothing the user
+    recognised. Accented letters fold to their base letter (é → e). A letter
+    with NO ASCII form (α, β, 株, µ) cannot, and replacing it made
+    "Rack α" and "Rack β" the same labware to the robot — and every
+    all-Greek name `custom_labware` (audit 2026-09-22). Such a name keeps a
+    short fingerprint of the WHOLE name, so it stays distinct and stable."""
+    import hashlib
+    import unicodedata
+    folded = unicodedata.normalize("NFKD", str(name).lower())
+    lossy = any(not ch.isascii() and not unicodedata.combining(ch)
+                for ch in folded)
+    base = "".join(ch if (ch.isascii() and ch.isalnum()) else "_"
+                   for ch in folded
+                   if not unicodedata.combining(ch)).strip("_")
+    if lossy or not base:
+        tag = hashlib.sha1(str(name).encode("utf-8")).hexdigest()[:6]
+        base = f"{base or 'custom_labware'}_{tag}"
+    return base
+
+
 def _ot2_build_labware_def(name: str, rows: int, cols: int, *,
                            category: str = "wellPlate", spacing: float = 9.0,
                            x_off: float = 14.38, y_off: float = 11.24,
                            diameter: float = 6.5, depth: float = 14.0,
                            volume: float = 200.0, x_dim: float = 127.76,
-                           y_dim: float = 85.48, z_dim: float = 15.0) -> "dict[str, Any]":
+                           y_dim: float = 85.48,
+                           z_dim: "float | None" = None) -> "dict[str, Any]":
     """Generate a structurally-valid Opentrons labware definition for a REGULAR
     rows×cols grid (well plate / tube rack / reservoir), with SLAS-footprint
     defaults. A1 is back-left; wells march right (columns) and toward the front
@@ -1274,7 +1753,39 @@ def _ot2_build_labware_def(name: str, rows: int, cols: int, *,
     diameter, depth = _fin(diameter, 6.5, 0.1, 100.0), _fin(depth, 14.0, 0.1, 300.0)
     volume = _fin(volume, 200.0, 0.0, 1e7)
     x_dim, y_dim = _fin(x_dim, 127.76, 1.0, 1000.0), _fin(y_dim, 85.48, 1.0, 1000.0)
-    z_dim = _fin(z_dim, 15.0, 1.0, 1000.0)
+    # A well cannot be deeper than the labware is tall: the well `z` below is
+    # `z_dim - depth`, so that combination puts every well BELOW THE DECK and the
+    # robot drives the pipette down through the plate. The old default height was
+    # a flat 15 mm (a well plate) while the AUTOLAB form's default DEPTH is 40 mm
+    # (a tube rack) and it never passed a height — so every custom tube rack it
+    # created had its wells at z = -25 mm (audit 2026-09-22).
+    #
+    # The height is REQUIRED. It cannot be derived: where a well's bottom sits
+    # (`z_dim - depth`) depends on how the labware is built, not on the well.
+    # A first fix derived "depth + a 3 mm base", which put a real 24-tube rack's
+    # tube bottoms (≈42 mm up an ≈80 mm rack) at 3 mm — the tip driven ~38 mm
+    # into the tubes — and lifted a PCR plate's well bottoms ~2 mm, so a small
+    # aspirate drew air. Emitting a definition that does not describe the
+    # physical labware is the one thing this file must never do.
+    if z_dim is None:
+        raise OT2Error(
+            "give the labware's overall height (z_dim, in mm — measured from "
+            "the deck to its top, with tubes in place for a rack). It cannot "
+            "be worked out from the well depth.")
+    try:
+        _z = float(z_dim)
+    except (TypeError, ValueError):
+        _z = float("nan")
+    if not (math.isfinite(_z) and 1.0 <= _z <= 1000.0):
+        raise OT2Error(
+            f"labware height must be a number of millimetres between 1 and "
+            f"1000, got {z_dim!r}")
+    z_dim = _z
+    if depth >= z_dim:
+        raise OT2Error(
+            f"well depth {depth:g} mm is not less than the labware height "
+            f"{z_dim:g} mm — the wells would sit below the deck. Raise the "
+            f"height (z_dim) or reduce the depth.")
     ordering: "list[list[str]]" = []
     wells: "dict[str, Any]" = {}
     for c in range(cols):
@@ -1288,8 +1799,7 @@ def _ot2_build_labware_def(name: str, rows: int, cols: int, *,
                          "y": round(y_dim - y_off - r * spacing, 2),
                          "z": round(z_dim - depth, 2)}
         ordering.append(col)
-    load_name = ("".join(ch if ch.isalnum() else "_" for ch in name.lower()).strip("_")
-                 or "custom_labware")
+    load_name = _ot2_custom_load_name(name)
     return {
         "ordering": ordering,
         "brand": {"brand": "SpliceCraft", "brandId": []},
@@ -1317,6 +1827,12 @@ def _ot2_base_url(host: str) -> str:
     Accepts a bare IP / hostname (``192.168.1.56``, ``opentrons.local``), an
     ``host:port`` pair, or a full ``http://…`` URL. Only plain HTTP to the
     robot-server is supported.
+
+    A NAME is resolved here, every address it resolves to is checked
+    (`_ot2_check_host`), and the URL is built on the checked ADDRESS: letting
+    the HTTP client resolve the name a second time connected to whatever that
+    second answer was — a name that resolves to the LAN for the check and to a
+    metadata service for the connection (audit 2026-09-22).
     """
     host = (host or "").strip()
     if not host:
@@ -1331,9 +1847,257 @@ def _ot2_base_url(host: str) -> str:
         netloc = parts.netloc or parts.path
     else:
         netloc = host
-    if ":" not in netloc:
-        netloc = f"{netloc}:{_OT2_PORT}"
-    return f"http://{netloc}"
+    # USERINFO has no place in a robot address — the OT-2 API is unauthenticated
+    # on the LAN — and `user@real-host` is how a host string is made to READ as
+    # one address while connecting to another. Refuse it rather than strip it,
+    # so the caller sees what was wrong (audit 2026-09-22).
+    if "@" in netloc:
+        raise OT2Error(
+            f"invalid OT-2 host {host!r}: credentials (\"user@host\") are not "
+            f"accepted — give the robot's address alone")
+    host_only, port = _ot2_netloc_parts(netloc, host)
+    addr = _ot2_check_host(host_only, host)
+    target = addr if addr is not None else host_only
+    if ":" in target:                       # an IPv6 address needs its brackets
+        target = f"[{target}]"
+    return f"http://{target}:{port if port is not None else _OT2_PORT}"
+
+
+def _ot2_netloc_parts(netloc: str, given: str = "") -> "tuple[str, int | None]":
+    """``(host, port)`` of a netloc; ``port`` None when none was written.
+
+    "192.168.1.56:" (a colon with nothing after it) is no port — it used to
+    become `http://192.168.1.56::31950`. A port must be 1-65535."""
+    host, has_port = _ot2_split_netloc(netloc)
+    if not has_port:
+        return host, None
+    raw = netloc.rsplit(":", 1)[1].strip()
+    if not (raw.isascii() and raw.isdigit() and 1 <= int(raw) <= 65535):
+        raise OT2Error(f"invalid OT-2 host {given or netloc!r}: the port must "
+                       f"be a number from 1 to 65535")
+    return host, int(raw)
+
+
+def _ot2_split_netloc(netloc: str) -> "tuple[str, bool]":
+    """``(host, has_explicit_port)`` for a netloc, IPv6-literal aware.
+
+    A bracketed IPv6 address is full of colons, so `":" in netloc` is not a port
+    test: it read `[fe80::1]` as already carrying a port (the default was never
+    appended) and extracted a host of `fe80:` that no address check recognised
+    (audit 2026-09-22). A trailing colon with no digits after it is no port.
+    """
+    n = (netloc or "").strip()
+    if n.startswith("["):
+        end = n.find("]")
+        if end == -1:
+            return n.strip("[]"), False
+        return n[1:end], bool(n[end + 1:].startswith(":") and n[end + 2:].strip())
+    if n.count(":") == 1:
+        head, _sep, tail = n.partition(":")
+        return head, bool(tail.strip())
+    # No colon, or several without brackets (a bare IPv6 literal) — no port.
+    return n, False
+
+
+# The cloud / container metadata services. They answer plain HTTP on
+# addresses a LAN client can reach, which is what makes a "robot host" field a
+# credential-fetch primitive; an OT-2 is never at one of them. (AWS / GCP /
+# Azure / DigitalOcean IMDS, the ECS task and EKS pod-identity agents, their
+# IPv6 forms, Alibaba, Oracle's legacy endpoint.)
+_OT2_METADATA_ADDRS = frozenset({
+    "169.254.169.254", "169.254.170.2", "169.254.170.23", "100.100.100.200",
+    "192.0.0.192", "fd00:ec2::254", "fd00:ec2::23"})
+# Carrier-grade NAT space — Tailscale's addresses, a real way a lab reaches
+# its robot remotely. `ipaddress` counts it as neither private nor global.
+_OT2_CGNAT = "100.64.0.0/10"
+# Labels may carry `_`: DNS proper forbids it, but local resolvers and robot
+# names do not, and v1.2.71 accepted it.
+_OT2_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}\.?$)[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
+    r"(?:\.[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)*\.?$")
+_OT2_OWN_NETS_TTL_S = 60.0
+# [computed-at (monotonic) or None for never, networks]. Not 0.0: monotonic
+# time counts from boot, so a 0.0 stamp read as FRESH for the first minute
+# of uptime and this machine's own network was empty.
+_OT2_OWN_NETS_CACHE: "list[Any]" = [None, ()]
+
+
+def _ot2_own_networks() -> "tuple[Any, ...]":
+    """The /24 around each of this machine's IPv4 addresses — the same notion
+    of "this network" discovery sweeps. Cached briefly: the lookup opens a few
+    sockets and every robot request asks."""
+    import ipaddress
+    now = time.monotonic()
+    stamp = _OT2_OWN_NETS_CACHE[0]
+    if stamp is not None and now - stamp < _OT2_OWN_NETS_TTL_S:
+        return _OT2_OWN_NETS_CACHE[1]
+    nets = []
+    try:
+        for ip, _is_ll in _ot2_host_ipv4s():
+            try:
+                nets.append(ipaddress.ip_network(f"{ip}/24", strict=False))
+            except ValueError:
+                continue
+    except Exception:                        # never let this break a request
+        nets = []
+    _OT2_OWN_NETS_CACHE[0], _OT2_OWN_NETS_CACHE[1] = now, tuple(nets)
+    return _OT2_OWN_NETS_CACHE[1]
+
+
+def _ot2_host_key(raw: str) -> str:
+    """A host string reduced to its bare host, for comparing two spellings of
+    one robot address (scheme, port, brackets, case and a trailing dot aside)."""
+    h = str(raw or "").strip()
+    if "://" in h:
+        try:
+            h = urllib.parse.urlsplit(h).netloc or h
+        except ValueError:
+            return ""
+    h = h.rsplit("@", 1)[-1]
+    try:
+        h = _ot2_split_netloc(h)[0]
+    except Exception:
+        return ""
+    return h.strip().rstrip(".").lower()
+
+
+def _ot2_trusted_host() -> str:
+    """The robot address the USER saved in AUTOLAB (`ot2_host` — a setting no
+    agent can write), as a `_ot2_host_key`. "" when unknown."""
+    hook = getattr(_state, "_ot2_trusted_host_hook", None)
+    try:
+        raw = hook() if callable(hook) else ""
+    except Exception:
+        raw = ""
+    return _ot2_host_key(str(raw)) if raw else ""
+
+
+def _ot2_addr_allowed(addr, *, trusted: bool = False) -> "str | None":
+    """None when an IP address is somewhere an OT-2 can be, else why not.
+
+    ``trusted``: the address is the one the user saved for their robot, so a
+    public address is accepted — a lab LAN can hand out public addresses —
+    but a metadata service never is."""
+    import ipaddress
+    # A zone (`fd00:ec2::254%1`) is part of `str(addr)`, so the metadata
+    # addresses were compared as a different string and passed as "private";
+    # the kernel ignores the zone for a non-link-local destination.
+    if getattr(addr, "scope_id", None):
+        addr = ipaddress.ip_address(str(addr).split("%", 1)[0])
+    # An IPv4 address written as IPv6 (`::ffff:169.254.169.254`) connects to
+    # that IPv4 address on a dual-stack socket, and `ipaddress` calls the IPv6
+    # form "private" — so it passed as a LAN address.
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    if str(addr) in _OT2_METADATA_ADDRS:
+        return "that is a cloud metadata service, not a robot"
+    if (addr.is_private or addr.is_link_local or addr.is_loopback
+            or (addr.version == 4
+                and addr in ipaddress.ip_network(_OT2_CGNAT))):
+        return None
+    if trusted:
+        return None
+    if addr.version == 4 and any(addr in net for net in _ot2_own_networks()):
+        return None                          # a public LAN — this machine's own
+    return ("that is a public internet address, not on this computer's own "
+            "network — an OT-2 is reached on your LAN, over USB (169.254.x.x), "
+            "by its .local name, or at the address you saved in AUTOLAB")
+
+
+def _ot2_check_host(host: str, given: str) -> "str | None":
+    """Refuse a robot address that is not somewhere an OT-2 can be; return the
+    ADDRESS to connect to for a name (None for an IP literal, which is
+    connected to as written).
+
+    The first fix (audit 2026-09-22, AA20) refused the whole link-local range
+    to keep the metadata service out — which also refused every USB-connected
+    OT-2, the very addresses the module's own discovery reports — while any
+    other SPELLING of the metadata address still got through: `2852039166`,
+    `0xa9fea9fe` and `169.254.43518` all mean 169.254.169.254 to the
+    resolver but are not IP literals to `ipaddress`, so they passed as
+    "hostnames". And `evil.example/x?s=1` became a URL path.
+
+    Now: an IP literal must be in canonical form (one trailing dot aside); a
+    name must be a well-formed hostname — never all-numeric labels, never
+    `/ ? # %` or whitespace — and is resolved, `.local` included, with EVERY
+    address it resolves to checked (`_ot2_addr_allowed`). Raises OT2Error."""
+    import ipaddress
+    import socket
+    h = (host or "").strip()
+    trusted = bool(h) and _ot2_host_key(h) == _ot2_trusted_host()
+    lit = h[:-1] if h.endswith(".") and not h.endswith("..") else h
+    try:
+        addr = ipaddress.ip_address(lit)
+    except ValueError:
+        addr = None
+    if addr is not None:
+        if addr.version == 4 and str(addr) != lit:
+            raise OT2Error(f"invalid OT-2 host {given!r}: write the address as "
+                           f"four decimal numbers, e.g. 192.168.1.56")
+        why = _ot2_addr_allowed(addr, trusted=trusted)
+        if why:
+            raise OT2Error(f"refusing to contact {lit} — {why}")
+        return str(addr) if lit != h else None
+    labels = h.rstrip(".").split(".")
+    if (not _OT2_HOSTNAME_RE.match(h)
+            or all(lbl.isdigit() or lbl.lower().startswith("0x")
+                   for lbl in labels)):
+        raise OT2Error(
+            f"invalid OT-2 host {given!r}: give the robot's IP address "
+            f"(e.g. 192.168.1.56) or its name (e.g. opentrons.local)")
+    try:
+        infos = socket.getaddrinfo(h, None, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError, OSError) as exc:
+        raise OT2Error(f"could not resolve OT-2 host {h!r}: {exc}") from exc
+    # Every address is CHECKED, and the connection is pinned to one that
+    # passed — so an address that fails is skipped, not fatal. Refusing the
+    # whole name made a dual-stack robot (a LAN IPv4 plus a global IPv6)
+    # unreachable, and its Stop answered "nothing is running" (round-2
+    # hardening, 2026-09-25). Only a name with NO allowed address is refused.
+    allowed: "list[tuple[Any, str]]" = []
+    refused: "list[str]" = []
+    for info in infos:
+        sockaddr = info[4]
+        raw_ip = str(sockaddr[0]).split("%", 1)[0]
+        try:
+            resolved = ipaddress.ip_address(raw_ip)
+        except (ValueError, IndexError):
+            continue
+        why = _ot2_addr_allowed(resolved, trusted=trusted)
+        if why:
+            refused.append(f"{resolved}: {why}")
+            continue
+        # getaddrinfo carries a link-local IPv6 address's ZONE in the
+        # sockaddr's scope field, not in the string; without it the address
+        # cannot be connected to at all.
+        if (resolved.version == 6 and resolved.is_link_local
+                and len(sockaddr) >= 4 and sockaddr[3]):
+            raw_ip = f"{raw_ip}%{int(sockaddr[3])}"
+        allowed.append((resolved, raw_ip))
+    if not allowed:
+        if refused:
+            raise OT2Error(
+                f"refusing to contact {h} — it resolves to {refused[0]}")
+        raise OT2Error(f"could not resolve OT-2 host {h!r} to an address")
+    # IPv4 first: macOS and Windows sort a `.local` name's link-local IPv6
+    # answer ahead of it, and only one address is connected to (pinned).
+    allowed.sort(key=lambda a: a[0].version != 4)
+    return allowed[0][1]
+
+
+def _ot2_host_is_link_local(host: str) -> bool:
+    """True for an IP in the link-local ranges (169.254.0.0/16, fe80::/10).
+
+    A hostname that is not an IP literal returns False — resolving it here would
+    be a second DNS lookup with its own TOCTOU, and the value of this check is
+    blocking the well-known literal address, not proving a name is safe.
+    """
+    try:
+        import ipaddress
+        return ipaddress.ip_address(host.strip()).is_link_local
+    except ValueError:
+        return False
 
 
 class _OT2NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1655,7 +2419,12 @@ def _ot2_is_lan_ip(ip: str) -> bool:
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return False
-    return bool(addr.is_private or addr.is_link_local)
+    if addr.is_private or addr.is_link_local:
+        return True
+    # A campus LAN can hand out PUBLIC addresses; this machine's own network
+    # is still the LAN. The address policy accepted such a robot while
+    # discovery never probed it (round-2 hardening, 2026-09-25).
+    return addr.version == 4 and any(addr in net for net in _ot2_own_networks())
 
 
 def _ot2_discover(*, probe_timeout: float = _OT2_DISCOVER_PROBE_TIMEOUT,
@@ -1812,10 +2581,17 @@ def _ot2_run_commands(host: str, rid: str, *, page_length: int = 200
     return out, total
 
 
-def _ot2_active_run(host: str) -> "str | None":
+def _ot2_active_run(host: str, *, strict: bool = False) -> "str | None":
     """The id of the current run, if any — so the monitor can watch a run started
-    from the Opentrons App too, not just one SpliceCraft launched."""
-    data, _ = _ot2_try_json(host, "/runs")
+    from the Opentrons App too, not just one SpliceCraft launched.
+
+    ``strict``: raise OT2Error when the robot could not be ASKED, instead of
+    answering None. None means "nothing is running", and a Stop that could
+    not reach the robot said exactly that and sent nothing, while Home and
+    Disengage went ahead on the same misreading (round-2 hardening)."""
+    data, err = _ot2_try_json(host, "/runs")
+    if data is None and strict:
+        raise OT2Error(f"could not ask the robot which run is active: {err}")
     runs = (data or {}).get("data") or []
     for r in runs:
         if r.get("current"):
@@ -2034,7 +2810,7 @@ def _ot2_run_control(host: str, action: str, *,
     """Resolve the current run (or use ``run_id``) and send it a control action.
     Returns ``{"ok", "action", "run_id"}``; raises ``OT2Error`` when there is no
     active run, the action is unknown, or the transport fails."""
-    rid = run_id or _ot2_active_run(host)
+    rid = run_id or _ot2_active_run(host, strict=True)
     if not rid:
         raise OT2Error("no active run to control (nothing is running on the robot)")
     _ot2_run_action(host, rid, action)
@@ -2234,6 +3010,10 @@ def _ot2_compile_position_check(plan: "dict[str, Any]", *,
         seen_set: "set[str]" = set()
         seen: "list[str]" = []
         for w in targets[:_OT2_MAX_POSCHECK_WELLS]:   # cap + O(n) dedup (was O(n²))
+            # The spelling the robot files the well under — `a1` / `A01` typed
+            # in, or a definition whose own keys are lower-case (the defaults
+            # above are upper-cased), named a well the analysis then refused.
+            w = _ot2_canonical_well(lw, str(w))
             if w not in seen_set:
                 seen_set.add(w)
                 seen.append(w)
@@ -2243,40 +3023,65 @@ def _ot2_compile_position_check(plan: "dict[str, Any]", *,
     return "\n".join(out) + "\n"
 
 
-def _ot2_pipette_base(name: "Any") -> str:
-    """A pipette identifier without its version/generation suffix so an analysed
-    ``pipetteName`` (``p300_single``) matches an attached ``instrumentModel``
-    (``p300_single_v1.5`` / ``p300_single_gen2``). Lower-cased; empty on junk."""
+# The GEN1 pipette names each GEN2 pipette can stand in for (Opentrons'
+# `backCompatNames`): a protocol that loads `p10_single` runs on an attached
+# P20 GEN2. Not the other way round — a GEN1 pipette cannot run a protocol
+# that asks for a GEN2 one.
+_OT2_PIPETTE_BACKCOMPAT: "dict[str, tuple[str, ...]]" = {
+    "p20_single_gen2": ("p10_single",),
+    "p20_multi_gen2": ("p10_multi",),
+    # opentrons-shared-data 9.1.2 `backCompatNames`: a P300 GEN2 stands in for
+    # a P300 GEN1 ONLY. Listing the P50 let a P50 protocol past the pre-run
+    # check on a P300 GEN2, to fail at `load_instrument` after the run had
+    # started (round-2 hardening, 2026-09-25).
+    "p300_single_gen2": ("p300_single",),
+    "p300_multi_gen2": ("p300_multi",),
+    "p1000_single_gen2": ("p1000_single",),
+}
+
+
+def _ot2_pipette_name(name: "Any") -> str:
+    """The generation-specific pipette NAME (``p300_single`` for a GEN1,
+    ``p300_single_gen2`` for a GEN2) of an analysed ``pipetteName`` or an
+    attached instrument's model. A model carries its generation in its version:
+    ``p300_single_v1.5`` is a GEN1, ``p300_single_v2.1`` a GEN2. Lower-cased;
+    empty on junk."""
     s = str(name or "").strip().lower()
-    for sep in ("_v", "_gen"):
-        i = s.find(sep)
-        if i != -1 and i + len(sep) < len(s) and s[i + len(sep)].isdigit():
-            s = s[:i]
+    i = s.find("_v")
+    if i != -1 and s[i + 2:i + 3].isdigit():
+        major = s[i + 2]
+        s = s[:i] + ("_gen2" if major == "2" else
+                     "" if major == "1" else f"_v{major}")
     return s
 
 
 def _ot2_pipette_mismatch(analysis_pipettes: "list[dict[str, Any]]",
                           instruments: "list[dict[str, Any]]") -> "list[str]":
     """Which pipettes the analysed protocol loads are NOT satisfied by an attached
-    instrument on the same mount + (version-insensitive) model. Returns
-    human-readable mismatch strings; empty when every required pipette is present.
-    The robot's *analysis* simulates with the requested pipette regardless of what
-    is physically attached, so a wrong / absent pipette passes analysis and only
-    fails at ``load_instrument`` once the run starts — this catches it BEFORE any
-    motion so the gate can refuse."""
+    instrument on the same mount. Returns human-readable mismatch strings; empty
+    when every required pipette is present. The robot's *analysis* simulates with
+    the requested pipette regardless of what is physically attached, so a wrong /
+    absent pipette passes analysis and only fails at ``load_instrument`` once the
+    run starts — this catches it BEFORE any motion so the gate can refuse.
+
+    The GENERATION counts (audit 2026-09-22): comparing names with it stripped
+    passed a GEN2 protocol on a GEN1 pipette, which then failed after the run
+    had started, and refused a GEN1 protocol on the GEN2 pipette the robot runs
+    it on (`_OT2_PIPETTE_BACKCOMPAT`)."""
     attached: "dict[str, str]" = {}
     for it in (instruments or []):
         if not isinstance(it, dict):
             continue
         mount = str(it.get("mount") or "").strip().lower()
-        if mount:
-            attached[mount] = _ot2_pipette_base(it.get("model"))
+        model = _ot2_pipette_name(it.get("model"))
+        if mount and model:
+            attached[mount] = model
     problems: "list[str]" = []
     for p in (analysis_pipettes or []):
         if not isinstance(p, dict):
             continue
         want_mount = str(p.get("mount") or "").strip().lower()
-        want = _ot2_pipette_base(p.get("pipetteName") or p.get("pipetteModel")
+        want = _ot2_pipette_name(p.get("pipetteName") or p.get("pipetteModel")
                                  or p.get("model"))
         if not want:
             continue
@@ -2284,10 +3089,69 @@ def _ot2_pipette_mismatch(analysis_pipettes: "list[dict[str, Any]]",
         if have is None:
             problems.append(f"protocol needs {want} on the {want_mount or '?'} mount "
                             "but nothing is attached there")
-        elif have != want:
+        elif have != want and want not in _OT2_PIPETTE_BACKCOMPAT.get(have, ()):
             problems.append(f"protocol needs {want} on the {want_mount} mount "
                             f"but a {have} is attached")
     return problems
+
+
+def _ot2_run_outcome(res: "dict[str, Any]") -> "tuple[bool, str]":
+    """``(ok, why)`` for an `_ot2_run_protocol` result: did the thing asked for
+    happen?
+
+    A run that ENDED ``failed`` or ``stopped`` without a detected fault came
+    back ``crashed: False``, and both the AUTOLAB tab ("run failed — complete",
+    in green, progress bar full) and the agent envelope (``ok: true``) read that
+    as success. A dry run that passed analysis and a run started without
+    waiting are successes; a pre-flight refusal, a crash, a failure or a stop
+    is not. ``why`` is "" when ``ok``."""
+    if not res.get("ran"):
+        reason = str(res.get("reason") or "not run")
+        if reason == "confirm-required":
+            return True, ""
+        detail = res.get("detail")
+        return False, (f"the run was not started: {reason}"
+                       + (f" — {detail}" if detail else ""))
+    status = str(res.get("run_status") or "")
+    if res.get("crashed"):
+        err = str(res.get("error") or "")
+        return False, (f"the run crashed ({status or 'unknown status'})"
+                       + (f": {err}" if err else ""))
+    if status in ("failed", "stopped"):
+        errs = [e.get("detail") if isinstance(e, dict) else e
+                for e in (res.get("run_errors") or [])]
+        errs = [str(e) for e in errs if e]
+        return False, (f"the run {status} before it finished"
+                       + (f": {errs[0]}" if errs else ""))
+    return True, ""
+
+
+def _ot2_run_aborted(host: str, rid: str, why: str,
+                     analysis: "dict[str, Any]", *,
+                     state: "dict[str, Any] | None" = None,
+                     status: "str | None" = None) -> "dict[str, Any]":
+    """The result for a run that EXISTS on the robot but could not be seen
+    through (the play failed, the monitor lost it, it outran the timeout).
+
+    Stops it — the gantry is never left moving unwatched — and reports it as a
+    CRASHED run rather than raising: see `_ot2_run_protocol` for why a retry
+    after an exception here moves the robot again."""
+    try:
+        _ot2_stop_run(host, rid)
+        tail = " — the run was stopped"
+    except Exception as exc:  # noqa: BLE001  (already failing; report both)
+        _log.exception("[ot2] could not stop run %s", rid)
+        tail = f" — and stopping it failed too ({exc}); check the robot"
+    msg = f"{why}{tail}"
+    snap = state if isinstance(state, dict) else {}
+    run = snap.get("run")
+    if not isinstance(run, dict):
+        run = {}
+    return {**analysis, "ran": True, "run_id": rid,
+            "run_status": str(status or run.get("status") or "unknown"),
+            "crashed": True, "error": msg, "faults": [msg],
+            "failed_commands": run.get("failed_commands") or [],
+            "run_errors": run.get("errors") or [], "state": snap}
 
 
 def _ot2_run_protocol(host: str, protocol_text: str, *, confirm: bool = False,
@@ -2313,11 +3177,13 @@ def _ot2_run_protocol(host: str, protocol_text: str, *, confirm: bool = False,
     calls ``on_state(snapshot)`` (for a live UI / log), turns the rail lights on as
     a "robot is moving" indicator (restored afterwards), and — the instant a fault
     is detected (a failed command, an instrument fault, …) — records it and, if
-    ``stop_on_fault``, halts the run. If the run overruns ``_OT2_RUN_POLL_TIMEOUT``
-    it is STOPPED on the robot before the timeout is raised (never left moving
-    unattended). The result carries ``crashed`` plus the ``faults`` /
-    ``failed_commands`` that explain what went wrong and where. ``indicator_lights``
-    (default on) governs the rail-light signalling.
+    ``stop_on_fault``, halts the run. If the run overruns ``_OT2_RUN_POLL_TIMEOUT``,
+    the play command fails, or the monitor loses the run, it is STOPPED on the
+    robot and reported as ``crashed`` with an ``error`` — never raised: once a run
+    exists, an exception becomes a retryable 5xx that would run it again. The
+    result carries ``crashed`` plus the ``faults`` / ``failed_commands`` that
+    explain what went wrong and where. ``indicator_lights`` (default on) governs
+    the rail-light signalling.
     """
     analysis = _ot2_analyze(host, protocol_text, filename=filename)
     if analysis["result"] != "ok":
@@ -2385,8 +3251,20 @@ def _ot2_run_protocol(host: str, protocol_text: str, *, confirm: bool = False,
     if not rid:
         raise OT2Error("OT-2 did not return a run id")
     _log.info("[ot2] starting physical run %s on %s", rid, host)
-    _ot2_request_json(host, f"/runs/{rid}/actions", method="POST",
-                      payload={"data": {"actionType": "play"}})
+    # From here a run EXISTS on the robot, so nothing below may raise. An
+    # exception is a 5xx to the agent, which no idempotency cache stores and
+    # every client retries — and the retry creates and plays a SECOND run over
+    # wells the first may already have filled (round-2 hardening,
+    # 2026-09-25). Each failure is stopped on the robot and reported as a
+    # crashed run instead (`_ot2_run_aborted`).
+    try:
+        _ot2_request_json(host, f"/runs/{rid}/actions", method="POST",
+                          payload={"data": {"actionType": "play"}})
+    except Exception as exc:
+        # The play may have reached the robot before the error did.
+        _log.exception("[ot2] play failed for run %s — stopping it", rid)
+        return _ot2_run_aborted(host, rid, f"the play command failed ({exc})",
+                                analysis)
 
     if not poll:
         return {"ran": True, "run_id": rid, "run_status": "running", **analysis}
@@ -2401,21 +3279,18 @@ def _ot2_run_protocol(host: str, protocol_text: str, *, confirm: bool = False,
             _ot2_set_lights(host, True)
         except OT2Error:
             pass
+    last_snap: "dict[str, Any]" = {}
     try:
         deadline = _util._monotonic() + _OT2_RUN_POLL_TIMEOUT
         while True:
-            try:
-                snap = _ot2_state(host, run_id=rid)
-            except Exception:
-                # SAFETY: an unexpected monitor error (e.g. a malformed robot
-                # response) must never leave the gantry moving unwatched — stop the
-                # run, then re-raise (the finally still restores the lights).
-                _log.exception("[ot2] monitor error during run %s — stopping it", rid)
-                try:
-                    _ot2_stop_run(host, rid)
-                except OT2Error:
-                    pass
-                raise
+            # SAFETY: an unexpected monitor error (a dropped connection, a
+            # malformed robot response) must never leave the gantry moving
+            # unwatched — the `except` below stops the run and reports it
+            # (the finally still restores the lights).
+            snap = _ot2_state(host, run_id=rid)
+            if not isinstance(snap, dict):
+                raise OT2Error(f"unexpected status reply ({type(snap).__name__})")
+            last_snap = snap
             if on_state:
                 try:
                     on_state(snap)
@@ -2446,17 +3321,19 @@ def _ot2_run_protocol(host: str, protocol_text: str, *, confirm: bool = False,
 
             if _util._monotonic() > deadline:
                 # SAFETY: never leave the gantry moving unattended. Stop the run on
-                # the robot BEFORE surfacing the timeout (this used to just stop
+                # the robot BEFORE reporting the timeout (this used to just stop
                 # watching while the robot kept running).
                 _log.warning("[ot2] run %s exceeded %ss — stopping it",
                              rid, _OT2_RUN_POLL_TIMEOUT)
-                try:
-                    _ot2_stop_run(host, rid)
-                except OT2Error:
-                    pass
-                raise OT2Error(f"OT-2 run {rid} did not finish within "
-                               f"{_OT2_RUN_POLL_TIMEOUT}s — the run was stopped")
+                return _ot2_run_aborted(
+                    host, rid,
+                    f"the run did not finish within {_OT2_RUN_POLL_TIMEOUT}s",
+                    analysis, state=snap, status=status)
             time.sleep(_OT2_POLL_INTERVAL)
+    except Exception as exc:
+        _log.exception("[ot2] monitor error during run %s — stopping it", rid)
+        return _ot2_run_aborted(host, rid, f"lost track of the run ({exc})",
+                                analysis, state=last_snap)
     finally:
         if indicator_lights:
             try:

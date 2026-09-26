@@ -50,7 +50,7 @@ class TestActivePointerFlushSync:
         # `_activate_collection` / `_deactivate_all_collections` helpers
         # (audit 2026-09-22), which move the pointer AND flush it only after
         # every write has landed. Pin both the delegation and the flush.
-        assert ("_activate_collection(new_active)" in src
+        assert ("_activate_collection(new_active" in src
                 and "_deactivate_all_collections()" in src)
         for helper in (sc._activate_collection,
                        sc._deactivate_all_collections):
@@ -309,7 +309,10 @@ class TestAgentApiHardening:
         src = inspect.getsource(
             sc._build_commercialsaas_features_packet_from_record
         )
-        # Sanitisation pass on qualifier `<V text=>` values.
+        # Sanitisation pass on qualifier `<V text=>` values — through the
+        # one XML-legality helper the writer now uses for every text.
         assert "sanitised" in src or "sanitized" in src
-        # The strip rule keeps printable + tab + newline.
-        assert "\\t" in src or "\\n" in src
+        assert "_xml_legal_text" in src
+        # And what it does: control bytes (and XML-illegal code points) go,
+        # tab and newline stay.
+        assert sc._xml_legal_text("a\x01b\x0bc\ufffe\td\ne") == "a b c \td\ne"

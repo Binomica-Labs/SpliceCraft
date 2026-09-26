@@ -220,6 +220,7 @@ class TestTraceVerificationSummary:
         seq = _seq()
         ref = _mutate(seq, mut_pos)
         r = sc._pairwise_align(seq, ref, mode="global")
+        kw.setdefault("circular", True)
         return sc._trace_verification_summary(
             r["aligned_q"], r["aligned_t"], ph if ph is not None else _trace(),
             **kw)
@@ -252,7 +253,7 @@ class TestTraceVerificationSummary:
         seq = _seq()
         r = sc._pairwise_align(seq, seq, mode="global")
         s = sc._trace_verification_summary(
-            r["aligned_q"], r["aligned_t"], _trace())
+            r["aligned_q"], r["aligned_t"], _trace(), circular=True)
         assert s["verdict"] == "clean"
         assert s["n_confident"] == 0
 

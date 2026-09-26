@@ -70,8 +70,16 @@ _SPACER_PENALTY_PER_BP = 0.06
 # whole class of real promoters.
 _EXT10_MOTIF = "TG"
 _EXT10_BONUS = 0.10
-# Transcription start site: ~7 nt downstream of the -10 hexamer's 5' end.
-_TSS_OFFSET_FROM_MINUS10 = 7
+# Transcription start site, as an offset from the -10 hexamer's 5' END (its
+# first base, 0-based). The hexamer sits at -12..-7 and +1 is the start, so from
+# its first base the start is 12 bases along — equivalently the ~7 nt downstream
+# of its 3' end that the literature quotes. Written from the 5' end because that
+# is the index the scan has in hand (`j`).
+#
+# This was 7 — the 3'-end spacing applied to the 5'-end index — which put every
+# reported TSS 5 bp early, while the scan WINDOW below was sized correctly for
+# 13. The two halves disagreed for as long as both existed (audit 2026-09-22).
+_TSS_OFFSET_FROM_MINUS10 = 12
 # Default reporting floor, CALIBRATED rather than guessed — an arbitrary floor
 # is how a scan reports 245 "promoters" in 2.7 kb and buries the one that
 # matters. Two measurements set it:
@@ -253,7 +261,9 @@ def _scan_promoters_one_strand(seq: str, circular: bool,
     n = len(seq)
     if n < (6 + _SPACER_MIN + 6):
         return []
-    span = 6 + _SPACER_MAX + 6 + _TSS_OFFSET_FROM_MINUS10
+    # -35 hexamer + spacer + everything from the -10's first base through the
+    # TSS inclusive. Derived from the offset so the two cannot drift apart.
+    span = 6 + _SPACER_MAX + _TSS_OFFSET_FROM_MINUS10 + 1
     scan = _scan_window(seq, circular, span)
     limit = n if circular else len(scan)
     out: "list[dict]" = []
@@ -286,18 +296,37 @@ def _scan_promoters_one_strand(seq: str, circular: bool,
         # register the polymerase would use, and emitting all five would be
         # the same redundancy bug the terminator scanner exists to avoid.
         tss = j + _TSS_OFFSET_FROM_MINUS10
-        out.append({
-            "start": i % n,
-            "end": (j + 6) % n,
-            "minus35": w35,
-            "minus35_start": i % n,
-            "spacer": spacer,
-            "minus10": w10,
-            "minus10_start": j % n,
-            "tss": tss % n,
-            "score": round(score, 3),
-            "components": comps,
-        })
+        # `% n` only on a CIRCLE. A LINEAR molecule has no way round: the -10
+        # can fit while the start site lies past the last base, and wrapping
+        # put that TSS at bp 0 — a promoter at the 3' end then "drove" the
+        # genes at the 5' end (audit 2026-09-24). There it is None: the
+        # promoter's own coordinates stand, no start site does.
+        if circular:
+            out.append({
+                "start": i % n,
+                "end": (j + 6) % n,
+                "minus35": w35,
+                "minus35_start": i % n,
+                "spacer": spacer,
+                "minus10": w10,
+                "minus10_start": j % n,
+                "tss": tss % n,
+                "score": round(score, 3),
+                "components": comps,
+            })
+        else:
+            out.append({
+                "start": i,
+                "end": j + 6,
+                "minus35": w35,
+                "minus35_start": i,
+                "spacer": spacer,
+                "minus10": w10,
+                "minus10_start": j,
+                "tss": tss if tss < n else None,
+                "score": round(score, 3),
+                "components": comps,
+            })
     return out
 
 
@@ -338,16 +367,17 @@ def _scan_promoters(seq: str, *, circular: bool = True,
             # [n - b, n - a) of the forward strand.
             def fwd(pos_in_rc: int) -> int:
                 return (n - 1 - (pos_in_rc % n)) % n
+            end = fwd(h["minus35_start"]) + 1
             hits.append({
                 **h,
                 "strand": -1,
                 # The element's forward-strand extent: its RC-string end maps
                 # to the lower forward coordinate.
                 "start": fwd(h["minus10_start"] + 5),
-                "end": (fwd(h["minus35_start"]) + 1) % n,
+                "end": end % n if circular else end,
                 "minus35_start": fwd(h["minus35_start"]),
                 "minus10_start": fwd(h["minus10_start"]),
-                "tss": fwd(h["tss"]),
+                "tss": fwd(h["tss"]) if h["tss"] is not None else None,
             })
     for h in hits:
         h["model"] = ("sigma70 consensus composite "
@@ -479,34 +509,67 @@ def _scan_terminators_one_strand(seq: str, circular: bool, min_stem: int,
         except Exception:
             _log.exception("terminator scan: fold failed at %d", stem5_start)
             dg = None
-        if dg is not None and dg >= _TERM_MAX_DG:
+        if dg is not None and dg > _TERM_MAX_DG:
+            # INCLUSIVE, as `_TERM_MAX_DG`'s own calibration comment documents
+            # ("dg <= -8 -> reporting floor"). The `>=` this replaced dropped a
+            # hairpin folding at exactly the floor (audit 2026-09-22).
             continue
+        # An exclusive END wraps only on a circle: on a linear molecule a
+        # hairpin ending at the last base ends at n, and `% n` reported it
+        # as ending at 0 (round-2 hardening, 2026-09-25 — the promoter scan
+        # already had this rule).
         out.append({
             "start": (stem5_start - off) % n,
-            "end": (t + u_len - off) % n,
+            "end": ((t + u_len - off) % n if circular else t + u_len - off),
             "hairpin_start": (stem5_start - off) % n,
-            "hairpin_end": (stem3_end - off) % n,
+            "hairpin_end": ((stem3_end - off) % n if circular
+                            else stem3_end - off),
             "stem_len": stem,
             "loop_len": loop,
             "u_tract": u_len,
             "u_tract_start": (t - off) % n,
             "dg": (round(dg, 2) if dg is not None else None),
             "efficiency": _terminator_tier(dg, u_len),
-            # Overlap is judged in PADDED coordinates, before the modulo, so
-            # two registers of one origin-spanning hairpin still look like the
-            # overlapping pair they are (`% n` would scatter them apart).
-            "_span": (stem5_start, t + u_len),
+            # Overlap is judged as an ARC — a (start, length) pair on the
+            # molecule — not as a padded-coordinate interval. Two registers of
+            # one origin-spanning hairpin can be discovered in different padded
+            # frames (one anchored in the left pad, one in the right), and a
+            # plain `a0 < b1 and b0 < a1` test then reads them as disjoint: the
+            # same hairpin came back as two records at exactly the rotations
+            # that put it across the origin (audit 2026-09-22).
+            "_span": ((stem5_start - off) % n, (t + u_len) - stem5_start),
         })
-    return _merge_overlapping(out)
+    return _merge_overlapping(out, total=n, circular=circular)
 
 
-def _merge_overlapping(hits: "list[dict]") -> "list[dict]":
+def _arcs_overlap(a_start: int, a_len: int, b_start: int, b_len: int,
+                  total: int) -> bool:
+    """Do two arcs of a circle of `total` bp share a base?
+
+    Each arc is a START and a LENGTH, so an arc that runs past the origin needs
+    no special case — which is the whole reason the spans are carried this way.
+    Two arcs overlap when either one's start lies inside the other.
+    """
+    if a_len <= 0 or b_len <= 0 or total <= 0:
+        return False
+    if a_len >= total or b_len >= total:
+        return True
+    return (((b_start - a_start) % total) < a_len
+            or ((a_start - b_start) % total) < b_len)
+
+
+def _merge_overlapping(hits: "list[dict]", *, total: int = 0,
+                       circular: bool = False) -> "list[dict]":
     """Collapse candidates whose spans overlap, keeping the best.
 
     THE point of this module's terminator half. Two U-tracts a base apart, or
     a hairpin that can close in two registers, are ONE terminator; reporting
     each separately is how a hand-rolled scan turned one hairpin into 22.
     Ranked by stem length, then tract length, then depth of fold.
+
+    ``_span`` is ``(start, length)`` on the molecule. On a circle the overlap
+    is judged as an ARC (`_arcs_overlap`): a hairpin that straddles the origin
+    is one record whatever rotation the file happens to be stored in.
     """
     if not hits:
         return []
@@ -514,11 +577,15 @@ def _merge_overlapping(hits: "list[dict]") -> "list[dict]":
         -h["stem_len"], -h["u_tract"], h["dg"] if h["dg"] is not None else 0.0))
     kept: "list[dict]" = []
     for h in ordered:
-        a0, a1 = h["_span"]
+        a0, alen = h["_span"]
         clash = False
         for k in kept:
-            b0, b1 = k["_span"]
-            if a0 < b1 and b0 < a1:
+            b0, blen = k["_span"]
+            if circular and total > 0:
+                if _arcs_overlap(a0, alen, b0, blen, total):
+                    clash = True
+                    break
+            elif a0 < b0 + blen and b0 < a0 + alen:
                 clash = True
                 break
         if not clash:
@@ -566,13 +633,14 @@ def _scan_terminators(seq: str, *, circular: bool = True,
                                               u_floor):
             def fwd(pos_in_rc: int) -> int:
                 return (n - 1 - (pos_in_rc % n)) % n
+            _wrap = (lambda x: x % n) if circular else (lambda x: x)
             hits.append({
                 **h,
                 "strand": -1,
                 "start": fwd((h["u_tract_start"] + h["u_tract"] - 1)),
-                "end": (fwd(h["hairpin_start"]) + 1) % n,
+                "end": _wrap(fwd(h["hairpin_start"]) + 1),
                 "hairpin_start": fwd(h["hairpin_end"] - 1),
-                "hairpin_end": (fwd(h["hairpin_start"]) + 1) % n,
+                "hairpin_end": _wrap(fwd(h["hairpin_start"]) + 1),
                 "u_tract_start": fwd(h["u_tract_start"] + h["u_tract"] - 1),
             })
     hits.sort(key=lambda h: (h["start"], -h["stem_len"]))

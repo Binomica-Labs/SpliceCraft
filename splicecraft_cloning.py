@@ -41,7 +41,7 @@ import splicecraft_state as _state
 from splicecraft_biology import (
     _digest_with_enzymes, _enzyme_cuts, _enzyme_signature, _feat_len,
     _forbidden_hit_set, _fragments_from_cuts,
-    _iupac_pattern, _rc, _slice_circular,
+    _iupac_pattern, _rc, _scan_restriction_sites, _slice_circular,
 )
 from splicecraft_codon import _codon_fix_mutation_positions, _codon_fix_sites  # L2
 from splicecraft_primer import (   # L2 (downward; primer never imports cloning)
@@ -60,7 +60,8 @@ from splicecraft_history import (
 from splicecraft_logging import _log, _timed
 from splicecraft_record import _gb_text_to_record, _normalize_primer_seq
 from splicecraft_util import (   # L0
-    _coerce_feature_strand, _feature_location,
+    _coerce_feature_strand, _feat_bounds, _feature_location,
+    _record_is_circular,
 )
 
 
@@ -300,6 +301,82 @@ def _simulate_cloned_plasmid(insert: str, oh5: str, oh3: str,
             + oh3 + _PUPD2_BACKBONE_STUB)
 
 
+def _cloned_plasmid_regenerated_sites(
+        cloned_seq: str, insert: str, oh5: str,
+        enzymes: "list[str] | None" = None) -> "list[dict]":
+    """Type IIS sites in a simulated cloned plasmid that NEITHER parent carried
+    — sites formed by a junction.
+
+    The stub backbone is scrubbed and the insert is domesticated, so any hit on
+    the product came into being at one of the four boundaries the simulation
+    creates (``oh5|insert``, ``insert|oh3``, ``oh3|stub``, and the circular
+    ``stub|oh5`` close). That happens for a few percent of real inserts — an
+    insert ending in ``…CGTC`` behind a ``TCTC``-adjacent boundary is enough —
+    and it makes the part uncuttable in the very assembly it was built for.
+
+    The DESIGNER already refuses this case. The stub-backbone simulation and
+    "Copy Cloned Sequence" did not check at all (audit 2026-09-22), so a part
+    saved through those paths carried the site silently. Returns
+    ``[{enzyme, cut_bp}]`` — empty when the product is clean.
+
+    A site is attributed to a junction when its RECOGNITION SPAN is not wholly
+    inside the insert's own bases. Comparing CUT lists against the insert
+    scanned on its own (the first version) misread every site the insert
+    carries near its ends: a Type IIS enzyme cuts away from its site, the
+    linear scan of the insert drops a cut that lands past the insert's end,
+    so nothing "explained" it — an insert starting with its own reverse BsaI
+    site was reported as a junction, 247 times in a 1,500-case fuzz against
+    137 real ones (audit 2026-09-22, CL8). Where the insert sits is read off
+    the product: straight after the 5' overhang, or three bases earlier when
+    its ATG collapsed into an AATG overhang.
+    """
+    names = list(enzymes or ("BsaI", "Esp3I"))
+    seq = (cloned_seq or "").upper()
+    n = len(seq)
+    if not n:
+        return []
+    ins = (insert or "").upper()
+    body_start = len(oh5 or "")
+    ins_lo = None
+    if ins:
+        if seq[body_start:body_start + len(ins)] == ins:
+            ins_lo = body_start
+        elif (body_start >= 3 and ins[:3] == seq[body_start - 3:body_start]
+              and seq[body_start:body_start + len(ins) - 3] == ins[3:]):
+            ins_lo = body_start - 3          # ATG folded into the overhang
+    try:
+        hits = _scan_restriction_sites(seq, circular=True, unique_only=False,
+                                       allowed_enzymes=frozenset(names))
+        catalog = _state._all_enzymes_hook() or {}
+    except Exception:
+        _log.exception("cloned-plasmid junction scan failed")
+        return []
+    out: "list[dict]" = []
+    seen: set = set()
+    for h in hits:
+        # Labelled pieces only — an origin-wrapping site is ONE site even
+        # though it is drawn as two pieces (sacred invariant #6).
+        if h.get("type") != "resite" or not h.get("label"):
+            continue
+        name = str(h.get("label") or "")
+        site = (catalog.get(name) or ("",))[0]
+        site_len = len(site) or (int(h.get("end", 0)) - int(h.get("start", 0)))
+        lo = int(h.get("start", 0))
+        if (ins_lo is not None and ins_lo <= lo
+                and lo + site_len <= ins_lo + len(ins)):
+            continue              # the insert's OWN site, not a junction's
+        cut = h.get("top_cut_bp")
+        if cut is None:
+            cc = h.get("cut_col")
+            cut = lo + int(cc) if cc is not None else lo
+        key = (name, int(cut) % n)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"enzyme": name, "cut_bp": int(cut) % n})
+    return out
+
+
 # ── Gibson assembly ───────────────────────────────────────────────────────────
 #
 # Gibson chemistry: 5' exonuclease chews back the 5' end of each fragment,
@@ -320,6 +397,29 @@ def _simulate_cloned_plasmid(insert: str, oh5: str, oh3: str,
 _GIBSON_MIN_OVERLAP_BP = 15
 _GIBSON_MAX_OVERLAP_BP = 200   # cap the suffix/prefix probe; longer is
                                 # unrealistic for Gibson primer tails
+
+# How far past `min_overlap` a MEASURED match may run before the designer says
+# so. The simulator collapses the whole measured overlap, so every base past the
+# design comes off the downstream fragment's 5' end — fine when it IS the
+# designed arm, a silent deletion when it is a repetitive end that happens to
+# match (audit 2026-09-22). 6 bp of slack keeps the ordinary case (a designed
+# arm measured a base or two long because the next base coincides) quiet.
+_GIB_LONG_OVERLAP_SLACK_BP = 6
+
+
+def _gibson_overlap_definite_bases(match: str) -> int:
+    """How many bases of a candidate overlap can actually ANNEAL — i.e. are
+    unambiguous A/C/G/T.
+
+    An ``N`` is an unresolved base, not a base that pairs with another ``N``.
+    Two fragments whose ends are both a run of ``N`` compare EQUAL as strings,
+    so an all-``N`` stretch was reported as a perfectly good homology arm and
+    the assembly was simulated off it (audit 2026-09-22) — a confident answer
+    about bases nobody has read. Ambiguity codes therefore do not count toward
+    the required overlap length, which leaves a long arm carrying the odd ``N``
+    acceptable while rejecting one made of them.
+    """
+    return sum(1 for c in (match or "").upper() if c in "ACGT")
 
 
 def _gibson_overlap_len(a_seq: str, b_seq: str, *,
@@ -358,6 +458,12 @@ def _gibson_overlap_len(a_seq: str, b_seq: str, *,
         return 0
     for k in range(max_check, min_overlap - 1, -1):
         if a[-k:] == b[:k]:
+            # Ambiguity codes don't anneal — see
+            # `_gibson_overlap_definite_bases`. A shorter suffix of the same
+            # match can only have FEWER definite bases, so a failure here means
+            # no k qualifies and the loop can stop.
+            if _gibson_overlap_definite_bases(a[-k:]) < min_overlap:
+                break
             return k
     # Nothing within the cap. The cap is a PROBE limit, not a biological one:
     # when the designed arm is longer than it, no k <= cap can match (the
@@ -373,7 +479,8 @@ def _gibson_overlap_len(a_seq: str, b_seq: str, *,
             k = len(a) - idx
             if (k <= len(b) and k >= min_overlap
                     and (full_match_safe or k < len(a))
-                    and a[-k:] == b[:k]):
+                    and a[-k:] == b[:k]
+                    and _gibson_overlap_definite_bases(a[-k:]) >= min_overlap):
                 return k
             idx = a.find(seed, idx + 1)
     return 0
@@ -2257,6 +2364,15 @@ def _annotate_scars_on_product(
         })
         return out
 
+    # Per-orientation junction classifications, merged into the warning list
+    # AFTER both orientations are walked. Appending inside each pass emitted the
+    # same junction twice under the same label ("Junction vector ↔ insert 1: …"),
+    # with nothing to say which orientation each line described — and when the
+    # two orientations classify differently, the pair read as a contradiction
+    # (audit 2026-09-22).
+    junction_cls: "dict[str, dict[str, str]]" = {}
+    junction_order: "list[str]" = []
+
     def _annotate_orient(prod: dict, *, reverse: bool) -> None:
         if not prod.get("compatible", False):
             return
@@ -2286,7 +2402,12 @@ def _annotate_scars_on_product(
                 j["left_enz"], j["right_enz"], context,
                 context_left_offset=ctx_left_offset,
             )
-            warnings.append(f"Junction {j['label']}: {cls['label']}")
+            lbl = str(j["label"])
+            if lbl not in junction_cls:
+                junction_cls[lbl] = {}
+                junction_order.append(lbl)
+            junction_cls[lbl]["reverse" if reverse else "forward"] = \
+                str(cls["label"])
             # Tag the ligation OVERHANG — light-blue, arrowless (strand 0) —
             # instead of labelling the junction a "LIGATION SCAR" (the user
             # wanted scars left as-is in the sequence, not annotated; the
@@ -2314,6 +2435,21 @@ def _annotate_scars_on_product(
 
     _annotate_orient(result.get("forward", {}), reverse=False)
     _annotate_orient(result.get("reverse", {}), reverse=True)
+
+    # One line per junction when both orientations agree (the usual case), two
+    # NAMED lines when they don't — that disagreement is a real property of the
+    # product and used to be indistinguishable from a duplicated message.
+    for lbl in junction_order:
+        by_orient = junction_cls[lbl]
+        fwd = by_orient.get("forward")
+        rev = by_orient.get("reverse")
+        if fwd is not None and rev is not None and fwd == rev:
+            warnings.append(f"Junction {lbl}: {fwd}")
+        else:
+            if fwd is not None:
+                warnings.append(f"Junction {lbl} (forward orientation): {fwd}")
+            if rev is not None:
+                warnings.append(f"Junction {lbl} (reverse orientation): {rev}")
 
 
 def _rc_fragment(frag: dict) -> dict:
@@ -3214,7 +3350,16 @@ def _gg_close_chain(seed: dict, required: list[dict], optional: list[dict],
     the seeds of one simulation. It is DECREMENTED in place, so the caller can
     tell an exhausted search from a search that finished and found nothing —
     those two must not read the same, since one means "unbuildable" and the
-    other means "I stopped looking"."""
+    other means "I stopped looking".
+
+    Each fragment is tried in BOTH orientations. A Golden Gate fragment is
+    double-stranded: what makes the assembly directional is its OVERHANGS, not
+    which strand the file happens to store. A part supplied reverse-complemented
+    — an insert read off the minus strand, a vector saved flipped — presents the
+    same two overhangs at swapped ends, and trying only the stored orientation
+    reported "the overhangs don't chain" for an assembly that works at the bench
+    (audit 2026-09-22). The flip goes through `_rc_fragment`, which moves the
+    overhang bases to the strand they are now on."""
     solutions: "list[list[dict]]" = []
     pool = list(required) + list(optional)
     if budget is None:
@@ -3222,6 +3367,35 @@ def _gg_close_chain(seed: dict, required: list[dict], optional: list[dict],
     # Identity, not equality: two fragments can be byte-identical (a duplicated
     # part) and still be two separate molecules.
     required_ids = {id(f) for f in required}
+    # Orientation variants, keyed by the ORIGINAL fragment's id so `used` and
+    # `required_ids` keep working on identity: a fragment and its flip are one
+    # molecule and must never both appear in a chain. Cached rather than
+    # recomputed per visit — `_rc_fragment` rebuilds top_seq and every feature.
+    # Each variant is tagged with the ORIGINAL fragment's id and whether it is
+    # the flip, so a caller can canonicalise a chain across seeds. `id()` of a
+    # freshly built flip is not stable between `_gg_close_chain` calls, and the
+    # simulator calls this once per vector piece — without the tags, one circle
+    # found from two seeds would count as two products and raise a spurious
+    # ambiguity warning.
+    variants: "dict[int, list[dict]]" = {}
+    for f in pool:
+        f.setdefault("_gg_src_id", id(f))
+        f.setdefault("_gg_flipped", False)
+        try:
+            flipped = _rc_fragment(f)
+        except Exception:
+            _log.exception("golden gate: could not flip fragment %r",
+                           f.get("source_label"))
+            variants[id(f)] = [f]
+            continue
+        flipped["_gg_src_id"] = f["_gg_src_id"]
+        flipped["_gg_flipped"] = True
+        # A palindromic fragment flips onto itself; offering it twice would
+        # double every solution count, which reads as ambiguity that isn't.
+        same = (flipped.get("top_seq") == f.get("top_seq")
+                and flipped.get("left", {}).get("overhang_seq")
+                == f.get("left", {}).get("overhang_seq"))
+        variants[id(f)] = [f] if same else [f, flipped]
 
     def _walk(chain: list, ligated: dict, used: set) -> None:
         if len(solutions) >= _GG_MAX_SOLUTIONS:   # enough to prove ambiguity
@@ -3238,14 +3412,15 @@ def _gg_close_chain(seed: dict, required: list[dict], optional: list[dict],
         for f in pool:
             if id(f) in used:
                 continue
-            nxt = _ligate_fragments(ligated, f)
-            if nxt is None:
-                continue
-            chain.append(f)
-            used.add(id(f))
-            _walk(chain, nxt, used)
-            used.discard(id(f))
-            chain.pop()
+            for cand in variants[id(f)]:
+                nxt = _ligate_fragments(ligated, cand)
+                if nxt is None:
+                    continue
+                chain.append(cand)
+                used.add(id(f))
+                _walk(chain, nxt, used)
+                used.discard(id(f))
+                chain.pop()
 
     _walk([seed], seed, {id(seed)})
     return solutions
@@ -3369,9 +3544,23 @@ def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
             # to the front. Comparing SETS would be wrong: two chains over the
             # same fragments in a different order are different sequences, and
             # that is precisely the ambiguity worth reporting.
-            ids = tuple(id(f) for f in chain)
-            lo = ids.index(min(ids))
-            canon = ids[lo:] + ids[:lo]
+            #
+            # The key is (source fragment, orientation), not `id()`: a flipped
+            # variant is rebuilt per seed, so raw ids would make one circle look
+            # like one product per seed it was found from. Orientation stays IN
+            # the key because a part assembled backwards is a different molecule.
+            ids = tuple((f.get("_gg_src_id", id(f)), bool(f.get("_gg_flipped")))
+                        for f in chain)
+
+            def _rot(t: tuple) -> tuple:
+                lo = t.index(min(t))
+                return t[lo:] + t[:lo]
+            # ...and over the OTHER STRAND: the same circle read the other way
+            # is the chain reversed with every piece flipped. Found from a
+            # second seed that way, one molecule was counted as two and raised
+            # an ambiguity warning that isn't (round-2 hardening, 2026-09-25).
+            canon = min(_rot(ids),
+                        _rot(tuple((sid, not fl) for sid, fl in reversed(ids))))
             if canon not in seen_circles:
                 seen_circles.add(canon)
                 solutions.append(chain)
@@ -3438,12 +3627,16 @@ def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
             "the search for alternative products hit its step limit, so this "
             "product is not confirmed to be the only one the reaction can "
             "make — check that every junction overhang is distinct.")
-    used = {id(f) for f in chain}
+    # Keyed on the SOURCE fragment, as the chain search is: a vector body
+    # used in its flipped orientation is a different object with the same
+    # `_gg_src_id`, and keying on `id()` would report it dropped.
+    used = {f.get("_gg_src_id", id(f)) for f in chain}
     # Vector pieces left out of the product are the dropout/stuffer — that is
     # what a destination vector's stuffer is FOR, so this is reported, not
     # warned about. (Vector religation background is a property of every
     # dropout vector; warning on it every time would be noise.)
-    dropped = [f for f in vec_bodies if id(f) not in used]
+    dropped = [f for f in vec_bodies
+               if f.get("_gg_src_id", id(f)) not in used]
     product = str(closed.get("top_seq") or "")
     # Fidelity: every junction overhang must be DISTINCT, or the reaction can
     # mis-assemble (two junctions with the same overhang are interchangeable).
@@ -3698,16 +3891,26 @@ def _frag_carries_backbone_marker(frag: dict) -> bool:
 def _acceptor_vector_features(rec) -> "list[dict]":
     """Minimal feature dicts (type/label/start/end) from a parsed entry-vector
     record, so the digest can tag which fragment carries a backbone marker.
-    Skips features whose coords don't resolve; wrap/compound features flatten to
-    their span (fine — only used to identify the backbone fragment)."""
+    Skips features whose coords don't resolve.
+
+    Coordinates come from `_feat_bounds`, which keeps an origin-spanning feature
+    encoded as ``end < start`` — the form `_split_features_at_cuts` recognises.
+    Reading ``int(loc.start)`` / ``int(loc.end)`` instead (sacred #9) flattened a
+    wrap to its OUTER bounds, so an AmpR annotated across bp 0 became a feature
+    covering nearly the whole plasmid: the splitter then put a piece of it on
+    BOTH halves of the digest, both halves reported a backbone marker, and
+    `_pick_insert_fragment` fell back to the size heuristic this function exists
+    to replace (audit 2026-09-22).
+    """
     out: list[dict] = []
+    total = len(getattr(rec, "seq", "") or "")
+    circular = _record_is_circular(rec)
     for f in getattr(rec, "features", None) or []:
-        try:
-            loc = getattr(f, "location", None)
-            s, e = int(loc.start), int(loc.end)   # type: ignore[union-attr]
-        except Exception:
+        bounds = _feat_bounds(f, total, circular=circular) if total else None
+        if bounds is None:
             continue
-        if e <= s:
+        s, e, _strand = bounds
+        if e == s:
             continue
         try:
             q = getattr(f, "qualifiers", {}) or {}

@@ -174,6 +174,11 @@ class TestCollectionsModalFlows:
             t.move_cursor(row=1)
             modal.query_one("#btn-coll-del").action_press()
             await pilot.pause(0.2)
+            # Two confirmations, as in the library panel (hardening 2026-09-25).
+            app.screen.query_one("#btn-colldel-yes").action_press()
+            await pilot.pause(0.2)
+            app.screen.query_one("#btn-scarydel-yes").action_press()
+            await pilot.pause(0.2)
             names = {c["name"] for c in sc._load_collections()}
             assert names == {"keep"}
             app.exit()

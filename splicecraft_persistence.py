@@ -373,16 +373,41 @@ def _backup_filename_pattern(path: Path) -> str:
     referenced it; new code should use `_backup_filename_patterns`."""
     return _backup_filename_patterns(path)[0]
 
+def _backup_generation(name: str) -> "int | None":
+    """The generation number of a `.bak.<ts>.g<NNNNNN>` backup, or None for a
+    name written before generations existed (`.bak.<ts>` / `.bak.<ts>.<bump>`)."""
+    rest = name.split(".bak.", 1)[-1]
+    if rest.endswith(".gz"):
+        rest = rest[:-3]
+    parts = rest.split(".")
+    if (len(parts) > 1 and parts[1].startswith("g")
+            and parts[1][1:].isdigit()):
+        return int(parts[1][1:])
+    return None
+
+
 def _backup_sort_key(name: str) -> "tuple":
     """Oldest→newest ordering key for one backup filename.
 
-    The collision bump MUST be compared numerically. As a bare integer in
-    the name it sorts lexicographically — `.1 < .10 < .11 < .12 < .2` — so
-    once a file was saved more than nine times inside one wall-second, the
-    "newest" backup was bump 9: retention then pruned the genuinely newest
-    generations and the recovery chain restored a stale one. Reachable from
-    a bulk delete, a scripted agent loop, or repeated settings writes.
+    Every backup written now carries a GENERATION number — one past the
+    highest the file has had (`_next_backup_generation`) — and generations
+    order by that number alone. The wall-clock stamp beside it is for the
+    human reading the directory, not for ordering: a clock that repeats an
+    hour (a DST fall-back), steps back, or ran a year fast and was corrected
+    put a NEWER backup at an OLDER sort position, and "keep the newest N" then
+    pruned exactly the generations it was meant to keep — as did reusing the
+    un-bumped slot of a busy second once retention had freed it (audit
+    2026-09-22, D13). Names from before generations sort first, among
+    themselves by `(timestamp, bump)`.
+
+    The collision bump of an older name MUST be compared numerically. As a
+    bare integer in the name it sorts lexicographically — `.1 < .10 < .11 <
+    .12 < .2` — so once a file was saved more than nine times inside one
+    wall-second, the "newest" backup was bump 9.
     """
+    gen = _backup_generation(name)
+    if gen is not None:
+        return (1, gen, name)
     rest = name.split(".bak.", 1)[-1]
     if rest.endswith(".gz"):
         rest = rest[:-3]
@@ -394,7 +419,16 @@ def _backup_sort_key(name: str) -> "tuple":
             bump = int(parts[1])
         except (TypeError, ValueError):
             bump = 0
-    return (ts, bump, name)
+    return (0, ts, bump, name)
+
+
+def _next_backup_generation(existing: "list[Path]") -> int:
+    """One past the highest generation among ``existing`` backups (1 when
+    none carries one yet). Retention only ever removes the OLDEST, so the
+    highest survives and the numbering never goes backwards."""
+    gens = [g for g in (_backup_generation(p.name) for p in existing)
+            if g is not None]
+    return (max(gens) + 1) if gens else 1
 
 
 def _iter_backups(path: Path) -> "list[Path]":
@@ -1114,16 +1148,18 @@ def _safe_save_json(path: Path, entries: list, label: str,
                     # is touched), legacy second (also raises now to
                     # avoid the silent-corrupt-legacy-bak case).
                     ts = _datetime.now().strftime("%Y%m%d-%H%M%S")
-                    bak_ts = path.with_name(f"{path.name}.bak.{ts}")
-                    bump = 0
-                    while bak_ts.exists():
-                        bump += 1
-                        # Zero-padded so the NAME also sorts correctly for
-                        # any external tool reading the directory; the
-                        # in-process ordering goes through `_backup_sort_key`,
-                        # which parses the bump either way.
+                    # A GENERATION number orders the backups, not the clock
+                    # (`_backup_sort_key`): one past the highest this file
+                    # has had, so a slot freed by retention is never reused
+                    # and a clock that repeats, steps back or was wrong can
+                    # never file a new backup under an older one (D13).
+                    gen = _next_backup_generation(_existing_baks)
+                    bak_ts = path.with_name(f"{path.name}.bak.{ts}.g{gen:06d}")
+                    while (bak_ts.exists() or bak_ts.with_name(
+                            bak_ts.name + ".gz").exists()):
+                        gen += 1
                         bak_ts = path.with_name(
-                            f"{path.name}.bak.{ts}.{bump:03d}")
+                            f"{path.name}.bak.{ts}.g{gen:06d}")
                     try:
                         _atomic_write_bytes(bak_ts, existing)
                     except OSError as exc:
@@ -1422,6 +1458,25 @@ def _backup_info(path: Path) -> "dict | None":
                 "error": "unexpected JSON shape (not list or envelope)"}
     return {"n_entries": n, "mtime_str": ts, "error": ""}
 
+def _note_data_recovery(label: str, message: str) -> None:
+    """Record that a user-data file was recovered from a backup.
+
+    The startup check reports recoveries by calling `_safe_load_json` per file —
+    but a recovery REWRITES the main file, so that second call sees valid data
+    and returns nothing. Any earlier load in the launch sequence therefore
+    swallowed the notice and the user was never told (audit 2026-09-22).
+    Recording it here makes the report independent of who loaded first.
+
+    Bounded: a pathological data dir must not grow this without limit.
+    """
+    try:
+        log = _state._DATA_RECOVERIES
+        if len(log) < 64 and not any(lbl == label for lbl, _m in log):
+            log.append((str(label), str(message)))
+    except Exception:          # pragma: no cover - never break a recovery
+        _log.exception("could not record the recovery of %r", label)
+
+
 def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
     """Load a JSON payload from `path`. Returns (entries, warning_or_None).
 
@@ -1475,9 +1530,10 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
             except OSError:
                 _log.warning("Could not rewrite %s from backup %s",
                              path, _cand.name)
-            return _entries, (
-                f"{label} main file was missing — restored "
-                f"{len(_entries)} entries from backup {_cand.name}.")
+            _msg = (f"{label} main file was missing — restored "
+                    f"{len(_entries)} entries from backup {_cand.name}.")
+            _note_data_recovery(label, _msg)
+            return _entries, _msg
         return [], None
 
     # Size cap + symlink rejection — refuse to read multi-GB files
@@ -1586,6 +1642,10 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
                         "Could not rewrite main file %s from backup",
                         path,
                     )
+                _note_data_recovery(
+                    label,
+                    f"{label} was corrupt — restored {len(entries)} "
+                    f"entries from backup.")
                 return entries, (
                     f"{label} was corrupt — restored {len(entries)} entries "
                     f"from backup."
@@ -1642,11 +1702,11 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
             _log.warning(
                 "Could not rewrite main file %s from rotated backup", path,
             )
-        return chain_entries, (
-            f"{label} and its .bak were corrupt — restored "
-            f"{len(chain_entries)} entries from rotated backup "
-            f"{chain_bak.name}."
-        )
+        _chain_msg = (f"{label} and its .bak were corrupt — restored "
+                      f"{len(chain_entries)} entries from rotated backup "
+                      f"{chain_bak.name}.")
+        _note_data_recovery(label, _chain_msg)
+        return chain_entries, _chain_msg
 
     return [], (main_warning
                 or f"{label} is corrupt and no valid backup was found. "

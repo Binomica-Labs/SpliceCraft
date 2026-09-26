@@ -103,9 +103,26 @@ _CONTROL_CHARS_RE = re.compile(
     # cells + `.gb` qualifiers (Trojan-Source-style spoofing) and has no
     # legitimate use in a plasmid / feature name. ZWNJ/ZWJ (U+200C/200D) are
     # deliberately LEFT intact - they legitimately join scripts + emoji.
+    # U+FFFE/U+FFFF are Unicode noncharacters and XML 1.0 forbids them: a name
+    # holding one made every SVG map / .dna file it reached unreadable (audit
+    # 2026-09-22).
     r"[\x00-\x1f\x7f-\x9f\u200e\u200f\u2028-\u202e\u2066-\u2069\ufeff"
-    r"\ud800-\udfff]+"
+    r"\ud800-\udfff\ufffe\uffff]+"
 )
+
+# Characters XML 1.0 forbids outright: C0 controls other than TAB / LF / CR,
+# the surrogates, and the noncharacters U+FFFE / U+FFFF. A document holding one
+# is not well-formed, and a conforming reader refuses the WHOLE file — so every
+# XML writer (the .dna packets, the SVG map) passes its text through
+# `_xml_legal_text` first. (`xml.sax.saxutils.escape` escapes markup only.)
+_XML_ILLEGAL_CHARS_RE = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+
+
+def _xml_legal_text(text: str) -> str:
+    """``text`` with every XML-illegal character (and CR) replaced by a space,
+    so a value the writer emits can always be read back."""
+    return _XML_ILLEGAL_CHARS_RE.sub(" ", text).replace("\r", " ")
 
 
 def _natural_sort_key(s: str) -> tuple:
@@ -497,6 +514,9 @@ def _record_is_circular(record) -> bool:
     ).strip().lower() != "linear"
 
 
+_MARKUP_BACKSLASH_BEFORE_BRACKET_RE = re.compile(r"\\(?=\[|$)")
+
+
 def _markup_escape(text) -> str:
     """Escape user / file-derived text for a Rich/Textual MARKUP string.
 
@@ -504,13 +524,128 @@ def _markup_escape(text) -> str:
     markup template it becomes markup: ``Cloning [old]`` rendered as
     "Cloning ", ``Lab stock [/b]`` raised MarkupError at render time and
     closed the app, and ``[@click=app.…]`` made a clickable action (audit
-    2026-09-22). Textual's own `escape` leaves a TRAILING backslash alone,
-    which then escapes the template's next tag — doubled here."""
-    from textual.markup import escape as _tx_escape
-    out = _tx_escape(str(text if text is not None else ""))
-    if out.endswith("\\") and (len(out) - len(out.rstrip("\\"))) % 2:
-        out += "\\"
-    return out
+    2026-09-22).
+
+    EVERY ``[`` is escaped, not only the tag-shaped ones Textual's own
+    `escape` handles: Textual 8's parser also swallows ``[ y ]`` and
+    ``[3' end]``. And a backslash cannot be escaped at all — the parser
+    reads any ``[`` after a backslash as literal and never un-doubles
+    ``\\\\`` — so a backslash that would touch a ``[`` (a name ending in
+    one, then the template's closing tag) gets an invisible U+200B after
+    it instead. Both parsers (Textual `Content` and Rich `Text`) read the
+    result the same way."""
+    s = str(text if text is not None else "")
+    s = _MARKUP_BACKSLASH_BEFORE_BRACKET_RE.sub("\\\\\u200b", s)
+    return s.replace("[", "\\[")
+
+
+# A bracketed run, for `_markup_escape_unstyled`.
+_MARKUP_TAG_RE = re.compile(r"\[([^\[\]\n]*)\]")
+# A `$variable` in a style tag (`[$accent]`, `[b $error]`) — the theme's
+# colours, which resolve only inside a running App.
+_MARKUP_VAR_RE = re.compile(r"\$[A-Za-z_][\w-]*")
+
+
+@_functools.lru_cache(maxsize=1024)
+def _markup_tag_is_style(body: str) -> bool:
+    """True when ``[body]`` is a style tag TEXTUAL will apply — the app's own
+    `[green]`, `[b $error]`, `[not bold]` — and not bracketed text.
+
+    Asked of Textual's own parser, because Textual is what renders these
+    strings. Rich's was used first and disagrees both ways: it rejects the
+    theme's `$variables` (so `[b $error]⚠ PHYSICAL ROBOT MOTION[/]` showed
+    its markup), and it lower-cases style words while Textual does not (so
+    `[R]` passed as Rich's "reverse" and a primer named ``Primer [R]`` lost
+    its ``[R]``). A `$variable` cannot resolve outside a running App, so
+    there the rest of the tag is judged with a stand-in colour. Never a
+    style: an action or link (`@click=…`, anything with ``=``), or a tag that
+    parses to NO style at all (`[50%]`), or a tag holding a quote: Textual's
+    style parser skips a quoted word (`b 'x'` is bold) but its markup
+    tokenizer does not take ``[b 'x']`` for a tag, so keeping it unescaped
+    left the rest of the message's tags unmatched (round-2 hardening)."""
+    body = body.strip()
+    if (not body or body.startswith("@") or "=" in body
+            or "'" in body or '"' in body):
+        return False
+    try:
+        from textual.markup import parse_style
+    except ImportError:                          # pragma: no cover
+        return False
+    try:
+        style = parse_style(body)
+    except Exception:
+        if not _MARKUP_VAR_RE.search(body):
+            return False
+        try:
+            style = parse_style(_MARKUP_VAR_RE.sub("red", body))
+        except Exception:
+            return False
+    if getattr(style, "link", None) or getattr(style, "meta", None):
+        return False
+    return bool(style)
+
+
+def _markup_escape_unstyled(text: str, *, validate: bool = True) -> "str | None":
+    """`text` with every ``[`` that does not open or close a real style tag
+    escaped.
+
+    For a message the app has ALREADY built by pasting a name into its own
+    markup — ``f"[green]Imported {name}[/green]"`` — where escaping the name
+    is too late. A name like ``pUC19 [v2]`` parsed as a style tag called
+    ``v2`` and its text vanished from the toast (audit 2026-09-22); sending
+    the whole message as plain text instead would show ``[green]`` too.
+    Kept: tags `_markup_tag_is_style` accepts, and closing tags that close
+    one of them. EVERY other ``[`` is escaped — not only the bracketed runs:
+    in ``[[x]]`` escaping just the inner ``[x]`` left the outer ``[`` to open
+    a broken tag, which showed a stray backslash. A ``[`` already escaped by
+    the caller (a backslash before it) is left alone.
+
+    Returns None when the result still does not parse (``validate``), so the
+    caller can fall back to plain text. A name that is itself a style word
+    (``[red]``) is indistinguishable from markup here — escape it at the call
+    site."""
+    keep: "set[int]" = set()
+    stack: "list[str]" = []
+    # How many of each tag are open: a closer that matches none is answered
+    # without walking the stack, which made thousands of them quadratic.
+    open_n: "dict[str, int]" = {}
+
+    def _norm(tag: str) -> str:
+        return " ".join(tag.split())
+
+    for m in _MARKUP_TAG_RE.finditer(text):
+        start = m.start()
+        if start and text[start - 1] == "\\":
+            continue                           # already escaped by the caller
+        body = m.group(1).strip()
+        if body.startswith("/"):
+            name = _norm(body[1:])
+            if stack and not name:
+                open_n[stack.pop()] -= 1
+                keep.add(start)
+            elif name and open_n.get(name):
+                k = len(stack) - 1             # the innermost open one
+                while stack[k] != name:
+                    k -= 1
+                del stack[k]
+                open_n[name] -= 1
+                keep.add(start)
+        elif _markup_tag_is_style(body):
+            name = _norm(body)
+            stack.append(name)
+            open_n[name] = open_n.get(name, 0) + 1
+            keep.add(start)
+    out: "list[str]" = []
+    for i, ch in enumerate(text):
+        if (ch == "[" and i not in keep
+                and not (i and text[i - 1] == "\\")):
+            out.append("\\[")
+        else:
+            out.append(ch)
+    res = "".join(out)
+    if validate and not _markup_parses(res):
+        return None
+    return res
 
 
 def _markup_parses(text: str) -> bool:
@@ -541,14 +676,24 @@ def _phred_in_alignment_frame(phred, result) -> list:
         q.reverse()
     try:
         rot = int(result.get("query_rotation") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # a stored `inf`
         rot = 0
     if rot:
         rot %= len(q)
         q = q[rot:] + q[:rot]
+    # A LOCAL alignment keeps the read's clipped ends out of its rows (soft
+    # clips): only the aligned stretch `local_q_span` has columns.
+    span = result.get("local_q_span")
+    if (isinstance(span, (list, tuple)) and len(span) == 2
+            and all(isinstance(v, int) for v in span)):
+        q0, q1 = span
+        if 0 <= q0 <= q1 <= len(q):
+            q = q[q0:q1]
+    if not q:
+        return q
     try:
         shift = int(result.get("query_frame_shift") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # a stored `inf`
         shift = 0
     if shift:
         # A target-rotation pick cut the alignment's columns back into the
@@ -1445,18 +1590,42 @@ def _gb_text_is_circular(gb_text: "str | None") -> bool:
     rule; this one stays here because L0 cannot import L1."""
     if not gb_text:
         return True
+    return _locus_topology(gb_text) != "linear"
+
+
+def _locus_topology(gb_text) -> "str | None":
+    """``"linear"`` / ``"circular"`` as the LOCUS line's TOPOLOGY FIELD says,
+    or None when there is no LOCUS line or no such field.
+
+    The field follows the length unit — ``LOCUS <name> <len> bp <mol>
+    <topology> <division> <date>`` — so only tokens AFTER the unit are read.
+    Reading every token on the line let the NAME answer: a plasmid called
+    `linear` (or `Circular`) set its own topology (audit 2026-09-22, FM11).
+    One rule for `_gb_text_is_circular` here and record L1's
+    `_topology_from_gb_text`."""
+    if not isinstance(gb_text, str) or not gb_text:
+        return None
     line = gb_text[:200].lstrip().split("\n", 1)[0]
     if line[:5].upper() != "LOCUS":
-        return True
-    return "linear" not in {t.lower() for t in line.split()}
+        return None
+    low = [t.lower() for t in line.split()]
+    # The unit is never the keyword or the name (indices 0 and 1).
+    unit = next((i for i, t in enumerate(low) if i >= 2
+                 and t in ("bp", "aa", "rc")), None)
+    tail = low[unit + 1:] if unit is not None else low[2:]
+    if "linear" in tail:
+        return "linear"
+    if "circular" in tail:
+        return "circular"
+    return None
 
 
 def _esc_md(s: str) -> str:
-    """Local helper — escape Rich markup metachars so a hostile / odd
-    file path or error string can't inject styling into Static updates
-    in this modal. Equivalent to `rich.markup.escape`."""
-    from rich.markup import escape
-    return escape(s)
+    """Local helper — escape markup metachars so a hostile / odd file path
+    or error string can't inject styling into Static updates in this modal.
+    `_markup_escape`, not `rich.markup.escape`, which leaves Textual's
+    `[$var]` tags alone."""
+    return _markup_escape(s)
 
 
 def _now_iso() -> str:
@@ -1629,7 +1798,14 @@ def _safe_xml_parse(xml_data: str, *, allow_dtd: bool = False):
     # document. The old form parsed twice — a full iterparse tree for the depth
     # scan, then a second full `fromstring` build — doubling CPU and peak memory
     # on multi-MB XML (the amplifier behind the .dna packet-parse OOM).
-    _MAX_DEPTH = 256
+    # 500 (the depth the HISTORY MODEL accepts, `_HISTORY_NODE_MAX_DEPTH`) plus
+    # room for the document's own wrapper elements. A `.dna` construction history
+    # nests ONE level per save, so a 256 ceiling refused the whole document after
+    # ~254 saves — the provenance of the most-worked-on plasmids, the ones most
+    # worth keeping, was exactly what stopped loading (audit 2026-09-22). The
+    # guard is about BOUNDEDNESS, not this particular number, and the walk here
+    # is iterative (`iterparse`), so raising the ceiling costs no stack.
+    _MAX_DEPTH = 600
     depth = 0
     root = None
     for event, elem in ET.iterparse(
@@ -1707,6 +1883,25 @@ def _strip_fasta_headers(text: str) -> str:
 # Reasons: (1) a monkeypatch on `_now` / `_monotonic` covers every callsite at
 # once; (2) `_now()` is always tz-aware, avoiding silent DST off-by-hours bugs;
 # (3) a future "freeze the clock for this transaction" need lands in one place.
+def _iso_instant(stamp: object) -> float:
+    """POSIX seconds for an ISO-8601 stamp — the key to ORDER stamps by time.
+
+    `_now_iso` writes the local UTC offset, so as STRINGS stamps sort by wall
+    clock rather than by time: across a DST fall-back `01:10-05:00` (the
+    later edit) sorts before `01:30-04:00`, and a notebook kept while
+    travelling interleaves its time zones. A stamp without an offset (older
+    files) is read as local time; one that does not parse sorts oldest."""
+    if not isinstance(stamp, str) or not stamp.strip():
+        return float("-inf")
+    s = stamp.strip()
+    if s[-1:] in ("Z", "z"):             # `fromisoformat` takes it from 3.11
+        s = s[:-1] + "+00:00"
+    try:
+        return _datetime.fromisoformat(s).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return float("-inf")
+
+
 def _now() -> _datetime:
     """Current wall-clock as a tz-aware datetime in the user's local
     zone. Use this everywhere instead of `datetime.now()`."""
@@ -1944,3 +2139,20 @@ def _to_ascii_text(s: object) -> str:
         folded = folded.encode("ascii", "ignore").decode("ascii")
         _emit(folded if folded else "?")
     return "".join(out)
+
+
+def _variant_group_key(v: dict) -> tuple:
+    """The key two reads' variants must share to count as the SAME variant.
+
+    Uses the left-normalised position when there is one, so a deletion an
+    aligner placed at three different offsets inside one homopolymer groups as
+    one event with three reads behind it rather than three events with one each.
+    """
+    if not isinstance(v, dict):
+        return ("?", 0, "", "")
+    kind = str(v.get("type") or "")
+    if "norm_pos" in v:
+        return (kind, int(v.get("norm_pos") or 0),
+                str(v.get("norm_ref") or ""), str(v.get("norm_alt") or ""))
+    return (kind, int(v.get("target_pos") or 0),
+            str(v.get("ref") or ""), str(v.get("alt") or ""))

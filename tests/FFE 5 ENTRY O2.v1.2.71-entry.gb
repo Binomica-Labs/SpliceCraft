@@ -1,0 +1,222 @@
+LOCUS       FFE_5_ENTRY_O2          2573 bp    DNA     circular SYN 27-OCT-2024
+DEFINITION  .
+ACCESSION   FFE_5_ENTRY_O2
+VERSION     FFE_5_ENTRY_O2
+KEYWORDS    .
+SOURCE      .
+  ORGANISM  .
+            .
+COMMENT     Created by SpliceCraft v1.2.71 on 2026-09-25
+            SpliceCraft-name: FFE 5 ENTRY O2
+FEATURES             Location/Qualifiers
+     misc_feature    993..998
+                     /label="XbaI"
+                     /ApEinfo_revcolor="#ff00ff"
+                     /ApEinfo_fwdcolor="#ff00ff"
+     misc_feature    join(47,48..52)
+                     /label="EcoRI"
+                     /ApEinfo_revcolor="#ff00ff"
+                     /ApEinfo_fwdcolor="#ff00ff"
+     primer_bind     1..17
+                     /note="common sequencing primer, one of multiple similar
+                     variants"
+                     /label="M13 fwd"
+                     /ApEinfo_revcolor="#a020f0"
+                     /ApEinfo_fwdcolor="#a020f0"
+                     /primer_seq="GTAAAACGACGGCCAGT"
+     misc_feature    20..46
+                     /label="IR-F"
+                     /ApEinfo_revcolor="#008080"
+                     /ApEinfo_fwdcolor="#008080"
+     misc_feature    18..19
+                     /label="Integration Seq"
+                     /ApEinfo_revcolor="#ff00ff"
+                     /ApEinfo_fwdcolor="#ff00ff"
+     primer_bind     complement(964..980)
+                     /note="common sequencing primer, one of multiple similar
+                     variants"
+                     /label="M13 rev"
+                     /ApEinfo_revcolor="#a020f0"
+                     /ApEinfo_fwdcolor="#a020f0"
+                     /primer_seq="CAGGAAACAGCTATGAC"
+     misc_feature    complement(935..961)
+                     /label="IR-R"
+                     /ApEinfo_revcolor="#008080"
+                     /ApEinfo_fwdcolor="#008080"
+     misc_feature    962..963
+                     /label="Integration Seq"
+                     /ApEinfo_revcolor="#ff00ff"
+                     /ApEinfo_fwdcolor="#ff00ff"
+     misc_feature    join(929..933,934)
+                     /label="KpnI"
+                     /ApEinfo_revcolor="#ff00ff"
+                     /ApEinfo_fwdcolor="#ff00ff"
+     misc_feature    981..986
+                     /label="XmaI"
+                     /ApEinfo_revcolor="#ff00ff"
+                     /ApEinfo_fwdcolor="#ff00ff"
+     misc_feature    987..992
+                     /label="XmaI"
+                     /ApEinfo_revcolor="#ff00ff"
+                     /ApEinfo_fwdcolor="#ff00ff"
+     misc_feature    2568..2573
+                     /label="BamHI"
+                     /ApEinfo_revcolor="#ff00ff"
+                     /ApEinfo_fwdcolor="#ff00ff"
+     misc_feature    2241
+                     /note="C to T to kill MlyI"
+                     /label="MUT"
+                     /ApEinfo_revcolor="#a6acb3"
+                     /ApEinfo_fwdcolor="#a6acb3"
+     rep_origin      1948..2567
+                     /direction=RIGHT
+                     /label="Ori*"
+                     /ApEinfo_revcolor="#ffff00"
+                     /ApEinfo_fwdcolor="#ffff00"
+     misc_feature    1942..1947
+                     /label="SalI"
+                     /ApEinfo_revcolor="#ff00ff"
+                     /ApEinfo_fwdcolor="#ff00ff"
+     misc_feature    1931..1941
+                     /label="Binomica Spacer"
+                     /ApEinfo_revcolor="#a6acb3"
+                     /ApEinfo_fwdcolor="#a6acb3"
+     misc_feature    1925..1930
+                     /label="HindIII"
+                     /ApEinfo_revcolor="#ff00ff"
+                     /ApEinfo_fwdcolor="#ff00ff"
+     promoter        999..1108
+                     /label="KanR Promoter"
+                     /ApEinfo_revcolor="#ffffff"
+                     /ApEinfo_fwdcolor="#ffffff"
+     CDS             1109..1924
+                     /codon_start=1
+                     /gene="aph(3')-Ia"
+                     /note="confers resistance to kanamycin in bacteria or G418
+                     (Geneticin®) in eukaryotes"
+                     /product="aminoglycoside phosphotransferase"
+                     /transl_table=1
+                     /translation="MSHIQRETSCSRPRLNSNMDADLYGYKWARDNVGQSGATIYRLYG
+                     KPDAPELFLKHGKGSVANDVTDEMVRLNWLTEFMPLPTIKHFIRTPDDAWLLTTAIPGK
+                     TAFQVLEEYPDSGENIVDALAVFLRRLHSIPVCNCPFNSDRVFRLAQAQSRMNNGLVDA
+                     SDFDDERNGWPVEQVWKEMHKLLPFSPDSVVTHGDFSLDNLIFDEGKLIGCIDVGRVGI
+                     ADRYQDLAILWNCLGEFSPSLQKRLFQKYGIDNPDMNKLQFHLMLDEFF*"
+                     /label="KanR"
+                     /ApEinfo_revcolor="#ccffcc"
+                     /ApEinfo_fwdcolor="#ccffcc"
+     misc_feature    138..143
+                     /label="NcoI"
+                     /ApEinfo_revcolor="#ff00ff"
+                     /ApEinfo_fwdcolor="#ff00ff"
+     CDS             140..865
+                     /codon_start=1
+                     /transl_table=1
+                     /translation="MVSSGEDIFSGLVPILIELEGDVNGHRFSVRGEGYGDASNGKLEI
+                     KFICTTGRLPVPWPTLVTTLSYGVQCFAKYPEHMRQNDFFKSAMPDGYVQERTISFKED
+                     GTYKTRAEVKFEGEALVNRIDLKGLEFKEDGNILGHKLEYSFNSHYVYITADKNRNGLE
+                     AQFRIRHNVDDGSVQLADHYQQNTPIGEGPVLLPEQHYLTTNSVLSKDPQERRDHMVLV
+                     EFVTAAGLSLGMDELYKS**"
+                     /label="fuGFP"
+                     /ApEinfo_revcolor="#00ff00"
+                     /ApEinfo_fwdcolor="#00ff00"
+     terminator      872..910
+                     /label="Terminator B1006"
+                     /ApEinfo_revcolor="#ff6600"
+                     /ApEinfo_fwdcolor="#ff6600"
+     misc_feature    866..871
+                     /label="SacI"
+                     /ApEinfo_revcolor="#ff00ff"
+                     /ApEinfo_fwdcolor="#ff00ff"
+     misc_feature    110..120
+                     /label="spacer"
+                     /ApEinfo_revcolor="#a6acb3"
+                     /ApEinfo_fwdcolor="#a6acb3"
+     RBS             121..132
+                     /note="strong bacterial ribosome binding site (Elowitz and
+                     Leibler, 2000)"
+                     /label="RBS B0030"
+                     /ApEinfo_revcolor="#339966"
+                     /ApEinfo_fwdcolor="#339966"
+     promoter        75..109
+                     /label="Promoter J23100"
+                     /ApEinfo_revcolor="#00ffff"
+                     /ApEinfo_fwdcolor="#00ffff"
+     misc_feature    133..137
+                     /label="MlyI"
+                     /note="/__SeqFeature__=True"
+                     /note="/__level__=0"
+                     /note="/name=MlyI"
+                     /note="/official_designation=MlyI"
+                     /note="/uuid=75fb195eb5a74e72bdce2a3ca7265588"
+                     /note="/vntifkey=21"
+                     /ApEinfo_revcolor="#ff00ff"
+                     /ApEinfo_fwdcolor="#ff00ff"
+     misc_feature    918..921
+                     /label="CGCT"
+                     /ApEinfo_revcolor="#00ffff"
+                     /ApEinfo_fwdcolor="#00ffff"
+     misc_feature    911..916
+                     /label="BsmBI"
+                     /ApEinfo_revcolor="#ffcc00"
+                     /ApEinfo_fwdcolor="#ffcc00"
+     misc_feature    complement(923..928)
+                     /label="BsaI"
+                     /ApEinfo_revcolor="#800000"
+                     /ApEinfo_fwdcolor="#800000"
+     misc_feature    complement(69..74)
+                     /label="BsmBI"
+                     /ApEinfo_revcolor="#ffcc00"
+                     /ApEinfo_fwdcolor="#ffcc00"
+     misc_feature    64..67
+                     /label="GGAG"
+                     /ApEinfo_revcolor="#00ffff"
+                     /ApEinfo_fwdcolor="#00ffff"
+     misc_feature    53..58
+                     /label="BsaI"
+                     /ApEinfo_revcolor="#800000"
+                     /ApEinfo_fwdcolor="#800000"
+ORIGIN
+        1 gtaaaacgac ggccagttaa caggttggct gataagtccc cggtctgaat tcggtctcag
+       61 tcaggagtga gacgttgacg gctagctcag tcctaggtac agtgctagct actagagatt
+      121 aaagaggaga aagagtccca tggtgagcag tggcgaagat attttctcgg gcttggttcc
+      181 gattctgatc gagctggagg gcgacgtgaa cggtcatcgt tttagcgttc gcggtgaagg
+      241 ttatggcgac gcgagcaacg gcaaactgga aattaagttc atctgcacga ccggtcgcct
+      301 gccggtgcct tggccgacct tggtgacgac cttgtcgtat ggcgtgcagt gttttgcgaa
+      361 gtatccggag cacatgcgcc aaaacgattt ctttaaaagt gccatgccgg acggttacgt
+      421 ccaggagcgt accatttcct tcaaggaaga tggcacgtac aaaactcgcg cagaggttaa
+      481 gtttgaaggt gaagcgctgg tcaatcgtat cgatttgaag ggtttggagt ttaaagagga
+      541 tggtaacatt ctgggccata aactggagta tagcttcaac agccattatg tttacattac
+      601 ggcagacaag aatcgtaacg gcttggaggc ccaattccgt attcgccaca atgttgatga
+      661 cggtagcgtc caactggccg accattacca acagaacacc ccaattggtg agggtccggt
+      721 gttgctgccg gaacaacact atctgacgac caatagcgtg ctgagcaaag atccgcagga
+      781 acgccgtgat cacatggtcc tggtggaatt tgtgaccgct gcgggcttga gcctgggtat
+      841 ggacgagctg tataagagct aataagagct caaaaaaaaa ccccgcccct gacagggcgg
+      901 ggtttttttt cgtctcacgc ttgagaccgg taccagaccg gggacttatc agccaacctg
+      961 ttagtcatag ctgtttcctg cccgggcccg ggtctagaaa agccacgttg tgtctcaaaa
+     1021 tctctgatgt tacattgcac aagataaaaa tatatcatca tgaacaataa aactgtctgc
+     1081 ttacataaac agtaatacaa ggggtgttat gagccatatt caacgggaaa cgtcttgctc
+     1141 gaggccgcga ttaaattcca acatggatgc tgatttatat gggtataaat gggctcgcga
+     1201 taatgtcggg caatcaggtg cgacaatcta tcgattgtat gggaagcccg atgcgccaga
+     1261 gttgtttctg aaacatggca aaggtagcgt tgccaatgat gttacagatg agatggtcag
+     1321 actaaactgg ctgacggaat ttatgcctct tccgaccatc aagcatttta tccgtactcc
+     1381 tgatgatgca tggttactca ccactgcgat ccccggcaaa acagcattcc aggtattaga
+     1441 agaatatcct gattcaggtg aaaatattgt tgatgcgctg gcagtgttcc tgcgccggtt
+     1501 gcattcgatt cctgtttgta attgtccttt taacagcgat cgcgtatttc gtctggctca
+     1561 ggcgcaatca cgaatgaata acggtttggt tgatgcgagt gattttgatg acgagcgtaa
+     1621 tggctggcct gttgaacaag tctggaaaga aatgcataag ctgttgccat tctcaccgga
+     1681 ttcagtcgtc actcatggtg atttctcact tgataacctt atttttgacg aggggaaatt
+     1741 aataggttgt attgatgttg gacgagtggg aatcgcagac cgataccagg atcttgccat
+     1801 cctatggaac tgcctcggtg agttttctcc ttcattacag aaacggcttt ttcaaaaata
+     1861 tggtattgat aatcctgata tgaataaatt gcagtttcat ttgatgctcg atgagttttt
+     1921 ctaaaagctt tatagattac agtcgacaga tcaaaggatc ttcttgagat cctttttttc
+     1981 tgcgcgtaat ctgctgcttg caaacaaaaa aaccaccgct accagcggtg gtttgtttgc
+     2041 cggatcaaga gctaccaact ctttttccga aggtaactgg cttcagcaga gcgcagatac
+     2101 caaatactgt tcttctagtg tagccgtagt taggccacca cttcaagaac tctgtagcac
+     2161 cgcctacata cctcgctctg ctaatcctgt taccagtggc tgctgccagt ggcgataagt
+     2221 cgtgtcttac cgggttggac ccaagacgat agttaccgga taaggcgcag cggtcgggct
+     2281 gaacgggggg ttcgtgcaca cagcccagct tggagcgaac gacctacacc gaactgagat
+     2341 acctacagcg tgagctatga gaaagcgcca cgcttcccga agggagaaag gcggacaggt
+     2401 atccggtaag cggcagggtc ggaacaggag agcgcacgag ggagcttcca gggggaaacg
+     2461 cctggtatct ttatagtcct gtcgggtttc gccacctctg acttgagcgt cgatttttgt
+     2521 gatgctcgtc aggggggcgg agcctatgga aaaacgccag caacgcggga tcc
+//

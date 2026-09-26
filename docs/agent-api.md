@@ -149,7 +149,13 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   end-exclusive `start`/`end` as every endpoint takes them, plus 1-based
   `start_1based`/`end_1based`; its own sequence 5'→3' on its strand, spliced
   parts joined; for a CDS the translation of the bases as they stand, with
-  `translation_matches_annotation` when the file carries a /translation; and
+  `translation_matches_annotation` when the file carries a /translation, and
+  `protein` — the protein as the CDS's own annotation reads it. The two differ
+  only at residue 1 of a CDS whose GTG / TTG start the file declares as Met
+  (its `/translation` begins M and agrees with the bases over its N-terminus,
+  or a `/transl_except` puts Met there): then `translation` keeps the codon
+  table's letter, `protein` has M, and `initiator` says so —
+  `{codon, codon_reads, declared_by: "translation" | "transl_except"}`; and
   `unique_cutters_inside` — every enzyme that cuts the whole plasmid once with
   that cut inside the feature, as `[{enzyme, cut_bp}]`);
   `amplify-feature` `{name | idx, type?, target_tm?}` (binding-only PCR primers
@@ -168,7 +174,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   supports `.gb` / `.gbk` / `.genbank` / `.dna` / `.embl` /
   FASTA / `.ab1` / single-record `.fastq` / `.gff3`),
   export GenBank / GFF3 / FASTA / EMBL / CommercialSaaS `.dna`
-  (symlink-guarded), bulk import a folder, bulk export a
+  (symlink-guarded), bulk import a folder (`bulk-import-folder` answers
+  `422` / `ok: false` when every file failed, and then creates no collection,
+  so a retry is not met with a 409; when only some failed it is `ok: true`
+  with `partial: true`, the `failures` and a `warnings` line), bulk export a
   collection — to any of those formats or a circular-map image
   (`png` / `svg`) — via `bulk-export-collection`, or export the
   LOADED plasmid's circular map alone (`png` / `svg`) via
@@ -186,12 +195,19 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   whole `{names:[…]}` list into one collection in a single locked save,
   the machine-friendly path that sidesteps the rate limiter; per-item
   results report copied/moved, not_found, ambiguous, and conflict, never
-  silently renaming or dropping), create / rename / delete collections,
-  get / set the active collection, list / set plasmid statuses.
+  silently renaming or dropping). A move is committed to the collections
+  file first; if refreshing the live library mirror then fails, the move
+  answers `ok: true` with a `warnings` entry saying so (the same holds for
+  `move-part`) instead of reporting a failure for a move that happened.
+  Create / rename / delete collections (deleting the ACTIVE one switches to
+  the next and returns it as `active`), get / set the active collection,
+  list / set plasmid statuses.
 - **Parts** — list-parts, get-part, create-part / update-part (full
   parity with the Part editor — name / grammar / type / level / position /
   overhangs / sequence plus `backbone`, selection `marker`, and
-  `fwd_primer` / `rev_primer` domestication primers, Tms derived),
+  `fwd_primer` / `rev_primer` domestication primers, Tms derived; a part
+  whose clone would re-create a Type IIS site at a junction comes back with
+  `junction_sites` and a warning, since it would be cut in its own assembly),
   delete-part, move-part (reassign a part to another bin in one atomic
   call), classify-part (overhang-pair lookup against every grammar),
   make-l0-part-from-fragment (turn a saved synthetic FRAG into a
@@ -325,7 +341,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   pUPD2-stub backbone, so an agent never files a wrong construct;
   `domesticate-parts` runs the same engine over a `{parts:[…]}` batch in
   ONE call — dirty-guard checked once, per-item results so one part that
-  can't clone doesn't abort the rest),
+  can't clone doesn't abort the rest. Each item gets the routing-key check a
+  single call gets (an item naming a key the engine ignores is that item's
+  `code: 400` + `unsupported`); a batch that built nothing answers `422`,
+  one that built some `ok: true` with `partial: true` + `warnings`),
   assemble-into-entry-vector (the multi-source level-up clone: chain L0
   parts into an α/L1 TU, or TUs into an Ω/L2 module, by their fusion
   overhangs and ligate into the configured `role` acceptor at the level-up
@@ -437,7 +456,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   `resolved_enzymes` reporting what each one became, and names the catalog
   genuinely doesn't know are reported under `unknown_enzymes` rather than
   silently dropped — this endpoint reports rather than refuses, so a long
-  list still returns the cuts it can make).
+  list still returns the cuts it can make. Only a request in which NO name
+  resolves is refused, `400` with `unknown_enzymes`: answering it would
+  present the uncut molecule as the digest).
 - **Transcripts** — `predict-transcript` reconstructs the MATURE mRNA of an
   annotated transcription unit on the loaded record and scores translation
   initiation on it. Pick the unit with `promoter` / `cds` / `terminator` (a
@@ -463,7 +484,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   -10) promoters and `scan-terminators` finds intrinsic (Rho-independent)
   terminators, on `{sequence | id | name}`, wrap-aware, with FORWARD-strand
   coordinates for hits on either strand. A promoter hit carries both hexamers,
-  the spacer, the predicted `tss`, a `score` and its `components`; **the score
+  the spacer, the predicted `tss` (`null` on a linear molecule when the start
+  site would fall past its end — it never wraps to bp 0), a `score` and its
+  `components`; **the score
   RANKS, it does not predict** — it is a composite of named parts with no
   trained model behind it, good for "does this insert carry a cryptic promoter
   and how does it compare with the others", not for a transcription rate. The
@@ -496,7 +519,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   reaches it. A T7-only cassette is `silent_in_host` in a strain with no T7
   RNAP — unless something else on the circle reads through into it, which is
   exactly the case that looks like a mystery at the bench. Each promoter
-  carries `host_recognised` plus the `host_basis` that decided it.
+  carries `host_recognised` plus the `host_basis` that decided it. A promoter
+  or terminator annotated with no strand is read FORWARD, flagged
+  `strand_unknown: true`, and named in `warnings` — it is never silently
+  dropped, which would make an arrowless terminator block nothing.
 - **Read heterogeneity** — `analyse-read-heterogeneity` reports per-base
   ALLELE FRACTIONS from raw reads: **is what I sequenced one thing?** Body
   `{reference | reference_id | reference_name, reads_path (a FASTQ) | reads,
@@ -527,8 +553,14 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   single ordinary read turn a clonal culture into `mixed`.
   The thresholds behind the verdict are echoed in
   `thresholds` — they are conventions, not a calibrated model. Reads are
-  bounded by a `reads x reference length` work budget; whenever it bites,
-  `capped_by` and a warning say so rather than quietly changing every fraction.
+  bounded by a `reads x reference length` work budget and by `max_reads`;
+  whenever either trims the set — the DEFAULT `max_reads` included —
+  `capped_by` names it and a warning says so, rather than quietly changing
+  every fraction (`capped_by` is null when every read was used). From a FASTQ
+  only the first `max_reads` reads are aligned, but `reads_available` counts
+  every read in the file. A mode is judged on the calls AT OR ABOVE the noise
+  floor, never on a bin that merely straddles it, and a reported
+  `mode_fraction` is never below the floor.
 
   **The verdict keys off the SHAPE of the distribution, not a count.** A count
   rule ("5+ positions above 1%") calls every long-read dataset `mixed`:
@@ -634,7 +666,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   writes `history_xml` and nothing else. `dry_run` defaults to `true` —
   the first call reports what would change; pass
   `{"dry_run": false}` to apply. Optional `collection` / `name` narrow
-  the scan.
+  the scan itself: only `.dna` files whose sequence matches a plasmid in
+  scope are indexed, so a run that stopped at the memory budget
+  (`truncated: true`) is finished a collection at a time.
   Agent assemblies (`gibson-assemble`,
   `traditional-clone`, `golden-gate-assemble`) attach real parent
   lineage — each input fragment / part / vector becomes a parent node, so
@@ -811,9 +845,17 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   collection is a real partition, not only for writes). `delete-primers`
   prunes a whole `{names:[…]}` batch in ONE locked save (the machine-friendly
   path for a large cleanup that would otherwise trip the rate limiter),
-  reporting `removed` / `not_found` / `ambiguous`.
+  reporting `removed` / `not_found` / `ambiguous`; a batch that removed
+  nothing answers `404` / `ok: false` with an `error` that counts both (`409`
+  when every name was ambiguous), and one that removed some answers `ok: true`
+  with `partial: true` and a `warnings` line for what it left. `copy-plasmids`
+  / `move-plasmids` answer the same way.
 - **Data safety** — list-backups, restore-backup,
-  list-pre-update-snapshots, restore-pre-update-snapshot.
+  list-pre-update-snapshots, restore-pre-update-snapshot. Restoring a
+  settings backup whose active collection, primer library, parts bin or
+  project no longer exists answers `409` with nothing changed; unsaved work
+  is saved into its own collection before anything is restored, and the
+  whole restore holds the data lock, so no save can land in the middle.
 - **Settings** — get-settings, set-setting (allowlisted toggles only;
   a handful of settings — the Plasmidsaurus secret, the online-search
   egress gate `allow_online_search` — are deliberately NOT in the
@@ -908,7 +950,19 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   `transfer` (with optional `mix_before` / `mix_after` / `blow_out` / `touch_tip`),
   `distribute` (one source → many wells), `consolidate` (many wells → one),
   `mix`, `delay`, `pause`, `comment` — compiled into one protocol; a control-only
-  protocol (delay/pause/comment) needs no tips or labware. `ot2-analyze` uploads a plan/protocol to the robot for its **built-in
+  protocol (delay/pause/comment) needs no tips or labware. A plan that fails
+  validation answers `422` / `ok: false` (with `valid: false` and its
+  `errors`). Validation follows what the robot's own planner does: a tip rack
+  from another pipette's family is an error, and so is a `distribute` /
+  `consolidate` whose single trip will not fit the tip (the planner splits
+  against the PIPETTE's maximum but loads against the TIP's, and silently
+  ends the step at the first piece that does not fit); a multichannel step
+  may start only in the rows its first channel reaches (row A on a 96-well
+  plate, A–B on a 384); a custom definition with a well below the deck is
+  refused. Wells
+  are compiled the way the robot names them — `a1` and `A01` are written `A1`,
+  a custom definition's own key is used verbatim — so a plan the validator
+  passes is one the robot can load. `ot2-analyze` uploads a plan/protocol to the robot for its **built-in
   simulate** — server-side validation with NO motion, the pre-flight for a run.
   `ot2-status` returns a full state snapshot for **crash monitoring**:
   reachability + versions, pipette OK flags + volume specs, motor engagement,
@@ -920,8 +974,28 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   `{"confirm": true}`, refuses on an already-faulted robot (pre-flight check), and
   monitors state throughout — halting and reporting the instant a fault is
   detected. Pass `{"wait": false}` to start a run and poll `ot2-status` with the
-  returned `run_id` to watch it live. Host comes from the body's `host` or the
-  persisted `ot2_host` setting. (Compiler + client live in the app-free
+  returned `run_id` to watch it live. `ok` says whether the run did its job: a
+  dry call (no `confirm`) whose analysis passed is `ok`, as is a run started
+  with `wait: false`; a pre-flight refusal, a crash, or a run that ENDED
+  `failed` or `stopped` is `422` / `ok: false` with an `error` naming why — so
+  check `ok`, not just `ran`. (`422`, never a 5xx or 409: those are statuses a
+  client may retry on its own, and a retried run moves the robot again. A run
+  that started but could not be watched to its end — the play request
+  failed, the monitor lost it, or it outran its timeout — is STOPPED and
+  answers `422` with `crashed: true` the same way. `ot2-position-check`
+  answers the same way.) The pre-run pipette check
+  compares GENERATIONS: a
+  protocol for a GEN2 pipette is refused with a GEN1 attached, while a GEN1
+  protocol runs on the GEN2 pipette Opentrons back-maps it to. Host comes from
+  the body's `host` or the persisted `ot2_host` setting, and must be on your
+  own network: a private, link-local (USB) or CGNAT/Tailscale address, an
+  address in one of this computer's own /24 networks (campus networks hand
+  lab devices public addresses), or the address saved in AUTOLAB (`ot2_host`
+  — only AUTOLAB writes it). Every name, `.local` included, is resolved,
+  every address it returns must pass, and the request is sent to the address
+  that was checked — never looked up a second time. A cloud-metadata address
+  is refused however it is written (an IPv4-mapped `::ffff:` form included),
+  as is a URL carrying credentials or a port outside 1–65535. (Compiler + client live in the app-free
   `splicecraft_opentrons` sibling.)
 - **OT-2 run control** — `ot2-run-control` (a **write** endpoint) pauses, resumes,
   or stops a live run: `{"host": ..., "action": "pause"|"resume"|"stop",
@@ -934,7 +1008,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   It respects the pipette's volume floor/ceiling (from `pipette`, or `min_vol` /
   `max_vol`), flags samples too dilute/concentrated to reach target (never dropping
   them), and — when a `src` + `dst` (+ `dst_wells` or `dst_labware`, optional
-  `diluent_ref`) is given — also returns compile-ready `steps`.
+  `diluent_ref`) is given — also returns compile-ready `steps`. One labware may
+  be both `src` and `dst` only when `dst_wells` is given and none of those
+  wells is a sample or the diluent well (`400` otherwise — the defaults fill
+  from A1, over samples still to be read).
 - **OT-2 plate map** — `ot2-plate-map` maps a plasmid collection onto a labware's
   wells row-major (the "a plate IS a collection" link): `{"collection", "labware"}`
   → `{map: {well: {id, name}}, wells, n, overflow}`. Feed the result into
@@ -1031,6 +1108,9 @@ also needlessly double the API's largest response. Don't blindly read
   codon is chosen from the active codon-usage table, with `alternatives` ranked
   so you can pick one that avoids a site you care about. `silent`,
   `creates_stop` and `removes_stop` are reported rather than refused.
+  `initiator` is set when residue 1 is a start codon the CDS's annotation
+  reads as Met (see `find-feature`): `wt_aa` is then `M`, and changing the
+  codon to ATG is a silent edit.
 - **Reads + verification** — `read-consensus` combines every read STORED on a
   plasmid: for each difference, how many reads that COVER that base show it and
   how many looked and disagreed (`confirmed` / `single_read` / `unconfirmed` /
@@ -1038,7 +1118,16 @@ also needlessly double the API's largest response. Don't blindly read
   "100% identity" over the half that was sequenced. `verify-against-reads` takes
   read SEQUENCES instead, and its optional `read_quality` (per-read Phred
   arrays) splits each read's differences into the ones it supports and the ones
-  sitting in unreliable basecalls.
+  sitting in unreliable basecalls. Each read is judged on its COVERED identity —
+  over the stretch of reference the read spans, where a deletion or insertion
+  inside that stretch counts against it and an `N` is a no-call, neither match
+  nor mismatch. A read that covers nothing (all `N`) is never a pass, and a
+  read that does not span the whole plasmid is marked `partial` (with its
+  `covered_bp` / `coverage_pct`): a pass then confirms that window only. A
+  read with fewer than 20 aligned bases is `too_short` and never passes. The
+  reference's topology is honoured throughout — a linear reference is never
+  judged as a circle — and a local-mode read's clipped ends are not counted
+  as deletions.
 - **Ordering + the bench** — `export-primers` writes an order sheet
   (`generic` / `idt` / `plate` — row-major A1..A12 wells, rolling onto plate 2
   past 96 oligos), closing the gap where only the GUI could order oligos.
@@ -1049,11 +1138,24 @@ also needlessly double the API's largest response. Don't blindly read
 
 ## Security posture
 
-- **Bearer-token auth** on every write endpoint; reads are
-  unauthenticated to keep scripted introspection ergonomic.
+- **Bearer-token auth on EVERY endpoint**, reads included — the token
+  check fires before the handler lookup, so an unauthenticated probe for
+  any path gets a uniform `401` rather than a `404` that would confirm
+  which endpoints exist. (The two pre-envelope endpoints below,
+  `health` and `tools`, are the documented exceptions: a client has to
+  be able to self-describe before it holds a token.) This section used
+  to say reads were unauthenticated; they have not been for some time,
+  and a reader planning around that would have mis-set their own
+  expectations about what a co-resident local process can read.
 - **Localhost only** (`127.0.0.1`) — single-tenant by design. Do not
   expose on a LAN.
 - **Inputs are length-, range-, and shape-validated at the boundary.**
+  A request body must arrive with a `Content-Length`: one sent with a
+  transfer coding (chunked, gzip…) answers `411`, as does an HTTP/1.0
+  request that carries a body without one — it used to run as an empty
+  request. With an idempotency key, a body too deeply nested to fingerprint
+  is refused (`400`) rather than risking a replay of another request's
+  answer.
 - **Symlink refusal**: write paths go through
   `_check_agent_write_path` which walks the full ancestor chain via
   `resolve()` divergence + per-segment `is_symlink()`. Pre-fix this
@@ -1133,11 +1235,22 @@ auto-filed on `save` — creating a new library entry requires an explicit
 collection. Unknown body keys are echoed back under `ignored` rather than
 silently dropped. A stricter guard applies to a closed set of **routing /
 selection** params (`collection`, `source_collection`, `bin`, `parts_bin`,
-`enzyme`, `enzymes`, `orientation`, `rename`): passing one to an endpoint that
+`enzyme`, `enzymes`, `orientation`, `rename`, `carry_annotations`): passing
+one to an endpoint that
 doesn't accept it is a hard **400** (it would change *where/how* the op applies,
 so a silent drop is the SC-D footgun) — while any *other* unknown key stays soft
-for forward-compat. Currently enforced on the `move-primer` / `move-part` /
-`move-experiment` routers.
+for forward-compat. The check is central, on every WRITE endpoint: the
+dispatcher derives the keys each handler actually reads from its own code
+(following `payload` into the helpers it is passed to) and refuses a routing
+key the handler would ignore with `400` and `unsupported: [...]` —
+`delete-part {"parts_bin": "Archive"}` used to answer `200` and delete from
+the ACTIVE bin. The analysis follows a key read inside a constant-tuple loop
+and reads an f-string key as its shape — so `traditional-clone` is known to
+take `vector_collection` / `insert_collection` and a bare `collection` is
+refused, rather than the product quietly landing in the active collection. A
+routing key sent EMPTY (`null`, `""`, `false`, `[]`, `{}`) is inert and never
+refused — typed clients send optional fields that way. A handler whose reads
+cannot be fully traced is left alone rather than guessed at.
 
 `load-file` and `add-current-to-library` accept optional `{id, name}`
 overrides to stamp the record's identity directly. This is the
@@ -1155,6 +1268,13 @@ applied to a copy, so the live canvas record is untouched.
   `@work(thread=True)` workers; the API returns immediately with a
   status the client can poll, OR blocks the request until the worker
   completes — endpoint-specific.
+- A fixed set of CPU- or network-heavy endpoints (`blast`, `hmmscan`,
+  `multi-align`, `optimize-protein`, `verify-against-reads`,
+  `analyse-read-heterogeneity`, `fetch`, `blast-online`, `design-guides`,
+  `scan-terminators`, `map-transcription`, … — `_AGENT_HEAVY_ENDPOINTS`) share
+  a concurrency cap of half the CPU cores (at least 2). A call past the cap is
+  answered at once with `503` and `retry_after: 2` rather than queued; nothing
+  ran, so retrying it is safe.
 - The agent server uses `_agent_save_or_500(save_fn, label)` for
   every `_save_*` call so an OSError / RuntimeError becomes a 500 +
   in-app notify, not a silent in-memory / disk desync.

@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from rich.markup import escape as _rich_escape
+from splicecraft_util import _markup_escape as _rich_escape
 
 import splicecraft_logging as _logging
 import splicecraft_net as _net
@@ -739,19 +739,17 @@ _INLINE_MD_RE = re.compile(r"\*\*(.+?)\*\*|`([^`]+)`")
 
 
 def _escape_no_dangling(text: str) -> str:
-    """Rich-escape `text`, guaranteeing it cannot swallow a tag that follows.
+    """Escape `text`, guaranteeing it cannot swallow a tag that follows.
 
-    Rich reads ``\\[`` as a literal ``[``. So if an escaped run ends in an ODD
-    number of backslashes — which ordinary model prose does, e.g. ``\\**bold**``
-    or a LaTeX-ish fragment — the very next emitted ``[b]`` is eaten as text,
-    its ``[/b]`` becomes an orphan, and Rich raises MarkupError out of
-    `Static.update`. Doubling the trailing backslash keeps the text literal
-    AND leaves the following tag intact."""
-    out = _rich_escape(text)
-    trailing = len(out) - len(out.rstrip("\\"))
-    if trailing % 2:
-        out += "\\"
-    return out
+    A markup parser reads ``\\[`` as a literal ``[``, so an escaped run that
+    ends in a backslash — ordinary model prose does, e.g. ``\\**bold**`` or a
+    LaTeX-ish fragment — ate the very next emitted ``[b]``, orphaned its
+    ``[/b]``, and raised MarkupError out of `Static.update`.
+    `_markup_escape` (imported here as `_rich_escape`) puts an invisible
+    U+200B after such a backslash, and escapes EVERY ``[`` — Rich's own
+    escape left Textual's ``[$var]`` tags alone, so a model could hide the
+    rest of its reply from the user (round-2 hardening, 2026-09-25)."""
+    return _rich_escape(text)
 
 
 def _inline_md(s: str) -> str:

@@ -16,10 +16,15 @@ For every save through `_safe_save_json` (the only sanctioned path):
    "non-empty and closes with `}`" tail check for larger ones — so a
    silently-truncated write is caught and the live file is left intact
    instead of being overwritten with garbage.
-2. **Rotating timestamped backups** (`*.json.bak.YYYYMMDD-HHMMSS`,
+2. **Rotating numbered backups** (`*.json.bak.YYYYMMDD-HHMMSS.gNNNNNN`,
    last 10 retained per file) so an *old* good copy is recoverable,
-   not just the most recent. Two refinements keep this from eating
-   disk on big libraries:
+   not just the most recent. Backups are ordered by the **generation
+   number** (`gNNNNNN`, one higher than any backup already on disk),
+   never by the clock stamp beside it: ordering by the stamp let two
+   backups in one second, or a system clock that stepped back, file the
+   newest as the oldest — and retention then deleted it at once. Older
+   stamp-only names still sort, as older than every numbered one. Two
+   refinements keep this from eating disk on big libraries:
    - **Compression** — at launch, every timestamped backup except the
      newest is gzipped (`*.bak.<ts>.gz`); plasmid JSON compresses
      ~4-5×. The newest timestamped backup and the legacy `.bak` stay
@@ -49,6 +54,27 @@ For every save through `_safe_save_json` (the only sanctioned path):
    collection could be refused outright.) The `lost_entries/` directory
    is now itself bounded (last 5 files, ≤ 500 MB) — pre-1.0.22 it grew
    without limit, reaching 1.5 GB of switch-driven spills.
+
+**Restoring a spill merges it.** A `lost_entries/` file holds only what
+one shrinking save dropped, so Settings → Restore from backup (and the
+agent's `restore-backup`) ADD its entries back into the current file
+instead of replacing the file with them — a collection it holds gets its
+missing plasmids or primers back, and an entry vector is matched by its
+grammar and role, not its name.
+
+**Nothing is left without a collection.** Plasmids saved while no
+collection was active (the active one deleted, say) are gathered into a
+**Recovered plasmids** collection at the next launch, and orphaned primers
+into **Recovered primers**, with a notice — rather than being overwritten
+by whichever collection becomes active — also when a primer collection
+is switched away from while none was active. Restoring `collections.json`
+(or the primer / parts-bin / notebook-project collections) from a backup
+re-stages the live mirror from what was restored, so the next ordinary
+save cannot write the pre-restore state back over it. Restoring
+`settings.json` first saves unsaved work into its own collection, refuses
+(changing nothing) a backup that names a collection, primer library, parts
+bin or project that no longer exists, and holds the data lock from start
+to finish so no save can land in between.
 
 **Recovery.** On load, a corrupt main file is restored from the legacy
 `.bak`; if **both** the main file and `.bak` are corrupt (e.g. two bad

@@ -40,12 +40,12 @@ import splicecraft_opentrons as _ot2
 from splicecraft_dataaccess import (_load_custom_labware, _load_protocol_collections,
                                     _save_custom_labware, _save_protocol_collections)
 from splicecraft_backup import (_list_pre_update_snapshots)
-from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _feat_len, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len, _span_in_span)
-from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi, _enzyme_is_type_iis)
-from splicecraft_codon import (_CODON_RAMP_CODONS, _CODON_RARE_W, _codon_relative_adaptiveness, _CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_cai, _codon_diversify, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
+from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _feat_len, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len, _span_full_lap_len, _span_in_span)
+from splicecraft_cloning import (_cloned_plasmid_regenerated_sites, _GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi, _enzyme_is_type_iis)
+from splicecraft_codon import (_CODON_RAMP_CODONS, _CODON_RARE_W, _codon_relative_adaptiveness, _CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_ambiguous_stops, _codon_cai, _codon_diversify, _codon_table_for, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
 from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _flush_dirty_mirror_before_switch, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_all_experiments, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
-from splicecraft_experiments import (_EXPERIMENT_ACTIONS, _experiment_duplicate, _experiment_html_document, _experiment_markdown_document, _experiment_project_markdown, _experiment_ref_token_ok, _experiment_search, _experiment_snippet, _experiment_search_terms, _experiment_template_markdown, _experiments_referencing, _new_experiment_id, _normalise_experiment_entry, _protocol_steps_markdown, _sanitize_experiment_id)
-from splicecraft_fileio import (_PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
+from splicecraft_experiments import (_EXPERIMENT_ACTIONS, _as_str_list, _tag_values, _experiment_duplicate, _experiment_html_document, _experiment_markdown_document, _experiment_project_markdown, _experiment_ref_token_ok, _experiment_search, _experiment_snippet, _experiment_search_terms, _experiment_template_markdown, _experiments_referencing, _new_experiment_id, _normalise_experiment_entry, _protocol_steps_markdown, _sanitize_experiment_id)
+from splicecraft_fileio import (_insdc_qualifier_name, _PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
 from splicecraft_gels import (_new_gel_id, _normalise_gel_entry)
 from splicecraft_history import (_HISTORY_NODE_MAX_DEPTH, _HISTORY_NODE_MAX_NODES, _history_build_steps, _history_node_warnings)
 from splicecraft_crispr import (  # noqa: E402
@@ -64,13 +64,13 @@ from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq,
                                 _topology_from_gb_text)
 from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript, _map_transcription)
-from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _feature_traversal, _phred_in_alignment_frame, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _degenerate_tm_bracket, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
+from splicecraft_util import (_iso_instant, _variant_group_key, _PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _feature_traversal, _phred_in_alignment_frame, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _degenerate_tm_bracket, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
-from splicecraft_biology import (_digest_with_enzymes, _enzyme_aliases, _enzyme_cuts, _enzyme_resolve_one, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
+from splicecraft_biology import (_covered_identity, _read_extent_for, _read_is_clipped, _digest_with_enzymes, _enzyme_aliases, _enzyme_site_methylation_targets, _methylated_base_positions, _enzyme_cuts, _enzyme_resolve_one, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
 from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _build_synthesis_l0_fragment, _design_gb_primers, _entry_vector_acceptor_overhangs, _grammar_position_by_type, _l0_part_from_syn_fragment)
 from splicecraft_dataaccess import (_active_enzyme_resolution, _agent_scan_library_for_key, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
-from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member, _fastq_path_to_records)
+from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member, _fastq_count_reads, _fastq_path_to_records)
 from splicecraft_gels import (_AGAROSE_CHOICES, _GEL_HEIGHT_MAX, _GEL_HEIGHT_MIN, _GEL_LANE_WIDTH_MAX, _GEL_LANE_WIDTH_MIN, _GEL_MAX_LANES, _agarose_mobility, _gel_bands_for_lane, _gel_resolve_enzymes, _render_gel_image)
 from splicecraft_persistence import (_safe_save_json_mirror)
 from splicecraft_regulatory import (_PROMOTER_MIN_SCORE, _TERM_MAX_STEM, _TERM_MIN_STEM, _TERM_MIN_U_TRACT, _TERM_U_TRACT_WINDOW, _scan_promoters, _scan_terminators)
@@ -405,6 +405,271 @@ _AGENT_DANGEROUS_PARAMS = frozenset({
 })
 
 
+# ── Which payload keys can a handler read? ──────────────────────────────────
+# `_agent_reject_dangerous_unknowns` needs each endpoint's accepted keys, and
+# only a handful of the ~130 write endpoints passed it any — so `delete-part`
+# given `{"parts_bin": "Archive"}` answered 200 and deleted from the ACTIVE bin
+# (audit 2026-09-22, AA5). The dispatcher now works the set out from the
+# handler itself: an AST walk that records every constant key read from the
+# `payload` argument, following `payload` into the helpers it is handed to.
+# Anything the walk cannot account for — `payload.items()`, `**payload`,
+# `payload.get(variable)`, a callee it cannot resolve — makes the answer
+# UNKNOWN (None), and an unknown endpoint is simply not checked centrally. So
+# the check can refuse only a key the handler provably never reads; it can
+# never refuse one it does.
+
+# Calls that take `payload` and cannot change what a handler READS from it.
+_PAYLOAD_INERT_CALLS = frozenset({"isinstance", "len", "bool", "id", "type"})
+# Helpers whose SECOND argument declares the keys a handler recognises.
+_PAYLOAD_DECLARING_CALLS = frozenset({
+    "_agent_ignored_keys", "_agent_reject_dangerous_unknowns"})
+# Helpers called as ``f(payload, "key", …)`` that read exactly that one key.
+# Every OTHER helper called that way is analysed like any callee: taking the
+# constant for the key read `_agent_active_collection_only(payload,
+# "delete-from-library")` — whose second argument names the ENDPOINT and which
+# reads `collection` — as reading a key called "delete-from-library", and a
+# `collection` the helper accepts was refused with 400.
+_PAYLOAD_KEYED_READERS = frozenset({"_payload_bool"})
+_PAYLOAD_KEYS_MAX_DEPTH = 4
+_PAYLOAD_KEYS_CACHE: "dict[object, frozenset | None]" = {}
+# Marks an entry of `_agent_payload_keys` that is a regex over key NAMES (an
+# f-string key) rather than a key; no real key starts with a NUL.
+_PAYLOAD_KEY_PATTERN = "\x00re:"
+
+
+def _agent_payload_keys(fn) -> "frozenset | None":
+    """The constant keys agent handler ``fn`` can read from its payload (its
+    second parameter), or None when that cannot be established. Cached."""
+    if fn in _PAYLOAD_KEYS_CACHE:
+        return _PAYLOAD_KEYS_CACHE[fn]
+    try:
+        keys = _payload_keys_of(fn, 1, 0, frozenset())
+    except Exception:                 # analysis must never break a request
+        _log.debug("payload-key analysis failed for %r", fn, exc_info=True)
+        keys = None
+    _PAYLOAD_KEYS_CACHE[fn] = keys
+    return keys
+
+
+def _payload_keys_of(fn, param: "int | str", depth: int,
+                     seen: frozenset) -> "frozenset | None":
+    import ast as _ast
+    import textwrap as _textwrap
+    if depth > _PAYLOAD_KEYS_MAX_DEPTH or fn in seen:
+        return None
+    fn = inspect.unwrap(fn)
+    try:
+        tree = _ast.parse(_textwrap.dedent(inspect.getsource(fn)))
+    except (OSError, TypeError, SyntaxError, ValueError):
+        return None
+    fdef = next((n for n in tree.body
+                 if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))),
+                None)
+    if fdef is None or fdef.name != getattr(fn, "__name__", None):
+        # Not the function that is running: its file changed on disk since it
+        # was imported (an update under a live server), and the source read
+        # back is some other function. Unknown, never another's key set.
+        return None
+    pos = [a.arg for a in fdef.args.posonlyargs + fdef.args.args]
+    if isinstance(param, str):
+        pname = param if param in pos or any(
+            a.arg == param for a in fdef.args.kwonlyargs) else None
+    else:
+        pname = pos[param] if param < len(pos) else None
+    if pname is None:
+        return None
+    parent = {}
+    for node in _ast.walk(fdef):
+        for child in _ast.iter_child_nodes(node):
+            parent[child] = node
+    glb = getattr(fn, "__globals__", {}) or {}
+    keys: set = set()
+    seen = seen | {fn}
+    # `for k in ("a", "b"):` loops over constants — the key a
+    # `payload.get(k)` inside one reads is one of them.
+    # Only a name bound NOWHERE else: `for k in payload:` elsewhere in the same
+    # function reuses `k` for any key at all.
+    loop_consts: "dict[str, set]" = {}
+    const_bindings: "dict[str, int]" = {}
+    bindings: "dict[str, int]" = {}
+    for node in _ast.walk(fdef):
+        if isinstance(node, _ast.Name) and isinstance(node.ctx, _ast.Store):
+            bindings[node.id] = bindings.get(node.id, 0) + 1
+        elif isinstance(node, _ast.arg):
+            bindings[node.arg] = bindings.get(node.arg, 0) + 1
+        if (isinstance(node, (_ast.For, _ast.comprehension))
+                and isinstance(node.target, _ast.Name)
+                and isinstance(node.iter, (_ast.Tuple, _ast.List, _ast.Set))):
+            vals = [e.value for e in node.iter.elts
+                    if isinstance(e, _ast.Constant) and isinstance(e.value, str)]
+            if len(vals) == len(node.iter.elts):
+                loop_consts.setdefault(node.target.id, set()).update(vals)
+                const_bindings[node.target.id] = (
+                    const_bindings.get(node.target.id, 0) + 1)
+    loop_consts = {k: v for k, v in loop_consts.items()
+                   if bindings.get(k) == const_bindings.get(k)}
+
+    def _const_str(node) -> "str | None":
+        if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return None
+
+    def _key_reads(node) -> "set | None":
+        """The keys a subscript / `.get()` argument can name: a constant, a
+        loop variable over constants, or an f-string — recorded as a
+        `_PAYLOAD_KEY_PATTERN` pattern, which can match only keys of its
+        shape (`f"{side}_collection"` never reads `collection`)."""
+        k = _const_str(node)
+        if k is not None:
+            return {k}
+        if isinstance(node, _ast.Name) and node.id in loop_consts:
+            return set(loop_consts[node.id])
+        if isinstance(node, _ast.JoinedStr):
+            parts = []
+            for v in node.values:
+                if isinstance(v, _ast.Constant) and isinstance(v.value, str):
+                    parts.append(re.escape(v.value))
+                else:
+                    parts.append(".*")
+            return {_PAYLOAD_KEY_PATTERN + "".join(parts)}
+        return None
+
+    def _declared(node) -> "set | None":
+        """Constant strings in a set / list / tuple literal, or in a
+        module-level container a Name resolves to."""
+        if isinstance(node, (_ast.Set, _ast.List, _ast.Tuple)):
+            vals = [_const_str(e) for e in node.elts]
+            return None if any(v is None for v in vals) else set(vals)
+        if isinstance(node, _ast.Name) and isinstance(
+                glb.get(node.id), (set, frozenset, list, tuple)):
+            vals = glb[node.id]
+            return (set(vals) if all(isinstance(v, str) for v in vals)
+                    else None)
+        if (isinstance(node, _ast.BinOp)
+                and isinstance(node.op, (_ast.BitOr, _ast.Add))):
+            a, b = _declared(node.left), _declared(node.right)
+            return None if a is None or b is None else (a | b)
+        if (isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name)
+                and node.func.id in ("set", "frozenset") and len(node.args) == 1):
+            return _declared(node.args[0])
+        return None
+
+    for node in _ast.walk(fdef):
+        if not (isinstance(node, _ast.Name) and node.id == pname
+                and isinstance(node.ctx, _ast.Load)):
+            continue
+        up = parent.get(node)
+        if isinstance(up, _ast.Attribute) and up.value is node:
+            call = parent.get(up)
+            if (up.attr in ("get", "pop") and isinstance(call, _ast.Call)
+                    and call.func is up and call.args):
+                ks = _key_reads(call.args[0])
+                if ks is not None:
+                    keys |= ks
+                    continue
+            return None
+        if isinstance(up, _ast.Subscript) and up.value is node:
+            ks = _key_reads(up.slice)
+            if ks is None:
+                return None
+            keys |= ks
+            continue
+        if (isinstance(up, _ast.Compare) and len(up.ops) == 1
+                and isinstance(up.ops[0], (_ast.In, _ast.NotIn))
+                and up.comparators[0] is node
+                and _const_str(up.left) is not None):
+            keys.add(_const_str(up.left))
+            continue
+        if isinstance(up, _ast.Call) and node in up.args:
+            fname = (up.func.id if isinstance(up.func, _ast.Name) else None)
+            if fname in _PAYLOAD_INERT_CALLS:
+                continue
+            i = up.args.index(node)
+            if fname in _PAYLOAD_DECLARING_CALLS:
+                if len(up.args) > i + 1:
+                    decl = _declared(up.args[i + 1])
+                    if decl is None:
+                        return None
+                    keys |= decl
+                continue
+            if (fname in _PAYLOAD_KEYED_READERS and len(up.args) > i + 1
+                    and _const_str(up.args[i + 1]) is not None):
+                # `_payload_bool(payload, "key")`.
+                keys.add(_const_str(up.args[i + 1]))
+                continue
+            callee = glb.get(fname) if fname else None
+            if not callable(callee):
+                return None
+            sub = _payload_keys_of(callee, i, depth + 1, seen)
+            if sub is None:
+                return None
+            keys |= sub
+            continue
+        if isinstance(up, _ast.keyword) and isinstance(parent.get(up), _ast.Call):
+            call = parent[up]
+            fname = (call.func.id if isinstance(call.func, _ast.Name) else None)
+            callee = glb.get(fname) if fname else None
+            if not callable(callee) or up.arg is None:
+                return None
+            sub = _payload_keys_of(callee, up.arg, depth + 1, seen)
+            if sub is None:
+                return None
+            keys |= sub
+            continue
+        return None
+    return frozenset(keys)
+
+
+# Routing keys that are FLAGS: any spelling `_payload_bool` reads as false
+# asks for nothing.
+_AGENT_FLAG_PARAMS = frozenset({"carry_annotations"})
+
+
+def _agent_enzyme_string_list(text: str) -> "list[str]":
+    """Enzymes named in ONE string (a GET query has no lists): the whole
+    string when it IS an enzyme — a custom enzyme's name may hold a comma,
+    and `create-custom-enzyme` accepts it — else its comma-separated parts.
+    Splitting first turned ``"Cus,1"`` into an unknown ``Cus`` (round-2
+    hardening, 2026-09-25)."""
+    whole = str(text).strip()
+    if whole and _enzyme_resolve_one(whole) is not None:
+        return [whole]
+    return [part.strip() for part in whole.split(",") if part.strip()]
+
+
+def _agent_routing_value_inert(value, key: "str | None" = None) -> bool:
+    """A routing key sent as null, "", false or an empty list / object names
+    no target and changes nothing — typed clients and LLM tool calls send
+    optional fields that way, and refusing them on the key's presence alone
+    broke ~120 write endpoints for those callers.
+
+    A FLAG (`_AGENT_FLAG_PARAMS`) is also inert when it reads as false the way
+    the handlers read it (`_payload_bool`): ``"false"``, ``"no"``, ``0`` —
+    refusing those while accepting ``false`` rejected requests v1.2.71 served
+    (round-2 hardening, 2026-09-25). A NAME is never coerced: a collection
+    may be called ``"0"``."""
+    if value is None or value is False or (
+            isinstance(value, (str, list, tuple, dict)) and not value):
+        return True
+    return key in _AGENT_FLAG_PARAMS and _coerce_bool(value, name=key) is False
+
+
+def _agent_unread_routing_keys(fn, payload) -> "list[str]":
+    """The routing/selection keys in ``payload`` that handler ``fn`` provably
+    never reads (empty when it reads them all, or when that is unknown)."""
+    if not isinstance(payload, dict):
+        return []
+    accepted = _agent_payload_keys(fn)
+    if accepted is None:
+        return []
+    patterns = [re.compile(a[len(_PAYLOAD_KEY_PATTERN):], re.DOTALL)
+                for a in accepted if a.startswith(_PAYLOAD_KEY_PATTERN)]
+    return sorted(str(k) for k, v in payload.items()
+                  if k in _AGENT_DANGEROUS_PARAMS and k not in accepted
+                  and not any(p.fullmatch(str(k)) for p in patterns)
+                  and k != "force" and not _agent_routing_value_inert(v, k))
+
+
 def _agent_reject_dangerous_unknowns(payload, allowed):
     """Fail loud (400) when ``payload`` carries a routing/selection param from
     `_AGENT_DANGEROUS_PARAMS` that this endpoint does NOT accept — the "silent
@@ -416,8 +681,9 @@ def _agent_reject_dangerous_unknowns(payload, allowed):
     if not isinstance(payload, dict):
         return None
     ok = set(allowed) | {"force"}
-    bad = sorted(str(k) for k in payload
-                 if k in _AGENT_DANGEROUS_PARAMS and k not in ok)
+    bad = sorted(str(k) for k, v in payload.items()
+                 if k in _AGENT_DANGEROUS_PARAMS and k not in ok
+                 and not _agent_routing_value_inert(v, k))
     if bad:
         keys = ", ".join(repr(k) for k in bad)
         return ({"error":
@@ -451,6 +717,16 @@ def _agent_sanitize_qualifiers(raw):
         key = _sanitize_label(str(k), max_len=50)
         if not key:
             continue
+        # A qualifier NAME has an INSDC charset. Accepting anything a label
+        # allows meant `/my qualifier` was stored happily and then silently
+        # renamed to `/my_qualifier` by the GenBank exporter — the caller asked
+        # for one name and the file carried another (audit 2026-09-22). Refuse
+        # here, where the caller can still fix it, rather than rename later.
+        legal = _insdc_qualifier_name(key)
+        if legal != key:
+            return None, (f"qualifier name {key!r} is not a legal GenBank "
+                          f"qualifier (letters, digits, '_' and '-'; it would "
+                          f"be written as {legal!r}) — rename it")
         if isinstance(v, (list, tuple)):
             vals = [_sanitize_note(str(x), max_len=2000) for x in list(v)[:32]]
         else:
@@ -677,7 +953,12 @@ def _h_export_commercialsaas(app, payload):
         )}, 422)
     try:
         out_path = _export_commercialsaas_dna(entry, path)
-    except (OSError, ValueError) as exc:
+    except ValueError as exc:
+        # A refusal (a block over what SpliceCraft can read back, text that
+        # will not parse) is the same answer every time — 422, never a 5xx a
+        # client retries (round-2 hardening, 2026-09-25).
+        return ({"error": f"export refused: {_scrub_path(str(exc))}"}, 422)
+    except OSError as exc:
         return ({"error": f"export failed: {_scrub_path(str(exc))}"}, 500)
     try:
         size = Path(out_path).stat().st_size
@@ -1245,7 +1526,8 @@ def _h_guide_offtargets(app, payload):
 @_agent_endpoint("guide-cloning-oligos")
 def _h_guide_cloning_oligos(app, payload):
     """The annealed oligo pair that clones a spacer into a Type IIS guide
-    vector. Body: ``{guide: str, top_prefix?, bottom_prefix?, add_g?: bool}``.
+    vector. Body:
+    ``{guide: str, overhang_top?, overhang_bottom?, add_g?: bool}``.
 
     Returns ``{top, bottom, duplex, guide, added_g, overhang_top,
     overhang_bottom}``. Body may override ``overhang_top`` / ``overhang_bottom``
@@ -1892,9 +2174,39 @@ def _h_optimize_protein(app, payload):
     # far more than overall GC — a healthy overall number can hide a collapsed
     # wobble position, which is a real silencing / mRNA-instability risk. Warn
     # when it is extreme so the caller isn't lulled by the top-line GC.
-    gc3 = round(_codon_gc3(dna), 2)
     warnings: list = []
-    if ((len(dna) // 3) >= _CODON_GC3_MIN_CODONS
+    # How many of the emitted codons are terminators: a trailing '*' run in the
+    # protein overrides `stops`, exactly as `_codon_optimize` documents.
+    trailing_stars = len(protein) - len(protein.rstrip("*"))
+    n_stop_codons = trailing_stars if trailing_stars else max(0, stops)
+    # The appended terminator may not terminate. Tables 27 / 28 / 31 read one or
+    # more stop codons as SENSE codons too, context-dependently — table 28 has
+    # no unconditional stop at all — so a construct for such a host can read
+    # straight through the codon just written. Warned, never refused: the codon
+    # is still the best available choice (audit 2026-09-22).
+    amb = _codon_ambiguous_stops(transl_table)
+    if amb and n_stop_codons and len(dna) >= 3 * n_stop_codons:
+        tail = dna[len(dna) - 3 * n_stop_codons:]
+        risky = sorted({tail[i:i + 3] for i in range(0, len(tail), 3)} & set(amb))
+        if risky:
+            msg = (f"genetic-code table {transl_table or 1} reads "
+                   f"{', '.join(risky)} as BOTH a stop and an amino acid, "
+                   f"depending on context, so the terminator this design ends "
+                   f"on may be read through in that host.")
+            all_stops = {c for c, a in _codon_table_for(transl_table).items()
+                         if a == "*"}
+            if all_stops and all_stops <= set(amb):
+                msg += (" Every stop codon in this code is ambiguous — there is "
+                        "no unconditional terminator to use instead.")
+            warnings.append(msg)
+    # GC3 over the CODING BODY. The appended stops are not synonymous choices,
+    # so counting their wobble base skewed the metric AND let a 30-codon protein
+    # plus three stops clear a floor meant to keep GC3 off short sequences
+    # (audit 2026-09-22).
+    body_dna = dna[:len(dna) - 3 * n_stop_codons] if n_stop_codons else dna
+    body_codons = len(body_dna) // 3
+    gc3 = round(_codon_gc3(body_dna), 2)
+    if (body_codons >= _CODON_GC3_MIN_CODONS
             and (gc3 < _CODON_GC3_LOW or gc3 > _CODON_GC3_HIGH)):
         side = "well below" if gc3 < _CODON_GC3_LOW else "well above"
         msg = (f"third-position GC (GC3) is {gc3}% — {side} the typical range, "
@@ -2503,7 +2815,10 @@ def _h_delete_primers(app, payload):
     to disambiguate). Every removal commits under a single ``_cache_lock`` +
     one ``.bak``-rotating save.
 
-    Returns ``{ok, removed, removed_names, not_found, ambiguous, collection}``."""
+    Returns ``{ok, removed, removed_names, not_found, ambiguous, collection}``.
+    When NOTHING was removed, ``ok`` is false and ``error`` says why (every name
+    missing or ambiguous) — a batch that deleted some and skipped others stays
+    ``ok: true`` with the skipped names listed."""
     names = payload.get("names")
     if names is None:
         names = payload.get("ids")
@@ -2570,10 +2885,35 @@ def _h_delete_primers(app, payload):
                 if (err := _agent_save_or_500(
                         lambda: _save_primers(new_list), "primers")) is not None:
                     return err
-    return {"ok": True, "removed": len(removed_names),
-            "removed_names": removed_names, "not_found": not_found,
-            "ambiguous": ambiguous,
-            "collection": coll if named is not None else ""}
+    out = {"ok": bool(removed_names), "removed": len(removed_names),
+           "removed_names": removed_names, "not_found": not_found,
+           "ambiguous": ambiguous,
+           "collection": coll if named is not None else ""}
+    if not removed_names:
+        # A prune that deleted nothing answered `ok: true, removed: 0`; a caller
+        # checking only the envelope believed the primers were gone (audit
+        # 2026-09-22, AA8). Name what stopped each one.
+        why = []
+        if not_found:
+            why.append(f"{len(not_found)} not found")
+        if ambiguous:
+            why.append(f"{len(ambiguous)} ambiguous (more than one primer has "
+                       f"that name — delete-primer by sequence instead)")
+        out["error"] = "no primers were removed: " + "; ".join(why)
+        # Not a 2xx: a status-checking caller read the failed prune as done.
+        # 409 when a name was ambiguous — those primers still exist, and the
+        # single `delete-primer` answers 409 for the same case; a 404 ("already
+        # gone") is cached by the idempotency layer and read as success by a
+        # delete-is-idempotent client (round-2 hardening, 2026-09-25).
+        return out, (409 if ambiguous else 404)
+    if not_found or ambiguous:
+        out["partial"] = True
+        out["warnings"] = (
+            [f"{len(not_found)} name(s) not found: "
+             + ", ".join(map(str, not_found[:20]))] if not_found else []) + (
+            [f"{len(ambiguous)} name(s) ambiguous, not removed: "
+             + ", ".join(map(str, ambiguous[:20]))] if ambiguous else [])
+    return out
 
 
 @_agent_endpoint("list-primer-collections")
@@ -2634,13 +2974,25 @@ def _h_set_active_primer_collection(app, payload):
                 f"unknown primer collection {name!r}; "
                 f"valid: {sorted(n for n in valid_names if n)}"
             )}, 404)
-        # Push a previous failed mirror's work into the OUTGOING container
-        # before the live file is rewritten (audit 2026-09-22).
-        try:
-            _flush_dirty_mirror_before_switch("primers")
-        except RuntimeError as exc:
-            return ({"error": _scrub_path(str(exc))}, 500)
         prev = _get_active_primer_collection_name() or ""
+        if name != prev:
+            # The ONE step every primer switch runs (hub
+            # `_prepare_primer_switch`): a failed mirror's work is pushed into
+            # the OUTGOING collection, and primers no collection holds — the
+            # "" default's, or ones saved while the pointer named a deleted
+            # collection — are kept before the live file is rewritten.
+            prepare = getattr(_state, "_prepare_primer_switch_hook", None)
+            if prepare is not None:
+                try:
+                    prepare("switch of the active primer collection")
+                except Exception as exc:
+                    _log.exception("agent set-active-primer-collection: the "
+                                   "outgoing primer library could not be kept")
+                    return ({"error": "the current primer library could not "
+                                      "be kept before the switch "
+                                      f"({_scrub_path(str(exc))}); nothing "
+                                      "was changed"}, 500)
+                colls = _load_primer_collections()
         if (err := _agent_save_or_500(
                 lambda: _set_active_primer_collection_name(name or None),
                 "primer_collections")) is not None:
@@ -3794,8 +4146,10 @@ def _h_create_part(app, payload):
                         lambda: _save_parts_bin_collections(bins),
                         "parts_bin_collections")) is not None:
                     return err
-                return {"ok": True, "name": p["name"],
-                        "grammar": p["grammar"], "bin": bin_name}
+                out = {"ok": True, "name": p["name"],
+                       "grammar": p["grammar"], "bin": bin_name}
+                _agent_add_junction_warning(out, p)
+                return out
             # bin == active → fall through to the mirrored active path.
         entries = _load_parts_bin()
         for e in entries:
@@ -3810,8 +4164,10 @@ def _h_create_part(app, payload):
                 lambda: _save_parts_bin(entries),
                 "parts_bin")) is not None:
             return err
-    return {"ok": True, "name": p["name"], "grammar": p["grammar"],
-            "bin": _get_active_parts_bin_name() or ""}
+    out = {"ok": True, "name": p["name"], "grammar": p["grammar"],
+           "bin": _get_active_parts_bin_name() or ""}
+    _agent_add_junction_warning(out, p)
+    return out
 
 
 @_agent_endpoint("make-l0-part-from-fragment", write=True)
@@ -4029,6 +4385,31 @@ def _h_make_l0_part_from_fragment(app, payload):
     return out
 
 
+def _agent_add_junction_warning(out: dict, part: dict) -> None:
+    """Warn — as the Part editor does — when this part's clone would carry a
+    Type IIS site formed at a junction (CL8). Judged on the stub product, the
+    same one the editor and "Copy Cloned Sequence" check; best-effort."""
+    seq = str(part.get("sequence") or "")
+    oh5, oh3 = str(part.get("oh5") or ""), str(part.get("oh3") or "")
+    if not (seq and oh5 and oh3):
+        return
+    try:
+        from splicecraft_cloning import _simulate_cloned_plasmid
+        regen = _cloned_plasmid_regenerated_sites(
+            _simulate_cloned_plasmid(seq, oh5, oh3, str(part.get("type") or "")),
+            seq, oh5)
+    except Exception:
+        _log.debug("junction check failed for part %r", part.get("name"),
+                   exc_info=True)
+        return
+    if regen:
+        out["junction_sites"] = regen
+        out.setdefault("warnings", []).append(
+            f"a {', '.join(sorted({d['enzyme'] for d in regen}))} site forms "
+            f"at a junction of this part's clone — it would be cut in its own "
+            f"assembly. Re-domesticate to remove it.")
+
+
 @_agent_endpoint("update-part", write=True)
 def _h_update_part(app, payload):
     """Update an existing part. Body: `{name, grammar?, ...new fields}`.
@@ -4053,8 +4434,10 @@ def _h_update_part(app, payload):
                     lambda: _save_parts_bin(entries),
                     "parts_bin")) is not None:
                 return err
-            return {"ok": True, "name": p_new["name"],
-                    "grammar": p_new["grammar"]}
+            out = {"ok": True, "name": p_new["name"],
+                   "grammar": p_new["grammar"]}
+            _agent_add_junction_warning(out, p_new)
+            return out
     return ({"error": (
         f"no part {p_new['name']!r}"
         + (f" in grammar {target_grammar!r}" if target_grammar else "")
@@ -4279,15 +4662,32 @@ def _h_move_part(app, payload):
         # Re-sync the live mirror if the ACTIVE bin's parts changed. Idempotent
         # on the canonical record (writes the same parts back), and keeps
         # parts_bin.json from drifting from the bin it mirrors.
+        #
+        # The move is COMMITTED above (the bins file is the source of truth).
+        # A mirror failure here used to answer 500 "save failed" for a move
+        # that had happened, and left the pre-move parts in the cache for the
+        # next parts save to write back over it — losing a part moved INTO the
+        # active bin (audit 2026-09-22, D9). Re-seat the cache from the
+        # committed bin instead; the next launch restores the file from it.
+        mirror_warning = ""
         if active in (from_name, to_name) and active in by_name:
-            ab = by_name[active].get("parts") or []
-            if (err := _agent_save_or_500(
-                    lambda: _save_parts_bin(ab), "parts_bin")) is not None:
-                return err
-    return {"ok": True, "name": name, "from": from_name, "to": to_name,
-            "grammar": part.get("grammar"),
-            "ignored": _agent_ignored_keys(
-                payload, {"name", "id", "to", "from", "grammar"})}
+            ab = [p for p in (by_name[active].get("parts") or [])
+                  if isinstance(p, dict)]
+            try:
+                _save_parts_bin(ab)
+            except (OSError, RuntimeError) as exc:
+                _state._parts_bin_cache = _typed_clone(ab)
+                mirror_warning = (
+                    f"the move IS saved, but the parts-bin file could not be "
+                    f"refreshed ({_scrub_path(str(exc))}). This session and the "
+                    f"next launch both read the bin from the saved collection.")
+    out = {"ok": True, "name": name, "from": from_name, "to": to_name,
+           "grammar": part.get("grammar"),
+           "ignored": _agent_ignored_keys(
+               payload, {"name", "id", "to", "from", "grammar"})}
+    if mirror_warning:
+        out["warnings"] = [mirror_warning]
+    return out
 
 
 def _agent_feature_dict(payload: dict) -> "dict | str":
@@ -5514,8 +5914,13 @@ def _agent_carry_source_features(payload, vec_seq, ins_seq):
         """-> (feats, err). Records the per-side outcome in `carried`."""
         if not name:
             return [], None
-        entry, err = _agent_resolve_carry_entry(
-            name, payload.get(f"{which}_collection"), which)
+        # Two explicit keys, not `f"{which}_collection"`: the routing guard
+        # reads the handler's source, and a key it cannot spell out became the
+        # pattern `.*_collection`, which let a stray `source_collection` pass
+        # as read (round-2 hardening, 2026-09-25).
+        coll = (payload.get("vector_collection") if which == "vector"
+                else payload.get("insert_collection"))
+        entry, err = _agent_resolve_carry_entry(name, coll, which)
         if err is not None:
             return None, err
         # `err is None` ⇒ the entry is populated; assert so pyright narrows
@@ -7343,6 +7748,13 @@ def _h_export_migrate_archive(app, payload):
             "ignored": _agent_ignored_keys(payload, {"path", "include_hmm"})}
 
 
+def _site_wraps(rec_start, rec_end) -> bool:
+    """An origin-spanning site has its recognition END at a LOWER coordinate
+    than its start — that, and only that, is the wrap."""
+    return (isinstance(rec_start, int) and isinstance(rec_end, int)
+            and rec_end < rec_start)
+
+
 @_agent_endpoint("list-restriction-sites")
 def _h_list_restriction_sites(app, payload):
     """Scan the loaded record for restriction sites. Body:
@@ -7407,7 +7819,9 @@ def _h_list_restriction_sites(app, payload):
     if enzymes is None and payload.get("enzyme") not in (None, ""):
         enzymes = payload.get("enzyme")
     if isinstance(enzymes, str):
-        enzymes = [enzymes]
+        # `?enzymes=EcoRI,BamHI` — a GET query string has no lists; split it
+        # the way `digest` does.
+        enzymes = _agent_enzyme_string_list(enzymes)
     resolved: "list[str]" = []
     if enzymes is not None:
         # Shape, size and element type up front. A mixed-type list (e.g.
@@ -7542,7 +7956,14 @@ def _h_list_restriction_sites(app, payload):
             continue
         for nm in (want_by_sig.get(_enzyme_signature(label), [label])
                    if resolved else [label]):
-            out.append({
+            # The scan emits ONE label per (span, recognition site), which is
+            # right for the MAP and wrong for a query: an UNFILTERED listing
+            # showed only `BsmBI` and a caller looking for `Esp3I` read the
+            # plasmid as not carrying it. Naming an enzyme explicitly already
+            # re-expanded the collapse (INV-187); the unnamed listing now
+            # carries the other spellings alongside (audit 2026-09-22).
+            other = [a for a in _enzyme_aliases(nm) if a != nm]
+            row = {
                 "enzyme":        nm,
                 "start":         s.get("start"),
                 "end":           s.get("end"),
@@ -7553,15 +7974,21 @@ def _h_list_restriction_sites(app, payload):
                 # private table of cut offsets (blue field report #6).
                 "bottom_cut_bp": s.get("bottom_cut_bp", -1),
                 "site":          (_enzyme_signature(nm) or ("", 0, 0))[0],
-                # An origin-spanning site has end <= start in plasmid
-                # coordinates; say so rather than making the caller infer it.
-                "wraps":         bool(s.get("rec_start") is not None
-                                      and s.get("end") == len(seq)
-                                      and s.get("rec_end", 0) > 0),
+                # An origin-spanning site has its recognition END at a LOWER
+                # coordinate than its start — that, and only that, is the wrap.
+                # Testing `end == len(seq)` instead (as this did until the
+                # 2026-09-22 audit) also caught the ordinary site whose last
+                # base IS the molecule's last base, which does not wrap at all:
+                # a plasmid ending in GAATTC reported `wraps: true`.
+                "wraps":         _site_wraps(s.get("rec_start"),
+                                             s.get("rec_end")),
                 # False for a site at the end of a LINEAR molecule whose cut
                 # falls past the end: the site is there, it cleaves nothing.
                 "cuts":          not s.get("cut_outside", False),
-            })
+            }
+            if other:
+                row["aliases"] = other
+            out.append(row)
 
     # `allowed_enzymes` deliberately overrides `unique_only` inside the
     # scanner ("unique cutters of MY hand-picked list" hides the multi-cutter
@@ -7580,6 +8007,37 @@ def _h_list_restriction_sites(app, payload):
             f"linear molecule that the cut falls outside it — the recognition "
             f"sequence is present (and cuts once the fragment is cloned), but "
             f"it cleaves nothing here (`cuts: false`)")
+
+    # Dam / Dcm methylation context, WARN ONLY (audit 2026-09-22). Plasmid DNA
+    # from any ordinary cloning strain is Dam+ Dcm+ methylated, and a digest
+    # that silently ignores that fails at the bench with nothing on screen to
+    # explain it. Reported per site, as the PRECONDITION only — whether a given
+    # enzyme is actually blocked is laboratory fact per enzyme, not something
+    # sequence can answer.
+    meth_pos = _methylated_base_positions(seq, circular=is_circular)
+    if meth_pos:
+        methylated: "set[str]" = set()
+        for r in out:
+            site_len = len(r.get("site") or "")
+            rs = r.get("start")
+            if not isinstance(rs, int) or site_len <= 0:
+                continue
+            hits = sorted({meth_pos[(rs + i) % len(seq)]
+                           for i in range(site_len)
+                           if (rs + i) % len(seq) in meth_pos})
+            if hits:
+                r["methylation_context"] = hits
+                methylated.add(r["enzyme"])
+        if methylated:
+            warnings = list(warnings or [])
+            warnings.append(
+                f"{', '.join(sorted(methylated))}: at least one site contains a "
+                f"base that Dam (GATC) or Dcm (CCWGG) methylates, so plasmid "
+                f"grown in an ordinary dam+/dcm+ strain carries a methyl group "
+                f"inside it (`methylation_context` names which). Whether that "
+                f"blocks the enzyme is per-enzyme — BclI is blocked, BamHI and "
+                f"BglII are not, DpnI requires it — so check your supplier's "
+                f"methylation-sensitivity table before trusting the digest")
     resp: dict = {"sites": out, "count": len(out)}
     if resolved:
         # Report the spellings the ROWS are labelled with — for a commercial
@@ -7638,6 +8096,13 @@ def _agent_enzyme_dict(name: str, site: str, fwd_cut: int,
         # one label, so a caller needs to know which spellings a result
         # already covers.
         "aliases":         [a for a in _enzyme_aliases(name) if a != name],
+        # Methylase systems whose target is inside this recognition site for
+        # EVERY matching sequence, so a plasmid from an ordinary dam+/dcm+
+        # strain is methylated inside every site of this enzyme. The PRE-
+        # CONDITION for blocking, never the verdict: BclI is blocked by Dam,
+        # BamHI and BglII contain GATC and are not, and DpnI requires it
+        # (audit 2026-09-22).
+        "methylation_targets": _enzyme_site_methylation_targets(site_u),
     }
 
 
@@ -7672,8 +8137,12 @@ def _agent_transcript_feature_dicts(rec) -> "list[dict]":
         quals = getattr(f, "qualifiers", {}) or {}
         label = (quals.get("label") or quals.get("product") or [f.type])[0]
         # 0 is a strand, not a falsy default — see `_agent_carry_feature_dicts`.
+        # 2 is the ◀▶ "both ways" marker, carried in a qualifier because
+        # Biopython holds only ±1 / 0 — dropped here, a bidirectional element
+        # arrived as "no strand".
+        _both = (quals.get("SpliceCraft_strand") or [None])[0] == "double"
         d = {"start": int(s), "end": int(e),
-             "strand": 0 if strand is None else int(strand),
+             "strand": 2 if _both else (0 if strand is None else int(strand)),
              "type": f.type, "label": str(label)[:200]}
         if e >= s:                       # not a wrap — parts may be exons
             parts: "list[list[int]]" = []
@@ -7778,8 +8247,7 @@ def _agent_resolve_scan_target(app, payload, *, want_record: bool = False):
         if err:
             return ("", True, None, "",
                     ({"error": f"'sequence' rejected: {err}"}, 400))
-        circ = payload.get("circular")
-        return (seq, (True if circ is None else bool(circ)), None,
+        return (seq, _payload_bool(payload, "circular", True), None,
                 "sequence", None)
     key = _sanitize_label(payload.get("id") or payload.get("name"),
                           max_len=200)
@@ -7820,9 +8288,7 @@ def _agent_resolve_scan_target(app, payload, *, want_record: bool = False):
         return ("", True, None, "",
                 ({"error": f"{label!r} exceeds {_PAIRWISE_MAX_LEN:,} bp"},
                  413))
-    circ_override = payload.get("circular")
-    circular = (_record_is_circular(rec) if circ_override is None
-                else bool(circ_override))
+    circular = _payload_bool(payload, "circular", _record_is_circular(rec))
     return (seq, circular, rec, label, None)
 
 
@@ -8143,8 +8609,8 @@ def _h_predict_transcript(app, payload):
         return ({"error":
                   f"transcript prediction failed: {_scrub_path(str(exc))}"},
                 500)
-    if isinstance(result, dict) and not bool(
-            payload.get("include_sequences", True)):
+    if isinstance(result, dict) and not _payload_bool(
+            payload, "include_sequences", True):
         # The message itself is the point of this endpoint, so it ships by
         # default — but a screening loop over a whole collection only wants
         # the verdicts, and a long transcription unit puts three copies of
@@ -8317,7 +8783,14 @@ def _h_span_contains(app, payload):
     if err is not None:
         return ({"error": err}, 400)
     assert outer is not None
+    # RAW coordinates are what `_span_in_span` needs: it detects a FULL LAP
+    # (`[0, total)`, a whole-molecule "backbone" annotation) from the unreduced
+    # pair, and taking `% total` first turns that into `(0, 0)` — an empty span
+    # that contains nothing, which is the one case the helper was hardened for
+    # (audit 2026-09-22). The reduced pair is kept for DISPLAY only.
+    o_raw_start, o_raw_end = outer[0], outer[1]
     o_start, o_end = outer[0] % total, outer[1] % total
+    o_len = _span_full_lap_len(o_raw_start, o_raw_end, total)
 
     if "inner" not in payload:
         return ({"error": "missing 'inner'"}, 400)
@@ -8352,9 +8825,10 @@ def _h_span_contains(app, payload):
         results.append({
             "start":    i_start,
             "end":      i_end,
-            "length":   _feat_len(i_start, i_end, total),
+            "length":   _span_full_lap_len(span[0], span[1], total),
             "wraps":    bool(i_end < i_start),
-            "contains": _span_in_span(i_start, i_end, o_start, o_end, total),
+            "contains": _span_in_span(span[0], span[1],
+                                      o_raw_start, o_raw_end, total),
         })
 
     resp = {
@@ -8363,7 +8837,7 @@ def _h_span_contains(app, payload):
         "outer": {
             "start":  o_start,
             "end":    o_end,
-            "length": _feat_len(o_start, o_end, total),
+            "length": o_len,
             "wraps":  bool(o_end < o_start),
         },
         "length": total,
@@ -8448,7 +8922,11 @@ def _h_digest(app, payload):
     if enzymes is None and payload.get("enzyme") not in (None, ""):
         enzymes = payload.get("enzyme")
     if isinstance(enzymes, str):
-        enzymes = [enzymes]
+        # A GET query string has no lists, so `?enzymes=EcoRI,BamHI` is the
+        # natural spelling — and taking it as ONE name resolved to nothing,
+        # digesting with no enzyme and reporting 0 cuts with the whole string
+        # in `unknown_enzymes` (audit 2026-09-22).
+        enzymes = _agent_enzyme_string_list(enzymes)
     if not isinstance(enzymes, list) or not enzymes:
         return ({"error":
                   "'enzymes' must be a non-empty list (or 'enzyme' a string)"},
@@ -8472,6 +8950,14 @@ def _h_digest(app, payload):
     # catalog key.
     resolved, unresolved = _resolve_enzyme_names(enzymes)
     unknown = sorted({w[:_AGENT_NAME_ECHO_MAX] for w, _ in unresolved})
+    if not resolved:
+        # Report-don't-error is for a LONG list with a typo in it. When NOTHING
+        # resolved there is nothing to digest with, and answering 200 with 0
+        # cuts and one uncut fragment read as "this enzyme doesn't cut here"
+        # (audit 2026-09-22, AA6).
+        return ({"error": f"none of the requested enzymes is in the catalog: "
+                          f"{', '.join(unknown)} — nothing was digested",
+                 "unknown_enzymes": unknown}, 400)
 
     try:
         cuts = _enzyme_cuts(bases, resolved, circular=circular)
@@ -8597,11 +9083,8 @@ def _h_diff_plasmid(app, payload):
                 500)
     # Auto-detect circular from topology annotation; agents can override
     # with an explicit `circular` boolean.
-    circ_raw = payload.get("circular")
-    if circ_raw is None:
-        is_circular = _record_is_circular(target_record)
-    else:
-        is_circular = bool(circ_raw)
+    is_circular = _payload_bool(payload, "circular",
+                                _record_is_circular(target_record))
     query_seq = str(rec.seq)
     target_seq = str(target_record.seq)
     # Pre-cap both seqs at `_PAIRWISE_MAX_LEN` BEFORE the picker runs.
@@ -8659,6 +9142,8 @@ def _h_diff_plasmid(app, payload):
 
 
 _VERIFY_READS_MAX = 200   # one alignment per read — cap the batch size
+# Below this many reference bases a read says nothing a verdict can rest on.
+_VERIFY_MIN_COVERED_BP = 20
 
 
 def _agent_resolve_read_reference(payload):
@@ -8682,7 +9167,7 @@ def _agent_resolve_read_reference(payload):
     wrong topology silently re-frames every coordinate in the answer.
     """
     circular_override = payload.get("circular")
-    circular = bool(circular_override) if circular_override is not None else True
+    circular = _payload_bool(payload, "circular", True)
     ref_raw = payload.get("reference")
     if isinstance(ref_raw, str) and ref_raw.strip():
         ref_seq, e = _sanitize_bases(ref_raw)
@@ -8739,8 +9224,20 @@ def _h_verify_against_reads(app, payload):
     the reference with the SAME rotation + RC-aware picker the Plasmidsaurus
     aligner and the UI use, and its identity% reported. Returns
     ``{ok, reference_len, n_reads, min_identity, verdict, circular,
-    reads:[{index, length, identity_pct, rc, inversions, inverted_bp, passes}],
+    reads:[{index, length, identity_pct, covered_identity_pct, covered_bp,
+    coverage_pct, partial, rc, inversions, inverted_bp, passes}],
     summary:{mean, min, max, n_pass, n_fail, n_inverted}}``.
+
+    **Partial reads.** ``identity_pct`` is BLAST-style over the whole alignment,
+    so for a read that covers part of the reference the bases it never reached
+    count against it — a PERFECT 800 bp Sanger read of a 5 kb plasmid scores
+    ~16%. ``covered_identity_pct`` is the identity over the bases the read
+    actually has, ``coverage_pct`` how much of the reference that was, and
+    ``partial`` says which case you are in. ``passes`` is judged on the COVERED
+    identity for a partial read, so a good Sanger read passes — and a
+    ``warnings`` entry then says the verdict confirms the sequenced windows
+    only, because "match" on 16% coverage is not a verified plasmid. The union
+    of what every read covered, and what nobody did, is in ``consensus``.
 
     ``verdict`` is "match" when EVERY read ≥ ``min_identity``; "inverted" when
     every read that falls short does so because part of it matches the
@@ -8802,6 +9299,15 @@ def _h_verify_against_reads(app, payload):
                     for v in one):
                 return ({"error": f"read_quality[{qi}] must be a list of "
                                   f"numbers or null"}, 400)
+            # One score per BASE. A short array silently left the tail of the
+            # read with no quality — and the tail of a Sanger read is exactly
+            # where the ragged basecalls are, so the differences the array
+            # exists to discount were the ones it stopped covering
+            # (audit 2026-09-22).
+            if len(one) != len(reads[qi]):
+                return ({"error": f"read_quality[{qi}] has {len(one)} scores "
+                                  f"for a {len(reads[qi])} base read — one per "
+                                  f"base, or null"}, 400)
             read_quals.append([int(v) for v in one])
     min_phred = _coerce_int(payload.get("min_phred", 20), name="min_phred")
     if isinstance(min_phred, str):
@@ -8845,16 +9351,45 @@ def _h_verify_against_reads(app, payload):
             try:
                 _entry["quality"] = _state._trace_verification_summary_hook(
                     res.get("aligned_q") or "", res.get("aligned_t") or "",
-                    one_q, min_phred=min_phred)
+                    one_q, min_phred=min_phred,
+                    frame_shift=res.get("query_frame_shift", 0),
+                    circular=circular, clipped=_read_is_clipped(res))
             except Exception:
                 _log.exception("verify-against-reads: quality summary failed")
         _consensus_inputs.append(_entry)
+        # Identity over the bases this read actually COVERS, alongside the
+        # BLAST-style figure over the whole alignment. A Sanger read — which the
+        # body documents as an input — covers a fraction of a plasmid, and every
+        # base it never reached is a gap column in the semi-global alignment, so
+        # `identity_pct` for a PERFECT 800 bp read of a 5 kb plasmid is ~16% and
+        # the default `min_identity` of 99 made it `passes: false`. The alignment
+        # was taught about partial reads; the metric was not (audit 2026-09-22).
+        cov_ident, cov_bp = _covered_identity(res, len(ref_seq),
+                                              circular=circular)
+        ref_len = len(ref_seq) or 1
+        coverage_pct = round(100.0 * cov_bp / ref_len, 2)
+        partial = cov_bp < ref_len
+        # Every read is judged on its own extent, indels included: a partial
+        # read on what it read, a full one on all of it. `identity_pct` stays
+        # exactly as it was for every existing caller. A read with no base to
+        # compare (all `N`) is no answer — it used to fall back to
+        # `identity_pct`, which counts an `N` as a match, and pass — and so
+        # is one too short to say anything: "A", "AC" and "GATTACA" all
+        # verified as `match` (round-2 hardening, 2026-09-25).
+        too_short = 0 < cov_bp < min(_VERIFY_MIN_COVERED_BP, len(ref_seq))
+        judged = cov_ident if cov_bp > 0 and not too_short else None
         out_reads.append({"index": i, "length": len(rs), "identity_pct": ident,
+                          "covered_identity_pct": cov_ident,
+                          "covered_bp": cov_bp,
+                          "coverage_pct": coverage_pct,
+                          "partial": bool(partial),
+                          **({"too_short": True} if too_short else {}),
                           "rc": bool(res.get("query_rc", False)),
                           "inversions": inv,
                           "inverted_bp": sum(
                               max(0, int(s.get("length") or 0)) for s in inv),
-                          "passes": ident >= min_identity})
+                          "passes": (judged is not None
+                                     and judged >= min_identity)})
     idents = [r["identity_pct"] for r in out_reads]
     n_pass = sum(1 for r in out_reads if r["passes"])
     n_inverted = sum(1 for r in out_reads if r["inversions"])
@@ -8870,7 +9405,29 @@ def _h_verify_against_reads(app, payload):
         verdict = "mismatch"
     _log_event("verify.reads.agent", n_reads=len(out_reads), verdict=verdict,
                min_identity=min_identity, n_inverted=n_inverted, via="agent")
-    return {"ok": True, "reference_len": len(ref_seq),
+    # A partial read that PASSES says its own window matches — nothing about the
+    # rest of the plasmid. Reporting `verdict: "match"` for it without saying so
+    # is the most dangerous sentence this endpoint can produce: it turns a
+    # plasmid nobody read past bp 800 into a confirmed construct. The union of
+    # what the reads covered is in `consensus`; this names the shortfall.
+    warnings: "list[str]" = []
+    partials = [r for r in out_reads if r.get("partial")]
+    if partials and verdict == "match":
+        widest = max(r["coverage_pct"] for r in partials)
+        warnings.append(
+            f"every read matches the reference over the bases it COVERS, but "
+            f"{len(partials)} of {len(out_reads)} read(s) are partial (the "
+            f"widest covers {widest}% of the reference). This confirms the "
+            f"sequenced windows only — see `consensus` for the union of what "
+            f"was read and what nobody covered.")
+    shorts = [r["index"] for r in out_reads if r.get("too_short")]
+    if shorts:
+        warnings.append(
+            f"read(s) {', '.join(str(i) for i in shorts[:10])} cover fewer "
+            f"than {_VERIFY_MIN_COVERED_BP} bp of the reference — too little "
+            f"to verify anything, so they do not pass")
+    resp_extra = {"warnings": warnings} if warnings else {}
+    return {"ok": True, "reference_len": len(ref_seq), **resp_extra,
             "n_reads": len(out_reads), "min_identity": min_identity,
             "verdict": verdict, "circular": circular, "reads": out_reads,
             "summary": {"mean": round(sum(idents) / len(idents), 2),
@@ -8882,7 +9439,7 @@ def _h_verify_against_reads(app, payload):
             # Per-read identity cannot answer any of those — two reads at 99.9%
             # might disagree about entirely different bases.
             "consensus": _state._multi_read_summary_hook(
-                _consensus_inputs, len(ref_seq)),
+                _consensus_inputs, len(ref_seq), circular=circular),
             "read_quality": [e.get("quality") for e in _consensus_inputs],
             "ignored": _agent_ignored_keys(payload, {
                 "reference", "reference_id", "reference_name", "reads",
@@ -9054,30 +9611,41 @@ def _hetero_shape(fractions: "list[float]", floor: float = 0.0,
     mutations sharing one fraction apart from a noise skirt.
 
     A mode is only honoured at or above `floor`: below it, a bump is noise
-    structure, not a sub-population worth reporting. `max_fraction` reports
-    the VOTING maximum when one is supplied, since that is what the dominant
-    test keys on.
+    structure, not a sub-population worth reporting. The EVIDENCE for a mode is
+    the calls at or above the floor, not the bin they share: judging by the bin
+    centre let a custom floor that falls inside a bin build a mode from calls
+    all below it (floor 0.07: six calls at 0.051-0.065 reported a mode at
+    0.075 and the verdict `mixed`), and drop a real one just above it (audit
+    2026-09-22). A reported mode is never below the floor. `max_fraction`
+    reports the VOTING maximum when one is supplied, since that is what the
+    dominant test keys on.
     """
     if not fractions:
         return {"n": 0, "max_fraction": round(float(max_fraction or 0.0), 4),
                 "max_observed_fraction": 0.0,
                 "bins": [], "monotonic_decay": True, "mode_fraction": None}
+    # The bin index with a tolerance: 0.15 / 0.05 is 2.9999999999999996 in
+    # binary floating point, so a fraction ON an edge fell into the bin below.
+    def _bin(f: float) -> int:
+        return int(f / _HETERO_SHAPE_BIN + 1e-9)
     top = max(fractions)
-    n_bins = max(1, int(top / _HETERO_SHAPE_BIN) + 1)
+    n_bins = max(1, _bin(top) + 1)
     counts = [0] * n_bins
+    above = [0] * n_bins            # the members at or above the floor
     for f in fractions:
-        counts[min(n_bins - 1, max(0, int(f / _HETERO_SHAPE_BIN)))] += 1
+        b = min(n_bins - 1, max(0, _bin(f)))
+        counts[b] += 1
+        if f >= floor:
+            above[b] += 1
     mode = None
     for i in range(1, n_bins):
         # A bin's centre can sit past 1.0 for the topmost bin (a fraction of
         # exactly 1.0 lands in [1.00, 1.05)), and a reported "mode_fraction"
         # above 1 is not a fraction. Clamp to the bin's own upper edge.
         centre = min(1.0, (i + 0.5) * _HETERO_SHAPE_BIN)
-        if centre < floor:
-            continue
-        if (counts[i] >= _HETERO_MODE_MIN_POSITIONS
-                and counts[i] - counts[i - 1] >= _HETERO_MODE_MIN_EXCESS):
-            mode = round(centre, 4)
+        if (above[i] >= _HETERO_MODE_MIN_POSITIONS
+                and above[i] - counts[i - 1] >= _HETERO_MODE_MIN_EXCESS):
+            mode = round(max(centre, floor), 4)
             break
     bins = [{"from": round(i * _HETERO_SHAPE_BIN, 4),
              "to": round(min(1.0, (i + 1) * _HETERO_SHAPE_BIN), 4),
@@ -9198,12 +9766,17 @@ def _h_analyse_read_heterogeneity(app, payload):
     # Work budget — see `_HETERO_WORK_BUDGET_BP`. Applied here so it bounds
     # BOTH read sources, and only ever downwards.
     budget_reads = max(1, _HETERO_WORK_BUDGET_BP // max(1, len(ref_seq)))
-    capped_by = None
+    # WHICH limit is the binding one. Whether it actually CAPPED anything is a
+    # different question, answered once the read count is known: reporting
+    # `capped_by: "max_reads"` merely because the caller passed the parameter
+    # told them their fractions came from a truncated set when every read they
+    # supplied had been used (audit 2026-09-22).
+    # The default `max_reads` caps too: 450 inline reads at the default 400
+    # reported `capped_by: None` beside a warning that 50 were left out.
+    cap_source = "max_reads"
     if budget_reads < max_reads:
         max_reads = budget_reads
-        capped_by = "work_budget"
-    elif payload.get("max_reads") is not None:
-        capped_by = "max_reads"
+        cap_source = "work_budget"
 
     # ── Reads: a FASTQ on disk, or inline sequences ──────────────────
     reads_path = payload.get("reads_path")
@@ -9213,6 +9786,7 @@ def _h_analyse_read_heterogeneity(app, payload):
     seqs: "list[str]" = []
     quals: "list" = []
     dropped: "list[dict]" = []
+    fastq_count_note = ""
     if reads_path is not None:
         p = _sanitize_path(reads_path)
         if p is None:
@@ -9247,6 +9821,17 @@ def _h_analyse_read_heterogeneity(app, payload):
                 "phred_quality")
             quals.append([int(v) for v in q] if q else None)
         n_available = len(recs)
+        if n_available >= max_reads:
+            # The loader stops AT `max_reads`, so a file of 1,500 reads and
+            # one of 400 both came back as 400: the truncation was silent,
+            # and every fraction below changes with it. Count the rest.
+            n_total, count_err = _fastq_count_reads(str(p))
+            n_available = max(n_available, n_total)
+            if count_err:
+                fastq_count_note = (
+                    f"the FASTQ could not be read past read {n_total:,} "
+                    f"({_scrub_path(count_err)}); the reads used come from "
+                    f"before that point")
     else:
         if not isinstance(inline, list) or not inline:
             return ({"error": "provide 'reads_path' (a FASTQ) or 'reads' "
@@ -9279,6 +9864,12 @@ def _h_analyse_read_heterogeneity(app, payload):
                     for v in one):
                 return ({"error": f"read_quality[{i}] must be a list of "
                                   f"numbers or null"}, 400)
+            # One score per base — see the same check in
+            # `verify-against-reads` (audit 2026-09-22).
+            if len(one) != len(rs):
+                return ({"error": f"read_quality[{i}] has {len(one)} scores "
+                                  f"for a {len(rs)} base read — one per base, "
+                                  f"or null"}, 400)
             quals.append([int(v) for v in one])
         n_available = len(inline)
 
@@ -9295,15 +9886,19 @@ def _h_analyse_read_heterogeneity(app, payload):
             + (f" — the {_HETERO_WORK_BUDGET_BP:,} bp-read work budget allows "
                f"{max_reads} against a {len(ref_seq):,} bp reference. Every "
                f"fraction below is computed from those {max_reads} reads."
-               if capped_by == "work_budget"
+               if cap_source == "work_budget"
                else f" ('max_reads'). Every fraction below is computed from "
                     f"those {max_reads} reads."))
+    if fastq_count_note:
+        hetero_warnings.append(fastq_count_note)
     if dropped:
         hetero_warnings.append(f"{len(dropped)} read(s) were unusable and "
                                f"excluded; see 'dropped_reads'")
     base = {"ok": True, "reference_len": len(ref_seq), "circular": circular,
             "reads_source": source, "reads_available": n_available,
-            "max_reads": max_reads, "capped_by": capped_by,
+            "max_reads": max_reads,
+            # None unless reads were genuinely left out.
+            "capped_by": (cap_source if n_available > max_reads else None),
             "work_budget_bp": _HETERO_WORK_BUDGET_BP,
             "warnings": hetero_warnings,
             "thresholds": thresholds,
@@ -9345,7 +9940,12 @@ def _h_analyse_read_heterogeneity(app, payload):
     # other about the same reads.
     roll = _state._multi_read_summary_hook(aligned, len(ref_seq),
                                            circular=circular)
-    depth_of = {(int(v["target_pos"]), v["type"], v.get("alt", "")): v
+    # Keyed with `_variant_group_key`, the SAME function `_multi_read_summary`
+    # groups its buckets with. The rollup keys indels on their left-normalised
+    # position (so one homopolymer deletion is one event, not three), and a
+    # second keying scheme here missed every one of those buckets — every
+    # position silently dropped for want of a depth (audit 2026-09-22).
+    depth_of = {_variant_group_key(v): v
                 for v in (roll.get("variants") or [])}
 
     # ── Quality-filtered per-position tally ──────────────────────────
@@ -9362,16 +9962,30 @@ def _h_analyse_read_heterogeneity(app, payload):
         q = quals[i] if i < len(quals) else None
         if q:
             q = _phred_in_alignment_frame(q, res)
-        for v in _state._alignment_variants_in_axis_hook(entry):
+        # THIS read's extent. Gating on "some read's rollup has this key"
+        # counted one read's unread remainder — a global alignment reports it
+        # as a deletion — as support, whenever normalisation filed it under the
+        # same key as another read's real deletion; and counting no-calls
+        # before any gate tallied reference ambiguity codes (an NNK site) that
+        # no read ever reached (audit 2026-09-24).
+        extent = _read_extent_for(res, len(ref_seq), circular=circular)
+        # ONE vote per read per event (the rollup counts the same way): the
+        # two halves of an indel the rows split across bp 0 share a key, and
+        # one read was tallied twice (round-2 hardening, 2026-09-25).
+        seen_keys: set = set()
+        for v in _state._alignment_variants_in_axis_hook(
+                entry, circular=circular):
             if v.get("type") == "truncated":
                 continue
-            key = (int(v.get("target_pos", 0) or 0), v.get("type"),
-                   v.get("alt", ""))
-            if key not in depth_of:
-                # Outside the read's observed extent — the rollup already
-                # excluded it (a global alignment reports the unread remainder
-                # as one long deletion). Honour that same decision.
+            _pos = int(v.get("target_pos", 0) or 0)
+            if circular and v.get("type") == "insertion" and ref_seq:
+                _pos %= len(ref_seq)        # after the last base = before bp 0
+            if extent and not any(lo <= _pos < hi for lo, hi in extent):
                 continue
+            key = _variant_group_key(v)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
             # A NO-CALL IS NOT AN ALLELE. A basecaller that emits `N` is saying
             # it could not read that base, and counting it as a difference
             # turns one ordinary read with a ten-base N run into a ten-position
@@ -9387,6 +10001,10 @@ def _h_analyse_read_heterogeneity(app, payload):
             if (_alt and any(c not in "ACGT" for c in _alt)) or \
                     (_ref and any(c not in "ACGT" for c in _ref)):
                 n_no_call += 1
+                continue
+            if key not in depth_of:
+                # The rollup has no depth for it (its bucket cap, or nothing to
+                # compare against) — no fraction can be formed.
                 continue
             ph = None
             if q:
@@ -9408,7 +10026,8 @@ def _h_analyse_read_heterogeneity(app, payload):
 
     positions: "list[dict]" = []
     for key, slot in tally.items():
-        pos, vtype, alt = key
+        _kind, pos, _kref, alt = key
+        vtype = _kind
         ref_v = depth_of[key]
         d = int(ref_v.get("depth") or 0)
         if d <= 0:
@@ -9689,11 +10308,8 @@ def _h_align_plasmidsaurus_zip(app, payload):
         return ({"error": f"target exceeds {_PAIRWISE_MAX_LEN:,} bp"},
                 413)
     # Circular rotation: same auto-detect as `diff-plasmid`.
-    circ_raw = payload.get("circular")
-    if circ_raw is None:
-        is_circular = _record_is_circular(target_record)
-    else:
-        is_circular = bool(circ_raw)
+    is_circular = _payload_bool(payload, "circular",
+                                _record_is_circular(target_record))
     # INV-72 (2026-05-25): use the same picker the UI uses. Pre-sweep
     # this endpoint ran bare `_pairwise_align` after a single
     # `_find_circular_alignment_offset` call — agents missed the
@@ -10513,6 +11129,21 @@ def _h_restore_backup(app, payload):
     if src not in legitimate:
         return ({"error": "source_path is not a registered backup for "
                   f"label {msg!r}"}, 403)
+    # ONE critical section from the preparation to the reconcile: a save that
+    # lands between them reads the restored pointer while the caches still
+    # hold the old container, and writes the old plasmids into the new one
+    # (round-2 hardening, 2026-09-25). RLock — every step re-enters freely.
+    with _state._cache_lock:
+        return _restore_backup_locked(path, src, msg)
+
+
+def _restore_backup_locked(path, src, msg):
+    prepare = getattr(_state, "_prepare_mirrors_for_restore_hook", None)
+    if prepare is not None:
+        try:
+            prepare(path, src)
+        except (RuntimeError, OSError) as exc:
+            return ({"error": f"restore refused: {_scrub_path(str(exc))}"}, 409)
     try:
         n = _restore_from_backup(path, src, label=msg)
     except ValueError as exc:
@@ -11093,7 +11724,8 @@ def _h_design_gb_part(app, payload):
     # Optional entry-vector compatibility check (agent-API feedback): does the
     # part's (oh5, oh3) actually match the configured acceptor? Advisory —
     # attached to the result, never fails the design.
-    if isinstance(result, dict) and payload.get("check_entry_vector"):
+    if isinstance(result, dict) and _payload_bool(payload,
+                                                  "check_entry_vector", False):
         role = payload.get("entry_vector_role", "") or ""
         if not isinstance(role, str):
             return ({"error": "'entry_vector_role' must be a string"}, 400)
@@ -11517,16 +12149,15 @@ def _h_list_experiments(app, payload):
         out.append({
             "id":          e.get("id", ""),
             "title":       e.get("title", ""),
-            "tags":        list(e.get("tags") or []),
+            "tags":        _tag_values(e.get("tags")),
             "created_at":  e.get("created_at", ""),
             "updated_at":  e.get("updated_at", ""),
             "body_bytes":  body_bytes,
-            "attached_plasmid_ids": list(
-                e.get("attached_plasmid_ids") or [],
-            ),
-            "attached_gel_ids":     list(e.get("attached_gel_ids") or []),
-            "attached_actions":     list(e.get("attached_actions") or []),
-            "image_paths":          list(e.get("image_paths") or []),
+            "attached_plasmid_ids": _as_str_list(
+                e.get("attached_plasmid_ids")),
+            "attached_gel_ids":     _as_str_list(e.get("attached_gel_ids")),
+            "attached_actions":     _as_str_list(e.get("attached_actions")),
+            "image_paths":          _as_str_list(e.get("image_paths")),
         })
     pj = payload.get("project")
     return {"experiments": out,
@@ -11874,7 +12505,7 @@ def _agent_experiment_rows(payload) -> "tuple[list[tuple[str, dict]] | None, tup
     the same scoping `list-experiments` uses, plus the cross-project
     option the GUI's Ctrl+F search has.
     """
-    if payload.get("all_projects"):
+    if _payload_bool(payload, "all_projects", False):
         if payload.get("project"):
             return None, ({"error": "pass 'project' or 'all_projects', "
                                      "not both"}, 400)
@@ -11896,7 +12527,7 @@ def _agent_experiment_hit(project: str, entry: dict, *,
         "id":         entry.get("id", ""),
         "title":      entry.get("title", ""),
         "project":    project,
-        "tags":       list(entry.get("tags") or []),
+        "tags":       _tag_values(entry.get("tags")),
         "created_at": entry.get("created_at", ""),
         "updated_at": entry.get("updated_at", ""),
         "body_bytes": len(body.encode("utf-8", errors="replace"))
@@ -11930,8 +12561,15 @@ def _h_search_experiments(app, payload):
     tags = payload.get("tags") or []
     if not isinstance(tags, list):
         return ({"error": "'tags' must be a list of strings"}, 400)
+    # An EMPTY tag is not a criterion. `tags: [""]` passed the "did you give me
+    # anything" check and then matched every entry, so a filter returned the whole
+    # notebook and read as a search result (audit 2026-09-22) — while the
+    # equivalent `tags: []` correctly 400s. Drop the blanks, then re-check.
+    tags = [t for t in tags if isinstance(t, str) and t.strip()]
     if not query.strip() and not tags:
-        return ({"error": "pass 'query' and/or 'tags'"}, 400)
+        return ({"error": "pass 'query' and/or 'tags' — an empty tag is not a "
+                          "filter, and searching with no criteria would return "
+                          "the whole notebook"}, 400)
     limit = _coerce_int(payload.get("limit", 200), name="limit")
     if isinstance(limit, str):
         return ({"error": limit}, 400)
@@ -11941,11 +12579,11 @@ def _h_search_experiments(app, payload):
     grouped: "dict[str, list[dict]]" = {}
     for proj, e in rows:
         grouped.setdefault(proj, []).append(e)
-    scored: "list[tuple[int, str, str, dict, list]]" = []
+    scored: "list[tuple[int, float, str, dict, list]]" = []
     for proj, entries in grouped.items():
         for h in _experiment_search(entries, query, tags=tags):
             scored.append((h["score"],
-                           h["entry"].get("updated_at") or "",
+                           _iso_instant(h["entry"].get("updated_at")),
                            proj, h["entry"], h["fields"]))
     scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
     terms = _experiment_search_terms(query)
@@ -11958,7 +12596,7 @@ def _h_search_experiments(app, payload):
     ]
     return {"experiments": out, "count": len(out),
             "truncated": len(scored) > limit,
-            "scope": ("all" if payload.get("all_projects")
+            "scope": ("all" if _payload_bool(payload, "all_projects", False)
                       else (payload.get("project")
                             or _get_active_project_name() or ""))}
 
@@ -12000,7 +12638,7 @@ def _h_experiment_backlinks(app, payload):
     for proj, entries in grouped.items():
         for e in _experiments_referencing(entries, refs, kind=kind):
             out.append(_agent_experiment_hit(proj, e))
-    out.sort(key=lambda h: h.get("updated_at") or "", reverse=True)
+    out.sort(key=lambda h: _iso_instant(h.get("updated_at")), reverse=True)
     return {"experiments": out, "count": len(out), "kind": kind,
             "ref": [r for r in refs if isinstance(r, str) and r.strip()]}
 
@@ -12161,7 +12799,7 @@ def _h_export_experiment(app, payload):
                                   else "")}, 404)
         entries = [entry]
     else:
-        entries = sorted(src, key=lambda e: (e.get("updated_at") or ""),
+        entries = sorted(src, key=lambda e: _iso_instant(e.get("updated_at")),
                           reverse=True)
         if not entries:
             return ({"error": "no entries to export"}, 404)
@@ -12472,9 +13110,11 @@ def _h_ot2_compile(app, payload):
     Friendly labware aliases (``tiprack_300``, ``eppi_24``, ``plate_24``,
     ``plate_96``, ``reservoir_12`` …) expand to canonical Opentrons load names.
 
-    Returns ``{summary, valid, errors, warnings, protocol?}`` — ``protocol`` (the
-    ``.py`` text) is present only when the plan validates. Always re-check with
-    ``ot2-analyze`` before running on hardware.
+    Returns ``{ok, summary, valid, errors, warnings, protocol?}`` — ``protocol``
+    (the ``.py`` text) is present only when the plan validates. An invalid plan
+    answers ``ok: false`` with an ``error`` naming how many problems ``errors``
+    lists — nothing was compiled. Always re-check with ``ot2-analyze`` before
+    running on hardware.
     """
     plan = _agent_ot2_plan(payload)
     if not isinstance(plan, dict):
@@ -12482,10 +13122,21 @@ def _h_ot2_compile(app, payload):
     try:
         report = _ot2._ot2_validate_plan(plan)
         summary = _ot2._ot2_plan_summary(plan)
-        out = {"summary": summary, "valid": not report["errors"],
+        valid = not report["errors"]
+        # `ok` is the OUTCOME: an invalid plan compiled nothing, and answering
+        # `ok: true` beside `valid: false` let a caller that checks only the
+        # envelope carry on with no protocol (audit 2026-09-22, AA8).
+        out = {"ok": valid, "summary": summary, "valid": valid,
                "errors": report["errors"], "warnings": report["warnings"]}
-        if not report["errors"]:
+        if valid:
             out["protocol"] = _ot2._ot2_compile_protocol(plan)
+        else:
+            n = len(report["errors"])
+            out["error"] = (f"the plan has {n} error{'s' if n != 1 else ''} — "
+                            f"see `errors`; no protocol was compiled")
+            # A 4xx as well as `ok: false`: a status-checking caller (the CLI
+            # exits 0 on any 2xx) otherwise went on with no protocol.
+            return out, 422
     except _ot2.OT2Error as exc:
         return ({"error": str(exc)}, 400)
     return out
@@ -12572,7 +13223,7 @@ def _h_ot2_run(app, payload):
             return ({"error": f"cannot compile plan: {exc}"}, 400)
         offset_plan = plan   # so any per-labware offsets in the plan are applied
     try:
-        return _ot2._ot2_run_protocol(
+        res = _ot2._ot2_run_protocol(
             host, protocol,
             confirm=_payload_bool(payload, "confirm", False),
             poll=_payload_bool(payload, "wait", True),
@@ -12581,6 +13232,27 @@ def _h_ot2_run(app, payload):
         )
     except _ot2.OT2Error as exc:
         return ({"error": str(exc)}, 502)
+    # Explicit `ok`: without it the envelope called a failed, stopped or
+    # refused run a success (the dispatcher leaves an explicit `ok` alone).
+    return _agent_ot2_run_envelope(res)
+
+
+def _agent_ot2_run_envelope(res):
+    """An `ot2-run` / `ot2-position-check` result with an explicit ``ok``.
+
+    Without it the envelope called a failed, stopped or refused run a success
+    (the dispatcher leaves an explicit ``ok`` alone). A run that did not do
+    what was asked answers 422: with HTTP 200 a status-checking caller
+    (`splicecraft-cli` exits 0 on any 2xx) read a crashed run as done. Never a
+    5xx or a 409 — neither is cached for an idempotent retry, and clients
+    retry both, so the retry would move the robot through the protocol again
+    over wells the failed run had already filled."""
+    ok, why = _ot2._ot2_run_outcome(res)
+    res = {**res, "ok": ok}
+    if not ok:
+        res["error"] = why
+        return res, 422
+    return res
 
 
 @_agent_endpoint("ot2-run-control", write=True)
@@ -12603,7 +13275,11 @@ def _h_ot2_run_control(app, payload):
     if action not in ("pause", "resume", "stop", "cancel"):
         return ({"error": "missing/invalid 'action' (use pause | resume | stop)"}, 400)
     rid = payload.get("run_id")
-    rid = str(rid) if rid else _ot2._ot2_active_run(host)
+    try:
+        rid = str(rid) if rid else _ot2._ot2_active_run(host, strict=True)
+    except _ot2.OT2Error as exc:
+        # NOT "nothing is running": the robot could not be asked.
+        return ({"error": str(exc)}, 502)
     if not rid:
         return ({"error": "no active run to control (nothing is running on the robot)"}, 409)
     try:
@@ -12664,16 +13340,41 @@ def _h_ot2_normalize(app, payload):
             resolution=_ot2_opt_float(payload, "resolution", 0.1) or 0.1)
     except _ot2.OT2Error as exc:
         return ({"error": str(exc)}, 400)
+    n_off = sum(1 for r in normalized
+                if r.get("ok") and not r.get("on_target"))
     out = {"ok": True, "normalized": normalized,
            "n_ok": sum(1 for r in normalized if r.get("ok")),
+           # `n_ok` counts wells a transfer was PLANNED for; `n_on_target` counts
+           # the ones that actually reach the requested amount. A clamped, under-
+           # target well is `ok` and NOT on target, and reading only `n_ok` said
+           # the plate normalised when part of it did not (audit 2026-09-22).
+           "n_on_target": sum(1 for r in normalized if r.get("on_target")),
            "warnings": [f"{r['name'] or r.get('well')}: {r['warning']}"
                         for r in normalized if r.get("warning")]}
+    if n_off:
+        out["warnings"].insert(0, (
+            f"{n_off} of {out['n_ok']} planned well(s) do NOT reach the target "
+            f"(volume clamped to the pipette's range, or the stock is too "
+            f"dilute) — they are still transferred, at the concentration each "
+            f"row's `achieved_conc` reports"))
     src, dst = payload.get("src"), payload.get("dst")
     if src and dst:
+        same_plate = str(src).strip() == str(dst).strip()
         dst_wells = payload.get("dst_wells")
-        if not (isinstance(dst_wells, list) and dst_wells):
+        explicit_wells = isinstance(dst_wells, list) and bool(dst_wells)
+        if not explicit_wells:
             dst_wells = _ot2._ot2_entry_wells({"labware": str(payload.get("dst_labware", "") or "")})
         diluent_ref = str(payload["diluent_ref"]) if payload.get("diluent_ref") else None
+        if same_plate and not explicit_wells:
+            # Same plate on both ends and the destinations left to default: they
+            # fill from A1, straight over the samples still to be read (audit
+            # 2026-09-22).
+            return ({"error": f"'src' and 'dst' are the same labware "
+                              f"({str(src).strip()!r}) and no 'dst_wells' were "
+                              f"given — the destinations would fill from A1, over "
+                              f"the samples the normalise still has to read. "
+                              f"Name the destination wells, or use a second "
+                              f"plate."}, 400)
         # A dilution target with no diluent well would build undiluted samples while
         # the `normalized` preview reports the diluted concentration — warn loudly.
         if not diluent_ref and any((r.get("diluent_ul") or 0) > 0
@@ -12685,7 +13386,46 @@ def _h_ot2_normalize(app, payload):
             normalized, src_id=str(src), dst_id=str(dst),
             dst_wells=[str(w) for w in (dst_wells or [])],
             diluent_ref=diluent_ref, new_tip=str(payload.get("new_tip", "always")))
+        # No destination may land on a well that already holds something: on
+        # one plate, EVERY item's well (a sample the normalise skipped is still
+        # in its well — only the wells a step reads were checked, so a skipped
+        # sample was pipetted into), and on either plate the diluent well (a
+        # diluent on the destination plate was never checked when the plates
+        # differed, so a sample went into the diluent and every later dilution
+        # drew from it). One plate for both is fine while no well is both —
+        # refusing it outright (the first fix) refused column 1 into column 7.
+        occupied = [diluent_ref] if diluent_ref else []
+        if same_plate:
+            occupied += [f"{str(src).strip()}:{it.get('well')}" for it in items
+                         if isinstance(it, dict) and it.get("well")]
+        clash = _ot2_same_plate_clash(out["steps"], str(dst).strip(), occupied)
+        if clash:
+            return ({"error": f"{', '.join(clash[:6])}"
+                              f"{' …' if len(clash) > 6 else ''} on "
+                              f"{str(dst).strip()!r} would be both read and "
+                              f"written — a destination must never be a "
+                              f"sample's well or the diluent well. Choose "
+                              f"other destination wells, or use a second "
+                              f"plate."}, 400)
     return out
+
+
+def _ot2_same_plate_clash(steps, plate: str, occupied) -> "list[str]":
+    """The wells of ``plate`` that a normalise's ``steps`` would write into
+    while they already hold something — a step's source, or any ``occupied``
+    reference (``"plate:A1"``: the samples, the diluent) — in canonical
+    spelling."""
+    def _key(ref) -> "str | None":
+        lid, sep, well = str(ref or "").partition(":")
+        if not sep or lid.strip() != plate:
+            return None
+        parsed = _ot2._ot2_parse_well(well)
+        return (f"{_ot2._ROW_LETTERS[parsed[0]]}{parsed[1]}"
+                if parsed is not None else well.strip().upper())
+    written = {k for k in (_key(s.get("to")) for s in steps) if k}
+    read = {k for k in (_key(s.get("from")) for s in steps) if k}
+    read |= {k for k in (_key(r) for r in (occupied or [])) if k}
+    return sorted(written & read)
 
 
 @_agent_endpoint("ot2-plate-map")
@@ -12752,7 +13492,11 @@ def _h_ot2_home(app, payload):
     host = _agent_ot2_host(payload)
     if not host:
         return ({"error": "no OT-2 host (pass 'host' or set the 'ot2_host' setting)"}, 400)
-    if _ot2._ot2_active_run(host):
+    try:
+        busy = _ot2._ot2_active_run(host, strict=True)
+    except _ot2.OT2Error as exc:     # fail closed: never home blind
+        return ({"error": str(exc)}, 502)
+    if busy:
         return ({"error": "a run is active — stop it before homing"}, 409)
     try:
         _ot2._ot2_home(host)
@@ -12796,7 +13540,11 @@ def _h_ot2_disengage(app, payload):
     host = _agent_ot2_host(payload)
     if not host:
         return ({"error": "no OT-2 host (pass 'host' or set the 'ot2_host' setting)"}, 400)
-    if _ot2._ot2_active_run(host):
+    try:
+        busy = _ot2._ot2_active_run(host, strict=True)
+    except _ot2.OT2Error as exc:     # fail closed: never disengage blind
+        return ({"error": str(exc)}, 502)
+    if busy:
         return ({"error": "a run is active — stop it before disengaging the motors"}, 409)
     # Validate axes against the six-axis set (drop unknowns, cap the list); an empty
     # or absent list means the engine default (all six).
@@ -12843,12 +13591,15 @@ def _h_ot2_position_check(app, payload):
     else:
         wells = None
     try:
-        return _ot2._ot2_run_position_check(
+        res = _ot2._ot2_run_position_check(
             host, plan, wells=wells, confirm=_payload_bool(payload, "confirm", False),
             poll=_payload_bool(payload, "wait", True),
             stop_on_fault=_payload_bool(payload, "stop_on_fault", True))
     except _ot2.OT2Error as exc:
         return ({"error": str(exc)}, 502)
+    # The same outcome rule as `ot2-run`: a position check that crashed,
+    # failed or was stopped answered `ok: true` (audit 2026-09-22).
+    return _agent_ot2_run_envelope(res)
 
 
 # ── OT-2 protocol library + custom-labware library endpoints ────────────────────

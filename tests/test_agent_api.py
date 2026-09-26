@@ -1276,7 +1276,10 @@ class TestDeletePrimersBatch:
         sc._save_primers([])
         sc._h_create_primer(None, {"name": "dup", "sequence": "AAAACCCCGG"})
         sc._h_create_primer(None, {"name": "dup", "sequence": "TTTTGGGGAA"})
-        r = sc._h_delete_primers(None, {"names": ["dup"]})
+        r, code = sc._h_delete_primers(None, {"names": ["dup"]})
+        # 409, not 404: the primers still exist, and a 404 ("already gone")
+        # is cached and read as done (hardening 2026-09-25).
+        assert code == 409 and r["ok"] is False   # nothing was removed
         assert r["ambiguous"] == ["dup"] and r["removed"] == 0
         assert len(sc._load_primers()) == 2   # both kept (ambiguous → skipped)
 
@@ -1293,16 +1296,19 @@ class TestDomesticatePartsBatch:
         assert sc._h_domesticate_parts(MockApp(), {"parts": []})[1] == 400
 
     def test_per_item_failure_without_entry_vector(self, isolated_library):
-        # No entry vector configured → each part fails 422, reported per-item;
-        # the batch itself returns ok with built=0 (it does NOT abort).
+        # No entry vector configured → each part fails 422, reported per-item.
+        # The batch does NOT abort — but it built nothing, so it must not answer
+        # `ok: true` beside two failures (audit 2026-09-22, AA8).
         sc._save_entry_vectors([])
         app = MockApp()
         parts = [
             {"sequence": "ATGAAACGTTAA", "oh5": "GGAG", "oh3": "AATG", "name": "p1"},
             {"sequence": "ATGGGGCCCTAA", "oh5": "GGAG", "oh3": "AATG", "name": "p2"},
         ]
-        r = sc._h_domesticate_parts(app, {"parts": parts})
-        assert r["ok"] is True
+        r, code = sc._h_domesticate_parts(app, {"parts": parts})
+        # A 4xx as well: the CLI exits 0 on any 2xx.
+        assert code == 422
+        assert r["ok"] is False and r.get("error")
         assert r["built"] == 0 and r["total"] == 2
         assert all(item["ok"] is False for item in r["results"])
         assert all(item.get("code") == 422 for item in r["results"])
@@ -6351,8 +6357,10 @@ class TestBatchMoveCopyPlasmids:
         ])
         sc._set_active_collection_name("Act")
         sc._restore_library_from_active_collection()
-        r = sc._h_copy_plasmids(None, {"names": ["dup"], "to": "W"})
-        assert r["ok"] and r["copied"] == 0 and r["ambiguous"] == ["dup"]
+        r, code = sc._h_copy_plasmids(None, {"names": ["dup"], "to": "W"})
+        # Nothing copied is not `ok` (hardening 2026-09-25); ambiguous → 409.
+        assert code == 409 and not r["ok"]
+        assert r["copied"] == 0 and r["ambiguous"] == ["dup"]
         r2 = sc._h_copy_plasmids(None,
                                  {"names": ["dup"], "to": "W", "from": "X"})
         assert r2["copied"] == 1
@@ -6397,8 +6405,10 @@ class TestBatchMoveCopyPlasmids:
         ])
         sc._set_active_collection_name("Act")
         sc._restore_library_from_active_collection()
-        r = sc._h_move_plasmids(None,
-                                {"names": ["shared"], "to": "T", "from": "S"})
+        r, code = sc._h_move_plasmids(None,
+                                      {"names": ["shared"], "to": "T",
+                                       "from": "S"})
+        assert code == 409 and not r["ok"]      # nothing moved (2026-09-25)
         assert r["moved"] == 0 and r["conflict"] == ["shared"]
         # The source entry must NOT have been removed — no data loss.
         assert self._names("S") == ["shared"]

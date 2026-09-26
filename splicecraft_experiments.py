@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 import uuid as _uuid
 
-from splicecraft_util import (_NOTE_CTRL_RE, _is_image_path, _now_iso,
+from splicecraft_util import (_NOTE_CTRL_RE, _is_image_path, _iso_instant, _now_iso,
                               _sanitize_label)
 
 
@@ -50,8 +50,18 @@ _EXPERIMENT_TAGS_MAX      = 20
 # (`(?>...)`) so the lookahead+backref idiom is the portable
 # stand-in. The captured id is still `m.group(1)` and the full
 # match (sigil + id) is still `m.group(0)`.
+#
+# Audit 2026-09-22 (S10f), two refinements:
+#   * `;` is rejected after a GEL id only. Only `&` forms an HTML entity;
+#     after `@`/`!` a semicolon is prose ("…transformed @pUC19; plated…"),
+#     and rejecting it dropped the reference.
+#   * An id is capped at 64 characters, and a longer token is now rejected
+#     rather than CUT: the lookahead took the first 64 characters and the
+#     reference resolved as that prefix — a different plasmid, or none.
+#     `(?![\w=]|[.\-]\w)` refuses a match the id would continue past.
+_REF_ID = r"(?=([A-Za-z](?:[\w.\-]{0,62}\w)?))\1"
 _PLASMID_REF_RE = re.compile(
-    r"(?<![\w@])@(?=([A-Za-z](?:[\w.\-]{0,62}\w)?))\1(?![;=])"
+    r"(?<![\w@])@" + _REF_ID + r"(?![\w=]|[.\-]\w)"
 )
 
 # Action cross-reference token: `!<id>` inline anywhere in the body.
@@ -60,7 +70,7 @@ _PLASMID_REF_RE = re.compile(
 # next char to be a letter, while images require `[`. Same atomic-
 # group + trailing-reject hardening as the plasmid pattern (sweep #9).
 _ACTIONS_REF_RE = re.compile(
-    r"(?<![\w!])!(?=([A-Za-z](?:[\w.\-]{0,62}\w)?))\1(?![;=])"
+    r"(?<![\w!])!" + _REF_ID + r"(?![\w=]|[.\-]\w)"
 )
 
 # Gel cross-reference token: `&<id>` inline anywhere in the body
@@ -75,7 +85,7 @@ _ACTIONS_REF_RE = re.compile(
 # editor, and surfacing a misleading "no such gel" notify on
 # Ctrl+G click-through.
 _GEL_REF_RE = re.compile(
-    r"(?<![\w&])&(?=([A-Za-z](?:[\w.\-]{0,62}\w)?))\1(?![;=])"
+    r"(?<![\w&])&" + _REF_ID + r"(?![\w;=]|[.\-]\w)"
 )
 
 # Filesystem-id constraint. Entry ids are mechanically generated as
@@ -122,6 +132,19 @@ def _as_str_list(value: object) -> "list[str]":
         return []
     return [v for v in value if isinstance(v, str)]
 
+
+
+def _tag_values(value: object) -> "list[str]":
+    """An entry's tags as strings. A LIST is read like `_as_str_list`; a bare
+    string — hand-edited `experiments.json` — is read as the comma-separated
+    text the tags field itself takes, so ``"gibson"`` is the tag `gibson`.
+
+    Tags are the one field where a bare string is unambiguous. Reading it as
+    no tags at all (`_as_str_list`) blanked the tags field and the next save
+    wrote ``tags: []`` — the tag was deleted rather than shown."""
+    if isinstance(value, str):
+        return [t.strip() for t in value.split(",") if t.strip()]
+    return _as_str_list(value)
 
 def _new_experiment_id(existing: "set[str] | None" = None) -> str:
     """Generate a fresh `exp-<8 hex>` id. `existing` (the current
@@ -257,7 +280,7 @@ def _normalise_experiment_entry(entry: dict, *, fresh: bool = False
             "utf-8", errors="ignore",
         )
     out["body_md"] = body
-    raw_tags = out.get("tags") or []
+    raw_tags = _tag_values(out.get("tags"))
     tags: list[str] = []
     if isinstance(raw_tags, list):
         for t in raw_tags:
@@ -371,10 +394,7 @@ def _experiment_match_fields(entry: dict, terms: "list[str]") -> "list[str]":
     title_l = title.lower() if isinstance(title, str) else ""
     body = entry.get("body_md") or ""
     body_l = body.lower() if isinstance(body, str) else ""
-    raw_tags = entry.get("tags") or []
-    tags_l = " ".join(
-        t.lower() for t in raw_tags if isinstance(t, str)
-    ) if isinstance(raw_tags, list) else ""
+    tags_l = " ".join(t.lower() for t in _tag_values(entry.get("tags")))
     fields: "list[str]" = []
     for t in terms:
         hit = False
@@ -463,7 +483,7 @@ def _experiment_search(entries: "list[dict]", query: object, *,
         if not isinstance(e, dict):
             continue
         if want_tags:
-            have = {t.lower() for t in _as_str_list(e.get("tags"))}
+            have = {t.lower() for t in _tag_values(e.get("tags"))}
             if not all(w in have for w in want_tags):
                 continue
         if terms:
@@ -487,7 +507,7 @@ def _experiment_search(entries: "list[dict]", query: object, *,
             "score":   score,
         })
     out.sort(
-        key=lambda h: (h["score"], (h["entry"].get("updated_at") or "")),
+        key=lambda h: (h["score"], _iso_instant(h["entry"].get("updated_at"))),
         reverse=True,
     )
     if isinstance(limit, int) and limit > 0:
@@ -565,7 +585,7 @@ def _experiments_referencing(entries: "list[dict]", ref_id: object, *,
         refs = extract(body)
         if any(r.lower() in want for r in refs):
             out.append(e)
-    out.sort(key=lambda e: (e.get("updated_at") or ""), reverse=True)
+    out.sort(key=lambda e: _iso_instant(e.get("updated_at")), reverse=True)
     return out
 
 
@@ -785,7 +805,7 @@ def _experiment_duplicate(entry: dict, *, new_id: str,
                    else (f"{base} (copy)" if base else "(untitled) (copy)"),
         "body_md": src.get("body_md") if isinstance(src.get("body_md"), str)
                    else "",
-        "tags":    [t for t in (src.get("tags") or []) if isinstance(t, str)],
+        "tags":    _tag_values(src.get("tags")),
         "image_paths": [],
     }
     return _normalise_experiment_entry(out, fresh=True)
@@ -820,6 +840,23 @@ def _experiment_reference_block(entry: dict) -> str:
     return "## References\n\n" + "\n\n".join(parts) + "\n"
 
 
+def _md_local_target(src: str) -> str:
+    """A link target a markdown viewer will follow: a `file:` URI becomes the
+    local path it names, in ``<…>`` when it holds a space or a parenthesis
+    (CommonMark's form for such a destination); anything else is unchanged."""
+    if not isinstance(src, str) or not src.lower().startswith("file:"):
+        return src
+    try:
+        import urllib.parse as _up
+        import urllib.request as _ur
+        path = _ur.url2pathname(_up.urlsplit(src).path)
+    except (ValueError, OSError):
+        return src
+    if not path or "<" in path or ">" in path or "\n" in path:
+        return src
+    return f"<{path}>" if any(c in path for c in " ()") else path
+
+
 def _experiment_markdown_document(entry: dict, *,
                                   project: "str | None" = None,
                                   image_srcs: "dict[str, str] | None" = None
@@ -830,7 +867,11 @@ def _experiment_markdown_document(entry: dict, *,
     exported entry can be pasted back into a new entry and still carry
     working `@`/`!`/`&` refs. Everything the export adds (metadata
     header, references, attachment list) goes around the body, never
-    through it.
+    through it. The one exception is the TARGET of a link or image that
+    names a stored attachment: that is pointed at where the export put the
+    file (`image_srcs`), because the bare stored name resolves nowhere
+    outside the app. Those attachments are then not listed again under
+    Attachments, which holds only the files the body does not show.
     """
     e = entry if isinstance(entry, dict) else {}
     title = (e.get("title") or "").strip() or "(untitled)"
@@ -844,22 +885,34 @@ def _experiment_markdown_document(entry: dict, *,
         meta.append(f"- **Created:** {e.get('created_at')}")
     if e.get("updated_at"):
         meta.append(f"- **Updated:** {e.get('updated_at')}")
-    tags = [t for t in (e.get("tags") or []) if isinstance(t, str)]
+    tags = _tag_values(e.get("tags"))
     if tags:
         meta.append("- **Tags:** " + ", ".join(tags))
     if meta:
         lines += meta + [""]
+    images = _as_str_list(e.get("image_paths"))
+    # A markdown viewer needs a PATH, not a `file:` URI: CommonMark renderers
+    # (markdown-it's default) refuse the `file:` scheme outright, so every
+    # attachment exported without embedding rendered as nothing (round-2
+    # hardening, 2026-09-25). The HTML exporter keeps the URI.
+    srcs = {k: _md_local_target(v) for k, v in (image_srcs or {}).items()}
+    url_map = _attachment_url_map(images, srcs)
+    shown: "set[str]" = set()
     body = e.get("body_md")
     if isinstance(body, str) and body.strip():
+        shown = _body_attachment_refs(body, images)
+        if url_map:
+            body = _md_map_link_targets(
+                body, lambda t: url_map.get(t, t),
+                as_link=lambda t: t in url_map and not _is_image_path(t))
         lines += [body.rstrip(), ""]
     refs = _experiment_reference_block(e)
     if refs:
         lines += [refs]
-    images = _as_str_list(e.get("image_paths"))
-    if images:
+    rest = [p for p in images if p not in shown]
+    if rest:
         lines += ["## Attachments", ""]
-        srcs = image_srcs or {}
-        for p in images:
+        for p in rest:
             src = srcs.get(p, p)
             # `![...]` only for a raster image. A trace / CSV / datasheet
             # gets a plain link — an image tag around a `.ab1` renders as
@@ -913,7 +966,8 @@ _MARKDOWN_HTML_SUBSET = (
 _MD_HEADING_RE  = re.compile(r"^(#{1,6})\s+(.*)$")
 _MD_HR_RE       = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
 _MD_UL_RE       = re.compile(r"^\s*[-*+]\s+(.*)$")
-_MD_OL_RE       = re.compile(r"^\s*\d+[.)]\s+(.*)$")
+# The number is captured so a list that starts at 3 renders as 3, not 1.
+_MD_OL_RE       = re.compile(r"^\s*(\d{1,9})[.)]\s+(.*)$")
 _MD_QUOTE_RE    = re.compile(r"^\s*>\s?(.*)$")
 _MD_FENCE_RE    = re.compile(r"^\s*```+\s*([A-Za-z0-9_+-]*)\s*$")
 _MD_CODE_RE     = re.compile(r"`([^`\n]+)`")
@@ -921,13 +975,27 @@ _MD_CODE_RE     = re.compile(r"`([^`\n]+)`")
 # let a label swallow a whole run of them, so a body of 20,000 '[' took
 # quadratic time to export, and it is exactly the shape of a link nested in
 # an image's alt text — which used to be rewritten INSIDE the <img> tag.
-_MD_IMAGE_RE    = re.compile(r"!\[([^\[\]]*)\]\(([^)\s]+)\)")
-_MD_LINK_RE     = re.compile(r"\[([^\[\]]+)\]\(([^)\s]+)\)")
+# The target stops at '(' as well as ')' for the same reason: a run of
+# unclosed `[a](` let every attempt scan to the end of the line before
+# failing, so 8,000 of them took ~2 s to export and a 160 KB body ~45 s.
+# Stopping at the next '(' bounds each attempt by the distance to the next
+# one, which makes the whole pass linear. One level of BALANCED parentheses is
+# still allowed — `…/wiki/Foo_(bar)`, a DOI like `0378-1119(85)90120-9` — and
+# the target has no length cap: a cap of 2,048 broke every embedded
+# `data:image/…` target, so an exported notebook pasted back as a body came out
+# as a wall of base64 text. A '(' opening a group must close before the next
+# '(' or ')', so each attempt is still bounded by the next parenthesis.
+_MD_URL         = r"(?:[^()\s]|\([^()\s]*\))+"
+_MD_IMAGE_RE    = re.compile(r"!\[([^\[\]]*)\]\((" + _MD_URL + r")\)")
+_MD_LINK_RE     = re.compile(r"\[([^\[\]]+)\]\((" + _MD_URL + r")\)")
 _MD_BOLD_RE     = re.compile(r"\*\*(\S(?:[^*]*\S)?)\*\*")
 # Only `*italic*`, never `_italic_`: a lab notebook is full of
 # snake_case identifiers and file names, and turning `pUC19_v2` into
 # italics mid-word is a mangling the user can't undo.
 _MD_ITALIC_RE   = re.compile(r"(?<![\w*])\*(\S(?:[^*]*\S)?)\*(?![\w*])")
+
+
+_C0_AND_SPACE = "".join(map(chr, range(0x21)))
 
 
 def _html_safe_url(raw: object) -> str:
@@ -942,8 +1010,10 @@ def _html_safe_url(raw: object) -> str:
     if not isinstance(raw, str):
         return ""
     # A browser's URL parser deletes tab / CR / LF anywhere in a URL, so
-    # "/\t/host" IS "//host": judge the string the browser will use.
-    s = re.sub(r"[\t\r\n]", "", raw).strip()
+    # "/\t/host" IS "//host": judge the string the browser will use. It
+    # also strips every C0 control and space from both ends, so
+    # "\x02//host" is "//host" too (round-2 hardening, 2026-09-25).
+    s = re.sub(r"[\t\r\n]", "", raw).strip(_C0_AND_SPACE).strip()
     if not s:
         return ""
     low = s.lower()
@@ -970,8 +1040,118 @@ def _html_safe_url(raw: object) -> str:
     return s
 
 
-def _md_inline_to_html(text: str) -> str:
+def _html_attachment_url(raw: object) -> str:
+    """The src/href for a stored attachment, as SpliceCraft produced it: a
+    `data:` URI (embedded) or a `file:` URI (left where it is on this
+    machine), else whatever `_html_safe_url` allows.
+
+    Separate from `_html_safe_url` because the two answer different
+    questions: that one polices text a USER put in a body, this one passes
+    locations the exporter itself computed. Run through the body allowlist,
+    a Windows attachment path read as a `C:` scheme and the attachment was
+    silently dropped from the page (audit 2026-09-22) — the exporter now
+    hands over `Path.as_uri()` and this accepts it."""
+    if not isinstance(raw, str):
+        return ""
+    s = re.sub(r"[\t\r\n]", "", raw).strip()
+    if s.lower().startswith(("data:", "file:")):
+        return s
+    return _html_safe_url(s)
+
+
+def _md_map_link_targets(md: object, fn, as_link=None) -> str:
+    """`md` with ``fn(target)`` applied to the target of every link and image
+    the HTML renderer would draw, and to nothing else: text inside a fenced
+    block or an inline code span stays exactly as written, and every other
+    character comes back unchanged. Mirrors `_md_inline_to_html`'s passes —
+    code spans parked first, then images, then links — so a link whose label
+    holds code or an image is recognised the same way here as there.
+
+    ``as_link(target)`` true writes that IMAGE reference as a plain link: an
+    attachment that is not a picture (a trace, a CSV) inside `![…]` is a
+    broken-image box in every viewer."""
+    if not isinstance(md, str) or not md:
+        return md if isinstance(md, str) else ""
+    placeholder = re.compile("\x00(\\d+)\x00")
+
+    def _line(line: str) -> str:
+        if "\x00" in line:        # keep the placeholder scheme unambiguous
+            return line
+        stash: "list[str]" = []
+
+        def _park(text: str) -> str:
+            stash.append(text)
+            return f"\x00{len(stash) - 1}\x00"
+
+        def _img(m) -> str:
+            new = fn(m.group(2))
+            if as_link is not None and as_link(m.group(2)):
+                return _park(f"[{m.group(1)}]({new})")
+            return _park(m.group(0) if new == m.group(2)
+                         else f"![{m.group(1)}]({new})")
+
+        def _lnk(m) -> str:
+            new = fn(m.group(2))
+            return (m.group(0) if new == m.group(2)
+                    else f"[{m.group(1)}]({new})")
+        t = _MD_CODE_RE.sub(lambda m: _park(m.group(0)), line)
+        t = _MD_IMAGE_RE.sub(_img, t)
+        t = _MD_LINK_RE.sub(_lnk, t)
+        # Parked text can hold earlier placeholders (code inside an image's
+        # alt text), so restore until none are left; each pass only reaches
+        # lower indices, so this ends.
+        for _ in range(len(stash) + 1):
+            if "\x00" not in t:
+                break
+            t = placeholder.sub(lambda m: stash[int(m.group(1))], t)
+        return t
+
+    out: "list[str]" = []
+    in_fence = False
+    for line in md.splitlines(keepends=True):
+        if _MD_FENCE_RE.match(line.rstrip("\r\n")):
+            in_fence = not in_fence
+            out.append(line)
+        elif in_fence:
+            out.append(line)
+        else:
+            out.append(_line(line))
+    return "".join(out)
+
+
+def _attachment_url_map(attachments: "list[str]",
+                        image_srcs: "dict[str, str] | None") -> "dict[str, str]":
+    """Stored attachment name → where the export put it, for the ones the
+    caller resolved (an embedded `data:` URI or a local `file:` URI)."""
+    srcs = image_srcs or {}
+    return {p: srcs[p] for p in attachments
+            if isinstance(srcs.get(p), str) and srcs[p] and srcs[p] != p}
+
+
+def _body_attachment_refs(body: object, attachments: "list[str]") -> "set[str]":
+    """The stored attachments the body already shows or links to. The
+    notebook's Attach button inserts `![name](name)` AND records the file,
+    so an export that listed every recorded file under Attachments showed
+    each image twice (audit 2026-09-22) — this is what it leaves out."""
+    want = set(attachments)
+    seen: "set[str]" = set()
+
+    def _note(target: str) -> str:
+        if target in want:
+            seen.add(target)
+        return target
+    _md_map_link_targets(body, _note)
+    return seen
+
+
+def _md_inline_to_html(text: str,
+                       url_map: "dict[str, str] | None" = None) -> str:
     """Inline markdown → HTML for one already-block-classified line.
+
+    `url_map` sends a link or image whose target is a stored attachment to
+    where the export put that attachment (see `_attachment_url_map`). Its
+    values are produced by SpliceCraft, not typed into a body, so they are
+    checked with `_html_attachment_url` rather than the body allowlist.
 
     Every tag this emits is built from the RAW text, escaped exactly once,
     and parked behind a placeholder until the end — so no later pass can
@@ -981,33 +1161,74 @@ def _md_inline_to_html(text: str) -> str:
     attribute, and escaped every '&' in a URL twice.)"""
     from html import escape as _esc
     stash: "list[str]" = []
+    # What each placeholder stood for in the body, and how it reads as plain
+    # text. A code span is parked before links are matched, so a backtick in
+    # a link's TARGET (`https://x.org/`v2``) left the placeholder itself in
+    # the href — NUL bytes in the exported page (round-2 hardening).
+    source: "list[str]" = []
+    plain: "list[str]" = []
 
-    def _park(html: str) -> str:
+    def _park(html: str, src: str = "", txt: str = "") -> str:
         stash.append(html)
+        source.append(src)
+        plain.append(txt)
         return f"\x00{len(stash) - 1}\x00"
+
+    def _unpark(s: str, table: "list[str]") -> str:
+        for _ in range(3):              # an image's text holds code spans
+            if "\x00" not in s:
+                break
+            s = re.sub(r"\x00(\d+)\x00", lambda m: table[int(m.group(1))], s)
+        return s.replace("\x00", "")
     out = str(text).replace("\x00", "")
     # Code spans first, so `**literal**` inside backticks stays literal.
     out = _MD_CODE_RE.sub(
-        lambda m: _park(f"<code>{_esc(m.group(1), quote=False)}</code>"), out)
+        lambda m: _park(f"<code>{_esc(m.group(1), quote=False)}</code>",
+                        m.group(0), m.group(1)), out)
+
+    def _target(raw: str) -> str:
+        if url_map and raw in url_map:
+            return _html_attachment_url(url_map[raw])
+        return _html_safe_url(raw)
+
+    def _attachment_file(raw: str) -> bool:
+        # A stored attachment that is not a picture: a link that saves it
+        # under its own name, never an <img> (a broken-image box) and never a
+        # bare `data:` link that opens as text.
+        return bool(url_map) and raw in url_map and not _is_image_path(raw)
+
+    def _open_link(href: str, raw: str) -> str:
+        dl = (f' download="{_esc(raw, quote=True)}"'
+              if _attachment_file(raw) else "")
+        return (f'<a href="{_esc(href, quote=True)}"{dl} rel="noopener '
+                f'noreferrer">')
 
     def _img(m) -> str:
-        src = _html_safe_url(m.group(2))
+        raw = _unpark(m.group(2), source)
+        src = _target(raw)
         alt = m.group(1)
+        alt_text = _unpark(alt, plain)
         if not src:
-            return _park(_esc(f"[image: {alt}]", quote=False))
+            return _park(_esc(f"[image: {alt_text}]", quote=False),
+                         m.group(0), alt_text)
+        if _attachment_file(raw):
+            return (_park(_open_link(src, raw), "![")
+                    + (alt or m.group(2)) + _park("</a>", f"]({m.group(2)})"))
         return _park(f'<img src="{_esc(src, quote=True)}" '
-                     f'alt="{_esc(alt, quote=True)}">')
+                     f'alt="{_esc(alt_text, quote=True)}">',
+                     m.group(0), alt_text)
     out = _MD_IMAGE_RE.sub(_img, out)
 
     def _link(m) -> str:
-        href = _html_safe_url(m.group(2))
+        raw = _unpark(m.group(2), source)
+        href = _target(raw)
         label = m.group(1)
         if not href:
             return label
         # Only the tags are parked; the label stays in the stream so it is
         # escaped and can still carry bold / italic.
-        return (_park(f'<a href="{_esc(href, quote=True)}" rel="noopener '
-                      f'noreferrer">') + label + _park("</a>"))
+        return (_park(_open_link(href, raw), "[") + label
+                + _park("</a>", f"]({m.group(2)})"))
     out = _MD_LINK_RE.sub(_link, out)
     out = _esc(out, quote=False)
     out = _MD_BOLD_RE.sub(r"<strong>\1</strong>", out)
@@ -1015,8 +1236,12 @@ def _md_inline_to_html(text: str) -> str:
     return re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m.group(1))], out)
 
 
-def _markdown_subset_to_html(md: object) -> str:
+def _markdown_subset_to_html(md: object, *,
+                             url_map: "dict[str, str] | None" = None) -> str:
     """Convert the documented markdown subset to an HTML fragment.
+
+    `url_map`: attachment target → exported location, for the links and
+    images in the body that name a stored attachment.
 
     See `_MARKDOWN_HTML_SUBSET` for exactly what is covered. Input is
     HTML-escaped first, so raw HTML in a body renders as visible source
@@ -1089,7 +1314,8 @@ def _markdown_subset_to_html(md: object) -> str:
         if h:
             _flush_all()
             lvl = len(h.group(1))
-            out.append(f"<h{lvl}>{_md_inline_to_html(h.group(2))}</h{lvl}>")
+            out.append(f"<h{lvl}>{_md_inline_to_html(h.group(2), url_map)}"
+                       f"</h{lvl}>")
             continue
         if _MD_HR_RE.match(raw):
             _flush_all()
@@ -1099,23 +1325,33 @@ def _markdown_subset_to_html(md: object) -> str:
         if q:
             _flush_para()
             _flush_list()
-            quote.append(_md_inline_to_html(q.group(1)))
+            quote.append(_md_inline_to_html(q.group(1), url_map))
             continue
         _flush_quote()
         ul = _MD_UL_RE.match(raw)
         ol = _MD_OL_RE.match(raw) if ul is None else None
-        li = ul if ul is not None else ol
-        if li is not None:
+        if ul is not None or ol is not None:
             _flush_para()
             want = "ul" if ul is not None else "ol"
             if list_kind != want:
                 _flush_list()
-                out.append(f"<{want}>")
+                start = ""
+                if ol is not None and int(ol.group(1)) != 1:
+                    # `3. …` starts the list at 3. Without `start` a
+                    # numbered list continued after a paragraph restarted
+                    # at 1 in the export (audit 2026-09-22).
+                    start = f' start="{int(ol.group(1))}"'
+                out.append(f"<{want}{start}>")
                 list_kind = want
-            out.append(f"<li>{_md_inline_to_html(li.group(1))}</li>")
+            if ul is not None:
+                item = ul.group(1)
+            else:
+                assert ol is not None       # one of the two matched
+                item = ol.group(2)
+            out.append(f"<li>{_md_inline_to_html(item, url_map)}</li>")
             continue
         _flush_list()
-        para.append(_md_inline_to_html(raw))
+        para.append(_md_inline_to_html(raw, url_map))
     if fence_lang is not None:
         # Unclosed fence — emit what we collected rather than dropping it.
         cls = (f' class="language-{_esc(fence_lang, quote=True)}"'
@@ -1223,21 +1459,27 @@ def _experiment_html_document(entries: "list[dict]", *,
             if isinstance(val, str) and val:
                 meta.append(f"<li><strong>{label}:</strong> "
                             f"{_esc(val, quote=False)}</li>")
-        tags = [t for t in (e.get("tags") or []) if isinstance(t, str)]
+        tags = _tag_values(e.get("tags"))
         if tags:
             meta.append("<li><strong>Tags:</strong> "
                         + _esc(", ".join(tags), quote=False) + "</li>")
         if meta:
             body.append('<ul class="sc-meta">' + "".join(meta) + "</ul>")
-        body.append(_markdown_subset_to_html(e.get("body_md") or ""))
+        images = _as_str_list(e.get("image_paths"))
+        url_map = _attachment_url_map(images, srcs)
+        body_md = e.get("body_md")
+        body_md = body_md if isinstance(body_md, str) else ""
+        shown = _body_attachment_refs(body_md, images)
+        body.append(_markdown_subset_to_html(body_md, url_map=url_map))
         refs = _experiment_reference_block(e)
         if refs:
             body.append(_markdown_subset_to_html(refs))
-        images = _as_str_list(e.get("image_paths"))
-        if images:
+        rest = [p for p in images if p not in shown]
+        if rest:
             body.append("<h2>Attachments</h2>")
-            for p in images:
-                src = _html_safe_url(srcs.get(p, p))
+            for p in rest:
+                src = (_html_attachment_url(url_map[p]) if p in url_map
+                       else _html_safe_url(p))
                 if not src:
                     continue
                 if _is_image_path(p):

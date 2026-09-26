@@ -34,6 +34,9 @@ _GEL_LANE_DETAIL_MAX_LEN = 200
 _GEL_LANE_SOURCE_MAX_LEN = 64
 
 _GEL_LANES_MAX = 20            # mirrors SimulatorScreen._MAX_LANES
+# A frozen PCR amplicon size is a plasmid-scale number; the cap only has to
+# reject a hostile / corrupt value, not model a real limit.
+_GEL_LANE_PCR_BP_MAX = 50_000_000
 
 _GEL_AGAROSE_MIN = 0.3
 
@@ -125,6 +128,23 @@ def _new_gel_id(existing: "set[str] | None" = None) -> str:
     return f"gel-{_uuid.uuid4().hex}"
 
 
+def _gel_lane_pcr_bp(value) -> "int | None":
+    """A lane's frozen PCR size (`_pcr_bp`) as a usable bp count, else None.
+
+    One rule for every path that carries it — a saved gel's normalisation AND
+    the Gel Library's load, which rebuilt each lane from three fields and so
+    lost the size even after saving kept it. `json.loads` accepts `1e400` /
+    `Infinity`, and `int(inf)` raises OverflowError, which the old guard did
+    not catch — an agent `create-gel` answered 500 instead of dropping it."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        bp = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return bp if 0 < bp <= _GEL_LANE_PCR_BP_MAX else None
+
+
 def _normalise_gel_entry(entry: dict, *, fresh: bool = False) -> dict:
     """Normalise: cap name + notes + lanes + lane-fields, stamp
     timestamps, sanitise id, clamp agarose % to a sane range
@@ -169,12 +189,22 @@ def _normalise_gel_entry(entry: dict, *, fresh: bool = False) -> dict:
         nm  = raw_nm  if isinstance(raw_nm,  str) else ""
         src = raw_src if isinstance(raw_src, str) else "empty"
         det = raw_det if isinstance(raw_det, str) else ""
-        lanes.append({
+        lane: "dict[str, str | int]" = {
             "name":   _sanitize_label(nm,  max_len=_GEL_LANE_NAME_MAX_LEN),
             "source": (_sanitize_label(src, max_len=_GEL_LANE_SOURCE_MAX_LEN)
                        or "empty"),
             "detail": _sanitize_label(det, max_len=_GEL_LANE_DETAIL_MAX_LEN),
-        })
+        }
+        # A `pcr` lane FREEZES its amplicon size in `_pcr_bp` — that is the only
+        # record of which of several amplicons this lane ran, and it cannot be
+        # re-derived from `detail` (see `_gel_bands_for_lane`). Rebuilding the
+        # lane from three fields dropped it, so a SAVED gel's PCR lanes came back
+        # sized from whatever the primer pair resolves to now, or blank
+        # (audit 2026-09-22).
+        bp = _gel_lane_pcr_bp(ln.get("_pcr_bp"))
+        if bp is not None:
+            lane["_pcr_bp"] = bp
+        lanes.append(lane)
     out["lanes"] = lanes
     now = _now_iso()
     if fresh or not isinstance(out.get("created_at"), str):
@@ -340,20 +370,21 @@ def _gel_bands_for_lane(
         # selected amplicon for a `pcr` lane the user added manually via
         # the source dropdown (no frozen size).
         bp = 0
-        frozen = lane.get("_pcr_bp")
-        if isinstance(frozen, int) and not isinstance(frozen, bool) \
-                and frozen > 0:
+        # One rule for both sizes (`_gel_lane_pcr_bp`): the agent accepts an
+        # arbitrary dict for `pcr_amplicon`, and `1e400` / `10**400` escaped
+        # the old `int()` guard as OverflowError — a 500 — while `true` drew
+        # a 1 bp band and a saved 2450.7 was ignored (round-2 hardening).
+        frozen = _gel_lane_pcr_bp(lane.get("_pcr_bp"))
+        if frozen:
             bp = frozen
         elif isinstance(pcr_amplicon, dict):
-            # Defensive: agent endpoint accepts an arbitrary dict for
-            # `pcr_amplicon`; a hostile / malformed payload could carry
-            # a non-numeric `length`. `int()` on the bad value would
-            # surface as a 500 — better to render an empty lane than
-            # crash the gel.
-            try:
-                bp = int(pcr_amplicon.get("length", 0))
-            except (TypeError, ValueError):
-                bp = 0
+            raw = pcr_amplicon.get("length", 0)
+            if isinstance(raw, str):
+                try:
+                    raw = int(raw.strip())
+                except ValueError:      # "²", 5,000 digits, "12 kb"
+                    raw = None
+            bp = _gel_lane_pcr_bp(raw) or 0
         if bp > 0:
             bands.append((bp, "linear"))
     return bands

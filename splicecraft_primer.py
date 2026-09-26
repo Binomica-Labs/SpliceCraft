@@ -1106,7 +1106,12 @@ def _mut_design_inner(dna: str, mut_pos_1: int, mut_aa: str, wt_aa: str,
             hi  = min(seq_len, nt_start + 3 + right_ext)
             fwd = mut_dna[lo:hi]
             if len(fwd) < 15 or len(fwd) > 58:
-                rejected["length"] += 1
+                # A LENGTH dead end only when a sequence end cut the window
+                # short. The smallest extensions are under 15 nt by
+                # construction, so counting them put "too close to a sequence
+                # end" into every failure, mid-sequence ones included.
+                if lo > nt_start - left_ext or hi < nt_start + 3 + right_ext:
+                    rejected["length"] += 1
                 continue
             t  = _mut_tm(fwd)
             gc = _mut_gc_pct(fwd)
@@ -1139,15 +1144,29 @@ def _mut_design_inner(dna: str, mut_pos_1: int, mut_aa: str, wt_aa: str,
             })
 
     if not candidates:
-        worst = max(rejected, key=lambda k: rejected[k])
-        why = {
+        why_of = {
             "length": "the mutation is too close to a sequence end to fit a "
                       "15 nt primer around it",
             "tm":     f"no window around it reaches a Tm of "
                       f"{TM_MIN:.0f}-{TM_MAX:.0f} °C (too AT- or GC-rich)",
             "gc":     f"no window around it has {GC_MIN:.0f}-{GC_MAX:.0f} % "
                       f"GC",
-        }[worst]
+        }
+        # EVERY reason that rejected a window, commonest first — not just
+        # `max(rejected, ...)`. That returned the FIRST key on a tie, and the
+        # dict is ordered `length, tm, gc`, so a pure Tm or GC dead end was
+        # reported as "too close to a sequence end" and sent the user to move a
+        # mutation that was nowhere near one (audit 2026-09-22). The counts are
+        # included because they say which constraint to relax.
+        ranked_reasons = [(k, n) for k, n in
+                          sorted(rejected.items(), key=lambda kv: -kv[1])
+                          if n > 0 and k in why_of]
+        if ranked_reasons:
+            why = "; ".join(f"{why_of[k]} ({n} window"
+                            f"{'' if n == 1 else 's'})"
+                            for k, n in ranked_reasons)
+        else:
+            why = "no candidate window was generated at all"
         raise RuntimeError(
             f"No valid inner primers found for {wt_aa}{mut_pos_1}{mut_aa}: "
             f"{why}."

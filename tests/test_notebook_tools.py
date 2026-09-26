@@ -520,10 +520,19 @@ class TestHtmlSubset:
         assert "<script>" not in html and "&lt;script&gt;" in html
 
     def test_drops_javascript_urls(self):
-        html = sc._markdown_subset_to_html("[click](javascript:alert(1))")
-        assert "javascript" not in html
-        html = sc._markdown_subset_to_html("![x](javascript:alert(1))")
-        assert "javascript" not in html
+        # A target that parses is dropped: the label survives, the URL does not.
+        html = sc._markdown_subset_to_html("[click](javascript:void0)")
+        assert "javascript" not in html and "<a" not in html
+        html = sc._markdown_subset_to_html("![x](javascript:void0)")
+        assert "javascript" not in html and "<img" not in html
+        # A target holding '(' does not parse as a link at all (the target
+        # stops at '(' so a run of them can't go quadratic — audit
+        # 2026-09-22): it is shown as escaped source, never as an href/src.
+        for md in ("[click](javascript:alert(1))", "![x](javascript:alert(1))"):
+            html = sc._markdown_subset_to_html(md)
+            assert "<a" not in html and "<img" not in html
+            assert 'href="javascript' not in html
+            assert 'src="javascript' not in html
 
     def test_code_spans_protect_their_contents(self):
         assert "<strong>" not in sc._markdown_subset_to_html("`**x**`")
@@ -1370,7 +1379,11 @@ class TestStringWhereListBelongs:
         e = _entry("a", "t", "b")
         e["tags"] = "gibson"          # not a list
         assert sc._experiment_search([e], "", tags=["g"]) == []
-        assert sc._experiment_search([e], "", tags=["gibson"]) == []
+        # ...but it IS the tag `gibson` — the comma-separated text the tags
+        # field takes. Reading it as NO tags made the next save delete it
+        # (hardening 2026-09-24, `_tag_values`).
+        hits = sc._experiment_search([e], "", tags=["gibson"])
+        assert [h["entry"]["id"] for h in hits] == ["a"]
 
     def test_protocol_inputs_are_not_split_into_characters(self):
         md = sc._protocol_steps_markdown(
@@ -1730,4 +1743,6 @@ class TestExportWriteIsAtomic:
             monkeypatch.setattr(sc.Path, "read_bytes", _no_read)
             srcs2, embedded2 = m._image_srcs([entry], embed=True)
             assert embedded2 is False
-            assert srcs2[saved.name] == str(saved)     # local path fallback
+            # local fallback — as a file: URI, which survives a Windows drive
+            # letter and a space in the path (audit 2026-09-22)
+            assert srcs2[saved.name] == saved.absolute().as_uri()

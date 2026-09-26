@@ -18,7 +18,12 @@ What you can do without leaving the terminal.
   feature lanes, restriction-site overlays, and inline AA translation
   (one letter per codon midpoint, in the CDS's colour, with wrap-CDS
   support across the origin). Click an AA letter to highlight the
-  codon's three bases on the strand.
+  codon's three bases on the strand. A GTG / TTG start the CDS's own
+  annotation reads as Met — lacI's, for one: its `/translation` begins
+  with M, or a `/transl_except` declares it — shows as a red **M**, as
+  the popular commercial plasmid editor marks it; without that annotation the codon's own amino acid
+  is shown, so a Leu-first site annotated as a CDS is never turned into a
+  start. The protein copied with `Ctrl+C` follows the same rule.
 - **Per-strand restriction-cut visualisation** — clicking a sticky
   cutter (EcoRI, HindIII, BsaI, BsmBI, BbsI, …) tints upstream bases
   blue and downstream red, with the staggered overhang showing as
@@ -309,7 +314,10 @@ What you can do without leaving the terminal.
 - **Plasmid collections** — named buckets (e.g. "yeast project",
   "E. coli toolkit"); the panel toggles between a collection list and
   the active collection's plasmids. Atomic writes, `.bak` per change.
-  Add the loaded record to your library with `Alt+K` ("keep").
+  Add the loaded record to your library with `Alt+K` ("keep"). Deleting
+  a collection — from the library panel or the Collections dialog —
+  asks twice, and never discards unsaved edits to the plasmid on the
+  canvas.
 - **Bulk import a folder** — from the collections-list view, click `+`,
   type a name, and pick a folder via the embedded directory tree.
   Every `.dna` / `.gb` / `.gbk` / `.genbank` file inside is loaded
@@ -522,7 +530,9 @@ offset, any introns and the origin, and that is exactly where a hand-done edit
 goes wrong. The codon is chosen from your active codon-usage table, with the
 synonymous alternatives listed so you can pick one that avoids a site you care
 about. A silent change is allowed and labelled as silent; introducing or
-removing a stop is called out. `Ctrl+Z` undoes it.
+removing a stop is called out. Residue 1 of a CDS whose annotation reads its
+GTG / TTG start as Met is Met here too, so swapping that start for ATG shows
+as silent. `Ctrl+Z` undoes it.
 
 ## Ordering and running it
 
@@ -642,7 +652,10 @@ outright.
   one modal lists every recoverable copy of any user-data file
   across the four storage tiers. Damaged rows are surfaced tagged
   `[damaged]` instead of silently dropped — you can see what was
-  there even if it can't be restored.
+  there even if it can't be restored. Unsaved work is saved into its
+  own collection first, and a settings backup that points at a
+  collection, primer library, parts bin or project that no longer
+  exists is refused with nothing changed.
 - **Master Delete** (`Settings → Master Delete…`) — a typed-`YES`
   guarded recovery affordance that resets the entire SpliceCraft
   data dir to a fresh-install state. Two-stage confirmation +
@@ -767,7 +780,13 @@ A five-panel protocol designer for an OT-2 liquid handler.
   what each bay holds. Click a bay to place or clear labware.
 - **Designer** — an ordered step sequence: transfer, distribute,
   consolidate, mix, delay, pause, comment.
-- **Labware** — a library of custom labware defined from a grid form.
+- **Labware** — a library of custom labware defined from a grid form:
+  rows × columns, spacing, well volume and depth, and the labware's
+  overall height — required, because it is what places the well bottoms
+  above the deck. Every field is read strictly: a value it can't read
+  (`38,5`, `38.5 mm`) is named and refused, never replaced by a default.
+  A saved labware whose wells would sit below the deck is refused before
+  a run.
 - **Library** — binds a deck plate to a plasmid collection so wells map
   to your plasmids; cherry-pick or replate by identity, or normalise
   DNA concentration to a target ng or ng/µL.

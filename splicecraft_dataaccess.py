@@ -1050,14 +1050,18 @@ def _save_primers(entries: list[dict]) -> None:
         # the mirror file can't drift from the live file (sweep #10,
         # [INV-50]). _save_primer_collections re-acquires the RLock.
         try:
-            _sync_active_primer_collection_primers(deduped)
+            wrote = _sync_active_primer_collection_primers(deduped)
         except BaseException:
             # primers.json already landed; the collection is now behind it,
             # and the next launch restores primers.json FROM the collection.
             _mark_mirror_dirty("primer save could not mirror into the "
                                "active primer collection", "primers")
             raise
-        _clear_mirror_dirty("primers")
+        if wrote:
+            _clear_mirror_dirty("primers")
+        # (No collection received them otherwise — see `_save_library` for
+        # why that must not mark the mirror dirty; the launch rescues primers
+        # that belong to no collection instead.)
 
 
 def _load_primer_collections() -> list[dict]:
@@ -1122,25 +1126,28 @@ def _save_primer_collections(entries: list[dict]) -> None:
         _state._primer_collections_cache = _typed_clone(entries)
 
 
-def _sync_active_primer_collection_primers(entries: list[dict]) -> None:
+def _sync_active_primer_collection_primers(entries: list[dict]) -> bool:
     """Mirror the live primer library into the active collection so the
-    on-disk record never drifts from `primers.json`. Silent no-op if no
-    collection is active or the active name has been deleted. Caller
-    MUST already hold `_cache_lock` (this re-acquires via RLock for
+    on-disk record never drifts from `primers.json`. Returns True when it
+    wrote into an existing active collection, False (a no-op) when none is
+    active or the active name has been deleted — see
+    `_sync_active_collection_plasmids` for why the caller needs to know.
+    Caller MUST already hold `_cache_lock` (this re-acquires via RLock for
     `_save_primer_collections`). See `[INV-50]` for the save-chain
     lock-release gap that this design avoids.
     """
     _get_name = getattr(_state, "_active_primer_collection_name_hook", None)
     name = _get_name() if _get_name is not None else None
     if not name:
-        return
+        return False
     snapshot = [_typed_clone(e) for e in entries if isinstance(e, dict)]
     colls = _load_primer_collections()
     for c in colls:
         if c.get("name") == name:
             c["primers"] = snapshot
             _save_primer_collections(colls)
-            return
+            return True
+    return False
 
 
 # ── Plasmid library + collections (the 160 MB SACRED path) ──────────────────
@@ -1218,7 +1225,7 @@ def _mirror_is_dirty(kind: str = "library") -> bool:
         return False
 
 
-def _flush_dirty_mirror_before_switch(kind: str) -> None:
+def _flush_dirty_mirror_before_switch(kind: str, what: str = "switch") -> None:
     """Before a primer-collection / parts-bin / notebook-project SWITCH:
     when a previous mirror write failed (`_mirror_is_dirty(kind)`), push the
     live file into the OUTGOING container first. Every switch rewrites the
@@ -1254,12 +1261,12 @@ def _flush_dirty_mirror_before_switch(kind: str) -> None:
     except BaseException as exc:
         raise RuntimeError(
             f"your latest {label} changes could not be saved into "
-            f"{active!r} ({exc}); the switch was cancelled so they are not "
+            f"{active!r} ({exc}); the {what} was cancelled so they are not "
             f"lost") from exc
     if _mirror_is_dirty(kind):
         raise RuntimeError(
             f"your latest {label} changes could not be saved into "
-            f"{active!r}; the switch was cancelled so they are not lost")
+            f"{active!r}; the {what} was cancelled so they are not lost")
 
 
 def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
@@ -1279,8 +1286,18 @@ def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
         _mirror = getattr(_state, "_sync_active_collection_plasmids_hook", None)
         if _mirror is not None:
             try:
-                _mirror(entries, async_write=async_sync)
-                if not async_sync:
+                wrote = _mirror(entries, async_write=async_sync)
+                if wrote is False:
+                    # Nothing received these entries (no collection active, or
+                    # the active one is gone), so the two files do NOT agree —
+                    # leave any marker exactly as it was. Marking dirty here
+                    # instead would be worse: launch then keeps this file and
+                    # FLUSHES it into whichever collection it makes active,
+                    # replacing that collection's own plasmids. Entries that
+                    # belong to no collection are rescued into one instead
+                    # (`_rescue_orphan_library_entries`, D10).
+                    pass
+                elif not async_sync:
                     # Both files agree again (the async path clears its own
                     # marker when the worker's write lands).
                     _clear_mirror_dirty()
@@ -1709,16 +1726,26 @@ def _get_setting(key: str, default: "_Any" = None) -> "_Any":
     (e.g. ``experiments_custom_dict``) still clone defensively so a
     caller mutation can't poison the cache.
     """
-    if _state._settings_cache is None:
+    cache = _state._settings_cache
+    if cache is None:
         # Trigger cache populate (one-time per session).
         _load_settings()
-    with _state._cache_lock:
         cache = _state._settings_cache
         if cache is None:
             return default
-        if key not in cache:
-            return default
-        return _typed_clone(cache[key])
+    # Lock-FREE, like `_load_settings`' cache-hit path: one `dict.get` is
+    # atomic, and `_set_setting` replaces a value rather than mutating it in
+    # place. Taking `_cache_lock` here queued every UI read of a setting — a
+    # keystroke's restriction re-scan asks for several — behind a Ctrl+S
+    # holding that lock across the library write: 1.3 s of frozen UI on a
+    # large library (audit 2026-09-22, H7).
+    value = cache.get(key, _SETTING_MISSING)
+    if value is _SETTING_MISSING:
+        return default
+    return _typed_clone(value)
+
+
+_SETTING_MISSING = object()
 
 
 # Setting keys whose VALUE is a secret — redacted in the change-log + event
@@ -1926,7 +1953,16 @@ def _get_active_collection_name() -> "str | None":
 
 
 def _set_active_collection_name(name: "str | None") -> None:
-    """Persist (or clear) the active-collection pointer."""
+    """Persist (or clear) the active-collection pointer — the POINTER only.
+
+    Moving it does not move the library: switching collections goes through
+    the hub's `_activate_collection` (or `_deactivate_all_collections`). A
+    library left holding entries that belong to no collection is rescued into
+    one at the next launch or switch (`_rescue_orphan_library_entries`) —
+    marking the mirror dirty for it (tried in the 2026-09-22 audit) made the
+    launch keep that library and then FLUSH it into whichever collection it
+    had just made active, replacing that collection's plasmids.
+    """
     prev = _get_active_collection_name()
     target = name or ""
     if prev != target:

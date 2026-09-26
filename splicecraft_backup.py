@@ -54,6 +54,7 @@ from splicecraft_persistence import (
     _prune_lost_entries,
     _read_backup_bytes,
     _safe_file_size_check,
+    _safe_load_json,
     _safe_save_json,
 )
 from splicecraft_util import _RUNTIME_PLATFORM, _is_windows_reserved_stem
@@ -1874,6 +1875,169 @@ def _list_recoverable_backups(target_path: Path) -> "list[dict]":
     return found
 
 
+def _is_lost_entries_spill(source_path: Path, raw) -> bool:
+    """Is `source_path` a shrink-guard spill (`_spill_lost_entries`) rather
+    than a whole-file backup? Recognised by where it lives AND by the
+    envelope keys only the spill writer stamps."""
+    try:
+        in_lost_dir = source_path.parent.name == _state._LOST_ENTRIES_DIR_NAME
+    except (AttributeError, TypeError):
+        in_lost_dir = False
+    stamped = isinstance(raw, dict) and "_recovered_from" in raw
+    return in_lost_dir or stamped
+
+
+# The item list a NAMED COLLECTION holds, in each collection file.
+_CONTAINER_LIST_KEYS = ("plasmids", "primers", "parts", "experiments",
+                        "models", "enzymes", "protocols", "labware", "proteins")
+
+
+def _is_container_entry(entry: dict) -> bool:
+    """A named collection: a name plus one of the collection files' item
+    lists. Requiring items that carry an ``id`` missed every collection whose
+    items have none — primers, parts, model refs, enzyme NAMES — so a spilled
+    primer collection was matched to the current one by name and every primer
+    it held beyond the current copy's was dropped (round-2 hardening,
+    2026-09-25)."""
+    return bool(entry.get("name")) and any(
+        isinstance(entry.get(k), list) for k in _CONTAINER_LIST_KEYS)
+
+
+def _hashable(v):
+    """``v`` as a set member: itself when hashable, else its canonical JSON (a
+    hand-edited file can hold a list where a name belongs)."""
+    try:
+        hash(v)
+        return v
+    except TypeError:
+        return json.dumps(v, sort_keys=True, default=str)
+
+
+def _spill_identity(entry: dict) -> "tuple | None":
+    """What makes an id-less entry the SAME entry. An entry-vector binding is
+    its ``(grammar_id, role)`` — two grammars may bind vectors of one name; a
+    settings row is its key; otherwise the name with its sequence and type (a
+    primer is its name + sequence; a feature its name + type). None when it
+    has no name — then only an identical entry matches."""
+    if "grammar_id" in entry and "role" in entry:
+        return ("entry_vector", _hashable(entry.get("grammar_id")),
+                _hashable(entry.get("role") or ""))
+    if "key" in entry and "value" in entry and not entry.get("name"):
+        return ("setting", _hashable(entry.get("key")))
+    name = entry.get("name")
+    if not name:
+        return None
+    seq = entry.get("sequence")
+    seq = "".join(str(seq).split()).upper() if seq else None
+    kind = entry.get("feature_type") or entry.get("type")
+    return (_hashable(name), seq, str(kind) if kind else None)
+
+
+def _item_key(item) -> tuple:
+    """How one collection ITEM is recognised: its id; else its identity (a
+    primer is name + sequence); else the item itself (an enzyme name)."""
+    if isinstance(item, dict):
+        if item.get("id"):
+            return ("id", _hashable(item["id"]))
+        ident = _spill_identity(item)
+        if ident is not None:
+            return ("ident",) + ident
+    return ("raw", json.dumps(item, sort_keys=True, default=str))
+
+
+def _merge_spilled_entries(current: list, spilled: list) -> "tuple[list, int]":
+    """The inverse of `_diff_lost_entries`: ``current`` plus every spilled
+    entry it no longer has. Returns ``(merged, n_added)``; nothing is ever
+    removed or overwritten.
+
+    Entries match on ``id`` first, as the spill did. A named COLLECTION (see
+    `_is_container_entry`) — which the spill records whole whenever it
+    CHANGED — that shares its ``name`` with a current one is merged into it
+    rather than added beside it: its item list gets back the items the
+    current copy lacks, each recognised by `_item_key`. Any other id-less
+    entry is added unless one with the same identity (`_spill_identity`) is
+    already there. That is what a primer is: two primers may share a name,
+    and matching on the name alone read a restored M13F variant as the "twin"
+    of the current M13F and dropped it. Linear in the entries (a set per
+    kind, not a list scan per entry)."""
+    merged = [dict(e) if isinstance(e, dict) else e for e in current]
+    ids = {_hashable(e.get("id")) for e in merged
+           if isinstance(e, dict) and e.get("id")}
+    containers = {_hashable(e.get("name")): e for e in merged
+                  if isinstance(e, dict) and not e.get("id")
+                  and _is_container_entry(e)}
+    have_keys = {_spill_identity(e) for e in merged
+                 if isinstance(e, dict) and not e.get("id")}
+    have_raw = {json.dumps(e, sort_keys=True, default=str) for e in merged
+                if isinstance(e, dict) and not e.get("id")}
+    n_added = 0
+    for ent in spilled:
+        if not isinstance(ent, dict):
+            continue
+        eid = ent.get("id")
+        if eid:
+            if _hashable(eid) not in ids:
+                merged.append(ent)
+                ids.add(_hashable(eid))
+                n_added += 1
+            continue
+        if _is_container_entry(ent):
+            twin = containers.get(_hashable(ent.get("name")))
+            if twin is None:
+                merged.append(ent)
+                containers[_hashable(ent.get("name"))] = ent
+                n_added += 1
+                continue
+            for key in _CONTAINER_LIST_KEYS:
+                items = ent.get(key)
+                if not isinstance(items, list):
+                    continue
+                have = twin.get(key)
+                have = list(have) if isinstance(have, list) else []
+                have_items = {_item_key(i) for i in have}
+                back = []
+                for i in items:
+                    k = _item_key(i)
+                    if k not in have_items:
+                        back.append(i)
+                        have_items.add(k)
+                if back:
+                    twin[key] = have + back
+                    n_added += len(back)
+            continue
+        raw = json.dumps(ent, sort_keys=True, default=str)
+        if raw in have_raw:
+            continue
+        key = _spill_identity(ent)
+        if key is not None and key in have_keys:
+            continue
+        merged.append(ent)
+        have_keys.add(key)
+        have_raw.add(raw)
+        n_added += 1
+    return merged, n_added
+
+
+def _read_backup_entries(source_path: Path, label: str) -> list:
+    """The entries a backup file holds, read exactly as a restore reads it
+    (size cap, symlink refusal, gzip-aware). Raises ValueError when it cannot
+    be read — for checks that must look inside a backup BEFORE restoring it."""
+    ok, reason = _safe_file_size_check(
+        source_path, _state._SAFE_LOAD_JSON_MAX_BYTES, "backup",
+    )
+    if not ok:
+        raise ValueError(reason or "backup file rejected")
+    try:
+        raw = json.loads(_read_backup_bytes(source_path).decode("utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"unreadable backup: {exc}") from exc
+    entries, _w = _extract_entries(raw, label)
+    if entries is None:
+        raise ValueError(f"backup {Path(source_path).name} is not a "
+                         f"recognisable {label} payload")
+    return list(entries)
+
+
 def _restore_from_backup(target_path: Path, source_path: Path,
                           label: str) -> int:
     """Read entries from `source_path` and write them onto
@@ -1918,6 +2082,18 @@ def _restore_from_backup(target_path: Path, source_path: Path,
             f"backup {source_path.name} is not a recognisable "
             f"{label} payload"
         )
+    if _is_lost_entries_spill(source_path, raw):
+        # A spill is NOT a copy of the file: it holds only the entries one
+        # shrinking save dropped (`_spill_lost_entries`). Written over the file
+        # like any other backup, "restoring" one replaced a 4-entry library with
+        # the 7 spilled entries — deleting everything else (audit 2026-09-22,
+        # D15). Merge it back instead: add what is missing, remove nothing.
+        with _state._cache_lock:
+            current, _w = _safe_load_json(target_path, label)
+            merged, n_added = _merge_spilled_entries(current or [], entries)
+            if n_added:
+                _safe_save_json(target_path, merged, label)
+        return n_added
     # Restore can legitimately write a small backup over a large live
     # file (e.g. user picks `library.json.bak.<old>` after a recent
     # bulk add). Opt in to the L3 catastrophic-shrink bypass so the

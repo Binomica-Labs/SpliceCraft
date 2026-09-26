@@ -56,7 +56,12 @@ def _history_human_dt(stamp: str) -> str:
     if not m:
         return ""
     year, mon, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    if not (1 <= mon <= 12 and 1 <= day <= 31):
+    # A real calendar date, not just "day <= 31": FEB 30, APR 31 and FEB 29
+    # of a common year all rendered as if they had happened.
+    from datetime import date as _date
+    try:
+        _date(year, mon, day)
+    except ValueError:
         return ""
     out = f"{_HISTORY_MONTHS[mon - 1]} {day} {year}"
     if m.group(4) is not None:
@@ -897,17 +902,55 @@ def _history_manipulation_detail(node: "_CommercialSaaSHistoryNode") -> str:
     return ""
 
 
-def _history_node_signature(node: "_CommercialSaaSHistoryNode") -> str:
-    """Identity key for collapsing repeated ancestor subtrees in the
-    viewer. Two nodes with the same cleaned name + length + operation
-    are treated as the same plasmid — repeats come from the same parent
-    entry's inherited ``history_xml``, so the subtree IS identical.
+def _history_node_signature(node: "_CommercialSaaSHistoryNode",
+                            _memo: "dict | None" = None) -> str:
+    """Identity key for collapsing a repeated sub-assembly in the viewer and
+    the protocol: the node's cleaned name + length + operation, followed by
+    the signatures of its parents in order — a hash of the WHOLE subtree.
 
-    Purely cosmetic: a false match merely renders the 2nd occurrence as
-    a ``↳ … (shown above)`` reference instead of redrawing it. It never
+    Name + length + operation of the node alone is NOT identity for a chain of
+    LENGTH-PRESERVING edits: three successive point mutations (or re-origins,
+    or synonymous scrubs) share all three fields, so the 2nd and 3rd collapsed
+    into "(shown above)" and the protocol dropped their steps (audit
+    2026-09-22, S3). Adding the node's ``ID`` fixed that and broke the case
+    the collapse exists for — every history we build is renumbered
+    (`_history_renumber_node_ids`), so two copies of one reused backbone
+    never shared an ID again and each was redrawn, and listed as a step,
+    once per use. Hashing the subtree separates the two for the right reason:
+    each link of an edit chain CONTAINS the one before it, while two copies
+    of one sub-assembly contain the same things, whatever they are numbered.
+
+    ``_memo`` (``{id(element): signature}``), shared across one traversal,
+    makes a whole tree cost one pass. Iterative and bounded by the shared
+    depth cap, like every other walk of hostile-shaped XML.
+
+    Purely cosmetic either way: a false match merely renders the 2nd occurrence
+    as a ``↳ … (shown above)`` reference instead of redrawing it. It never
     touches stored history."""
-    return (f"{_history_clean_name(node.name)}\x00{int(node.seq_len)}"
-            f"\x00{(node.operation or '').strip()}")
+    memo = _memo if _memo is not None else {}
+    hit = memo.get(id(node.element))
+    if hit is not None:
+        return hit
+    import hashlib as _hashlib
+    stack: list = [(node.element, 0, False)]
+    while stack:
+        el, depth, expanded = stack.pop()
+        if id(el) in memo:
+            continue
+        kids = el.findall("Node") if depth < _HISTORY_NODE_MAX_DEPTH else []
+        if not expanded:
+            stack.append((el, depth, True))
+            stack.extend((k, depth + 1, False) for k in kids
+                         if id(k) not in memo)
+            continue
+        own = _CommercialSaaSHistoryNode(el)
+        h = _hashlib.sha1(
+            f"{_history_clean_name(own.name)}\x00{int(own.seq_len)}"
+            f"\x00{(own.operation or '').strip()}".encode("utf-8"))
+        for k in kids:
+            h.update(b"\x01" + memo.get(id(k), "").encode("ascii"))
+        memo[id(el)] = h.hexdigest()
+    return memo[id(node.element)]
 
 
 def _history_tree_label(node: "_CommercialSaaSHistoryNode") -> str:
@@ -923,7 +966,7 @@ def _history_tree_label(node: "_CommercialSaaSHistoryNode") -> str:
 
     Names + ops are Rich-escaped (XML attrs can legally contain ``[``)
     and truncated so a hostile value can't push the column off-screen."""
-    from rich.markup import escape as _esc
+    from splicecraft_util import _markup_escape as _esc
     raw = _history_clean_name(node.name)
     if len(raw) > _HISTORY_LABEL_NAME_MAX:
         raw = raw[: _HISTORY_LABEL_NAME_MAX - 1] + "…"
@@ -963,7 +1006,7 @@ def _history_reference_label(node: "_CommercialSaaSHistoryNode") -> str:
     ``↳ name  size  (shown above)``. No operation tag (the canonical
     occurrence carries the detail); the marker tells the user the full
     subtree lives elsewhere in the tree rather than being drawn again."""
-    from rich.markup import escape as _esc
+    from splicecraft_util import _markup_escape as _esc
     raw = _history_clean_name(node.name)
     if len(raw) > _HISTORY_LABEL_NAME_MAX:
         raw = raw[: _HISTORY_LABEL_NAME_MAX - 1] + "…"
@@ -1050,6 +1093,7 @@ def _history_populate_tree(tree, root: "_CommercialSaaSHistoryNode",
     Populates ``node_by_id`` ``{textual_node_id: hist_node}`` for the
     detail pane. Returns ``True`` if a cap truncated the render."""
     seen: "set[str]" = set()
+    sig_memo: dict = {}
     truncated = False
     n_seen = 0
     # Frame: (textual_parent_node, hist_node, depth). Pre-order; push
@@ -1060,7 +1104,7 @@ def _history_populate_tree(tree, root: "_CommercialSaaSHistoryNode",
         if n_seen >= _HISTORY_NODE_MAX_NODES or depth >= _HISTORY_NODE_MAX_DEPTH:
             truncated = True
             continue
-        sig = _history_node_signature(hist)
+        sig = _history_node_signature(hist, sig_memo)
         is_ref = sig in seen
         if is_ref:
             label = _history_reference_label(hist)
@@ -1153,6 +1197,7 @@ def _history_build_steps(root: "_CommercialSaaSHistoryNode") -> "list[dict]":
     by_sig: "dict[str, dict]" = {}
     depth_of: "dict[str, int]" = {}
     order: "list[str]" = []
+    sig_memo: dict = {}
     stack: list = [(root, 0)]
     n_seen = 0
     while stack:
@@ -1162,7 +1207,7 @@ def _history_build_steps(root: "_CommercialSaaSHistoryNode") -> "list[dict]":
         n_seen += 1
         parents = node.parents
         if parents:
-            sig = _history_node_signature(node)
+            sig = _history_node_signature(node, sig_memo)
             # A reused sub-assembly sorts to its EARLIEST (deepest) use.
             depth_of[sig] = max(depth_of.get(sig, 0), depth)
             if sig not in by_sig:
@@ -1194,7 +1239,7 @@ def _history_protocol_step_cells(
     lets `_history_protocol_renderable`'s table hang-indent WRAPPED lines
     under the content rather than under the next step's number (user
     nitpick 2026-06-01)."""
-    from rich.markup import escape as _esc
+    from splicecraft_util import _markup_escape as _esc
     steps = _history_build_steps(root)
     if not steps:
         # No step nodes — but the root still records HOW the molecule
@@ -1297,7 +1342,7 @@ def _history_detail_lines(hist: "_CommercialSaaSHistoryNode",
     consistency block: claims the record makes that the DNA contradicts.
     Omit them and the block is skipped — callers pass a sequence only for
     a node they can identify with certainty."""
-    from rich.markup import escape as _esc
+    from splicecraft_util import _markup_escape as _esc
     warnings = _history_node_warnings(hist, seq, enzymes=enzymes)
     name_disp = (f"[b]{_esc(_history_clean_name(hist.name))}[/b]"
                  if hist.name else "[dim](unnamed)[/]")

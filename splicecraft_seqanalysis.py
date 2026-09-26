@@ -32,6 +32,7 @@ from splicecraft_record import _gb_text_to_record
 from splicecraft_dataaccess import _all_grammars, _load_entry_vectors
 from splicecraft_cloning import _excise_fragment_pair, _grammar_tu_overhangs
 from splicecraft_logging import _log, _log_event
+from splicecraft_util import _feat_bounds, _record_is_circular
 
 
 def _find_orfs(seq: str, *,
@@ -522,14 +523,22 @@ def _ev_frag_input_features(record) -> "list[dict]":
     ``[{start, end, type, label}]`` shape `_excise_fragment_pair` splits onto
     its fragments, so `_fragment_has_backbone_marker` can tell the backbone half
     from the dropout by ORIGIN/RESISTANCE markers instead of by size (which
-    inverts when a vector's dropout cassette outgrows its backbone)."""
+    inverts when a vector's dropout cassette outgrows its backbone).
+
+    Wrap-aware via `_feat_bounds` (sacred #9): ``int(f.location.start)`` on a
+    CompoundLocation returns ``min(parts.start)``, which turned an origin-
+    spanning marker into a near-whole-plasmid feature, tagged BOTH halves of the
+    digest with it, and dropped the caller back onto the size heuristic
+    (audit 2026-09-22).
+    """
     feats: "list[dict]" = []
+    total = len(getattr(record, "seq", "") or "")
+    circular = _record_is_circular(record)
     for f in (getattr(record, "features", None) or []):
-        try:
-            start = int(f.location.start)
-            end = int(f.location.end)
-        except (AttributeError, TypeError, ValueError):
+        bounds = _feat_bounds(f, total, circular=circular) if total else None
+        if bounds is None:
             continue
+        start, end, _strand = bounds
         q = getattr(f, "qualifiers", None) or {}
         label = ""
         for k in ("label", "gene", "product", "note"):
@@ -1938,12 +1947,42 @@ def _tx_norm_type(feat) -> str:
     return str((feat or {}).get("type") or "").strip().lower()
 
 
-def _tx_feature_strand(feat) -> int:
+def _tx_feature_strand(feat, default: int = 1) -> int:
+    """The strand to read `feat` on: ``+1`` / ``-1``, or ``0`` for "no arrow".
+
+    ``default`` is what "no arrow" — an absent strand, or an explicit ``0`` —
+    means. A PROMOTER or TERMINATOR has to point somewhere to be modelled at
+    all, so its callers keep the historical ``+1``: honouring only an ABSENT
+    key (the first fix) read an explicit ``0`` — SpliceCraft's own "no arrow",
+    and every arrowless element a `.dna` import now keeps — as pointing
+    nowhere, so an arrowless promoter drove nothing and an arrowless
+    terminator blocked nothing (audit 2026-09-24). A GENE does not: an
+    arrowless CDS has no known reading direction, and silently calling it
+    forward answered "nothing transcribes this" for a gene whose only promoter
+    reads the other way (audit 2026-09-22). That caller passes ``default=0``
+    and the walk then tries both directions.
+    """
+    d = int(default)
+    d = -1 if d < 0 else (0 if d == 0 else 1)
+    raw = (feat or {}).get("strand")
+    if raw is None:
+        return d
     try:
-        s = int((feat or {}).get("strand", 1) or 1)
+        s = int(raw)
     except (TypeError, ValueError):
-        return 1
+        return d
+    if s in (0, 2):              # no arrow, or ◀▶ both: no ONE direction
+        return d
     return -1 if s < 0 else 1
+
+
+def _tx_strand_unknown(feat) -> bool:
+    """True when `feat` carries no arrow (strand absent or 0)."""
+    raw = (feat or {}).get("strand")
+    try:
+        return raw is None or int(raw) == 0
+    except (TypeError, ValueError):
+        return True
 
 
 def _tx_arc(frm: int, to: int, total: int) -> int:
@@ -2027,6 +2066,8 @@ def _tx_element_record(el: dict, source: str, kind: str) -> dict:
         "start": int(el.get("start", 0) or 0),
         "end": int(el.get("end", 0) or 0),
         "strand": _tx_feature_strand(el),
+        # No arrow on the element: read forward, and said so.
+        "strand_unknown": _tx_strand_unknown(el),
         "label": str(el.get("label") or "") or None,
     }
     for k in ("score", "strength", "minus35", "minus10", "spacer", "tss",
@@ -2155,13 +2196,26 @@ def _map_transcription(seq: str, features: "list[dict]", *,
     genes: "list[dict]" = []
     for f in feats:
         t = _tx_norm_type(f)
-        if t in _TX_PROMOTER_TYPES:
-            promoters.append(_tx_element_record(f, "annotated", "promoter"))
-        elif t in _TX_TERMINATOR_TYPES:
-            terminators.append(_tx_element_record(f, "annotated",
-                                                  "terminator"))
+        # Strand 2 is the ◀▶ "both ways" marker (`SpliceCraft_strand`). A
+        # promoter or terminator marked so acts on BOTH strands, so it is one
+        # element per strand — read forward only, a bidirectional terminator
+        # blocked nothing coming the other way, and the report said the
+        # element "carries no strand" (round-2 hardening, 2026-09-25).
+        both = str(f.get("strand")) == "2"
+        if t in _TX_PROMOTER_TYPES or t in _TX_TERMINATOR_TYPES:
+            kind = "promoter" if t in _TX_PROMOTER_TYPES else "terminator"
+            dest = promoters if kind == "promoter" else terminators
+            for el in ([dict(f, strand=1), dict(f, strand=-1)] if both
+                       else [f]):
+                dest.append(_tx_element_record(el, "annotated", kind))
         elif t in _TX_CODING_TYPES:
             genes.append(f)
+    for el in promoters + terminators:
+        if el.get("strand_unknown"):
+            warnings.append(
+                f"{el['kind']} '{el.get('label') or el['start']}' carries no "
+                f"strand and was read FORWARD — annotate its orientation if it "
+                f"points the other way")
 
     if include_predicted:
         try:
@@ -2206,13 +2260,19 @@ def _map_transcription(seq: str, features: "list[dict]", *,
         # `_tx_promoter_fires_at` documents).
         g_start = (int(g["start"]) % total) if circular else int(g["start"])
         g_end = (int(g["end"]) % total) if circular else int(g["end"])
-        g_strand = _tx_feature_strand(g)
+        # An arrowless CDS keeps strand 0 here: its reading direction is
+        # genuinely unknown, so both are tried rather than one invented.
+        g_strand = _tx_feature_strand(g, default=0)
         # Where transcription must ARRIVE for this CDS to be transcribed: its
         # 5' end on the strand it is read from.
         target = g_start if g_strand >= 0 else g_end
         reach: "list[dict]" = []
         for prom in promoters:
-            if prom["strand"] != g_strand:
+            if g_strand == 0:
+                # Unknown direction: a promoter on either strand could be the
+                # one, and the arrival point depends on which.
+                target = g_start if prom["strand"] >= 0 else g_end
+            elif prom["strand"] != g_strand:
                 continue
             fire, direction = _tx_promoter_fires_at(prom, total, circular)
             if circular:
@@ -2235,7 +2295,8 @@ def _map_transcription(seq: str, features: "list[dict]", *,
                 # CDS start), not a promoter firing into it.
                 continue
             between = [t for t in terminators
-                       if t["strand"] == g_strand
+                       if t["strand"] == (prom["strand"] if g_strand == 0
+                                          else g_strand)
                        and _tx_between(fire, target, direction, total,
                                        int(t.get("start", 0)), circular)]
             between.sort(key=lambda t: _tx_arc(fire, int(t["start"]), total)
@@ -2258,9 +2319,15 @@ def _map_transcription(seq: str, features: "list[dict]", *,
         # circle reads through into it.
         host_reach = [r for r in unblocked
                       if r["promoter"].get("host_recognised")]
+        if g_strand == 0:
+            warnings.append(
+                f"'{_feat_label_or(g)}' carries no strand, so both reading "
+                f"directions were considered — annotate its orientation to "
+                f"narrow this down")
         out_genes.append({
             "cds": {"label": _feat_label_or(g), "start": g_start,
                     "end": g_end, "strand": g_strand,
+                    "strand_unknown": g_strand == 0,
                     "type": _tx_norm_type(g)},
             "reachable_from": reach,
             "n_sources": len(reach),

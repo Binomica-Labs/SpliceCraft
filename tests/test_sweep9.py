@@ -202,8 +202,11 @@ class TestTagRegexRejectsHTMLEntities:
         # it while reshaping the pattern.
         assert list(sc._PLASMID_REF_RE.finditer("user@example.com")) == []
 
-    def test_action_regex_rejects_trailing_semicolon(self):
-        assert list(sc._ACTIONS_REF_RE.finditer("!digest;")) == []
+    def test_action_regex_reads_a_trailing_semicolon_as_punctuation(self):
+        # Only `&` forms an HTML entity; after `!` a semicolon is prose
+        # ("!digest; then !ligate"), so the audit 2026-09-22 reversed this.
+        assert [m.group(1) for m in sc._ACTIONS_REF_RE.finditer(
+            "!digest; then !ligate")] == ["digest", "ligate"]
 
     def test_action_regex_still_matches_normal_tag(self):
         matches = [m.group(0) for m in sc._ACTIONS_REF_RE.finditer("!digest")]

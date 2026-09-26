@@ -188,9 +188,12 @@ class TestCommercialSaaSHistoryExtract:
         gigabytes must NOT silently allocate that much. The cap lives
         at `_COMMERCIALSAAS_HISTORY_MAX_XML`; lower it for the test so we
         don't actually have to build a multi-GB file."""
-        monkeypatch.setattr(_fileio, "_COMMERCIALSAAS_HISTORY_MAX_XML", 100)
         big_xml = "<HistoryTree>" + ("X" * 500) + "</HistoryTree>"
+        # Packed BEFORE the cap is lowered: the writer refuses a history
+        # over the cap too, so SpliceCraft never writes one it would refuse
+        # to read (round-2 hardening, 2026-09-25).
         payload = sc._pack_commercialsaas_history_payload(big_xml)
+        monkeypatch.setattr(_fileio, "_COMMERCIALSAAS_HISTORY_MAX_XML", 100)
         data = _make_minimal_dna((0x07, payload))
         with pytest.raises(ValueError) as exc:
             sc._extract_commercialsaas_history_xml(data)
@@ -206,9 +209,9 @@ class TestCommercialSaaSHistoryExtract:
         # 10 KB compressed cap with a payload that decompresses to ~100 KB.
         # The old code would allocate the full 100 KB before checking
         # — verify behaviour is now bounded by the cap.
-        monkeypatch.setattr(_fileio, "_COMMERCIALSAAS_HISTORY_MAX_XML", 1_000)
         big_xml = "<HistoryTree>" + ("Z" * 100_000) + "</HistoryTree>"
         payload = sc._pack_commercialsaas_history_payload(big_xml)
+        monkeypatch.setattr(_fileio, "_COMMERCIALSAAS_HISTORY_MAX_XML", 1_000)
         data = _make_minimal_dna((0x07, payload))
         with pytest.raises(ValueError, match="too large"):
             sc._extract_commercialsaas_history_xml(data)
@@ -1705,14 +1708,27 @@ class TestWriterHardening:
                 break
         import xml.etree.ElementTree as _ET
         root = _ET.fromstring(xml_text)
-        # Find the V element with our note.
+        # Find the V element with our note. A value holding `<` / `>` is stored
+        # in the editor's own rich form (an escaped HTML document) — written
+        # raw, every reader that strips markup deleted `<tags>` (audit
+        # 2026-09-22, FM6) — and decodes back to exactly what was written.
         for v in root.iter("V"):
             text = v.get("text") or ""
             if "quotes" in text:
-                assert text == 'Has "quotes" & <tags>'
+                assert sc._commercialsaas_decode_text(text) \
+                    == 'Has "quotes" & <tags>'
                 break
         else:
             pytest.fail("note V element with our text not found")
+        # …and through the real reader, end to end.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            path = f"{td}/q.dna"
+            with open(path, "wb") as fh:
+                fh.write(data)
+            back = sc.load_genbank(path)
+        cds = [f for f in back.features if f.type == "CDS"][0]
+        assert cds.qualifiers["note"] == ['Has "quotes" & <tags>']
 
     def test_writer_handles_no_features(self):
         """Empty features list emits a valid `<Features

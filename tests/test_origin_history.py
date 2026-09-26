@@ -932,6 +932,40 @@ class TestRecoverHistoryFromDna:
         _index, note = sc._scan_dna_originals_for_history()
         assert note and ".dna files were scanned" in note
 
+    def test_a_filtered_rerun_narrows_the_scan_as_the_note_says(
+            self, monkeypatch):
+        """The budget note says to narrow the run with a filter, but the
+        filters applied only AFTER the scan: a filtered re-run hit the same
+        budget on the same files and the plasmid asked for was never reached
+        (audit 2026-09-22)."""
+        seqs = {"a1": self.SEQ_A, "b2": self.SEQ_B, "c3": "TTAACCGGAT" * 12}
+        sc._save_collections([{"name": "Work", "saved": "2026-01-01",
+                               "plasmids": [
+            {"id": i, "name": i, "gb_text": _gb(i, sq), "size": len(sq),
+             "history_xml": sc._build_origin_history_xml(
+                 name=i, seq_len=len(sq), circular=True, source="id:x")}
+            for i, sq in seqs.items()]}])
+        sc._set_active_collection_name("Work")
+        sc._restore_library_from_active_collection()
+        for i, sq in seqs.items():
+            self._sidecar(i, sq, self._rich_history(i, 6))
+        index, _ = sc._scan_dna_originals_for_history()
+        one = max(len(sq) + len(v[1]) for sq, v in index.items())
+        monkeypatch.setattr(sc, "_HISTORY_RECOVER_MAX_INDEX_BYTES", one)
+        r = sc._h_recover_history_from_dna(None, {})
+        assert r["truncated"] is True and "filter" in r["note"]
+        assert "c3" not in {u["name"] for u in r["updated"]}
+        r = sc._h_recover_history_from_dna(None, {"name": "c3"})
+        assert r["truncated"] is False
+        assert [u["name"] for u in r["updated"]] == ["c3"]
+
+    def test_nothing_to_match_answers_in_the_normal_shape(self):
+        self._seed()
+        self._sidecar("pRich", self.SEQ_A, self._rich_history("pRich", 6))
+        r = sc._h_recover_history_from_dna(None, {"collection": "Nope"})
+        assert r["updated_count"] == 0 and r["updated"] == []
+        assert "filtered scope" in r["note"]
+
 
 class TestGeneratedVsImportedHistorySerialisation:
     """`_finalize_generated_history` renumbers node IDs so a merged

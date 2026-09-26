@@ -21,6 +21,7 @@ from io import StringIO
 
 import splicecraft_state as _state
 from splicecraft_logging import _log
+from splicecraft_util import _locus_topology
 
 
 _SC_STRAND_QUAL = "SpliceCraft_strand"
@@ -266,22 +267,32 @@ def _split_multiline_qualifiers(features):
     (returns the SAME list object)."""
     feats = features or []
 
+    def _breaks(s) -> bool:
+        # A LONE carriage return (a GFF3 `%0D`, a `.dna` `&#13;`) broke the
+        # line exactly like LF and was never split, because only "\n" was
+        # looked for — the stored text then read back wrong, and a bulk export
+        # copied it into a file nothing could parse (audit 2026-09-22, FM10).
+        # Everything `str.splitlines()` breaks on counts — including ONE
+        # trailing break: `"abc\n".splitlines()` is a single piece, so counting
+        # pieces missed exactly the note a `.dna` `&#10;` or a GFF3 `%0A` ends
+        # with, and the raw newline made the saved entry unreadable. A value
+        # has a break iff dropping its breaks changes it.
+        return isinstance(s, str) and "".join(s.splitlines()) != s
+
     def _has_multiline(quals):
         for v in quals.values():
-            if isinstance(v, str) and "\n" in v:
+            if _breaks(v):
                 return True
-            if isinstance(v, list) and any(
-                    isinstance(x, str) and "\n" in x for x in v):
+            if isinstance(v, list) and any(_breaks(x) for x in v):
                 return True
         return False
 
     def _split_value(v):
-        # Normalise CR / CRLF to LF, split on LF, drop blank lines (collapsing
-        # paragraph gaps exactly like the editor's blank-line split). Fall back
-        # to a single empty entry so an all-whitespace value still emits a
-        # parseable qualifier instead of vanishing.
-        s = v.replace("\r\n", "\n").replace("\r", "\n")
-        return [ln for ln in s.split("\n") if ln.strip()] or [""]
+        # Split on every line break (CR, CRLF, LF, VT, FF, U+2028…), drop blank
+        # lines (collapsing paragraph gaps exactly like the editor's blank-line
+        # split). Fall back to a single empty entry so an all-whitespace value
+        # still emits a parseable qualifier instead of vanishing.
+        return [ln for ln in v.splitlines() if ln.strip()] or [""]
 
     out: list = []
     changed = False
@@ -292,12 +303,12 @@ def _split_multiline_qualifiers(features):
             continue
         new_quals: dict = {}
         for k, v in quals.items():
-            if isinstance(v, str) and "\n" in v:
+            if _breaks(v):
                 new_quals[k] = _split_value(v)
             elif isinstance(v, list):
                 expanded: list = []
                 for x in v:
-                    if isinstance(x, str) and "\n" in x:
+                    if _breaks(x):
                         expanded.extend(_split_value(x))
                     else:
                         expanded.append(x)
@@ -333,23 +344,87 @@ def _restore_display_name_from_comment(rec) -> None:
     comment = (getattr(rec, "annotations", None) or {}).get("comment", "")
     if isinstance(comment, (list, tuple)):
         comment = "\n".join(str(x) for x in comment)
-    # `[ \t]*` not `\s*`: `\s` matches a NEWLINE, so a marker with an empty
-    # value swallowed the following comment line and restored it as the name.
-    m = re.search(re.escape(_DISPLAY_NAME_MARKER) + r"[ \t]*(.+)",
-                  str(comment or ""), re.S)
-    if not m:
+    lines = str(comment or "").split("\n")
+    span = _display_name_marker_span(lines)
+    if span is None:
         return
-    # The marker is the LAST line of our COMMENT stamp, so everything after it
-    # belongs to the name. Biopython wraps COMMENT at 68 columns, so a name
-    # with spaces arrives split across physical lines; keeping only the first
-    # of them silently truncated every display name past ~50 characters (and
-    # then re-stamped the truncation, making it permanent).
-    name = " ".join(m.group(1).split())
+    # The marker line plus the lines Biopython's 68-column COMMENT wrapping
+    # FORCED onto it — keeping only the first physical line silently truncated
+    # every display name past ~50 characters (and the next save then made the
+    # truncation permanent). Anything after that is somebody else's comment
+    # line: the old rule, "everything after the marker is the name", folded
+    # a `Sequence verified …` line appended by another tool into the name, and
+    # the next save deleted it from the COMMENT (audit 2026-09-22, FM11).
+    first = lines[span[0]]
+    rest = first[first.index(_DISPLAY_NAME_MARKER) + len(_DISPLAY_NAME_MARKER):]
+    name = " ".join(" ".join([rest] + lines[span[0] + 1:span[1]]).split())
     if name:
         try:
             rec._tui_display_name = name  # type: ignore[attr-defined]
         except Exception:
             pass
+
+
+# Biopython's GenBank writer wraps each COMMENT line to this many columns
+# (`MAX_WIDTH - HEADER_WIDTH`) at word boundaries, and its parser joins the
+# physical lines back with "\n" — a wrapped line and a real line break arrive
+# looking the same.
+_GB_COMMENT_WRAP = 68
+
+
+# `[47] SpliceCraft-name: <name>` — the name's length, written AHEAD of the
+# marker so every reader still finds `SpliceCraft-name:` and the name after
+# it. The wrap rule below cannot always tell our own wrapped continuation from
+# a line another tool appended (a name of ~45 characters, a name ending in an
+# unbreakable token, an appended line that starts with a URL); a length makes
+# the marker self-delimiting (round-2 hardening, 2026-09-25).
+_DISPLAY_NAME_LEN_RE = re.compile(r"\[(\d{1,4})\]\s*" + re.escape(_DISPLAY_NAME_MARKER))
+
+
+def _display_name_marker_span(lines: "list[str]") -> "tuple[int, int] | None":
+    """``[start, end)`` of the display-name marker's LOGICAL line within a
+    COMMENT's physical lines, or None when there is no marker.
+
+    A following line belongs to it only when the writer was FORCED to wrap
+    there — the line before it, plus a space, plus the next line's first word,
+    would not have fit in `_GB_COMMENT_WRAP` columns. That is exactly how
+    Biopython's `_split_multi_line` decides, so it recovers our own wrapping
+    and stops at a line another tool (or the user) appended after the marker.
+
+    A line LONGER than the wrap is one Biopython could only have written as a
+    single word too long to break (`_split_multi_line` puts such a word on a
+    line of its own), and the wrap after it was forced like any other — so it
+    continues too. Only a multi-word line over the limit is proof of another
+    writer, and ends the name.
+    """
+    start = next((i for i, ln in enumerate(lines)
+                  if _DISPLAY_NAME_MARKER in ln), None)
+    if start is None:
+        return None
+    m = _DISPLAY_NAME_LEN_RE.search(lines[start])
+    if m is not None:
+        want = int(m.group(1))
+        first = lines[start]
+        got = " ".join(first[first.index(_DISPLAY_NAME_MARKER)
+                             + len(_DISPLAY_NAME_MARKER):].split())
+        end = start + 1
+        while len(got) < want and end < len(lines):
+            more = " ".join(lines[end].split())
+            got = f"{got} {more}".strip() if more else got
+            end += 1
+        if len(got) == want:
+            return start, end
+        # A length that does not add up (the COMMENT was edited by hand):
+        # fall back to the wrap rule rather than trust either.
+    end = start + 1
+    while end < len(lines):
+        prev, words = lines[end - 1], lines[end].split()
+        if (not words
+                or (len(prev) > _GB_COMMENT_WRAP and len(prev.split()) > 1)
+                or len(prev) + 1 + len(words[0]) <= _GB_COMMENT_WRAP):
+            break
+        end += 1
+    return start, end
 
 
 def _topology_from_gb_text(gb_text, default: str = "circular") -> str:
@@ -373,17 +448,7 @@ def _topology_from_gb_text(gb_text, default: str = "circular") -> str:
     LOCUS line, or carries neither token — the historical behaviour at each
     call site (mostly ``"circular"``: nearly every stored entry is a plasmid).
     """
-    if not isinstance(gb_text, str) or not gb_text:
-        return default
-    line = gb_text[:200].lstrip().split("\n", 1)[0]
-    if line[:5].upper() != "LOCUS":
-        return default
-    tokens = {t.lower() for t in line.split()}
-    if "linear" in tokens:
-        return "linear"
-    if "circular" in tokens:
-        return "circular"
-    return default
+    return _locus_topology(gb_text) or default
 
 
 def _backfill_topology(rec, gb_text: str) -> None:
@@ -476,10 +541,26 @@ def _record_to_gb_text(record) -> str:
         # `_tui_display_name` says, and is dropped when the LOCUS can carry
         # the name unchanged. Still idempotent: re-serialising a record whose
         # marker already matches produces the same text.
-        _before, _sep, _ = _cur.partition(_DISPLAY_NAME_MARKER)
-        _head = _before.rstrip() if _sep else _cur
+        # Drop only the marker's own logical line (`_display_name_marker_span`)
+        # and keep every other line, BEFORE and AFTER it — cutting from the
+        # marker to the end deleted any comment line another tool had added
+        # after ours (FM11).
+        _lines = _cur.split("\n")
+        _span = _display_name_marker_span(_lines)
+        _sep = _span is not None
+        if _span is not None:
+            _pre = _lines[_span[0]]
+            _pre = _pre[:_pre.index(_DISPLAY_NAME_MARKER)].rstrip()
+            # …and the length prefix that belongs to it.
+            _pre = re.sub(r"\[\d{1,4}\]$", "", _pre).rstrip()
+            _kept = (_lines[:_span[0]] + ([_pre] if _pre else [])
+                     + _lines[_span[1]:])
+            _head = "\n".join(_kept).strip()
+        else:
+            _head = _cur
         if _disp_clean and _disp_clean != _locus_form:
-            _nm = f"{_DISPLAY_NAME_MARKER} {_disp_clean}"
+            _norm = " ".join(_disp_clean.split())      # as the reader rejoins
+            _nm = f"[{len(_norm)}] {_DISPLAY_NAME_MARKER} {_norm}"
             anns["comment"] = f"{_head}\n{_nm}".strip() if _head else _nm
         elif _sep:
             anns["comment"] = _head
@@ -769,6 +850,13 @@ def _gb_text_to_record(text: str, *, cache: bool = True):
                 return _clone_cached_record(hit)
     from Bio import SeqIO
     rec = SeqIO.read(StringIO(text), "genbank")
+    if not getattr(rec.seq, "defined", True):
+        # A CONTIG / scaffold record: a length and no bases. Loading it
+        # crashed the first reader of the sequence (the launch auto-load
+        # included) with UndefinedSequenceError (audit 2026-09-22, FM11).
+        raise ValueError(
+            "this GenBank record has no sequence of its own — it is a CONTIG "
+            "/ scaffold record that refers to other entries")
     _backfill_topology(rec, text)
     # SC-E: restore the human display name stamped into the COMMENT so it
     # survives the round-trip (the LOCUS is the underscored/truncated form).

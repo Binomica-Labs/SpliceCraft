@@ -7440,7 +7440,11 @@ class TestInvertedSegmentDetection:
         ref = a + ins + b
         r = self._align(a + sc._rc(ins)[:760] + b, ref)
         assert len(self._spans(r)) == 1
-        assert self._spans(r)[0][0] == 1500
+        # The inverted bases are ins[40:] (target 1540-2300); ins[:40] is
+        # DELETED, not inverted. The span is trimmed to where the reverse
+        # complement aligns, so it no longer claims the deletion too
+        # (hardening 2026-09-25; it used to report 1500).
+        assert self._spans(r) == [(1540, 2300)]
 
     def test_inversion_at_the_origin(self):
         i1, mid, b = _rand_dna(800, 25), _rand_dna(900, 26), _rand_dna(1400, 27)

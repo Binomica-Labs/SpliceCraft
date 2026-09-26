@@ -104,6 +104,72 @@ def _codon_table_for(table_id: "int | None") -> "dict[str, str]":
 
 _STOP_CODONS = frozenset(("TAA", "TAG", "TGA"))
 
+_START_CODONS_BY_ID: "dict[int, frozenset]" = {}
+_AMBIGUOUS_STOPS_BY_ID: "dict[int, tuple]" = {}
+
+
+def _codon_ambiguous_stops(table_id: "int | None") -> "tuple[str, ...]":
+    """Codons that are BOTH a sense codon and a stop in this genetic code.
+
+    Three NCBI tables have them, and in all three the readthrough is context-
+    dependent rather than a property of the codon: 27 (Karyorelict, ``TGA`` =
+    Trp *or* stop), 31 (Blastocrithidia, ``TAA`` / ``TAG`` = Glu *or* stop) and
+    28 (Condylostoma) — where ALL THREE stops are ambiguous, so the code has no
+    unconditional terminator at all.
+
+    `_codon_table_for` has to pick one meaning per codon and picks stop, which
+    is the right default for translating. But an OPTIMIZER appending a
+    terminator for such a host is writing a codon the ribosome may read through,
+    and until the 2026-09-22 audit it said nothing about it. Callers use this to
+    warn; it is never used to refuse, because the codon is still the best
+    available choice.
+    """
+    try:
+        tid = int(table_id) if table_id else 1
+    except (TypeError, ValueError):
+        tid = 1
+    cached = _AMBIGUOUS_STOPS_BY_ID.get(tid)
+    if cached is not None:
+        return cached
+    try:
+        from Bio.Data import CodonTable as _BioCodonTable
+        ct = _BioCodonTable.unambiguous_dna_by_id[tid]
+        got = tuple(sorted(set(ct.forward_table) & set(ct.stop_codons)))
+    except Exception:  # noqa: BLE001  (KeyError for a bad id, ImportError, …)
+        got = ()
+    _AMBIGUOUS_STOPS_BY_ID[tid] = got
+    return got
+
+
+def _codon_start_codons_for(table_id: "int | None") -> frozenset:
+    """The INITIATION codons of an NCBI genetic-code table.
+
+    Table 1 allows ``ATG`` plus ``CTG`` / ``TTG``; the bacterial table 11 adds
+    ``ATT`` / ``ATC`` / ``ATA`` / ``GTG``. This is a separate question from what
+    a codon encodes mid-gene, which is why it is a separate table: an initiator
+    ``GTG`` is translated as Met (the ribosome loads fMet), and a file's
+    ``/translation`` therefore begins ``M`` where `_translate_cds` — honestly
+    reporting what the codon encodes — reads ``V``.
+
+    Comparing the two without this convention reported a perfectly correct
+    bacterial annotation as a mismatch (audit 2026-09-22). An unknown id falls
+    back to table 1's set, the same way `_codon_table_for` does.
+    """
+    try:
+        tid = int(table_id) if table_id else 1
+    except (TypeError, ValueError):
+        tid = 1
+    cached = _START_CODONS_BY_ID.get(tid)
+    if cached is not None:
+        return cached
+    try:
+        from Bio.Data import CodonTable as _BioCodonTable
+        got = frozenset(_BioCodonTable.unambiguous_dna_by_id[tid].start_codons)
+    except Exception:  # noqa: BLE001  (KeyError for a bad id, ImportError, …)
+        got = frozenset(("TTG", "CTG", "ATG"))
+    _START_CODONS_BY_ID[tid] = got
+    return got
+
 # Codon-selection strategies for `_codon_optimize`. Deliberately NOT offering
 # "harmonize": true Angov-style harmonization needs the SOURCE organism's usage
 # table to preserve the relative rare-codon positions that pace cotranslational

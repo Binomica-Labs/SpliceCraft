@@ -43,7 +43,9 @@ from xml.sax.saxutils import escape as _xml_escape
 
 import splicecraft_biology as _bio
 from splicecraft_logging import _log
-from splicecraft_util import _feat_label_full, _feature_traversal, _sanitize_label
+from splicecraft_util import (_feat_label_full, _feature_traversal,
+                             _record_is_circular, _sanitize_label,
+                             _xml_legal_text)
 
 # ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -592,7 +594,8 @@ def render_plasmid_map_svg(feats: list, total: int, *, title: str = "",
             f'<text x="{x:.2f}" y="{y:.2f}" font-size="{fs:.2f}" '
             f'fill="{color}" text-anchor="{anchor}" '
             f'dominant-baseline="central" '
-            f'font-weight="{weight}"{tr}>{_xml_escape(text)}</text>'
+            f'font-weight="{weight}"{tr}>'
+            f'{_xml_escape(_xml_legal_text(str(text)))}</text>'
         )
     parts.append("</svg>")
     return "\n".join(parts)
@@ -747,9 +750,9 @@ def _map_feats_from_record(record) -> "tuple[list[dict], int]":
     if record is None:
         return [], 0
     total = len(getattr(record, "seq", "") or "")
-    circular = str(
-        (getattr(record, "annotations", {}) or {}).get("topology", "")
-    ).strip().lower() != "linear"
+    # ONE topology rule for the whole app (`_record_is_circular`, util L0): an
+    # unannotated record is a circle, which is what the on-screen map draws.
+    circular = _record_is_circular(record)
     feats: list[dict] = []
     skip = {"source"}
     idx = 0
@@ -788,13 +791,21 @@ def _map_sites_from_record(record, *, allowed_enzymes=None,
                            unique_only: bool = True) -> "list[dict]":
     """Restriction cut sites (recut dicts: ``{start, label}``) for a record,
     for the outer tick ring. Defensive: an unbuilt scan catalog or a bad
-    sequence yields ``[]`` rather than raising."""
+    sequence yields ``[]`` rather than raising.
+
+    Topology comes from the record, through the app-wide `_record_is_circular`.
+    Hardcoding ``circular=True`` (as this did until the 2026-09-22 audit) drew
+    origin-spanning tick marks on a LINEAR molecule — sites that only exist if
+    you join its two ends — and the exported image then disagreed with the site
+    list for the same file.
+    """
     seq = str(getattr(record, "seq", "") or "")
     if not seq:
         return []
     try:
         hits = _bio._scan_restriction_sites(
-            seq, unique_only=unique_only, circular=True,
+            seq, unique_only=unique_only,
+            circular=_record_is_circular(record),
             allowed_enzymes=allowed_enzymes,
         )
     except Exception:      # scan catalog may be unbuilt off-hub; never fail export

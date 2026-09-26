@@ -851,17 +851,25 @@ class TestNormalizeForGenbank:
         normalized = sc._normalize_for_genbank(rec)
         assert normalized.annotations["molecule_type"] == "DNA"
 
-    def test_fills_topology_linear_default(self, tiny_record):
-        # 2026-05-27 (audit-3 H1): default changed from "circular"
-        # to "linear" so a record imported from GFF3 / FASTA without
-        # an explicit topology is NOT silently relabelled circular.
-        # Topology is biologically load-bearing; circular-default
-        # corrupted PCR sim + restriction wrap detection downstream.
+    def test_fills_topology_from_the_app_rule(self, tiny_record):
+        # An undeclared topology is filled in by `_record_is_circular` — the
+        # rule the map, the scans and every digest already use (audit
+        # 2026-09-22 L5b). The 2026-05-27 "linear" default protected GFF3 /
+        # FASTA imports from being relabelled circular; those ingest paths now
+        # stamp `topology="linear"` themselves (see the FASTA test below).
         rec = tiny_record
         rec.annotations = {k: v for k, v in rec.annotations.items()
                            if k != "topology"}
         normalized = sc._normalize_for_genbank(rec)
-        assert normalized.annotations["topology"] == "linear"
+        assert normalized.annotations["topology"] == (
+            "circular" if sc._record_is_circular(rec) else "linear")
+        assert normalized.annotations["topology"] == "circular"
+
+    def test_a_fasta_import_still_exports_linear(self, tmp_path):
+        fa = tmp_path / "frag.fa"
+        fa.write_text(">frag\n" + "ACGT" * 30 + "\n")
+        rec = sc._fasta_path_to_record(str(fa))
+        assert sc._normalize_for_genbank(rec).annotations["topology"] == "linear"
 
     def test_fills_division_syn_default(self, tiny_record):
         """Synthetic plasmids default to the SYN division code."""
@@ -1026,9 +1034,11 @@ class TestExportGenBankToPath:
         sc._export_genbank_to_path(bare, out)
         reloaded = sc.load_genbank(str(out))
         assert reloaded.annotations["molecule_type"] == "DNA"
-        # 2026-05-27 (audit-3 H1): topology defaults to "linear"
-        # for records with no explicit value.
-        assert reloaded.annotations["topology"] == "linear"
+        # An undeclared topology exports as what the app draws — a circle
+        # (`_record_is_circular`, audit 2026-09-22 L5b). The 2026-05-27
+        # "linear" default existed for FASTA / GFF3 imports, which now stamp
+        # `linear` at ingest instead.
+        assert reloaded.annotations["topology"] == "circular"
 
     def test_export_parent_dir_created(self, tiny_record, tmp_path):
         """Intermediate directories are created as needed."""

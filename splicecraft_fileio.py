@@ -14,6 +14,7 @@ resolves unchanged.
 """
 from __future__ import annotations
 
+import html as _html
 import os
 import re
 import threading as _threading
@@ -31,13 +32,15 @@ from splicecraft_biology import _rc
 from splicecraft_util import (
     _CONTROL_CHARS_RE, _DEFAULT_TYPE_COLORS, _feat_bounds, _feature_traversal,
     _is_windows_reserved_stem,
-    _natural_sort_key, _pick_single_record, _record_is_circular, _safe_xml_parse,
-    _sanitize_label, _to_ascii_text,
+    _natural_sort_key, _pick_single_record, _record_is_circular,
+    _safe_color_for_write, _safe_xml_parse, _sanitize_label, _to_ascii_text,
+    _xml_legal_text,
 )
 from splicecraft_record import (
     _arrowless_decode_features, _arrowless_encode_features,
     _backfill_topology, _gb_text_to_record, _locus_name_cap, _locus_name_for,
     _normalize_primer_seq,
+    _SC_STRAND_QUAL,
     _record_to_gb_text, _repair_wrapped_primer_seqs, _restore_display_name_from_comment,
     _split_multiline_qualifiers,
 )
@@ -94,6 +97,14 @@ def _insdc_feature_key(raw: object) -> str:
     """Coerce a feature type to a legal INSDC feature key."""
     s = _FT_NAME_OK_RE.sub("_", str(raw or "").strip()) or "misc_feature"
     return s[:_FT_KEY_MAX]
+
+
+# INSDC LOCUS month names. Fixed table, not `strftime("%b")`: the latter is
+# locale-dependent and the flat-file format is not.
+_INSDC_MONTHS: "tuple[str, ...]" = (
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+    "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+)
 
 
 def _insdc_qualifier_name(raw: object) -> str:
@@ -182,7 +193,32 @@ def _ascii_features_for_insdc(
                 new_quals[nk] = nvals
         loc = getattr(f, "location", None)
         new_loc = None
-        if loc is not None and getattr(loc, "strand", 1) in (0, None):
+        if (is_protein and loc is not None
+                and getattr(loc, "strand", None) not in (None,)):
+            # A PROTEIN flat file has no strand column, so BioPython writes the
+            # location plainly and reads it back STRANDLESS whatever we gave it.
+            # Any stranded protein feature therefore "diverged" on round-trip and
+            # the guard refused the whole export — an annotated domain on an NCBI
+            # `.gp`, anything `fetch_protein` brought in with a `+` on it, and
+            # every `order(...)` location (which carries its parts' strands)
+            # (audit 2026-09-22). Strip the strand here so the comparison sees
+            # the same thing twice; it is not information a protein record holds.
+            parts = list(getattr(loc, "parts", None) or [loc])
+            try:
+                rebuilt = [FeatureLocation(p.start, p.end, strand=None)
+                           for p in parts]
+            except (TypeError, ValueError):
+                rebuilt = []
+            if rebuilt:
+                # Keep the operator: `order(...)` / `bond(...)` round-trip
+                # through Biopython's writer and parser verbatim; rebuilding
+                # without it made every one a `join(...)` (FM9).
+                new_loc = (rebuilt[0] if len(rebuilt) == 1
+                           else CompoundLocation(
+                               rebuilt,
+                               operator=getattr(loc, "operator", "join")
+                               or "join"))
+        elif loc is not None and getattr(loc, "strand", 1) in (0, None):
             parts = list(getattr(loc, "parts", None) or [loc])
             if all(getattr(p, "strand", None) in (0, None) for p in parts):
                 # `source` is the one feature `_arrowless_encode_features`
@@ -215,7 +251,10 @@ def _ascii_features_for_insdc(
                         rebuilt = []
                     if rebuilt:
                         new_loc = (rebuilt[0] if len(rebuilt) == 1
-                                   else CompoundLocation(rebuilt))
+                                   else CompoundLocation(
+                                       rebuilt,
+                                       operator=getattr(loc, "operator",
+                                                        "join") or "join"))
         if new_type == (getattr(f, "type", "") or "") and not quals_changed \
                 and new_loc is None:
             out.append(f)
@@ -244,18 +283,30 @@ def _normalize_for_genbank(record):
     anns = dict(getattr(record, "annotations", None) or {})
 
     anns.setdefault("molecule_type", "DNA")
-    # 2026-05-27 (audit-3 H1): default to "linear" not "circular" so a
-    # record imported from GFF3 / FASTA without an explicit topology
-    # is NOT silently re-labelled circular on first GenBank save.
-    # Topology is biologically load-bearing — getting it wrong changes
-    # how every downstream tool (PCR sim, primer design, restriction
-    # scan wrap detection) treats the sequence. Pre-fix all topology-
-    # less imports flipped to circular on the first save.
-    anns.setdefault("topology", "linear")
+    # Topology from `_record_is_circular` — the ONE rule the rest of the app
+    # uses (an unannotated record is a CIRCLE, which is what the map draws and
+    # what every scan, digest and agent endpoint assumes since `[INV-206]`).
+    #
+    # This used to default to "linear" instead (2026-05-27, audit-3 H1) so a
+    # GFF3 / FASTA import was not silently re-labelled circular. That concern is
+    # now handled where it belongs: those ingest paths stamp `topology="linear"`
+    # explicitly, so such a record never reaches here unannotated. What survived
+    # was the disagreement — the app drew a circle, the exported file said
+    # `linear`, and every other tool then read the user's plasmid as a fragment
+    # (audit 2026-09-22). One rule, both halves.
+    if not anns.get("topology"):
+        anns["topology"] = ("circular" if _record_is_circular(record)
+                            else "linear")
     anns.setdefault("data_file_division", "SYN")
 
     if not anns.get("date"):
-        anns["date"] = _dt.now().strftime("%d-%b-%Y").upper()
+        # Month name from a TABLE, never `strftime("%b")` — that is
+        # locale-dependent, so a user running under a non-English locale wrote a
+        # LOCUS date like `23-SEPT.-2026` or `23-СЕН-2026`, which is not the
+        # INSDC `DD-MMM-YYYY` the readers parse (audit 2026-09-22). Nothing sets
+        # the locale today, which is exactly why it went unnoticed.
+        _n = _dt.now()
+        anns["date"] = f"{_n.day:02d}-{_INSDC_MONTHS[_n.month - 1]}-{_n.year}"
 
     if not anns.get("accessions"):
         acc = rec.id if rec.id and rec.id != "<unknown id>" else ""
@@ -413,6 +464,23 @@ def _export_genbank_to_path(record, path) -> dict:
 
     src_sigs = sorted(_feature_signature(f) for f in normalized.features)
     dst_sigs = sorted(_feature_signature(f) for f in parsed.features)
+    # On a PROTEIN record, strand is not information the format carries: there is
+    # no strand column, BioPython reads every protein feature back strandless,
+    # and `(?)` in a signature therefore says nothing about fidelity. Comparing
+    # it refused every protein record whose features carried a strand — and, once
+    # the strand was stripped for that reason, refused them for NOT carrying one
+    # (audit 2026-09-22). Take strand out of the comparison for proteins only.
+    _is_prot = (str((getattr(normalized, "annotations", {}) or {})
+                    .get("molecule_type") or "").strip().lower()
+                .startswith("protein"))
+    if _is_prot:
+        def _strip_strand(sig):
+            ftype, loc_str, qual_sig = sig
+            for suffix in ("(+)", "(-)", "(?)"):
+                loc_str = loc_str.replace(suffix, "")
+            return (ftype, loc_str, qual_sig)
+        src_sigs = sorted(_strip_strand(x) for x in src_sigs)
+        dst_sigs = sorted(_strip_strand(x) for x in dst_sigs)
     if src_sigs != dst_sigs:
         # Compare as MULTISETS rather than zipping the two sorted lists:
         # one changed signature re-sorts, so the zip flags every feature
@@ -1601,6 +1669,24 @@ def _fastq_quality_format(path: str) -> str:
     return "fastq"
 
 
+def _fastq_count_reads(path: str) -> "tuple[int, str | None]":
+    """``(reads, error)``: how many reads a FASTQ holds, counted with the
+    string-level iterator `SeqIO`'s own FASTQ parser runs on, so no record or
+    quality list is built per read. For a SAMPLING caller of
+    `_fastq_path_to_records`, which stops at ``max_reads`` and so cannot tell a
+    file of exactly that many reads from one of ten times as many. ``error`` is
+    the parse failure that stopped the count, with ``reads`` counted up to it."""
+    from Bio.SeqIO.QualityIO import FastqGeneralIterator
+    n = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for _rec in FastqGeneralIterator(fh):
+                n += 1
+    except (OSError, ValueError) as exc:
+        return n, str(exc)
+    return n, None
+
+
 def _fastq_path_to_records(path: str, *,
                            max_reads: "int | None" = None) -> "list":
     """Parse a multi-read `.fastq` / `.fq` file into a list of
@@ -1706,9 +1792,58 @@ _COMMERCIALSAAS_HISTORY_MAX_XML = 32 * 1024 * 1024   # 32 MB hard cap on
 # primers (0x05), notes (0x06). ElementTree materialises a tree ~30x the raw
 # XML byte size, so an uncapped ~100 MB flat-`<Feature>` packet (which fits
 # inside the whole-file cap) would balloon to multiple GB and OOM the worker
-# (the hosted demo droplet / small VMs fall over). Real feature/primer/notes
-# XML is a few KB; 8 MB is wildly generous but bounds the amplification.
-_COMMERCIALSAAS_PACKET_MAX_XML = 8 * 1024 * 1024
+# (the hosted demo droplet / small VMs fall over). A plasmid's feature XML is a
+# few KB, but an annotated bacterial genome is not: 7,800 CDS with their
+# translations is a ~10 MB features block, which SpliceCraft's own writer
+# produces. The cap was 8 MB when it only skipped colour/label stamping; once
+# the whole file was refused above it, those genomes stopped opening at all —
+# including SpliceCraft's own exports. 32 MB covers an annotated ~25 Mb
+# genome, and `_build_commercialsaas_packet` refuses to WRITE a block over it,
+# so every `.dna` SpliceCraft writes it can also read.
+_COMMERCIALSAAS_PACKET_MAX_XML = 32 * 1024 * 1024
+
+# The packets Biopython's reader hands to minidom: primers, notes, features.
+_COMMERCIALSAAS_XML_PACKETS = (0x05, 0x06, 0x0A)
+
+
+def _commercialsaas_refuse_oversized_xml(path) -> None:
+    """Refuse a .dna whose primers / notes / features XML packet exceeds
+    `_COMMERCIALSAAS_PACKET_MAX_XML` — from the packet HEADERS alone, before
+    anything parses it.
+
+    The cap was enforced only by our own packet readers, which run AFTER
+    Biopython's: its reader builds a minidom tree of every XML packet first,
+    so a 200 MB features packet (inside the 256 MB file cap) was expanded
+    ~30x in memory before any check saw it (audit 2026-09-22, FM11). Walking
+    the 5-byte headers and seeking past each payload reads almost nothing.
+
+    A file that does not open with the cookie packet is left alone: it is
+    not a `.dna` at all, and the parser's own error says so better than a
+    "block too large" read off whatever its bytes happen to be."""
+    import struct as _struct
+    with open(path, "rb") as fh:
+        first = True
+        while True:
+            hdr = fh.read(5)
+            if len(hdr) < 5:
+                return
+            ptype = hdr[0]
+            if first and ptype != _COMMERCIALSAAS_PACKET_COOKIE:
+                return
+            first = False
+            length = _struct.unpack(">I", hdr[1:5])[0]
+            if (ptype in _COMMERCIALSAAS_XML_PACKETS
+                    and length > _COMMERCIALSAAS_PACKET_MAX_XML):
+                what = {0x05: "primers", 0x06: "notes",
+                        0x0A: "features"}[ptype]
+                raise ValueError(
+                    f"{Path(str(path)).name}: its embedded {what} block is "
+                    f"{length / 1048576:.1f} MB, over the "
+                    f"{_COMMERCIALSAAS_PACKET_MAX_XML / 1048576:.0f} MB "
+                    f"SpliceCraft reads for one block (a plasmid's is a few "
+                    f"KB). It was not opened: parsing a block that size can "
+                    f"exhaust memory.")
+            fh.seek(length, 1)
 
 
 def _iter_commercialsaas_packets(data: bytes):
@@ -1787,6 +1922,17 @@ def _build_commercialsaas_packet(type_byte: int, payload: bytes) -> bytes:
     if len(payload) > 0xFFFFFFFF:
         raise ValueError(f"payload too large for 32-bit length: "
                          f"{len(payload)} bytes")
+    if (type_byte in _COMMERCIALSAAS_XML_PACKETS
+            and len(payload) > _COMMERCIALSAAS_PACKET_MAX_XML):
+        # The reader refuses a file carrying a block this size — never write
+        # one it would then refuse to open.
+        what = {0x05: "primers", 0x06: "notes", 0x0A: "features"}.get(
+            type_byte, "XML")
+        raise ValueError(
+            f"the .dna {what} block would be "
+            f"{len(payload) / (1024 * 1024):.1f} MB, over the "
+            f"{_COMMERCIALSAAS_PACKET_MAX_XML // (1024 * 1024)} MB SpliceCraft "
+            f"can read back — export this one as GenBank instead")
     return bytes([type_byte]) + _struct.pack(">I", len(payload)) + payload
 
 
@@ -1844,6 +1990,16 @@ def _pack_commercialsaas_history_payload(xml_text: str) -> bytes:
     wrapping in `_build_commercialsaas_packet(0x07, …)`."""
     import lzma as _lzma
     encoded = xml_text.encode("utf-8")
+    if len(encoded) > _COMMERCIALSAAS_HISTORY_MAX_XML:
+        # The reader drops a history over this cap without a word, so
+        # writing one produced a file whose history silently vanished on the
+        # next open (round-2 hardening, 2026-09-25). Refused like the other
+        # oversized blocks.
+        raise ValueError(
+            f"the .dna construction history would be "
+            f"{len(encoded) / 1e6:.0f} MB, over the "
+            f"{_COMMERCIALSAAS_HISTORY_MAX_XML // (1024 * 1024)} MB "
+            f"SpliceCraft can read back — export this one as GenBank instead")
     return _lzma.compress(encoded)
 
 
@@ -1934,6 +2090,10 @@ _COMMERCIALSAAS_COOKIE_MAGIC      = bytes.fromhex("536e617047656e65")  # 8 bytes
 _COMMERCIALSAAS_COOKIE_SEQ_TYPE   = 1
 _COMMERCIALSAAS_COOKIE_EXP_VER    = 15
 _COMMERCIALSAAS_COOKIE_IMP_VER    = 19
+# DNA-packet flag bits other than topology: double-stranded (0x02) plus Dam /
+# Dcm / EcoKI methylation (0x04 | 0x08 | 0x10). See
+# `_build_commercialsaas_dna_packet`.
+_COMMERCIALSAAS_DNA_FLAGS_DS_METHYLATED = 0x1E
 
 
 def _build_commercialsaas_cookie_packet() -> bytes:
@@ -1950,9 +2110,17 @@ def _build_commercialsaas_cookie_packet() -> bytes:
 def _build_commercialsaas_dna_packet(seq: str, *, circular: bool) -> bytes:
     """Build the 0x00 DNA packet — 1-byte flags + N-byte ASCII
     sequence. Real CommercialSaaS files appear to use lowercase bases
-    in the payload; we lowercase to match the convention. Flag
-    bit 0x01 = circular; other bits cleared (their meaning is
-    not fully documented and CommercialSaaS defaults them on read).
+    in the payload; we lowercase to match the convention.
+
+    Flag byte: 0x01 circular, 0x02 DOUBLE-STRANDED, 0x04 / 0x08 / 0x10 Dam /
+    Dcm / EcoKI methylated — the reading an independent third-party parser
+    gives the same byte, and every real file in
+    `tests/*.dna` carries 0x1f. Writing 0x01 alone told the other editor our
+    plasmid was SINGLE-stranded and unmethylated (audit 2026-09-22, FM6).
+    Methylation is set because that is the editor's own default for DNA out of
+    a standard E. coli strain, and claiming "unmethylated" is the failure that
+    costs a digest; SpliceCraft itself only ever WARNS about a methylation-
+    sensitive site, never adjudicates one.
 
     2026-05-27 (audit-3 H5): validate the sequence up front instead
     of relying on a bare ``.encode("ASCII")`` strict crash. A stray
@@ -1979,7 +2147,7 @@ def _build_commercialsaas_dna_packet(seq: str, *, circular: bool) -> bytes:
             f"{' (truncated)' if len(bad) >= 3 else ''}"
             f" — strip whitespace/unicode artefacts before export."
         )
-    flags = 0x01 if circular else 0x00
+    flags = _COMMERCIALSAAS_DNA_FLAGS_DS_METHYLATED | (0x01 if circular else 0x00)
     payload = bytes([flags]) + seq.lower().encode("ascii", "strict")
     return _build_commercialsaas_packet(_COMMERCIALSAAS_PACKET_DNA, payload)
 
@@ -1999,23 +2167,23 @@ def _build_commercialsaas_features_packet_from_record(record) -> bytes:
         attrs = {
             "recentID": str(i),
             "name":     _commercialsaas_feat_name(feat),
-            "type":     feat.type or "misc_feature",
+            # A control byte in an attribute is not XML at all — the reader
+            # then refuses the whole packet (audit 2026-09-22, FM11).
+            "type":     (_CONTROL_CHARS_RE.sub("", feat.type or "")
+                         or "misc_feature"),
             "allowSegmentOverlaps": "0",
             "consecutiveTranslationNumbering": "1",
         }
-        # Strand → CommercialSaaS's `directionality` attribute.
-        # Forward = "1", reverse = "2", omit for unknown / unstranded.
-        strand = feat.location.strand
-        if strand == 1:
-            attrs["directionality"] = "1"
-        elif strand == -1:
-            attrs["directionality"] = "2"
+        # Strand → the format's own `directionality` vocabulary: "1" forward,
+        # "2" reverse, "3" both, ABSENT for no arrow.
+        _dir = _commercialsaas_directionality(feat)
+        if _dir is not None:
+            attrs["directionality"] = _dir
         feat_el = _ET.SubElement(root, "Feature", attrs)
-        # Color: derive from `_DEFAULT_TYPE_COLORS` so newly-written
-        # features get a sensible default that matches what SpliceCraft
-        # renders. CommercialSaaS's library-wide colour map differs slightly,
-        # but it gracefully accepts any 6-digit hex.
-        color = _DEFAULT_TYPE_COLORS.get(feat.type or "", "#a6acb3")
+        # Colour: the feature's OWN colour when it has one, else the type
+        # default. Stamping the type default on everything overwrote every
+        # colour the user had picked the moment the file was reopened (FM6).
+        color = _commercialsaas_feat_color(feat)
         # Segments: one per CompoundLocation part; one for simple. An origin
         # wrap collapses to a single inverted range — see
         # `_commercialsaas_segment_ranges`.
@@ -2033,6 +2201,11 @@ def _build_commercialsaas_features_packet_from_record(record) -> bytes:
         # `<V text=>` (or `<V int=>` when the value is an integer).
         for qname, qvals in (feat.qualifiers or {}).items():
             if qname == "label":
+                continue
+            if qname == _SC_STRAND_QUAL:
+                # The "both arrows" marker travels as `directionality="3"`,
+                # which the other editor draws natively — a stray
+                # `SpliceCraft_strand` qualifier would only clutter its panel.
                 continue
             q_el = _ET.SubElement(feat_el, "Q", {"name": qname})
             for v in (qvals if isinstance(qvals, list) else [qvals]):
@@ -2055,12 +2228,9 @@ def _build_commercialsaas_features_packet_from_record(record) -> bytes:
                     # the user's feature-styling work. Mirrors
                     # `_commercialsaas_feat_name` (line ~8230) which
                     # already strips controls from the feature label.
-                    sanitised = "".join(
-                        c if (c >= " " or c in "\t\n")
-                        else " "
-                        for c in str(v)
-                    )
-                    _ET.SubElement(q_el, "V", {"text": sanitised})
+                    sanitised = _xml_legal_text(str(v))
+                    _ET.SubElement(q_el, "V", {
+                        "text": _commercialsaas_encode_text(sanitised)})
     body = _ET.tostring(root, encoding="unicode")
     xml = '<?xml version="1.0"?>' + body
     return _build_commercialsaas_packet(_COMMERCIALSAAS_PACKET_FEATURES,
@@ -2079,6 +2249,16 @@ def _build_commercialsaas_notes_packet(record) -> bytes:
     root = _ET.Element("Notes")
     _ET.SubElement(root, "Type").text = "Synthetic"
     _ET.SubElement(root, "ConfirmedExperimentally").text = "0"
+    # The format has no NAME field — the file name is the name — so the
+    # plasmid's own name travels as the map label, which the other editor
+    # shows on the map when `UseCustomMapLabel` is 1 and which
+    # `load_genbank` reads back. Without it a renamed file came back under its
+    # file name, or under the first WORD of its description (Biopython's
+    # reading of `<Comments>`) — "Cloning" for "Cloning vector pX" (FM6).
+    _label = _commercialsaas_record_label(record)
+    if _label:
+        _ET.SubElement(root, "CustomMapLabel").text = _label
+        _ET.SubElement(root, "UseCustomMapLabel").text = "1"
     created = _ET.SubElement(root, "Created", {
         "UTC": now.strftime("%H:%M:%S"),
     })
@@ -2092,7 +2272,13 @@ def _build_commercialsaas_notes_packet(record) -> bytes:
     # parser convention).
     desc = getattr(record, "description", "") or ""
     if desc and desc != "<unknown description>":
-        _ET.SubElement(root, "Comments").text = str(desc)
+        # A control byte here is not XML, and Biopython's reader parses this
+        # packet unguarded — the whole file then failed to open (FM11). Text
+        # between angle brackets is encoded like a qualifier's
+        # (`_commercialsaas_encode_text`): written plain, `pTest <v2>` came
+        # back as `pTest ` to every reader.
+        _ET.SubElement(root, "Comments").text = _commercialsaas_encode_text(
+            _xml_legal_text(str(desc)))
     body = _ET.tostring(root, encoding="unicode")
     return _build_commercialsaas_packet(_COMMERCIALSAAS_PACKET_NOTES,
                                      body.encode("utf-8"))
@@ -2156,6 +2342,172 @@ def _commercialsaas_feat_name(feat) -> str:
     label = (quals.get("label") or quals.get("product") or [feat.type or "?"])
     name = str(label[0] if isinstance(label, list) else label)
     return _CONTROL_CHARS_RE.sub("", name)[:200] or "feature"
+
+
+# Characters XML 1.0 cannot carry at all, even escaped: C0 controls other than
+# TAB / LF / CR, lone surrogates, U+FFFE and U+FFFF. One of them in a `.dna`
+# text makes the whole packet unparseable.
+
+
+def _commercialsaas_feat_color(feat) -> str:
+    """The ``<Segment color=…>`` for a feature: its OWN colour, looked up in the
+    order the map reads it (``ApEinfo_fwdcolor``, ``ApEinfo_revcolor``,
+    ``color``), else the type default. A short ``#RGB`` is widened to
+    ``#RRGGBB``, the form the other editor writes."""
+    quals = getattr(feat, "qualifiers", None) or {}
+    for key in ("ApEinfo_fwdcolor", "ApEinfo_revcolor", "color"):
+        vals = quals.get(key)
+        first = (vals[0] if isinstance(vals, list) and vals
+                 else vals if isinstance(vals, str) else None)
+        col = _safe_color_for_write(first) if isinstance(first, str) else None
+        if col:
+            if len(col) == 4:
+                col = "#" + "".join(ch * 2 for ch in col[1:])
+            return col
+    return _DEFAULT_TYPE_COLORS.get(getattr(feat, "type", "") or "", "#a6acb3")
+
+
+def _commercialsaas_directionality(feat) -> "str | None":
+    """A feature's strand in the format's own vocabulary — ``"1"`` forward,
+    ``"2"`` reverse, ``"3"`` both, ``None`` (attribute omitted) for no arrow.
+    The same reading an independent third-party parser gives the
+    attribute; `_augment_dna_record_from_packets` is the inverse."""
+    quals = getattr(feat, "qualifiers", None) or {}
+    marker = quals.get(_SC_STRAND_QUAL)
+    if (isinstance(marker, list) and marker
+            and str(marker[0]).strip().lower() == "double"):
+        return "3"
+    strand = getattr(getattr(feat, "location", None), "strand", None)
+    if strand == 1:
+        return "1"
+    if strand == -1:
+        return "2"
+    return None
+
+
+_DNA_RICH_TEXT_RE = re.compile(r"\s*<[A-Za-z!/]")
+_DNA_TAG_RE = re.compile(r"<[^>]*>")
+# Exactly what Biopython's `.dna` reader deletes from EVERY text value
+# (Biopython's `.dna` reader, `_decode`).
+_BIOPYTHON_DNA_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _has_biopython_dna_tag(value: str) -> bool:
+    """Would Biopython's `.dna` reader strip something from ``value`` — does
+    `_BIOPYTHON_DNA_TAG_RE` match anywhere? Answered in ONE pass: searched with
+    the regex, a long run of ``<`` with no ``>`` after it re-scanned the rest
+    of the string from every ``<`` (0.25 s at 20 k characters, ~25 s at
+    200 k). A match needs a ``<`` with at least one character before the
+    next ``>``, so each stretch between two ``>`` is checked for its first
+    ``<`` (round-2 hardening, 2026-09-25)."""
+    start = 0
+    while True:
+        j = value.find(">", start)
+        if j == -1:
+            return False
+        k = value.find("<", start, j)
+        if k != -1 and k < j - 1:
+            return True
+        start = j + 1
+_DNA_BREAK_TAG_RE = re.compile(r"<br\s*/?>|</p\s*>|</div\s*>", re.IGNORECASE)
+
+
+def _commercialsaas_encode_text(value: str) -> str:
+    """A qualifier value as a ``<V text=…>`` the other editor and our own
+    reader both read back as ``value``.
+
+    The editor keeps a rich note as an HTML document and a plain one verbatim,
+    side by side (both occur in `tests/*.dna`). A plain value holding ``<`` or
+    ``>`` does not survive: Biopython deletes anything between angle brackets,
+    so ``use < 5 ng and > 2 ng`` came back as ``use  2 ng`` (FM6). Such a value
+    is written as the editor's own rich form — an escaped HTML document —
+    which `_commercialsaas_decode_text` reverses exactly. Anything else is
+    written as it stands.
+
+    Only text Biopython WOULD strip (`<…>` with something inside) or that our
+    own reader would take for markup is wrapped. A lone ``<5 kb`` or
+    ``Tm > 60 C`` survives every reader as it stands, while the wrapped form
+    reaches Biopython — which never decodes an entity — as ``&lt;5 kb``."""
+    if _has_biopython_dna_tag(value) or _DNA_RICH_TEXT_RE.match(value):
+        return ("<html><body>" + _html.escape(value, quote=False)
+                + "</body></html>")
+    return value
+
+
+def _commercialsaas_decode_text(raw):
+    """Inverse of `_commercialsaas_encode_text`, for any writer's file.
+
+    A value that IS markup (it opens with a tag — the editor's
+    ``<html><body>…`` rich note) has its tags removed and its entities
+    decoded: ``&lt;UTR&gt;`` is ``<UTR>``. A value that is not is returned as
+    written — Biopython strips tag-shaped text out of those as well, and never
+    decodes an entity in either."""
+    if not isinstance(raw, str) or not _DNA_RICH_TEXT_RE.match(raw):
+        return raw
+    text = _DNA_BREAK_TAG_RE.sub(" ", raw)
+    return _html.unescape(_DNA_TAG_RE.sub("", text)).strip()
+
+
+def _commercialsaas_record_label(record) -> str:
+    """The name a `.dna` should carry as its map label: the plasmid's display
+    name, else a real LOCUS name, else nothing."""
+    for cand in (getattr(record, "_tui_display_name", None),
+                 getattr(record, "name", None)):
+        if isinstance(cand, str):
+            label = _sanitize_label(cand, max_len=200)
+            if label and not label.startswith("<unknown"):
+                return label
+    return ""
+
+
+def _commercialsaas_notes_fields(packets) -> dict:
+    """The identity fields of a `.dna`'s Notes packet: ``map_label`` (only
+    when ``UseCustomMapLabel`` is 1 — otherwise the editor itself shows the
+    file name) and ``accession``. Parsed through `_safe_xml_parse` under the
+    same size cap as every other packet; ``{}`` when absent or unreadable."""
+    import xml.etree.ElementTree as _ET
+    for type_byte, _length, payload in packets:
+        if type_byte != _COMMERCIALSAAS_PACKET_NOTES:
+            continue
+        if len(payload) > _COMMERCIALSAAS_PACKET_MAX_XML:
+            return {}
+        try:
+            text = re.sub(r"^\s*<\?xml[^>]*\?>\s*", "",
+                          payload.decode("utf-8", "replace"), count=1)
+            root = _safe_xml_parse(text)
+        except (_ET.ParseError, ValueError):
+            return {}
+        if root is None:
+            return {}
+
+        def _field(tag: str) -> str:
+            el = root.find(tag)
+            return (el.text or "").strip() if el is not None else ""
+
+        out: dict = {}
+        # The map label is PLAIN text in the other editor (and as we write
+        # it): decoded like a rich note, `<Cas9> donor v2` lost its `<Cas9>`,
+        # and a label that decoded to nothing blanked the name (round-2
+        # hardening, 2026-09-25). A label typed over several lines is one line
+        # here: joined on a space, not run together ("pGEX-4T-1GST…").
+        label = " ".join((_field("CustomMapLabel") or "").split())
+        if label and _field("UseCustomMapLabel") == "1":
+            out["map_label"] = label
+        acc = _field("AccessionNumber")
+        if acc:
+            out["accession"] = acc
+        # The description as the file means it: Biopython deletes anything
+        # tag-shaped from `<Comments>` and decodes no entity. Only RICH text
+        # (which decoding changed) has its layout whitespace collapsed; plain
+        # text keeps its own spacing, as the GenBank DEFINITION does.
+        raw_desc = _field("Comments")
+        decoded = str(_commercialsaas_decode_text(raw_desc) or "")
+        desc = (" ".join(decoded.split()) if decoded != raw_desc
+                else raw_desc.strip())
+        if desc:
+            out["description"] = desc
+        return out
+    return {}
 
 
 def _build_commercialsaas_addprops_packet_default() -> bytes:
@@ -2316,7 +2668,8 @@ def _write_commercialsaas_dna_bytes(record, *,
     return b"".join(parts)
 
 
-def _commercialsaas_segment_parts(segments) -> "tuple[tuple[int, int], ...]":
+def _commercialsaas_segment_parts(segments, clamp_to: "int | None" = None
+                                  ) -> "tuple[tuple[int, int], ...]":
     """Every ``<Segment range="a-b">`` as a sorted tuple of BioPython-frame
     ``(start, end)`` pairs — the PRECISE identity of a multi-part feature.
 
@@ -2335,13 +2688,21 @@ def _commercialsaas_segment_parts(segments) -> "tuple[tuple[int, int], ...]":
             start_1based, end_1based = int(head), int(tail)
         except ValueError:
             continue
+        if clamp_to is not None:
+            # The record side clamps an out-of-range part into the sequence
+            # (`_clamp_feature_parts_to_record` — a writer emitting `0-10` is
+            # seen in the wild); keyed unclamped here, the two never matched
+            # and the feature lost its colour, label and arrow.
+            start_1based = max(1, start_1based)
+            end_1based = min(int(clamp_to), end_1based)
         if start_1based < 1 or end_1based < start_1based:
             continue
         out.append((start_1based - 1, end_1based))
     return tuple(sorted(out))
 
 
-def _commercialsaas_segment_span(segments) -> "tuple[int, int] | None":
+def _commercialsaas_segment_span(segments, clamp_to: "int | None" = None
+                                 ) -> "tuple[int, int] | None":
     """Reduce a ``.dna`` ``<Feature>``'s ``<Segment range="a-b">`` children to a
     single BioPython-frame span ``(start, end)`` — 0-based inclusive start,
     exclusive end — so it compares directly against
@@ -2363,14 +2724,14 @@ def _commercialsaas_segment_span(segments) -> "tuple[int, int] | None":
     malformed-input rules live in ONE place — two copies would be free to
     disagree about what counts as a usable segment.
     """
-    parts = _commercialsaas_segment_parts(segments)
+    parts = _commercialsaas_segment_parts(segments, clamp_to=clamp_to)
     if not parts:
         return None
     return (min(p[0] for p in parts), max(p[1] for p in parts))
 
 
 def _augment_dna_record_from_packets(
-    rec, data: bytes, *, packets=None,
+    rec, data: bytes, *, packets=None, legacy: bool = False,
 ) -> list[dict]:
     """Recover info BioPython's ``.dna`` parser drops:
       * **per-feature colours** from the 0x0A Features packet
@@ -2403,6 +2764,11 @@ def _augment_dna_record_from_packets(
     standalone 0x05 ``<Primer>`` entry, with duplicates by sequence
     already collapsed within this call. The caller (``_apply_record``)
     dedupes against the existing primer DB before persisting.
+
+    ``legacy=True`` reads the file the way SpliceCraft 1.2.71 and earlier
+    did — without the qualifier-text and arrow passes — for ONE purpose:
+    telling whether an entry those versions imported is still unedited
+    (`_dna_sidecar_matches_entry`). Never for an import.
     """
     import xml.etree.ElementTree as _ET
 
@@ -2440,6 +2806,20 @@ def _augment_dna_record_from_packets(
     # gene/CDS pair sits at identical coordinates — and each still needs its own
     # entry to hand out. [INV-179]
     xml_features: list[dict] = []
+    # The XML parts are clamped into the sequence exactly when the RECORD's
+    # were (`load_genbank` clamps before this runs): then both sides key the
+    # same coordinates. A record still holding a part outside its sequence
+    # was not clamped, so neither side is.
+    _seq_n = len(getattr(rec, "seq", "") or "") or None
+    try:
+        if _seq_n is not None and any(
+                int(_p.start) < 0 or int(_p.end) > _seq_n
+                for _f in (rec.features or [])
+                for _p in (getattr(_f.location, "parts", None)
+                           or [_f.location])):
+            _seq_n = None
+    except (TypeError, ValueError, AttributeError):
+        _seq_n = None
     standalone_primers: list[dict] = []
 
     # Iterate the packet stream ONCE: the file-load path materialises
@@ -2480,13 +2860,47 @@ def _augment_dna_record_from_packets(
                 # survive verbatim.
                 xml_name = feat_el.get("name", "") or ""
                 xml_name = _CONTROL_CHARS_RE.sub("", xml_name)[:200]
-                # `directionality`: "1" forward, "2" reverse, omitted when the
-                # writer has no opinion (see `_build_commercialsaas_features_packet`).
+                # `directionality`: "1" forward, "2" reverse, "3" both, omitted
+                # for no arrow (`_commercialsaas_directionality`).
                 _dir = (feat_el.get("directionality") or "").strip()
+                # Every qualifier's text, decoded the way the file means it
+                # (`_commercialsaas_decode_text`), aligned value-for-value with
+                # the list Biopython builds — `None` where Biopython's own
+                # reading stands (an integer, or a value kind it skips).
+                _texts: dict = {}
+                for _q in feat_el.findall("Q"):
+                    _qname = _q.get("name")
+                    if not _qname:
+                        continue
+                    _vals: list = []
+                    for _v in _q.findall("V"):
+                        if "text" in _v.attrib:
+                            _vals.append(_commercialsaas_decode_text(
+                                _v.get("text")))
+                        elif "predef" in _v.attrib:
+                            _vals.append(_commercialsaas_decode_text(
+                                _v.get("predef")))
+                        elif "int" in _v.attrib:
+                            _vals.append(None)
+                    _texts[_qname] = _vals
                 xml_features.append({
-                    "strand": 1 if _dir == "1" else (-1 if _dir == "2" else None),
-                    "parts": _commercialsaas_segment_parts(segments),
-                    "span":  _commercialsaas_segment_span(segments),
+                    # Keyed the way BIOPYTHON reads the arrow (only "2" is
+                    # reverse), because the record side of the match is
+                    # Biopython's: keyed by the file's own reading, an arrowless
+                    # feature looked up as +1 took the entry of a forward
+                    # feature sharing its span, with its notes.
+                    # `legacy` reproduces v1.2.71's OWN key (only "1" was
+                    # forward, anything else unkeyed), swap bug included: it
+                    # is what those entries stored.
+                    "strand": ((1 if _dir == "1" else (-1 if _dir == "2"
+                                                        else None))
+                               if legacy else (-1 if _dir == "2" else 1)),
+                    "dir":   _dir,
+                    "texts": _texts,
+                    "parts": _commercialsaas_segment_parts(
+                        segments, clamp_to=None if legacy else _seq_n),
+                    "span":  _commercialsaas_segment_span(
+                        segments, clamp_to=None if legacy else _seq_n),
                     "type":  (feat_el.get("type", "") or "").strip(),
                     "name":  xml_name,
                     "color": color,
@@ -2646,6 +3060,7 @@ def _augment_dna_record_from_packets(
         n_matched += 1
         # Color stamp.
         c = ent["color"]
+        _seg_colored = False
         if c and isinstance(c, str):
             c = c.strip()
             # Defensive: only accept plausible CSS hex colours
@@ -2654,9 +3069,49 @@ def _augment_dna_record_from_packets(
             if c.startswith("#") and len(c) in (4, 7):
                 f.qualifiers["ApEinfo_revcolor"] = [c]
                 f.qualifiers["ApEinfo_fwdcolor"] = [c]
+                _seg_colored = True
         # Label override from raw XML.
         if ent["name"]:
             f.qualifiers["label"] = [ent["name"]]
+        if legacy:
+            continue
+        # Qualifier text, as the file means it. Biopython deletes anything
+        # tag-shaped from EVERY value and decodes no entity in any, so a plain
+        # `use < 5 ng and > 2 ng` read back as `use  2 ng` and a rich
+        # `5&#x27; UTR` kept its entity (FM6). Only replaced value-for-value
+        # where the two readings line up.
+        for _qname, _vals in ent["texts"].items():
+            if _qname == "label":
+                continue
+            if _seg_colored and _qname in ("ApEinfo_fwdcolor",
+                                           "ApEinfo_revcolor"):
+                # The colour the file DRAWS is its segment's. A colour
+                # qualifier left over from an earlier editor (our own export
+                # writes one, then the feature is recoloured) is stale —
+                # unless the file's forward colour still IS the segment's:
+                # then its qualifiers are current, and a DIFFERENT reverse
+                # colour was chosen on purpose (it was lost; round-2
+                # hardening, 2026-09-25).
+                _fwd = (ent["texts"].get("ApEinfo_fwdcolor") or [None])[0]
+                if not (_qname == "ApEinfo_revcolor" and isinstance(_fwd, str)
+                        and _fwd.strip().lower() == str(c).lower()):
+                    continue
+            _cur = f.qualifiers.get(_qname)
+            if isinstance(_cur, list) and len(_cur) == len(_vals):
+                f.qualifiers[_qname] = [
+                    _cur[_k] if _v is None else _v
+                    for _k, _v in enumerate(_vals)]
+        # Direction, as the file means it: Biopython reads a MISSING
+        # `directionality` — the editor's "no arrow", and the form most
+        # misc_features, terminators and RBSs take in `tests/*.dna` — as
+        # forward, and "3" (both arrows) as forward too.
+        if ent["dir"] in ("", "0", "3"):
+            try:
+                f.location.strand = 0
+            except (AttributeError, ValueError, TypeError):
+                pass
+            if ent["dir"] == "3":
+                f.qualifiers[_SC_STRAND_QUAL] = ["double"]
 
     # Leftovers are diagnostic gold: a 0x0A entry nobody claimed means the
     # file's coordinates and BioPython's disagree, which is precisely the
@@ -3975,6 +4430,28 @@ def _dna_record_signature(rec) -> tuple:
     return seq, topo, tuple(sorted(feats))
 
 
+# The release whose `.dna` reader first read arrows and qualifier text the way
+# the file means them (arrowless stays arrowless, `<html>` notes decoded). An
+# entry an EARLIER version imported was read without that, so re-reading its
+# sidecar with today's reader can never reproduce it — every such entry looked
+# edited, and its export was rebuilt from scratch, dropping the reads, primers
+# and notes splice mode exists to keep. `_dna_sidecar_matches_entry` also tries
+# the old reading for those entries. Entry provenance comes from the
+# "Created by SpliceCraft vX.Y.Z" stamp `_record_to_gb_text` writes once, at
+# import, and preserves on every re-save.
+_DNA_READER_REVISED_IN = (1, 3, 0)
+_SC_CREATED_BY_RE = re.compile(r"Created by SpliceCraft v(\d+)\.(\d+)\.(\d+)")
+
+
+def _entry_predates_dna_reader_revision(gb_text: str) -> bool:
+    """True when the entry was imported before `_DNA_READER_REVISED_IN`
+    (or carries no provenance stamp at all — older still)."""
+    m = _SC_CREATED_BY_RE.search(gb_text or "")
+    if m is None:
+        return True
+    return tuple(int(g) for g in m.groups()) < _DNA_READER_REVISED_IN
+
+
 def _dna_sidecar_matches_entry(original: bytes, entry: dict) -> bool:
     """True only when the imported `.dna` sidecar still describes the entry
     EXACTLY as it is now — same sequence, topology and features.
@@ -3987,21 +4464,111 @@ def _dna_sidecar_matches_entry(original: bytes, entry: dict) -> bool:
     round trip storage applies, so an unedited entry compares equal and any
     divergence falls back to a from-scratch build. A false "differs" only
     costs the exotic packets splice mode preserves; a false "same" loses
-    the user's edits, so every doubt answers False."""
+    the user's edits, so every doubt answers False.
+
+    "The same importer" is the one that created the entry: an entry a
+    release before `_DNA_READER_REVISED_IN` imported is compared with the
+    sidecar as THAT reader saw it, too."""
     import tempfile as _tempfile
     try:
-        entry_rec = _gb_text_to_record(entry.get("gb_text") or "")
+        gb_text = entry.get("gb_text") or ""
+        # Through TODAY's writer, as the sidecar side is: the stored text was
+        # written by whatever release imported it, and today's writer splits
+        # a CR / U+2028 / U+0085 inside a value where that one did not — an
+        # unedited entry then "differed" and its export dropped the reads,
+        # primers and enzymes only the sidecar holds (round-2 hardening).
+        want = _dna_record_signature(_gb_text_to_record(
+            _record_to_gb_text(_gb_text_to_record(gb_text))))
+        # An old entry is compared with the OLD reading first — the one it
+        # was made with, so the usual answer costs one parse, not two.
+        readings = ([True, False] if _entry_predates_dna_reader_revision(gb_text)
+                    else [False])
         with _tempfile.TemporaryDirectory(prefix="sc-dna-cmp-") as td:
             p = Path(td) / "sidecar.dna"
             p.write_bytes(original)
-            side = load_genbank(str(p))
-        side_rt = _gb_text_to_record(_record_to_gb_text(side))
-        return _dna_record_signature(side_rt) == _dna_record_signature(entry_rec)
+            for legacy in readings:
+                side = load_genbank(str(p), legacy_dna_reader=legacy)
+                side_rt = _gb_text_to_record(_record_to_gb_text(side))
+                if _dna_record_signature(side_rt) == want:
+                    return True
+        return False
     except Exception:
         _log.exception("dna export: could not compare the import sidecar "
                        "with entry %r; rebuilding from GenBank",
                        entry.get("id"))
         return False
+
+
+def _splice_identity(data: bytes, entry: dict, out_path) -> bytes:
+    """A splice-mode export carries the ENTRY's name and description.
+
+    The sidecar match compares sequence and features only, so a renamed entry
+    still spliced its original bytes — and their `CustomMapLabel` then won
+    over the file name on reopen: the export came back under the OLD name,
+    and a description edit was dropped the same way (round-2 hardening,
+    2026-09-25). Only the Notes packet's identity fields are rewritten, and
+    only when they differ from what the file would present, so an unedited
+    export stays byte-identical."""
+    try:
+        fields = _commercialsaas_notes_fields(
+            list(_iter_commercialsaas_packets(data)))
+    except Exception:
+        _log.exception("dna export: could not read the Notes packet")
+        return data
+    name = str(entry.get("name") or "").strip()
+    label = None
+    if name and name != (fields.get("map_label")
+                         or Path(str(out_path)).stem):
+        label = name
+    desc = None
+    try:
+        rec_desc = str(_gb_text_to_record(entry.get("gb_text") or "")
+                       .description or "").strip()
+    except Exception:
+        rec_desc = ""
+    if rec_desc not in ("", ".", "<unknown description>") and (
+            " ".join(rec_desc.split())
+            != " ".join(str(fields.get("description") or "").split())):
+        desc = rec_desc
+    if label is None and desc is None:
+        return data
+    return _commercialsaas_rewrite_notes(data, label=label, description=desc)
+
+
+def _commercialsaas_rewrite_notes(data: bytes, *, label: "str | None",
+                                  description: "str | None") -> bytes:
+    """``data`` with its Notes packet's `CustomMapLabel` (+ the flag the other
+    editor shows it by) and `Comments` replaced; every other packet — and
+    every other Notes field — verbatim. Unchanged when there is no Notes
+    packet or it cannot be parsed."""
+    import xml.etree.ElementTree as _ET
+
+    def _put(root, tag: str, text: str) -> None:
+        el = root.find(tag)
+        if el is None:
+            el = _ET.SubElement(root, tag)
+        el.text = text
+    out: "list[bytes]" = []
+    done = False
+    for type_byte, _length, payload in _iter_commercialsaas_packets(data):
+        if type_byte == _COMMERCIALSAAS_PACKET_NOTES and not done:
+            done = True
+            try:
+                text = re.sub(r"^\s*<\?xml[^>]*\?>\s*", "",
+                              payload.decode("utf-8", "replace"), count=1)
+                root = _safe_xml_parse(text)
+            except (_ET.ParseError, ValueError):
+                root = None
+            if root is not None:
+                if label is not None:
+                    _put(root, "CustomMapLabel", _xml_legal_text(label))
+                    _put(root, "UseCustomMapLabel", "1")
+                if description is not None:
+                    _put(root, "Comments", _commercialsaas_encode_text(
+                        _xml_legal_text(description)))
+                payload = _ET.tostring(root, encoding="unicode").encode("utf-8")
+        out.append(_build_commercialsaas_packet(type_byte, payload))
+    return b"".join(out)
 
 
 def _export_commercialsaas_dna(entry: dict, out_path: "Path | str") -> "str":
@@ -4037,8 +4604,10 @@ def _export_commercialsaas_dna(entry: dict, out_path: "Path | str") -> "str":
         original = None
     if original is not None:
         # Splice mode: replace history packet, leave everything else
-        # byte-identical.
+        # byte-identical — except the Notes packet's name and description when
+        # the entry has changed them (`_splice_identity`).
         out_bytes = _inject_commercialsaas_history(original, history_xml)
+        out_bytes = _splice_identity(out_bytes, entry, out_path)
     else:
         # From-scratch mode: rebuild from the GenBank text.
         gb_text = entry.get("gb_text") or ""
@@ -4054,6 +4623,12 @@ def _export_commercialsaas_dna(entry: dict, out_path: "Path | str") -> "str":
                 f"entry {entry.get('name')!r}: GenBank text is not "
                 f"parseable ({exc}); cannot build .dna"
             ) from exc
+        # The library entry's name IS the plasmid's name; the stored GenBank
+        # text only carries a LOCUS-safe form of it. The writer puts it in the
+        # file's map label so it survives a renamed file (FM6).
+        _entry_name = entry.get("name")
+        if isinstance(_entry_name, str) and _entry_name.strip():
+            record._tui_display_name = _entry_name.strip()
         out_bytes = _write_commercialsaas_dna_bytes(
             record, history_xml=history_xml,
         )
@@ -4180,8 +4755,69 @@ def _detect_plasmid_format(path: str) -> str:
     return "genbank"
 
 
+def _require_defined_sequence(rec, where: str) -> None:
+    """Refuse a record whose sequence Biopython could not DEFINE.
+
+    A CONTIG-only GenBank record (a WGS master or scaffold that assembles
+    itself from other entries) parses to an undefined `Seq` — it has a length
+    and no bases. It loaded, and the first thing that read the bases (the
+    launch's auto-load, a render, a save) crashed with
+    `UndefinedSequenceError` (audit 2026-09-22, FM11). Say what it is instead.
+    """
+    seq = getattr(rec, "seq", None)
+    if seq is not None and not getattr(seq, "defined", True):
+        raise ValueError(
+            f"{where} has no sequence of its own — it is a CONTIG / scaffold "
+            f"record that refers to other entries. Fetch or export the "
+            f"assembled sequence instead.")
+
+
+def _clamp_feature_parts_to_record(rec, where: str) -> None:
+    """Bring every feature part of a `.dna` record inside ``[0, len)``.
+
+    The format's ranges are 1-based, and a writer that emits `0-10` (seen in
+    the wild) makes Biopython build `[-1:10]` — a location every consumer
+    mis-draws and that the GenBank export then refused, taking the whole
+    record with it (audit 2026-09-22, FM11). Clamped, with a log line; a part
+    left with nothing inside the record is dropped, and a feature left with no
+    part at all goes with it."""
+    from Bio.SeqFeature import CompoundLocation, SimpleLocation
+    n = len(getattr(rec, "seq", "") or "")
+    if not n:
+        return
+    kept = []
+    fixed = 0
+    for f in getattr(rec, "features", None) or []:
+        loc = getattr(f, "location", None)
+        parts = list(getattr(loc, "parts", None) or ([loc] if loc else []))
+        try:
+            bad = any(int(p.start) < 0 or int(p.end) > n for p in parts)
+        except (TypeError, ValueError):
+            bad = False
+        if not bad:
+            kept.append(f)
+            continue
+        fixed += 1
+        new_parts = []
+        for p in parts:
+            a, b = max(0, int(p.start)), min(n, int(p.end))
+            if b > a:
+                new_parts.append(SimpleLocation(a, b, strand=p.strand))
+        if not new_parts:
+            continue
+        f.location = (new_parts[0] if len(new_parts) == 1
+                      else CompoundLocation(
+                          new_parts,
+                          operator=getattr(loc, "operator", "join") or "join"))
+        kept.append(f)
+    if fixed:
+        rec.features = kept
+        _log.warning("%s: %d feature(s) had ranges outside the %d bp "
+                     "sequence and were clamped to it", where, fixed, n)
+
+
 @_timed("op.load_genbank")
-def load_genbank(path: str):
+def load_genbank(path: str, *, legacy_dna_reader: bool = False):
     """Load a plasmid file (GenBank .gb/.gbk or .dna). Returns
     SeqRecord.
 
@@ -4204,7 +4840,16 @@ def load_genbank(path: str):
     Raises ValueError with a user-friendly message if the file has no
     records, multiple records, is oversized, or is a symlink to a
     character device.
+
+    ``legacy_dna_reader`` reads a `.dna` the way SpliceCraft 1.2.71 and
+    earlier did (see `_augment_dna_record_from_packets`); it exists only so
+    `_dna_sidecar_matches_entry` can recognise an unedited entry those
+    versions imported.
     """
+    # ExpatError is the C XML parser's own exception class and is NOT a
+    # ValueError; imported here so the handler below can name it.
+    from xml.parsers.expat import ExpatError as _ExpatError
+
     import struct
     from io import StringIO as _StringIO
     from Bio import SeqIO
@@ -4215,6 +4860,11 @@ def load_genbank(path: str):
     if not ok:
         raise ValueError(reason or "Plasmid file is unsafe to load")
     fmt = _detect_plasmid_format(path)
+    if fmt == _BIOPYTHON_DNA_FMT:
+        # Before the parse, and outside the handler below that rewrites a
+        # parse failure as "try re-exporting it": re-exporting cannot shrink
+        # a block, and the refusal already says what is wrong.
+        _commercialsaas_refuse_oversized_xml(path)
     gb_source_text = ""
     # Biopython WARNS rather than raises for a feature table it could only
     # half-read — an over-indented key, a tab where the spec wants spaces, a
@@ -4247,6 +4897,29 @@ def load_genbank(path: str):
                 # UnicodeDecodeError traceback).
                 gb_source_text = _read_text_tolerant(_P(path))
                 records = list(SeqIO.parse(_StringIO(gb_source_text), fmt))
+    except (RecursionError, _ExpatError) as exc:
+        # A deeply-nested or malformed XML payload inside a `.dna` (the history
+        # block) raises RecursionError from the parser's own descent, or
+        # ExpatError from the C parser — neither is a ValueError, so both escaped
+        # `load_genbank` as a raw traceback and the file-open path had no error to
+        # show (audit 2026-09-22). Same user-facing shape as the other parse
+        # failures below.
+        raise ValueError(
+            f"Could not parse {path}: its embedded XML is malformed or nested "
+            f"too deeply ({type(exc).__name__}). The file is likely corrupt."
+        ) from exc
+    except (AttributeError, TypeError, KeyError, IndexError) as exc:
+        # Biopython's `.dna` feature reader assumes every `<Segment>` has a
+        # `range` and every number parses; a file missing one escaped here as
+        # a raw AttributeError (audit 2026-09-22, FM11). Only the binary
+        # format has a reader this trusting — a text-format parser raising
+        # one of these is a real bug, so it still propagates.
+        if fmt != _BIOPYTHON_DNA_FMT:
+            raise
+        raise ValueError(
+            f"Could not parse {path}: a feature or segment in it is malformed "
+            f"({type(exc).__name__}). The file is likely corrupt."
+        ) from exc
     except (ValueError, struct.error) as exc:
         # CommercialSaaS parser raises ValueError on most malformed files, but
         # Biopython's binary unpacking can also leak struct.error when a
@@ -4265,6 +4938,10 @@ def load_genbank(path: str):
         _log.warning("Parser warning for %s: %s", path,
                      str(_w.message).replace("\n", " ")[:300])
     rec = _pick_single_record(records, path)
+    _require_defined_sequence(rec, path)
+    if fmt == _BIOPYTHON_DNA_FMT and not legacy_dna_reader:
+        # (v1.2.71 never clamped: the legacy reading must not either.)
+        _clamp_feature_parts_to_record(rec, path)
 
     # The three post-parse repairs `_gb_text_to_record` applies to a record
     # loaded FROM THE LIBRARY. Opening the very same record as a FILE skipped
@@ -4358,8 +5035,34 @@ def load_genbank(path: str):
                 # raises ValueError here, caught by the outer handler exactly as
                 # the augment's own raise was before.
                 _dna_packets = list(_iter_commercialsaas_packets(_dna_bytes))
+                # Identity. The format has no name field: the FILE is the name,
+                # plus an optional map label. Biopython instead names the record
+                # after the FIRST WORD of its `<Comments>` note — "Cloning" for
+                # "Cloning vector pX" — which the stem fallback above never
+                # overrides because it is not a sentinel (FM6).
+                _notes = _commercialsaas_notes_fields(_dna_packets)
+                if (rec.name != safe_stem
+                        and rec.name == (rec.description or "").split(" ", 1)[0]):
+                    rec.name = safe_stem
+                    if not _notes.get("accession"):
+                        rec.id = safe_stem
+                _label = _sanitize_label(_notes.get("map_label") or "",
+                                         max_len=200)
+                if _label:
+                    # The label the file itself carries wins over the file
+                    # name — the same precedence the GenBank COMMENT marker
+                    # has, and what our own `.dna` export writes it for. Only
+                    # a label with something left in it: one that sanitised to
+                    # nothing blanked the name, and the UI fell back to the
+                    # underscored LOCUS (round-2 hardening, 2026-09-25).
+                    rec._tui_display_name = _label
+                if _notes.get("description") and not legacy_dna_reader:
+                    # After the naming rule above, which needs Biopython's
+                    # own reading of the same field.
+                    rec.description = _notes["description"]
                 extra_primers = _augment_dna_record_from_packets(
-                    rec, _dna_bytes, packets=_dna_packets)
+                    rec, _dna_bytes, packets=_dna_packets,
+                    legacy=legacy_dna_reader)
                 if extra_primers:
                     rec._dna_primer_entries = extra_primers
                 # Stash the construction-history packet + the raw bytes
@@ -4528,6 +5231,7 @@ def fetch_genbank(accession: str, email: str = "splicecraft@local"):
         )
     records = list(SeqIO.parse(io.StringIO(text), "genbank"))
     rec = _pick_single_record(records, f"NCBI accession {accession!r}")
+    _require_defined_sequence(rec, f"NCBI accession {accession!r}")
     # 2026-05-27 (audit-3 H4): verify the returned record actually
     # matches the requested accession. NCBI occasionally redirects an
     # obsolete accession to a different record; pre-fix we accepted

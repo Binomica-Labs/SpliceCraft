@@ -86,7 +86,10 @@ class TestDnaExportUsesCurrentEntry:
                  "gb_text": sc._record_to_gb_text(sc.load_genbank(str(src)))}
         assert _fileio._dna_sidecar_matches_entry(raw, entry)
         sc._save_dna_original("ffe1", raw)
-        out = tmp_path / "ffe1.dna"
+        # Named as the entry is: exported under ANOTHER file name, the splice
+        # records the entry's name in the Notes packet so the file reopens
+        # under it (round-2 hardening, 2026-09-25) — no longer byte-exact.
+        out = tmp_path / "FFE 1.dna"
         sc._export_commercialsaas_dna(entry, out)
         assert out.read_bytes() == sc._inject_commercialsaas_history(raw, None)
 
