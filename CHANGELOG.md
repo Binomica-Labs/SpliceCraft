@@ -14,6 +14,52 @@
 
 ---
 
+## [1.3.5] — 2026-09-29
+
+### Bug fixes
+
+- **The Claude plugin listing couldn't be read by Anthropic's directory.** The
+  skill's frontmatter had a colon inside its description — "…or a `.gb`/`.gbk`/
+  `.dna` file: annotating a sequence…" — and YAML reads a colon followed by a
+  space as the start of a nested field, so the whole block failed to parse.
+  The directory's scanner could not read the plugin's only component, could not
+  establish what it runs or connects to, and held the listing for manual
+  review. Reworded, with a test that parses every shipped skill's frontmatter
+  strictly. Worth noting `claude plugin validate --strict` passes the broken
+  version, so the local tool alone is not enough cover.
+
+- **Loading a bacterial genome no longer freezes the terminal.** (Reported as
+  issue #27 — thank you, and sorry it took a while.) A ~4.3 Mb chromosome with
+  a few thousand genes locked the whole app for over a minute; on an 80-column
+  terminal, closer to a minute and a half. It now loads in **under a second**.
+
+  Two things were wrong. The sequence panel worked out its row layout by
+  re-examining *every* feature for *every* display row, so the cost grew with
+  genome size **times** gene count — fine for a plasmid, hopeless for a
+  chromosome, and worse the narrower your terminal. That work is now indexed:
+  about 78× faster on a real genome, producing byte-identical output.
+  Separately, when the restriction-site scan finished it made the panel rebuild
+  that entire layout a second time in order to draw an overlay containing
+  nothing — on every single load. It no longer does.
+
+  The "large plasmid" heads-up has also dropped from 5 Mb to 1 Mb, because a
+  4.385 Mb genome sat just below the old threshold and so got no warning at all
+  while the app was busy freezing.
+
+- **The alignment tools were nearly impossible to find.** (Issue #24.)
+  Comparing two plasmids and seeing per-base mismatches has been in SpliceCraft
+  since v1.0 — `Alt+A` aligns library plasmids against whatever you have open,
+  `Alt+L` opens the base-by-base view with mismatches in red and deletions as
+  dashes. But none of those keys appeared in the keybindings doc, the command
+  palette called the plasmid-vs-plasmid aligner "Align sequencing run", and the
+  README described it only under Sequencing. So if your question was "how do I
+  compare two plasmids", every signpost pointed at sequencing runs. The keys
+  are now documented, the palette entry says what it does, `File ▸ Diff with
+  another plasmid…` has a palette entry (it was mouse-only), and the README has
+  a "Compare two sequences" section.
+
+---
+
 ## [1.3.4] — 2026-09-28
 
 ### Bug fixes

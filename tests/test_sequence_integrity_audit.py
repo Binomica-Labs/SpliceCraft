@@ -704,3 +704,229 @@ class TestEntryVectorOpsImmutability:
         sc._auto_bind_entry_vectors_from_entries([entry])
         # The entry's gb_text must not be touched.
         assert entry["gb_text"] == gb_text_before
+
+
+class TestRestrictionOverlayNoRedundantRebuild:
+    """Issue #27: the restriction worker's callback must not rebuild the whole
+    sequence-panel layout to paint an overlay containing nothing.
+
+    `update_seq` is handed `pm._feats + displayed`, and that `+` produces a NEW
+    list even when `displayed` is empty. Every sequence-panel cache is keyed
+    partly on `id(feats)`, so the new object misses all of them and the layout
+    is recomputed from scratch. On a plasmid that is invisible; on a 4.3 Mb
+    chromosome it is a second multi-second freeze, and it fires on EVERY load
+    because the default `unique_only=True` finds no unique cutters in a few
+    megabases.
+    """
+
+    def _panel(self, feats):
+        sp = sc.SequencePanel.__new__(sc.SequencePanel)
+        sp._feats = feats
+        return sp
+
+    def test_reports_no_overlay_for_plain_features(self):
+        sp = self._panel([{"start": 0, "end": 9, "type": "CDS", "label": "x"}])
+        assert sp._feats_have_restriction_overlay() is False
+
+    def test_reports_no_overlay_when_empty(self):
+        assert self._panel([])._feats_have_restriction_overlay() is False
+
+    @pytest.mark.parametrize("kind", ["resite", "recut"])
+    def test_detects_a_showing_overlay(self, kind):
+        """Both overlay types must count — otherwise switching the overlay OFF
+        would skip the repaint that removes it, leaving it stuck on screen."""
+        sp = self._panel([
+            {"start": 0, "end": 9, "type": "CDS", "label": "x"},
+            {"start": 3, "end": 9, "type": kind, "label": "EcoRI"},
+        ])
+        assert sp._feats_have_restriction_overlay() is True
+
+    def test_new_list_of_same_features_misses_the_layout_cache(self):
+        """The property that makes the guard worth having.
+
+        If `feats + []` hit the cache this would all be free and the guard
+        would be pointless — so pin the behaviour that motivates it.
+        """
+        seq = "ACGT" * 400
+        feats = [{"start": i * 40, "end": i * 40 + 20, "strand": 1,
+                  "type": "CDS", "label": f"f{i}", "color": "color(40)"}
+                 for i in range(8)]
+        sc._CHUNK_LAYOUT_CACHE.clear()
+        sc._chunk_layout(seq, feats, 60)
+        n_after_first = len(sc._CHUNK_LAYOUT_CACHE)
+        sc._chunk_layout(seq, feats, 60)          # same object → hit
+        assert len(sc._CHUNK_LAYOUT_CACHE) == n_after_first
+        sc._chunk_layout(seq, feats + [], 60)     # new object → MISS
+        assert len(sc._CHUNK_LAYOUT_CACHE) == n_after_first + 1, (
+            "a new list object with identical contents must miss the id-keyed "
+            "layout cache — if this ever stops being true, revisit the "
+            "restriction-callback guard that exists because of it"
+        )
+
+
+class TestChunkFeatIndexMatchesLinearScan:
+    """Issue #27: `_feats_in_chunk` gained a bisect index so `_chunk_layout`
+    stops being O(chunks x features) on a bacterial chromosome.
+
+    The indexed path is only safe if it returns EXACTLY what the linear scan
+    returns — same features, same order, same wrap-split halves, same
+    `_orig_*` stamps, same flap stripping. The linear scan stays in the code
+    as the reference implementation and this compares the two directly, so a
+    future edit to either one that changes behaviour shows up here rather than
+    as mis-drawn bases.
+
+    Order matters as much as membership: `_chunk_lane_groups` packs lanes in
+    the order it receives features, so a reordering would silently move
+    features between rows.
+    """
+
+    def _corpus(self):
+        """Feature shapes that historically broke this code path."""
+        total = 400
+        return total, [
+            # plain, in order, some overlapping and some adjacent
+            {"start": 0,   "end": 50,  "strand": 1,  "type": "CDS",  "label": "a", "color": "color(40)"},
+            {"start": 40,  "end": 120, "strand": -1, "type": "CDS",  "label": "b", "color": "color(41)"},
+            {"start": 120, "end": 121, "strand": 1,  "type": "misc", "label": "single-bp", "color": "color(42)"},
+            # spans the whole molecule — keeps the prefix-max high for every chunk
+            {"start": 0,   "end": 400, "strand": 1,  "type": "source", "label": "whole", "color": "color(43)"},
+            # wrap features (end < start) — split into tail + head
+            {"start": 380, "end": 20,  "strand": 1,  "type": "CDS", "label": "wrap-fwd", "color": "color(44)"},
+            {"start": 350, "end": 10,  "strand": -1, "type": "CDS", "label": "wrap-rev", "color": "color(45)"},
+            # primer with a 5' flap that lands OUTSIDE the bound region
+            {"start": 200, "end": 220, "strand": 1, "type": "primer_bind", "label": "p-fwd",
+             "color": "color(46)", "_flap_start": 190, "_flap_end": 200, "_flap_bases": "ACGTACGTAC", "_flap_len": 10},
+            # flap that runs off the start (negative) — wrap-aware
+            {"start": 5,   "end": 25,  "strand": 1, "type": "primer_bind", "label": "p-neg",
+             "color": "color(47)", "_flap_start": -8, "_flap_end": 5, "_flap_bases": "ACGTACGT", "_flap_len": 8},
+            # flap that runs past the end
+            {"start": 385, "end": 398, "strand": -1, "type": "primer_bind", "label": "p-past",
+             "color": "color(48)", "_flap_start": 398, "_flap_end": 410, "_flap_bases": "ACGTACGTACGT", "_flap_len": 12},
+            # a wrap feature that ALSO carries a flap
+            {"start": 395, "end": 8,   "strand": 1, "type": "primer_bind", "label": "p-wrap",
+             "color": "color(49)", "_flap_start": 388, "_flap_end": 395, "_flap_bases": "ACGTACG", "_flap_len": 7},
+            # restriction overlay features — these legitimately reach the
+            # layout (they carry the enzyme label art), in volume on a genome
+            {"start": 60,  "end": 66,  "strand": 1, "type": "resite", "label": "EcoRI", "color": "color(9)"},
+            {"start": 63,  "end": 64,  "strand": 1, "type": "recut",  "label": "",      "color": "color(9)"},
+        ]
+
+    def test_indexed_lookup_matches_linear_for_every_chunk(self):
+        total, feats = self._corpus()
+        index = sc._build_chunk_feat_index(feats)
+        for line_width in (7, 13, 60, 132, 401):
+            for cs in range(0, total, line_width):
+                ce = min(cs + line_width, total)
+                slow = sc._feats_in_chunk(feats, cs, ce, total)
+                fast = sc._feats_in_chunk(feats, cs, ce, total, index=index)
+                assert len(slow) == len(fast), (
+                    f"count differs at lw={line_width} chunk [{cs},{ce}): "
+                    f"{len(slow)} vs {len(fast)}"
+                )
+                for i, (a, b) in enumerate(zip(slow, fast)):
+                    assert a == b, (
+                        f"feature {i} differs at lw={line_width} "
+                        f"chunk [{cs},{ce}):\n  linear={a}\n  indexed={b}"
+                    )
+
+    def test_identity_preserved_for_unsplit_features(self):
+        """Non-wrapped features must pass through as the SAME dict object —
+        click / hover resolution identity-matches them against `pm._feats`."""
+        total, feats = self._corpus()
+        index = sc._build_chunk_feat_index(feats)
+        got = sc._feats_in_chunk(feats, 40, 70, total, index=index)
+        plain = [f for f in got if "_orig_dict" not in f]
+        assert plain, "expected at least one unsplit feature in this chunk"
+        assert any(f is feats[1] for f in plain), (
+            "an unsplit feature must be the identical dict object, not a copy"
+        )
+
+    def test_matches_linear_on_randomised_corpora(self):
+        """Fuzz the shapes rather than trusting one hand-built corpus."""
+        import random
+        rng = random.Random(20260929)
+        for trial in range(40):
+            total = rng.choice([50, 137, 400, 1000])
+            feats = []
+            for _ in range(rng.randint(0, 25)):
+                s = rng.randrange(total)
+                if rng.random() < 0.15:                 # wrap
+                    e = rng.randrange(0, max(1, s))
+                else:
+                    e = min(total, s + rng.randint(1, max(1, total // 3)))
+                f = {"start": s, "end": e, "strand": rng.choice([1, -1]),
+                     "type": rng.choice(["CDS", "misc", "resite", "recut",
+                                         "primer_bind"]),
+                     "label": f"f{len(feats)}", "color": "color(40)"}
+                if f["type"] == "primer_bind" and rng.random() < 0.6:
+                    fl = rng.randint(1, 15)
+                    f["_flap_start"] = s - fl
+                    f["_flap_end"] = s
+                    f["_flap_bases"] = "A" * fl
+                    f["_flap_len"] = fl
+                feats.append(f)
+            index = sc._build_chunk_feat_index(feats)
+            lw = rng.choice([9, 31, 80])
+            for cs in range(0, total, lw):
+                ce = min(cs + lw, total)
+                slow = sc._feats_in_chunk(feats, cs, ce, total)
+                fast = sc._feats_in_chunk(feats, cs, ce, total, index=index)
+                assert slow == fast, (
+                    f"trial {trial} total={total} lw={lw} chunk [{cs},{ce}) "
+                    f"diverged:\n  linear={slow}\n  indexed={fast}"
+                )
+
+    def test_empty_feature_list(self):
+        index = sc._build_chunk_feat_index([])
+        assert sc._feats_in_chunk([], 0, 60, 400, index=index) == []
+
+    @pytest.mark.parametrize("name,feats,total", [
+        ("zero-length feature",      [{"start": 10, "end": 10}], 100),
+        ("feature at bp 0",          [{"start": 0,  "end": 5}],  100),
+        ("ends exactly at total",    [{"start": 95, "end": 100}], 100),
+        ("spans whole molecule",     [{"start": 0,  "end": 100}], 100),
+        ("wrap ending at bp 0",      [{"start": 50, "end": 0}],  100),
+        ("start beyond total",       [{"start": 200, "end": 300}], 100),
+        ("single-bp molecule",       [{"start": 0,  "end": 1}],  1),
+        ("inert flap (end <= start)",
+         [{"start": 20, "end": 30, "_flap_start": 5, "_flap_end": 5}], 100),
+        ("non-int flap keys",
+         [{"start": 20, "end": 30, "_flap_start": "x", "_flap_end": None}], 100),
+    ])
+    def test_edge_shapes_match_linear(self, name, feats, total):
+        """Shapes that break interval indexes: empty spans, boundary hits,
+        a feature covering everything (prefix-max never drops), a wrap whose
+        head ends at bp 0, coordinates past the sequence, and flap keys the
+        overlap test must treat as absent."""
+        feats = [dict(f, strand=1, type="CDS", label=name, color="color(40)")
+                 for f in feats]
+        index = sc._build_chunk_feat_index(feats)
+        for lw in (1, 3, 7, 60, 1000):
+            for cs in range(0, max(total, 1), lw):
+                ce = min(cs + lw, total)
+                assert (sc._feats_in_chunk(feats, cs, ce, total)
+                        == sc._feats_in_chunk(feats, cs, ce, total,
+                                              index=index)), \
+                    f"{name} diverged at lw={lw} chunk [{cs},{ce})"
+
+    def test_duplicate_identical_dicts_all_survive(self):
+        """The same dict object listed N times must come back N times — the
+        index keys on position, not identity, and lane packing counts them."""
+        f = {"start": 5, "end": 25, "strand": 1, "type": "CDS",
+             "label": "dup", "color": "color(40)"}
+        feats = [f] * 6
+        index = sc._build_chunk_feat_index(feats)
+        got = sc._feats_in_chunk(feats, 0, 30, 100, index=index)
+        assert len(got) == 6
+        assert got == sc._feats_in_chunk(feats, 0, 30, 100)
+
+    def test_unsorted_input_order_is_preserved_in_output(self):
+        """Input is not sorted by start, and the output must stay in INPUT
+        order — `_chunk_lane_groups` assigns rows in the order it receives
+        features, so a sort-by-start would move features between lanes."""
+        feats = [{"start": 90 - i * 10, "end": 95 - i * 10, "strand": 1,
+                  "type": "CDS", "label": f"f{i}", "color": "color(40)"}
+                 for i in range(9)]
+        index = sc._build_chunk_feat_index(feats)
+        got = sc._feats_in_chunk(feats, 0, 100, 100, index=index)
+        assert [f["label"] for f in got] == [f["label"] for f in feats]

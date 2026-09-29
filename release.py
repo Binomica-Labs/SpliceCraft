@@ -1259,19 +1259,28 @@ def _refresh_web_demo(version: str) -> None:
             return
         if i < attempts:
             # Distinguish a connection / sc-update failure (rc != 0 — e.g. a
-            # host-key or auth problem) from a real PyPI Simple-index skew
-            # (rc 0 but the demo still serves the old version).
+            # host-key or auth problem) from the demo simply not having picked
+            # the new version up yet (rc 0 but it still serves the old one).
             reason = (f"sc-update couldn't run (rc {rc})" if rc != 0
-                      else f"demo still on {served or '?'} (PyPI index skew)")
+                      else f"demo still on {served or '?'}")
             print(f"  {reason} — retrying in 30s ({i}/{attempts - 1})…")
             time.sleep(30)
     if last_rc not in (0, None):
         print(f"  sc-update kept failing (rc {last_rc}) — couldn't reach or "
               f"update the droplet (check SSH access). Run manually: {manual}")
     else:
+        # This USED to say "PyPI's Simple index is lagging", which was wrong
+        # and sent every investigation down the wrong path: the droplet could
+        # fetch the new release fine, but `pipx upgrade` was reading pip's
+        # CACHED index page and reporting "already at latest <previous>". The
+        # nightly cron then "fixed" it only because the cache had expired by
+        # morning. `scripts/sc-update` now passes `--no-cache-dir`; if the demo
+        # is still behind, the droplet's copy is probably the old script.
         print(f"  Demo still on {_demo_served_version() or '?'} after "
-              f"{attempts} tries — PyPI's Simple index is lagging. The nightly "
-              f"sc-update cron will catch it; or re-run later: {manual}")
+              f"{attempts} tries. Check the droplet is running the current "
+              f"`scripts/sc-update` (it must pass --no-cache-dir; without it "
+              f"pipx reads a cached index and no-ops). The nightly cron is the "
+              f"backstop; or re-run now: {manual}")
 
 
 _PRIVATE_NAMES_FILE = REPO_ROOT / ".private-names"

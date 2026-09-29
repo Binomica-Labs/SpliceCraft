@@ -243,7 +243,7 @@ What you can do without leaving the terminal.
   its own grade in the Verification Report, and reported with its exact
   span and identity. A read that aligns wholly as the reverse
   complement is called out too.
-- **Pairwise alignment of sequencing runs** — File → Align sequencing
+- **Pairwise alignment (library plasmids `Alt+A`, or sequencing runs)** — File → Align sequencing
   run loads a Plasmidsaurus `.zip` (or any `.gbk` / `.gb`), pairwise-
   aligns it against the loaded plasmid, and renders a full-screen
   alignment viewer with target-feature lane, parallel target/query

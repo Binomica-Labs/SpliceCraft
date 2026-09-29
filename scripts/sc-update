@@ -1,0 +1,35 @@
+#!/bin/bash
+# Web-demo staleguard — deployed to the droplet as /usr/local/bin/sc-update.
+#
+# Pulls the latest published splicecraft, restarts the demo to apply it (keeps
+# the web demo 1-to-1 with PyPI), and publishes the live version for the
+# landing-page chip via a same-origin /version.txt.
+#
+# Run from the nightly cron AND by `release.py::_refresh_web_demo` right after a
+# release. This file is the canonical copy: edit it here, then redeploy with
+#
+#     scp scripts/sc-update root@<droplet>:/usr/local/bin/sc-update
+#     ssh root@<droplet> 'chmod +x /usr/local/bin/sc-update'
+#
+# so a droplet rebuild can't silently lose a fix. See docs/web-demo.md.
+#
+# `--no-cache-dir` is load-bearing, not tidiness (2026-09-28). Without it
+# `pipx upgrade` consults pip's CACHED copy of the PyPI index and reports
+# "splicecraft is already at latest version <previous>" for a version that was
+# published minutes earlier — even though the droplet can fetch the new release
+# from the index perfectly well. That made the release-time refresh no-op on
+# every release and defer to this cron, by which time the cache had expired, so
+# it looked like PyPI propagation lag and was reported as such. It was pip's
+# cache the whole time.
+set -u
+
+su - demo -c 'pipx upgrade splicecraft --pip-args=--no-cache-dir' \
+    >> /home/demo/upgrade.log 2>&1
+
+systemctl restart splicecraft-demo
+
+VER=$(su - demo -c 'pipx list --short' 2>/dev/null | awk '/^splicecraft /{print $2}')
+# Only rewrite version.txt when the version is actually readable: a blank file
+# would make the landing page's chip claim the demo is running nothing.
+[ -n "$VER" ] && printf '%s\n' "$VER" > /var/www/splicecraft/version.txt
+chmod a+r /var/www/splicecraft/version.txt 2>/dev/null || true

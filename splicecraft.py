@@ -29,6 +29,7 @@ import math
 import os
 import re
 import itertools as _itertools
+import bisect as _bisect
 import shutil
 import subprocess
 import sys
@@ -42,13 +43,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.3.4"
+__version__ = "1.3.5"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-09-28"
+_RELEASE_DATE = "2026-09-29"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -7845,8 +7846,63 @@ _FLAP_KEYS: tuple[str, ...] = (
 )
 
 
+def _build_chunk_feat_index(feats: list[dict]):
+    """Pre-sort `feats` so `_feats_in_chunk` can find a chunk's overlaps by
+    bisection instead of rescanning every feature.
+
+    `_chunk_layout` calls `_feats_in_chunk` once per display chunk, and the
+    linear scan made that O(chunks x features) — on a 4.4 Mb chromosome with
+    ~4,000 CDS features that is ~1.3e8 pair-iterations, ~30 s of frozen UI
+    thread (issue #27, a user loading a C. difficile genome). Chunk count
+    scales with 1/terminal-width, so a narrow terminal was worse still.
+
+    Returns `(starts, prefmax, simple, special)`:
+      * `simple`  — `(start, end, order, feat)` for ordinary features, sorted
+        by start. `order` is the feature's index in `feats`, kept so the
+        result can be restored to input order (lane packing is order-
+        sensitive: `_chunk_lane_groups` assigns rows in the order it receives
+        features, so reordering silently moves features between rows).
+      * `starts`  — the sorted start coordinates, for `bisect`.
+      * `prefmax` — running max of `end` over `simple`. Non-decreasing, so the
+        backwards walk can stop as soon as it drops to `chunk_start`: no
+        earlier feature can reach the chunk either. Same idiom as
+        `PlasmidMap.load_record`'s `_feats_prefmax_end`.
+      * `special` — `(order, feat)` for wrap features (`end < start`) and
+        primer features carrying a 5' flap. Both need the full per-feature
+        logic (splitting, flap stripping, wrap-aware flap overlap), and both
+        are rare — a handful per record, never thousands — so they stay on
+        the linear path rather than complicating the index.
+
+    Build it once per layout and hand it to every `_feats_in_chunk` call for
+    that layout. One-off callers can omit it and get the linear scan.
+    """
+    simple: "list[tuple[int, int, int, dict]]" = []
+    special: "list[tuple[int, dict]]" = []
+    for order, f in enumerate(feats):
+        s, e = f["start"], f["end"]
+        # A feature is "simple" only if it neither wraps nor carries a flap.
+        # The flap test mirrors `_flap_overlaps_chunk`'s own guard: anything
+        # it would reject outright can take the fast path.
+        if e >= s and not (isinstance(f.get("_flap_start"), int)
+                           and isinstance(f.get("_flap_end"), int)
+                           and f["_flap_end"] > f["_flap_start"]):
+            simple.append((s, e, order, f))
+        else:
+            special.append((order, f))
+    simple.sort(key=lambda t: t[0])
+    starts = [t[0] for t in simple]
+    prefmax: list[int] = []
+    running = -1
+    for t in simple:
+        if t[1] > running:
+            running = t[1]
+        prefmax.append(running)
+    return (starts, prefmax, simple, special)
+
+
 def _feats_in_chunk(
-    feats: list[dict], chunk_start: int, chunk_end: int, total: int
+    feats: list[dict], chunk_start: int, chunk_end: int, total: int,
+    index=None,
 ) -> list[dict]:
     """Return features overlapping [chunk_start, chunk_end), with wrap-around
     features (end < start) split into tail [start, total) + head [0, end)
@@ -7856,59 +7912,116 @@ def _feats_in_chunk(
 
     Needed because the naive overlap test `start < chunk_end and end > chunk_start`
     drops wrap features from every chunk (both halves fail the conjunction).
+
+    Pass `index` (from `_build_chunk_feat_index`) to find the ordinary
+    features by bisection instead of scanning all of them — that is what keeps
+    `_chunk_layout` linear on a chromosome (issue #27). Without it this runs
+    the plain scan below, which stays as the reference implementation:
+    `tests/test_sequence_integrity_audit.py::TestChunkFeatIndexMatchesLinearScan`
+    asserts the two agree feature-for-feature, in order, across a fuzz corpus.
     """
+    if index is not None:
+        return _feats_in_chunk_indexed(index, chunk_start, chunk_end, total)
     out: list[dict] = []
     for f in feats:
-        s, e = f["start"], f["end"]
-        if e >= s:
-            if s < chunk_end and e > chunk_start:
-                out.append(f)
-            elif _flap_overlaps_chunk(f, chunk_start, chunk_end, total):
-                # Bound region misses this chunk, but the primer's
-                # unbound flap (wrap-aware — may spill onto the next
-                # display row or cross the origin) lands here, so
-                # include the feature for the flap row. The bound-bar
-                # painter no-ops when [start, end) doesn't intersect
-                # the chunk, so only the flap renders.
-                out.append(f)
-            continue
-        # Wrap feature: split into tail + head. Stamp the original
-        # (start, end) on each half so renderers that need the full
-        # CDS reading frame (`_paint_cds_aa`, the AA-click handler
-        # in `_check_packed`) can recover it. Without these, codon
-        # midpoints would be computed off the half's local start
-        # and the AA letters would land on the wrong bp with the
-        # wrong translation. Non-CDS features ignore these keys.
-        # `_orig_dict` keeps a reference to the unsplit feature so
-        # the click / hover resolver can identity-match a half-dict
-        # back to a feature in `pm._feats` (without it the App's
-        # `event.feat is f` check fails for wrap features and falls
-        # back to bp-search).
-        # A primer's 5' flap attaches to exactly ONE side of a wrap-split
-        # feature: forward → the TAIL piece (which holds the binding
-        # `start`, and the flap sits just 5' of it); reverse → the HEAD
-        # piece (which holds the binding `end`, with the flap just 3' of
-        # it). Copying `{**f}` would put the flap fields on BOTH halves,
-        # so the flap-bar painter drew it twice AND the duplicate copy
-        # collided in the 2D packer, bumping the two bound-bar halves onto
-        # different rows (the wrap bar looked like two features). Strip the
-        # flap from the non-attaching piece. [primer flap wrap, 2026-05-30]
-        _strand = f.get("strand", 1)
-        if s < chunk_end and total > chunk_start:
-            tail = {**f, "end": total,
-                    "_orig_start": s, "_orig_end": e, "_orig_dict": f}
-            if _strand < 0:
-                for _k in _FLAP_KEYS:
-                    tail.pop(_k, None)
-            out.append(tail)
-        if 0 < chunk_end and e > chunk_start:
-            head = {**f, "start": 0, "label": "",
-                    "_orig_start": s, "_orig_end": e, "_orig_dict": f}
-            if _strand >= 0:
-                for _k in _FLAP_KEYS:
-                    head.pop(_k, None)
-            out.append(head)
+        _chunk_pieces_for_feat(f, chunk_start, chunk_end, total, out)
     return out
+
+
+def _chunk_pieces_for_feat(f: dict, chunk_start: int, chunk_end: int,
+                           total: int, out: list[dict]) -> None:
+    """Append `f`'s contribution to one chunk onto `out` (nothing if it
+    doesn't reach the chunk).
+
+    Split out of `_feats_in_chunk` so the linear scan and the indexed path
+    (issue #27) run the SAME wrap-splitting / flap-stripping code rather than
+    two copies that could drift apart — this is the delicate half, and the
+    half whose output the differential test pins.
+    """
+    s, e = f["start"], f["end"]
+    if e >= s:
+        if s < chunk_end and e > chunk_start:
+            out.append(f)
+        elif _flap_overlaps_chunk(f, chunk_start, chunk_end, total):
+            # Bound region misses this chunk, but the primer's
+            # unbound flap (wrap-aware — may spill onto the next
+            # display row or cross the origin) lands here, so
+            # include the feature for the flap row. The bound-bar
+            # painter no-ops when [start, end) doesn't intersect
+            # the chunk, so only the flap renders.
+            out.append(f)
+        return
+    # Wrap feature: split into tail + head. Stamp the original
+    # (start, end) on each half so renderers that need the full
+    # CDS reading frame (`_paint_cds_aa`, the AA-click handler
+    # in `_check_packed`) can recover it. Without these, codon
+    # midpoints would be computed off the half's local start
+    # and the AA letters would land on the wrong bp with the
+    # wrong translation. Non-CDS features ignore these keys.
+    # `_orig_dict` keeps a reference to the unsplit feature so
+    # the click / hover resolver can identity-match a half-dict
+    # back to a feature in `pm._feats` (without it the App's
+    # `event.feat is f` check fails for wrap features and falls
+    # back to bp-search).
+    # A primer's 5' flap attaches to exactly ONE side of a wrap-split
+    # feature: forward → the TAIL piece (which holds the binding
+    # `start`, and the flap sits just 5' of it); reverse → the HEAD
+    # piece (which holds the binding `end`, with the flap just 3' of
+    # it). Copying `{**f}` would put the flap fields on BOTH halves,
+    # so the flap-bar painter drew it twice AND the duplicate copy
+    # collided in the 2D packer, bumping the two bound-bar halves onto
+    # different rows (the wrap bar looked like two features). Strip the
+    # flap from the non-attaching piece. [primer flap wrap, 2026-05-30]
+    _strand = f.get("strand", 1)
+    if s < chunk_end and total > chunk_start:
+        tail = {**f, "end": total,
+                "_orig_start": s, "_orig_end": e, "_orig_dict": f}
+        if _strand < 0:
+            for _k in _FLAP_KEYS:
+                tail.pop(_k, None)
+        out.append(tail)
+    if 0 < chunk_end and e > chunk_start:
+        head = {**f, "start": 0, "label": "",
+                "_orig_start": s, "_orig_end": e, "_orig_dict": f}
+        if _strand >= 0:
+            for _k in _FLAP_KEYS:
+                head.pop(_k, None)
+        out.append(head)
+
+
+def _feats_in_chunk_indexed(index, chunk_start: int, chunk_end: int,
+                            total: int) -> list[dict]:
+    """`_feats_in_chunk` over a `_build_chunk_feat_index` index.
+
+    Ordinary features are found by bisection; wrap / flap features go through
+    `_chunk_pieces_for_feat`, the same code the linear scan uses. Results are
+    restored to the input feature order before returning, because lane packing
+    is order-sensitive.
+    """
+    starts, prefmax, simple, special = index
+    picked: "list[tuple[int, dict]]" = []
+
+    # Every candidate has start < chunk_end, so only the right-hand bound
+    # needs searching; walk left while some feature at or before `i` can still
+    # reach the chunk. `prefmax` is non-decreasing, so the first failure ends
+    # it — nothing earlier reaches either.
+    i = _bisect.bisect_left(starts, chunk_end) - 1
+    while i >= 0 and prefmax[i] > chunk_start:
+        s, e, order, f = simple[i]
+        if e > chunk_start:
+            picked.append((order, f))
+        i -= 1
+
+    for order, f in special:
+        pieces: list[dict] = []
+        _chunk_pieces_for_feat(f, chunk_start, chunk_end, total, pieces)
+        for piece in pieces:
+            picked.append((order, piece))
+
+    # Stable sort: a wrap feature's tail and head share an `order` and must
+    # keep the tail-then-head order `_chunk_pieces_for_feat` produced.
+    picked.sort(key=lambda t: t[0])
+    return [f for _, f in picked]
 
 
 def _build_seq_inputs(seq: str, feats: list[dict]) -> tuple[list[str], list[dict]]:
@@ -8009,9 +8122,16 @@ def _chunk_layout(seq: str, feats: list[dict], line_width: int):
         _CHUNK_LAYOUT_CACHE[key] = layout
         return layout
 
+    # Build the overlap index ONCE for the whole layout. Without it this loop
+    # is O(chunks x features) — ~30 s of frozen UI thread on a 4.4 Mb
+    # chromosome with 4,000 CDS features (issue #27). See
+    # `_build_chunk_feat_index`.
+    feat_index = _build_chunk_feat_index(annot_feats)
+
     for chunk_start in range(0, n, line_width):
         chunk_end   = min(chunk_start + line_width, n)
-        chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
+        chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n,
+                                      index=feat_index)
         groups      = _chunk_lane_groups(chunk_feats, chunk_start, chunk_end, n)
         above_p, below_p, above_rows, below_rows = groups
         # `above_pairs` / `below_pairs` are stored as lane *pair counts*
@@ -24623,6 +24743,20 @@ class SequencePanel(Widget):
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
+    def _feats_have_restriction_overlay(self) -> bool:
+        """True when the panel is currently showing restriction-overlay
+        features (`resite` / `recut`).
+
+        Lets the restriction worker's callback skip a full `update_seq`
+        rebuild when it has nothing to draw AND nothing is currently drawn —
+        while still repainting when an overlay is being CLEARED, which is the
+        case a plain "is `displayed` empty?" test would get wrong (the
+        overlay would stay on screen after being switched off). See the
+        callback in `_restr_scan_worker`.
+        """
+        return any(f.get("type") in ("resite", "recut")
+                   for f in (self._feats or ()))
+
     def update_seq(self, seq: str, feats: list[dict]) -> None:
         """Called after loading a record or committing an edit.
 
@@ -26612,7 +26746,7 @@ Click a CDS bar (or its amino-acid letters) and `Ctrl+C` copies the **protein** 
 | `Ctrl+P` | Primer design |
 | `Ctrl+B` | BLAST / HMMscan — **Local** (your library) + **Online** (NCBI BLAST · Pfam) |
 | `Ctrl+G` | Cloning-grammar editor (Golden Braid · MoClo · …) |
-| `Alt+A` | Align the current plasmid against library plasmids — each pick adds a row to the linear-map overlay (blue match · red mismatch · gray gap · magenta inverted, with a coverage histogram). A stretch that matches the other plasmid BACKWARDS is marked inverted rather than written off as mismatch. **Click a lane to jump the sequence panel to that spot** (centered + highlighted) so misaligned / to-be-edited bases are one click away. |
+| `Alt+A` | Align the current plasmid against library plasmids — each pick adds a row to the linear-map overlay (blue match · red mismatch · gray gap · magenta inverted). A stretch that matches the other plasmid BACKWARDS is marked inverted rather than written off as mismatch. **Click a lane to jump the sequence panel to that spot** (centered + highlighted) so misaligned / to-be-edited bases are one click away. |
 | `Alt+L` | Open the Alignment Manager — the full pairwise-alignment detail view (per-base aligned strands) opens with **Enter** on a row. |
 | `Alt+Shift+A` | Clear every alignment row from the overlay |
 
@@ -53918,11 +54052,14 @@ def _ungapped_extend(
 
 
 # Per-plasmid size cap for the BLAST DB index. Plasmids exceeding this
-# get skipped with a notify rather than blowing up the worker. 10 Mbp
-# is 2× the soft "large plasmid" threshold (`_LARGE_PLASMID_BP`); a
-# typical Mbp-scale chromosome dump still indexes, but a full mammalian
-# chromosome (250 Mbp) would be refused. The k-mer index for a single
-# plasmid costs ~150 B per base on both strands — 10 Mbp ≈ 3 GB index.
+# get skipped with a notify rather than blowing up the worker. The cap
+# is set by MEMORY, not by the soft "large plasmid" notice
+# (`_LARGE_PLASMID_BP`, which is only a heads-up toast and now sits at
+# 1 Mb): the k-mer index costs ~150 B per base on both strands, so
+# 10 Mbp ≈ 3 GB. A typical Mbp-scale chromosome dump still indexes; a
+# full mammalian chromosome (250 Mbp) is refused. (This comment used to
+# describe 10 Mbp as "2× `_LARGE_PLASMID_BP`" — that arithmetic broke
+# when the notice threshold moved, so state the real reason instead.)
 _BLAST_DB_BUILD_MAX_PER_PLASMID_BP = 10_000_000
 
 # Total-collection size cap. Sum of every included plasmid's length
@@ -116427,11 +116564,26 @@ NcbiTaxonPickerModal { align: center middle; }
              lambda: self.push_screen(FeatureLibraryScreen())),
             ("Codon tables", "Manage codon-usage tables",
              self.action_open_codon_tables),
-            ("Align sequencing run", "Overlay sequencing reads on the map",
+            # Issue #24: this used to read "Align sequencing run — Overlay
+            # sequencing reads on the map", but the callback is the LIBRARY
+            # PLASMID picker. Someone typing "align" or "compare" in the
+            # palette saw only sequencing framing and concluded that comparing
+            # two plasmids wasn't possible — and filed a feature request for a
+            # feature that has shipped since v1.0. Name what it actually does.
+            ("Align / compare sequences",
+             "Align library plasmids (or reads) against the open record — "
+             "mismatches in red on the map  [Alt+A]",
              self.action_open_align_picker),
-            ("Manage alignments", "Edit / remove alignment overlays",
+            ("Compare two plasmids (diff)",
+             "Align one library plasmid against the open record and report "
+             "identity + inversions",
+             self.action_diff_plasmid),
+            ("Manage alignments",
+             "Browse stored alignments; Enter opens the base-by-base view  "
+             "[Alt+L]",
              self.action_open_alignment_manager),
-            ("Clear alignments", "Remove all alignment overlays from the map",
+            ("Clear alignments",
+             "Remove all alignment overlays from the map  [Alt+Shift+A]",
              self.action_clear_alignments),
             ("Settings", "Settings · grammars · enzymes · codon tables",
              self.action_open_settings),
@@ -117579,6 +117731,22 @@ NcbiTaxonPickerModal { align: center middle; }
             displayed = self._restr_cache if self._show_restr else []
             pm._restr_feats = displayed
             pm.refresh()
+            # Nothing to overlay → nothing for the sequence panel to redo.
+            #
+            # `update_seq` below is handed `pm._feats + displayed`, and that
+            # `+` builds a NEW list even when `displayed` is empty. Every
+            # sequence-panel cache is keyed partly on `id(feats)`
+            # (`_CHUNK_LAYOUT_CACHE`, `_BUILD_SEQ_CACHE`,
+            # `_CHUNK_STATIC_CACHE`), so the new object misses all three and
+            # the full layout is rebuilt — to paint an overlay containing
+            # nothing. On a small plasmid that is invisible; on a bacterial
+            # chromosome it is a second multi-second freeze on the UI thread,
+            # and it fires on EVERY load, because the default
+            # `unique_only=True` finds no unique cutters in a few megabases
+            # (issue #27). The map still repaints above — only the redundant
+            # panel rebuild is skipped.
+            if not displayed and not sp._feats_have_restriction_overlay():
+                return
             # The overlay re-render must NOT disturb the user's cursor /
             # selection — only the restriction OVERLAY changed, the
             # sequence is identical. `update_seq` resets cursor + sel, so
@@ -121892,10 +122060,19 @@ NcbiTaxonPickerModal { align: center middle; }
     # Above this size, render + restriction-scan + auto-translate
     # operations on the new record will visibly stutter. The user
     # gets a one-shot warning so they understand "the UI feels
-    # heavy" isn't a bug. Threshold is conservative — Textual + the
-    # braille canvas + biopython feature traversal hold up to ~5 Mb
-    # before the frame budget gets uncomfortable.
-    _LARGE_PLASMID_BP = 5_000_000
+    # heavy" isn't a bug.
+    #
+    # Lowered 5 Mb → 1 Mb (issue #27). A user loading a 4.385 Mb
+    # C. difficile chromosome got NO warning at all, because the
+    # threshold sat 615 kb above their record — while the sequence
+    # panel froze the terminal for over a minute. The layout is now
+    # indexed and that load is sub-second, but a few megabases still
+    # costs a multi-second restriction scan and a heavier frame
+    # budget, which is exactly what this notice is for. 1 Mb also
+    # lines up with `_LAZY_RENDER_THRESHOLD_BP`, so the two
+    # "this record is big" thresholds agree instead of being 5×
+    # apart.
+    _LARGE_PLASMID_BP = 1_000_000
 
     def _apply_record(self, record, *, clear_undo: bool = True) -> None:
         """Load a SeqRecord into all panels.

@@ -25,6 +25,9 @@ can drag-select a combo to copy).
 | `Ctrl+E`       | Enter sequence editor mode                   |
 | `Ctrl+S`       | Save edits to file                           |
 | `Ctrl+F`       | Find a DNA subsequence (fuzzy, both strands) |
+| `Alt+A`        | **Align / compare** — pick library plasmids to align against the open record; mismatches show **red** on the linear map |
+| `Alt+L`        | Alignment manager — `Enter` on a row opens the **base-by-base** view (mismatches red, deletions as `─`) |
+| `Alt+Shift+A`  | Clear all alignment overlays from the map    |
 | `Alt+Shift+F`  | Add a new feature (from the current selection) |
 | `Alt+Shift+C` | Capture selection / feature → Feature library |
 | `Ctrl+P`       | Primer Design workbench                      |
@@ -111,7 +114,7 @@ every one by name. Most menus also have an `Alt`+letter (shown in `?` Help).
 | Parts       | Parts Bin (per-grammar; multi-bin via Parts Bin collections)                     |
 | Constructor | Traditional · Gibson · Golden Braid · MoClo assembly                             |
 | Simulator   | In-silico PCR + agarose gel rendering (0.5–4.0 %, ladder / uncut / digest / amplicon lanes) |
-| Sequencing  | Plasmidsaurus run alignment / verification overlay                              |
+| Sequencing  | Plasmidsaurus run + Sanger `.ab1` alignment / verification overlay (to compare two **library plasmids** instead, use `Alt+A`) |
 | Experiments | Lab notebook (projects, entries, inline image attachments)                      |
 | History     | Construction-history viewer (`F6` / `Alt+H`)                                     |
 | AUTOLAB     | Opentrons OT-2 robot control (`Alt+U`)                                           |

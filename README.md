@@ -229,6 +229,25 @@ number and the new amino acid, and the codon it resolves to is shown — through
 the strand, the reading frame offset, any introns and the origin — before
 anything changes.
 
+### Compare two sequences
+
+Press **`Alt+A`** to align library plasmids against whatever you have open — up
+to 20 at once. Each lands as its own lane under the linear map: **blue** where
+it matches, **red** where it doesn't, grey for gaps, magenta for a region that
+went in backwards. Zoom in (`+`) and each lane switches to showing the other
+sequence's actual bases, one per column, so a single-base change is legible;
+zoom out and that change survives as a red fleck rather than averaging away.
+Click a lane to jump the sequence panel to that spot.
+
+**`Alt+L`** lists your alignments, and `Enter` on one opens the base-by-base
+view: target above, query below, mismatches in red, deletions as `─`, with the
+features each column falls in shown alongside — plus match / mismatch / gap
+counts and identity both with and without gaps. `File ▸ Diff with another
+plasmid…` does the same for a single pair and reports inverted segments.
+
+This is the same machinery the Sequencing tab uses; the difference is only what
+you feed it.
+
 ### Sequencing
 
 Verify constructs against real reads. Drop in a Plasmidsaurus `.zip` or fetch a

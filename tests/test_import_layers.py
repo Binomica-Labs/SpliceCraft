@@ -233,3 +233,44 @@ def test_claude_skill_is_collected_by_both_build_targets():
             f"skills/ (see this test's docstring), then re-run "
             f"`python -m build` and inspect the artifact."
         )
+
+
+def test_plugin_skill_frontmatter_parses_as_strict_yaml():
+    """Every shipped SKILL.md must have frontmatter a STRICT YAML parser reads.
+
+    `claude plugin validate --strict` passes a file this test rejects, so the
+    local tool is not sufficient cover. The Anthropic plugin directory parses
+    it strictly: when it fails, the plugin's only component is unreadable, the
+    scan cannot vouch for what the plugin runs or connects to, and the listing
+    is held (`REACH_UNKNOWN`, 2026-09-29).
+
+    The way it broke is worth knowing, because it is invisible on the page:
+    an unquoted YAML scalar cannot contain ": " — the description said
+    "... a `.gb`/`.gbk`/`.dna` file: annotating a sequence ...", and YAML read
+    that colon as the start of a nested mapping. Prose in a description
+    naturally wants colons, so prefer an em dash, or quote the whole value.
+    """
+    import re
+    import yaml          # dev dependency; see pyproject [project.optional-dependencies]
+    skills = sorted((_REPO / "plugin").rglob("SKILL.md"))
+    assert skills, "expected at least one shipped SKILL.md under plugin/"
+    for sk in skills:
+        text = sk.read_text(encoding="utf-8")
+        m = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+        assert m, f"{sk.relative_to(_REPO)} has no YAML frontmatter block"
+        try:
+            data = yaml.safe_load(m.group(1))
+        except yaml.YAMLError as exc:                     # noqa: PERF203
+            raise AssertionError(
+                f"{sk.relative_to(_REPO)} frontmatter is not valid YAML — the "
+                f"plugin directory will hold the listing as unreadable:\n{exc}"
+            ) from exc
+        assert isinstance(data, dict), (
+            f"{sk.relative_to(_REPO)} frontmatter must parse to a mapping, "
+            f"got {type(data).__name__}"
+        )
+        for field in ("name", "description"):
+            assert isinstance(data.get(field), str) and data[field].strip(), (
+                f"{sk.relative_to(_REPO)} frontmatter needs a non-empty "
+                f"{field!r}"
+            )

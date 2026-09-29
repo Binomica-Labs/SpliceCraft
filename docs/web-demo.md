@@ -205,6 +205,19 @@ just prints the manual command) and opt-out via `SPLICECRAFT_SKIP_DEMO_REFRESH=1
 ```cron
 30 4 * * * root /usr/local/bin/sc-update   # pipx upgrade splicecraft + restart demo + refresh /version.txt
 ```
+The script's canonical copy is **[`scripts/sc-update`](../scripts/sc-update)** in
+this repo — edit it there and redeploy with
+`scp scripts/sc-update root@<droplet>:/usr/local/bin/sc-update`, so a droplet
+rebuild can't silently lose a fix. It passes `--no-cache-dir` to pip for a
+load-bearing reason: without it `pipx upgrade` reads pip's **cached** copy of the
+PyPI index and reports "already at latest `<previous>`" for a version published
+minutes earlier, even though the droplet can fetch the new release perfectly
+well. That made the release-time refresh no-op on every release and defer to the
+nightly cron — which appeared to "fix" it only because the cache had expired by
+morning. It looked exactly like PyPI propagation lag and was misdiagnosed as such
+until an A/B on the droplet showed the same `pipx upgrade` failing without the
+flag and succeeding with it (2026-09-28).
+
 After `release.py` ships X.Y.Z it pulls it automatically (or the next cron run /
 a manual `sc-update` does);
 the banner shows `v{__version__}` so drift is visible at a glance. `sc-update`
