@@ -390,6 +390,38 @@ every write returns 409 naming the process holding the lock, and nothing on
 disk changes. See [`docs/agent-api.md`](docs/agent-api.md) and
 [`docs/cli.md`](docs/cli.md).
 
+### Claude Skill
+
+SpliceCraft ships a [Claude Skill](https://docs.claude.com/en/docs/claude-code/skills)
+that teaches Claude to drive the agent API properly — how to connect (including
+attaching read-only to a session you already have open), the canvas-vs-library
+model, the coordinate convention, the preview-then-commit pairs, and the failure
+modes that look like success (a Golden Gate that can't close answers HTTP 200
+with `ok: false`). To use it, copy it into a project or your user config:
+
+Install it as a Claude Code plugin — this repo is also a plugin marketplace:
+
+```bash
+claude plugin marketplace add Binomica-Labs/SpliceCraft
+claude plugin install splicecraft@splicecraft
+```
+
+Or copy the folder in by hand, if you'd rather not add a marketplace:
+
+```bash
+# from a checkout
+cp -r skills/splicecraft ~/.claude/skills/
+
+# from an installed copy (find_spec locates the package without importing it)
+SC=$(python3 -c "import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec('splicecraft').origin).parent)")
+cp -r "$SC/skills/splicecraft" ~/.claude/skills/
+```
+
+Claude then picks it up whenever a task involves plasmids, cloning, primers or a
+`.gb`/`.dna` file. The skill is documentation only — nothing imports it, it adds
+no dependencies, and it makes no changes of its own. It costs ~340 tokens of
+always-on context and loads the rest only when it fires.
+
 ## Documentation
 
 | Topic                         | Where                                                                |

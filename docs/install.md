@@ -182,7 +182,7 @@ tables, settings) lives in the platform-appropriate data directory:
 |----------|-----------------------------------------------|
 | Linux    | `~/.local/share/splicecraft/`                 |
 | macOS    | `~/Library/Application Support/splicecraft/`  |
-| Windows  | `%APPDATA%\splicecraft\`                      |
+| Windows  | `%LOCALAPPDATA%\splicecraft\`                 |
 
 Override with `SPLICECRAFT_DATA_DIR=/path/to/dir splicecraft`.
 

@@ -42,13 +42,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-09-25"
+_RELEASE_DATE = "2026-09-28"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -138,7 +138,8 @@ except (ImportError, AttributeError):
 # the platform-appropriate data dir:
 #   Linux:   ~/.local/share/splicecraft/
 #   macOS:   ~/Library/Application Support/splicecraft/
-#   Windows: %APPDATA%\splicecraft\
+#   Windows: %LOCALAPPDATA%\splicecraft\   (Local, not Roaming:
+#            platformdirs is called with roaming=False)
 # Override with $SPLICECRAFT_DATA_DIR (useful for tests and portable installs).
 
 # ── Demo mode ────────────────────────────────────────────────────────────────

@@ -200,3 +200,36 @@ def test_all_siblings_are_packaged():
     assert not (siblings - sdist), (
         f"siblings missing from pyproject sdist include: {sorted(siblings - sdist)}"
     )
+
+
+def test_claude_skill_is_collected_by_both_build_targets():
+    """The Claude Skill must be COLLECTED by hatchling for both the wheel and the
+    sdist — not merely listed in pyproject.
+
+    Listing it is not enough, and that distinction is the whole point of this
+    test. A symlink anywhere else in the tree pointing INTO `skills/` (for
+    example a convenience `.claude/skills/splicecraft` ->
+    `../../skills/splicecraft`) makes hatchling resolve the alias first, mark
+    that real path as already seen, and then prune the real `skills/` directory.
+    The pyproject entry still reads correctly, `--wheel`-only builds still work,
+    and the pattern still matches under `include_path()` — but a full
+    `python -m build` silently ships an artifact with no skill in it, because
+    the wheel is built from the sdist. That shipped-empty failure is invisible
+    without asking the builder what it actually collected, which is what this
+    does.
+    """
+    from hatchling.builders.sdist import SdistBuilder
+    from hatchling.builders.wheel import WheelBuilder
+
+    skill = "skills/splicecraft/SKILL.md"
+    for builder_cls, label in ((SdistBuilder, "sdist"), (WheelBuilder, "wheel")):
+        collected = {
+            f.relative_path.replace("\\", "/")
+            for f in builder_cls(str(_REPO)).recurse_included_files()
+        }
+        assert skill in collected, (
+            f"{skill} is not collected for the {label}: a `python -m build` would "
+            f"ship without the Claude Skill. Check for a symlink pointing into "
+            f"skills/ (see this test's docstring), then re-run "
+            f"`python -m build` and inspect the artifact."
+        )

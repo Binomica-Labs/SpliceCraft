@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.3.0"
+version         = "1.3.1"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -173,6 +173,12 @@ dev = [
     # matching above.
     "edlib>=1.3.9.post1; (platform_machine == 'x86_64' or platform_machine == 'arm64') and python_version < '3.14'",
     "build>=1.6.1",
+    # `build` runs the backend in an ISOLATED env, so it does not put hatchling
+    # in the test env. tests/test_import_layers.py asks the real builders which
+    # files they collect (the only way to catch a symlink silently pruning
+    # `skills/` out of the sdist, and so out of the wheel built from it), which
+    # needs hatchling importable here. Mirror the [build-system] floor.
+    "hatchling>=1.32.4",
     # Floor-pinned at 7.0.0 (2026-08-15): hatchling 1.32 emits
     # `Metadata-Version: 2.5`, which twine 6.x rejects as invalid even though
     # PyPI accepts it. An older twine fails `twine check` at the very end of a
@@ -272,6 +278,12 @@ only-include = [
     # Bacterial regulatory-element scanners: sigma-70 promoters and
     # intrinsic (Rho-independent) terminators, both wrap-aware.
     "splicecraft_regulatory.py",
+    # The Claude Skill that teaches an AI agent to drive the agent API
+    # (connect, the canvas/library model, coordinates, the failure modes
+    # that look like success). Ships with the package so an agent working
+    # in any project can install it from the user's existing SpliceCraft
+    # install — see README "Claude Skill". Data only; nothing imports it.
+    "skills/splicecraft",
     "CHANGELOG.md",
 ]
 
@@ -318,6 +330,11 @@ include = [
     # Bacterial regulatory-element scanners: sigma-70 promoters and
     # intrinsic (Rho-independent) terminators, both wrap-aware.
     "splicecraft_regulatory.py",
+    # The Claude Skill for driving the agent API (see the wheel target), plus
+    # the plugin/marketplace manifests that make this repo installable with
+    # `claude plugin marketplace add Binomica-Labs/SpliceCraft`.
+    "skills/**",
+    ".claude-plugin/**",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",

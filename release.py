@@ -61,6 +61,13 @@ from typing import NoReturn
 REPO_ROOT = Path(__file__).resolve().parent
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 SPLICECRAFT = REPO_ROOT / "splicecraft.py"
+# The Claude Code plugin manifests. This repo doubles as a plugin marketplace
+# (`claude plugin marketplace add Binomica-Labs/SpliceCraft`), and the plugin
+# version is what `claude plugin update` compares against — leave it behind and
+# installed copies never see an update.
+PLUGIN_MANIFEST = REPO_ROOT / ".claude-plugin" / "plugin.json"
+MARKETPLACE_MANIFEST = REPO_ROOT / ".claude-plugin" / "marketplace.json"
+PLUGIN_SKILL = REPO_ROOT / "skills" / "splicecraft" / "SKILL.md"
 CHANGELOG = REPO_ROOT / "CHANGELOG.md"
 CONDA_RECIPE = REPO_ROOT / "conda-recipe" / "meta.yaml"
 CITATION_CFF = REPO_ROOT / "CITATION.cff"
@@ -91,6 +98,11 @@ _PYPROJECT_VERSION_RE = re.compile(
 )
 _SPLICECRAFT_VERSION_RE = re.compile(
     r'^(__version__\s*=\s*)"[^"]+"', re.MULTILINE,
+)
+# `"version": "X.Y.Z"` inside .claude-plugin/plugin.json (JSON, so the
+# separator is a colon and the key is quoted).
+_PLUGIN_VERSION_RE = re.compile(
+    r'^(\s*"version"\s*:\s*)"[^"]+"', re.MULTILINE,
 )
 
 # Citation metadata (the Zenodo DOI record + GitHub's "Cite this repository"
@@ -606,6 +618,42 @@ def _verify_bump(path: Path, new_version: str, var_name: str) -> None:
     if not expected.search(text):
         _die(f"failed to update {path.name} (expected "
              f'{var_name} = "{new_version}").')
+
+
+def _bump_plugin_manifest(new_version: str) -> None:
+    """Bump + validate the Claude Code plugin manifests.
+
+    Verification parses the JSON rather than regex-matching it back: a manifest
+    that stops being valid JSON doesn't fail loudly at release time, it fails
+    silently for every user who has `claude plugin marketplace add`ed this repo,
+    which is the worst place to find out. The skill file's existence is checked
+    for the same reason — a plugin whose only component has moved installs fine
+    and then does nothing.
+    """
+    if not PLUGIN_MANIFEST.is_file():
+        _die(f"plugin manifest missing: {PLUGIN_MANIFEST}")
+    _bump_version_in_file(
+        PLUGIN_MANIFEST, _PLUGIN_VERSION_RE, new_version,
+        ".claude-plugin/plugin.json",
+    )
+    for manifest in (PLUGIN_MANIFEST, MARKETPLACE_MANIFEST):
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _die(f"{manifest.name} is not readable as JSON after the bump "
+                 f"({exc}) — installs from this marketplace would break.")
+        if not data.get("name"):
+            _die(f"{manifest.name} has no 'name' — the plugin id is immutable "
+                 f"once published and must not go missing.")
+    stamped = json.loads(PLUGIN_MANIFEST.read_text(encoding="utf-8"))
+    if stamped.get("version") != new_version:
+        _die(f'failed to update .claude-plugin/plugin.json (expected version '
+             f'"{new_version}", found "{stamped.get("version")}").')
+    if not PLUGIN_SKILL.is_file():
+        _die(f"plugin skill missing: {PLUGIN_SKILL} — the plugin would install "
+             f"with no components.")
+    print(f"  .claude-plugin/plugin.json → {new_version} "
+          f"(manifests parse, skill present)")
 
 
 def _clean_build_artifacts() -> None:
@@ -1525,6 +1573,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     _verify_bump(PYPROJECT,   new_version, "version")
     _verify_bump(SPLICECRAFT, new_version, "__version__")
+    _bump_plugin_manifest(new_version)
     # Citation metadata rides the same bump — CITATION.cff / .zenodo.json /
     # `_RELEASE_DATE` feed the Zenodo DOI record minted when the GitHub
     # Release for this tag is published (see docs/citation.md).

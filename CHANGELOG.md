@@ -14,6 +14,44 @@
 
 ---
 
+## [1.3.1] — 2026-09-28
+
+### New features
+
+- **A Claude Skill now ships with SpliceCraft, installable as a plugin.** If you
+  drive SpliceCraft from Claude Code, the guesswork is gone:
+
+  ```
+  claude plugin marketplace add Binomica-Labs/SpliceCraft
+  claude plugin install splicecraft@splicecraft
+  ```
+
+  (or copy `skills/splicecraft` into `~/.claude/skills/` by hand). Claude then
+  picks it up whenever a task involves plasmids, cloning, primers or a
+  `.gb`/`.dna` file. It teaches the things an agent otherwise gets wrong —
+  how to attach read-only to the session you already have open instead of asking
+  you to quit, that loading a record and saving it are separate steps, the
+  0-based forward-strand coordinate convention, which endpoints preview before
+  they commit, and the results that look like success and aren't (a Golden Gate
+  that can't close answers HTTP 200 with `ok: false`; a perfect 800 bp read of a
+  5 kb plasmid scores 16% identity). It also tells Claude not to overstate what
+  the tool measured — no invented efficiency scores, no off-target claim wider
+  than what was actually searched. The skill is documentation only: nothing
+  imports it, it adds no dependencies, and it changes nothing on its own —
+  ~340 tokens of always-on context, the rest loaded only when it fires. See the
+  README's "Claude Skill" section.
+
+### Hardening
+
+- **Corrected the Windows data-dir path in the docs.** `docs/install.md`,
+  `docs/cli.md` and the header comment in `splicecraft.py` all said
+  `%APPDATA%\splicecraft\`. SpliceCraft asks for the non-roaming directory, so
+  it is actually `%LOCALAPPDATA%\splicecraft\` — anyone on Windows following the
+  docs to find their library, their `agent_token`, or a backup was looking in
+  the wrong folder.
+
+---
+
 ## [1.3.0] — 2026-09-25
 
 A big one, hence 1.3. The tail of the 2026-09-22 audit, worked to the end —

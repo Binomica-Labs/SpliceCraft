@@ -33,7 +33,7 @@ The CLI auto-discovers the running session via the token file at
 |----------|-----------------------------------------------|
 | Linux    | `~/.local/share/splicecraft/agent_token`      |
 | macOS    | `~/Library/Application Support/splicecraft/agent_token` |
-| Windows  | `%APPDATA%\splicecraft\agent_token`           |
+| Windows  | `%LOCALAPPDATA%\splicecraft\agent_token`      |
 
 Override the data dir with `SPLICECRAFT_DATA_DIR=/path/to/dir`.
 

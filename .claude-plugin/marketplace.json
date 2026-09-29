@@ -1,0 +1,15 @@
+{
+  "name": "splicecraft",
+  "description": "Skills for driving SpliceCraft, the terminal plasmid-map viewer, sequence editor and molecular-cloning workbench, from Claude.",
+  "owner": {
+    "name": "Binomica Labs",
+    "url": "https://github.com/Binomica-Labs"
+  },
+  "plugins": [
+    {
+      "name": "splicecraft",
+      "source": "./",
+      "description": "Drive SpliceCraft's plasmid workbench through its localhost agent API: annotate records, design and verify primers, simulate Golden Gate / Gibson / restriction clones, codon-optimize, design CRISPR guides, verify builds against sequencing reads."
+    }
+  ]
+}
