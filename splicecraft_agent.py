@@ -68,13 +68,13 @@ from splicecraft_util import (_iso_instant, _variant_group_key, _PLASMID_STATUS_
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
 from splicecraft_biology import (_covered_identity, _read_extent_for, _read_is_clipped, _digest_with_enzymes, _enzyme_aliases, _enzyme_site_methylation_targets, _methylated_base_positions, _enzyme_cuts, _enzyme_resolve_one, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
-from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _build_synthesis_l0_fragment, _design_gb_primers, _entry_vector_acceptor_overhangs, _grammar_position_by_type, _l0_part_from_syn_fragment)
+from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _build_synthesis_l0_fragment, _design_gb_primers, _entry_vector_acceptor_overhangs, _grammar_position_by_type, _insilico_pcr_amplicons, _l0_part_from_syn_fragment)
 from splicecraft_dataaccess import (_active_enzyme_resolution, _agent_scan_library_for_key, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
 from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member, _fastq_count_reads, _fastq_path_to_records)
 from splicecraft_gels import (_AGAROSE_CHOICES, _GEL_HEIGHT_MAX, _GEL_HEIGHT_MIN, _GEL_LANE_WIDTH_MAX, _GEL_LANE_WIDTH_MIN, _GEL_MAX_LANES, _agarose_mobility, _gel_bands_for_lane, _gel_resolve_enzymes, _render_gel_image)
 from splicecraft_persistence import (_safe_save_json_mirror)
 from splicecraft_regulatory import (_PROMOTER_MIN_SCORE, _TERM_MAX_STEM, _TERM_MIN_STEM, _TERM_MIN_U_TRACT, _TERM_U_TRACT_WINDOW, _scan_promoters, _scan_terminators)
-from splicecraft_primer import (_AS_MIN_LEN, _design_allele_specific_primer, _design_cloning_primers_raw, _design_detection_primers, _design_generic_primers, _primer_binding_sites, _primer_check_confidence, _primer_tm)
+from splicecraft_primer import (_AS_MIN_LEN, _TM_PROFILES, _design_allele_specific_primer, _design_cloning_primers_raw, _design_detection_primers, _design_generic_primers, _mut_hairpin_dg, _mut_homodimer_dg, _primer_binding_sites, _primer_check_confidence, _primer_heterodimer_dg, _primer_tm, _tm_profile_kwargs)
 
 
 def _custom_enzyme_meta(name: str) -> "dict | None":
@@ -5482,7 +5482,8 @@ def _h_check_primer(app, payload):
     """Check ONE primer against a template: melting temp, GC%, and every
     3'-anchored binding site (both strands, wrap-aware on a circular
     template). Body: ``{primer, template?, circular?: bool = true,
-    min_identity?: float = 0, max_sites?: int = 50}``.
+    min_identity?: float = 0, max_sites?: int = 50,
+    tm_profile?: "primer3_default"|"benchling_compatible"}``.
 
     `template` defaults to the LOADED plasmid (with its own topology). With
     no template and nothing loaded, the melting temperature and GC% are
@@ -5509,6 +5510,10 @@ def _h_check_primer(app, payload):
     length, ident_pct, mismatches, confidence}]}`` — `foot_start` is the
     0-based footprint start on the cleaned template; sites are
     best-first (highest identity)."""
+    tm_profile = payload.get("tm_profile", "primer3_default")
+    if not isinstance(tm_profile, str) or tm_profile not in _TM_PROFILES:
+        return ({"error": "'tm_profile' must be 'primer3_default' or "
+                          "'benchling_compatible'"}, 400)
     primer_raw = payload.get("primer")
     template_raw = payload.get("template")
     seq_raw = payload.get("sequence")
@@ -5540,6 +5545,14 @@ def _h_check_primer(app, payload):
         return ({"error": "no IUPAC bases in 'primer'"}, 400)
     if len(primer) > 1000:
         return ({"error": "'primer' too long (max 1000 bp)"}, 413)
+    # For a degenerate oligo, `tm` is the minimum member Tm and `tm_range`
+    # contains the minimum and maximum. Use the selected profile for both.
+    bracket = _degenerate_tm_bracket(
+        primer, **_tm_profile_kwargs(tm_profile))
+    tm_extra = ({"tm_range": [round(bracket[0], 1), round(bracket[1], 1)],
+                 "tm_note": "degenerate oligo: tm is the weakest member's "
+                            "nearest-neighbour Tm. tm_range spans the mix"}
+                if bracket is not None else {})
     loaded_default = False
     if template_raw is None or not template_raw.strip():
         rec = getattr(app, "_current_record", None)
@@ -5548,7 +5561,9 @@ def _h_check_primer(app, payload):
             gc = sum(1 for c in primer if c in "GCS")
             return {
                 "ok": True, "primer": primer, "length": len(primer),
-                "tm": _primer_tm(primer),
+                "tm": _primer_tm(primer, tm_profile),
+                "tm_profile": tm_profile,
+                **tm_extra,
                 "gc_pct": round(100.0 * gc / len(primer), 1),
                 "binds": None, "n_sites": 0, "sites": [],
                 "note": "no template given and no plasmid loaded — melting "
@@ -5609,18 +5624,12 @@ def _h_check_primer(app, payload):
     gc = sum(1 for c in primer if c in "GCS")
     gc_pct = round(100.0 * gc / len(primer), 1)
     best = max((s["ident_pct"] for s in out_sites), default=None)
-    # A degenerate oligo is a mix: `tm` is its WEAKEST member's Tm (what the
-    # anneal must respect) and `tm_range` says how far the mix spreads.
-    bracket = _degenerate_tm_bracket(primer)
-    tm_extra = ({"tm_range": [round(bracket[0], 1), round(bracket[1], 1)],
-                 "tm_note": "degenerate oligo: tm is the weakest member's "
-                            "nearest-neighbour Tm; tm_range spans the mix"}
-                if bracket is not None else {})
     return {
         "ok":            True,
         "primer":        primer,
         "length":        len(primer),
-        "tm":            _primer_tm(primer),
+        "tm":            _primer_tm(primer, tm_profile),
+        "tm_profile":    tm_profile,
         **tm_extra,
         "gc_pct":        gc_pct,
         "circular":      circular,
@@ -5634,6 +5643,162 @@ def _h_check_primer(app, payload):
            if had_u else {}),
         **({"template": "the loaded plasmid"} if loaded_default else {}),
         **({"primer_from": "sequence"} if read_seq_as_primer else {}),
+    }
+
+
+@_agent_endpoint("check-primer-pair")
+def _h_check_primer_pair(app, payload):
+    """Analyse one PCR-primer pair. Body: ``{forward_primer,
+    reverse_primer, template, forward_binding?, reverse_binding?,
+    circular?: bool = true, tm_profile?: "primer3_default"|
+    "benchling_compatible", max_amplicon?: int = 20000}``.
+
+    Tm and template binding use the annealing sequence (the explicit
+    ``*_binding`` value, or the whole primer when omitted). Hairpin,
+    homodimer and heterodimer calculations use the complete ordered oligos,
+    including cloning tails. An explicit binding sequence must be a 3' suffix
+    of its full primer. This excludes bases from the non-annealing 5' tail.
+
+    ``tm_profile`` affects Tm only. Secondary-structure checks use the standard
+    Primer3 reaction conditions. Candidate amplicons include hetero-primer and
+    homo-primer products.
+
+    Read-only. ΔG values are in kcal/mol. A ``None`` value has a corresponding
+    warning. Each primer reports ``truncated`` and optional ``read_u_as_t``.
+    The pair reports ``amplicons_truncated`` when the search reaches its limit.
+    """
+    tm_profile = payload.get("tm_profile", "primer3_default")
+    if not isinstance(tm_profile, str) or tm_profile not in _TM_PROFILES:
+        return ({"error": "'tm_profile' must be 'primer3_default' or "
+                          "'benchling_compatible'"}, 400)
+    template_raw = payload.get("template") or payload.get("sequence")
+    if not isinstance(template_raw, str) or not template_raw.strip():
+        return ({"error": "missing or non-string 'template'"}, 400)
+    template, bad = _check_primer_bases(template_raw, "template")
+    if bad:
+        return ({"error": bad}, 400)
+    if not template:
+        return ({"error": "no IUPAC bases in 'template'"}, 400)
+    if len(template) > _PAIRWISE_MAX_LEN:
+        return ({"error": f"'template' exceeds {_PAIRWISE_MAX_LEN:,} bp cap"},
+                413)
+
+    primers: "dict[str, str]" = {}
+    bindings: "dict[str, str]" = {}
+    read_u_as_t: "dict[str, bool]" = {}
+    for role in ("forward", "reverse"):
+        full_raw = payload.get(f"{role}_primer")
+        if not isinstance(full_raw, str) or not full_raw.strip():
+            return ({"error": f"missing or non-string '{role}_primer'"}, 400)
+        full, bad = _check_primer_bases(full_raw,
+                                         f"{role}_primer")
+        if bad or not full:
+            return ({"error": bad or f"empty '{role}_primer'"}, 400)
+        if len(full) > 1000:
+            return ({"error": f"'{role}_primer' too long (max 1000 bp)"}, 413)
+        binding_raw = payload.get(f"{role}_binding")
+        if binding_raw is None:
+            binding = full
+        else:
+            if not isinstance(binding_raw, str) or not binding_raw.strip():
+                return ({"error": f"'{role}_binding' must be a non-empty "
+                                  "string"}, 400)
+            binding, bad = _check_primer_bases(binding_raw, f"{role}_binding")
+            if bad or not binding:
+                return ({"error": bad or f"empty '{role}_binding'"}, 400)
+            if not full.endswith(binding):
+                return ({"error": f"'{role}_binding' must be a 3' suffix of "
+                                  f"'{role}_primer'"}, 400)
+        primers[role] = full
+        bindings[role] = binding
+        read_u_as_t[role] = (
+            "U" in full_raw.upper()
+            or (isinstance(binding_raw, str) and "U" in binding_raw.upper())
+        )
+
+    max_amplicon = _coerce_int(payload.get("max_amplicon", 20_000),
+                               name="max_amplicon")
+    if isinstance(max_amplicon, str):
+        return ({"error": max_amplicon}, 400)
+    if not (1 <= max_amplicon <= _PCR_AMPLICON_HARD_CAP):
+        return ({"error": f"'max_amplicon' must be in [1, "
+                          f"{_PCR_AMPLICON_HARD_CAP}]"}, 400)
+    circular = _payload_bool(payload, "circular", True)
+
+    checked: "dict[str, dict]" = {}
+    for role in ("forward", "reverse"):
+        result = _h_check_primer(app, {
+            "primer": bindings[role], "template": template,
+            "circular": circular, "tm_profile": tm_profile,
+        })
+        if isinstance(result, tuple):
+            return result
+        checked[role] = result
+
+    amps = _insilico_pcr_amplicons(
+        checked["forward"]["sites"], checked["reverse"]["sites"],
+        len(template), circular=circular, max_amplicon=max_amplicon,
+        max_amplicons=_PCR_MAX_AMPLICONS + 1,
+    )
+    amplicons_truncated = len(amps) > _PCR_MAX_AMPLICONS
+    amps = amps[:_PCR_MAX_AMPLICONS]
+    warnings: "list[str]" = []
+    if amplicons_truncated:
+        warnings.append(
+            f"candidate amplicons were truncated at {_PCR_MAX_AMPLICONS}. "
+            "amplicon uniqueness is not established")
+
+    def _primer_result(role: str) -> dict:
+        full = primers[role]
+        hp = _mut_hairpin_dg(full)
+        hd = _mut_homodimer_dg(full)
+        if hp is None or hd is None:
+            warnings.append(
+                f"{role} hairpin/self-dimer ΔG could not be computed. "
+                "That primer is not fully secondary-structure checked")
+        check = checked[role]
+        if check["truncated"]:
+            warnings.append(
+                f"{role} binding sites were truncated at {check['n_sites']}. "
+                "amplicon uniqueness is not established")
+        return {
+            "primer": full,
+            "binding": bindings[role],
+            "tm": check["tm"],
+            "gc_pct": check["gc_pct"],
+            "hairpin_dg": None if hp is None else round(hp, 2),
+            "homodimer_dg": None if hd is None else round(hd, 2),
+            "n_sites": check["n_sites"],
+            "sites": check["sites"],
+            "truncated": check["truncated"],
+            **({"read_u_as_t": True,
+                "note_u": "deoxyuridine (U) read as T for primer analysis"}
+               if read_u_as_t[role] else {}),
+        }
+
+    fwd = _primer_result("forward")
+    rev = _primer_result("reverse")
+    hetero = _primer_heterodimer_dg(
+        primers["forward"], primers["reverse"])
+    if hetero is None:
+        warnings.append(
+            "pair heterodimer ΔG could not be computed. The pair is not "
+            "fully secondary-structure checked")
+    return {
+        "ok": True,
+        "forward": fwd,
+        "reverse": rev,
+        "pair": {
+            "tm_delta": (None if fwd["tm"] is None or rev["tm"] is None
+                         else round(abs(fwd["tm"] - rev["tm"]), 1)),
+            "heterodimer_dg": (None if hetero is None else round(hetero, 2)),
+            "n_amplicons": len(amps),
+            "amplicons": amps,
+            "amplicons_truncated": amplicons_truncated,
+        },
+        "tm_profile": tm_profile,
+        "dg_units": "kcal/mol",
+        "warnings": warnings,
     }
 
 
@@ -12023,8 +12188,9 @@ def _agent_design_allele_specific(template: str, payload):
 @_agent_endpoint("design-primers")
 def _h_design_primers(app, payload):
     """Primer-pair design over a target region. Body:
-    ``{template, start, end, mode?: "detection"|"cloning"|"generic",
-        target_tm?: float, site_5?: str, site_3?: str}``.
+    ``{template, start?, end?, mode?: "detection"|"cloning"|"generic"|
+        "allele_specific", target_tm?: float, site_5?: str, site_3?: str,
+        tm_profile?: "primer3_default"|"benchling_compatible"}``.
 
     Wraps `_design_detection_primers`, `_design_cloning_primers_raw`,
     and `_design_generic_primers`:
@@ -12043,8 +12209,11 @@ def _h_design_primers(app, payload):
         the selected region. Returns `fwd_seq`/`rev_seq` +
         `fwd_pos`/`rev_pos`. Needs ≥ 18 bp.
 
-    All modes return `fwd_tm`/`rev_tm`. The primer dict is under the
-    `result` key, with `mode` echoed alongside.
+    All modes return `fwd_tm` and `rev_tm`. ``primer3_default`` is the default
+    Tm profile. Cloning and generic modes also accept
+    ``benchling_compatible``. Detection mode accepts only ``primer3_default``
+    because Primer3 calculates Tm during pair design. The response contains
+    the primer data under `result` and repeats the selected `mode`.
     """
     template = payload.get("template") or payload.get("sequence")  # SC-G alias
     if not isinstance(template, str) or not template.strip():
@@ -12084,6 +12253,14 @@ def _h_design_primers(app, payload):
         return ({"error": "'target_tm' must be a number"}, 400)
     if not (40.0 <= target_tm <= 90.0):
         return ({"error": "'target_tm' must be in [40, 90] °C"}, 400)
+    tm_profile = payload.get("tm_profile", "primer3_default")
+    if not isinstance(tm_profile, str) or tm_profile not in _TM_PROFILES:
+        return ({"error": "'tm_profile' must be 'primer3_default' or "
+                          "'benchling_compatible'"}, 400)
+    if mode == "detection" and tm_profile != "primer3_default":
+        return ({"error": "'benchling_compatible' is supported only for "
+                          "cloning and generic modes because detection mode "
+                          "uses Primer3 pair selection"}, 400)
     try:
         if mode == "detection":
             result = _design_detection_primers(
@@ -12094,6 +12271,7 @@ def _h_design_primers(app, payload):
             # forward anneals at the region start, the reverse at the end.
             result = _design_generic_primers(
                 template_clean, start, end, target_tm=target_tm,
+                tm_profile=tm_profile,
             )
         else:
             site_5 = payload.get("site_5", "")
@@ -12104,14 +12282,15 @@ def _h_design_primers(app, payload):
             result = _design_cloning_primers_raw(
                 template_clean, start, end,
                 site_5=site_5.upper(), site_3=site_3.upper(),
-                target_tm=target_tm,
+                target_tm=target_tm, tm_profile=tm_profile,
             )
     except Exception as exc:
         _log.exception("agent design-primers: design failed")
         return ({"error": f"design failed: {_scrub_path(str(exc))}"}, 500)
     if isinstance(result, dict) and result.get("error"):
         return ({"error": result["error"]}, 422)
-    return {"ok": True, "mode": mode, "result": result}
+    return {"ok": True, "mode": mode, "tm_profile": tm_profile,
+            "result": result}
 
 
 def _agent_project_experiments_list(project):

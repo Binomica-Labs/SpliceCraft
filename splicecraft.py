@@ -9907,6 +9907,7 @@ from splicecraft_cloning import (  # noqa: E402
     _fuse_overhang_body as _fuse_overhang_body,
     _build_pupd2_backbone_stub as _build_pupd2_backbone_stub,
     _PUPD2_BACKBONE_STUB as _PUPD2_BACKBONE_STUB,
+    _insilico_pcr_amplicons as _insilico_pcr_amplicons,
     _simulate_primed_amplicon as _simulate_primed_amplicon,
     _simulate_cloned_plasmid as _simulate_cloned_plasmid,
     _cloned_plasmid_regenerated_sites as _cloned_plasmid_regenerated_sites,
@@ -98308,82 +98309,6 @@ _PRIMER_CHECK_MIN_LEN   = 10     # shortest primer accepted (cf _PCR_MIN_PRIMER_
 _PRIMER_CHECK_MAX_ROWS  = 1000   # results-table row cap across the whole library
 
 
-def _insilico_pcr_amplicons(
-    sites_a: "list[dict]", sites_b: "list[dict]", total: int, *,
-    circular: bool = True,
-    max_amplicon: int = _PCR_DEFAULT_MAX_AMPLICON,
-    min_amplicon: int = 1,
-    max_amplicons: int = _PCR_MAX_AMPLICONS,
-) -> "list[dict]":
-    """Pair forward + reverse binding sites (POOLED across both primers) into
-    amplicons. Geometry mirrors `_simulate_pcr`: a product runs from a forward
-    site's foot_start to a reverse site's foot_start+length, the reverse site
-    downstream (clockwise on a circle). `sites_a`/`sites_b` are the
-    `_primer_binding_sites` lists for primer 1 / primer 2; `fwd_primer`
-    /`rev_primer` in each result record which primer (0 or 1) plays each role
-    (so hetero P1×P2 and homo P1×P1 products are both surfaced honestly).
-
-    Returns amplicons sorted by certainty (min of the two site identities)
-    desc, then length asc::
-
-        {"start": int,        # amplicon 5' on the top strand, canonical [0,total)
-         "length": int, "wraps": bool,
-         "fwd_ident": float, "rev_ident": float, "certainty": float,
-         "fwd_primer": 0|1, "rev_primer": 0|1,
-         "rev_3p": int}       # reverse primer 3' end (canonical)
-    """
-    if total <= 0:
-        return []
-    fwd = [(s, idx) for idx, lst in ((0, sites_a), (1, sites_b))
-           for s in (lst or []) if s["strand"] == 1]
-    rev = [(s, idx) for idx, lst in ((0, sites_a), (1, sites_b))
-           for s in (lst or []) if s["strand"] == -1]
-    max_amp = max(1, min(int(max_amplicon), _PCR_AMPLICON_HARD_CAP))
-    amps: "list[dict]" = []
-    seen: "set[tuple[int, int, int]]" = set()
-    for fs, fidx in fwd:
-        f_left = fs["foot_start"]
-        for rs, ridx in rev:
-            r_left = rs["foot_start"]            # reverse primer 3' end
-            lr = rs["length"]
-            if circular:
-                length = ((r_left - f_left) % total) + lr
-            else:
-                if r_left < f_left or r_left + lr > total:
-                    continue
-                length = (r_left + lr) - f_left
-            # Floor at fwd_len + rev_len (matching `_simulate_pcr`'s `min_amp`)
-            # so an overlapping / primer-dimer geometry — where the product
-            # would be shorter than the two primers laid end to end — is never
-            # reported as a real amplicon.
-            lo = max(int(min_amplicon), fs["length"] + lr)
-            if length < lo or length > max_amp:
-                continue
-            start = f_left % total
-            end_canon = (f_left + length) % total
-            key = (start, end_canon, length)
-            if key in seen:
-                continue
-            seen.add(key)
-            amps.append({
-                "start":      start,
-                "length":     length,
-                "wraps":      bool(circular and (f_left + length) > total),
-                "fwd_ident":  fs["ident_pct"],
-                "rev_ident":  rs["ident_pct"],
-                "certainty":  min(fs["ident_pct"], rs["ident_pct"]),
-                "fwd_primer": fidx,
-                "rev_primer": ridx,
-                "rev_3p":     r_left,
-            })
-            if len(amps) >= max_amplicons:
-                break
-        if len(amps) >= max_amplicons:
-            break
-    amps.sort(key=lambda a: (-a["certainty"], a["length"], a["start"]))
-    return amps
-
-
 def _arc_intervals(start: int, length: int, total: int) -> "list[tuple[int, int]]":
     """Split the arc [start, start+length) on a circle of size `total` into
     1–2 linear [s, e) intervals within [0, total)."""
@@ -102823,6 +102748,7 @@ from splicecraft_agent import (  # noqa: E402  (deferred handlers + their valida
     _h_design_synthesis_fragment as _h_design_synthesis_fragment,
     _h_design_primers as _h_design_primers,
     _h_check_primer as _h_check_primer,
+    _h_check_primer_pair as _h_check_primer_pair,
     _h_list_experiments as _h_list_experiments,
     _h_delete_experiment as _h_delete_experiment,
     _h_list_experiment_projects as _h_list_experiment_projects,

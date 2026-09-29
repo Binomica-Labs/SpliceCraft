@@ -1,7 +1,8 @@
 """splicecraft_cloning — construction simulation (Phase D, layer L3).
 
-The "simulate the real steps" construction helpers ([INV-127]): build real
-amplicons (`_simulate_primed_amplicon`), assemble real cloned plasmids via
+The "simulate the real steps" construction helpers ([INV-127]): identify PCR
+products (`_insilico_pcr_amplicons`), build real amplicons
+(`_simulate_primed_amplicon`), assemble real cloned plasmids via
 digest+ligation (`_simulate_cloned_plasmid`), the pUPD2 backbone stub, overhang
 fusion, the Commercial-SaaS `.dna` history serialisation, and the **Gibson assembly
 simulator** ([INV-85/86]): `_simulate_gibson_assembly` + its `_gibson_*` helpers
@@ -5073,3 +5074,77 @@ _PCR_MAX_TEMPLATE_BP    = 5_000_000  # 5 Mb — above this we skip the run rathe
 # either side at this many positions and refuse — surfacing a clearer error
 # than a multi-second UI freeze on a pure-A primer.
 _PCR_MAX_PRIMER_HITS    = 5_000
+
+
+def _insilico_pcr_amplicons(
+    sites_a: "list[dict]", sites_b: "list[dict]", total: int, *,
+    circular: bool = True,
+    max_amplicon: int = _PCR_DEFAULT_MAX_AMPLICON,
+    min_amplicon: int = 1,
+    max_amplicons: int = _PCR_MAX_AMPLICONS,
+) -> "list[dict]":
+    """Build amplicons from forward and reverse sites in both primer lists.
+
+    Geometry matches `_simulate_pcr`. A product starts at the forward site's
+    `foot_start` and ends after the downstream reverse site. On a circular
+    template, downstream follows the clockwise direction. `fwd_primer` and
+    `rev_primer` identify which primer list supplies each site. The results
+    include hetero-primer and homo-primer products.
+
+    Returns amplicons sorted by certainty (min of the two site identities)
+    desc, then length asc::
+
+        {"start": int,        # amplicon 5' on the top strand, canonical [0,total)
+         "length": int, "wraps": bool,
+         "fwd_ident": float, "rev_ident": float, "certainty": float,
+         "fwd_primer": 0|1, "rev_primer": 0|1,
+         "rev_3p": int}       # reverse primer 3' end (canonical)
+    """
+    if total <= 0:
+        return []
+    fwd = [(s, idx) for idx, lst in ((0, sites_a), (1, sites_b))
+           for s in (lst or []) if s["strand"] == 1]
+    rev = [(s, idx) for idx, lst in ((0, sites_a), (1, sites_b))
+           for s in (lst or []) if s["strand"] == -1]
+    max_amp = max(1, min(int(max_amplicon), _PCR_AMPLICON_HARD_CAP))
+    amps: "list[dict]" = []
+    seen: "set[tuple[int, int, int]]" = set()
+    for fs, fidx in fwd:
+        f_left = fs["foot_start"]
+        for rs, ridx in rev:
+            r_left = rs["foot_start"]            # reverse primer 3' end
+            r_len = rs["length"]
+            if circular:
+                length = ((r_left - f_left) % total) + r_len
+            else:
+                if r_left < f_left or r_left + r_len > total:
+                    continue
+                length = (r_left + r_len) - f_left
+            # Match `_simulate_pcr`: exclude products shorter than the combined
+            # primer lengths because those sites form an overlap geometry.
+            lo = max(int(min_amplicon), fs["length"] + r_len)
+            if length < lo or length > max_amp:
+                continue
+            start = f_left % total
+            end_canon = (f_left + length) % total
+            key = (start, end_canon, length)
+            if key in seen:
+                continue
+            seen.add(key)
+            amps.append({
+                "start": start,
+                "length": length,
+                "wraps": bool(circular and (f_left + length) > total),
+                "fwd_ident": fs["ident_pct"],
+                "rev_ident": rs["ident_pct"],
+                "certainty": min(fs["ident_pct"], rs["ident_pct"]),
+                "fwd_primer": fidx,
+                "rev_primer": ridx,
+                "rev_3p": r_left,
+            })
+            if len(amps) >= max_amplicons:
+                break
+        if len(amps) >= max_amplicons:
+            break
+    amps.sort(key=lambda a: (-a["certainty"], a["length"], a["start"]))
+    return amps

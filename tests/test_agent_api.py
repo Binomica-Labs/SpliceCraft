@@ -6124,6 +6124,23 @@ class TestDesignPrimersModes:
         # No tail keys leak in from the other modes.
         assert "fwd_full" not in res
 
+    def test_generic_accepts_benchling_compatible_tm_profile(self):
+        n = len(_PRIMER_TMPL)
+        r = sc._h_design_primers(None, {
+            "template": _PRIMER_TMPL, "start": 0, "end": n,
+            "mode": "generic", "tm_profile": "benchling_compatible",
+        })
+        assert r["ok"] and r["tm_profile"] == "benchling_compatible"
+        assert r["result"]["fwd_tm"] == sc._primer_tm(
+            r["result"]["fwd_seq"], "benchling_compatible")
+
+    def test_detection_rejects_unapplied_tm_profile(self):
+        err, code = sc._h_design_primers(None, {
+            "template": _PRIMER_TMPL, "start": 0, "end": len(_PRIMER_TMPL),
+            "mode": "detection", "tm_profile": "benchling_compatible",
+        })
+        assert code == 400 and "detection mode" in err["error"]
+
     def test_generic_region_too_short_422(self):
         r = sc._h_design_primers(None, {"template": _PRIMER_TMPL, "start": 0,
                                         "end": 10, "mode": "generic"})
@@ -6157,6 +6174,40 @@ class TestCheckPrimer:
         r = sc._h_check_primer(None, {"primer": "ACGTACGTTTGGCCAAGTGA"})
         assert r["tm"] == sc._primer_tm("ACGTACGTTTGGCCAAGTGA")
         assert r["gc_pct"] == 50.0 and r["binds"] is None and "note" in r
+
+    @pytest.mark.parametrize(("sequence", "expected"), [
+        ("tactgtttctccatacccgtttttttggg", 59.4),
+        ("TGGCCTTTTTGCGTTTCTACAAACT", 58.2),
+        ("CTCAGTTCGGTGTAGGTCGTTCGCTCCAAGCTGGGCTGTGTGCACGAACCCCCCGTTCAGCC"
+         "CGACCGCTGCGCCTTATCCGGTAACTATCGTCTTGAGTCCAACCCGGTAAGACACGACTTAT"
+         "CGCCACTGGCAGCAGCCACTGGTAACAGGATTAGCAGAGCGAGGTATGTAGG", 80.3),
+    ])
+    def test_benchling_compatible_reference_values(self, sequence, expected):
+        r = sc._h_check_primer(None, {
+            "primer": sequence, "tm_profile": "benchling_compatible",
+        })
+        assert r["tm"] == pytest.approx(expected, abs=0.1)
+        assert r["tm_profile"] == "benchling_compatible"
+
+    def test_tm_profile_is_opt_in_and_validated(self):
+        seq = "TACTGTTTCTCCATACCCGTTTTTTTGGG"
+        default = sc._h_check_primer(None, {"primer": seq})
+        assert default["tm"] == sc._primer_tm(seq)
+        assert default["tm_profile"] == "primer3_default"
+        err, code = sc._h_check_primer(None, {
+            "primer": seq, "tm_profile": "snapgene",
+        })
+        assert code == 400 and "tm_profile" in err["error"]
+
+    def test_degenerate_tm_range_uses_selected_profile(self):
+        primer = "TACTGTTTCTCCATACCCGTTTTTTTGGN"
+        template = "AAAA" + primer[:-1] + "A" + "CCCC"
+        r = sc._h_check_primer(None, {
+            "primer": primer, "template": template, "circular": False,
+            "tm_profile": "benchling_compatible",
+        })
+        assert r["tm_range"] == pytest.approx([58.7, 59.4], abs=0.1)
+        assert r["tm"] == pytest.approx(r["tm_range"][0], abs=0.1)
 
     def test_a_lone_sequence_is_the_primer_otherwise_the_template(self):
         # The Babs bench: asked a primer's Tm, a 7B sent the oligo as
@@ -6278,6 +6329,72 @@ class TestCheckPrimer:
                    for s in circ["sites"] if s["orientation"] == "forward")
         assert not any(s["foot_start"] == n - 10
                        for s in lin["sites"] if s["orientation"] == "forward")
+
+
+class TestCheckPrimerPair:
+    def test_full_oligos_are_structured_but_binding_arms_set_tm_and_sites(self):
+        fwd_binding = _PRIMER_TMPL[40:62]
+        rev_binding = sc._rc(_PRIMER_TMPL[200:222])
+        fwd = "CGGTCACCTGCCCTGGGAG" + fwd_binding
+        rev = "CGGTCACCTGCCCTGAGTA" + rev_binding
+        r = sc._h_check_primer_pair(None, {
+            "forward_primer": fwd,
+            "reverse_primer": rev,
+            "forward_binding": fwd_binding,
+            "reverse_binding": rev_binding,
+            "template": _PRIMER_TMPL,
+            "circular": False,
+            "tm_profile": "benchling_compatible",
+        })
+        assert r["ok"] and r["tm_profile"] == "benchling_compatible"
+        assert r["forward"]["primer"] == fwd
+        assert r["forward"]["tm"] == sc._primer_tm(
+            fwd_binding, "benchling_compatible")
+        assert r["reverse"]["tm"] == sc._primer_tm(
+            rev_binding, "benchling_compatible")
+        assert r["forward"]["n_sites"] == r["reverse"]["n_sites"] == 1
+        assert r["pair"]["n_amplicons"] == 1
+        assert r["pair"]["amplicons"][0]["start"] == 40
+        assert r["pair"]["amplicons"][0]["length"] == 182
+        assert r["dg_units"] == "kcal/mol"
+        assert r["pair"]["heterodimer_dg"] is not None
+
+    def test_binding_arm_must_be_the_three_prime_suffix(self):
+        err, code = sc._h_check_primer_pair(None, {
+            "forward_primer": "AAAAACGTACGTACGTACGTACGT",
+            "reverse_primer": "TTTTACGTACGTACGTACGTACGT",
+            "forward_binding": "AAAAACGTACGT",
+            "template": _PRIMER_TMPL,
+        })
+        assert code == 400 and "3' suffix" in err["error"]
+
+    def test_deoxyuridine_conversion_is_reported(self):
+        template = "ACGTTGCA" * 5
+        r = sc._h_check_primer_pair(None, {
+            "forward_primer": "ACGUUGCAACGTTGCA",
+            "reverse_primer": "TGCAACGUUGCAACGT",
+            "template": template,
+            "circular": False,
+        })
+        assert r["forward"]["primer"] == "ACGTTGCAACGTTGCA"
+        assert r["reverse"]["primer"] == "TGCAACGTTGCAACGT"
+        assert r["forward"]["read_u_as_t"] is True
+        assert r["reverse"]["read_u_as_t"] is True
+
+    def test_binding_and_amplicon_caps_are_disclosed(self):
+        template = "ACGT" * 1000
+        primer = "ACGTACGTACGTACGTACGT"
+        r = sc._h_check_primer_pair(None, {
+            "forward_primer": primer,
+            "reverse_primer": primer,
+            "template": template,
+            "circular": False,
+        })
+        assert r["forward"]["truncated"] is True
+        assert r["reverse"]["truncated"] is True
+        assert r["pair"]["amplicons_truncated"] is True
+        assert r["pair"]["n_amplicons"] == sc._PCR_MAX_AMPLICONS
+        assert any("uniqueness is not established" in w for w in r["warnings"])
 
 
 class TestBatchMoveCopyPlasmids:

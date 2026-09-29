@@ -32,6 +32,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `capture-snapshot` | W | Write a Markdown UI snapshot (same content as Alt+D) and return the file path. Useful for an agent assembling a bug report: snapshot first, then… |
 | `check-primer` | R | Check ONE primer against a template: melting temp, GC%, and every 3'-anchored binding site (both strands, wrap-aware on a circular template).… |
 | `check-primer-duplicates` | R | Scan the primer library for duplicate sequences. Returns a list of groups where multiple entries share the same canonical primer sequence — useful… |
+| `check-primer-pair` | R | Analyse one PCR-primer pair. Body: `{forward_primer, reverse_primer, template, forward_binding?, reverse_binding?, circular?: bool = true,… |
 | `classify-part` | R | Classify a candidate part by digest-overhang matching, without persisting. Body: `{sequence, circular?: bool = true, features?: list}` — same… |
 | `clear-entry-vectors-for-grammar` | W | Drop every entry-vector binding for one grammar id. Body: `{grammar_id: str}`. Used by grammar-delete flows; agents rarely need this directly but… |
 | `cofold-rna` | R | Bound-state heterodimer ΔG of two strands. Body: `{seq_a, seq_b}`. Returns `{ok, dg}` — the free energy (kcal/mol) of strand B bound to strand A… |
@@ -76,7 +77,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `design-gb-part` | R | Design Golden Braid / MoClo domestication primers. Body: `{template, start, end, part_type, grammar?, target_tm?, codon_taxid?,… |
 | `design-guides` | R | CRISPR guide design over the loaded plasmid or a supplied sequence. |
 | `design-mutagenesis` | R | Design SOE-PCR primers for a single-site mutation. Body: `{cds_dna, mutation, codon_taxid?}`. `mutation` is a string like `"W140F"` (WT-aa,… |
-| `design-primers` | R | Primer-pair design over a target region. Body: `{template, start, end, mode?: "detection"\|"cloning"\|"generic", target_tm?: float, site_5?: str,… |
+| `design-primers` | R | Primer-pair design over a target region. Body: `{template, start?, end?, mode?: "detection"\|"cloning"\|"generic"\| "allele_specific", target_tm?:… |
 | `design-rbs` | R | Reverse-design a 5'UTR (Shine-Dalgarno + spacer) for a target relative RBS strength. Body: `{cds, target}` — `cds` begins with the start codon,… |
 | `design-synthesis-fragment` | R | Wrap a sequence in the correct nested overhangs so the directly- SYNTHESISED fragment (order it as a gBlock — no PCR) becomes a Level-0 part once… |
 | `diff-plasmid` | R | Pairwise alignment of the loaded record against another plasmid in the library. Body: `{target_id, mode?, circular?}`. |

@@ -383,7 +383,17 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   is never silent. A degenerate oligo gets a real nearest-neighbour `tm` —
   its WEAKEST variant, which is what sets the anneal — plus `tm_range`
   spanning the mix. Sites come back ranked, and `truncated` says whether
-  `max_sites` cut the list short), optimize-protein
+  `max_sites` cut the list short. Set `tm_profile` to
+  `"benchling_compatible"` to use the same SantaLucia conditions as the
+  Benchling-compatible design modes), check-primer-pair
+  (a complete forward/reverse PCR-primer pair against one template. Optional
+  `forward_binding` and `reverse_binding` identify the annealing 3' suffixes,
+  while hairpin and dimer checks use each complete oligo, including its 5'
+  cloning tail. The response reports binding sites, Tm difference,
+  homo/heterodimer energies and candidate amplicons. `truncated` on either
+  primer or `amplicons_truncated` on the pair means the capped search was not
+  exhaustive, so uniqueness is not established. A dU base is read as T and
+  reported with `read_u_as_t`), optimize-protein
   (codon-optimise an AA sequence to a chosen table — `table` is a taxid
   (integer or string) OR a table NAME, and one it cannot resolve is a `404`,
   never a quiet fall-back to the E. coli default; optional `stops`
@@ -938,7 +948,11 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   primer-collection, parts-bin, experiment-project, enzyme-collection,
   hmm-database) has a matching `get-active-*` so a client can read the
   current selection before changing it.
-- **Utility** — check-primer-duplicates, capture-snapshot.
+- **Primer Tm profiles** — `design-primers` accepts
+  `tm_profile: "benchling_compatible"` in `cloning` and `generic` modes.
+  Detection mode accepts only `primer3_default` because Primer3 calculates Tm
+  during pair design.
+- **Utility** — check-primer-pair, check-primer-duplicates, capture-snapshot.
 - **OT-2 / Opentrons** (liquid-handler control) — `ot2-compile` turns a
   plate-transfer plan (a pipette, labware on deck slots, and `from → to` well
   transfers with µL volumes) into an Opentrons Protocol API v2 `.py` text,

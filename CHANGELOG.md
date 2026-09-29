@@ -14,6 +14,17 @@
 
 ---
 
+## Unreleased
+
+### Added
+
+- **Primer checks now support a Benchling-compatible Tm profile and pair-level
+  analysis.** `check-primer` and the simple `design-primers` modes can use
+  the opt-in profile. The new read-only `check-primer-pair` endpoint checks the
+  annealing arms against a template while evaluating hairpins and dimers on the
+  complete oligos, including cloning tails. Responses mark truncated site and
+  amplicon searches. They also report dU-to-T normalization.
+
 ## [1.3.5] — 2026-09-29
 
 ### Bug fixes

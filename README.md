@@ -404,6 +404,9 @@ A 260+ endpoint localhost JSON API (`splicecraft --agent`, or `--headless` for
 a no-UI server with a `/healthz` probe) and a stdlib-only CLI
 (`splicecraft-cli`, including a `call` passthrough to every endpoint) drive
 every workflow. `/tools` self-describes each endpoint's request schema.
+Primer workflows include pair-level binding, amplicon and secondary-structure
+checks, plus an opt-in Benchling-compatible Tm profile for single-primer and
+simple cloning/generic primer design.
 `--agent --read-only` attaches **alongside a running GUI** — every read answers,
 every write returns 409 naming the process holding the lock, and nothing on
 disk changes. See [`docs/agent-api.md`](docs/agent-api.md) and

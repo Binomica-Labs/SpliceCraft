@@ -122,6 +122,33 @@ _MUT_BSAI_REV_TAIL = "CCCC" + "GGTCTCA" + "AACG"   # 15 nt; AACG = revcomp(CGTT)
 _MUT_P3 = dict(mv_conc=50.0, dv_conc=1.5, dntp_conc=0.6, dna_conc=50.0)
 
 
+# Tm conditions for primer-check and simple primer-design endpoints.
+# `primer3_default` uses Primer3 defaults. `benchling_compatible` specifies
+# SantaLucia conditions for comparison with Benchling results.
+_TM_PROFILES = {
+    "primer3_default": {},
+    "benchling_compatible": {
+        "mv_conc": 50.0,
+        "dv_conc": 0.0,
+        "dntp_conc": 0.0,
+        "dna_conc": 250.0,
+        "tm_method": "santalucia",
+        "salt_corrections_method": "santalucia",
+        "max_nn_length": 60,
+    },
+}
+
+
+def _tm_profile_kwargs(name: str = "primer3_default") -> dict:
+    """Return a copy of Primer3 kwargs for a supported Tm profile."""
+    if name not in _TM_PROFILES:
+        raise ValueError(
+            f"unknown tm_profile {name!r}. Expected one of "
+            f"{', '.join(_TM_PROFILES)}"
+        )
+    return dict(_TM_PROFILES[name])
+
+
 def _mut_parse(s: str) -> tuple:
     """Parse a mutation string like 'W140F'. Returns (wt_aa, pos_1based, mut_aa)."""
     m = re.fullmatch(r"([A-Za-z\*])(\d+)([A-Za-z\*])", s.strip())
@@ -264,6 +291,22 @@ def _mut_homodimer_dg(seq: str) -> "float | None":
         return None
     _mut_thermo_cache_put(_MUT_HOMODIMER_CACHE, seq, val)
     return val
+
+
+def _primer_heterodimer_dg(seq1: str, seq2: str) -> "float | None":
+    """Pair heterodimer ΔG in kcal/mol, or ``None`` when unmeasured."""
+    try:
+        import primer3
+        return (primer3.calc_heterodimer(
+            seq1, seq2,
+            mv_conc=_MUT_P3["mv_conc"], dv_conc=_MUT_P3["dv_conc"],
+            dntp_conc=_MUT_P3["dntp_conc"], dna_conc=_MUT_P3["dna_conc"],
+        ).dg / _CAL_PER_KCAL)
+    except Exception:
+        _log.exception(
+            "_primer_heterodimer_dg: primer3.calc_heterodimer raised on "
+            "%d/%d-mers. Reporting None (not measured)", len(seq1), len(seq2))
+        return None
 
 
 def _mut_gc_pct(seq: str) -> float:
@@ -555,7 +598,7 @@ def _primer_check_confidence(pct: "float | int | None") -> "tuple[str, str]":
 # designers (primer3 thermodynamics; enzyme catalog via _state._all_enzymes_hook).
 # Verified by the real-plasmid design golden (byte-identical output). The GB /
 # domestication-scrub designers (_design_gb_primers / _scrub_*) stay hub-side.
-def _primer_tm(seq: str) -> "float | None":
+def _primer_tm(seq: str, tm_profile: str = "primer3_default") -> "float | None":
     """Melting temperature (°C, 1 dp) of an oligo — primer3's nearest-neighbour
     model when available, else the 2(A+T)+4(G+C) rule. Module-level so the CSV
     import (and any caller) can compute a Tm without the local ``_calc_tm``
@@ -563,13 +606,14 @@ def _primer_tm(seq: str) -> "float | None":
     s = (seq or "").strip().upper()
     if not s:
         return None
+    conditions = _tm_profile_kwargs(tm_profile)
     try:
         import primer3
-        return round(float(primer3.calc_tm(s)), 1)
+        return round(float(primer3.calc_tm(s, **conditions)), 1)
     except Exception:
         # Degenerate oligo → its weakest member's NN Tm (what the anneal must
         # respect), not the 2+4 rule, which runs ~8-12 °C away from it.
-        bracket = _degenerate_tm_bracket(s)
+        bracket = _degenerate_tm_bracket(s, **conditions)
         if bracket is not None:
             return round(bracket[0], 1)
         gc = sum(1 for c in s if c in "GC")
@@ -604,7 +648,8 @@ def _binding_max_len(tail_len: int, min_len: int = 18) -> int:
 
 
 def _pick_binding_region(seq: str, target_tm: float = 60.0,
-                         min_len: int = 18, max_len: int = 25) -> tuple[str, float]:
+                         min_len: int = 18, max_len: int = 25,
+                         tm_profile: str = "primer3_default") -> tuple[str, float]:
     """Return the prefix of `seq` (length min_len..max_len) whose Tm is
     closest to `target_tm`. Uses primer3-py's SantaLucia Tm calculation.
 
@@ -625,6 +670,7 @@ def _pick_binding_region(seq: str, target_tm: float = 60.0,
         # (mirrors `_primer_tm` / `_mut_tm`).
         return float(2 * at + 4 * gc + 3 * (len(u) - gc - at))
     _tm: "_Callable[..., float]"
+    conditions = _tm_profile_kwargs(tm_profile)
     try:
         import primer3
         _p3_tm = primer3.calc_tm
@@ -656,7 +702,8 @@ def _pick_binding_region(seq: str, target_tm: float = 60.0,
         # longer drops the whole design onto the 2+4 rule.
         def _tm_nn(s: str) -> float:
             try:
-                return float(_p3_tm(s.upper().translate(_IUPAC_WEAKEST_BASE)))
+                return float(_p3_tm(
+                    s.upper().translate(_IUPAC_WEAKEST_BASE), **conditions))
             except (ValueError, OSError, RuntimeError, TypeError):
                 return _tm_fallback(s)
         _window = seq[:max_len].upper()
@@ -823,6 +870,7 @@ def _design_cloning_primers_raw(
     name_3: str = "3'site",
     target_tm: float = 60.0,
     padding: str = "GCGC",
+    tm_profile: str = "primer3_default",
 ) -> dict:
     """Design cloning primers with arbitrary recognition-site tails + padding.
 
@@ -853,10 +901,12 @@ def _design_cloning_primers_raw(
     # Cap each binding so the TOTAL oligo (tail + binding) stays within
     # `_PRIMER_MAX_OLIGO_LEN`; tail = padding + RE site.
     fwd_bind, fwd_tm = _pick_binding_region(
-        insert, target_tm, max_len=_binding_max_len(len(padding) + len(site_5)))
+        insert, target_tm, max_len=_binding_max_len(len(padding) + len(site_5)),
+        tm_profile=tm_profile)
     rev_bind, rev_tm = _pick_binding_region(
         _rc(insert), target_tm,
-        max_len=_binding_max_len(len(padding) + len(site_3)))
+        max_len=_binding_max_len(len(padding) + len(site_3)),
+        tm_profile=tm_profile)
 
     fwd_full = padding + site_5 + fwd_bind
     rev_full = padding + _rc(site_3) + rev_bind
@@ -893,6 +943,7 @@ def _design_cloning_primers(
     re_3prime: str,
     target_tm: float = 60.0,
     padding: str = "GCGC",
+    tm_profile: str = "primer3_default",
 ) -> dict:
     """Design cloning primers using enzyme names from the combined
     catalog (built-in NEB ∪ user-added custom). Delegates to
@@ -907,7 +958,7 @@ def _design_cloning_primers(
     return _design_cloning_primers_raw(
         template_seq, start, end, site_5, site_3,
         name_5=re_5prime, name_3=re_3prime,
-        target_tm=target_tm, padding=padding,
+        target_tm=target_tm, padding=padding, tm_profile=tm_profile,
     )
 
 
@@ -917,6 +968,7 @@ def _design_generic_primers(
     start: int,
     end: int,
     target_tm: float = 60.0,
+    tm_profile: str = "primer3_default",
 ) -> dict:
     """Design simple binding primers (no tails, no RE sites, no overhangs).
 
@@ -931,9 +983,10 @@ def _design_generic_primers(
     # No tail (binding-only primers) → the whole oligo IS the binding, so it
     # may grow up to the full `_PRIMER_MAX_OLIGO_LEN`.
     fwd_bind, fwd_tm = _pick_binding_region(
-        insert, target_tm, max_len=_binding_max_len(0))
+        insert, target_tm, max_len=_binding_max_len(0), tm_profile=tm_profile)
     rev_bind, rev_tm = _pick_binding_region(
-        _rc(insert), target_tm, max_len=_binding_max_len(0))
+        _rc(insert), target_tm, max_len=_binding_max_len(0),
+        tm_profile=tm_profile)
     if wraps:
         fwd_pos = (start, (start + len(fwd_bind)) % total)
         rev_pos = ((end - len(rev_bind)) % total, end)
