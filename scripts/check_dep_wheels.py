@@ -32,6 +32,7 @@ import tomllib
 from pathlib import Path
 
 from packaging.requirements import Requirement
+from packaging.version import InvalidVersion, Version
 
 ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = ROOT / "pyproject.toml"
@@ -127,6 +128,52 @@ def _wheel_exists(spec: str, py: str, plat_tags: list[str], cache: str) -> bool:
     return subprocess.run(cmd, capture_output=True, text=True).returncode == 0
 
 
+def _newest_allowed(req: Requirement, cache: str) -> "str | None":
+    """The version a real ``pip install`` would actually pick for *req* — the
+    highest release its specifier allows. None if that can't be determined.
+
+    This exists because `_wheel_exists` answers a subtly different question
+    than the one that matters. It runs ``pip download --only-binary=:all:``,
+    which FORCES pip to find a wheel, so pip is free to backtrack to an older
+    release inside the range that still has one. A real user's pip is not so
+    restricted: it takes the NEWEST allowed version and, finding only an sdist
+    for their platform, compiles it.
+
+    So a cap raised past a release that DROPPED a platform's wheels reported
+    clean — the exact shape of Dependabot PR #26 (biopython `<1.87` → `<1.89`,
+    where 1.87 and 1.88 ship no Intel-macOS wheels but 1.86 does). Range
+    coverage was green; a real Intel-Mac install would have compiled biopython
+    from source. Pinning the newest allowed version is what closes that gap.
+
+    Implemented with pip rather than a PyPI JSON call so it honours whatever
+    index the caller is configured against.
+    """
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "index", "versions", req.name,
+         "--disable-pip-version-check"],
+        capture_output=True, text=True, cwd=cache,
+    )
+    if r.returncode != 0:
+        return None
+    # "name (1.2.3)\n  Available versions: 1.2.3, 1.2.2, ..."
+    for line in r.stdout.splitlines():
+        if "Available versions:" not in line:
+            continue
+        raw = line.split("Available versions:", 1)[1]
+        versions = []
+        for chunk in raw.split(","):
+            try:
+                versions.append(Version(chunk.strip()))
+            except InvalidVersion:
+                continue
+        allowed = [v for v in versions
+                   if req.specifier.contains(v, prereleases=False)]
+        if allowed:
+            return str(max(allowed))
+        return None
+    return None
+
+
 def check() -> int:
     deps = _required_deps()
     # entries are (name, requirement-str, platform-label, py)
@@ -134,12 +181,41 @@ def check() -> int:
     checked = 0
     with tempfile.TemporaryDirectory(prefix="wheelcheck-") as cache:
         for req in deps:
+            # The version a real resolver picks. Checking the RANGE alone lets
+            # pip backtrack to an older release that still has a wheel, which
+            # hides a cap raised past a release that dropped one — see
+            # `_newest_allowed`. Pin it and ask again.
+            newest = _newest_allowed(req, cache)
+            if newest is None:
+                print(f"  note: couldn't determine the newest allowed version "
+                      f"for {str(req)!r}; checked the range only.")
             for label, sysplat, machine, tags in PLATFORMS:
                 for py in PYTHONS:
                     env = _marker_env(sysplat, machine, py)
                     if req.marker is not None and not req.marker.evaluate(env):
                         continue  # marker excludes this dep here — not required
                     checked += 1
+                    # Ask about the PINNED newest first: it is what a real
+                    # install resolves to, and if it has a wheel the range
+                    # trivially does too — so the common all-green path costs
+                    # one probe per cell, not two. Only when the pin fails is
+                    # the range worth checking, and then only to tell a hard
+                    # miss (nothing in range has a wheel) apart from the blind
+                    # spot (range resolves by backtracking, newest does not).
+                    if newest is not None:
+                        if _wheel_exists(f"{req.name}=={newest}", py, tags,
+                                         cache):
+                            continue
+                        spec = f"{req.name}{req.specifier}"
+                        if _wheel_exists(spec, py, tags, cache):
+                            missing.append(
+                                (req.name,
+                                 f"{req} (newest allowed: {newest} — the range "
+                                 f"resolves only by backtracking to an older "
+                                 f"release)", label, py))
+                        else:
+                            missing.append((req.name, str(req), label, py))
+                        continue
                     spec = f"{req.name}{req.specifier}"  # keep the version floor
                     if not _wheel_exists(spec, py, tags, cache):
                         missing.append((req.name, str(req), label, py))

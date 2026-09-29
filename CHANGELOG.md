@@ -14,6 +14,42 @@
 
 ---
 
+## [1.3.4] — 2026-09-28
+
+### Bug fixes
+
+- **A primer from another vector is no longer drawn on the wrong bases.**
+  (Reported as issue #22 — thank you.) Adding a primer from the library to the
+  map placed it at the coordinates it had on whatever molecule it was designed
+  against. If it didn't anneal to the plasmid you had open — a primer carried
+  over from a different vector, or a "generic" primer designed from a pasted
+  sequence — it was drawn at a position it has no relationship to, and the map
+  showed it as a *fully annealed* bar: no mismatch marks, no weak-binding
+  flag, nothing to suggest the primer and the DNA under it had nothing to do
+  with each other. Ordering from that is a wasted experiment.
+
+  SpliceCraft now works out where each primer actually anneals on the plasmid
+  in front of you and adds it there. One that doesn't bind is left off and
+  named, so you are told rather than shown something untrue. Primers carrying
+  deliberate mismatches are unaffected — a mutagenic primer, an
+  allele-specific one, or a cloning primer with a restriction-site tail all
+  still land correctly, because the position is read from the 3′ end that does
+  anneal. Select several primers and only some bind, and the ones that bind
+  are still added.
+
+### Hardening
+
+- **The release check that keeps installs wheel-only had a blind spot.** It
+  asked whether *some* version in a dependency's allowed range has a wheel for
+  every platform. But `pip` installs the *newest* allowed version, so raising
+  a version cap past a release that dropped a platform's wheels still looked
+  clean while a real install on that platform would silently compile from
+  source. The check now tests the version a real install would actually
+  resolve to. Caught live: a proposed biopython bump to `<1.89` reports as a
+  failure for Intel macOS, which is correct — 1.87 and 1.88 ship no Intel-mac
+  wheels. The check is no slower, because the more meaningful probe replaces
+  the old one rather than adding to it.
+
 ## [1.3.3] — 2026-09-28
 
 ### New features

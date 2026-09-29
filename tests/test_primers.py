@@ -1523,16 +1523,28 @@ class TestAddSelectedPrimerTopology:
     `PlasmidMap._parse` got the v1.0.14 topology fix), so it wrapped
     linear fragments too."""
 
-    SEQ = "ACGTACGTAC" * 12          # 120 bp; no 12-bp run of the primer
+    # 120 bp, NON-repetitive: every 12-mer is unique even across the origin,
+    # so a wrap binding is distinguishable from a non-wrap one. The previous
+    # substrate was `"ACGTACGTAC" * 12`, which is periodic with period 10 over
+    # a length that is a multiple of 10 — rotationally symmetric, so a
+    # "wrapping" primer was indistinguishable from any other placement.
+    SEQ = ("AGACTTTCAAAGATATGCTGGGTAGAGGTCGAGGTTATTATTTGTTACCAATTCTCATTGT"
+           "GTTTCGGAACTTGCGTTTTAGGTATGTCTTAGTGACTCTAAATACCAAGGCAGTCCTCG")
 
     def _seed_wrap_primer(self):
-        # A primer absent from the template (re-derivation returns None →
-        # the STALE wrap position drives the branch) with pos_end <
-        # pos_start (wraps the 120-bp origin).
+        # A primer that GENUINELY anneals across the origin: the template's
+        # last 12 bases followed by its first 12.
+        #
+        # This used to seed a primer ABSENT from the template, so that
+        # re-derivation returned None and the STALE stored wrap position drove
+        # the branch — which pinned the issue-#22 bug (a foreign primer drawn
+        # at coordinates from another molecule) as though it were intended.
+        # The topology rule under test is unchanged; it is now exercised with
+        # a primer that actually binds, which is the only way the wrap is real.
         sc._save_primers([{
             "name": "wrapper",
-            "sequence": "GGGGGCCCCCAAAAATTTTTGG",
-            "pos_start": 110, "pos_end": 6, "strand": 1,
+            "sequence": self.SEQ[-12:] + self.SEQ[:12],
+            "pos_start": 108, "pos_end": 12, "strand": 1,
         }])
 
     async def _primer_loc_types(self, rec, isolated_library):
@@ -1571,6 +1583,78 @@ class TestAddSelectedPrimerTopology:
         locs = await self._primer_loc_types(rec, isolated_library)
         assert "CompoundLocation" in locs, (
             "a circular record should keep the wrap primer (topology control)"
+        )
+
+    async def test_foreign_primer_is_not_drawn_at_its_stored_position(
+            self, isolated_library, isolated_primers):
+        """Issue #22: a primer designed against a DIFFERENT molecule must not
+        be annotated at the coordinates it had there.
+
+        This is the catastrophic-class failure the whole path guards against —
+        the map drew such a primer as a fully annealed bar (no mismatch marks,
+        no weak flag) over bases it shares nothing with, so it read as a clean
+        binding. Re-derivation already returned None here; the bug was the
+        fallback to `pos_start`/`pos_end`.
+        """
+        foreign = "GGGCCCAAATTTGGGCCCAAAT"       # absent from SEQ
+        assert foreign not in self.SEQ and sc._rc(foreign) not in self.SEQ
+        sc._save_primers([{
+            "name": "from_other_vector",
+            "sequence": foreign,
+            # Coordinates from the vector it was designed against. In range
+            # here, so nothing else rejects them — only binding does.
+            "pos_start": 25, "pos_end": 47, "strand": 1,
+        }])
+        rec = _topo_record(self.SEQ, circular=True, rid="CIRC2")
+        locs = await self._primer_loc_types(rec, isolated_library)
+        assert locs == [], (
+            "a primer that doesn't anneal to this plasmid must be skipped, "
+            f"not drawn at its stored coordinates — got {locs}"
+        )
+
+    async def test_mixed_selection_adds_the_binder_and_drops_the_rest(
+            self, isolated_library, isolated_primers):
+        """A partial failure must not become an all-or-nothing one.
+
+        Selecting a binding primer alongside a foreign one has to add the
+        binder and drop only the foreign one — refusing the whole batch would
+        be its own wrong answer, and adding both is the issue-#22 bug.
+        """
+        binder = self.SEQ[30:52]                    # anneals at [30, 52)
+        foreign = "GGGCCCAAATTTGGGCCCAAAT"
+        sc._save_primers([
+            {"name": "binds-here", "sequence": binder,
+             # Deliberately WRONG stored coordinates: if these ever drive the
+             # annotation the assertion below catches it.
+             "pos_start": 5, "pos_end": 27, "strand": 1},
+            {"name": "from_other_vector", "sequence": foreign,
+             "pos_start": 25, "pos_end": 47, "strand": 1},
+        ])
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        rec = _topo_record(self.SEQ, circular=True, rid="CIRC3")
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            screen = sc.PrimerDesignScreen(str(rec.seq), [], rec.id)
+            app.push_screen(screen)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            screen._lib_selected = {0, 1}           # select BOTH
+            screen._add_selected_to_map(None)
+            await pilot.pause(0.05)
+            feats = [f for f in app._current_record.features
+                     if f.type == "primer_bind"]
+            spans = [(int(f.location.start), int(f.location.end))
+                     for f in feats]
+            labels = [f.qualifiers.get("label", [""])[0] for f in feats]
+            app.exit()
+        assert labels == ["binds-here"], (
+            f"only the primer that anneals should be drawn — got {labels}"
+        )
+        assert spans == [(30, 52)], (
+            "the binder must be annotated where it actually anneals, not at "
+            f"its stored pos_start/pos_end of (5, 27) — got {spans}"
         )
 
 

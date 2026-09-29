@@ -42,7 +42,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.3.3"
+__version__ = "1.3.4"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
@@ -97320,6 +97320,7 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             (getattr(new_rec, "annotations", {}) or {}).get("topology", "")
         ).strip().lower() != "linear"
         added = []
+        unbound: list[str] = []
         for idx in sorted(self._lib_selected):
             if idx < 0 or idx >= len(primers):
                 continue
@@ -97332,18 +97333,45 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             # Safety net (2026-05-30): re-derive the binding straight from
             # the loaded template so a stale / mis-saved pos_start/pos_end
             # can't park the primer off its real site — the displayed
-            # primer letters then always line up with the DNA they anneal
-            # to. Falls back to the stored positions when the primer
-            # doesn't cleanly match this template (e.g. a primer for a
-            # different construct, or one carrying intended mismatches).
+            # primer letters then always line up with the DNA they anneal to.
+            #
+            # Issue #22 (2026-09-28): this used to FALL BACK to the stored
+            # pos_start/pos_end when re-derivation found nothing. Those
+            # coordinates belong to whatever molecule the primer was designed
+            # against, so a primer carried over from another vector — or a
+            # "generic" primer designed from a pasted sequence — was drawn at
+            # a position on THIS plasmid that it has no relationship to. The
+            # map then rendered it as a fully annealed bar (no mismatch
+            # bumps, no weak flag) over bases it shares nothing with: silent
+            # wrong biology, and a mis-placed primer is catastrophic
+            # ([[project_primer_design_catastrophic]]). The sibling
+            # `_attach_named_primers_to_record` already SKIPS a primer that
+            # doesn't bind; this path now agrees with it instead of guessing.
+            #
+            # A primer carrying INTENDED mismatches still lands correctly and
+            # does not need the old fallback: `_rederive_primer_binding` takes
+            # the LONGEST contiguous 3' stretch that matches and treats
+            # everything 5' of it as flap, so a mutagenic primer (central
+            # edit), an allele-specific one, and a tailed cloning primer
+            # (enzyme site / fusion overhang) all re-derive as long as their
+            # 3' anchor is >= `_PRIMER_REBIND_MIN`. What no longer gets drawn
+            # is a primer with no such anchor here — which is a primer that
+            # does not anneal to this plasmid at all.
             if full_seq:
                 rb = _rederive_primer_binding(
                     full_seq, int(strand or 1), str(new_rec.seq),
                     total, hint_start=int(p_start or 0),
                     circular=is_circ,
                 )
-                if rb is not None:
-                    p_start, p_end = rb
+                if rb is None:
+                    _log.info(
+                        "add-to-map: %r doesn't bind this plasmid "
+                        "(no >=%d bp 3' match) — skipped rather than drawn "
+                        "at its stored position", name, _PRIMER_REBIND_MIN,
+                    )
+                    unbound.append(name)
+                    continue
+                p_start, p_end = rb
             if p_end == p_start:
                 continue
             # Wrap primer: pos_end < pos_start means the binding region
@@ -97400,9 +97428,22 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             ))
             added.append(name)
 
+        # Say which primers didn't bind, by name. Skipping them silently
+        # would trade one wrong answer for another: the user selected them
+        # and would otherwise be left believing they were drawn.
+        if unbound:
+            self.app.notify(
+                f"{len(unbound)} primer{'s' if len(unbound) != 1 else ''} "
+                f"do{'' if len(unbound) != 1 else 'es'} not bind this plasmid "
+                f"and {'were' if len(unbound) != 1 else 'was'} not added: "
+                f"{', '.join(unbound)}",
+                severity="warning",
+            )
+
         if not added:
-            self.app.notify("Selected primers are already on the map.",
-                            severity="information")
+            if not unbound:
+                self.app.notify("Selected primers are already on the map.",
+                                severity="information")
             return
 
         try:
