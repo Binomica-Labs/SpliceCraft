@@ -290,12 +290,14 @@ path:
 2. **To experiment, sandbox with `SPLICECRAFT_DATA_DIR`** and run a whole
    throwaway daemon — cheap, and completely isolated from the real library:
    ```bash
-   export SPLICECRAFT_DATA_DIR=$(mktemp -d)
-   export SPLICECRAFT_LOG="$SPLICECRAFT_DATA_DIR/sandbox.log"   # spare the real log
-   splicecraft --headless --agent-port 6899 </dev/null &        # own data dir AND lock
+   mkdir -p /tmp/sc-sandbox
+   export SPLICECRAFT_DATA_DIR=/tmp/sc-sandbox              # app AND cli, one value
+   export SPLICECRAFT_LOG=/tmp/sc-sandbox/sandbox.log       # spare the real log
+   splicecraft --headless --agent-port 6899 </dev/null &    # own data dir AND lock
    until splicecraft-cli status >/dev/null 2>&1; do sleep 0.3; done
-   test -f "$SPLICECRAFT_DATA_DIR/collections.json" || echo "NOT sandboxed — stop"
+   test -f /tmp/sc-sandbox/collections.json || echo "NOT sandboxed — stop"
    ```
+   (Pick a fresh directory per run if you want a clean slate each time.)
    Use `SPLICECRAFT_DATA_DIR`, **not `XDG_DATA_HOME`**: it is honoured first, on
    every platform, sets the app and the CLI from one value, and points *directly*
    at the dir (nothing is appended). `XDG_DATA_HOME` works on Linux and macOS but
@@ -306,9 +308,9 @@ path:
 
    **Verify the sandbox on the filesystem, not over the API.** No endpoint
    reports which data dir the session is using — `status` has no `data_dir`
-   field — so the surest check is that the daemon created its own files where
-   you pointed it, as in the snippet above (`collections.json` is written at
-   launch).
+   field — so the surest check is that the daemon created its own files in the
+   directory you named, as in the snippet above (`collections.json` is written
+   at launch).
 3. **Never `import splicecraft` in a scratch script** against the real data dir:
    the path is fixed at import time, so it is too late to redirect afterwards.
    Prefer the API. If you genuinely need Python-level access, set the env var
