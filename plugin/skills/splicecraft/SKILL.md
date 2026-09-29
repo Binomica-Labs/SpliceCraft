@@ -245,17 +245,26 @@ it your first call in any sequence rather than inferring state from a read.
 
 ## 5. Making writes safe to retry
 
-The retry hazard on an unattended batch of creates: a network hiccup makes you
-re-send, the artifact gets created twice, and the name-collision logic yields
-`"Foo_2"` — leaving you unable to tell whether the original landed.
+The hazard on an unattended batch: a call succeeds, the connection drops before
+you see the response, and you re-send. Named creates refuse duplicates rather
+than making a second copy, so what you get back is `409 "… already exists"` — an
+*error* for an operation that actually worked. A batch loop reading that as
+failure will abort or mis-report a build that is, in fact, fine.
 
-The server supports an **`X-Idempotency-Key`** header on write endpoints (60 s
-TTL, the key bound to a hash of the body; a reused key with a *different* body
-is a `409` and does nothing, which is the whole point — `409`s and `5xx`s are
-never cached, so those retry normally). `splicecraft-cli` doesn't currently
-expose it, so in practice: **check before you re-send.** After a failure with an
-unclear outcome, `list-collections` / `list-library` / `list-primers` and look
-before retrying, rather than assuming nothing happened.
+Pass `--idempotency-key` on writes you may need to re-send:
+
+```bash
+splicecraft-cli call create-collection --json '{"name":"Build 07"}' \
+    --idempotency-key build-07-collection
+```
+
+Within 60 s, the same key **with the same body** replays the first response —
+you get the original success back, stamped `_idempotent_replay: true`, instead
+of the 409. The same key with a *different* body is refused (`409`, nothing
+done), which is the point: it can't silently hand you another request's answer.
+Use a **fresh key per distinct request**. Keys are `[A-Za-z0-9_-]`, 128 chars
+max. `409`s and `5xx`s are never cached, so genuine failures still retry
+normally.
 
 Better still, avoid the situation: the bulk endpoints — `add-features`,
 `copy-plasmids`, `move-plasmids`, `delete-primers` — do N items in one locked
@@ -392,18 +401,18 @@ Load as needed — detail, not prerequisites:
 - **`references/endpoints.md`** — all 267 endpoints organised by what you're
   trying to do, with the per-cluster gotchas worth knowing before you call.
 
-SpliceCraft's own reference docs are in its repository — `docs/agent-api.md`
-(the contract in prose), `docs/cli.md`, `docs/features.md` — at
-<https://github.com/Binomica-Labs/SpliceCraft>. Those paths exist in a source
-checkout; from a `pipx`/`pip` install they don't, so fetch them from the repo
-rather than telling the user a file is missing.
+SpliceCraft keeps its own reference docs — `docs/agent-api.md` (the contract in
+prose), `docs/cli.md`, `docs/features.md` — in the project's source tree. Those
+paths exist in a checkout; from a `pipx` or `pip` install they don't, so look
+them up in the project's repository rather than telling the user a file is
+missing.
 
 ## A note on shells
 
 The snippets here are POSIX shell. On Windows outside WSL the shell is usually
-PowerShell, where `export VAR=x` is `$env:VAR = "x"`, `$(mktemp -d)` has no
-direct equivalent (use `New-TemporaryFile`/`$env:TEMP` and make a directory),
-and `until … done` / `</dev/null` don't exist. The *endpoint* behaviour is
-identical everywhere — only the shell syntax changes, so translate rather than
-reporting that something is unsupported. `splicecraft-cli` itself is
+PowerShell, which sets environment variables through its own `env:` drive rather
+than `export`, has no `mktemp -d` (make a directory under the temp path
+instead), and has neither `until … done` nor `</dev/null`. The *endpoint*
+behaviour is identical everywhere — only the shell syntax changes, so translate
+rather than reporting that something is unsupported. `splicecraft-cli` itself is
 cross-platform.

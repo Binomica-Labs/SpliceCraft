@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -161,7 +162,8 @@ class _AgentCliError(Exception):
 
 def _request(endpoint: str, method: str = "GET",
               payload: "dict | None" = None,
-              timeout: float = 30.0) -> dict:
+              timeout: float = 30.0,
+              idempotency_key: "str | None" = None) -> dict:
     host, port, token = _read_session()
     url = f"http://{host}:{port}/{endpoint}"
     data = (json.dumps(payload or {}).encode("utf-8")
@@ -170,6 +172,8 @@ def _request(endpoint: str, method: str = "GET",
     req.add_header("Authorization", f"Bearer {token}")
     if data is not None:
         req.add_header("Content-Type", "application/json")
+    if idempotency_key:
+        req.add_header("X-Idempotency-Key", idempotency_key)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             # Cap the read size symmetric with the server's cap; a
@@ -222,8 +226,36 @@ def _emit_json(obj) -> None:
     print(json.dumps(obj, indent=2, default=str))
 
 
+_IDEMPOTENCY_KEY_MAX = 128
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_idempotency_key(key: str) -> str:
+    """Reject a key the server would reject, before the request goes out.
+
+    The server constrains the key to ``[A-Za-z0-9_-]`` (so nothing that
+    could reach a log as an escape or a path separator) and caps it at 128
+    chars. Checking here turns a wasted round-trip into an argparse-time
+    error, and — more usefully — a caller who mistakenly passes something
+    like a whole JSON body or a path finds out immediately instead of
+    believing their batch was retry-safe when the header never applied.
+    """
+    if len(key) > _IDEMPOTENCY_KEY_MAX:
+        raise argparse.ArgumentTypeError(
+            f"idempotency key is {len(key)} chars; the server caps it at "
+            f"{_IDEMPOTENCY_KEY_MAX}"
+        )
+    if not _IDEMPOTENCY_KEY_RE.match(key):
+        raise argparse.ArgumentTypeError(
+            "idempotency key may contain only letters, digits, hyphen and "
+            "underscore"
+        )
+    return key
+
+
 def _call_pick_method(endpoint: str, method: str, payload: "dict | None",
-                       *, allow_upgrade: bool) -> dict:
+                       *, allow_upgrade: bool,
+                       idempotency_key: "str | None" = None) -> dict:
     """Issue the request, retrying once with the method the server names.
 
     `call` has to guess a method: with no `--json` there is no body to
@@ -237,13 +269,18 @@ def _call_pick_method(endpoint: str, method: str, payload: "dict | None",
     method and gets the real 405 back.
     """
     try:
-        return _request(endpoint, method=method, payload=payload)
+        return _request(endpoint, method=method, payload=payload,
+                        idempotency_key=idempotency_key)
     except _AgentCliError as exc:
         allow = (exc.payload or {}).get("allow") if isinstance(
             exc.payload, dict) else None
         if (allow_upgrade and exc.code == 405 and method == "GET"
                 and str(allow or "").upper() == "POST"):
-            return _request(endpoint, method="POST", payload=payload or {})
+            # Carry the key onto the retry: the whole point of the header is
+            # that the RETRY is the risky call, so dropping it here would
+            # leave exactly the request that needs protecting unprotected.
+            return _request(endpoint, method="POST", payload=payload or {},
+                            idempotency_key=idempotency_key)
         raise
 
 
@@ -268,7 +305,8 @@ def cmd_call(args) -> None:
     method = (args.method or ("POST" if payload is not None else "GET")).upper()
     try:
         result = _call_pick_method(args.endpoint, method, payload,
-                                    allow_upgrade=not explicit_method)
+                                    allow_upgrade=not explicit_method,
+                                    idempotency_key=args.idempotency_key)
     except _AgentCliError as exc:
         # Surface the structured server error as JSON (then exit
         # non-zero) rather than a bare message, so a calling script can
@@ -769,6 +807,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_call.add_argument("--json", default=None, metavar="JSON",
                          help="Request body as a JSON object, e.g. "
                               "'{\"old\": \"a\", \"new\": \"b\"}'.")
+    p_call.add_argument("--idempotency-key", default=None, metavar="KEY",
+                         type=_validate_idempotency_key,
+                         help="Make this write safe to retry: send "
+                              "X-Idempotency-Key. If the same key + same "
+                              "body arrives again within 60s the first "
+                              "result is replayed instead of the write "
+                              "running twice. Use a FRESH key per distinct "
+                              "request; the same key with a different body "
+                              "is refused (409) and does nothing. "
+                              "[A-Za-z0-9_-], max 128 chars.")
     p_call.set_defaults(fn=cmd_call)
 
     return parser

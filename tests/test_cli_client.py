@@ -521,3 +521,76 @@ class TestMainSmoke:
             result_code = 1
         # Either way, the user did not silently succeed.
         assert result_code != 0
+
+
+class TestCallIdempotencyKey:
+    """`--idempotency-key` on `call` (the retry-safety header).
+
+    Without it, re-sending a write whose response was lost comes back
+    `409 "... already exists"` — an ERROR for an operation that actually
+    succeeded, which a batch loop reads as failure. The header makes the
+    retry replay the original success instead.
+    """
+
+    def test_key_reaches_the_request_as_a_header(self, tmp_path, monkeypatch):
+        _setup_token(tmp_path, monkeypatch)
+        args = cli._build_parser().parse_args(
+            ["call", "create-collection", "--json", '{"name":"B"}',
+             "--idempotency-key", "build-07"])
+        with patch.object(cli, "_request", return_value={"ok": True}) as req:
+            args.fn(args)
+        assert req.call_args.kwargs["idempotency_key"] == "build-07"
+
+    def test_absent_by_default(self, tmp_path, monkeypatch):
+        """No flag must mean no header — sending a stale or shared key
+        silently would be worse than not offering the feature."""
+        _setup_token(tmp_path, monkeypatch)
+        args = cli._build_parser().parse_args(
+            ["call", "create-collection", "--json", '{"name":"B"}'])
+        with patch.object(cli, "_request", return_value={"ok": True}) as req:
+            args.fn(args)
+        assert req.call_args.kwargs["idempotency_key"] is None
+
+    def test_key_survives_the_405_method_upgrade(self, tmp_path, monkeypatch):
+        """`call` retries as POST when the server answers 405. The retry is
+        precisely the call the key protects, so dropping it there would leave
+        the risky request unprotected."""
+        _setup_token(tmp_path, monkeypatch)
+        args = cli._build_parser().parse_args(
+            ["call", "save", "--idempotency-key", "k1"])
+        err = cli._AgentCliError("needs POST (HTTP 405)", code=405,
+                                  payload={"allow": "POST"})
+        with patch.object(cli, "_request",
+                          side_effect=[err, {"ok": True}]) as req:
+            args.fn(args)
+        assert req.call_count == 2
+        assert req.call_args_list[1].kwargs["idempotency_key"] == "k1"
+
+    @pytest.mark.parametrize("bad,reason", [
+        ("has space", "letters, digits"),
+        ("slash/es", "letters, digits"),
+        ("dot.dot", "letters, digits"),
+        ("semi;colon", "letters, digits"),
+        ("n\newline", "letters, digits"),
+        ("k" * 129, "caps it at 128"),
+    ])
+    def test_server_rejectable_keys_fail_at_argparse(self, bad, reason, capsys):
+        """The server constrains the key to [A-Za-z0-9_-] and 128 chars.
+        Catching it here turns a wasted round-trip into an immediate error —
+        and stops a caller believing a batch was retry-safe when the header
+        was never accepted.
+
+        Asserting the REASON matters: without it this passes on a build that
+        has no such flag at all, because argparse rejects the unknown option
+        and raises the same SystemExit.
+        """
+        with pytest.raises(SystemExit):
+            cli._build_parser().parse_args(
+                ["call", "create-collection", "--idempotency-key", bad])
+        assert reason in capsys.readouterr().err
+
+    @pytest.mark.parametrize("ok", ["build-07", "a_b", "K" * 128, "9"])
+    def test_valid_keys_accepted(self, ok):
+        args = cli._build_parser().parse_args(
+            ["call", "create-collection", "--idempotency-key", ok])
+        assert args.idempotency_key == ok

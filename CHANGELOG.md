@@ -14,7 +14,21 @@
 
 ---
 
-## [Unreleased]
+## [1.3.3] — 2026-09-28
+
+### New features
+
+- **`splicecraft-cli call` can now make a write safe to re-send.** If a write
+  succeeds but you never see the response — the connection drops, a script is
+  killed — sending it again comes back "… already exists". That's an error for
+  something that actually worked, and an unattended batch reads it as a failure
+  and stops. Pass `--idempotency-key <key>` and the retry returns the *original*
+  result instead, marked `_idempotent_replay`. Reusing a key with a different
+  body is refused outright, so it can never hand you some other request's
+  answer. The server has supported this since the agent API shipped; until now
+  the only way to use it was to hand-write HTTP, which meant handling your own
+  API token. Keys are letters, digits, hyphen and underscore, up to 128
+  characters, checked before the request is sent.
 
 ### Hardening
 

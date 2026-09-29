@@ -70,7 +70,7 @@ The token file is two lines: `port\ntoken`. The CLI:
 | `list-restriction-sites`    | Scan the record for restriction sites                     |
 | `list-codon-tables`         | List available codon usage tables                         |
 | `optimize-protein <aa>`     | Codon-optimize AA sequence to DNA                         |
-| `call <endpoint>`           | Generic passthrough — call ANY endpoint (`--json '{...}'`, `--method`) |
+| `call <endpoint>`           | Generic passthrough — call ANY endpoint (`--json '{...}'`, `--method`, `--idempotency-key`) |
 
 Most subcommands support `--json` for machine-readable output and
 `--force` to override unsaved-changes guards.
@@ -84,6 +84,26 @@ splicecraft-cli call rename-plasmid --json '{"old":"My Plasmid","new":"My Plasmi
 splicecraft-cli call list-entry-vectors          # GET (no body)
 splicecraft-cli call blast --json '{"query":"ATGC...","collections":["MyCollection"]}'
 ```
+
+### Retry-safe writes (`--idempotency-key`)
+
+When a write's response is lost in transit, re-sending it comes back
+`409 "… already exists"` — an error for an operation that actually
+succeeded, which an unattended batch reads as a failure. Pass a key and
+the retry replays the first response instead:
+
+```bash
+splicecraft-cli call create-collection --json '{"name":"Build 07"}' \
+    --idempotency-key build-07-collection
+```
+
+Within 60 s, the same key with the **same** body returns the original
+result stamped `_idempotent_replay: true`. The same key with a
+**different** body is refused (`409`, nothing done) — it can never hand
+you another request's answer. Use a fresh key per distinct request;
+keys are `[A-Za-z0-9_-]`, 128 chars max, validated before the request
+leaves. `409`s and `5xx`s are never cached, so genuine failures retry
+normally. Reads are already idempotent and are not cached.
 
 Run `splicecraft-cli tools --json` first; each endpoint's `doc_full`
 documents its request body.
