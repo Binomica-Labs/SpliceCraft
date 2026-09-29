@@ -221,7 +221,7 @@ def test_claude_skill_is_collected_by_both_build_targets():
     from hatchling.builders.sdist import SdistBuilder
     from hatchling.builders.wheel import WheelBuilder
 
-    skill = "skills/splicecraft/SKILL.md"
+    skill = "plugin/skills/splicecraft/SKILL.md"
     for builder_cls, label in ((SdistBuilder, "sdist"), (WheelBuilder, "wheel")):
         collected = {
             f.relative_path.replace("\\", "/")

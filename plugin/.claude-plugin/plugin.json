@@ -2,7 +2,7 @@
   "name": "splicecraft",
   "displayName": "SpliceCraft",
   "description": "Drive SpliceCraft — a terminal plasmid-map viewer, sequence editor and molecular-cloning workbench — through its localhost agent API. Teaches Claude to connect (including attaching read-only to a session you already have open), the canvas-vs-library model, the 0-based forward-strand coordinate convention, the preview-then-commit endpoint pairs, and the results that look like success and are not.",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "author": {
     "name": "Binomica Labs",
     "url": "https://github.com/Binomica-Labs"

@@ -14,6 +14,24 @@
 
 ---
 
+## [1.3.2] — 2026-09-28
+
+### Bug fixes
+
+- **The Claude Skill moved to `plugin/skills/splicecraft/` so it can be listed in
+  Anthropic's plugin directory.** Submitting it was refused with "a file is too
+  large": the plugin sat at the repository root, which makes the *whole repo* the
+  plugin folder, and `splicecraft.py` is ~5.7 MB against a 5 MiB per-file limit.
+  The plugin now lives in its own subfolder — nothing about the skill's content
+  changed, and `claude plugin marketplace add Binomica-Labs/SpliceCraft` still
+  works unchanged, because the marketplace manifest stays at the repository root
+  and points into it. If you install the package and copy the skill in by hand,
+  the path is now `plugin/skills/splicecraft` (the README has the current
+  commands). As a bonus the plugin now passes `claude plugin validate --strict`
+  with no warnings at all.
+
+---
+
 ## [1.3.1] — 2026-09-28
 
 ### New features

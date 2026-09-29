@@ -65,9 +65,9 @@ SPLICECRAFT = REPO_ROOT / "splicecraft.py"
 # (`claude plugin marketplace add Binomica-Labs/SpliceCraft`), and the plugin
 # version is what `claude plugin update` compares against — leave it behind and
 # installed copies never see an update.
-PLUGIN_MANIFEST = REPO_ROOT / ".claude-plugin" / "plugin.json"
+PLUGIN_MANIFEST = REPO_ROOT / "plugin" / ".claude-plugin" / "plugin.json"
 MARKETPLACE_MANIFEST = REPO_ROOT / ".claude-plugin" / "marketplace.json"
-PLUGIN_SKILL = REPO_ROOT / "skills" / "splicecraft" / "SKILL.md"
+PLUGIN_SKILL = REPO_ROOT / "plugin" / "skills" / "splicecraft" / "SKILL.md"
 CHANGELOG = REPO_ROOT / "CHANGELOG.md"
 CONDA_RECIPE = REPO_ROOT / "conda-recipe" / "meta.yaml"
 CITATION_CFF = REPO_ROOT / "CITATION.cff"
@@ -634,7 +634,7 @@ def _bump_plugin_manifest(new_version: str) -> None:
         _die(f"plugin manifest missing: {PLUGIN_MANIFEST}")
     _bump_version_in_file(
         PLUGIN_MANIFEST, _PLUGIN_VERSION_RE, new_version,
-        ".claude-plugin/plugin.json",
+        "plugin/.claude-plugin/plugin.json",
     )
     for manifest in (PLUGIN_MANIFEST, MARKETPLACE_MANIFEST):
         try:
@@ -647,12 +647,12 @@ def _bump_plugin_manifest(new_version: str) -> None:
                  f"once published and must not go missing.")
     stamped = json.loads(PLUGIN_MANIFEST.read_text(encoding="utf-8"))
     if stamped.get("version") != new_version:
-        _die(f'failed to update .claude-plugin/plugin.json (expected version '
+        _die(f'failed to update plugin/.claude-plugin/plugin.json (expected version '
              f'"{new_version}", found "{stamped.get("version")}").')
     if not PLUGIN_SKILL.is_file():
         _die(f"plugin skill missing: {PLUGIN_SKILL} — the plugin would install "
              f"with no components.")
-    print(f"  .claude-plugin/plugin.json → {new_version} "
+    print(f"  plugin/.claude-plugin/plugin.json → {new_version} "
           f"(manifests parse, skill present)")
 
 

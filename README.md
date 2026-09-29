@@ -410,11 +410,11 @@ Or copy the folder in by hand, if you'd rather not add a marketplace:
 
 ```bash
 # from a checkout
-cp -r skills/splicecraft ~/.claude/skills/
+cp -r plugin/skills/splicecraft ~/.claude/skills/
 
 # from an installed copy (find_spec locates the package without importing it)
 SC=$(python3 -c "import importlib.util,pathlib;print(pathlib.Path(importlib.util.find_spec('splicecraft').origin).parent)")
-cp -r "$SC/skills/splicecraft" ~/.claude/skills/
+cp -r "$SC/plugin/skills/splicecraft" ~/.claude/skills/
 ```
 
 Claude then picks it up whenever a task involves plasmids, cloning, primers or a

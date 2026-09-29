@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "splicecraft",
-      "source": "./",
+      "source": "./plugin",
       "description": "Drive SpliceCraft's plasmid workbench through its localhost agent API: annotate records, design and verify primers, simulate Golden Gate / Gibson / restriction clones, codon-optimize, design CRISPR guides, verify builds against sequencing reads."
     }
   ]
