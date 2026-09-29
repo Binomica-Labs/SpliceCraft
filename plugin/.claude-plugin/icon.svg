@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="SpliceCraft: a circular plasmid map">
+  <title>SpliceCraft</title>
+
+  <!-- Rounded tile. Deep slate reads on both light and dark surfaces, so the
+       mark never sits on an invisible background the way a transparent icon
+       can when the host theme flips. -->
+  <rect width="256" height="256" rx="56" fill="#141C2B"/>
+
+  <!-- The plasmid backbone: a closed circle, because the whole tool is about
+       circular DNA and the origin-wrap that comes with it. -->
+  <circle cx="128" cy="128" r="74" fill="none" stroke="#3B4A66" stroke-width="13"/>
+
+  <!-- Feature arcs, drawn as the on-screen map draws them: coloured segments
+       sitting ON the backbone, with a gap between each so they read as
+       separate annotated elements rather than one ring. -->
+  <g fill="none" stroke-width="13" stroke-linecap="butt">
+    <!-- CDS, forward -->
+    <path d="M 128 54 A 74 74 0 0 1 196.4 99.7" stroke="#4ADE80"/>
+    <!-- promoter -->
+    <path d="M 201 128 A 74 74 0 0 1 166.3 191.2" stroke="#38BDF8"/>
+    <!-- second CDS, reverse -->
+    <path d="M 89.7 191.2 A 74 74 0 0 1 55 128" stroke="#F472B6"/>
+  </g>
+
+  <!-- A restriction cut: the one place the circle is opened. The notch in the
+       backbone plus the tick outside it is the same idiom the map uses for a
+       cut site, and it's what distinguishes this from a generic ring logo. -->
+  <g stroke="#FBBF24" stroke-width="13" stroke-linecap="round">
+    <path d="M 128 46 L 128 62"/>
+  </g>
+  <circle cx="128" cy="128" r="74" fill="none" stroke="#141C2B" stroke-width="15"
+          stroke-dasharray="11 453" stroke-dashoffset="-227" transform="rotate(-90 128 128)"/>
+
+  <!-- Centre: the double helix rungs, small enough to survive downscaling to a
+       16px favicon as a simple dense dot. -->
+  <g stroke="#E2E8F0" stroke-width="9" stroke-linecap="round">
+    <path d="M 110 104 L 146 116"/>
+    <path d="M 110 128 L 146 128"/>
+    <path d="M 110 152 L 146 140"/>
+  </g>
+</svg>

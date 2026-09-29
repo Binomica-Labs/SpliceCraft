@@ -14,6 +14,22 @@
 
 ---
 
+## [Unreleased]
+
+### Hardening
+
+- **The Claude Skill no longer tells Claude to read your API token off disk.**
+  It routed a couple of examples through `<DATA_DIR>/agent_token`; now everything
+  goes through `splicecraft-cli`, which finds the running session and
+  authenticates itself. Nothing you do changes — it was already the recommended
+  path — but an agent following the skill never touches the credential, which is
+  also what Anthropic's plugin-directory policy asks for. The skill now carries
+  an icon, and gained a note that `splicecraft-cli call` has no
+  `--idempotency-key` flag, so after an ambiguous failure the advice is to list
+  and look before re-sending rather than assume nothing happened.
+
+---
+
 ## [1.3.2] — 2026-09-28
 
 ### Bug fixes

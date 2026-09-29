@@ -48,11 +48,11 @@ genuinely isn't a TTY, so `splicecraft --agent &` from an interactive shell star
 a **real TUI in the background** and stops on `SIGTTIN`.
 
 Don't hardcode the port: if 6701 is busy the daemon walks to the next free one
-(only an explicit `--agent-port` is never moved). The CLI reads the real port
-from `<DATA_DIR>/agent_token` (two lines: port, then token — rotated each
-launch), so letting it discover the session is more robust than polling a URL
-you guessed. If you do need the unauthenticated probe directly, take the port
-from that file: `curl -sf http://127.0.0.1:$(head -1 <DATA_DIR>/agent_token)/healthz`.
+(only an explicit `--agent-port` is never moved). Let `splicecraft-cli`
+discover the session rather than polling a URL you guessed — it locates the
+running session and handles authentication itself, so you never need to touch
+the user's credentials. Use `splicecraft-cli status` as the readiness probe and
+for every call after it.
 
 **If the user already has the GUI open**, that process holds a single-instance
 lock and your launch will refuse, naming the PID. Attach alongside it:
@@ -245,25 +245,23 @@ it your first call in any sequence rather than inferring state from a read.
 
 ## 5. Making writes safe to retry
 
-On an unattended batch of creates, send **`X-Idempotency-Key`** (write endpoints
-only, 60 s TTL, key bound to a hash of the body):
+The retry hazard on an unattended batch of creates: a network hiccup makes you
+re-send, the artifact gets created twice, and the name-collision logic yields
+`"Foo_2"` — leaving you unable to tell whether the original landed.
 
-```bash
-curl -H "Authorization: Bearer $TOKEN" -H 'X-Idempotency-Key: build-07-collection' \
-     -H 'Content-Type: application/json' -d '{"name":"Build 07"}' \
-     http://127.0.0.1:6701/create-collection
-```
+The server supports an **`X-Idempotency-Key`** header on write endpoints (60 s
+TTL, the key bound to a hash of the body; a reused key with a *different* body
+is a `409` and does nothing, which is the whole point — `409`s and `5xx`s are
+never cached, so those retry normally). `splicecraft-cli` doesn't currently
+expose it, so in practice: **check before you re-send.** After a failure with an
+unclear outcome, `list-collections` / `list-library` / `list-primers` and look
+before retrying, rather than assuming nothing happened.
 
-Without it, a retry after a network hiccup re-creates the artifact and the
-collision logic yields `"Foo_2"` — leaving you unable to tell whether the
-original landed. Use a **fresh key per distinct request**; reusing a key with a
-different body is a `409` (nothing done), which is the whole point. `409`s and
-`5xx`s are never cached, so those retry normally.
-
-The API is rate-limited per token (token bucket, ~30/s, burst 60, **a write costs
-double a read**). On `429`, back off by `retry_after`. Better: prefer the bulk
-endpoints — `add-features`, `copy-plasmids`, `move-plasmids`, `delete-primers` —
-which do N items in one locked save and sidestep the limiter entirely.
+Better still, avoid the situation: the bulk endpoints — `add-features`,
+`copy-plasmids`, `move-plasmids`, `delete-primers` — do N items in one locked
+save, so there's one outcome to check instead of N. They also sidestep the rate
+limiter, which matters because the API is throttled per session (~30 ops/s,
+burst 60, **a write costs double a read**). On `429`, back off by `retry_after`.
 
 ## 6. Data safety
 
@@ -287,7 +285,7 @@ path:
    export SPLICECRAFT_LOG="$SPLICECRAFT_DATA_DIR/sandbox.log"   # spare the real log
    splicecraft --headless --agent-port 6899 </dev/null &        # own data dir AND lock
    until splicecraft-cli status >/dev/null 2>&1; do sleep 0.3; done
-   test -f "$SPLICECRAFT_DATA_DIR/agent_token" || echo "NOT sandboxed — stop"
+   test -f "$SPLICECRAFT_DATA_DIR/collections.json" || echo "NOT sandboxed — stop"
    ```
    Use `SPLICECRAFT_DATA_DIR`, **not `XDG_DATA_HOME`**: it is honoured first, on
    every platform, sets the app and the CLI from one value, and points *directly*
@@ -299,8 +297,9 @@ path:
 
    **Verify the sandbox on the filesystem, not over the API.** No endpoint
    reports which data dir the session is using — `status` has no `data_dir`
-   field — so the token file existing at `$SPLICECRAFT_DATA_DIR/agent_token` is
-   your only real confirmation, as in the snippet above.
+   field — so the surest check is that the daemon created its own files where
+   you pointed it, as in the snippet above (`collections.json` is written at
+   launch).
 3. **Never `import splicecraft` in a scratch script** against the real data dir:
    the path is fixed at import time, so it is too late to redirect afterwards.
    Prefer the API. If you genuinely need Python-level access, set the env var
@@ -363,7 +362,7 @@ Errors are self-explanatory and name the fix — read the message.
 |---|---|---|
 | `400` `"malformed JSON body"` | **Four causes share this one message**: invalid JSON, a body over the ~1 MiB cap, a UTF-8 decode failure, or the socket breaking mid-body. Check the payload's *size* before debugging your serializer — a 1.2 MB body reports as malformed, not `413`. This is why `load-file` takes a server-side *path*, not bytes. | Shrink or chunk the body; validate the JSON separately. |
 | `400` + `unsupported: [...]` | You passed a routing key (`collection`, `bin`, `enzyme`, `orientation`, `carry_annotations`, …) this endpoint ignores — it would have acted on its **default** target. Nothing ran. | Fix the key, or use an endpoint that accepts it. Never re-send without it and assume it worked. |
-| `401` | Bad/missing token; fires before handler lookup, so any path 401s. | Re-read `<DATA_DIR>/agent_token` (two lines: port, token; rotated each launch). |
+| `401` | Authentication failed; fires before handler lookup, so any path 401s. Credentials rotate on every launch. | Re-run through `splicecraft-cli`, which re-discovers the current session. If it persists, the session likely restarted — check `splicecraft-cli status`. |
 | `403` | Egress gate unarmed, forbidden Host, or a refused write path (symlink). | You can't arm egress — tell the user which setting. |
 | `404` | Unknown endpoint (body lists them all) or entity not found. | Check `tools`; use `list-library`/`search-library` for entities. |
 | `405` | `GET` on a write endpoint. Writes are POST-only so a pasted URL can't fire one. | Use POST. Reads accept GET with a query string as the payload. |
