@@ -32,6 +32,7 @@ resolves unchanged.
 """
 from __future__ import annotations
 
+import heapq as _heapq
 import re
 from typing import TYPE_CHECKING
 
@@ -5076,6 +5077,15 @@ _PCR_MAX_TEMPLATE_BP    = 5_000_000  # 5 Mb — above this we skip the run rathe
 _PCR_MAX_PRIMER_HITS    = 5_000
 
 
+# `_insilico_pcr_amplicons` ranks EVERY qualifying site pair before it caps —
+# capping first kept the first `max_amplicons` pairs in SCAN order, so on a
+# repeat-rich template the best product could be dropped for 50 worse ones (the
+# trap `_primer_binding_sites` fell into, fixed there 2026-09-22). This bounds
+# the pairs it will look at for one pathological primer pair; the site lists
+# feeding it are capped upstream, so a real primer never comes near it.
+_PCR_AMPLICON_RANK_BUDGET = 20_000
+
+
 def _insilico_pcr_amplicons(
     sites_a: "list[dict]", sites_b: "list[dict]", total: int, *,
     circular: bool = True,
@@ -5083,22 +5093,28 @@ def _insilico_pcr_amplicons(
     min_amplicon: int = 1,
     max_amplicons: int = _PCR_MAX_AMPLICONS,
 ) -> "list[dict]":
-    """Build amplicons from forward and reverse sites in both primer lists.
+    """Pair forward + reverse binding sites (POOLED across both primers) into
+    amplicons — the in-silico PCR behind the Primer Check tab and
+    `check-primer-pair`. Geometry mirrors `_simulate_pcr`: a product runs from
+    a forward site's `foot_start` to a reverse site's `foot_start + length`,
+    the reverse site downstream (clockwise on a circle). `sites_a` / `sites_b`
+    are the `_primer_binding_sites` lists for primer 1 / primer 2;
+    `fwd_primer` / `rev_primer` in each result record which primer (0 or 1)
+    plays each role, so hetero (P1×P2) and homo (P1×P1) products are both
+    surfaced honestly.
 
-    Geometry matches `_simulate_pcr`. A product starts at the forward site's
-    `foot_start` and ends after the downstream reverse site. On a circular
-    template, downstream follows the clockwise direction. `fwd_primer` and
-    `rev_primer` identify which primer list supplies each site. The results
-    include hetero-primer and homo-primer products.
-
-    Returns amplicons sorted by certainty (min of the two site identities)
-    desc, then length asc::
+    Returns the best `max_amplicons` amplicons — ranked over every pair (up to
+    `_PCR_AMPLICON_RANK_BUDGET`), THEN capped — sorted by certainty (the lower
+    of the two site identities) desc, then length asc::
 
         {"start": int,        # amplicon 5' on the top strand, canonical [0,total)
          "length": int, "wraps": bool,
          "fwd_ident": float, "rev_ident": float, "certainty": float,
          "fwd_primer": 0|1, "rev_primer": 0|1,
          "rev_3p": int}       # reverse primer 3' end (canonical)
+
+    `length` spans the two FOOTPRINTS: a primer's non-annealing 5' tail is in
+    it only when that primer's sites were scored over the whole oligo.
     """
     if total <= 0:
         return []
@@ -5107,7 +5123,7 @@ def _insilico_pcr_amplicons(
     rev = [(s, idx) for idx, lst in ((0, sites_a), (1, sites_b))
            for s in (lst or []) if s["strand"] == -1]
     max_amp = max(1, min(int(max_amplicon), _PCR_AMPLICON_HARD_CAP))
-    amps: "list[dict]" = []
+    cand: "list[tuple]" = []
     seen: "set[tuple[int, int, int]]" = set()
     for fs, fidx in fwd:
         f_left = fs["foot_start"]
@@ -5126,25 +5142,28 @@ def _insilico_pcr_amplicons(
             if length < lo or length > max_amp:
                 continue
             start = f_left % total
-            end_canon = (f_left + length) % total
-            key = (start, end_canon, length)
+            key = (start, (f_left + length) % total, length)
             if key in seen:
                 continue
             seen.add(key)
-            amps.append({
-                "start": start,
-                "length": length,
-                "wraps": bool(circular and (f_left + length) > total),
-                "fwd_ident": fs["ident_pct"],
-                "rev_ident": rs["ident_pct"],
-                "certainty": min(fs["ident_pct"], rs["ident_pct"]),
-                "fwd_primer": fidx,
-                "rev_primer": ridx,
-                "rev_3p": r_left,
-            })
-            if len(amps) >= max_amplicons:
+            cand.append((-min(fs["ident_pct"], rs["ident_pct"]), length,
+                         start, fs, rs, fidx, ridx, f_left))
+            if len(cand) >= _PCR_AMPLICON_RANK_BUDGET:
                 break
-        if len(amps) >= max_amplicons:
+        if len(cand) >= _PCR_AMPLICON_RANK_BUDGET:
             break
-    amps.sort(key=lambda a: (-a["certainty"], a["length"], a["start"]))
-    return amps
+    # (−certainty, length, start) is unique per amplicon (start + length fix
+    # the end), so the order is total — no tie is left to scan order.
+    top = _heapq.nsmallest(max(0, int(max_amplicons)), cand,
+                           key=lambda c: (c[0], c[1], c[2]))
+    return [{
+        "start": start,
+        "length": length,
+        "wraps": bool(circular and (f_left + length) > total),
+        "fwd_ident": fs["ident_pct"],
+        "rev_ident": rs["ident_pct"],
+        "certainty": -neg_cert,
+        "fwd_primer": fidx,
+        "rev_primer": ridx,
+        "rev_3p": rs["foot_start"],
+    } for neg_cert, length, start, fs, rs, fidx, ridx, f_left in top]

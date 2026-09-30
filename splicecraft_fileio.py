@@ -32,7 +32,7 @@ from splicecraft_biology import _rc
 from splicecraft_util import (
     _CONTROL_CHARS_RE, _DEFAULT_TYPE_COLORS, _feat_bounds, _feature_traversal,
     _is_windows_reserved_stem,
-    _natural_sort_key, _pick_single_record, _record_is_circular,
+    _natural_sort_key, _p3_tm, _pick_single_record, _record_is_circular,
     _safe_color_for_write, _safe_xml_parse, _sanitize_label, _to_ascii_text,
     _xml_legal_text,
 )
@@ -2778,10 +2778,10 @@ def _augment_dna_record_from_packets(
     # computed Tm so the Primer Library table renders the same way it
     # does for designed primers (it does `f"{tm:.1f}°C"` on the value).
     try:
-        import primer3 as _primer3
+        import primer3 as _primer3  # noqa: F401 — availability probe only
         def _calc_tm(s: str) -> float:
             try:
-                return float(_primer3.calc_tm(s))
+                return _p3_tm(s)      # thread-safe path (see `_p3_tm`)
             except Exception:
                 # primer3 occasionally barfs on weird sequences (very
                 # short, contains N, etc.); fall back to the 2+4 rule.

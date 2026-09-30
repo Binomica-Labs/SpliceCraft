@@ -12,6 +12,7 @@ from __future__ import annotations
 import math as _math
 import re
 import platform
+import threading as _threading
 import functools as _functools
 import time as _time_mod
 from datetime import datetime as _datetime
@@ -1163,6 +1164,98 @@ def _surface_placeholder_gene(s: str) -> str:
     return s
 
 
+# ── primer3 access: every SpliceCraft call goes through these two ───────────
+# primer3-py is not thread-safe, in two separate ways, and an agent request runs
+# on its own thread right next to the Textual workers, so both can happen:
+#
+#  1. Its thermodynamic alignment (`thal` — hairpin, homodimer, heterodimer,
+#     3'-end stability, and the same checks Primer3 runs inside
+#     `design_primers`) keeps its dynamic-programming tables in C STATIC
+#     globals and runs with the GIL RELEASED. Two threads in it at once corrupt
+#     each other's tables: six threads mixing hairpin and homodimer calls on
+#     60-mers got ~20 % WRONG ΔG back (primer3-py 2.3.1, 2026-09-30), silently.
+#  2. The module functions (`primer3.calc_tm(seq, mv_conc=…)`) write their
+#     conditions onto ONE shared ThermoAnalysis object and THEN compute, so a
+#     thread asking for different conditions in between gets its answer under
+#     the other thread's — the moment Tm profiles made per-request conditions
+#     possible, that stopped being hypothetical.
+#
+# Tm (`calc_tm` → oligotm) keeps no C state of its own, so `_p3_tm` needs only
+# its own ThermoAnalysis per THREAD, and no lock — which keeps the UI-thread Tm
+# readouts from ever waiting behind a background design. The alignment has to
+# be serialised: `_p3_thermo` holds `_PRIMER3_LOCK`, as must any direct
+# `design_primers` call (`_design_detection_primers`). Both helpers import
+# primer3 on EVERY call — a cached module would defeat the tests that hide
+# primer3 to exercise the fallbacks — and raise exactly what primer3 raises.
+_PRIMER3_LOCK = _threading.RLock()
+_P3_TLS = _threading.local()
+_P3_THERMO: "list[_Any]" = []          # the lock-guarded alignment instance
+# The keywords the module functions take — `primer3.calc_tm` and
+# `calc_hairpin` / `calc_homodimer` / `calc_heterodimer` /
+# `calc_end_stability`. `ThermoAnalysis.set_thermo_args` swallows ANY keyword
+# (`**kwargs`), so a misspelt condition would silently compute under the
+# default for it; the module function raised TypeError, and so do these.
+_P3_TM_KWARGS = frozenset({
+    "mv_conc", "dv_conc", "dntp_conc", "dna_conc", "dmso_conc", "dmso_fact",
+    "formamide_conc", "annealing_temp_c", "max_nn_length", "tm_method",
+    "salt_corrections_method"})
+_P3_THERMO_KWARGS = frozenset({
+    "mv_conc", "dv_conc", "dntp_conc", "dna_conc", "temp_c", "max_loop"})
+
+
+def _p3_check_kwargs(conditions: dict, allowed: frozenset) -> None:
+    unknown = sorted(set(conditions) - allowed)
+    if unknown:
+        raise TypeError(f"unexpected primer3 condition(s): {unknown}")
+
+
+def _p3_tm(seq: str, **conditions) -> float:
+    """primer3's nearest-neighbour Tm (°C) of `seq` under `conditions`
+    (primer3 `calc_tm` keywords; any left out take primer3's defaults, reset
+    on every call). Thread-safe. Raises ImportError when primer3 is missing,
+    ValueError for a non-ACGT base and TypeError for an unknown keyword, like
+    `primer3.calc_tm`."""
+    _p3_check_kwargs(conditions, _P3_TM_KWARGS)
+    from primer3 import thermoanalysis as _ta  # pyright: ignore[reportAttributeAccessIssue]
+    inst = getattr(_P3_TLS, "tm", None)
+    if inst is None:
+        inst = _P3_TLS.tm = _ta.ThermoAnalysis()
+    inst.set_thermo_args(**conditions)
+    return float(inst.calc_tm(seq))
+
+
+def _p3_thermo(kind: str, seq1: str, seq2: str = "", *,
+               structure: bool = False, **conditions):
+    """One primer3 thermodynamic alignment, serialised under `_PRIMER3_LOCK`.
+    `kind`: ``hairpin`` / ``homodimer`` (`seq1`), ``heterodimer`` /
+    ``end_stability`` (`seq1` against `seq2`; the latter anchors `seq1`'s 3'
+    end). Returns primer3's ThermoResult — ΔG in CAL/mol, `.tm` in °C —
+    identical to the module function of the same name; `structure=True` also
+    fills its `ascii_structure_lines` (hairpin and dimers). Raises ImportError
+    when primer3 is missing, RuntimeError when it refuses the input (e.g.
+    both strands over 60 nt), ValueError on an unknown `kind` and TypeError
+    for an unknown keyword."""
+    _p3_check_kwargs(conditions, _P3_THERMO_KWARGS)
+    from primer3 import thermoanalysis as _ta  # pyright: ignore[reportAttributeAccessIssue]
+    with _PRIMER3_LOCK:
+        if not _P3_THERMO:
+            _P3_THERMO.append(_ta.ThermoAnalysis())
+        inst = _P3_THERMO[0]
+        inst.set_thermo_args(**conditions)
+        # `.check_exc()` raises primer3's own error (a refused input comes
+        # back as a RESULT carrying a message, not an exception) — exactly what
+        # the module functions do; without it a refusal read as a number.
+        if kind == "hairpin":
+            return inst.calc_hairpin(seq1, structure).check_exc()
+        if kind == "homodimer":
+            return inst.calc_homodimer(seq1, structure).check_exc()
+        if kind == "heterodimer":
+            return inst.calc_heterodimer(seq1, seq2, structure).check_exc()
+        if kind == "end_stability":
+            return inst.calc_end_stability(seq1, seq2).check_exc()
+    raise ValueError(f"unknown primer3 alignment kind {kind!r}")
+
+
 # ── Primer-Tm + single-record-pick pure helpers (moved, Phase D) ────────────
 # Nearest-neighbour Tm is undefined for a degenerate oligo — primer3 refuses
 # any non-ACGT base — but the oligo is really a MIX, and its members' Tms are
@@ -1186,11 +1279,8 @@ def _degenerate_tm_bracket(seq: str, **conditions) -> "tuple[float, float] | Non
     if not s or not (set(s) <= _IUPAC_DNA_CHARS) or set(s) <= set("ACGT"):
         return None
     try:
-        import primer3
-        lo = float(primer3.calc_tm(s.translate(_IUPAC_WEAKEST_BASE),
-                                   **conditions))
-        hi = float(primer3.calc_tm(s.translate(_IUPAC_STRONGEST_BASE),
-                                   **conditions))
+        lo = _p3_tm(s.translate(_IUPAC_WEAKEST_BASE), **conditions)
+        hi = _p3_tm(s.translate(_IUPAC_STRONGEST_BASE), **conditions)
     except (ImportError, OSError, ValueError, RuntimeError, TypeError):
         return None
     return (min(lo, hi), max(lo, hi))
@@ -1212,8 +1302,7 @@ def _primer_tm_safe(seq: str) -> "float | None":
     if not (5 <= len(s) <= 200):
         return None
     try:
-        import primer3
-        return float(primer3.calc_tm(s))
+        return _p3_tm(s)
     except (ImportError, OSError, ValueError, RuntimeError, TypeError):
         return None
 

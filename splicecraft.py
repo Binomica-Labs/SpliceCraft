@@ -43,13 +43,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.3.5"
+__version__ = "1.3.6"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-09-29"
+_RELEASE_DATE = "2026-09-30"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -6554,10 +6554,25 @@ from splicecraft_primer import (  # noqa: E402
     _rederive_primer_binding as _rederive_primer_binding,
     _PRIMER_CHECK_SEED_LEN as _PRIMER_CHECK_SEED_LEN,
     _PRIMER_CHECK_MAX_SITES as _PRIMER_CHECK_MAX_SITES,
+    _PRIMER_CHECK_MIN_LEN as _PRIMER_CHECK_MIN_LEN,
     _primer_binding_sites as _primer_binding_sites,
     _design_allele_specific_primer as _design_allele_specific_primer,
     _primer_check_confidence as _primer_check_confidence,
     _primer_tm as _primer_tm,
+    _TM_PROFILES as _TM_PROFILES,
+    _TM_PROFILE_DEFAULT as _TM_PROFILE_DEFAULT,
+    _TM_PROFILE_ALIASES as _TM_PROFILE_ALIASES,
+    _tm_profile_resolve as _tm_profile_resolve,
+    _tm_profile_kwargs as _tm_profile_kwargs,
+    _tm_profile_catalog as _tm_profile_catalog,
+    _PRIMER_DIMER_TM_LIMIT as _PRIMER_DIMER_TM_LIMIT,
+    _PRIMER_ANNEAL_BELOW_TM as _PRIMER_ANNEAL_BELOW_TM,
+    _anneal_ref as _anneal_ref,
+    _THAL_MAX_LEN as _THAL_MAX_LEN,
+    _PRIMER_PAIR_MAX_TM_DELTA as _PRIMER_PAIR_MAX_TM_DELTA,
+    _primer_structure as _primer_structure,
+    _primer_oligo_qc as _primer_oligo_qc,
+    _primer_pair_qc as _primer_pair_qc,
     _PRIMER_MAX_OLIGO_LEN as _PRIMER_MAX_OLIGO_LEN,
     _binding_max_len as _binding_max_len,
     _pick_binding_region as _pick_binding_region,
@@ -9804,6 +9819,9 @@ def _nice_tick(total: int) -> int:
 from splicecraft_util import (  # noqa: E402
     _primer_tm_safe as _primer_tm_safe,
     _degenerate_tm_bracket as _degenerate_tm_bracket,
+    _PRIMER3_LOCK as _PRIMER3_LOCK,
+    _p3_tm as _p3_tm,
+    _p3_thermo as _p3_thermo,
     _pick_single_record as _pick_single_record,
 )
 
@@ -9907,6 +9925,7 @@ from splicecraft_cloning import (  # noqa: E402
     _fuse_overhang_body as _fuse_overhang_body,
     _build_pupd2_backbone_stub as _build_pupd2_backbone_stub,
     _PUPD2_BACKBONE_STUB as _PUPD2_BACKBONE_STUB,
+    _PCR_AMPLICON_RANK_BUDGET as _PCR_AMPLICON_RANK_BUDGET,
     _insilico_pcr_amplicons as _insilico_pcr_amplicons,
     _simulate_primed_amplicon as _simulate_primed_amplicon,
     _simulate_cloned_plasmid as _simulate_cloned_plasmid,
@@ -94092,6 +94111,76 @@ class PrimerCsvExportModal(_OneShotDismissScreen, ModalScreen):
 
 # ── Primer design screen (full-screen) ─────────────────────────────────────────
 
+def _design_result_qc(kind: str, design: dict) -> "dict | None":
+    """`_primer_pair_qc` of one Primer Design result. Cloning and Golden Braid
+    primers carry a 5' tail, so their Tm comes from the binding arm while the
+    structures use the whole oligo; detection / generic primers are all arm.
+    None (logged) when it can't be run — the design still shows."""
+    try:
+        if kind in ("cloning", "goldenbraid"):
+            return _primer_pair_qc(design["fwd_full"], design["rev_full"],
+                                   fwd_binding=design["fwd_binding"],
+                                   rev_binding=design["rev_binding"])
+        return _primer_pair_qc(design["fwd_seq"], design["rev_seq"])
+    except (KeyError, TypeError, ValueError):
+        _log.exception("Primer design: pair QC failed (%s)", kind)
+        return None
+
+
+def _primer_qc_text(qc: dict, *, whole_oligo: bool = False) -> Text:
+    """`_primer_pair_qc` / `_primer_oligo_qc` output as the compact block the
+    Primer Design screen shows: a verdict line, one ⚠ line per warning — the
+    engine's own words, so the screen and check-primer-pair say the same
+    thing — and the ΔG numbers, dim, underneath. `whole_oligo` labels the Tm
+    as the whole oligo's (the Primer Check tab has no binding-arm input)."""
+    t = Text()
+    pair = "pair" in qc
+    warnings = [w for w in (qc.get("warnings") or []) if isinstance(w, str)]
+    limit = qc.get("dimer_tm_limit", _PRIMER_DIMER_TM_LIMIT)
+    ref = qc.get("anneal_ref_c")
+    at = f" at a {ref:.1f} °C anneal" if isinstance(ref, (int, float)) else ""
+    of = " (whole oligos)" if whole_oligo and pair else (
+        " (whole oligo)" if whole_oligo else "")
+    if pair:
+        d = qc["pair"].get("tm_delta")
+        extra = f"  ·  ΔTm {d:.1f} °C{of}" if d is not None else ""
+        clean = (f"no hairpin still folded{at}, no dimer stable above "
+                 f"{limit:.0f} °C")
+    else:
+        tm, gc = qc.get("tm"), qc.get("gc_pct")
+        extra = ((f"  ·  Tm {tm:.1f} °C{of}" if tm is not None else "")
+                 + (f"  ·  GC {gc:.0f}%" if gc is not None else ""))
+        clean = (f"no hairpin still folded{at}, no self-dimer stable above "
+                 f"{limit:.0f} °C")
+    t.append("Pair check  " if pair else "Primer check  ", style="bold")
+    if warnings:
+        t.append(f"⚠ {len(warnings)} flag{'' if len(warnings) == 1 else 's'}",
+                 style="bold yellow")
+        t.append(extra + "\n", style="dim")
+        for w in warnings:
+            t.append("  ⚠ ", style="yellow")
+            t.append(w + "\n", style="yellow")
+    else:
+        t.append("✓ " + clean, style="green")
+        t.append(extra + "\n", style="dim")
+
+    def _dg(v) -> str:
+        return "—" if v is None else f"{v:.2f}"
+    if pair:
+        f, r, pr = qc["forward"], qc["reverse"], qc["pair"]
+        line = (f"  ΔG kcal/mol  ·  hairpin F {_dg(f.get('hairpin_dg'))} "
+                f"R {_dg(r.get('hairpin_dg'))}  ·  self-dimer F "
+                f"{_dg(f.get('homodimer_dg'))} R {_dg(r.get('homodimer_dg'))}"
+                f"  ·  primer-dimer {_dg(pr.get('heterodimer_dg'))} "
+                f"(3' {_dg(pr.get('heterodimer_3p_dg'))})")
+    else:
+        line = (f"  ΔG kcal/mol  ·  hairpin {_dg(qc.get('hairpin_dg'))}  ·  "
+                f"self-dimer {_dg(qc.get('homodimer_dg'))} "
+                f"(3' {_dg(qc.get('homodimer_3p_dg'))})")
+    t.append(line + "\n", style="dim")
+    return t
+
+
 class PrimerDesignScreen(_OneShotDismissScreen, Screen):
     """Full-screen Primer3-backed primer design workbench.
 
@@ -94500,6 +94589,10 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
                                                      "plasmids these "
                                                      "primer(s) anneal to "
                                                      "/ amplify")
+                        # The pasted primer(s)' own QC — Tm, hairpin,
+                        # self-dimers, and with two primers the primer-dimer
+                        # between them — shown the moment Scan is pressed.
+                        yield Static("", id="pd-pc-qc", markup=False)
                         yield Static("", id="pd-pc-progress", markup=True)
                         yield ProgressBar(id="pd-pc-bar", show_eta=False)
                         yield Static("", id="pd-pc-status", markup=True)
@@ -94741,6 +94834,7 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
             raw2 = self.query_one("#pd-pc-p2", Input).value
         except NoMatches:
             return
+        self._pc_set_qc("")               # never leave the LAST primers' QC up
         try:
             p1 = _normalize_dna_for_align(raw1 or "")
         except ValueError as exc:
@@ -94799,6 +94893,26 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
         self._pc_scan_worker(p1=p1, p2=p2, two_primer=two,
                              scope=scope, max_amp=max_amp)
 
+    def _pc_set_qc(self, content: "Text | str") -> None:
+        try:
+            self.query_one("#pd-pc-qc", Static).update(content)
+        except NoMatches:
+            pass
+
+    @staticmethod
+    def _pc_qc_text(p1: str, p2: str) -> Text:
+        """The pasted primer(s)' thermodynamic QC as `#pd-pc-qc` shows it:
+        `_primer_oligo_qc` for one primer, `_primer_pair_qc` for two — the
+        numbers check-primer-pair returns. Runs in the scan worker, never on
+        the UI thread: primer3's alignment shares one lock with a running
+        Primer3 design, and the screen must not wait on it."""
+        try:
+            qc = (_primer_pair_qc(p1, p2) if p2
+                  else _primer_oligo_qc(p1, role="primer"))
+        except ValueError as exc:
+            return Text(f"Primer QC not run: {exc}", style="dim")
+        return _primer_qc_text(qc, whole_oligo=True)
+
     @work(thread=True, exclusive=True, group="pd_primer_check")
     def _pc_scan_worker(self, *, p1: str, p2: str, two_primer: bool,
                         scope: str, max_amp: int) -> None:
@@ -94809,6 +94923,14 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
         `_amplicon_feature_summary`."""
         from textual.worker import get_current_worker
         worker = get_current_worker()
+        # The pasted primers' own QC first, so it is up while the scan runs.
+        try:
+            qc_text = self._pc_qc_text(p1, p2 if two_primer else "")
+        except Exception:
+            _log.exception("PrimerCheck: primer QC failed")
+            qc_text = Text("Primer QC not run (see the log).", style="dim")
+        if not worker.is_cancelled:
+            self.app.call_from_thread(self._pc_set_qc, qc_text)
         try:
             if scope == "collection":
                 cname = _get_active_collection_name()
@@ -96828,6 +96950,12 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
         if "product_size" in design:
             t.append(f"Product: {design['product_size']} bp\n",
                      style="white")
+        # The pair check (hairpins, self-dimers, the primer-dimer between the
+        # two, ΔTm) the design worker ran — `_design_result_qc`.
+        qc = design.get("qc")
+        if isinstance(qc, dict):
+            t.append("\n")
+            t.append_text(_primer_qc_text(qc))
         # Trailing blank row so the docked button row at the
         # bottom of the page has visual breathing space below the
         # reverse primer / product line.
@@ -97042,6 +97170,7 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
         screen mid-flight and re-enters on a different plasmid.
         """
         entry_counter = getattr(self.app, "_record_load_counter", 0)
+        result: dict
         try:
           with _worker_watchdog(self.app, "Primer3 design"):
             if kind == "detection":
@@ -97066,6 +97195,9 @@ class PrimerDesignScreen(_OneShotDismissScreen, Screen):
                 )
             else:
                 result = {"error": f"unknown design kind: {kind!r}"}
+            # Pair QC here, off the UI thread — `_show_result` only paints it.
+            if isinstance(result, dict) and "error" not in result:
+                result["qc"] = _design_result_qc(kind, result)
         except Exception as exc:
             _log.exception("Primer design failed (%s)", kind)
             result = {"error": str(exc)}
@@ -98305,7 +98437,8 @@ def _simulate_pcr(
 # prime here, and how well?". On EXACT-binding primers the amplicons returned
 # match `_simulate_pcr` bp-for-bp (asserted in tests/test_primer_check.py).
 
-_PRIMER_CHECK_MIN_LEN   = 10     # shortest primer accepted (cf _PCR_MIN_PRIMER_LEN)
+# `_PRIMER_CHECK_MIN_LEN` (shortest primer accepted) lives in splicecraft_primer
+# beside the seed length, so `check-primer-pair` (agent L7) holds the same floor.
 _PRIMER_CHECK_MAX_ROWS  = 1000   # results-table row cap across the whole library
 
 
@@ -102749,6 +102882,7 @@ from splicecraft_agent import (  # noqa: E402  (deferred handlers + their valida
     _h_design_primers as _h_design_primers,
     _h_check_primer as _h_check_primer,
     _h_check_primer_pair as _h_check_primer_pair,
+    _h_list_tm_profiles as _h_list_tm_profiles,
     _h_list_experiments as _h_list_experiments,
     _h_delete_experiment as _h_delete_experiment,
     _h_list_experiment_projects as _h_list_experiment_projects,
@@ -114952,6 +115086,7 @@ NcbiTaxonPickerModal { align: center middle; }
 #pd-pc-scope { width: 28; }
 #pd-pc-maxamp { width: 18; }
 #pd-pc-gocol { padding-right: 0; }
+#pd-pc-qc { width: 100%; height: auto; margin-top: 1; }
 #pd-pc-progress { width: 100%; height: auto; display: none; margin-top: 1; }
 #pd-pc-progress.-active { display: block; }
 #pd-pc-bar { width: 100%; display: none; margin-top: 1; }

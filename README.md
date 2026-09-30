@@ -127,13 +127,18 @@ linear record. **File ▸ Find ORFs** runs a wrap-aware six-frame scan.
 ### Primers
 
 A full-screen Primer3 designer for detection, cloning, Golden Braid, and
-generic primers, each with a **Designed → Ordered → Validated** lifecycle. The
+generic primers, each with a **Designed → Ordered → Validated** lifecycle.
+Every design comes with a **pair check**: hairpins, self-dimers, the
+primer-dimer between the two, and the Tm gap, judged the way Primer3 judges its
+own designs — a hairpin is flagged when it holds a primer's 3′ end at the
+annealing temperature, a dimer when it is stable above 47 °C. The
 **Primer Check** tab runs in-silico PCR across your library: one primer lists
 every plasmid it anneals to with % identity, strand, and position; two add the
-amplicon length and the feature amplified, ranked ✓ / ⚠ / ~ / ✗. Binding is
-judged on the 3′ end, so a 5′ cloning tail lowers identity rather than
-vanishing. The library organises into collections with fuzzy search, and
-exports order-ready **CSV** — generic or the **IDT bulk-upload** template.
+amplicon length and the feature amplified, ranked ✓ / ⚠ / ~ / ✗, and the same
+pair check for what you pasted. Binding is judged on the 3′ end, so a 5′
+cloning tail lowers identity rather than vanishing. The library organises into
+collections with fuzzy search, and exports order-ready **CSV** — generic or the
+**IDT bulk-upload** template.
 
 ### Mutato
 
@@ -404,9 +409,11 @@ A 260+ endpoint localhost JSON API (`splicecraft --agent`, or `--headless` for
 a no-UI server with a `/healthz` probe) and a stdlib-only CLI
 (`splicecraft-cli`, including a `call` passthrough to every endpoint) drive
 every workflow. `/tools` self-describes each endpoint's request schema.
-Primer workflows include pair-level binding, amplicon and secondary-structure
-checks, plus an opt-in Benchling-compatible Tm profile for single-primer and
-simple cloning/generic primer design.
+`check-primer-pair` analyses a whole PCR pair against a template — each 3′
+annealing arm's Tm, hairpins and dimers on the full tailed oligos, every
+product with its size including the tails — and every Tm-reporting primer
+endpoint takes a `tm_profile` (`benchling_compatible` reads the same oligo on
+Benchling's scale, ~4–5 °C lower; `list-tm-profiles` gives the conditions).
 `--agent --read-only` attaches **alongside a running GUI** — every read answers,
 every write returns 409 naming the process holding the lock, and nothing on
 disk changes. See [`docs/agent-api.md`](docs/agent-api.md) and

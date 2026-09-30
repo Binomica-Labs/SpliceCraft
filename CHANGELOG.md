@@ -14,16 +14,55 @@
 
 ---
 
-## Unreleased
+## [1.3.6] — 2026-09-30
 
-### Added
+### New features
 
-- **Primer checks now support a Benchling-compatible Tm profile and pair-level
-  analysis.** `check-primer` and the simple `design-primers` modes can use
-  the opt-in profile. The new read-only `check-primer-pair` endpoint checks the
-  annealing arms against a template while evaluating hairpins and dimers on the
-  complete oligos, including cloning tails. Responses mark truncated site and
-  amplicon searches. They also report dU-to-T normalization.
+- **Every primer design now comes with a pair check.** Under each Detection,
+  Cloning, Golden Braid and Generic design in the Primer Design screen, a short
+  verdict says whether the pair is clean or lists what to watch: a hairpin that
+  holds a primer's 3′ end at the annealing temperature (so it can't prime), a
+  self-dimer or primer-dimer Primer3 itself would reject, or Tms more than 5 °C
+  apart — with the free energies underneath. A tailed cloning primer's Tm is
+  taken from the part that anneals, while the dimer checks use the whole oligo,
+  because the whole oligo is what's in the tube. The Primer Check tab shows the
+  same verdict for the primers you paste the moment you press Scan, before the
+  library scan finishes.
+- **Check a whole primer pair in one call.** Agents get `check-primer-pair`:
+  a forward and reverse primer (tails and all) against a template — the loaded
+  plasmid by default — returns each primer's Tm and GC%, the Tm gap, hairpins,
+  self-dimers, the primer-dimer between them, where each binds (flagging any
+  second site it could prime from), and every product the pair makes,
+  including one a single primer makes on its own by binding both strands. Name
+  a tailed primer's 3′ annealing part and the product size includes the tails,
+  so it matches the band on the gel. The design endpoint returns the same pair
+  check with every design. Contributed by **Hazlam Shamin** (PR #28) — thank
+  you — and extended here.
+- **Match the Tm numbers Benchling shows.** The same primer reads about
+  4–5 °C lower in Benchling than in SpliceCraft, because Benchling's default
+  assumes no Mg2+ and five times the primer. Agents can now pass
+  `tm_profile: "benchling_compatible"` to `check-primer`, `check-primer-pair`
+  and every `design-primers` mode, and get Tms on Benchling's scale; a design
+  aims its target Tm at that scale too. `list-tm-profiles` spells out the exact
+  conditions behind each profile. Nothing changes unless you ask — SpliceCraft's
+  own numbers are exactly what they were. Also contributed in PR #28.
+
+### Bug fixes
+
+- **Hairpin and dimer numbers could come back wrong when two things computed
+  them at once.** The thermodynamics library underneath is not safe to use from
+  two threads together, and SpliceCraft runs agent requests right alongside the
+  app's own background work. Under load about one answer in five came back
+  wrong — sometimes a real hairpin read as "no structure at all", which looks
+  like the best possible result. Every thermodynamic calculation now goes
+  through one thread-safe path.
+- **Primer Check could put the wrong product first on a repetitive template.**
+  With more than 50 candidate products it kept the first 50 it came across
+  rather than the best 50, so a poor product could be shown as the best while a
+  near-perfect one was dropped. It now ranks every candidate before trimming.
+- **`check-primer` said a primer carried deoxyuridine when only its FASTA
+  header had a "U" in it**, and didn't say so at all when no template was
+  given. It now reads only the bases.
 
 ## [1.3.5] — 2026-09-29
 

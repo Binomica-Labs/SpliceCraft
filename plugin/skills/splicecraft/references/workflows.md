@@ -78,7 +78,8 @@ Always read `binds_as_designed` and `other_sites` before reporting a primer.
 A non-empty `other_sites` means it anneals somewhere else too — a real
 mispriming risk, not a formality.
 
-Related: `check-primer` (one primer vs a template, both strands, wrap-aware),
+Related: `check-primer-pair` (a whole pair: Tm gap, hairpins, dimers, every
+product), `check-primer` (one primer vs a template, both strands, wrap-aware),
 `design-primers`, `pcr-program` (thermocycler conditions), `simulate-pcr`.
 Persist with `create-primer` so the primer joins the user's ordering library.
 

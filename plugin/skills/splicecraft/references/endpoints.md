@@ -28,7 +28,7 @@ twin takes the *same payload*.
 | 12 | `simulate-golden-gate` → `golden-gate-assemble` | Dominant modern cloning path |
 | 13 | `simulate-traditional-cloning` → `traditional-clone` | Restriction cloning, with the self-ligation off-target report |
 | 14 | `design-primers` / `amplify-feature` | Primer design with binding verified |
-| 15 | `check-primer` / `simulate-pcr` | Does it bind, and only there; what does the pair produce |
+| 15 | `check-primer-pair` / `check-primer` | Is the pair sound — Tm gap, hairpins, dimers — where does each bind, and what does it produce |
 | 16 | `optimize-protein` | Codon optimization with host-hazard scrubbing |
 | 17 | `verify-against-reads` | The other end: reads came back, does the clone match |
 | 18 | `digest` | Overhang-aware digest of a **raw sequence you supply** — QC any junction you just designed |
@@ -143,6 +143,7 @@ twin takes the *same payload*.
 ## Primers
 
 `design-primers` `amplify-feature` `design-mutagenesis` `check-primer`
+`check-primer-pair` `list-tm-profiles`
 `check-primer-duplicates` `simulate-pcr` `pcr-program` `list-polymerases`
 `create-primer` `get-primer` `update-primer` `delete-primer` `delete-primers`
 `move-primer` `list-primers` `export-primers` + collection endpoints
@@ -150,6 +151,18 @@ twin takes the *same payload*.
 - `design-primers` has three modes: `detection` (diagnostic amplicon inside the
   region), `cloning` (needs `site_5`+`site_3`, appends RE tails), `generic`
   (binding-only). For Type IIS grammar overhangs use `design-gb-part` instead.
+  Each returns `qc` — the pair check below — so read `qc.warnings` too.
+- `check-primer-pair` is the QC for a pair you were GIVEN (a colleague's, a
+  paper's, a supplier's): pass the oligos as ordered and, for a tailed primer,
+  its 3' annealing arm as `forward_binding` / `reverse_binding` — otherwise the
+  tail is scored as mismatches and the Tm is the whole oligo's. Report
+  `warnings` verbatim, and `pair.product.product_bp` (tails included — the band
+  on the gel) rather than `template_bp`. `single_product: null` means the
+  search was capped, not that there is one product.
+- A Tm is only comparable under the same conditions. If the user quotes a Tm
+  from Benchling, pass `tm_profile: "benchling_compatible"` (it reads ~4-5 °C
+  lower than SpliceCraft's default); `list-tm-profiles` gives the conditions.
+  Never convert one tool's Tm to another's by hand.
 - Always surface `binds_as_designed` and `other_sites` — a primer that displays
   somewhere other than where it anneals is a wrong experiment.
 - `simulate-pcr`'s binding model is **exact-match**: no mismatch tolerance, no

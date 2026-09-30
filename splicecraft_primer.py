@@ -47,8 +47,8 @@ from typing import Callable as _Callable
 import splicecraft_state as _state
 from splicecraft_logging import _log, _timed
 from splicecraft_util import (
-    _IUPAC_DNA_CHARS, _IUPAC_WEAKEST_BASE, _degenerate_tm_bracket,
-    _normalize_dna_for_align,
+    _IUPAC_DNA_CHARS, _IUPAC_WEAKEST_BASE, _PRIMER3_LOCK,
+    _degenerate_tm_bracket, _normalize_dna_for_align, _p3_thermo, _p3_tm,
 )
 from splicecraft_biology import (
     _circ_slice, _forbidden_hit_set, _iupac_compatible, _iupac_pattern,
@@ -119,34 +119,104 @@ _MUT_BSAI_REV_TAIL = "CCCC" + "GGTCTCA" + "AACG"   # 15 nt; AACG = revcomp(CGTT)
 # used 0.2 mM dNTP / 250 nM oligo instead, so the SAME oligo read 2-3 °C
 # higher on the mutagenesis screen than on Check Primer, and a PCR program
 # built from a stored mutagenesis Tm annealed that much too hot.
-_MUT_P3 = dict(mv_conc=50.0, dv_conc=1.5, dntp_conc=0.6, dna_conc=50.0)
+# Typed as a plain `dict` so `**_MUT_P3` type-checks into the primer3 helpers.
+_MUT_P3: dict = dict(mv_conc=50.0, dv_conc=1.5, dntp_conc=0.6, dna_conc=50.0)
 
 
-# Tm conditions for primer-check and simple primer-design endpoints.
-# `primer3_default` uses Primer3 defaults. `benchling_compatible` specifies
-# SantaLucia conditions for comparison with Benchling results.
-_TM_PROFILES = {
-    "primer3_default": {},
-    "benchling_compatible": {
-        "mv_conc": 50.0,
-        "dv_conc": 0.0,
-        "dntp_conc": 0.0,
-        "dna_conc": 250.0,
-        "tm_method": "santalucia",
-        "salt_corrections_method": "santalucia",
-        "max_nn_length": 60,
+# ── Tm profiles: which reaction conditions a reported Tm is computed under ──
+# A Tm means nothing without its conditions, and tools pick different ones: the
+# same 25-mer reads 62.4 °C here and 58.2 °C in Benchling. A profile names one
+# set; every Tm in a response that took a `tm_profile` is computed under it,
+# and the response names the profile back. Both use primer3's SantaLucia 1998
+# nearest-neighbour model with the SantaLucia salt correction (primer3's
+# defaults) — only the concentrations differ. `primer3_default` IS `_MUT_P3`,
+# the app-wide conditions above, so a caller that never names a profile gets
+# exactly the numbers it always got. `benchling_compatible` is Benchling's
+# default SantaLucia setting — no Mg2+ or dNTP, 5x the oligo — which reads an
+# oligo ~4-5 °C LOWER (the missing Mg2+ outweighs the extra oligo); it
+# reproduces Tms read off Benchling to 0.1 °C (tests/test_primer_pair.py).
+#
+# A profile moves the Tm ONLY. Secondary structure (`_primer_structure`) is
+# always judged in a real PCR buffer, `_MUT_P3`: leaving Mg2+ out is a way of
+# REPORTING a Tm, but every PCR tube has Mg2+ in it, and scoring a hairpin
+# without it would understate exactly the risk being checked.
+_TM_PROFILES: "dict[str, dict]" = {
+    "primer3_default": {
+        "label": "Primer3 defaults",
+        "conditions": dict(_MUT_P3),
+        "about": ("SpliceCraft's own conditions — what every screen, the "
+                  "mutagenesis designers and the .dna import show: primer3's "
+                  "defaults, a typical PCR buffer."),
     },
+    "benchling_compatible": {
+        "label": "Benchling-compatible",
+        "conditions": dict(mv_conc=50.0, dv_conc=0.0, dntp_conc=0.0,
+                           dna_conc=250.0),
+        "about": ("Benchling's default SantaLucia melting-temperature settings "
+                  "(no Mg2+ or dNTP, 250 nM oligo), for comparing a Tm with "
+                  "one Benchling shows. If you changed Benchling's Melting "
+                  "Temp settings, compare the conditions instead."),
+    },
+}
+_TM_PROFILE_DEFAULT = "primer3_default"
+_TM_PROFILE_METHOD = ("SantaLucia 1998 nearest-neighbour, SantaLucia salt "
+                      "correction (primer3 calc_tm)")
+# Spellings a caller might reasonably send for one of the profiles above
+# (after case-folding and `-` / space → `_`).
+_TM_PROFILE_ALIASES = {
+    "default": "primer3_default",
+    "primer3": "primer3_default",
+    "benchling": "benchling_compatible",
 }
 
 
-def _tm_profile_kwargs(name: str = "primer3_default") -> dict:
-    """Return a copy of Primer3 kwargs for a supported Tm profile."""
-    if name not in _TM_PROFILES:
+def _tm_profile_resolve(name: object) -> "str | None":
+    """The canonical profile key for `name`, or None when it names none.
+    None / blank → the default profile; case, `-` and spaces are forgiven and
+    `_TM_PROFILE_ALIASES` apply, so `"Benchling"` finds `benchling_compatible`.
+    Anything that is not a string is unknown (None) — never the default."""
+    if name is None:
+        return _TM_PROFILE_DEFAULT
+    if not isinstance(name, str):
+        return None
+    key = "_".join(name.strip().lower().replace("-", " ").split())
+    if not key:
+        return _TM_PROFILE_DEFAULT
+    if key in _TM_PROFILES:
+        return key
+    return _TM_PROFILE_ALIASES.get(key)
+
+
+def _tm_profile_kwargs(name: str = _TM_PROFILE_DEFAULT) -> dict:
+    """The primer3 `calc_tm` keywords (salt / dNTP / oligo concentrations) of
+    a Tm profile — a copy, so a caller can't edit the registry. Raises
+    ValueError for a name `_tm_profile_resolve` doesn't recognise."""
+    key = _tm_profile_resolve(name)
+    if key is None:
         raise ValueError(
-            f"unknown tm_profile {name!r}. Expected one of "
-            f"{', '.join(_TM_PROFILES)}"
-        )
-    return dict(_TM_PROFILES[name])
+            f"unknown tm_profile {name!r}; expected one of "
+            f"{', '.join(_TM_PROFILES)}")
+    return dict(_TM_PROFILES[key]["conditions"])
+
+
+def _tm_profile_catalog() -> "list[dict]":
+    """Every Tm profile with its conditions spelled out in lab units — what
+    `list-tm-profiles` returns, so a caller can see what a number came from."""
+    out = []
+    for key, prof in _TM_PROFILES.items():
+        c = prof["conditions"]
+        out.append({
+            "key": key,
+            "label": prof["label"],
+            "default": key == _TM_PROFILE_DEFAULT,
+            "monovalent_mm": c["mv_conc"],
+            "mg_mm": c["dv_conc"],
+            "dntp_mm": c["dntp_conc"],
+            "oligo_nm": c["dna_conc"],
+            "method": _TM_PROFILE_METHOD,
+            "about": prof["about"],
+        })
+    return out
 
 
 def _mut_parse(s: str) -> tuple:
@@ -210,8 +280,7 @@ def _mut_tm(seq: str) -> float:
     if hit is not None:
         return hit
     try:
-        import primer3
-        val = primer3.calc_tm(seq, **_MUT_P3)  # type: ignore[arg-type]
+        val = _p3_tm(seq, **_MUT_P3)
     except Exception:
         # A degenerate window (a consensus N, a typed IUPAC code) is a MIX:
         # rate it by its weakest member's nearest-neighbour Tm — the same
@@ -262,9 +331,7 @@ def _mut_hairpin_dg(seq: str) -> "float | None":
     if hit is not None:
         return hit
     try:
-        import primer3
-        val = (primer3.calc_hairpin(seq, **_MUT_P3).dg  # type: ignore[arg-type]
-               / _CAL_PER_KCAL)
+        val = _p3_thermo("hairpin", seq, **_MUT_P3).dg / _CAL_PER_KCAL
     except Exception:
         _log.exception(
             "_mut_hairpin_dg: primer3.calc_hairpin raised on %d-mer; "
@@ -281,9 +348,7 @@ def _mut_homodimer_dg(seq: str) -> "float | None":
     if hit is not None:
         return hit
     try:
-        import primer3
-        val = (primer3.calc_homodimer(seq, **_MUT_P3).dg  # type: ignore[arg-type]
-               / _CAL_PER_KCAL)
+        val = _p3_thermo("homodimer", seq, **_MUT_P3).dg / _CAL_PER_KCAL
     except Exception:
         _log.exception(
             "_mut_homodimer_dg: primer3.calc_homodimer raised on "
@@ -291,22 +356,6 @@ def _mut_homodimer_dg(seq: str) -> "float | None":
         return None
     _mut_thermo_cache_put(_MUT_HOMODIMER_CACHE, seq, val)
     return val
-
-
-def _primer_heterodimer_dg(seq1: str, seq2: str) -> "float | None":
-    """Pair heterodimer ΔG in kcal/mol, or ``None`` when unmeasured."""
-    try:
-        import primer3
-        return (primer3.calc_heterodimer(
-            seq1, seq2,
-            mv_conc=_MUT_P3["mv_conc"], dv_conc=_MUT_P3["dv_conc"],
-            dntp_conc=_MUT_P3["dntp_conc"], dna_conc=_MUT_P3["dna_conc"],
-        ).dg / _CAL_PER_KCAL)
-    except Exception:
-        _log.exception(
-            "_primer_heterodimer_dg: primer3.calc_heterodimer raised on "
-            "%d/%d-mers. Reporting None (not measured)", len(seq1), len(seq2))
-        return None
 
 
 def _mut_gc_pct(seq: str) -> float:
@@ -318,8 +367,11 @@ def _mut_ends_gc(seq: str) -> bool:
     return bool(seq) and seq[-1].upper() in "GC"
 
 
-def _mut_score_outer(anneal: str, target_tm: float = 60.0) -> float:
-    t  = _mut_tm(anneal)
+def _mut_score_outer(anneal: str, target_tm: float = 60.0,
+                     tm_fn: "_Callable[[str], float] | None" = None) -> float:
+    # `tm_fn` lets a caller rank under another Tm profile; left out, it is
+    # `_mut_tm` (looked up at CALL time, so a test patching it still counts).
+    t  = (tm_fn or _mut_tm)(anneal)
     gc = _mut_gc_pct(anneal)
     # ΔG is kcal/mol; an unmeasurable one scores as no penalty (ranking only —
     # the REPORTED field keeps the None so a QC gate can't pass vacuously).
@@ -471,6 +523,12 @@ _PRIMER_CHECK_SEED_LEN  = 12     # exact 3'-anchor required for a binding call
 _PRIMER_CHECK_MAX_SITES = 200    # per-template binding-site cap (repeat guard)
 
 
+# Shortest primer the Primer Check tab and `check-primer-pair` accept (cf the
+# PCR simulator's `_PCR_MIN_PRIMER_LEN`): below it a 3'-anchored "site" is
+# noise and primer3's Tm is meaningless (a 1-mer reads −1,000,000 °C).
+_PRIMER_CHECK_MIN_LEN   = 10
+
+
 def _primer_binding_sites(
     primer: str, top: str, total: int, *,
     circular: bool = True,
@@ -598,18 +656,20 @@ def _primer_check_confidence(pct: "float | int | None") -> "tuple[str, str]":
 # designers (primer3 thermodynamics; enzyme catalog via _state._all_enzymes_hook).
 # Verified by the real-plasmid design golden (byte-identical output). The GB /
 # domestication-scrub designers (_design_gb_primers / _scrub_*) stay hub-side.
-def _primer_tm(seq: str, tm_profile: str = "primer3_default") -> "float | None":
-    """Melting temperature (°C, 1 dp) of an oligo — primer3's nearest-neighbour
-    model when available, else the 2(A+T)+4(G+C) rule. Module-level so the CSV
-    import (and any caller) can compute a Tm without the local ``_calc_tm``
-    closures the design / .dna paths use. Returns None for empty input."""
+def _primer_tm(seq: str,
+               tm_profile: str = _TM_PROFILE_DEFAULT) -> "float | None":
+    """Melting temperature (°C, 1 dp) of an oligo under a Tm profile
+    (`_TM_PROFILES`; the default is the app-wide conditions) — primer3's
+    nearest-neighbour model when available, else the 2(A+T)+4(G+C) rule.
+    Module-level so the CSV import (and any caller) can compute a Tm without
+    the local ``_calc_tm`` closures the design / .dna paths use. Returns None
+    for empty input; raises ValueError for an unknown profile."""
     s = (seq or "").strip().upper()
     if not s:
         return None
     conditions = _tm_profile_kwargs(tm_profile)
     try:
-        import primer3
-        return round(float(primer3.calc_tm(s, **conditions)), 1)
+        return round(_p3_tm(s, **conditions), 1)
     except Exception:
         # Degenerate oligo → its weakest member's NN Tm (what the anneal must
         # respect), not the 2+4 rule, which runs ~8-12 °C away from it.
@@ -649,9 +709,12 @@ def _binding_max_len(tail_len: int, min_len: int = 18) -> int:
 
 def _pick_binding_region(seq: str, target_tm: float = 60.0,
                          min_len: int = 18, max_len: int = 25,
-                         tm_profile: str = "primer3_default") -> tuple[str, float]:
+                         tm_profile: str = _TM_PROFILE_DEFAULT,
+                         ) -> tuple[str, float]:
     """Return the prefix of `seq` (length min_len..max_len) whose Tm is
-    closest to `target_tm`. Uses primer3-py's SantaLucia Tm calculation.
+    closest to `target_tm`. Uses primer3-py's SantaLucia Tm calculation under
+    the Tm profile's conditions (`_TM_PROFILES`), so `target_tm` means the same
+    thing the profile's reported Tm does.
 
     Returns (binding_sequence, tm). If primer3-py is not installed, falls
     back to a crude 2+4 rule estimate.
@@ -672,8 +735,7 @@ def _pick_binding_region(seq: str, target_tm: float = 60.0,
     _tm: "_Callable[..., float]"
     conditions = _tm_profile_kwargs(tm_profile)
     try:
-        import primer3
-        _p3_tm = primer3.calc_tm
+        import primer3  # noqa: F401 — availability probe; `_p3_tm` computes
     except ImportError:
         _tm = _tm_fallback
     else:
@@ -702,9 +764,10 @@ def _pick_binding_region(seq: str, target_tm: float = 60.0,
         # longer drops the whole design onto the 2+4 rule.
         def _tm_nn(s: str) -> float:
             try:
-                return float(_p3_tm(
-                    s.upper().translate(_IUPAC_WEAKEST_BASE), **conditions))
-            except (ValueError, OSError, RuntimeError, TypeError):
+                return _p3_tm(s.upper().translate(_IUPAC_WEAKEST_BASE),
+                              **conditions)
+            except (ImportError, ValueError, OSError, RuntimeError,
+                    TypeError):
                 return _tm_fallback(s)
         _window = seq[:max_len].upper()
         _tm = (_tm_nn
@@ -743,6 +806,7 @@ def _design_detection_primers(
     product_max: int = 550,
     target_tm: float = 60.0,
     primer_len: int = 25,
+    tm_profile: str = _TM_PROFILE_DEFAULT,
 ) -> dict:
     """Design diagnostic PCR primers WITHIN a selected region using Primer3.
 
@@ -754,10 +818,17 @@ def _design_detection_primers(
     Uses SEQUENCE_INCLUDED_REGION (not SEQUENCE_TARGET) so Primer3 places
     both primers inside the selected region rather than trying to flank it.
 
+    `tm_profile` (`_TM_PROFILES`) sets Primer3's salt / dNTP / oligo
+    concentrations, so `target_tm` and the returned Tms are on that profile's
+    scale — the SAME numbers `_primer_tm(seq, tm_profile)` gives. Primer3 has
+    one set of conditions per run, so its own hairpin / dimer screening runs
+    under the profile too; `_primer_pair_qc` re-judges those in PCR buffer.
+
     Returns a dict with keys: fwd_seq, rev_seq, fwd_tm, rev_tm, fwd_pos,
     rev_pos, product_size, or an 'error' key on failure.
     """
     import primer3
+    cond = _tm_profile_kwargs(tm_profile)
     seq   = template_seq.upper()
     total = len(seq)
     wraps = target_end < target_start
@@ -785,31 +856,40 @@ def _design_detection_primers(
                      f"region or reduce the product size."
         }
 
+    seq_args = {
+        "SEQUENCE_TEMPLATE": p3_seq,
+        # INCLUDED_REGION: primers must bind WITHIN this region.
+        # This is the key difference from SEQUENCE_TARGET (which
+        # would require primers to sit OUTSIDE the target).
+        "SEQUENCE_INCLUDED_REGION": [p3_start, region_len],
+    }
+    global_args = {
+        "PRIMER_TASK": "generic",
+        "PRIMER_PICK_LEFT_PRIMER": 1,
+        "PRIMER_PICK_RIGHT_PRIMER": 1,
+        # primer_len is the OPTIMAL length — Primer3 will expand
+        # or contract within the min/max range to find the best Tm.
+        "PRIMER_OPT_SIZE": primer_len,
+        "PRIMER_MIN_SIZE": max(15, primer_len - 8),
+        "PRIMER_MAX_SIZE": min(36, primer_len + 8),
+        "PRIMER_OPT_TM": target_tm,
+        "PRIMER_MIN_TM": target_tm - 3,
+        "PRIMER_MAX_TM": target_tm + 3,
+        "PRIMER_PRODUCT_SIZE_RANGE": [[product_min, product_max]],
+        "PRIMER_NUM_RETURN": 1,
+        # The Tm profile's reaction conditions. The default profile's ARE
+        # Primer3's defaults — passed anyway so the two can't drift apart.
+        "PRIMER_SALT_MONOVALENT": cond["mv_conc"],
+        "PRIMER_SALT_DIVALENT": cond["dv_conc"],
+        "PRIMER_DNTP_CONC": cond["dntp_conc"],
+        "PRIMER_DNA_CONC": cond["dna_conc"],
+    }
     try:
-        result = primer3.design_primers(
-            seq_args={
-                "SEQUENCE_TEMPLATE": p3_seq,
-                # INCLUDED_REGION: primers must bind WITHIN this region.
-                # This is the key difference from SEQUENCE_TARGET (which
-                # would require primers to sit OUTSIDE the target).
-                "SEQUENCE_INCLUDED_REGION": [p3_start, region_len],
-            },
-            global_args={
-                "PRIMER_TASK": "generic",
-                "PRIMER_PICK_LEFT_PRIMER": 1,
-                "PRIMER_PICK_RIGHT_PRIMER": 1,
-                # primer_len is the OPTIMAL length — Primer3 will expand
-                # or contract within the min/max range to find the best Tm.
-                "PRIMER_OPT_SIZE": primer_len,
-                "PRIMER_MIN_SIZE": max(15, primer_len - 8),
-                "PRIMER_MAX_SIZE": min(36, primer_len + 8),
-                "PRIMER_OPT_TM": target_tm,
-                "PRIMER_MIN_TM": target_tm - 3,
-                "PRIMER_MAX_TM": target_tm + 3,
-                "PRIMER_PRODUCT_SIZE_RANGE": [[product_min, product_max]],
-                "PRIMER_NUM_RETURN": 1,
-            },
-        )
+        # Primer3's design runs its thermodynamic alignment on the same C
+        # statics as `_p3_thermo` — serialise it with every other alignment.
+        with _PRIMER3_LOCK:
+            result = primer3.design_primers(seq_args=seq_args,
+                                            global_args=global_args)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
         # Sweep #25 (2026-05-23): `(OSError, Exception)` is `Exception`
         # since `Exception` subsumes `OSError` — that tuple was a
@@ -870,7 +950,7 @@ def _design_cloning_primers_raw(
     name_3: str = "3'site",
     target_tm: float = 60.0,
     padding: str = "GCGC",
-    tm_profile: str = "primer3_default",
+    tm_profile: str = _TM_PROFILE_DEFAULT,
 ) -> dict:
     """Design cloning primers with arbitrary recognition-site tails + padding.
 
@@ -943,7 +1023,7 @@ def _design_cloning_primers(
     re_3prime: str,
     target_tm: float = 60.0,
     padding: str = "GCGC",
-    tm_profile: str = "primer3_default",
+    tm_profile: str = _TM_PROFILE_DEFAULT,
 ) -> dict:
     """Design cloning primers using enzyme names from the combined
     catalog (built-in NEB ∪ user-added custom). Delegates to
@@ -968,7 +1048,7 @@ def _design_generic_primers(
     start: int,
     end: int,
     target_tm: float = 60.0,
-    tm_profile: str = "primer3_default",
+    tm_profile: str = _TM_PROFILE_DEFAULT,
 ) -> dict:
     """Design simple binding primers (no tails, no RE sites, no overhangs).
 
@@ -1001,6 +1081,260 @@ def _design_generic_primers(
         "fwd_pos":  fwd_pos,
         "rev_pos":  rev_pos,
     }
+
+
+# ── primer / primer-pair QC (check-primer-pair, design results, Primer Check) ─
+# Tm under a profile, plus the secondary structures Primer3 screens for when it
+# DESIGNS — each reported as ΔG at 37 °C (kcal/mol, the unit supplier sheets
+# use) AND as the structure's MELTING TEMPERATURE, the number Primer3 itself
+# tests (they match its design output, PRIMER_LEFT_0_HAIRPIN_TH and friends,
+# digit for digit, floored at 0 °C as it reports them). The melting temperature
+# is what decides: a hairpin at a harmless-looking −2.6 kcal/mol can melt at
+# 62 °C, i.e. stay folded through the whole anneal.
+#
+# What gets FLAGGED was measured, not assumed (2026-09-30, 200 random designs a
+# mode). Primer3's 47 °C limit on every structure flags 0 % of its own detection
+# designs — it filters on exactly that — but 55 % of generic and 82 % of
+# cloning designs: a GCGC + restriction-site tail folds onto the arm (median
+# hairpin 48 °C) in primers labs use every day, and a warning on four cloning
+# pairs in five is a warning nobody reads. Such a hairpin is REAL but rarely
+# decisive — primers sit in vast excess, refold in microseconds, and from cycle
+# 2 the template carries the tail's complement. What fails a PCR is a 3' end
+# that cannot anneal or extend. So:
+#   * a HAIRPIN is flagged when its stem takes in the primer's 3'-terminal
+#     `_PRIMER_3P_END` bases (Primer3's own "3' end", PRIMER_MAX_END_STABILITY)
+#     AND it is still folded at the anneal — Tm (concentration-independent for a
+#     hairpin) at or above `_PRIMER_ANNEAL_BELOW_TM` under the lower primer's Tm
+#     in PCR buffer, the conventional annealing temperature. 0 % / 12 % / 12 %
+#     of detection / generic / cloning designs. Every hairpin's ΔG and Tm is
+#     reported regardless, with `hairpin_3p` saying whether it holds the 3' end.
+#   * a DIMER (self or pair; anywhere or on a 3' end) keeps Primer3's 47 °C
+#     limit (PRIMER_MAX_SELF_ANY_TH / _SELF_END_TH / PAIR_MAX_COMPL_ANY_TH /
+#     _COMPL_END_TH), below any anneal on purpose: a paired 3' end can be
+#     extended while the reaction is set up and ramped, which is how a
+#     primer-dimer band is made. ~1 % of designs; every real primer-dimer.
+_PRIMER_DIMER_TM_LIMIT = 47.0
+_PRIMER_ANNEAL_BELOW_TM = 5.0
+_PRIMER_3P_END = 5
+# primer3's thermodynamic alignment refuses a hairpin / self-dimer of a strand
+# longer than this, and any pairing in which BOTH strands are longer.
+_THAL_MAX_LEN = 60
+# The 5 °C amplify-feature already warns at.
+_PRIMER_PAIR_MAX_TM_DELTA = 5.0
+_IUPAC_AMBIGUOUS = frozenset("RYSWKMBDHVN")
+
+
+def _same_structure(a: "dict | None", b: "dict | None") -> bool:
+    """Two `_primer_structure` results that are the SAME structure — the most
+    stable dimer anywhere happening to be 3'-anchored — so it is flagged once."""
+    return (a is not None and b is not None and a["dg"] == b["dg"]
+            and a["tm"] == b["tm"])
+
+
+def _primer_structure(kind: str, seq1: str, seq2: str = "") -> "dict | None":
+    """One secondary structure in PCR buffer (`_MUT_P3` — never a Tm
+    profile's conditions, see `_TM_PROFILES`): ``{"dg": kcal/mol at 37 °C
+    (2 dp), "tm": melting temperature °C (1 dp, floored at 0)}``, or None when
+    primer3 couldn't measure it (not installed, or it refused the input —
+    callers check `_THAL_MAX_LEN` first, so they can say why). `kind` as in
+    `_p3_thermo`. No structure at all comes back as ΔG 0 / Tm 0. A hairpin
+    also carries ``"end_paired"``: does its stem take in any of the oligo's
+    3'-terminal `_PRIMER_3P_END` bases."""
+    hairpin = kind == "hairpin"
+    try:
+        res = _p3_thermo(kind, seq1, seq2, structure=hairpin, **_MUT_P3)
+    except (ImportError, OSError, RuntimeError, ValueError, TypeError) as exc:
+        _log.warning("_primer_structure: primer3 %s on %d/%d-mer not "
+                     "measured: %s", kind, len(seq1), len(seq2), exc)
+        return None
+    out: dict = {"dg": round(res.dg / _CAL_PER_KCAL, 2),
+                 "tm": round(max(0.0, float(res.tm)), 1)}
+    if hairpin:
+        # primer3 draws a hairpin as ONE line under the sequence: `/` and `\`
+        # mark the two sides of the stem, `-` a free base.
+        drawn = ""
+        if res.structure_found:
+            for line in (res.ascii_structure_lines or []):
+                if line.startswith("SEQ\t"):
+                    drawn = line[4:]
+                    break
+        out["end_paired"] = any(ch in "/\\" for ch in drawn[-_PRIMER_3P_END:])
+    return out
+
+
+def _anneal_ref(*arms: str) -> "float | None":
+    """The conventional annealing temperature for these arms — the lower Tm IN
+    PCR BUFFER (the default profile, whatever profile the Tm is reported
+    under: the anneal happens in the tube) minus `_PRIMER_ANNEAL_BELOW_TM`."""
+    tms = [t for t in (_primer_tm(a) for a in arms) if t is not None]
+    return round(min(tms) - _PRIMER_ANNEAL_BELOW_TM, 1) if tms else None
+
+
+def _primer_oligo_qc(primer: str, *, binding: "str | None" = None,
+                     tm_profile: str = _TM_PROFILE_DEFAULT,
+                     role: str = "primer",
+                     anneal_ref: "float | None" = None) -> dict:
+    """Tm + secondary-structure QC of ONE oligo — no template needed.
+
+    `primer` is the whole oligo as ordered, 5'→3' (IUPAC; any 5' tail
+    included); `binding` its 3' annealing arm — a 3' suffix of `primer` — or
+    None when the whole oligo anneals. Tm and GC% are the ARM's (it alone
+    anneals in the first cycles, so it sets the annealing temperature); the
+    hairpin and self-dimers are the WHOLE oligo's (all of it is in the tube).
+    `role` only words the warnings ("the forward primer …"). A hairpin is
+    judged against `anneal_ref` — by default this oligo's own
+    (`_anneal_ref`); a pair passes the lower of its two.
+
+    Returns ``{primer, length, binding, binding_length, tail, tm, gc_pct,
+    hairpin_dg, hairpin_tm, hairpin_3p, homodimer_dg, homodimer_tm,
+    homodimer_3p_dg, homodimer_3p_tm, anneal_ref_c, warnings}`` (+
+    ``tm_range`` for a degenerate arm) — `hairpin_3p` is whether the hairpin
+    holds the 3' end, which is what gets it flagged (with a Tm at or above
+    `anneal_ref_c`). A ``None`` ΔG/Tm means NOT measured, and a warning says
+    why — never "no structure", which reads 0. Raises ValueError for an empty
+    oligo, a `binding` that isn't a 3' suffix, or an unknown profile."""
+    p = (primer or "").strip().upper()
+    b = p if binding is None else (binding or "").strip().upper()
+    if not p or not b:
+        raise ValueError("empty primer or binding arm")
+    if not p.endswith(b):
+        raise ValueError("the binding arm must be a 3' suffix of the primer")
+    cond = _tm_profile_kwargs(tm_profile)
+    if anneal_ref is None:
+        anneal_ref = _anneal_ref(b)
+    warnings: "list[str]" = []
+    out: dict = {
+        "primer": p, "length": len(p),
+        "binding": b, "binding_length": len(b),
+        "tail": p[:len(p) - len(b)],
+        "tm": _primer_tm(b, tm_profile),
+        "gc_pct": round(100.0 * sum(1 for c in b if c in "GCS") / len(b), 1),
+        "anneal_ref_c": anneal_ref,
+    }
+    bracket = _degenerate_tm_bracket(b, **cond)
+    if bracket is not None:
+        out["tm_range"] = [round(bracket[0], 1), round(bracket[1], 1)]
+    names = (("hairpin", "hairpin"), ("homodimer", "homodimer"),
+             ("homodimer_3p", "end_stability"))
+    if len(p) > _THAL_MAX_LEN:
+        for name, _k in names:
+            out[f"{name}_dg"] = out[f"{name}_tm"] = None
+        out["hairpin_3p"] = None
+        warnings.append(
+            f"the {role} primer is {len(p)} nt — primer3 folds oligos only "
+            f"up to {_THAL_MAX_LEN} nt, so its hairpin and self-dimers were "
+            f"not checked")
+        out["warnings"] = warnings
+        return out
+    found = {name: _primer_structure(kind, p,
+                                     p if kind == "end_stability" else "")
+             for name, kind in names}
+    for name, _k in names:
+        st = found[name]
+        out[f"{name}_dg"] = None if st is None else st["dg"]
+        out[f"{name}_tm"] = None if st is None else st["tm"]
+    hp = found["hairpin"]
+    out["hairpin_3p"] = None if hp is None else hp["end_paired"]
+    if (hp is not None and hp["end_paired"] and anneal_ref is not None
+            and hp["tm"] >= anneal_ref):
+        warnings.append(
+            f"the {role} primer's 3' end is held in a hairpin that melts at "
+            f"{hp['tm']:.1f} °C (ΔG {hp['dg']:.2f} kcal/mol) — still folded "
+            f"at a {anneal_ref:.1f} °C anneal ({_PRIMER_ANNEAL_BELOW_TM:.0f} "
+            f"°C under the lower primer Tm), so it can't prime")
+    homo, homo3 = found["homodimer"], found["homodimer_3p"]
+    for st, words in ((homo, "a self-dimer"),
+                      (homo3, "a self-dimer on its 3' end (extendable)")):
+        if st is None or st["tm"] <= _PRIMER_DIMER_TM_LIMIT:
+            continue
+        if st is homo and _same_structure(homo, homo3):
+            continue            # one structure: the 3' warning says more
+        warnings.append(
+            f"the {role} primer forms {words} stable up to {st['tm']:.1f} °C "
+            f"(ΔG {st['dg']:.2f} kcal/mol) — Primer3 rejects one stable "
+            f"above {_PRIMER_DIMER_TM_LIMIT:.0f} °C")
+    if any(v is None for v in found.values()):
+        warnings.append(
+            f"the {role} primer's hairpin / self-dimer could not be computed "
+            f"(primer3 unavailable) — it is NOT secondary-structure checked")
+    elif set(p) & _IUPAC_AMBIGUOUS:
+        warnings.append(
+            f"the {role} primer carries ambiguity codes — its structures "
+            f"count them as non-pairing, so the worst member of the mix can "
+            f"fold more than shown")
+    out["warnings"] = warnings
+    return out
+
+
+def _primer_pair_qc(fwd: str, rev: str, *,
+                    fwd_binding: "str | None" = None,
+                    rev_binding: "str | None" = None,
+                    tm_profile: str = _TM_PROFILE_DEFAULT) -> dict:
+    """Thermodynamic QC of one PCR primer pair — no template needed.
+
+    Each oligo gets `_primer_oligo_qc` (its Tm from the annealing arm, its
+    structures from the whole oligo), with ONE annealing reference for both —
+    the reaction has one anneal, set by the weaker arm. The pair adds the Tm
+    difference of the two arms and the primer-dimers between the two WHOLE
+    oligos: anywhere, and with either 3' end anchored (the worse direction).
+
+    Returns ``{forward, reverse, pair: {tm_delta, heterodimer_dg,
+    heterodimer_tm, heterodimer_3p_dg, heterodimer_3p_tm}, tm_profile,
+    dg_units, anneal_ref_c, dimer_tm_limit, warnings}`` with every oligo's
+    warnings folded into the one list (empty = nothing to flag). Raises
+    ValueError as `_primer_oligo_qc` does."""
+    key = _tm_profile_resolve(tm_profile)
+    if key is None:
+        raise ValueError(f"unknown tm_profile {tm_profile!r}")
+    fb = (fwd_binding if fwd_binding is not None else fwd or "").strip()
+    rb = (rev_binding if rev_binding is not None else rev or "").strip()
+    ref = _anneal_ref(fb.upper(), rb.upper()) if fb and rb else None
+    f = _primer_oligo_qc(fwd, binding=fwd_binding, tm_profile=key,
+                         role="forward", anneal_ref=ref)
+    r = _primer_oligo_qc(rev, binding=rev_binding, tm_profile=key,
+                         role="reverse", anneal_ref=ref)
+    warnings = f.pop("warnings") + r.pop("warnings")
+    pair: dict = {"tm_delta": None}
+    if f["tm"] is not None and r["tm"] is not None:
+        pair["tm_delta"] = round(abs(f["tm"] - r["tm"]), 1)
+        if pair["tm_delta"] > _PRIMER_PAIR_MAX_TM_DELTA:
+            warnings.append(f"primer Tms differ by {pair['tm_delta']:.1f} °C")
+    fp, rp = f["primer"], r["primer"]
+    if len(fp) > _THAL_MAX_LEN and len(rp) > _THAL_MAX_LEN:
+        pair.update(heterodimer_dg=None, heterodimer_tm=None,
+                    heterodimer_3p_dg=None, heterodimer_3p_tm=None)
+        warnings.append(
+            f"both primers are longer than {_THAL_MAX_LEN} nt — primer3 "
+            f"cannot align them against each other, so primer-dimers were "
+            f"not checked")
+    else:
+        het = _primer_structure("heterodimer", fp, rp)
+        ends = [st for st in (_primer_structure("end_stability", fp, rp),
+                              _primer_structure("end_stability", rp, fp))
+                if st is not None]
+        end = max(ends, key=lambda st: st["tm"]) if len(ends) == 2 else None
+        pair["heterodimer_dg"] = None if het is None else het["dg"]
+        pair["heterodimer_tm"] = None if het is None else het["tm"]
+        pair["heterodimer_3p_dg"] = None if end is None else end["dg"]
+        pair["heterodimer_3p_tm"] = None if end is None else end["tm"]
+        if het is None or end is None:
+            warnings.append(
+                "the primer-dimer between the two primers could not be "
+                "computed (primer3 unavailable) — the pair is NOT "
+                "secondary-structure checked")
+        for st, words in ((het, "pair with each other"),
+                          (end, "pair at a 3' end (extendable)")):
+            if st is None or st["tm"] <= _PRIMER_DIMER_TM_LIMIT:
+                continue
+            if st is het and _same_structure(het, end):
+                continue        # one structure: the 3' warning says more
+            warnings.append(
+                f"the two primers {words} up to {st['tm']:.1f} °C "
+                f"(ΔG {st['dg']:.2f} kcal/mol) — Primer3 rejects a pair "
+                f"stable above {_PRIMER_DIMER_TM_LIMIT:.0f} °C")
+    return {"forward": f, "reverse": r, "pair": pair, "tm_profile": key,
+            "dg_units": "kcal/mol", "anneal_ref_c": ref,
+            "dimer_tm_limit": _PRIMER_DIMER_TM_LIMIT, "warnings": warnings}
 
 
 # ── mutagenesis-INNER design (Phase D, moved from hub) ─────────────────────
@@ -2125,7 +2459,8 @@ def _design_allele_specific_primer(
         orientation: str = "auto",
         target_tm: float = 60.0,
         destabilize: bool = False,
-        circular: bool = False) -> "dict | None":
+        circular: bool = False,
+        tm_profile: str = _TM_PROFILE_DEFAULT) -> "dict | None":
     """One allele-specific primer whose 3'-terminal base sits ON `variant_pos`.
 
     `alt_base` is the allele the primer must be specific FOR; omit it to
@@ -2145,11 +2480,29 @@ def _design_allele_specific_primer(
     is chosen, and quietly ranking it lower would leave the caller wondering
     why every candidate scored badly instead of telling them the allele itself
     is the constraint.
+
+    `tm_profile` (`_TM_PROFILES`) puts `target_tm` and the reported `tm` on
+    that profile's scale; the default keeps the mutagenesis engine's own
+    `_mut_tm`, so a default design is unchanged to the last digit.
     """
     t = (template or "").upper()
     n = len(t)
     if n == 0 or not (0 <= variant_pos < n):
         return None
+    _cond = _tm_profile_kwargs(tm_profile)           # ValueError if unknown
+
+    def _tm_profiled(s: str) -> float:
+        try:
+            return _p3_tm(s, **_cond)
+        except Exception:
+            # Same fallback ladder as `_mut_tm`: the weakest member of a
+            # degenerate window, else the 2+4 rule.
+            br = _degenerate_tm_bracket(s, **_cond)
+            return br[0] if br is not None else float(_mut_tm(s))
+    # Distinct names, not a redefinition: pyright's reportRedeclaration.
+    tm_fn: "_Callable[[str], float]" = (
+        _mut_tm if _tm_profile_resolve(tm_profile) == _TM_PROFILE_DEFAULT
+        else _tm_profiled)
     ref_base = t[variant_pos]
     allele = (alt_base or ref_base).upper()
     if allele not in "ACGT":
@@ -2194,14 +2547,14 @@ def _design_allele_specific_primer(
                 swap = {"A": "C", "C": "A", "G": "T", "T": "G"}.get(cur, cur)
                 seq = seq[:i] + swap + seq[i + 1:]
                 destab_pos = i
-            score = _mut_score_outer(seq, target_tm)
+            score = _mut_score_outer(seq, target_tm, tm_fn=tm_fn)
             if best is None or score < best["score"]:
                 three = seq[-1]
                 best = {
                     "seq": seq,
                     "orientation": orient,
                     "length": len(seq),
-                    "tm": _mut_tm(seq),
+                    "tm": tm_fn(seq),
                     "gc": _mut_gc_pct(seq),
                     "score": score,
                     "three_prime_base": three,

@@ -6134,12 +6134,18 @@ class TestDesignPrimersModes:
         assert r["result"]["fwd_tm"] == sc._primer_tm(
             r["result"]["fwd_seq"], "benchling_compatible")
 
-    def test_detection_rejects_unapplied_tm_profile(self):
-        err, code = sc._h_design_primers(None, {
+    def test_detection_honours_tm_profile(self):
+        # Primer3 takes the profile's salts as design arguments, so its Tm IS
+        # the profile's Tm — detection used to refuse the profile instead.
+        r = sc._h_design_primers(None, {
             "template": _PRIMER_TMPL, "start": 0, "end": len(_PRIMER_TMPL),
             "mode": "detection", "tm_profile": "benchling_compatible",
         })
-        assert code == 400 and "detection mode" in err["error"]
+        assert r["ok"] and r["tm_profile"] == "benchling_compatible"
+        res = r["result"]
+        for seq_key, tm_key in (("fwd_seq", "fwd_tm"), ("rev_seq", "rev_tm")):
+            assert res[tm_key] == sc._primer_tm(res[seq_key],
+                                                "benchling_compatible")
 
     def test_generic_region_too_short_422(self):
         r = sc._h_design_primers(None, {"template": _PRIMER_TMPL, "start": 0,
@@ -6195,7 +6201,7 @@ class TestCheckPrimer:
         assert default["tm"] == sc._primer_tm(seq)
         assert default["tm_profile"] == "primer3_default"
         err, code = sc._h_check_primer(None, {
-            "primer": seq, "tm_profile": "snapgene",
+            "primer": seq, "tm_profile": "no-such-profile",
         })
         assert code == 400 and "tm_profile" in err["error"]
 
@@ -6354,8 +6360,13 @@ class TestCheckPrimerPair:
             rev_binding, "benchling_compatible")
         assert r["forward"]["n_sites"] == r["reverse"]["n_sites"] == 1
         assert r["pair"]["n_amplicons"] == 1
-        assert r["pair"]["amplicons"][0]["start"] == 40
-        assert r["pair"]["amplicons"][0]["length"] == 182
+        amp = r["pair"]["amplicons"][0]
+        assert amp["start"] == 40
+        # 182 bp of template between the arms' outer edges; the product on
+        # the gel carries both 19-nt tails as well.
+        assert amp["template_bp"] == 182
+        assert amp["product_bp"] == 182 + 19 + 19
+        assert r["pair"]["product"] == amp and r["pair"]["single_product"]
         assert r["dg_units"] == "kcal/mol"
         assert r["pair"]["heterodimer_dg"] is not None
 

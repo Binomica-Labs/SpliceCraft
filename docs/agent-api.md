@@ -110,7 +110,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-~267 endpoints across:
+~269 endpoints across:
 
 - **Records** — `new-plasmid` (create from a raw sequence, the Ctrl+N
   flow), get / set sequence, add / update / delete features (with the full
@@ -354,7 +354,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   close; the L2→binary hop is a known engine gap), design-primers
   (Primer3 primer-pair design over a region: `detection` picks a
   diagnostic amplicon, `cloning` appends RE-site tails, `generic`
-  returns binding-only primers — no tails / overhangs; and
+  returns binding-only primers — no tails / overhangs — and each of those
+  three returns `qc`, the check-primer-pair thermodynamics of the designed
+  pair (see below); and
   `allele_specific`, which is anchored on a single `variant_pos` rather than a
   region and pins the primer's **3'-terminal base** on the variant, because
   that pinning IS allele-specific PCR — the other modes slide to whatever
@@ -383,17 +385,34 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   is never silent. A degenerate oligo gets a real nearest-neighbour `tm` —
   its WEAKEST variant, which is what sets the anneal — plus `tm_range`
   spanning the mix. Sites come back ranked, and `truncated` says whether
-  `max_sites` cut the list short. Set `tm_profile` to
-  `"benchling_compatible"` to use the same SantaLucia conditions as the
-  Benchling-compatible design modes), check-primer-pair
-  (a complete forward/reverse PCR-primer pair against one template. Optional
-  `forward_binding` and `reverse_binding` identify the annealing 3' suffixes,
-  while hairpin and dimer checks use each complete oligo, including its 5'
-  cloning tail. The response reports binding sites, Tm difference,
-  homo/heterodimer energies and candidate amplicons. `truncated` on either
-  primer or `amplicons_truncated` on the pair means the capped search was not
-  exhaustive, so uniqueness is not established. A dU base is read as T and
-  reported with `read_u_as_t`), optimize-protein
+  `max_sites` cut the list short), check-primer-pair
+  (a whole PCR pair against a template — by default the LOADED plasmid with
+  its own topology; with neither, the thermodynamics still come back and a
+  `note` says binding was not checked. Primers are the oligos as ordered,
+  tails included (`forward_primer` / `reverse_primer`; aliases `fwd_primer` /
+  `forward` / `fwd`, `rev_primer` / `reverse` / `rev`); name a tailed primer's
+  3' ANNEALING arm with `forward_binding` / `reverse_binding` — a 3' suffix of
+  the oligo, ≥ 10 nt — and the Tm, GC% and binding sites come from the arm
+  while the hairpin and dimers use the whole oligo. Returns per primer `tm`,
+  `gc_pct`, `tail`, `hairpin_dg`/`_tm`, `hairpin_3p` (does the hairpin hold the
+  3' end), `homodimer_dg`/`_tm`, `homodimer_3p_dg`/`_tm` and the ranked
+  `sites`; for the pair `tm_delta`, `heterodimer_dg`/`_tm`,
+  `heterodimer_3p_dg`/`_tm` and every product in `amplicons`, each with
+  `template_bp` AND `product_bp` (the tails added back — the band on the gel)
+  and `primers` naming which primer primes each end: `forward+reverse` is the
+  pair's product, `forward+forward` one primer priming both strands.
+  `product` is the best two-primer product; `single_product` is true only when
+  it is the ONLY one, null when a capped search (`truncated`,
+  `amplicons_truncated`) could not settle it. ΔG is kcal/mol at 37 °C, a
+  structure's `_tm` its melting temperature; `null` means NOT measured, never
+  "no structure". `warnings` flags, in plain words, what Primer3's own design
+  rules would: a hairpin holding a 3' end that is still folded at
+  `anneal_ref_c` (5 °C under the lower arm's Tm), a dimer stable above
+  `dimer_tm_limit` (47 °C), arm Tms more than 5 °C apart — plus a primer that
+  doesn't bind, a second site ≥80 % identity, extra products. A dU base is
+  read as T and reported with `read_u_as_t`), list-tm-profiles
+  (every value `tm_profile` takes, with its conditions in lab units — see
+  **Tm profiles** below), optimize-protein
   (codon-optimise an AA sequence to a chosen table — `table` is a taxid
   (integer or string) OR a table NAME, and one it cannot resolve is a `404`,
   never a quiet fall-back to the E. coli default; optional `stops`
@@ -948,11 +967,21 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   primer-collection, parts-bin, experiment-project, enzyme-collection,
   hmm-database) has a matching `get-active-*` so a client can read the
   current selection before changing it.
-- **Primer Tm profiles** — `design-primers` accepts
-  `tm_profile: "benchling_compatible"` in `cloning` and `generic` modes.
-  Detection mode accepts only `primer3_default` because Primer3 calculates Tm
-  during pair design.
-- **Utility** — check-primer-pair, check-primer-duplicates, capture-snapshot.
+- **Tm profiles** — `check-primer`, `check-primer-pair` and every
+  `design-primers` mode take `tm_profile`: which reaction conditions each Tm
+  in the response is computed under, echoed back as `tm_profile`.
+  `primer3_default` (the default — 50 mM monovalent, 1.5 mM Mg2+, 0.6 mM dNTP,
+  50 nM oligo) is what every SpliceCraft screen shows; `benchling_compatible`
+  (50 mM Na+, no Mg2+ or dNTP, 250 nM oligo) is Benchling's default setting and
+  reads the same oligo ~4-5 °C lower. Both are SantaLucia 1998 with the
+  SantaLucia salt correction. Case, `-` and the short forms `benchling` /
+  `default` are forgiven; an unknown name is a 400, never a quiet fall-back.
+  A design aims its `target_tm` at the profile's scale — in `detection` mode
+  the conditions go to Primer3 itself, so its reported Tm is the profile's.
+  A profile moves the Tm ONLY: hairpins and dimers are always judged in PCR
+  buffer, because every tube has Mg2+ in it. `list-tm-profiles` returns both
+  with their conditions.
+- **Utility** — check-primer-duplicates, capture-snapshot.
 - **OT-2 / Opentrons** (liquid-handler control) — `ot2-compile` turns a
   plate-transfer plan (a pipette, labware on deck slots, and `from → to` well
   transfers with µL volumes) into an Opentrons Protocol API v2 `.py` text,

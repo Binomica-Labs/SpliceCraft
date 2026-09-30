@@ -74,7 +74,7 @@ from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, 
 from splicecraft_gels import (_AGAROSE_CHOICES, _GEL_HEIGHT_MAX, _GEL_HEIGHT_MIN, _GEL_LANE_WIDTH_MAX, _GEL_LANE_WIDTH_MIN, _GEL_MAX_LANES, _agarose_mobility, _gel_bands_for_lane, _gel_resolve_enzymes, _render_gel_image)
 from splicecraft_persistence import (_safe_save_json_mirror)
 from splicecraft_regulatory import (_PROMOTER_MIN_SCORE, _TERM_MAX_STEM, _TERM_MIN_STEM, _TERM_MIN_U_TRACT, _TERM_U_TRACT_WINDOW, _scan_promoters, _scan_terminators)
-from splicecraft_primer import (_AS_MIN_LEN, _TM_PROFILES, _design_allele_specific_primer, _design_cloning_primers_raw, _design_detection_primers, _design_generic_primers, _mut_hairpin_dg, _mut_homodimer_dg, _primer_binding_sites, _primer_check_confidence, _primer_heterodimer_dg, _primer_tm, _tm_profile_kwargs)
+from splicecraft_primer import (_AS_MIN_LEN, _PRIMER_CHECK_MIN_LEN, _PRIMER_CHECK_SEED_LEN, _PRIMER_ANNEAL_BELOW_TM, _PRIMER_DIMER_TM_LIMIT, _TM_PROFILES, _design_allele_specific_primer, _design_cloning_primers_raw, _design_detection_primers, _design_generic_primers, _primer_binding_sites, _primer_check_confidence, _primer_pair_qc, _primer_tm, _TM_PROFILE_DEFAULT, _tm_profile_catalog, _tm_profile_kwargs, _tm_profile_resolve)
 
 
 def _custom_enzyme_meta(name: str) -> "dict | None":
@@ -5477,13 +5477,59 @@ def _check_primer_bases(raw, what: str) -> "tuple[str, str | None]":
     return "".join(ch for ch in text.upper() if ch in _CHECK_PRIMER_IUPAC), None
 
 
+def _raw_has_u(raw) -> bool:
+    """Did the caller's BASES carry a U (read as T)? A FASTA header line is not
+    bases — ">Primer_UP …" must not stamp `read_u_as_t` on a U-free oligo."""
+    return any("U" in ln.upper() for ln in str(raw).splitlines()
+               if not ln.lstrip().startswith(">"))
+
+
+def _agent_tm_profile(payload) -> "tuple[str, tuple | None]":
+    """The request's `tm_profile` as a canonical key, or a 400 naming the
+    choices. Absent / null / blank → the default; spelling is forgiven
+    (`_tm_profile_resolve`) but an unknown name is REFUSED — a quiet
+    fall-back would return numbers under conditions the caller didn't ask for.
+    """
+    raw = payload.get("tm_profile")
+    key = _tm_profile_resolve(raw)
+    if key is None:
+        return "", ({"error": f"unknown 'tm_profile' {str(raw)[:40]!r} — use "
+                              f"{' or '.join(_TM_PROFILES)} (list-tm-profiles "
+                              f"shows the conditions behind each)"}, 400)
+    return key, None
+
+
+def _agent_primer_site_rows(sites) -> "list[dict]":
+    """`_primer_binding_sites` rows as check-primer / check-primer-pair report
+    them: orientation named, identity to 1 dp, the confidence glyph."""
+    rows = []
+    for s in sites:
+        glyph, _color = _primer_check_confidence(s.get("ident_pct"))
+        rows.append({
+            "orientation": "forward" if s.get("strand") == 1 else "reverse",
+            "strand":      s.get("strand"),
+            "foot_start":  s.get("foot_start"),
+            "length":      s.get("length"),
+            "ident_pct":   round(float(s.get("ident_pct") or 0.0), 1),
+            "mismatches":  s.get("mismatches"),
+            "confidence":  glyph,
+        })
+    return rows
+
+
 @_agent_endpoint("check-primer")
 def _h_check_primer(app, payload):
     """Check ONE primer against a template: melting temp, GC%, and every
     3'-anchored binding site (both strands, wrap-aware on a circular
     template). Body: ``{primer, template?, circular?: bool = true,
-    min_identity?: float = 0, max_sites?: int = 50,
-    tm_profile?: "primer3_default"|"benchling_compatible"}``.
+    min_identity?: float = 0, max_sites?: int = 50, tm_profile?: str}``.
+
+    `tm_profile` picks the reaction conditions `tm` (and `tm_range`) are
+    computed under — ``primer3_default`` (the default: what every SpliceCraft
+    screen shows) or ``benchling_compatible`` (Benchling's default settings,
+    ~4-5 °C lower); list-tm-profiles spells out both. The response names the
+    profile it used. For a whole PAIR — both Tms, hairpins, dimers and the
+    products — use check-primer-pair.
 
     `template` defaults to the LOADED plasmid (with its own topology). With
     no template and nothing loaded, the melting temperature and GC% are
@@ -5510,10 +5556,9 @@ def _h_check_primer(app, payload):
     length, ident_pct, mismatches, confidence}]}`` — `foot_start` is the
     0-based footprint start on the cleaned template; sites are
     best-first (highest identity)."""
-    tm_profile = payload.get("tm_profile", "primer3_default")
-    if not isinstance(tm_profile, str) or tm_profile not in _TM_PROFILES:
-        return ({"error": "'tm_profile' must be 'primer3_default' or "
-                          "'benchling_compatible'"}, 400)
+    tm_profile, err = _agent_tm_profile(payload)
+    if err:
+        return err
     primer_raw = payload.get("primer")
     template_raw = payload.get("template")
     seq_raw = payload.get("sequence")
@@ -5540,19 +5585,23 @@ def _h_check_primer(app, payload):
                                       "sequence" if read_seq_as_primer else "primer")
     if bad:
         return ({"error": bad}, 400)
-    had_u = "U" in str(primer_raw).upper()
+    had_u = _raw_has_u(primer_raw)
     if not primer:
         return ({"error": "no IUPAC bases in 'primer'"}, 400)
     if len(primer) > 1000:
         return ({"error": "'primer' too long (max 1000 bp)"}, 413)
-    # For a degenerate oligo, `tm` is the minimum member Tm and `tm_range`
-    # contains the minimum and maximum. Use the selected profile for both.
+    # A degenerate oligo is a mix: `tm` is its WEAKEST member's Tm (what the
+    # anneal must respect) and `tm_range` says how far the mix spreads — both
+    # under the requested profile, and on the template-less path too.
     bracket = _degenerate_tm_bracket(
         primer, **_tm_profile_kwargs(tm_profile))
     tm_extra = ({"tm_range": [round(bracket[0], 1), round(bracket[1], 1)],
                  "tm_note": "degenerate oligo: tm is the weakest member's "
-                            "nearest-neighbour Tm. tm_range spans the mix"}
+                            "nearest-neighbour Tm; tm_range spans the mix"}
                 if bracket is not None else {})
+    u_extra = ({"read_u_as_t": True,
+                "note_u": "deoxyuridine (U) read as T for binding and Tm"}
+               if had_u else {})
     loaded_default = False
     if template_raw is None or not template_raw.strip():
         rec = getattr(app, "_current_record", None)
@@ -5568,6 +5617,7 @@ def _h_check_primer(app, payload):
                 "binds": None, "n_sites": 0, "sites": [],
                 "note": "no template given and no plasmid loaded — melting "
                         "temperature and GC% only; binding was not checked",
+                **u_extra,
                 **({"primer_from": "sequence"} if read_seq_as_primer else {}),
             }
         template_raw = loaded
@@ -5607,19 +5657,7 @@ def _h_check_primer(app, payload):
     except ValueError as exc:
         return ({"error": f"alignment failed: {_scrub_path(str(exc))}"}, 400)
     truncated = len(sites) > max_sites
-    sites = sites[:max_sites]
-    out_sites = []
-    for s in sites:
-        glyph, _color = _primer_check_confidence(s.get("ident_pct"))
-        out_sites.append({
-            "orientation": "forward" if s.get("strand") == 1 else "reverse",
-            "strand":      s.get("strand"),
-            "foot_start":  s.get("foot_start"),
-            "length":      s.get("length"),
-            "ident_pct":   round(float(s.get("ident_pct") or 0.0), 1),
-            "mismatches":  s.get("mismatches"),
-            "confidence":  glyph,
-        })
+    out_sites = _agent_primer_site_rows(sites[:max_sites])
     # S = G|C, so count it toward GC for the ambiguous-base case.
     gc = sum(1 for c in primer if c in "GCS")
     gc_pct = round(100.0 * gc / len(primer), 1)
@@ -5638,169 +5676,349 @@ def _h_check_primer(app, payload):
         "best_identity": best,
         "sites":         out_sites,
         "truncated":     truncated,
-        **({"read_u_as_t": True,
-            "note_u": "deoxyuridine (U) read as T for binding and Tm"}
-           if had_u else {}),
+        **u_extra,
         **({"template": "the loaded plasmid"} if loaded_default else {}),
         **({"primer_from": "sequence"} if read_seq_as_primer else {}),
     }
 
 
+# check-primer-pair's key spellings, canonical first (simulate-pcr's aliases).
+_PAIR_PRIMER_KEYS = {
+    "forward": ("forward_primer", "fwd_primer", "forward", "fwd"),
+    "reverse": ("reverse_primer", "rev_primer", "reverse", "rev"),
+}
+_PAIR_BINDING_KEYS = {
+    "forward": ("forward_binding", "fwd_binding"),
+    "reverse": ("reverse_binding", "rev_binding"),
+}
+_PAIR_TEMPLATE_KEYS = ("template", "template_seq", "sequence")
+_PAIR_MAX_SITES = 50            # per primer, as check-primer's default
+_PAIR_MISPRIME_MIN_IDENT = 80.0  # the "other site" floor amplify-feature warns at
+_PAIR_HETERO = ("forward+reverse", "reverse+forward")
+
+
+def _pair_first(payload, keys):
+    """(key, value) of the first of `keys` present with a non-empty value."""
+    for k in keys:
+        v = payload.get(k)
+        if v is not None and v != "":
+            return k, v
+    return keys[0], None
+
+
 @_agent_endpoint("check-primer-pair")
 def _h_check_primer_pair(app, payload):
-    """Analyse one PCR-primer pair. Body: ``{forward_primer,
-    reverse_primer, template, forward_binding?, reverse_binding?,
-    circular?: bool = true, tm_profile?: "primer3_default"|
-    "benchling_compatible", max_amplicon?: int = 20000}``.
+    """Check one PCR primer PAIR as a whole: the Tm of each annealing arm and
+    their difference, the secondary structures Primer3 screens for (hairpin,
+    self-dimers, the primer-dimer between the two), where each primer binds,
+    and every product the two make — including one primer making a product
+    on its own. Body: ``{forward_primer, reverse_primer, forward_binding?,
+    reverse_binding?, template?, circular?, tm_profile?,
+    max_amplicon?: int = 20000}``.
 
-    Tm and template binding use the annealing sequence (the explicit
-    ``*_binding`` value, or the whole primer when omitted). Hairpin,
-    homodimer and heterodimer calculations use the complete ordered oligos,
-    including cloning tails. An explicit binding sequence must be a 3' suffix
-    of its full primer. This excludes bases from the non-annealing 5' tail.
+    Primers are the whole oligos as ordered, 5'→3' (aliases `fwd_primer` /
+    `forward` / `fwd` and `rev_primer` / `reverse` / `rev`). A 5' tail — RE
+    site, Gibson overlap, USER site — is fine: name the 3' ANNEALING arm
+    with `forward_binding` / `reverse_binding` (a 3' suffix of the oligo)
+    and the Tm, GC% and binding sites come from the arm while the hairpin
+    and dimers use the whole oligo; a product's `product_bp` adds the tails
+    back. Without an arm the whole oligo is the arm, so a tail reads as
+    mismatches in the site identity, and a warning says so.
 
-    ``tm_profile`` affects Tm only. Secondary-structure checks use the standard
-    Primer3 reaction conditions. Candidate amplicons include hetero-primer and
-    homo-primer products.
+    `template` (aliases `template_seq` / `sequence`) defaults to the LOADED
+    plasmid with its own topology, like check-primer; with neither, the
+    thermodynamics still come back (`binds` null, a `note` says binding was
+    not checked). `tm_profile` picks the conditions every Tm in the response
+    is computed under (list-tm-profiles; default ``primer3_default``, what
+    the app shows everywhere). Secondary structure is always judged in PCR
+    buffer, with Mg2+, whatever the profile.
 
-    Read-only. ΔG values are in kcal/mol. A ``None`` value has a corresponding
-    warning. Each primer reports ``truncated`` and optional ``read_u_as_t``.
-    The pair reports ``amplicons_truncated`` when the search reaches its limit.
+    Returns ``{ok, tm_profile, template_bp, circular, forward, reverse, pair,
+    dg_units, anneal_ref_c, dimer_tm_limit, warnings}``:
+
+      * ``forward`` / ``reverse`` — ``primer, length, binding,
+        binding_length, tail, tm, gc_pct, hairpin_dg, hairpin_tm,
+        homodimer_dg, homodimer_tm, homodimer_3p_dg, homodimer_3p_tm,
+        n_sites, binds, best_identity, sites, truncated`` (+ ``tm_range``
+        for a degenerate arm, ``read_u_as_t`` when a U was read as T).
+      * ``pair`` — ``tm_delta, heterodimer_dg, heterodimer_tm,
+        heterodimer_3p_dg, heterodimer_3p_tm, n_amplicons, amplicons,
+        amplicons_truncated, product, single_product``. Each amplicon is
+        ``{start, end, wraps, template_bp, product_bp, primers, certainty,
+        fwd_ident, rev_ident}``: `primers` is ``"forward+reverse"`` for the
+        pair's own product (``"reverse+forward"`` if their names are
+        swapped), ``"forward+forward"`` / ``"reverse+reverse"`` for a product
+        ONE primer makes by binding both strands. `product` is the best
+        two-primer product; `single_product` is true when it is the ONLY
+        product, false when there are others (or none), null when the capped
+        searches could not settle it.
+      * ``warnings`` — plain-language flags: a hairpin still folded at
+        `anneal_ref_c` (the conventional anneal, 5 °C under the lower arm's
+        Tm in PCR buffer), a dimer stable above `dimer_tm_limit` (47 °C,
+        Primer3's own limit) — both judged on the structure's MELTING
+        TEMPERATURE, not its ΔG — arm Tms more than 5 °C apart, a primer that
+        doesn't bind or also primes elsewhere (≥80 % identity), extra
+        products, any check that could not run. Empty = nothing to flag.
+
+    ΔG is kcal/mol at 37 °C; ``None`` means NOT measured (a warning says
+    why), never "no structure", which reads 0. Read-only.
     """
-    tm_profile = payload.get("tm_profile", "primer3_default")
-    if not isinstance(tm_profile, str) or tm_profile not in _TM_PROFILES:
-        return ({"error": "'tm_profile' must be 'primer3_default' or "
-                          "'benchling_compatible'"}, 400)
-    template_raw = payload.get("template") or payload.get("sequence")
-    if not isinstance(template_raw, str) or not template_raw.strip():
-        return ({"error": "missing or non-string 'template'"}, 400)
-    template, bad = _check_primer_bases(template_raw, "template")
-    if bad:
-        return ({"error": bad}, 400)
-    if not template:
-        return ({"error": "no IUPAC bases in 'template'"}, 400)
-    if len(template) > _PAIRWISE_MAX_LEN:
-        return ({"error": f"'template' exceeds {_PAIRWISE_MAX_LEN:,} bp cap"},
-                413)
+    tm_profile, err = _agent_tm_profile(payload)
+    if err:
+        return err
 
-    primers: "dict[str, str]" = {}
-    bindings: "dict[str, str]" = {}
-    read_u_as_t: "dict[str, bool]" = {}
+    # ── the two oligos and their annealing arms ─────────────────────────
+    oligos: "dict[str, dict]" = {}
     for role in ("forward", "reverse"):
-        full_raw = payload.get(f"{role}_primer")
-        if not isinstance(full_raw, str) or not full_raw.strip():
-            return ({"error": f"missing or non-string '{role}_primer'"}, 400)
-        full, bad = _check_primer_bases(full_raw,
-                                         f"{role}_primer")
-        if bad or not full:
-            return ({"error": bad or f"empty '{role}_primer'"}, 400)
+        keys = _PAIR_PRIMER_KEYS[role]
+        key, raw = _pair_first(payload, keys)
+        if not isinstance(raw, str) or not raw.strip():
+            return ({"error": f"missing or non-string '{keys[0]}' (aliases: "
+                              f"{', '.join(keys[1:])})"}, 400)
+        full, bad = _check_primer_bases(raw, key)
+        if bad:
+            return ({"error": bad}, 400)
+        if not full:
+            return ({"error": f"no IUPAC bases in '{key}'"}, 400)
         if len(full) > 1000:
-            return ({"error": f"'{role}_primer' too long (max 1000 bp)"}, 413)
-        binding_raw = payload.get(f"{role}_binding")
-        if binding_raw is None:
+            return ({"error": f"'{key}' too long (max 1000 nt)"}, 413)
+        bkeys = _PAIR_BINDING_KEYS[role]
+        bkey, braw = _pair_first(payload, bkeys)
+        if braw is None and any(payload.get(k) == "" for k in bkeys):
+            return ({"error": f"'{bkeys[0]}' must be a non-empty string"}, 400)
+        if braw is None:
             binding = full
         else:
-            if not isinstance(binding_raw, str) or not binding_raw.strip():
-                return ({"error": f"'{role}_binding' must be a non-empty "
-                                  "string"}, 400)
-            binding, bad = _check_primer_bases(binding_raw, f"{role}_binding")
-            if bad or not binding:
-                return ({"error": bad or f"empty '{role}_binding'"}, 400)
+            if not isinstance(braw, str) or not braw.strip():
+                return ({"error": f"'{bkey}' must be a non-empty string"}, 400)
+            binding, bad = _check_primer_bases(braw, bkey)
+            if bad:
+                return ({"error": bad}, 400)
+            if not binding:
+                return ({"error": f"no IUPAC bases in '{bkey}'"}, 400)
             if not full.endswith(binding):
-                return ({"error": f"'{role}_binding' must be a 3' suffix of "
-                                  f"'{role}_primer'"}, 400)
-        primers[role] = full
-        bindings[role] = binding
-        read_u_as_t[role] = (
-            "U" in full_raw.upper()
-            or (isinstance(binding_raw, str) and "U" in binding_raw.upper())
-        )
+                return ({"error": f"'{bkey}' must be a 3' suffix of '{key}' "
+                                  f"— the annealing arm is the 3' END of the "
+                                  f"oligo, the tail is everything 5' of it"},
+                        400)
+        if len(binding) < _PRIMER_CHECK_MIN_LEN:
+            what = bkey if braw is not None else key
+            return ({"error": f"'{what}' anneals over only {len(binding)} nt "
+                              f"— a primer needs at least "
+                              f"{_PRIMER_CHECK_MIN_LEN}"}, 400)
+        oligos[role] = {
+            "full": full, "binding": binding, "arm_given": braw is not None,
+            "had_u": _raw_has_u(raw) or (isinstance(braw, str)
+                                         and _raw_has_u(braw)),
+        }
 
-    max_amplicon = _coerce_int(payload.get("max_amplicon", 20_000),
-                               name="max_amplicon")
+    max_amplicon = _coerce_int(
+        payload.get("max_amplicon", _PCR_DEFAULT_MAX_AMPLICON),
+        name="max_amplicon")
     if isinstance(max_amplicon, str):
         return ({"error": max_amplicon}, 400)
     if not (1 <= max_amplicon <= _PCR_AMPLICON_HARD_CAP):
         return ({"error": f"'max_amplicon' must be in [1, "
                           f"{_PCR_AMPLICON_HARD_CAP}]"}, 400)
-    circular = _payload_bool(payload, "circular", True)
 
-    checked: "dict[str, dict]" = {}
-    for role in ("forward", "reverse"):
-        result = _h_check_primer(app, {
-            "primer": bindings[role], "template": template,
-            "circular": circular, "tm_profile": tm_profile,
-        })
-        if isinstance(result, tuple):
-            return result
-        checked[role] = result
+    # ── the template: given, else the loaded plasmid, else none ─────────
+    tkey, template_raw = _pair_first(payload, _PAIR_TEMPLATE_KEYS)
+    if template_raw is not None and not isinstance(template_raw, str):
+        return ({"error": f"'{tkey}' must be a string"}, 400)
+    loaded_default = False
+    circular_default = True
+    template: "str | None" = None
+    if template_raw is None or not template_raw.strip():
+        rec = getattr(app, "_current_record", None)
+        loaded = str(getattr(rec, "seq", "") or "") if rec is not None else ""
+        if loaded:
+            # Our own record: read it as always (no label strictness).
+            template = "".join(ch for ch in loaded.upper()
+                               if ch in _CHECK_PRIMER_IUPAC)
+            loaded_default = True
+            circular_default = _record_is_circular(rec)
+    else:
+        template, bad = _check_primer_bases(template_raw, tkey)
+        if bad:
+            return ({"error": bad}, 400)
+    if template is not None:
+        if not template:
+            return ({"error": "no IUPAC bases in 'template'"}, 400)
+        if len(template) > _PAIRWISE_MAX_LEN:
+            return ({"error": f"'template' exceeds {_PAIRWISE_MAX_LEN:,} bp "
+                              f"cap"}, 413)
+    circular = _payload_bool(payload, "circular", circular_default)
 
-    amps = _insilico_pcr_amplicons(
-        checked["forward"]["sites"], checked["reverse"]["sites"],
-        len(template), circular=circular, max_amplicon=max_amplicon,
-        max_amplicons=_PCR_MAX_AMPLICONS + 1,
-    )
-    amplicons_truncated = len(amps) > _PCR_MAX_AMPLICONS
-    amps = amps[:_PCR_MAX_AMPLICONS]
-    warnings: "list[str]" = []
-    if amplicons_truncated:
-        warnings.append(
-            f"candidate amplicons were truncated at {_PCR_MAX_AMPLICONS}. "
-            "amplicon uniqueness is not established")
+    # ── thermodynamics (no template needed) ─────────────────────────────
+    fo, ro = oligos["forward"], oligos["reverse"]
+    try:
+        qc = _primer_pair_qc(fo["full"], ro["full"],
+                             fwd_binding=fo["binding"],
+                             rev_binding=ro["binding"], tm_profile=tm_profile)
+    except ValueError as exc:
+        return ({"error": _scrub_path(str(exc))}, 400)
+    warnings: "list[str]" = qc["warnings"]
+    fwd, rev, pair = qc["forward"], qc["reverse"], qc["pair"]
+    for role, rec_out in (("forward", fwd), ("reverse", rev)):
+        if oligos[role]["had_u"]:
+            rec_out["read_u_as_t"] = True
+            rec_out["note_u"] = ("deoxyuridine (U) read as T for binding, Tm "
+                                 "and structure")
 
-    def _primer_result(role: str) -> dict:
-        full = primers[role]
-        hp = _mut_hairpin_dg(full)
-        hd = _mut_homodimer_dg(full)
-        if hp is None or hd is None:
+    note = None
+    if template is None:
+        for rec_out in (fwd, rev):
+            rec_out.update(n_sites=0, binds=None, best_identity=None,
+                           sites=[], truncated=False)
+        pair.update(n_amplicons=None, amplicons=[], amplicons_truncated=False,
+                    product=None, single_product=None)
+        note = ("no template given and no plasmid loaded — Tm and secondary "
+                "structure only; binding and products were not checked")
+    else:
+        n = len(template)
+        site_lists: "dict[str, list]" = {}
+        for role, rec_out in (("forward", fwd), ("reverse", rev)):
+            try:
+                # One more than we keep, so a capped list SAYS it is capped.
+                sites = _primer_binding_sites(
+                    oligos[role]["binding"], template, n, circular=circular,
+                    max_sites=_PAIR_MAX_SITES + 1)
+            except ValueError as exc:
+                return ({"error": f"alignment failed: "
+                                  f"{_scrub_path(str(exc))}"}, 400)
+            truncated = len(sites) > _PAIR_MAX_SITES
+            site_lists[role] = sites[:_PAIR_MAX_SITES]
+            rows = _agent_primer_site_rows(site_lists[role])
+            best = max((r["ident_pct"] for r in rows), default=None)
+            rec_out.update(n_sites=len(rows), binds=bool(rows),
+                           best_identity=best, sites=rows,
+                           truncated=truncated)
+            arm = _PAIR_BINDING_KEYS[role][0]
+            if not rows:
+                warnings.append(
+                    f"the {role} primer does not anneal to the template — no "
+                    f"exact match over its 3'-terminal "
+                    f"{min(_PRIMER_CHECK_SEED_LEN, len(oligos[role]['binding']))}"
+                    f" nt on either strand")
+                continue
+            if truncated:
+                warnings.append(
+                    f"the {role} primer anneals at more than "
+                    f"{_PAIR_MAX_SITES} sites — only the best "
+                    f"{_PAIR_MAX_SITES} were paired, so uniqueness is not "
+                    f"established")
+            others = sum(1 for r in rows[1:]
+                         if r["ident_pct"] >= _PAIR_MISPRIME_MIN_IDENT)
+            if others:
+                warnings.append(
+                    f"the {role} primer also matches {others} other site(s) "
+                    f"≥{_PAIR_MISPRIME_MIN_IDENT:.0f}% — risk of mispriming")
+            if not oligos[role]["arm_given"] and best is not None \
+                    and best < 100.0:
+                warnings.append(
+                    f"the {role} primer matches its best site at {best}% — "
+                    f"if its 5' end is a tail, give {arm} so the Tm and "
+                    f"identity come from the annealing arm alone")
+
+        amps = _insilico_pcr_amplicons(
+            site_lists["forward"], site_lists["reverse"], n,
+            circular=circular, max_amplicon=max_amplicon,
+            max_amplicons=_PCR_MAX_AMPLICONS + 1)
+        amps_truncated = len(amps) > _PCR_MAX_AMPLICONS
+        # Sites were scored over the ARM, so an arm's footprint leaves its
+        # oligo's 5' tail out of the span — the product carries it anyway.
+        tails = (len(fo["full"]) - len(fo["binding"]),
+                 len(ro["full"]) - len(ro["binding"]))
+        names = ("forward", "reverse")
+        rows_a: "list[dict]" = []
+        for a in amps[:_PCR_MAX_AMPLICONS]:
+            end = a["start"] + a["length"]
+            if circular:
+                end = end % n or n       # ends on the origin → `n`, not 0
+            rows_a.append({
+                "start": a["start"], "end": end, "wraps": a["wraps"],
+                "template_bp": a["length"],
+                "product_bp": (a["length"] + tails[a["fwd_primer"]]
+                               + tails[a["rev_primer"]]),
+                "primers": f"{names[a['fwd_primer']]}+"
+                           f"{names[a['rev_primer']]}",
+                "certainty": round(float(a["certainty"]), 1),
+                "fwd_ident": round(float(a["fwd_ident"]), 1),
+                "rev_ident": round(float(a["rev_ident"]), 1),
+            })
+        product = next((r for r in rows_a if r["primers"] in _PAIR_HETERO),
+                       None)
+        trunc_sites = bool(fwd["truncated"] or rev["truncated"])
+        single: "bool | None"
+        if amps_truncated or len(rows_a) >= 2:
+            single = False
+        elif trunc_sites:
+            single = None
+        else:
+            single = product is not None
+        pair.update(n_amplicons=len(rows_a), amplicons=rows_a,
+                    amplicons_truncated=amps_truncated, product=product,
+                    single_product=single)
+        if amps_truncated:
             warnings.append(
-                f"{role} hairpin/self-dimer ΔG could not be computed. "
-                "That primer is not fully secondary-structure checked")
-        check = checked[role]
-        if check["truncated"]:
+                f"more than {_PCR_MAX_AMPLICONS} candidate products — the "
+                f"list was cut there, so uniqueness is not established")
+        if product is None:
+            if fwd["binds"] and rev["binds"]:
+                warnings.append(
+                    f"the two primers make no product together within "
+                    f"{max_amplicon:,} bp — they must anneal to opposite "
+                    f"strands with their 3' ends facing each other")
+        elif len(rows_a) > 1:
+            solo = sorted({r["primers"].split("+")[0] for r in rows_a
+                           if r["primers"] not in _PAIR_HETERO})
+            extra = (f" — incl. the {' and '.join(solo)} primer on its own "
+                     f"(it binds both strands)" if solo else "")
             warnings.append(
-                f"{role} binding sites were truncated at {check['n_sites']}. "
-                "amplicon uniqueness is not established")
-        return {
-            "primer": full,
-            "binding": bindings[role],
-            "tm": check["tm"],
-            "gc_pct": check["gc_pct"],
-            "hairpin_dg": None if hp is None else round(hp, 2),
-            "homodimer_dg": None if hd is None else round(hd, 2),
-            "n_sites": check["n_sites"],
-            "sites": check["sites"],
-            "truncated": check["truncated"],
-            **({"read_u_as_t": True,
-                "note_u": "deoxyuridine (U) read as T for primer analysis"}
-               if read_u_as_t[role] else {}),
-        }
+                f"{len(rows_a) - 1}{'+' if amps_truncated else ''} other "
+                f"product(s) besides the {product['product_bp']:,} bp "
+                f"one{extra} — see `amplicons`")
 
-    fwd = _primer_result("forward")
-    rev = _primer_result("reverse")
-    hetero = _primer_heterodimer_dg(
-        primers["forward"], primers["reverse"])
-    if hetero is None:
-        warnings.append(
-            "pair heterodimer ΔG could not be computed. The pair is not "
-            "fully secondary-structure checked")
+    _log_event("primers.check_pair", template_bp=len(template or ""),
+               circular=circular, tm_profile=tm_profile,
+               fwd_len=len(fo["full"]), rev_len=len(ro["full"]),
+               n_amplicons=pair.get("n_amplicons"), n_warnings=len(warnings))
     return {
         "ok": True,
+        "tm_profile": tm_profile,
+        **({"template": "the loaded plasmid"} if loaded_default else {}),
+        "template_bp": len(template) if template is not None else None,
+        "circular": circular if template is not None else None,
         "forward": fwd,
         "reverse": rev,
-        "pair": {
-            "tm_delta": (None if fwd["tm"] is None or rev["tm"] is None
-                         else round(abs(fwd["tm"] - rev["tm"]), 1)),
-            "heterodimer_dg": (None if hetero is None else round(hetero, 2)),
-            "n_amplicons": len(amps),
-            "amplicons": amps,
-            "amplicons_truncated": amplicons_truncated,
-        },
-        "tm_profile": tm_profile,
-        "dg_units": "kcal/mol",
+        "pair": pair,
+        "dg_units": qc["dg_units"],
+        "anneal_ref_c": qc["anneal_ref_c"],
+        "dimer_tm_limit": qc["dimer_tm_limit"],
         "warnings": warnings,
+        **({"note": note} if note else {}),
     }
 
+
+@_agent_endpoint("list-tm-profiles")
+def _h_list_tm_profiles(app, payload):
+    """The Tm profiles `check-primer`, `check-primer-pair` and
+    `design-primers` accept as ``tm_profile``. Returns ``{ok, default,
+    profiles: [{key, label, default, monovalent_mm, mg_mm, dntp_mm, oligo_nm,
+    method, about}, ...], note}`` — the reaction conditions each melting
+    temperature is computed under, so you can see what a number came from
+    and match another tool's. Read-only."""
+    return {
+        "ok": True,
+        "default": _TM_PROFILE_DEFAULT,
+        "profiles": _tm_profile_catalog(),
+        "note": ("A profile moves the Tm only. Hairpins and dimers are always "
+                 "judged in PCR buffer (with Mg2+): a hairpin is flagged when "
+                 "it is still folded at the anneal "
+                 f"({_PRIMER_ANNEAL_BELOW_TM:.0f} °C under the lower primer "
+                 "Tm), a dimer when it is stable above "
+                 f"{_PRIMER_DIMER_TM_LIMIT:.0f} °C (Primer3's own limit)."),
+    }
 
 @_agent_endpoint("check-primer-duplicates")
 def _h_check_primer_duplicates(app, payload):
@@ -11999,12 +12217,14 @@ _AS_OFF_TARGET_MAX = 20          # named off-target templates per call
 _AS_SEED_LEN = 12                # 3'-anchor length for a binding call
 
 
-def _agent_design_allele_specific(template: str, payload):
+def _agent_design_allele_specific(template: str, payload,
+                                  tm_profile: str = _TM_PROFILE_DEFAULT):
     """`design-primers` with ``mode: "allele_specific"``.
 
     Body: ``{template, variant_pos, alt_base?, orientation?="auto",
     partner_primer?, off_targets?, target_tm?=60, destabilize?=false,
-    circular?=false}``.
+    circular?=false, tm_profile?}`` — `tm_profile` puts `target_tm` and every
+    reported Tm (the primer's and the partner's) on that profile's scale.
 
     Designs the DISCRIMINATING primer — the one whose 3'-terminal base sits on
     the variant — and reports how specific it actually is. ``off_targets`` is
@@ -12045,7 +12265,8 @@ def _agent_design_allele_specific(template: str, payload):
 
     best = _design_allele_specific_primer(
         template, variant_pos, alt_base=alt_base, orientation=orientation,
-        target_tm=target_tm, destabilize=destabilize, circular=circular)
+        target_tm=target_tm, destabilize=destabilize, circular=circular,
+        tm_profile=tm_profile)
     if best is None:
         return ({"error": f"could not place an allele-specific primer at "
                           f"{variant_pos} — the template has fewer than "
@@ -12146,7 +12367,10 @@ def _agent_design_allele_specific(template: str, payload):
             elif best["orientation"] == "rev" and p0["strand"] == 1:
                 product = (best["binding_end"] - p0["foot_start"]) % (n or 1)
         partner = {
-            "seq": pseq, "tm": _primer_tm_safe(pseq),
+            # The default profile keeps the reading this field always had.
+            "seq": pseq, "tm": (_primer_tm_safe(pseq)
+                                if tm_profile == _TM_PROFILE_DEFAULT
+                                else _primer_tm(pseq, tm_profile)),
             "n_sites": len(psites),
             "strand": (psites[0]["strand"] if psites else None),
             "product_size": product,
@@ -12168,7 +12392,8 @@ def _agent_design_allele_specific(template: str, payload):
     _log_event("primers.allele_specific", variant_pos=variant_pos,
                orientation=best["orientation"], gc_clamp=best["gc_clamp"],
                n_off_targets=len(templates) - 1, via="agent")
-    return {"ok": True, "mode": "allele_specific", "result": best,
+    return {"ok": True, "mode": "allele_specific", "tm_profile": tm_profile,
+            "result": best,
             "specificity": specificity, "partner": partner,
             "gc_clamp": best["gc_clamp"], "clamp_note": best["clamp_note"],
             # `discriminates` True means the primer's 3' seed does NOT match
@@ -12182,15 +12407,14 @@ def _agent_design_allele_specific(template: str, payload):
             "ignored": _agent_ignored_keys(payload, {
                 "template", "sequence", "mode", "variant_pos", "alt_base",
                 "orientation", "partner_primer", "off_targets", "target_tm",
-                "destabilize", "circular"})}
+                "destabilize", "circular", "tm_profile"})}
 
 
 @_agent_endpoint("design-primers")
 def _h_design_primers(app, payload):
     """Primer-pair design over a target region. Body:
-    ``{template, start?, end?, mode?: "detection"|"cloning"|"generic"|
-        "allele_specific", target_tm?: float, site_5?: str, site_3?: str,
-        tm_profile?: "primer3_default"|"benchling_compatible"}``.
+    ``{template, start?, end?, mode?: "detection"|"cloning"|"generic"|"allele_specific",
+        target_tm?: float, site_5?: str, site_3?: str, tm_profile?: str}``.
 
     Wraps `_design_detection_primers`, `_design_cloning_primers_raw`,
     and `_design_generic_primers`:
@@ -12209,11 +12433,19 @@ def _h_design_primers(app, payload):
         the selected region. Returns `fwd_seq`/`rev_seq` +
         `fwd_pos`/`rev_pos`. Needs ≥ 18 bp.
 
-    All modes return `fwd_tm` and `rev_tm`. ``primer3_default`` is the default
-    Tm profile. Cloning and generic modes also accept
-    ``benchling_compatible``. Detection mode accepts only ``primer3_default``
-    because Primer3 calculates Tm during pair design. The response contains
-    the primer data under `result` and repeats the selected `mode`.
+    All modes return `fwd_tm`/`rev_tm`. `tm_profile` (list-tm-profiles)
+    puts `target_tm` and those Tms on one profile's scale in EVERY mode —
+    ``primer3_default`` (the default, what the app shows) or
+    ``benchling_compatible`` (Benchling's defaults, ~4-5 °C lower, so the
+    same target designs longer arms); an unknown name is a 400. The primer
+    dict is under `result`, with `mode` and `tm_profile` echoed alongside.
+
+    Detection, cloning and generic responses also carry `qc` — the
+    check-primer-pair thermodynamics of the designed pair (each primer's
+    hairpin and self-dimers, the primer-dimer between them, the Tm
+    difference, with `qc.warnings` flagging anything Primer3's own 47 °C
+    structure limit would reject), the same check the Primer Design screen
+    shows under a result.
     """
     template = payload.get("template") or payload.get("sequence")  # SC-G alias
     if not isinstance(template, str) or not template.strip():
@@ -12225,11 +12457,17 @@ def _h_design_primers(app, payload):
     if len(template_clean) > _PAIRWISE_MAX_LEN:
         return ({"error": f"'template' exceeds "
                   f"{_PAIRWISE_MAX_LEN:,} bp cap"}, 413)
+    # The Tm profile is read FIRST: allele-specific dispatches below, and a
+    # profile it skipped would be one it silently ignored.
+    tm_profile, err = _agent_tm_profile(payload)
+    if err:
+        return err
     # Allele-specific is dispatched BEFORE start/end are parsed: it is anchored
     # on a single base, not a region, so requiring a region it never uses would
     # be a mandatory parameter with no meaning.
     if payload.get("mode") == "allele_specific":
-        return _agent_design_allele_specific(template_clean, payload)
+        return _agent_design_allele_specific(template_clean, payload,
+                                             tm_profile)
     start = _coerce_int(payload.get("start"), name="start")
     if isinstance(start, str):
         return ({"error": start}, 400)
@@ -12253,18 +12491,11 @@ def _h_design_primers(app, payload):
         return ({"error": "'target_tm' must be a number"}, 400)
     if not (40.0 <= target_tm <= 90.0):
         return ({"error": "'target_tm' must be in [40, 90] °C"}, 400)
-    tm_profile = payload.get("tm_profile", "primer3_default")
-    if not isinstance(tm_profile, str) or tm_profile not in _TM_PROFILES:
-        return ({"error": "'tm_profile' must be 'primer3_default' or "
-                          "'benchling_compatible'"}, 400)
-    if mode == "detection" and tm_profile != "primer3_default":
-        return ({"error": "'benchling_compatible' is supported only for "
-                          "cloning and generic modes because detection mode "
-                          "uses Primer3 pair selection"}, 400)
     try:
         if mode == "detection":
             result = _design_detection_primers(
                 template_clean, start, end, target_tm=target_tm,
+                tm_profile=tm_profile,
             )
         elif mode == "generic":
             # Binding-only primers (no tails / RE sites / overhangs): the
@@ -12289,8 +12520,22 @@ def _h_design_primers(app, payload):
         return ({"error": f"design failed: {_scrub_path(str(exc))}"}, 500)
     if isinstance(result, dict) and result.get("error"):
         return ({"error": result["error"]}, 422)
+    # The pair QC the Primer Design screen shows under a result: the whole
+    # oligos' structures, the arms' Tms (cloning mode carries a 5' tail).
+    qc = None
+    try:
+        if mode == "cloning":
+            qc = _primer_pair_qc(result["fwd_full"], result["rev_full"],
+                                 fwd_binding=result["fwd_binding"],
+                                 rev_binding=result["rev_binding"],
+                                 tm_profile=tm_profile)
+        else:
+            qc = _primer_pair_qc(result["fwd_seq"], result["rev_seq"],
+                                 tm_profile=tm_profile)
+    except (KeyError, TypeError, ValueError):
+        _log.exception("agent design-primers: pair QC failed (%s)", mode)
     return {"ok": True, "mode": mode, "tm_profile": tm_profile,
-            "result": result}
+            "result": result, "qc": qc}
 
 
 def _agent_project_experiments_list(project):
