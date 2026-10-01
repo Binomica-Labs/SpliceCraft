@@ -43,13 +43,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.3.6"
+__version__ = "1.3.7"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-09-30"
+_RELEASE_DATE = "2026-10-01"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -832,10 +832,6 @@ def _log_startup_banner() -> None:
     _log.info("platform  : %s", _RUNTIME_PLATFORM)
     _log.info("textual   : %s", _ver("textual"))
     _log.info("biopython : %s", _ver("Bio"))
-    _log.info("edlib     : %s", (
-        f"{_ver('edlib')} (active — turbo aligner)" if _EDLIB_AVAILABLE
-        else "not installed — built-in Myers aligner"
-    ))
     _log.info("log path  : %s", _LOG_PATH)
     try:
         _log.info("stacks    : %s  (kill -USR1 <pid> on hang)",
@@ -1918,7 +1914,60 @@ def _blob_exists(gb_ref: str) -> bool:
 
 # Blob paths whose on-disk bytes this process has hashed and found to match
 # their name — `_blob_write` re-verifies an existing blob only once per path.
+# `_blob_read` adds every blob it verifies, so the first save after launch no
+# longer re-hashes the library the launch just read.
 _BLOB_VERIFIED_PATHS: "set[str]" = set()
+
+# id(text) -> (text, ref, utf-8 byte size) for every text this process has
+# hashed: read and verified (`_blob_read`) or written (`_blob_write`). A
+# collections save dehydrates EVERY entry, and each one used to be re-encoded
+# and SHA-256 hashed only to rediscover the blob name it already had — 0.39 s
+# of a 0.43 s save on a 1,258-plasmid library ([INV-214]). Keyed by IDENTITY,
+# not content: hashing 270 MB of str to key a dict cost launch ~0.2 s, while an
+# unchanged entry keeps the very str object it was loaded with. The entry holds
+# the text, so its id cannot be reused while cached, and a hit must be that
+# same object (`is`), so a cached ref is always the right name. A content-equal
+# copy simply misses and is hashed as before. Bounded by
+# `_dehydrate_collections`, which rebuilds it from the library it just saved.
+_BLOB_REF_BY_TEXT: "dict[int, tuple[str, str, int]]" = {}
+
+
+def _blob_ref_cached(text: str) -> "tuple[str, int] | None":
+    hit = _BLOB_REF_BY_TEXT.get(id(text))
+    if hit is not None and hit[0] is text:
+        return hit[1], hit[2]
+    return None
+
+
+# Safety valve on the cache above: it is rebuilt from the library on every
+# full collections save, but a session whose collections saves keep failing
+# would otherwise hold every text it ever hashed. Past this many entries it
+# starts over — a cache miss only costs a hash.
+_BLOB_REF_CACHE_MAX = 50_000
+
+
+def _blob_ref_remember(text: str, ref: str, size: int) -> None:
+    if len(_BLOB_REF_BY_TEXT) >= _BLOB_REF_CACHE_MAX:
+        _BLOB_REF_BY_TEXT.clear()
+    _BLOB_REF_BY_TEXT[id(text)] = (text, ref, size)
+
+
+def _blob_reuse(path: Path, ref: str, size: int) -> bool:
+    """`_blob_existing_is_sound`, plus keeping a re-referenced blob inside the
+    orphan GC's grace window. Its mtime is refreshed only once it is older than
+    half that window: the GC quarantines a blob only past the FULL window, so a
+    blob younger than half of it cannot be taken by a GC that read the metadata
+    a moment before this save (the D15 race). Refreshing on every reuse touched
+    every blob in the library on every save."""
+    if not _blob_existing_is_sound(path, ref, size):
+        return False
+    try:
+        import time
+        if time.time() - path.stat().st_mtime > _BLOB_GC_GRACE_SECONDS / 2:
+            os.utime(path, None)
+    except OSError:
+        pass
+    return True
 
 
 def _blob_existing_is_sound(path: Path, ref: str, size: int) -> bool:
@@ -1961,15 +2010,21 @@ def _blob_write(gb_text: str) -> str:
     blob the new entry was about to reference (D15)."""
     if not isinstance(gb_text, str):
         raise ValueError("gb_text must be a str")
+    cached = _blob_ref_cached(gb_text)
+    if cached is not None:
+        c_ref, c_size = cached
+        try:
+            c_path = _blob_path(c_ref)
+        except ValueError:
+            c_path = None
+        if c_path is not None and _blob_reuse(c_path, c_ref, c_size):
+            return c_ref
     data = gb_text.encode("utf-8")
     ref = _blob_hash_bytes(data)
     path = _blob_path(ref)
     if path.is_file():
-        if _blob_existing_is_sound(path, ref, len(data)):
-            try:
-                os.utime(path, None)
-            except OSError:
-                pass
+        if _blob_reuse(path, ref, len(data)):
+            _blob_ref_remember(gb_text, ref, len(data))
             return ref
         _log.warning("blob %s on disk does not match its name — rewriting it "
                      "from the text being saved", ref)
@@ -1991,6 +2046,8 @@ def _blob_write(gb_text: str) -> str:
             f"blob {ref} failed post-write verification — written bytes "
             f"hash to a different digest (corrupt write); aborting"
         )
+    _BLOB_VERIFIED_PATHS.add(str(path))
+    _blob_ref_remember(gb_text, ref, len(data))
     return ref
 
 
@@ -2020,10 +2077,14 @@ def _blob_read(gb_ref: str) -> "str | None":
         )
         return None
     try:
-        return data.decode("utf-8")
+        text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         _log.error("blob read: %s not valid utf-8: %s", gb_ref, exc)
         return None
+    # Hashed and matched: remembered so a save need not hash it again.
+    _BLOB_VERIFIED_PATHS.add(str(path))
+    _blob_ref_remember(text, gb_ref, len(data))
+    return text
 
 
 # ── gb_text dehydrate / rehydrate (blob store <-> materialised entries) ──────────
@@ -2092,12 +2153,67 @@ def _dehydrate_entry(entry: dict) -> dict:
     return out
 
 
-def _rehydrate_field(out: dict, text_key: str, ref_key: str, what: str) -> None:
+# Blob reads in flight at once when a whole library rehydrates. File reads and
+# SHA-256 release the GIL; utf-8 decoding and the per-blob bookkeeping do not,
+# so past ~4 workers the pool only adds contention (measured on 2,325 blobs /
+# 271 MB: 0.55 s sequential, 0.27 s at 4, no better at 8 or 16).
+_BLOB_READ_WORKERS = 4
+# Below this many blobs a pool costs more than it saves.
+_BLOB_READ_POOL_MIN = 32
+
+
+def _blob_refs_to_read(entries) -> "list[str]":
+    """Every blob ref `_rehydrate_field` would resolve for ``entries`` — those
+    without inline text (inline always wins) — de-duplicated, in order."""
+    out: "list[str]" = []
+    seen: "set[str]" = set()
+    for e in entries or ():
+        if not isinstance(e, dict):
+            continue
+        for text_key, ref_key, _what in _BLOB_BACKED_FIELDS:
+            inline = e.get(text_key)
+            if isinstance(inline, str) and inline:
+                continue
+            ref = e.get(ref_key)
+            if isinstance(ref, str) and ref and ref not in seen:
+                seen.add(ref)
+                out.append(ref)
+    return out
+
+
+def _blob_read_many(refs) -> "dict[str, str | None]":
+    """`_blob_read` for many refs at once — the launch-time rehydration of a
+    whole library. Each UNIQUE ref is read once (the same plasmid in two
+    collections, or in the active-collection mirror, shares its blob), and the
+    reads run on a small pool. Every blob is still hash-verified exactly as
+    `_blob_read` always does — this changes the schedule, never the check —
+    and a missing or corrupt blob maps to None for the caller to handle."""
+    uniq = list(dict.fromkeys(r for r in refs if isinstance(r, str) and r))
+    if len(uniq) < _BLOB_READ_POOL_MIN:
+        return {r: _blob_read(r) for r in uniq}
+    from concurrent.futures import ThreadPoolExecutor
+    workers = max(1, min(_BLOB_READ_WORKERS, os.cpu_count() or 1))
+    try:
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="sc-blob-read") as ex:
+            texts = list(ex.map(_blob_read, uniq, chunksize=16))
+    except RuntimeError:
+        # No threads to be had — interpreter shutdown, a process near its
+        # thread limit. The library must still load: read them in turn.
+        _log.debug("blob read pool unavailable — reading sequentially",
+                   exc_info=True)
+        return {r: _blob_read(r) for r in uniq}
+    return dict(zip(uniq, texts))
+
+
+def _rehydrate_field(out: dict, text_key: str, ref_key: str, what: str,
+                     prefetched: "dict | None" = None) -> None:
     """Materialise `out[text_key]` from `out[ref_key]` (blob store). Inline text
     ALWAYS wins (and a stray ref is dropped — old-format backward read). A
     missing/corrupt blob leaves the text "" but RETAINS the ref (auto-recovers
     if the blob is restored) and logs loudly — never silently presents an
-    unresolved entry as empty. Mutates `out`."""
+    unresolved entry as empty. Mutates `out`. ``prefetched`` is a
+    `_blob_read_many` result; a ref it lacks is read on the spot."""
     inline = out.get(text_key)
     if isinstance(inline, str) and inline:
         out.pop(ref_key, None)             # inline wins; drop any stray ref
@@ -2105,7 +2221,10 @@ def _rehydrate_field(out: dict, text_key: str, ref_key: str, what: str) -> None:
     ref = out.get(ref_key)
     if not (isinstance(ref, str) and ref):
         return                             # no text, no ref → leave as-is
-    text = _blob_read(ref)
+    if prefetched is not None and ref in prefetched:
+        text = prefetched[ref]
+    else:
+        text = _blob_read(ref)
     if text is None:
         out[text_key] = ""                 # keep ref for auto-recovery
         _log.error(
@@ -2118,7 +2237,7 @@ def _rehydrate_field(out: dict, text_key: str, ref_key: str, what: str) -> None:
     out[text_key] = text
 
 
-def _rehydrate_entry(entry: dict) -> dict:
+def _rehydrate_entry(entry: dict, prefetched: "dict | None" = None) -> dict:
     """Return a copy of `entry` with blob-backed fields (`gb_text`,
     `history_xml`) materialised from their refs. Inline text wins; a missing
     blob leaves that field "" with the ref retained + a loud log, never dropping
@@ -2128,7 +2247,7 @@ def _rehydrate_entry(entry: dict) -> dict:
         return entry
     out = dict(entry)
     for text_key, ref_key, what in _BLOB_BACKED_FIELDS:
-        _rehydrate_field(out, text_key, ref_key, what)
+        _rehydrate_field(out, text_key, ref_key, what, prefetched)
     return out
 
 
@@ -2139,20 +2258,40 @@ def _dehydrate_entries(entries: list) -> list:
     return [_dehydrate_entry(e) for e in entries]
 
 
-def _rehydrate_entries(entries: list) -> list:
-    return [_rehydrate_entry(e) for e in entries]
+def _rehydrate_entries(entries: list,
+                       prefetched: "dict | None" = None) -> list:
+    if prefetched is None:
+        prefetched = _blob_read_many(_blob_refs_to_read(entries))
+    return [_rehydrate_entry(e, prefetched) for e in entries]
 
 
 def _dehydrate_collections(colls: list) -> list:
-    """Dehydrate every collection's embedded `plasmids` list (new dicts)."""
+    """Dehydrate every collection's embedded `plasmids` list (new dicts).
+
+    This is the whole library, so it also bounds `_BLOB_REF_BY_TEXT`: the
+    cache is rebuilt from exactly the texts saved here, and a text the user
+    replaced or deleted stops being held alive by it."""
+    global _BLOB_REF_BY_TEXT
     out: list = []
+    live: "dict[int, tuple[str, str, int]]" = {}
+    cache = _BLOB_REF_BY_TEXT
     for c in colls:
         if isinstance(c, dict) and isinstance(c.get("plasmids"), list):
             c2 = dict(c)
             c2["plasmids"] = _dehydrate_entries(c["plasmids"])
             out.append(c2)
+            for e in c["plasmids"]:
+                if not isinstance(e, dict):
+                    continue
+                for text_key, _rk, _w in _BLOB_BACKED_FIELDS:
+                    t = e.get(text_key)
+                    if isinstance(t, str) and t:
+                        hit = cache.get(id(t))
+                        if hit is not None and hit[0] is t:
+                            live[id(t)] = hit
         else:
             out.append(c)
+    _BLOB_REF_BY_TEXT = live
     return out
 
 
@@ -2165,11 +2304,17 @@ _state._dehydrate_collections_hook = _dehydrate_collections
 
 
 def _rehydrate_collections(colls: list) -> list:
+    # One read of every blob the whole library needs, up front (see
+    # `_blob_read_many`), then the per-entry materialisation from it.
+    prefetched = _blob_read_many(_blob_refs_to_read(
+        e for c in colls
+        if isinstance(c, dict) and isinstance(c.get("plasmids"), list)
+        for e in c["plasmids"]))
     out: list = []
     for c in colls:
         if isinstance(c, dict) and isinstance(c.get("plasmids"), list):
             c2 = dict(c)
-            c2["plasmids"] = _rehydrate_entries(c["plasmids"])
+            c2["plasmids"] = _rehydrate_entries(c["plasmids"], prefetched)
             out.append(c2)
         else:
             out.append(c)
@@ -5165,6 +5310,7 @@ from splicecraft_util import (  # noqa: E402
     _feat_bounds as _feat_bounds,
     _feature_traversal as _feature_traversal,
     _phred_in_alignment_frame as _phred_in_alignment_frame,
+    _read_rotation_in_rows as _read_rotation_in_rows,
     _markup_escape as _markup_escape,
     _markup_escape_unstyled as _markup_escape_unstyled,
     _markup_parses as _markup_parses,
@@ -6071,6 +6217,9 @@ from splicecraft_biology import (  # noqa: E402
     _read_is_full_length as _read_is_full_length,
     _PARTIAL_READ_FRACTION as _PARTIAL_READ_FRACTION,
     _read_no_call_positions as _read_no_call_positions,
+    _slide_gaps_to_ends as _slide_gaps_to_ends,
+    _pos_in_spans as _pos_in_spans,
+    _variant_gate_pos as _variant_gate_pos,
     _span_full_lap_len as _span_full_lap_len,
     _enzyme_signature as _enzyme_signature,
     _enzyme_aliases   as _enzyme_aliases,
@@ -8177,7 +8326,8 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                     show_connectors: bool = False,
                     re_highlight: "dict | None" = None,
                     aa_highlight: "dict | None" = None,
-                    viewport_y_range: "tuple[int,int] | None" = None) -> Text:
+                    viewport_y_range: "tuple[int,int] | None" = None,
+                    window_info: "dict | None" = None) -> Text:
     """Rich Text of the sequence with per-position feature coloring.
 
     sel_range    — feature highlight: bold + underline on feature bases
@@ -8198,6 +8348,14 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                    refreshes so a scroll back-and-forth doesn't pay
                    the render cost twice. None = render everything
                    (the historical behaviour).
+    window_info  — with ``viewport_y_range``: render ONLY the chunks in the
+                   window, no blank placeholders, and record the rows left
+                   out as ``window_info["above"]`` / ``["below"]`` for the
+                   caller to restore as padding ([INV-214]). The placeholders
+                   were one text line per row of the WHOLE sequence: 124k
+                   lines that Textual laid out on every update of an
+                   18.6 Mbp record, 11-23 s per load. Padding the same height
+                   keeps every row at the same scroll offset.
 
     Rendering order (closest to DNA first):
       RE sites (far) → regular feature bars (close) → DNA → regular (close) → RE (far)
@@ -8351,9 +8509,28 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     vp_min, vp_max = (viewport_y_range
                        if viewport_y_range is not None
                        else (None, None))
-    for i, (chunk_start, chunk_end, groups, _ab_pairs, _be_pairs,
-            *_extra) in enumerate(chunks_layout):
-        if vp_min is not None and vp_max is not None:
+    window_mode = (window_info is not None
+                   and vp_min is not None and vp_max is not None)
+    lo_i, hi_i = 0, len(chunks_layout)
+    if window_info is not None and vp_min is not None and vp_max is not None:
+        # The chunks overlapping [vp_min, vp_max): chunk i spans rows
+        # [_pf_dna2[i], _pf_dna2[i+1]) and the prefix sums only grow, so two
+        # bisects find them without visiting the rest.
+        import bisect as _bisect
+        total_rows = _pf_dna2[-1]
+        lo_i = max(0, _bisect.bisect_right(_pf_dna2, vp_min) - 1)
+        hi_i = min(len(chunks_layout), _bisect.bisect_left(_pf_dna2, vp_max))
+        if lo_i >= hi_i:
+            # Nothing overlaps (a viewport past the end, just after the text
+            # shrank): render the last chunk rather than an empty text, which
+            # would still count as one line and make the view a row taller.
+            lo_i, hi_i = max(0, len(chunks_layout) - 1), len(chunks_layout)
+        window_info["above"] = _pf_dna2[lo_i]
+        window_info["below"] = total_rows - _pf_dna2[hi_i]
+    for i in range(lo_i, hi_i):
+        (chunk_start, chunk_end, groups, _ab_pairs, _be_pairs,
+         *_extra) = chunks_layout[i]
+        if not window_mode and vp_min is not None and vp_max is not None:
             row_lo = _pf_dna2[i]
             row_hi = _pf_dna2[i + 1] if i + 1 < len(_pf_dna2) else row_lo
             if row_hi <= vp_min or row_lo >= vp_max:
@@ -11966,7 +12143,7 @@ def _trace_verification_summary(
     if _extent:
         variants = [v for v in (variants or [])
                     if not isinstance(v, dict) or v.get("type") == "truncated"
-                    or _pos_in_spans(int(v.get("target_pos", 0) or 0),
+                    or _pos_in_spans(_variant_gate_pos(v, _t_len, circular),
                                      _extent)]
     ann = _annotate_variants_with_quality(
         variants, aligned_q, aligned_t, quals, min_phred=thr)
@@ -12337,21 +12514,6 @@ def _extent_from_aligned_spans(spans, total: int,
     return [(spans[i + 1][0], total), (0, spans[i][1])]
 
 
-def _pos_in_spans(pos: int, spans) -> bool:
-    return any(lo <= pos < hi for lo, hi in (spans or ()))
-
-
-def _variant_gate_pos(v: dict, n: int, circular: bool) -> int:
-    """The position that decides whether a read OBSERVED ``v``: its
-    ``target_pos`` — except that on a circle an insertion after the last base
-    (``target_pos == n``) sits where bp 0 does. Gated at ``n`` it fell
-    outside every read's extent, so a clonal insertion at the origin counted
-    only in the reads whose aligner filed it at 0 (round-2 hardening,
-    2026-09-25)."""
-    pos = int(v.get("target_pos", 0) or 0)
-    if circular and n > 0 and v.get("type") == "insertion":
-        return pos % n
-    return pos
 def _read_observed_extent(align: dict) -> "tuple[int, int] | None":
     """First to last aligned base — the window this read can say ANYTHING about.
 
@@ -13658,6 +13820,11 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
         raise ValueError(
             f"canvas_axis must be 'target' or 'query' (got {canvas_axis!r})"
         )
+    # A READ against a LINEAR reference may stop short of either end, so the
+    # reference it never reached is free at the alignment's ends ([INV-213]).
+    # A circle has no ends to leave unread, and the diff flow (canvas=query)
+    # compares two whole molecules — both keep end gaps costed.
+    free_ends = (not is_circular) and canvas_axis == "target"
     # Reject empty inputs upfront. `_pairwise_align` has its own
     # length cap (`_PAIRWISE_MAX_LEN`) and degenerate-input handling,
     # but 0-length sequences would silently produce a 0%-identity
@@ -13705,13 +13872,15 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
         )
 
     try:
-        r_plain = _pairwise_align(query_seq, target_seq, mode=mode)
+        r_plain = _pairwise_align(query_seq, target_seq, mode=mode,
+                                  free_read_ends=free_ends)
         candidates.append(("none", 0, False, r_plain))
     except Exception as exc:
         plain_exc = exc
     if rc_query_seq and not _good_enough():
         try:
-            r_plain_rc = _pairwise_align(rc_query_seq, target_seq, mode=mode)
+            r_plain_rc = _pairwise_align(rc_query_seq, target_seq, mode=mode,
+                                         free_read_ends=free_ends)
             candidates.append(("none", 0, True, r_plain_rc))
         except Exception:
             _log.exception(
@@ -13796,7 +13965,8 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
             if q_rot:
                 try:
                     rq = eff_query[q_rot:] + eff_query[:q_rot]
-                    r = _pairwise_align(rq, target_seq, mode=mode)
+                    r = _pairwise_align(rq, target_seq, mode=mode,
+                                         free_read_ends=free_ends)
                     candidates.append(("query", q_rot, rot_is_rc, r))
                 except Exception:
                     _log.exception(
@@ -13819,7 +13989,8 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
             if t_rot:
                 try:
                     rt = target_seq[t_rot:] + target_seq[:t_rot]
-                    r = _pairwise_align(eff_query, rt, mode=mode)
+                    r = _pairwise_align(eff_query, rt, mode=mode,
+                                         free_read_ends=free_ends)
                     candidates.append(("target", t_rot, rot_is_rc, r))
                 except Exception:
                     _log.exception(
@@ -13843,11 +14014,20 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
     # overlay informative AND what corresponds to the correct
     # rotation biologically. `ungapped_identity_pct` breaks ties
     # in favour of cleaner matched regions.
+    # A full tie on both falls to FEWER GAP OPENINGS, not to list order. A
+    # partial read crossing the origin by 3 bp ties exactly between the
+    # target-rotated candidate (the read whole, one unread arc) and the
+    # query-rotated one, where the semi-global aligner cannot put the 3 bases
+    # at bp 0 and threads them through a chance match 10 bp short of the read
+    # with a 7 bp gap — a phantom deletion that won only by coming first
+    # ([INV-214]).
     def _rank_key(c):
         r = c[3]
         return (
             int(r.get("n_matches", 0) or 0),
             float(r.get("ungapped_identity_pct", 0.0) or 0.0),
+            -(int(r.get("n_gap_opens_q", 0) or 0)
+              + int(r.get("n_gap_opens_t", 0) or 0)),
         )
     best_kind, best_offset, best_is_rc, best_result = max(
         candidates, key=_rank_key,
@@ -13952,7 +14132,7 @@ def _pick_best_rotation(query_seq: str, target_seq: str, *,
         best_result["inverted_segments"] = _alignment_inverted_segments(
             best_result.get("aligned_q", ""),
             best_result.get("aligned_t", ""),
-            frame_shift=best_result.get("query_frame_shift", 0),
+            frame_shift=_read_rotation_in_rows(best_result),
         )
     except Exception:
         _log.exception("rotation picker: inverted-segment probe raised")
@@ -14010,83 +14190,32 @@ from splicecraft_util import (  # noqa: E402
 
 
 
-# ── edlib fast-aligner engine (optional) ───────────────────────────────────────
+# ── Myers/Hirschberg pure-Python global aligner (THE global engine) ──────────
 #
-# edlib is a bit-parallel (Myers) edit-distance aligner — ~90–600× faster
-# than Biopython's DP on long near-identical sequences, and it produces
-# the SAME aligned columns for the high-identity alignments that drive QC
-# (validated on real Plasmidsaurus reads, 2026-05-31: identical
-# identity / mismatch / indel counts; it diverges only on low-identity
-# alignments, which the rotation picker discards anyway). It is OPTIONAL:
-# a platform with no edlib wheel transparently falls back to Biopython, so
-# nothing can regress. Match COUNTING in `_pairwise_align` stays IUPAC-
-# aware (`_iupac_compatible`); the same IUPAC pairs are also handed to
-# edlib as `additionalEqualities` so the alignment itself treats N/R/etc.
-# as matches — keeping engine and counting in lockstep.
-try:
-    import edlib as _edlib  # type: ignore[import-not-found]
-    _EDLIB_AVAILABLE = True
-except Exception:
-    _edlib = None
-    _EDLIB_AVAILABLE = False
-
-# Unordered IUPAC-compatible character pairs (N vs A, R vs G, …) for
-# edlib's `additionalEqualities`, built once from `_iupac_compatible` so
-# the alignment engine and the match counting can never disagree about
-# which ambiguity pairings count as a match.
-_EDLIB_IUPAC_EQUALITIES = [
-    (a, b)
-    for a in sorted(_IUPAC_NUC_CHARS)
-    for b in sorted(_IUPAC_NUC_CHARS)
-    if a < b and _iupac_compatible(a, b)
-]
-
-
-def _edlib_align_global(query: str, target: str) -> "tuple[str, str]":
-    """Global (Needleman–Wunsch) alignment via edlib → gapped
-    ``(query, target)`` strings, the fast-path engine for
-    `_pairwise_align`. Raises on any edlib failure so the caller falls
-    through to its ValueError handling. Inputs are already normalised +
-    length-capped by `_pairwise_align`."""
-    if _edlib is None:                       # defensive; gated by caller
-        raise ValueError("edlib not available")
-    res = _edlib.align(
-        query, target, mode="NW", task="path",
-        additionalEqualities=_EDLIB_IUPAC_EQUALITIES,
-    )
-    if res.get("editDistance", -1) < 0:
-        raise ValueError("edlib produced no alignment")
-    nice = _edlib.getNiceAlignment(res, query, target)
-    aq = nice.get("query_aligned") or ""
-    at = nice.get("target_aligned") or ""
-    if not aq or not at:
-        raise ValueError("edlib produced empty aligned rows")
-    return aq, at
-
-
-# ── Myers/Hirschberg pure-Python global aligner (no-dependency engine) ────────
+# The global-alignment engine on every install: bit-parallel Myers edit
+# distance wrapped in a linear-space Hirschberg traceback, in pure Python.
+# Biopython stays the per-call safety net (and the local-mode engine). See
+# [INV-91] / [INV-106] for its history.
 #
-# The universal global-alignment engine: bit-parallel Myers edit distance
-# (the same algorithm edlib implements) wrapped in a linear-space
-# Hirschberg traceback, in pure Python. It replaces Biopython as the
-# `_pairwise_align` global fallback so EVERY platform — Linux-aarch64,
-# Python 3.14+, native Windows, any box without an edlib wheel — gets a
-# fast aligner with no compiled dependency at all. edlib (when its wheel
-# is present) stays the turbo over this; Biopython remains the ultimate
-# safety net (and the local-mode engine). See [INV-91].
+# It is the ONLY global engine, on purpose ([INV-212]). edlib used to run in
+# front of it wherever edlib had a wheel (x86_64/arm64, Python ≤ 3.13). Both
+# are unit-cost, so many alignments tie, and edlib returned a different one:
+# on a read missing an end, an indel at the origin or an inversion boundary
+# it scattered one gap into many — a perfect read missing its first 100 bp
+# came back as 20 phantom variants. The release machine (Python 3.14, no
+# edlib wheel) never ran it, so its suite stayed green while CI and most
+# installs got the wrong answer for 16 days. A faster engine is welcome only
+# if it returns the SAME alignment, and is tested wherever releases are cut.
 #
 # Why it's fast enough in pure Python: Python's arbitrary-precision ints
 # give the Myers bit-vector for free (the whole pattern is one int — no
-# 64-bit word-blocking edlib's C needs), and an IUPAC-aware longest-
-# common-prefix/suffix trim applied at EVERY Hirschberg level peels the
-# long exact-match runs between scattered sequencing errors, collapsing
-# the work. A real ~18 kb Plasmidsaurus read at ~99% identity aligns in
-# ~0.7 s — vs ~8.6 s for the Biopython DP it replaces (~12×; edlib does
-# it in ~0.02 s). Counts are IDENTICAL to edlib on any unique-optimal
-# alignment; on divergent reads the engines pick different co-optimal
-# alignments (same edit distance), which is immaterial — those reads are
-# discarded by `_pick_best_rotation`, exactly as [INV-91] notes for the
-# edlib-vs-Biopython case.
+# 64-bit word-blocking needed), and an IUPAC-aware longest-common-prefix/
+# suffix trim applied at EVERY Hirschberg level peels the long exact-match
+# runs between scattered sequencing errors, collapsing the work. A real
+# ~18 kb Plasmidsaurus read at ~99% identity aligns in ~0.7 s — vs ~8.6 s
+# for the Biopython DP it replaced (~12×). That trim is also what keeps a
+# cleanly missing read end in ONE gap: the shared suffix (or prefix) is
+# matched before any gap is placed.
 #
 # Hardening: the engine is EXACT (validated against a naive O(nm) DP for
 # round-trip + minimum-edit-distance optimality + IUPAC over thousands of
@@ -14102,12 +14231,23 @@ _MYERS_DP_AREA = 4096
 
 # For each pattern character, the text characters that "match" it under
 # IUPAC compatibility (N matches A, R matches A/G, …). Built once from
-# `_iupac_compatible` — the SAME predicate `_pairwise_align` counts with,
-# and that edlib gets via `additionalEqualities` — so the alignment
-# engine and the match counting can never disagree about ambiguity.
+# `_iupac_compatible` — the SAME predicate `_pairwise_align` counts with —
+# so the alignment engine and the match counting can never disagree
+# about ambiguity.
 _MYERS_COMPAT_CHARS = {
     p: tuple(c for c in sorted(_IUPAC_NUC_CHARS) if _iupac_compatible(p, c))
     for p in _IUPAC_NUC_CHARS
+}
+
+
+# For each text letter c: a `str.translate` table writing "1" for every pattern
+# letter c matches and "0" for the rest. Reversed and read as base 2, a pattern
+# becomes c's bit-vector in C time — bit j is the LAST character of the
+# reversed string's j-th from the end, i.e. pattern[j].
+_MYERS_PEQ_TABLES: "dict[str, dict[int, str]]" = {
+    c: str.maketrans({p: ("1" if c in _MYERS_COMPAT_CHARS[p] else "0")
+                      for p in _IUPAC_NUC_CHARS})
+    for c in sorted(_IUPAC_NUC_CHARS)
 }
 
 
@@ -14116,12 +14256,28 @@ def _myers_build_peq(pattern: str) -> "dict[str, int]":
     set iff text character ``c`` is IUPAC-compatible with ``pattern[j]``.
     A character outside the IUPAC alphabet contributes no bits (it matches
     nothing) — defensive; inputs are pre-validated by
-    `_normalize_dna_for_align`."""
+    `_normalize_dna_for_align`.
+
+    Built with `str.translate` + `int(..., 2)` per text letter ([INV-214]):
+    the per-position loop OR-ed a growing big int for every compatible letter
+    of every position — quadratic in the pattern, and ~40% of an alignment.
+    A pattern holding anything outside the alphabet takes that loop, which
+    is the definition this must equal."""
+    if not pattern:
+        return {}
+    if not set(pattern) <= _IUPAC_NUC_CHARS:
+        peq_slow: "dict[str, int]" = {}
+        for j, ch in enumerate(pattern):
+            bit = 1 << j
+            for c in _MYERS_COMPAT_CHARS.get(ch, ()):
+                peq_slow[c] = peq_slow.get(c, 0) | bit
+        return peq_slow
+    rev = pattern[::-1]
     peq: "dict[str, int]" = {}
-    for j, ch in enumerate(pattern):
-        bit = 1 << j
-        for c in _MYERS_COMPAT_CHARS.get(ch, ()):
-            peq[c] = peq.get(c, 0) | bit
+    for c, table in _MYERS_PEQ_TABLES.items():
+        mask = int(rev.translate(table), 2)
+        if mask:
+            peq[c] = mask
     return peq
 
 
@@ -14163,34 +14319,45 @@ def _myers_edit_profile(pattern: str, text: str,
 def _myers_dp_global(a: str, b: str) -> "tuple[str, str]":
     """Direct Needleman–Wunsch with traceback (unit costs, IUPAC match)
     for a small block — the Hirschberg base case. Tie-break prefers the
-    diagonal, then a gap in ``b`` (deletion), then a gap in ``a``, which
-    reproduces edlib's gap placement on unique-optimal alignments."""
+    diagonal, then a gap in ``b`` (deletion), then a gap in ``a``. That
+    order picks which of several equal-cost alignments every caller sees,
+    so changing it changes reported variant positions ([INV-212])."""
     m, n = len(a), len(b)
     if m == 0:
         return "-" * n, b
     if n == 0:
         return a, "-" * m
+    # The 0/1 substitution cost of each letter of `a` against all of `b`,
+    # once per DISTINCT letter (at most 16) rather than once per cell: the
+    # same `==`-then-IUPAC predicate, out of the inner loop ([INV-214]).
+    cost = {c: [0 if (c == bj or _iupac_compatible(c, bj)) else 1 for bj in b]
+            for c in set(a)}
     dp = [[0] * (n + 1) for _ in range(m + 1)]
     for i in range(1, m + 1):
         dp[i][0] = i
     for j in range(1, n + 1):
         dp[0][j] = j
     for i in range(1, m + 1):
-        ai = a[i - 1]
+        crow = cost[a[i - 1]]
         row = dp[i]
         prev = dp[i - 1]
+        left = row[0]
         for j in range(1, n + 1):
-            sub = prev[j - 1] + (
-                0 if (ai == b[j - 1] or _iupac_compatible(ai, b[j - 1])) else 1)
-            row[j] = min(sub, prev[j] + 1, row[j - 1] + 1)
+            v = prev[j - 1] + crow[j - 1]
+            up = prev[j] + 1
+            if up < v:
+                v = up
+            if left + 1 < v:
+                v = left + 1
+            row[j] = v
+            left = v
     i, j = m, n
     ga: "list[str]" = []
     gb: "list[str]" = []
     while i > 0 and j > 0:
         here = dp[i][j]
         ai, bj = a[i - 1], b[j - 1]
-        if here == dp[i - 1][j - 1] + (
-                0 if (ai == bj or _iupac_compatible(ai, bj)) else 1):
+        if here == dp[i - 1][j - 1] + cost[ai][j - 1]:
             ga.append(ai); gb.append(bj); i -= 1; j -= 1
         elif here == dp[i - 1][j] + 1:
             ga.append(ai); gb.append("-"); i -= 1
@@ -14258,11 +14425,10 @@ def _myers_align_core(a: str, b: str) -> "tuple[str, str]":
 
 def _myers_align_global(query: str, target: str) -> "tuple[str, str]":
     """Global (Needleman–Wunsch) alignment via pure-Python Myers/
-    Hirschberg → gapped ``(query, target)`` strings — the no-dependency
-    engine for `_pairwise_align`, mirroring `_edlib_align_global`'s
-    contract. Inputs are already normalised + length-capped by the
-    caller; the caller round-trip-guards the result and falls back to
-    Biopython on any failure."""
+    Hirschberg → gapped ``(query, target)`` strings — the global engine
+    for `_pairwise_align` on every install ([INV-212]). Inputs are already
+    normalised + length-capped by the caller; the caller round-trip-guards
+    the result and falls back to Biopython on any failure."""
     if query == target:            # exact-equal fast path (common re-align)
         return query, target
     return _myers_align_core(query, target)
@@ -14271,7 +14437,7 @@ def _myers_align_global(query: str, target: str) -> "tuple[str, str]":
 # ── Partial reads: semi-global placement (audit 2026-09-22) ───────────────
 # A read shorter than its plasmid (a Sanger trace, a partial long read) must
 # be aligned END-TO-END over itself with the plasmid's ends FREE. The global
-# engines (edlib / the built-in Myers) are UNIT-COST: covering the unread
+# engine (the built-in Myers) is UNIT-COST: covering the unread
 # plasmid costs the same number of deletions however the read is laid down,
 # so "optimal" meant threading the read through the plasmid as a scattered
 # subsequence rather than paying for one mismatch. An 800 bp read with one SNP
@@ -14346,6 +14512,239 @@ def _semiglobal_align(q: str, t: str, *, match: float, mismatch: float,
             t[:w0] + at + t[w1:], aln)
 
 
+# ── Indel refinement: affine re-alignment of messy gap clusters ([INV-213]) ──
+# The global engine is UNIT-COST: a gap costs per column and nothing to open,
+# so splitting one deletion into three is free — and the aligner did exactly
+# that whenever splitting let a nearby base match by chance. A 60 bp deletion
+# with an SNP 3 bp away came back as 78 different answers over 120 random
+# plasmids (the SNP gone, the deletion in two or three pieces); two deletions
+# 5 bp apart, 95 different answers. Which answer depended on nothing but the
+# bases around the event. Each cluster of gap runs that is NOT a clean single
+# gap — several runs close together, or a gap beside a mismatch — is
+# re-aligned in its own small window with gap OPENING costed, so one indel
+# plus one SNP beats a split indel, and the answer becomes a function of the
+# event. A clean isolated gap is left exactly where the engine put it.
+#
+# Scores: splitting a gap costs (open - extend) = 7 more, and can buy at most
+# one mismatch turned into a match, worth (match - mismatch) = 5 — so a split
+# never pays for itself. Two genuine deletions 2 bp apart still score better
+# kept apart than merged into one gap over mismatched bases.
+_REFINE_MATCH = 2.0
+_REFINE_MISMATCH = -3.0
+_REFINE_OPEN = -8.0
+_REFINE_EXTEND = -1.0
+# Runs separated by fewer aligned columns than this are one event; a window
+# reaches this far into the aligned context on each side (and never past the
+# midpoint to the next cluster, so windows cannot overlap).
+_REFINE_SEP = 16
+_REFINE_PAD = 16
+# Only an EVENT inside solid alignment is refined: the aligned context on each
+# side of the cluster must match at this rate. Divergent sequence — a flipped
+# insert, an unrelated stretch — is a run of chance matches (~55% under the
+# unit-cost engine), not an event to place; re-aligning it piecewise moved the
+# edge of an inversion by a base and lost two inversions outright, because
+# `_alignment_inverted_segments` reads those rows. At 90% a cluster in such a
+# region qualifies on both sides well under 0.1% of the time, while an indel
+# with an SNP beside it in a 99% read passes.
+_REFINE_MIN_CONTEXT_IDENTITY = 0.90
+# An event carries a handful of mismatches beside its gaps (the SNPs the
+# unit-cost engine tried to thread around). Divergent sequence carries dozens:
+# a 30 bp flip already holds ~13. Above this a cluster is left alone.
+_REFINE_MAX_MISMATCHES = 8
+# Columns of aligned context a cluster needs on any side it shares with
+# another cluster (the read's own ends are exempt).
+_REFINE_MIN_CONTEXT = 8
+# Larger windows are left as the engine aligned them: a cluster that long, or
+# a window that size (~0.1 s), is divergent sequence rather than an event.
+_REFINE_MAX_SPAN = 2_000
+_REFINE_MAX_CELLS = 4_000_000
+_REFINE_MATRIX = None
+
+
+def _refine_scoring_matrix():
+    """IUPAC-aware substitution matrix for the refinement aligner, built once:
+    the SAME `_iupac_compatible` predicate the counting uses, so an `N` in a
+    read never reads as a mismatch here and a match there."""
+    global _REFINE_MATRIX
+    if _REFINE_MATRIX is None:
+        from Bio.Align import substitution_matrices
+        alpha = "ACGTRYSWKMBDHVN"
+        m = substitution_matrices.Array(alphabet=alpha, dims=2)
+        for a in alpha:
+            for b in alpha:
+                m[a, b] = (_REFINE_MATCH if _iupac_compatible(a, b)
+                           else _REFINE_MISMATCH)
+        _REFINE_MATRIX = m
+    return _REFINE_MATRIX
+
+
+def _gap_run_spans(aq: str, at: str) -> "list[tuple[int, int]]":
+    """Maximal ``[start, end)`` column stretches where EITHER row has a gap."""
+    spans = sorted([(m.start(), m.end()) for m in re.finditer(r"-+", aq)]
+                   + [(m.start(), m.end()) for m in re.finditer(r"-+", at)])
+    merged: "list[list[int]]" = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
+def _context_is_solid(aq: str, at: str, lo: int, hi: int) -> bool:
+    """Do columns ``[lo, hi)`` read as solid alignment — at least
+    `_REFINE_MIN_CONTEXT_IDENTITY` of them aligned AND matching? An empty
+    stretch (the cluster touches the alignment's end) is solid by default:
+    there is no divergence there to protect."""
+    if hi <= lo:
+        return True
+    hits = sum(1 for i in range(lo, hi)
+               if aq[i] != "-" and at[i] != "-"
+               and _iupac_compatible(aq[i], at[i]))
+    return hits >= _REFINE_MIN_CONTEXT_IDENTITY * (hi - lo)
+
+
+def _refine_indel_clusters(aq: str, at: str, *,
+                           free_read_ends: bool = False) -> "tuple[str, str]":
+    """Re-align every messy gap cluster of a global alignment with affine
+    gap costs (see the block comment above). Returns the rows unchanged when
+    there is nothing to refine, and leaves any window it cannot improve —
+    too large, or a re-alignment that fails its round trip — exactly as it
+    was, so this can only ever tidy, never lose, an alignment.
+
+    ``free_read_ends`` (a read against a LINEAR reference): a window that
+    reaches either end of the alignment is ALWAYS re-aligned, with a gap in
+    the read row at that end — the reference the read never reached —
+    costing one opening whatever its length.
+    Without it, a read missing its start whose first base is an error that
+    happens to match bp 0 was pinned there by a 60 bp internal "deletion"
+    rather than read as an unread start plus one mismatch. On a CIRCLE the
+    pinned reading is the right one (a full-length read has no unread end),
+    which is why this is the caller's choice and off by default."""
+    n = len(aq)
+    if not n or n != len(at) or ("-" not in aq and "-" not in at):
+        return aq, at
+    # A PARTIAL read's leading / trailing gap blocks are the reference it
+    # never reached — absence of data, not an event. They are never part of a
+    # cluster and no window reaches into them: merged with a messy stretch at
+    # the read's start, they let a 30 bp inversion scatter its bases across
+    # 1.5 kb of unread plasmid, and the inversion was gone. A FULL-LENGTH read
+    # keeps them: there they are half of the event (an unread start on a
+    # linear molecule, one side of a deletion across a circle's seam), and a
+    # window that could not see them pinned the read's first base on a chance
+    # match and called a 1 bp deletion.
+    r_lo, r_hi = 0, n
+    if not _read_is_full_length(aq, at, n - at.count("-")):
+        r_lo = len(aq) - len(aq.lstrip("-"))
+        r_hi = len(aq.rstrip("-"))
+        if r_hi <= r_lo:
+            return aq, at
+    runs = [(max(s, r_lo), min(e, r_hi)) for s, e in _gap_run_spans(aq, at)
+            if min(e, r_hi) > max(s, r_lo)]
+    if not runs:
+        return aq, at
+    clusters: "list[list[int]]" = []           # [start, end, n_runs]
+    for s, e in runs:
+        if clusters and s - clusters[-1][1] < _REFINE_SEP:
+            clusters[-1][1] = e
+            clusters[-1][2] += 1
+        else:
+            clusters.append([s, e, 1])
+    def _mismatch(i: int) -> bool:
+        return (aq[i] != "-" and at[i] != "-"
+                and not _iupac_compatible(aq[i], at[i]))
+
+    windows: "list[tuple[int, int]]" = []
+    for k, (cs, ce, n_runs) in enumerate(clusters):
+        # Never past the midpoint to a neighbouring cluster: windows must not
+        # overlap, and each keeps its own share of the context between them.
+        lim_lo = (max(r_lo, (clusters[k - 1][1] + cs) // 2) if k > 0
+                  else r_lo)
+        lim_hi = (min(r_hi, (ce + clusters[k + 1][0]) // 2)
+                  if k + 1 < len(clusters) else r_hi)
+        # The event is the gap runs AND the mismatches beside them: grow the
+        # span over any mismatch within `_REFINE_SEP` of its edge. Judged on
+        # the gap runs alone, the event's own SNPs fell into the "context" and
+        # failed it — an insertion and deletion 4 bp apart went unrefined.
+        es, ee = cs, ce
+        grown = True
+        while grown:
+            grown = False
+            for i in range(max(lim_lo, es - _REFINE_SEP), es):
+                if _mismatch(i):
+                    es, grown = i, True
+                    break
+            for i in range(min(lim_hi, ee + _REFINE_SEP) - 1, ee - 1, -1):
+                if _mismatch(i):
+                    ee, grown = i + 1, True
+                    break
+        if ee - es > _REFINE_MAX_SPAN:
+            continue
+        n_mm = sum(1 for i in range(es, ee) if _mismatch(i))
+        if n_mm > _REFINE_MAX_MISMATCHES:
+            continue                       # divergent sequence, not an event
+        lo = max(lim_lo, es - _REFINE_PAD)
+        hi = min(lim_hi, ee + _REFINE_PAD)
+        # A side may run short only at the read's own end. Squeezed against a
+        # neighbouring cluster it means the differences never stop — a span
+        # grown through divergent sequence until it hit the midpoint had no
+        # context left at all, passed as "solid", and was re-aligned piecewise
+        # until two inversions disappeared.
+        if ((lo > r_lo and es - lo < _REFINE_MIN_CONTEXT)
+                or (hi < r_hi and hi - ee < _REFINE_MIN_CONTEXT)):
+            continue
+        if not (_context_is_solid(aq, at, lo, es)
+                and _context_is_solid(aq, at, ee, hi)):
+            continue                       # divergent sequence, not an event
+        at_end = free_read_ends and (lo == r_lo or hi == r_hi)
+        if not at_end and n_runs == 1 and n_mm == 0:
+            continue                       # a clean single gap: leave it be
+        windows.append((lo, hi))
+    if not windows:
+        return aq, at
+    from Bio.Align import PairwiseAligner
+    for lo, hi in reversed(windows):       # right to left: indices stay valid
+        q_sub = aq[lo:hi].replace("-", "")
+        t_sub = at[lo:hi].replace("-", "")
+        if not q_sub or not t_sub:
+            continue
+        if len(q_sub) * len(t_sub) > _REFINE_MAX_CELLS:
+            continue
+        aligner = PairwiseAligner()
+        aligner.mode = "global"
+        aligner.substitution_matrix = _refine_scoring_matrix()
+        aligner.open_gap_score = _REFINE_OPEN
+        aligner.extend_gap_score = _REFINE_EXTEND
+        if free_read_ends:
+            # Biopython calls a gap in the FIRST sequence's row (the read
+            # here) an insertion; at the read's own ends it is the
+            # reference the read never reached. It costs ONE opening and
+            # nothing per base: a read may stop short by any amount for the
+            # price of one gap — enough that a 60 bp unread start beats a
+            # 60 bp internal "deletion", not so little that "starts 1 bp late
+            # plus a mismatch" beats a real 1 bp deletion near the read's
+            # start (fully free ends explained that deletion away).
+            if lo == r_lo:
+                aligner.open_left_insertion_score = _REFINE_OPEN
+                aligner.extend_left_insertion_score = 0.0
+            if hi == r_hi:
+                aligner.open_right_insertion_score = _REFINE_OPEN
+                aligner.extend_right_insertion_score = 0.0
+        try:
+            aln = aligner.align(q_sub, t_sub)[0]
+            new_q, new_t = str(aln[0]), str(aln[1])
+        except Exception:
+            _log.debug("indel refinement: window %d-%d failed", lo, hi,
+                       exc_info=True)
+            continue
+        if (len(new_q) != len(new_t) or new_q.replace("-", "") != q_sub
+                or new_t.replace("-", "") != t_sub):
+            continue
+        aq = aq[:lo] + new_q + aq[hi:]
+        at = at[:lo] + new_t + at[hi:]
+    return aq, at
+
+
 @_timed("op.pairwise_align")
 def _pairwise_align(query_seq: str, target_seq: str,
                      *, mode: str = "global",
@@ -14353,8 +14752,13 @@ def _pairwise_align(query_seq: str, target_seq: str,
                      mismatch: float = -1.0,
                      open_gap: float = -2.0,
                      extend_gap: float = -0.5,
+                     free_read_ends: bool = False,
                      ) -> dict:
-    """Run a pairwise alignment via Biopython's PairwiseAligner.
+    """Run a pairwise alignment. Global mode uses the built-in Myers
+    engine (`_myers_align_global`, the same one on every install —
+    [INV-212]), or a semi-global placement for a read much shorter than
+    its plasmid; local mode uses Biopython's PairwiseAligner, which is
+    also the safety net if the built-in engine fails.
 
     Returns a dict:
 
@@ -14405,16 +14809,15 @@ def _pairwise_align(query_seq: str, target_seq: str,
         )
     if mode not in ("global", "local"):
         raise ValueError(f"mode must be 'global' or 'local' (got {mode!r})")
-    # Engine (global mode): a three-tier cascade — edlib (turbo, when its
-    # wheel is installed — `_edlib_align_global`) → the built-in pure-
-    # Python Myers/Hirschberg aligner (`_myers_align_global`, ~12× the old
-    # Biopython speed, no dependency) → Biopython (the ultimate per-call
-    # safety net). Each tier is round-trip-guarded; a failure cascades to
-    # the next. Local mode always uses Biopython (no Myers/edlib NW-local
+    # Engine (global mode): the built-in pure-Python Myers/Hirschberg
+    # aligner (`_myers_align_global`) → Biopython (the per-call safety
+    # net). The Myers result is round-trip-guarded; a failure cascades to
+    # Biopython. It is deliberately the ONLY fast engine — an optional one
+    # in front of it gave different answers on the installs that had it
+    # ([INV-212]). Local mode always uses Biopython (no Myers NW-local
     # equivalent). `bio_first` holds the Biopython Alignment row object
     # when that path runs so the affine `score` can be read off it; the
-    # edlib and Myers paths reconstruct an equivalent score from the
-    # counts below.
+    # Myers path reconstructs an equivalent score from the counts below.
     bio_first = None
     aligned_q: "str | None" = None
     aligned_t: "str | None" = None
@@ -14422,28 +14825,11 @@ def _pairwise_align(query_seq: str, target_seq: str,
         aligned_q, aligned_t, bio_first = _semiglobal_align(
             q, t, match=match, mismatch=mismatch,
             open_gap=open_gap, extend_gap=extend_gap)
-    if (aligned_q is None and _EDLIB_AVAILABLE and mode == "global"):
-        try:
-            aq, at = _edlib_align_global(q, t)
-            # Round-trip guard: the ungapped rows MUST reconstruct the
-            # normalised inputs. If edlib ever returns a corrupt or mis-
-            # ordered alignment (version drift, an upstream bug), reject
-            # it rather than let a wrong alignment reach the QC counts —
-            # cascade to the built-in Myers aligner for this one call.
-            if aq.replace("-", "") != q or at.replace("-", "") != t:
-                raise ValueError("edlib alignment failed round-trip check")
-            aligned_q, aligned_t = aq, at
-        except Exception:
-            _log.debug(
-                "pairwise: edlib path failed (q=%d, t=%d) — cascading to "
-                "the built-in aligner for this call", len(q), len(t),
-                exc_info=True,
-            )
-            aligned_q = aligned_t = None
     if (aligned_q is None or aligned_t is None) and mode == "global":
-        # Built-in pure-Python Myers/Hirschberg engine — the universal
-        # global aligner (edlib absent, or it failed its guard above).
-        # Same round-trip guard; on any failure cascade to Biopython.
+        # Built-in pure-Python Myers/Hirschberg engine — THE global
+        # aligner. Round-trip guard: the ungapped rows MUST reconstruct
+        # the normalised inputs, or a wrong alignment would reach the QC
+        # counts; on any failure cascade to Biopython for this one call.
         try:
             aq, at = _myers_align_global(q, t)
             if aq.replace("-", "") != q or at.replace("-", "") != t:
@@ -14486,6 +14872,20 @@ def _pairwise_align(query_seq: str, target_seq: str,
             f"aligned strings differ in length: q={len(aligned_q)} "
             f"vs t={len(aligned_t)}"
         )
+    if mode == "global":
+        # Two canonicalisations, both [INV-213]. (1) Re-align every messy gap
+        # cluster with gap OPENING costed: the unit-cost engine split one
+        # indel into several whenever that let a nearby base match by chance.
+        # (2) A gap just inside either end can sit before or after a chance
+        # match at the same cost, and a read missing its start was pinned to
+        # bp 0 by its first bases matching, and called a deletion: move such
+        # gaps out to the end — never worse.
+        new_q, new_t = _slide_gaps_to_ends(
+            *_refine_indel_clusters(aligned_q, aligned_t,
+                                    free_read_ends=free_read_ends))
+        if new_q != aligned_q or new_t != aligned_t:
+            aligned_q, aligned_t = new_q, new_t
+            bio_first = None     # its score described the rows before the move
     n_matches      = 0
     n_mismatches   = 0
     n_no_calls     = 0
@@ -14536,7 +14936,7 @@ def _pairwise_align(query_seq: str, target_seq: str,
     identity_pct          = (100.0 * n_matches / aligned_cols) if aligned_cols else 0.0
     ungapped_identity_pct = (100.0 * n_matches / ungapped_cols) if ungapped_cols else 0.0
     # Score: read Biopython's affine score off the alignment row when
-    # that engine ran; for the edlib path reconstruct an equivalent
+    # that engine ran; for the Myers path reconstruct an equivalent
     # affine score from the counts (same scalar params) so the displayed
     # "Score" stays comparable across engines. `score` isn't used in any
     # ranking — the rotation picker ranks by identity (INV-76) — so this
@@ -24648,6 +25048,7 @@ class SequencePanel(Widget):
         self._cursor_pos:   int                     = -1    # -1 = no cursor
         self._view_cache_key: "tuple | None"        = None
         self._view_cache_txt: "Text | None"         = None
+        self._view_cache_pad: "tuple[int, int]"     = (0, 0)
         self._show_connectors:  bool = False
         self._re_highlight: "dict | None" = None  # RE cut visualization
         # Active AA-translation highlight. Set when the user clicks
@@ -26427,6 +26828,9 @@ class SequencePanel(Widget):
         except NoMatches:
             scroll = None
         if not self._seq:
+            pad = view.styles.padding
+            if pad.top or pad.bottom:          # left over from a windowed view
+                view.styles.padding = (0, pad.right, 0, pad.left)
             view.update(Text("  No sequence loaded.", style="dim italic"))
             return
         # Rotated views: when `_view_origin_bp == 0` these alias the
@@ -26525,6 +26929,11 @@ class SequencePanel(Widget):
                self._show_connectors, reh_key, aa_key, vp,
                self._view_origin_bp, len(disp_feats))
         if key != self._view_cache_key:
+            # With a viewport, only the window is rendered and the rows above
+            # and below it become padding of the same height ([INV-214]);
+            # clicks and hovers map through the scroll offset, which is
+            # unchanged.
+            window: "dict | None" = {} if vp is not None else None
             with _log_timing("seq.build_text"):
                 self._view_cache_txt = _build_seq_text(
                     disp_seq, disp_feats,
@@ -26536,7 +26945,11 @@ class SequencePanel(Widget):
                     re_highlight    = disp_re_hi,
                     aa_highlight    = disp_aa_hi,
                     viewport_y_range = vp,
+                    window_info     = window,
                 )
+            self._view_cache_pad = ((int(window.get("above", 0)),
+                                     int(window.get("below", 0)))
+                                    if window else (0, 0))
             self._view_cache_key = key
 
         # Don't try to "preserve scroll across content update" here. An
@@ -26563,6 +26976,10 @@ class SequencePanel(Widget):
         # of triggering a re-layout. Regression guard for 2026-05-04.
         if self._view_cache_txt is not None and \
                 key != getattr(self, "_pushed_view_key", None):
+            top, bottom = getattr(self, "_view_cache_pad", (0, 0))
+            pad = view.styles.padding
+            if (pad.top, pad.bottom) != (top, bottom):
+                view.styles.padding = (top, pad.right, bottom, pad.left)
             view.update(self._view_cache_txt)
             self._pushed_view_key = key
 
@@ -66197,8 +66614,8 @@ class SequencingScreen(Screen):
                                         self.app, "_sanger_min_phred",
                                         _SANGER_MIN_PHRED_DEFAULT)),
                                     circular=bool(target_is_circular),
-                                    frame_shift=result.get(
-                                        "query_frame_shift", 0),
+                                    frame_shift=_read_rotation_in_rows(
+                                        result),
                                     clipped=_read_is_clipped(result),
                                 )
                             )
@@ -112983,6 +113400,28 @@ class RecordController:
 
 # ── Main app ───────────────────────────────────────────────────────────────────
 
+def _register_splicecraft_theme(app) -> None:
+    """Register the pure-black SpliceCraft theme and select it. Idempotent:
+    re-selecting the active theme changes nothing, so it costs nothing."""
+    if "splicecraft-black" not in app.available_themes:
+        app.register_theme(Theme(
+            name="splicecraft-black",
+            primary="#0178D4",
+            secondary="#004578",
+            warning="#ffa62b",
+            error="#ba3c5b",
+            success="#4EBF71",
+            accent="#ffa62b",
+            foreground="#e0e0e0",
+            background="#000000",
+            surface="#1c1c1c",
+            panel="#000000",
+            dark=True,
+        ))
+    if app.theme != "splicecraft-black":
+        app.theme = "splicecraft-black"
+
+
 class PlasmidApp(App):
     """The Textual application — owns global keyboard state, undo
     stashes, autosave, agent-API dispatch, modal stack management.
@@ -113066,6 +113505,14 @@ class PlasmidApp(App):
     # tests resolving unchanged: GETTERS are defensive (return the old
     # class-default before compose() builds self._record); SETTERS lazily build
     # it so a pre-mount write can't crash either.
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Select the theme BEFORE the first stylesheet parse. Selected in
+        # `on_mount` (as it was), the change re-parsed every CSS source and
+        # re-applied styles to every node, on the path to the first painted
+        # map ([INV-214]). `on_mount` still calls this — a no-op by then.
+        _register_splicecraft_theme(self)
+
     @property
     def _current_record(self):
         rec = getattr(self, "_record", None)
@@ -116734,21 +117181,7 @@ NcbiTaxonPickerModal { align: center middle; }
         # read as a distinct surface against the surrounding pure-
         # black backdrop. Keeping it monochrome (no indigo / blue
         # tint) preserves the theme's overall look.
-        self.register_theme(Theme(
-            name="splicecraft-black",
-            primary="#0178D4",
-            secondary="#004578",
-            warning="#ffa62b",
-            error="#ba3c5b",
-            success="#4EBF71",
-            accent="#ffa62b",
-            foreground="#e0e0e0",
-            background="#000000",
-            surface="#1c1c1c",
-            panel="#000000",
-            dark=True,
-        ))
-        self.theme = "splicecraft-black"
+        _register_splicecraft_theme(self)
         # Apply hydrated preference toggles to children that hadn't
         # been composed when `compose()` ran. `_pending_show_connectors`
         # / `_pending_map_mode` are the staging values from the
@@ -128506,6 +128939,8 @@ def _agent_headless_for_no_tty(enable_agent_api: bool, stdin_isatty: bool) -> bo
     on a real terminal (``stdin_isatty`` True) keeps the live TUI. [INV-138]
     """
     return bool(enable_agent_api) and not stdin_isatty
+
+
 
 
 def main():

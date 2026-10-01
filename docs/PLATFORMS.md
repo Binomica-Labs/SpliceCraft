@@ -19,7 +19,7 @@ Last update: 2026-06-14 (SpliceCraft 1.0.81+).
 | Linux | alacritty | ✅ Fully supported | Same as kitty |
 | Linux | xterm | ⚠ Limited | OSC 52 clipboard needs `allowWindowOps`; mouse drag-select may need `xtermMouseProtocol` set |
 | Linux | tmux / screen | ✅ Works under | Pass `-e` (env), use `tmux`'s `set -g allow-passthrough on` for OSC 52 |
-| **Raspberry Pi / ARM Linux** (64-bit) | LXTerminal / SSH | ✅ Supported (one-time toolchain) | `primer3-py` ships **no `aarch64` wheel** and primer design has no fallback, so it compiles at install — run `sudo apt install build-essential python3-dev` **once**, then `pipx install splicecraft`. `edlib` (the optional turbo aligner) also lacks an `aarch64` wheel but transparently falls back to the built-in pure-Python Myers aligner (~12× the old Biopython fallback, identical results — no build needed). All other compiled deps (`pyhmmer`/`biopython`/`Pillow`) ship `aarch64` wheels. Needs 64-bit Pi OS Bookworm+ (Python ≥3.10); Pi 4/5 ideal. See [Raspberry Pi / ARM Linux](#raspberry-pi--arm-linux) |
+| **Raspberry Pi / ARM Linux** (64-bit) | LXTerminal / SSH | ✅ Supported (one-time toolchain) | `primer3-py` ships **no `aarch64` wheel** and primer design has no fallback, so it compiles at install — run `sudo apt install build-essential python3-dev` **once**, then `pipx install splicecraft`. Sequence alignment uses SpliceCraft's own built-in aligner — no compiled dependency, and the same results on every platform. All other compiled deps (`pyhmmer`/`biopython`/`Pillow`) ship `aarch64` wheels. Needs 64-bit Pi OS Bookworm+ (Python ≥3.10); Pi 4/5 ideal. See [Raspberry Pi / ARM Linux](#raspberry-pi--arm-linux) |
 | Raspberry Pi / ARM Linux (32-bit) | LXTerminal / SSH | ⚠ Limited | No 32-bit-ARM wheels — `pyhmmer`/`primer3-py`/`biopython`/`Pillow` source-compile (slow). Use the 64-bit OS |
 | **macOS** | Terminal.app | ✅ Fully supported | macOS 11+; older may lack true-color. **Apple Silicon + Python ≥3.10:** `primer3-py` ships no arm64 wheel for 3.10+, so it compiles at install — `xcode-select --install` once. Intel Macs use prebuilt wheels (biopython is pinned to a version that still ships them). |
 | macOS | iTerm2 | ✅ Fully supported | Preferred for OSC 52 reliability |
@@ -170,11 +170,9 @@ Two things decide whether the install is painless:
   `aarch64` wheel** (upstream ships none) and primer design has no
   pure-Python fallback, so it source-compiles at install: run
   `sudo apt install build-essential python3-dev` **once** before
-  `pipx install splicecraft` (it's a small, fast C extension). `edlib`
-  (the optional turbo aligner) also lacks an `aarch64` wheel, but it
-  transparently falls back to the built-in pure-Python Myers aligner — so
-  it never needs the compiler (~12× the old Biopython fallback, identical
-  results). HMMscan works (the `aarch64`
+  `pipx install splicecraft` (it's a small, fast C extension). Sequence
+  alignment needs no compiler: the aligner is built in (pure Python) and
+  is the same one on every platform. HMMscan works (the `aarch64`
   `pyhmmer` wheel exists — the POSIX marker drops `pyhmmer` only on
   native Windows, not ARM Linux). On a **32-bit** OS (`armv7l` /
   `armhf`) none of the compiled deps have wheels, so everything

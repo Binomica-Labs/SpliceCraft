@@ -77,7 +77,11 @@ PLATFORMS = [
 # biopython-1.87 / edlib-aarch64 class) still blocks the release, while a
 # known upstream limitation we've chosen to document doesn't wedge it.
 # Keep this list SHORT and justified; prefer a marker + in-code fallback
-# (like edlib) over an accepted gap whenever the feature can degrade.
+# over an accepted gap whenever the feature can degrade — but ONLY when the
+# fallback returns the SAME results and only the speed differs. edlib was
+# such a marker (Python <= 3.13): its alignments differed from the built-in
+# engine's, the release machine could not install it, and wrong variant
+# calls shipped for 16 days with only CI seeing them ([INV-212]).
 ACCEPTED_GAPS = {
     # primer3-py ships no Linux-aarch64 wheel and no Apple-Silicon wheel
     # for Python >=3.10 (only cp39 arm64); no release fixes this. Primer
@@ -241,7 +245,8 @@ def check() -> int:
             print(f"    {dep!r}  →  {label} / cp{py.replace('.', '')}")
         print("\nFix one of:\n"
               "  • narrow the dep's marker to the platforms that HAVE wheels "
-              "(and rely on an in-code fallback elsewhere — like edlib), or\n"
+              "(and rely on an in-code fallback that gives the SAME results "
+              "elsewhere), or\n"
               "  • move it to an optional extra in "
               "[project.optional-dependencies], or\n"
               "  • if the platform must compile it by deliberate policy, add "

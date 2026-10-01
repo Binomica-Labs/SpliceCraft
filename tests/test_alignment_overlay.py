@@ -6820,42 +6820,12 @@ class TestAlignmentIndelEvents:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# _pairwise_align engine — edlib fast path + Biopython safety net
+# _pairwise_align engine — built-in Myers aligner + Biopython safety net
 # ═══════════════════════════════════════════════════════════════════════════════
 class TestPairwiseAlignEngine:
-    """Hardening for the edlib fast-aligner + Biopython fallback. The
-    fallback / guard tests force the relevant path via monkeypatch so
-    they run under EITHER engine (no edlib install required); the
-    equivalence tests skip when edlib is absent."""
-
-    def test_fallback_when_edlib_disabled(self, monkeypatch):
-        # Force the Biopython path — alignment must still be correct.
-        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
-        r = sc._pairwise_align("ATGCATGCAT", "ATGCATGCAT")
-        assert r["identity_pct"] == 100.0
-        assert r["n_matches"] == 10
-        assert r["n_mismatches"] == 0
-
-    def test_round_trip_guard_falls_back_to_biopython(self, monkeypatch):
-        # Force the edlib branch and make it return a round-trip-violating
-        # alignment; the guard must reject it and fall back to Biopython,
-        # which produces the correct 100% result.
-        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", True)
-        monkeypatch.setattr(sc, "_edlib_align_global",
-                            lambda q, t: ("ZZZZ", "ZZZZ"))
-        r = sc._pairwise_align("ATGC", "ATGC")
-        assert r["identity_pct"] == 100.0
-        assert r["n_matches"] == 4
-
-    def test_edlib_exception_falls_back(self, monkeypatch):
-        # An edlib failure must not abort the alignment — Biopython covers.
-        def _boom(_q, _t):
-            raise RuntimeError("edlib exploded")
-        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", True)
-        monkeypatch.setattr(sc, "_edlib_align_global", _boom)
-        r = sc._pairwise_align("ATGCATGC", "ATGCATGC")
-        assert r["identity_pct"] == 100.0
-        assert r["n_matches"] == 8
+    """Hardening for the global-alignment engine: the built-in Myers
+    aligner, round-trip-guarded, with Biopython as the per-call safety
+    net. The guard tests force the failure path via monkeypatch."""
 
     def test_round_trip_reconstructs_inputs(self):
         # Whatever engine ran, the gapped rows reconstruct the inputs.
@@ -6866,8 +6836,7 @@ class TestPairwiseAlignEngine:
         assert r["aligned_t"].replace("-", "") == t
 
     def test_iupac_ambiguity_aligns_as_match(self):
-        # N / R against compatible bases count as matches under EITHER
-        # engine (edlib gets the IUPAC `additionalEqualities`).
+        # N / R against compatible bases count as matches.
         r = sc._pairwise_align("ANGCRTGC", "ATGCATGC")
         assert r["n_mismatches"] == 0
         assert r["n_matches"] == 8
@@ -6878,36 +6847,9 @@ class TestPairwiseAlignEngine:
         with pytest.raises(ValueError):
             sc._pairwise_align("ATGC", "A" * (sc._PAIRWISE_MAX_LEN + 1))
 
-    def test_edlib_matches_biopython_on_near_identical(self, monkeypatch):
-        if not sc._EDLIB_AVAILABLE:
-            pytest.skip("edlib not installed")
-        q = _det_seq(2000, seed=11)
-        # 1 SNP + a 3 bp deletion — the kind of near-identical pair QC
-        # actually sees; both engines must agree exactly.
-        t = (q[:800] + ("A" if q[800] != "A" else "C")
-             + q[801:1500] + q[1503:])
-        r_edlib = sc._pairwise_align(q, t)
-        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
-        r_bio = sc._pairwise_align(q, t)
-        assert r_edlib["n_matches"] == r_bio["n_matches"]
-        assert r_edlib["n_mismatches"] == r_bio["n_mismatches"]
-        assert r_edlib["n_gap_cols"] == r_bio["n_gap_cols"]
-        assert abs(r_edlib["identity_pct"] - r_bio["identity_pct"]) < 1e-9
-
-    def test_edlib_global_helper_round_trips(self):
-        if not sc._EDLIB_AVAILABLE:
-            pytest.skip("edlib not installed")
-        aq, at = sc._edlib_align_global("ATGCATGC", "ATGGATGC")
-        assert aq.replace("-", "") == "ATGCATGC"
-        assert at.replace("-", "") == "ATGGATGC"
-        assert len(aq) == len(at)
-
-    # ── built-in Myers/Hirschberg tier (between edlib and Biopython) ──
-
-    def test_myers_engine_invoked_when_edlib_absent(self, monkeypatch):
-        # With edlib off, global mode must run the built-in Myers engine
-        # (NOT Biopython) — spy that `_myers_align_global` is called.
-        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
+    def test_global_mode_runs_the_myers_engine(self, monkeypatch):
+        # Global mode must run the built-in Myers engine (NOT Biopython)
+        # — spy that `_myers_align_global` is called.
         calls = []
         real = sc._myers_align_global
 
@@ -6921,9 +6863,8 @@ class TestPairwiseAlignEngine:
         assert r["identity_pct"] == 100.0 and r["n_matches"] == 10
 
     def test_myers_round_trip_guard_falls_back(self, monkeypatch):
-        # edlib off + Myers returns a round-trip-violating alignment →
-        # the guard rejects it and cascades to Biopython (correct result).
-        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
+        # Myers returns a round-trip-violating alignment → the guard
+        # rejects it and cascades to Biopython (correct result).
         monkeypatch.setattr(sc, "_myers_align_global",
                             lambda q, t: ("ZZZZ", "ZZZZ"))
         r = sc._pairwise_align("ATGC", "ATGC")
@@ -6933,7 +6874,6 @@ class TestPairwiseAlignEngine:
         # A Myers failure must not abort the alignment — Biopython covers.
         def _boom(_q, _t):
             raise RuntimeError("myers exploded")
-        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
         monkeypatch.setattr(sc, "_myers_align_global", _boom)
         r = sc._pairwise_align("ATGCATGC", "ATGCATGC")
         assert r["identity_pct"] == 100.0 and r["n_matches"] == 8
@@ -6944,19 +6884,10 @@ class TestPairwiseAlignEngine:
         assert at.replace("-", "") == "ATGGATGC"
         assert len(aq) == len(at)
 
-    def test_myers_iupac_aligns_as_match(self, monkeypatch):
-        # N / R against compatible bases count as matches on the Myers tier.
-        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
-        r = sc._pairwise_align("ANGCRTGC", "ATGCATGC")
-        assert r["n_mismatches"] == 0 and r["n_matches"] == 8
-
-    def test_myers_matches_engines_on_near_identical(self, monkeypatch):
+    def test_myers_matches_biopython_on_near_identical(self, monkeypatch):
         """On a UNIQUE-optimal near-identical pair (1 SNP + a 3 bp
         deletion, well separated) the Myers engine agrees EXACTLY with
-        Biopython AND edlib — same matches / mismatches / gaps. On
-        divergent reads the engines pick different co-optimal alignments
-        (same edit distance); that's immaterial and not asserted — see
-        [INV-91]."""
+        Biopython — same matches / mismatches / gaps."""
         q = _det_seq(2000, seed=11)
         t = (q[:800] + ("A" if q[800] != "A" else "C")
              + q[801:1500] + q[1503:])
@@ -6967,15 +6898,43 @@ class TestPairwiseAlignEngine:
         def _raise(_q, _t):
             raise ValueError("forced Biopython cascade")
 
-        edlib_counts = (_counts(sc._pairwise_align(q, t))
-                        if sc._EDLIB_AVAILABLE else None)
-        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
         myers_counts = _counts(sc._pairwise_align(q, t))          # Myers path
         monkeypatch.setattr(sc, "_myers_align_global", _raise)
         bio_counts = _counts(sc._pairwise_align(q, t))            # Biopython
         assert myers_counts == bio_counts
-        if edlib_counts is not None:
-            assert myers_counts == edlib_counts
+
+    def test_a_read_missing_its_start_is_one_end_gap(self):
+        """A perfect read that starts 100 bp in is long enough (≥ 95% of
+        the plasmid) to take the global engine, and must come back as ONE
+        100 bp end gap. Under unit cost, scattering those 100 deletions
+        through the read's first bases ties with it — and edlib, which
+        Python ≤ 3.13 installs used to run, picked the scattered one: 21
+        gap runs, reported as 20 phantom variants ([INV-212])."""
+        import re
+        ref = _det_seq(3000, seed=7)
+        r = sc._pairwise_align(ref[100:], ref)
+        runs = [len(g) for g in re.findall(r"-+", r["aligned_q"])]
+        assert runs == [100], runs
+        assert r["n_mismatches"] == 0
+
+    def test_one_alignment_engine_on_every_install(self):
+        """No optional engine may run in front of the built-in aligner.
+        edlib did, wherever it had a wheel (Python ≤ 3.13): it picked
+        different equal-cost alignments, the release machine (Python 3.14)
+        could not install it, and wrong variant calls reached most users
+        for 16 days while only CI saw them ([INV-212]). A faster engine is
+        welcome only if it returns the SAME alignment — delete this test
+        deliberately, with that proof, not to make room for one."""
+        import tomllib
+        from pathlib import Path
+        root = Path(__file__).resolve().parent.parent
+        meta = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        deps = list(meta["project"]["dependencies"])
+        for extra in meta["project"].get("optional-dependencies", {}).values():
+            deps.extend(extra)
+        assert not [d for d in deps if d.lower().startswith("edlib")], deps
+        for path in sorted(root.glob("splicecraft*.py")):
+            assert "import edlib" not in path.read_text(encoding="utf-8"), path.name
 
 
 def _naive_edit_distance(a, b):
@@ -7067,10 +7026,9 @@ class TestMyersAligner:
         assert ga.replace("-", "") == q and gb.replace("-", "") == base
         assert _implied_edit_distance(ga, gb) == _naive_edit_distance(q, base)
 
-    def test_myers_tier_respects_length_cap(self, monkeypatch):
+    def test_myers_tier_respects_length_cap(self):
         # The engine has no internal cap; `_pairwise_align` enforces
         # `_PAIRWISE_MAX_LEN` before any engine runs.
-        monkeypatch.setattr(sc, "_EDLIB_AVAILABLE", False)
         with pytest.raises(ValueError):
             sc._pairwise_align("ATGC", "A" * (sc._PAIRWISE_MAX_LEN + 1))
 

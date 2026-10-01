@@ -39,7 +39,7 @@ from collections import OrderedDict
 # the @_timed scan decorator + _log come from splicecraft_logging.
 import splicecraft_state as _state
 from splicecraft_logging import _log, _timed
-from splicecraft_util import _normalize_dna_for_align  # same-layer L0 (util doesn't import biology); used by _search_subsequence
+from splicecraft_util import _normalize_dna_for_align, _read_rotation_in_rows  # same-layer L0 (util doesn't import biology)
 
 
 # ── IUPAC + reverse complement ────────────────────────────────────────────
@@ -2998,6 +2998,16 @@ _IUPAC_BASE_SET: "dict[str, frozenset[str]]" = {
     "N": frozenset("ACGT"),
 }
 
+# Every ASCII IUPAC letter (both cases) -> the letters (both cases) it is
+# compatible with: `_iupac_compatible`'s fast path. Built from `_IUPAC_BASE_SET`
+# with the same "share a base" rule, so the two can never disagree; anything
+# outside these 32 letters takes the original slow path.
+_IUPAC_COMPAT_SETS: "dict[str, frozenset[str]]" = {
+    a: frozenset(b for bu in _IUPAC_BASE_SET for b in (bu, bu.lower())
+                 if _IUPAC_BASE_SET[au] & _IUPAC_BASE_SET[bu])
+    for au in _IUPAC_BASE_SET for a in (au, au.lower())
+}
+
 
 def _read_end_columns(aligned_q: str,
                       frame_shift: "int | None" = 0) -> "tuple[int, int] | None":
@@ -3053,7 +3063,7 @@ def _read_extent_for(result: dict, total: int, *,
         return None
     return _read_extent_from_rows(
         result.get("aligned_q") or "", result.get("aligned_t") or "", total,
-        frame_shift=result.get("query_frame_shift", 0), circular=circular,
+        frame_shift=_read_rotation_in_rows(result), circular=circular,
         clipped=_read_is_clipped(result))
 
 
@@ -3102,6 +3112,96 @@ def _read_is_full_length(aligned_q: str, aligned_t: str, total: int) -> bool:
     aligned = sum(1 for cq, ct in zip(aligned_q, aligned_t)
                   if cq != "-" and ct != "-")
     return aligned >= _PARTIAL_READ_FRACTION * total
+
+
+def _slide_gaps_to_ends(aligned_q: str, aligned_t: str) -> "tuple[str, str]":
+    """Canonicalise the ENDS of a global alignment: a gap run that a few
+    aligned columns separate from either end is moved out to that end, when
+    every base it moves past still matches where it lands.
+
+    The two placements cost the same, so an aligner picks one arbitrarily —
+    and the choice decided the verdict. pUC19 begins ``TC``, and so does the
+    read at bp 100: aligning that read with its first two bases on bp 0-1
+    pinned it to bp 0 and turned its unread start into a 100 bp "deletion".
+    On a linear reference ~30% of perfect reads missing their start came back
+    as changed, by nothing but the chance match of their first bases
+    ([INV-213]). The slid alignment is never worse — the same gap columns,
+    no more gap opens, at least as many matches — so this only removes an
+    arbitrary choice. Gaps in either row slide (a read missing bases, or a
+    read running past the reference), at both ends. Rows that do not line up
+    are returned unchanged."""
+    if not aligned_q or not aligned_t or len(aligned_q) != len(aligned_t):
+        return aligned_q, aligned_t
+    aq, at = _slide_leading_gaps(aligned_q, aligned_t)
+    raq, rat = _slide_leading_gaps(aq[::-1], at[::-1])
+    return raq[::-1], rat[::-1]
+
+
+def _slide_leading_gaps(aq: str, at: str) -> "tuple[str, str]":
+    """The left-end half of `_slide_gaps_to_ends` (the right end is this on
+    the reversed rows). Each pass grows the leading gap block by one run, so
+    the loop is bounded by the number of runs it can absorb."""
+    for _ in range(len(aq)):
+        moved = False
+        for gapped in (0, 1):
+            g_row, o_row = (aq, at) if gapped == 0 else (at, aq)
+            lead = len(g_row) - len(g_row.lstrip("-"))
+            if "-" in o_row[:lead]:
+                continue            # both rows gapped at the start: leave it
+            c = g_row.find("-", lead)
+            if c <= lead:
+                continue            # no gap run, or nothing between it and the block
+            o_gap = o_row.find("-", lead)
+            if 0 <= o_gap < c:
+                continue            # the other row gaps first: never slide across it
+            e = c
+            while e < len(g_row) and g_row[e] == "-" and o_row[e] != "-":
+                e += 1
+            run = e - c
+            if run <= 0:
+                continue
+            if not all(_iupac_compatible(g_row[lead + i], o_row[lead + run + i])
+                       for i in range(c - lead)):
+                continue            # a moved base would stop matching
+            slid = g_row[:lead] + "-" * run + g_row[lead:c] + g_row[e:]
+            if gapped == 0:
+                aq = slid
+            else:
+                at = slid
+            moved = True
+        if not moved:
+            break
+    return aq, at
+
+
+def _pos_in_spans(pos: int, spans) -> bool:
+    return any(lo <= pos < hi for lo, hi in (spans or ()))
+
+
+def _variant_gate_pos(v: dict, n: int, circular: bool) -> int:
+    """The position that decides whether a read OBSERVED ``v`` — tested
+    against the read's extent with `_pos_in_spans`. Shared by every place that
+    gates variants on an extent (the per-read verdict, the multi-read summary,
+    the heterogeneity scan), so they cannot disagree about one alignment.
+
+    It is the ``target_pos``, except for an insertion at either END:
+
+      * On a circle an insertion after the last base (``target_pos == n``)
+        sits where bp 0 does. Gated at ``n`` it fell outside every read's
+        extent, so a clonal insertion at the origin counted only in the reads
+        whose aligner filed it at 0 (round-2 hardening, 2026-09-25).
+      * On a LINEAR reference an insertion before bp 0 or after the last base
+        is the read running past the reference — overhang, the way a soft clip
+        is — and lies outside every extent. Only the trailing one used to: the
+        same ten extra bases were a "real change" at the start and nothing at
+        the end ([INV-213])."""
+    pos = int(v.get("target_pos", 0) or 0)
+    if n > 0 and v.get("type") == "insertion":
+        if circular:
+            return pos % n
+        if pos <= 0 or pos >= n:
+            return -1
+    return pos
 
 
 def _read_no_call_positions(aligned_q: str, aligned_t: str) -> "set[int]":
@@ -3160,7 +3260,7 @@ def _covered_identity(align: dict, total: "int | None" = None, *,
     at = str(align.get("aligned_t") or "")
     if not aq or not at or len(aq) != len(at):
         return 0.0, 0
-    ends = _read_end_columns(aq, align.get("query_frame_shift"))
+    ends = _read_end_columns(aq, _read_rotation_in_rows(align))
     if ends is None:
         return 0.0, 0
     first, last = ends
@@ -3209,6 +3309,15 @@ def _iupac_compatible(a: str, b: str) -> bool:
     nucleotide alphabet — including the gap glyph ``"-"`` (gaps are
     handled BEFORE this check at every call site).
     """
+    # Fast path: both single ASCII IUPAC letters (any case) — one dict lookup
+    # and one set test from a table built off the slow path below. It is called
+    # in every aligner inner loop (620k times in one rotation pick, [INV-214]).
+    compat = _IUPAC_COMPAT_SETS.get(a)
+    if compat is not None:
+        if b in compat:
+            return True
+        if b in _IUPAC_COMPAT_SETS:
+            return False
     if not a or not b:
         return False
     sa = _IUPAC_BASE_SET.get(a.upper())

@@ -1767,11 +1767,14 @@ class TestTempReadbackValidation:
         sc._safe_save_json(p, [{"id": "g1"}, {"id": "g2"}], "test")
         real_dumps = json.dumps
 
-        def _bad_dump(obj, fh, **kw):
-            # Write a VALID envelope but with the wrong entry count.
-            fh.write(real_dumps({"_schema_version": 1, "entries": []}))
+        def _bad_dumps(obj, **kw):
+            # Serialise a VALID envelope but with the wrong entry count, so
+            # the bytes that reach the temp file do not match the payload.
+            # (The save serialises once with `json.dumps` and writes that
+            # text — it used to stream through `json.dump`.)
+            return real_dumps({"_schema_version": 1, "entries": []}, **kw)
 
-        monkeypatch.setattr(sc.json, "dump", _bad_dump)
+        monkeypatch.setattr(sc.json, "dumps", _bad_dumps)
         with pytest.raises(OSError, match="read-back"):
             sc._safe_save_json(p, [{"id": "x"}, {"id": "y"}], "test")
         # Live file untouched (still the two good entries). `json.loads`

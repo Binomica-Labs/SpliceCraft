@@ -1098,12 +1098,34 @@ def _safe_save_json(path: Path, entries: list, label: str,
         if _state._dehydrate_collections_hook is not None:
             entries = _state._dehydrate_collections_hook(entries)
 
+    # Serialise once, up front: Step 1 compares it with the file already on
+    # disk, and Step 3 writes exactly this text (what `json.dump(..., indent=2)`
+    # produced, byte for byte).
+    payload = {"_schema_version": schema_version, "entries": entries}
+    try:
+        payload_text = json.dumps(payload, indent=2)
+    except Exception:
+        _log.exception("Failed to save %s to %s", label, path)
+        raise
+    # Text mode writes `\n` as the platform line separator.
+    expected_bytes = (payload_text if os.linesep == "\n"
+                      else payload_text.replace("\n", os.linesep)
+                      ).encode("utf-8")
+
     # Step 1: read prior content for backup + shrink-guard analysis.
     existing_count = 0
     prev_entries: "list | None" = None
     if path.exists():
         try:
             existing = path.read_bytes()
+            if existing == expected_bytes:
+                # Already exactly this on disk: nothing to back up, nothing to
+                # write. Launch re-wrote the active-collection and primer
+                # mirrors every time, each with an fsync and a backup
+                # rotation, to put back bytes that were already there
+                # ([INV-214]).
+                _log.debug("%s unchanged on disk — save skipped", label)
+                return
             if existing.strip():
                 # Backup dedup (2026-06-03): if the prior file is
                 # byte-identical to the most recent existing backup it is
@@ -1328,14 +1350,13 @@ def _safe_save_json(path: Path, entries: list, label: str,
                 )
 
     # Step 3: atomic write — tempfile in same dir → os.replace.
-    payload = {"_schema_version": schema_version, "entries": entries}
     try:
         fd, tmp_name = tempfile.mkstemp(
             prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2)
+                fh.write(payload_text)
                 fh.flush()
                 # 2026-05-28 (sweep #30): re-raise fsync failures here
                 # too — mirrors the H2 hardening in `_atomic_write_text`

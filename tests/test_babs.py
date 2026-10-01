@@ -580,10 +580,13 @@ class TestBabsUI:
             assert seen["messages"][0]["role"] == "system"
             assert "Babs" in seen["messages"][0]["content"]
 
-    async def test_recall_composes_with_agent_mode(self, monkeypatch):
+    async def test_recall_composes_with_agent_mode(self, monkeypatch, tmp_path):
         """Corpus + Agent together: the agentic tool loop runs (tools ARE sent) AND the recalled
         passages are in the turn. The pre-fix build refused this combination outright, noting
         that agent actions were 'paused this turn'."""
+        # The recall tool is offered only when the babs engine is installed. Pin it, or the
+        # test passes only on a machine with a real ~/babs checkout (it failed in CI).
+        monkeypatch.setattr(sc, "_learn_resolve_babs_home", lambda: tmp_path)
         monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
         monkeypatch.setattr(sc, "_babs_recall", lambda q, **k: {
             "passages": [{"n": 1, "title": "BsaI overhangs", "section": "", "source": "Reference",

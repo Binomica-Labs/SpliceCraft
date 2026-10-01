@@ -659,6 +659,26 @@ def _markup_parses(text: str) -> bool:
         return False
 
 
+def _read_rotation_in_rows(result) -> int:
+    """How far the read is rotated inside ``result["aligned_q"]``: the
+    rotation the picker gave the READ before aligning it (``query_rotation``,
+    a query-rotation pick) plus the one a target-rotation pick's column cut
+    applied afterwards (``query_frame_shift``). `_phred_in_alignment_frame`
+    composes exactly these two, so every caller locating the read's ENDS in
+    the rows must as well: reading only the frame shift put a query-rotated
+    partial read's own seam in the middle of its extent, and the plasmid it
+    never reached came back as a 999 bp deletion ([INV-213])."""
+    if not isinstance(result, dict):
+        return 0
+    total = 0
+    for key in ("query_rotation", "query_frame_shift"):
+        try:
+            total += int(result.get(key) or 0)
+        except (TypeError, ValueError, OverflowError):   # a stored `inf`
+            pass
+    return total
+
+
 def _phred_in_alignment_frame(phred, result) -> list:
     """A read's per-base Phred array re-ordered into the frame of
     ``result["aligned_q"]`` — the read AS ALIGNED.

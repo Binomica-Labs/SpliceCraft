@@ -14,6 +14,64 @@
 
 ---
 
+## [1.3.7] — 2026-10-01
+
+### Bug fixes
+
+- **Read verification no longer reports changes that aren't there.** On Linux
+  and macOS with Python 3.13 or older, a read that simply starts or ends
+  partway into the plasmid could be split into dozens of tiny gaps, so a
+  perfect read came back as "real changes" with around 20 made-up deletions.
+  The same fault made one insertion or deletion at the origin show up as many
+  separate events in the multi-read heterogeneity check, and put the edges of
+  an inverted insert a few bases off, or missed a second inversion entirely.
+  SpliceCraft now uses its own built-in aligner on every computer, so every
+  install gives the same answer. Aligning a long read on those systems is
+  slower as a result (an 18 kb read takes about 2–3 seconds instead of a
+  fraction of one), the same speed Python 3.14 users already had.
+- **The same change in a read is reported the same way, wherever it sits.**
+  An insertion or deletion with an SNP or a second indel a few bases away
+  could come back as several smaller deletions with the SNP missing, and
+  which answer you got depended on nothing but the surrounding bases. Read
+  verification, the multi-read summary and the heterogeneity check now report
+  the events that are actually there, the same way every time.
+- **A read that simply starts late on a linear reference is no longer a
+  "deletion".** Roughly one in three perfect reads missing their first bases
+  was reported as a real change, because its first bases happened to match
+  the reference's first bases. A read with a sequencing error right at its
+  edge now reports just that one base, and extra bases a read carries past
+  either end of a linear reference are treated the same at both ends (outside
+  the reference) instead of being a change at the start only.
+- **A partial read across the origin no longer reports the plasmid it never
+  reached as a deletion** when it was matched by rotating the read itself.
+- **A partial read that crosses the origin by a few bases is no longer
+  called a deletion.** When two ways of placing such a read tied exactly, the
+  one listed first won, and it could thread the crossing bases through a
+  chance match with a short gap. The placement with fewer gaps now wins.
+- **One fewer dependency.** The optional `edlib` aligner is no longer
+  installed. An install that already has it simply ignores it.
+
+### Performance
+
+- **Faster launch.** The library's sequences are read and checked in
+  parallel, each shared sequence once, and launch no longer rewrites files
+  that haven't changed. On a 1,258-plasmid library the first plasmid is on
+  screen about 10% sooner.
+- **Saving the library is about 9 times faster.** Every save used to re-check
+  every sequence in every collection; sequences already verified this session
+  are no longer checked again (still checked for truncation each time).
+- **Switching to a large plasmid is much faster.** The sequence panel now lays
+  out only the rows near what you're looking at: a 180 kb plasmid paints about
+  twice as fast and an 18.6 Mbp record in about a second instead of 10–20.
+- **Read verification is faster.** Aligning a read is 15–30% faster with
+  identical results, and a 20-read heterogeneity check runs about 3 times
+  faster.
+
+### Hardening
+
+- If a background thread can't be started (a busy machine, or during exit),
+  the library still loads, reading its sequences one at a time.
+
 ## [1.3.6] — 2026-09-30
 
 ### New features

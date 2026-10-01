@@ -64,10 +64,10 @@ from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq,
                                 _topology_from_gb_text)
 from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript, _map_transcription)
-from splicecraft_util import (_iso_instant, _variant_group_key, _PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _feature_traversal, _phred_in_alignment_frame, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _degenerate_tm_bracket, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
+from splicecraft_util import (_iso_instant, _variant_group_key, _PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _feature_traversal, _phred_in_alignment_frame, _read_rotation_in_rows, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _degenerate_tm_bracket, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
-from splicecraft_biology import (_covered_identity, _read_extent_for, _read_is_clipped, _digest_with_enzymes, _enzyme_aliases, _enzyme_site_methylation_targets, _methylated_base_positions, _enzyme_cuts, _enzyme_resolve_one, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
+from splicecraft_biology import (_covered_identity, _read_extent_for, _read_is_clipped, _pos_in_spans, _variant_gate_pos, _digest_with_enzymes, _enzyme_aliases, _enzyme_site_methylation_targets, _methylated_base_positions, _enzyme_cuts, _enzyme_resolve_one, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
 from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _build_synthesis_l0_fragment, _design_gb_primers, _entry_vector_acceptor_overhangs, _grammar_position_by_type, _insilico_pcr_amplicons, _l0_part_from_syn_fragment)
 from splicecraft_dataaccess import (_active_enzyme_resolution, _agent_scan_library_for_key, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
 from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member, _fastq_count_reads, _fastq_path_to_records)
@@ -9735,7 +9735,7 @@ def _h_verify_against_reads(app, payload):
                 _entry["quality"] = _state._trace_verification_summary_hook(
                     res.get("aligned_q") or "", res.get("aligned_t") or "",
                     one_q, min_phred=min_phred,
-                    frame_shift=res.get("query_frame_shift", 0),
+                    frame_shift=_read_rotation_in_rows(res),
                     circular=circular, clipped=_read_is_clipped(res))
             except Exception:
                 _log.exception("verify-against-reads: quality summary failed")
@@ -10360,10 +10360,11 @@ def _h_analyse_read_heterogeneity(app, payload):
                 entry, circular=circular):
             if v.get("type") == "truncated":
                 continue
-            _pos = int(v.get("target_pos", 0) or 0)
-            if circular and v.get("type") == "insertion" and ref_seq:
-                _pos %= len(ref_seq)        # after the last base = before bp 0
-            if extent and not any(lo <= _pos < hi for lo, hi in extent):
+            # The same gate the per-read verdict and the rollup use: an
+            # insertion after the last base of a circle is at bp 0, and one
+            # past either end of a linear reference is overhang ([INV-213]).
+            if extent and not _pos_in_spans(
+                    _variant_gate_pos(v, len(ref_seq), circular), extent):
                 continue
             key = _variant_group_key(v)
             if key in seen_keys:
