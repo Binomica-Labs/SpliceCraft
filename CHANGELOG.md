@@ -14,6 +14,36 @@
 
 ---
 
+## [1.3.8] — 2026-10-09
+
+### Bug fixes
+
+- **A digest of a linear piece of DNA no longer reads like a digest of a
+  plasmid.** Digesting a raw sequence through the agent API assumes a circular
+  molecule unless you say otherwise — right for a plasmid, wrong for a PCR
+  product, gBlock, oligo or excised fragment. Left circular, a linear piece
+  had its two end fragments quietly fused into one that no tube ever contains,
+  and two ends that happen to spell a recognition site only where they meet
+  were reported as a genuine cut the enzyme cannot make in a linear molecule.
+  The fragment carrying your insert came back identical either way, so the
+  check anyone actually writes — "the digest released my insert" — passed
+  whichever topology was used, and only the number of fragments gave it away.
+  A construct with a faulty end could be verified clean and ordered. Every
+  fragment now reports where on the sequence it came from and whether it spans
+  the join, every cut says whether it exists only on a circle, and when you
+  didn't state a topology and the answer turns on it, the reply says so. The
+  default is unchanged, and a topology you *do* state is never second-guessed.
+
+- **In-silico PCR now says which molecule it amplified.** `simulate-pcr` never
+  echoed back whether it had treated your template as circular, and a primer
+  pair bracketing the two ends produced a product that can only form on a
+  circle — on a linear template the polymerase runs off the end and there is
+  no band — without anything saying so. The topology is now in the reply, and
+  a product crossing the join is called out when you left the topology to
+  default.
+
+---
+
 ## [1.3.7] — 2026-10-01
 
 ### Bug fixes

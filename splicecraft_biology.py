@@ -2364,9 +2364,20 @@ def _enzyme_cuts(seq: str, enzyme_names: list[str], *,
                   circular: bool = True) -> list[dict]:
     """Return all cuts on `seq` from the given enzymes, sorted by top
     cut position. Each entry is
-    ``{top, bot, kind, overhang_seq, enzyme}`` where ``top`` and
+    ``{top, bot, kind, overhang_seq, enzyme, wraps}`` where ``top`` and
     ``bot`` are absolute 0-based top-strand coords of the top-strand
     and bottom-strand cuts respectively.
+
+    ``wraps`` marks a cut that exists ONLY because the molecule was
+    scanned as a circle — either the recognition site spans the origin,
+    or the site is inside but a Type IIS reach puts the cut outside. On
+    a real plasmid such a cut is entirely physical and the flag is just
+    bookkeeping. On a molecule that is actually LINEAR and was scanned
+    with the `circular=True` default it is a phantom: two ends that form
+    `GAATTC` only when joined answer "yes, EcoRI cuts here" for a piece
+    the enzyme never touches. A linear scan always reports `wraps:
+    False` for every cut, so the flag is also the audit trail for which
+    cuts a `circular=False` rescan would drop. See `[INV-215]`.
 
     Unknown enzyme names are silently dropped (caller validates).
     Empty `enzyme_names` returns ``[]``.
@@ -2467,7 +2478,7 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
             continue
         is_pal   = (rc_site == site_u)
 
-        def _emit(top_bp_raw: int, bot_bp_raw: int):
+        def _emit(top_bp_raw: int, bot_bp_raw: int, wraps: bool = False):
             # Use raw (pre-modulo) values for kind detection AND to find
             # the overhang's earlier-cut anchor — post-modulo, a cut
             # that crosses the origin can flip the top<bot ordering
@@ -2505,6 +2516,11 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
                 names = prev["enzyme"].split("/")
                 if ename not in names:
                     prev["enzyme"] = "/".join(names + [ename])
+                # AND, not OR: the bond is origin-dependent only if EVERY site
+                # that severs it is. One enzyme reaching this bond from a site
+                # wholly inside the molecule makes the cut real on a linear
+                # molecule too, whatever the other's geometry.
+                prev["wraps"] = bool(prev.get("wraps", False)) and bool(wraps)
                 return
             out[key] = {
                 "top":          top_bp,
@@ -2512,6 +2528,7 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
                 "kind":         kind,
                 "overhang_seq": overhang,
                 "enzyme":       ename,
+                "wraps":        bool(wraps),
             }
 
         pairs = [(fwd_cut, rev_cut)]
@@ -2531,7 +2548,18 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
                         (p + f_cut) <= 0 or (p + f_cut) >= n
                         or (p + r_cut) <= 0 or (p + r_cut) >= n):
                     continue
-                _emit(p + f_cut, p + r_cut)
+                # Would a LINEAR scan have produced this cut? Two ways it
+                # wouldn't: the recognition site exists only across the join
+                # (`p + site_len > n` — a match found in the wrap-augmented
+                # `scan_seq`), or the site is inside but the cut lands outside
+                # (exactly the guard above). On `circular=False` the first is
+                # unreachable (`scan_seq` is unaugmented) and the second
+                # already `continue`d, so this is False throughout — the
+                # linear cut set stays byte-identical.
+                _emit(p + f_cut, p + r_cut,
+                      wraps=((p + site_len) > n
+                             or (p + f_cut) <= 0 or (p + f_cut) >= n
+                             or (p + r_cut) <= 0 or (p + r_cut) >= n))
         if not is_pal:
             rc_pat = _iupac_pattern(rc_site)
             for p in _iter_match_starts(rc_pat, scan_seq):
@@ -2553,7 +2581,10 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
                             _rev_top_raw <= 0 or _rev_top_raw >= n
                             or _rev_bot_raw <= 0 or _rev_bot_raw >= n):
                         continue
-                    _emit(_rev_top_raw, _rev_bot_raw)
+                    _emit(_rev_top_raw, _rev_bot_raw,
+                          wraps=((p + site_len) > n
+                                 or _rev_top_raw <= 0 or _rev_top_raw >= n
+                                 or _rev_bot_raw <= 0 or _rev_bot_raw >= n))
     return sorted(out.values(), key=lambda c: (c["top"], c["enzyme"]))
 
 
@@ -2742,11 +2773,34 @@ def _fragments_from_cuts(seq: str, cuts: list[dict], *,
     Each fragment's `top_seq` is the contiguous top-strand slice from
     one cut's `top` to the next cut's `top` (or origin / endpoint).
     Features are slotted via `_split_features_at_cuts` and shifted into
-    fragment-local 0-based coords."""
+    fragment-local 0-based coords.
+
+    Every fragment also carries where it CAME FROM on the input:
+    ``start`` (absolute 0-based first base), ``end`` (absolute 0-based
+    half-open end) and ``wraps``. The one identity that always holds is
+    ``(seq + seq)[start : start + len(top_seq)] == top_seq``, so
+    ``wraps`` is exactly ``start + len(top_seq) > n`` — "this fragment
+    runs off the end of the input and continues at the start". `end` is
+    then `n` for a fragment ending exactly at the origin and `< start`
+    for a wrapping one.
+
+    `wraps` matters because an origin-spanning fragment is the JOIN of
+    the input's 3' and 5' ends. On a real plasmid that join is physical
+    and the flag is mere bookkeeping. On a molecule that is actually
+    LINEAR and was digested `circular=True` (the default — see
+    `_digest_with_enzymes`) the same fragment is a fiction: it fuses the
+    two end pieces into one that no tube ever contains. Pre-2026-10-08
+    nothing in the returned data told those two apart, so only the
+    fragment COUNT distinguished a linear digest from a circular one —
+    and a script asserting "my insert fragment is present" passed either
+    way, because the internal insert-bearing fragment is byte-identical.
+    An end-piece error could verify clean and get ordered. The flag is
+    what a caller can now assert on; see `[INV-215]`."""
     n = len(seq)
     if n == 0:
         return []
     if not cuts:
+        # Uncut either way: the whole input, one contiguous piece [0, n).
         if circular:
             return [{
                 "top_seq": seq,
@@ -2754,6 +2808,7 @@ def _fragments_from_cuts(seq: str, cuts: list[dict], *,
                 "right": {"overhang_seq": "", "kind": "linear", "enzyme": ""},
                 "features": [dict(f) for f in (features or [])],
                 "source_label": source_label,
+                "start": 0, "end": n, "wraps": False,
             }]
         return [{
             "top_seq": seq,
@@ -2761,6 +2816,7 @@ def _fragments_from_cuts(seq: str, cuts: list[dict], *,
             "right": {"overhang_seq": "", "kind": "linear", "enzyme": ""},
             "features": [dict(f) for f in (features or [])],
             "source_label": source_label,
+            "start": 0, "end": n, "wraps": False,
         }]
     # De-dup COINCIDENT top-strand cuts. Two enzymes severing the same top bond
     # with different overhangs stay as separate cuts (`_enzyme_cuts` merges only
@@ -2854,6 +2910,15 @@ def _fragments_from_cuts(seq: str, cuts: list[dict], *,
                     local_feats.append({**f, "start": 0,     "end": new_e})
                     continue
                 local_feats.append({**f, "start": new_s, "end": new_e})
+            # Absolute provenance on the input. `end_raw` is deliberately NOT
+            # taken modulo before the comparison: a fragment ending exactly at
+            # the origin (`end_raw == n`) is a contiguous 3'-end slice and does
+            # NOT wrap, while the single-cut full-lap fragment (`a == b > 0`)
+            # gives `end_raw == n + a` and does. Both collapse to the same `b`
+            # once reduced, which is why the flag can't be re-derived from
+            # `end < start` by a caller.
+            end_raw = a + frag_len
+            f_wraps = end_raw > n
             fragments.append({
                 "top_seq": top_seq,
                 "left":  {"overhang_seq": c["overhang_seq"],
@@ -2864,6 +2929,9 @@ def _fragments_from_cuts(seq: str, cuts: list[dict], *,
                            "enzyme": nxt["enzyme"]},
                 "features": local_feats,
                 "source_label": source_label,
+                "start": a,
+                "end":   (end_raw - n) if f_wraps else end_raw,
+                "wraps": f_wraps,
             })
         return fragments
     # Linear: walk left → right
@@ -2896,6 +2964,12 @@ def _fragments_from_cuts(seq: str, cuts: list[dict], *,
             "right":        right,
             "features":     local_feats,
             "source_label": source_label,
+            # A linear digest never joins anything through the origin: every
+            # fragment is a plain `seq[a:b]`, so `wraps` is unconditionally
+            # False and `end` is the true endpoint (`n` for the last one).
+            "start":        a,
+            "end":          b,
+            "wraps":        False,
         })
     return fragments
 
@@ -2909,6 +2983,24 @@ def _digest_with_enzymes(seq: str, enzyme_names: list[str], *,
     Fragments are sorted in cut order around the molecule (or 5'→3' for
     linear). Caller passes the input's features in absolute 0-based
     coords; they're slotted + shifted onto the appropriate fragments.
+
+    Each fragment is ``{top_seq, left, right, features, source_label,
+    start, end, wraps}``; `left`/`right` are
+    ``{overhang_seq, kind, enzyme}``. There is no outer wrapper dict and
+    no `length` key — the agent-API `digest` endpoint adds those; this
+    is the in-process shape.
+
+    **`circular` defaults True, which is wrong for an amplicon.** This
+    is a plasmid tool, so a circle is the right default for a loaded
+    record (an undeclared topology reads as circular app-wide), but a
+    PCR product, a gBlock, an Ultramer or an excised piece is linear and
+    must pass `circular=False`. Get it wrong and the digest both invents
+    cuts across the join and fuses the two end fragments into one — and
+    the insert-bearing internal fragment is byte-identical either way,
+    so the obvious "my insert came out" assertion passes regardless.
+    The `wraps` flag on each fragment and each cut is what tells the two
+    apart; assert on it rather than on the fragment count. See
+    `[INV-215]`.
 
     Empty `enzyme_names` (or all-unknown) returns the input as a single
     uncut fragment."""

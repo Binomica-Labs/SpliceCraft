@@ -9256,20 +9256,42 @@ def _h_digest(app, payload):
       contribute no cuts) rather than silently dropped.
     * ``circular`` (default ``true``) — origin-spanning cuts + fragment
       count (a circular molecule with N cuts → N fragments; linear → N+1).
+      **The default is wrong for an amplicon.** A plasmid is the right
+      assumption for the loaded canvas, but a PCR product, gBlock, oligo
+      or excised piece is LINEAR and needs ``circular: false``: left
+      circular, the scan invents cuts across the join and fuses the two
+      end pieces into one. Both are now labelled ``wraps`` and, when the
+      topology was never declared, named in ``warnings``.
     * ``include_fragment_seq`` (default ``false``) — include each fragment's
       top-strand sequence; off by default so a megabase digest doesn't echo
       its whole self back.
 
     Returns:
-      * ``cuts`` — ``[{enzyme, top, bottom, kind, overhang_seq}]`` in cut
-        order; ``top``/``bottom`` are absolute 0-based top/bottom-strand cut
-        coordinates, ``kind`` ∈ ``5'`` / ``3'`` / ``blunt``.
-      * ``fragments`` — ``[{index, length, left, right}]`` in cut order
-        around the molecule (5'→3' for linear); ``left``/``right`` are
-        ``{overhang_seq, kind, enzyme}`` (the empty-enzyme ``linear`` kind
-        marks a free end of a linear input). ``seq`` is added per fragment
-        only when ``include_fragment_seq`` is set.
+      * ``cuts`` — ``[{enzyme, top, bottom, kind, overhang_seq, wraps}]``
+        in cut order; ``top``/``bottom`` are absolute 0-based top/bottom-strand
+        cut coordinates, ``kind`` ∈ ``5'`` / ``3'`` / ``blunt``. ``wraps``
+        marks a cut that exists only because the molecule was treated as a
+        circle (site across the join, or a Type IIS reach past an end) — real
+        on a plasmid, a phantom on a linear piece.
+      * ``fragments`` — ``[{index, start, end, length, wraps, left, right}]``
+        in cut order around the molecule (5'→3' for linear);
+        ``left``/``right`` are ``{overhang_seq, kind, enzyme}`` (the
+        empty-enzyme ``linear`` kind marks a free end of a linear input).
+        ``start``/``end`` are absolute 0-based half-open coordinates on the
+        input, so ``(sequence+sequence)[start : start+length]`` is the
+        fragment for every fragment — including the one ``wraps`` marks,
+        which is the JOIN of the input's 3' and 5' ends rather than a
+        contiguous slice (at most one fragment can be that). ``seq`` is
+        added per fragment only when ``include_fragment_seq`` is set.
       * ``n_cuts``, ``n_fragments``, ``circular``, ``unknown_enzymes``.
+      * ``warnings`` — present only when ``circular`` was left to default
+        AND the answer turns on it (some cut or fragment wraps).
+
+    NB the in-process helper `_digest_with_enzymes` returns a BARE LIST of
+    fragments keyed ``top_seq`` — no outer dict, no ``length``/``index``.
+    The wrapper, the ``length`` field and the cut list are this endpoint's
+    presentation of it; a script driving the library directly gets the
+    other shape.
       * ``resolved_enzymes`` — present only when a requested name is a
         commercial synonym (Thermo's ``Eco31I`` is NEB's ``BsaI``, ``LguI``
         is ``SapI``, ``AarI`` is ``PaqCI``): ``{asked: catalog_name}``, so
@@ -9320,6 +9342,13 @@ def _h_digest(app, payload):
         return ({"error": "'enzymes' must contain only non-empty strings"}, 400)
     circular = _payload_bool(payload, "circular", True)
     include_seq = _payload_bool(payload, "include_fragment_seq", False)
+    # Did the caller DECLARE a topology? Checked AFTER the loaded-record branch
+    # above, which fills `circular` in from the record — so this is True only
+    # for a BODY sequence sent with no `circular` key, the one case where the
+    # answer rests on an assumption nobody made. A loaded record always
+    # declares (its own LOCUS, or the app-wide unannotated⇒circular rule the
+    # map already draws), so digesting the canvas stays warning-free.
+    topology_assumed = payload.get("circular") is None
 
     # Report names the catalog doesn't know (they contribute no cuts) so a
     # typo'd enzyme is visible instead of silently scanning nothing — the
@@ -9355,6 +9384,7 @@ def _h_digest(app, payload):
         "bottom":       c.get("bot"),
         "kind":         c.get("kind", ""),
         "overhang_seq": c.get("overhang_seq", ""),
+        "wraps":        bool(c.get("wraps", False)),
     } for c in cuts]
 
     frags_out = []
@@ -9365,6 +9395,21 @@ def _h_digest(app, payload):
         entry = {
             "index":  i,
             "length": len(top_seq),
+            # Where this fragment came from on the input. `(seq+seq)[start :
+            # start+length]` is the fragment, so a caller can locate every
+            # piece without asking for `include_fragment_seq` — and `wraps`
+            # names the one fragment that is the JOIN of the input's 3' and 5'
+            # ends rather than a contiguous slice of it.
+            #
+            # NOT `_site_wraps` (= `end < start`), which is right for a SITE
+            # and wrong for a fragment both ways round: the single-cut full-lap
+            # fragment has `end == start` and IS a join, while a fragment
+            # ending exactly at the origin reduces to `end < start` and is a
+            # plain contiguous 3' slice. The engine computes it from the
+            # unreduced span; don't unify the two.
+            "start":  int(f.get("start", 0)),
+            "end":    int(f.get("end", 0)),
+            "wraps":  bool(f.get("wraps", False)),
             "left":  {"overhang_seq": left.get("overhang_seq", ""),
                        "kind": left.get("kind", ""),
                        "enzyme": left.get("enzyme", "")},
@@ -9384,6 +9429,40 @@ def _h_digest(app, payload):
         "circular":        circular,
         "unknown_enzymes": unknown,
     }
+    # An undeclared topology that CHANGES the answer. The `wraps` fields above
+    # are unconditional data; this is the judgement, and it fires only when the
+    # caller never said which molecule they meant — warning on every digest of
+    # a declared plasmid would just train the reader to skip `warnings`.
+    #
+    # Worth saying out loud because the failure is silent in the direction that
+    # matters: digest an AMPLICON with the circular default and the two end
+    # pieces fuse into one origin-spanning fragment while the insert-bearing
+    # internal fragment stays byte-identical — so "my insert came out" passes
+    # either way and only the fragment COUNT differs. A tail error in an end
+    # piece can verify clean and get ordered (field report, 2026-10-08).
+    wrap_cuts = [c for c in cuts_out if c["wraps"]]
+    wrap_frag = next((f for f in frags_out if f["wraps"]), None)
+    if topology_assumed and (wrap_cuts or wrap_frag is not None):
+        warnings = [
+            "'circular' was not given and defaulted to true, and this answer "
+            "depends on it — pass circular:false if this sequence is a linear "
+            "molecule (a PCR product, gBlock, oligo or excised fragment)"]
+        if wrap_cuts:
+            names = sorted({c["enzyme"] for c in wrap_cuts})
+            shown = ", ".join(names[:6]) + ("…" if len(names) > 6 else "")
+            warnings.append(
+                f"{len(wrap_cuts)} of {len(cuts_out)} cut(s) ({shown}) exist "
+                "only because the sequence was treated as circular: the "
+                "recognition site spans the join, or a Type IIS reach puts "
+                "the cut past an end. On a linear molecule the enzyme does "
+                "not cut there at all")
+        if wrap_frag is not None:
+            warnings.append(
+                f"fragment {wrap_frag['index']} spans the origin — it is the "
+                f"join of the sequence's 3' end (bp {wrap_frag['start']}.."
+                f"{len(bases)}) and its 5' start (bp 0..{wrap_frag['end']}), "
+                "which on a linear molecule are two separate fragments")
+        out["warnings"] = warnings
     # `cuts[].enzyme` carries the CATALOG name (the engines key on it), so a
     # caller who digested with a commercial synonym would find their own
     # spelling nowhere in the answer and read that as "it didn't cut". Say
@@ -11646,6 +11725,16 @@ def _h_simulate_pcr(app, payload):
     (5 Mb) are refused rather than risking a chromosome-scale find.
     Returns up to ``_PCR_MAX_AMPLICONS`` (50) amplicons sorted by
     length descending; the ``capped`` field flags mispriming runaway.
+    The reply echoes ``circular`` so the answer says which molecule was
+    simulated.
+
+    ``template_seq`` is always body-supplied, so the ``circular: true``
+    default is an assumption every time — and a pair that brackets the
+    join yields an amplicon marked ``wraps: true`` which, on a template
+    that is really LINEAR, is a product no tube ever contains (the
+    polymerase runs off the end). When the topology was left to default
+    and some amplicon wraps, ``warnings`` says so. Pass
+    ``circular: false`` for a PCR product, gBlock or genomic fragment.
 
     Read-only. To save an amplicon as a linear library entry, use the
     Simulator screen (which constructs a SeqRecord with primer_bind
@@ -11714,12 +11803,34 @@ def _h_simulate_pcr(app, payload):
                 max_amplicon=max_amp,
                 n_amplicons=len(amps),
                 capped=(len(amps) >= _PCR_MAX_AMPLICONS))
-    return {
+    out = {
         "ok":         True,
         "n":          len(amps),
         "capped":     len(amps) >= _PCR_MAX_AMPLICONS,
+        # Echo the topology the simulation actually used. `template_seq` is
+        # always body-supplied here (there is no loaded-record fallback), so
+        # the circular default is an assumption EVERY time — and without this
+        # echo a caller could not tell from the answer which molecule was
+        # simulated. `digest` has echoed it all along; this half didn't.
+        "circular":   circular,
         "amplicons":  amps,
     }
+    # An amplicon that crosses the join exists only on a circle. The
+    # per-amplicon `wraps` flag has always said so, but when the caller never
+    # declared a topology the product may be a phantom: on a linear template
+    # the polymerase runs off the end and there is no band at all. Same
+    # judgement-vs-data split as `digest` — warn only on an ASSUMED topology,
+    # so a declared plasmid stays quiet (field report, 2026-10-08).
+    if payload.get("circular") is None:
+        n_wrap = sum(1 for a in amps if isinstance(a, dict) and a.get("wraps"))
+        if n_wrap:
+            out["warnings"] = [
+                "'circular' was not given and defaulted to true: "
+                f"{n_wrap} of {len(amps)} amplicon(s) cross the join and "
+                "exist only on a circular template — pass circular:false if "
+                "this template is linear (a PCR product, gBlock or genomic "
+                "fragment), where no such product forms"]
+    return out
 
 
 @_agent_endpoint("simulate-gel")

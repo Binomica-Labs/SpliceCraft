@@ -440,7 +440,14 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 - **Simulate** — simulate-pcr (exact-match in-silico amplification,
   wrap-aware on circular templates) and simulate-gel (per-lane band
   positions + optional rendered ASCII gel image; ladder / plasmid /
-  digest / PCR-amplicon sources).
+  digest / PCR-amplicon sources). simulate-pcr's `template_seq` is always
+  supplied in the body, so its `circular: true` default is an assumption
+  every time: the reply now echoes `circular` so the answer says which
+  molecule it simulated, and an amplicon marked `wraps` — a product that
+  exists only on a circle, since on a linear template the polymerase runs
+  off the end — earns a `warnings` entry when the topology was left to
+  default. Pass `circular: false` for a PCR product, gBlock or genomic
+  fragment.
 - **Restriction sites** — `list-restriction-sites` scans the LOADED record
   (singular `enzyme` accepted; omit it to scan the catalog, honouring your
   active enzyme collection). Each hit carries `start` / `end` / `strand`,
@@ -479,7 +486,22 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   QC for a Golden-Braid / restriction junction without loading the
   sequence onto the canvas; with no `sequence` it digests the LOADED plasmid
   with its own topology and says so in `sequence_from`; `circular` defaults
-  true for a raw sequence, a singular `enzyme`
+  true for a raw sequence — **right for a plasmid, wrong for an amplicon**,
+  and the difference used to be invisible. Left circular, a linear piece has
+  its two end fragments FUSED into one origin-spanning fragment while the
+  insert-bearing internal fragment stays byte-identical, so "the digest
+  released my insert" passes either way and only the fragment count differs;
+  worse, two ends that spell `GAATTC` only when joined report a cut the
+  enzyme cannot make in a linear molecule. Both are now labelled: every
+  fragment carries `start` / `end` / `wraps` (and
+  `(sequence+sequence)[start : start+length]` is the fragment, so each piece
+  is locatable without `include_fragment_seq`), every cut carries `wraps`,
+  and at most one fragment can wrap. `wraps` is not the same as
+  `end < start` — a single-cut full-lap fragment and a fragment ending
+  exactly at the origin both reduce that way and only one is a join. When
+  the topology was never declared AND the answer turns on it, `warnings`
+  says so; a *declared* topology is never second-guessed. A singular
+  `enzyme`
   is accepted, names are matched case-insensitively so `bsai` cuts,
   commercial synonyms resolve (Thermo's `Eco31I` is NEB's `BsaI`) with
   `resolved_enzymes` reporting what each one became, and names the catalog
