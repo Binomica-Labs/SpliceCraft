@@ -14,10 +14,82 @@
 
 ---
 
-## [Unreleased]
+## [1.3.9] — 2026-10-13
+
+### New features
+
+- **SpliceCraft reads GenBank files itself.** Every GenBank file you open,
+  every plasmid in your library and every record fetched from NCBI is now read
+  by SpliceCraft's own reader instead of Biopython's. Where Biopython already
+  read a file correctly you get exactly the same plasmid. That was checked on
+  313 NCBI records, Biopython's own test files and a 1,300-plasmid library.
+  Files Biopython refused or misread now open:
+  - a feature table indented with tabs, or shifted as a whole;
+  - sequence lines without position numbers (Biopython quietly dropped the
+    first ten bases of every line);
+  - a LOCUS line with a field one column out of place, which was refused, or
+    with too few fields, which lost the plasmid's topology;
+  - a qualifier written without its `=` sign;
+  - text that starts with a byte-order mark or uses old Mac line endings
+    (when it reaches SpliceCraft as text, through the agent API).
 
 ### Bug fixes
 
+- **A plasmid with a feature across the origin, in a file that calls it
+  linear, can be saved and exported.** Some plasmid-repository exports mark a
+  circular plasmid "linear" and still have a feature running across the
+  origin. That feature came in with no position at all, and the next library
+  save or export crashed. It is now kept as a feature across the origin, and
+  File > Open tells you the file calls the molecule linear.
+- **File > Open tells you when a feature had to be left out.** A feature whose
+  position can't be read is left out of the plasmid. That used to be noted
+  only in the log, and now a warning says how many were left out.
+- **`.dna` imports keep flags, ranges and dates.** Importing a file from the
+  popular commercial plasmid editor dropped every value Biopython's reader
+  doesn't handle: flags such as `/pseudo`, `/ribosomal_slippage` and
+  `/trans_splicing`, ranges such as `/rpt_unit_range`, and
+  `/collection_date`. Some of those plasmids then failed to export to
+  GenBank. These values now come through. For plasmids imported by an earlier
+  version, the new agent call `recover-qualifiers-from-dna` restores them from
+  the original `.dna` files SpliceCraft keeps. By default it only reports what
+  it would change.
+- **Damaged GenBank files no longer crash the import or put junk into the
+  plasmid.**
+  - A location nested thousands of levels deep crashed the reader; now only
+    that feature is left out.
+  - A file cut off before its sequence is refused with a message that says so.
+    It used to blame a "CONTIG record" the file never had.
+  - A duplicated first line no longer turns one plasmid into two.
+  - A misspelled header keyword no longer spills into the field above it.
+  - A stray character before a qualifier no longer hides that qualifier.
+  - A character in the sequence that isn't a base is named in the error.
+- **GenBank files from gene-synthesis vendors open.** A file that gives the
+  plasmid a name with spaces in it on its first line was refused outright with
+  "Did not recognise the LOCUS line layout". Twist's construct downloads do
+  this (they name the plasmid "<gene> in <vector>"), and so do some other
+  tools. These files now open under the file's name as before, with the full
+  title kept as the description.
+- **A GenBank file no longer loses all of its features when its feature
+  table is spaced differently.** The same downloads put extra space before
+  `Location/Qualifiers` in the line that starts the feature table, and the
+  importer then read the whole table as header text. The plasmid opened with
+  its sequence and no features at all, and nothing said so. The features now
+  come through.
+- **Feature types with a stray trailing underscore are restored on import.**
+  `misc_feature_` now arrives as `misc_feature`, so it gets the right colour
+  and exports as a valid GenBank feature key.
+- **A file holding several plasmids or reads names each one for itself.**
+  Opening a multi-record GenBank, FASTA or FASTQ file, or importing a folder
+  that contains a multi-read FASTQ, used to put every entry in the library
+  under the file's own name: ten plasmids all called "order". Each now gets
+  its own name from the file. A repeated name gets a number, like "pX (2)".
+- **Each plasmid in a multi-record file is read the way a single file is.**
+  Opening several at once used to skip three things a single file gets. A
+  circular plasmid whose first line puts "circular" in an unusual column could
+  be saved as linear. A feature drawn without an arrow came back pointing
+  forward. And a record that only refers to other entries, with no sequence of
+  its own, could crash the import. Such a record is now skipped, with a note in
+  the log.
 - **BABS chat replies stream in as they are written.** BABS read Ollama's
   reply in 16 KB blocks and waited for each block to fill, so a short answer
   appeared all at once when it was finished and a long one arrived in jumps.
@@ -26,6 +98,14 @@
 - **Stopping a BABS reply no longer reports an error.** Pressing Stop while a
   reply was streaming showed a red "chat error: 'NoneType' object has no
   attribute 'read'" instead of "…stopped". The reply now stops cleanly.
+
+### Performance
+
+- **Opening a GenBank file is about 2.4 times faster.** File > Open used to
+  read every file twice: once to count its records, then again to open it.
+  It now reads it once, with the faster reader.
+- **Loading plasmids from the library is about 25% faster**, for the same
+  reason.
 
 ## [1.3.8] — 2026-10-09
 

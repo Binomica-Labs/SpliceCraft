@@ -1327,10 +1327,24 @@ def _primer_tm_safe(seq: str) -> "float | None":
         return None
 
 
+class _MultipleRecordsError(ValueError):
+    """A file that holds several records where one was expected. A
+    ValueError like every other "cannot load this" answer, so existing
+    handlers keep working; its own class so File > Open can tell it apart
+    and import the records as a collection instead — without parsing every
+    single-record file twice to find out (it used to count the records with
+    one full parse, then load with another)."""
+
+    def __init__(self, message: str, count: int):
+        super().__init__(message)
+        self.count = count
+
+
 def _pick_single_record(records: list, source: str):
     """Given a list of SeqRecords, return the single one if there's exactly
-    one, else raise ValueError with a user-friendly message. Used by both
-    NCBI fetch and file load so the error text is consistent.
+    one, else raise ValueError with a user-friendly message — a
+    `_MultipleRecordsError` when there are several. Used by both NCBI fetch
+    and file load so the error text is consistent.
     """
     if not records:
         raise ValueError(
@@ -1339,10 +1353,11 @@ def _pick_single_record(records: list, source: str):
     if len(records) > 1:
         ids = ", ".join(r.id for r in records[:3])
         more = f" (and {len(records) - 3} more)" if len(records) > 3 else ""
-        raise ValueError(
+        raise _MultipleRecordsError(
             f"{source} contains {len(records)} records — SpliceCraft loads "
             f"one plasmid at a time. Split the file or extract a single "
-            f"record first (found: {ids}{more})."
+            f"record first (found: {ids}{more}).",
+            len(records),
         )
     return records[0]
 

@@ -720,6 +720,20 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   the scan itself: only `.dna` files whose sequence matches a plasmid in
   scope are indexed, so a run that stopped at the memory budget
   (`truncated: true`) is finished a collection at a time.
+  **recover-qualifiers-from-dna** puts back the qualifier VALUES a `.dna`
+  import used to drop: flags (`/pseudo`, `/ribosomal_slippage`,
+  `/trans_splicing`, …), ranges (`/rpt_unit_range`, `/tag_peptide`),
+  dates (`/collection_date`) and empty values, for plasmids imported
+  before 1.3.9, from the `.dna` originals saved in the data dir. It
+  matches on EXACT sequence, adds a value only to the feature of the same
+  type at the same coordinates and only where that feature has none for
+  the key, and proves each result (same sequence, topology, name and
+  features; every existing value unchanged) before keeping it. Originals
+  that would add different values are reported in `skipped`, never
+  guessed between. A dry run by default: pass `{"apply": true}` (or
+  `{"dry_run": false}`) to write, and check `applied`. Optional
+  `collection` / `name` narrow it. It reads each matching original twice,
+  so genome-scale originals take minutes.
   Agent assemblies (`gibson-assemble`,
   `traditional-clone`, `golden-gate-assemble`) attach real parent
   lineage — each input fragment / part / vector becomes a parent node, so

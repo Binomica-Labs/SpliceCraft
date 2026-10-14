@@ -170,6 +170,17 @@ being closed.**
 - New modals add a row to `test_modal_boundaries.py::_MODAL_CASES`
   (every modal must fit 160×48).
 
+**Reader scoreboard.** Before changing how a sequence file is READ (GenBank,
+EMBL, `.dna`), score the change on real files rather than on the files you
+thought of. `scripts/format_scoreboard.py fetch` downloads a public corpus
+(NCBI records, a 4.6 Mb chromosome, Biopython's own awkward test fixtures)
+into `~/.cache/splicecraft-corpus`; `scripts/format_scoreboard.py run` scores
+each reader on it plus generated layout variants, seeded fuzz and, read in
+place and reported only by hash, your own library and `.dna` originals. It
+counts refusals, crashes, silent losses against an independent census
+(`tests/_format_oracles.py`), speed, and what the write side does with the
+result. `tests/test_format_scoreboard.py` keeps the harness honest.
+
 ## Style
 
 - Python 3.10+ syntax. `from __future__ import annotations` is fine.

@@ -749,21 +749,29 @@ class TestCommercialSaaSDispatch:
 
     def test_gb_path_still_uses_genbank_parser(self, tmp_path, monkeypatch,
                                                 tiny_record):
-        """Regression guard: .gb files still dispatch to the genbank
-        parser, not commercialsaas."""
-        called_fmt = {}
+        """Regression guard: .gb files still dispatch to the GenBank reader
+        (SpliceCraft's own since 1.3.9, [INV-219]), not commercialsaas."""
+        import splicecraft_insdc
+        from Bio import SeqIO
+        seqio_fmts: list = []
+        texts: list = []
 
-        def fake_parse(path, fmt):
-            called_fmt["fmt"] = fmt
+        def fake_seqio(path, fmt, *a, **k):
+            seqio_fmts.append(fmt)
             return iter([tiny_record])
 
-        from Bio import SeqIO
-        monkeypatch.setattr(SeqIO, "parse", fake_parse)
+        def fake_reader(text):
+            texts.append(text)
+            return [tiny_record]
+
+        monkeypatch.setattr(SeqIO, "parse", fake_seqio)
+        monkeypatch.setattr(splicecraft_insdc, "parse_genbank", fake_reader)
 
         gb_file = tmp_path / "plasmid.gb"
         gb_file.write_text("stub")
-        sc.load_genbank(str(gb_file))
-        assert called_fmt["fmt"] == "genbank"
+        assert sc.load_genbank(str(gb_file)) is tiny_record
+        assert texts == ["stub"]
+        assert sc._BIOPYTHON_DNA_FMT not in seqio_fmts
 
     def test_malformed_dna_raises_helpful_error(self, tmp_path):
         """A .dna file that isn't actually a valid binary plasmid file
@@ -1574,6 +1582,145 @@ class TestMultiRecordFastaImport:
             assert app.screen_stack[-1] is not modal
 
 
+def _gb_record_text(name: str, seq: str) -> str:
+    lines = [f"LOCUS       {name:<16}{len(seq):>12} bp    DNA     circular SYN "
+             "12-OCT-2026",
+             "FEATURES             Location/Qualifiers",
+             "ORIGIN"]
+    lines += [f"{i + 1:>9} " + " ".join(seq[j:j + 10]
+                                        for j in range(i, min(i + 60, len(seq)), 10))
+              for i in range(0, len(seq), 60)]
+    return "\n".join(lines + ["//"]) + "\n"
+
+
+class TestMultiRecordEntryNames:
+    """A file holding several records used to put EVERY one of them in the
+    library under the file's own name — `_record_to_library_entry` names an
+    entry after the file stem, which is right for one record per file and
+    wrong for a multi-record GenBank, FASTA or FASTQ."""
+
+    @staticmethod
+    def _names(coll_name: str) -> "list[str]":
+        coll = sc._find_collection(coll_name)
+        assert coll is not None
+        return [p["name"] for p in coll["plasmids"]]
+
+    def test_genbank_collection_names_each_record(self, tmp_path,
+                                                  isolated_library):
+        p = tmp_path / "order.gb"
+        p.write_text(_gb_record_text("pAlpha", "ACGT" * 30)
+                     + _gb_record_text("pBeta", "TTGCA" * 30))
+        recs = sc._genbank_records_to_seqrecords(
+            sc._parse_genbank_file_records(str(p)), str(p))
+        sc._create_genbank_collection("Order", recs, str(p))
+        assert self._names("Order") == ["pAlpha", "pBeta"]
+        assert sorted(e["name"] for e in sc._load_library()) == [
+            "pAlpha", "pBeta"]
+
+    def test_repeated_name_gets_a_number_not_an_underscore(
+            self, tmp_path, isolated_library):
+        p = tmp_path / "dupes.gb"
+        p.write_text(_gb_record_text("pX", "ACGT" * 30)
+                     + _gb_record_text("pX", "GGCC" * 30))
+        recs = sc._genbank_records_to_seqrecords(
+            sc._parse_genbank_file_records(str(p)), str(p))
+        sc._create_genbank_collection("Dupes", recs, str(p))
+        coll = sc._find_collection("Dupes")
+        assert [e["name"] for e in coll["plasmids"]] == ["pX", "pX (2)"]
+        assert [e["id"] for e in coll["plasmids"]] == ["pX", "pX_2"]
+
+    def test_spaced_display_names_survive_a_multi_record_file(
+            self, tmp_path, isolated_library):
+        """[INV-98] A file of records SpliceCraft wrote carries each typed
+        name in its COMMENT marker; the LOCUS holds only the underscored
+        form."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        texts = []
+        for i, nm in enumerate(("My Plasmid 1", "My Plasmid 2"), 1):
+            rec = SeqRecord(Seq("ACGT" * 20 * i), id=f"My_Plasmid_{i}",
+                            name=f"My_Plasmid_{i}")
+            rec.annotations.update(molecule_type="DNA", topology="circular")
+            rec._tui_display_name = nm
+            texts.append(sc._record_to_gb_text(rec))
+        p = tmp_path / "export.gb"
+        p.write_text("".join(texts))
+        recs = sc._genbank_records_to_seqrecords(
+            sc._parse_genbank_file_records(str(p)), str(p))
+        sc._create_genbank_collection("Typed", recs, str(p))
+        assert self._names("Typed") == ["My Plasmid 1", "My Plasmid 2"]
+
+    def test_fasta_collection_names_each_record(self, tmp_path,
+                                                isolated_library):
+        fa = tmp_path / "set.fa"
+        fa.write_text(">a\nACGTACGT\n>seq\nGCATGCAT\n>seq\nTTAATTAA\n")
+        from Bio import SeqIO
+        recs = sc._fasta_records_to_seqrecords(
+            list(SeqIO.parse(str(fa), "fasta")), str(fa))
+        sc._create_fasta_collection("FASTA Set", recs, str(fa))
+        coll = sc._find_collection("FASTA Set")
+        assert [e["name"] for e in coll["plasmids"]] == [
+            "a", "seq", "seq (2)"]
+        assert [e["id"] for e in coll["plasmids"]] == ["a", "seq", "seq_2"]
+
+    def test_bulk_import_names_each_fastq_read(self, tmp_path):
+        folder = tmp_path / "run"
+        folder.mkdir()
+        (folder / "reads.fastq").write_text(
+            "".join(f"@read{i}\nACGTACGTAC\n+\nIIIIIIIIII\n" for i in (1, 2, 3)))
+        (folder / "single.fa").write_text(">contig\nACGTACGTACGT\n")
+        entries, failures = sc._bulk_import_folder(folder)
+        assert failures == []
+        by_source = {}
+        for e in entries:
+            by_source.setdefault(e["source"], []).append(e["name"])
+        assert by_source["file:reads.fastq"] == ["read1", "read2", "read3"]
+        # One record per file: the file still names it, as before.
+        assert by_source["file:single.fa"] == ["single"]
+
+    def test_each_record_gets_the_repairs_a_single_file_gets(self, tmp_path):
+        """[INV-195] The multi-record door skipped `load_genbank`'s post-parse
+        repairs: a plasmid whose LOCUS puts `circular` in an unusual column
+        came in with NO topology (stored as linear), and an arrowless feature
+        came back pointing forward with its encoding marker still attached."""
+        seq = "ACGT" * 30
+        second = _gb_record_text("pB", seq).replace(
+            f"LOCUS       pB              {len(seq):>12} bp    DNA     circular SYN 12-OCT-2026",
+            f"LOCUS       pB {len(seq)} bp DNA circular 12-OCT-2026").replace(
+            "FEATURES             Location/Qualifiers\n",
+            "FEATURES             Location/Qualifiers\n"
+            "     misc_feature    5..20\n"
+            '                     /label="flat"\n'
+            '                     /SpliceCraft_strand="none"\n')
+        p = tmp_path / "pair.gb"
+        p.write_text(_gb_record_text("pA", seq) + second)
+        a, b = sc._parse_genbank_file_records(str(p))
+        assert b.annotations.get("topology") == "circular"
+        (feat,) = b.features
+        assert feat.location.strand == 0
+        assert "SpliceCraft_strand" not in feat.qualifiers
+
+    def test_a_record_without_bases_is_skipped_not_raised(self):
+        """A CONTIG record has a length and no bases; reading them raised out
+        of `_genbank_collection_worker`, whose default `exit_on_error` takes
+        the whole app down with it."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        ok = SeqRecord(Seq("ACGT" * 10), id="ok", name="ok")
+        contig = SeqRecord(Seq(None, length=40), id="contig", name="contig")
+        out = sc._genbank_records_to_seqrecords([ok, contig], "order.gb")
+        assert [r.id for r in out] == ["ok"]
+
+    def test_a_record_with_no_name_falls_back_to_the_file(self):
+        from pathlib import Path
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        recs = [SeqRecord(Seq("ACGT")),            # Biopython's <unknown …>
+                SeqRecord(Seq("ACGT"), id="", name="")]
+        assert sc._multi_record_entry_names(recs, Path("batch.gb")) == [
+            "batch 1", "batch 2"]
+
+
 class TestFastaTopologyHeuristic:
     """FASTA carries no topology field, so import guesses from the
     description. Guessing CIRCULAR is the expensive direction: it fabricates
@@ -1774,3 +1921,89 @@ class TestDisplayNameCommentRoundTrip:
     def test_no_stamp_when_display_equals_locus(self):
         assert "SpliceCraft-name:" not in sc._record_to_gb_text(
             self._rec(name="pUC19", locus="pUC19"))
+
+
+class TestOpenParsesAFileOnce:
+    """File > Open used to parse every GenBank file TWICE — once to count
+    its records, once more to load the one it found — which is why it read
+    at half the parser's speed (format scoreboard, 2026-10-12)."""
+
+    @staticmethod
+    def _open(path, monkeypatch):
+        """Counts every GenBank PARSE, by either reader: Biopython's (up to
+        1.3.8) and SpliceCraft's own (`splicecraft_insdc`, from 1.3.9)."""
+        from Bio import SeqIO
+        reads = []
+        real = SeqIO.parse
+
+        def _counting(handle, fmt, *a, **k):
+            if fmt == "genbank":
+                reads.append(fmt)
+            return real(handle, fmt, *a, **k)
+        monkeypatch.setattr(SeqIO, "parse", _counting)
+        try:
+            import splicecraft_insdc
+        except ImportError:                 # a release before the reader
+            pass
+        else:
+            real_own = splicecraft_insdc.parse_genbank
+
+            def _counting_own(text):
+                reads.append("genbank")
+                return real_own(text)
+            monkeypatch.setattr(splicecraft_insdc, "parse_genbank",
+                                _counting_own)
+        out: dict = {}
+
+        class _App:
+            @staticmethod
+            def call_from_thread(fn, *a, **k):
+                return fn(*a, **k)
+
+        class _Widget:
+            disabled = False
+
+            @staticmethod
+            def update(msg):
+                out["error"] = str(msg)
+
+        class _Modal:                       # UI plumbing only
+            app = _App()
+            is_mounted = True
+
+            @staticmethod
+            def query_one(*_a, **_k):
+                return _Widget()
+
+            def _dismiss_once(self, rec):
+                out["record"] = rec
+
+            def _handle_multi_record_genbank(self, path, recs):
+                out["multi"] = recs
+
+        # The real worker body, under its `@work` wrapper.
+        getattr(sc.OpenFileModal._do_load, "__wrapped__")(_Modal(), str(path))
+        return reads, out
+
+    def test_a_single_record_file_is_read_once(self, tmp_path, monkeypatch):
+        p = tmp_path / "one.gb"
+        p.write_text(_gb_record_text("pAlpha", "ACGT" * 30))
+        reads, out = self._open(p, monkeypatch)
+        assert len(reads) == 1, reads
+        assert str(out["record"].seq) == "ACGT" * 30
+
+    def test_a_multi_record_file_still_becomes_a_collection(
+            self, tmp_path, monkeypatch):
+        p = tmp_path / "two.gb"
+        p.write_text(_gb_record_text("pAlpha", "ACGT" * 30)
+                     + _gb_record_text("pBeta", "TTGCA" * 30))
+        _reads, out = self._open(p, monkeypatch)
+        assert "record" not in out
+        assert [r.name for r in out["multi"]] == ["pAlpha", "pBeta"]
+
+    def test_a_file_with_no_record_still_says_so(self, tmp_path, monkeypatch):
+        p = tmp_path / "empty.gb"
+        p.write_text("nothing to see here\n")
+        _reads, out = self._open(p, monkeypatch)
+        assert "record" not in out and "multi" not in out
+        assert "no GenBank records" in out["error"]

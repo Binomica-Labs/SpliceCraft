@@ -10,7 +10,8 @@ not.
 So the assertions here are written against the FORMAT SPECS — the NCBI GenBank
 release-notes layout and the INSDC Feature Table definition, the ENA flat-file
 ID line, GFF3 1.26, RFC 4180 — not against what SpliceCraft happens to emit.
-`_gb_problems` / `_gff3_problems` below are deliberately small independent
+`_gb_problems` / `_gff3_problems` (in `tests/_format_oracles.py`, shared with
+the reader scoreboard) are deliberately small independent
 re-implementations of the rules, not calls back into the code under test.
 """
 
@@ -25,149 +26,7 @@ from Bio.SeqFeature import CompoundLocation, FeatureLocation, SeqFeature
 from Bio.SeqRecord import SeqRecord
 
 import splicecraft as sc
-
-
-# ── independent format checkers ───────────────────────────────────────────────
-
-_GB_DIVISIONS = set(
-    "PRI ROD MAM VRT INV PLN BCT VRL PHG SYN UNA EST PAT STS GSS HTG HTC ENV "
-    "CON TSA UNK".split()
-)
-
-
-def _gb_problems(text: str) -> "list[str]":
-    """Check GenBank flat-file text against the published layout."""
-    out: list[str] = []
-    lines = text.split("\n")
-    if lines and lines[-1] == "":
-        lines = lines[:-1]
-    for i, ln in enumerate(lines, 1):
-        if len(ln) > 80:
-            out.append(f"line {i}: {len(ln)} columns (max 80): {ln[:48]!r}")
-        if not ln.isascii():
-            bad = [c for c in ln if not c.isascii()]
-            out.append(f"line {i}: non-ASCII {bad[:4]!r}")
-        if "\t" in ln:
-            out.append(f"line {i}: TAB character")
-    if not lines:
-        return ["empty file"] + out
-    loc = lines[0]
-    if not loc.startswith("LOCUS       "):
-        out.append("no LOCUS line")
-        return out
-    if not re.search(r"(?<= )\d+$", loc[12:40]):
-        out.append(f"LOCUS: length not right-justified to col 40: {loc[12:40]!r}")
-    if loc[41:43] not in ("bp", "aa"):
-        out.append(f"LOCUS: cols 42-43 = {loc[41:43]!r}, expected bp/aa")
-    if loc[55:63].strip() not in ("linear", "circular", ""):
-        out.append(f"LOCUS: topology field = {loc[55:63]!r}")
-    if loc[64:67].strip() and loc[64:67] not in _GB_DIVISIONS:
-        out.append(f"LOCUS: division {loc[64:67]!r} unknown")
-    if loc[68:79].strip() and not re.fullmatch(r"\d{2}-[A-Z]{3}-\d{4}",
-                                               loc[68:79]):
-        out.append(f"LOCUS: date {loc[68:79]!r} not DD-MMM-YYYY")
-    if "FEATURES             Location/Qualifiers" not in text:
-        out.append("no FEATURES header")
-    if not text.rstrip().endswith("//"):
-        out.append("no // terminator")
-    in_ft = False
-    for i, ln in enumerate(lines, 1):
-        if ln.startswith("FEATURES"):
-            in_ft = True
-            continue
-        if in_ft and ln[:6] in ("ORIGIN", "//"):
-            break
-        if not in_ft:
-            continue
-        if ln[:5] != "     ":
-            out.append(f"line {i}: feature line not indented 5: {ln[:12]!r}")
-            continue
-        key = ln[5:20]
-        if key.strip():
-            if len(key.strip()) > 15:
-                out.append(f"line {i}: feature key >15 chars: {key.strip()!r}")
-            if ln[20:21] not in (" ", ""):
-                out.append(f"line {i}: no space before the location column")
-        elif ln[:21] != " " * 21:
-            out.append(f"line {i}: qualifier not indented 21: {ln[:21]!r}")
-    # ORIGIN block
-    if "\nORIGIN" in text:
-        body = text.split("\nORIGIN", 1)[1].split("\n", 1)[1]
-        pos = 1
-        for ln in body.split("\n"):
-            if ln.strip() in ("//", ""):
-                break
-            if ln[:9] != str(pos).rjust(9):
-                out.append(f"ORIGIN: expected base counter {pos} in cols 1-9, "
-                           f"got {ln[:9]!r}")
-                break
-            blocks = [b for b in ln[10:].split(" ") if b]
-            if any(not re.fullmatch(r"[a-z]+", b) for b in blocks):
-                out.append(f"ORIGIN: non-lowercase block in {ln[:40]!r}")
-                break
-            pos += sum(len(b) for b in blocks)
-    return out
-
-
-_GFF3_RESERVED = {"ID", "Name", "Alias", "Parent", "Target", "Gap",
-                  "Derives_from", "Note", "Dbxref", "Ontology_term",
-                  "Is_circular"}
-
-
-def _gff3_problems(text: str) -> "list[str]":
-    """Check GFF3 text against specification 1.26."""
-    out: list[str] = []
-    lines = text.split("\n")
-    if not lines[0].startswith("##gff-version 3"):
-        out.append("first line is not '##gff-version 3'")
-    ids: dict = {}
-    for i, raw in enumerate(lines, 1):
-        if not raw or raw.startswith("#"):
-            continue
-        cols = raw.split("\t")
-        if len(cols) != 9:
-            out.append(f"line {i}: {len(cols)} columns, GFF3 needs exactly 9")
-            continue
-        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
-        if not re.fullmatch(r"[A-Za-z0-9.:^*$@!+_?|%-]+", seqid):
-            out.append(f"line {i}: seqid {seqid!r} needs percent-encoding")
-        if not source or not ftype:
-            out.append(f"line {i}: empty source/type column")
-        if re.search(r"\s", ftype):
-            out.append(f"line {i}: whitespace in the type column {ftype!r}")
-        if not (start.isdigit() and end.isdigit()):
-            out.append(f"line {i}: non-integer coordinates {start!r} {end!r}")
-        elif int(start) < 1 or int(end) < int(start):
-            out.append(f"line {i}: bad span {start}..{end}")
-        if strand not in ("+", "-", ".", "?"):
-            out.append(f"line {i}: strand {strand!r}")
-        if phase not in (".", "0", "1", "2"):
-            out.append(f"line {i}: phase {phase!r}")
-        if ftype == "CDS" and phase == ".":
-            out.append(f"line {i}: CDS without a phase")
-        seen: list = []
-        for kv in attrs.split(";"):
-            if not kv or kv == ".":
-                continue
-            if "=" not in kv:
-                out.append(f"line {i}: attribute {kv!r} has no '='")
-                continue
-            k, _, v = kv.partition("=")
-            if k in seen:
-                out.append(f"line {i}: duplicate attribute tag {k!r}")
-            seen.append(k)
-            if any(c in v for c in "\t\n\r"):
-                out.append(f"line {i}: raw control char in attribute {k!r}")
-            for m in re.finditer("%", v):
-                if not re.match(r"%[0-9A-Fa-f]{2}", v[m.start():m.start() + 3]):
-                    out.append(f"line {i}: bare '%' in attribute {k!r}")
-                    break
-            if k == "ID":
-                ids.setdefault(v, set()).add(ftype)
-    for gid, types in ids.items():
-        if len(types) > 1:
-            out.append(f"ID={gid!r} shared by different types {sorted(types)}")
-    return out
+from tests._format_oracles import _gb_problems, _gff3_problems
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -370,6 +229,190 @@ class TestGenBankConformance:
         out = tmp_path / "p.gb"
         sc._export_genbank_to_path(plasmid, out)
         assert b"\r" not in out.read_bytes()
+
+
+# ── GenBank written by other tools ───────────────────────────────────────────
+
+_VENDOR_SEQ = "ATGCGTACGTTGCAAGCTTC" * 6           # 120 bp, synthetic
+_VENDOR_NAME = "GeneX in pShuttle Amp High Copy"
+_ODD_FEATURES = "FEATURES" + " " * 33 + "Location/Qualifiers"
+
+
+def _origin_lines(seq: str) -> "list[str]":
+    return [f"{i + 1:>9} " + " ".join(seq[j:j + 10]
+                                       for j in range(i, min(i + 60, len(seq)), 10))
+            for i in range(0, len(seq), 60)]
+
+
+def _vendor_gb(name: str = _VENDOR_NAME, *, eol: str = "\r\n",
+               features_header: str = _ODD_FEATURES) -> str:
+    """A gene-synthesis vendor's construct download, layout copied from a real
+    one: the construct's full title (spaces and all) where the one-token LOCUS
+    name belongs, every header value pushed out to column 42, a feature key
+    with an underscore appended, CRLF line endings, a date but no division."""
+    n, pad = len(_VENDOR_SEQ), " " * 41
+    lines = [
+        f"LOCUS       {name}                {n} bp DNA     circular   "
+        "12-OCT-2026",
+        "DEFINITION" + " " * 31 + name,
+        "",
+        "COMMENT" + " " * 34 + "This file was created by a synthesis vendor",
+        features_header,
+        "     source" + " " * 30 + f"1..{n}",
+        f'{pad}/organism="{name}"',
+        "     misc_feature_" + " " * 23 + "1..60",
+        f'{pad}/label="Insert"',
+        "     misc_feature_" + " " * 23 + f"61..{n}",
+        f'{pad}/label="vector_backbone-61-{n}"',
+        "ORIGIN",
+        *_origin_lines(_VENDOR_SEQ),
+        "//",
+    ]
+    return eol.join(lines) + eol
+
+
+class TestThirdPartyGenBankImport:
+    """Biopython reads the LOCUS line by column and recognises the start of the
+    feature table by exact match. A vendor file that breaks the first was
+    refused outright ("Did not recognise the LOCUS line layout"); one that
+    breaks the second loaded with every feature silently gone."""
+
+    def test_spaced_locus_name_loads(self, tmp_path):
+        p = tmp_path / "GeneX-demo.gb"
+        p.write_bytes(_vendor_gb().encode("ascii"))
+        rec = sc.load_genbank(str(p))
+        assert str(rec.seq) == _VENDOR_SEQ
+        assert rec.annotations["topology"] == "circular"
+        assert rec.annotations["date"] == "12-OCT-2026"
+        # No blank division conjured out of the absent field.
+        assert "data_file_division" not in rec.annotations
+        assert rec.description == _VENDOR_NAME
+        assert " " not in rec.name and " " not in rec.id
+
+    def test_odd_features_header_keeps_every_feature(self, tmp_path):
+        """The silent one: with a standard LOCUS line and only the FEATURES
+        header spaced differently, the record used to load with no features."""
+        good_locus = (f"LOCUS       pDemo{len(_VENDOR_SEQ):>23} bp    DNA     "
+                      "circular SYN 12-OCT-2026")
+        text = _vendor_gb(eol="\n").split("\n", 1)[1]
+        p = tmp_path / "pDemo.gb"
+        p.write_text(good_locus + "\n" + text)
+        rec = sc.load_genbank(str(p))
+        assert [(f.type, int(f.location.start), int(f.location.end))
+                for f in rec.features] == [("source", 0, 120),
+                                           ("misc_feature", 0, 60),
+                                           ("misc_feature", 60, 120)]
+        assert [f.qualifiers.get("label") for f in rec.features[1:]] == [
+            ["Insert"], ["vector_backbone-61-120"]]
+
+    def test_display_name_is_never_the_rewritten_locus(self, tmp_path):
+        """[INV-98] The rewritten LOCUS is the underscored, truncated form. A
+        filename that carries the name wins, as for any GenBank file; with a
+        plain one, the name is the one the file SPELLED, never the token."""
+        hyphen = tmp_path / "GeneX-demo.gb"
+        hyphen.write_bytes(_vendor_gb().encode("ascii"))
+        assert sc.load_genbank(str(hyphen))._tui_display_name == "GeneX-demo"
+        plain = tmp_path / "genex.gb"
+        plain.write_bytes(_vendor_gb().encode("ascii"))
+        rec = sc.load_genbank(str(plain))
+        assert rec._tui_display_name == _VENDOR_NAME
+        # …and the name survives the library round-trip.
+        back = sc._gb_text_to_record(sc._record_to_gb_text(rec), cache=False)
+        assert back._tui_display_name == _VENDOR_NAME
+
+    def test_appended_underscore_feature_keys_are_restored(self, tmp_path):
+        p = tmp_path / "GeneX-demo.gb"
+        p.write_bytes(_vendor_gb().encode("ascii"))
+        assert [f.type for f in sc.load_genbank(str(p)).features] == [
+            "source", "misc_feature", "misc_feature"]
+
+    def test_feature_key_repair_only_touches_known_keys(self):
+        rec = SeqRecord(Seq("A" * 30), id="x")
+        rec.features = [SeqFeature(FeatureLocation(0, 10, strand=1), type=t)
+                        for t in ("CDS__", "my_custom_", "_", "promoter")]
+        assert sc._repair_feature_key_artifacts(rec) == 1
+        assert [f.type for f in rec.features] == [
+            "CDS", "my_custom_", "_", "promoter"]
+
+    def test_export_of_a_repaired_import_is_spec_clean(self, tmp_path):
+        p = tmp_path / "genex.gb"
+        p.write_bytes(_vendor_gb().encode("ascii"))
+        out = tmp_path / "out.gb"
+        sc._export_genbank_to_path(sc.load_genbank(str(p)), out)
+        assert _gb_problems(out.read_text()) == []
+
+    def test_text_path_reads_the_vendor_layout(self):
+        """Agent callers hand GenBank TEXT to `_gb_text_to_record`; same two
+        failures, same repair. Feature keys are left as given on this path —
+        it is also how every library entry loads, and those types are the
+        user's own."""
+        rec = sc._gb_text_to_record(_vendor_gb(), cache=False)
+        assert str(rec.seq) == _VENDOR_SEQ
+        assert rec._tui_display_name == _VENDOR_NAME
+        assert len(rec.features) == 3
+
+    def test_multi_record_file_names_each_record(self, tmp_path):
+        p = tmp_path / "order.gb"
+        p.write_bytes((_vendor_gb() + _vendor_gb("GeneY in pShuttle Kan"))
+                      .encode("ascii"))
+        recs = sc._parse_genbank_file_records(str(p))
+        assert [r._tui_display_name for r in recs] == [
+            _VENDOR_NAME, "GeneY in pShuttle Kan"]
+        assert all([f.type for f in r.features] ==
+                   ["source", "misc_feature", "misc_feature"] for r in recs)
+
+    def test_library_text_is_returned_untouched(self, plasmid):
+        text = sc._record_to_gb_text(plasmid)
+        assert sc._repair_genbank_text(text) == (text, [None])
+        assert sc._repair_genbank_text(text)[0] is text
+
+    def test_length_is_the_last_number_before_a_unit(self):
+        """A name may say "500 bp"; the fields after the unit never do."""
+        line, name = sc._canonical_locus_line(
+            "LOCUS       pX 500 bp stuffer 3000 bp ds-dna Circular syn "
+            "1-jan-2020 trailing-junk")
+        assert name == "pX 500 bp stuffer"
+        from io import StringIO
+        from Bio import SeqIO
+        rec = SeqIO.read(StringIO(line + "\nORIGIN\n//\n"), "genbank")
+        assert rec.name == "pX_500_bp_stuffer"
+        assert rec.annotations["molecule_type"] == "ds-DNA"
+        assert rec.annotations["topology"] == "circular"
+        assert rec.annotations["date"] == "01-JAN-2020"
+        assert rec.annotations["data_file_division"] == "SYN"
+
+    def test_long_name_is_cut_to_the_column_layout(self):
+        line, name = sc._canonical_locus_line(
+            "LOCUS       a very long construct name that will not fit "
+            "123456 bp DNA linear")
+        assert len(line) == 79 and line[40:44] == " bp "
+        assert name.startswith("a very long construct")
+        assert line[12:40].split()[1] == "123456"
+
+    @pytest.mark.parametrize("line", [
+        "LOCUS       pUC19     2686 bp    DNA     circular SYN 27-OCT-2024",
+        "LOCUS       pX 3206 bp DNA circular 12-OCT-2026",
+        "LOCUS       a b ³ bp DNA",               # a digit int() rejects
+        "LOCUS       no length here",
+        "LOCUSTAG    x 10 bp DNA",
+    ])
+    def test_lines_left_to_biopython(self, line):
+        assert sc._canonical_locus_line(line) is None
+
+    def test_unpadded_keyword_is_found_again(self):
+        """`LOCUS pX …` with one space is not a record start to Biopython at
+        all — the file read as empty."""
+        from io import StringIO
+        from Bio import SeqIO
+        text, names = sc._repair_genbank_text(
+            "LOCUS pX 10 bp DNA linear\nORIGIN\n        1 acgtacgtac\n//\n")
+        assert names == ["pX"]
+        assert SeqIO.read(StringIO(text), "genbank").name == "pX"
+
+    def test_crlf_lines_keep_their_carriage_return(self):
+        text, _ = sc._repair_genbank_text(_vendor_gb())
+        assert text.count("\r\n") == _vendor_gb().count("\r\n")
+        assert "\nFEATURES             Location/Qualifiers\r\n" in text
 
 
 # ── EMBL ──────────────────────────────────────────────────────────────────────

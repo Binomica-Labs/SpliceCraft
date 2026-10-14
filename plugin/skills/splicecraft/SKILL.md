@@ -170,7 +170,7 @@ the same payload and saves:
 
 Some *write* endpoints are also dry-run by default and need `{"apply": true}`:
 `transfer-annotations`, `annotate-from-presets`, `apply-gff3`,
-`recover-history-from-dna`. (`commit`/`write`/`persist` are rejected 400 rather
+`recover-history-from-dna`, `recover-qualifiers-from-dna`. (`commit`/`write`/`persist` are rejected 400 rather
 than silently previewing.) Check the `applied` field — reporting a preview as a
 completed action is a real failure mode.
 

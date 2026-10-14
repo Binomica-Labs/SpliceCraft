@@ -1324,12 +1324,18 @@ def _check_private_tokens() -> None:
         print("  .private-names has no patterns — gate is a no-op. Continuing.")
         return
     try:
-        tracked = subprocess.run(
-            ["git", "ls-files"], cwd=REPO_ROOT,
+        # Tracked AND untracked-but-not-ignored: the release commit is a
+        # `git add -A`, so a brand-new file ships too — and a gate that read
+        # only `git ls-files` never saw one (a release that added six new
+        # modules and tests scanned none of them). `-z`, because a name with a
+        # space in it split into pieces that were then silently skipped.
+        tracked = [rel for rel in subprocess.run(
+            ["git", "ls-files", "-z", "--cached", "--others",
+             "--exclude-standard"], cwd=REPO_ROOT,
             capture_output=True, text=True, check=True,
-        ).stdout.split()
+        ).stdout.split("\0") if rel]
     except Exception as exc:                       # noqa: BLE001 — best-effort
-        _die(f"private-name gate: couldn't list tracked files ({exc}).")
+        _die(f"private-name gate: couldn't list the files to ship ({exc}).")
     skip_suffixes = {
         ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".zip", ".gz",
         ".whl", ".pyc", ".pdf", ".woff", ".woff2",
@@ -1351,14 +1357,15 @@ def _check_private_tokens() -> None:
         more = (f"\n    … and {len(hits) - 40} more"
                 if len(hits) > 40 else "")
         _die(
-            "confidential client name(s) found in tracked files — `origin` is "
+            "confidential client name(s) found in files the release would "
+            "ship — `origin` is "
             "PUBLIC, so releasing would leak them. Replace each with a generic "
             "standin (e.g. promoter `Pdemo`, CDS `GeneX`, plasmid `Demo NN`), "
             "or — if a name is genuinely public now — drop its pattern from "
             ".private-names:\n" + shown + more
         )
     print(f"  Clean — none of the {len(patterns)} confidential pattern(s) "
-          "appear in tracked files.")
+          f"appear in the {len(tracked)} files the release would ship.")
 
 
 # Generic vocabulary that legitimately appears BOTH in plasmid names and in
@@ -1484,10 +1491,10 @@ def _check_library_name_leaks() -> None:
     # whole and splice it into the same stream as `+` lines.
     extra: list[str] = []
     try:
-        untracked = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard"],
+        untracked = [rel for rel in subprocess.run(
+            ["git", "ls-files", "-z", "--others", "--exclude-standard"],
             cwd=REPO_ROOT, capture_output=True, text=True, check=True,
-        ).stdout.split()
+        ).stdout.split("\0") if rel]
     except Exception:                              # noqa: BLE001 — best-effort
         untracked = []
     for rel in untracked:

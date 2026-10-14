@@ -4,9 +4,9 @@ The hub's record serialization core, extracted so the modal/screen siblings that
 parse/serialise records can import it instead of calling it bare on the hub. This
 is MISSION-CRITICAL (INV-98: the GenBank LOCUS must never carry the human/display
 name; the .dna + library round-trips depend on byte-faithful parse/serialise), so
-it moved as one self-contained unit with its own LRU parse cache. Biopython is
-imported lazily inside the two entry points (the writer subclass and
-`SeqIO.read`) exactly as in the hub. The SpliceCraft version stamped into the GenBank COMMENT is read from
+it moved as one self-contained unit with its own LRU parse cache. Reading is
+SpliceCraft's own (`splicecraft_insdc`, [INV-219]); Biopython is imported
+lazily for the writer subclass. The SpliceCraft version stamped into the GenBank COMMENT is read from
 `_state._sc_version` (the hub sets it from `__version__`, which must stay in
 splicecraft.py for release.py's bump regex). Re-exported by the hub so `sc.<name>`
 + every existing call site resolves unchanged.
@@ -19,9 +19,10 @@ from collections import OrderedDict as _OD
 from copy import copy as _shallow_copy
 from io import StringIO
 
+import splicecraft_insdc as _insdc
 import splicecraft_state as _state
 from splicecraft_logging import _log
-from splicecraft_util import _locus_topology
+from splicecraft_util import _DEFAULT_TYPE_COLORS, _locus_topology, _sanitize_label
 
 
 _SC_STRAND_QUAL = "SpliceCraft_strand"
@@ -475,6 +476,198 @@ def _backfill_topology(rec, gb_text: str) -> None:
         anns["topology"] = topo
 
 
+# ── Third-party GenBank layouts Biopython cannot read ───────────────────────
+# Biopython finds the LOCUS fields by COLUMN and the start of the feature table
+# by EXACT MATCH. Real files from other tools break both, and in two different
+# ways:
+#
+# * A LOCUS NAME with spaces in it: a gene-synthesis vendor that writes the
+#   construct's full title ("<insert> in <vector>") where the one-token name
+#   belongs, or an editor that writes a spaced file name. None of Biopython's
+#   fallback layouts accept it, so the WHOLE FILE was refused with "Did not
+#   recognise the LOCUS line layout".
+# * A `FEATURES` header with a different amount of space before
+#   `Location/Qualifiers`. Biopython does not see the feature table start at
+#   all, reads every feature line as header text, and returns the record with
+#   NO FEATURES and no warning. That one is silent.
+#
+# `_repair_genbank_text` rewrites exactly those lines into the standard layout
+# before the parse and leaves every other byte alone; text that needs nothing
+# is returned as the same object, so a well-formed file (and every library
+# entry, which SpliceCraft wrote itself) parses exactly as it always did.
+_LOCUS_UNITS = ("bp", "aa", "rc")
+_LOCUS_TOPOLOGIES = ("linear", "circular")
+# Molecule type: `DNA`, `mRNA`, `snRNA`, `ds-DNA`, … — the column holds 7.
+_LOCUS_MOL_RE = re.compile(r"(?:[sdm]s-)?[a-z]{0,4}(?:dna|rna)", re.IGNORECASE)
+_LOCUS_DIVISION_RE = re.compile(r"[A-Za-z]{3}")
+_LOCUS_DATE_RE = re.compile(r"(\d{1,2})-([A-Za-z]{3})-(\d{4})")
+_GB_LOCUS_KEYWORD = "LOCUS       "
+_GB_FEATURES_HEADER = "FEATURES             Location/Qualifiers"
+_GB_FEATURES_HEADER_RE = re.compile(r"FEATURES\s+Location/Qualifiers\s*",
+                                    re.IGNORECASE)
+
+
+def _canonical_locus_line(line: str) -> "tuple[str, str] | None":
+    """``(new_line, name)`` for a LOCUS line Biopython cannot read because its
+    NAME holds whitespace (or because the keyword is not padded out to column
+    13, which hides the record from the parser altogether): `new_line` is the
+    standard 79-column layout, `name` the name exactly as the file spelled it
+    (whitespace runs collapsed). None when the line needs no repair or cannot
+    be read with confidence — Biopython then reports it as before.
+
+    The length is the LAST ``<digits> <unit>`` pair on the line: a name may say
+    "500 bp", the fields after the unit never do. Those fields are placed by
+    what they ARE rather than where they sit, and a token that is none of them
+    is dropped (logged) rather than guessed into a column. The name in the
+    rewritten line is the LOCUS-safe form, cut to what the 28-column
+    name+length field holds — the caller keeps the full spelling as the
+    display name."""
+    toks = line.split()
+    if len(toks) < 4 or toks[0] != "LOCUS":
+        return None
+    unit_i = next((i for i in range(len(toks) - 1, 2, -1)
+                   if toks[i].lower() in _LOCUS_UNITS
+                   and toks[i - 1].isascii() and toks[i - 1].isdigit()), None)
+    if unit_i is None:
+        return None
+    if unit_i == 3 and line.startswith(_GB_LOCUS_KEYWORD):
+        return None  # a one-token name: Biopython's own layouts cover it
+    name = " ".join(toks[1:unit_i - 1])
+    size = toks[unit_i - 1]
+    mol = topo = div = date = ""
+    dropped = []
+    for t in toks[unit_i + 1:]:
+        if t.lower() in _LOCUS_TOPOLOGIES and not topo:
+            topo = t.lower()
+        elif not mol and len(t) <= 7 and _LOCUS_MOL_RE.fullmatch(t):
+            # Biopython warns on a lower-case `dna` and the writer then refuses
+            # it; the prefix (`m` of mRNA, `ds-`) keeps its case.
+            mol = t[:-3] + t[-3:].upper()
+        elif (not div and _LOCUS_DIVISION_RE.fullmatch(t)
+              and not _LOCUS_MOL_RE.fullmatch(t)):
+            div = t.upper()
+        elif not date and (m := _LOCUS_DATE_RE.fullmatch(t)):
+            date = f"{int(m.group(1)):02d}-{m.group(2).upper()}-{m.group(3)}"
+        else:
+            dropped.append(t)
+    token = (_LOCUS_BAD_CHARS_RE.sub("_", name)[:_locus_name_cap(int(size))]
+             .rstrip("_") or "PLASMID")
+    if len(token) + 1 + len(size) > _GB_LOCUS_NAME_FIELD:
+        return None  # a length no column layout holds; leave it to the parser
+    if dropped:
+        _log.warning("GenBank LOCUS line repaired: dropped unrecognised "
+                     "field(s) %s", " ".join(dropped)[:200])
+    name_and_length = token + size.rjust(_GB_LOCUS_NAME_FIELD)[len(token):]
+    new_line = (f"{_GB_LOCUS_KEYWORD}{name_and_length} {toks[unit_i].lower()}"
+                f"    {mol:<7} {topo:<8} {div:<3} {date}")
+    return new_line.ljust(79), name
+
+
+def _repair_genbank_text(text: str) -> "tuple[str, list[str | None]]":
+    """Rewrite the LOCUS and FEATURES lines of GenBank `text` that Biopython
+    cannot read (see the block comment above) into the standard layout.
+
+    Returns ``(text, locus_names)``. `locus_names` has one entry per record, in
+    file order — the name the file gave a record whose LOCUS line was
+    rewritten, else None — for `_apply_locus_repair` to finish each parsed
+    record with. Text needing no repair comes back as the same object.
+
+    Only line STARTS are inspected (`str.find`, not a split): one pass over the
+    text for LOCUS lines, and each record's FEATURES header is looked for only
+    between its LOCUS line and its `ORIGIN`, never across the bases."""
+    names: "list[str | None]" = []
+    if not isinstance(text, str) or not text:
+        return text, names
+    if text[:1] == "\ufeff" or ("\r" in text and "\n" not in text):
+        # A BOM, or CR-only line ends (text handed in directly; the file
+        # loaders decode both away). Normalised first: with no `\n` in it the
+        # whole text was ONE line, its LOCUS line the entire record, and a
+        # note saying "500 bp" made the rewrite below replace the record with
+        # a single LOCUS line. CRLF text keeps its line ends (each line's
+        # `\r` is handled below).
+        text = _insdc._normalise(text)
+    # `find("LOCUS")` + a look-behind, not `find("\nLOCUS")`: a needle that
+    # starts with the commonest character in the text is ~5x slower (measured,
+    # 8.3 vs 1.7 ms on a 6.7 MB record).
+    starts = []
+    i = text.find("LOCUS")
+    while i >= 0:
+        if i == 0 or text[i - 1] == "\n":
+            starts.append(i)
+        i = text.find("LOCUS", i + 5)
+
+    def _line(pos: int) -> "tuple[int, str, str]":
+        end = text.find("\n", pos)
+        end = len(text) if end < 0 else end
+        line = text[pos:end]
+        cr = "\r" if line.endswith("\r") else ""
+        return end, line[:len(line) - len(cr)], cr
+
+    edits = []  # (start, end, replacement), in file order
+    for k, pos in enumerate(starts):
+        end, body, cr = _line(pos)
+        fixed = _canonical_locus_line(body)
+        if fixed is not None:
+            edits.append((pos, end, fixed[0] + cr))
+            names.append(fixed[1])
+        elif body.startswith(_GB_LOCUS_KEYWORD):
+            names.append(None)
+        limit = starts[k + 1] if k + 1 < len(starts) else len(text)
+        origin = text.find("\nORIGIN", end, limit)
+        feat = text.find("\nFEATURES", end, origin if origin >= 0 else limit)
+        if feat >= 0:
+            fend, fbody, fcr = _line(feat + 1)
+            if (fbody.rstrip() not in (_GB_FEATURES_HEADER, "FEATURES")
+                    and _GB_FEATURES_HEADER_RE.fullmatch(fbody)):
+                edits.append((feat + 1, fend, _GB_FEATURES_HEADER + fcr))
+    if not edits:
+        return text, names
+    out, last = [], 0
+    for start, end, repl in edits:
+        out.append(text[last:start])
+        out.append(repl)
+        last = end
+    out.append(text[last:])
+    return "".join(out), names
+
+
+def _apply_locus_repair(rec, name: "str | None") -> None:
+    """Finish one record parsed from `_repair_genbank_text` output; no-op when
+    its LOCUS line was not rewritten (`name` None).
+
+    Stamps the name as the file spelled it as the display name — unless the
+    caller already holds a better one (the SpliceCraft COMMENT marker, a
+    filename), which is why each caller runs this AFTER its own name sources
+    [INV-98: the rewritten LOCUS is the underscored, truncated form and must
+    not become what the user sees]. Also drops the blank division Biopython
+    records when the original line carried a date but no division."""
+    if not name:
+        return
+    anns = getattr(rec, "annotations", None)
+    if isinstance(anns, dict) and not str(anns.get("data_file_division", "x")).strip():
+        anns.pop("data_file_division", None)
+    if name != getattr(rec, "name", None) and not getattr(rec, "_tui_display_name", None):
+        label = _sanitize_label(name, max_len=200)
+        if label:
+            rec._tui_display_name = label
+
+
+def _repair_feature_key_artifacts(rec) -> int:
+    """In place: give back a feature its INSDC key when an exporter appended
+    underscores to it (`misc_feature_`). Only a key whose underscore-free form
+    is one SpliceCraft knows is touched — no INSDC key ends in `_`, so the
+    trailing ones are the exporter's, not the user's. Returns how many changed.
+
+    Run on FILE imports only: a library entry's types are the user's own."""
+    n = 0
+    for f in getattr(rec, "features", None) or ():
+        t = getattr(f, "type", None)
+        if isinstance(t, str) and t.endswith("_") and t.rstrip("_") in _DEFAULT_TYPE_COLORS:
+            f.type = t.rstrip("_")
+            n += 1
+    return n
+
+
 def _record_to_gb_text(record) -> str:
     """Serialize a SeqRecord to GenBank format text.
 
@@ -609,6 +802,16 @@ _HARD_BREAKABLE_QUALS: frozenset = frozenset({"translation", "primer_seq"})
 # Back-compat alias for the name this set shipped under.
 _NO_SPACE_REJOIN_QUALS = _HARD_BREAKABLE_QUALS
 
+# The INSDC qualifiers that take NO value — the feature table's "Value format:
+# none". Readers hold one as `['']`; the flat file spells it `/pseudo`, with no
+# `=`. Biopython's writer quotes the empty string instead (`/pseudo=""`), which
+# its own reader takes back but which is not how the format writes a flag.
+_INSDC_FLAG_QUALIFIERS: frozenset = frozenset({
+    "circular_RNA", "environmental_sample", "focus", "germline",
+    "macronuclear", "proviral", "pseudo", "rearranged", "ribosomal_slippage",
+    "trans_splicing", "transgenic",
+})
+
 # HEADER tags BioPython writes with `_write_single_line` — no wrapping, just a
 # `BiopythonWarning` — even when the value is kilobytes long. `DBSOURCE` is the
 # one that actually carries such a value: every protein record NCBI serves puts
@@ -688,6 +891,9 @@ def _unbreakable_insdc_writer(handle, fmt: str = "genbank"):
             return super()._write_single_line(tag, text)
 
         def _write_feature_qualifier(self, key, value=None, quote=None):
+            if value == "" and key in _INSDC_FLAG_QUALIFIERS:
+                # A flag in its INSDC spelling: `/pseudo`, no `=`.
+                return super()._write_feature_qualifier(key, None, quote)
             if value is None or not isinstance(value, str):
                 return super()._write_feature_qualifier(key, value, quote)
             if key in _HARD_BREAKABLE_QUALS:
@@ -848,8 +1054,12 @@ def _gb_text_to_record(text: str, *, cache: bool = True):
             if hit is not None:
                 _GB_PARSE_CACHE.move_to_end(key)
                 return _clone_cached_record(hit)
-    from Bio import SeqIO
-    rec = SeqIO.read(StringIO(text), "genbank")
+    # A no-op (same object back) for anything SpliceCraft wrote; reaches the
+    # third-party text agent callers hand in.
+    parse_text, locus_names = _repair_genbank_text(text)
+    # SpliceCraft's own reader [INV-219] — the record Biopython's would give
+    # for any file it reads right, and a sane one where it would not.
+    rec = _insdc.read_genbank(parse_text)
     if not getattr(rec.seq, "defined", True):
         # A CONTIG / scaffold record: a length and no bases. Loading it
         # crashed the first reader of the sequence (the launch auto-load
@@ -857,12 +1067,14 @@ def _gb_text_to_record(text: str, *, cache: bool = True):
         raise ValueError(
             "this GenBank record has no sequence of its own — it is a CONTIG "
             "/ scaffold record that refers to other entries")
-    _backfill_topology(rec, text)
+    _backfill_topology(rec, parse_text)
     # SC-E: restore the human display name stamped into the COMMENT so it
     # survives the round-trip (the LOCUS is the underscored/truncated form).
     # Done before caching so every caller — load-entry, add-current, diff —
     # sees the real name without a manual rename.
     _restore_display_name_from_comment(rec)
+    # After the marker, which outranks the name a rewritten LOCUS line held.
+    _apply_locus_repair(rec, locus_names[0] if len(locus_names) == 1 else None)
     # Restore arrowless (strand 0) features tagged on the write side before
     # the result is cached, so every caller sees a faithful + clean record.
     _arrowless_decode_features(rec)

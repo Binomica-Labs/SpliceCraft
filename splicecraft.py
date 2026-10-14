@@ -43,13 +43,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.3.8"
+__version__ = "1.3.9"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-10-09"
+_RELEASE_DATE = "2026-10-13"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -6508,6 +6508,7 @@ from splicecraft_fileio import (  # noqa: E402
     _BIOPYTHON_DNA_FMT as _BIOPYTHON_DNA_FMT,
     _DNA_AUGMENT_MAX_BYTES as _DNA_AUGMENT_MAX_BYTES,
     _detect_plasmid_format as _detect_plasmid_format,
+    _parse_genbank_file_records as _parse_genbank_file_records,
     load_genbank as load_genbank,
     # ── NCBI Entrez fetch (finish-fileio) ──
     _NCBI_GB_MAX_RESPONSE_BYTES as _NCBI_GB_MAX_RESPONSE_BYTES,
@@ -10000,6 +10001,7 @@ from splicecraft_util import (  # noqa: E402
     _p3_tm as _p3_tm,
     _p3_thermo as _p3_thermo,
     _pick_single_record as _pick_single_record,
+    _MultipleRecordsError as _MultipleRecordsError,
 )
 
 
@@ -10247,7 +10249,8 @@ _BULK_IMPORT_MAX_NAME_LEN = 256
 
 
 def _record_to_library_entry(record, source_path: Path, *,
-                                 history_xml: "str | None" = None) -> dict:
+                                 history_xml: "str | None" = None,
+                                 name: "str | None" = None) -> dict:
     """Build a plasmid_library.json entry dict from a SeqRecord.
 
     Display name uses the original filename stem (spaces preserved); the
@@ -10255,6 +10258,11 @@ def _record_to_library_entry(record, source_path: Path, *,
     file named "FFE 1 ENTRY UPD.dna" shows up in the panel as
     "FFE 1 ENTRY UPD" (truncated to 14 chars by the panel) rather than
     the underscored LOCUS form.
+
+    ``name`` overrides the stem, for a file that holds MORE than one record:
+    the stem names the file, not each record in it, and every entry of a
+    multi-record import used to come out under the same name. Those callers
+    pass `_multi_record_entry_names`.
 
     Display name is capped at `_BULK_IMPORT_MAX_NAME_LEN` and stripped of
     control characters so a hostile filename can't blow up the panel
@@ -10267,7 +10275,8 @@ def _record_to_library_entry(record, source_path: Path, *,
     XML here too. Unattached entries (the common case for plain
     GenBank imports) just omit the field.
     """
-    raw_name = source_path.stem or record.name or record.id or "plasmid"
+    raw_name = (name or source_path.stem or record.name or record.id
+                or "plasmid")
     # Strip control chars (newline, tab, carriage return, NUL). Replace
     # with underscore so the name stays readable.
     cleaned = "".join(c if c.isprintable() else "_" for c in raw_name)
@@ -10284,6 +10293,35 @@ def _record_to_library_entry(record, source_path: Path, *,
     if history_xml:
         entry["history_xml"] = history_xml
     return entry
+
+
+def _multi_record_entry_names(records: list, source_path: Path) -> "list[str]":
+    """One library name per record of a file that holds several: the name
+    the record carries itself — a display name its reader stamped (the
+    SpliceCraft COMMENT marker, a spaced LOCUS name, a FASTA id before
+    de-duplication), else its LOCUS name, else its id — and the file stem
+    plus a position only when it carries none. A repeated name gets " (2)",
+    " (3)", …: a space-and-number, never the `_2` the entry ids use [INV-98].
+    """
+    names: "list[str]" = []
+    taken: "set[str]" = set()
+    stem = source_path.stem or "record"
+    for i, rec in enumerate(records):
+        raw = ""
+        for cand in (getattr(rec, "_tui_display_name", None),
+                     getattr(rec, "name", None), getattr(rec, "id", None)):
+            cand = _sanitize_label(cand, max_len=_BULK_IMPORT_MAX_NAME_LEN)
+            if cand and not cand.startswith("<unknown"):
+                raw = cand
+                break
+        base = raw or f"{stem} {i + 1}"
+        out, n = base, 1
+        while out.casefold() in taken:
+            n += 1
+            out = f"{base} ({n})"
+        taken.add(out.casefold())
+        names.append(out)
+    return names
 
 
 def _try_extract_history_xml_from_dna_path(path: Path) -> "str | None":
@@ -11188,13 +11226,19 @@ def _bulk_import_folder(
                     records_to_emit = fastq_records
                 else:
                     records_to_emit = [rec]
+                # Several reads in one file: each is named for itself, not
+                # all for the file.
+                sub_names = (_multi_record_entry_names(records_to_emit, path)
+                             if len(records_to_emit) > 1
+                             else [None] * len(records_to_emit))
                 primary_entry_id: "str | None" = None
-                for sub_rec in records_to_emit:
+                for sub_rec, sub_name in zip(records_to_emit, sub_names):
                     if _seq_len(sub_rec) == 0:
                         continue
                     entry = _record_to_library_entry(
                         sub_rec, path,
                         history_xml=history_xml if sub_rec is rec else None,
+                        name=sub_name,
                     )
                     base_id = entry["id"]
                     n = 1
@@ -11304,6 +11348,10 @@ from splicecraft_record import (  # noqa: E402
     _HARD_BREAKABLE_QUALS as _HARD_BREAKABLE_QUALS,
     _NO_SPACE_REJOIN_QUALS as _NO_SPACE_REJOIN_QUALS,
     _backfill_topology as _backfill_topology,
+    _canonical_locus_line as _canonical_locus_line,
+    _repair_genbank_text as _repair_genbank_text,
+    _apply_locus_repair as _apply_locus_repair,
+    _repair_feature_key_artifacts as _repair_feature_key_artifacts,
     _normalize_primer_seq as _normalize_primer_seq,
     _arrowless_encode_features as _arrowless_encode_features,
     _arrowless_decode_features as _arrowless_decode_features,
@@ -17538,8 +17586,6 @@ def _bulk_export_collection(collection_name: str,
     them.
     """
     from pathlib import Path as _P
-    from Bio import SeqIO as _SeqIO
-    from io import StringIO as _SIO
     if fmt not in _BULK_EXPORT_FORMATS:
         raise ValueError(
             f"unknown export format {fmt!r}; "
@@ -17609,9 +17655,10 @@ def _bulk_export_collection(collection_name: str,
                 gb_text = entry.get("gb_text") or ""
                 if not gb_text:
                     raise ValueError("entry has no gb_text payload")
-                rec = next(_SeqIO.parse(_SIO(gb_text), "genbank"), None)
-                if rec is None:
-                    raise ValueError("entry gb_text could not be parsed")
+                # Through the library's own reader, so the record is the one
+                # the canvas shows: arrowless features arrowless, the display
+                # name restored.
+                rec = _gb_text_to_record(gb_text, cache=False)
                 if fmt == "embl":
                     summary = _export_embl_to_path(rec, str(out_path))
                     bp = summary.get("bp", 0)
@@ -17679,8 +17726,6 @@ def _bulk_export_map_images(entries: "list[dict]", target_dir: "Path | str",
     `render_opts` (size / transparent / show_labels / show_sites) pass
     straight through to `_mapimage.export_plasmid_map`."""
     from pathlib import Path as _P
-    from Bio import SeqIO as _SeqIO
-    from io import StringIO as _SIO
     fmt = (fmt or "png").lower()
     if fmt not in ("png", "svg"):
         raise ValueError(f"map-image bulk export needs png/svg, got {fmt!r}")
@@ -17704,9 +17749,7 @@ def _bulk_export_map_images(entries: "list[dict]", target_dir: "Path | str",
             gb_text = entry.get("gb_text") or ""
             if not gb_text:
                 raise ValueError("entry has no gb_text payload")
-            rec = next(_SeqIO.parse(_SIO(gb_text), "genbank"), None)
-            if rec is None:
-                raise ValueError("entry gb_text could not be parsed")
+            rec = _gb_text_to_record(gb_text, cache=False)
             summary = _mapimage.export_plasmid_map(
                 str(out_path), record=rec, fmt=fmt,
                 title=(ent_name or rec.name or "plasmid"), **render_opts,
@@ -30555,22 +30598,26 @@ class OpenFileModal(ModalScreen):
                 # name and import all of them; if single, fall through
                 # to the existing single-record path (which preserves
                 # display-name + .dna augmentations).
-                from Bio import SeqIO as _SeqIO
                 from pathlib import Path as _Path
                 ok, reason = _safe_file_size_check(
                     _Path(path), _GB_INGEST_MAX_BYTES, "Plasmid",
                 )
                 if not ok:
                     raise ValueError(reason or "Plasmid file is unsafe to load")
+                # One parse for the common single-record file: load it,
+                # and only a file that turns out to hold several records
+                # is parsed again, as records. (Counting the records first
+                # parsed EVERY file twice — File > Open read GenBank at
+                # half the parser's speed.)
                 try:
-                    from io import StringIO as _SIO
-                    gb_records = list(_SeqIO.parse(
-                        _SIO(_read_text_tolerant(_Path(path))), "genbank"))
-                except (OSError, ValueError) as exc:
-                    raise ValueError(
-                        f"Could not parse GenBank file {path}: {exc}"
-                    ) from exc
-                if len(gb_records) > 1:
+                    record = load_genbank(path)
+                except _MultipleRecordsError:
+                    try:
+                        gb_records = _parse_genbank_file_records(path)
+                    except (OSError, ValueError) as exc:
+                        raise ValueError(
+                            f"Could not parse GenBank file {path}: {exc}"
+                        ) from exc
                     # Hand off to the UI thread for the name picker;
                     # mirrors the FASTA flow exactly.
                     self.app.call_from_thread(
@@ -30578,7 +30625,6 @@ class OpenFileModal(ModalScreen):
                         path, gb_records,
                     )
                     return
-                record = load_genbank(path)
             else:
                 record = load_genbank(path)
         except Exception as exc:
@@ -63440,6 +63486,10 @@ def _fasta_records_to_seqrecords(parsed_records, file_path: str) -> list:
         )
         new_rec.annotations["molecule_type"] = "DNA"
         new_rec.annotations["topology"]      = topology
+        if str(rec.id or "").strip():
+            # The header's own id is the record's name; the `_2` above only
+            # keeps entry ids unique (`_multi_record_entry_names`).
+            new_rec._tui_display_name = str(rec.id).strip()  # type: ignore[attr-defined]
         out.append(new_rec)
     return out
 
@@ -63460,7 +63510,16 @@ def _genbank_records_to_seqrecords(parsed_records: list,
     valid_chars = set("ACGTURYMKSWBDHVN-X*")
     file_name = Path(file_path).name
     for i, rec in enumerate(parsed_records):
-        seq = str(getattr(rec, "seq", "") or "").upper()
+        try:
+            seq = str(getattr(rec, "seq", "") or "").upper()
+        except ValueError:
+            # A CONTIG / scaffold record: a length and no bases. Reading them
+            # raised UndefinedSequenceError out of the import worker.
+            _log.warning(
+                "GenBank record %d (%r): no sequence of its own (CONTIG), "
+                "skipping", i, getattr(rec, "id", "?"),
+            )
+            continue
         if not seq:
             _log.warning(
                 "GenBank record %d (%r): empty sequence, skipping",
@@ -63502,7 +63561,9 @@ def _create_genbank_collection(name: str, records: list,
     if _collection_name_taken(name):
         raise ValueError(f"A collection named {name!r} already exists.")
     src_path = Path(file_path)
-    plasmids = [_record_to_library_entry(rec, src_path) for rec in records]
+    plasmids = [_record_to_library_entry(rec, src_path, name=nm)
+                for rec, nm in zip(records,
+                                   _multi_record_entry_names(records, src_path))]
     existing = _load_collections()
     existing.append({
         "name":        name,
@@ -63534,7 +63595,9 @@ def _create_fasta_collection(name: str, records: list, file_path: str) -> None:
     if _collection_name_taken(name):
         raise ValueError(f"A collection named {name!r} already exists.")
     src_path = Path(file_path)
-    plasmids = [_record_to_library_entry(rec, src_path) for rec in records]
+    plasmids = [_record_to_library_entry(rec, src_path, name=nm)
+                for rec, nm in zip(records,
+                                   _multi_record_entry_names(records, src_path))]
     # Append the empty-shell collection first; the active-collection
     # mirror in `_save_library` then fills its `plasmids` array.
     existing = _load_collections()
@@ -63713,7 +63776,11 @@ def _parse_protein_fasta_single(path: str) -> tuple[str, str]:
     except OSError as exc:
         raise ValueError(f"Could not read sequence file: {exc}") from exc
     try:
-        records = list(SeqIO.parse(_SIO(_txt), fmt))
+        if fmt == "genbank":
+            from splicecraft_insdc import parse_genbank as _parse_gb
+            records = _parse_gb(_txt)
+        else:
+            records = list(SeqIO.parse(_SIO(_txt), fmt))
     except (OSError, ValueError):
         records = []
     # A .pep / .seq / non-FASTA file is often really FASTA — retry once.
@@ -108981,6 +109048,315 @@ def _h_recover_history_from_dna(app, payload):
     return out
 
 
+# Qualifiers `recover-qualifiers-from-dna` never adds: they are not values the
+# old reader dropped but things the import itself derives or decorates.
+_QUAL_RECOVER_SKIP = frozenset({"label", "ApEinfo_fwdcolor", "ApEinfo_revcolor",
+                                _SC_STRAND_QUAL, "primer_seq"})
+
+
+def _dna_originals_by_sequence(wanted: "set[str]") -> "tuple[dict[str, list], str]":
+    """``({sequence: [path, …]}, note)`` — every saved `.dna` original whose
+    sequence is one of ``wanted``. Paths only (the qualifier recovery reads
+    each candidate itself), so the index costs nothing to hold. ``note`` is
+    "" for a complete scan, else why it stopped early."""
+    index: "dict[str, list]" = {}
+    note = ""
+    d = _state._DNA_ORIGINALS_DIR
+    try:
+        paths = sorted(p for p in d.glob("*.dna") if p.is_file())
+    except OSError as exc:
+        _log.warning("qualifier recovery: cannot list %s: %s", d, exc)
+        return index, f"could not read {d}: {_scrub_path(str(exc))}"
+    if len(paths) > _HISTORY_RECOVER_MAX_SIDECARS:
+        note = (f"only the first {_HISTORY_RECOVER_MAX_SIDECARS:,} of "
+                f"{len(paths):,} .dna files were scanned")
+        paths = paths[:_HISTORY_RECOVER_MAX_SIDECARS]
+    for p in paths:
+        try:
+            seq = _dna_sidecar_sequence(p.read_bytes())
+        except (OSError, ValueError) as exc:
+            _log.debug("qualifier recovery: skipping %s: %s", p.name, exc)
+            continue
+        if seq and seq in wanted:
+            index.setdefault(seq, []).append(p)
+    return index, note
+
+
+def _dna_dropped_qualifier_values(path) -> "list[tuple[str, tuple, dict]]":
+    """What the previous `.dna` reading of ``path`` dropped and today's
+    keeps: ``[(feature type, parts, {qualifier: values})]``, one row per
+    feature that gained anything. Both readings come from the same file in
+    the same order, so their features pair up one for one."""
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("ignore")
+        old = load_genbank(str(path), dna_reader_revision=1)
+        new = load_genbank(str(path))
+    if len(old.features) != len(new.features):
+        raise ValueError("the two readings disagree on the features")
+    rows = []
+    for fo, fn in zip(old.features, new.features):
+        if fo.type != fn.type:
+            raise ValueError("the two readings disagree on the features")
+        gained = {k: list(v) for k, v in (fn.qualifiers or {}).items()
+                  if k not in _QUAL_RECOVER_SKIP and v
+                  and not (fo.qualifiers or {}).get(k)}
+        if gained:
+            rows.append((fn.type, _feature_parts_key(fn), gained))
+    return rows
+
+
+def _feature_parts_key(feat) -> "tuple | None":
+    """A feature's parts as sorted ``(start, end)`` pairs — None when one
+    is not a plain position."""
+    loc = getattr(feat, "location", None)
+    if loc is None:
+        return None
+    try:
+        return tuple(sorted((int(p.start), int(p.end))
+                            for p in (getattr(loc, "parts", None) or [loc])))
+    except (TypeError, ValueError):
+        return None
+
+
+def _plan_qualifier_recovery(gb_text: str, rows) -> "tuple[str, dict] | None":
+    """The entry's GenBank text with the dropped values put back — onto the
+    feature of the same type at the same coordinates, and only where that
+    feature has no value of its own for the key — plus ``{qualifier: n}``.
+    None when nothing would change. Raises ValueError when the result would
+    differ from the entry in anything but the added values."""
+    rec = _gb_text_to_record(gb_text, cache=False)
+    by_key: "dict[tuple, list]" = {}
+    for f in rec.features:
+        k = (f.type, _feature_parts_key(f))
+        if k[1] is not None:
+            by_key.setdefault(k, []).append(f)
+    added: "dict[str, int]" = {}
+    for ftype, parts, gained in rows:
+        bucket = by_key.get((ftype, parts))
+        if not bucket:
+            continue
+        f = bucket.pop(0)
+        for k, vals in gained.items():
+            if f.qualifiers.get(k):
+                continue
+            f.qualifiers[k] = list(vals)
+            added[k] = added.get(k, 0) + 1
+    if not added:
+        return None
+    new_text = _record_to_gb_text(rec)
+    # Prove the result is the entry plus the added values, nothing else.
+    before = _gb_text_to_record(gb_text, cache=False)
+    after = _gb_text_to_record(new_text, cache=False)
+    if str(before.seq).upper() != str(after.seq).upper():
+        raise ValueError("the sequence would change")
+    if ((before.annotations or {}).get("topology")
+            != (after.annotations or {}).get("topology")
+            or getattr(before, "_tui_display_name", None)
+            != getattr(after, "_tui_display_name", None)):
+        raise ValueError("the topology or the name would change")
+    if len(before.features) != len(after.features):
+        raise ValueError("the feature count would change")
+    for fb, fa in zip(before.features, after.features):
+        if (fb.type != fa.type or str(fb.location) != str(fa.location)
+                or any(fa.qualifiers.get(k) != v
+                       for k, v in fb.qualifiers.items())):
+            raise ValueError("a feature would change beyond its added values")
+    return new_text, added
+
+
+@_agent_endpoint("recover-qualifiers-from-dna", write=True)
+def _h_recover_qualifiers_from_dna(app, payload):
+    """Put back the qualifier VALUES SpliceCraft's `.dna` import used to drop
+    — flags (`/pseudo`, `/ribosomal_slippage`, `/trans_splicing`, …), ranges
+    (`/rpt_unit_range`), dates (`/collection_date`) and empty values — for
+    plasmids imported before 1.3.9, from the `.dna` originals saved in the
+    data dir. Body: ``{apply?: bool, dry_run?: bool, collection?: str,
+    name?: str}``.
+
+    A plasmid is matched to its original by EXACT sequence, and each value
+    goes back onto the feature of the same type at the same coordinates —
+    only where that feature holds no value of its own for the key. Several
+    originals with the same sequence that would add different values make
+    the plasmid ambiguous: it is reported, never guessed. Every result is
+    proven before it is kept: same sequence, same features, every existing
+    value unchanged, the added ones on top.
+
+    A dry run by DEFAULT: the first call reports what WOULD change and
+    writes nothing. Pass ``{"apply": true}`` (or ``{"dry_run": false}``) to
+    apply; ``applied`` in the reply says whether anything was written. A
+    truthy ``commit`` / ``write`` / ``persist`` is refused (400) rather than
+    silently previewing. A plasmid open on the canvas keeps its in-memory
+    copy — reload it afterwards.
+
+    Cost note: reads each matching original twice (old and new reading), so
+    a library of genome-scale originals takes minutes. It's a repair."""
+    import hashlib as _hashlib
+    apply_in = payload.get("apply")
+    if apply_in is None and "dry_run" not in payload:
+        for _syn in ("commit", "write", "persist"):
+            if payload.get(_syn):
+                return ({"error":
+                          f"{_syn!r} is not a recognised switch — pass "
+                          '{"apply": true} to apply (default is a dry run)'},
+                        400)
+    if apply_in is not None:
+        do_apply = _coerce_bool(apply_in, name="apply")
+        if isinstance(do_apply, str):
+            return ({"error": do_apply}, 400)
+    else:
+        dry_in = payload.get("dry_run", True)
+        if not isinstance(dry_in, bool):
+            return ({"error": "'dry_run' must be a boolean"}, 400)
+        do_apply = not dry_in
+    dry_run = not do_apply
+    coll_filter = None
+    raw_coll = payload.get("collection")
+    if raw_coll not in (None, ""):
+        coll_filter = _normalize_collection_name(raw_coll)
+        if coll_filter is None:
+            return ({"error": "invalid 'collection'"}, 400)
+    name_filter = _sanitize_label(payload.get("name"), max_len=200) or None
+    ignored = _agent_ignored_keys(
+        payload, {"apply", "dry_run", "collection", "name"})
+
+    guard = _agent_dirty_guard(app, payload)
+    if guard is not None:
+        return guard
+
+    index, scan_note = _dna_originals_by_sequence(
+        _history_recover_wanted_seqs(coll_filter, name_filter))
+
+    # Phase 1, unlocked: work out every change. Reading the originals is the
+    # slow part, and the GUI must keep saving while it runs.
+    rows_cache: "dict[str, list | None]" = {}
+    plans: "list[dict]" = []
+    skipped: "list[dict]" = []
+    for c in _iter_collections_readonly():
+        cname = c.get("name") or ""
+        if coll_filter is not None and cname != coll_filter:
+            continue
+        for e in (c.get("plasmids") or []):
+            if not isinstance(e, dict):
+                continue
+            nm = str(e.get("name") or "")
+            if name_filter is not None and nm != name_filter:
+                continue
+            text = _rehydrate_entry(e).get("gb_text") or ""
+            cands = index.get(_gb_text_sequence(text)) if text else None
+            if not cands:
+                continue
+            results = []
+            for p in cands:
+                key = str(p)
+                if key not in rows_cache:
+                    try:
+                        rows_cache[key] = _dna_dropped_qualifier_values(p)
+                    except Exception as exc:
+                        _log.warning("qualifier recovery: cannot read %s: %s",
+                                     p.name, exc)
+                        rows_cache[key] = None
+                rows = rows_cache[key]
+                if not rows:
+                    continue
+                try:
+                    plan = _plan_qualifier_recovery(text, rows)
+                except Exception as exc:
+                    skipped.append({"collection": cname, "name": nm,
+                                    "reason": f"not provably safe: {exc}"})
+                    results = []
+                    break
+                if plan is not None:
+                    results.append((plan, p.name))
+            if not results:
+                continue
+            distinct = {r[0][0] for r in results}
+            if len(distinct) > 1:
+                skipped.append({
+                    "collection": cname, "name": nm,
+                    "reason": (f"{len(results)} originals with this sequence "
+                               f"would add different values")})
+                continue
+            (new_text, added), src = results[0]
+            plans.append({
+                "collection": cname, "id": e.get("id"), "name": nm,
+                "old_sha": _hashlib.sha256(text.encode()).hexdigest(),
+                "new_text": new_text, "added": added, "source": src})
+
+    # Phase 2, locked: apply each change to an entry that is still exactly
+    # what phase 1 read.
+    updated: "list[dict]" = []
+    if plans and not dry_run:
+        with _cache_lock:
+            colls = _load_collections()
+            before_counts = [len(c.get("plasmids") or []) for c in colls]
+            by_coll = {c.get("name") or "": c for c in colls}
+            for pl in plans:
+                c = by_coll.get(pl["collection"])
+                e = next((x for x in ((c.get("plasmids") or []) if c else [])
+                          if isinstance(x, dict) and x.get("id") == pl["id"]
+                          and str(x.get("name") or "") == pl["name"]), None)
+                cur = (_rehydrate_entry(e).get("gb_text") or "") if e else ""
+                if (e is None or _hashlib.sha256(cur.encode()).hexdigest()
+                        != pl["old_sha"]):
+                    skipped.append({"collection": pl["collection"],
+                                    "name": pl["name"],
+                                    "reason": "changed while the repair ran"})
+                    continue
+                e["gb_text"] = pl["new_text"]
+                e.pop(_GB_REF_KEY, None)
+                updated.append(pl)
+            if updated:
+                after_counts = [len(c.get("plasmids") or []) for c in colls]
+                if after_counts != before_counts:
+                    _log.error("qualifier recovery: entry counts changed "
+                               "(%r -> %r); refusing to save",
+                               before_counts, after_counts)
+                    return ({"error": "internal: entry count changed; "
+                                      "nothing was saved"}, 500)
+                if (err := _agent_save_or_500(
+                        lambda: _save_collections(colls),
+                        "collections")) is not None:
+                    return err
+                active = _get_active_collection_name()
+                if any(u["collection"] == active for u in updated):
+                    src = by_coll.get(active)
+                    if src is not None:
+                        _safe_save_json_mirror(
+                            _state._LIBRARY_FILE,
+                            [p for p in (src.get("plasmids") or [])
+                             if isinstance(p, dict)],
+                            "Plasmid library")
+                        _state._library_cache = None
+        if updated:
+            if app is not None and hasattr(app, "call_from_thread"):
+                app.call_from_thread(_agent_refresh_library_panel, app)
+            _log_event("qualifiers.recovered", count=len(updated),
+                       via="agent")
+    report = updated if not dry_run else plans
+    totals: "dict[str, int]" = {}
+    for pl in report:
+        for k, n in pl["added"].items():
+            totals[k] = totals.get(k, 0) + n
+    out = {
+        "ok": True,
+        "dry_run": dry_run,
+        "applied": bool(updated),
+        "originals_matched": sum(len(v) for v in index.values()),
+        "updated_count": len(report),
+        "updated": [{"collection": pl["collection"], "name": pl["name"],
+                     "added": pl["added"], "source": pl["source"]}
+                    for pl in report],
+        "added_total": totals,
+        "skipped": skipped,
+        "truncated": bool(scan_note),
+        "ignored": ignored,
+    }
+    if scan_note:
+        out["note"] = scan_note
+    return out
+
+
 def _agent_batch_plasmid_keys(payload):
     """Shared front-door for the batch move/copy endpoints: validate
     ``{names|ids: [str,…], to, from?}`` and resolve ``to`` / ``from``.
@@ -120062,6 +120438,14 @@ NcbiTaxonPickerModal { align: center middle; }
             return
         # Single-record path: same as before.
         self._import_and_persist(result)
+        # A GenBank file the reader had to leave a feature out of (or keep one
+        # across the origin of a molecule the file calls linear) says so here,
+        # not only in the log [INV-219].
+        from splicecraft_insdc import repair_note as _repair_note
+        note = _repair_note(result)
+        if note:
+            self.notify(f"Read with repairs: {note}", severity="warning",
+                        timeout=10)
 
     @_action_log("app.show_help")
     def action_show_help(self) -> None:

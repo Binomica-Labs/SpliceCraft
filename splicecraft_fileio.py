@@ -22,6 +22,7 @@ from copy import copy as _shallow_copy
 from datetime import date as _date
 from pathlib import Path
 
+import splicecraft_insdc as _insdc
 import splicecraft_state as _state
 from splicecraft_logging import _log, _log_event, _timed
 from splicecraft_persistence import (
@@ -37,11 +38,14 @@ from splicecraft_util import (
     _xml_legal_text,
 )
 from splicecraft_record import (
+    _apply_locus_repair,
     _arrowless_decode_features, _arrowless_encode_features,
-    _backfill_topology, _gb_text_to_record, _locus_name_cap, _locus_name_for,
+    _backfill_topology, _gb_text_to_record, _INSDC_FLAG_QUALIFIERS,
+    _locus_name_cap, _locus_name_for,
     _normalize_primer_seq,
     _SC_STRAND_QUAL,
-    _record_to_gb_text, _repair_wrapped_primer_seqs, _restore_display_name_from_comment,
+    _record_to_gb_text, _repair_feature_key_artifacts, _repair_genbank_text,
+    _repair_wrapped_primer_seqs, _restore_display_name_from_comment,
     _split_multiline_qualifiers,
 )
 from splicecraft_history import _CommercialSaaSHistoryNode, _history_human_dt
@@ -185,6 +189,18 @@ def _ascii_features_for_insdc(
                 if nv != one:
                     quals_changed = True
                 nvals.append(nv)
+            if not nvals:
+                # No value at all: a flat file cannot hold the key without
+                # one, the writer emits nothing for it, and the round-trip
+                # guard then refused the export over a value that was never
+                # there (every `.dna` import carrying `/pseudo`, until 1.3.9).
+                quals_changed = True
+                continue
+            if (nk in _INSDC_FLAG_QUALIFIERS and len(nvals) > 1
+                    and all(x == "" for x in nvals)):
+                # A flag is set or not; the reader keeps one `/pseudo`.
+                nvals = [""]
+                quals_changed = True
             # A name collision after sanitisation (`a/b` and `a-b` both fold to
             # `a_b`) merges values rather than dropping one of them.
             if nk in new_quals:
@@ -2448,6 +2464,108 @@ def _commercialsaas_decode_text(raw):
     return _html.unescape(_DNA_TAG_RE.sub("", text)).strip()
 
 
+# Revisions of SpliceCraft's `.dna` reading. An entry remembers which release
+# imported it (the "Created by SpliceCraft vX.Y.Z" stamp `_record_to_gb_text`
+# writes once), and only the reading THAT release did reproduces it — see
+# `_dna_sidecar_matches_entry`, which must recognise an unedited entry.
+#   0  SpliceCraft <= 1.2.71 — Biopython's reading as it stands.
+#   1  1.3.0 — qualifier text decoded the way the file means it, arrows kept.
+#   2  1.3.9 — every VALUE KIND. Biopython's reader keeps a `<V>` only when it
+#      carries `text`, `predef` or `int`, so a flag the editor stores as
+#      `<V bool="1"/>` came in as `/pseudo=[]`, which the GenBank writer writes
+#      as nothing: 3,338 `/pseudo` across 42 real files vanished on import, with
+#      `/ribosomal_slippage`, `/trans_splicing`, ranges and dates alongside.
+_DNA_READER_REVISIONS: "tuple[tuple[int, tuple[int, int, int]], ...]" = (
+    (0, (0, 0, 0)), (1, (1, 3, 0)), (2, (1, 3, 9)))
+_DNA_READER_REVISION = _DNA_READER_REVISIONS[-1][0]
+
+_INSDC_DATE_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _commercialsaas_value_kind_text(v_el) -> "str | None":
+    """One `<V>` Biopython's `.dna` reader skips, as GenBank text — or None
+    when it holds no value at all (a flag stored as unset).
+
+      * ``bool="1"`` — a flag (`/pseudo`) → ``""``, GenBank's valueless form;
+        ``bool="0"`` → None.
+      * ``range="a-b"`` (1-based, inclusive) → ``"a..b"`` (`/rpt_unit_range`,
+        `/tag_peptide`); an end of 0 (``0-0``, the editor's "unset") → ``""``.
+      * ``year`` / ``month`` / ``day`` → ``"21-Oct-1952"``, ``"Oct-1952"`` or
+        ``"1952"`` (`/collection_date`); a zero year → ``""``.
+      * an empty ``<V/>`` → ``""``: the qualifier is THERE, with no value.
+      * anything else → its first attribute's text, so a value kind this
+        reader has never met still arrives as something.
+    """
+    a = v_el.attrib
+    if "bool" in a:
+        return "" if str(a.get("bool", "")).strip().lower() in (
+            "1", "true", "yes") else None
+    if "range" in a:
+        m = re.fullmatch(r"\s*(\d+)\s*-\s*(\d+)\s*", str(a.get("range") or ""))
+        if m is None or int(m.group(1)) < 1 or int(m.group(2)) < 1:
+            return ""
+        return f"{int(m.group(1))}..{int(m.group(2))}"
+    if "year" in a or "month" in a or "day" in a:
+        def _num(k: str) -> int:
+            try:
+                return int(str(a.get(k) or "0").strip())
+            except ValueError:
+                return 0
+        y, mo, d = _num("year"), _num("month"), _num("day")
+        if y <= 0:
+            return ""
+        if not 1 <= mo <= 12:
+            return f"{y:04d}"
+        if not 1 <= d <= 31:
+            return f"{_INSDC_DATE_MONTHS[mo - 1]}-{y:04d}"
+        return f"{d:02d}-{_INSDC_DATE_MONTHS[mo - 1]}-{y:04d}"
+    if not a:
+        return ""
+    return _commercialsaas_decode_text(str(next(iter(a.values()))))
+
+
+def _commercialsaas_qualifier_values(
+        q_el, *, revision: int = _DNA_READER_REVISION) -> list:
+    """Every value of one `<Q>` element, as ``(kind, value)`` pairs aligned
+    with Biopython's reading of it: ``("bio", v)`` for each value Biopython
+    ALSO produces (``text`` / ``predef`` decoded the way the file means them;
+    ``None`` for an ``int``, whose reading stands), and — from reader revision
+    2 — ``("ours", v)`` for each one it skips (`_commercialsaas_value_kind_text`).
+    Revision 1 reads only the ``bio`` kinds, as 1.3.0–1.3.8 did."""
+    out: list = []
+    for v_el in q_el.findall("V"):
+        a = v_el.attrib
+        if "text" in a:
+            out.append(("bio", _commercialsaas_decode_text(a.get("text"))))
+        elif "predef" in a:
+            out.append(("bio", _commercialsaas_decode_text(a.get("predef"))))
+        elif "int" in a:
+            out.append(("bio", None))
+        elif revision >= 2:
+            txt = _commercialsaas_value_kind_text(v_el)
+            if txt is not None:
+                out.append(("ours", txt))
+    return out
+
+
+def _commercialsaas_merge_qualifier(cur: list, vals: list) -> "list | None":
+    """Biopython's value list for a qualifier (``cur``) merged with the
+    file's own reading (``vals``, from `_commercialsaas_qualifier_values`).
+    None when the two do not line up — then Biopython's reading stands."""
+    if sum(1 for kind, _v in vals if kind == "bio") != len(cur):
+        return None
+    it = iter(cur)
+    out: list = []
+    for kind, v in vals:
+        if kind == "bio":
+            b = next(it)
+            out.append(b if v is None else v)
+        else:
+            out.append(v)
+    return out
+
+
 def _commercialsaas_record_label(record) -> str:
     """The name a `.dna` should carry as its map label: the plasmid's display
     name, else a real LOCUS name, else nothing."""
@@ -2732,6 +2850,7 @@ def _commercialsaas_segment_span(segments, clamp_to: "int | None" = None
 
 def _augment_dna_record_from_packets(
     rec, data: bytes, *, packets=None, legacy: bool = False,
+    revision: "int | None" = None,
 ) -> list[dict]:
     """Recover info BioPython's ``.dna`` parser drops:
       * **per-feature colours** from the 0x0A Features packet
@@ -2765,12 +2884,18 @@ def _augment_dna_record_from_packets(
     already collapsed within this call. The caller (``_apply_record``)
     dedupes against the existing primer DB before persisting.
 
-    ``legacy=True`` reads the file the way SpliceCraft 1.2.71 and earlier
-    did — without the qualifier-text and arrow passes — for ONE purpose:
-    telling whether an entry those versions imported is still unedited
+    ``revision`` picks the reading (`_DNA_READER_REVISIONS`; default: the
+    current one). ``legacy=True`` is revision 0 — the way SpliceCraft 1.2.71
+    and earlier read the file, without the qualifier-text and arrow passes.
+    Any revision but the current one exists for ONE purpose: telling whether
+    an entry an older version imported is still unedited
     (`_dna_sidecar_matches_entry`). Never for an import.
     """
     import xml.etree.ElementTree as _ET
+
+    if revision is None:
+        revision = 0 if legacy else _DNA_READER_REVISION
+    legacy = revision == 0
 
     # Local Tm calculator — primer3 if available, 2+4 fallback otherwise.
     # Captured once at the top of the augment so we don't pay the import
@@ -2863,26 +2988,16 @@ def _augment_dna_record_from_packets(
                 # `directionality`: "1" forward, "2" reverse, "3" both, omitted
                 # for no arrow (`_commercialsaas_directionality`).
                 _dir = (feat_el.get("directionality") or "").strip()
-                # Every qualifier's text, decoded the way the file means it
-                # (`_commercialsaas_decode_text`), aligned value-for-value with
-                # the list Biopython builds — `None` where Biopython's own
-                # reading stands (an integer, or a value kind it skips).
+                # Every qualifier's values, read the way the file means them
+                # and aligned with the list Biopython builds — see
+                # `_commercialsaas_qualifier_values`.
                 _texts: dict = {}
                 for _q in feat_el.findall("Q"):
                     _qname = _q.get("name")
                     if not _qname:
                         continue
-                    _vals: list = []
-                    for _v in _q.findall("V"):
-                        if "text" in _v.attrib:
-                            _vals.append(_commercialsaas_decode_text(
-                                _v.get("text")))
-                        elif "predef" in _v.attrib:
-                            _vals.append(_commercialsaas_decode_text(
-                                _v.get("predef")))
-                        elif "int" in _v.attrib:
-                            _vals.append(None)
-                    _texts[_qname] = _vals
+                    _texts[_qname] = _commercialsaas_qualifier_values(
+                        _q, revision=revision)
                 xml_features.append({
                     # Keyed the way BIOPYTHON reads the arrow (only "2" is
                     # reverse), because the record side of the match is
@@ -2984,9 +3099,16 @@ def _augment_dna_record_from_packets(
     by_parts_type: dict[tuple, "_deque[dict]"] = {}
     by_span_type: dict[tuple[int, int, str], "_deque[dict]"] = {}
     by_span: dict[tuple[int, int], "_deque[dict]"] = {}
+    # A `source` entry's only partner is the record's own `source` row, and it
+    # meets it for one thing alone: the qualifier VALUES Biopython skips
+    # (`/collection_date`, `/focus` — revision 2). Never a label, colour or
+    # arrow.
+    source_by_span: dict[tuple[int, int], "_deque[dict]"] = {}
     for _ent in xml_features:
         if _ent["span"] is None:
             continue
+        if _ent["type"] == "source":
+            source_by_span.setdefault(_ent["span"], _deque()).append(_ent)
         # A `source` entry has NO legitimate partner: the stamping loop skips
         # the record's own `source` row by design, so this entry can only ever
         # be claimed by something it doesn't describe. Left in, the span-only
@@ -3022,10 +3144,36 @@ def _augment_dna_record_from_packets(
                 return ent
         return None
 
+    def _merge_texts(f, ent, skip: "set | frozenset" = frozenset()) -> None:
+        for _qname, _vals in ent["texts"].items():
+            if _qname == "label" or _qname in skip:
+                continue
+            _cur = f.qualifiers.get(_qname)
+            if not isinstance(_cur, list):
+                continue
+            _merged = _commercialsaas_merge_qualifier(_cur, _vals)
+            if _merged is None:
+                continue
+            if _merged or revision < 2:
+                f.qualifiers[_qname] = _merged
+            else:
+                # Nothing GenBank can hold (a flag stored as unset): a key
+                # with no values is written as nothing, so it would only make
+                # the stored entry and the record disagree.
+                del f.qualifiers[_qname]
+
     n_matched = 0
     n_unmatched = 0
     for f in rec.features:
         if f.type == "source":
+            if revision >= 2:
+                try:
+                    _src = _take(source_by_span.get(
+                        (int(f.location.start), int(f.location.end))))
+                except (TypeError, ValueError, AttributeError):
+                    _src = None
+                if _src is not None:
+                    _merge_texts(f, _src)
             continue
         try:
             span = (int(f.location.start), int(f.location.end))
@@ -3080,27 +3228,21 @@ def _augment_dna_record_from_packets(
         # `use < 5 ng and > 2 ng` read back as `use  2 ng` and a rich
         # `5&#x27; UTR` kept its entity (FM6). Only replaced value-for-value
         # where the two readings line up.
-        for _qname, _vals in ent["texts"].items():
-            if _qname == "label":
-                continue
-            if _seg_colored and _qname in ("ApEinfo_fwdcolor",
-                                           "ApEinfo_revcolor"):
-                # The colour the file DRAWS is its segment's. A colour
-                # qualifier left over from an earlier editor (our own export
-                # writes one, then the feature is recoloured) is stale —
-                # unless the file's forward colour still IS the segment's:
-                # then its qualifiers are current, and a DIFFERENT reverse
-                # colour was chosen on purpose (it was lost; round-2
-                # hardening, 2026-09-25).
-                _fwd = (ent["texts"].get("ApEinfo_fwdcolor") or [None])[0]
-                if not (_qname == "ApEinfo_revcolor" and isinstance(_fwd, str)
-                        and _fwd.strip().lower() == str(c).lower()):
-                    continue
-            _cur = f.qualifiers.get(_qname)
-            if isinstance(_cur, list) and len(_cur) == len(_vals):
-                f.qualifiers[_qname] = [
-                    _cur[_k] if _v is None else _v
-                    for _k, _v in enumerate(_vals)]
+        _skip: set = set()
+        if _seg_colored:
+            # The colour the file DRAWS is its segment's. A colour qualifier
+            # left over from an earlier editor (our own export writes one,
+            # then the feature is recoloured) is stale — unless the file's
+            # forward colour still IS the segment's: then its qualifiers are
+            # current, and a DIFFERENT reverse colour was chosen on purpose
+            # (it was lost; round-2 hardening, 2026-09-25).
+            _fwd = (ent["texts"].get("ApEinfo_fwdcolor") or [None])[0]
+            _fwd = _fwd[1] if isinstance(_fwd, tuple) else _fwd
+            _skip.add("ApEinfo_fwdcolor")
+            if not (isinstance(_fwd, str)
+                    and _fwd.strip().lower() == str(c).lower()):
+                _skip.add("ApEinfo_revcolor")
+        _merge_texts(f, ent, skip=_skip)
         # Direction, as the file means it: Biopython reads a MISSING
         # `directionality` — the editor's "no arrow", and the form most
         # misc_features, terminators and RBSs take in `tests/*.dna` — as
@@ -3112,6 +3254,14 @@ def _augment_dna_record_from_packets(
                 pass
             if ent["dir"] == "3":
                 f.qualifiers[_SC_STRAND_QUAL] = ["double"]
+
+    if revision >= 2:
+        # A qualifier left with no values (on a feature the file's entries
+        # could not be matched to, so its flags were never read) holds nothing
+        # GenBank can write — see the merge above.
+        for f in rec.features:
+            for _k in [k for k, v in (f.qualifiers or {}).items() if v == []]:
+                del f.qualifiers[_k]
 
     # Leftovers are diagnostic gold: a 0x0A entry nobody claimed means the
     # file's coordinates and BioPython's disagree, which is precisely the
@@ -4430,26 +4580,34 @@ def _dna_record_signature(rec) -> tuple:
     return seq, topo, tuple(sorted(feats))
 
 
-# The release whose `.dna` reader first read arrows and qualifier text the way
-# the file means them (arrowless stays arrowless, `<html>` notes decoded). An
-# entry an EARLIER version imported was read without that, so re-reading its
-# sidecar with today's reader can never reproduce it — every such entry looked
-# edited, and its export was rebuilt from scratch, dropping the reads, primers
-# and notes splice mode exists to keep. `_dna_sidecar_matches_entry` also tries
-# the old reading for those entries. Entry provenance comes from the
+# Each revision of the `.dna` reading (`_DNA_READER_REVISIONS`) reads some
+# files differently from the one before — 1.3.0 kept arrows and decoded
+# `<html>` notes, 1.3.9 kept flags, ranges and dates. An entry an EARLIER
+# version imported was read without that, so re-reading its sidecar with
+# today's reader can never reproduce it: every such entry looked edited, and
+# its export was rebuilt from scratch, dropping the reads, primers and notes
+# splice mode exists to keep. `_dna_sidecar_matches_entry` also tries the
+# reading that made the entry. Entry provenance comes from the
 # "Created by SpliceCraft vX.Y.Z" stamp `_record_to_gb_text` writes once, at
 # import, and preserves on every re-save.
-_DNA_READER_REVISED_IN = (1, 3, 0)
+_DNA_READER_REVISED_IN = _DNA_READER_REVISIONS[1][1]
 _SC_CREATED_BY_RE = re.compile(r"Created by SpliceCraft v(\d+)\.(\d+)\.(\d+)")
+
+
+def _entry_dna_reader_revision(gb_text: str) -> int:
+    """The `.dna` reader revision the release that created this entry used —
+    0 when it carries no provenance stamp at all (older still)."""
+    m = _SC_CREATED_BY_RE.search(gb_text or "")
+    if m is None:
+        return 0
+    made_by = tuple(int(g) for g in m.groups())
+    return max(rev for rev, since in _DNA_READER_REVISIONS if made_by >= since)
 
 
 def _entry_predates_dna_reader_revision(gb_text: str) -> bool:
     """True when the entry was imported before `_DNA_READER_REVISED_IN`
     (or carries no provenance stamp at all — older still)."""
-    m = _SC_CREATED_BY_RE.search(gb_text or "")
-    if m is None:
-        return True
-    return tuple(int(g) for g in m.groups()) < _DNA_READER_REVISED_IN
+    return _entry_dna_reader_revision(gb_text) == 0
 
 
 def _dna_sidecar_matches_entry(original: bytes, entry: dict) -> bool:
@@ -4466,9 +4624,10 @@ def _dna_sidecar_matches_entry(original: bytes, entry: dict) -> bool:
     costs the exotic packets splice mode preserves; a false "same" loses
     the user's edits, so every doubt answers False.
 
-    "The same importer" is the one that created the entry: an entry a
-    release before `_DNA_READER_REVISED_IN` imported is compared with the
-    sidecar as THAT reader saw it, too."""
+    "The same importer" is the one that created the entry: an entry an
+    older release imported is compared with the sidecar as THAT reader saw
+    it, and then as every later one does (`recover-qualifiers-from-dna`
+    brings an old entry up to today's reading)."""
     import tempfile as _tempfile
     try:
         gb_text = entry.get("gb_text") or ""
@@ -4479,15 +4638,15 @@ def _dna_sidecar_matches_entry(original: bytes, entry: dict) -> bool:
         # primers and enzymes only the sidecar holds (round-2 hardening).
         want = _dna_record_signature(_gb_text_to_record(
             _record_to_gb_text(_gb_text_to_record(gb_text))))
-        # An old entry is compared with the OLD reading first — the one it
-        # was made with, so the usual answer costs one parse, not two.
-        readings = ([True, False] if _entry_predates_dna_reader_revision(gb_text)
-                    else [False])
+        # An old entry is compared with the reading it was made with first,
+        # so the usual answer costs one parse.
+        readings = range(_entry_dna_reader_revision(gb_text),
+                         _DNA_READER_REVISION + 1)
         with _tempfile.TemporaryDirectory(prefix="sc-dna-cmp-") as td:
             p = Path(td) / "sidecar.dna"
             p.write_bytes(original)
-            for legacy in readings:
-                side = load_genbank(str(p), legacy_dna_reader=legacy)
+            for revision in readings:
+                side = load_genbank(str(p), dna_reader_revision=revision)
                 side_rt = _gb_text_to_record(_record_to_gb_text(side))
                 if _dna_record_signature(side_rt) == want:
                     return True
@@ -4816,8 +4975,40 @@ def _clamp_feature_parts_to_record(rec, where: str) -> None:
                      "sequence and were clamped to it", where, fixed, n)
 
 
+def _parse_genbank_file_records(path: str) -> list:
+    """Every record in a GenBank FILE, read through `_repair_genbank_text` —
+    for the multi-record Open, which hands the records straight to a new
+    collection instead of going through `load_genbank`. Each record gets the
+    post-parse repairs `load_genbank` gives the one record it returns:
+    topology from ITS OWN LOCUS line, the arrowless decode, the primer-seq
+    repair, the SpliceCraft display-name marker, then the LOCUS-name and
+    feature-key repairs. Without them a multi-record file came in through a
+    different door than the same records one per file — arrowless features
+    pointing forward, a misaligned-LOCUS plasmid saved linear [INV-195].
+    Raises ValueError on a file it cannot read."""
+    import re as _re
+    from pathlib import Path as _P
+    text, locus_names = _repair_genbank_text(_read_text_tolerant(_P(path)))
+    records = _insdc.parse_genbank(text)
+    # One name per LOCUS line the parser starts a record at; if the two ever
+    # disagree, no record gets a name or topology meant for another.
+    locus_lines = _re.findall(r"(?m)^LOCUS {7}[^\n]*", text)
+    aligned = len(locus_names) == len(records) == len(locus_lines)
+    for i, rec in enumerate(records):
+        if aligned:
+            _backfill_topology(rec, locus_lines[i])
+        _arrowless_decode_features(rec)
+        _repair_wrapped_primer_seqs(rec)
+        _repair_feature_key_artifacts(rec)
+        _restore_display_name_from_comment(rec)
+        if aligned:
+            _apply_locus_repair(rec, locus_names[i])
+    return records
+
+
 @_timed("op.load_genbank")
-def load_genbank(path: str, *, legacy_dna_reader: bool = False):
+def load_genbank(path: str, *, legacy_dna_reader: bool = False,
+                 dna_reader_revision: "int | None" = None):
     """Load a plasmid file (GenBank .gb/.gbk or .dna). Returns
     SeqRecord.
 
@@ -4841,11 +5032,15 @@ def load_genbank(path: str, *, legacy_dna_reader: bool = False):
     records, multiple records, is oversized, or is a symlink to a
     character device.
 
-    ``legacy_dna_reader`` reads a `.dna` the way SpliceCraft 1.2.71 and
-    earlier did (see `_augment_dna_record_from_packets`); it exists only so
-    `_dna_sidecar_matches_entry` can recognise an unedited entry those
+    ``dna_reader_revision`` reads a `.dna` the way an older release did
+    (`_DNA_READER_REVISIONS`; ``legacy_dna_reader=True`` is revision 0, the
+    1.2.71 reading — see `_augment_dna_record_from_packets`). Both exist only
+    so `_dna_sidecar_matches_entry` can recognise an unedited entry those
     versions imported.
     """
+    if dna_reader_revision is None:
+        dna_reader_revision = 0 if legacy_dna_reader else _DNA_READER_REVISION
+    legacy_dna_reader = dna_reader_revision == 0
     # ExpatError is the C XML parser's own exception class and is NOT a
     # ValueError; imported here so the handler below can name it.
     from xml.parsers.expat import ExpatError as _ExpatError
@@ -4860,6 +5055,7 @@ def load_genbank(path: str, *, legacy_dna_reader: bool = False):
     if not ok:
         raise ValueError(reason or "Plasmid file is unsafe to load")
     fmt = _detect_plasmid_format(path)
+    locus_names: "list[str | None]" = []
     if fmt == _BIOPYTHON_DNA_FMT:
         # Before the parse, and outside the handler below that rewrites a
         # parse failure as "try re-exporting it": re-exporting cannot shrink
@@ -4896,7 +5092,16 @@ def load_genbank(path: str, *, legacy_dna_reader: bool = False):
                 # author name in a REFERENCE block used to surface as a raw
                 # UnicodeDecodeError traceback).
                 gb_source_text = _read_text_tolerant(_P(path))
-                records = list(SeqIO.parse(_StringIO(gb_source_text), fmt))
+                if fmt == "genbank":
+                    # A LOCUS name with spaces (refused outright) and an
+                    # odd-spaced FEATURES header (every feature silently
+                    # dropped) — see `_repair_genbank_text`.
+                    gb_source_text, locus_names = _repair_genbank_text(
+                        gb_source_text)
+                    # SpliceCraft's own reader [INV-219].
+                    records = _insdc.parse_genbank(gb_source_text)
+                else:
+                    records = list(SeqIO.parse(_StringIO(gb_source_text), fmt))
     except (RecursionError, _ExpatError) as exc:
         # A deeply-nested or malformed XML payload inside a `.dna` (the history
         # block) raises RecursionError from the parser's own descent, or
@@ -4956,6 +5161,11 @@ def load_genbank(path: str, *, legacy_dna_reader: bool = False):
         _backfill_topology(rec, gb_source_text)
     _arrowless_decode_features(rec)
     _repair_wrapped_primer_seqs(rec)
+    if fmt != _BIOPYTHON_DNA_FMT:
+        _n_keys = _repair_feature_key_artifacts(rec)
+        if _n_keys:
+            _log.info("%s: %d feature key(s) had trailing underscores "
+                      "(e.g. misc_feature_) and were restored", path, _n_keys)
 
     # CommercialSaaS (and occasionally minimally-annotated GenBank) records
     # leave id/name as Biopython sentinels. Fall back to the filename
@@ -5010,6 +5220,10 @@ def load_genbank(path: str, *, legacy_dna_reader: bool = False):
             rec._tui_display_name = _sanitize_label(stem, max_len=200)
         except Exception:
             pass
+    # A LOCUS line `_repair_genbank_text` rewrote ranks where any LOCUS name
+    # does — below the marker and the filename above — but supplies its name
+    # as the file SPELLED it, never the underscored form it now carries.
+    _apply_locus_repair(rec, locus_names[0] if len(locus_names) == 1 else None)
 
     # `.dna` augmentation: re-read the file bytes to recover per-feature
     # colours + primer-bind sequence stamps + 0x05 primer-DB entries that
@@ -5062,7 +5276,7 @@ def load_genbank(path: str, *, legacy_dna_reader: bool = False):
                     rec.description = _notes["description"]
                 extra_primers = _augment_dna_record_from_packets(
                     rec, _dna_bytes, packets=_dna_packets,
-                    legacy=legacy_dna_reader)
+                    revision=dna_reader_revision)
                 if extra_primers:
                     rec._dna_primer_entries = extra_primers
                 # Stash the construction-history packet + the raw bytes
@@ -5139,10 +5353,9 @@ def fetch_genbank(accession: str, email: str = "splicecraft@local"):
     if _acc is None:
         raise ValueError(f"invalid NCBI accession: {accession!r}")
     accession = _acc
-    import io
     import socket
     import time as _time
-    from Bio import Entrez, SeqIO
+    from Bio import Entrez
     Entrez.email = email
     # Sweep #27: NCBI's E-utilities policy asks every caller to identify
     # itself via `Entrez.tool` + `Entrez.email` so they can rate-limit
@@ -5229,7 +5442,7 @@ def fetch_genbank(accession: str, email: str = "splicecraft@local"):
             f"{accession!r} — the service may be down or rate-limiting. "
             f"Wait a moment and try again."
         )
-    records = list(SeqIO.parse(io.StringIO(text), "genbank"))
+    records = _insdc.parse_genbank(text)
     rec = _pick_single_record(records, f"NCBI accession {accession!r}")
     _require_defined_sequence(rec, f"NCBI accession {accession!r}")
     # 2026-05-27 (audit-3 H4): verify the returned record actually

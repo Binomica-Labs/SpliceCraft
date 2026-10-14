@@ -132,9 +132,19 @@ def _wheel_exists(spec: str, py: str, plat_tags: list[str], cache: str) -> bool:
     return subprocess.run(cmd, capture_output=True, text=True).returncode == 0
 
 
-def _newest_allowed(req: Requirement, cache: str) -> "str | None":
+def _newest_allowed(req: Requirement, cache: str,
+                    py: "str | None" = None) -> "str | None":
     """The version a real ``pip install`` would actually pick for *req* — the
-    highest release its specifier allows. None if that can't be determined.
+    highest release its specifier allows — on Python *py*. None if that
+    can't be determined.
+
+    Per Python version, because pip skips a release whose Requires-Python
+    excludes the running interpreter BEFORE it picks the newest. Asked
+    once for the interpreter running this script instead, a release that
+    dropped an old Python (platformdirs 4.13.0, Requires-Python >=3.11)
+    became "the newest allowed" on 3.10 too, had no 3.10 wheel, and
+    blocked the release, although every 3.10 install resolves cleanly to
+    4.12.4 (2026-10-13).
 
     This exists because `_wheel_exists` answers a subtly different question
     than the one that matters. It runs ``pip download --only-binary=:all:``,
@@ -152,11 +162,11 @@ def _newest_allowed(req: Requirement, cache: str) -> "str | None":
     Implemented with pip rather than a PyPI JSON call so it honours whatever
     index the caller is configured against.
     """
-    r = subprocess.run(
-        [sys.executable, "-m", "pip", "index", "versions", req.name,
-         "--disable-pip-version-check"],
-        capture_output=True, text=True, cwd=cache,
-    )
+    cmd = [sys.executable, "-m", "pip", "index", "versions", req.name,
+           "--disable-pip-version-check"]
+    if py is not None:
+        cmd += ["--python-version", py]
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cache)
     if r.returncode != 0:
         return None
     # "name (1.2.3)\n  Available versions: 1.2.3, 1.2.2, ..."
@@ -189,16 +199,21 @@ def check() -> int:
             # pip backtrack to an older release that still has a wheel, which
             # hides a cap raised past a release that dropped one — see
             # `_newest_allowed`. Pin it and ask again.
-            newest = _newest_allowed(req, cache)
-            if newest is None:
-                print(f"  note: couldn't determine the newest allowed version "
-                      f"for {str(req)!r}; checked the range only.")
+            # One answer per Python version (`_newest_allowed`), asked lazily.
+            newest_for: "dict[str, str | None]" = {}
             for label, sysplat, machine, tags in PLATFORMS:
                 for py in PYTHONS:
                     env = _marker_env(sysplat, machine, py)
                     if req.marker is not None and not req.marker.evaluate(env):
                         continue  # marker excludes this dep here — not required
                     checked += 1
+                    if py not in newest_for:
+                        newest_for[py] = _newest_allowed(req, cache, py)
+                        if newest_for[py] is None:
+                            print(f"  note: couldn't determine the newest "
+                                  f"allowed version of {str(req)!r} on Python "
+                                  f"{py}; checked the range only.")
+                    newest = newest_for[py]
                     # Ask about the PINNED newest first: it is what a real
                     # install resolves to, and if it has a wheel the range
                     # trivially does too — so the common all-green path costs

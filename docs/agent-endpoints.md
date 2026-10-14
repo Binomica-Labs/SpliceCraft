@@ -221,6 +221,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `read-url` | R | Open ONE web page and return its readable text (HTML → text; NO JavaScript). Body: `{url, max_chars?}`. |
 | `recall-knowledge` | R | Recall passages from Babs' knowledge corpus (papers, protocols and curated reference data) for a question. Body: `{query, max_passages?, packs?,… |
 | `recover-history-from-dna` | W | Restore construction history to plasmids whose saved `.dna` original documents more of their build than the library currently holds. Body:… |
+| `recover-qualifiers-from-dna` | W | Put back the qualifier VALUES SpliceCraft's `.dna` import used to drop — flags (`/pseudo`, `/ribosomal_slippage`, `/trans_splicing`, …), ranges… |
 | `redo` | W | Redo the last undone canvas mutation — the agent counterpart to Ctrl+Y. Body: `{}`. Returns `{ok, redone, redo_remaining, undo_available,… |
 | `reference-lookup` | R | Look a term up in Babs' CURATED reference registries - antibiotics and selection agents, promoters, terminators, UTRs/enhancers, plasmid origins,… |
 | `remember-fact` | W | Save a durable fact to Babs' persistent memory. Body: `{fact, title?}`. |

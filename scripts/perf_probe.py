@@ -6,12 +6,17 @@ Run from the repo root:  python3 scripts/perf_probe.py
 Times the operations our perf audit flagged as suspect, and runs the
 proposed alternatives side-by-side so we can pick fixes from data
 rather than from agent reports. Not part of pytest. No assertions.
+
+Every probe runs on synthetic data, and the data dir + log are sandboxed
+BEFORE `import splicecraft` (CLAUDE.md's data-dir rules): the import alone
+used to append to the real `logs/splicecraft.log`.
 """
 from __future__ import annotations
 
 import copy
 import gc
 import json
+import os
 import pickle
 import random
 import statistics
@@ -21,9 +26,17 @@ import time
 from functools import lru_cache
 from pathlib import Path
 
+_SANDBOX = tempfile.mkdtemp(prefix="sc-perfprobe-")
+os.environ["XDG_DATA_HOME"] = _SANDBOX
+os.environ.pop("SPLICECRAFT_DATA_DIR", None)        # it outranks XDG_DATA_HOME
+os.environ["SPLICECRAFT_LOG"] = os.path.join(_SANDBOX, "perf_probe.log")
+os.environ.setdefault("SPLICECRAFT_SKIP_LOCK", "1")
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import splicecraft as sc  # noqa: E402
+
+assert _SANDBOX in str(sc._state._DATA_DIR), f"unsandboxed: {sc._state._DATA_DIR}"
 
 
 # ── timing harness ────────────────────────────────────────────────────────────
