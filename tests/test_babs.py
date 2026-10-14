@@ -331,6 +331,36 @@ class TestBabsEngine:
         assert stream.delivered == 1        # line 1 came out before the rest arrived
         assert list(it) == [{"n": 2}, {"n": 3}]
 
+    def test_iter_ndjson_stop_mid_read_ends_cleanly(self):
+        # Stop sets the cancel event, then closes the response from the main thread;
+        # http.client drops its file object under the blocked read, which fails with
+        # AttributeError (seen live) instead of OSError. That is a stop, not a chat error.
+        class _Cancel:
+            flag = False
+
+            def is_set(self):
+                return self.flag
+        cancel = _Cancel()
+
+        class _ClosedUnderRead:
+            calls = 0
+
+            def read1(self, n):
+                self.calls += 1
+                if self.calls == 1:
+                    return b'{"a":1}\n'
+                cancel.flag = True               # Stop pressed while this read blocked
+                raise AttributeError("'NoneType' object has no attribute 'read1'")
+        assert list(B._iter_ndjson(_ClosedUnderRead(), cancel=cancel,
+                                   max_total=10**9, max_line=10**6)) == [{"a": 1}]
+
+    def test_iter_ndjson_read_error_without_stop_still_raises(self):
+        class _Broken:
+            def read1(self, n):
+                raise AttributeError("a real bug, not a Stop")
+        with pytest.raises(AttributeError):
+            list(B._iter_ndjson(_Broken(), cancel=None, max_total=10**9, max_line=10**6))
+
     def test_iter_ndjson_skips_non_dict(self):
         # A stray scalar / array line must not reach the dict-expecting consumers.
         data = b'42\n{"a":1}\n["x"]\n"str"\n{"b":2}'

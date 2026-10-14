@@ -23,6 +23,9 @@
   appeared all at once when it was finished and a long one arrived in jumps.
   Each part of a reply now shows up as soon as Ollama sends it, and model
   downloads report their progress as it happens for the same reason.
+- **Stopping a BABS reply no longer reports an error.** Pressing Stop while a
+  reply was streaming showed a red "chat error: 'NoneType' object has no
+  attribute 'read'" instead of "…stopped". The reply now stops cleanly.
 
 ## [1.3.8] — 2026-10-09
 

@@ -30,6 +30,7 @@ SECURITY / hardening
 from __future__ import annotations
 
 import functools
+import http.client
 import json
 import math
 import os
@@ -275,6 +276,13 @@ def _iter_ndjson(resp, *, cancel, max_total: int, max_line: int):
         except (urllib.error.URLError, OSError):
             # Socket closed (often our own cancel) — stop cleanly.
             return
+        except (AttributeError, ValueError, http.client.HTTPException):
+            # Stop sets `cancel` and then closes the response from the main thread.
+            # http.client drops its file object under the blocked read, which then fails
+            # with one of these rather than OSError. Only a requested stop is clean.
+            if cancel is not None and cancel.is_set():
+                return
+            raise
         if not chunk:
             break
         total += len(chunk)
