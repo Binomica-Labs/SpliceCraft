@@ -263,11 +263,15 @@ def _iter_ndjson(resp, *, cancel, max_total: int, max_line: int):
     are skipped, never fatal."""
     total = 0
     buf = b""
+    # read1 hands back whatever has arrived. Ollama streams with chunked transfer
+    # encoding, and on a chunked response read(n) keeps reading chunks until it has n
+    # bytes or EOF, so a short reply surfaced all at once when the stream ENDED.
+    read = getattr(resp, "read1", None) or resp.read
     while True:
         if cancel is not None and cancel.is_set():
             return
         try:
-            chunk = resp.read(16384)
+            chunk = read(16384)
         except (urllib.error.URLError, OSError):
             # Socket closed (often our own cancel) — stop cleanly.
             return

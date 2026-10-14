@@ -62,6 +62,27 @@ class _ByteStream:
         return chunk
 
 
+class _ChunkedStream:
+    """http.client on a chunked response: `read(n)` keeps reading chunks until it has n
+    bytes or the stream ends; `read1(n)` returns the next chunk that has arrived."""
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.delivered = 0              # chunks handed out so far
+
+    def read(self, n):
+        out = b""
+        while self._chunks and len(out) < n:
+            out += self._chunks.pop(0)
+            self.delivered += 1
+        return out
+
+    def read1(self, n):
+        if not self._chunks:
+            return b""
+        self.delivered += 1
+        return self._chunks.pop(0)
+
+
 def _fake_chat(model, messages, **kwargs):
     for piece in ["Hello ", "<think>secret reasoning</think>", "**world**"]:
         yield {"content": piece, "thinking": "", "done": False, "error": None}
@@ -299,6 +320,16 @@ class TestBabsEngine:
                 return True
         assert list(B._iter_ndjson(_ByteStream(b'{"a":1}\n'), cancel=_C(),
                                    max_total=10**9, max_line=10**6)) == []
+
+    def test_iter_ndjson_yields_each_line_as_it_arrives(self):
+        # Ollama streams with chunked transfer encoding. read(16384) on such a response
+        # waits for 16 KB or the end of the stream, so a short reply surfaced all at once
+        # when it finished. The reader must hand over each line as its chunk arrives.
+        stream = _ChunkedStream([b'{"n":1}\n', b'{"n":2}\n', b'{"n":3}\n'])
+        it = B._iter_ndjson(stream, cancel=None, max_total=10**9, max_line=10**6)
+        assert next(it) == {"n": 1}
+        assert stream.delivered == 1        # line 1 came out before the rest arrived
+        assert list(it) == [{"n": 2}, {"n": 3}]
 
     def test_iter_ndjson_skips_non_dict(self):
         # A stray scalar / array line must not reach the dict-expecting consumers.

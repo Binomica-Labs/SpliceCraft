@@ -14,6 +14,16 @@
 
 ---
 
+## [Unreleased]
+
+### Bug fixes
+
+- **BABS chat replies stream in as they are written.** BABS read Ollama's
+  reply in 16 KB blocks and waited for each block to fill, so a short answer
+  appeared all at once when it was finished and a long one arrived in jumps.
+  Each part of a reply now shows up as soon as Ollama sends it, and model
+  downloads report their progress as it happens for the same reason.
+
 ## [1.3.8] — 2026-10-09
 
 ### Bug fixes
