@@ -361,6 +361,18 @@ class TestBabsEngine:
         with pytest.raises(AttributeError):
             list(B._iter_ndjson(_Broken(), cancel=None, max_total=10**9, max_line=10**6))
 
+    def test_iter_ndjson_falls_back_when_read1_is_unsupported(self):
+        # io.UnsupportedOperation subclasses OSError, which the reader treats as a closed
+        # socket; a stream whose read1 exists but can't run would otherwise end silently.
+        import io
+
+        class _NoRead1(_ByteStream):
+            def read1(self, n):
+                raise io.UnsupportedOperation("read1")
+        got = list(B._iter_ndjson(_NoRead1(b'{"a":1}\n{"b":2}\n'), cancel=None,
+                                  max_total=10**9, max_line=10**6))
+        assert got == [{"a": 1}, {"b": 2}]
+
     def test_iter_ndjson_skips_non_dict(self):
         # A stray scalar / array line must not reach the dict-expecting consumers.
         data = b'42\n{"a":1}\n["x"]\n"str"\n{"b":2}'

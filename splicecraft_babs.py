@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import functools
 import http.client
+import io
 import json
 import math
 import os
@@ -267,12 +268,20 @@ def _iter_ndjson(resp, *, cancel, max_total: int, max_line: int):
     # read1 hands back whatever has arrived. Ollama streams with chunked transfer
     # encoding, and on a chunked response read(n) keeps reading chunks until it has n
     # bytes or EOF, so a short reply surfaced all at once when the stream ENDED.
-    read = getattr(resp, "read1", None) or resp.read
+    read1 = getattr(resp, "read1", None)
+    read = read1 or resp.read
     while True:
         if cancel is not None and cancel.is_set():
             return
         try:
             chunk = read(16384)
+        except io.UnsupportedOperation:
+            # A file-like that has read1 but can't do it. It subclasses OSError, so
+            # without this the stream would end silently with no data; use read.
+            if read is read1:
+                read = resp.read
+                continue
+            return
         except (urllib.error.URLError, OSError):
             # Socket closed (often our own cancel) — stop cleanly.
             return
