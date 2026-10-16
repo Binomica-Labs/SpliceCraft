@@ -2588,6 +2588,109 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
     return sorted(out.values(), key=lambda c: (c["top"], c["enzyme"]))
 
 
+def _clip_spans(spans, lo: int, hi: int) -> "list[list[int]]":
+    """The sub-spans of `spans` that fall inside ``[lo, hi)``, order kept.
+
+    Unparseable entries are skipped rather than raised on: this runs inside
+    the digest, where one malformed annotation must not sink the reaction."""
+    out: "list[list[int]]" = []
+    for p in (spans or []):
+        try:
+            ps, pe = int(p[0]), int(p[1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+        a, b = max(ps, lo), min(pe, hi)
+        if a < b:
+            out.append([a, b])
+    return out
+
+
+def _fragment_local_parts(f: dict, n: int, a: int,
+                          intervals: "list[tuple[int, int]]",
+                          *, modular: bool) -> "list[list[int]] | None":
+    """A feature dict's exon ``parts``, clipped to one fragment and rebased
+    into fragment-local coordinates — or ``None`` when the feature has no
+    introns, or nothing discontiguous survives the clip.
+
+    `intervals` are the fragment's ABSOLUTE spans (two for an origin-crossing
+    fragment, one otherwise) and `a` is its absolute start.
+
+    **The end is mapped by LENGTH, not modularly.** `(abs - a) % n` is right
+    for a span's start but sends an end landing exactly on the input's last
+    base (`abs == n`) to 0, so the span would invert; a span's LENGTH is
+    invariant under the shift, which is the form that cannot.
+
+    **Local parts come back ASCENDING, and that is not a sort for tidiness.**
+    A digest fragment is a LINEAR molecule, so nothing on it crosses an
+    origin and forward-traversal order *is* ascending order. One absolute
+    exon can land in both intervals of an origin-crossing fragment (the
+    fragment's own 5'/3' boundary falls inside it), which arrives as two
+    local spans that only ascending order puts the right way round.
+
+    Returns ``None`` rather than raising on a malformed ``parts`` — reading as
+    "not spliced" is exactly the behaviour this chain had before introns, and
+    one bad annotation must not sink a digest (`_feat_dict_spans`' rule)."""
+    raw = f.get("parts")
+    if not isinstance(raw, (list, tuple)) or len(raw) < 2 or n <= 0:
+        return None
+    out: "list[list[int]]" = []
+    for p in raw:
+        try:
+            ps, pe = int(p[0]), int(p[1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            return None
+        for lo, hi in intervals:
+            s2, e2 = max(ps, lo), min(pe, hi)
+            if s2 < e2:
+                s_loc = ((s2 - a) % n) if modular else (s2 - a)
+                out.append([s_loc, s_loc + (e2 - s2)])
+    out.sort()
+    merged: "list[list[int]]" = []
+    for ps, pe in out:
+        if merged and ps <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], pe)
+        else:
+            merged.append([ps, pe])
+    return merged if len(merged) > 1 else None
+
+
+def _apply_local_parts(piece: dict, loc_parts, lo: int,
+                       hi: int) -> "dict | None":
+    """Narrow one emitted fragment piece to its own exons, in place.
+
+    `loc_parts` are the whole feature's parts in the piece's coordinate
+    frame; the piece keeps the ones inside its ``[lo, hi)``. Returns the
+    piece, or ``None`` meaning **drop it**.
+
+    ``loc_parts is None`` means the feature has no introns: the piece is
+    returned untouched, so every contiguous feature behaves exactly as it did
+    before introns existed.
+
+    For a SPLICED feature the piece is narrowed to the HULL of its surviving
+    exons, and dropped when none survive. Both matter, and a probe showed why:
+    an enzyme cutting INSIDE an intron splits the gene into two pieces that
+    each still spanned intron bases, so they translated to ``MAEAKGFEVSL`` and
+    ``NSFFQRLDLKAW*`` instead of the gene's own ``MAEAKGFERLDLKAW*``. Keeping
+    the fragment-clipped bounds would annotate intron DNA as coding; keeping a
+    piece with no exon at all would put the gene's name on a fragment that
+    carries only its intron. The exon list is re-attached only while the
+    piece is genuinely discontiguous, because ABSENT is the contract for "no
+    introns" and a one-span `parts` would be a second, disagreeing truth."""
+    if loc_parts is None:
+        piece.pop("parts", None)
+        return piece
+    kept = _clip_spans(loc_parts, lo, hi)
+    if not kept:
+        return None
+    piece["start"], piece["end"] = kept[0][0], kept[-1][1]
+    if (len(kept) > 1
+            and sum(b - a for a, b in kept) < (kept[-1][1] - kept[0][0])):
+        piece["parts"] = kept
+    else:
+        piece.pop("parts", None)
+    return piece
+
+
 def _split_features_at_cuts(features: list[dict], n: int,
                               cut_top_positions: list[int],
                               circular: bool) -> dict[int, list[dict]]:
@@ -2602,6 +2705,18 @@ def _split_features_at_cuts(features: list[dict], n: int,
       - linear: `i` ranges over `[0, len(cuts)+1)`, fragment 0 starts at 0
         and fragment `len(cuts)` ends at `n`.
     """
+    if not features:
+        return {}
+    # Non-dict entries are dropped at the door. `features` is caller-supplied
+    # at every public mouth of this chain (`_digest_with_enzymes`,
+    # `_simulate_golden_gate`, `simulate-gibson`, `scrub-plasmid`), and a
+    # plausible mistake — handing ONE feature list where a list PER PART is
+    # wanted — made the loops below call `.get` on a dict KEY and surface as
+    # `'str' object has no attribute 'get'` from the middle of a digest. The
+    # `except (TypeError, ValueError)` guards never covered it because that
+    # is an AttributeError. A bad entry is now ignored, the usable ones still
+    # ride, and nothing raises out of a reaction over an annotation.
+    features = [f for f in features if isinstance(f, dict)]
     if not features:
         return {}
     n_cuts = len(cut_top_positions)
@@ -2648,14 +2763,26 @@ def _split_features_at_cuts(features: list[dict], n: int,
             # `_rejoin_cut_split_features`). Stamp it from the pre-expansion
             # coordinates — after halving, neither piece knows the whole.
             _full = _feat_len(fs, fe, n)
-            expanded.append({**f, "start": fs, "end": n,
-                              "_wrap_origin_split": "tail",
-                              "_wrap_origin_group": gid,
-                              "_split_full_len": _full})
-            expanded.append({**f, "start": 0, "end": fe,
-                              "_wrap_origin_split": "head",
-                              "_wrap_origin_group": gid,
-                              "_split_full_len": _full})
+            # A feature can BOTH wrap and be spliced. Its exons are absolute
+            # and in traversal order here, so each origin half keeps the ones
+            # on its own side — otherwise the tail would claim the head's
+            # exons and the intron structure would move.
+            _abs_parts = f.get("parts")
+            if not (isinstance(_abs_parts, (list, tuple))
+                    and len(_abs_parts) > 1):
+                _abs_parts = None
+            _tail = {**f, "start": fs, "end": n,
+                     "_wrap_origin_split": "tail",
+                     "_wrap_origin_group": gid,
+                     "_split_full_len": _full}
+            _head = {**f, "start": 0, "end": fe,
+                     "_wrap_origin_split": "head",
+                     "_wrap_origin_group": gid,
+                     "_split_full_len": _full}
+            for _half, _lo, _hi in ((_tail, fs, n), (_head, 0, fe)):
+                _kept = _apply_local_parts(_half, _abs_parts, _lo, _hi)
+                if _kept is not None:
+                    expanded.append(_kept)
         else:
             expanded.append(f)
     features = expanded
@@ -2799,6 +2926,13 @@ def _fragments_from_cuts(seq: str, cuts: list[dict], *,
     n = len(seq)
     if n == 0:
         return []
+    # Same door-check as `_split_features_at_cuts`, applied HERE because the
+    # uncut early-returns below never reach it — they copy `features`
+    # straight onto the one fragment, so a non-dict entry raised
+    # `ValueError: dictionary update sequence element #0 has length 1` out of
+    # an uncut digest while a cut one tolerated it. Two paths, one rule.
+    if features:
+        features = [f for f in features if isinstance(f, dict)]
     if not cuts:
         # Uncut either way: the whole input, one contiguous piece [0, n).
         if circular:
@@ -2849,10 +2983,18 @@ def _fragments_from_cuts(seq: str, cuts: list[dict], *,
                 top_seq = seq[a:] + seq[:b]
                 offset  = a   # fragment-local coord = (abs - a) % n
             frag_len = len(top_seq)
+            # Absolute extent of this fragment, as linear interval(s) — two
+            # when it crosses the origin. Shared by the exon clip below.
+            _ivs: "list[tuple[int, int]]" = ([(a, b)] if a < b
+                                             else [(a, n), (0, b)])
             local_feats: list[dict] = []
             for f in feat_slots.get(i, []):
                 fs = int(f.get("start", 0))
                 fe = int(f.get("end",   0))
+                # Exons clipped to this fragment and rebased to local coords,
+                # computed once and then narrowed to each emitted piece.
+                _lp = _fragment_local_parts(f, n, a, _ivs,
+                                            modular=not (a < b))
                 # Shift into fragment-local.
                 if a < b:
                     new_s = fs - offset
@@ -2906,10 +3048,18 @@ def _fragments_from_cuts(seq: str, cuts: list[dict], *,
                     # length exactly `n`, so this can't swallow a real piece.
                     # Pre-fix such a feature was emitted as a zero-length
                     # marker and vanished from the fragment.
-                    local_feats.append({**f, "start": new_s, "end": frag_len})
-                    local_feats.append({**f, "start": 0,     "end": new_e})
+                    for _pc, _lo, _hi in (
+                            ({**f, "start": new_s, "end": frag_len},
+                             new_s, frag_len),
+                            ({**f, "start": 0, "end": new_e}, 0, new_e)):
+                        _kept = _apply_local_parts(_pc, _lp, _lo, _hi)
+                        if _kept is not None:
+                            local_feats.append(_kept)
                     continue
-                local_feats.append({**f, "start": new_s, "end": new_e})
+                _kept = _apply_local_parts(
+                    {**f, "start": new_s, "end": new_e}, _lp, new_s, new_e)
+                if _kept is not None:
+                    local_feats.append(_kept)
             # Absolute provenance on the input. `end_raw` is deliberately NOT
             # taken modulo before the comparison: a fragment ending exactly at
             # the origin (`end_raw == n`) is a contiguous 3'-end slice and does
@@ -2943,11 +3093,13 @@ def _fragments_from_cuts(seq: str, cuts: list[dict], *,
         for f in feat_slots.get(i, []):
             fs = int(f.get("start", 0))
             fe = int(f.get("end",   0))
-            local_feats.append({
-                **f,
-                "start": max(0, min(fs - a, len(top_seq))),
-                "end":   max(0, min(fe - a, len(top_seq))),
-            })
+            _ls = max(0, min(fs - a, len(top_seq)))
+            _le = max(0, min(fe - a, len(top_seq)))
+            _lp = _fragment_local_parts(f, n, a, [(a, b)], modular=False)
+            _kept = _apply_local_parts(
+                {**f, "start": _ls, "end": _le}, _lp, _ls, _le)
+            if _kept is not None:
+                local_feats.append(_kept)
         left  = ({"overhang_seq": "", "kind": "linear", "enzyme": ""}
                  if i == 0 else
                  {"overhang_seq": cuts[i - 1]["overhang_seq"],

@@ -31,7 +31,7 @@ from splicecraft_persistence import (
 )
 from splicecraft_record import _gb_text_to_record
 from splicecraft_biology import _enzyme_resolve_one, _rc
-from splicecraft_util import _feat_label, _fuzzy_match, _natural_sort_key, _sanitize_gel_id, _sanitize_plasmid_status
+from splicecraft_util import _feat_label, _feature_traversal, _fuzzy_match, _record_is_circular, _natural_sort_key, _sanitize_gel_id, _sanitize_plasmid_status
 from splicecraft_presets import _merge_presets_with_library
 
 # Immutable types `_typed_clone` returns as-is (no copy needed). Everything else
@@ -2707,40 +2707,42 @@ def _grammar_dropdown_options() -> list[tuple[str, str]]:
 def _extract_feature_entries_from_record(record) -> list[dict]:
     """Return one feature-library entry dict per non-source feature.
 
-    Wrap features (origin-spanning CompoundLocations) are flattened into the
-    forward-strand genomic sequence before export, so the entry's ``sequence``
-    is always the 5'→3' DNA that would be re-inserted. Reverse-strand
-    features store the revcomp (i.e. the 5'→3' of the feature as read), which
-    matches how the Add Feature modal expects input.
+    Multi-part locations (an origin wrap, or a SPLICED gene) are flattened
+    into the forward-strand genomic sequence before export, so the entry's
+    ``sequence`` is always the 5'→3' DNA that would be re-inserted.
+    Reverse-strand features store the revcomp (i.e. the 5'→3' of the feature
+    as read), which matches how the Add Feature modal expects input.
+
+    **Reading order comes from `_feature_traversal`, not from `loc.parts`.**
+    Biopython stores a `complement(join(...))`'s parts in READING order, which
+    for the minus strand is DESCENDING, and SpliceCraft deliberately writes a
+    minus-strand wrap head-first ([INV-182]). Concatenating the stored order
+    and then reverse-complementing therefore produced the right bases in the
+    wrong block order — a CYCLICALLY ROTATED gene — for every minus-strand
+    spliced or origin-spanning feature. That is not a display fault: this
+    function feeds "Import from library plasmid" in the Add Feature modal, so
+    the rotated DNA was SAVED into the user's feature library and re-annotated
+    onto other plasmids; it also fed the BLAST/HMMER "search by feature" query
+    and the operon tool's protein import. Verified against Biopython's own
+    `feature.extract()` on all four geometries. See `[INV-221]`.
     """
-    try:
-        from Bio.SeqFeature import CompoundLocation
-    except ImportError:
-        CompoundLocation = tuple()  # type: ignore[assignment]
     seq = str(getattr(record, "seq", "") or "").upper()
     total = len(seq)
+    _circular = _record_is_circular(record)
     entries: list[dict] = []
     for feat in getattr(record, "features", []) or []:
         if feat.type == "source":
             continue
         loc = feat.location
         strand = getattr(loc, "strand", 1) or 1
-        # Assemble the forward-strand genomic sequence under the feature,
-        # respecting wrap/compound locations.
-        if isinstance(loc, CompoundLocation):
-            parts_seq = []
-            for part in loc.parts:
-                s = int(part.start) % total if total else 0
-                e = int(part.end)   % (total or 1) if total else 0
-                if total and e <= s:
-                    parts_seq.append(seq[s:] + seq[:e])
-                else:
-                    parts_seq.append(seq[s:e])
-            fwd = "".join(parts_seq)
-        else:
-            s = int(loc.start)
-            e = int(loc.end)
-            fwd = seq[s:e]
+        # Forward-strand genomic sequence under the feature, assembled in
+        # traversal order so a wrap reads tail→head and a spliced gene reads
+        # exon 1 → exon N on EITHER strand.
+        trav = _feature_traversal(loc, total, circular=_circular)
+        if trav is None:
+            continue
+        fwd = "".join(seq[max(0, int(ps)):min(total, int(pe))]
+                      for ps, pe in trav[2])
         # Store 5'→3' of the feature as read. For reverse-strand CDS that is
         # the revcomp of the genomic slice.
         if strand == -1 and fwd:

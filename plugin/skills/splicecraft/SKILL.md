@@ -1,6 +1,6 @@
 ---
 name: splicecraft
-description: Drive SpliceCraft — a terminal plasmid-map viewer, sequence editor and molecular-cloning workbench — through its localhost agent API (~269 endpoints via `splicecraft-cli`). Use this whenever the work involves plasmids, vectors, constructs or a `.gb`/`.gbk`/`.dna` file — annotating a sequence, designing or checking primers, simulating a Golden Gate / Golden Braid / MoClo / Gibson / restriction clone, codon-optimizing a protein, scanning restriction sites or regulatory elements, designing CRISPR guides, verifying a build against sequencing reads, driving an Opentrons OT-2, or managing a plasmid library. Use it even when the user doesn't name SpliceCraft — if `splicecraft-cli` is on PATH it is almost certainly the right tool, and it beats hand-rolling Biopython because it simulates the actual bench steps and keeps the user's real library consistent.
+description: Drive SpliceCraft — a terminal plasmid-map viewer, sequence editor and molecular-cloning workbench — through its localhost agent API (~284 endpoints via `splicecraft-cli`). Use this whenever the work involves plasmids, vectors, constructs or a `.gb`/`.gbk`/`.dna` file — annotating a sequence, designing or checking primers, simulating a Golden Gate / Golden Braid / MoClo / Gibson / restriction clone, codon-optimizing a protein, scanning restriction sites or regulatory elements, designing CRISPR guides, verifying a build against sequencing reads, driving an Opentrons OT-2, or managing a plasmid library. Use it even when the user doesn't name SpliceCraft — if `splicecraft-cli` is on PATH it is almost certainly the right tool, and it beats hand-rolling Biopython because it simulates the actual bench steps and keeps the user's real library consistent.
 ---
 
 # Driving SpliceCraft
@@ -84,15 +84,24 @@ so pending writes flush. Leave the user's own session running.
 ## 2. Read the endpoint's docs before calling it
 
 ```bash
-splicecraft-cli tools --json      # {name, method, write, doc, doc_full} × 267
+splicecraft-cli tools --filter primer   # ranked matches — START HERE
+splicecraft-cli tools                   # all of them, READ/WRITE name one-liner
+splicecraft-cli tools --json            # + doc_full (~150 KB — the whole corpus)
 splicecraft-cli call <endpoint> --json '{...}'    # POST with --json, else GET
 ```
 
+**Search by the VERB you want, don't guess a name.** `--filter` ranks over names
+*and* docstrings (a name hit weighs 3, a doc hit 1), returns the best 25 and tells
+you `N endpoint(s) match` — so the count is honest even when the page is capped.
+Over HTTP it is `GET /tools?filter=primer`, plus `brief: true` to drop `doc_full`.
+The vocabulary is specific and the surface is wider than you expect: before
+concluding SpliceCraft can't do something, search for the verb. Three tries at
+different words beats one wrong conclusion.
+
 `doc_full` is the complete docstring: request body, response shape, and the
 specific mistake that endpoint was hardened against. It will tell you the footgun
-before you hit it. Grep for the *verb* you want (`tools --json | grep -i primer`)
-rather than guessing a name — the vocabulary is specific and the surface is wider
-than you expect. Before concluding SpliceCraft can't do something, search.
+before you hit it. Reach for the unfiltered `--json` form only when you genuinely
+want the whole catalogue — it is the single largest payload in the API.
 
 Aliases that save a 404: `features` == `list-features`,
 `plasmidsaurus-items` == `list-plasmidsaurus-items`.
@@ -156,6 +165,20 @@ The API states this in its own responses:
 - When showing a position to a **human**, use 1-based inclusive
   (`start+1..end`) — what GenBank and SnapGene show — and say which you're using.
 
+### "Do it to what I've got selected"
+
+`status` returns a **`view`** block describing what the user is actually
+looking at: `{selection: {start, end}, cursor_bp, origin_bp, map_mode,
+selected_feature: {idx, label, type, start, end, strand}}`.
+
+This is the one thing that lets you act on *"this feature"* or *"the bit I've
+highlighted"* instead of making the user retype coordinates — and it matters
+most on the `--read-only` attach path (§1), where their GUI is open in front of
+them while you work. Read `view` before asking a human for a number they are
+already pointing at. Any field can be `null` when nothing is loaded or nothing
+is selected, so check rather than assume; `selected_feature.idx` is the same
+index `update-feature` / `delete-feature` take.
+
 ### Preview, then commit
 
 `simulate-X` is read-only and returns what *would* happen; its write twin takes
@@ -168,11 +191,23 @@ the same payload and saves:
 | `simulate-traditional-cloning` | `traditional-clone` |
 | `plan-residue-edit` | `edit-residue` |
 
-Some *write* endpoints are also dry-run by default and need `{"apply": true}`:
-`transfer-annotations`, `annotate-from-presets`, `apply-gff3`,
-`recover-history-from-dna`, `recover-qualifiers-from-dna`. (`commit`/`write`/`persist` are rejected 400 rather
-than silently previewing.) Check the `applied` field — reporting a preview as a
-completed action is a real failure mode.
+Some *write* endpoints are also dry-run by default, but **they do not all take
+the same key.** Sending the wrong one is a silent no-op you will then report as
+a completed action:
+
+| Endpoint | How to commit | Dry-run by default? |
+|---|---|---|
+| `transfer-annotations` | `{"apply": true}` (or legacy `{"dry_run": false}`) | yes |
+| `annotate-from-presets` | `{"apply": true}` | yes |
+| `recover-qualifiers-from-dna` | `{"apply": true}` **or** `{"dry_run": false}` | yes |
+| `recover-history-from-dna` | `{"dry_run": false}` — **`apply` is ignored** | yes |
+| `apply-gff3` | nothing — **it writes on the first call** | **no** |
+
+`commit`/`write`/`persist` are rejected 400 rather than silently previewing.
+Check the `applied` field where there is one — reporting a preview as a
+completed action is a real failure mode, and so is the reverse: `apply-gff3`
+returns `{ok, features_added}` with **no** `applied` field, so an agent hunting
+for one concludes "preview" about a write that already landed.
 
 ## 4. Four ways a call can look successful and not be
 
@@ -340,11 +375,19 @@ starts changes nothing — export it before you launch.
   Both need `{"confirm": true}` *and* a passing analysis. Never pass `confirm`
   unless the user asked for the run; walk the chain first (`ot2-compile` →
   `ot2-analyze` → `ot2-position-check` → `ot2-run`).
-- **Egress.** `blast-online`, `hmmer-web`, `fpbase-search`, `read-url`,
-  `learn-start` ship data off the machine and return `403` unless the user has
-  armed the setting. **You cannot enable it yourself** — it's deliberately outside
-  the agent allowlist. Report the refusal and name the toggle; prefer in-process
-  `blast`, which never leaves the box.
+- **Egress.** Eleven endpoints ship data off the machine and return `403`
+  unless armed. **There are TWO independent settings — name the right one in
+  the refusal you relay, or the user will toggle the wrong switch:**
+
+  | Setting | Settings label | Endpoints |
+  |---|---|---|
+  | `allow_online_search` | "Allow agent online BLAST/HMMER" | `blast-online`, `hmmer-web` |
+  | `allow_online_lookups` | "Allow Babs online database lookups" | `fpbase-search`, `uniprot-search`, `literature-search`, `genbank-search`, `wikipedia-search`, `web-search`, `patent-search`, `read-url`, plus `learn-start`, `ingest-url`, `recall-knowledge {web:true}` |
+
+  **You cannot enable either yourself** — both are deliberately outside the
+  agent settings allowlist, so an autonomous agent can't self-arm. Report the
+  refusal verbatim and name the toggle. Prefer in-process `blast`, which never
+  leaves the box. `fetch` (NCBI by accession) is **not** gated.
 
 ## 8. Report what was actually established
 
@@ -400,14 +443,23 @@ Load as needed — detail, not prerequisites:
 - **`references/workflows.md`** — worked, verified end-to-end recipes: annotate a
   bare NCBI record, design and verify primers, restriction cloning, Golden Gate,
   codon optimization, read verification, notebook. Read the one matching the job.
-- **`references/endpoints.md`** — all 267 endpoints organised by what you're
+- **`references/endpoints.md`** — all 284 endpoints organised by what you're
   trying to do, with the per-cluster gotchas worth knowing before you call.
 
-SpliceCraft keeps its own reference docs — `docs/agent-api.md` (the contract in
-prose), `docs/cli.md`, `docs/features.md` — in the project's source tree. Those
-paths exist in a checkout; from a `pipx` or `pip` install they don't, so look
-them up in the project's repository rather than telling the user a file is
-missing.
+SpliceCraft keeps its own reference docs in the project's source tree:
+
+- **`docs/agent-endpoints.md`** — the COMPLETE index, generated from the live
+  handler registry with a two-way drift test, so it can neither miss an
+  endpoint nor invent one. Use this when you want to know whether something
+  exists at all.
+- **`docs/agent-api.md`** — the contract in prose, with request/response
+  shapes and worked examples. It is a GUIDE, not an inventory: it covers
+  roughly half the endpoints, so its silence about one means nothing.
+- `docs/cli.md`, `docs/features.md` — the CLI and the user-facing feature tour.
+
+Those paths exist in a checkout; from a `pipx` or `pip` install they don't, so
+look them up in the project's repository rather than telling the user a file is
+missing. The live `tools --filter` beats all of them.
 
 ## A note on shells
 

@@ -1,6 +1,6 @@
 # The endpoint surface, organised by job
 
-267 endpoints as of SpliceCraft 1.3.0. **`splicecraft-cli tools --json` is
+284 endpoints as of SpliceCraft 1.3.10. **`splicecraft-cli tools --json` is
 always authoritative** — this file helps you find the right name and warns you
 about the sharp edges; the endpoint's own `doc_full` is the contract.
 
@@ -79,7 +79,15 @@ twin takes the *same payload*.
 `find-sequence` `get-sequence` `span-contains` `list-restriction-sites` `digest`
 `list-enzymes` `find-orfs` `get-history` `get-plasmid-protocol` `diff-plasmid`
 `simulate-gel` `replace-sequence` `get-feature-colors` `set-feature-color`
+`set-origin` `reverse-complement`
 
+- `set-origin` re-cuts a CIRCULAR plasmid so a chosen base (or a named
+  feature's start) becomes base 1; `reverse-complement` flips the whole record.
+  Both re-frame every feature, keep spliced exons and origin wraps intact, are
+  undoable with `undo`, and CLEAR stored alignments — every coordinate moved, so
+  a band drawn against the old frame now points at the wrong bases. `set-origin`
+  **422s on a linear record**: rotating it would join two ends that aren't
+  joined. Flipping a linear record is fine.
 - `list-restriction-sites` respects the active enzyme collection; the full
   catalogue returns hundreds of hits (309 on pUC19). Returns `cut_bp` /
   `bottom_cut_bp` so fragment sizes need no private offset table.
@@ -121,6 +129,9 @@ twin takes the *same payload*.
 - Both `transfer-annotations` and `annotate-from-presets` are **dry-run by
   default** (`{"apply": true}` to commit). Preset matching is **exact**, so an
   allelic variant won't be called — use `blast` for near-identical hits.
+- `apply-gff3` is **not** dry-run: it writes on the first call and returns
+  `{ok, features_added}` with no `applied` field. See the commit-key table in
+  SKILL.md §3 — the dry-run endpoints do not all take the same key.
 - `transfer-annotations`: **read `skipped`** (see SKILL.md §4).
 
 ## Library management
@@ -144,13 +155,20 @@ twin takes the *same payload*.
 
 `design-primers` `amplify-feature` `design-mutagenesis` `check-primer`
 `check-primer-pair` `list-tm-profiles`
-`check-primer-duplicates` `simulate-pcr` `pcr-program` `list-polymerases`
+`check-primer-duplicates` `simulate-pcr` `save-amplicon` `pcr-program` `list-polymerases`
 `create-primer` `get-primer` `update-primer` `delete-primer` `delete-primers`
-`move-primer` `list-primers` `export-primers` + collection endpoints
+`move-primer` `list-primers` `export-primers`
+`create-primer-collection` `rename-primer-collection`
+`delete-primer-collection` `list-primer-collections`
+`get-active-primer-collection` `set-active-primer-collection`
+`update-stored-primer` `import-primers`
 
-- `design-primers` has three modes: `detection` (diagnostic amplicon inside the
-  region), `cloning` (needs `site_5`+`site_3`, appends RE tails), `generic`
-  (binding-only). For Type IIS grammar overhangs use `design-gb-part` instead.
+- `design-primers` has **four** modes: `detection` (diagnostic amplicon inside
+  the region), `cloning` (needs `site_5`+`site_3`, appends RE tails), `generic`
+  (binding-only), and `allele_specific` (SNP / genotyping — it pins the primer's
+  3' TERMINUS on the discriminating base, where the other modes slide the window;
+  an A/T discriminating base is reported as precluding a GC clamp rather than
+  silently scored down). For Type IIS grammar overhangs use `design-gb-part`.
   Each returns `qc` — the pair check below — so read `qc.warnings` too.
 - `check-primer-pair` is the QC for a pair you were GIVEN (a colleague's, a
   paper's, a supplier's): pass the oligos as ordered and, for a tailed primer,
@@ -165,6 +183,17 @@ twin takes the *same payload*.
   Never convert one tool's Tm to another's by hand.
 - Always surface `binds_as_designed` and `other_sites` — a primer that displays
   somewhere other than where it anneals is a wrong experiment.
+- `save-amplicon` files one of `simulate-pcr`'s products as a linear library
+  entry (it re-runs the same payload, so preview and save cannot disagree).
+  `amplicon_index` 0 is the LONGEST product — pass the index you saw, don't
+  assume there is only one. `name` is required.
+- `update-stored-primer` renames a STORED primer, moves it through
+  Designed→Ordered→Validated, or sets the `$` cart flag; `export-primers
+  {cart: true}` then writes the cross-collection cart. Note `update-primer` is
+  a DIFFERENT endpoint — it edits a `primer_bind` feature on the canvas.
+- `import-primers` is the inverse of `export-primers {format: "generic"}`.
+  Invalid rows are skipped and reported in `skipped`, never filed as broken
+  primers — read it, a partial import is normal for a hand-edited sheet.
 - `simulate-pcr`'s binding model is **exact-match**: no mismatch tolerance, no
   Tm-aware annealing. Don't present it as a thermodynamic prediction.
 - `pcr-program` with no Tms anneals at a conventional 55 °C and **says so** in
@@ -236,6 +265,10 @@ shifts, every feature keeps its coordinates, and it's undoable.
 `optimize-protein` `analyse-cds` `list-codon-tables` `add-codon-table`
 `delete-codon-table` `set-active-codon-table` `get-active-codon-table`
 `list-protein-motifs` `set-protein-motif` `delete-protein-motif`
+`taxon-search`
+`list-protein-collections` `get-protein-collection`
+`create-protein-collection` `rename-protein-collection`
+`delete-protein-collection` `save-protein` `delete-protein`
 
 - `optimize-protein`: `mode` = `frequency` (default) or `max_cai`, plus
   `hazard_hosts` (plant/mammalian/bacterial), `forbidden_motifs`, GC banding and
@@ -251,7 +284,10 @@ shifts, every feature keeps its coordinates, and it's undoable.
 `blast` `blast-online` `hmmscan` `hmmer-web` `multi-align` `diff-plasmid`
 `find-orfs` `map-transcription` `predict-transcript` `scan-promoters`
 `scan-terminators` `rbs-strength` `design-rbs` `assemble-operon` `fold-rna`
-`cofold-rna` + HMM database management
+`cofold-rna`
+`add-hmm-database` `get-hmm-database` `list-hmm-databases`
+`download-hmm-database` `delete-hmm-database`
+`get-active-hmm-database` `set-active-hmm-database`
 
 - `blast` is in-process against the user's own collections and **never leaves the
   machine**. A whole large library can exceed the DB build cap and 400 — pass
@@ -291,10 +327,18 @@ any off-target claim; omit the search and it's `0`, so silence can't be read as
 ## Sequencing reads
 
 `verify-against-reads` `read-consensus` `analyse-read-heterogeneity`
+`read-trace`
 `plasmidsaurus-items`(=`list-plasmidsaurus-items`) `list-plasmidsaurus-members`
 `download-plasmidsaurus` `align-plasmidsaurus-zip`
 
 - See SKILL.md §4 for the `identity_pct` / `uncovered_spans` traps.
+- `read-trace` base-calls a Sanger `.ab1`/`.abi` and returns `bases` +
+  `phred_quality` — the input `verify-against-reads`' `read_quality` wants.
+  Feed them straight across to get the trace-quality split: a mismatch under a
+  low-quality basecall is an instrument artefact, not a mutation.
+- **`read-consensus` reads STORED alignments, which only the GUI writes.** On a
+  plasmid you have reads for, `no_reads` means they were never stored — not
+  that it's unverified. Hold the sequences? Use `verify-against-reads`.
 - `analyse-read-heterogeneity` answers "is this culture one thing?" —
   `clonal` / `minor_variants` / `mixed`. A Plasmidsaurus consensus is depth 1, so
   `read-consensus` cannot see a heterogeneous population; it consenses to wild
@@ -309,9 +353,14 @@ any off-target claim; omit the search and it's `0`, so silence can't be read as
 `create-experiment` `get-experiment` `update-experiment` `delete-experiment`
 `duplicate-experiment` `move-experiment` `list-experiments` `search-experiments`
 `experiment-backlinks` `export-experiment` `attach-experiment-image`
-`experiment-step-template` `list-experiment-actions` + project endpoints +
-`list-gels` `get-gel` `create-gel` `update-gel` `delete-gel` `simulate-gel` +
-protocol endpoints
+`experiment-step-template` `list-experiment-actions`
+`create-experiment-project` `rename-experiment-project`
+`delete-experiment-project` `list-experiment-projects`
+`get-active-experiment-project` `set-active-experiment-project`
+`list-gels` `get-gel` `create-gel` `update-gel` `delete-gel` `simulate-gel`
+`save-protocol` `get-protocol` `list-protocols` `delete-protocol`
+`create-protocol-collection` `list-protocol-collections`
+`delete-protocol-collection`
 
 Entry bodies carry cross-reference sigils `@plasmid`, `!action`, `&gel`,
 extracted automatically. `search-experiments` requires **all** query terms and
@@ -325,7 +374,10 @@ in-silico agarose gel from ladder/plasmid/digest/pcr lanes.
 
 `ot2-status` `ot2-calibration` `ot2-compile` `ot2-analyze` `ot2-run`
 `ot2-run-control` `ot2-position-check` `ot2-home` `ot2-disengage` `ot2-lights`
-`ot2-normalize` `ot2-plate-map` + protocol and custom-labware endpoints
+`ot2-normalize` `ot2-plate-map`
+`save-custom-labware` `get-custom-labware` `list-custom-labware`
+`delete-custom-labware` `create-labware-collection`
+`list-labware-collections` `delete-labware-collection`
 
 Canonical order: `ot2-plate-map`/`ot2-normalize` (plan) → `ot2-compile` (offline
 validate) → `ot2-analyze` (the robot's own simulate, no motion) →
@@ -341,7 +393,11 @@ collection onto labware wells.
 ## Enzymes
 
 `list-enzymes` `list-custom-enzymes` `get-custom-enzyme` `create-custom-enzyme`
-`update-custom-enzyme` `delete-custom-enzyme` + enzyme-collection endpoints
+`update-custom-enzyme` `delete-custom-enzyme`
+`create-enzyme-collection` `update-enzyme-collection`
+`delete-enzyme-collection` `get-enzyme-collection`
+`list-enzyme-collections` `get-active-enzyme-collection`
+`set-active-enzyme-collection`
 
 Enzyme collections scope a restriction scan to what's actually on the bench.
 
@@ -360,8 +416,14 @@ Enzyme collections scope a restriction scan to what's actually on the bench.
   a generated answer. `index-library` indexes the user's own plasmids, primers,
   parts and notebook into a private local pack, so recall can answer "which of my
   plasmids carries a KanR and a T7 promoter?"
-- `fpbase-search`, `read-url`, `learn-start` and `recall-knowledge {web:true}`
-  are egress-gated (403).
+- **Every search in this cluster is egress-gated (403)** behind
+  `allow_online_lookups` ("Allow Babs online database lookups"):
+  `fpbase-search`, `uniprot-search`, `literature-search`, `genbank-search`,
+  `wikipedia-search`, `web-search`, `patent-search`, `read-url`, plus
+  `learn-start`, `ingest-url` and `recall-knowledge {web:true}`. That is a
+  DIFFERENT setting from `allow_online_search`, which gates only `blast-online`
+  and `hmmer-web` — see SKILL.md §7. `reference-lookup` and a plain
+  `recall-knowledge` are local and ungated.
 
 ## Backup and maintenance
 

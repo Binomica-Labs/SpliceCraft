@@ -1,6 +1,6 @@
 # Worked workflows
 
-Every command here was run against a live SpliceCraft 1.3.0 session; the outputs
+Every command here was run against a live SpliceCraft 1.3.10 session; the outputs
 are real. Read the recipe matching the user's job — you don't need the others.
 
 Set up once per shell if you're working against a sandbox rather than the user's
@@ -228,8 +228,9 @@ splicecraft-cli call analyse-read-heterogeneity --json '{...}'
 `analyse-read-heterogeneity` answers "is this culture one thing?" — per-base
 allele fractions from the raw reads. A clone that matches the reference at the
 consensus level can still be a mixed population; this is what catches it. For
-Plasmidsaurus runs there's a dedicated cluster (`list-plasmidsaurus-*`,
-`align-plasmidsaurus-zip`, `import-plasmidsaurus-*`).
+Plasmidsaurus runs there's a dedicated cluster: `plasmidsaurus-items` /
+`list-plasmidsaurus-items`, `list-plasmidsaurus-members`,
+`download-plasmidsaurus`, `align-plasmidsaurus-zip`.
 
 ---
 
@@ -245,6 +246,6 @@ splicecraft-cli call create-experiment --json '{
 ```
 
 `@plasmid`, `!action` and `&gel` tokens in the body become cross-references.
-`protocol-from-history` turns an actual construction history into protocol
+`get-plasmid-protocol` turns an actual construction history into protocol
 steps — the provenance is already recorded, so the protocol doesn't have to be
 written from memory.

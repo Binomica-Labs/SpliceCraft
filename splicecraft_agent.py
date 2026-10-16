@@ -45,7 +45,7 @@ from splicecraft_cloning import (_cloned_plasmid_regenerated_sites, _GIBSON_MAX_
 from splicecraft_codon import (_CODON_RAMP_CODONS, _CODON_RARE_W, _codon_relative_adaptiveness, _CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_ambiguous_stops, _codon_cai, _codon_diversify, _codon_table_for, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
 from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _flush_dirty_mirror_before_switch, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_all_experiments, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
 from splicecraft_experiments import (_EXPERIMENT_ACTIONS, _as_str_list, _tag_values, _experiment_duplicate, _experiment_html_document, _experiment_markdown_document, _experiment_project_markdown, _experiment_ref_token_ok, _experiment_search, _experiment_snippet, _experiment_search_terms, _experiment_template_markdown, _experiments_referencing, _new_experiment_id, _normalise_experiment_entry, _protocol_steps_markdown, _sanitize_experiment_id)
-from splicecraft_fileio import (_insdc_qualifier_name, _PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
+from splicecraft_fileio import (_ab1_path_to_record, _insdc_qualifier_name, _PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
 from splicecraft_gels import (_new_gel_id, _normalise_gel_entry)
 from splicecraft_history import (_HISTORY_NODE_MAX_DEPTH, _HISTORY_NODE_MAX_NODES, _history_build_steps, _history_node_warnings)
 from splicecraft_crispr import (  # noqa: E402
@@ -62,9 +62,9 @@ from splicecraft_persistence import (_safe_file_size_check, _safe_load_json)
 from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_design, _scrub_qc_primers, _scrub_qc_verify)
 from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq,
                                 _topology_from_gb_text)
-from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
+from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _ncbi_taxid_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript, _map_transcription)
-from splicecraft_util import (_iso_instant, _variant_group_key, _PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _feature_traversal, _phred_in_alignment_frame, _read_rotation_in_rows, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _degenerate_tm_bracket, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
+from splicecraft_util import (_iso_instant, _variant_group_key, _PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _feat_spans, _feature_traversal, _phred_in_alignment_frame, _read_rotation_in_rows, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _degenerate_tm_bracket, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
 from splicecraft_biology import (_covered_identity, _read_extent_for, _read_is_clipped, _pos_in_spans, _variant_gate_pos, _digest_with_enzymes, _enzyme_aliases, _enzyme_site_methylation_targets, _methylated_base_positions, _enzyme_cuts, _enzyme_resolve_one, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
@@ -3740,6 +3740,38 @@ def _settings_validator_custom_enzymes_csv(value):
     return ",".join(sorted(valid)), None
 
 
+def _settings_validator_enzyme_name_list(value):
+    """A LIST of enzyme names, each in the combined catalog. Accepts a
+    comma-separated string too, and canonicalises to a sorted, deduped list.
+
+    **An unknown name is REFUSED, not dropped** — the opposite of
+    `_settings_validator_custom_enzymes_csv` above, and deliberately so.
+    That one feeds a display filter, where dropping a typo costs the user a
+    missing overlay they can see. This one feeds the codon optimiser's
+    forbidden-site scrub (`_codon_forbidden_sites`), where silently dropping
+    a name means the site is NOT scrubbed and survives into DNA the user
+    then orders — a quiet wrong answer in synthesis output, which is the
+    failure class this project refuses to ship. Name the bad entry instead."""
+    if value is None or value == "":
+        return [], None
+    if isinstance(value, str):
+        raw = [s.strip() for s in value.replace(";", ",").split(",")
+               if s and s.strip()]
+    elif isinstance(value, (list, tuple)):
+        raw = [str(s).strip() for s in value if str(s).strip()]
+    else:
+        return None, ("must be a list of enzyme names (or a "
+                      "comma-separated string)")
+    catalog = _state._all_enzymes_hook()
+    unknown = [nm for nm in raw if nm not in catalog]
+    if unknown:
+        return None, (f"unknown enzyme(s): {', '.join(sorted(set(unknown)))}"
+                      " — see `list-enzymes` for the catalog. Refused rather "
+                      "than dropped: a forbidden site that is silently not "
+                      "scrubbed ends up in ordered DNA.")
+    return sorted(set(raw)), None
+
+
 def _settings_validator_collection_name(value):
     """Empty string / null is allowed to clear the active collection.
     Otherwise route through `_normalize_collection_name`."""
@@ -3781,6 +3813,13 @@ _AGENT_SETTINGS_ALLOWLIST: "dict[str, tuple]" = {
     "active_enzyme_collection": (_settings_validator_collection_name,     ""),
     "active_grammar":        (_settings_validator_grammar_id,            "gb_l0"),
     "constructor_filter_by_grammar": (_settings_validator_bool,           True),
+    # The forbidden-site list the codon optimiser scrubs by default. Without
+    # it the two surfaces disagreed: the UI optimiser scrubbed the user's
+    # configured enzymes (`_codon_forbidden_sites`), while `optimize-protein`
+    # scrubbed nothing unless the caller passed `forbidden_motifs` — and the
+    # agent could neither read the list to match it nor see that it differed.
+    "codon_forbidden_enzymes": (_settings_validator_enzyme_name_list,
+                                 ["BsaI"]),
 }
 
 
@@ -6156,17 +6195,26 @@ def _agent_carry_feature_dicts(rec) -> "list[dict]":
     `_gibson_record_from_result` reads back). Skips the ``source`` feature;
     wrap features are emitted with ``end < start`` so the engine's
     `_split_features_at_cuts` halves them at the origin. Feeds
-    ``carry_annotations`` on `traditional-clone`."""
+    ``carry_annotations`` on `traditional-clone`.
+
+    A SPLICED feature also carries ``parts`` — its exons in forward-traversal
+    order (`_feat_spans`). Without it the flat ``(start, end)`` pair is the
+    gene's OUTER bounds, so a carried two-exon CDS was annotated straight
+    through its intron: a 48 bp gene shipped as 72 bp, translating to
+    ``MAEAKGFEVSLI*FFQRLDLKAW*`` where the parent reads ``MAEAKGFERLDLKAW*``
+    — a premature stop, presented as the product's own annotation. The whole
+    digest → ligate chain now shifts and clips the exon list alongside the
+    bounds. See `[INV-221]`."""
     out: "list[dict]" = []
     total = _seq_len(rec)
     _circular = _record_is_circular(rec)
     for f in getattr(rec, "features", None) or []:
         if getattr(f, "type", "") == "source":
             continue
-        bounds = _feat_bounds(f, total, circular=_circular)
-        if bounds is None:
+        spans = _feat_spans(f, total, circular=_circular)
+        if spans is None:
             continue
-        s, e, strand = bounds
+        s, e, strand, parts = spans
         quals = getattr(f, "qualifiers", {}) or {}
         label = (quals.get("label") or quals.get("product") or [f.type])[0]
         # `int(strand or 1)` turned every ARROWLESS parent feature into a
@@ -6181,6 +6229,8 @@ def _agent_carry_feature_dicts(rec) -> "list[dict]":
             dict_strand = 2
         d = {"start": int(s), "end": int(e), "strand": dict_strand,
              "type": f.type, "label": str(label)[:200]}
+        if parts:
+            d["parts"] = parts
         color = (quals.get("ApEinfo_fwdcolor") or [""])[0] or ""
         if color:
             d["color"] = str(color)
@@ -7845,10 +7895,22 @@ _LANE_SOURCES: tuple[tuple[str, str], ...] = (
 )
 
 
+_TOOLS_FILTER_MAX = 25
+
+
 @_agent_endpoint("tools")
 def _h_tools(app, payload):
     """Self-describe: every endpoint with its read/write mode and full
-    request-body documentation.
+    request-body documentation. Body (all optional):
+    ``{filter?: str, brief?: bool}``.
+
+    `filter` ranks by name and docstring (a name hit weighs 3, a doc hit 1),
+    returns the best 25 and reports the honest ``total_matches`` alongside
+    ``capped`` — so a budgeted caller can search for a VERB
+    (``{"filter": "primer"}``) instead of reading the whole ~150 KB
+    catalogue or guessing a name. ``brief: true`` drops `doc_full` from a
+    filtered page for a cheap name-and-summary scan. Unfiltered, the full
+    list comes back as before, now with `count` / `total_matches`.
 
     Each entry is ``{name, method, write, doc, doc_full}`` — ``doc`` is
     the one-line summary; ``doc_full`` (snag #19) is the COMPLETE
@@ -7893,7 +7955,30 @@ def _h_tools(app, payload):
     # the single largest payload in the API (~150 KB → ~300 KB) for zero
     # ergonomic gain — a client calling the discovery endpoint reads
     # `endpoints` by name.
-    return {"endpoints": [
+    #
+    # `filter` is the BUDGETED form of discovery. The unfiltered payload is
+    # ~150 KB of `doc_full`, which is the whole catalogue and also far more
+    # than most callers can afford to read in one go — and a catalogue that
+    # does not survive the channel is the `[INV-202]` failure: there, every
+    # tool result was sliced at 6000 chars, so a model saw 51 of 264
+    # endpoints as truncated JSON with no sign anything was missing, and
+    # concluded features did not exist. Ranked name-and-doc matching with an
+    # honest `total_matches` is what that invariant built for the local
+    # model; this exposes the same thing over HTTP so no caller has to
+    # choose between 150 KB and guessing a name.
+    _filter = payload.get("filter") if isinstance(payload, dict) else None
+    _terms: "list[str]" = []
+    if isinstance(_filter, str) and _filter.strip():
+        _terms = [t for t in re.split(r"[^a-z0-9]+", _filter.lower()) if t]
+    _brief = _payload_bool(payload, "brief", False) if _terms else False
+
+    def _rank(name: str, doc: str) -> int:
+        """Name hits weigh 3, doc hits 1 — the ranking `[INV-202]` measured."""
+        nm, dc = name.lower(), doc.lower()
+        return sum((3 if t in nm else 0) + (1 if t in dc else 0)
+                   for t in _terms)
+
+    rows = [
         {
             "name":   name,
             "method": "POST" if write else "GET",
@@ -7908,7 +7993,26 @@ def _h_tools(app, payload):
             "doc_full": inspect.getdoc(fn) or "",
         }
         for name, (fn, write) in sorted(_state._AGENT_HANDLERS.items())
-    ]}
+    ]
+    if not _terms:
+        # Deliberately still the BARE `{endpoints: [...]}` it has always been.
+        # `/tools` is served ahead of the dispatcher's envelope and a client
+        # may rely on that exact shape (`test_tools_handler_returns_bare_shape`
+        # pins it), so the unfiltered reply gains nothing — `len(endpoints)` is
+        # the count. The extra `count` / `total_matches` / `capped` keys ride
+        # only on the FILTERED reply, which is new surface and breaks nothing.
+        return {"endpoints": rows}
+    scored = [(r, _rank(r["name"], r["doc_full"])) for r in rows]
+    hits = sorted((r for r, s in scored if s > 0),
+                  key=lambda r: (-_rank(r["name"], r["doc_full"]), r["name"]))
+    # `total_matches` is the TRUE count, reported even when the page is
+    # capped, so "25 shown" can never be read as "25 exist".
+    out = hits[:_TOOLS_FILTER_MAX]
+    if _brief:
+        out = [{k: v for k, v in r.items() if k != "doc_full"} for r in out]
+    return {"endpoints": out, "count": len(out),
+            "total_matches": len(hits), "filter": _filter,
+            "capped": len(hits) > len(out)}
 
 
 _EXPORT_GENBANK_EXTS = (".gb", ".gbk", ".genbank")
@@ -10124,6 +10228,70 @@ def _hetero_shape(fractions: "list[float]", floor: float = 0.0,
             "monotonic_decay": mode is None, "mode_fraction": mode}
 
 
+@_agent_endpoint("read-trace")
+def _h_read_trace(app, payload):
+    """Base-call a Sanger `.ab1` / `.abi` trace and return its sequence WITH
+    per-base Phred quality. Body: ``{path, trim?: bool}``.
+
+    This is the input `verify-against-reads`' ``read_quality`` exists for, and
+    until now it could not be obtained over HTTP at all: that endpoint takes
+    quality only as an inline array, `analyse-read-heterogeneity` accepts a
+    `reads_path` but refuses anything that isn't FASTQ, and `load-file` parses
+    `.ab1` happily yet drops `letter_annotations["phred_quality"]` on the
+    floor. So the one trace format a Sanger user actually has was readable by
+    the GUI's "Check against canvas" button and by nothing else. Feed
+    ``bases`` + ``phred_quality`` straight into `verify-against-reads` to get
+    the trace-quality split (`[INV-197]`): a mismatch under a low-quality
+    basecall is an instrument artefact, not a mutation, and that distinction
+    is the whole reason to carry quality at all.
+
+    ``trim: true`` additionally reports ``trimmed_span`` — the first and last
+    base at or above the user's `sanger_min_phred` setting — so a caller can
+    cut the ragged ends the way the GUI does. The bases themselves are
+    returned UNTRIMMED either way: trimming silently would change every
+    coordinate in the answer.
+
+    Read-only, and no egress — the file is read from a server-side path.
+    Returns ``{ok, name, length, bases, phred_quality, mean_phred,
+    min_phred, trimmed_span?}``."""
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    if path.suffix.lower() not in (".ab1", ".abi"):
+        return ({"error": "path must end in .ab1 or .abi"}, 400)
+    if _check_agent_read_path_ancestors(path) is not None:
+        _log.warning("agent read-trace: refused (ancestor symlink): %s", path)
+        return ({"error": "refused: a parent directory is a symlink"}, 403)
+    if not path.exists():
+        return ({"error": f"no such file: {_scrub_path(str(path))}"}, 404)
+    try:
+        rec = _ab1_path_to_record(str(path))
+    except ValueError as exc:
+        return ({"error": f"could not read the trace: "
+                          f"{_scrub_path(str(exc))}"}, 400)
+    except OSError as exc:
+        return ({"error": f"read failed: {_scrub_path(str(exc))}"}, 500)
+    bases = str(getattr(rec, "seq", "") or "")
+    qual = list((getattr(rec, "letter_annotations", None)
+                 or {}).get("phred_quality") or [])
+    out = {"ok": True,
+           "name": str(getattr(rec, "id", "") or path.stem),
+           "length": len(bases), "bases": bases,
+           "phred_quality": [int(q) for q in qual],
+           "mean_phred": (round(sum(qual) / len(qual), 1) if qual else None),
+           "min_phred": (min(qual) if qual else None)}
+    if _payload_bool(payload, "trim", False) and qual:
+        floor = _get_setting("sanger_min_phred", 20)
+        try:
+            floor = int(floor)
+        except (TypeError, ValueError):
+            floor = 20
+        good = [i for i, q in enumerate(qual) if q >= floor]
+        out["trimmed_span"] = ([good[0], good[-1] + 1] if good else None)
+        out["trim_min_phred"] = floor
+    return out
+
+
 @_agent_endpoint("analyse-read-heterogeneity")
 def _h_analyse_read_heterogeneity(app, payload):
     """Per-base ALLELE FRACTIONS from raw reads — "is this culture one thing?"
@@ -11308,6 +11476,49 @@ def _h_genbank_search(app, payload):
             "total_matches": total, "count": len(results), "results": results}
 
 
+@_agent_endpoint("taxon-search")
+def _h_taxon_search(app, payload):
+    """Resolve an ORGANISM NAME to an NCBI taxid. Body:
+    ``{query, max_hits?}``.
+
+    The missing half of codon-table work over HTTP: `add-codon-table`
+    requires a DIGIT taxid, so "build a codon table for Saccharomyces
+    cerevisiae" was not expressible without already knowing 4932. The GUI has had this since
+    it shipped (`NcbiTaxonPickerModal` fires whenever the Kazusa field gets a
+    non-numeric query); this is the side door to the same engine.
+
+    Uses the cascading search `_ncbi_taxid_search_terms` builds — strictest
+    term first, then auto-wildcarded partials, then a genus-typo rescue via
+    the species epithet — so a slightly wrong name surfaces RELATED taxa
+    instead of a dead end. `term_used` reports which term actually hit, so a
+    caller can see it matched something looser than it asked for rather than
+    trusting a lucky-looking first row.
+
+    Requires arming Settings → "Allow Babs online database lookups" (403
+    otherwise). Gated like every other `*-search`, not like `fetch`: only a
+    query string leaves the box, but a query string an autonomous agent
+    composed is exactly what the gate exists to hold. Pass a numeric taxid
+    straight to `add-codon-table` if lookups are disarmed. Read-only."""
+    if not _online_lookups_armed():
+        return _online_lookups_refusal()
+    query, n, err = _validate_lookup_payload(payload, _ONLINE_LOOKUP_MAX_HITS)
+    if err:
+        return err
+    assert query is not None  # validated non-None above
+    if query.strip().isdigit():
+        return ({"error": f"{query!r} is already a taxid — pass it straight "
+                          f"to `add-codon-table` as 'taxid'"}, 400)
+    try:
+        hits, total, msg = _ncbi_taxid_search(query, retmax=max(1, n))
+    except Exception as exc:
+        return _online_lookup_error(exc, "taxon-search")
+    return {"ok": True, "source": "NCBI Taxonomy", "query": query,
+            "total_matches": total, "count": len(hits),
+            "hits": [{"taxid": str(h.get("taxid") or ""),
+                       "name": str(h.get("name") or "")} for h in hits],
+            "term_used": msg}
+
+
 @_agent_endpoint("wikipedia-search")
 def _h_wikipedia_search(app, payload):
     """Search Wikipedia for encyclopedic background. Body:
@@ -11736,9 +11947,11 @@ def _h_simulate_pcr(app, payload):
     and some amplicon wraps, ``warnings`` says so. Pass
     ``circular: false`` for a PCR product, gBlock or genomic fragment.
 
-    Read-only. To save an amplicon as a linear library entry, use the
-    Simulator screen (which constructs a SeqRecord with primer_bind
-    features at the ends) — the agent flow is meant for analysis.
+    Read-only. To SAVE one of these amplicons as a linear library entry,
+    pass the same payload to `save-amplicon` with a `name` (and the
+    `amplicon_index` you saw here) — it re-runs this simulation and files
+    the product with its primer_bind features, so the preview and the save
+    can never disagree about what was built.
     """
     # Natural-guess aliases (ergonomics nit) — canonical name wins when
     # present, else fall back. `or` is safe: an empty/missing canonical

@@ -113,7 +113,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 ~269 endpoints across:
 
 - **Records** — `new-plasmid` (create from a raw sequence, the Ctrl+N
-  flow), get / set sequence, add / update / delete features (with the full
+  flow; pass `parts: [[start, end], …]` on a feature to author a SPLICED
+  gene, written as a GenBank `join(...)` — its `end > n` wrap convention
+  still works beside that), `set-origin` / `reverse-complement` (the whole
+  record reframes behind Alt+Shift+O / Alt+Shift+R: every feature is
+  re-framed per part so spliced exons and origin wraps survive, both are
+  undoable with `undo`, both CLEAR stored alignments because every
+  coordinate moved, and `set-origin` refuses a linear molecule `422` —
+  rotating one would join two ends that are not joined), get / set
+  sequence, add / update / delete
+  features (with the full
   arrow type — forward ▶ / reverse ◀ / arrowless / double-stranded ◀▶ —
   plus colour and arbitrary GenBank qualifiers, matching the Insert/Edit
   Feature dialog. **Colour takes whatever `list-features` reports** — hex
@@ -266,7 +275,14 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   `422` instead. A restriction site the ligation REGENERATES (the normal
   outcome at a directional clone's junctions) comes back as one intact
   feature, not two `(disrupted)` halves, and each junction's sticky overhang
-  is annotated at the bases that actually anneal),
+  is annotated at the bases that actually anneal. A SPLICED parent feature
+  carries its exon structure: the returned feature dict adds
+  `parts: [[start, end], …]` in reading order, and `start`/`end` stay the
+  outer bounds, so a gene with introns is not annotated across them.
+  **`parts` is absent when a feature is contiguous** — that is the contract,
+  so treat its absence as "one block" rather than as missing data. An enzyme
+  cutting INSIDE an intron annotates the two exons it separated rather than
+  claiming the intron bases),
   golden-gate-assemble / simulate-golden-gate (Type IIS — BsaI /
   BsmBI / BbsI / SapI / Esp3I — overhang-directed N-part assembly: parts in
   any order, chained by their 4-nt overhangs into a circle, with a

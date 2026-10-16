@@ -14,6 +14,77 @@
 
 ---
 
+## [1.3.10] — 2026-10-16
+
+### New features
+
+- **Fourteen things the app could do that scripts and AI agents could not.**
+  A sweep across every keyboard shortcut, menu item and button found
+  capabilities with no equivalent in the agent API. Now reachable from
+  outside the app: **set the origin** of a circular plasmid and
+  **reverse-complement** a record (the Alt+Shift+O / Alt+Shift+R actions);
+  **save a simulated PCR amplicon** to the library; **import primers from a
+  CSV** (the exporter had been advertising this for a while without it
+  existing); **rename a stored primer, move it through Designed → Ordered →
+  Validated, and flag it for the order cart**, then export the cart;
+  **look up an organism's NCBI taxid by name**, so a codon table can be
+  requested by organism name rather than by its taxid number; **read a .ab1
+  trace** with its per-base quality scores, which is what the read-checking
+  endpoint wanted all along; and the whole **protein collections** store,
+  which the Synthesis screen has had since it shipped.
+- **Search the API instead of guessing at it.** `splicecraft-cli tools
+  --filter primer` ranks endpoints by name and description and shows the best
+  matches with a true match count, instead of making you read the entire
+  ~150 KB catalogue or guess a name.
+- The codon optimiser's "avoid these sites" list is now readable and settable
+  from outside the app, so a script optimises against the same forbidden
+  enzymes the app does instead of silently scrubbing nothing.
+
+### Bug fixes
+
+- **Genes with introns now survive cloning with their exons intact.** Cloning
+  a plasmid that carries a spliced gene used to annotate the product straight
+  through the gene's introns, so the intron read as coding DNA. On a two-exon
+  test gene that turned a 16-residue protein into a 24-residue one with a stop
+  codon in the middle — and it was the product's own CDS annotation saying so.
+  Restriction cloning, Golden Gate / MoClo one-pot, Gibson and the construction
+  simulator all carry the exon structure now, and the saved file gets a proper
+  `join(...)` location. An enzyme that cuts inside an intron annotates the two
+  exons it separates, rather than claiming the intron bases.
+- **Importing a reverse-strand gene into your feature library stored the wrong
+  DNA.** "Import from library plasmid" in the Add Feature dialog read a
+  minus-strand gene's exons (or an origin-spanning feature's two halves) in the
+  wrong order, so the sequence it saved was the right bases rearranged — a
+  rotated gene. Anything you later annotated from that library entry inherited
+  it. The same reading fed "search by feature" for BLAST/HMMER and the operon
+  tool's protein import.
+- **Gibson assembly no longer drops a feature without telling you.** A feature
+  whose coordinates a linear fragment cannot express was discarded silently, so
+  a saved assembly could come back missing an annotation with nothing in the
+  result to explain it. It now names the feature in the warnings.
+- **The protein tab no longer invents residue positions.** For a gene that
+  crosses the plasmid's origin, the Synthesis protein editor could import an
+  unrelated feature from elsewhere on the backbone as a protein motif, and put
+  the gene's own N-terminal tag past the end of the protein. Motifs are now
+  numbered from the spliced message, and anything intronic or outside the gene
+  is left out.
+
+- **The Claude Skill told agents some things that weren't true.** Two of them
+  made an agent report a write as a preview or a preview as a write: applying
+  a GFF3 file was described as needing a confirmation step when it writes
+  immediately, and recovering history from a `.dna` file was described with
+  the wrong key, so the documented call did nothing and said it had worked.
+  Two endpoint names in it didn't exist, the allele-specific primer mode was
+  missing, and the two separate "allow online lookups" settings were
+  described as one — so a refusal told you to flip the wrong switch. All
+  corrected, and a test now fails if the skill drifts from the code again.
+
+### Hardening
+
+- A malformed feature list handed to a digest — wrong shape, non-numeric
+  coordinates, overlapping exons — is now ignored entry by entry instead of
+  aborting the whole reaction with an unhelpful error.
+
 ## [1.3.9] — 2026-10-13
 
 ### New features

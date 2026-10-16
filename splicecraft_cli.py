@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -324,13 +325,30 @@ def cmd_status(args) -> None:
 
 
 def cmd_tools(args) -> None:
-    result = _request("tools")
+    flt = getattr(args, "filter", None)
+    # `tools` is a GET, and the server reads a GET's payload from the QUERY
+    # STRING (`_parse_query_params`), not from a body — so the filter rides
+    # the URL rather than `_request`'s `payload`, which only ships on POST.
+    ep = ("tools?filter=" + urllib.parse.quote(flt, safe="")) if flt \
+        else "tools"
+    result = _request(ep)
     if args.json:
         _emit_json(result)
         return
-    for ep in result.get("endpoints", []):
+    eps = result.get("endpoints", [])
+    # 34, not 14: `analyse-read-heterogeneity` is 26 characters and the old
+    # width pushed every long name's summary out of alignment, which is
+    # exactly the column a reader scans.
+    for ep in eps:
         flag = "WRITE" if ep.get("write") else "READ "
-        print(f"  {flag}  {ep['name']:14}  {ep.get('doc', '')}")
+        print(f"  {flag}  {ep['name']:34}  {ep.get('doc', '')}")
+    total = result.get("total_matches")
+    if flt and isinstance(total, int):
+        # Say how many matched, not just how many printed — a capped page
+        # read as the whole answer is the mistake this count exists to stop.
+        shown = len(eps)
+        more = f" (showing the best {shown})" if total > shown else ""
+        print(f"\n  {total} endpoint(s) match {flt!r}{more}")
 
 
 def cmd_features(args) -> None:
@@ -573,6 +591,10 @@ def _build_parser() -> argparse.ArgumentParser:
                                 help="List all endpoints the session exposes.")
     p_tools.add_argument("--json", action="store_true",
                           help="Emit JSON instead of a table")
+    p_tools.add_argument("--filter", metavar="TERMS", default=None,
+                          help="Rank by name + docs and show the best "
+                               "matches (e.g. --filter primer) — search the "
+                               "VERB you want instead of guessing a name.")
     p_tools.set_defaults(fn=cmd_tools)
 
     p_feat = sub.add_parser("features",

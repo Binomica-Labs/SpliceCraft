@@ -1672,7 +1672,20 @@ def main(argv: list[str] | None = None) -> int:
     # cuts that to ~5 min on an 8-core box. Tests are isolated by the
     # autouse `_protect_user_data` fixture so cross-worker collisions
     # are impossible.
-    _run([sys.executable, "-m", "pytest", "-n", "auto", "-q", "--tb=short"])
+    #
+    # `SPLICECRAFT_PYTEST_WORKERS` overrides the count, because `-n auto` is a
+    # RAM bet and not only a CPU one: every worker imports the ~100k-line hub
+    # plus Biopython, so eight of them on a 14 GB box got the release
+    # OOM-KILLED at ~34% of the suite — twice — each time leaving a
+    # half-bumped tree (version written to 5 files, nothing committed) and
+    # nothing in the output but a truncated progress line. A stall that looks
+    # like a crash and is really memory pressure is worth one env var: set it
+    # to 4 on a smaller box. Any xdist spec works (`4`, `auto`, `logical`).
+    _workers = (os.environ.get("SPLICECRAFT_PYTEST_WORKERS") or "auto").strip()
+    if _workers != "auto":
+        print(f"  SPLICECRAFT_PYTEST_WORKERS={_workers} — overriding -n auto")
+    _run([sys.executable, "-m", "pytest", "-n", _workers, "-q",
+          "--tb=short"])
 
     _heading("Building sdist + wheel")
     _clean_build_artifacts()

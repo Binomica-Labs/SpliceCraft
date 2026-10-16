@@ -41,6 +41,7 @@ if TYPE_CHECKING:  # annotation-only; the real Bio import is lazy, inside the fn
 
 import splicecraft_state as _state
 from splicecraft_biology import (
+    _apply_local_parts, _clip_spans,
     _digest_with_enzymes, _enzyme_cuts, _enzyme_signature, _feat_len,
     _forbidden_hit_set, _fragments_from_cuts,
     _iupac_pattern, _rc, _scan_restriction_sites, _slice_circular,
@@ -62,8 +63,8 @@ from splicecraft_history import (
 from splicecraft_logging import _log, _timed
 from splicecraft_record import _gb_text_to_record, _normalize_primer_seq
 from splicecraft_util import (   # L0
-    _coerce_feature_strand, _feat_bounds, _feature_location,
-    _record_is_circular,
+    _coerce_feature_strand, _feat_bounds, _feat_dict_set_spans,
+    _feat_dict_spans, _feature_location_for_dict, _record_is_circular,
 )
 
 
@@ -760,6 +761,7 @@ def _gibson_build_product(
 def _gibson_shift_features(
     norm_fragments: list[dict], overlap_lens: list[int],
     offsets: list[int], product_len: int, *, circular: bool,
+    warnings: "list[str] | None" = None,
 ) -> list[dict]:
     """Shift each fragment's features into product coords. Features
     wholly inside a fragment's leading-overlap region (i > 0) are
@@ -783,6 +785,27 @@ def _gibson_shift_features(
             except (TypeError, ValueError):
                 continue
             if e <= s:
+                # A Gibson fragment is LINEAR and its features are in
+                # fragment-local coordinates, so `end <= start` cannot be an
+                # origin wrap here — it is a malformed input (often an
+                # `end < start` wrap dict copied from a CIRCULAR parent, or
+                # from this function's own OUTPUT, where that encoding IS
+                # meaningful). Dropping it is right; dropping it in SILENCE
+                # was not: `simulate-gibson` and the WRITE endpoint
+                # `gibson-assemble` both take caller-supplied feature dicts,
+                # so a saved product quietly lost the annotation with no
+                # warning anywhere in the response. Split an origin-spanning
+                # parent feature into `_wrap_pair` halves (what
+                # `_record_features` does) to carry it across the junction.
+                if warnings is not None:
+                    _lbl = str(feat.get("label") or feat.get("type")
+                               or "feature")
+                    warnings.append(
+                        f"fragment {f_dict.get('name') or i + 1}: dropped "
+                        f"{_lbl!r} — its start {s} is not before its end {e}, "
+                        f"which a linear fragment's coordinates cannot "
+                        f"express (use _wrap_pair halves for an "
+                        f"origin-spanning feature)")
                 continue
             if i > 0 and e <= oh_lead:
                 # Feature lies entirely in the leading-overlap region
@@ -824,7 +847,34 @@ def _gibson_shift_features(
                     new_e = product_len
                 if new_e <= new_s:
                     continue
-            shifted.append({**feat, "start": new_s, "end": new_e})
+            _nf = {**feat, "start": new_s, "end": new_e}
+            # Exons ride the same shift as the bounds, then get clipped to
+            # the feature's final span — the product may have truncated it.
+            # A feature whose exon list doesn't survive degrades to the
+            # contiguous reading rather than being lost.
+            _raw = feat.get("parts")
+            if isinstance(_raw, (list, tuple)) and len(_raw) > 1:
+                _sh: "list[list[int]]" = []
+                for _p in _raw:
+                    try:
+                        _sh.append([int(_p[0]) + offset, int(_p[1]) + offset])
+                    except (TypeError, ValueError, IndexError, KeyError):
+                        _sh = []
+                        break
+                if new_e >= new_s:
+                    if _apply_local_parts(_nf, _sh or None,
+                                          new_s, new_e) is None:
+                        continue
+                else:
+                    # Wrapped into the product's own origin: keep the exons
+                    # whole, expressed across the wrap, rather than clipping
+                    # them to an inverted span.
+                    _feat_dict_set_spans(
+                        _nf, _clip_spans(_sh, 0, product_len), product_len)
+                    _nf["start"], _nf["end"] = new_s, new_e
+            else:
+                _nf.pop("parts", None)
+            shifted.append(_nf)
     return shifted
 
 
@@ -871,6 +921,18 @@ def _gibson_merge_wrap_halves(
                               if not k.startswith("_wrap_")}
                     merged["start"] = tail["start"]
                     merged["end"]   = head["end"]
+                    # A SPLICED feature severed at the junction rejoins its
+                    # exons too, tail-first (traversal order across the
+                    # product's wrap). `_feat_dict_set_spans` re-derives the
+                    # same bounds just set and drops `parts` again when the
+                    # halves prove contiguous.
+                    if (isinstance(tail.get("parts"), (list, tuple))
+                            or isinstance(head.get("parts"), (list, tuple))):
+                        _sp = (_feat_dict_spans(tail, product_len)
+                               + _feat_dict_spans(head, product_len))
+                        _feat_dict_set_spans(merged, _sp, product_len)
+                        merged["start"], merged["end"] = (tail["start"],
+                                                          head["end"])
                     out_feats.append(merged)
                     handled_pairs.add(pid)
                     continue
@@ -970,7 +1032,7 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
 
     shifted = _gibson_shift_features(
         norm_fragments, overlap_lens, offsets, product_len,
-        circular=circular,
+        circular=circular, warnings=warnings,
     )
     out_feats = _gibson_merge_wrap_halves(
         shifted, product_len, circular=circular,
@@ -1058,8 +1120,11 @@ def _gibson_record_from_result(result: dict, *, name: str) -> "SeqRecord | None"
         if ps:
             quals["primer_seq"] = [_normalize_primer_seq(ps)]
         # Wrap features split via `_feature_location`, which orders a
-        # minus-strand origin-wrap's halves 5'→3' (see its docstring).
-        loc = _feature_location(s, e, n, 0 if strand == 2 else strand)
+        # minus-strand origin-wrap's halves 5'→3' (see its docstring);
+        # `_feature_location_for_dict` adds the exon list, so a spliced
+        # feature exports as `join(...)` rather than one block over its
+        # own introns (`[INV-221]`).
+        loc = _feature_location_for_dict(f, n, 0 if strand == 2 else strand)
         if loc is None:
             continue
         rec.features.append(SeqFeature(loc, type=ftype, qualifiers=quals))
@@ -1172,12 +1237,16 @@ def _rejoin_origin_split_features(features: "list[dict]",
             continue
         if a_e == b_s:
             start, end = a_s, b_e
+            first, second = a, b
         elif b_e == a_s:
             start, end = b_s, a_e
+            first, second = b, a
         elif total and a_e == total and b_s == 0:
             start, end = a_s, b_e          # wraps the product's own origin
+            first, second = a, b
         elif total and b_e == total and a_s == 0:
             start, end = b_s, a_e
+            first, second = b, a
         else:
             continue                        # genuinely separated — leave it
         # Contiguous is necessary but NOT sufficient: when a cut also fell
@@ -1194,6 +1263,20 @@ def _rejoin_origin_split_features(features: "list[dict]",
                     if k not in ("_wrap_origin_split", "_wrap_origin_group",
                                   "_split", "_split_full_len")}
         rejoined["start"], rejoined["end"] = start, end
+        # A spliced feature halved at the origin rejoins its EXONS too, in
+        # traversal order (the half that comes first in the product first).
+        # `_feat_dict_set_spans` re-derives the same bounds computed above
+        # from that ordered span list, and drops `parts` again when the two
+        # halves turn out to reconstitute a contiguous feature — so a plain
+        # wrap keeps coming back as a plain wrap. Only entered when an exon
+        # list is actually present, leaving the non-spliced path untouched.
+        if (isinstance(first.get("parts"), (list, tuple))
+                or isinstance(second.get("parts"), (list, tuple))):
+            _spans = (_feat_dict_spans(first, total)
+                      + _feat_dict_spans(second, total))
+            _feat_dict_set_spans(rejoined, _spans, total)
+        else:
+            rejoined.pop("parts", None)
         replacements.append(rejoined)
         merged_ids |= {id(a), id(b)}
 
@@ -1342,6 +1425,18 @@ def _rejoin_cut_split_features(features: "list[dict]", total: int,
                                       "_wrap_origin_split",
                                       "_wrap_origin_group")}
             rejoined["start"], rejoined["end"] = start, end
+            # Exons rejoin in RUN order, which is already the traversal order
+            # (the pieces are sorted, then rotated when the run continues
+            # across the product origin). Same `_feat_dict_set_spans` call as
+            # the origin pass: it reproduces the bounds just computed and
+            # drops `parts` when the pieces turn out contiguous.
+            if any(isinstance(x.get("parts"), (list, tuple)) for x in run):
+                _spans: "list[list[int]]" = []
+                for x in run:
+                    _spans.extend(_feat_dict_spans(x, total))
+                _feat_dict_set_spans(rejoined, _spans, total)
+            else:
+                rejoined.pop("parts", None)
             replacements.append(rejoined)
             merged_ids |= {id(x) for x in run}
 
@@ -1373,13 +1468,35 @@ def _ligate_fragments(a: dict, b: dict) -> "dict | None":
     if not _ends_compatible(a["right"], b["left"]):
         return None
     shift = len(a["top_seq"])
-    merged_feats = list(a["features"])
+    merged_feats = [{**f, "parts": [list(p) for p in f["parts"]]}
+                    if isinstance(f.get("parts"), (list, tuple)) else dict(f)
+                    for f in a["features"]]
     for f in b["features"]:
-        merged_feats.append({
+        nf = {
             **f,
             "start": int(f.get("start", 0)) + shift,
             "end":   int(f.get("end",   0)) + shift,
-        })
+        }
+        # Exons shift with the bounds. Copied rather than shifted in place:
+        # `{**f}` shares the SAME list object as the input fragment, so
+        # mutating it would reach back into the caller's fragment — and a
+        # fragment is ligated twice when both orientations are simulated.
+        _raw = f.get("parts")
+        if isinstance(_raw, (list, tuple)) and len(_raw) > 1:
+            _sh: "list[list[int]]" = []
+            for _p in _raw:
+                try:
+                    _sh.append([int(_p[0]) + shift, int(_p[1]) + shift])
+                except (TypeError, ValueError, IndexError, KeyError):
+                    _sh = []
+                    break
+            if _sh:
+                nf["parts"] = _sh
+            else:
+                nf.pop("parts", None)
+        else:
+            nf.pop("parts", None)
+        merged_feats.append(nf)
     return {
         "top_seq":      a["top_seq"] + b["top_seq"],
         "left":         a["left"],
@@ -1398,7 +1515,13 @@ def _close_circular(frag: dict) -> "dict | None":
         return None
     return {
         "top_seq":      frag["top_seq"],
-        "features":     [dict(f) for f in frag["features"]],
+        # Copy the exon list too — `dict(f)` is shallow, so the closed
+        # circle would otherwise share `parts` with the linear fragment it
+        # came from and the rejoin passes below would edit both.
+        "features":     [{**f, "parts": [list(p) for p in f["parts"]]}
+                         if isinstance(f.get("parts"), (list, tuple))
+                         else dict(f)
+                         for f in frag["features"]],
         "source_label": frag["source_label"],
         "circular":     True,
     }
@@ -2588,6 +2711,29 @@ def _rc_fragment(frag: dict) -> dict:
         # orientation insert came out pointing right (audit 2026-09-22).
         _old_strand = _coerce_feature_strand(f.get("strand", 1))
         new_f["strand"] = -_old_strand if _old_strand in (-1, 1) else _old_strand
+        # Exons ride the SAME affine map as the bounds — old end becomes new
+        # start — and the list order REVERSES, because a fragment is linear
+        # so forward-traversal order is ascending and flipping the molecule
+        # inverts it. Mapping the bounds and leaving the exons alone would
+        # put the intron structure on the mirror image of itself.
+        _raw_parts = f.get("parts")
+        if isinstance(_raw_parts, (list, tuple)) and len(_raw_parts) > 1:
+            _mapped: "list[list[int]]" = []
+            for _p in reversed(list(_raw_parts)):
+                try:
+                    _ps, _pe = int(_p[0]), int(_p[1])
+                except (TypeError, ValueError, IndexError, KeyError):
+                    _mapped = []
+                    break
+                _mapped.append([(n - _pe) - right_strip + new_left_extra_len,
+                                (n - _ps) - right_strip + new_left_extra_len])
+            if _apply_local_parts(new_f, _mapped or None,
+                                  new_f["start"], new_f["end"]) is None:
+                # No exon survives the flip's clamp — the feature lay
+                # entirely in bases that left the top strand.
+                continue
+        else:
+            new_f.pop("parts", None)
         # The clamp is not free. An overhang that was on the TOP strand
         # before the flip is on the BOTTOM strand after it, so its bases
         # leave `top_seq` — and a feature that reached into them loses

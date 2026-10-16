@@ -503,6 +503,58 @@ def _feature_location(start: int, end: int, total: int, strand):
     return CompoundLocation([head, tail] if strand == -1 else [tail, head])
 
 
+def _feature_location_spans(spans, total: int, strand):
+    """Build the Biopython location for a feature carrying explicit exon
+    `spans` (forward-traversal order) — the INVERSE of `_feat_spans`' ``parts``
+    and the multi-exon sibling of `_feature_location`.
+
+    One span (or one left after dropping degenerate ones) delegates to
+    `_feature_location`, so the wrap encoding, the ends-on-origin collapse
+    and the degenerate-span refusal keep living in exactly one place.
+
+    **Stored order is READING order** — the rule `_feature_location` exists to
+    enforce, applied to N parts instead of two: Biopython concatenates a
+    `CompoundLocation`'s parts in stored order and writes
+    ``complement(join(...))`` by reversing them, so a minus-strand feature's
+    parts are stored DESCENDING. Emitting forward order for both strands is
+    invisible inside SpliceCraft (`_feature_traversal` recovers the reading
+    order from either) but exports a `join()` that Biopython, SnapGene,
+    Benchling and NCBI all read with the exons in the wrong order — a
+    cyclically rotated protein, the `[INV-182]` fault. Route every
+    multi-exon build through here."""
+    from Bio.SeqFeature import CompoundLocation, FeatureLocation
+    total = int(total)
+    clean = [(int(a), int(b)) for a, b in (spans or []) if int(b) > int(a)]
+    if not clean:
+        return None
+    if len(clean) == 1:
+        return _feature_location(clean[0][0], clean[0][1], total, strand)
+    locs = [FeatureLocation(a, b, strand=strand) for a, b in clean]
+    return CompoundLocation(list(reversed(locs)) if strand == -1 else locs)
+
+
+def _feature_location_for_dict(fd, total: int, strand):
+    """The Biopython location for an engine-dict feature, honouring ``parts``.
+
+    The one call every dict → `SeqFeature` builder should make: it uses the
+    exon list when the feature carries one and falls back to
+    `_feature_location`'s ``(start, end)`` reading otherwise, so a builder
+    cannot accidentally emit a spliced feature as one contiguous block (which
+    is how a carried two-exon CDS came out translating through its intron,
+    premature stop and all). A `parts` list that fails to build falls back the
+    same way rather than losing the feature."""
+    parts = fd.get("parts") if isinstance(fd, dict) else None
+    if isinstance(parts, (list, tuple)) and len(parts) > 1:
+        loc = _feature_location_spans(parts, total, strand)
+        if loc is not None:
+            return loc
+    try:
+        s, e = int(fd.get("start", 0)), int(fd.get("end", 0))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return _feature_location(s, e, total, strand)
+
+
 def _record_is_circular(record) -> bool:
     """Topology of a Biopython record, read from its ``topology`` annotation.
 
@@ -873,6 +925,151 @@ def _feat_bounds(feat, total: int, *,
         return int(loc.start), int(loc.end), strand
     except (TypeError, ValueError):
         return None
+
+
+def _span_len_wrapaware(start: int, end: int, total: int) -> int:
+    """Wrap-aware span length — `(total - start) + end` when `end < start`.
+
+    Deliberately a MIRROR of biology L0's `_feat_len` rather than an import:
+    `splicecraft_biology` imports this module, so importing it back would
+    make a cycle. The two formulas must never drift, and
+    `tests/test_introns.py::test_util_span_len_matches_feat_len` fails if they
+    do (same drift-guard pattern as mapimage's `_FALLBACK_PALETTE`).
+    See sacred invariant #8."""
+    start, end, total = int(start), int(end), int(total)
+    return (total - start) + end if end < start else end - start
+
+
+def _feat_spans(feat, total: int, *, circular: "bool | None" = None):
+    """`_feat_bounds` PLUS the exon spans — ``(start, end, strand, parts)``.
+
+    ``parts`` is the feature's spans in FORWARD-TRAVERSAL order, or ``None``
+    when the feature is contiguous and the ``(start, end)`` pair already says
+    everything. It is emitted ONLY when the feature has INTRONS, decided by
+    measurement rather than by shape: exonic length (the sum of the parts)
+    strictly less than the traversal span (`_feat_len(start, end, total)`).
+
+    **Why measurement and not `len(parts) > 1`.** An origin-WRAPPING feature
+    is a two-part `CompoundLocation` exactly like a spliced one (sacred
+    invariant #9), and the dict model has always encoded that wrap as
+    ``end < start`` — so reporting its two halves as exons would invent an
+    intron spanning the whole backbone. The length test separates them with
+    no special case, and it keeps being right for the awkward third kind: a
+    feature that BOTH wraps and is spliced, where neither the part count nor
+    the `end < start` test alone can tell you which gaps are introns.
+
+    A compound whose parts overlap (malformed, or a hand-edited file) measures
+    exonic >= span and so reads as contiguous — deliberately fail-safe: the
+    outer bounds are the answer `_feat_bounds` has always given.
+
+    This is the producer half of the engine's intron contract; `_feat_dict_spans`
+    reads it back off a dict and `_feature_location_spans` turns it into a
+    Biopython location. See `[INV-221]`."""
+    loc = getattr(feat, "location", None)
+    if loc is None:
+        return None
+    bounds = _feat_bounds(feat, total, circular=circular)
+    if bounds is None:
+        return None
+    s, e, strand = bounds
+    trav = _feature_traversal(loc, total, circular=circular)
+    if trav is None or not trav[2]:
+        return s, e, strand, None
+    parts = [[int(ps), int(pe)] for ps, pe in trav[2] if int(pe) > int(ps)]
+    if len(parts) < 2:
+        return s, e, strand, None
+    exonic = sum(pe - ps for ps, pe in parts)
+    span = _span_len_wrapaware(s, e, total) if total > 0 else (e - s)
+    return s, e, strand, (parts if exonic < span else None)
+
+
+def _feat_dict_spans(fd, total: int) -> "list[list[int]]":
+    """The exon spans of an ENGINE-DICT feature, forward-traversal order.
+
+    One reader for every site in the digest → ligate chain, so "what bases
+    does this feature cover" has a single answer. Returns at least one span.
+
+    * ``parts`` present and usable → those spans.
+    * no ``parts`` → the single ``[start, end)`` span, split at the origin
+      into ``[start, total)`` + ``[0, end)`` when the feature wraps
+      (``end < start``), which is the shape the rest of the chain expects.
+
+    **Never raises and never returns ``[]``.** A malformed ``parts`` (not a
+    list, wrong arity, non-integer, every span degenerate) falls back to the
+    single span, because reading as "not spliced" is the behaviour this code
+    had before introns existed — whereas an exception here would take down a
+    digest over one bad annotation, and an empty list would silently delete
+    the feature. Same rule `_tx_usable_features` applies, for the same
+    reason."""
+    try:
+        s = int(fd.get("start", 0))
+        e = int(fd.get("end", 0))
+    except (TypeError, ValueError, AttributeError):
+        return [[0, 0]]
+    raw = fd.get("parts") if isinstance(fd, dict) else None
+    if isinstance(raw, (list, tuple)) and len(raw) > 1:
+        spans: "list[list[int]]" = []
+        ok = True
+        for p in raw:
+            try:
+                ps, pe = int(p[0]), int(p[1])
+            except (TypeError, ValueError, IndexError, KeyError):
+                ok = False
+                break
+            if pe > ps:
+                spans.append([ps, pe])
+        if ok and len(spans) > 1:
+            return spans
+    if e < s and total > 0:
+        out = [[s, total]] if total > s else []
+        if e > 0:
+            out.append([0, e])
+        return out or [[s, e]]
+    return [[s, e]]
+
+
+def _feat_dict_set_spans(fd: dict, spans, total: int) -> dict:
+    """Write exon `spans` back onto an engine-dict feature, in place.
+
+    Keeps ``start``/``end`` as the outer traversal bounds (so every consumer
+    that never heard of introns is unaffected) and carries ``parts`` ONLY
+    while the spans are genuinely discontiguous. Adjacent spans are merged
+    first, which is what makes a cut through an intron collapse back to a
+    contiguous feature instead of leaving a phantom zero-width intron behind.
+
+    Removes a stale ``parts`` key when the spans have become contiguous —
+    the absence of the key is the contract for "no introns", so leaving a
+    one-span `parts` behind would be a second, disagreeing truth."""
+    clean = [[int(a), int(b)] for a, b in (spans or []) if int(b) > int(a)]
+    if not clean:
+        fd.pop("parts", None)
+        return fd
+    # **Order is information and must NOT be sorted.** `spans` arrive in
+    # FORWARD-TRAVERSAL order, where a descending step means the traversal
+    # crosses the origin. Sorting them throws that away, and the two readings
+    # are then indistinguishable: on a 400 bp circle the spans
+    # `[[0,40],[360,400]]` are either ONE 80 bp feature crossing the origin or
+    # a two-exon gene with a 320 bp intron, and only the order says which.
+    # (Sorting first is how the first cut of this helper turned every
+    # whole-span spliced gene into a wrap.) Merge only spans that are
+    # adjacent or overlapping IN ORDER, so a collapsed intron closes up
+    # without an origin crossing ever being merged away.
+    merged: "list[list[int]]" = [clean[0]]
+    for ps, pe in clean[1:]:
+        last = merged[-1]
+        if last[0] <= ps <= last[1]:
+            last[1] = max(last[1], pe)
+        else:
+            merged.append([ps, pe])
+    fd["start"], fd["end"] = merged[0][0], merged[-1][1]
+    exonic = sum(pe - ps for ps, pe in merged)
+    span = (_span_len_wrapaware(fd["start"], fd["end"], total) if total > 0
+            else fd["end"] - fd["start"])
+    if len(merged) > 1 and exonic < span:
+        fd["parts"] = merged
+    else:
+        fd.pop("parts", None)
+    return fd
 
 
 def _name_modal_result(result: "_Any",

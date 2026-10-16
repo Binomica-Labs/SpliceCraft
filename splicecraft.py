@@ -43,13 +43,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.3.9"
+__version__ = "1.3.10"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-10-13"
+_RELEASE_DATE = "2026-10-16"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -5308,6 +5308,12 @@ def _commit_library_entry_to_collection(entry: dict, collection: str,
 # ── Pure helpers moved to splicecraft_util (Phase D) ────────────────────────
 from splicecraft_util import (  # noqa: E402
     _feat_bounds as _feat_bounds,
+    _feat_spans as _feat_spans,
+    _feat_dict_spans as _feat_dict_spans,
+    _feat_dict_set_spans as _feat_dict_set_spans,
+    _feature_location_spans as _feature_location_spans,
+    _feature_location_for_dict as _feature_location_for_dict,
+    _span_len_wrapaware as _span_len_wrapaware,
     _feature_traversal as _feature_traversal,
     _phred_in_alignment_frame as _phred_in_alignment_frame,
     _read_rotation_in_rows as _read_rotation_in_rows,
@@ -10694,7 +10700,7 @@ def _build_clone_region_amplicon_entry(
             quals["primer_seq"] = [_normalize_primer_seq(_ps)]
         # `_feature_location` owns the wrap split, including the part ORDER
         # a minus-strand origin-wrap needs so it exports as the right protein.
-        loc = _feature_location(s, e, n, _biopython_strand(strand))
+        loc = _feature_location_for_dict(f, n, _biopython_strand(strand))
         if loc is None:
             continue
         rec.features.append(SeqFeature(
@@ -43231,10 +43237,13 @@ def _clone_part_marshal_vec_features(vec_rec) -> list[dict]:
     for f in (vec_rec.features or []):
         if f.type == "source":
             continue
-        bounds = _feat_bounds(f, total_vec)
-        if bounds is None:
+        # `_feat_spans`, not `_feat_bounds`: a SPLICED vector feature needs
+        # its exon list carried or the fragment gets the gene's outer bounds
+        # with the intron annotated as coding (`[INV-221]`).
+        _sp = _feat_spans(f, total_vec)
+        if _sp is None:
             continue
-        fs, fe, _fs_strand = bounds
+        fs, fe, _fs_strand, _fs_parts = _sp
         label = ""
         for k in ("label", "gene", "product", "note"):
             vals = f.qualifiers.get(k, [])
@@ -43247,13 +43256,16 @@ def _clone_part_marshal_vec_features(vec_rec) -> list[dict]:
             if vals:
                 color = str(vals[0])
                 break
-        vec_features.append({
+        _fd = {
             "start":  fs, "end":   fe,
             "strand": f.location.strand or 1,
             "type":   f.type,
             "label":  label or f.type,
             "color":  color or "white",
-        })
+        }
+        if _fs_parts:
+            _fd["parts"] = _fs_parts
+        vec_features.append(_fd)
     return vec_features
 
 
@@ -43629,8 +43641,8 @@ def _clone_part_build_seqrecord(
         # Wrap features go through `_feature_location`, which owns both
         # halves' order (a minus-strand wrap reads head-first) and the
         # e == 0 / e == s edge cases CompoundLocation refuses.
-        loc: "FeatureLocation | CompoundLocation | None" = _feature_location(
-            s, e, n_seq, _biopython_strand(strand))
+        loc: "FeatureLocation | CompoundLocation | None" = (
+            _feature_location_for_dict(f, n_seq, _biopython_strand(strand)))
         if loc is None:
             continue
         quals: dict = _double_strand_qualifiers({
@@ -54048,7 +54060,18 @@ class NewPlasmidModal(_OneShotDismissScreen, ModalScreen):
                 qualifiers.setdefault("ApEinfo_revcolor", [color])
                 qualifiers.setdefault("ApEinfo_fwdcolor", [color])
             _bp_strand = _biopython_strand(strand)
-            if end > n:
+            _parts = f.get("parts")
+            if isinstance(_parts, (list, tuple)) and len(_parts) > 1:
+                # A SPLICED feature: `parts` are the exons in forward-
+                # traversal order, and `_feature_location_spans` owns the
+                # minus-strand DESCENDING storage order ([INV-182]). This is
+                # the only way to AUTHOR a gene with introns from outside the
+                # GUI — `new-plasmid`'s own `end > n` wrap convention is kept
+                # untouched beside it, because it is documented API (V1_GATE).
+                loc = _feature_location_spans(_parts, n, _bp_strand)
+                if loc is None:
+                    continue
+            elif end > n:
                 # Wrap-around hit — split into two FeatureLocations.
                 loc = CompoundLocation([
                     FeatureLocation(start, n, strand=_bp_strand),
@@ -80622,21 +80645,31 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
         """
         out: list[dict] = []
         try:
-            cds_starts_ends: list[tuple[int, int]] = []
-            for sf in (record.features or []):
-                if sf.type != "CDS":
-                    continue
-                try:
-                    s = int(sf.location.start)
-                    e = int(sf.location.end)
-                except (TypeError, AttributeError, ValueError):
-                    continue
-                cds_starts_ends.append((s, e))
-            if not cds_starts_ends:
+            _cds_feat = next((sf for sf in (record.features or [])
+                              if sf.type == "CDS"), None)
+            if _cds_feat is None:
                 return out
             # First CDS is the protein's CDS — the save flow writes
-            # exactly one. Sub-features must lie INSIDE this span.
-            cds_s, cds_e = cds_starts_ends[0]
+            # exactly one. Sub-features must lie INSIDE its CODING bases.
+            #
+            # The residue map comes from `_cds_coding_positions`, the
+            # existing inverse of `_translate_cds`, NOT from the CDS's outer
+            # bounds. Reading `int(location.start/.end)` flattened a spliced
+            # or origin-WRAPPING CDS (sacred #9), and both halves of this
+            # function then went wrong at once: the "inside the CDS" test
+            # became vacuous — for a wrap it spans the whole molecule — so a
+            # `misc_feature` 300 bp away on the backbone was imported as a
+            # protein motif at an invented residue, while the CDS's own
+            # N-terminal tag was reported hundreds of residues past the end
+            # of a 40-residue protein. Mapping each base through the coding
+            # positions excludes anything intronic or off-CDS by
+            # construction and numbers the rest from the MESSAGE.
+            _total = _seq_len(record)
+            _coding = _cds_coding_positions(
+                _total, _cds_feat, circular=_record_is_circular(record))
+            if not _coding:
+                return out
+            _idx_of = {bp: i for i, bp in enumerate(_coding)}
             for sf in record.features:
                 # Sweep #18 (2026-05-21) — tighten the type filter
                 # from "not CDS" to "misc_feature only". The save
@@ -80651,12 +80684,32 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 # ourselves wrote.
                 if sf.type != "misc_feature":
                     continue
-                try:
-                    fs = int(sf.location.start)
-                    fe = int(sf.location.end)
-                except (TypeError, AttributeError, ValueError):
+                # The sub-feature's own bases, read through the SAME geometry
+                # (its exons, its strand, its wrap) rather than its outer
+                # bounds — then expressed as positions in the message.
+                _sfsp = _feat_spans(
+                    sf, _total, circular=_record_is_circular(record))
+                if _sfsp is None:
                     continue
-                if fs < cds_s or fe > cds_e:
+                _sf_s, _sf_e, _sf_strand, _sf_parts = _sfsp
+                _bps: list[int] = []
+                for _ps, _pe in (_sf_parts
+                                 or _feat_dict_spans(
+                                     {"start": _sf_s, "end": _sf_e}, _total)):
+                    _bps.extend(range(int(_ps), int(_pe)))
+                if not _bps:
+                    continue
+                # Every base must be a CODING base of this CDS. A motif that
+                # strays into an intron, or sits outside the gene entirely,
+                # has no residue number and is dropped rather than guessed.
+                try:
+                    _idxs = [_idx_of[bp] for bp in _bps]
+                except KeyError:
+                    continue
+                _lo, _hi = min(_idxs), max(_idxs) + 1
+                # Contiguous in the MESSAGE: a motif spanning an intron is
+                # still one run of coding indices, which is exactly right.
+                if _hi - _lo != len(set(_idxs)):
                     continue
                 # Sweep #18 — codon-alignment guard. The save path
                 # always writes coords as AA × 3, so well-formed
@@ -80667,11 +80720,11 @@ class SynthesisScreen(_OneShotDismissScreen, Screen):
                 # if a misc_feature with mis-aligned coords slipped
                 # past the type filter, the AA bounds we'd compute
                 # would be visually wrong.
-                if (fs - cds_s) % 3 != 0 or (fe - cds_s) % 3 != 0:
+                if _lo % 3 != 0 or _hi % 3 != 0:
                     continue
-                # DNA coords back to AA. Save wrote AA × 3, so /3.
-                aa_s = (fs - cds_s) // 3
-                aa_e = (fe - cds_s) // 3
+                # Message coords back to AA. Save wrote AA × 3, so /3.
+                aa_s = _lo // 3
+                aa_e = _hi // 3
                 if aa_e <= aa_s:
                     continue
                 quals = dict(sf.qualifiers or {})
@@ -86847,10 +86900,13 @@ class TraditionalCloningPane(Vertical):
         for f in rec.features:
             if f.type == "source":
                 continue
-            bounds = _feat_bounds(f, total)
-            if bounds is None:
+            # `_feat_spans` so a SPLICED feature keeps its exon list through
+            # the digest → ligate chain instead of being annotated across its
+            # own introns (`[INV-221]`).
+            _sp = _feat_spans(f, total)
+            if _sp is None:
                 continue
-            s, e, strand = bounds
+            s, e, strand, _parts = _sp
             label = (f.qualifiers.get("label")
                       or f.qualifiers.get("product")
                       or [f.type])[0]
@@ -86861,6 +86917,8 @@ class TraditionalCloningPane(Vertical):
                 "type":   f.type,
                 "label":  str(label)[:200],
             }
+            if _parts:
+                fd["parts"] = _parts
             # Carry the primer's full 5'→3' sequence (+ Tm note) so an
             # inherited primer_bind renders its BOUND bases inline + 5'
             # flap on the cloning product instead of a plain bar. The
@@ -87189,7 +87247,8 @@ class TraditionalCloningPane(Vertical):
             # Origin-spanning (wrap) features survive the ligation join
             # instead of being silently dropped ([INV-44]); `_feature_location`
             # owns the split + the minus-strand half order.
-            loc = _feature_location(s, e, n_top, _biopython_strand(strand))
+            loc = _feature_location_for_dict(
+                f, n_top, _biopython_strand(strand))
             _double_strand_qualifiers(qualifiers, strand)
             if loc is None:
                 continue
@@ -105339,7 +105398,14 @@ def _agent_feature_parts(sf, row, rec=None) -> "list[tuple[int, int]] | None":
     origin wrap. Uses `_feature_traversal`, so a spliced gene whose transcript
     crosses bp 0 — which the row flags as `wraps` too — still gets its exons
     (skipping every wrap made `find-feature` translate such a gene straight
-    through its introns; audit 2026-09-22)."""
+    through its introns; audit 2026-09-22).
+
+    Encodes the SAME rule as util L0's `_feat_spans` — "report exons only
+    when the feature is genuinely discontiguous" — reached from the other
+    side (a SeqFeature + an already-built row, with a no-total fallback this
+    one needs and that one doesn't). Two expressions of one rule, so
+    `tests/test_introns.py::test_agent_feature_parts_agrees_with_feat_spans`
+    pins them together; change one and the test makes you change both."""
     if sf is None:
         return None
     loc = getattr(sf, "location", None)
@@ -106266,8 +106332,12 @@ def _h_new_plasmid(app, payload):
 
     `sequence` is IUPAC DNA (capped at 1 Mbp). `features` is an OPTIONAL
     list of ``{start, end, strand?=1, name?, feature_type?, color?,
-    qualifiers?}`` (0-based half-open; a feature whose ``end`` exceeds the
-    length wraps the origin). The record is loaded for EDITING only — like
+    qualifiers?, parts?}`` (0-based half-open; a feature whose ``end``
+    exceeds the length wraps the origin). Give ``parts: [[start, end], …]``
+    in reading order to author a SPLICED feature — a gene with introns —
+    which is written as a GenBank ``join(...)`` and read back with its exons
+    intact; ``start``/``end`` stay the outer bounds. The record is loaded for
+    EDITING only — like
     `fetch` / `load-file` it is NOT auto-saved; call `add-current-to-library`
     (or `save`) to persist it (this avoids silently filing a throwaway into
     the active collection — see the fetch→save footgun). The spaced `name`
@@ -106385,6 +106455,183 @@ def _h_redo(app, payload):
     return {"ok": True, **res}
 
 
+def _agent_reframe_guard(app, rec, n_before, feats_before, new_rec, what):
+    """Shared post-transform check for the two whole-record reframes.
+
+    Returns ``(payload_extras, err)``. A reframe must never change how much
+    DNA there is, so a length change restores the undo just pushed rather
+    than installing a corrupted record — the same belt-and-braces the UI
+    actions apply, and the reason they exist is that every coordinate in the
+    record moves at once, so a regression here is not locally visible."""
+    n_after = len(str(getattr(new_rec, "seq", "") or ""))
+    if n_after != n_before:
+        app._pop_undo_silently()
+        _log.error("%s: length changed %d -> %d; aborted",
+                   what, n_before, n_after)
+        return None, ({"error": f"{what} aborted — length changed "
+                                f"({n_before} → {n_after} bp). The record "
+                                f"is untouched."}, 500)
+    dropped = feats_before - len(new_rec.features or [])
+    n_aln = app._invalidate_alignments_for_reframe(new_rec)
+    return {"length": n_after,
+            "n_features": len(new_rec.features or []),
+            "n_features_dropped": max(0, dropped),
+            "n_alignments_cleared": n_aln}, None
+
+
+@_agent_endpoint("set-origin", write=True)
+def _h_set_origin(app, payload):
+    """Re-originate the loaded CIRCULAR record so a chosen base becomes
+    base 1 — the agent counterpart to Alt+Shift+O. Body:
+    ``{bp? , feature? , feature_idx?}`` (give exactly one).
+
+    `bp` is 0-based. `feature` names a feature (label / gene / product) and
+    `feature_idx` indexes `features`; either way the feature's START becomes
+    the new origin, which is what the map's "set origin to this feature"
+    does. Every feature is re-framed per PART, so a spliced gene keeps its
+    exons and an origin-wrapping one keeps its wrap ([INV-182]) — rotation
+    is feature-conserving and pinned by test as such.
+
+    **Circular only — 422 on a linear record.** Rotating a linear molecule
+    would fabricate a junction between two ends that are not joined, i.e.
+    invent sequence adjacency that does not exist in the tube; the GUI
+    refuses it for the same reason.
+
+    Returns ``{ok, offset, length, n_features, n_features_dropped,
+    n_alignments_cleared}``. Stored alignments are CLEARED because every
+    coordinate moved and a band drawn against the old frame now points at
+    the wrong bases ([INV-181]). Undoable with `undo`."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    n = len(str(getattr(rec, "seq", "") or ""))
+    if n == 0:
+        return ({"error": "this record has no sequence"}, 422)
+    if not _record_is_circular(rec):
+        return ({"error": "set-origin needs a CIRCULAR molecule — this "
+                          "record is linear, and rotating it would join two "
+                          "ends that aren't joined. Change the topology "
+                          "first."}, 422)
+    offset, oerr = _agent_resolve_origin_offset(rec, payload, n)
+    if oerr is not None:
+        return oerr
+    assert offset is not None
+    if offset % n == 0:
+        return {"ok": True, "offset": 0, "rotated": False,
+                "length": n, "n_features": len(rec.features or []),
+                "n_features_dropped": 0, "n_alignments_cleared": 0,
+                "note": "already the origin — nothing to rotate"}
+    feats_before = len(rec.features or [])
+
+    def _do():
+        app._push_undo()
+        rotated = _rotate_seq_record(rec, offset, keep_source=True)
+        extras, err = _agent_reframe_guard(app, rec, n, feats_before,
+                                            rotated, "set-origin")
+        if err is not None:
+            return {"_err": err}
+        # Cursor to 0: it pointed at the base that IS the new origin.
+        app._apply_snapshot(str(rotated.seq), 0, rotated)
+        return extras
+
+    res = app.call_from_thread(_do)
+    if "_err" in res:
+        return res["_err"]
+    return {"ok": True, "offset": int(offset), "rotated": True, **res}
+
+
+def _agent_resolve_origin_offset(rec, payload, n):
+    """``(offset, None)`` or ``(None, (err, status))`` for `set-origin`.
+
+    Exactly one of `bp` / `feature` / `feature_idx` — ambiguity is refused
+    rather than silently preferring one, because picking the wrong anchor
+    rotates the whole molecule to the wrong place and every downstream
+    coordinate inherits it."""
+    given = [k for k in ("bp", "feature", "feature_idx")
+             if payload.get(k) not in (None, "")]
+    if len(given) != 1:
+        return None, ({"error": "give exactly one of 'bp', 'feature' or "
+                                f"'feature_idx' (got {given or 'none'})"},
+                      400)
+    if "bp" in given:
+        bp = _coerce_int(payload.get("bp"), name="bp")
+        if isinstance(bp, str):
+            return None, ({"error": bp}, 400)
+        if not (0 <= bp < n):
+            return None, ({"error": f"'bp' {bp} is outside the molecule "
+                                    f"(0..{n - 1})"}, 400)
+        return bp, None
+    feats = list(getattr(rec, "features", None) or [])
+    if "feature_idx" in given:
+        idx = _coerce_int(payload.get("feature_idx"), name="feature_idx")
+        if isinstance(idx, str):
+            return None, ({"error": idx}, 400)
+        if not (0 <= idx < len(feats)):
+            return None, ({"error": f"'feature_idx' {idx} is outside the "
+                                    f"feature list (0..{len(feats) - 1})"},
+                          400)
+        target = feats[idx]
+    else:
+        want = str(payload.get("feature") or "").strip().lower()
+        hits = [f for f in feats
+                if want and want == str(_feat_label(f) or "").strip().lower()]
+        if not hits:
+            return None, ({"error": f"no feature labelled "
+                                    f"{payload.get('feature')!r}"}, 404)
+        if len(hits) > 1:
+            return None, ({"error": f"{len(hits)} features are labelled "
+                                    f"{payload.get('feature')!r} — use "
+                                    f"'feature_idx' to pick one"}, 409)
+        target = hits[0]
+    bounds = _feat_bounds(target, n, circular=True)
+    if bounds is None:
+        return None, ({"error": "that feature's location does not resolve "
+                                "to a coordinate"}, 422)
+    return int(bounds[0]) % n, None
+
+
+@_agent_endpoint("reverse-complement", write=True)
+def _h_reverse_complement(app, payload):
+    """Reverse-complement the WHOLE loaded record in place — the agent
+    counterpart to Alt+Shift+R. Body: ``{}``.
+
+    Every feature is re-framed so it still covers the same physical bases
+    read from the other strand, and forward/reverse arrows swap. Arrowless
+    and double-stranded features keep their marker, because neither has a
+    direction to reverse ([INV-105]). A spliced feature's exons are mirrored
+    AND their order inverted, so the gene still reads 5'→3' ([INV-221]).
+
+    Works on LINEAR and CIRCULAR records alike — flipping is meaningful for
+    both, unlike `set-origin`, which needs a circle to cut.
+
+    Returns ``{ok, length, n_features, n_features_dropped,
+    n_alignments_cleared}``. Stored alignments are cleared (every
+    coordinate moved). Undoable with `undo`."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    n = len(str(getattr(rec, "seq", "") or ""))
+    if n == 0:
+        return ({"error": "this record has no sequence to flip"}, 422)
+    feats_before = len(rec.features or [])
+
+    def _do():
+        app._push_undo()
+        flipped = _reverse_complement_record(rec)
+        extras, err = _agent_reframe_guard(app, rec, n, feats_before,
+                                            flipped, "reverse-complement")
+        if err is not None:
+            return {"_err": err}
+        sp = app.query_one("#seq-panel", SequencePanel)
+        app._apply_snapshot(str(flipped.seq), sp._cursor_pos, flipped)
+        return extras
+
+    res = app.call_from_thread(_do)
+    if "_err" in res:
+        return res["_err"]
+    return {"ok": True, **res}
+
+
 def _resolve_cds_feature(app, payload):
     """Pick the CDS a residue-edit payload is talking about.
 
@@ -106463,7 +106710,19 @@ def _h_export_primers(app, payload):
         truncating.
 
     With no selector every primer in the active collection is written; `ids` /
-    `names` narrow it. Returns ``{ok, path, count, format}``."""
+    `names` narrow it.
+
+    ``cart: true`` instead writes the ORDER CART — every primer flagged
+    ``in_cart`` (the ``$`` mark) across **every** collection, deduped by
+    sequence, which is the user's pending synthesis order and the one
+    selector that is deliberately cross-collection. Set the flag with
+    `update-stored-primer {in_cart: true}`. Pair it with
+    ``clear_cart_after: true`` to reset the cart once the sheet is written,
+    exactly as the GUI's "Export Cart" button does — and only ever AFTER a
+    successful write, so a failed export can't silently empty the cart.
+
+    Returns ``{ok, path, count, format}`` plus ``cart_cleared`` when the
+    cart was reset."""
     path = _sanitize_path(payload.get("path"))
     if path is None:
         return ({"error": "missing 'path'"}, 400)
@@ -106476,11 +106735,24 @@ def _h_export_primers(app, payload):
     if fmt not in ("generic", "idt", "plate"):
         return ({"error": f"unknown format {fmt!r}; choose generic, idt or "
                           f"plate"}, 400)
-    try:
-        primers = _load_primers()
-    except Exception as exc:
-        return ({"error": f"could not read primers: {exc}"}, 500)
+    want_cart = _payload_bool(payload, "cart", False)
+    if want_cart:
+        try:
+            primers = _collect_cart_primers()
+        except Exception as exc:
+            return ({"error": f"could not read the cart: {exc}"}, 500)
+        if not primers:
+            return ({"error": "the order cart is empty — flag primers with "
+                              "update-stored-primer {in_cart: true} first"},
+                    404)
+    else:
+        try:
+            primers = _load_primers()
+        except Exception as exc:
+            return ({"error": f"could not read primers: {exc}"}, 500)
     coll = payload.get("collection")
+    if want_cart:
+        coll = None                 # the cart IS the selector, cross-collection
     if isinstance(coll, str) and coll.strip():
         want = coll.strip()
         # Primers live INSIDE a collection in `primer_collections.json` — an
@@ -106520,7 +106792,591 @@ def _h_export_primers(app, payload):
         return ({"error": str(exc)}, 400)
     except OSError as exc:
         return ({"error": f"export failed: {_scrub_path(str(exc))}"}, 500)
-    return {"ok": True, "format": fmt, **result}
+    out = {"ok": True, "format": fmt, **result}
+    # Only after the write SUCCEEDED — clearing first would empty the cart on
+    # a failed export and lose the user's pending order with nothing written.
+    if want_cart and _payload_bool(payload, "clear_cart_after", False):
+        try:
+            out["cart_cleared"] = _clear_all_cart_marks()
+        except (OSError, RuntimeError) as exc:
+            out["cart_cleared"] = 0
+            out["warnings"] = [
+                f"the sheet was written but the cart could not be cleared: "
+                f"{_scrub_path(str(exc))}"]
+    return out
+
+
+@_agent_endpoint("update-stored-primer", write=True)
+def _h_update_stored_primer(app, payload):
+    """Edit a primer STORED IN THE LIBRARY — rename it, move it through its
+    order status, or flag it for the order cart. Body:
+    ``{sequence | name | id, collection?, new_name?, status?, notes?, type?,
+    source?, in_cart?}``.
+
+    **Not to be confused with `update-primer`, which edits a `primer_bind`
+    FEATURE on the loaded record.** Two different objects; the older endpoint
+    took the obvious name first.
+
+    Identity is by ``sequence`` (preferred — stable across dedupe and
+    reindex, and the key the GUI itself uses), or by ``name`` / ``id``.
+    Ambiguity is a 409 rather than a guess: editing the wrong stored primer
+    is silent and the user finds out when the wrong oligo arrives.
+
+    `status` is one of Designed / Ordered / Validated — the cycle Shift+S
+    walks in the GUI. Nothing could change it after creation before this:
+    `list-primers` REPORTED status while `create-primer` was the only thing
+    that could set it, so an agent could design and file primers but never
+    mark them ordered.
+
+    ``in_cart`` sets or clears the ``$`` order-cart flag through the same
+    atomic `_set_primer_cart_flag` the GUI's Space cycle uses — a fresh
+    read-modify-write under the cache lock, because a concurrent primer save
+    from another worker would otherwise clobber the mark. Collect the cart
+    with `export-primers {cart: true}`.
+
+    Returns ``{ok, sequence, name, changed: [...], collection}``.
+    ``changed`` lists the fields that actually differed, so a no-op call is
+    visible as ``changed: []`` rather than reading as a successful edit."""
+    seq_in = payload.get("sequence")
+    name_in = _sanitize_label(payload.get("name"), max_len=200)
+    id_in = str(payload.get("id") or "").strip()
+    if not any((isinstance(seq_in, str) and seq_in.strip(), name_in, id_in)):
+        return ({"error": "identify the primer by 'sequence' (preferred), "
+                          "'name' or 'id'"}, 400)
+    status = payload.get("status")
+    if status not in (None, "") and status not in _PRIMER_STATUS_VALUES:
+        return ({"error": f"'status' must be one of "
+                          f"{list(_PRIMER_STATUS_VALUES)}"}, 400)
+    new_name = _sanitize_label(payload.get("new_name"), max_len=200)
+    if payload.get("new_name") not in (None, "") and not new_name:
+        return ({"error": "'new_name' is empty after sanitising"}, 400)
+    cart_in = payload.get("in_cart")
+    if cart_in not in (None, "") and not isinstance(cart_in, bool):
+        return ({"error": "'in_cart' must be a boolean"}, 400)
+    coll_in = payload.get("collection")
+    if coll_in not in (None, "") and not isinstance(coll_in, str):
+        return ({"error": "'collection' must be a string"}, 400)
+    want_coll = (coll_in or "").strip()
+
+    def _matches(p: dict) -> bool:
+        if isinstance(seq_in, str) and seq_in.strip():
+            return ((p.get("sequence") or "").upper()
+                    == seq_in.strip().upper())
+        if id_in:
+            return str(p.get("id") or "") == id_in
+        return str(p.get("name") or "").strip().lower() == name_in.lower()
+
+    with _state._cache_lock:
+        active = _get_active_primer_collection_name() or ""
+        in_named = bool(want_coll) and want_coll != active
+        if in_named:
+            colls = _load_primer_collections()
+            tgt = next((c for c in colls
+                        if str(c.get("name") or "") == want_coll), None)
+            if tgt is None:
+                return ({"error": f"no primer collection named "
+                                  f"{want_coll!r}"}, 404)
+            bucket = [p for p in (tgt.get("primers") or [])
+                      if isinstance(p, dict)]
+        else:
+            colls = None
+            bucket = [p for p in _load_primers() if isinstance(p, dict)]
+        hits = [p for p in bucket if _matches(p)]
+        if not hits:
+            return ({"error": "no stored primer matched that "
+                              "sequence / name / id",
+                      "collection": want_coll or active}, 404)
+        if len(hits) > 1:
+            return ({"error": f"{len(hits)} stored primers match — identify "
+                              f"by 'sequence', which is unique",
+                      "names": [str(p.get("name") or "") for p in hits[:8]]},
+                    409)
+        p = hits[0]
+        changed: "list[str]" = []
+        for key, val in (("name", new_name), ("status", status),
+                         ("notes", payload.get("notes")),
+                         ("type", payload.get("type")),
+                         ("source", payload.get("source"))):
+            if val in (None, ""):
+                continue
+            if str(p.get(key) or "") != str(val):
+                p[key] = str(val)
+                changed.append(key)
+        if changed:
+            if in_named and colls is not None:
+                if (err := _agent_save_or_500(
+                        lambda: _save_primer_collections(colls),
+                        "primer_collections")) is not None:
+                    return err
+            else:
+                if (err := _agent_save_or_500(
+                        lambda: _save_primers(bucket), "primers")) is not None:
+                    return err
+        out_seq = str(p.get("sequence") or "")
+        out_name = str(p.get("name") or "")
+
+    # OUTSIDE the lock-held block above on purpose: `_set_primer_cart_flag`
+    # does its own read-modify-write under the same RLock, and it spans BOTH
+    # the library and the collections, so it must see the rename already
+    # committed rather than a half-written snapshot.
+    if isinstance(cart_in, bool):
+        try:
+            if _set_primer_cart_flag(out_seq, cart_in):
+                changed.append("in_cart")
+        except (OSError, RuntimeError) as exc:
+            return ({"error": f"save failed for primers: "
+                              f"{_scrub_path(str(exc))}"}, 500)
+    return {"ok": True, "sequence": out_seq, "name": out_name,
+            "changed": changed, "collection": want_coll or active}
+
+
+@_agent_endpoint("import-primers", write=True)
+def _h_import_primers(app, payload):
+    """Load primers from a CSV order sheet into a primer collection — the
+    inverse of `export-primers` ``format: "generic"``, whose own docstring
+    has advertised this endpoint while it did not exist, leaving the
+    round-trip it promised half-missing. Body:
+    ``{path, collection?, on_duplicate?: "skip"|"replace"}``.
+
+    Column detection matches the GUI importer: a header row naming
+    ``Name`` / ``Sequence``|``Oligo`` / ``Tm`` (case-insensitive, any order)
+    is honoured, else positional (0=name, 1=sequence, 2=Tm). A missing Tm is
+    computed from the oligo.
+
+    **CATASTROPHIC-CLASS, so a bad row is never applied.** A row whose oligo
+    isn't valid IUPAC DNA, or is empty, or duplicates one earlier in the same
+    file, is SKIPPED and REPORTED in ``skipped`` — a broken primer filed in
+    the library would be ordered and synthesised. Read `skipped`: a partial
+    import is the normal outcome for a hand-edited sheet.
+
+    Duplicates against the TARGET COLLECTION are compared by sequence (the
+    same rule the GUI uses, and the one `create-primer` 409s on):
+    ``on_duplicate: "skip"`` (default) leaves the stored primer alone and
+    counts it in ``duplicates``; ``"replace"`` overwrites its row, keeping the
+    stored `id` so anything referencing it still resolves.
+
+    Without ``collection`` the primers land in the ACTIVE collection. With it
+    they go to that NAMED collection, and a collection that doesn't exist is a
+    404 rather than a silent fall-back to the default — the outcome-changing
+    parameter rule `create-primer` already follows.
+
+    Returns ``{ok, imported, duplicates, skipped: [...], collection,
+    total_in_file}``."""
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    if path.suffix.lower() != ".csv":
+        return ({"error": "path must end in .csv"}, 400)
+    if _check_agent_read_path_ancestors(path) is not None:
+        _log.warning("agent import-primers: refused (ancestor symlink): %s",
+                     path)
+        return ({"error": "refused: a parent directory is a symlink"}, 403)
+    if not path.exists():
+        return ({"error": f"no such file: {_scrub_path(str(path))}"}, 404)
+    dup_mode = str(payload.get("on_duplicate") or "skip").strip().lower()
+    if dup_mode not in ("skip", "replace"):
+        return ({"error": "'on_duplicate' must be 'skip' or 'replace'"}, 400)
+    try:
+        res = _import_primers_from_csv(path)
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
+    except OSError as exc:
+        return ({"error": f"import failed: {_scrub_path(str(exc))}"}, 500)
+    new = [p for p in (res.get("primers") or []) if isinstance(p, dict)]
+    skipped = list(res.get("skipped") or [])
+    if not new:
+        return ({"error": "no valid primers in that CSV",
+                  "skipped": skipped}, 400)
+
+    coll_in = payload.get("collection")
+    if coll_in not in (None, "") and not isinstance(coll_in, str):
+        return ({"error": "'collection' must be a string"}, 400)
+    want = (coll_in or "").strip()
+
+    def _merge(bucket: list) -> tuple:
+        """Fold `new` into `bucket` in place. -> (imported, duplicates)."""
+        by_seq = {}
+        for i, e in enumerate(bucket):
+            if isinstance(e, dict):
+                by_seq[(e.get("sequence") or "").upper()] = i
+        imported = dups = 0
+        for p in new:
+            key = (p.get("sequence") or "").upper()
+            if key in by_seq:
+                if dup_mode == "replace":
+                    old = bucket[by_seq[key]]
+                    # Keep the stored id so references survive the overwrite.
+                    if isinstance(old, dict) and old.get("id"):
+                        p = {**p, "id": old["id"]}
+                    bucket[by_seq[key]] = p
+                    imported += 1
+                else:
+                    dups += 1
+                continue
+            bucket.insert(0, p)       # MRU at index 0, as create-primer does
+            by_seq = {k: (v + 1) for k, v in by_seq.items()}
+            by_seq[key] = 0
+            imported += 1
+        return imported, dups
+
+    with _state._cache_lock:
+        active = _get_active_primer_collection_name() or ""
+        if want and want != active:
+            colls = _load_primer_collections()
+            tgt = next((c for c in colls
+                        if str(c.get("name") or "") == want), None)
+            if tgt is None:
+                return ({"error": f"no primer collection named {want!r}; "
+                                  f"create it with create-primer-collection",
+                          "collections": [str(c.get("name") or "")
+                                          for c in colls]}, 404)
+            bucket = tgt.setdefault("primers", [])
+            imported, dups = _merge(bucket)
+            if (err := _agent_save_or_500(
+                    lambda: _save_primer_collections(colls),
+                    "primer_collections")) is not None:
+                return err
+            landed = want
+        else:
+            entries = _load_primers()
+            imported, dups = _merge(entries)
+            if (err := _agent_save_or_500(
+                    lambda: _save_primers(entries), "primers")) is not None:
+                return err
+            landed = active
+    return {"ok": True, "imported": imported, "duplicates": dups,
+            "skipped": skipped, "collection": landed,
+            "total_in_file": len(new) + len(skipped)}
+
+
+@_agent_endpoint("save-amplicon", write=True)
+def _h_save_amplicon(app, payload):
+    """Save an in-silico PCR amplicon as a LINEAR library entry — the write
+    twin of `simulate-pcr`, whose docstring used to send callers to the GUI
+    because this did not exist. Body: `simulate-pcr`'s payload plus
+    ``{name, collection?, amplicon_index?=0}``.
+
+    Runs `simulate-pcr` with the SAME payload (so every alias, cap and
+    topology warning behaves identically — and a preview call shows exactly
+    what this will save), then files amplicon `amplicon_index` from that
+    result. Index 0 is the LONGEST product, since `simulate-pcr` sorts by
+    length descending; pass the index you saw in the preview rather than
+    assuming there is only one.
+
+    The entry is built the way the Simulator screen builds it: topology
+    `linear`, a GenBank LOCUS id sanitised separately from the display name
+    (so "My Insert v2" stays verbatim in the library and only the LOCUS is
+    collapsed, [INV-98]), and each run primer attached as a `primer_bind`
+    feature carrying the full oligo in ``/primer_seq``, **re-derived against
+    the amplicon's own sequence** — a primer that cannot be re-derived is
+    skipped rather than drawn at an unverified site
+    (`[[project_primer_design_catastrophic]]`).
+
+    `name` is REQUIRED: the GUI can fall back to an auto-name because a human
+    is looking at the dialog, but an agent filing something into a permanent
+    library should say what it is. Collision-renames within the target
+    collection, so the stored name may differ — read `saved_name`.
+
+    Returns ``{ok, saved_name, collection, length, n_features,
+    amplicon_index, n_amplicons, wraps}``."""
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    if not name:
+        return ({"error": "missing 'name' — an amplicon filed into the "
+                          "library must be named"}, 400)
+    sim = _h_simulate_pcr(app, payload)
+    # The simulate handler returns `(dict, status)` on refusal; pass its own
+    # validation error straight through rather than re-wording it.
+    if isinstance(sim, tuple):
+        return sim
+    amps = sim.get("amplicons") or []
+    if not amps:
+        return ({"error": "no amplicons — nothing to save. Check primer "
+                          "orientation and the template.",
+                  "warnings": sim.get("warnings") or []}, 422)
+    idx = _coerce_int(payload.get("amplicon_index", 0),
+                      name="amplicon_index")
+    if isinstance(idx, str):
+        return ({"error": idx}, 400)
+    if not (0 <= idx < len(amps)):
+        return ({"error": f"'amplicon_index' {idx} is outside the "
+                          f"{len(amps)} amplicon(s) this PCR produced "
+                          f"(0..{len(amps) - 1})"}, 400)
+    amp = amps[idx]
+    if not (isinstance(amp, dict) and amp.get("amplicon_seq")):
+        return ({"error": f"amplicon {idx} has no sequence"}, 422)
+    coll_in = payload.get("collection")
+    if coll_in not in (None, "") and not isinstance(coll_in, str):
+        return ({"error": "'collection' must be a string"}, 400)
+    coll = (coll_in or "").strip() or (_get_active_collection_name()
+                                       or "Default")
+    if not any(isinstance(c, dict)
+               and str(c.get("name") or "").strip() == coll
+               for c in _iter_collections_readonly()):
+        return ({"error": f"no collection named {coll!r}",
+                  "collections": [str(c.get("name") or "")
+                                  for c in _iter_collections_readonly()]},
+                404)
+    try:
+        # Unbound on purpose: the builder touches `self` only in its
+        # auto-name branch, and `name` is required above so that branch
+        # cannot run. Same idiom `new-plasmid` uses for `_build_record`.
+        entry = SimulatorScreen._build_amplicon_library_entry(
+            None,  # type: ignore[arg-type]  (ignored when `name` is given)
+            amp, name=name)
+    except (ValueError, KeyError) as exc:
+        return ({"error": f"could not build the amplicon entry: "
+                          f"{_scrub_path(str(exc))}"}, 400)
+    try:
+        final_name = _commit_library_entry_to_collection(entry, coll)
+    except (OSError, RuntimeError) as exc:
+        return ({"error": f"save failed for library: "
+                          f"{_scrub_path(str(exc))}"}, 500)
+    # Count the primer_bind features that actually landed, by reading back
+    # the entry's own GenBank text — the builder SKIPS a primer it could not
+    # re-derive, so "2" is a result worth reporting rather than an assumption.
+    n_binds = 0
+    try:
+        _rec = _gb_text_to_record(entry.get("gb_text") or "")
+        n_binds = sum(1 for f in (getattr(_rec, "features", None) or [])
+                      if getattr(f, "type", "") == "primer_bind")
+    except Exception:                       # pragma: no cover - defensive
+        n_binds = 0
+    return {"ok": True, "saved_name": final_name, "collection": coll,
+            "length": int(amp.get("length") or 0),
+            "n_primer_binds": n_binds,
+            "amplicon_index": idx, "n_amplicons": len(amps),
+            "wraps": bool(amp.get("wraps"))}
+
+
+# ── Protein collections (agent side door) ──────────────────────────────────
+# `protein_collections.json` is a first-class user store — it is in the backup
+# registry and the Synthesis Operon tab has full CRUD for it — but it had ZERO
+# endpoints, so an agent could neither read the proteins the user had filed nor
+# put one there. These wrap the same five hub helpers the UI buttons call, so
+# both surfaces share one definition of validation and locking.
+
+
+def _agent_protein_coll_status(err: str) -> int:
+    """Map a `_protein_collection_*` error string onto an HTTP status.
+
+    The helpers return one prose string for every failure, so the status has
+    to be read back off it: a missing target is 404 and a name clash 409,
+    because a caller retries those differently — 404 means "create it first",
+    409 means "pick another name". Everything else is caller input, 400."""
+    low = err.lower()
+    if low.startswith("no "):
+        return 404
+    if "already exists" in low:
+        return 409
+    return 400
+
+
+@_agent_endpoint("list-protein-collections")
+def _h_list_protein_collections(app, payload):
+    """Every protein collection with its protein COUNT. Body: ``{}``.
+
+    Sequences are omitted here on purpose — a collection can hold many
+    multi-kB proteins and this is the index. Use `get-protein-collection`
+    for one collection's contents. Returns
+    ``{ok, collections: [{name, description, n_proteins}], count}``."""
+    try:
+        entries = _load_protein_collections()
+    except Exception as exc:
+        _log.exception("agent list-protein-collections: load failed")
+        return ({"error": f"load failed: {_scrub_path(str(exc))}"}, 500)
+    out = []
+    for c in entries:
+        if not isinstance(c, dict):
+            continue
+        prots = [p for p in (c.get("proteins") or []) if isinstance(p, dict)]
+        out.append({"name": str(c.get("name") or ""),
+                    "description": str(c.get("description") or ""),
+                    "n_proteins": len(prots)})
+    return {"ok": True, "collections": out, "count": len(out)}
+
+
+@_agent_endpoint("get-protein-collection")
+def _h_get_protein_collection(app, payload):
+    """One protein collection's full contents. Body: ``{name}``.
+
+    Returns ``{ok, name, description, proteins: [{name, sequence, length,
+    description, source}], count}``. 404 when there is no such collection —
+    an empty list would read as "the collection exists and is empty"."""
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    if not name:
+        return ({"error": "missing 'name'"}, 400)
+    try:
+        entries = _load_protein_collections()
+    except Exception as exc:
+        _log.exception("agent get-protein-collection: load failed")
+        return ({"error": f"load failed: {_scrub_path(str(exc))}"}, 500)
+    coll = next((c for c in entries
+                 if isinstance(c, dict) and str(c.get("name") or "") == name),
+                None)
+    if coll is None:
+        return ({"error": f"no protein collection named {name!r}",
+                  "collections": [str(c.get("name") or "") for c in entries
+                                  if isinstance(c, dict)]}, 404)
+    prots = []
+    for p in (coll.get("proteins") or []):
+        if not isinstance(p, dict):
+            continue
+        seq = str(p.get("sequence") or "")
+        prots.append({"name": str(p.get("name") or ""), "sequence": seq,
+                      "length": len(seq),
+                      "description": str(p.get("description") or ""),
+                      "source": str(p.get("source") or "")})
+    return {"ok": True, "name": name,
+            "description": str(coll.get("description") or ""),
+            "proteins": prots, "count": len(prots)}
+
+
+@_agent_endpoint("create-protein-collection", write=True)
+def _h_create_protein_collection(app, payload):
+    """Create a new EMPTY protein collection. Body: ``{name}``.
+    409 if one of that name already exists."""
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    if not name:
+        return ({"error": "missing 'name'"}, 400)
+    try:
+        err = _protein_collection_create(name)
+    except (OSError, RuntimeError) as exc:
+        return ({"error": f"save failed for protein collections: "
+                          f"{_scrub_path(str(exc))}"}, 500)
+    if err:
+        return ({"error": err}, _agent_protein_coll_status(err))
+    return {"ok": True, "name": name}
+
+
+@_agent_endpoint("rename-protein-collection", write=True)
+def _h_rename_protein_collection(app, payload):
+    """Rename a protein collection. Body: ``{name, new_name}``.
+    404 if the source is missing, 409 if the target name is taken."""
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    new_name = _sanitize_label(payload.get("new_name"), max_len=200)
+    if not name or not new_name:
+        return ({"error": "both 'name' and 'new_name' are required"}, 400)
+    try:
+        err = _protein_collection_rename(name, new_name)
+    except (OSError, RuntimeError) as exc:
+        return ({"error": f"save failed for protein collections: "
+                          f"{_scrub_path(str(exc))}"}, 500)
+    if err:
+        return ({"error": err}, _agent_protein_coll_status(err))
+    return {"ok": True, "name": new_name, "previous_name": name}
+
+
+@_agent_endpoint("delete-protein-collection", write=True)
+def _h_delete_protein_collection(app, payload):
+    """Delete an entire protein collection AND every protein in it. Body:
+    ``{name, confirm: true}``.
+
+    `confirm` is required because this is the only protein endpoint that
+    destroys more than one record at a time, and the count is not visible in
+    the request — call `list-protein-collections` first to see what you are
+    about to lose. 404 if there is no such collection."""
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    if not name:
+        return ({"error": "missing 'name'"}, 400)
+    if not _payload_bool(payload, "confirm", False):
+        try:
+            entries = _load_protein_collections()
+        except Exception:
+            entries = []
+        coll = next((c for c in entries if isinstance(c, dict)
+                     and str(c.get("name") or "") == name), None)
+        n = len([p for p in ((coll or {}).get("proteins") or [])
+                 if isinstance(p, dict)])
+        return ({"error": f"refusing to delete protein collection {name!r} "
+                          f"({n} protein(s)) without confirm:true"}, 400)
+    try:
+        err = _protein_collection_delete(name)
+    except (OSError, RuntimeError) as exc:
+        return ({"error": f"save failed for protein collections: "
+                          f"{_scrub_path(str(exc))}"}, 500)
+    if err:
+        return ({"error": err}, _agent_protein_coll_status(err))
+    return {"ok": True, "deleted": name}
+
+
+@_agent_endpoint("save-protein", write=True)
+def _h_save_protein(app, payload):
+    """File a protein into a collection — the side door to the Operon tab's
+    "paste a protein" / "from feature" / "fetch by accession" buttons. Body:
+    ``{collection, name, sequence, description?, source?}``.
+
+    **Upsert by name**, which is what the UI helper does: a protein already
+    called `name` in that collection is OVERWRITTEN. The collection is
+    created if it doesn't exist, so a first save needs no setup call.
+
+    `sequence` is validated as amino acids by the same checker the UI uses —
+    a character outside the canonical alphabet is a 400.
+
+    **A pure-ACGT sequence is ACCEPTED, and that is correct, not a hole.** A,
+    C, G and T are all canonical residues (Ala / Cys / Gly / Thr), so a DNA
+    string is indistinguishable from a real peptide of those four and refusing
+    it would reject legitimate proteins. Since pasting DNA into a protein
+    field is nonetheless a common slip, the reply carries a
+    ``warnings`` advisory when the whole sequence is ACGT — said out loud
+    rather than guessed at by refusing.
+
+    Returns ``{ok, collection, name, length, overwrote, warnings?}``."""
+    coll = _sanitize_label(payload.get("collection"), max_len=200)
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    seq = payload.get("sequence")
+    if not coll or not name:
+        return ({"error": "both 'collection' and 'name' are required"}, 400)
+    if not isinstance(seq, str) or not seq.strip():
+        return ({"error": "missing or non-string 'sequence'"}, 400)
+    overwrote = False
+    try:
+        existing = _load_protein_collections()
+        tgt = next((c for c in existing if isinstance(c, dict)
+                    and str(c.get("name") or "") == coll), None)
+        overwrote = bool(tgt) and any(
+            isinstance(p, dict) and str(p.get("name") or "") == name
+            for p in (tgt or {}).get("proteins") or [])
+    except Exception:                       # pragma: no cover - defensive
+        overwrote = False
+    try:
+        err = _protein_collection_add(
+            coll, name, seq,
+            description=str(payload.get("description") or ""),
+            source=str(payload.get("source") or "agent"))
+    except (OSError, RuntimeError) as exc:
+        return ({"error": f"save failed for protein collections: "
+                          f"{_scrub_path(str(exc))}"}, 500)
+    if err:
+        return ({"error": err}, _agent_protein_coll_status(err))
+    clean = seq.strip().upper()
+    out = {"ok": True, "collection": coll, "name": name,
+           "length": len(clean), "overwrote": overwrote}
+    if len(clean) >= 12 and set(clean) <= set("ACGT"):
+        out["warnings"] = [
+            f"{name!r} is {len(clean)} residues of only A/C/G/T. Those are "
+            f"real amino acids (Ala/Cys/Gly/Thr) so it was stored as given, "
+            f"but if you meant to paste DNA this is not a protein — "
+            f"`optimize-protein` or `translate` the nucleotides first."]
+    return out
+
+
+@_agent_endpoint("delete-protein", write=True)
+def _h_delete_protein(app, payload):
+    """Remove ONE protein from a collection. Body: ``{collection, name}``.
+    404 if either the collection or the protein is missing — the two are
+    distinguished in the message so a caller knows which to fix."""
+    coll = _sanitize_label(payload.get("collection"), max_len=200)
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    if not coll or not name:
+        return ({"error": "both 'collection' and 'name' are required"}, 400)
+    try:
+        err = _protein_collection_remove(coll, name)
+    except (OSError, RuntimeError) as exc:
+        return ({"error": f"save failed for protein collections: "
+                          f"{_scrub_path(str(exc))}"}, 500)
+    if err:
+        return ({"error": err}, _agent_protein_coll_status(err))
+    return {"ok": True, "collection": coll, "deleted": name}
 
 
 @_agent_endpoint("pcr-program")
@@ -106752,8 +107608,17 @@ def _h_read_consensus(app, payload):
 
     **`uncovered_spans` is part of the answer, not a footnote.** A plasmid can
     be "100% identity" over the half that was read, and leaving coverage out is
-    how a partial read passes as a full one. Use ``verify-against-reads`` when
-    you have read SEQUENCES to check rather than stored alignments."""
+    how a partial read passes as a full one.
+
+    **Where its input comes from, which matters if you get `no_reads`.** The
+    stored alignments this reads are written by the GUI — Alt+A to align a
+    read, or the Sequencing screen's bulk-align over a Plasmidsaurus run. There
+    is no endpoint that WRITES them yet, so an agent cannot populate this store
+    itself and `no_reads` on a plasmid you have reads for means they were never
+    stored, not that the plasmid is unverified. When you hold the read
+    SEQUENCES, use ``verify-against-reads`` (or ``analyse-read-heterogeneity``
+    for sub-population fractions) — those take reads directly and need nothing
+    stored first."""
     key_id = payload.get("id")
     key_name = payload.get("name")
     min_support = _coerce_int(payload.get("min_support", 2),
@@ -110184,7 +111049,14 @@ def _h_set_entry_vector(app, payload):
 
 @_agent_endpoint("update-primer", write=True)
 def _h_update_primer(app, payload):
-    """Edit a `primer_bind` feature's label / sequence / strand / notes.
+    """Edit a `primer_bind` FEATURE on the loaded record — its label /
+    sequence / strand / notes.
+
+    **This is the map feature, NOT a stored primer.** To rename a primer in
+    the LIBRARY, change its order status or flag it for the cart, use
+    `update-stored-primer`. This endpoint took the obvious name first and the
+    two are easy to confuse, so check which object you mean.
+
     Body: ``{idx, label?, primer_seq?, strand?, notes?}``. ``idx`` is
     the 0-based index into the non-source feature list (same convention
     as `update-feature`). The feature at ``idx`` MUST be a
@@ -112233,8 +113105,17 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
             # `tools` is intentionally unauthenticated — it's the
             # self-describe entry point that clients call before
             # they have a token.
+            #
+            # The query string IS forwarded, so `GET /tools?filter=primer`
+            # works. It used to be called with a hardcoded `{}`, which meant
+            # the handler's own `filter` could never fire through HTTP — the
+            # endpoint self-described a parameter it silently ignored, and
+            # the unfiltered 150 KB was the only reachable answer. `?brief=1`
+            # is a query boolean, so any non-empty value is true (see
+            # `_parse_query_params`); POST a JSON body for the strict form.
             return self._send(
-                _h_tools(getattr(self.server, "_app", None), {})
+                _h_tools(getattr(self.server, "_app", None),
+                         self._parse_query_params())
             )
         # Sweep #25 (2026-05-23): bearer token required on ALL
         # endpoints (was: write endpoints only). The earlier "reads

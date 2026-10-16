@@ -51,6 +51,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `create-parts-bin` | W | Create a new (empty) named parts bin (SC-M) — the parts-side parallel to `create-collection` / `create-primer-collection`. Body: `{name,… |
 | `create-primer` | W | Add a primer to the library. Body: `{name, sequence, source?, status?, type?, tm?, notes?, collection?}`. |
 | `create-primer-collection` | W | Create a new (empty) named primer collection. Body: `{name, description?}`. |
+| `create-protein-collection` | W | Create a new EMPTY protein collection. Body: `{name}`. 409 if one of that name already exists. |
 | `create-protocol-collection` | W | Create an empty named protocol collection. Body: `{name}`. |
 | `delete-codon-table` | W | Remove a codon-usage table by `taxid` or `name`. Built-in tables (source='builtin') cannot be removed. |
 | `delete-collection` | W | Delete a collection by exact name. Body: `{name}`. If the deleted collection is the active one, the next collection becomes active (reported as… |
@@ -71,6 +72,8 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `delete-primer` | W | Remove a primer by `{name}` (or `{id}`) or exact `{sequence}`, optionally scoped to a `{collection}`. Body: one of `{name}`/`{id}`/`{sequence}` (+… |
 | `delete-primer-collection` | W | Delete a named primer collection + its primers. Body: `{name}`. Refuses to delete the last remaining named collection (matches the GUI… |
 | `delete-primers` | W | Batch-delete primers by name in ONE locked save — the machine-friendly path for a large cleanup (agent-API feedback SC-L), so a 600-item prune… |
+| `delete-protein` | W | Remove ONE protein from a collection. Body: `{collection, name}`. 404 if either the collection or the protein is missing — the two are… |
+| `delete-protein-collection` | W | Delete an entire protein collection AND every protein in it. Body: `{name, confirm: true}`. |
 | `delete-protein-motif` | W | Delete a user-stored protein motif override. Built-in motifs cannot be deleted — only user overrides. If `name` matches a built-in but the user… |
 | `delete-protocol` | W | Delete a saved protocol — the FIRST match for `name` (case-insensitive), optionally scoped to `collection`. Body: `{name, collection?}`. |
 | `delete-protocol-collection` | W | Delete a protocol collection AND every protocol in it. Body: `{name}`. |
@@ -131,6 +134,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `get-part` | R | Fetch a single part by `name` (and optional `grammar` to disambiguate when two grammars carry a part with the same name). Returns the full entry… |
 | `get-plasmid-protocol` | R | A plasmid's recorded construction history as a bench protocol. Body: `{id: str, collection?: str}`. |
 | `get-primer` | R | Return a primer-library entry by `{name\|id}` or exact (case-insensitive) `{sequence}`. Optional `{collection}` scopes the lookup to that… |
+| `get-protein-collection` | R | One protein collection's full contents. Body: `{name}`. |
 | `get-protocol` | R | The saved `plan` for a protocol. Body: `{name}`. The plan is compile-able by `ot2-compile` / `ot2-run`. |
 | `get-sequence` | R | Return DNA from `[start, end)`. Body: `{start, end, bottom?}`. `bottom: true` returns the reverse-complement (5'→3' on the bottom strand).… |
 | `get-settings` | R | Return every allowlisted user-toggle setting with its current value, default, and validator hint. Useful for an agent that wants to inspect which… |
@@ -141,6 +145,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `hmmer-web` | R | Remote hmmscan vs Pfam via the EBI HMMER web API. Body: `{query, max_hits?}` — `query` is a PROTEIN sequence. |
 | `hmmscan` | R | Scan a query AA sequence against a HMMER 3 profile DB. Body: `{query, hmm_path, max_hits?}`. `hmm_path` must point at a readable .hmm / .h3m /… |
 | `import-feature-preset` | W | Copy one or more built-in presets into the user's feature library. |
+| `import-primers` | W | Load primers from a CSV order sheet into a primer collection — the inverse of `export-primers` `format: "generic"`, whose own docstring has… |
 | `index-library` | W | Index the user's OWN work - plasmids, primers, parts and lab-notebook entries - into a PRIVATE Babs pack, so Babs can answer questions about their… |
 | `ingest-url` | W | Persist ONE web page into Babs' knowledge corpus so she knows it in every future session. Body: `{url, title?}`. |
 | `learn-list` | R | List Background Learning sessions on this machine: `{slug, topic, kept, status}` each. Read-only. |
@@ -178,6 +183,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `list-pre-update-snapshots` | R | List pre-update snapshots created by `splicecraft update`. Returns each snapshot's id, from_version, mtime, and counts — same data the… |
 | `list-primer-collections` | R | Every named primer collection. Each item: `{name, n_primers}`. The unnamed "default" collection (= top-level primers.json) is surfaced as `{name:… |
 | `list-primers` | R | Return the primer library. Each item: `{name, sequence, source, tm, status, type, date, notes}`. Sequence + notes can be long; clients on small… |
+| `list-protein-collections` | R | Every protein collection with its protein COUNT. Body: `{}`. |
 | `list-protein-motifs` | R | List the merged protein-motif library (built-ins + user overrides). Each entry carries name, feature_type, sequence, color, description. Sourced… |
 | `list-protocol-collections` | R | Named protocol collections as `[{name, count}]`. |
 | `list-protocols` | R | Every saved OT-2 protocol as `[{name, collection}]`. Load a plan with `get-protocol`; save one with `save-protocol`. |
@@ -218,6 +224,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `predict-transcript` | R | Reconstruct the MATURE mRNA of an annotated transcription unit on the loaded record, and score translation initiation on it. |
 | `rbs-strength` | R | Relative E. coli translation-initiation strength of a ribosome binding site. Body: `{mrna, start}` — `start` is the 0-based index of the start… |
 | `read-consensus` | R | Combine every sequencing read STORED on a plasmid into one answer. |
+| `read-trace` | R | Base-call a Sanger `.ab1` / `.abi` trace and return its sequence WITH per-base Phred quality. Body: `{path, trim?: bool}`. |
 | `read-url` | R | Open ONE web page and return its readable text (HTML → text; NO JavaScript). Body: `{url, max_chars?}`. |
 | `recall-knowledge` | R | Recall passages from Babs' knowledge corpus (papers, protocols and curated reference data) for a question. Body: `{query, max_passages?, packs?,… |
 | `recover-history-from-dna` | W | Restore construction history to plasmids whose saved `.dna` original documents more of their build than the library currently holds. Body:… |
@@ -230,12 +237,16 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `rename-parts-bin` | W | Rename a parts bin. Body: `{name, new_name}`. Matching is case-insensitive; 404 if `name` is unknown, 409 if `new_name` collides with another bin.… |
 | `rename-plasmid` | W | Rename a library plasmid's display name. Body: `{old\|id, new}`. |
 | `rename-primer-collection` | W | Rename a primer collection. Body: `{name, new_name}` (both named collections; the reserved default is the empty string and can't be renamed).… |
+| `rename-protein-collection` | W | Rename a protein collection. Body: `{name, new_name}`. 404 if the source is missing, 409 if the target name is taken. |
 | `replace-sequence` | W | Replace `[start, end)` with `bases` (mutagenesis / edit). Body: `{start, end, bases}`. Pass `{"force": true}` to bypass the dirty-state guard.… |
 | `restart` | W | Restart the `--agent` daemon so it picks up an on-disk update (SC-A). Body: `{}`. |
 | `restore-backup` | W | Restore one user-data file from a chosen backup. Body: `{label, source_path}` where `source_path` must come from a prior `list-backups` response… |
 | `restore-pre-update-snapshot` | W | Restore a pre-update snapshot by id (or "latest"). Body: `{id?: str}`. When `id` is missing or "latest", restores the newest snapshot. |
+| `reverse-complement` | W | Reverse-complement the WHOLE loaded record in place — the agent counterpart to Alt+Shift+R. Body: `{}`. |
 | `save` | W | Save the current record to its source file (if any) and library. |
+| `save-amplicon` | W | Save an in-silico PCR amplicon as a LINEAR library entry — the write twin of `simulate-pcr`, whose docstring used to send callers to the GUI… |
 | `save-custom-labware` | W | Save (or overwrite) a custom labware. Body: `{name, definition, collection?}` — `definition` is an Opentrons labware-definition object with a… |
+| `save-protein` | W | File a protein into a collection — the side door to the Operon tab's "paste a protein" / "from feature" / "fetch by accession" buttons. Body:… |
 | `save-protocol` | W | Save (or overwrite) a protocol. Body: `{name, plan, collection?}`. `plan` is a compile-able plan (see `ot2-compile`) — it is validated before… |
 | `scan-promoters` | R | Scan for sigma-70 (-35 / spacer / -10) promoters. |
 | `scan-terminators` | R | Scan for intrinsic (Rho-independent) terminators: a stem-loop followed by a U-tract. |
@@ -252,6 +263,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `set-active-primer-collection` | W | Switch the active primer collection AND re-point the live `primers.json` mirror at it. Body: `{name}` where `name` is one of the collections from… |
 | `set-entry-vector` | W | Set or clear a grammar's entry vector. Body to set: `{grammar_id, name, gb_text, source?}`; body to clear: `{grammar_id, clear: true}`. `gb_text`… |
 | `set-feature-color` | W | Set or clear the render colour for a feature type. Body: `{feature_type, color}` — `color` is a hex string (`#1f77b4` or the short `#abc` form).… |
+| `set-origin` | W | Re-originate the loaded CIRCULAR record so a chosen base becomes base 1 — the agent counterpart to Alt+Shift+O. Body: `{bp? , feature? ,… |
 | `set-plasmid-status` | W | Set / clear a library entry's workflow status. Body: `{name\|id, status}`. `status` must be one of the values from `list-plasmid-statuses`, or… |
 | `set-protein-motif` | W | Create or override a protein motif. Body: `{name: str, sequence: str, feature_type?: str = "Motif", color?: str = "", description?: str = ""}`. |
 | `set-setting` | W | Persist a single user-toggle setting. Body: `{key, value}`. `key` must be in the allowlist (see `get-settings`); `value` is type-checked +… |
@@ -263,7 +275,8 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `simulate-traditional-cloning` | R | Dry-run a traditional restriction-cloning reaction: digest a vector and an insert with the chosen enzymes, then ligate. Body: `{vector_seq,… |
 | `span-contains` | R | Circular-aware containment: does a span contain a base or another span, on a molecule where either may cross the origin? |
 | `status` | R | Current session state: loaded record, dirty flag, source path. |
-| `tools` | R | Self-describe: every endpoint with its read/write mode and full request-body documentation. |
+| `taxon-search` | R | Resolve an ORGANISM NAME to an NCBI taxid. Body: `{query, max_hits?}`. |
+| `tools` | R | Self-describe: every endpoint with its read/write mode and full request-body documentation. Body (all optional): `{filter?: str, brief?: bool}`. |
 | `traditional-clone` | W | Run a traditional restriction-cloning reaction AND save the product to the library — the restriction-cloning analog of `gibson-assemble`. Body… |
 | `transfer-annotations` | W | Transfer features from a source plasmid (`source_id` in the library) onto the loaded record by sequence-identity matching. Body: `{source_id: str,… |
 | `undo` | W | Undo the last canvas mutation (sequence edit, feature add/update/ delete, replace-sequence, new-plasmid load, …) — the agent counterpart to… |
@@ -276,7 +289,8 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `update-gel` | W | Replace a saved gel's fields by id. Body: `{id: str, name?: str, lanes?: list[dict], agarose_pct?: float, notes?: str}`. Fields not supplied keep… |
 | `update-grammar` | W | Replace an existing custom grammar by id. Built-in ids are refused (mirrors the UI's `editable=False` gate). |
 | `update-part` | W | Update an existing part. Body: `{name, grammar?, ...new fields}`. Lookup is by `(name, grammar)`; if grammar is omitted matches the first part by… |
-| `update-primer` | W | Edit a `primer_bind` feature's label / sequence / strand / notes. Body: `{idx, label?, primer_seq?, strand?, notes?}`. `idx` is the 0-based index… |
+| `update-primer` | W | Edit a `primer_bind` FEATURE on the loaded record — its label / sequence / strand / notes. |
+| `update-stored-primer` | W | Edit a primer STORED IN THE LIBRARY — rename it, move it through its order status, or flag it for the order cart. Body: `{sequence \| name \| id,… |
 | `verify-against-reads` | R | Verify a designed construct against sequencing reads — the "I built X, I got reads back, do they match?" check. Body: `{reference \| reference_id \|… |
 | `web-search` | R | General web search. Body: `{query, max_hits?}`. |
 | `wikipedia-search` | R | Search Wikipedia for encyclopedic background. Body: `{query, max_hits?}`. |

@@ -144,6 +144,14 @@ What you can do without leaving the terminal.
   enzyme's own 5'/3' geometry, and a cloning site the ligation
   regenerates comes back as one intact feature instead of two halves
   marked "(disrupted)" — a feature the cloning genuinely broke still is.
+- **Genes with introns keep their exons through a clone.** A spliced gene
+  carried onto a product keeps its exon structure rather than being annotated
+  across its own introns, and the saved file gets a proper `join(...)`
+  location — so the product's CDS still translates to the protein the parent
+  coded for. This holds for restriction cloning, Golden Gate / MoClo one-pot,
+  Gibson and the construction simulator, on either strand and across the
+  origin. An enzyme that cuts inside an intron annotates the two exons it
+  separated instead of claiming the intron bases.
   Save the simulated product back to the
   library with full **construction-history XML** (`<HistoryTree>`
   matching the popular commercial editor's format) so the lineage of
