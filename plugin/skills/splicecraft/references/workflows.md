@@ -1,6 +1,6 @@
 # Worked workflows
 
-Every command here was run against a live SpliceCraft 1.3.10 session; the outputs
+Every command here was run against a live SpliceCraft 1.3.11 session; the outputs
 are real. Read the recipe matching the user's job — you don't need the others.
 
 Set up once per shell if you're working against a sandbox rather than the user's

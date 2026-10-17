@@ -565,3 +565,327 @@ def test_cart_export_with_an_empty_cart_is_404(tmp_path):
                 cart=True)
     assert _status(res) == 404
     assert "cart is empty" in _body(res)["error"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stored alignments — the writer, and the asymmetry it closes
+# ═══════════════════════════════════════════════════════════════════════════
+
+_PLASMID = ("ATGGCTGAAGCTAAGGGTTTCGAACGTCTGGATCTGAAAGCTTGG"
+            "ACGTACGTACGTACGTAAGGCCTTAACCGGTTAAGGCCTTAACCG"
+            "GTTAAGGCCTTAACCGGTTAACCGGTTAAGGCCTTGACCGGATCC")
+
+
+def _seed_entry(name="Target", coll=None):
+    """One real library entry, present in BOTH places the alignment
+    endpoints read: the active-collection library mirror (which
+    `_iter_library_readonly` walks to resolve the target) and
+    `collections.json` (which the persistence helper walks to find the
+    collection that holds it). Seeded directly rather than through
+    `create-collection`, which is app-coupled."""
+    rec = SeqRecord(Seq(_PLASMID), id=name[:8], name=name[:8],
+                    annotations={"molecule_type": "DNA",
+                                 "topology": "circular"})
+    entry = {"id": name, "name": name,
+             "gb_text": sc._record_to_gb_text(rec)}
+    coll = coll or (sc._get_active_collection_name() or "Default")
+    colls = [c for c in sc._load_collections() if isinstance(c, dict)]
+    tgt = next((c for c in colls if str(c.get("name") or "") == coll), None)
+    if tgt is None:
+        tgt = {"name": coll, "plasmids": []}
+        colls.append(tgt)
+    plasmids = [p for p in (tgt.get("plasmids") or []) if isinstance(p, dict)]
+    plasmids = [p for p in plasmids if str(p.get("id") or "") != entry["id"]]
+    plasmids.append(dict(entry))
+    tgt["plasmids"] = plasmids
+    sc._save_collections(colls)
+    sc._save_library(plasmids)
+    return entry
+
+
+def test_store_alignment_persists_and_read_consensus_can_use_it():
+    """THE point of the writer: `read-consensus` reads stored alignments, and
+    nothing but the GUI could write them — so an agent could never set up
+    that endpoint's own input. One call must now close that loop."""
+    _seed_entry()
+    before = _body(_call("read-consensus", None, name="Target"))
+    assert before.get("n_reads", 0) == 0, "fixture should start with no reads"
+
+    read = _PLASMID[10:70]                      # a clean 60 bp "read"
+    res = _call("store-alignment", None, name="Target", read_seq=read,
+                read_name="sanger-1")
+    assert _status(res) == 200, res
+    # A PERFECT short read scores low on raw identity by construction — the
+    # plasmid it doesn't reach counts as gaps. `covered_identity_pct` is the
+    # number to judge on ([INV-207]).
+    b = _body(res)
+    assert b["covered_identity_pct"] == 100.0, b
+    assert b["identity_pct"] < 100.0, "raw identity should include the gaps"
+    assert 0 < b["covered_pct"] <= 100
+
+    lst = _body(_call("list-alignments", None, name="Target"))
+    assert lst["count"] == 1
+    assert lst["alignments"][0]["read_name"] == "sanger-1"
+
+    after = _body(_call("read-consensus", None, name="Target"))
+    assert after["n_reads"] == 1, "read-consensus still can't see it"
+
+
+def test_store_alignment_is_idempotent():
+    """Re-storing a byte-identical alignment updates the row instead of
+    appending a duplicate (`_merge_stored_alignments` semantics)."""
+    _seed_entry(name="Idem")
+    read = _PLASMID[5:65]
+    for _ in range(3):
+        assert _status(_call("store-alignment", None, name="Idem",
+                             read_seq=read, read_name="r")) == 200
+    assert _body(_call("list-alignments", None, name="Idem"))["count"] == 1
+
+
+def test_store_alignment_computes_it_rather_than_trusting_the_caller():
+    """There is deliberately no way to hand in gapped strings or
+    coordinates — a caller-built alignment is a caller-built VERDICT, and
+    `read-consensus` reads it as ground truth."""
+    import inspect
+    src = inspect.getsource(sc._h_store_alignment)
+    assert "_pairwise_align(" in src, "the engine must do the alignment"
+    for forbidden in ('payload.get("aligned_q")', 'payload.get("aligned_t")',
+                      'payload.get("result")', 'payload.get("segments")'):
+        assert forbidden not in src, f"store-alignment must not accept {forbidden}"
+
+
+@pytest.mark.parametrize("kw,code", [
+    ({}, 400),                                       # no target
+    ({"name": "ghost", "read_seq": "ACGTACGTAC"}, 404),
+])
+def test_store_alignment_refusals(kw, code):
+    _seed_entry()
+    assert _status(_call("store-alignment", None, **kw)) == code
+
+
+def test_store_alignment_refuses_an_empty_read():
+    _seed_entry()
+    assert _status(_call("store-alignment", None, name="Target",
+                         read_seq="")) == 400
+
+
+def test_store_alignment_caps_an_oversized_read():
+    _seed_entry()
+    res = _call("store-alignment", None, name="Target",
+                read_seq="ACGT" * 100_000)          # 400 kb
+    assert _status(res) == 413
+
+
+def test_update_alignment_toggles_visibility():
+    _seed_entry(name="Vis")
+    _call("store-alignment", None, name="Vis", read_seq=_PLASMID[:60],
+          read_name="r")
+    sid = _body(_call("list-alignments", None,
+                      name="Vis"))["alignments"][0]["stored_id"]
+    res = _call("update-alignment", None, name="Vis", stored_id=sid,
+                visible=False)
+    assert _status(res) == 200, res
+    assert "visible" in _body(res)["changed"]
+    lst = _body(_call("list-alignments", None, name="Vis"))
+    assert lst["alignments"][0]["visible"] is False
+    assert lst["count"] == 1, "a hidden alignment is still ON DISK and listed"
+    assert lst["n_visible"] == 0
+    # a no-op repeat reports no change rather than claiming an edit
+    again = _call("update-alignment", None, name="Vis", stored_id=sid,
+                  visible=False)
+    assert _body(again)["changed"] == []
+
+
+def test_update_alignment_404_on_unknown_stored_id():
+    _seed_entry(name="U404")
+    _call("store-alignment", None, name="U404", read_seq=_PLASMID[:60])
+    res = _call("update-alignment", None, name="U404",
+                stored_id="nope", visible=False)
+    assert _status(res) == 404
+    assert _body(res)["stored_ids"], "the error should name the real ids"
+
+
+def test_delete_alignment_by_id_and_all():
+    _seed_entry(name="Del")
+    for i in range(3):
+        _call("store-alignment", None, name="Del",
+              read_seq=_PLASMID[i:60 + i], read_name=f"r{i}")
+    lst = _body(_call("list-alignments", None, name="Del"))
+    assert lst["count"] == 3
+    sid = lst["alignments"][0]["stored_id"]
+    one = _call("delete-alignment", None, name="Del", stored_id=sid)
+    assert _status(one) == 200 and _body(one)["deleted"] == 1
+    assert _body(_call("list-alignments", None, name="Del"))["count"] == 2
+    allr = _call("delete-alignment", None, name="Del", all=True)
+    assert _status(allr) == 200 and _body(allr)["deleted"] == 2
+    assert _body(_call("list-alignments", None, name="Del"))["count"] == 0
+
+
+def test_delete_alignment_requires_an_explicit_selector():
+    """`all` is spelled out rather than reachable by omitting stored_id —
+    dropping every alignment resets a verification."""
+    _seed_entry(name="Sel")
+    _call("store-alignment", None, name="Sel", read_seq=_PLASMID[:60])
+    assert _status(_call("delete-alignment", None, name="Sel")) == 400
+    assert _status(_call("delete-alignment", None, name="Sel",
+                         stored_id="x", all=True)) == 400
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# restore-deleted-plasmid — the agent can now consume the undo it creates
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def undo_rig(monkeypatch):
+    """A real `PlasmidApp` + real `LibraryPanel` with ONLY the UI hooks
+    stubbed, so `_push_library_undo` (depth cap, drop-incomplete-batches) and
+    `action_undo_delete` (slot restore, collection guard, batch all-or-
+    nothing) all run for real. Stubbing either would hide the exact
+    behaviour these tests exist to check."""
+    lib = [{"id": f"P{i}", "name": f"Plasmid {i}", "gb_text": ""}
+           for i in range(4)]
+    coll = sc._get_active_collection_name() or "Default"
+    sc._save_collections([{"name": coll, "plasmids": [dict(e) for e in lib]}])
+    # A fresh sandbox has no ACTIVE collection, and the restore's collection
+    # guard (the UI's own, `want and want != active`) then refuses every
+    # restore. Set it so the rig matches a real session.
+    sc._set_active_collection_name(coll)
+    sc._save_library([dict(e) for e in lib])
+
+    panel = sc.LibraryPanel.__new__(sc.LibraryPanel)
+    panel._marked_ids, panel._mark_kind = set(), {}
+    panel._view_mode = "plasmids"
+    box = {"notes": [], "saved": None}
+
+    app = sc.PlasmidApp.__new__(sc.PlasmidApp)
+    app._current_record = None
+    app.notify = lambda m, severity="information", **k: box["notes"].append(m)
+    app.call_from_thread = lambda fn, *a, **k: fn(*a, **k)
+    app.query_one = lambda *a, **k: panel
+    monkeypatch.setattr(type(panel), "app", property(lambda self: app))
+    monkeypatch.setattr(type(panel), "_repopulate_plasmids", lambda self: None)
+    monkeypatch.setattr(type(panel), "set_active", lambda self, x: None)
+    monkeypatch.setattr(
+        type(panel), "_delete_save_to_disk",
+        lambda self, entries, bin_, op="": sc._save_library(entries))
+    return app, panel, [e["id"] for e in lib], box, coll
+
+
+def _delete_one(app, idx, ids, coll):
+    """Record one deletion the way the delete paths do, then remove it."""
+    lib = sc._load_library()
+    entry = next(e for e in lib if e["id"] == ids[idx])
+    app._push_library_undo({"name": entry["name"], "entry": dict(entry),
+                            "index": idx, "collection": coll})
+    sc._save_library([e for e in lib if e["id"] != ids[idx]])
+
+
+def test_restore_deleted_plasmid_puts_it_back_in_its_slot(undo_rig):
+    app, panel, ids, box, coll = undo_rig
+    _delete_one(app, 1, ids, coll)
+    assert [e["id"] for e in sc._load_library()] == [ids[0], ids[2], ids[3]]
+    res = _call("restore-deleted-plasmid", app)
+    assert _status(res) == 200, res
+    assert _body(res)["count"] == 1
+    assert _body(res)["restored"] == ["Plasmid 1"]
+    # Back in the SLOT it came from, not appended at the end.
+    assert [e["id"] for e in sc._load_library()] == ids
+
+
+def test_restore_with_an_empty_stack_is_404(undo_rig):
+    app, panel, ids, box, coll = undo_rig
+    res = _call("restore-deleted-plasmid", app)
+    assert _status(res) == 404
+    assert _body(res)["restored"] == []
+
+
+def test_restore_refuses_when_the_collection_changed(undo_rig):
+    """The library file IS the active collection's contents, so restoring
+    into a different one would file the plasmid somewhere it never lived.
+    The records must SURVIVE the refusal."""
+    app, panel, ids, box, coll = undo_rig
+    _delete_one(app, 0, ids, coll)
+    stack = app._library_undo_stack()
+    stack[-1]["collection"] = "SomeOtherCollection"
+    res = _call("restore-deleted-plasmid", app)
+    assert _status(res) == 409
+    assert _body(res)["deleted_from"] == "SomeOtherCollection"
+    assert len(app._library_undo_stack()) == 1, \
+        "a refused restore must leave the record recoverable"
+
+
+def test_restore_brings_a_whole_bulk_batch_back_in_one_call(undo_rig):
+    """Restoring 2 of 3 and reporting success is the partial-recovery-reads-
+    as-complete failure the batch design exists to prevent."""
+    app, panel, ids, box, coll = undo_rig
+    lib = sc._load_library()
+    # Records are pushed highest-index-first, all sharing one batch id.
+    for idx in (2, 1, 0):
+        entry = next(e for e in lib if e["id"] == ids[idx])
+        app._push_library_undo({"name": entry["name"], "entry": dict(entry),
+                                "index": idx, "collection": coll,
+                                "batch": "bulk-1"})
+    sc._save_library([e for e in lib if e["id"] not in set(ids[:3])])
+    assert [e["id"] for e in sc._load_library()] == [ids[3]]
+    res = _call("restore-deleted-plasmid", app)
+    assert _status(res) == 200, res
+    assert _body(res)["count"] == 3, "one call must restore the WHOLE batch"
+    assert [e["id"] for e in sc._load_library()] == ids
+    assert app._library_undo_stack() == []
+
+
+def test_master_delete_has_no_endpoint():
+    """Authorised 2026-10-16: agents may delete and undo. The WIPE stays
+    human-only — a deliberately unreachable capability, not an oversight."""
+    names = set(sc._state._AGENT_HANDLERS)
+    for forbidden in ("master-delete", "wipe", "wipe-all",
+                      "delete-everything", "master-wipe"):
+        assert forbidden not in names
+    assert not [n for n in names if "master" in n and "delete" in n]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# store-alignment hardening: what counts as a read at all
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("n_bp", [1, 5, 19])
+def test_a_read_too_short_to_be_evidence_is_refused(n_bp):
+    """`read-consensus` counts every stored row as a read, so a 1 bp "read"
+    would raise depth at some base and could flip a verdict while supporting
+    nothing. It used to be stored at 0% identity."""
+    _seed_entry(name="Short")
+    res = _call("store-alignment", None, name="Short",
+                read_seq=_PLASMID[:n_bp])
+    assert _status(res) == 400
+    assert "cannot support or contradict" in _body(res)["error"]
+
+
+def test_a_mostly_no_call_read_is_refused():
+    """An ambiguity-dominated read aligns at ~0% and would be filed as a
+    FAILED VERIFICATION rather than a bad read — the no-call-as-evidence
+    shape [INV-200] removed from the heterogeneity caller."""
+    _seed_entry(name="Ns")
+    res = _call("store-alignment", None, name="Ns", read_seq="N" * 60)
+    assert _status(res) == 400
+    assert "no-calls" in _body(res)["error"]
+
+
+def test_a_read_longer_than_its_template_is_flagged():
+    """`covered_pct` saturates at 100, so without a warning a 3x concatemer
+    reads as "perfect and fully covered"."""
+    _seed_entry(name="Cat")
+    res = _call("store-alignment", None, name="Cat",
+                read_seq=_PLASMID * 3)
+    assert _status(res) == 200, res
+    b = _body(res)
+    assert b["warnings"], "a read longer than the plasmid must say so"
+    assert "concatemer" in b["warnings"][0]
+
+
+def test_a_normal_read_carries_no_warnings():
+    """The guards must not fire on ordinary input, or they become noise."""
+    _seed_entry(name="Fine")
+    b = _body(_call("store-alignment", None, name="Fine",
+                    read_seq=_PLASMID[10:80]))
+    assert b["warnings"] == []
+    assert b["covered_identity_pct"] == 100.0

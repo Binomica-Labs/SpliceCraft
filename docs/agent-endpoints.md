@@ -53,6 +53,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `create-primer-collection` | W | Create a new (empty) named primer collection. Body: `{name, description?}`. |
 | `create-protein-collection` | W | Create a new EMPTY protein collection. Body: `{name}`. 409 if one of that name already exists. |
 | `create-protocol-collection` | W | Create an empty named protocol collection. Body: `{name}`. |
+| `delete-alignment` | W | Remove stored alignment(s) from a library plasmid. Body: `{id\|name, stored_id \| all: true}`. |
 | `delete-codon-table` | W | Remove a codon-usage table by `taxid` or `name`. Built-in tables (source='builtin') cannot be removed. |
 | `delete-collection` | W | Delete a collection by exact name. Body: `{name}`. If the deleted collection is the active one, the next collection becomes active (reported as… |
 | `delete-custom-enzyme` | W | Delete a custom enzyme by `name`. Built-in NEB enzymes are refused. Any enzyme collection that referenced the deleted name keeps the stale row —… |
@@ -154,6 +155,8 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `learn-start` | W | Launch a Background Learning session: grow Babs' corpus about a TOPIC via a focused, drift-resistant crawl of open-access databases. Body:… |
 | `learn-status` | R | Progress of a Background Learning session. Body: `{slug}`. Returns the live counters (kept / fetched / dropped / frontier / status / drift),… |
 | `lint-synthesis` | R | Synthesis / assembly-readiness pre-flight for a construct — the "is it safe to order + assemble?" check. Body: `{sequence \| id \| name,… |
+| `list-alignments` | R | Every sequencing alignment STORED on a library plasmid. Body: `{id\|name}`. |
+| `list-assembly-strategies` | R | The assembly chemistries `plan-chromosome-segments` can plan for, with the overlap sizes each one actually needs. Body: `{}`. |
 | `list-backups` | R | List recoverable backups for user-data files. Body: `{label?}`. |
 | `list-cas-variants` | R | The Cas nucleases `design-guides` supports. Returns `{variants: [{key, label, pam, pam_side, guide_len, cut_offsets, notes}, ...]}`. |
 | `list-codon-tables` | R | Available codon usage tables. Returns name, taxid, source (builtin/kazusa/user) and date added for each entry, plus the `active_taxid` field… |
@@ -218,6 +221,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `ot2-status` | R | Full OT-2 state snapshot — the monitoring surface. Reports reachability + versions, pipette OK flags + volume specs, motor engagement, deck /… |
 | `patent-search` | R | Search patents. Body: `{query, max_hits?}`. |
 | `pcr-program` | R | A thermocycler program for one PCR. Body: `{product_bp, primer_tms?: [float, ...], primers?: [name\|id, ...], polymerase?: "q5"\|"phusion"\|"taq",… |
+| `plan-chromosome-segments` | R | Cut a long target into orderable, assemblable segments and prove the junctions are unambiguous — the design half of chromosome-scale work. Body:… |
 | `plan-residue-edit` | R | What changing one residue of an annotated CDS would do — WITHOUT doing it. |
 | `plasmid-overview` | R | One call for a first look at the LOADED plasmid: name, length, topology, unsaved state, its features, and every enzyme that cuts it exactly ONCE… |
 | `plasmidsaurus-items` | R | List your Plasmidsaurus items (sequencing orders), most-recent first, over the official OAuth2 REST API. Read-only; no body. |
@@ -241,6 +245,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `replace-sequence` | W | Replace `[start, end)` with `bases` (mutagenesis / edit). Body: `{start, end, bases}`. Pass `{"force": true}` to bypass the dirty-state guard.… |
 | `restart` | W | Restart the `--agent` daemon so it picks up an on-disk update (SC-A). Body: `{}`. |
 | `restore-backup` | W | Restore one user-data file from a chosen backup. Body: `{label, source_path}` where `source_path` must come from a prior `list-backups` response… |
+| `restore-deleted-plasmid` | W | Undo the most recent library deletion — the agent counterpart to the library panel's Ctrl+Z. Body: `{}`. |
 | `restore-pre-update-snapshot` | W | Restore a pre-update snapshot by id (or "latest"). Body: `{id?: str}`. When `id` is missing or "latest", restores the newest snapshot. |
 | `reverse-complement` | W | Reverse-complement the WHOLE loaded record in place — the agent counterpart to Alt+Shift+R. Body: `{}`. |
 | `save` | W | Save the current record to its source file (if any) and library. |
@@ -275,12 +280,14 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `simulate-traditional-cloning` | R | Dry-run a traditional restriction-cloning reaction: digest a vector and an insert with the chosen enzymes, then ligate. Body: `{vector_seq,… |
 | `span-contains` | R | Circular-aware containment: does a span contain a base or another span, on a molecule where either may cross the origin? |
 | `status` | R | Current session state: loaded record, dirty flag, source path. |
+| `store-alignment` | W | Align a sequencing READ against a library plasmid and PERSIST the result onto that entry — the side door to Alt+A / the Sequencing screen's bulk… |
 | `taxon-search` | R | Resolve an ORGANISM NAME to an NCBI taxid. Body: `{query, max_hits?}`. |
 | `tools` | R | Self-describe: every endpoint with its read/write mode and full request-body documentation. Body (all optional): `{filter?: str, brief?: bool}`. |
 | `traditional-clone` | W | Run a traditional restriction-cloning reaction AND save the product to the library — the restriction-cloning analog of `gibson-assemble`. Body… |
 | `transfer-annotations` | W | Transfer features from a source plasmid (`source_id` in the library) onto the loaded record by sequence-identity matching. Body: `{source_id: str,… |
 | `undo` | W | Undo the last canvas mutation (sequence edit, feature add/update/ delete, replace-sequence, new-plasmid load, …) — the agent counterpart to… |
 | `uniprot-search` | R | Search UniProtKB for PROTEINS. Body: `{query, max_hits?}` (`query` is a UniProt query, e.g. "Cas9", "NPTII", "gene:BAR AND organism_id:3702"). |
+| `update-alignment` | W | Show / hide or relabel ONE stored alignment. Body: `{id\|name, stored_id, visible?, label?}`. |
 | `update-custom-enzyme` | W | Replace an existing custom enzyme by `name`. Built-in NEB enzymes are not editable via this endpoint (refuse with 400) — add a custom enzyme with… |
 | `update-enzyme-collection` | W | Replace an existing enzyme collection by `name`. Body: `{name, enzymes?: [str, ...], new_name?: str}`. `new_name` renames the collection (and… |
 | `update-experiment` | W | Update an existing notebook entry. Body: `{id: str, title?: str, body_md?: str, tags?: list[str]}`. Fields not supplied keep their prior value.… |

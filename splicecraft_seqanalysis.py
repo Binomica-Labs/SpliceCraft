@@ -32,7 +32,7 @@ from splicecraft_record import _gb_text_to_record
 from splicecraft_dataaccess import _all_grammars, _load_entry_vectors
 from splicecraft_cloning import _excise_fragment_pair, _grammar_tu_overhangs
 from splicecraft_logging import _log, _log_event
-from splicecraft_util import _feat_bounds, _record_is_circular
+from splicecraft_util import _feat_bounds, _primer_tm_safe, _record_is_circular
 
 
 def _find_orfs(seq: str, *,
@@ -2361,4 +2361,400 @@ def _map_transcription(seq: str, features: "list[dict]", *,
                                                           t["strand"])),
         "genes": out_genes,
         "warnings": warnings,
+    }
+
+
+# ── Chromosome segmentation (synthetic design at chromosome scale) ──────────
+# A 1 Gbp target cannot be ordered as one piece, so designing one means
+# deciding WHERE to cut it and proving the pieces can only reassemble one way.
+# The per-segment synthesis checks already exist (`_synthesis_lint`), so this
+# adds the part that doesn't: the JUNCTIONS. See `[INV-223]`.
+
+_SEGMENT_STRATEGIES: "dict[str, dict]" = {
+    # Overlap sizes are the chemistry's, not a preference. Gibson's exonuclease
+    # chew-back works on tens of bases; yeast homologous recombination wants
+    # far longer homology and happily takes many pieces per round; Golden Gate
+    # fuses on a 4 nt sticky end and cares about nothing else.
+    "gibson": {
+        "label": "Gibson / NEBuilder HiFi",
+        "overlap_bp": 30, "overlap_min": 18, "overlap_max": 80,
+        "tm_lo": 48.0, "tm_hi": 72.0, "gc_lo": 0.40, "gc_hi": 0.65,
+        "forbidden": (), "nudge_bp": 200,
+    },
+    "yeast_hr": {
+        "label": "Yeast homologous recombination",
+        "overlap_bp": 120, "overlap_min": 40, "overlap_max": 500,
+        "tm_lo": None, "tm_hi": None, "gc_lo": 0.30, "gc_hi": 0.70,
+        "forbidden": (), "nudge_bp": 200,
+    },
+    "goldengate": {
+        "label": "Golden Gate (Type IIS)",
+        "overlap_bp": 4, "overlap_min": 4, "overlap_max": 4,
+        "tm_lo": None, "tm_hi": None, "gc_lo": 0.0, "gc_hi": 1.0,
+        "forbidden": _SYNTHESIS_FORBIDDEN_ENZYMES,
+        # 4 nt leaves only 256 overhangs, so boundaries at an arbitrary stride
+        # collide constantly on real sequence — 2 of 9 were reverse
+        # complements of each other on the first random target tried. A human
+        # designer moves the cut; so does this, over a wide window.
+        "nudge_bp": 2000,
+    },
+}
+# WHICH sites are forbidden is a property of the ASSEMBLY, not of DNA.
+# `_synthesis_lint` defaults to flagging internal Type IIS sites as errors,
+# which is right for a Golden Gate part and meaningless for a Gibson or
+# yeast-HR chromosome — an internal BsaI site is simply not consulted by
+# either chemistry. Left on by default it reported 281 errors per 20 kb
+# segment of ordinary sequence, which is not a warning, it is noise that
+# teaches the reader to skim the whole report. So the set comes from the
+# strategy, and a caller who IS planning downstream Type IIS work passes
+# `forbidden_enzymes` explicitly.
+
+# A plan with more pieces than this is not a plan anyone can execute, and the
+# honest answer is a bigger `segment_bp` (or a hierarchical build) rather than
+# a 100,000-row table. 1 Gbp at 10 kb segments IS 100,000 pieces.
+_SEGMENT_MAX_COUNT = 2000
+
+# Off-target homology search is O(total x junctions) — one whole-sequence scan
+# per junction. A 10 Mbp target with 501 junctions is 5 BILLION character
+# comparisons and took 13.7 s, which is not a check, it is a hang. So the
+# budget is on the WORK, not the length: a 10 Mbp / 101-junction plan (1e9,
+# ~3 s) still gets checked while the 501-junction one does not.
+#
+# When it is skipped, `offtarget_checked: false` SAYS so. Quietly dropping it
+# would turn "no off-target homology found" into a claim nobody verified,
+# which is worse than not checking — the caller would act on it.
+_SEGMENT_OFFTARGET_MAX_BP = 50_000_000
+_SEGMENT_OFFTARGET_BUDGET = 1_000_000_000
+
+
+def _segment_gc(s: str) -> float:
+    if not s:
+        return 0.0
+    return (s.count("G") + s.count("C")) / len(s)
+
+
+def _plan_chromosome_segments(
+    seq: str, *, strategy: str = "gibson", segment_bp: int = 10_000,
+    overlap_bp: "int | None" = None, circular: bool = True,
+    lint: bool = True, forbidden_enzymes=None,
+    max_segments: int = _SEGMENT_MAX_COUNT,
+    nudge_bp: "int | None" = None,
+) -> dict:
+    """Cut a long target into orderable, assemblable segments and prove the
+    junctions are unambiguous.
+
+    Returns ``{ok, strategy, n_segments, segment_bp, overlap_bp, total_bp,
+    circular, segments: [...], junctions: [...], warnings, errors}``.
+
+    **The junction analysis is the point.** Segment boundaries are arithmetic;
+    what decides whether a build works is whether every junction is UNIQUE. Two
+    junctions sharing an overlap (or one being another's reverse complement)
+    give an assembly that is chemically happy and structurally wrong — pieces
+    swap or invert, and it is only caught after sequencing. So duplicates are
+    `errors`, not warnings: a plan with an ambiguous junction is not a plan.
+
+    Each junction also reports its own homology — length, GC, Tm where the
+    chemistry cares — and, when the molecule is small enough to search,
+    whether the overlap occurs ANYWHERE ELSE in the target. An overlap that
+    matches a second site can recombine there instead, which long homology
+    arms make more likely rather than less.
+
+    Per-segment synthesis readiness is `_synthesis_lint`, reused rather than
+    respun, so a segment is judged by the same rules a single ordered fragment
+    is: extreme or windowed GC, homopolymers, repeats, degenerate bases.
+
+    **Forbidden sites come from the STRATEGY, not from DNA.** Only Golden Gate
+    cares about an internal Type IIS site; Gibson and yeast HR never consult
+    one. Lint-by-default reported 281 "errors" per 20 kb segment of ordinary
+    sequence — noise that teaches a reader to skim the report it is supposed
+    to focus them on. Pass `forbidden_enzymes` to override either way.
+
+    `circular=True` wraps the last segment onto the first, which is what a
+    chromosome or a plasmid needs; `False` leaves two free ends.
+
+    `nudge_bp` caps how far a boundary may MOVE to find a clean junction
+    (strategy default; Golden Gate searches widest because 4 nt leaves only
+    256 overhangs and arbitrary cuts collide constantly). Set it to 0 to take
+    the arithmetic boundaries exactly as given — which is how you see the
+    collisions a plan WOULD have had, and the only way to reproduce a fixed
+    cut layout someone else specified."""
+    raw = (seq or "").upper()
+    s = "".join(c for c in raw if c in "ACGT")
+    total = len(s)
+    errors: "list[str]" = []
+    warnings: "list[str]" = []
+
+    strat_key = str(strategy or "gibson").strip().lower()
+    strat = _SEGMENT_STRATEGIES.get(strat_key)
+    if strat is None:
+        return {"ok": False, "errors": [
+            f"unknown strategy {strategy!r} — choose one of "
+            f"{sorted(_SEGMENT_STRATEGIES)}"], "warnings": []}
+    if total == 0:
+        return {"ok": False, "errors": ["no ACGT bases in the sequence"],
+                "warnings": []}
+
+    ov = strat["overlap_bp"] if overlap_bp is None else int(overlap_bp)
+    if not (strat["overlap_min"] <= ov <= strat["overlap_max"]):
+        return {"ok": False, "errors": [
+            f"overlap_bp {ov} is outside what {strat['label']} supports "
+            f"({strat['overlap_min']}..{strat['overlap_max']} bp)"],
+            "warnings": []}
+    seg_bp = int(segment_bp)
+    if seg_bp <= ov:
+        return {"ok": False, "errors": [
+            f"segment_bp {seg_bp} must exceed overlap_bp {ov} — otherwise a "
+            f"segment is nothing but its own junctions"], "warnings": []}
+    if seg_bp > total:
+        return {"ok": False, "errors": [
+            f"segment_bp {seg_bp:,} exceeds the {total:,} bp target — it does "
+            f"not need segmenting"], "warnings": []}
+
+    stride = seg_bp - ov                     # unique bases each segment adds
+    n_seg = -(-total // stride) if circular else -(-(total - ov) // stride)
+    n_seg = max(1, n_seg)
+    if n_seg > max_segments:
+        suggest = -(-total // max_segments) + ov
+        return {"ok": False, "errors": [
+            f"{n_seg:,} segments exceeds the {max_segments:,} cap — that is "
+            f"not an executable plan. Use segment_bp >= {suggest:,} bp, or "
+            f"build hierarchically (segment into blocks, then segment each "
+            f"block)."], "warnings": []}
+
+    def _take(start: int, length: int) -> str:
+        """Circular-safe slice."""
+        start %= total
+        if start + length <= total:
+            return s[start:start + length]
+        return s[start:] + s[:(start + length) - total]
+
+    # ── Choose boundaries, don't just take them ────────────────────────────
+    # A boundary at an arbitrary stride inherits whatever junction sequence
+    # happens to be there, and a colliding junction makes the whole assembly
+    # ambiguous. So each boundary is NUDGED within a window to the nearest
+    # position whose overlap is unused, not the reverse complement of one
+    # already used, and (Golden Gate) not palindromic. This is what a human
+    # designer does by hand, and it is why the planner can return a buildable
+    # plan for ordinary sequence instead of reporting that ordinary sequence
+    # cannot be built.
+    nudge = (int(strat.get("nudge_bp") or 0) if nudge_bp is None
+             else max(0, int(nudge_bp)))
+    used: "dict[str, int]" = {}
+    nudged = 0
+
+    def _ok_overlap(w: str) -> bool:
+        if len(w) != ov:
+            return False
+        if w in used:
+            return False
+        if _rc(w) in used:
+            return False
+        if strat_key == "goldengate" and w == _rc(w):
+            return False
+        return True
+
+    boundaries: "list[int]" = [0]
+    first_ov = _take(0, ov)
+    used[first_ov] = 0
+    for i in range(1, n_seg):
+        ideal = i * stride
+        if ideal >= total:
+            break
+        chosen = None
+        # Search outward from the ideal cut so the plan stays as close to the
+        # requested segment size as it can.
+        for d in range(0, nudge + 1):
+            for cand in ((ideal + d,) if d == 0 else (ideal + d, ideal - d)):
+                if not (0 < cand < total):
+                    continue
+                if cand <= boundaries[-1]:
+                    continue
+                w = _take(cand, ov)
+                if _ok_overlap(w):
+                    chosen = cand
+                    used[w] = i
+                    break
+            if chosen is not None:
+                break
+        if chosen is None:
+            # No clean overhang in the window — keep the ideal cut so the
+            # collision is REPORTED below rather than silently papered over.
+            chosen = ideal
+            used.setdefault(_take(chosen, ov), i)
+        elif chosen != ideal:
+            nudged += 1
+        boundaries.append(chosen)
+    if nudged:
+        warnings.append(
+            f"{nudged} of {len(boundaries) - 1} boundaries were moved (up to "
+            f"{nudge} bp) to give every junction a distinct overlap — segment "
+            f"lengths therefore vary around the {seg_bp:,} bp requested")
+
+    segments: "list[dict]" = []
+    for i in range(len(boundaries)):
+        start = boundaries[i] % total
+        # A segment runs from its own boundary to the NEXT one plus the
+        # overlap, so consecutive pieces share exactly `ov` bases by
+        # construction and lengths vary with where the boundaries landed.
+        nxt_b = (boundaries[i + 1] if i + 1 < len(boundaries)
+                 else (total if circular else total))
+        if circular:
+            # The last segment finishes exactly one overlap past the origin
+            # rather than running a further full `segment_bp` — otherwise the
+            # plan tiles past the end and the final piece re-covers bases the
+            # first one already has, DNA you would pay to synthesise twice.
+            length = (nxt_b + ov) - boundaries[i]
+        else:
+            length = min((nxt_b + ov) - boundaries[i], total - boundaries[i])
+            if length <= 0:
+                break
+        if length <= ov:
+            # The remainder is shorter than a junction: fold it into the
+            # previous segment rather than emitting a piece that is nothing
+            # but overlap.
+            if segments:
+                prev = segments[-1]
+                prev_len = prev["length"] + length - ov
+                body_prev = _take(prev["start"], prev_len)
+                prev.update(
+                    length=len(body_prev), seq=body_prev,
+                    end=(prev["start"] + prev_len) % total if circular
+                    else prev["start"] + prev_len,
+                    gc_pct=round(_segment_gc(body_prev) * 100, 1),
+                    overlap_3=body_prev[-ov:] if circular else "")
+                break
+        body = _take(start, length)
+        seg = {
+            "index": i,
+            "start": start,
+            "end": (start + length) % total if circular else start + length,
+            "length": len(body),
+            "seq": body,
+            "gc_pct": round(_segment_gc(body) * 100, 1),
+            "overlap_5": body[:ov] if (circular or i > 0) else "",
+            "overlap_3": (body[-ov:]
+                          if (circular or i < n_seg - 1) else ""),
+            "warnings": [],
+        }
+        if lint:
+            # Typed separately: `circular` is a bool and `forbidden_enzymes`
+            # a tuple, so one dict would widen to object and lose both.
+            _forbid = tuple(forbidden_enzymes) if forbidden_enzymes is not None \
+                else tuple(strat["forbidden"])
+            try:
+                rep = _synthesis_lint(body, circular=False,
+                                      forbidden_enzymes=_forbid)
+            except Exception:                 # pragma: no cover - defensive
+                rep = None
+            if rep is not None:
+                seg["lint_score"] = rep.get("score")
+                seg["warnings"] = [
+                    w for w in (rep.get("warnings") or [])
+                    if w.get("level") in ("error", "warn")]
+        segments.append(seg)
+
+    # ── Junctions: the half that decides whether the build works ───────────
+    junctions: "list[dict]" = []
+    n_j = len(segments) if circular else max(0, len(segments) - 1)
+    for i in range(n_j):
+        nxt = (i + 1) % len(segments)
+        overlap = segments[i]["overlap_3"]
+        if not overlap:
+            continue
+        j = {
+            "index": i,
+            "between": [i, nxt],
+            "overlap": overlap,
+            "length": len(overlap),
+            "gc_pct": round(_segment_gc(overlap) * 100, 1),
+            "warnings": [],
+        }
+        if strat["tm_lo"] is not None:
+            tm = _primer_tm_safe(overlap)
+            j["tm"] = round(tm, 1) if tm is not None else None
+            if tm is not None and tm < strat["tm_lo"]:
+                j["warnings"].append(
+                    f"junction Tm {tm:.0f} C is below the {strat['tm_lo']:.0f} C "
+                    f"{strat['label']} wants — lengthen the overlap or move "
+                    f"the boundary into richer sequence")
+            elif tm is not None and tm > strat["tm_hi"]:
+                j["warnings"].append(
+                    f"junction Tm {tm:.0f} C is above {strat['tm_hi']:.0f} C — "
+                    f"may form stable secondary structure")
+        gcf = _segment_gc(overlap)
+        if gcf < strat["gc_lo"]:
+            j["warnings"].append(
+                f"junction GC {gcf * 100:.0f}% is low for {strat['label']}")
+        elif gcf > strat["gc_hi"]:
+            j["warnings"].append(
+                f"junction GC {gcf * 100:.0f}% is high for {strat['label']}")
+        if strat_key == "goldengate" and overlap == _rc(overlap):
+            j["warnings"].append(
+                "palindromic 4 nt overhang — it can ligate to itself")
+        junctions.append(j)
+
+    # Uniqueness, by DICT not all-pairs: a 2,000-segment plan would be 2 M
+    # comparisons, and exact + reverse-complement collision is what actually
+    # mis-assembles.
+    by_seq: "dict[str, list[int]]" = {}
+    for j in junctions:
+        by_seq.setdefault(j["overlap"], []).append(j["index"])
+    n_dup = 0
+    for ov_seq, idxs in by_seq.items():
+        if len(idxs) > 1:
+            n_dup += 1
+            errors.append(
+                f"junctions {idxs} share the identical {len(ov_seq)} bp "
+                f"overlap — the assembly is AMBIGUOUS and segments can swap. "
+                f"Shift one boundary.")
+            for j in junctions:
+                if j["index"] in idxs:
+                    j["unique"] = False
+    for j in junctions:
+        rc_hit = by_seq.get(_rc(j["overlap"]))
+        if rc_hit and rc_hit != [j["index"]]:
+            n_dup += 1
+            errors.append(
+                f"junction {j['index']}'s overlap is the reverse complement "
+                f"of junction(s) {rc_hit} — a segment can insert INVERTED.")
+            j["unique"] = False
+        j.setdefault("unique", True)
+
+    # Off-target homology, bounded and honest about it.
+    work = total * max(1, len(junctions))
+    offtarget_checked = (total <= _SEGMENT_OFFTARGET_MAX_BP
+                         and work <= _SEGMENT_OFFTARGET_BUDGET)
+    if offtarget_checked:
+        for j in junctions:
+            extra = s.count(j["overlap"]) - 1
+            if extra > 0:
+                j["offtarget_hits"] = extra
+                j["warnings"].append(
+                    f"this overlap also occurs {extra} other place(s) in the "
+                    f"target — it can recombine there instead")
+    else:
+        warnings.append(
+            f"off-target homology NOT checked: {total:,} bp x "
+            f"{len(junctions)} junctions is "
+            f"{work:,} character comparisons, over the "
+            f"{_SEGMENT_OFFTARGET_BUDGET:,} budget. Junction UNIQUENESS was "
+            f"still verified (that check is cheap); what was skipped is "
+            f"whether a junction's homology also occurs elsewhere in the "
+            f"target. Re-run on a region, or use larger segments.")
+
+    n_seg_warn = sum(1 for sg in segments if sg["warnings"])
+    if n_seg_warn:
+        warnings.append(
+            f"{n_seg_warn} of {len(segments)} segments carry synthesis "
+            f"warnings — read each segment's own `warnings`")
+    return {
+        "ok": not errors,
+        "strategy": strat_key, "strategy_label": strat["label"],
+        "n_segments": len(segments), "n_junctions": len(junctions),
+        "segment_bp": seg_bp, "overlap_bp": ov, "stride_bp": stride,
+        "total_bp": total, "circular": bool(circular),
+        "n_ambiguous_junctions": n_dup,
+        "offtarget_checked": offtarget_checked,
+        "segments": segments, "junctions": junctions,
+        "warnings": warnings, "errors": errors,
     }

@@ -43,7 +43,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.3.10"
+__version__ = "1.3.11"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
@@ -18108,6 +18108,12 @@ class PlasmidMap(Widget):
         self.origin_bp    = 0
         self.selected_idx = -1
         self._feats       = self._parse(record)
+        # Generation for the LOD caches. NOT `id(self._feats)`:
+        # CPython reuses addresses after GC, so a fresh feature list of
+        # the same length could land on a freed one's address and be
+        # served a STALE density ring — the identical trap
+        # `_RESTR_SCAN_CACHE` documents for transient strings.
+        self._lod_gen = getattr(self, '_lod_gen', 0) + 1
         # Stale tooltip clear: a worker callback (BLAST/RE-scan/diff)
         # can reseat the record while the mouse hovers stationary over
         # an old feature — `on_mouse_move` only fires on movement, so
@@ -19625,6 +19631,182 @@ class PlasmidMap(Widget):
         self._draw_cache = (key, result)
         return result
 
+    def _lod_feature_threshold(self) -> int:
+        """Feature count above which the map draws a DENSITY view instead of
+        every feature. ``0`` disables aggregation entirely.
+
+        The default is measured, not picked. Rotating the map repaints EVERY
+        feature — ~14 trig calls and ~100 `round()`s each — so one keypress
+        costs 1.3 ms at 1 feature, 8 ms at 200, 69 ms at 2,000 and **40
+        SECONDS at 200,000** (which is a 1 Gbp chromosome at one gene per
+        5 kb). 2,000 is where a keypress stops feeling instant, so that is
+        where the aggregate view takes over. See `[INV-223]`."""
+        try:
+            v = int(_get_setting("map_lod_feature_threshold",
+                                 _MAP_LOD_DEFAULT_THRESHOLD))
+        except (TypeError, ValueError):
+            v = _MAP_LOD_DEFAULT_THRESHOLD
+        return max(0, v)
+
+    def _lod_active(self) -> bool:
+        """True when this record should render as a density ring."""
+        thr = self._lod_feature_threshold()
+        return bool(thr) and len(self._feats) > thr
+
+    def _lod_histogram(self):
+        """``(counts, colors)`` over `_MAP_LOD_BUCKETS` fixed bp buckets.
+
+        Built ONCE per record and cached, and deliberately independent of both
+        rotation and terminal geometry — only bp coordinates go into it, so a
+        rotate or a resize reuses it untouched. That is what makes the
+        aggregate frame cost O(buckets) instead of O(features): the same 2,048
+        arcs to paint whether the molecule carries 2,000 features or 200,000.
+
+        Counts come from a DIFFERENCE array (+1 at the first bucket, −1 past
+        the last, one prefix sum at the end), so a feature costs O(1) no
+        matter how many buckets it spans. Walking each feature's buckets
+        instead would be quadratic in disguise on a chromosome of long genes —
+        the same shape as the per-frame cost this whole path exists to remove.
+
+        Colour is the widest feature STARTING in a bucket, carried forward
+        across the buckets it covers: enough to keep the ring readable without
+        pretending to resolve individual features."""
+        total = self._total
+        feats = self._feats
+        key = (len(feats), total, getattr(self, "_lod_gen", 0))
+        cached = getattr(self, "_lod_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        n = _MAP_LOD_BUCKETS
+        if total <= 0 or not feats:
+            out = ([0] * n, [""] * n)
+            self._lod_cache = (key, out)
+            return out
+        delta = [0] * (n + 1)
+        start_color: "list[tuple[int, str]]" = [(0, "")] * n
+        for f in feats:
+            try:
+                raw_s = int(f["start"])
+                span = max(1, _feat_len(raw_s, int(f["end"]), total))
+            except (KeyError, TypeError, ValueError):
+                continue
+            b0 = (raw_s % total) * n // total
+            nb = max(1, min(n, span * n // total))
+            # Wrap-aware: a run passing the last bucket continues at 0, so it
+            # is recorded as TWO runs rather than one that falls off the end.
+            if b0 + nb <= n:
+                delta[b0] += 1
+                delta[b0 + nb] -= 1
+            else:
+                delta[b0] += 1
+                delta[n] -= 1
+                delta[0] += 1
+                delta[b0 + nb - n] -= 1
+            if span > start_color[b0][0]:
+                start_color[b0] = (span, str(f.get("color") or ""))
+        counts: "list[int]" = [0] * n
+        run = 0
+        for i in range(n):
+            run += delta[i]
+            counts[i] = run if run > 0 else 0
+        colors: "list[str]" = [""] * n
+        last = next((c for _, c in reversed(start_color) if c), "")
+        for i in range(n):
+            c = start_color[i][1]
+            if c:
+                last = c
+            colors[i] = last if counts[i] else ""
+        out = (counts, colors)
+        self._lod_cache = (key, out)
+        return out
+
+    def _lod_label_slots(self, total: int):
+        """``[(feat_idx, mid_bp, label, color)]`` for the widest features.
+
+        Cached on the same key as the histogram: which features deserve a
+        label, and where their midpoints sit, depend only on bp — a rotate
+        changes where they DRAW, never which they are."""
+        key = (len(self._feats), total, getattr(self, "_lod_gen", 0))
+        cached = getattr(self, "_lod_label_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        out: "list[tuple[int, int, str, str]]" = []
+        if total > 0:
+            def _arc(iv) -> int:
+                """Sort key that cannot raise. A feature with a non-integer
+                or missing coordinate — a fuzzy `<1..>500` location, a
+                hand-edited GenBank, a caller-built list — otherwise made
+                `sorted` compare int to None and took the whole MAP down with
+                a TypeError. The histogram already skipped such features; the
+                label pass did not, so one bad annotation blanked the view
+                that was supposed to survive it."""
+                try:
+                    return -_feat_len(int(iv[1]["start"]), int(iv[1]["end"]),
+                                      total)
+                except (KeyError, TypeError, ValueError):
+                    return 1        # sorts last, below every real feature
+            widest = sorted(
+                enumerate(self._feats), key=_arc,
+            )[:_MAP_LOD_MAX_LABELS]
+            for orig_idx, f in widest:
+                try:
+                    arc = _feat_len(int(f["start"]), int(f["end"]), total)
+                    mid = (int(f["start"]) + arc // 2) % total
+                except (KeyError, TypeError, ValueError):
+                    continue
+                out.append((orig_idx, mid, _feat_decorated_label(f),
+                            str(f.get("color") or "color(244)")))
+        self._lod_label_cache = (key, out)
+        return out
+
+    def _paint_lod_density(self, bc_bits, bc_colors, bc_prio, bc_cols,
+                           bc_rows, total, _BIT, bp2a, a2xy):
+        """Paint the aggregate density ring; return its label slots.
+
+        One arc tick per non-empty bucket, radial thickness scaled by how many
+        features the bucket holds — so a gene-dense arm reads as a thick band
+        and an empty one as bare backbone.
+
+        **This is not a degraded fallback.** A 76x27 braille map has ~16,000
+        addressable dots, so 200,000 features cannot be drawn distinctly at
+        any speed; binning is the only honest rendering at that scale, and
+        zooming in resolves the individual features again.
+
+        Labels are capped at `_MAP_LOD_MAX_LABELS` and go to the WIDEST
+        features, because at this zoom a label can only usefully name
+        something big enough to see."""
+        counts, colors = self._lod_histogram()
+        if total <= 0:
+            return []
+        slots_out: "list[tuple[float, str, str, int]]" = []
+        n = _MAP_LOD_BUCKETS
+        peak = max(counts) if counts else 0
+        bucket_bp = total / n
+        for b in range(n):
+            c = counts[b]
+            if not c:
+                continue
+            angle = bp2a(int((b + 0.5) * bucket_bp))
+            thick = 1 if peak <= 1 else 1 + min(2, c * 3 // max(1, peak))
+            style = colors[b] or "color(244)"
+            for dr in range(1, thick + 1):
+                px, py = a2xy(angle, dr=dr)
+                px2, py4 = px * 2, py * 4
+                pcol, prow = px2 >> 1, py4 >> 2
+                if 0 <= pcol < bc_cols and 0 <= prow < bc_rows:
+                    bc_bits[prow][pcol] |= 1 << _BIT[(py4 & 3) << 1
+                                                     | (px2 & 1)]
+                    if bc_prio[prow][pcol] <= 1:
+                        bc_colors[prow][pcol] = style
+                        bc_prio[prow][pcol] = 2
+        # WHICH features get labelled, and where their midpoints are, depend
+        # only on bp — not on rotation — so this is cached beside the
+        # histogram. Re-sorting 200,000 features per frame to pick 24 labels
+        # was the rest of the residual cost.
+        for orig_idx, mid, label, color in self._lod_label_slots(total):
+            slots_out.append((bp2a(mid), label, color, orig_idx))
+        return slots_out
+
     def _paint_map_feature(self, f, is_sel, bc_bits, bc_colors, bc_prio,
                            bc_cols, bc_rows, canvas, cx2, cy4, rx, ry, _ry_rx,
                            n_steps, total, _BIT, N_DR, bp2a, a2xy):
@@ -19895,10 +20077,14 @@ class PlasmidMap(Widget):
                         canvas.put(tx, ty, "┼" if dr == 0 else "·", color)
 
         # ── Features (large → small) ──────────────────────────────────────────
-        feats_sorted = sorted(
-            enumerate(self._feats),
-            key=lambda iv: -_feat_len(iv[1]["start"], iv[1]["end"], total),
-        )
+        # Only when the per-feature path will actually consume it: sorting
+        # 200,000 features EVERY FRAME and then taking the aggregate branch
+        # was most of the residual rotate cost after the density ring landed.
+        feats_sorted = (
+            [] if self._lod_active() else
+            sorted(enumerate(self._feats),
+                   key=lambda iv: -_feat_len(iv[1]["start"], iv[1]["end"],
+                                             total)))
         # Reset click-target bboxes for this draw pass. Filled below
         # as labels get placed; `_feat_at` reads it when the user
         # clicks anywhere outside the arc itself.
@@ -19909,17 +20095,26 @@ class PlasmidMap(Widget):
         label_slots: list[tuple[float, str, str, int]] = []
         N_DR = 4   # radial samples per arc (was 6; 4 is visually identical)
 
-        for orig_idx, f in feats_sorted:
-            # Base draws all features UNSELECTED (selection-independent ⇒
-            # cacheable); `_draw` re-tints the selected one after copying.
-            is_sel = False
-            lbl = self._paint_map_feature(
-                f, is_sel, bc_bits, bc_colors, bc_prio, bc_cols, bc_rows,
-                canvas, cx2, cy4, rx, ry, _ry_rx, n_steps, total, _BIT, N_DR,
-                bp2a, a2xy,
-            )
-            if lbl is not None:
-                label_slots.append((lbl[0], lbl[1], f["color"], orig_idx))
+        if self._lod_active():
+            # Too many features to draw distinctly — see
+            # `_paint_lod_density`. O(buckets) instead of O(features), so a
+            # 200,000-feature chromosome costs the same per frame as a
+            # 2,000-feature one.
+            label_slots.extend(self._paint_lod_density(
+                bc_bits, bc_colors, bc_prio, bc_cols, bc_rows, total, _BIT,
+                bp2a, a2xy))
+        else:
+            for orig_idx, f in feats_sorted:
+                # Base draws all features UNSELECTED (selection-independent ⇒
+                # cacheable); `_draw` re-tints the selected one after copying.
+                is_sel = False
+                lbl = self._paint_map_feature(
+                    f, is_sel, bc_bits, bc_colors, bc_prio, bc_cols, bc_rows,
+                    canvas, cx2, cy4, rx, ry, _ry_rx, n_steps, total, _BIT,
+                    N_DR, bp2a, a2xy,
+                )
+                if lbl is not None:
+                    label_slots.append((lbl[0], lbl[1], f["color"], orig_idx))
 
         # Add restriction site labels (from resite entries only) —
         # tagged with idx=-1 so they don't appear in click bboxes.
@@ -46699,6 +46894,10 @@ _SETTINGS_SCHEMA: "dict[str, tuple[tuple, object]]" = {
     # `_codon_forbidden_sites`; the picker is `ForbiddenSitesModal`. Default
     # BsaI (the Golden-Gate tail enzyme) — the historical hardcoded behaviour.
     "codon_forbidden_enzymes": ((list,),               ["BsaI"]),
+    # Feature count above which the circular map draws an aggregate
+    # density ring instead of every feature. 0 disables it. See
+    # `PlasmidMap._lod_feature_threshold` for the measurements.
+    "map_lod_feature_threshold": ((int,),             2000),
     # Crash-recovery dedupe: list of recovery-file basenames already
     # shown to the user so reopened sessions don't repeat the "found
     # unsaved edits from <date>" prompt. Forward-compat passthrough
@@ -103540,7 +103739,40 @@ def _check_agent_read_dir(path: Path) -> "str | None":
 # Exceeding it surfaces a 500 with a `body_too_large` marker so the
 # client can react (re-query with a tighter filter) rather than
 # silently receive a truncated payload.
+# ── Map level-of-detail (large chromosomes) ────────────────────────────────
+# Fixed bucket count for the aggregate density ring. Fixed on purpose: the
+# histogram is keyed on bp only, so it survives a rotate AND a resize, which
+# is what keeps the aggregate frame cost independent of feature count.
+# 2,048 comfortably exceeds the ~500 distinguishable arc positions on a wide
+# terminal, so the ring is never the thing limiting resolution.
+_MAP_LOD_BUCKETS = 2048
+
+# Features above which the map aggregates. MEASURED: one rotation repaints
+# every feature, costing 1.3 ms at 1 feature, 8 ms at 200, 69 ms at 2,000 and
+# 40 SECONDS at 200,000 — a 1 Gbp chromosome at one gene per 5 kb. 2,000 is
+# where a keypress stops feeling instant. Override per-user with the
+# `map_lod_feature_threshold` setting; 0 disables aggregation.
+_MAP_LOD_DEFAULT_THRESHOLD = 2000
+
+# How many labels the aggregate view places. At this zoom a label can only
+# name something big enough to see, so they go to the widest features.
+_MAP_LOD_MAX_LABELS = 24
+
 _AGENT_RESPONSE_MAX_BYTES = 50 * 1024 * 1024
+
+# Longest read `store-alignment` will align. The aligner is Myers/Hirschberg
+# (`[INV-106]`), so cost is O(read x plasmid) — a 200 kb "read" against a
+# 250 kb plasmid is a 50-gigacell problem that would hold the request open for
+# minutes and look like a hang. Real reads are Sanger (~1 kb) or a long-read
+# consensus (plasmid-length), so 300 kb is generous for the instrument while
+# still refusing the case that is really a mis-passed genome.
+_AGENT_ALIGN_READ_MAX_BP = 300_000
+
+# Shortest read `store-alignment` will file. Every stored row counts as a read
+# in `read-consensus`, so a 1 bp "read" would raise depth at some base and
+# could flip a verdict while supporting nothing. 20 bp is below any real
+# instrument output and well above the length where an alignment is noise.
+_AGENT_ALIGN_READ_MIN_BP = 20
 
 # Sweep #32 (2026-05-26): cap the post-edit total record length
 # in `_h_replace_sequence`. Pre-fix the `bases` field was capped
@@ -107670,6 +107902,516 @@ def _h_read_consensus(app, payload):
     out["plasmid"] = label
     out["phrase"] = _multi_read_phrase(out)
     return out
+
+
+@_agent_endpoint("restore-deleted-plasmid", write=True)
+def _h_restore_deleted_plasmid(app, payload):
+    """Undo the most recent library deletion — the agent counterpart to the
+    library panel's Ctrl+Z. Body: ``{}``.
+
+    Closes a real asymmetry: the agent's own `delete-from-library` PUSHES an
+    undo record (`_push_library_undo`), and until now only the GUI could
+    consume it, so an agent could create undo state it had no way to use.
+    Authorised by the maintainer 2026-10-16; **`master-delete` stays
+    human-only and deliberately has no endpoint**, pinned by
+    `test_master_delete.py::test_no_agent_endpoint_exposes_wipe`.
+
+    **A bulk delete restores as ONE unit.** Records carry a shared `batch`
+    id, and one call brings the whole batch back or none of it — restoring
+    3 of 5 and reporting success is the partial-recovery-reads-as-complete
+    failure this design exists to prevent
+    (`[[feedback_bulk_destructive_one_undo]]`, `[INV-171]`).
+
+    Each entry goes back in the SLOT it came from, not appended at the end,
+    and the parts-bin cascade the delete performed is reversed with it.
+
+    **409 when the collection has changed since the delete** — the library
+    file IS the active collection's contents, so restoring into a different
+    one would silently file the plasmid somewhere it never lived. The error
+    names the collection to switch to, and the records stay on the stack so
+    the entry is still recoverable once you do.
+
+    Returns ``{ok, restored: [names], count, collection, remaining}``.
+    ``restored: []`` with 404 means nothing was deleted this session — that
+    is not an error state, just an empty stack."""
+    if app is None:
+        return ({"error": "no live app"}, 422)
+    stack_fn = getattr(app, "_library_undo_stack", None)
+    stack = stack_fn() if callable(stack_fn) else None
+    if not isinstance(stack, list) or not stack:
+        return ({"error": "nothing to restore — no plasmid was deleted this "
+                          "session", "restored": [], "count": 0}, 404)
+    top = stack[-1] if isinstance(stack[-1], dict) else {}
+    batch = str(top.get("batch") or "")
+    # Pre-flight the collection guard HERE so the refusal carries a 409 and
+    # names the collection. The UI action refuses the same way but reports it
+    # as a toast, which an HTTP caller never sees.
+    want = str(top.get("collection") or "")
+    active = _get_active_collection_name() or ""
+    if want and want != active:
+        return ({"error": f"those plasmid(s) were deleted from collection "
+                          f"{want!r} but {active!r} is active. Switch with "
+                          f"set-active-collection to restore them — they stay "
+                          f"recoverable until then.",
+                  "deleted_from": want, "active_collection": active}, 409)
+    # Names up front: the records are consumed by the restore.
+    if batch:
+        pending = [r for r in reversed(stack)
+                   if isinstance(r, dict) and str(r.get("batch") or "") == batch]
+    else:
+        pending = [top]
+    names = [str(r.get("name") or "?") for r in pending]
+    before = len(stack)
+
+    def _do():
+        try:
+            panel = app.query_one(LibraryPanel)
+        except NoMatches:
+            return {"_err": ({"error": "the library panel is not mounted"},
+                             500)}
+        panel.action_undo_delete()
+        return {}
+
+    res = app.call_from_thread(_do)
+    if "_err" in res:
+        return res["_err"]
+    after = len(stack)
+    if after >= before:
+        # The action declined for a reason the pre-flight didn't catch (the
+        # commonest is "already back" — re-imported or restored by another
+        # route, which pops the record WITHOUT inserting). Report honestly
+        # rather than claiming a restore.
+        return {"ok": True, "restored": [], "count": 0,
+                "collection": active, "remaining": after,
+                "note": "nothing was restored — the entry is already in the "
+                        "library, or the restore was declined; call "
+                        "list-library to check"}
+    return {"ok": True, "restored": names, "count": before - after,
+            "collection": active, "remaining": after,
+            "batch": batch or None}
+
+
+def _agent_resolve_alignment_target(payload):
+    """Resolve the library entry the alignment endpoints act on.
+
+    Returns ``(entry, where, err)`` where ``where`` is ``""`` for the
+    active-collection library MIRROR and a collection NAME when the entry was
+    found by walking `collections.json`.
+
+    **`where` exists so the three endpoints cannot disagree.** Stored
+    alignments live in two places depending on whether the plasmid is in the
+    active collection — the mirror that `_iter_library_readonly` serves, or a
+    collection's own `plasmids` list. The first cut of these endpoints wrote
+    to the mirror and then read and deleted from `collections.json`, so an
+    alignment persisted successfully and appeared not to exist: the
+    two-halves-of-one-operation-disagreeing shape this codebase keeps
+    relearning. One resolver decides the location once and the writer, the
+    lister and the deleter all use it."""
+    key_id = payload.get("id") or payload.get("entry_id")
+    key_name = payload.get("name") or payload.get("entry_name")
+    if key_id is None and key_name is None:
+        return None, None, ({"error": "give 'id' or 'name' — the library "
+                                      "entry the alignment is stored ON"},
+                            400)
+
+    def _hit(e) -> bool:
+        if not isinstance(e, dict):
+            return False
+        if key_id is not None and str(e.get("id") or "") == str(key_id):
+            return True
+        return (key_name is not None
+                and str(e.get("name") or "") == str(key_name))
+
+    for e in _iter_library_readonly():
+        if _hit(e):
+            return e, "", None
+    # Cross-collection: the entry may be filed outside the active collection
+    # (a Plasmidsaurus run aligning against a plasmid kept elsewhere is the
+    # normal case the GUI already handles).
+    for c in _iter_collections_readonly():
+        if not isinstance(c, dict):
+            continue
+        for p in (c.get("plasmids") or []):
+            if _hit(p):
+                return p, str(c.get("name") or ""), None
+    return None, None, ({"error": f"no library entry matching "
+                                  f"{key_id or key_name!r}"}, 404)
+
+
+def _agent_alignment_rows_rmw(entry, where, mutate):
+    """Read-modify-write one plasmid's stored ``alignments``, in the place
+    `_agent_resolve_alignment_target` said it lives.
+
+    `mutate(rows)` returns ``(new_rows, result)``; `result` is handed back to
+    the caller untouched, or may be an ``(err, status)`` tuple to abort. The
+    whole cycle runs under `_cache_lock` because concurrent alignment writers
+    against the same entry are a real interleave (INV-73) — A loads, B loads,
+    A saves, B clobbers A.
+
+    Returns ``(result, None)`` or ``(None, (err, status))``."""
+    target_id = str(entry.get("id") or "")
+    with _state._cache_lock:
+        if not where:
+            entries = _load_library()
+            idx = next((i for i, e in enumerate(entries)
+                        if isinstance(e, dict)
+                        and str(e.get("id") or "") == target_id), -1)
+            if idx < 0:
+                return None, ({"error": "that plasmid is no longer in the "
+                                        "active collection"}, 409)
+            rows = [a for a in (entries[idx].get("alignments") or [])
+                    if isinstance(a, dict)]
+            new_rows, result = mutate(rows)
+            if isinstance(result, tuple):
+                return None, result
+            # `new_rows is not None` IS the save signal. Comparing
+            # `new_rows != rows` looked equivalent and was not: an edit that
+            # mutates a row in place leaves the same list object, so the
+            # comparison was always False and `visible: false` silently never
+            # persisted. A mutate that changed nothing returns None.
+            if new_rows is not None:
+                entries[idx]["alignments"] = new_rows
+                if (serr := _agent_save_or_500(
+                        lambda: _save_library(entries),
+                        "library")) is not None:
+                    return None, serr
+            return result, None
+        colls = _load_collections()
+        for c in colls:
+            if str(c.get("name") or "") != where:
+                continue
+            for p in (c.get("plasmids") or []):
+                if not (isinstance(p, dict)
+                        and str(p.get("id") or "") == target_id):
+                    continue
+                rows = [a for a in (p.get("alignments") or [])
+                        if isinstance(a, dict)]
+                new_rows, result = mutate(rows)
+                if isinstance(result, tuple):
+                    return None, result
+                if new_rows is not None:          # the save signal, see above
+                    p["alignments"] = new_rows
+                    if (serr := _agent_save_or_500(
+                            lambda: _save_collections(colls),
+                            "collections")) is not None:
+                        return None, serr
+                return result, None
+    return None, ({"error": f"could not find that plasmid in "
+                            f"{where!r} any more"}, 409)
+
+
+@_agent_endpoint("store-alignment", write=True)
+def _h_store_alignment(app, payload):
+    """Align a sequencing READ against a library plasmid and PERSIST the
+    result onto that entry — the side door to Alt+A / the Sequencing screen's
+    bulk align. Body:
+    ``{id|name, read_seq, read_name?, label?, visible?=true, free_read_ends?}``.
+
+    **The engine computes the alignment; you do not supply one.** There is
+    deliberately no way to hand in gapped strings or coordinates. Those are
+    what `read-consensus` later reads as ground truth to decide whether a
+    clone is confirmed, so a caller-built alignment would be a caller-built
+    VERDICT — and a wrong one is indistinguishable from a right one once
+    stored. You name the read and the target; `_pairwise_align` (the same
+    engine the GUI runs) does the rest.
+
+    `free_read_ends` defaults TRUE because the normal case is a read SHORTER
+    than its plasmid: charging it for the plasmid it doesn't cover would
+    report a perfect 800 bp Sanger read of a 5 kb plasmid as a catastrophic
+    mismatch (`[INV-207]`). Pass false for a full-length consensus.
+
+    Merge semantics are the GUI's (`_merge_stored_alignments`): re-storing a
+    byte-identical alignment is IDEMPOTENT — it updates the existing row
+    instead of appending a duplicate — and a `visible: false` row already on
+    disk is never clobbered. Persists cross-collection, so the entry does not
+    have to be in the active collection.
+
+    Returns ``{ok, stored_id, collection, n_stored, identity_pct,
+    covered_identity_pct, covered_pct, read_name}``.
+
+    **Judge the read on `covered_identity_pct`, not `identity_pct`.** The raw
+    `identity_pct` is measured over every aligned column, so the plasmid the
+    read does not reach counts against it as gaps: a PERFECT 60 bp read of a
+    135 bp plasmid scores 44 %, and a perfect 800 bp Sanger read of a 5 kb
+    plasmid scores ~16 %. That is the number `[INV-207]` fixed
+    `verify-against-reads` for presenting. `covered_identity_pct` is identity
+    over the columns the read actually covers (100 % in both those cases), and
+    `covered_pct` says how much of the plasmid that was — so "perfect over the
+    third it read" is expressible, and "perfect" alone is not mistakable for
+    "verified". Both are reported because the stored row keeps the raw figure
+    and a caller comparing the two must see the same pair."""
+    entry, where, err = _agent_resolve_alignment_target(payload)
+    if err is not None:
+        return err
+    assert entry is not None and where is not None
+    read_seq, berr = _sanitize_bases(payload.get("read_seq"))
+    if berr:
+        return ({"error": f"'read_seq': {berr}"}, 400)
+    if not read_seq:
+        return ({"error": "'read_seq' is empty after sanitising"}, 400)
+    if len(read_seq) > _AGENT_ALIGN_READ_MAX_BP:
+        return ({"error": f"'read_seq' exceeds the "
+                          f"{_AGENT_ALIGN_READ_MAX_BP:,} bp cap"}, 413)
+    # A read this short is not evidence of anything, and `read-consensus`
+    # counts every stored row as a read — so a 1 bp "read" would raise the
+    # depth at some base and change a verdict. Refused rather than stored at
+    # 0 % identity, which is what it did before.
+    if len(read_seq) < _AGENT_ALIGN_READ_MIN_BP:
+        return ({"error": f"'read_seq' is {len(read_seq)} bp; a read under "
+                          f"{_AGENT_ALIGN_READ_MIN_BP} bp cannot support or "
+                          f"contradict anything and would still count toward "
+                          f"read depth"}, 400)
+    # An ambiguity-dominated read aligns at ~0 % identity and would be filed
+    # as a failed verification — the same no-call-counted-as-evidence shape
+    # `[INV-200]`'s hardening removed from the heterogeneity caller.
+    _acgt = sum(read_seq.count(c) for c in "ACGT")
+    if _acgt * 2 < len(read_seq):
+        return ({"error": f"'read_seq' is only {_acgt}/{len(read_seq)} "
+                          f"unambiguous bases — mostly no-calls. Trim the read "
+                          f"before storing it; as-is it would be filed as a "
+                          f"failed verification rather than a bad read"}, 400)
+    try:
+        target_rec = _gb_text_to_record(entry.get("gb_text") or "")
+    except Exception as exc:
+        return ({"error": f"could not parse the stored plasmid: "
+                          f"{_scrub_path(str(exc))}"}, 500)
+    target_seq = str(getattr(target_rec, "seq", "") or "")
+    if not target_seq:
+        return ({"error": "that library entry has no sequence to align "
+                          "against"}, 422)
+    read_name = (_sanitize_label(payload.get("read_name"), max_len=200)
+                 or "agent read")
+    label = _sanitize_label(payload.get("label"), max_len=200) or read_name
+    free_ends = _payload_bool(payload, "free_read_ends", True)
+    try:
+        result = _pairwise_align(read_seq, target_seq,
+                                  free_read_ends=free_ends)
+    except Exception as exc:
+        _log.exception("agent store-alignment: aligner failed")
+        return ({"error": f"alignment failed: {_scrub_path(str(exc))}"}, 500)
+    # The serializer wants the in-memory shape `_register_alignment` produces:
+    # the target RECORD (it re-serialises it so the stored row can be
+    # re-rendered later) plus the raw `result`. Built here rather than going
+    # through `_register_alignment`, because that method's job is the render
+    # BAND — an agent writing storage must not disturb what the user is
+    # looking at on the canvas.
+    in_memory = {"name": label, "query_label": read_name,
+                 "target_label": entry.get("name") or entry.get("id") or "?",
+                 "target_record": target_rec, "result": result,
+                 "axis": "target"}
+    if payload.get("visible") is not None:
+        in_memory["_stored_visible"] = _payload_bool(payload, "visible", True)
+    # Persist through the ONE shared RMW, in the place the resolver found the
+    # entry — mirror or named collection. `_merge_stored_alignments` gives the
+    # GUI's semantics for free: a byte-identical re-store updates the existing
+    # row instead of appending, and a `visible: false` row already on disk is
+    # never clobbered.
+    def _merge(rows):
+        merged, stamp_pairs = _merge_stored_alignments(
+            rows, [in_memory], source_for_fresh="agent")
+        for align, sid in stamp_pairs:
+            align["_stored_id"] = sid
+        # None when an identical alignment was already stored — that is what
+        # makes a repeat call idempotent instead of a pointless rewrite.
+        return (merged if merged != rows else None), len(merged)
+
+    n_stored, rerr = _agent_alignment_rows_rmw(entry, where, _merge)
+    if rerr is not None:
+        return rerr
+    coll_name = where or (_get_active_collection_name() or "")
+    q_len = int(result.get("q_len") or len(read_seq))
+    t_len = int(result.get("t_len") or len(target_seq))
+    covered = round(100.0 * min(q_len, t_len) / t_len, 1) if t_len else 0.0
+    notes: "list[str]" = []
+    if q_len > t_len:
+        # `covered_pct` saturates at 100 here, so without saying this a 6 kb
+        # read of a 2 kb plasmid reads as "perfect and fully covered" when it
+        # is really a concatemer or the wrong reference.
+        notes.append(
+            f"the read is {q_len:,} bp against a {t_len:,} bp plasmid "
+            f"({q_len / t_len:.1f}x) — a concatemer, a multimer, or the wrong "
+            f"reference. `covered_pct` saturates at 100 and cannot show this.")
+    return {"ok": True,
+            "stored_id": str(in_memory.get("_stored_id") or ""),
+            "collection": coll_name, "n_stored": n_stored,
+            "identity_pct": result.get("identity_pct"),
+            "covered_identity_pct": result.get("ungapped_identity_pct"),
+            "covered_pct": covered, "read_name": read_name,
+            "warnings": notes,
+            "plasmid": entry.get("name") or entry.get("id") or "?"}
+
+
+@_agent_endpoint("list-alignments")
+def _h_list_alignments(app, payload):
+    """Every sequencing alignment STORED on a library plasmid. Body:
+    ``{id|name}``.
+
+    Returns ``{ok, plasmid, alignments: [{stored_id, label, read_name,
+    visible, source, added, identity_pct, q_len, t_len, n_mismatches}],
+    count, n_visible}``. The gapped alignment STRINGS are omitted — they are
+    large and `read-consensus` is the endpoint that interprets them; this is
+    the index. `visible: false` rows ARE listed, because they exist on disk
+    and a caller deleting by index would otherwise skip them."""
+    entry, where, err = _agent_resolve_alignment_target(payload)
+    if err is not None:
+        return err
+    assert entry is not None
+    rows = []
+    for a in (entry.get("alignments") or []):
+        if not isinstance(a, dict):
+            continue
+        res = a.get("result") or {}
+        rows.append({
+            "stored_id": str(a.get("id") or ""),
+            "label": str(a.get("name") or ""),
+            "read_name": str(a.get("query_label") or ""),
+            "visible": bool(a.get("visible", True)),
+            "source": str(a.get("source") or ""),
+            "added": str(a.get("added") or ""),
+            "identity_pct": res.get("identity_pct"),
+            "q_len": res.get("q_len"), "t_len": res.get("t_len"),
+            "n_mismatches": res.get("n_mismatches"),
+        })
+    return {"ok": True,
+            "plasmid": entry.get("name") or entry.get("id") or "?",
+            "collection": where or (_get_active_collection_name() or ""),
+            "alignments": rows, "count": len(rows),
+            "n_visible": sum(1 for r in rows if r["visible"])}
+
+
+@_agent_endpoint("update-alignment", write=True)
+def _h_update_alignment(app, payload):
+    """Show / hide or relabel ONE stored alignment. Body:
+    ``{id|name, stored_id, visible?, label?}``.
+
+    `visible` is what the Alignment Manager's Hide/Show toggles write — a
+    hidden alignment stays on disk and keeps counting in `read-consensus`,
+    it just doesn't draw on the map band. Returns
+    ``{ok, stored_id, changed: [...]}``; an empty `changed` means the values
+    already matched, which is not an error but is also not an edit."""
+    entry, where, err = _agent_resolve_alignment_target(payload)
+    if err is not None:
+        return err
+    assert entry is not None and where is not None
+    stored_id = str(payload.get("stored_id") or "").strip()
+    if not stored_id:
+        return ({"error": "missing 'stored_id' (see list-alignments)"}, 400)
+    vis = payload.get("visible")
+    if vis is not None and not isinstance(vis, bool):
+        return ({"error": "'visible' must be a boolean"}, 400)
+    label = _sanitize_label(payload.get("label"), max_len=200)
+    if vis is None and not label:
+        return ({"error": "nothing to change — give 'visible' and/or "
+                          "'label'"}, 400)
+    def _edit(rows):
+        row = next((a for a in rows
+                    if str(a.get("id") or "") == stored_id), None)
+        if row is None:
+            return None, ({"error": f"no stored alignment with id "
+                                    f"{stored_id!r} on that plasmid",
+                            "stored_ids": [str(a.get("id") or "")
+                                           for a in rows]}, 404)
+        changed = _agent_apply_alignment_edit(row, vis, label)
+        return (rows if changed else None), changed
+
+    changed, err2 = _agent_alignment_rows_rmw(entry, where, _edit)
+    if err2 is not None:
+        return err2
+    return {"ok": True, "stored_id": stored_id, "changed": changed}
+
+
+def _agent_apply_alignment_edit(row: dict, vis, label) -> "list[str]":
+    """Apply a `visible` / `label` edit to one stored row. -> changed keys."""
+    changed: "list[str]" = []
+    if vis is not None and bool(row.get("visible", True)) != bool(vis):
+        row["visible"] = bool(vis)
+        changed.append("visible")
+    if label and str(row.get("name") or "") != label:
+        row["name"] = label
+        changed.append("label")
+    return changed
+
+
+@_agent_endpoint("delete-alignment", write=True)
+def _h_delete_alignment(app, payload):
+    """Remove stored alignment(s) from a library plasmid. Body:
+    ``{id|name, stored_id | all: true}``.
+
+    `all: true` drops every stored alignment on that entry — which is what
+    resets a verification, so it is spelled out rather than reachable by
+    omitting `stored_id`. The plasmid itself is untouched either way; only
+    the read evidence goes. Returns ``{ok, deleted, remaining}``."""
+    entry, where, err = _agent_resolve_alignment_target(payload)
+    if err is not None:
+        return err
+    assert entry is not None and where is not None
+    stored_id = str(payload.get("stored_id") or "").strip()
+    want_all = _payload_bool(payload, "all", False)
+    if not stored_id and not want_all:
+        return ({"error": "give 'stored_id', or 'all': true to drop every "
+                          "stored alignment on this plasmid"}, 400)
+    if stored_id and want_all:
+        return ({"error": "give 'stored_id' OR 'all', not both"}, 400)
+
+    def _drop(rows):
+        if want_all:
+            return [], {"deleted": len(rows), "remaining": 0}
+        kept = [a for a in rows if str(a.get("id") or "") != stored_id]
+        if len(kept) == len(rows):
+            return None, ({"error": f"no stored alignment with id "
+                                    f"{stored_id!r} on that plasmid",
+                            "stored_ids": [str(a.get("id") or "")
+                                           for a in rows]}, 404)
+        return kept, {"deleted": len(rows) - len(kept),
+                      "remaining": len(kept)}
+
+    res, derr = _agent_alignment_rows_rmw(entry, where, _drop)
+    if derr is not None:
+        return derr
+    assert res is not None
+    # The live overlay band belongs to the UI thread; drop any band entry
+    # whose stored id just went away so the canvas can't keep drawing an
+    # alignment that no longer exists on disk.
+    _agent_drop_live_alignment_band(app, str(entry.get("id") or ""),
+                                     stored_id, want_all)
+    return {"ok": True, **res}
+
+
+def _agent_drop_live_alignment_band(app, target_id, stored_id, want_all):
+    """Remove deleted alignments from the LIVE overlay band, if the canvas is
+    showing that plasmid. Best-effort and never fatal: the disk write already
+    succeeded, and a stale band is a redraw away from correct — but leaving
+    it is how a user sees evidence for a read that has been deleted."""
+    if app is None:
+        return
+    try:
+        rec = getattr(app, "_current_record", None)
+        if rec is None or str(getattr(rec, "id", "") or "") != target_id:
+            return
+
+        def _prune():
+            band = list(getattr(app, "_alignments", None) or [])
+            keep = ([] if want_all
+                    else [a for a in band
+                          if str(a.get("_stored_id") or "") != stored_id])
+            if len(keep) == len(band):
+                return
+            # Bump the generation for the same reason `_clear_alignments`
+            # does: a worker that started before this delete must not
+            # re-register the row we just removed.
+            app._alignments_generation = (
+                getattr(app, "_alignments_generation", 0) + 1)
+            app._alignments = keep
+            try:
+                pm = app.query_one("#plasmid-map", PlasmidMap)
+            except NoMatches:
+                return
+            pm.set_alignments(keep)
+
+        app.call_from_thread(_prune)
+    except Exception:                       # pragma: no cover - cosmetic only
+        _log.debug("delete-alignment: live band prune skipped",
+                   exc_info=True)
 
 
 @_agent_endpoint("multi-align")

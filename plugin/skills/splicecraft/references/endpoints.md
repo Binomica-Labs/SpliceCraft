@@ -1,6 +1,6 @@
 # The endpoint surface, organised by job
 
-284 endpoints as of SpliceCraft 1.3.10. **`splicecraft-cli tools --json` is
+291 endpoints as of SpliceCraft 1.3.11. **`splicecraft-cli tools --json` is
 always authoritative** — this file helps you find the right name and warns you
 about the sharp edges; the endpoint's own `doc_full` is the contract.
 
@@ -140,7 +140,7 @@ twin takes the *same payload*.
 `get-active-collection` `set-active-collection` `create-collection`
 `rename-collection` `delete-collection` `copy-plasmid` `copy-plasmids`
 `move-plasmid` `move-plasmids` `rename-plasmid` `delete-from-library`
-`set-plasmid-status` `list-plasmid-statuses`
+`restore-deleted-plasmid` `set-plasmid-status` `list-plasmid-statuses`
 
 - `rename-plasmid`, `set-plasmid-status`, `delete-from-library` and
   `diff-plasmid` act on the **active collection only**.
@@ -149,7 +149,15 @@ twin takes the *same payload*.
 - `copy-plasmid`'s `to` must **not** be the active collection (copying into the
   active set goes through `add-current-to-library`).
 - `delete-from-library` matches by **name**, so one call can remove several
-  entries; the user can undo it in the running app that session.
+  entries. `restore-deleted-plasmid` undoes the most recent deletion —
+  including your own — putting each entry back in the SLOT it came from. A
+  bulk delete restores as ONE unit: all of it or none, because restoring part
+  of a batch and reporting success reads as complete recovery. It 409s if the
+  active collection changed since the delete (the records stay recoverable
+  until you switch back).
+- **There is no agent endpoint for the master wipe, deliberately.** Deleting
+  and undoing individual plasmids is yours; erasing the whole data directory
+  is the user's, at the keyboard. Don't offer to do it.
 
 ## Primers
 
@@ -279,6 +287,36 @@ shifts, every feature keeps its coordinates, and it's undoable.
 - `analyse-cds` is the read half: CAI, GC3, `rare_pct`, `tandem_rare_runs`,
   `worst_window`, 5′ `ramp`.
 
+## Large chromosomes
+
+`plan-chromosome-segments` `list-assembly-strategies`
+
+- A 1 Gbp target can't be ordered as one piece. `plan-chromosome-segments`
+  cuts it into orderable segments and **proves the junctions are
+  unambiguous** — read `n_ambiguous_junctions` and `ok` before the segment
+  table. Two junctions sharing an overlap (or one being another's reverse
+  complement) give an assembly that is chemically happy and structurally
+  wrong: segments swap or insert inverted, and it surfaces after sequencing.
+- `strategy` is REQUIRED — the chemistry sets the overlap size (Gibson ~30 bp,
+  yeast HR ~120 bp, Golden Gate 4 nt), so there is no sensible default. See
+  `list-assembly-strategies`.
+- **Boundaries are nudged, not just taken.** Each cut moves within `nudge_bp`
+  to the nearest clean junction; Golden Gate searches widest because 4 nt
+  leaves only 256 overhangs and arbitrary cuts collide constantly. Segment
+  lengths therefore vary. `nudge_bp: 0` takes the arithmetic cuts and shows
+  you the collisions a fixed layout would have had.
+- Forbidden sites come from the STRATEGY: only Golden Gate consults an
+  internal Type IIS site. Pass `forbidden_enzymes` to override.
+- `offtarget_checked: false` means that search was over budget and SKIPPED —
+  not that nothing was found. Junction uniqueness is always checked.
+- Pass `name`/`id` to read a library entry; a chromosome won't fit in the
+  1 MiB body. `include_sequences` is off by default (a 2,000-segment plan
+  carrying every base is tens of MB).
+- The MAP aggregates above ~2,000 features (`map_lod_feature_threshold`):
+  rotation went from 40 s to 8 ms at 200,000 features. A 76-column braille map
+  has ~16,000 dots, so individual features can't be drawn at that scale —
+  zoom in to resolve them.
+
 ## Sequence analysis
 
 `blast` `blast-online` `hmmscan` `hmmer-web` `multi-align` `diff-plasmid`
@@ -327,7 +365,8 @@ any off-target claim; omit the search and it's `0`, so silence can't be read as
 ## Sequencing reads
 
 `verify-against-reads` `read-consensus` `analyse-read-heterogeneity`
-`read-trace`
+`read-trace` `store-alignment` `list-alignments` `update-alignment`
+`delete-alignment`
 `plasmidsaurus-items`(=`list-plasmidsaurus-items`) `list-plasmidsaurus-members`
 `download-plasmidsaurus` `align-plasmidsaurus-zip`
 
@@ -336,9 +375,17 @@ any off-target claim; omit the search and it's `0`, so silence can't be read as
   `phred_quality` — the input `verify-against-reads`' `read_quality` wants.
   Feed them straight across to get the trace-quality split: a mismatch under a
   low-quality basecall is an instrument artefact, not a mutation.
-- **`read-consensus` reads STORED alignments, which only the GUI writes.** On a
-  plasmid you have reads for, `no_reads` means they were never stored — not
-  that it's unverified. Hold the sequences? Use `verify-against-reads`.
+- `store-alignment` aligns a read against a library plasmid and PERSISTS it,
+  which is what `read-consensus` reads. **You name the read and the target;
+  the engine computes the alignment** — there is deliberately no way to hand
+  in gapped strings, because a caller-built alignment is a caller-built
+  verdict. Re-storing the same read is idempotent. `list-/update-/delete-
+  alignment` manage the stored rows (a `visible: false` row stays on disk and
+  still counts in `read-consensus`).
+- **Judge a read on `covered_identity_pct`, never raw `identity_pct`.** The
+  raw figure counts the plasmid the read didn't reach as gaps, so a PERFECT
+  800 bp Sanger read of a 5 kb plasmid scores ~16 %. Read it with
+  `covered_pct`: "perfect over the third it covered" is the honest sentence.
 - `analyse-read-heterogeneity` answers "is this culture one thing?" —
   `clonal` / `minor_variants` / `mixed`. A Plasmidsaurus consensus is depth 1, so
   `read-consensus` cannot see a heterogeneous population; it consenses to wild

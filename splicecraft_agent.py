@@ -63,7 +63,7 @@ from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_des
 from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq,
                                 _topology_from_gb_text)
 from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _ncbi_taxid_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
-from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript, _map_transcription)
+from splicecraft_seqanalysis import (_classify_part_from_plasmid, _plan_chromosome_segments, _SEGMENT_STRATEGIES, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript, _map_transcription)
 from splicecraft_util import (_iso_instant, _variant_group_key, _PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _feat_spans, _feature_traversal, _phred_in_alignment_frame, _read_rotation_in_rows, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _degenerate_tm_bracket, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
@@ -3820,6 +3820,12 @@ _AGENT_SETTINGS_ALLOWLIST: "dict[str, tuple]" = {
     # agent could neither read the list to match it nor see that it differed.
     "codon_forbidden_enzymes": (_settings_validator_enzyme_name_list,
                                  ["BsaI"]),
+    # Large-chromosome map LOD. Exposed because the right value depends on the
+    # terminal and the molecule: a 200,000-feature chromosome is unusable
+    # without aggregation (40 s per rotation) and a 300-feature plasmid wants
+    # every feature drawn. 0 disables aggregation.
+    "map_lod_feature_threshold": (_settings_validator_int_range(0, 1_000_000),
+                                   2000),
 }
 
 
@@ -10226,6 +10232,149 @@ def _hetero_shape(fractions: "list[float]", floor: float = 0.0,
             "max_observed_fraction": round(float(top), 4),
             "bins": bins,
             "monotonic_decay": mode is None, "mode_fraction": mode}
+
+
+@_agent_endpoint("list-assembly-strategies")
+def _h_list_assembly_strategies(app, payload):
+    """The assembly chemistries `plan-chromosome-segments` can plan for, with
+    the overlap sizes each one actually needs. Body: ``{}``.
+
+    The sizes are the chemistry's, not a preference: Gibson's exonuclease
+    chew-back works on tens of bases, yeast homologous recombination wants far
+    longer homology and takes many pieces per round, and Golden Gate fuses on
+    a 4 nt sticky end. They give materially different segment plans, which is
+    why the strategy is a required choice rather than a default."""
+    return {"ok": True, "strategies": [
+        {"name": k, "label": v["label"],
+         "overlap_bp": v["overlap_bp"],
+         "overlap_min": v["overlap_min"], "overlap_max": v["overlap_max"],
+         "junction_tm_range": ([v["tm_lo"], v["tm_hi"]]
+                                if v["tm_lo"] is not None else None),
+         "forbidden_enzymes": list(v["forbidden"])}
+        for k, v in sorted(_SEGMENT_STRATEGIES.items())],
+        "count": len(_SEGMENT_STRATEGIES)}
+
+
+@_agent_endpoint("plan-chromosome-segments")
+def _h_plan_chromosome_segments(app, payload):
+    """Cut a long target into orderable, assemblable segments and prove the
+    junctions are unambiguous — the design half of chromosome-scale work.
+    Body: ``{sequence | name | id, strategy, segment_bp?, overlap_bp?,
+    circular?=true, lint?=true, forbidden_enzymes?, max_segments?,
+    include_sequences?=false}``.
+
+    Give `sequence` for a small target, or `name` / `id` to read a LIBRARY
+    entry — which is the usual path, because a chromosome does not fit in the
+    1 MiB request body.
+
+    **The junction analysis is the answer, not the segment list.** Boundaries
+    are arithmetic; what decides whether a build works is whether every
+    junction is UNIQUE. Two junctions sharing an overlap — or one being
+    another's reverse complement — give an assembly that is chemically happy
+    and structurally wrong: segments swap or insert inverted, and it surfaces
+    after sequencing, not before. So a duplicate is an `error` and
+    `ok: false`; read `n_ambiguous_junctions` before anything else.
+
+    Each junction reports its homology length, GC, and Tm where the chemistry
+    cares, plus — when the target is small enough to search exhaustively —
+    whether that overlap occurs ANYWHERE ELSE in the molecule, which long
+    homology arms make more dangerous rather than less. Above
+    ~20 Mbp that search is skipped and `offtarget_checked: false` SAYS so,
+    rather than letting "none found" mean "never looked".
+
+    Per-segment synthesis readiness reuses the same lint a single ordered
+    fragment gets. Forbidden sites come from the STRATEGY: only Golden Gate
+    consults an internal Type IIS site, so flagging them for a Gibson build
+    would be 281 errors per 20 kb of ordinary sequence.
+
+    Boundaries are NUDGED, not just taken: each cut moves within `nudge_bp`
+    (strategy default) to the nearest position whose junction is unused, not
+    the reverse complement of one already used, and not palindromic. That is
+    what makes a buildable plan possible for ordinary sequence — Golden Gate's
+    4 nt leaves only 256 overhangs, so arbitrary cuts collide constantly.
+    Segment lengths therefore vary around `segment_bp`, and `warnings` says
+    how many moved. Pass `nudge_bp: 0` to take the arithmetic cuts exactly as
+    given, which is how you see the collisions a fixed layout would have had.
+
+    `include_sequences: true` returns each segment's bases (large — a
+    2,000-segment plan is tens of MB); omit it for the plan and junction
+    report alone, then fetch the segments you want to order. Read-only."""
+    seq = payload.get("sequence")
+    if isinstance(seq, str) and seq.strip():
+        clean, berr = _sanitize_bases(seq)
+        if berr:
+            return ({"error": f"'sequence': {berr}"}, 400)
+        target = clean
+        src = "payload"
+    else:
+        key_id = payload.get("id")
+        key_name = payload.get("name")
+        if key_id is None and key_name is None:
+            return ({"error": "give 'sequence', or 'name' / 'id' of a "
+                              "library entry (a chromosome will not fit in "
+                              "the request body)"}, 400)
+        entry = None
+        for e in _iter_library_readonly():
+            if not isinstance(e, dict):
+                continue
+            if key_id is not None and str(e.get("id") or "") == str(key_id):
+                entry = e
+                break
+            if key_name is not None and str(e.get("name") or "") == str(key_name):
+                entry = e
+                break
+        if entry is None:
+            return ({"error": f"no library entry matching "
+                              f"{key_id or key_name!r}"}, 404)
+        try:
+            rec = _gb_text_to_record(entry.get("gb_text") or "")
+        except Exception as exc:
+            return ({"error": f"could not parse that entry: "
+                              f"{_scrub_path(str(exc))}"}, 500)
+        target = str(getattr(rec, "seq", "") or "")
+        src = f"library:{entry.get('name') or entry.get('id')}"
+    if not target:
+        return ({"error": "the target has no sequence"}, 422)
+
+    strategy = str(payload.get("strategy") or "").strip().lower()
+    if not strategy:
+        return ({"error": "missing 'strategy' — see list-assembly-strategies. "
+                          "The chemistry sets the overlap size, so there is "
+                          "no sensible default"}, 400)
+    if strategy not in _SEGMENT_STRATEGIES:
+        return ({"error": f"unknown strategy {strategy!r}; choose one of "
+                          f"{sorted(_SEGMENT_STRATEGIES)}"}, 400)
+    kw = {}
+    for key, lo, hi in (("segment_bp", 1, 50_000_000),
+                        ("overlap_bp", 1, 100_000),
+                        ("max_segments", 1, 100_000),
+                        ("nudge_bp", 0, 1_000_000)):
+        if payload.get(key) is not None:
+            v = _coerce_int(payload.get(key), name=key)
+            if isinstance(v, str):
+                return ({"error": v}, 400)
+            if not (lo <= v <= hi):
+                return ({"error": f"'{key}' {v} is outside {lo}..{hi}"}, 400)
+            kw[key] = v
+    forb = payload.get("forbidden_enzymes")
+    if forb is not None:
+        if not isinstance(forb, list):
+            return ({"error": "'forbidden_enzymes' must be a list"}, 400)
+        kw["forbidden_enzymes"] = [str(x) for x in forb]
+    try:
+        plan = _plan_chromosome_segments(
+            target, strategy=strategy, circular=_payload_bool(
+                payload, "circular", True),
+            lint=_payload_bool(payload, "lint", True), **kw)
+    except Exception as exc:
+        _log.exception("agent plan-chromosome-segments: planner failed")
+        return ({"error": f"planner failed: {_scrub_path(str(exc))}"}, 500)
+    if not _payload_bool(payload, "include_sequences", False):
+        for sg in (plan.get("segments") or []):
+            sg.pop("seq", None)
+        plan["sequences_omitted"] = True
+    plan["source"] = src
+    return plan
 
 
 @_agent_endpoint("read-trace")

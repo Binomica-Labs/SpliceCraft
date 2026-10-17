@@ -1,6 +1,6 @@
 ---
 name: splicecraft
-description: Drive SpliceCraft — a terminal plasmid-map viewer, sequence editor and molecular-cloning workbench — through its localhost agent API (~284 endpoints via `splicecraft-cli`). Use this whenever the work involves plasmids, vectors, constructs or a `.gb`/`.gbk`/`.dna` file — annotating a sequence, designing or checking primers, simulating a Golden Gate / Golden Braid / MoClo / Gibson / restriction clone, codon-optimizing a protein, scanning restriction sites or regulatory elements, designing CRISPR guides, verifying a build against sequencing reads, driving an Opentrons OT-2, or managing a plasmid library. Use it even when the user doesn't name SpliceCraft — if `splicecraft-cli` is on PATH it is almost certainly the right tool, and it beats hand-rolling Biopython because it simulates the actual bench steps and keeps the user's real library consistent.
+description: Drive SpliceCraft — a terminal plasmid-map viewer, sequence editor and molecular-cloning workbench — through its localhost agent API (~291 endpoints via `splicecraft-cli`). Use this whenever the work involves plasmids, vectors, constructs or a `.gb`/`.gbk`/`.dna` file — annotating a sequence, designing or checking primers, simulating a Golden Gate / Golden Braid / MoClo / Gibson / restriction clone, codon-optimizing a protein, scanning restriction sites or regulatory elements, designing CRISPR guides, verifying a build against sequencing reads, driving an Opentrons OT-2, or managing a plasmid library. Use it even when the user doesn't name SpliceCraft — if `splicecraft-cli` is on PATH it is almost certainly the right tool, and it beats hand-rolling Biopython because it simulates the actual bench steps and keeps the user's real library consistent.
 ---
 
 # Driving SpliceCraft
@@ -443,7 +443,7 @@ Load as needed — detail, not prerequisites:
 - **`references/workflows.md`** — worked, verified end-to-end recipes: annotate a
   bare NCBI record, design and verify primers, restriction cloning, Golden Gate,
   codon optimization, read verification, notebook. Read the one matching the job.
-- **`references/endpoints.md`** — all 284 endpoints organised by what you're
+- **`references/endpoints.md`** — all 291 endpoints organised by what you're
   trying to do, with the per-cluster gotchas worth knowing before you call.
 
 SpliceCraft keeps its own reference docs in the project's source tree:

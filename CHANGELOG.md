@@ -14,6 +14,46 @@
 
 ---
 
+## [1.3.11] — 2026-10-16
+
+### New features
+
+- **Chromosome-scale plasmid maps.** Opening a record with hundreds of
+  thousands of features used to take 41 seconds, and every rotation keypress
+  took another 40. Above a few thousand features the map now draws a density
+  view — a ring whose thickness shows how gene-dense each stretch is — and
+  rotating a 200,000-feature chromosome takes 8 milliseconds. Zoom in and
+  individual features come back. Plasmids are unaffected, and the threshold is
+  a setting if you want it higher or lower.
+- **Designing a chromosome you can actually order.** A megabase target can't
+  be bought as one piece, so there's a new planner that cuts it into
+  synthesis-sized segments with the right homology overlaps for your assembly
+  method — Gibson, yeast homologous recombination, or Golden Gate — then
+  checks the thing that actually ruins builds: that no two junctions look
+  alike. Two matching junctions let segments swap places or go in backwards,
+  which you'd only discover after sequencing, so that fails the plan rather
+  than warning about it. It also nudges each cut to find a clean junction
+  instead of just telling you the obvious one won't work, flags segments that
+  will be hard to synthesise, and warns when a junction's homology turns up
+  somewhere else in the target.
+- **Sequencing reads can be stored from outside the app.** Aligning a read to
+  a library plasmid and keeping it was previously GUI-only, which meant the
+  read-consensus check had no way to get its own input from a script. You
+  name the read and the plasmid; SpliceCraft does the alignment, so a
+  caller can't invent one.
+- **Agents can undo a deletion.** Deleting a plasmid from a script now has an
+  undo, restoring each entry to the slot it came from — and a bulk delete
+  comes back as one unit rather than partly. Erasing the whole data directory
+  stays something only a human at the keyboard can do.
+
+### Bug fixes
+
+- A perfect short sequencing read no longer reports a terrible identity
+  score. Identity measured across the whole plasmid counts the part the read
+  never covered as mismatch, so a flawless 800 bp read of a 5 kb plasmid
+  scored about 16%. Stored alignments now report identity over the region the
+  read actually covers, alongside how much of the plasmid that was.
+
 ## [1.3.10] — 2026-10-16
 
 ### New features
