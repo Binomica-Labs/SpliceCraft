@@ -204,3 +204,121 @@ class TestMigrateRegistryInvariant:
                     f"{attr} is in the user-data registry but missing from the "
                     "migrate manifest — keep _export_migrate_archive driven by "
                     "the registry.")
+
+
+# ── audit 2026-10-23: the import is all or nothing, and deletes no blob ─────
+
+class TestMigrateImportIsAllOrNothing:
+    """The import replaced the metadata files first and the folders after,
+    each on its own. A full disk during the blob copy left the archive's
+    collections pointing at blobs the rollback had just removed — every
+    imported plasmid without a sequence — and the blob store was replaced
+    wholesale although it is content-addressed, so this machine's blobs went
+    with it. Now: blobs are MERGED in first (never deleted), the other
+    folders replaced next, and the metadata only once every folder landed."""
+
+    def _archive_from_machine_a(self, tmp_path):
+        _seed()
+        cr = sc._state._CRASH_RECOVERY_DIR
+        cr.mkdir(parents=True, exist_ok=True)
+        (cr / "a-autosave.gb").write_text(_gb("AS", "ACGT" * 50))
+        zp = str(tmp_path / "a.zip")
+        sc._export_migrate_archive(zp)
+        return zp
+
+    def _machine_b(self):
+        _wipe()
+        cr = sc._state._CRASH_RECOVERY_DIR
+        if cr.is_dir():
+            shutil.rmtree(cr)
+        sc._save_collections([{"name": "Default", "plasmids": []}])
+        sc._commit_library_entry_to_collection({
+            "id": "pB", "name": "B plasmid", "size": 800, "n_feats": 0,
+            "source": "test", "added": "2026-10-24",
+            "gb_text": _gb("PB", "GATC" * 200)}, "Default")
+        _bust()
+        files = {k: v for k, v in _fingerprint().items()
+                 if not k.startswith("blob:")}
+        blobs = {p.name for p in sc._plasmid_blob_dir().glob("*.gb")}
+        assert blobs, "machine B has no blob to lose"
+        return files, blobs
+
+    @staticmethod
+    def _fail_copies_into(monkeypatch, live_dir):
+        import splicecraft_backup as B
+        real_copy2, real_tree = B.shutil.copy2, B.shutil.copytree
+
+        def _inside(dst):
+            try:
+                return sc.Path(dst).resolve().is_relative_to(live_dir.resolve())
+            except OSError:
+                return False
+
+        def copy2(src, dst, *a, **k):
+            if _inside(dst):
+                raise OSError(28, "No space left on device")
+            return real_copy2(src, dst, *a, **k)
+
+        def copytree(src, dst, *a, **k):
+            if _inside(dst) or sc.Path(dst) == live_dir:
+                sc.Path(dst).mkdir(parents=True, exist_ok=True)
+                raise OSError(28, "No space left on device")
+            return real_tree(src, dst, *a, **k)
+        monkeypatch.setattr(B.shutil, "copy2", copy2)
+        monkeypatch.setattr(B.shutil, "copytree", copytree)
+
+    def test_a_full_disk_during_the_blob_merge_changes_nothing(
+            self, tmp_path, monkeypatch):
+        zp = self._archive_from_machine_a(tmp_path)
+        files, blobs = self._machine_b()
+        self._fail_copies_into(monkeypatch, sc._plasmid_blob_dir())
+        summary = sc._import_migrate_archive(zp)
+        assert summary["failed"] and not summary["restored_files"], summary
+        _bust()
+        assert {k: v for k, v in _fingerprint().items()
+                if not k.startswith("blob:")} == files
+        assert blobs <= {p.name for p in sc._plasmid_blob_dir().glob("*.gb")}
+
+    def test_a_failed_folder_after_the_blobs_replaces_no_metadata(
+            self, tmp_path, monkeypatch):
+        zp = self._archive_from_machine_a(tmp_path)
+        files, blobs = self._machine_b()
+        self._fail_copies_into(monkeypatch, sc._state._CRASH_RECOVERY_DIR)
+        summary = sc._import_migrate_archive(zp)
+        assert summary["failed"] and not summary["restored_files"], summary
+        _bust()
+        assert {k: v for k, v in _fingerprint().items()
+                if not k.startswith("blob:")} == files
+        assert blobs <= {p.name for p in sc._plasmid_blob_dir().glob("*.gb")}
+        assert not (sc._state._CRASH_RECOVERY_DIR / "a-autosave.gb").exists()
+
+    def test_an_import_keeps_this_machines_blobs(self, tmp_path):
+        zp = self._archive_from_machine_a(tmp_path)
+        _files, blobs = self._machine_b()
+        summary = sc._import_migrate_archive(zp)
+        assert not summary["failed"], summary["failed"]
+        _bust()
+        assert blobs <= {p.name for p in sc._plasmid_blob_dir().glob("*.gb")}
+        plasmids = next(c["plasmids"] for c in sc._load_collections()
+                        if c.get("name") == "Default")
+        assert [p["id"] for p in plasmids] == ["p1"]
+        assert "LOCUS" in (sc._rehydrate_entry(plasmids[0]).get("gb_text") or "")
+
+    def test_a_queued_mirror_cannot_land_on_the_import(self, tmp_path):
+        """A deferred collection mirror queued before the import used to land
+        AFTER it: with the caches busted, it wrote its queued snapshot — this
+        machine's old library — into the imported collection of the same
+        name. The import transaction lands it first."""
+        zp = self._archive_from_machine_a(tmp_path)
+        self._machine_b()
+        stale = [dict(e) for e in sc._load_library()]
+        seq = sc._mark_mirror_pending()
+        sc._state._collection_sync_pending = ("Default", stale, seq)
+        sc._migrate_import_transaction(zp)
+        payload = sc._state._collection_sync_pending
+        if payload:                       # what the background drain does next
+            sc._land_deferred_mirror(*payload)
+        _bust()
+        plasmids = next(c["plasmids"] for c in sc._load_collections()
+                        if c.get("name") == "Default")
+        assert [p["id"] for p in plasmids] == ["p1"]

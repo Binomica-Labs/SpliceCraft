@@ -3446,3 +3446,77 @@ class TestFeatureModalSpaceMark:
             modal.on_key(self._SpaceKey())          # Space again unmarks
             await pilot.pause()
             assert len(modal._marked_ids) == 0
+
+
+# Audit 2026-10-23 round 2 (W9): every test below failed on the pre-fix tree.
+async def _settle_w9(pilot, n=4):
+    for _ in range(n):
+        await pilot.pause()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# W9 — a label-only feature edit keeps `<` / `>` partial ends
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _partial_record():
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    from Bio.SeqFeature import (SeqFeature, FeatureLocation, CompoundLocation,
+                                BeforePosition, AfterPosition)
+    r = SeqRecord(Seq("ACGT" * 150), id="aPart", name="aPart",
+                  annotations={"molecule_type": "DNA", "topology": "circular"})
+    r.features = [
+        SeqFeature(FeatureLocation(BeforePosition(10), AfterPosition(60), strand=1),
+                   type="CDS", qualifiers={"label": ["simple"]}),
+        SeqFeature(CompoundLocation([
+            FeatureLocation(BeforePosition(100), 150, strand=1),
+            FeatureLocation(200, AfterPosition(250), strand=1)]),
+            type="CDS", qualifiers={"label": ["spliced"]}),
+        SeqFeature(FeatureLocation(BeforePosition(300), AfterPosition(350), strand=-1),
+                   type="misc_feature", qualifiers={"label": ["minus"]}),
+    ]
+    return r
+
+
+class TestFeatureEditKeepsPartialEnds:
+
+    async def test_label_only_edit_keeps_partial_ends(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await _settle_w9(pilot)
+            app._apply_record(_partial_record())
+            await _settle_w9(pilot)
+            before = [str(f.location) for f in app._current_record.features]
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            for idx, f in enumerate(list(pm._feats)):
+                # exactly what FeatureEditModal's Save sends: the strand the
+                # editor showed, unchanged
+                app._apply_feature_edit({
+                    "action": "save", "idx": idx, "label": f["label"] + "2",
+                    "type": f["type"], "strand": f["strand"], "color": None,
+                    "notes": ""})
+                await _settle_w9(pilot, 1)
+            after = [str(f.location) for f in app._current_record.features]
+        assert after == before, (before, after)
+
+    def test_restrand_keeps_partial_ends(self):
+        from Bio.SeqFeature import BeforePosition, AfterPosition
+        loc = _partial_record().features[1].location
+        flipped = sc._restrand_location(loc, -1, 600, circular=True)
+        starts = [type(p.start).__name__ for p in flipped.parts]
+        ends = [type(p.end).__name__ for p in flipped.parts]
+        assert "BeforePosition" in starts and "AfterPosition" in ends, (starts, ends)
+
+    async def test_agent_update_feature_with_the_same_strand_keeps_them(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await _settle_w9(pilot)
+            app._apply_record(_partial_record())
+            await _settle_w9(pilot)
+            before = str(app._current_record.features[0].location)
+            import asyncio
+            res = await asyncio.to_thread(sc._h_update_feature, app,
+                                          {"idx": 0, "label": "x", "strand": 1})
+            await _settle_w9(pilot)
+            after = str(app._current_record.features[0].location)
+        assert after == before, (res, before, after)

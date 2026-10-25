@@ -174,6 +174,31 @@ class TestUrlRedaction:
         assert sc._redact_url_credentials("not a url at all") == "not a url at all"
         assert sc._redact_url_credentials("") == ""
 
+    # audit 2026-10-23: four shapes that reached a log line intact.
+    @pytest.mark.parametrize("url,secret,kept", [
+        # an unparseable port made `.port` raise, and the fallback returned
+        # the URL — credentials and all
+        ("https://user:s3cretpw@host.com:99999/x", "s3cretpw", "host.com"),
+        ("http://user:s3cretpw@[::1/x", "s3cretpw", "http://"),
+        # a matrix parameter
+        ("https://host.com/dl/file.zip;jsessionid=Tok3nTok3n",
+         "Tok3nTok3n", "file.zip"),
+        # a key-only query, where the KEY is the secret
+        ("https://host.com/x?Tok3nTok3nTok3n", "Tok3nTok3nTok3n", "host.com"),
+        # a capability token as a path segment
+        ("https://host.com/download/9f8e7d6c5b4a39281706f5e4d3c2b1a0/run.zip",
+         "9f8e7d6c5b4a39281706f5e4d3c2b1a0", "run.zip"),
+    ])
+    def test_secrets_outside_the_query_values_are_redacted(self, url, secret,
+                                                          kept):
+        out = sc._redact_url_credentials(url)
+        assert secret not in out, out
+        assert kept in out, out
+
+    def test_named_query_values_still_keep_their_names(self):
+        out = sc._redact_url_credentials("https://h.org/x?db=nuccore&id=L09137")
+        assert out == "https://h.org/x?db=REDACTED&id=REDACTED"
+
 
 # ── Scheme policy ────────────────────────────────────────────────────
 

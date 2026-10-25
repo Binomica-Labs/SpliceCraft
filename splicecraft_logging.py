@@ -60,18 +60,32 @@ class _SurrogateScrubFilter(logging.Filter):
             try:
                 value.encode("utf-8")
             except UnicodeEncodeError:
-                value = value.encode("utf-8", "backslashreplace").decode("ascii")
+                # `backslashreplace` escapes ONLY what UTF-8 cannot encode
+                # (the lone surrogates); everything else stays UTF-8, so the
+                # result is decoded as UTF-8. Decoding as ASCII raised on any
+                # other non-ASCII character in the same string (`Gel é` +
+                # a surrogate) — out of the filter and out of the `_log` call,
+                # turning a SUCCESSFUL agent write into a 500 whose retry made
+                # a duplicate (audit 2026-10-23).
+                value = value.encode("utf-8", "backslashreplace").decode("utf-8")
             if _LOG_CTRL_RE.search(value):
                 value = _LOG_CTRL_RE.sub(
                     lambda m: "\\x%02x" % ord(m.group()), value)
         return value
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = self._scrub(record.msg)
-        if isinstance(record.args, tuple):
-            record.args = tuple(self._scrub(a) for a in record.args)
-        elif isinstance(record.args, dict):
-            record.args = {k: self._scrub(v) for k, v in record.args.items()}
+        # A logging filter must never raise: the exception would surface at
+        # whatever call site happened to log — usually after the real work
+        # was done.
+        try:
+            record.msg = self._scrub(record.msg)
+            if isinstance(record.args, tuple):
+                record.args = tuple(self._scrub(a) for a in record.args)
+            elif isinstance(record.args, dict):
+                record.args = {k: self._scrub(v)
+                               for k, v in record.args.items()}
+        except Exception:                              # noqa: BLE001
+            record.msg, record.args = ascii(record.msg), ()
         return True
 
 _log = logging.getLogger("splicecraft")

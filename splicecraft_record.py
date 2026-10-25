@@ -22,16 +22,33 @@ from io import StringIO
 import splicecraft_insdc as _insdc
 import splicecraft_state as _state
 from splicecraft_logging import _log
-from splicecraft_util import _DEFAULT_TYPE_COLORS, _locus_topology, _sanitize_label
+from splicecraft_util import _CONTROL_CHARS_RE, _DEFAULT_TYPE_COLORS, _locus_topology, _sanitize_label
 
 
 _SC_STRAND_QUAL = "SpliceCraft_strand"
+
+# A feature type the GenBank key field cannot hold (longer than its 15
+# columns, or a character outside the key alphabet) is written as
+# `misc_feature` carrying the real type in this qualifier, and restored on
+# read. Written raw, Biopython truncated the key and ran the location into
+# it (`     origin_of_replic500..900`), which a reader that goes by content
+# cannot see as a feature — the feature vanished and its text was glued into
+# the previous feature's qualifier on the next library load (audit
+# 2026-10-23). GFF3 / Sequence Ontology types (`origin_of_replication`,
+# `primer_binding_site`, …) are the everyday source.
+_SC_TYPE_QUAL = "SpliceCraft_type"
+_GB_KEY_OK_RE = re.compile(r"[A-Za-z0-9_'*-]{1,15}")
 
 _GB_TEXT_MAX_BYTES = 64 * 1024 * 1024
 
 _GB_PARSE_CACHE: "_OD" = _OD()
 
 _GB_PARSE_CACHE_MAX = 16
+
+# ...and capped by the total sequence length it holds: an entry is a whole
+# parsed record, tens of MB for a genome, so browsing a few genomes kept
+# hundreds of MB alive (audit 2026-10-23). The newest entry always stays.
+_GB_PARSE_CACHE_BP_BUDGET = 32_000_000
 
 _GB_PARSE_CACHE_LOCK = threading.RLock()
 
@@ -159,6 +176,105 @@ def _arrowless_encode_features(features):
         else:
             out.append(f)
     return out if changed else features
+
+
+def _long_type_encode_features(features):
+    """Return a features list in which every feature whose type cannot be a
+    GenBank feature key is written as ``misc_feature`` carrying
+    ``SpliceCraft_type=[<type>]`` (see `_SC_TYPE_QUAL`). Pure and
+    copy-on-write like `_arrowless_encode_features`: the SAME list comes back
+    when nothing needs encoding."""
+    feats = features or []
+    out: list = []
+    changed = False
+    for f in feats:
+        t = getattr(f, "type", None)
+        if (isinstance(t, str) and t and _GB_KEY_OK_RE.fullmatch(t) is None):
+            nf = _shallow_copy(f)
+            nf.type = "misc_feature"
+            quals = getattr(f, "qualifiers", None) or {}
+            nf.qualifiers = {**quals, _SC_TYPE_QUAL: [t]}
+            out.append(nf)
+            changed = True
+        else:
+            out.append(f)
+    return out if changed else features
+
+
+def _unknown_position_encode_features(features, total: int):
+    """Return a features list in which every UNKNOWN position (`?`) is
+    written as a partial at the molecule's edge — an unknown start as ``<1``,
+    an unknown end as ``>len``. Copy-on-write like the encoders above: the
+    SAME list comes back when nothing needs encoding.
+
+    The writer is Biopython's, and it turns an unknown start into
+    ``<END..END`` — a 1 bp feature — and an unknown end into
+    ``START..>START+1``, and refuses ``?..?`` outright ("Feature with unknown
+    location"), so a record holding one could never be saved again (audit
+    2026-10-23). The partial markers say what is known — the feature runs
+    past what is recorded on that side — and read back the same on every
+    later cycle. The READER keeps Biopython's `UnknownPosition`
+    (`[INV-219]`'s contract); only what reaches the file changes. The
+    GenBank EXPORT deliberately does not do this: its round-trip guard
+    refuses a file whose claim differs from the record's ("extends past
+    here" is not "not known") — `TestExportRoundTripDiagnostics`."""
+    feats = features or []
+    try:
+        from Bio.SeqFeature import (
+            AfterPosition, BeforePosition, CompoundLocation, SimpleLocation,
+            UnknownPosition,
+        )
+    except ImportError:            # pragma: no cover - Biopython is required
+        return features
+    out: list = []
+    changed = False
+    for f in feats:
+        loc = getattr(f, "location", None)
+        parts = list(getattr(loc, "parts", None) or ([loc] if loc else []))
+        if not any(isinstance(p.start, UnknownPosition)
+                   or isinstance(p.end, UnknownPosition) for p in parts):
+            out.append(f)
+            continue
+        new_parts = [SimpleLocation(
+            BeforePosition(0) if isinstance(p.start, UnknownPosition)
+            else p.start,
+            AfterPosition(total) if isinstance(p.end, UnknownPosition)
+            else p.end,
+            strand=p.strand, ref=p.ref, ref_db=p.ref_db) for p in parts]
+        nf = _shallow_copy(f)
+        nf.location = (new_parts[0] if len(new_parts) == 1
+                       else CompoundLocation(
+                           new_parts,
+                           operator=getattr(loc, "operator", "join") or "join"))
+        out.append(nf)
+        changed = True
+    if changed:
+        # The GenBank export refuses this rewrite (its round-trip guard sees
+        # the claim change); the library has to store SOMETHING.
+        _log.info("library save: %d feature(s) with an unknown (`?`) "
+                  "position stored as a partial at the molecule's edge",
+                  sum(1 for a, b in zip(out, feats) if a is not b))
+    return out if changed else features
+
+
+def _long_type_decode_features(record):
+    """Inverse of `_long_type_encode_features`, in place: restore each
+    feature's real type from its marker and strip the marker. The marker only
+    speaks for the `misc_feature` it was written on — anywhere else it is
+    dropped without changing the type."""
+    for f in getattr(record, "features", None) or []:
+        quals = getattr(f, "qualifiers", None)
+        if not isinstance(quals, dict) or _SC_TYPE_QUAL not in quals:
+            continue
+        q = quals.pop(_SC_TYPE_QUAL)
+        if (getattr(f, "type", None) == "misc_feature"
+                and isinstance(q, list) and q and isinstance(q[0], str)):
+            # The marker is file text: no control byte may become a type
+            # (types are painted to the terminal).
+            t = _CONTROL_CHARS_RE.sub("", q[0]).strip()
+            if t:
+                f.type = t
+    return record
 
 
 def _arrowless_decode_features(record):
@@ -772,8 +888,10 @@ def _record_to_gb_text(record) -> str:
     # length needs. Overflowing it makes Biopython abandon the fixed-column
     # layout entirely — see `_locus_name_cap`.
     rec.name = _locus_name_for(rec, cap=_locus_cap)
-    rec.features = _split_multiline_qualifiers(
-        _arrowless_encode_features(getattr(record, "features", None)))
+    rec.features = _split_multiline_qualifiers(_long_type_encode_features(
+        _arrowless_encode_features(_unknown_position_encode_features(
+            getattr(record, "features", None),
+            len(getattr(record, "seq", "") or "")))))
     buf = StringIO()
     _unbreakable_genbank_writer(buf).write_file([rec])
     return buf.getvalue()
@@ -1078,6 +1196,7 @@ def _gb_text_to_record(text: str, *, cache: bool = True):
     # Restore arrowless (strand 0) features tagged on the write side before
     # the result is cached, so every caller sees a faithful + clean record.
     _arrowless_decode_features(rec)
+    _long_type_decode_features(rec)
     # Undo BioPython's wrap-rejoin space corruption of long `/primer_seq`
     # qualifiers BEFORE caching, so the renderer never paints a phantom gap.
     _repair_wrapped_primer_seqs(rec)
@@ -1089,6 +1208,10 @@ def _gb_text_to_record(text: str, *, cache: bool = True):
             # `key`) so it's unconditionally bound in this separate `if cache:`
             # block — miss-path only, so the extra hash is dwarfed by the parse.
             _GB_PARSE_CACHE[_gb_cache_key(text)] = _clone_cached_record(rec)
-            while len(_GB_PARSE_CACHE) > _GB_PARSE_CACHE_MAX:
-                _GB_PARSE_CACHE.popitem(last=False)
+            held = sum(len(r.seq) for r in _GB_PARSE_CACHE.values())
+            while len(_GB_PARSE_CACHE) > 1 and (
+                    len(_GB_PARSE_CACHE) > _GB_PARSE_CACHE_MAX
+                    or held > _GB_PARSE_CACHE_BP_BUDGET):
+                _old_key, old = _GB_PARSE_CACHE.popitem(last=False)
+                held -= len(old.seq)
     return rec

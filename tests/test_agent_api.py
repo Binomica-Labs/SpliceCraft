@@ -195,7 +195,7 @@ class MockApp:
             class _PMShim:
                 _feats = self._feats_from_record()
                 _restr_feats: list = []
-                def load_record(self, rec):
+                def load_record(self, rec, *, keep_origin=False):
                     pass
                 def refresh(self):
                     pass
@@ -2976,11 +2976,15 @@ class TestPlasmidsaurusEndpoints:
             },
         )
         assert result["ok"] is True
-        # The lookup matched by display name; returned `target_id` is
-        # the library entry's id, `target_name` is the parsed LOCUS
-        # name from the gb_text (TEST001 here per `tiny_record`).
+        # The lookup matched by display name, and that is the name that comes
+        # back — NOT the LOCUS form from the gb_text. Reporting the LOCUS
+        # ("TEST001" here, and "My_plasmid_v2" for any name with a space)
+        # handed the caller a string that does not resolve the entry it just
+        # named, and the same comparison reported `_target_renamed_to` on
+        # every entry whose name holds a space ([INV-98]; audit 2026-10-24).
         assert result["target_id"] == "tgt"
-        assert result["target_name"] == "TEST001"
+        assert result["target_name"] == "Looked Up By Name"
+        assert "_target_renamed_to" not in (result.get("result") or {})
 
     def test_align_missing_target_returns_404(self, tiny_record,
                                                  tmp_path,
@@ -4892,6 +4896,62 @@ class TestLintSynthesis:
         r = sc._h_lint_synthesis(None, {"name": "Lint Me"})
         assert r["ok"] and r["stats"]["circular"] is True
         assert any(w["kind"] == "type_iis_site" for w in r["warnings"])
+
+    # audit 2026-10-23: the report's positions and run lengths were in an
+    # ACGT-FILTERED frame, and the window scans ignored `circular`.
+
+    def test_positions_point_at_the_bases_they_name(self):
+        """A plasmid with ambiguous bases (every Sanger/nanopore consensus)
+        shifted every reported position: a 14xA run at bp 325 was reported
+        at 298, pointing at unrelated bases."""
+        import random
+        rng = random.Random(3)
+        # `CGT` flanks: nothing may extend the planted run.
+        head = "".join(rng.choice("CGT") for _ in range(100))
+        mid = "N" * 25
+        gap = "".join(rng.choice("CGT") for _ in range(200))
+        raw = head + mid + gap + "A" * 14 + "".join(
+            rng.choice("CGT") for _ in range(100))
+        at = len(head + mid + gap)
+        r = self._lint(raw, circular=False)
+        runs = [w for w in r["warnings"] if w["kind"] == "homopolymer"]
+        assert runs, r["warnings"]
+        w = runs[0]
+        assert (w["start"], w["end"]) == (at, at + 14), (w, at)
+        assert raw[w["start"]:w["end"]] == "A" * 14
+        assert "14\u00d7A" in w["message"], w["message"]
+        assert r["stats"]["length"] == len(raw)
+
+    def test_a_run_is_not_fused_across_ambiguous_bases(self):
+        """Stripping the Ns joined two short runs into one long one that does
+        not exist in the sequence."""
+        raw = "CGT" * 10 + "A" * 7 + "N" * 25 + "A" * 7 + "CGT" * 10
+        r = self._lint(raw, circular=False, homopolymer_max=10)
+        assert not [w for w in r["warnings"] if w["kind"] == "homopolymer"], \
+            r["warnings"]
+
+    def test_a_homopolymer_across_the_origin_is_reported(self):
+        import random
+        rng = random.Random(5)
+        body = "".join(rng.choice("CGT") for _ in range(400))
+        raw = "A" * 6 + body + "A" * 6          # 12 A's across bp 0
+        r = self._lint(raw, circular=True)
+        runs = [w for w in r["warnings"] if w["kind"] == "homopolymer"]
+        assert runs, r["warnings"]
+        assert any("12" in w["message"] for w in runs), runs
+        # Linear: the same bases are two 6-runs, neither long enough.
+        assert not [w for w in self._lint(raw, circular=False)["warnings"]
+                    if w["kind"] == "homopolymer"]
+
+    def test_a_tandem_repeat_across_the_origin_is_reported(self):
+        import random
+        rng = random.Random(7)
+        body = "".join(rng.choice("ACGT") for _ in range(300))
+        unit = "GCTA"
+        raw = unit * 3 + body + unit * 3       # 6 copies across bp 0
+        r = self._lint(raw, circular=True)
+        assert [w for w in r["warnings"] if w["kind"] == "tandem_repeat"], \
+            r["warnings"]
 
     def test_missing_input_400(self):
         r = sc._h_lint_synthesis(None, {})
@@ -7600,3 +7660,48 @@ class TestSpanContainsHardening:
                    "inner": {"bp": -1}})
         assert r["results"][0]["start"] == 99
         assert r["results"][0]["contains"] is True
+
+
+class TestAssembleIntoEntryVectorWarns:
+    """The IIS simulation cannot tell a two-tier nest from a part in the
+    wrong slot, so it builds the product and SAYS what it fused — in the
+    response, not only the log (audit 2026-10-23; user's call: warn, never
+    refuse)."""
+
+    @staticmethod
+    def _vector(oh5, oh3):
+        import random
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rng = random.Random(21)
+        esp = "CGTCTC"
+        seq = ("".join(rng.choice("ACGT") for _ in range(400))
+               + esp + "A" + oh5
+               + "".join(rng.choice("ACGT") for _ in range(120))
+               + oh3 + "T" + sc._rc(esp))
+        rec = SeqRecord(Seq(seq), id="pACC", name="pACC",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        return sc._record_to_gb_text(rec)
+
+    def _run(self, oh5, oh3, body):
+        sc._set_entry_vector("gb_l0", {
+            "name": "pACC", "gb_text": self._vector("GGAG", "AATG")}, "")
+        return sc._h_assemble_into_entry_vector(None, {
+            "name": "TU1", "grammar": "gb_l0", "source_level": 0,
+            "sources": [{"name": "P1", "sequence": body,
+                         "oh5": oh5, "oh3": oh3, "type": "CDS"}]})
+
+    def test_a_fused_overhang_pair_is_reported(self, isolated_library):
+        r = self._run("GCTT", "CGCT", "ATG" + "GCTACG" * 20 + "TAA")
+        if isinstance(r, tuple):                 # a refusal is not the choice
+            pytest.fail(f"refused instead of warning: {r}")
+        assert r["ok"] is True
+        assert any("GCTT" in w and "GGAG" in w for w in r.get("warnings", [])), \
+            r.get("warnings")
+
+    def test_a_clean_part_has_no_warnings_key(self, isolated_library):
+        r = self._run("GGAG", "AATG", "ATG" + "GCTACG" * 20 + "TAA")
+        if isinstance(r, tuple):
+            pytest.skip(f"this acceptor/part pair does not assemble: {r}")
+        assert "warnings" not in r, r.get("warnings")

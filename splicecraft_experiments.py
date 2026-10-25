@@ -302,14 +302,26 @@ def _normalise_experiment_entry(entry: dict, *, fresh: bool = False
     image_paths = out.get("image_paths") or []
     if not isinstance(image_paths, list):
         image_paths = []
+    # An attachment is a BARE filename in the entry's own attachment folder
+    # (`_save_experiment_image` writes `img-<ts>-<rand>.<ext>`). Anything
+    # else — an absolute path, `..`, a separator — let a hand-edited or
+    # imported experiments.json make an export read and embed an arbitrary
+    # local file (`~/.ssh/id_rsa`) into a document the user then shares
+    # (audit 2026-10-23).
     out["image_paths"] = [
-        p for p in image_paths if isinstance(p, str) and p
+        p for p in image_paths if _is_bare_attachment_name(p)
     ]
     now = _now_iso()
     if fresh or not isinstance(out.get("created_at"), str):
         out["created_at"] = now
     out["updated_at"] = now
     return out
+
+
+def _is_bare_attachment_name(p) -> bool:
+    """A plain file name — no directory part, drive, or relative hop."""
+    return (isinstance(p, str) and bool(p) and p not in (".", "..")
+            and not p.startswith(".") and not any(c in p for c in "/\\:\x00"))
 
 
 # ── Curated bench-action catalog ─────────────────────────────────────────
@@ -635,6 +647,32 @@ def _protocol_action_for_op(op: object) -> str:
     return _PROTOCOL_ACTION_BY_OP.get(op.strip(), "")
 
 
+# A sigil the ref extractors would read is swapped for its fullwidth twin:
+# still legible, and never an `@`/`!`/`&` reference.
+_PROTOCOL_SIGIL_TWIN = {"@": "＠", "!": "！", "&": "＆"}
+
+
+def _protocol_inert(raw: object) -> str:
+    """Text read off a construction history, made inert for a notebook body.
+
+    History names, verbs, enzymes and coordinates come from a `.dna` file —
+    one the user may have been sent. Returned: one line (every control or
+    line-separator character becomes a space), no backtick (the code-span
+    delimiter, so a name cannot close its span early), and no sigil the
+    `_extract_*_refs` regexes would read. Those regexes do not skip code
+    spans, so a node named ``x @pUC19`` attached pUC19 to the entry even
+    inside backticks — the exact dangling ref the `known_ids` gate exists to
+    prevent (audit 2026-10-23). A sigil that is not a reference
+    (``user@lab``, ``A&B``) is left alone."""
+    s = raw if isinstance(raw, str) else ""
+    s = "".join(ch if ch.isprintable() else " " for ch in s)
+    s = " ".join(s.replace("`", "'").split())
+    for rx in (_PLASMID_REF_RE, _ACTIONS_REF_RE, _GEL_REF_RE):
+        s = rx.sub(lambda m: _PROTOCOL_SIGIL_TWIN[m.group(0)[0]] + m.group(1),
+                   s)
+    return s
+
+
 def _protocol_steps_markdown(steps: "list[dict]", *,
                              product: str = "",
                              known_ids: "set[str] | None" = None,
@@ -654,17 +692,27 @@ def _protocol_steps_markdown(steps: "list[dict]", *,
     """
     known = known_ids or set()
 
+    def _code(raw: object) -> str:
+        s = _protocol_inert(raw)
+        return f"`{s}`" if s else "`?`"
+
     def _name(raw: object) -> str:
         nm = raw if isinstance(raw, str) else ""
-        if not nm:
-            return "`?`"
-        if nm in known and _experiment_ref_token_ok(nm):
+        if nm and nm in known and _experiment_ref_token_ok(nm):
             return f"@{nm}"
-        return f"`{nm}`"
+        return _code(nm)
+
+    def _prose(raw: object) -> str:
+        # Text set where the protocol supplies its own markup (the heading,
+        # the bold verb, the coordinate tag): kept as text when it holds no
+        # inline markdown, an inert code span when it does.
+        s = _protocol_inert(raw)
+        return f"`{s}`" if any(c in s for c in "[]*") else s
 
     head = "## Protocol"
-    if isinstance(product, str) and product.strip():
-        head += f" — {product.strip()}"
+    _head_name = _prose(product)
+    if _head_name:
+        head += f" — {_head_name}"
     lines = [head, ""]
     if not steps:
         lines.append(
@@ -688,8 +736,8 @@ def _protocol_steps_markdown(steps: "list[dict]", *,
         enzymes = _as_str_list(s.get("enzymes"))
         where = (s.get("where") or "").strip()
         bits: "list[str]" = []
-        if verb:
-            bits.append(f"**{verb}**")
+        if verb and _prose(verb):
+            bits.append(f"**{_prose(verb)}**")
         # In-place edit — a single input that IS the product reads as
         # "X → X"; name the product once and say what was done to it.
         if len(ins) == 1 and not backbone and ins[0] == prod:
@@ -716,9 +764,9 @@ def _protocol_steps_markdown(steps: "list[dict]", *,
             else:
                 bits.append(_name(prod))
         if enzymes:
-            bits.append("· " + " + ".join(f"`{e}`" for e in enzymes))
-        if where:
-            bits.append(f"({where})")
+            bits.append("· " + " + ".join(_code(e) for e in enzymes))
+        if where and _prose(where):
+            bits.append(f"({_prose(where)})")
         if action_refs:
             act = _protocol_action_for_op(verb)
             if act:

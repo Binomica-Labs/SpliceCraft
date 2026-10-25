@@ -513,6 +513,143 @@ def _rederive_primer_binding(primer_seq: str, strand: int, template: str,
     return None
 
 
+# Placement of a primer that anneals WITH designed mismatches. ─────────────
+#
+# `_rederive_primer_binding` needs a contiguous >= `_PRIMER_REBIND_MIN` (12) bp
+# exact 3' suffix. The app's own SOE / QuikChange inner primers keep only 5–20
+# (median 9) bp past the edit, and an allele-specific primer with
+# `destabilize` carries a deliberate mismatch 3 bases from its 3' end: 70 % of
+# inner designs, and every destabilised ARMS primer, were refused as "does not
+# bind this plasmid" although they anneal at ~90 % identity (audit
+# 2026-10-23). The renderer (`PlasmidMap._parse`) already lays such a primer
+# per base from a stored location; what was missing was FINDING the location.
+_PRIMER_MISMATCH_PLACE_MIN_IDENTITY = 0.80
+_PRIMER_MISMATCH_SEED = 10
+_PRIMER_MISMATCH_MAX_CANDIDATES = 20000
+# A designed edit is a codon (<= 3 adjacent bases) or an ARMS primer's
+# 3'-proximal pair; random agreement scatters its mismatches. Plus a
+# significance bound: the expected number of CHANCE sites of that shape on a
+# template this size must stay under this (see `_locate_mismatched_primer`).
+_PRIMER_MISMATCH_MAX = 3
+_PRIMER_MISMATCH_MAX_SPAN = 3
+_PRIMER_MISMATCH_MAX_CHANCE = 0.01
+
+
+def _locate_mismatched_primer(primer_seq: str, strand: int, template: str,
+                              total: int, hint_start: "int | None" = None,
+                              *, circular: bool = True,
+                              min_identity: float =
+                              _PRIMER_MISMATCH_PLACE_MIN_IDENTITY,
+                              ) -> "tuple[int, int] | None":
+    """The FULL footprint of a primer that anneals with designed mismatches,
+    as ``(pos_start, pos_end)`` in the same shape `_rederive_primer_binding`
+    returns (``pos_end < pos_start`` across the origin) — or None.
+
+    Strict on purpose, because a primer drawn where it does not anneal is
+    catastrophic: the primer must lie on its OWN strand, match the template
+    over >= `min_identity` of its full length WITHOUT gaps, pair at its
+    3'-terminal base (nothing extends otherwise), and differ in the SHAPE of
+    a designed edit — at most 3 mismatches, all inside 3 adjacent bases (a
+    codon change, an ARMS primer's 3'-proximal pair) — where chance
+    agreement scatters them. Even that shape is refused when the template is
+    big enough for it to occur by chance (expected chance sites >=
+    `_PRIMER_MISMATCH_MAX_CHANCE`): a 15-mer still places on a 3 kb plasmid,
+    not on a 20 kb one. Candidates come from exact occurrences of
+    overlapping internal windows, so a central edit and a near-3' ARMS
+    mismatch are both found. The best site must be UNIQUE; a tie is broken
+    by `hint_start` (the stored position) only when one candidate is
+    nearest, and refused otherwise."""
+    seq = (primer_seq or "").upper()
+    L = len(seq)
+    if L < _PRIMER_REBIND_MIN or not template or total <= 0 or L > total:
+        return None
+    top = seq if strand >= 0 else _rc(seq)
+    aug = template + template[:L - 1] if circular else template
+    # Seeds no longer than the shorter clean flank of a codon edit (up to
+    # three consecutive mismatches, so `(L - 3) // 2`; 6..12 bp) at a fine
+    # step, so at least one window clears the edit: fixed 10 bp seeds both
+    # straddled the mismatch of a 15-mer inner primer and no candidate was
+    # ever generated.
+    seed = max(6, min(_PRIMER_MISMATCH_SEED + 2, (L - 3) // 2))
+    offs = list(range(0, L - seed + 1, max(1, seed // 3)))
+    if offs[-1] != L - seed:
+        offs.append(L - seed)
+    cands: set = set()
+    for off in offs:
+        k = top[off:off + seed]
+        i = aug.find(k)
+        while i != -1 and len(cands) <= _PRIMER_MISMATCH_MAX_CANDIDATES:
+            st = i - off
+            if circular:
+                st %= total
+            if 0 <= st < total and (circular or st + L <= total):
+                cands.add(st)
+            i = aug.find(k, i + 1)
+    # Is a site of the allowed SHAPE significant on a template this size?
+    # Chance patterns per window: the all-match one plus, for each of the
+    # (L - 2) three-base spans, the 4**3 - 1 ways it can differ.
+    chance = 2 * len(template) * ((L - 2) * 63 + 1) * 4.0 ** (-L)
+    if chance >= _PRIMER_MISMATCH_MAX_CHANCE:
+        return None
+    best: "list[int]" = []
+    best_ident = -1.0
+    ring = template + template[:L] if circular else template
+    for st in cands:
+        w = ring[st:st + L]
+        if len(w) < L:
+            continue
+        # The 3'-terminal base must pair: forward 3' end = last column,
+        # reverse primer's 3' end = the footprint's FIRST column.
+        if (strand >= 0 and w[-1] != top[-1]) or (strand < 0 and w[0] != top[0]):
+            continue
+        mm = [j for j in range(L) if w[j] != top[j]]
+        if (len(mm) > _PRIMER_MISMATCH_MAX
+                or (mm and mm[-1] - mm[0] + 1 > _PRIMER_MISMATCH_MAX_SPAN)):
+            continue
+        ident = (L - len(mm)) / L
+        if ident > best_ident:
+            best_ident, best = ident, [st]
+        elif ident == best_ident:
+            best.append(st)
+    if not best or best_ident < min_identity:
+        return None
+    if len(best) > 1:
+        if hint_start is None or hint_start < 0:
+            return None
+        h = int(hint_start) % total
+
+        def _cdist(p: int) -> int:
+            d = abs(p - h)
+            return min(d, total - d)
+        best.sort(key=_cdist)
+        if _cdist(best[0]) == _cdist(best[1]):
+            return None
+    st = best[0]
+    end = st + L
+    if end > total:
+        end -= total
+    return (st, end)
+
+
+def _primer_binding_for_map(primer_seq: str, strand: int, template: str,
+                            total: int, hint_start: "int | None" = None,
+                            *, circular: bool = True,
+                            ) -> "tuple[int, int] | None":
+    """Where to DRAW a primer on `template`: the exact 3'-anchored binding
+    when there is one (`_rederive_primer_binding` — tailed / flapped
+    primers), else the full footprint of a primer with designed mismatches
+    (`_locate_mismatched_primer`), else None — never a guess."""
+    rb = _rederive_primer_binding(
+        primer_seq, strand, template, total,
+        hint_start=(hint_start if hint_start is not None and hint_start >= 0
+                    else 0),
+        circular=circular)
+    if rb is not None:
+        return rb
+    return _locate_mismatched_primer(primer_seq, strand, template, total,
+                                     hint_start, circular=circular)
+
+
 # ── primer-CHECK binding finder (Phase D, moved from hub) ──────────────────
 # Mismatch-tolerant 3'-anchored binding-site list (which sites a primer binds, with
 # identity %) + the confidence glyph. Verified by the real-plasmid golden

@@ -387,9 +387,29 @@ any off-target claim; omit the search and it's `0`, so silence can't be read as
   800 bp Sanger read of a 5 kb plasmid scores ~16 %. Read it with
   `covered_pct`: "perfect over the third it covered" is the honest sentence.
 - `analyse-read-heterogeneity` answers "is this culture one thing?" —
-  `clonal` / `minor_variants` / `mixed`. A Plasmidsaurus consensus is depth 1, so
-  `read-consensus` cannot see a heterogeneous population; it consenses to wild
-  type and reads as clean.
+  `clonal` / `minor_variants` / `mixed` / `inconclusive` / `no_reads`. A
+  Plasmidsaurus consensus is depth 1, so `read-consensus` cannot see a
+  heterogeneous population; it consenses to wild type and reads as clean.
+  A verdict only describes the bases the reads REACHED and the basecalls that
+  cleared `min_phred`: `inconclusive` means the only thing that looks mixed is
+  a position whose every observation fell below that threshold AND whose
+  apparent fraction is substantial (lower `min_phred` to have those judged) —
+  a smaller apparent fraction in poor basecalls is the instrument's error
+  floor and stays `clonal`, with a warning. `no_reads` covers `covered_bp: 0`
+  as well as nothing aligning. Nothing is muted silently — every position the verdict could not
+  count is still listed with `muted_by` naming the reason, and `warnings` says
+  what was set aside.
+- `verify-against-reads` reports `match` only when the reads agree on NO
+  difference and carry no indel more reads show than contradict —
+  `min_identity` is a tolerance for substitution noise and cannot express "no
+  indel" (a 100 bp deletion in a 10 kb plasmid is 99 %). `inverted` means the
+  orientation is the only thing wrong; check `inversions_only` and
+  `identity_outside_inversions_pct`. Partial reads of any length are placed on
+  the stretch of reference they actually span, so an insert a read is missing
+  reads out as that deletion. A read with nothing to compare (all `N`, or
+  placed over no reference base) carries `no_data: true`; when every read is
+  like that the verdict is `inconclusive`, not `mismatch` — re-sequence
+  rather than discarding the clone.
 - Plasmidsaurus: **pick by `has_results`, not `status`** — ~40% of a real listing
   is shipping-label orders marked `complete` with no results zip, and they sort
   to the top. `download-plasmidsaurus` runs synchronously (download → parse →

@@ -816,3 +816,154 @@ class TestAppDoors:
     def test_a_cut_off_text_says_so(self):
         with pytest.raises(ValueError, match="ends before its sequence"):
             sc._gb_text_to_record(_FULL[:_FULL.index("ORIGIN")], cache=False)
+
+
+# ── audit 2026-10-23: silent losses on the library round trip ───────────────
+
+def _lib_round_trip(rec):
+    """What every library save + load does."""
+    return sc._gb_text_to_record(sc._record_to_gb_text(rec), cache=False)
+
+
+def _lib_rec(features, seq="ACGT" * 250):
+    r = SeqRecord(Seq(seq), id="pX", name="pX", description="demo")
+    r.annotations.update(molecule_type="DNA", topology="circular")
+    r.features = list(features)
+    return r
+
+
+class TestLibraryRoundTripLosses:
+
+    @pytest.mark.parametrize("ftype", [
+        "origin_of_replication", "primer_binding_site", "regulatory_region",
+        "polyA_signal_sequence", "my feature", "promoter/enhancer",
+        "transcription_start_site"])
+    def test_any_feature_type_survives_the_library(self, ftype):
+        """A type the 15-column key field can't hold was truncated and run
+        into its location by the writer; the reader then dropped the feature
+        and glued its text into the PREVIOUS feature's qualifier."""
+        feats = [
+            SeqFeature(SimpleLocation(99, 200, 1), type="promoter",
+                       qualifiers={"label": ["Plac"]}),
+            SeqFeature(SimpleLocation(499, 900, 1), type=ftype,
+                       qualifiers={"label": ["X"], "note": ["n"]}),
+            SeqFeature(SimpleLocation(950, 990, -1), type="terminator",
+                       qualifiers={"label": ["T"]})]
+        back = _lib_round_trip(_lib_rec(feats))
+        assert [(f.type, dict(f.qualifiers)) for f in back.features] == [
+            ("promoter", {"label": ["Plac"]}),
+            (ftype, {"label": ["X"], "note": ["n"]}),
+            ("terminator", {"label": ["T"]})]
+        assert [str(f.location) for f in back.features] == \
+            [str(f.location) for f in feats]
+
+    def test_long_type_marker_never_reaches_a_short_type(self):
+        """The marker speaks only for the misc_feature it was written on."""
+        rec = _quiet(H.read_genbank, _record(
+            "     gene            10..50\n"
+            '                     /SpliceCraft_type="origin_of_replication"\n'
+            '                     /label="g"'))
+        import splicecraft_record as scr
+        scr._long_type_decode_features(rec)
+        assert rec.features[0].type == "gene"
+        assert "SpliceCraft_type" not in rec.features[0].qualifiers
+
+    def test_glued_long_key_reads_like_biopython(self):
+        """Text Biopython's writer makes for a 16+ character key — and what
+        the library held before the fix — must read the way Biopython reads
+        it (key cut at column 21), with the neighbour left alone."""
+        r = _lib_rec([
+            SeqFeature(SimpleLocation(99, 200, 1), type="promoter",
+                       qualifiers={"label": ["Plac"]}),
+            SeqFeature(SimpleLocation(499, 900, 1),
+                       type="origin_of_replication",
+                       qualifiers={"label": ["pMB1 ori"]})])
+        buf = io.StringIO()
+        _quiet(SeqIO.write, r, buf, "genbank")
+        text = buf.getvalue()
+        assert "origin_of_replic500..900" in text
+        (ours,) = _assert_same(text)
+        assert [f.type for f in ours.features] == ["promoter",
+                                                   "origin_of_replic"]
+        assert ours.features[0].qualifiers == {"label": ["Plac"]}
+        assert ours._insdc_repairs.get("truncated_feature_key") == 1
+        assert "cut short" in (H.repair_note(ours) or "")
+
+    @pytest.mark.parametrize("k", range(0, 48))
+    def test_wrapped_value_with_escaped_quote_and_slash_survives(self, k):
+        """A wrapped /note whose line ends in an escaped `""` looks closed;
+        the next line `(aph) / ""AmpR"" …` was cut into junk + a qualifier
+        with an EMPTY name, written back permanently by the next save."""
+        note = ("w" * k + ' Selection marker "KanR" (aph) / "AmpR" (bla) '
+                'swap checked by colony PCR')
+        r = _lib_rec([SeqFeature(SimpleLocation(10, 100, 1),
+                                 type="misc_feature",
+                                 qualifiers={"note": [note]})])
+        text = sc._record_to_gb_text(r)
+        back = sc._gb_text_to_record(text, cache=False)
+        assert dict(back.features[0].qualifiers) == {"note": [note]}
+        _assert_same(text)
+
+    @pytest.mark.parametrize("loc,want", [
+        ("?..100", "[<0:100](+)"),
+        ("50..?", "[49:>1000](+)"),
+        ("?..?", "[<0:>1000](+)"),
+        ("complement(?..100)", "[<0:100](-)"),
+    ])
+    def test_an_unknown_position_survives_the_library(self, loc, want):
+        """`?` is an unknown position; Biopython's writer turns an unknown
+        start into `<END..END` — a 1 bp feature — an unknown end into
+        `START..>START+1`, and refuses `?..?` outright, so a record holding
+        one could never be saved (audit 2026-10-23). Written as a partial at
+        the molecule's edge it reads back the same on every cycle."""
+        rec = _quiet(H.read_genbank, _record(
+            f"     misc_feature    {loc}\n"
+            '                     /label="u"', seq="ACGT" * 250))
+        once = _lib_round_trip(rec)
+        assert str(once.features[0].location) == want
+        twice = _lib_round_trip(once)
+        assert str(twice.features[0].location) == want
+
+    def test_tab_inside_a_qualifier_value_is_kept(self):
+        r = _lib_rec([SeqFeature(SimpleLocation(10, 100, 1),
+                                 type="misc_feature",
+                                 qualifiers={"note": ["Tm\t62.1\tGC\t55%"]})])
+        text = sc._record_to_gb_text(r)
+        back = sc._gb_text_to_record(text, cache=False)
+        assert back.features[0].qualifiers["note"] == ["Tm\t62.1\tGC\t55%"]
+        _assert_same(text)
+
+
+def test_glued_long_key_with_a_bare_position_reads_like_biopython():
+    """`origin_of_replic230` — a one-base feature — is all key characters, so
+    it read as a key with NO location and the feature was dropped."""
+    text = _record("     origin_of_replic30\n"
+                   '                     /label="ori"\n'
+                   "     gene            40..50")
+    (ours,) = _assert_same(text)
+    assert [f.type for f in ours.features] == ["origin_of_replic", "gene"]
+
+
+@pytest.mark.parametrize("name", ["Primer Tm", "Gene Name", "my note key"])
+def test_multi_word_qualifier_name_survives_the_library(name):
+    """`/Primer Tm="62.5 C"` read as `{'Primer': ['Tm="62.5 C"']}` and the
+    next save made that permanent; Biopython keeps the name."""
+    r = _lib_rec([SeqFeature(SimpleLocation(10, 100, 1), type="misc_feature",
+                             qualifiers={"label": ["L"], name: ["62.5 C"]})])
+    text = sc._record_to_gb_text(r)
+    back = sc._gb_text_to_record(text, cache=False)
+    assert dict(back.features[0].qualifiers) == {"label": ["L"],
+                                                 name: ["62.5 C"]}
+    _assert_same(text)
+
+
+def test_missing_equals_repair_still_applies():
+    """The repair the multi-word rule must not swallow: a value written
+    without `=`, and a space before `=`."""
+    rec = _quiet(H.read_genbank, _record(
+        "     CDS             10..50\n"
+        '                     /product "text with = sign"\n'
+        '                     /note ="x"'))
+    assert dict(rec.features[0].qualifiers) == {
+        "product": ["text with = sign"], "note": ["x"]}
+

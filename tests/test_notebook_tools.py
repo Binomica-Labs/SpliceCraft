@@ -359,6 +359,71 @@ class TestProtocolMarkdown:
         assert "**PCR**" in md
 
 
+class TestProtocolTextFromAFileIsInert:
+    """Every name, verb, enzyme and coordinate in a protocol is read off a
+    `.dna` history — a file the user may have been sent. The promise is that
+    only names VERIFIED in the library become refs and nothing else becomes
+    markup. A backtick in a node name broke out of its code span, a sigil
+    inside one was still extracted as a ref, and a newline started a new
+    markdown block (audit 2026-10-23)."""
+
+    HOSTILE = [
+        "x` @pUC19 !miniprep &gel1 `y",
+        "a\n## injected heading\n- item",
+        "[click](https://evil.example/x)",
+        "![t](https://evil.example/pixel.png)",
+        "**bold**",
+        "@pUC19",
+        "line sep\rmore",
+        "bidi‮evil",
+    ]
+
+    @pytest.mark.parametrize("field", ["product", "input", "backbone",
+                                       "enzyme", "where", "op", "heading"])
+    def test_hostile_text_is_neither_a_ref_nor_markup(self, field):
+        import re
+        for bad in self.HOSTILE:
+            st = _step("PCR", "prod", ["inp"], enzymes=["EcoRI"],
+                       where="region 1-9")
+            heading = "pFinal"
+            if field == "product":
+                st["product"] = bad
+            elif field == "input":
+                st["inputs"] = [bad, "other"]
+            elif field == "backbone":
+                st["backbone"] = bad
+            elif field == "enzyme":
+                st["enzymes"] = [bad]
+            elif field == "where":
+                st["where"] = bad
+            elif field == "op":
+                st["op"] = bad
+            else:
+                heading = bad
+            md = sc._protocol_steps_markdown([st], product=heading,
+                                             known_ids=set(),
+                                             action_refs=False)
+            what = (field, bad, md)
+            assert sc._extract_plasmid_refs(md) == [], what
+            assert sc._extract_action_refs(md) == [], what
+            assert sc._extract_gel_refs(md) == [], what
+            assert "‮" not in md and " " not in md, what
+            html = sc._markdown_subset_to_html(md)
+            assert "<a " not in html and "<img" not in html, (what, html)
+            assert html.count("<li") == 1, (what, html)
+            assert len(re.findall(r"<h\d", html)) == 1, (what, html)
+            assert "<strong>bold</strong>" not in html, (what, html)
+
+    def test_ordinary_names_come_through_unchanged(self):
+        md = sc._protocol_steps_markdown(
+            [_step("PCR", "A&B v2 (final)", ["user@lab template"],
+                   enzymes=["BamHI-HF"], where="region 1,200–1,950")])
+        assert "`A&B v2 (final)`" in md
+        assert "`user@lab template`" in md
+        assert "`BamHI-HF`" in md
+        assert "(region 1,200–1,950)" in md
+
+
 class TestRefTokenOk:
     def test_accepts_plain_ids(self):
         assert sc._experiment_ref_token_ok("pUC19")

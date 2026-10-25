@@ -61,6 +61,8 @@ _REPAIRS = (
     "feature_table_layout",           # tabs / shifted lines read by content
     "unnumbered_sequence",            # sequence lines without position numbers
     "unclosed_quote",                 # a quoted value that never closed
+    "truncated_feature_key",          # a key longer than its 15-column field
+                                      # ran into the location: read by column
 )
 
 
@@ -959,16 +961,23 @@ def _feature_table(lines: "list[str]", r: _Rec) -> "list[_Feat]":
         if not raw:
             continue
         tabs = "\t" in raw
+        # `sv` is the line's TEXT for a qualifier value: a TAB inside a value
+        # is data (Biopython keeps it), so only the layout copy is expanded —
+        # and only a tab in the INDENT says the layout isn't the standard one.
+        sv = raw.lstrip()
+        lead_tabs = tabs and "\t" in raw[:len(raw) - len(sv)]
         if tabs:
             raw = raw.expandtabs(8)
         s = raw.lstrip()
         if not s:
             continue
+        if not tabs:
+            sv = s
         indent = len(raw) - len(s)
-        col_key = tabs or bool(raw[2:21].strip())   # the fixed-column reading
+        col_key = lead_tabs or bool(raw[2:21].strip())   # fixed-column reading
         if open_q is not None:
             if not (indent < 21 and _is_feature_start(s)):
-                open_q[1].append(s)
+                open_q[1].append(sv)
                 if s[-1] == '"':
                     open_q[2] = False
                     open_q = None
@@ -995,11 +1004,21 @@ def _feature_table(lines: "list[str]", r: _Rec) -> "list[_Feat]":
             # Junk in front of a qualifier (`"   /codon_start=1`, a stray
             # character where the indent was): the qualifier is the line.
             # Biopython reads the qualifier column and never sees the junk.
+            #
+            # Only text LEFT of the qualifier column can be junk. A line that
+            # starts at (or right of) that column is a value's continuation —
+            # Biopython's reading — even when a word on it starts with `/`:
+            # a wrapped `/note` line ending in an escaped `""` looks closed,
+            # and `(aph) / ""AmpR"" (bla)` on the next line was cut into junk
+            # plus a qualifier with an EMPTY name, which the next save wrote
+            # back permanently (audit 2026-10-23).
             sp = s.find(" ")
             if sp > 0 and s[sp:].lstrip().startswith("/") and (
+                    indent < (q_ind if q_ind is not None else 21)) and (
                     cur is not None or not _KEY_CHARS_RE.fullmatch(s[:sp])):
                 _warn(f"Text in front of a qualifier dropped: {s[:sp]!r}")
                 s = s[sp:].lstrip()
+                sv = s
                 # Its column is where the qualifier starts, not where the
                 # junk did: the first qualifier line sets the column every
                 # later line is judged by.
@@ -1013,7 +1032,7 @@ def _feature_table(lines: "list[str]", r: _Rec) -> "list[_Feat]":
                 continue
             if q_ind is None:
                 q_ind = indent
-            q = _qualifier_start(s)
+            q = _qualifier_start(sv)
             cur.quals.append(q)
             if q[2]:
                 open_q = q
@@ -1029,6 +1048,27 @@ def _feature_table(lines: "list[str]", r: _Rec) -> "list[_Feat]":
             k = k_ind if k_ind is not None else 5   # set by the first feature
             threshold = (k + (q_ind if q_ind is not None else k + 16)) // 2 + 1
             is_key = indent < threshold and _KEY_CHARS_RE.fullmatch(tok) is not None
+        # A key with no location of its own (`origin_of_replic230` is all
+        # key characters — digits are allowed in a key) is the same glued
+        # shape when a location starts at column 22.
+        glued = (None if (is_key and sp >= 0) or tabs or indent >= 21
+                 else _glued_key(raw, indent))
+        if glued is not None:
+            # A key too long for its 15-column field ran into the location
+            # (`     origin_of_replic500..900` — Biopython's writer truncates
+            # the key to fill columns 6-21 and appends the location with no
+            # space). As one token it is no key, so the line used to be
+            # glued into the PREVIOUS feature's last qualifier and the
+            # feature vanished; Biopython reads it by column. Read it by
+            # column too, and say the key arrived truncated.
+            if k_ind is None:
+                k_ind = indent
+            r.repairs.append("truncated_feature_key")
+            _warn(f"Feature key ran into its location — read as "
+                  f"{glued[0]!r} (the writer truncated a longer key)")
+            cur = _Feat(glued[0], glued[1])
+            feats.append(cur)
+            continue
         if is_key and indent == 0 and tok in _HEADER_KEYS:
             # A header keyword inside the table (`COMMENT` written after the
             # features): it and its continuation lines are text, never a
@@ -1053,9 +1093,9 @@ def _feature_table(lines: "list[str]", r: _Rec) -> "list[_Feat]":
         last = cur.quals[-1]
         if last[1] is None:
             _warn(f"/{last[0]} takes no value, but text follows it: {s[:80]!r}")
-            last[1] = [s]
+            last[1] = [sv]
         else:
-            last[1].append(s)
+            last[1].append(sv)
     if open_q is not None:
         r.repairs.append("unclosed_quote")
         _warn(f"/{open_q[0]} never closes its quotes")
@@ -1064,6 +1104,20 @@ def _feature_table(lines: "list[str]", r: _Rec) -> "list[_Feat]":
         r.repairs.append("feature_table_layout")
         _warn("Feature table not in the standard columns — read by layout")
     return feats
+
+
+def _glued_key(raw: str, indent: int) -> "tuple[str, str] | None":
+    """``(key, location)`` for a feature line whose key ran into its location
+    with no space — what a writer emits for a key longer than the 15-column
+    field — read by the fixed columns, as Biopython reads it: the key is
+    columns 6-21, the location starts at column 22. None for anything else."""
+    if len(raw) <= 21:
+        return None
+    key, loc = raw[indent:21], raw[21:].strip()
+    if (not loc or _KEY_CHARS_RE.fullmatch(key) is None
+            or _LOC_START_RE.match(loc) is None):
+        return None
+    return key, loc
 
 
 def _is_feature_start(s: str) -> bool:
@@ -1092,6 +1146,15 @@ def _qualifier_start(s: str) -> list:
     continuation."""
     i = s.find("=")
     sp = s.find(" ")
+    if (i > 0 and 0 <= sp < i and '"' not in s[1:i]
+            and " " in s[1:i].strip() and s[i + 1:].lstrip().startswith('"')):
+        # A NAME of several words followed by `=` and a quoted value
+        # (`/Primer Tm="62.5 C"`, `/Gene Name="lacZ"` — SnapGene / GFF3 /
+        # agent-made names) is not a missing `=`: Biopython's reading, the
+        # name up to the `=`, is the right one. Taking the first word as the
+        # name made the rest of it part of the value, and the next save wrote
+        # that back for good (audit 2026-10-23).
+        sp = -1
     if i == -1 or 0 <= sp < i:
         if sp < 0:
             return [s[1:], None, False]
@@ -1450,6 +1513,10 @@ def repair_note(rec) -> "str | None":
         parts.append(f"{n} feature{'s' if n != 1 else ''} "
                      f"run{'' if n != 1 else 's'} across the origin, but the "
                      f"file marks the molecule linear")
+    n = int(rep.get("truncated_feature_key", 0) or 0)
+    if n:
+        parts.append(f"{n} feature type{'s' if n != 1 else ''} arrived cut "
+                     f"short by the program that wrote the file")
     if not parts:
         return None
     return "; ".join(parts) + " (details in the log)."

@@ -7746,3 +7746,90 @@ class TestInvertedSegmentsRoundTrip:
             inv = [(s, e) for s, e, st in entry["segments"]
                    if st == "inverted"]
             assert inv == [(40, 60)]
+
+
+# ── audit 2026-10-23: placing a LONG partial read ──────────────────────────
+# `_semiglobal_align` caps the DP at `read x window` cells, and the window is
+# the read plus ~664 bp — so the limit is quadratic in the read and bites at
+# ~7.4 kb, far below the documented 200 kb. Two things were wrong beyond the
+# cap itself: the refusal reported the FORWARD attempt's reason whatever the
+# read's orientation, and a window clipped NARROWER than the read still got
+# aligned into, which is where a perfect read came back as a mismatch with
+# invented variants.
+
+def _plasmid_and_read(n=12_000, read=8_000, at=2_000, seed=4):
+    import random
+    rng = random.Random(seed)
+    t = "".join(rng.choice("ACGT") for _ in range(n))
+    return t, t[at:at + read]
+
+
+class TestPlacingALongPartialRead:
+
+    def test_a_long_perfect_read_is_placed_on_either_strand(self):
+        """The affine DP's cell cap is QUADRATIC in read length — the window
+        is only `read + ~664` wide — so every partial read over about 7.4 kb
+        was refused, against a documented 200 kb limit: 16 of 16 perfect
+        7.5-9.5 kb reads were unverifiable, and the reverse complement of a
+        read sharing every base with the plasmid was told it shares no 16-bp
+        stretch with it. Placed with the built-in Myers engine in the read's
+        own seed-chain footprint instead (audit 2026-10-24)."""
+        t, q = _plasmid_and_read()
+        assert len(q) > 7_400, len(q)
+        for label, read in (("fwd", q), ("rc", sc._rc(q))):
+            res = sc._pick_best_rotation(read, t, is_circular=True)
+            assert res["n_matches"] == len(read), (label, res["n_matches"])
+            assert res["n_mismatches"] == 0, (label, res["n_mismatches"])
+            cov, cov_bp = sc._covered_identity(res, len(t), circular=True)
+            assert (cov, cov_bp) == (100.0, len(read)), (label, cov, cov_bp)
+
+    def test_a_long_read_still_reports_the_indel_it_carries(self):
+        """The band has to follow the read's FOOTPRINT, not its length: a
+        read missing 1 kb covers 1 kb MORE reference than it has bases, and
+        a band sized from the read reported the real deletion plus a
+        spurious insertion where it ran out."""
+        t, q = _plasmid_and_read()
+        at = len(q) // 2
+        start = t.index(q[:40])
+        read = q[:at] + t[start + at + 900:start + len(q) + 900]
+        res = sc._pick_best_rotation(read, t, is_circular=True)
+        # The gated view: the plasmid outside the read's extent is unread,
+        # not deleted. `_alignment_variants_in_axis` reports that arc too.
+        variants = sc._alignment_reportable_variants(
+            {"result": res, "axis": "target"}, len(t), circular=True)
+        assert [(v["type"], v["length"]) for v in variants] == [
+            ("deletion", 900)], variants
+
+    def test_the_band_tracks_the_footprint_not_the_read_length(self):
+        t, q = _plasmid_and_read()
+        start = t.index(q[:40])
+        # A read missing 900 bp spans 900 MORE reference than its own length.
+        read = q[:len(q) // 2] + t[start + len(q) // 2 + 900:
+                                   start + len(q) + 900]
+        band = sc._semiglobal_band(read, t)
+        assert band is not None
+        assert band[1] - band[0] >= len(read) + 900, (band, len(read))
+
+    def test_the_band_can_always_hold_the_read(self):
+        """A read crossing the origin seeds near the end of the string, so the
+        band came back clipped to less than the read's own length — nothing
+        can be placed end to end in it, and the aligner threaded the read
+        through whatever matched inside."""
+        t, _q = _plasmid_and_read()
+        wrap = t[11_500:] + t[:1_000]          # 1,500 bp across bp 0
+        b = sc._semiglobal_band(wrap, t)
+        assert b is not None
+        assert (b[1] - b[0]) >= len(wrap), (b, len(wrap))
+
+    def test_a_short_read_gets_a_band_around_where_it_came_from(self):
+        t, _q = _plasmid_and_read()
+        read = t[5_000:5_800]
+        b = sc._semiglobal_band(read, t)
+        assert b is not None and b[0] <= 5_000 and b[1] >= 5_800
+        assert (b[1] - b[0]) <= len(read) + 4 * sc._SEMIGLOBAL_WINDOW_PAD
+
+    def test_no_seed_is_a_refusal_not_a_guess(self):
+        """Nothing shared means the read cannot be placed — the band must say
+        so rather than return an arbitrary stretch of the plasmid."""
+        t, _q = _plasmid_and_read()
+        assert sc._semiglobal_band("ACGT" * 400, "A" * 12_000) is None

@@ -603,3 +603,16 @@ class TestDehydrateHookWiring:
         sc._save_library([{"id": "p2", "name": "p2", "gb_text": GB}])
         raw = json.loads(sc._state._LIBRARY_FILE.read_text(encoding="utf-8"))
         assert raw["entries"][0].get("gb_text") == GB
+
+
+def test_gc_keeps_a_blob_named_by_a_field_this_build_does_not_know():
+    """A newer build's blob-backed field (`*_ref`) rides through saves here
+    untouched; quarantining its blob lost that data on a downgrade → upgrade
+    round trip (audit 2026-10-23, D8)."""
+    ref = sc._blob_write(GB)
+    _age(sc._blob_path(ref), sc._BLOB_GC_GRACE_SECONDS + 100)
+    sc._state._LIBRARY_FILE.write_text(json.dumps({
+        "_schema_version": 1,
+        "entries": [{"id": "e0", "future_feature_ref": ref}]}))
+    assert sc._gc_orphan_blobs() == 0
+    assert sc._blob_path(ref).is_file()

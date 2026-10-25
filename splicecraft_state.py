@@ -88,8 +88,13 @@ _MIRROR_DIRTY_RECOVERY_NAME: "str | None" = None
 _MIRROR_DIRTY_RECOVERY_KINDS: "set[str]" = set()
 _SPELLCHECK_ENGINE: "_Any | None" = None
 _WHATS_NEW_CACHE: "tuple[str, float, str] | None" = None  # (path, mtime, body_md)
-_collection_sync_pending: "tuple[str, list[dict]] | None" = None
+_collection_sync_pending: "tuple[str, list[dict], int] | None" = None
 _collection_sync_thread: "threading.Thread | None" = None
+# Per mirror kind: the sequence number of the latest live-file write whose
+# container mirror was deferred (`_mark_mirror_pending`). A deferred mirror
+# clears the marker only when it carries the CURRENT number, so a mirror that
+# lands after a newer write was raised cannot declare the files in agreement.
+_mirror_pending_seq: "dict[str, int]" = {}
 _feature_library_index_cache: "tuple[int, dict[tuple[str, str], str]] | None" = None
 _features_generation: int = 0
 _primer_usage_cache: "dict[str, int] | None" = None
@@ -335,6 +340,22 @@ _SNAPSHOT_DIR_NAME: str = "snapshots"
 # registration regression is caught loudly by test_blob_store, not silently.
 _dehydrate_entries_hook: "_Callable[[list], list] | None" = None
 _dehydrate_collections_hook: "_Callable[[list], list] | None" = None
+# Called by `_safe_save_json` with ``(path, entries)`` — the caller's own
+# (hydrated) entries — after every save that leaves `path` holding them
+# (written, or found already identical on disk). The hub uses it to know what
+# the library file holds, so the exit path can tell a library-cache change
+# whose disk write never ran (a worker cancelled by the exit) from one that
+# landed. Must not raise; None during the import window.
+_json_saved_hook: "_Callable[[_Any, list], None] | None" = None
+# Data files that EXIST but could not be read when loaded this session
+# (`_safe_load_json` refused them without touching disk). `_safe_save_json`
+# refuses to overwrite them until a later load reads them: the in-memory
+# state is empty for that file, and saving it would replace the user's data
+# the moment the file became readable again.
+_UNREADABLE_AT_LOAD: "set[str]" = set()
+# The library entries last read from or written to `plasmid_library.json`
+# (hub bookkeeping for the exit flush above). None until the first load.
+_library_disk_snapshot: "list | None" = None
 
 
 # ── The data-layer save lock (Phase D) ─────────────────────────────────────
@@ -580,6 +601,11 @@ _trace_verification_summary_hook: "_Callable[..., _Any]" = _deferred_agent_hook_
 # travel to the agent sibling through hooks, like the rest of the read engine.
 _alignment_variants_in_axis_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
 _variant_phred_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+# `verify-against-reads` needs the inverted spans in target coordinates to ask
+# "is anything wrong BESIDES the orientation" — the question the `inverted`
+# verdict rests on. Reached through a hook rather than re-parsed, because two
+# readings of `inverted_segments` are two readings that can disagree.
+_inverted_spans_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
 _reset_master_delete_cache_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
 _bulk_export_collection_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
 _blast_search_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered

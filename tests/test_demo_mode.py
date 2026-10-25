@@ -210,6 +210,42 @@ class TestDemoModeQA:
 
 
 class TestDemoSeed:
+    async def test_seed_touches_widgets_only_from_the_ui_thread(
+            self, monkeypatch):
+        """The seed runs in a thread worker, and it repopulated the library
+        table and scheduled the canvas load straight from that thread —
+        DataTable surgery off the event loop, on the public web demo
+        (audit 2026-10-23)."""
+        import threading
+        seen: "dict[str, set]" = {"repopulate": set(), "apply": set()}
+        real_repop = sc.LibraryPanel._repopulate
+        real_apply = sc.PlasmidApp._apply_record
+
+        def repop(self, *a, **k):
+            seen["repopulate"].add(threading.get_ident())
+            return real_repop(self, *a, **k)
+
+        def apply(self, *a, **k):
+            seen["apply"].add(threading.get_ident())
+            return real_apply(self, *a, **k)
+        monkeypatch.setattr(sc.LibraryPanel, "_repopulate", repop)
+        monkeypatch.setattr(sc.PlasmidApp, "_apply_record", apply)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            ui = threading.get_ident()
+            await pilot.pause()
+            seen["repopulate"].clear()
+            seen["apply"].clear()
+            app._seed_demo_data()
+            try:
+                await app.workers.wait_for_complete()
+            except Exception:
+                pass
+            for _ in range(5):
+                await pilot.pause()
+        assert seen["repopulate"] and seen["apply"], seen
+        assert seen["repopulate"] == {ui} and seen["apply"] == {ui}, seen
+
     async def test_seed_populates_demo_library(self):
         app = sc.PlasmidApp()
         async with app.run_test(size=(120, 40)) as pilot:

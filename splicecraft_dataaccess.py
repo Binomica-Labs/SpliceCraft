@@ -1210,6 +1210,42 @@ def _mark_mirror_dirty(reason: str, kind: str = "library") -> None:
         _log.exception("Could not write the %s mirror-dirty marker", kind)
 
 
+_MIRROR_SEQ_LOCK = __import__("threading").Lock()
+
+
+def _mark_mirror_pending(kind: str = "library") -> int:
+    """Raise the mirror-dirty marker BEFORE a live-file write whose container
+    mirror is deferred to a background thread; returns the sequence number
+    that deferred mirror must carry to `_clear_mirror_pending`.
+
+    Until audit 2026-10-23 the marker was written only when a mirror FAILED,
+    so a hard kill, OOM or power loss between the live write and the deferred
+    mirror left no trace: the next launch restored the live file FROM the
+    stale container as an ordinary mirror swap and the save was silently
+    reverted (measured: lost at 0.05 s and 0.15 s after a save of a
+    2,500-plasmid library). Quiet — this is the normal path, not a failure."""
+    with _MIRROR_SEQ_LOCK:
+        seq = _state._mirror_pending_seq.get(kind, 0) + 1
+        _state._mirror_pending_seq[kind] = seq
+    try:
+        _atomic_write_text(_mirror_dirty_path(kind),
+                           f"pending deferred mirror #{seq}\n")
+    except BaseException:                      # noqa: BLE001 - never mask
+        _log.exception("Could not write the %s mirror-pending marker", kind)
+    return seq
+
+
+def _clear_mirror_pending(seq: int, kind: str = "library") -> bool:
+    """Drop the marker after a deferred mirror carrying `seq` landed — but
+    only when no newer deferred write has raised it since. Returns whether
+    it was cleared."""
+    with _MIRROR_SEQ_LOCK:
+        if _state._mirror_pending_seq.get(kind, 0) != seq:
+            return False
+        _clear_mirror_dirty(kind)
+        return True
+
+
 def _clear_mirror_dirty(kind: str = "library") -> None:
     """Drop the marker once the two files agree again."""
     try:
@@ -1278,7 +1314,18 @@ def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
     save from drifting library.json vs collections.json). The migration + mirror
     + cache-busts stay hub-side via `_state` hooks."""
     with _state._cache_lock:
-        _safe_save_json(_state._LIBRARY_FILE, entries, "Plasmid library")
+        pending = None
+        if async_sync:
+            # The mirror below is deferred: raise the marker before the live
+            # write, so a kill before the mirror lands cannot be read at the
+            # next launch as "the collection is current" (D1).
+            pending = (_mirror_is_dirty(), _mark_mirror_pending())
+        try:
+            _safe_save_json(_state._LIBRARY_FILE, entries, "Plasmid library")
+        except BaseException:
+            if pending is not None and not pending[0]:
+                _clear_mirror_pending(pending[1])
+            raise
         # Deep-copy into the cache so it's independent of the caller's reference.
         _state._library_cache = _typed_clone(entries)
         # Mirror into the active collection — hub-side (async worker subsystem),
@@ -1287,6 +1334,11 @@ def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
         if _mirror is not None:
             try:
                 wrote = _mirror(entries, async_write=async_sync)
+                if wrote is False and pending is not None and not pending[0]:
+                    # No collection receives a deferred mirror: take back the
+                    # marker raised before the write (see below for why one
+                    # must not be left behind).
+                    _clear_mirror_pending(pending[1])
                 if wrote is False:
                     # Nothing received these entries (no collection active, or
                     # the active one is gone), so the two files do NOT agree —
@@ -1319,6 +1371,34 @@ def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
     _after = getattr(_state, "_after_library_save_hook", None)
     if _after is not None:
         _after()
+
+
+def _library_append_unique(entries: "list[dict]") -> "list[dict]":
+    """Append `entries` to the library as ONE read-modify-write under
+    `_cache_lock`, bumping any `id` the library already holds to
+    ``<id>_2``, ``<id>_3``, … (in place on the entries, which come back).
+
+    Three importers — the Plasmidsaurus fetch worker, the agent's
+    `download-plasmidsaurus`, the Sanger "Add to library" button — each did
+    `_load_library()` → append → `_save_library()` without the lock, so a
+    save from another thread (the UI, an agent request) landing in between
+    was overwritten by the importer's older copy (audit 2026-10-23). The id
+    bump keeps `id` the canonical key: a duplicate would make a later
+    delete-by-id remove BOTH copies. The mirror is synchronous on purpose —
+    the importers report success only once both files hold the entries."""
+    with _state._cache_lock:
+        lib = _load_library()
+        seen = {e.get("id") for e in lib if isinstance(e, dict)}
+        for e in entries:
+            base = e["id"]
+            n = 1
+            while e["id"] in seen:
+                n += 1
+                e["id"] = f"{base}_{n}"
+            seen.add(e["id"])
+            lib.append(e)
+        _save_library(lib)
+    return entries
 
 
 def _load_collections() -> list[dict]:
@@ -1834,6 +1914,24 @@ def _iter_library_readonly() -> list[dict]:
     return _state._library_cache
 
 
+def _library_cache_snapshot() -> list:
+    """The published library list, populated + migrated, read WITHOUT the
+    lock. Writers reseat `_state._library_cache` and never mutate a
+    published list or entry (pitfall #17), so a walk over this snapshot is
+    consistent: it answers what it would have answered a moment earlier.
+    Holding `_cache_lock` for the walk made every UI lookup wait out a whole
+    Ctrl+S library write (audit 2026-10-23). A bust between the ensure and
+    the read (cache reset to None) re-populates once."""
+    for _ in range(2):
+        _ensure = _state._ensure_library_hook
+        if _ensure is not None:
+            _ensure()
+        cache = _state._library_cache
+        if cache is not None:
+            return cache
+    return []
+
+
 def _find_library_entry_by_id(entry_id: "str | None") -> "dict | None":
     """Return a deep-clone of the library entry whose ``id`` matches,
     or ``None`` if no match. Accepts ``None`` / non-string / empty
@@ -1843,10 +1941,10 @@ def _find_library_entry_by_id(entry_id: "str | None") -> "dict | None":
     ``next((e for e in _load_library() if e.get("id") == X), None)``,
     which clones the ENTIRE library on every lookup. On a 100+ MB
     library this is multi-second per click for status changes,
-    history-viewer opens, picker dismisses. This helper takes
-    ``_cache_lock``, walks ``_state._library_cache`` directly, and clones
-    only the matched entry — O(N) walk with O(1) cloned bytes
-    instead of O(N) cloned bytes.
+    history-viewer opens, picker dismisses. This helper walks the
+    published cache (lock-free since 2026-10-23, see
+    ``_library_cache_snapshot``) and clones only the matched entry —
+    O(N) walk with O(1) cloned bytes instead of O(N) cloned bytes.
 
     Returns a deep copy of the entry so callers can mutate freely
     without poisoning the cache (same contract as ``_load_library``
@@ -1857,14 +1955,9 @@ def _find_library_entry_by_id(entry_id: "str | None") -> "dict | None":
     """
     if not isinstance(entry_id, str) or not entry_id:
         return None
-    _ensure = _state._ensure_library_hook
-    if _ensure is not None:
-        _ensure()
-    assert _state._library_cache is not None
-    with _state._cache_lock:
-        for e in _state._library_cache:
-            if e.get("id") == entry_id:
-                return _typed_clone(e)
+    for e in _library_cache_snapshot():
+        if e.get("id") == entry_id:
+            return _typed_clone(e)
     return None
 
 
@@ -1882,14 +1975,9 @@ def _find_library_entry_by_name(entry_name: str) -> "dict | None":
     """
     if not isinstance(entry_name, str) or not entry_name:
         return None
-    _ensure = _state._ensure_library_hook
-    if _ensure is not None:
-        _ensure()
-    assert _state._library_cache is not None
-    with _state._cache_lock:
-        for e in _state._library_cache:
-            if e.get("name") == entry_name:
-                return _typed_clone(e)
+    for e in _library_cache_snapshot():
+        if e.get("name") == entry_name:
+            return _typed_clone(e)
     return None
 
 
@@ -1983,10 +2071,10 @@ def _find_collection(name: str) -> "dict | None":
     """
     if not isinstance(name, str) or not name:
         return None
-    with _state._cache_lock:
-        for c in _iter_collections_readonly():
-            if isinstance(c, dict) and c.get("name") == name:
-                return _typed_clone(c)
+    # Lock-free, for the reason `_library_cache_snapshot` gives.
+    for c in _iter_collections_readonly():
+        if isinstance(c, dict) and c.get("name") == name:
+            return _typed_clone(c)
     return None
 
 

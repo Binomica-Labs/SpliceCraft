@@ -13,6 +13,7 @@ import re
 from rich.text import Text
 from textual.coordinate import Coordinate as _Coordinate
 from textual.events import MouseDown
+from textual import work as _textual_work
 from textual.widgets import Button, DataTable, DirectoryTree, Input, Static
 
 from splicecraft_logging import _log
@@ -22,6 +23,24 @@ from splicecraft_util import (
     _xterm_index_to_hex as _xterm_index_to_hex,
 )
 from splicecraft_dataaccess import _load_feature_colors
+
+
+def _safe_work(method=None, /, **kwargs):
+    """Textual's ``@work`` with ``exit_on_error=False`` as the DEFAULT.
+
+    Textual's own default ENDS THE APP when an exception escapes a worker
+    (`app._handle_exception(WorkerFailed)`), taking unsaved edits with it;
+    `PlasmidApp._on_worker_state_changed` — the log + toast safety net
+    written for exactly that case — only ever ran after the shutdown had
+    begun (audit 2026-10-23: an error raised in the autosave worker's
+    deepcopy exited the app with return code 1). With this default the
+    worker ends in its ERROR state, the net reports it, and the session
+    lives on. A worker that genuinely should take the app down can still
+    pass ``exit_on_error=True``. Hub and modals bind this as ``work``."""
+    kwargs.setdefault("exit_on_error", False)
+    if method is None:
+        return _textual_work(**kwargs)
+    return _textual_work(method, **kwargs)
 
 
 class _InstantPressButton(Button):
@@ -662,3 +681,351 @@ _PLASMID_STATUS_COLORS: dict[str, str] = {
     "VERIFIED":   "#4EBF71",   # green (matches success accent)
     "ERROR":      "#FF5C5C",   # red  (matches error/divergent accent)
 }
+
+
+# ── Virtualised row table ────────────────────────────────────────────────────
+
+from rich.segment import Segment as _Segment          # noqa: E402
+from textual import events as _events                 # noqa: E402
+from textual.binding import Binding as _Binding       # noqa: E402
+from textual.geometry import Size as _Size            # noqa: E402
+from textual.message import Message as _Message       # noqa: E402
+from textual.scroll_view import ScrollView as _ScrollView  # noqa: E402
+from textual.strip import Strip as _Strip             # noqa: E402
+
+# C0 / DEL / C1 control characters. A cell is written to the terminal
+# verbatim, so an escape byte in a feature label (a file is untrusted input)
+# would reach the terminal as a live control sequence.
+_VRT_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+class _VirtualColumn:
+    """One column of a `_VirtualRowTable`: a header label and the width the
+    cells are drawn at. `width` IS the rendered width (cells are truncated
+    with an ellipsis or padded to it)."""
+
+    __slots__ = ("key", "label", "width")
+
+    def __init__(self, key: str, label: str, width: int) -> None:
+        self.key = key
+        self.label = label
+        self.width = max(0, int(width))
+
+
+class _VirtualRowTable(_ScrollView, can_focus=True):
+    """A row-cursor table that only ever draws the rows on screen.
+
+    Textual's `DataTable` materialises every row: `add_row` builds per-row
+    bookkeeping, and the next idle pass renders AND measures every cell of
+    every new row (`_update_dimensions`). That is roughly 200 µs a row, so a
+    50,000-feature chromosome took seconds to list — and the Features sidebar
+    re-lists on every map rotation, because rotating re-sorts it.
+
+    This table keeps no per-row objects. The owner supplies a row count and a
+    `row_cells(i)` callback returning the cells of display row `i`, and gives
+    every column an explicit width; `render_line` draws only the visible
+    lines. Replacing or re-ordering the rows is therefore O(1) here — the
+    owner's own sort is the only O(n) work left.
+
+    Messages carry the click's modifiers, because the owner needs them and a
+    parent cannot see the `Click` itself (the table consumes it):
+
+    * `RowHighlighted(table, cursor_row, shift=)` — the cursor moved to a
+      different row (keyboard, click, or `move_cursor`).
+    * `RowSelected(table, cursor_row, shift=, chain=)` — a click on the row
+      the cursor is already on (`chain` >= 2 for a double-click), or Enter.
+
+    Header geometry matches `DataTable`: the header is screen line 0 and data
+    row `i` is drawn at line `i + 1 - scroll_y`.
+    """
+
+    DEFAULT_CSS = """
+    _VirtualRowTable {
+        background: $surface;
+        color: $foreground;
+        height: auto;
+        max-height: 100%;
+    }
+    _VirtualRowTable:focus {
+        background-tint: $foreground 5%;
+    }
+    _VirtualRowTable > .vrt--header {
+        text-style: bold;
+        background: $panel;
+        color: $foreground;
+    }
+    _VirtualRowTable > .vrt--even-row {
+        background: $surface-lighten-1 50%;
+    }
+    _VirtualRowTable:dark > .vrt--even-row {
+        background: $surface-darken-1 40%;
+    }
+    _VirtualRowTable > .vrt--odd-row {
+    }
+    _VirtualRowTable > .vrt--cursor {
+        background: $block-cursor-blurred-background;
+        color: $block-cursor-blurred-foreground;
+        text-style: $block-cursor-blurred-text-style;
+    }
+    _VirtualRowTable:focus > .vrt--cursor {
+        background: $block-cursor-background;
+        color: $block-cursor-foreground;
+        text-style: $block-cursor-text-style;
+    }
+    """
+
+    COMPONENT_CLASSES = {
+        "vrt--header", "vrt--cursor", "vrt--even-row", "vrt--odd-row",
+    }
+
+    BINDINGS = [
+        _Binding("enter", "select_cursor", "Select", show=False),
+        _Binding("up", "cursor_up", "Cursor up", show=False),
+        _Binding("down", "cursor_down", "Cursor down", show=False),
+        _Binding("pageup", "page_up", "Page up", show=False),
+        _Binding("pagedown", "page_down", "Page down", show=False),
+        _Binding("ctrl+home", "cursor_top", "Top", show=False),
+        _Binding("ctrl+end", "cursor_bottom", "Bottom", show=False),
+        _Binding("home", "cursor_top", "Top", show=False),
+        _Binding("end", "cursor_bottom", "Bottom", show=False),
+        _Binding("left", "scroll_left", "Scroll left", show=False),
+        _Binding("right", "scroll_right", "Scroll right", show=False),
+    ]
+
+    CELL_PADDING = 1
+
+    class RowHighlighted(_Message):
+        def __init__(self, table: "_VirtualRowTable", cursor_row: int,
+                     *, shift: bool = False) -> None:
+            self.table = table
+            self.cursor_row = cursor_row
+            self.shift = bool(shift)
+            super().__init__()
+
+        @property
+        def control(self) -> "_VirtualRowTable":
+            return self.table
+
+    class RowSelected(_Message):
+        def __init__(self, table: "_VirtualRowTable", cursor_row: int,
+                     *, shift: bool = False, chain: int = 1) -> None:
+            self.table = table
+            self.cursor_row = cursor_row
+            self.shift = bool(shift)
+            self.chain = int(chain)
+            super().__init__()
+
+        @property
+        def control(self) -> "_VirtualRowTable":
+            return self.table
+
+    def __init__(self, *, zebra_stripes: bool = True, show_header: bool = True,
+                 name: "str | None" = None, id: "str | None" = None,
+                 classes: "str | None" = None,
+                 disabled: bool = False) -> None:
+        super().__init__(name=name, id=id, classes=classes, disabled=disabled)
+        self.zebra_stripes = bool(zebra_stripes)
+        self.show_header = bool(show_header)
+        self.columns: "dict[str, _VirtualColumn]" = {}
+        self._row_count = 0
+        self._row_cells = None
+        self._cursor_row = 0
+
+    # ── data ────────────────────────────────────────────────────────────────
+
+    def add_columns(self, *labels: str) -> "list[str]":
+        """Add columns sized to their header label; set real widths with
+        `set_column_widths`."""
+        keys: "list[str]" = []
+        for label in labels:
+            key = f"col{len(self.columns)}"
+            self.columns[key] = _VirtualColumn(key, str(label), len(str(label)))
+            keys.append(key)
+        self._update_virtual_size()
+        return keys
+
+    def set_column_widths(self, widths) -> None:
+        for col, w in zip(self.columns.values(), widths):
+            col.width = max(0, int(w))
+        self._update_virtual_size()
+        self.refresh()
+
+    def set_rows(self, row_count: int, row_cells) -> None:
+        """Replace every row. `row_cells(i)` returns the cells of display row
+        `i` (a `Text` or anything `str()`-able per column); it is only called
+        for rows being drawn. The cursor returns to row 0 without posting
+        `RowHighlighted` — like `DataTable.clear()` + re-add, a repopulate is
+        not a user move."""
+        self._row_count = max(0, int(row_count))
+        self._row_cells = row_cells
+        self._cursor_row = 0
+        self._update_virtual_size()
+        self.scroll_to(x=0, y=0, animate=False, force=True)
+        self.refresh()
+
+    def clear(self) -> "_VirtualRowTable":
+        self.set_rows(0, None)
+        return self
+
+    @property
+    def row_count(self) -> int:
+        return self._row_count
+
+    @property
+    def cursor_row(self) -> int:
+        return self._cursor_row
+
+    def _total_width(self) -> int:
+        pad = 2 * self.CELL_PADDING
+        return sum(c.width + pad for c in self.columns.values())
+
+    def _header_height(self) -> int:
+        return 1 if self.show_header else 0
+
+    def _update_virtual_size(self) -> None:
+        self.virtual_size = _Size(self._total_width(),
+                                  self._row_count + self._header_height())
+
+    def _body_height(self) -> int:
+        return max(1, self.scrollable_content_region.height
+                   - self._header_height())
+
+    # ── cursor ──────────────────────────────────────────────────────────────
+
+    def move_cursor(self, *, row: "int | None" = None, animate: bool = False,
+                    scroll: bool = True) -> None:
+        """Programmatic cursor move. Posts `RowHighlighted` when the row
+        changes, exactly like `DataTable.move_cursor` (owners that drive it
+        from elsewhere suppress the echo themselves)."""
+        if row is None:
+            return
+        self._set_cursor(row, scroll=scroll)
+
+    def _set_cursor(self, row: int, *, shift: bool = False,
+                    scroll: bool = True) -> None:
+        if self._row_count <= 0:
+            self._cursor_row = 0
+            return
+        row = max(0, min(self._row_count - 1, int(row)))
+        old = self._cursor_row
+        self._cursor_row = row
+        if scroll:
+            self._scroll_cursor_into_view()
+        if row != old:
+            self.refresh()
+            self.post_message(self.RowHighlighted(self, row, shift=shift))
+
+    def _scroll_cursor_into_view(self) -> None:
+        top = int(self.scroll_offset.y)
+        body = self._body_height()
+        row = self._cursor_row
+        if row < top:
+            self.scroll_to(y=row, animate=False, force=True)
+        elif row >= top + body:
+            self.scroll_to(y=row - body + 1, animate=False, force=True)
+
+    def action_cursor_up(self) -> None:
+        self._set_cursor(self._cursor_row - 1)
+
+    def action_cursor_down(self) -> None:
+        self._set_cursor(self._cursor_row + 1)
+
+    def action_page_up(self) -> None:
+        self._set_cursor(self._cursor_row - self._body_height())
+
+    def action_page_down(self) -> None:
+        self._set_cursor(self._cursor_row + self._body_height())
+
+    def action_cursor_top(self) -> None:
+        self._set_cursor(0)
+
+    def action_cursor_bottom(self) -> None:
+        self._set_cursor(self._row_count - 1)
+
+    def action_select_cursor(self) -> None:
+        if 0 <= self._cursor_row < self._row_count:
+            self.post_message(self.RowSelected(self, self._cursor_row))
+
+    async def _on_click(self, event: _events.Click) -> None:
+        offset = event.get_content_offset(self)
+        if offset is None:
+            return
+        header = self._header_height()
+        if offset.y < header:
+            return
+        row = int(self.scroll_offset.y) + offset.y - header
+        if not 0 <= row < self._row_count:
+            return
+        event.stop()
+        # Ctrl is a Shift synonym: many terminals keep Shift+click for their
+        # own text selection.
+        shift = bool(getattr(event, "shift", False)
+                     or getattr(event, "ctrl", False))
+        chain = int(getattr(event, "chain", 1) or 1)
+        if row == self._cursor_row:
+            self.post_message(self.RowSelected(self, row, shift=shift,
+                                               chain=chain))
+        else:
+            self._set_cursor(row, shift=shift)
+
+    # ── rendering ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _cell_text(cell) -> Text:
+        if isinstance(cell, Text):
+            text = cell.copy()
+            if not text.plain.isprintable():
+                text = Text(_VRT_CONTROL_RE.sub("?", text.plain),
+                            style=text.style)
+            return text
+        s = "" if cell is None else str(cell)
+        if not s.isprintable():
+            s = _VRT_CONTROL_RE.sub("?", s)
+        return Text(s)
+
+    def _line_text(self, cells, header: bool = False) -> Text:
+        pad = " " * self.CELL_PADDING
+        line = Text(no_wrap=True, overflow="crop", end="")
+        cols = list(self.columns.values())
+        if header:
+            cells = [c.label for c in cols]
+        for col, cell in zip(cols, cells):
+            t = self._cell_text(cell)
+            t.truncate(col.width, overflow="ellipsis", pad=True)
+            line.append(pad)
+            line.append_text(t)
+            line.append(pad)
+        return line
+
+    def render_line(self, y: int) -> _Strip:
+        width = self.size.width
+        scroll_x, scroll_y = self.scroll_offset
+        base = self.rich_style
+        header = self._header_height()
+        if header and y == 0:
+            style = base + self.get_component_rich_style("vrt--header")
+            text = self._line_text([], header=True)
+            post = None
+        else:
+            row = scroll_y + y - header
+            if not (0 <= row < self._row_count) or self._row_cells is None:
+                return _Strip.blank(width, base)
+            try:
+                cells = self._row_cells(row)
+            except Exception:
+                _log.exception("_VirtualRowTable: row_cells(%d) failed", row)
+                cells = ()
+            text = self._line_text(cells)
+            if row == self._cursor_row:
+                style = base
+                post = self.get_component_rich_style("vrt--cursor")
+            else:
+                stripe = ("vrt--even-row" if row % 2 == 0 else "vrt--odd-row")
+                style = (base + self.get_component_rich_style(stripe)
+                         if self.zebra_stripes else base)
+                post = None
+        segments = list(_Segment.apply_style(
+            text.render(self.app.console), style, post))
+        fill = style + post if post is not None else style
+        strip = _Strip(segments).crop_extend(scroll_x, scroll_x + width, fill)
+        return strip.apply_offsets(scroll_x, y)

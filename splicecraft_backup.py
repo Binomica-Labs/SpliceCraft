@@ -1257,6 +1257,8 @@ def _validate_snapshot_member(snap_path: Path, name: str) -> "Path | None":
 def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
                                   *,
                                   backup_dir: "Path | None" = None,
+                                  exclude_dir_attrs: "frozenset[str]" = frozenset(),
+                                  all_or_nothing: bool = False,
                                   ) -> dict:
     """Restore a pre-update snapshot. Each canonical JSON is replaced
     via the temp-file + os.replace pattern (same as `_safe_save_json`).
@@ -1283,9 +1285,15 @@ def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
       * Directory restore rolls back fully on partial copytree:
         delete the partial target, then rename stash back.
 
+    ``all_or_nothing`` (the migrate import) replaces nothing unless
+    everything can land — see `_restore_snapshot_all_or_nothing`. The
+    default stays per item, because rolling back an update must restore
+    every file it can (`test_restore_verifies_sha256_and_refuses_corrupted`).
+
     Returns a summary dict:
         {pre_restore_snapshot, restored_files, restored_dirs,
-         failed: [(name, reason), ...]}
+         failed: [(name, reason), ...]}  (+ ``aborted`` when all-or-nothing
+         gave up)
     Raises FileNotFoundError if the snapshot id doesn't exist.
     Raises ValueError on unsupported schema version.
     """
@@ -1350,7 +1358,22 @@ def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
     # Whitelists: the manifest CANNOT name an attribute or path
     # outside our published user-data set. Tamper-resistance.
     file_attrs = set(_USER_DATA_FILE_ATTRS)
-    dir_attrs = set(_USER_DATA_DIR_ATTRS)
+    # `exclude_dir_attrs`: directories this restore must leave alone even
+    # when the snapshot carries them (a migrate archive's `plugins/`).
+    dir_attrs = set(_USER_DATA_DIR_ATTRS) - set(exclude_dir_attrs)
+
+    if all_or_nothing:
+        # One `_cache_lock` hold from the pre-restore snapshot to the last
+        # replace: nothing written in between can be missing from the undo
+        # point and then overwritten by the restore.
+        with _state._cache_lock:
+            pre_restore = _create_pre_update_snapshot(
+                f"{_state._sc_version}-pre-restore", backup_dir=backup_dir)
+            return _restore_snapshot_all_or_nothing(
+                snap_path, manifest, file_attrs, dir_attrs,
+                exclude_dir_attrs, {
+                    "pre_restore_snapshot": str(pre_restore),
+                    "restored_files": [], "restored_dirs": [], "failed": []})
 
     # Pre-restore snapshot — gives the user one click of undo if the
     # restored data turns out to be older than what they had.
@@ -1474,6 +1497,9 @@ def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
             continue
         attr = entry.get("attr", "")
         name = entry.get("name", "")
+        if attr in exclude_dir_attrs:
+            summary.setdefault("skipped_dirs", []).append(name or attr)
+            continue
         if attr not in dir_attrs:
             summary["failed"].append(
                 (name or "(no name)",
@@ -1500,7 +1526,6 @@ def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
         # snapshot dir lives under the sibling-update-backups path
         # which has looser perms than `_state._DATA_DIR`, so a local-
         # attacker-with-write to that parent has a plausible attack.
-        _SNAPSHOT_DIR_RESTORE_MAX_BYTES = 5 * 1024 * 1024 * 1024
         try:
             total_size = 0
             for f in src.rglob("*"):
@@ -1557,6 +1582,223 @@ def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
                 pass
             summary["failed"].append((name, str(exc)))
 
+    return summary
+
+
+# A content-addressed plasmid blob: `<sha256 of its bytes>.gb`.
+_BLOB_FILE_RE = re.compile(r"[0-9a-f]{64}\.gb")
+_SNAPSHOT_DIR_RESTORE_MAX_BYTES = 5 * 1024 * 1024 * 1024
+
+
+def _merge_blob_dir(src: Path, target: Path) -> int:
+    """Copy into the live blob store every blob `src` holds that the store
+    lacks (or holds damaged), deleting NOTHING. Returns how many were added.
+
+    The store is content-addressed — a name IS its content — so two machines'
+    stores merge without conflict, and replacing it wholesale (as the other
+    folders are) threw away this machine's blobs along with whatever still
+    referenced them. Each archive blob is hashed against its own name first,
+    so a damaged one can never become a trusted blob; quarantined blobs
+    (``.orphaned/``) come across the same way. Each copy lands through a
+    temp file + `os.replace`. A blob this store no longer needs is the GC's
+    business, never the restore's."""
+    import tempfile as _tempfile
+    added = 0
+    for f in sorted(src.rglob("*")):
+        if not f.is_file() or not _BLOB_FILE_RE.fullmatch(f.name):
+            continue
+        rel = f.relative_to(src)
+        ref = f.name[:-3]
+        if _sha256_file(f) != ref:
+            raise ValueError(f"archive blob {rel} does not match its name — "
+                             "the archive is damaged")
+        dst = target / rel
+        try:
+            if dst.is_file() and _sha256_file(dst) == ref:
+                continue
+        except OSError:
+            pass
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = _tempfile.mkstemp(prefix=f".{f.name}.", suffix=".restoring",
+                                    dir=str(dst.parent))
+        os.close(fd)
+        try:
+            shutil.copy2(f, tmp)
+            _fsync_path(Path(tmp))
+            os.replace(tmp, dst)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        added += 1
+    if added:
+        _fsync_path(target)
+    return added
+
+
+def _restore_snapshot_all_or_nothing(snap_path: Path, manifest: dict,
+                                     file_attrs: set, dir_attrs: set,
+                                     exclude_dir_attrs: "frozenset[str]",
+                                     summary: dict) -> dict:
+    """`_restore_pre_update_snapshot` for a restore that must not land half
+    (a migrate-archive import). The caller holds `_cache_lock`.
+
+    The per-item restore replaced the metadata files first and each folder
+    after, independently: a full disk during the blob copy left the archive's
+    collections pointing at blobs its rollback had just removed — every
+    imported plasmid without a sequence — and a save landing mid-import
+    could be rolled back with it (audit 2026-10-23). Here, in order:
+
+      1. every file is staged beside its target and sha256-verified;
+      2. every folder is validated;
+      3. the blob store is MERGED (`_merge_blob_dir`, add-only), then each
+         other folder is replaced, its original kept aside;
+      4. only once every folder has landed do the metadata files replace
+         theirs; then the kept originals go.
+
+    Any failure before step 4 rolls the replaced folders back, discards the
+    staged files and replaces NO metadata (``aborted`` in the summary). Blobs
+    the merge already added stay — unreferenced, for the GC — because a
+    content-addressed blob is never wrong to have."""
+    import tempfile as _tempfile
+    staged: "list[tuple[str, Path, Path]]" = []
+
+    def _abort(name: str, reason: str) -> dict:
+        for _n, tmp, _t in staged:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        summary["failed"].append((name, reason))
+        summary["restored_files"] = []
+        summary["restored_dirs"] = []
+        summary["aborted"] = True
+        _log.error("restore aborted, no data file replaced: %s — %s",
+                   name, reason)
+        return summary
+
+    files_list = manifest.get("files")
+    for entry in files_list if isinstance(files_list, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        attr, name = entry.get("attr", ""), entry.get("name", "")
+        if attr not in file_attrs:
+            return _abort(name or "(no name)", f"manifest attr {attr!r} is "
+                          "not a recognised user-data file")
+        src = _validate_snapshot_member(snap_path, name)
+        if src is None or not src.is_file():
+            return _abort(name, "snapshot member name is invalid or src absent")
+        target = _state._resolve_data_attr_hook(attr)
+        if not isinstance(target, Path):
+            return _abort(name, f"runtime attr {attr!r} is not a Path")
+        expected = entry.get("sha256")
+        if not isinstance(expected, str) or not expected:
+            return _abort(name, "manifest entry is missing the mandatory "
+                          "sha256 field — refusing restore")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_str = _tempfile.mkstemp(prefix=f".{target.name}.",
+                                            suffix=".restoring",
+                                            dir=str(target.parent))
+            os.close(fd)
+            staged.append((name, Path(tmp_str), target))
+            shutil.copy2(src, tmp_str)
+            _fsync_path(Path(tmp_str))
+            actual = _sha256_file(Path(tmp_str))
+        except (OSError, shutil.Error) as exc:
+            return _abort(name, str(exc))
+        if actual != expected:
+            return _abort(name, f"sha256 mismatch (snapshot corrupted): "
+                          f"expected {expected[:16]}…, got {actual[:16]}…")
+
+    plan: "list[tuple[str, str, Path, Path]]" = []
+    dirs_list = manifest.get("directories")
+    for entry in dirs_list if isinstance(dirs_list, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        attr, name = entry.get("attr", ""), entry.get("name", "")
+        if attr in exclude_dir_attrs:
+            summary.setdefault("skipped_dirs", []).append(name or attr)
+            continue
+        if attr not in dir_attrs:
+            return _abort(name or "(no name)", f"manifest attr {attr!r} is "
+                          "not a recognised user-data dir")
+        src = _validate_snapshot_member(snap_path, name)
+        if src is None or not src.is_dir():
+            return _abort(name, "snapshot member name is invalid or src absent")
+        target = _state._resolve_data_attr_hook(attr)
+        if not isinstance(target, Path):
+            return _abort(name, f"runtime attr {attr!r} is not a Path")
+        try:
+            total = 0
+            for f in src.rglob("*"):
+                if f.is_file():
+                    total += f.stat().st_size
+                    if total > _SNAPSHOT_DIR_RESTORE_MAX_BYTES:
+                        return _abort(name, "snapshot dir exceeds the 5 GB "
+                                      "restore cap; refused")
+        except OSError as exc:
+            return _abort(name, f"size-check failed: {exc}")
+        plan.append((attr, name, src, target))
+    # The blob store first: it is merged, so a failure anywhere after it
+    # costs nothing to undo.
+    plan.sort(key=lambda p: p[0] != "_PLASMID_BLOB_DIR")
+
+    replaced: "list[tuple[Path, Path | None, Path | None]]" = []
+    current = "(directory)"
+    try:
+        for attr, name, src, target in plan:
+            current = name
+            if attr == "_PLASMID_BLOB_DIR":
+                target.mkdir(parents=True, exist_ok=True)
+                _merge_blob_dir(src, target)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                stash_parent: "Path | None" = None
+                stashed: "Path | None" = None
+                if target.exists():
+                    stash_parent = Path(_tempfile.mkdtemp(
+                        prefix=f".{target.name}.restoring-",
+                        dir=str(target.parent)))
+                    stashed = stash_parent / target.name
+                    os.rename(target, stashed)
+                # Recorded BEFORE the copy, so the rollback also covers a
+                # copy that fails half-way.
+                replaced.append((target, stash_parent, stashed))
+                shutil.copytree(src, target)
+                _fsync_path(target.parent)
+            summary["restored_dirs"].append(name)
+    except (OSError, shutil.Error, ValueError) as exc:
+        for target, stash_parent, stashed in reversed(replaced):
+            try:
+                if target.exists():
+                    shutil.rmtree(target)
+                if stashed is not None:
+                    os.rename(stashed, target)
+                if stash_parent is not None:
+                    shutil.rmtree(stash_parent, ignore_errors=True)
+            except OSError:
+                _log.exception("restore: rolling back %s failed — the "
+                               "pre-restore snapshot holds its contents",
+                               target)
+        return _abort(current, str(exc))
+
+    for name, tmp, target in staged:
+        try:
+            os.replace(tmp, target)
+            _fsync_path(target.parent)
+            summary["restored_files"].append(name)
+        except OSError as exc:
+            summary["failed"].append((name, str(exc)))
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+    for _target, stash_parent, _stashed in replaced:
+        if stash_parent is not None:
+            shutil.rmtree(stash_parent, ignore_errors=True)
     return summary
 
 
@@ -1642,6 +1884,59 @@ def _export_migrate_archive(dest_path: "str | Path", *,
                n_dirs=n_dirs, included_hmm=bool(include_hmm))
     return {"path": str(dest), "bytes": size, "n_files": n_files,
             "n_dirs": n_dirs, "included_hmm": bool(include_hmm)}
+
+
+# Settings an imported archive must not decide for this machine — see
+# `_import_migrate_archive`.
+_MIGRATE_TRUST_SETTING_KEYS: "frozenset[str]" = frozenset({
+    "babs_home",              # a directory whose Python scripts BABS runs
+    "hmm_db_path",            # a file path the HMM scanner opens
+    "allow_online_lookups",   # egress gates
+    "allow_online_search",
+    "babs_tools_enabled",     # local-model tool use + autonomy
+    "babs_autonomy",
+    "babs_system",            # the local model's system prompt
+    "ot2_host",               # which robot the OT-2 client drives
+    "ot2_autoconnect",
+})
+
+
+def _read_trust_settings() -> "dict[str, dict]":
+    """This machine's settings.json entries for the trust keys."""
+    entries, _warn = _safe_load_json(_state._SETTINGS_FILE, "Settings")
+    return {e["key"]: dict(e) for e in entries
+            if isinstance(e, dict) and e.get("key") in _MIGRATE_TRUST_SETTING_KEYS}
+
+
+def _reapply_trust_settings(prior: "dict[str, dict]") -> "list[str]":
+    """After a restore, put back this machine's own value — or absence — for
+    every trust key; returns the keys the archive had tried to change."""
+    entries, _warn = _safe_load_json(_state._SETTINGS_FILE, "Settings")
+    out: list = []
+    changed: "list[str]" = []
+    seen: set = set()
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        k = e.get("key")
+        if k in _MIGRATE_TRUST_SETTING_KEYS:
+            seen.add(k)
+            mine = prior.get(k)
+            if mine is None or mine.get("value") != e.get("value"):
+                changed.append(k)
+            if mine is not None:
+                out.append(dict(mine))
+            continue
+        out.append(e)
+    for k, mine in prior.items():
+        if k not in seen:
+            out.append(dict(mine))
+    if changed:
+        _safe_save_json(_state._SETTINGS_FILE, out, "Settings")
+        _state._settings_cache = None
+        _log.warning("migrate import: kept this machine's settings for %s",
+                     ", ".join(sorted(changed)))
+    return sorted(changed)
 
 
 def _import_migrate_archive(zip_path: "str | Path") -> dict:
@@ -1760,7 +2055,21 @@ def _import_migrate_archive(zip_path: "str | Path") -> dict:
         # root). Hand it to the battle-tested restore: it snapshots the
         # CURRENT data first (reversible) and sha256-verifies every file
         # before the atomic replace.
-        summary = _restore_pre_update_snapshot(staging)
+        # A migrate archive is a file someone can SEND you. It must not
+        # decide, for this machine, where executable code runs from or which
+        # network / robot / tool-use gates are open: importing one adopted
+        # its settings verbatim (its own manifest vouches for its own
+        # settings.json) and installed its `plugins/` — so it could point
+        # BABS at a script it shipped, run on the next chat turn (audit
+        # 2026-10-23). Those keys keep this machine's values, and `plugins/`
+        # (reserved, holding no user data) is never taken from an archive.
+        prior_trust = _read_trust_settings()
+        # All or nothing: an archive is ONE consistent dataset, and half of
+        # it over half of this machine's is neither (audit 2026-10-23).
+        summary = _restore_pre_update_snapshot(
+            staging, exclude_dir_attrs=frozenset({"_PLUGINS_DIR"}),
+            all_or_nothing=True)
+        summary["kept_local_settings"] = _reapply_trust_settings(prior_trust)
         summary["marker"] = marker
         _log_event(
             "migrate.import.ok",

@@ -4813,3 +4813,38 @@ class TestSelfLigationInTheConstructorUI:
             # engine ligates with.
             puzzle = str(modal.query_one("#trad-puzzle-view", Static).content)
             assert "backbone re-closes without insert" in puzzle, puzzle
+
+
+class TestExcisionRefusesBeforeBuilding:
+    """A circular digest with the wrong number of cuts is refused — and it
+    built every fragment, features included, before saying so: 4 s on a
+    4 Mbp / 4,000-feature record just to return the error, paid again for
+    every enzyme pair a search tries (audit 2026-10-23)."""
+
+    @pytest.mark.parametrize("n_sites", [1, 3])
+    def test_a_wrong_cut_count_builds_no_fragments(self, monkeypatch,
+                                                   n_sites):
+        import random
+        import splicecraft_cloning as C
+        rng = random.Random(n_sites)
+        filler = lambda k: "".join(rng.choice("ACT") for _ in range(k))  # no G, so no GAATTC
+        seq = "".join(filler(300) + "GAATTC" for _ in range(n_sites)) + filler(300)
+        calls = []
+        real = C._fragments_from_cuts
+        monkeypatch.setattr(C, "_fragments_from_cuts",
+                            lambda *a, **k: calls.append(1) or real(*a, **k))
+        frags, err = C._excise_fragment_pair(
+            seq, ["EcoRI"], circular=True,
+            features=[{"start": 10, "end": 50, "strand": 1, "type": "CDS",
+                       "label": "x"}])
+        assert err is not None and str(n_sites) in err["error"], err
+        assert len(err["cuts"]) == n_sites
+        assert calls == [] and frags == []
+
+    def test_two_cuts_still_give_the_two_fragments(self):
+        import splicecraft_cloning as C
+        seq = "ACT" * 100 + "GAATTC" + "ACT" * 80 + "GGATCC" + "ACT" * 90
+        frags, err = C._excise_fragment_pair(seq, ["EcoRI", "BamHI"],
+                                             circular=True)
+        assert err is None and len(frags) == 2
+        assert sum(len(f["top_seq"]) for f in frags) >= len(seq)

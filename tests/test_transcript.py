@@ -184,6 +184,49 @@ class TestCoordinateInvariance:
         assert r["ok"] is False and "LINEAR" in r["error"]
 
 
+class TestALinearUnitMayEndOnTheLastBase:
+    """A linear record's last edge is `len(seq)` itself. Folding it `% len`
+    moved a terminator that ends on the last base to bp 0, and the unit was
+    refused as "crossing the origin" (audit 2026-10-23)."""
+
+    def test_the_reference_unit_reads_the_same_linear(self):
+        assert FEATS[-1]["end"] == N        # the premise: it ends on the end
+        r = sa._predict_transcript(SEQ, FEATS, circular=False)
+        assert r["ok"], r
+        assert _answer(r) == _answer(_predict())
+
+    def test_its_mirror_reads_the_same_linear(self):
+        flipped = [dict(f, start=N - f["end"], end=N - f["start"],
+                        strand=-f["strand"]) for f in FEATS]
+        r = sa._predict_transcript(sc._rc(SEQ), flipped, circular=False)
+        assert r["ok"] and r["unit"]["strand"] == -1, r
+        assert _answer(r) == _answer(_predict())
+
+    @pytest.mark.parametrize("strand", [1, -1])
+    def test_an_explicit_tx_end_at_the_length(self, strand):
+        feats = [f for f in FEATS if f["type"] in ("CDS", "intron")]
+        seq = SEQ
+        lo, hi = P1, N
+        if strand < 0:
+            seq = sc._rc(SEQ)
+            feats = [dict(f, start=N - f["end"], end=N - f["start"],
+                          strand=-1) for f in feats]
+            lo, hi = 0, N - P1
+        r = sa._predict_transcript(seq, feats, circular=False,
+                                   tx_start=lo, tx_end=hi)
+        assert r["ok"], r
+        assert _answer(r) == _answer(_predict())
+
+    def test_a_cds_filling_the_whole_molecule(self):
+        feats = [{"start": 0, "end": len(CDS), "strand": 1, "type": "CDS",
+                  "label": "whole"}]
+        r = sa._predict_transcript(CDS, feats, circular=False,
+                                   tx_start=0, tx_end=len(CDS))
+        assert r["ok"], r
+        assert r["mature_mrna"] == CDS
+        assert r["cds"]["protein"] == _predict()["cds"]["protein"]
+
+
 class TestIntronSources:
     def test_gap_between_location_parts_is_an_intron(self):
         """The standard GenBank way to spell a spliced feature — no `intron`

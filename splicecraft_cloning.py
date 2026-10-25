@@ -489,7 +489,6 @@ def _gibson_overlap_len(a_seq: str, b_seq: str, *,
     return 0
 
 
-@_timed("op.gibson_simulate")
 # ── _simulate_gibson_assembly helpers ─────────────────────────────────────
 #
 # The Gibson simulator was 370 lines pre-refactor. The math is
@@ -947,6 +946,7 @@ def _gibson_merge_wrap_halves(
     return out_feats
 
 
+@_timed("op.gibson_simulate")
 def _simulate_gibson_assembly(fragments: list[dict], *,
                                 min_overlap: int = _GIBSON_MIN_OVERLAP_BP,
                                 circular: bool = True,
@@ -1459,6 +1459,39 @@ def _ends_compatible(end_a: dict, end_b: dict) -> bool:
     return end_a.get("overhang_seq", "") == end_b.get("overhang_seq", "")
 
 
+def _shifted_feature(f: dict, shift: int) -> dict:
+    """A copy of engine feature dict `f` moved `shift` bp along the molecule —
+    bounds AND exons.
+
+    Every site that moves a feature must move its `parts` too: shifting only
+    `start`/`end` leaves the bounds on the right bases and the exons on the
+    wrong ones, and a spliced CDS then translates to garbage (audit
+    2026-10-23 found three such sites after `[INV-221]`). The exon list is
+    COPIED, never shifted in place — `{**f}` shares the input's list object,
+    and a fragment is shifted once per simulated orientation. A malformed or
+    single-span `parts` is dropped: absent is the contract for "contiguous".
+    """
+    nf = {
+        **f,
+        "start": int(f.get("start", 0)) + shift,
+        "end":   int(f.get("end",   0)) + shift,
+    }
+    raw = f.get("parts")
+    if isinstance(raw, (list, tuple)) and len(raw) > 1:
+        moved: "list[list[int]]" = []
+        for p in raw:
+            try:
+                moved.append([int(p[0]) + shift, int(p[1]) + shift])
+            except (TypeError, ValueError, IndexError, KeyError):
+                moved = []
+                break
+        if moved:
+            nf["parts"] = moved
+            return nf
+    nf.pop("parts", None)
+    return nf
+
+
 def _ligate_fragments(a: dict, b: dict) -> "dict | None":
     """Ligate `a.right` to `b.left`. Returns merged fragment (linear),
     or None if the overhangs are incompatible. The merged top strand
@@ -1471,32 +1504,7 @@ def _ligate_fragments(a: dict, b: dict) -> "dict | None":
     merged_feats = [{**f, "parts": [list(p) for p in f["parts"]]}
                     if isinstance(f.get("parts"), (list, tuple)) else dict(f)
                     for f in a["features"]]
-    for f in b["features"]:
-        nf = {
-            **f,
-            "start": int(f.get("start", 0)) + shift,
-            "end":   int(f.get("end",   0)) + shift,
-        }
-        # Exons shift with the bounds. Copied rather than shifted in place:
-        # `{**f}` shares the SAME list object as the input fragment, so
-        # mutating it would reach back into the caller's fragment — and a
-        # fragment is ligated twice when both orientations are simulated.
-        _raw = f.get("parts")
-        if isinstance(_raw, (list, tuple)) and len(_raw) > 1:
-            _sh: "list[list[int]]" = []
-            for _p in _raw:
-                try:
-                    _sh.append([int(_p[0]) + shift, int(_p[1]) + shift])
-                except (TypeError, ValueError, IndexError, KeyError):
-                    _sh = []
-                    break
-            if _sh:
-                nf["parts"] = _sh
-            else:
-                nf.pop("parts", None)
-        else:
-            nf.pop("parts", None)
-        merged_feats.append(nf)
+    merged_feats.extend(_shifted_feature(f, shift) for f in b["features"])
     return {
         "top_seq":      a["top_seq"] + b["top_seq"],
         "left":         a["left"],
@@ -1566,10 +1574,7 @@ def _simulate_traditional_cloning(insert_frag: dict,
                else vector_frag["top_seq"] + insert_rc["top_seq"])
 
     def _shift_feats(base: dict, shift: int) -> list[dict]:
-        return [{**f,
-                  "start": int(f.get("start", 0)) + shift,
-                  "end":   int(f.get("end",   0)) + shift}
-                 for f in base["features"]]
+        return [_shifted_feature(f, shift) for f in base["features"]]
 
     # Cloning enzymes at the junctions — name the cut in the "(disrupted)"
     # note for any vector feature a cut site landed inside.
@@ -2980,10 +2985,7 @@ def _excise_pcr_insert(seq: str, enz_left: str, enz_right: str, *,
     site_r = _instantiate_iupac_site(catalog[enz_right][0].upper())
     lead = len(pad) + len(site_l)
     wrapped = pad + site_l + cleaned + site_r + _rc(pad)
-    w_feats = ([{**f,
-                 "start": int(f.get("start", 0)) + lead,
-                 "end":   int(f.get("end",   0)) + lead}
-                for f in features]
+    w_feats = ([_shifted_feature(f, lead) for f in features]
                if features else None)
     interior = _interior(wrapped, w_feats)
     if len(interior) == 1:
@@ -3035,11 +3037,13 @@ def _excise_fragment_pair(seq: str, enzyme_names: list[str], *,
     per_enzyme: dict[str, int] = {}
     for c in cuts:
         per_enzyme[c["enzyme"]] = per_enzyme.get(c["enzyme"], 0) + 1
-    fragments = _fragments_from_cuts(seq, cuts, circular=circular,
-                                       features=features,
-                                       source_label=source_label)
+    # The cut count is decided BEFORE any fragment is built: a refusal used
+    # to build every fragment, features included, and then throw them away —
+    # 4 s on a 4 Mbp / 4,000-feature record, paid again for every enzyme
+    # pair a search tries (audit 2026-10-23). No caller reads the fragments
+    # of a refused digest.
     if circular and n_cuts < 2:
-        return fragments, {
+        return [], {
             "error":
                 (f"need ≥2 cuts to excise an insert; "
                  f"got {n_cuts} on a circular plasmid"),
@@ -3052,13 +3056,16 @@ def _excise_fragment_pair(seq: str, enzyme_names: list[str], *,
     # callers can't quietly take fragments[0:2] and ship a wrong product.
     if circular and n_cuts > 2:
         per_enz_str = ", ".join(f"{e}×{n}" for e, n in per_enzyme.items())
-        return fragments, {
+        return [], {
             "error":
                 (f"got {n_cuts} cut sites ({per_enz_str}); "
                  f"need exactly 2 for unambiguous excise. "
                  f"Pick a different enzyme pair."),
             "cuts": [{"enzyme": c["enzyme"], "top": c["top"]} for c in cuts],
         }
+    fragments = _fragments_from_cuts(seq, cuts, circular=circular,
+                                       features=features,
+                                       source_label=source_label)
     return fragments, None
 
 

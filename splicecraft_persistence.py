@@ -880,6 +880,49 @@ def _refuse_unauthorized_write(path: Path, label: str) -> None:
         f"`_protect_user_data` fixture, and the agent HTTP server.)"
     )
 
+_MANAGED_DIR_ATTRS = ("_PLASMID_BLOB_DIR", "_DNA_ORIGINALS_DIR",
+                      "_CRASH_RECOVERY_DIR", "_EXPERIMENTS_DIR",
+                      "_HMM_DATABASES_DIR", "_PLUGINS_DIR", "_UI_SNAPSHOTS_DIR")
+
+
+def _refuse_export_into_data_dir(path) -> None:
+    """Raise `OSError` when an EXPORT would land on SpliceCraft's own storage.
+
+    Exports are the user's files. The data dir holds managed storage the app
+    rewrites whole or references by content hash: an export landing on
+    `plasmid_blobs/<sha256>.gb` replaced a stored plasmid with no `.bak`, the
+    next load failed the blob's hash check, and the sequence was gone for
+    good (audit 2026-10-23 — agent `export-genbank`). Refused: anything
+    inside a managed sub-directory (blob stores, `.dna` originals, crash
+    recovery, notebook attachments, snapshots, spill, logs, …) and the store
+    files at the top level (`*.json` and their `.json.*` backups, dot-file
+    markers, the lock and the agent token). `OSError`, so every caller's
+    existing filesystem-error handling reports it."""
+    try:
+        target = Path(str(path)).expanduser().resolve()
+        data = Path(str(_state._DATA_DIR)).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return
+    if not (target == data or data in target.parents):
+        return
+    managed = {getattr(_state, "_LOST_ENTRIES_DIR_NAME", "lost_entries"),
+               getattr(_state, "_SNAPSHOT_DIR_NAME", "snapshots"),
+               "logs", "clipboard"}
+    for attr in _MANAGED_DIR_ATTRS:
+        d = getattr(_state, attr, None)
+        if d is not None:
+            managed.add(Path(str(d)).name)
+    rel = target.relative_to(data).parts if target != data else ()
+    name = target.name.lower()
+    if (not rel or rel[0] in managed
+            or name.endswith(".json") or ".json." in name
+            or name.startswith(".") or name == "splicecraft.lock"
+            or name.startswith("agent_token")):
+        raise OSError(
+            f"refusing to export onto SpliceCraft's own storage ({target}) "
+            f"in its data folder — choose a location outside the data folder")
+
+
 def _recovery_write_allowed(path: Path, label: str) -> bool:
     """May `_safe_load_json`'s recovery path WRITE to the data dir?
 
@@ -980,6 +1023,13 @@ def _safe_save_json(path: Path, entries: list, label: str,
     _refuse_unauthorized_write(path, label)
     import os
     import tempfile
+
+    if str(path) in _state._UNREADABLE_AT_LOAD:
+        raise OSError(
+            f"Refusing to save {label}: {path} could not be read when it was "
+            f"loaded, so this session never saw its contents — saving now "
+            f"would replace them. Fix the file's access and restart "
+            f"SpliceCraft.")
 
     if path.is_symlink():
         msg = (
@@ -1091,6 +1141,16 @@ def _safe_save_json(path: Path, entries: list, label: str,
     # The hooks are always registered before any save can run (guarded by
     # test_blob_store); the `is not None` check only covers the import window,
     # where no save occurs. Path dispatch is unchanged from the direct form.
+    given = entries          # the caller's own entries, for `_json_saved_hook`
+
+    def _saved() -> None:
+        hook = _state._json_saved_hook
+        if hook is not None:
+            try:
+                hook(path, given)
+            except Exception:                  # noqa: BLE001 - bookkeeping only
+                _log.debug("json-saved hook failed for %s", path, exc_info=True)
+
     if path == _state._LIBRARY_FILE:
         if _state._dehydrate_entries_hook is not None:
             entries = _state._dehydrate_entries_hook(entries)
@@ -1125,6 +1185,7 @@ def _safe_save_json(path: Path, entries: list, label: str,
                 # rotation, to put back bytes that were already there
                 # ([INV-214]).
                 _log.debug("%s unchanged on disk — save skipped", label)
+                _saved()
                 return
             if existing.strip():
                 # Backup dedup (2026-06-03): if the prior file is
@@ -1419,6 +1480,7 @@ def _safe_save_json(path: Path, entries: list, label: str,
             _fsync_parent_dir(path)
             _log.info("Saved %s: %d entries to %s (schema v%d)",
                       label, len(entries), path, schema_version)
+            _saved()
         except Exception:
             try:
                 os.unlink(tmp_name)
@@ -1568,10 +1630,41 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
         _log.warning("%s: %s", path, reason)
         return [], reason
 
-    # Try the main file
+    # Read the main file — SEPARATELY from parsing it. A file that cannot be
+    # READ (EIO, EACCES, EMFILE, an antivirus / sync-client lock on a
+    # network home) is not a corrupt file: treating it as one renamed the
+    # newest data aside as `.corrupt-<ts>` (a name the restore list never
+    # shows), rewrote the main file from the ONE-SAVE-OLDER `.bak`, and
+    # told the user it "was corrupt" — and blob GC later quarantined what
+    # only the aside referenced (audit 2026-10-23). Retry briefly, then
+    # refuse to load and touch nothing: the save side already refuses to
+    # overwrite a file it could not read, so the data stays intact for the
+    # user to fix the access and relaunch.
     main_warning: "str | None" = None
+    text = None
+    for _attempt in range(3):
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+            break
+        except UnicodeDecodeError:
+            break                      # bytes, but not text: that IS corrupt
+        except OSError as exc:
+            if _attempt == 2:
+                _log.error("%s: could not read %s (%s) — not loading it, "
+                           "and leaving it untouched on disk",
+                           label, path, exc)
+                _state._UNREADABLE_AT_LOAD.add(str(path))
+                return [], (
+                    f"{label} could not be read ({exc}) and was not "
+                    f"loaded; nothing was changed on disk. Fix the file's "
+                    f"access (permissions / disk / sync lock) and restart.")
+            import time as _t
+            _t.sleep(0.05 * (_attempt + 1))
+    _state._UNREADABLE_AT_LOAD.discard(str(path))
     try:
-        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        if text is None:
+            raise ValueError(f"{label} is not valid text")
+        raw = json.loads(text)
         entries, shape_warn = _extract_entries(raw, label)
         if entries is not None:
             # If this file was written by a newer SpliceCraft, stash

@@ -525,3 +525,255 @@ def test_fuzz_spans_round_trip(strand):
         assert back is not None
         assert str(SeqFeature(back, type="CDS").extract(Seq(SEQ))).upper() \
             == want, (spans, parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Audit 2026-10-23 — the exon list must ride EVERY shift and clip
+# ═══════════════════════════════════════════════════════════════════════════
+# One defect shape at four sites INV-221 did not reach: `start`/`end` moved
+# (or clipped) while `parts` stayed behind. The bounds then pointed at the
+# right place and the exons at the wrong one, so the product's saved CDS
+# translated to garbage. The oracle is the protein, as above.
+
+_PAD5 = "TTACGCATCAGCATACGATCAGCATTACGCA"
+_VPAD = "GCTAGCTTAACGGCATCAGCATTAGCCATTACGGACTACAGCATCAGCATCAGCAT"
+
+
+def _spliced_cds_dict(at: int, label: str = "myGene") -> dict:
+    b = at + len(EX1)
+    c = b + len(INTRON)
+    d = c + len(EX2)
+    return {"start": at, "end": d, "strand": 1, "type": "CDS",
+            "label": label, "parts": [[at, b], [c, d]]}
+
+
+def _ecori_kpni_insert_and_vector():
+    donor = (_PAD5 + "GAATTC" + "AA" + EX1 + INTRON + EX2 + "TT" + "GGTACC"
+             + _PAD5)
+    cds = _spliced_cds_dict(len(_PAD5) + 8)
+    vector = _VPAD + "GAATTC" + "ACGTACGTAC" + "GGTACC" + _VPAD
+    enz = ["EcoRI", "KpnI"]
+    dfr, derr = scc._excise_fragment_pair(donor, enz, circular=True,
+                                          features=[cds])
+    vfr, verr = scc._excise_fragment_pair(vector, enz, circular=True)
+    assert not derr and not verr, (derr, verr)
+    ins = next(f for f in dfr if EX1 in f["top_seq"])
+    vec = max(vfr, key=lambda f: len(f["top_seq"]))
+    gene = next(f for f in ins["features"] if f["label"] == "myGene")
+    assert _protein_of(gene, ins["top_seq"]) == PROTEIN   # the input is right
+    return ins, vec
+
+
+@pytest.mark.parametrize("orientation", ["forward", "reverse"])
+@pytest.mark.parametrize("entry", ["two_fragment", "n_way"])
+def test_traditional_cloning_shifts_the_exons(orientation, entry):
+    """The vector→insert shift moved the bounds but copied `parts` verbatim,
+    so the clone's CDS had bounds in the insert and exons in the BACKBONE
+    (translated `LTASALAI*RHQH*PL`). Both entry points: the Constructor's
+    N-way path delegates to the two-fragment engine."""
+    ins, vec = _ecori_kpni_insert_and_vector()
+    if entry == "two_fragment":
+        res = scc._simulate_traditional_cloning(ins, vec)
+    else:
+        res = scc._simulate_traditional_cloning_multi([ins], vec)
+    prod = res[orientation]
+    gene = next(f for f in prod["features"]
+                if str(f.get("label", "")).startswith("myGene"))
+    assert gene.get("parts"), "the exon list was dropped"
+    assert _protein_of(gene, prod["top_seq"]) == PROTEIN
+
+
+def test_pcr_insert_bare_region_offsets_the_exons():
+    """`_excise_pcr_insert` wraps a bare region in `[pad][site]` and moved
+    the bounds past that lead but not the exons — exon 1 came out 10 bp
+    short and exon 2 10 bp early (`MAEAKNN*RLDL`)."""
+    head, tail = "CGATCATTACG", "ACGTTACGAT"
+    region = head + EX1 + INTRON + EX2 + tail
+    frag, err = scc._excise_pcr_insert(region, "EcoRI", "KpnI",
+                                       features=[_spliced_cds_dict(len(head))],
+                                       source_label="bare")
+    assert err is None, err
+    gene = next(f for f in frag["features"] if f["label"] == "myGene")
+    assert gene.get("parts"), "the exon list was dropped"
+    assert _protein_of(gene, frag["top_seq"]) == PROTEIN
+
+
+@pytest.mark.parametrize("circular", [False, True])
+def test_digest_cut_inside_an_intron_narrows_each_piece_to_its_exon(circular):
+    """A cut INSIDE an intron leaves one exon per fragment. The linear digest
+    returned "no local parts" for a single surviving exon, which reads as
+    "not spliced", so each piece kept the intron bases up to the cut and
+    annotated them as coding."""
+    intron = INTRON[:10] + "GAATTC" + INTRON[10:]       # EcoRI in the intron
+    seq = _PAD5 * 3 + EX1 + intron + EX2 + _VPAD * 3
+    assert seq.count("GAATTC") == 1
+    a = len(_PAD5) * 3
+    f = {"start": a, "end": a + len(EX1) + len(intron) + len(EX2),
+         "strand": 1, "type": "CDS", "label": "g",
+         "parts": [[a, a + len(EX1)],
+                   [a + len(EX1) + len(intron),
+                    a + len(EX1) + len(intron) + len(EX2)]]}
+    pieces = []
+    for fr in sc._digest_with_enzymes(seq, ["EcoRI"], circular=circular,
+                                      features=[f]):
+        for g in fr["features"]:
+            spans = su._feat_dict_spans(g, len(fr["top_seq"]))
+            pieces.append("".join(fr["top_seq"][x:y] for x, y in spans))
+    assert sorted(pieces) == sorted([EX1, EX2]), pieces
+
+
+def test_region_copy_carries_and_clips_the_exons():
+    """Clone-selected-region / feature-rich copy rebuilt each carried feature
+    from a key whitelist that predates introns: `parts` was dropped while
+    `type: CDS` and `codon_start` were kept, so the copy annotated the CDS
+    straight through its intron (`MAEAKGFEVCFYF…` — a premature stop)."""
+    pre = _PAD5
+    seq = pre + EX1 + INTRON + EX2 + _VPAD
+    f = dict(_spliced_cds_dict(len(pre)), codon_start=1)
+    total = len(seq)
+    # Fully contained: the exons ride the rebase.
+    s, e = 10, len(seq) - 10
+    out = sc.PlasmidApp._gather_region_feats([f], s, e, total)
+    gene = next(g for g in out if g["label"] == "myGene")
+    assert _protein_of(gene, seq[s:e]) == PROTEIN
+    # Clipped through the intron: only the surviving exon is annotated.
+    cut = len(pre) + len(EX1) + 5
+    out = sc.PlasmidApp._gather_region_feats([f], 0, cut, total)
+    gene = next(g for g in out if g["label"] == "myGene")
+    spans = su._feat_dict_spans(gene, cut)
+    assert "".join(seq[:cut][x:y] for x, y in spans) == EX1
+    # A selection holding only intron bases carries no CDS at all.
+    lo = len(pre) + len(EX1) + 2
+    out = sc.PlasmidApp._gather_region_feats([f], lo, lo + 8, total)
+    assert not [g for g in out if g["label"] == "myGene"]
+
+
+def test_region_copy_rebases_exons_of_an_origin_wrapping_gene():
+    """A spliced gene that crosses the origin, copied by a selection that also
+    crosses it: the exons must ride the seam rebase with the bounds."""
+    body = _VPAD * 2
+    # exon 1 + intron at the END of the circle, exon 2 at the START
+    seq = EX2 + body + EX1 + INTRON
+    total = len(seq)
+    a = len(EX2) + len(body)                  # exon 1 start
+    b = a + len(EX1)                          # exon 1 end
+    f = {"start": a, "end": len(EX2), "strand": 1, "type": "CDS",
+         "label": "wrapGene", "codon_start": 1,
+         "parts": [[a, b], [0, len(EX2)]]}
+    assert _protein_of(f, seq) == PROTEIN
+    s, e = a - 7, len(EX2) + 5                # wrap selection around it
+    amplicon = seq[s:] + seq[:e]
+    out = sc.PlasmidApp._gather_region_feats([f], s, e, total)
+    gene = next(g for g in out if g["label"] == "wrapGene")
+    assert gene.get("parts"), "exons lost on the wrap rebase"
+    assert _protein_of(gene, amplicon) == PROTEIN
+
+
+# ── A whole-molecule feature written as an origin-wrap join ────────────────
+# `join(50..100,1..49)` on a 100 bp circle covers every base, starting at 50.
+# The dict model has no way to say "a full lap from bp 49", so it came out as
+# start == end == 49 — zero length — and the feature vanished from the map,
+# the digest and every carried product (audit 2026-10-23). Annotation-only
+# features normalise to the whole molecule, (0, total), the convention
+# `_rotate_seq_record` already uses for whole-record features.
+
+def _full_lap(ftype):
+    rng = random.Random(4)
+    seq = "".join(rng.choice("ACGT") for _ in range(100))
+    loc = CompoundLocation([FeatureLocation(49, 100, strand=1),
+                            FeatureLocation(0, 49, strand=1)])
+    rec = SeqRecord(Seq(seq), id="lap", name="lap",
+                    annotations={"molecule_type": "DNA",
+                                 "topology": "circular"},
+                    features=[SeqFeature(loc, type=ftype,
+                                         qualifiers={"label": ["whole"]})])
+    # Through the real writer and reader, as a library entry would be.
+    return sc._gb_text_to_record(sc._record_to_gb_text(rec)), seq
+
+
+@pytest.mark.parametrize("ftype", ["misc_feature", "rep_origin", "primer_bind"])
+def test_a_whole_molecule_join_reads_as_the_whole_molecule(ftype):
+    import splicecraft_mapimage as smi
+    rec, seq = _full_lap(ftype)
+    f = next(x for x in rec.features if x.type == ftype)
+    assert su._feat_bounds(f, 100) == (0, 100, 1)
+    assert su._feat_spans(f, 100) == (0, 100, 1, None)
+    carried = next(d for d in sca._agent_carry_feature_dicts(rec)
+                   if d.get("label") == "whole")
+    assert (carried["start"], carried["end"]) == (0, 100)
+    assert "parts" not in carried
+    drawn = next(d for d in sc.PlasmidMap()._parse(rec)
+                 if d.get("label") == "whole")
+    assert (drawn["start"], drawn["end"]) == (0, 100)
+    feats, total = smi._map_feats_from_record(rec)
+    img = next(d for d in feats if d.get("label") == "whole")
+    assert scb._feat_len(img["start"], img["end"], total) == 100
+
+
+def test_a_whole_circle_cds_keeps_its_frame_start():
+    """Not normalised: a CDS's start IS its reading frame, and reading it
+    from bp 0 would be a confident wrong protein."""
+    rec, seq = _full_lap("CDS")
+    f = next(x for x in rec.features if x.type == "CDS")
+    assert sc._cds_coding_positions(100, f)[:3] == [49, 50, 51]
+
+
+# ── The digest slots features by bisect, not by scanning every cut ─────────
+# `_split_features_at_cuts` tested every feature against every fragment:
+# 1,000 features x 3,864 cuts took 2.2 s, and 2,000 x 3,864 took 4.5 s
+# (audit 2026-10-23). With the cuts in order, each feature's fragments are a
+# contiguous run found by bisect; the per-fragment tests are unchanged.
+
+def _random_digest_case(rng):
+    n = rng.randint(50, 3000)
+    k = rng.randint(1, 25)
+    cuts = sorted(rng.sample(range(n), min(k, n)))
+    feats = []
+    for _ in range(rng.randint(0, 40)):
+        s = rng.randrange(n)
+        r = rng.random()
+        if r < 0.1:
+            e = s                                    # zero-length marker
+        elif r < 0.3:
+            e = rng.randrange(0, max(1, s))          # origin wrap
+        else:
+            e = min(n, s + rng.randint(1, n))
+        f = {"start": s, "end": e, "strand": rng.choice([1, -1]),
+             "type": rng.choice(["CDS", "misc_feature"]), "label": "f"}
+        if e > s + 20 and rng.random() < 0.3:        # spliced
+            a = s + rng.randint(1, (e - s) // 3)
+            b = a + rng.randint(1, (e - s) // 3)
+            if b < e:
+                f["parts"] = [[s, a], [b, e]]
+        feats.append(f)
+    return n, cuts, feats
+
+
+@pytest.mark.parametrize("circular", [True, False])
+def test_bisect_slotting_matches_the_scan_of_every_fragment(monkeypatch,
+                                                             circular):
+    rng = random.Random(20261024)
+    real = scb._cuts_strictly_ascending
+    for trial in range(600):
+        n, cuts, feats = _random_digest_case(rng)
+        got = scb._split_features_at_cuts(feats, n, cuts, circular)
+        # Never `monkeypatch.undo()`: it would revert conftest's data-dir
+        # sandbox too (see test_save_safety).
+        monkeypatch.setattr(scb, "_cuts_strictly_ascending", lambda c: False)
+        want = scb._split_features_at_cuts(feats, n, cuts, circular)
+        monkeypatch.setattr(scb, "_cuts_strictly_ascending", real)
+        assert got == want, (trial, n, cuts)
+
+
+def test_slotting_thousands_of_features_into_thousands_of_cuts_is_fast():
+    import time
+    n = 4_000_000
+    cuts = list(range(500, n, 1000))                 # ~4,000 cuts
+    feats = [{"start": i * 2000, "end": i * 2000 + 900, "strand": 1,
+              "type": "CDS", "label": f"g{i}"} for i in range(2000)]
+    t0 = time.perf_counter()
+    out = scb._split_features_at_cuts(feats, n, cuts, True)
+    dt = time.perf_counter() - t0
+    # Every gene crosses exactly one cut: two pieces each.
+    assert sum(len(v) for v in out.values()) == 4000
+    assert dt < 1.0, f"{dt:.2f} s"                   # was 4.5 s

@@ -930,3 +930,225 @@ class TestChunkFeatIndexMatchesLinearScan:
         index = sc._build_chunk_feat_index(feats)
         got = sc._feats_in_chunk(feats, 0, 100, 100, index=index)
         assert [f["label"] for f in got] == [f["label"] for f in feats]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The chromosome-speed layout must draw EXACTLY what the old one drew
+# (audit 2026-10-23). `_chunk_layout` now sweeps the rows instead of
+# bisecting per row, and the lane packer has a one-feature fast path and
+# reports the stack height itself — rotation at 10 Mbp cost ~2 s in this
+# loop. The reference below is the pre-change algorithm, frozen verbatim.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _ref_pack(feats, chunk_start, chunk_end, total=0):
+    width = chunk_end - chunk_start
+    if width <= 0 or not feats:
+        return []
+    placements = []
+    col_top = [-1] * width
+    resite_sibling_row: dict = {}
+    for f in feats:
+        spans = []
+        if f.get("type") == "resite":
+            span_l, span_r = sc._resite_render_span(f)
+        else:
+            span_l, span_r = f["start"], f["end"]
+        bar_s = max(span_l, chunk_start) - chunk_start
+        bar_e = min(span_r, chunk_end) - chunk_start
+        if bar_e > bar_s:
+            spans.append((bar_s, bar_e))
+        fs = f.get("_flap_start")
+        fe = f.get("_flap_end")
+        if isinstance(fs, int) and isinstance(fe, int) and fe > fs:
+            for a, b in sc._wrap_intervals(fs, fe, total):
+                ca = max(a, chunk_start) - chunk_start
+                cb = min(b, chunk_end) - chunk_start
+                if cb > ca:
+                    spans.append((ca, cb))
+        if not spans:
+            continue
+        height = sc._feat_stack_height(f)
+        sib_key = None
+        if f.get("type") == "resite":
+            rs, re_ = f.get("rec_start"), f.get("rec_end")
+            if isinstance(rs, int) and isinstance(re_, int):
+                sib_key = (rs, re_, f.get("color"))
+        sib_row = (resite_sibling_row.get(sib_key)
+                   if sib_key is not None else None)
+        if sib_row is not None:
+            bottom_row = sib_row
+        else:
+            bottom_row = max(max(col_top[a:b]) for a, b in spans) + 1
+        top_row = bottom_row + height - 1
+        for a, b in spans:
+            col_top[a:b] = [top_row] * (b - a)
+        if sib_key is not None and sib_key not in resite_sibling_row:
+            resite_sibling_row[sib_key] = bottom_row
+        placements.append((f, bottom_row))
+    return placements
+
+
+def _ref_layout(seq, feats, line_width):
+    n = len(seq)
+    annot = [f for f in feats if f.get("type") not in ("site", "recut")]
+    chunks, pf2, pfl = [], [0], [0]
+    for cs in range(0, n, line_width):
+        ce = min(cs + line_width, n)
+        cf = sc._feats_in_chunk(annot, cs, ce, n)      # linear reference scan
+        fwd = [f for f in cf if f.get("strand", 0) >= 0]
+        rev = [f for f in cf if f.get("strand", 0) < 0]
+        ap = _ref_pack(fwd, cs, ce, n)
+        bp = _ref_pack(rev, cs, ce, n)
+        ar = max((p[1] + sc._feat_stack_height(p[0]) for p in ap), default=0)
+        br = max((p[1] + sc._feat_stack_height(p[0]) for p in bp), default=0)
+        chunks.append((cs, ce, (ap, bp, ar, br), ar, br))
+        pf2.append(pf2[-1] + ar + 2 + br + 1)
+        pfl.append(pfl[-1] + ar + br)
+    return chunks, pf2, pfl
+
+
+class TestChunkLayoutSweepMatchesReference:
+
+    @staticmethod
+    def _random_feats(rng, total):
+        feats = []
+        for i in range(rng.randint(0, 40)):
+            s = rng.randrange(total)
+            r = rng.random()
+            if r < 0.12:                                    # origin wrap
+                e = rng.randrange(0, max(1, s))
+            elif r < 0.17:                                  # zero-length
+                e = s
+            elif r < 0.20:                                  # past the end
+                s, e = total + rng.randint(0, 9), total + rng.randint(10, 30)
+            else:
+                e = min(total, s + rng.randint(1, max(1, total // 4)))
+            t = rng.choice(["CDS", "misc_feature", "resite", "recut",
+                            "primer_bind", "gene", "site"])
+            f = {"start": s, "end": e, "strand": rng.choice([1, -1, 0]),
+                 "type": t, "label": f"f{i}" if rng.random() < 0.8 else "",
+                 "color": rng.choice(["color(40)", "color(9)", "#ff0000"])}
+            if t == "resite":
+                f["rec_start"], f["rec_end"] = s, e
+                if rng.random() < 0.3:
+                    f["cut_count"] = rng.randint(2, 4)
+                if rng.random() < 0.4 and feats:            # isoschizomer twin
+                    twin = dict(f, label=f"t{i}")
+                    feats.append(twin)
+            if t == "primer_bind" and rng.random() < 0.6:
+                fl = rng.randint(1, 15)
+                if f["strand"] >= 0:
+                    f["_flap_start"], f["_flap_end"] = s - fl, s
+                else:
+                    f["_flap_start"], f["_flap_end"] = e, e + fl
+                f["_flap_bases"], f["_flap_len"] = "A" * fl, fl
+                if rng.random() < 0.3:
+                    f["_bound_mismatch"] = {s: "A"}
+            feats.append(f)
+        return feats
+
+    def test_sweep_layout_equals_reference_on_fuzzed_records(self):
+        import random
+        rng = random.Random(20261023)
+        for trial in range(300):
+            total = rng.choice([1, 7, 50, 137, 400, 1000])
+            seq = "".join(rng.choice("ACGT") for _ in range(total))
+            feats = self._random_feats(rng, total)
+            for lw in (1, 7, 31, 80, 1001):
+                sc._CHUNK_LAYOUT_CACHE.clear()
+                sc._BUILD_SEQ_CACHE.clear()
+                got = sc._chunk_layout(seq, feats, lw)
+                want = _ref_layout(seq, feats, lw)
+                assert got[1] == want[1] and got[2] == want[2], (
+                    f"trial {trial} total={total} lw={lw}: row offsets differ")
+                assert len(got[0]) == len(want[0])
+                for i, (g, w) in enumerate(zip(got[0], want[0])):
+                    assert g == w, (
+                        f"trial {trial} total={total} lw={lw} row {i}:\n"
+                        f"  sweep={g}\n  reference={w}")
+
+    def test_lane_groups_and_packer_agree_with_reference(self):
+        import random
+        rng = random.Random(7)
+        for _ in range(400):
+            total = rng.choice([30, 160, 400])
+            feats = self._random_feats(rng, total)
+            cs = rng.randrange(0, total)
+            ce = min(total, cs + rng.randint(1, 90))
+            assert sc._pack_features_2d(feats, cs, ce, total) == \
+                _ref_pack(feats, cs, ce, total)
+            fwd = [f for f in feats if f.get("strand", 0) >= 0]
+            rev = [f for f in feats if f.get("strand", 0) < 0]
+            ap, bp = _ref_pack(fwd, cs, ce, total), _ref_pack(rev, cs, ce, total)
+            want = (ap, bp,
+                    max((p[1] + sc._feat_stack_height(p[0]) for p in ap),
+                        default=0),
+                    max((p[1] + sc._feat_stack_height(p[0]) for p in bp),
+                        default=0))
+            assert sc._chunk_lane_groups(feats, cs, ce, total) == want
+
+
+def test_cds_stop_scan_matches_full_translation():
+    """`PlasmidMap._parse` counts premature stops with `_cds_stop_residues`
+    instead of translating every CDS (~1 s per 10 Mbp genome); it must
+    report exactly the stops `_cds_aa_list` translates."""
+    import random
+    rng = random.Random(11)
+    for trial in range(1500):
+        n = rng.randint(30, 400)
+        seq = "".join(rng.choice("ACGTACGTN") for _ in range(n))
+        s = rng.randrange(n)
+        kind = rng.random()
+        f = {"type": "CDS", "strand": rng.choice([1, -1]),
+             "codon_start": rng.choice([1, 2, 3]),
+             "transl_table": rng.choice([1, 1, 2, 4, 11, 25])}
+        if kind < 0.2:                                      # origin wrap
+            f["start"], f["end"] = s, rng.randrange(0, max(1, s))
+        elif kind < 0.4:                                    # spliced
+            a = sorted(rng.sample(range(n), 4))
+            f["start"], f["end"] = a[0], a[3]
+            f["_exons"] = [(a[0], a[1]), (a[2], a[3])]
+        else:
+            f["start"], f["end"] = s, min(n, s + rng.randint(0, n))
+        if rng.random() < 0.1:
+            f["_init_m"] = True
+        sc._CDS_AA_CACHE.clear()
+        aa, _len, _ve = sc._cds_aa_list(seq, f)
+        stops, n_cod, first = sc._cds_stop_residues(seq, f)
+        assert n_cod == len(aa), (trial, f)
+        assert stops == [i + 1 for i, a in enumerate(aa)
+                         if a == sc._STOP_AA_CHAR], (trial, f)
+        assert first == (aa[0] if aa else ""), (trial, f)
+
+
+def test_stop_counts_are_reused_when_only_annotation_changed(monkeypatch):
+    """A feature delete or rename re-parses the map, which recounted the
+    premature stops of every CDS against the SAME bases — 0.4 s of a 10 Mbp
+    genome's 1 s delete (audit 2026-10-23). The count is cached on what it
+    depends on (bases, location, frame, code), like `_cds_aa_list`."""
+    import random
+    rng = random.Random(5)
+    seq = "".join(rng.choice("ACGT") for _ in range(30_000))
+    feats = [{"type": "CDS", "start": s, "end": s + 900, "strand": st,
+              "codon_start": 1, "transl_table": 1}
+             for s, st in zip(range(0, 27_000, 1000), [1, -1] * 20)]
+    calls = [0]
+    real = sc._in_frame_stop_indices
+
+    def counting(*a, **k):
+        calls[0] += 1
+        return real(*a, **k)
+    monkeypatch.setattr(sc, "_in_frame_stop_indices", counting)
+    first = [sc._cds_stop_residues(seq, f) for f in feats]
+    n_first = calls[0]
+    again = [sc._cds_stop_residues(seq, dict(f)) for f in feats]
+    assert again == first
+    assert n_first == len(feats) and calls[0] == n_first      # all reused
+    edited = seq[:5] + ("A" if seq[5] != "A" else "C") + seq[6:]
+    sc._cds_stop_residues(edited, feats[0])
+    assert calls[0] == n_first + 1                            # new bases
+    other = dict(feats[0], codon_start=2)
+    sc._cds_stop_residues(seq, other)
+    assert calls[0] == n_first + 2                            # new frame
+    first[0][0].append(-1)                                    # caller mutates
+    assert sc._cds_stop_residues(seq, feats[0])[0] != first[0][0]

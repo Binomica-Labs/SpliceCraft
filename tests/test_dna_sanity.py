@@ -1596,6 +1596,61 @@ class TestTranslateCds:
         assert aa == expected
 
 
+class TestTranslationReadsRnaAndAmbiguityCodes:
+    """A FASTA import keeps RNA's U, and IUPAC codes turn up in any sequence
+    with uncertain bases. A plus-strand `AUG` read "?" while its minus-strand
+    mirror read "M", and every ambiguous codon read "?" even when it can only
+    be one residue — GGN is Gly in any code (audit 2026-10-23). Biopython is
+    the oracle; a genuine disagreement stays "?" where it writes X/B/Z/J."""
+
+    def test_rna_reads_the_same_on_both_strands(self):
+        assert sc._translate_cds("AUGGCUUAA", 0, 9, 1) == "MA*"
+        assert sc._translate_cds("UUAAGCCAU", 0, 9, -1) == "MA*"
+
+    @pytest.mark.parametrize("table", [1, 2, 4, 11])
+    def test_every_ambiguous_codon_matches_biopython(self, table):
+        import itertools
+        from Bio.Seq import Seq
+        for c in itertools.product("ACGTRYSWKMBDHVN", repeat=3):
+            codon = "".join(c)
+            bio = str(Seq(codon).translate(table=table))
+            want = "?" if bio in "XBZJ" else bio
+            got = sc._translate_cds(codon, 0, 3, 1, transl_table=table)
+            assert got == want, (table, codon, got, bio)
+            rna = codon.replace("T", "U")
+            assert sc._translate_cds(rna, 0, 3, 1, transl_table=table) \
+                == want, (table, rna)
+
+    def test_the_stop_count_agrees_with_the_translation(self):
+        """`_cds_stop_residues` (the fast premature-stop count) must see a
+        `UAA` or a `TRA` exactly where `_cds_aa_list` reads a stop."""
+        import random
+        rng = random.Random(1024)
+        seen = 0
+        for trial in range(600):
+            n = rng.randint(30, 300)
+            seq = "".join(rng.choice("ACGTUACGTRYN") for _ in range(n))
+            s = rng.randrange(n)
+            f = {"type": "CDS", "strand": rng.choice([1, -1]),
+                 "codon_start": 1, "transl_table": rng.choice([1, 2, 11]),
+                 "start": s, "end": min(n, s + rng.randint(3, n))}
+            sc._CDS_AA_CACHE.clear()
+            aa, _len, _ve = sc._cds_aa_list(seq, f)
+            stops, n_cod, first = sc._cds_stop_residues(seq, f)
+            want = [i + 1 for i, a in enumerate(aa) if a == "*"]
+            assert stops == want, (trial, seq, f)
+            assert first == (aa[0] if aa else "")
+            seen += len(want)
+        assert seen > 50, "the corpus lost its stops"
+
+    def test_an_rna_orf_is_found_on_the_plus_strand(self):
+        body = "AUG" + "GCU" * 40 + "UAA"
+        seq = "CC" + body + "GG" * 10
+        plus = [o for o in sc._find_orfs(seq, min_aa=30, circular=False)
+                if o["strand"] == 1]
+        assert len(plus) == 1 and plus[0]["aa_seq"] == "M" + "A" * 40 + "*"
+
+
 class TestWrapCDSInlineTranslation:
     """Regression guard for 2026-04-30: the inline AA-translation row
     drawn into the seq panel's lane art must place AA letters at the
@@ -1861,6 +1916,92 @@ class TestFindOrfs:
         # The ATG at position 0 should map to exactly one ORF.
         zero_starts = [o for o in orfs if o["start"] == 0 and o["strand"] == 1]
         assert len(zero_starts) == 1
+
+
+def _maximal_orfs_by_brute_force(seq, min_aa, alt):
+    """Stopped ORFs on a circle, from the definition and nothing else: a
+    start codon whose previous in-frame start-or-stop, walking BACK round
+    the whole reading cycle, is a stop — read forward to the first stop.
+    Returns ``{(strand, start_in_strand_coords, nt_len)}``."""
+    n = len(seq)
+    starts = {"ATG"} | ({"GTG", "TTG"} if alt else set())
+    stops = {"TAA", "TAG", "TGA"}
+    cycle = n // 3 if n % 3 == 0 else n
+    out = set()
+    for strand, s in ((1, seq), (-1, sc._rc(seq))):
+        ext = s + s[:2]
+
+        def cod(p):
+            return ext[p % n:p % n + 3]
+        for p in range(n):
+            if cod(p) not in starts:
+                continue
+            q, maximal = p - 3, False
+            for _ in range(cycle):
+                if cod(q) in stops:
+                    maximal = True
+                    break
+                if cod(q) in starts:
+                    break
+                q -= 3
+            if not maximal:
+                continue
+            q, count = p, 0
+            for _ in range(cycle + 1):
+                count += 1
+                if cod(q) in stops:
+                    break
+                q += 3
+            if count - 1 >= min_aa:
+                out.add((strand, p, count * 3))
+    return out
+
+
+class TestOrfsLongerThanALap:
+    """When `n % 3 != 0` the three frames of a circle are ONE reading cycle
+    of three laps, so an ORF can run past the end of a doubled scan. The
+    scan dropped those (a 146 bp circle reported no ORFs at one rotation and
+    two at another) and its one-lap look back emitted interior starts as
+    phantom ORFs (audit 2026-10-23)."""
+
+    @staticmethod
+    def _circles(seed, count):
+        rng = random.Random(seed)
+        for _ in range(count):
+            n = rng.randint(60, 260)
+            # Stop-poor alphabets make multi-lap ORFs common.
+            alphabet = rng.choice(["ACGT", "ACGTGC", "GCAGCGC", "ACGTGGCC"])
+            yield ("".join(rng.choice(alphabet) for _ in range(n)),
+                   rng.choice([3, 10, 30]), rng.random() < 0.3,
+                   rng.randrange(1, n))
+
+    def test_the_orf_set_does_not_depend_on_the_origin(self):
+        laps = 0
+        for seq, min_aa, alt, k in self._circles(20261024, 300):
+            def summary(s):
+                return sorted((o["strand"], o["length_aa"], o["nt_len"],
+                               o["has_stop"], o["aa_seq"])
+                              for o in sc._find_orfs(
+                                  s, min_aa=min_aa, include_alt_starts=alt,
+                                  circular=True) if o["has_stop"])
+            got = summary(seq)
+            laps += sum(1 for o in got if o[2] >= len(seq))
+            assert summary(seq[k:] + seq[:k]) == got, (seq, min_aa, alt, k)
+        assert laps > 20, "the corpus lost its multi-lap ORFs"
+
+    def test_every_maximal_orf_and_nothing_else(self):
+        for seq, min_aa, alt, _k in self._circles(77, 300):
+            n = len(seq)
+            got = set()
+            for o in sc._find_orfs(seq, min_aa=min_aa,
+                                   include_alt_starts=alt, circular=True):
+                if not o["has_stop"]:
+                    continue
+                p = (o["start"] if o["strand"] == 1
+                     else (n - o["start"] - o["nt_len"]) % n)
+                got.add((o["strand"], p, o["nt_len"]))
+            assert got == _maximal_orfs_by_brute_force(seq, min_aa, alt), (
+                seq, min_aa, alt)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

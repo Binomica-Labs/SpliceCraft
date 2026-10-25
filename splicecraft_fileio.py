@@ -37,9 +37,11 @@ from splicecraft_util import (
     _safe_color_for_write, _safe_xml_parse, _sanitize_label, _to_ascii_text,
     _xml_legal_text,
 )
+from splicecraft_persistence import _refuse_export_into_data_dir
 from splicecraft_record import (
     _apply_locus_repair,
     _arrowless_decode_features, _arrowless_encode_features,
+    _long_type_decode_features,
     _backfill_topology, _gb_text_to_record, _INSDC_FLAG_QUALIFIERS,
     _locus_name_cap, _locus_name_for,
     _normalize_primer_seq,
@@ -70,6 +72,21 @@ _BULK_IMPORT_MAX_BYTES = 50 * 1024 * 1024
 # `abi` SeqIO key). Plasmidsaurus zips include these and we now surface
 # them as loadable entries.
 _AB1_EXTS: frozenset[str] = frozenset({".ab1", ".abi"})
+
+# An ABIF directory entry is a fixed 28 bytes (`Bio.SeqIO.AbiIO._DIRFMT`
+# = ">4sI2H4I"). The file HEADER declares how many of them there are and
+# how far apart they sit, and Biopython trusts both: it walks
+# `range(head_elem_num)` seeking to `head_offset + index * head_elem_size`.
+# Neither field is bounded by the file's own size, so a 217-byte trace
+# whose header claims 4.29 billion entries with a stride of ZERO re-reads
+# the same entry that many times — measured ~2-3 HOURS of real work, and
+# then it returns a perfectly ordinary 50 bp record, so nothing downstream
+# ever learns the file was hostile. The size cap can't see it (the file is
+# tiny) and neither can an exception handler (there is no exception).
+# Validated before the parse instead: a stride below one entry cannot
+# address distinct entries, and the directory has to actually fit in the
+# file. (Audit 2026-10-24.)
+_ABIF_DIR_ENTRY_BYTES = 28
 
 # FASTQ multi-read files (sequencing output). Imported as a new
 # collection per file, same flow as multi-record FASTA. Quality scores
@@ -427,6 +444,7 @@ def _export_genbank_to_path(record, path) -> dict:
     The round-trip happens BEFORE the target file is touched, so a failed
     export never leaves a half-written / corrupt .gb at `path`.
     """
+    _refuse_export_into_data_dir(path)
     from pathlib import Path as _Path
 
     p = _Path(path).expanduser()
@@ -824,6 +842,15 @@ def _record_to_gff3(record) -> str:
     return "\n".join(out)
 
 
+# A `Note` entry `key%3Dvalue`: the key is what `_record_to_gff3` writes —
+# quote(key, safe="") — so only unreserved characters and %XX escapes.
+_GFF3_NOTE_KEY_RE = re.compile(r"(?:[A-Za-z0-9_.~-]|%[0-9A-Fa-f]{2})+")
+_GFF3_NOTE_SEP_RE = re.compile(r"%3[Dd]|=")
+_GFF3_FASTA_LAYOUT_RE = re.compile(r"[\s0-9]+")
+# What a nucleotide import accepts: IUPAC + U, gap, stop, X.
+_NUCLEOTIDE_IMPORT_ALPHABET = frozenset("ACGTURYMKSWBDHVN-X*")
+
+
 def _parse_gff3_text(text: str) -> dict:
     """Parse GFF3 text into a structured dict for the loader.
 
@@ -970,12 +997,19 @@ def _parse_gff3_text(text: str) -> dict:
                 # separate notes. (Files written before that encoding landed —
                 # and any hand-written `Note=free text` — still read fine:
                 # an entry with no `=` becomes a plain note.)
-                for v_one in vals:
-                    if "=" in v_one:
-                        nk, _, nv = v_one.partition("=")
-                        quals.setdefault(nk, []).append(nv)
+                #
+                # Decided on the RAW entry: the writer percent-encodes the
+                # whole key, so a key holding anything it would have escaped
+                # — a raw space — is free text that happens to contain an
+                # (escaped) `=`. Splitting it made a qualifier named
+                # "induced with IPTG at a final OD600 " (audit 2026-10-23).
+                for raw_one in v.split(","):
+                    m = _GFF3_NOTE_SEP_RE.search(raw_one)
+                    if m and _GFF3_NOTE_KEY_RE.fullmatch(raw_one[:m.start()]):
+                        quals.setdefault(_u(raw_one[:m.start()]), []).append(
+                            _u(raw_one[m.end():]))
                     else:
-                        quals.setdefault("note", []).append(v_one)
+                        quals.setdefault("note", []).append(_u(raw_one))
                 continue
             quals.setdefault(k, []).extend(vals)
         if ftype == "region":
@@ -1006,7 +1040,16 @@ def _parse_gff3_text(text: str) -> dict:
             "phase":      phase,
         })
     if fasta_buf:
-        fasta_seq = "".join(fasta_buf).upper()
+        # Whitespace and position numbers are layout, not bases: kept, they
+        # made a 40 bp molecule import as 42 or 47 with every feature moved
+        # (audit 2026-10-23). What is left must be a nucleotide alphabet,
+        # the same one a FASTA import accepts.
+        fasta_seq = _GFF3_FASTA_LAYOUT_RE.sub("", "".join(fasta_buf)).upper()
+        bad = sorted(set(fasta_seq) - _NUCLEOTIDE_IMPORT_ALPHABET)
+        if bad:
+            raise ValueError(
+                "GFF3 ##FASTA section holds characters that are not IUPAC "
+                f"nucleotide codes: {''.join(bad[:8])!r}")
 
     return {
         "seqid":       seqid or "plasmid",
@@ -1019,6 +1062,19 @@ def _parse_gff3_text(text: str) -> dict:
         "fasta_seq":   fasta_seq,
         "region_qualifiers": region_quals,
     }
+
+
+def _spans_tile_molecule(asc: "list[tuple[int, int]]", total: int) -> bool:
+    """True when `asc` (ascending, from one feature) covers ``[0, total)``
+    edge to edge with no gap between consecutive spans — the shape a
+    whole-molecule feature has, and the one shape where a minus-strand
+    row order carries information nothing else does.
+    """
+    if total <= 0 or len(asc) < 2:
+        return False
+    if asc[0][0] != 0 or asc[-1][1] != total:
+        return False
+    return all(a[1] == b[0] for a, b in zip(asc, asc[1:]))
 
 
 def _gff3_features_to_biopython(
@@ -1122,6 +1178,20 @@ def _gff3_features_to_biopython(
             # The canonical origin wrap, whichever order the rows came in —
             # the same shape rule `_feature_traversal` keeps.
             fwd = [asc[-1], asc[0]]
+        elif strand == -1 and _spans_tile_molecule(asc, total) and is_circ:
+            # Rows that tile the WHOLE molecule end to end, no gap: here
+            # "descending by coordinate" is no longer the only reading order
+            # a minus-strand feature can have, because starting at the
+            # internal boundary and wrapping through the origin is equally
+            # legal and covers exactly the same bases. The two differ only
+            # in their ROW ORDER, which the branch below throws away — so a
+            # minus-strand whole-circle feature declared tail-first came
+            # back head-first and extracted a different sequence, while the
+            # GenBank path kept it (audit 2026-10-24). A spliced gene listed
+            # ascending the NCBI/Ensembl way always leaves intron gaps, so
+            # this shape only ever comes from a wrap convention and the
+            # rows' own order is the reading order `_record_to_gff3` wrote.
+            fwd = list(reversed(spans))
         elif strand == -1:
             if spans == asc or spans == list(reversed(asc)):
                 fwd = asc      # genomic (NCBI/Ensembl) or − reading order
@@ -1145,10 +1215,20 @@ def _gff3_features_to_biopython(
     def _codon_start_from_phase(parts: list[dict], feat) -> None:
         if str(feat.type).upper() != "CDS" or "codon_start" in feat.qualifiers:
             return
-        strand = -1 if all((p.get("strand") or 0) == -1 for p in parts) else 1
-        # 5'-most row: lowest start on +, highest end on −.
-        lead = (max(parts, key=lambda p: int(p["end"])) if strand == -1
-                else min(parts, key=lambda p: int(p["start_0"])))
+        # The row the ribosome meets first: the one holding the location's
+        # first part, which `_make_loc` stores in READING order. Picking it
+        # by coordinate (lowest start on +, highest end on −) took the
+        # second row of a CDS crossing the origin and stamped its phase —
+        # the first row's leftover — as /codon_start (audit 2026-10-23).
+        loc_parts = getattr(feat.location, "parts", None) or [feat.location]
+        first = (int(loc_parts[0].start), int(loc_parts[0].end))
+        lead = next((p for p in parts if first in (_row_spans(p) or [])),
+                    None)
+        if lead is None:
+            strand = (-1 if all((p.get("strand") or 0) == -1 for p in parts)
+                      else 1)
+            lead = (max(parts, key=lambda p: int(p["end"])) if strand == -1
+                    else min(parts, key=lambda p: int(p["start_0"])))
         ph = lead.get("phase")
         try:
             ph = int(ph) if ph not in (None, "", ".") else None
@@ -1297,6 +1377,7 @@ def _export_gff_to_path(record, path) -> dict:
     which is an optional dep). The serialiser is deterministic and
     test-covered, so the same source record always produces the
     same output."""
+    _refuse_export_into_data_dir(path)
     from pathlib import Path as _Path
 
     p = _Path(path).expanduser()
@@ -1341,6 +1422,7 @@ def _export_fasta_to_path(name: str, sequence: str, path) -> dict:
     leading ``>`` is dropped since the writer supplies its own) and the
     sequence is wrapped at `_FASTA_LINE_WIDTH`.
     """
+    _refuse_export_into_data_dir(path)
     from pathlib import Path as _Path
 
     header = _FASTA_HEADER_BAD_RE.sub(" ", str(name or "")).strip()
@@ -1424,6 +1506,7 @@ def _export_embl_to_path(record, path) -> dict:
       ValueError — record has no sequence, or the round-trip check fails.
       OSError    — filesystem failures (write, replace, fsync).
     """
+    _refuse_export_into_data_dir(path)
     from pathlib import Path as _Path
     from io import StringIO
     from Bio import SeqIO
@@ -1558,8 +1641,7 @@ def _parse_fasta_single(path: str) -> tuple[str, str]:
     seq = str(rec.seq).upper()
     if not seq:
         raise ValueError("FASTA record has empty sequence.")
-    valid = set("ACGTURYMKSWBDHVN-X*")
-    bad = sorted(set(seq) - valid)
+    bad = sorted(set(seq) - _NUCLEOTIDE_IMPORT_ALPHABET)
     if bad:
         # The everyday mistake on this path is handing a NUCLEOTIDE picker a
         # PROTEIN FASTA (an NCBI `.faa`, a UniProt download). "Non-IUPAC
@@ -1609,6 +1691,43 @@ def _fasta_path_to_record(path: str):
     return rec
 
 
+def _abif_header_reason(path: str, size: int) -> "str | None":
+    """Why `path`'s ABIF header is unusable, or None when it looks sane.
+
+    Guards the two header fields Biopython's directory walk trusts
+    unconditionally (see `_ABIF_DIR_ENTRY_BYTES`). Only an `ABIF`-magic
+    file is judged: anything else is left to the parser, which has a
+    better error for "this is not a trace at all".
+    """
+    import struct
+    from Bio.SeqIO.AbiIO import _HEADFMT
+    want = 4 + struct.calcsize(_HEADFMT)
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(want)
+    except OSError as exc:
+        return f"could not read AB1 header: {exc}"
+    if len(head) < want or head[:4] != b"ABIF":
+        return None
+    try:
+        parsed = struct.unpack(_HEADFMT, head[4:want])
+    except struct.error:
+        return None
+    stride, count, offset = int(parsed[4]), int(parsed[5]), int(parsed[7])
+    if count and stride < _ABIF_DIR_ENTRY_BYTES:
+        return (
+            f"corrupt AB1 header: the trace directory claims {count:,} "
+            f"entries {stride} bytes apart, but an entry is "
+            f"{_ABIF_DIR_ENTRY_BYTES} bytes"
+        )
+    if count and offset + (count - 1) * stride + _ABIF_DIR_ENTRY_BYTES > size:
+        return (
+            f"corrupt AB1 header: the trace directory claims {count:,} "
+            f"entries, which do not fit in a {size:,}-byte file"
+        )
+    return None
+
+
 def _ab1_path_to_record(path: str):
     """Parse a Sanger trace `.ab1` / `.abi` file into a `SeqRecord`.
 
@@ -1626,7 +1745,6 @@ def _ab1_path_to_record(path: str):
     Raises ValueError on malformed traces / missing base-call channels
     or files exceeding the size cap.
     """
-    import struct
     from Bio import SeqIO
     ok, reason = _safe_file_size_check(
         Path(path), _BULK_IMPORT_MAX_BYTES, "AB1",
@@ -1634,12 +1752,26 @@ def _ab1_path_to_record(path: str):
     if not ok:
         raise ValueError(reason or "AB1 trace rejected")
     try:
+        _size = Path(path).stat().st_size
+    except OSError as exc:
+        raise ValueError(f"could not read AB1 trace: {exc}") from exc
+    bad_header = _abif_header_reason(path, _size)
+    if bad_header:
+        raise ValueError(bad_header)
+    try:
         records = list(SeqIO.parse(path, "abi"))
-    except (OSError, ValueError, struct.error, KeyError) as exc:
-        # Biopython's ABI reader struct.unpack's attacker-controlled directory
-        # entries; a truncated/garbage trace can raise struct.error or KeyError.
-        # Normalise all of them to the friendly ValueError (mirrors load_genbank).
-        raise ValueError(f"could not parse AB1 trace: {exc}") from exc
+    except MemoryError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a hostile trace, not a bug
+        # Biopython's ABI reader unpacks attacker-controlled directory
+        # entries, and a corrupt one fails in whatever it hits first:
+        # struct.error / KeyError, an internal `assert` when an element count
+        # disagrees with its data size, AttributeError / TypeError when a tag
+        # holds the wrong element type. Every caller handles ValueError and
+        # nothing else — the Sanger picker let the rest exit the app (27% of
+        # 1-4 byte corruptions, audit 2026-10-23). Mirrors load_genbank.
+        raise ValueError(f"could not parse AB1 trace: "
+                         f"{type(exc).__name__}: {exc}") from exc
     if not records:
         raise ValueError(f"no base-called sequence in {Path(path).name}")
     if len(records) > 1:
@@ -1664,10 +1796,18 @@ def _fastq_quality_format(path: str) -> str:
     Phred+64 (Illumina 1.3–1.7) decoded as Phred+33 turns every score 31
     points too HIGH — Q2 junk reads as Q33 — which silently switched off the
     read-quality filter the heterogeneity verdict depends on (audit
-    2026-09-22). A quality character below ``;`` exists only in Phred+33; one
-    above ``J`` with nothing below ``@`` only in Phred+64. The range both
-    encodings share keeps the modern Phred+33 default."""
+    2026-09-22). A quality character below ``;`` exists only in Phred+33. The
+    range both encodings share keeps the modern Phred+33 default.
+
+    Nothing below ``@`` with something above ``J`` is NOT enough for Phred+64
+    on its own: a modern Phred+33 file whose every base is >= Q31 — HiFi,
+    duplex and consensus reads — looks exactly like that, and read as +64 it
+    lost 31 points a base (audit 2026-10-23). Phred+64 was only ever written
+    by Illumina / Solexa short-read pipelines, so a read longer than any of
+    them produced, or a character no Phred+64 file holds (above ``i``, Q41),
+    means Phred+33."""
     lo, hi = 255, 0
+    longest = 0
     try:
         with open(path, "rb") as fh:
             for i, line in enumerate(fh):
@@ -1678,11 +1818,23 @@ def _fastq_quality_format(path: str) -> str:
                     if q:
                         lo = min(lo, min(q))
                         hi = max(hi, max(q))
+                        longest = max(longest, len(q))
     except OSError:
         return "fastq"
     if lo >= 64 and hi > 74:
+        if hi > _PHRED64_MAX_CHAR or longest > _PHRED64_MAX_READ_LEN:
+            _log.info("FASTQ %s: every quality is >= Q31 but the reads (up to "
+                      "%d bp, max char %r) cannot be Phred+64; read as "
+                      "Phred+33", Path(path).name, longest, chr(hi))
+            return "fastq"
         return "fastq-illumina"
     return "fastq"
+
+
+# Phred+64 bounds: the Illumina 1.3-1.7 pipelines that wrote it topped out at
+# `i` (Q41) and at 150 bp reads. 300 leaves room for merged read pairs.
+_PHRED64_MAX_CHAR = ord("i")
+_PHRED64_MAX_READ_LEN = 300
 
 
 def _fastq_count_reads(path: str) -> "tuple[int, str | None]":
@@ -4752,6 +4904,7 @@ def _export_commercialsaas_dna(entry: dict, out_path: "Path | str") -> "str":
     Returns the absolute output path on success. Raises
     ``ValueError`` when the entry has no usable id or no parseable
     GenBank text. Raises ``OSError`` on file-write failure."""
+    _refuse_export_into_data_dir(out_path)
     from pathlib import Path as _Path
     eid = str(entry.get("id") or "")
     if not eid:
@@ -4998,6 +5151,7 @@ def _parse_genbank_file_records(path: str) -> list:
         if aligned:
             _backfill_topology(rec, locus_lines[i])
         _arrowless_decode_features(rec)
+        _long_type_decode_features(rec)
         _repair_wrapped_primer_seqs(rec)
         _repair_feature_key_artifacts(rec)
         _restore_display_name_from_comment(rec)
@@ -5160,6 +5314,7 @@ def load_genbank(path: str, *, legacy_dna_reader: bool = False,
     if gb_source_text:
         _backfill_topology(rec, gb_source_text)
     _arrowless_decode_features(rec)
+    _long_type_decode_features(rec)
     _repair_wrapped_primer_seqs(rec)
     if fmt != _BIOPYTHON_DNA_FMT:
         _n_keys = _repair_feature_key_artifacts(rec)

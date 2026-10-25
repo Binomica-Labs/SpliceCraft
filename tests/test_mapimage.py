@@ -606,3 +606,89 @@ class TestLayout:
         assert Image.open(BytesIO(
             mi.render_plasmid_map_png(feats, total, title=long_t,
                                       size=700))).size == (700, 700)
+
+
+# ── audit 2026-10-23: lane packing is O(F log F) and arcs are capped ────────
+
+def _ref_assign_lanes(feats, total):
+    """The pre-2026-10-23 pairwise algorithm, frozen as the reference."""
+    import splicecraft_biology as B
+    import splicecraft_mapimage as M
+
+    def in_arc(x, start, length):
+        return ((x - start) % total) < length
+
+    order = sorted(range(len(feats)),
+                   key=lambda i: B._feat_len(feats[i]["start"],
+                                             feats[i]["end"], total),
+                   reverse=True)
+    lanes, result = [], {}
+    for i in order:
+        f = feats[i]
+        s = int(f["start"])
+        ln = B._feat_len(s, f["end"], total)
+        placed = False
+        for lane_idx, occ in enumerate(lanes):
+            if all(not (in_arc(s, os_, ol) or in_arc(os_, s, ln))
+                   for os_, ol in occ):
+                occ.append((s, ln))
+                result[i] = lane_idx
+                placed = True
+                break
+        if not placed:
+            if len(lanes) >= M._MAP_MAX_LANES:
+                lanes[-1].append((s, ln))
+                result[i] = len(lanes) - 1
+            else:
+                lanes.append([(s, ln)])
+                result[i] = len(lanes) - 1
+    return result
+
+
+def test_lane_assignment_matches_the_pairwise_reference():
+    import random
+    import splicecraft_mapimage as M
+    rng = random.Random(20261024)
+    for trial in range(400):
+        total = rng.choice([50, 400, 3000, 10_000])
+        feats = []
+        for _ in range(rng.randint(0, 120)):
+            s = rng.randrange(-total, 2 * total)
+            r = rng.random()
+            if r < 0.08:
+                e = s                                      # zero length
+            elif r < 0.12:
+                e = s + total * rng.randint(1, 3)          # full turn(s)
+            elif r < 0.25:
+                e = rng.randrange(0, max(1, s % total))    # origin wrap
+            else:
+                e = s + rng.randint(1, max(1, total // rng.choice([2, 5, 50])))
+            feats.append({"start": s, "end": e})
+        assert M._assign_lanes(feats, total) == _ref_assign_lanes(feats, total), trial
+
+
+def test_lane_assignment_is_not_pairwise():
+    """8,000 non-overlapping features: the pairwise scan took 6 s here (and
+    21 s at 16k); the bisect packer takes ~15 ms. 100x headroom for a busy
+    machine, still 4x under what the old algorithm needs."""
+    import time
+    import splicecraft_mapimage as M
+    n = 8000
+    feats = [{"start": i * 100, "end": i * 100 + 60} for i in range(n)]
+    t0 = time.perf_counter()
+    lanes = M._assign_lanes(feats, n * 100)
+    dt = time.perf_counter() - t0
+    assert set(lanes.values()) == {0}
+    assert dt < 1.5, f"lane assignment took {dt:.2f} s for {n} features"
+
+
+def test_a_feature_far_past_the_end_draws_one_turn():
+    # 300 turns: the old renderer sampled every one of them (72k points here;
+    # `end=1e9` was 48 million points and the 11.7 GB OOM). Kept small so the
+    # test fails fast — not by exhausting memory — on code without the cap.
+    import splicecraft_mapimage as M
+    feats = [{"start": 10, "end": 10 + 5000 * 300, "strand": 1, "label": "x",
+              "color": "color(40)"}]
+    prims = M._build_primitives(feats, 5000, size=400)
+    n_points = sum(len(poly) for poly, *_rest in prims["polys"])
+    assert n_points < 2000, n_points

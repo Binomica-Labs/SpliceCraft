@@ -1125,3 +1125,23 @@ class TestBlastMenuEntry:
             await pilot.pause()
             await pilot.pause()
             assert isinstance(app.screen, sc.BlastModal)
+
+
+def test_auto_routes_a_long_nucleotide_query_off_nhmmer(monkeypatch):
+    """nhmmer builds a profile HMM from the whole query and grows roughly
+    quadratically: 4 kb took 16 s where seed-and-extend took 0.9 s, 10 kb
+    took 3 min / 1.3 GB, 20 kb died at a 1.5 GB cap — the 100 kb query cap
+    extrapolated to ~12 GB, one paste from an OOM (audit 2026-10-23)."""
+    import splicecraft as sc
+    monkeypatch.setattr(sc._state, "_PYHMMER_AVAILABLE", True)
+    called = []
+    monkeypatch.setattr(sc, "_blast_search_pyhmmer",
+                        lambda q, db, **k: called.append(len(q)) or [])
+    monkeypatch.setattr(sc, "_blast_search_pure", lambda q, db, **k: [])
+    db = {"program": "blastn", "subjects": [{"id": "s"}]}
+    sc._blast_search("ACGT" * 1500, db)                    # 6 kb
+    assert called == [], "a 6 kb query went to nhmmer"
+    sc._blast_search("ACGT" * 200, db)                     # 800 bp
+    assert called == [800]
+    sc._blast_search("ACGT" * 1500, db, backend="pyhmmer")  # still forceable
+    assert called == [800, 6000]

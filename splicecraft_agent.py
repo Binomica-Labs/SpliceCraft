@@ -43,7 +43,7 @@ from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _feat_len, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len, _span_full_lap_len, _span_in_span)
 from splicecraft_cloning import (_cloned_plasmid_regenerated_sites, _GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi, _enzyme_is_type_iis)
 from splicecraft_codon import (_CODON_RAMP_CODONS, _CODON_RARE_W, _codon_relative_adaptiveness, _CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_ambiguous_stops, _codon_cai, _codon_diversify, _codon_table_for, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
-from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _flush_dirty_mirror_before_switch, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_all_experiments, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
+from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _flush_dirty_mirror_before_switch, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_all_experiments, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _library_append_unique, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
 from splicecraft_experiments import (_EXPERIMENT_ACTIONS, _as_str_list, _tag_values, _experiment_duplicate, _experiment_html_document, _experiment_markdown_document, _experiment_project_markdown, _experiment_ref_token_ok, _experiment_search, _experiment_snippet, _experiment_search_terms, _experiment_template_markdown, _experiments_referencing, _new_experiment_id, _normalise_experiment_entry, _protocol_steps_markdown, _sanitize_experiment_id)
 from splicecraft_fileio import (_ab1_path_to_record, _insdc_qualifier_name, _PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
 from splicecraft_gels import (_new_gel_id, _normalise_gel_entry)
@@ -58,7 +58,7 @@ from splicecraft_presets import (
 )
 from splicecraft_logging import (_log, _log_event)
 from splicecraft_net import (_sanitize_accession)
-from splicecraft_persistence import (_safe_file_size_check, _safe_load_json)
+from splicecraft_persistence import (_refuse_export_into_data_dir, _safe_file_size_check, _safe_load_json)
 from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_design, _scrub_qc_primers, _scrub_qc_verify)
 from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq,
                                 _topology_from_gb_text)
@@ -67,7 +67,7 @@ from splicecraft_seqanalysis import (_classify_part_from_plasmid, _plan_chromoso
 from splicecraft_util import (_iso_instant, _variant_group_key, _PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _feat_spans, _feature_traversal, _phred_in_alignment_frame, _read_rotation_in_rows, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _degenerate_tm_bracket, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
-from splicecraft_biology import (_covered_identity, _read_extent_for, _read_is_clipped, _pos_in_spans, _variant_gate_pos, _digest_with_enzymes, _enzyme_aliases, _enzyme_site_methylation_targets, _methylated_base_positions, _enzyme_cuts, _enzyme_resolve_one, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
+from splicecraft_biology import (_covered_identity, _phred_trim_bounds, _read_extent_for, _read_is_clipped, _pos_in_spans, _variant_gate_pos, _digest_with_enzymes, _enzyme_aliases, _enzyme_site_methylation_targets, _methylated_base_positions, _enzyme_cuts, _enzyme_resolve_one, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
 from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _build_synthesis_l0_fragment, _design_gb_primers, _entry_vector_acceptor_overhangs, _grammar_position_by_type, _insilico_pcr_amplicons, _l0_part_from_syn_fragment)
 from splicecraft_dataaccess import (_active_enzyme_resolution, _agent_scan_library_for_key, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
 from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member, _fastq_count_reads, _fastq_path_to_records)
@@ -153,6 +153,10 @@ def _check_agent_write_path(path: Path) -> "str | None":
     """
     if path.is_symlink():
         return f"refusing to write through symlink at {path!s}"
+    try:
+        _refuse_export_into_data_dir(path)
+    except OSError as exc:
+        return str(exc)
     parent = path.parent
     if not parent.exists():
         return f"parent directory does not exist: {parent!s}"
@@ -294,6 +298,70 @@ def _coerce_int(value, *, name: str = "value") -> "int | str":
         except ValueError:
             return f"{name!r} must be an integer"
     return f"{name!r} must be an integer"
+
+
+_AGENT_PHRED_MAX = 93              # Sanger FASTQ ceiling (chr 126 − 33)
+
+
+def _agent_parse_read_quality(rq, cleaned_reads: "list[str]"
+                              ) -> "tuple[list, str | None]":
+    """Validate a ``read_quality`` payload against the reads it parallels.
+
+    Returns ``(arrays, error)`` — one ``list[int] | None`` per read, or an
+    error string for a 400. THE one validator for both
+    `verify-against-reads` and `analyse-read-heterogeneity`, which had two
+    copies that disagreed (audit 2026-10-24):
+
+      * NaN / ±Infinity are floats and passed the `isinstance` test, then
+        `int(v)` raised and the whole request became a scrubbed 500.
+      * A negative Phred was accepted; so was one past the Sanger ceiling.
+        Both then flow into the min_phred comparisons as real confidences.
+      * The length was compared against the RAW read in one endpoint and the
+        CLEANED read in the other, so a read with a trailing newline got a
+        400 on a correctly sized array. The cleaned read is what gets
+        aligned and what the array has to index, so it is the one to match.
+    """
+    import math
+    if rq is None:
+        return ([None] * len(cleaned_reads), None)
+    if not isinstance(rq, list):
+        return ([], "'read_quality' must be a list parallel to 'reads' "
+                    "(null for a read with no quality)")
+    if len(rq) != len(cleaned_reads):
+        return ([], f"'read_quality' has {len(rq)} entries for "
+                    f"{len(cleaned_reads)} reads — they must be parallel")
+    out: list = []
+    for qi, one in enumerate(rq):
+        if one is None:
+            out.append(None)
+            continue
+        if not isinstance(one, list):
+            return ([], f"read_quality[{qi}] must be a list of numbers "
+                        f"or null")
+        vals: "list[int]" = []
+        for v in one:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return ([], f"read_quality[{qi}] must be a list of numbers "
+                            f"or null")
+            if isinstance(v, float) and not math.isfinite(v):
+                return ([], f"read_quality[{qi}] holds {v!r} — a Phred score "
+                            f"must be a finite number 0-{_AGENT_PHRED_MAX}")
+            iv = int(v)
+            if not (0 <= iv <= _AGENT_PHRED_MAX):
+                return ([], f"read_quality[{qi}] holds {v!r} — a Phred score "
+                            f"must be 0-{_AGENT_PHRED_MAX}")
+            vals.append(iv)
+        # One score per BASE. A short array silently left the tail of the
+        # read with no quality — and the tail of a Sanger read is exactly
+        # where the ragged basecalls are, so the differences the array
+        # exists to discount were the ones it stopped covering
+        # (audit 2026-09-22).
+        if len(vals) != len(cleaned_reads[qi]):
+            return ([], f"read_quality[{qi}] has {len(vals)} scores for a "
+                        f"{len(cleaned_reads[qi])} base read — one per base, "
+                        f"or null")
+        out.append(vals)
+    return (out, None)
 
 
 def _agent_record_is_circular(app) -> bool:
@@ -1970,10 +2038,8 @@ def _h_optimize_protein(app, payload):
         return ({"error":
                   f"non-canonical amino acids in 'protein': "
                   f"{''.join(sorted(set(invalid_aa)))!r}"}, 400)
-    stops_raw = payload.get("stops", 1)
-    try:
-        stops = int(stops_raw)
-    except (TypeError, ValueError):
+    stops = _coerce_int(payload.get("stops", 1), name="stops")
+    if isinstance(stops, str):
         return ({"error": "'stops' must be an integer between 0 and 3"}, 400)
     if not 0 <= stops <= 3:
         return ({"error": "'stops' must be between 0 and 3"}, 400)
@@ -1984,9 +2050,8 @@ def _h_optimize_protein(app, payload):
     transl_raw = payload.get("transl_table")
     transl_table = None
     if transl_raw is not None:
-        try:
-            transl_table = int(transl_raw)
-        except (TypeError, ValueError):
+        transl_table = _coerce_int(transl_raw, name="transl_table")
+        if isinstance(transl_table, str):
             return ({"error": "'transl_table' must be an NCBI genetic-code "
                       "integer (e.g. 1, 4, 6, 11)"}, 400)
     mode = payload.get("mode", "frequency")
@@ -2923,17 +2988,19 @@ def _h_list_primer_collections(app, payload):
     surfaced as ``{name: "", n_primers: <count>}`` if it has content."""
     colls = _load_primer_collections()
     out = []
-    # Top-level primers — surfaced as the "default" collection.
+    active = _get_active_primer_collection_name() or ""
+    # Top-level primers -- the free-standing "default" collection. When a
+    # NAMED collection is active, primers.json is that collection's live
+    # mirror, so listing it too counted every primer twice (AG12).
     top = _load_primers()
-    if top:
+    if top and not any(c.get("name") == active for c in colls):
         out.append({"name": "", "n_primers": len(top)})
     for c in colls:
         out.append({
             "name":      c.get("name", "?"),
             "n_primers": len(c.get("primers", []) or []),
         })
-    return {"ok": True, "primer_collections": out,
-            "active": _get_active_primer_collection_name() or ""}
+    return {"ok": True, "primer_collections": out, "active": active}
 
 
 @_agent_endpoint("set-active-primer-collection", write=True)
@@ -3644,31 +3711,13 @@ def _h_download_plasmidsaurus(app, payload):
         if not entries:
             return ({"error": "no .gbk samples found in the results zip",
                      "warnings": warnings}, 422)
-        lib = _load_library()
-        # Uniquify the imported ids against the existing library before
-        # appending (mirrors the GUI fetch worker). Library `id` is the
-        # canonical key: `_find_library_entry_by_id` returns the first match
-        # and delete-by-id filters on `id != entry_id`, so a duplicate id
-        # would make a later single-entry delete remove BOTH copies. A
-        # re-import of the same run therefore suffix-bumps (`<id>_2`, …).
-        seen = {e.get("id") for e in lib if isinstance(e, dict)}
-        for e in entries:
-            base = e["id"]
-            n = 1
-            while e["id"] in seen:
-                n += 1
-                e["id"] = f"{base}_{n}"
-            seen.add(e["id"])
-            lib.append(e)
-        # Sync mirror (NOT async_sync): the agent is headless, so deferring the
-        # active-collection mirror to the background worker buys nothing and
-        # opens a crash window where the freshly-imported plasmids are in
-        # `plasmid_library.json` but not yet in the active collection — a
-        # crash + restart would then rebuild the live file from the active
-        # collection (`_restore_library_from_active_collection`) and LOSE the
-        # imports. Blocking the import response on the mirror is fine here.
+        # One locked read-modify-write with the id bump (`<id>_2`, …) — see
+        # `_library_append_unique`. Its mirror is synchronous: deferring it
+        # would open a crash window where the imports are in
+        # `plasmid_library.json` but not yet in the active collection, which
+        # the next launch restores the live file FROM.
         if (err := _agent_save_or_500(
-                lambda: _save_library(lib), "library")):
+                lambda: _library_append_unique(entries), "library")):
             return err
         added = [{"name": e["name"], "size": e["size"],
                   "n_feats": e["n_feats"]} for e in entries]
@@ -4081,9 +4130,9 @@ def _agent_part_dict(payload: dict) -> "dict | str":
     ptype = payload.get("type", "")
     if ptype is not None and not isinstance(ptype, str):
         return "'type' must be a string"
-    level = payload.get("level", 0)
-    if not isinstance(level, (int, float)) or isinstance(level, bool):
-        return "'level' must be a number"
+    level = _coerce_int(payload.get("level", 0), name="level")
+    if isinstance(level, str):
+        return level
     position = payload.get("position", "")
     if position is not None and not isinstance(position, str):
         return "'position' must be a string"
@@ -4756,10 +4805,8 @@ def _agent_feature_dict(payload: dict) -> "dict | str":
     ftype = payload.get("feature_type", "misc_feature")
     if ftype is not None and not isinstance(ftype, str):
         return "'feature_type' must be a string"
-    strand = payload.get("strand", 1)
-    if isinstance(strand, bool) or not isinstance(strand, (int, float)):
-        return "'strand' must be -1, 0, or 1"
-    if int(strand) not in (-1, 0, 1):
+    strand = _coerce_int(payload.get("strand", 1), name="strand")
+    if isinstance(strand, str) or strand not in (-1, 0, 1):
         return "'strand' must be -1, 0, or 1"
     color = payload.get("color")
     if color is not None and not isinstance(color, str):
@@ -7066,9 +7113,19 @@ def _h_scrub_plasmid(app, payload):
         feats_in = payload.get("features", [])
         if feats_in is None:
             feats_in = []
-        if not isinstance(feats_in, list):
+        if not isinstance(feats_in, list) or not all(
+                isinstance(f, dict) for f in feats_in):
             return ({"error": "'features' must be a list of feature dicts"}, 400)
-        feats = feats_in
+        feats = []
+        for _i, _f in enumerate(feats_in):
+            _f = dict(_f)
+            for _k in ("start", "end"):
+                if _f.get(_k) is not None:
+                    _v = _coerce_int(_f[_k], name=f"features[{_i}].{_k}")
+                    if isinstance(_v, str):
+                        return ({"error": _v}, 400)
+                    _f[_k] = _v
+            feats.append(_f)
     else:
         rec = getattr(app, "_current_record", None)
         if rec is None:
@@ -8122,7 +8179,7 @@ def _h_bulk_export_collection(app, payload):
     if not coll or not isinstance(coll, str):
         return ({"error": "missing 'collection'"}, 400)
     fmt = payload.get("format")
-    if fmt not in _BULK_EXPORT_FORMATS:
+    if not isinstance(fmt, str) or fmt not in _BULK_EXPORT_FORMATS:
         return ({"error": (
             f"unknown format {fmt!r}; "
             f"choose one of {sorted(_BULK_EXPORT_FORMATS)}"
@@ -9696,7 +9753,12 @@ def _h_diff_plasmid(app, payload):
     return {
         "ok":              True,
         "target_id":       target_id,
-        "target_name":     target_record.name or target_record.id or "",
+        # The library's own display name, not the LOCUS form of it: a caller
+        # that feeds this back as a name lookup must get a hit, and
+        # "My_plasmid_v2" does not resolve "My plasmid v2" ([INV-98]).
+        "target_name":     (target_entry.get("name")
+                            or target_record.name
+                            or target_record.id or ""),
         "circular":        is_circular,
         # Back-compat: the legacy single-rotation API exposed
         # `rotation_offset` as the bp the target was rotated by.
@@ -9798,7 +9860,8 @@ def _h_verify_against_reads(app, payload):
     ``{ok, reference_len, n_reads, min_identity, verdict, circular,
     reads:[{index, length, identity_pct, covered_identity_pct, covered_bp,
     coverage_pct, partial, rc, inversions, inverted_bp, passes}],
-    summary:{mean, min, max, n_pass, n_fail, n_inverted}}``.
+    summary:{mean, min, max, n_pass, n_fail, n_inverted}}``. A read with
+    nothing to compare also carries ``no_data: true`` (see ``verdict``).
 
     **Partial reads.** ``identity_pct`` is BLAST-style over the whole alignment,
     so for a read that covers part of the reference the bases it never reached
@@ -9813,8 +9876,12 @@ def _h_verify_against_reads(app, payload):
 
     ``verdict`` is "match" when EVERY read ≥ ``min_identity``; "inverted" when
     every read that falls short does so because part of it matches the
-    reference BACKWARDS; else "mismatch" (failing reads flagged
-    ``passes:false``). ``inversions`` lists each such span as
+    reference BACKWARDS; "inconclusive" when EVERY read had no comparable
+    base at all (a trace that came back all ``N``, marked ``no_data`` and
+    named in ``warnings``) — "mismatch" there says the construct is wrong on
+    the word of a read that says nothing, which costs a good clone, the same
+    rule `analyse-read-heterogeneity` applies with ``no_reads``; else
+    "mismatch" (failing reads flagged ``passes:false``). ``inversions`` lists each such span as
     ``{t_start, t_end, q_start, q_end, length, identity_pct,
     forward_identity_pct}`` in reference coordinates — an insert cloned the
     wrong way round otherwise scores like an unrelated plasmid, so identity
@@ -9851,36 +9918,10 @@ def _h_verify_against_reads(app, payload):
     # Per-read Phred arrays, parallel to `reads`. Validated up front so a
     # malformed entry is a 400 naming the read rather than a traceback halfway
     # through the alignment loop.
-    read_quals: list = []
-    rq = payload.get("read_quality")
-    if rq is not None:
-        if not isinstance(rq, list):
-            return ({"error": "'read_quality' must be a list parallel to "
-                              "'reads' (null for a read with no quality)"},
-                    400)
-        if len(rq) != len(reads):
-            return ({"error": f"'read_quality' has {len(rq)} entries for "
-                              f"{len(reads)} reads — they must be parallel"},
-                    400)
-        for qi, one in enumerate(rq):
-            if one is None:
-                read_quals.append(None)
-                continue
-            if not isinstance(one, list) or not all(
-                    isinstance(v, (int, float)) and not isinstance(v, bool)
-                    for v in one):
-                return ({"error": f"read_quality[{qi}] must be a list of "
-                                  f"numbers or null"}, 400)
-            # One score per BASE. A short array silently left the tail of the
-            # read with no quality — and the tail of a Sanger read is exactly
-            # where the ragged basecalls are, so the differences the array
-            # exists to discount were the ones it stopped covering
-            # (audit 2026-09-22).
-            if len(one) != len(reads[qi]):
-                return ({"error": f"read_quality[{qi}] has {len(one)} scores "
-                                  f"for a {len(reads[qi])} base read — one per "
-                                  f"base, or null"}, 400)
-            read_quals.append([int(v) for v in one])
+    read_quals, _rq_err = _agent_parse_read_quality(
+        payload.get("read_quality"), clean_reads)
+    if _rq_err is not None:
+        return ({"error": _rq_err}, 400)
     min_phred = _coerce_int(payload.get("min_phred", 20), name="min_phred")
     if isinstance(min_phred, str):
         return ({"error": min_phred}, 400)
@@ -9950,16 +9991,43 @@ def _h_verify_against_reads(app, payload):
         # verified as `match` (round-2 hardening, 2026-09-25).
         too_short = 0 < cov_bp < min(_VERIFY_MIN_COVERED_BP, len(ref_seq))
         judged = cov_ident if cov_bp > 0 and not too_short else None
+        # Is anything wrong BESIDES the orientation? An inverted block scores
+        # as mismatch across its whole length, so `covered_identity_pct` with
+        # it included cannot answer that — and `inverted` is defined as "the
+        # bases are right, the orientation isn't". Re-measured with the
+        # inverted spans dropped from both sides of the ratio.
+        rest_ident, rest_bp = (cov_ident, cov_bp)
+        if inv:
+            rest_ident, rest_bp = _covered_identity(
+                res, len(ref_seq), circular=circular,
+                exclude=_state._inverted_spans_hook(res, "target"))
+        rest_ok = (rest_bp >= min(_VERIFY_MIN_COVERED_BP, len(ref_seq))
+                   and rest_ident >= min_identity)
         out_reads.append({"index": i, "length": len(rs), "identity_pct": ident,
                           "covered_identity_pct": cov_ident,
                           "covered_bp": cov_bp,
                           "coverage_pct": coverage_pct,
                           "partial": bool(partial),
                           **({"too_short": True} if too_short else {}),
+                          # Nothing to compare at all (a trace that came back
+                          # all `N`, or a read the aligner placed over no
+                          # reference base). `passes: false` alone reads as
+                          # "compared and disagreed" — the sibling
+                          # `too_short` marker exists for exactly this and
+                          # stopped one base short of zero.
+                          **({"no_data": True} if cov_bp <= 0 else {}),
                           "rc": bool(res.get("query_rc", False)),
                           "inversions": inv,
                           "inverted_bp": sum(
                               max(0, int(s.get("length") or 0)) for s in inv),
+                          # Identity outside the inverted spans, so a caller
+                          # can see what `inverted` does and does not claim.
+                          **({"identity_outside_inversions_pct": rest_ident,
+                              "covered_bp_outside_inversions": rest_bp,
+                              # True when the inversion is the ONLY thing
+                              # wrong — what the `inverted` verdict means.
+                              "inversions_only": bool(rest_ok)}
+                             if inv else {}),
                           "passes": (judged is not None
                                      and judged >= min_identity)})
     idents = [r["identity_pct"] for r in out_reads]
@@ -9969,9 +10037,46 @@ def _h_verify_against_reads(app, payload):
     # right and the orientation isn't, which is a different next step at the
     # bench (re-screen colonies) from a failed build (start over). Only
     # reported when every read that falls short does so for THAT reason.
-    if n_pass == len(out_reads):
+    # The cross-read rollup, computed BEFORE the verdict because it is the
+    # only thing that can see what the reads AGREE on. Per-read identity
+    # cannot: a 100 bp deletion in a 10 kb plasmid is 99.0% covered identity,
+    # which clears the default threshold, so two reads both carrying it
+    # verified as `match` while `consensus.verdict` in the very same response
+    # read `confirmed` for that deletion and both trace verdicts said
+    # `real_changes` (audit 2026-10-24). An identity threshold alone cannot
+    # express "no indel", and a response must not contradict itself.
+    consensus = _state._multi_read_summary_hook(
+        _consensus_inputs, len(ref_seq), circular=circular)
+    _min_support = max(1, int(consensus.get("min_support") or 2))
+    # What stops a `match`: a difference the reads AGREE on (any type), or an
+    # INDEL that more reads show than contradict. `min_identity` is a
+    # tolerance for substitution-level noise — that is what a sequencing
+    # error floor looks like — and an indel is categorically not noise, so a
+    # single read carrying a confident 100 bp deletion blocks the verdict
+    # even though nothing corroborates it yet. A tolerated SNP still passes.
+    confirmed = [
+        v for v in (consensus.get("variants") or [])
+        if isinstance(v, dict)
+        and (int(v.get("support") or 0) >= _min_support
+             or (v.get("type") in ("insertion", "deletion")
+                 and int(v.get("support") or 0)
+                 > int(v.get("contradicted") or 0)))]
+    if out_reads and all(r.get("no_data") for r in out_reads):
+        # Every read carried no comparable base, so there is no evidence
+        # either way. `mismatch` claimed the construct was WRONG from a trace
+        # that came back all no-calls, which costs a good clone — the same
+        # "no data is not a verdict" rule `analyse-read-heterogeneity`
+        # applies with `no_reads` at `covered_bp: 0`.
+        verdict = "inconclusive"
+    elif n_pass == len(out_reads) and not confirmed:
         verdict = "match"
-    elif n_inverted and all(r["passes"] or r["inversions"] for r in out_reads):
+    elif n_inverted and all(
+            r["passes"] or r.get("inversions_only") for r in out_reads):
+        # "inverted" is reported only when the inversion is the ONLY thing
+        # wrong. Accepting any read that merely HAS an inversion called a
+        # read with an inversion plus an unrelated 400 bp deletion
+        # `inverted` at 82.7% covered identity, and the verdict is defined
+        # as "the bases are right, the orientation isn't".
         verdict = "inverted"
     else:
         verdict = "mismatch"
@@ -9983,6 +10088,13 @@ def _h_verify_against_reads(app, payload):
     # plasmid nobody read past bp 800 into a confirmed construct. The union of
     # what the reads covered is in `consensus`; this names the shortfall.
     warnings: "list[str]" = []
+    nodata = [r for r in out_reads if r.get("no_data")]
+    if nodata:
+        warnings.append(
+            f"{len(nodata)} of {len(out_reads)} read(s) gave no comparable "
+            f"base — every position was a no-call (`N`) or fell outside the "
+            f"reference. Those reads are evidence of nothing; re-sequence "
+            f"rather than reading them as a failed build.")
     partials = [r for r in out_reads if r.get("partial")]
     if partials and verdict == "match":
         widest = max(r["coverage_pct"] for r in partials)
@@ -9992,6 +10104,18 @@ def _h_verify_against_reads(app, payload):
             f"widest covers {widest}% of the reference). This confirms the "
             f"sequenced windows only — see `consensus` for the union of what "
             f"was read and what nobody covered.")
+    if confirmed and n_pass == len(out_reads):
+        _top = "; ".join(
+            f"{v.get('type', '?')} of {v.get('length', 1)} bp at bp "
+            f"{v.get('target_pos', '?')} "
+            f"({v.get('support', 0)}/{v.get('depth', 0)} reads)"
+            for v in confirmed[:5])
+        warnings.append(
+            f"every read clears {min_identity}% over the bases it covers, "
+            f"but the reads show {len(confirmed)} difference(s) from the "
+            f"reference that the threshold cannot express — {_top}. A 100 bp "
+            f"deletion in a 10 kb plasmid is 99% identity. The verdict is "
+            f"'mismatch' for that reason; see `consensus.variants`.")
     shorts = [r["index"] for r in out_reads if r.get("too_short")]
     if shorts:
         warnings.append(
@@ -10009,9 +10133,9 @@ def _h_verify_against_reads(app, payload):
             # Cross-read rollup: which differences the reads AGREE on, how much
             # of the reference they actually covered, and what nobody read.
             # Per-read identity cannot answer any of those — two reads at 99.9%
-            # might disagree about entirely different bases.
-            "consensus": _state._multi_read_summary_hook(
-                _consensus_inputs, len(ref_seq), circular=circular),
+            # might disagree about entirely different bases. Computed above,
+            # because the verdict depends on it.
+            "consensus": consensus,
             "read_quality": [e.get("quality") for e in _consensus_inputs],
             "ignored": _agent_ignored_keys(payload, {
                 "reference", "reference_id", "reference_name", "reads",
@@ -10096,6 +10220,13 @@ _HETERO_HOMOPOLYMER_MIN_RUN = 4
 # monotonically, a haplotype makes a bump. A bin must beat the one below it by
 # this many observations to count as a mode rather than binning jitter.
 _HETERO_SHAPE_BIN = 0.05
+# Coverage below which the verdict is reported with an explicit caveat. A
+# heterogeneity call describes the bases the reads REACHED, and reads covering
+# 3.8% of a plasmid answered `clonal` with nothing to distinguish that from a
+# fully covered clonal culture (audit 2026-10-24). Not a refusal: partial
+# coverage is a normal Sanger / amplicon situation and the answer is still
+# useful — it just must not be read as a statement about the whole molecule.
+_HETERO_LOW_COVERAGE_PCT = 50.0
 _HETERO_MODE_MIN_EXCESS = 2
 # A mode of one position is not a mode.
 _HETERO_MODE_MIN_POSITIONS = 2
@@ -10435,8 +10566,15 @@ def _h_read_trace(app, payload):
             floor = int(floor)
         except (TypeError, ValueError):
             floor = 20
-        good = [i for i, q in enumerate(qual) if q >= floor]
-        out["trimmed_span"] = ([good[0], good[-1] + 1] if good else None)
+        # THE GUI'S trim, not a re-derived one. `_phred_trim_bounds` slides a
+        # window in from each end and stops on the first whose MEAN clears
+        # the floor; picking the outermost base at or above it instead let a
+        # single lucky Q25 base hold 75 Q5 tail bases inside the "usable"
+        # span — [15, 576] where the GUI trims to (9, 500) (audit
+        # 2026-10-24). Two trims that disagree make the docstring's promise
+        # ("the way the GUI does") false.
+        start, end = _phred_trim_bounds(qual, min_phred=floor)
+        out["trimmed_span"] = ([start, end] if end > start else None)
         out["trim_min_phred"] = floor
     return out
 
@@ -10464,15 +10602,32 @@ def _h_analyse_read_heterogeneity(app, payload):
     Returns ``{ok, reference_len, n_reads, reads_source, circular, mean_depth,
     covered_bp, covered_pct, uncovered_spans, verdict, positions, thresholds,
     n_positions, n_filtered_low_quality, dropped_reads}`` where each entry of
-    `positions` is ``{pos, type, ref, alt, alt_reads, depth, fraction,
-    mean_phred, contradicted}``, sorted by descending fraction.
+    `positions` is ``{pos, type, ref, alt, alt_reads, low_quality_reads,
+    depth, fraction, observed_fraction, mean_phred, contradicted}``, sorted
+    by descending fraction. `fraction` is scored on the basecalls that
+    passed `min_phred`; `observed_fraction` is what the reads showed before
+    that filter, and the two differ exactly where `low_quality_reads` is
+    non-zero.
 
     `verdict` is:
       * ``clonal`` — nothing above `min_fraction`; the reads are one sequence.
       * ``minor_variants`` — a sub-population exists but is small and focal.
       * ``mixed`` — a position at/above 25% of the reads, OR 5+ distinct
         positions carrying real sub-populations (the escaper signature).
-      * ``no_reads`` — nothing aligned.
+      * ``inconclusive`` — clonal among the basecalls that passed
+        `min_phred`, while a position whose every observation fell below it
+        shows a SUBSTANTIAL apparent mixture (at/above `mixed_fraction`).
+        These reads cannot answer the question; lower `min_phred` to have
+        those calls judged. A smaller apparent fraction in poor basecalls is
+        the instrument's error floor and stays `clonal` — with a warning.
+      * ``no_reads`` — nothing aligned, or nothing covered.
+
+    A verdict only ever describes the bases the reads REACHED and the
+    basecalls good enough to judge; `covered_pct` and the warnings say how
+    far that goes. Nothing is muted silently — every position the verdict
+    could not count is still listed, with `muted_by` naming the reason
+    (``homopolymer`` / ``fixed_difference`` / ``low_quality`` /
+    ``noise_floor``) and a warning saying what was set aside.
 
     **`fraction`'s denominator is every read that COVERED the base**, including
     the ones that disagreed, so a variant inside a region only two reads reached
@@ -10634,22 +10789,13 @@ def _h_analyse_read_heterogeneity(app, payload):
                 return ({"error": f"reads[{i}] exceeds "
                                   f"{_PAIRWISE_MAX_LEN:,} bp"}, 413)
             seqs.append(rs)
-            one = rq[i] if isinstance(rq, list) and i < len(rq) else None
-            if one is None:
-                quals.append(None)
-                continue
-            if not isinstance(one, list) or not all(
-                    isinstance(v, (int, float)) and not isinstance(v, bool)
-                    for v in one):
-                return ({"error": f"read_quality[{i}] must be a list of "
-                                  f"numbers or null"}, 400)
-            # One score per base — see the same check in
-            # `verify-against-reads` (audit 2026-09-22).
-            if len(one) != len(rs):
-                return ({"error": f"read_quality[{i}] has {len(one)} scores "
-                                  f"for a {len(rs)} base read — one per base, "
-                                  f"or null"}, 400)
-            quals.append([int(v) for v in one])
+        # THE shared validator, against the reads that will actually be
+        # aligned — `rq` parallels the full `inline` list, so it is sliced to
+        # the ones `max_reads` kept.
+        quals, _rq_err = _agent_parse_read_quality(
+            rq[:len(seqs)] if isinstance(rq, list) else None, seqs)
+        if _rq_err is not None:
+            return ({"error": _rq_err}, 400)
         n_available = len(inline)
 
     thresholds = {"min_fraction": min_fraction, "min_phred": min_phred,
@@ -10694,6 +10840,7 @@ def _h_analyse_read_heterogeneity(app, payload):
                 "verdict": "no_reads", "positions": [], "n_positions": 0,
                 "n_filtered_low_quality": 0, "n_no_call_observations": 0,
                 "n_counted_in_verdict": 0, "n_muted_homopolymer": 0,
+                "n_muted_low_quality": 0,
                 "n_below_noise_floor": 0, "platform": platform,
                 "distribution": _hetero_shape([])}
 
@@ -10794,11 +10941,21 @@ def _h_analyse_read_heterogeneity(app, payload):
                     _log.exception("analyse-read-heterogeneity: phred lookup "
                                    "failed")
                     ph = None
-            if ph is not None and ph < min_phred:
-                n_filtered += 1
-                continue
-            slot = tally.setdefault(key, {"n": 0, "phred_sum": 0,
+            slot = tally.setdefault(key, {"n": 0, "lowq": 0, "phred_sum": 0,
                                           "phred_n": 0})
+            if ph is not None and ph < min_phred:
+                # MUTED, NOT DROPPED. Dropping it removed the position from
+                # the answer entirely, and since the read stays in the
+                # rollup's `depth` there was nothing left to form a fraction
+                # from: a true 50/50 mixture basecalled at Q15 — ordinary for
+                # older ONT — came back `clonal`, `positions: []`, no
+                # warning. That is the false-clonal direction this endpoint
+                # calls dangerous. Kept as support the verdict does not get
+                # to count, the same shape `homopolymer` / `noise_floor` /
+                # `fixed_difference` already use (audit 2026-10-24).
+                n_filtered += 1
+                slot["lowq"] += 1
+                continue
             slot["n"] += 1
             if ph is not None:
                 slot["phred_sum"] += ph
@@ -10813,6 +10970,13 @@ def _h_analyse_read_heterogeneity(app, payload):
         if d <= 0:
             continue
         frac = min(1.0, slot["n"] / d)
+        # What the reads SHOWED, before the quality filter: the same support
+        # with the sub-`min_phred` observations added back. Only used to
+        # decide whether the position is worth reporting at all — every
+        # threshold below still judges `frac`, so a poor basecall can never
+        # manufacture a verdict.
+        obs_frac = min(1.0, (slot["n"] + slot["lowq"]) / d)
+        lowq_only = slot["lowq"] > 0 and slot["n"] == 0
         # Heterogeneity is about the MINOR allele: a position where EVERY
         # read carries the alt is a clone that differs from the reference,
         # not a mixture. Judging the alt fraction called a perfectly clonal
@@ -10821,7 +10985,7 @@ def _h_analyse_read_heterogeneity(app, payload):
         # a fixed difference is reported — as `fixed`, outside the verdict.
         minor = min(frac, 1.0 - frac)
         fixed = frac >= 1.0 - noise_floor
-        if frac < min_fraction:
+        if frac < min_fraction and obs_frac < min_fraction:
             continue
         # Homopolymer context. Reported for EVERY call so a caller can see it
         # regardless of platform; it only removes a vote when the filter is on
@@ -10838,11 +11002,13 @@ def _h_analyse_read_heterogeneity(app, payload):
             "ref":          ref_v.get("ref", ""),
             "alt":          alt,
             "alt_reads":    slot["n"],
+            "low_quality_reads": slot["lowq"],
             "depth":        d,
             "fraction":     round(frac, 4),
+            "observed_fraction": round(obs_frac, 4),
             "minor_fraction": round(minor, 4),
             "fixed":        fixed,
-            "contradicted": max(0, d - slot["n"]),
+            "contradicted": max(0, d - slot["n"] - slot["lowq"]),
             "mean_phred":   (round(slot["phred_sum"] / slot["phred_n"], 1)
                              if slot["phred_n"] else None),
             "context":      ("homopolymer" if hp_len else None),
@@ -10853,9 +11019,11 @@ def _h_analyse_read_heterogeneity(app, payload):
             # the thresholds. The homopolymer filter is checked first because
             # it is the reason a caller can turn off.
             "counted_in_verdict": bool(not muted and not fixed
+                                       and not lowq_only
                                        and minor >= noise_floor),
             "muted_by": ("homopolymer" if muted
                          else "fixed_difference" if fixed
+                         else "low_quality" if lowq_only
                          else "noise_floor" if minor < noise_floor
                          else None),
         })
@@ -10877,7 +11045,8 @@ def _h_analyse_read_heterogeneity(app, payload):
     # real cluster sitting just above them.
     shape = _hetero_shape(
         [p["minor_fraction"] for p in positions
-         if p["muted_by"] not in ("homopolymer", "fixed_difference")],
+         if p["muted_by"] not in ("homopolymer", "fixed_difference",
+                                  "low_quality")],
         noise_floor,
         max_fraction=max((p["minor_fraction"] for p in voting), default=0.0))
     n_fixed = sum(1 for p in positions if p["muted_by"] == "fixed_difference")
@@ -10894,7 +11063,40 @@ def _h_analyse_read_heterogeneity(app, payload):
     n_muted_hp = sum(1 for p in positions if p["muted_by"] == "homopolymer")
     n_below_floor = sum(1 for p in positions
                         if p["muted_by"] == "noise_floor")
-    if not voting:
+    n_muted_lowq = sum(1 for p in positions if p["muted_by"] == "low_quality")
+    _covered_bp_pre = int(roll.get("covered_bp") or 0)
+    if not _covered_bp_pre:
+        # `clonal` means "the reads are one sequence". With nothing covered
+        # there are no reads to say that about: three all-N reads aligned and
+        # then reported `clonal` at `covered_bp: 0` with no warning, which
+        # reads as a clean result (audit 2026-10-24). Same answer the
+        # endpoint already gives when nothing aligns at all.
+        verdict = "no_reads"
+    elif not voting and any(
+            p["muted_by"] == "low_quality"
+            and min(p["observed_fraction"],
+                    1.0 - p["observed_fraction"]) >= _HETERO_MIXED_FRACTION
+            for p in positions):
+        # Clonal among the basecalls good enough to judge, while a position
+        # nothing could be read at looks like a SUBSTANTIAL mixture. `clonal`
+        # is the one answer this must not give there: 10 of 20 reads calling
+        # the same alternate base is not a Q15 error floor producing the same
+        # miscall ten times, it is a sub-population whose reads are
+        # individually unreliable and collectively conclusive. Reported as its
+        # own verdict rather than scored, because the honest statement is that
+        # these reads cannot answer the question — not a fraction derived from
+        # basecalls the caller's own threshold rejected (audit 2026-10-24).
+        #
+        # The bar is `_HETERO_MIXED_FRACTION`, the endpoint's own definition
+        # of a substantial sub-population — NOT `min_fraction`, which is the
+        # REPORTING floor. At `min_fraction` this fired on a 10% apparent alt
+        # in Q5 basecalls, which is exactly the instrument error floor the
+        # quality filter exists to remove: 10 reads of 100 at a ~32% per-base
+        # error rate. Below this bar the long-standing behaviour stands (the
+        # filter removes it, the verdict is `clonal`) — but no longer in
+        # silence: the warning below names every filtered observation.
+        verdict = "inconclusive"
+    elif not voting:
         verdict = "clonal"
     elif (shape["max_fraction"] >= _HETERO_MIXED_FRACTION
             or shape["mode_fraction"] is not None):
@@ -10919,6 +11121,36 @@ def _h_analyse_read_heterogeneity(app, payload):
     # something and the answer was not `mixed`, say what the biggest excluded
     # call was — that is the number that tells a caller whether anything
     # worth looking at was dropped.
+    # Quality filtering is the third way a real sub-population can vanish,
+    # and the only one that can remove ALL support for a position: those
+    # reads stay in the rollup's `depth`, so nothing is left to form a
+    # fraction from and the position used to disappear outright.
+    if n_filtered and verdict != "mixed":
+        _lowq_top = max((p["observed_fraction"] for p in positions
+                         if p["muted_by"] == "low_quality"), default=0.0)
+        hetero_warnings.append(
+            f"{n_filtered} observation(s) were basecalled below Q{min_phred} "
+            f"and did not count towards the verdict"
+            + (f" — {n_muted_lowq} position(s) are reported with "
+               f"muted_by 'low_quality' and NO usable support at all, the "
+               f"largest showing {_lowq_top:g} of its reads. The verdict "
+               f"below is what the reads that passed the quality filter say, "
+               f"not what the sample is."
+               if n_muted_lowq else
+               ". Their positions are still reported, scored on the reads "
+               "that passed.")
+            + " If the run is genuinely low-quality, re-run with a lower "
+              "min_phred to see those calls judged.")
+    if not _covered_bp_pre:
+        hetero_warnings.append(
+            "no read covered any base of the reference — there is nothing to "
+            "judge, so this is 'no_reads' rather than 'clonal'")
+    elif roll.get("covered_pct", 0.0) < _HETERO_LOW_COVERAGE_PCT:
+        hetero_warnings.append(
+            f"the reads cover only {roll.get('covered_pct', 0.0):g}% of the "
+            f"reference — this verdict says nothing about the "
+            f"{100.0 - float(roll.get('covered_pct', 0.0)):g}% no read "
+            f"reached; see 'uncovered_spans'")
     if n_below_floor and verdict != "mixed":
         _top_cut = max((p["fraction"] for p in positions
                         if p["muted_by"] == "noise_floor"), default=0.0)
@@ -10961,6 +11193,7 @@ def _h_analyse_read_heterogeneity(app, payload):
             # The verdict's working, so it can be checked rather than trusted.
             "n_counted_in_verdict": len(voting),
             "n_muted_homopolymer": n_muted_hp,
+            "n_muted_low_quality": n_muted_lowq,
             "n_below_noise_floor": n_below_floor,
             "distribution": shape,
             "platform": platform}
@@ -11045,6 +11278,12 @@ def _h_align_plasmidsaurus_zip(app, payload):
     # `target_name` would otherwise reflect the pre-rename name with
     # no way for the agent to detect the drift.
     resolved_target_id = target_entry.get("id") or ""
+    # The LIBRARY DISPLAY name as resolved, which is what a rename changes.
+    # `target_record.name` is the GenBank LOCUS form of it — spaces become
+    # underscores ([INV-98]) — so comparing the two reported a rename on
+    # every entry whose name holds a space: `_target_renamed_to: "Test
+    # plasmid v2"` when nothing had been renamed (audit 2026-10-24).
+    resolved_target_name = target_entry.get("name") or ""
     gb_text_target = target_entry.get("gb_text") or ""
     if not gb_text_target:
         return ({"error": "target entry has no gb_text"}, 422)
@@ -11124,8 +11363,7 @@ def _h_align_plasmidsaurus_zip(app, payload):
         # drift in the payload so the agent's follow-ups can use the
         # current name.
         current_name = current.get("name") or ""
-        if current_name and current_name != (target_record.name
-                                              or target_record.id or ""):
+        if current_name and current_name != resolved_target_name:
             result = dict(result)
             result["_target_renamed_to"] = current_name
     picked = result.get("picked_rotation", "none")
@@ -11148,7 +11386,12 @@ def _h_align_plasmidsaurus_zip(app, payload):
         "member":          member,
         "query_name":      query_record.name or query_record.id or "",
         "target_id":       target_entry.get("id") or "",
-        "target_name":     target_record.name or target_record.id or "",
+        # The library's own display name, not the LOCUS form of it: a caller
+        # that feeds this back as `target_name` must get a hit, and
+        # "Test_plasmid_v2" does not resolve "Test plasmid v2".
+        "target_name":     (resolved_target_name
+                            or target_record.name
+                            or target_record.id or ""),
         "circular":        is_circular,
         # Back-compat: `rotation_offset` mirrors `target_rotation`
         # (the legacy single-rotation API only ever rotated the target).
@@ -12516,12 +12759,8 @@ def _h_design_gb_part(app, payload):
     # same. Strand = -1 means the CDS is on the bottom strand; we
     # RC the slice before passing to `_design_gb_primers` so codon
     # repair runs in the right frame.
-    strand = payload.get("strand", 1)
-    try:
-        strand = int(strand)
-    except (TypeError, ValueError):
-        return ({"error": "'strand' must be 1 or -1"}, 400)
-    if strand not in (1, -1):
+    strand = _coerce_int(payload.get("strand", 1), name="strand")
+    if isinstance(strand, str) or strand not in (1, -1):
         return ({"error": "'strand' must be 1 or -1"}, 400)
     if strand == -1:
         # Wrap-aware slice + RC. Mirrors `_resolve_source`'s logic.
@@ -12684,6 +12923,23 @@ def _h_design_synthesis_fragment(app, payload):
         return ({"error": f"build failed: {_scrub_path(str(exc))}"}, 500)
     ev = _get_entry_vector(gid, "")
     result["entry_vector"] = (ev.get("name") if isinstance(ev, dict) else "") or ""
+    # A 4+ nt 5' overhang ending in ATG CARRIES the start codon (Golden
+    # Braid's AATG = A spacer + ATG), so a body that also opens on ATG
+    # duplicates it. On the typed path `_fuse_overhang_body` collapses the
+    # redundant one; a CUSTOM overhang has no part type, so the same insert
+    # with the same overhangs came out 3 bp longer reading
+    # `CTCG·AATG·ATG·…` — an extra Met, and [INV-136] through another door
+    # (audit 2026-10-24). Custom overhangs mean VERBATIM, so this is said
+    # rather than silently fixed — the same call the user made for the
+    # force-fit warning, and the caller may genuinely want M-M.
+    if (not part_type and cat5.upper().endswith("ATG") and len(cat5) >= 4
+            and seq[:3].upper() == "ATG"):
+        result.setdefault("warnings", []).append(
+            f"the custom 5' overhang {cat5!r} ends in ATG, which IS the "
+            f"start codon, and the body also opens on ATG — the fragment "
+            f"carries two (M-M). Custom overhangs are taken verbatim, so "
+            f"nothing was removed; drop the body's leading ATG to get the "
+            f"single start codon a typed {('CDS')!r} part produces.")
     return {"ok": True, "result": result}
 
 

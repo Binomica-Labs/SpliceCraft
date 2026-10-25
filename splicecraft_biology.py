@@ -27,12 +27,14 @@ extraction did not change them, only their physical home.
 from __future__ import annotations
 
 import base64 as _base64
+import bisect
 import functools
 import gzip as _gzip
 import math as _math
 import re
 import threading as _threading
 from collections import OrderedDict
+from collections.abc import Callable
 
 # Same-layer (L0) sibling deps for the restriction-scan engine
 # (Phase D): the LRU caches + catalog/enzyme getters live in _state;
@@ -1666,6 +1668,30 @@ def _iter_match_starts(pat, s: str):
         pos = start + 1   # +1 (not m.end()) keeps overlapping tandem hits
 
 
+# Exact early exit for the default `unique_only` scan (see
+# `_scan_restriction_sites_impl`). A module switch so a differential test can
+# compare against the ungated path.
+_SCAN_UNIQUE_GATE = True
+
+
+def _count_starts_below(pat, s: str, n: int, limit: int) -> int:
+    """Matches of `pat` in `s` (overlapping, as `_iter_match_starts` steps)
+    that start below `n`, counted up to `limit`."""
+    c = 0
+    for p in _iter_match_starts(pat, s):
+        if p >= n:
+            break
+        c += 1
+        if c >= limit:
+            break
+    return c
+
+
+class _ScanCancelled(Exception):
+    """Raised out of a restriction scan whose `cancel` callback answered
+    True. Never caught here, so a partial scan can't reach the cache."""
+
+
 def _scan_restriction_sites(
     seq: str,
     min_recognition_len: int = 6,
@@ -1673,6 +1699,8 @@ def _scan_restriction_sites(
     circular: bool = True,
     allowed_enzymes: "frozenset[str] | None" = None,
     distinct_cuts: bool = False,
+    *,
+    cancel: "Callable[[], bool] | None" = None,
 ) -> list[dict]:
     """Cached entry point for restriction-site scans. Identical
     signature + return shape to the inner `_scan_restriction_sites_impl`;
@@ -1686,7 +1714,12 @@ def _scan_restriction_sites(
 
     `distinct_cuts` (2026-08-26): keep NEOschizomers apart — see
     `_scan_restriction_sites_impl`. False (the map's setting) is the
-    historical behaviour; a QUERY surface wants True."""
+    historical behaviour; a QUERY surface wants True.
+
+    `cancel` is polled once per enzyme; when it answers True the scan
+    raises `_ScanCancelled` and nothing is cached. A Textual thread worker
+    can't be stopped from outside, so without it a superseded scan of a
+    chromosome kept the GIL for its full 10-20 s (audit 2026-10-23)."""
     # Cache key uses `hash(seq)` rather than `id(seq)`: id-based keys
     # break for transient strings (e.g. unit tests build a fresh seq
     # per test, GC'd between calls — CPython's allocator can hand the
@@ -1724,6 +1757,7 @@ def _scan_restriction_sites(
     result = _scan_restriction_sites_impl(
         seq, min_recognition_len, unique_only, circular,
         allowed_enzymes=allowed_enzymes, distinct_cuts=distinct_cuts,
+        cancel=cancel,
     )
     with _state._COMPUTE_CACHE_LOCK:
         if len(_state._RESTR_SCAN_CACHE) >= _state._RESTR_SCAN_CACHE_MAX:
@@ -1741,6 +1775,7 @@ def _scan_restriction_sites_impl(
     *,
     allowed_enzymes: "frozenset[str] | None" = None,
     distinct_cuts: bool = False,
+    cancel: "Callable[[], bool] | None" = None,
 ) -> list[dict]:
     """Scan both strands; return resite + recut dicts for every hit.
 
@@ -1779,7 +1814,10 @@ def _scan_restriction_sites_impl(
     # For circular sequences, scan an augmented copy that includes up to
     # site_len-1 bp re-attached from the beginning so matches starting near
     # the end (that would otherwise be truncated) are found too.
-    max_site_len = max((e[2] for e in _state._scan_catalog_hook()), default=0)
+    # ONE catalog snapshot for the whole scan: the hook used to be read four
+    # times, so a concurrent `_rebuild_scan_catalog` could mix two catalogs.
+    catalog = _state._scan_catalog_hook()
+    max_site_len = max((e[2] for e in catalog), default=0)
     # `max_site_len > 1` guard mirrors `_enzyme_cuts_impl`: at 0 (empty catalog)
     # the slice would be `seq_u[:-1]`, appending the whole sequence bar its last
     # base — a pointless O(n) copy of a ~2n string. Harmless today (an empty
@@ -1878,7 +1916,32 @@ def _scan_restriction_sites_impl(
             **common,
         })
 
-    for entry in _state._scan_catalog_hook():
+    # Exact early exit (audit 2026-10-23). Under `unique_only` an enzyme
+    # survives only if it has exactly ONE site, and on anything genome-sized
+    # nearly every enzyme cuts many times — the scan built ~1M site dicts at
+    # 2 Mbp (3.3 s, +136 MB) only to throw all of them away. Each match
+    # starting below `n` (forward; plus reverse for a non-palindrome) emits
+    # exactly ONE labelled resite below, which is what `n_sites` counts, so
+    # counting matches up to 2 decides the enzyme without building anything;
+    # a dropped enzyme never reaches `placed`. Only with unique catalog names:
+    # `seen` can dedup across two entries of the same name.
+    gate = (_SCAN_UNIQUE_GATE and unique_only and allowed_enzymes is None
+            and len({e[0] for e in catalog}) == len(catalog))
+    # Isoschizomers, HF variants and a non-palindrome's reverse pattern that
+    # equals another enzyme's forward one share a pattern; each was walked
+    # again — 206 regex passes for 146 distinct patterns (audit 2026-10-23).
+    # The same starts, in the same order, from one walk per pattern.
+    starts_memo: "dict[tuple, list[int]]" = {}
+
+    def _starts(rx) -> "list[int]":
+        key = (rx.pattern, rx.flags)
+        got = starts_memo.get(key)
+        if got is None:
+            got = starts_memo[key] = list(_iter_match_starts(rx, scan_seq))
+        return got
+    for entry in catalog:
+        if cancel is not None and cancel():
+            raise _ScanCancelled()
         name, site, site_len, fwd_cut, rev_cut, color, pat, is_palindrome, rc_pat = entry
         # `allowed_enzymes` (GH #13): when set, the user has hand-
         # picked a working list — bypass the length filter so a 4-cutter
@@ -1891,10 +1954,16 @@ def _scan_restriction_sites_impl(
         else:
             if site_len < min_recognition_len:
                 continue
+        if gate:
+            c = _count_starts_below(pat, scan_seq, n, 2)
+            if c < 2 and not is_palindrome:
+                c += _count_starts_below(rc_pat, scan_seq, n, 2 - c)
+            if c != 1:
+                continue
         hits: list[dict] = []
 
         # Forward strand scan (over augmented sequence if circular)
-        for p in _iter_match_starts(pat, scan_seq):
+        for p in _starts(pat):
             if p >= n:
                 continue   # duplicate of match already found at p - n
             key = (name, p, 1)
@@ -1951,7 +2020,7 @@ def _scan_restriction_sites_impl(
         if not is_palindrome:
             # Non-palindromic: scan for RC on forward strand to find
             # reverse-strand binding sites at their correct positions.
-            for p in _iter_match_starts(rc_pat, scan_seq):
+            for p in _starts(rc_pat):
                 if p >= n:
                     continue   # duplicate of match already found at p - n
                 key = (name, p, -1)
@@ -2050,10 +2119,10 @@ def _scan_restriction_sites_impl(
     # False and keeps one bar per span.
     placed: set[tuple] = set()
     site_of: dict[str, str] = {
-        entry[0]: entry[1] for entry in _state._scan_catalog_hook()
+        entry[0]: entry[1] for entry in catalog
     }
     cuts_of: dict[str, tuple] = {
-        entry[0]: (entry[3], entry[4]) for entry in _state._scan_catalog_hook()
+        entry[0]: (entry[3], entry[4]) for entry in catalog
     } if distinct_cuts else {}
     # When a custom enzyme list is active, the user has hand-picked
     # the set — surface every hit of those enzymes regardless of
@@ -2610,7 +2679,14 @@ def _fragment_local_parts(f: dict, n: int, a: int,
                           *, modular: bool) -> "list[list[int]] | None":
     """A feature dict's exon ``parts``, clipped to one fragment and rebased
     into fragment-local coordinates — or ``None`` when the feature has no
-    introns, or nothing discontiguous survives the clip.
+    introns.
+
+    A spliced feature ALWAYS gets a list back, even when only one exon (or
+    none) survives the clip: `_apply_local_parts` narrows the piece to what
+    survived, or drops it. Returning ``None`` for a single surviving exon —
+    as this did until audit 2026-10-23 — read as "not spliced", so a cut
+    inside an intron left each linear-digest piece annotating the intron
+    bases up to the cut as coding.
 
     `intervals` are the fragment's ABSOLUTE spans (two for an origin-crossing
     fragment, one otherwise) and `a` is its absolute start.
@@ -2651,7 +2727,7 @@ def _fragment_local_parts(f: dict, n: int, a: int,
             merged[-1][1] = max(merged[-1][1], pe)
         else:
             merged.append([ps, pe])
-    return merged if len(merged) > 1 else None
+    return merged
 
 
 def _apply_local_parts(piece: dict, loc_parts, lo: int,
@@ -2689,6 +2765,13 @@ def _apply_local_parts(piece: dict, loc_parts, lo: int,
     else:
         piece.pop("parts", None)
     return piece
+
+
+def _cuts_strictly_ascending(cuts: "list[int]") -> bool:
+    """Whether cut positions are in strictly ascending order — what lets the
+    digest find a feature's fragments by bisect. (A test seam as well: the
+    scan of every fragment is the reference it is compared against.)"""
+    return all(cuts[k] < cuts[k + 1] for k in range(len(cuts) - 1))
 
 
 def _split_features_at_cuts(features: list[dict], n: int,
@@ -2787,8 +2870,16 @@ def _split_features_at_cuts(features: list[dict], n: int,
             expanded.append(f)
     features = expanded
 
+    ordered = _cuts_strictly_ascending(cut_top_positions)
+
     def _slot_for(bp: int) -> int:
         """Return the fragment index containing `bp` (0-based)."""
+        if ordered:
+            if not circular:
+                return bisect.bisect_right(cut_top_positions, bp)
+            if bp < cut_top_positions[0] or bp >= cut_top_positions[-1]:
+                return n_cuts - 1
+            return bisect.bisect_right(cut_top_positions, bp) - 1
         if circular:
             # Find the cut k such that bp ∈ (cuts[k], cuts[k+1]] (mod n).
             for i in range(n_cuts):
@@ -2844,8 +2935,28 @@ def _split_features_at_cuts(features: list[dict], n: int,
         #       gene vanished from every other fragment it actually covers.
         # Intersecting the feature's span with each fragment's span reports
         # both correctly and is what "which fragments carry this gene?" means.
-        cut_inside = any(s < c < e for c in cut_top_positions)
-        for i, ivs in enumerate(spans):
+        if ordered:
+            # The fragments a span can touch are a contiguous run of cut
+            # intervals (plus, on a circle, the one crossing the origin):
+            # bisect finds them, and the tests below decide exactly as the
+            # scan of every fragment did — 4.5 s for 2,000 features against
+            # 3,864 cuts before (audit 2026-10-23).
+            k_lo = bisect.bisect_right(cut_top_positions, s)
+            k_hi = bisect.bisect_left(cut_top_positions, e)
+            cut_inside = (k_lo < n_cuts and cut_top_positions[k_lo] < e)
+            if circular:
+                cand = list(range(max(k_lo - 1, 0),
+                                  min(k_hi - 1, n_cuts - 2) + 1))
+                if (n_cuts == 1 or s < cut_top_positions[0]
+                        or e > cut_top_positions[-1]):
+                    cand.append(n_cuts - 1)
+            else:
+                cand = list(range(k_lo, min(k_hi, n_cuts) + 1))
+        else:
+            cut_inside = any(s < c < e for c in cut_top_positions)
+            cand = list(range(len(spans)))
+        for i in cand:
+            ivs = spans[i]
             if not any(max(s, lo) < min(e, hi) for lo, hi in ivs):
                 continue
             starts_here = any(lo <= s < hi for lo, hi in ivs)
@@ -3295,6 +3406,59 @@ def _read_is_clipped(result: dict) -> bool:
     return q0 > 0 or (q_len > 0 and q1 < q_len)
 
 
+_PHRED_TRIM_WINDOW = 10            # bases per sliding window for end trimming
+_SANGER_MIN_PHRED_DEFAULT = 20     # Phred 20 = 1 wrong base in 100; the
+                                   # threshold every Sanger pipeline uses as
+                                   # the line between "read it" and "don't".
+
+
+def _phred_trim_bounds(
+    phred, *, min_phred: int = _SANGER_MIN_PHRED_DEFAULT,
+    window: int = _PHRED_TRIM_WINDOW,
+) -> "tuple[int, int]":
+    """The usable window of a read, as a half-open ``(start, end)`` in read bp.
+
+    Walks a sliding window in from each end and stops at the first window whose
+    MEAN Phred clears `min_phred` — the standard Sanger end-trim. A mean rather
+    than a per-base test on purpose: one bad base inside an otherwise clean
+    stretch should not end the read, and a single lucky base inside the ragged
+    tail should not extend it.
+
+    Returns ``(0, 0)`` when nothing clears the bar. That is the honest answer
+    for a failed trace and callers MUST treat it as "this read proves nothing"
+    — reporting 100% identity over an empty window would be the worst possible
+    output here. A read shorter than `window` is judged as one short window, so
+    a 30-base read is not silently discarded for being small.
+
+    Lives here, beside the extent/clipping family, because the GUI trim and
+    the agent's `read-trace` must be THE SAME trim — two that disagree make
+    `trimmed_span`'s "the way the GUI does" promise false ([INV-87] shape;
+    audit 2026-10-24).
+    """
+    quals = [q for q in (phred or []) if isinstance(q, (int, float))]
+    n = len(quals)
+    if n == 0:
+        return (0, 0)
+    w = max(1, min(int(window) or 1, n))
+    thr = float(min_phred)
+
+    def _mean(lo: int) -> float:
+        return sum(quals[lo:lo + w]) / float(w)
+
+    start = 0
+    while start + w <= n and _mean(start) < thr:
+        start += 1
+    if start + w > n:
+        # No window anywhere clears the bar.
+        return (0, 0)
+    end = n
+    while end - w >= start and _mean(end - w) < thr:
+        end -= 1
+    if end <= start:
+        return (0, 0)
+    return (start, end)
+
+
 def _read_extent_for(result: dict, total: int, *,
                      circular: bool) -> "list[tuple[int, int]] | None":
     """`_read_extent_from_rows` for an alignment RESULT — rows, frame shift
@@ -3465,7 +3629,9 @@ def _read_no_call_positions(aligned_q: str, aligned_t: str) -> "set[int]":
 
 
 def _covered_identity(align: dict, total: "int | None" = None, *,
-                      circular: bool = False) -> "tuple[float, int]":
+                      circular: bool = False,
+                      exclude: "list[tuple[int, int]] | None" = None,
+                      ) -> "tuple[float, int]":
     """``(identity_pct, covered_bp)`` over the read's own EXTENT — the
     identity of what was sequenced.
 
@@ -3499,7 +3665,16 @@ def _covered_identity(align: dict, total: "int | None" = None, *,
     reference between its last base and its first is a deletion it sequenced
     across, not unread plasmid. Walking only first-to-last made a clone
     missing 120 bp across the origin verify as a match while the consensus in
-    the same response listed the deletion (round-2 hardening, 2026-09-25)."""
+    the same response listed the deletion (round-2 hardening, 2026-09-25).
+
+    ``exclude`` drops reference spans (half-open, target coordinates) from
+    BOTH the numerator and the denominator — "how right is the rest of it".
+    Its one caller is the `inverted` verdict: an inverted block scores as
+    mismatch everywhere, so the figure including it cannot say whether
+    anything ELSE is wrong, and a read with an inversion plus an unrelated
+    400 bp deletion was reported as merely `inverted` (audit 2026-10-24).
+    Excluded bases are not counted as covered either — nothing was verified
+    there."""
     aq = str(align.get("aligned_q") or "")
     at = str(align.get("aligned_t") or "")
     if not aq or not at or len(aq) != len(at):
@@ -3515,8 +3690,42 @@ def _covered_identity(align: dict, total: "int | None" = None, *,
     else:
         span = (range(first, last + 1) if first <= last
                 else list(range(first, len(aq))) + list(range(0, last + 1)))
+    # On a LINEAR reference the read may hang off either END, and those
+    # columns are gaps in the target row exactly like an insertion. They are
+    # not one: there is no reference base there to insert into. A perfect read
+    # plus 30 bp of adapter scored 98.52% and came back `mismatch` while the
+    # consensus was clean and the trace verdict said so too — the same
+    # overhang rule `_variant_gate_pos` already applies ([INV-213] item 4;
+    # audit 2026-10-24). On a CIRCLE there is no end to hang off: an
+    # insertion past the last base is at bp 0 and counts.
+    t_lo = t_hi = -1
+    if not circular:
+        for i, c in enumerate(at):
+            if c != "-":
+                if t_lo < 0:
+                    t_lo = i
+                t_hi = i
+    # Target bp per column, so `exclude` can be tested in reference
+    # coordinates. Built only when something is excluded.
+    skip_cols: set = set()
+    if exclude:
+        norm = [(int(s), int(e)) for s, e in exclude if int(e) > int(s)]
+        if norm:
+            tp = 0
+            for i, c in enumerate(at):
+                if c == "-":
+                    # A gap in the target belongs to the base it sits before,
+                    # so an insertion inside an excluded span is excluded too.
+                    if any(s <= tp < e for s, e in norm):
+                        skip_cols.add(i)
+                    continue
+                if any(s <= tp < e for s, e in norm):
+                    skip_cols.add(i)
+                tp += 1
     matches = compared = covered = 0
     for i in span:
+        if i in skip_cols:
+            continue
         cq, ct = aq[i], at[i]
         if cq == "-" and ct == "-":
             continue
@@ -3524,6 +3733,8 @@ def _covered_identity(align: dict, total: "int | None" = None, *,
             compared += 1
             covered += 1
             continue
+        if ct == "-" and t_lo >= 0 and (i < t_lo or i > t_hi):
+            continue                  # read overhang past a linear end
         if ct == "-":                 # an insertion the read carries
             if cq.upper() not in "ACGT":
                 continue              # a masked read end: no evidence

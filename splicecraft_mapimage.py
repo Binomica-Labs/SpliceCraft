@@ -37,6 +37,7 @@ Layer 1: imports biology / util / logging (L0) only — NOT the hub.
 """
 from __future__ import annotations
 
+import bisect
 import math
 from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape
@@ -45,7 +46,7 @@ import splicecraft_biology as _bio
 from splicecraft_logging import _log
 from splicecraft_util import (_feat_label_full, _feature_traversal,
                              _record_is_circular, _sanitize_label,
-                             _xml_legal_text)
+                             _traversal_bounds, _xml_legal_text)
 
 # ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -211,46 +212,98 @@ def _in_arc(x: float, start: float, length: float, total: int) -> bool:
     return ((x - start) % total) < length
 
 
+def _arc_extent(f: dict, total: int) -> "tuple[int, int]":
+    """``(start in [0, total), arc length capped at one full turn)``. A
+    caller-built feature with ``end`` far past ``total`` used to make
+    `_band_polygon` sample its many turns — 48 million points (11.7 GB) for
+    ``end=1e9`` on a 5 kb record (audit 2026-10-23)."""
+    s = int(f["start"]) % total
+    # A NEGATIVE length (start past `total`, end before it) contains nothing
+    # — a point, exactly like zero.
+    ln = _bio._feat_len(int(f["start"]), f["end"], total)
+    return s, max(0, min(ln, total))
+
+
 def _assign_lanes(feats: list, total: int) -> "dict[int, int]":
     """Greedy circular-arc colouring: map each feature index to a lane so
     overlapping arcs stack onto separate concentric rings. Returns
     ``{feat_index: lane}`` (lane 0 = on the backbone, higher = inward).
 
     Longest arcs are placed first so the dominant features own the outer
-    lanes — matches how the eye reads a plasmid map."""
+    lanes — matches how the eye reads a plasmid map.
+
+    Two arcs collide when either one's start lies inside the other
+    (half-open), so a ZERO-length arc is a point that blocks any arc over
+    it, and a full turn blocks everything. Each lane keeps its arcs as
+    sorted, disjoint linear pieces (an origin-wrapping arc is two), so a fit
+    test is a bisect rather than a scan of every occupant — the pairwise
+    scan was O(F²): 21 s for 16k features (audit 2026-10-23). Once the
+    lane cap is reached, whatever fits no earlier lane goes to the last
+    one, overlapping or not, so that lane needs no test."""
+    if total <= 0:
+        return {i: 0 for i in range(len(feats))}
     order = sorted(
         range(len(feats)),
         key=lambda i: _bio._feat_len(feats[i]["start"], feats[i]["end"], total),
         reverse=True,
     )
-    lanes: list[list[tuple[int, int]]] = []   # per lane: list of (start, arclen)
+    # per lane: (piece starts, piece ends, zero-length points), all sorted
+    lanes: "list[tuple[list[int], list[int], list[int]]]" = []
     result: dict[int, int] = {}
+
+    def _pieces(s: int, ln: int) -> "list[tuple[int, int]]":
+        if ln >= total:
+            return [(0, total)]
+        if s + ln <= total:
+            return [(s, s + ln)]
+        return [(s, total), (0, s + ln - total)]
+
+    def _fits(lane, s: int, ln: int) -> bool:
+        starts, ends, points = lane
+        if ln == 0:
+            i = bisect.bisect_right(starts, s) - 1
+            return not (i >= 0 and ends[i] > s)
+        for a, b in _pieces(s, ln):
+            i = bisect.bisect_left(starts, b)
+            if i > 0 and ends[i - 1] > a:
+                return False
+            j = bisect.bisect_left(points, a)
+            if j < len(points) and points[j] < b:
+                return False
+        return True
+
+    def _occupy(lane, s: int, ln: int) -> None:
+        starts, ends, points = lane
+        if ln == 0:
+            bisect.insort(points, s)
+            return
+        for a, b in _pieces(s, ln):
+            k = bisect.bisect_left(starts, a)
+            starts.insert(k, a)
+            ends.insert(k, b)
+
     for i in order:
-        f = feats[i]
-        s = int(f["start"])
-        ln = _bio._feat_len(s, f["end"], total)
+        s, ln = _arc_extent(feats[i], total)
+        n_lanes = len(lanes)
+        capped = n_lanes >= _MAP_MAX_LANES
         placed = False
-        for lane_idx, occ in enumerate(lanes):
-            if all(
-                not (_in_arc(s, os_, ol, total)
-                     or _in_arc(os_, s, ln, total))
-                for os_, ol in occ
-            ):
-                occ.append((s, ln))
+        for lane_idx in range(n_lanes - 1 if capped else n_lanes):
+            if _fits(lanes[lane_idx], s, ln):
+                _occupy(lanes[lane_idx], s, ln)
                 result[i] = lane_idx
                 placed = True
                 break
-        if not placed:
-            if len(lanes) >= _MAP_MAX_LANES:
-                # Cap the ring count: a plasmid with a huge overlapping-feature
-                # pile-up would otherwise spawn unbounded (invisibly thin) lanes
-                # and make lane assignment O(F²). Stack the overflow onto the
-                # innermost lane (accepting some visual overlap) instead.
-                lanes[-1].append((s, ln))
-                result[i] = len(lanes) - 1
-            else:
-                lanes.append([(s, ln)])
-                result[i] = len(lanes) - 1
+        if placed:
+            continue
+        if capped:
+            # Overflow: the innermost lane takes it, overlap accepted (a
+            # pathological pile-up would otherwise spawn unbounded, invisibly
+            # thin lanes).
+            result[i] = n_lanes - 1
+        else:
+            lanes.append(([], [], []))
+            _occupy(lanes[-1], s, ln)
+            result[i] = len(lanes) - 1
     return result
 
 
@@ -363,8 +416,7 @@ def _build_primitives(feats: list, total: int, *,
         deepest = max(lanes.values()) if lanes else 0
         inner_clear_r = _lane_radius(deepest, s) - (_BAND / 2.0) * s
         for i, f in enumerate(feats):
-            start = int(f["start"])
-            arclen = _bio._feat_len(start, f["end"], total)
+            start, arclen = _arc_extent(f, total)
             if arclen <= 0:
                 continue
             a0 = _angle(start, total, origin_bp)
@@ -728,7 +780,8 @@ def _feat_bounds(feat, total: int, *,
                                   circular=circular)
         if trav is None:
             return None
-        start, end = int(trav[0]), int(trav[1])
+        start, end = (int(v) for v in _traversal_bounds(
+            trav, total, getattr(feat, "type", None)))
         if end < start:
             return start, end
     except (TypeError, ValueError, AttributeError, IndexError):
@@ -854,6 +907,8 @@ def export_plasmid_map(out_path, *, feats: "list | None" = None,
     like the GenBank/FASTA exporters), so no chokepoint applies — but the
     write is still atomic (temp file + fsync + replace) to avoid a
     half-written image on a crash/full-disk."""
+    from splicecraft_persistence import _refuse_export_into_data_dir
+    _refuse_export_into_data_dir(out_path)
     fmt = (fmt or "png").lower()
     if fmt not in _MAP_EXPORT_FORMATS:
         raise ValueError(f"unknown map image format {fmt!r}; "

@@ -842,6 +842,31 @@ def _feature_traversal(loc, total: int, *,
     return fwd[0][0], fwd[-1][1], fwd
 
 
+def _traversal_bounds(trav, total: int, feat_type: object = None):
+    """``(start, end)`` of a `_feature_traversal` result for the dict model.
+
+    A whole-molecule feature written as an origin-wrap join —
+    ``join(50..100,1..49)`` on 100 bp — traverses contiguously from bp 49 all
+    the way back to bp 49, so its bounds are ``(49, 49)``: ZERO length to
+    `_feat_len`. The feature vanished from the map, the digest and every
+    carried product (audit 2026-10-23). It is the whole molecule, so it reads
+    as ``(0, total)`` — what `_rotate_seq_record` already makes of a
+    whole-record feature.
+
+    A CDS keeps its bounds: its start IS its reading frame, and reading it
+    from bp 0 would turn an obviously empty CDS into a confident wrong
+    protein. Its parts, which every translation reads, are untouched."""
+    start, end, parts = trav
+    if (start == end and total > 0 and len(parts) >= 2
+            and str(feat_type or "").upper() != "CDS"
+            and sum(int(b) - int(a) for a, b in parts) == total
+            and all(parts[i][1] == parts[i + 1][0]
+                    or (parts[i][1] == total and parts[i + 1][0] == 0)
+                    for i in range(len(parts) - 1))):
+        return 0, total
+    return start, end
+
+
 def _restrand_location(loc, strand, total: int, *,
                        circular: "bool | None" = None):
     """Rebuild ``loc`` on ``strand`` (±1 / 0) keeping its GEOMETRY.
@@ -853,12 +878,34 @@ def _restrand_location(loc, strand, total: int, *,
     different molecule to Biopython, every exporter and (via
     `_feature_traversal`) SpliceCraft itself (audit 2026-09-22). Parts are
     re-emitted from the forward traversal: reversed for −, as-is otherwise
-    (exactly how `_feature_location` orders a plain origin wrap)."""
+    (exactly how `_feature_location` orders a plain origin wrap).
+
+    The position OBJECTS survive: a `BeforePosition` / `AfterPosition` is a
+    `<` / `>` partial end, and rebuilding from int() ends dropped them — a
+    label-only edit in the feature editor (which always sends the strand)
+    silently turned `<11..>60` into `11..60` (audit 2026-10-23, W9). Each
+    traversal span is matched back to the part it came from; never sorted."""
     from Bio.SeqFeature import CompoundLocation, FeatureLocation
     parts = getattr(loc, "parts", None) or [loc]
     if len(parts) < 2:
-        return FeatureLocation(int(loc.start), int(loc.end), strand=strand)
+        return FeatureLocation(loc.start, loc.end, strand=strand)
     trav = _feature_traversal(loc, total, circular=circular)
+    ordered = None
+    if trav:
+        pool, ordered = list(parts), []
+        for a, b in trav[2]:
+            j = next((i for i, p in enumerate(pool)
+                      if int(p.start) == a and int(p.end) == b), None)
+            if j is None:            # the traversal re-cut a part
+                ordered = None
+                break
+            ordered.append(pool.pop(j))
+    if ordered is not None:
+        if strand == -1:
+            ordered.reverse()
+        return CompoundLocation(
+            [FeatureLocation(p.start, p.end, strand=strand) for p in ordered],
+            operator=getattr(loc, "operator", "join") or "join")
     spans = list(trav[2]) if trav else sorted(
         (int(p.start), int(p.end)) for p in parts)
     if strand == -1:
@@ -920,7 +967,8 @@ def _feat_bounds(feat, total: int, *,
         trav = _feature_traversal(loc, total, circular=circular)
         if trav is None:
             return None
-        return trav[0], trav[1], strand
+        s, e = _traversal_bounds(trav, total, getattr(feat, "type", None))
+        return s, e, strand
     try:
         return int(loc.start), int(loc.end), strand
     except (TypeError, ValueError):
@@ -1329,11 +1377,17 @@ def _feat_label_full(feat) -> str:
             # Collapse whitespace characters (newline, tab, vertical tab)
             # into single spaces so a multi-line /note="…" qualifier
             # doesn't break the sidebar row or clobber the map label.
+            # Then drop every remaining control / bidi character: a label
+            # is painted straight to the terminal (map, sidebar, sequence
+            # lanes), so an ESC in a file's /label was a live escape
+            # sequence — `ESC ] 52 ; c ; …` wrote attacker text to the
+            # user's clipboard on OSC-52 terminals (audit 2026-10-23).
             # Then strip and fall through if the result is empty.
-            s = " ".join(s.split())
+            s = _CONTROL_CHARS_RE.sub("", " ".join(s.split())).strip()
             if s:
                 return _surface_placeholder_gene(s)
-    return feat.type
+    t = getattr(feat, "type", "")
+    return _CONTROL_CHARS_RE.sub("", t) if isinstance(t, str) else str(t)
 
 
 def _feat_label(feat) -> str:

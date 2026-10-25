@@ -25,7 +25,9 @@ from pathlib import Path
 
 import splicecraft_state as _state
 from splicecraft_logging import _log
-from splicecraft_biology import _forbidden_hit_set, _iupac_pattern, _mut_revcomp
+from splicecraft_biology import (
+    _IUPAC_BASES, _forbidden_hit_set, _iupac_pattern, _mut_revcomp,
+)
 from splicecraft_util import _natural_sort_key, _sanitize_path
 from splicecraft_net import (
     _HMM_DB_RETRY_BACKOFF_S, _NCBI_MAX_RESPONSE_BYTES, _build_hardened_url_opener,
@@ -100,6 +102,82 @@ def _codon_table_for(table_id: "int | None") -> "dict[str, str]":
         m = _CODON_TABLE
     _CODON_TABLE_BY_ID[tid] = m
     return m
+
+
+_RESOLVED_CODONS_BY_ID: "dict[int, dict[str, str]]" = {}
+_RESOLVED_STOPS_BY_ID: "dict[int, tuple]" = {}
+# Every valid codon spelling: 4 bases + U + 11 IUPAC codes = 16 letters.
+_RESOLVED_CODON_CACHE_MAX = 16 ** 3
+
+
+def _resolve_codon(codon: str, table: "dict[str, str]") -> str:
+    """The residue a non-ACGT codon must be, or ``"?"``. `U` reads as `T`;
+    an IUPAC code stands for every base it names, and the codon resolves
+    only when EVERY concrete codon it stands for is the same residue."""
+    if len(codon) != 3:
+        return "?"
+    sets = []
+    for b in codon.upper():
+        bases = _IUPAC_BASES.get("T" if b == "U" else b)
+        if bases is None:
+            return "?"
+        sets.append(bases)
+    found = {table.get(x + y + z)
+             for x in sets[0] for y in sets[1] for z in sets[2]}
+    if len(found) == 1:
+        aa = found.pop()
+        return aa if aa is not None else "?"
+    return "?"
+
+
+def _translate_codon(codon: str, table_id: "int | None" = 1) -> str:
+    """One codon's residue in genetic code `table_id`, ``"?"`` if unknown.
+
+    An ACGT codon is a dict hit. A codon carrying RNA's ``U`` — which a FASTA
+    import keeps — or an IUPAC ambiguity code resolves to the residue every
+    concrete codon it stands for agrees on: ``AUG`` is Met, ``GGN`` Gly in
+    any code, ``TRA`` a stop in the standard one. Both used to read ``"?"``,
+    and ``U`` only on the plus strand — the minus strand's complement turned
+    it into ``A`` (audit 2026-10-23). A genuine disagreement stays ``"?"``,
+    where Biopython writes ``X`` / ``B`` / ``Z`` / ``J``.
+
+    Translation only: the tables themselves stay ACGT, because the codon
+    optimizer reads them as the set of codons it may write."""
+    table = _codon_table_for(table_id)
+    aa = table.get(codon)
+    if aa is not None:
+        return aa
+    try:
+        tid = int(table_id) if table_id else 1
+    except (TypeError, ValueError):
+        tid = 1
+    cache = _RESOLVED_CODONS_BY_ID.setdefault(tid, {})
+    aa = cache.get(codon)
+    if aa is None:
+        aa = _resolve_codon(codon, table)
+        if len(cache) < _RESOLVED_CODON_CACHE_MAX:
+            cache[codon] = aa
+    return aa
+
+
+def _resolved_stop_codons(table_id: "int | None" = 1) -> "tuple[str, ...]":
+    """Every codon SPELLING `_translate_codon` reads as a stop in this code —
+    the ACGT stops plus their ``U`` and IUPAC forms (``UAA``, ``TRA``,
+    ``TAR``, …) — so a stop count agrees with the translation it summarises."""
+    try:
+        tid = int(table_id) if table_id else 1
+    except (TypeError, ValueError):
+        tid = 1
+    cached = _RESOLVED_STOPS_BY_ID.get(tid)
+    if cached is not None:
+        return cached
+    table = _codon_table_for(tid)
+    letters = "ACGTU" + "".join(k for k in _IUPAC_BASES if k not in "ACGT")
+    out = tuple(sorted(
+        x + y + z for x in letters for y in letters for z in letters
+        if (table.get(x + y + z) or _resolve_codon(x + y + z, table)) == "*"))
+    _RESOLVED_STOPS_BY_ID[tid] = out
+    return out
 
 
 _STOP_CODONS = frozenset(("TAA", "TAG", "TGA"))
@@ -1976,8 +2054,15 @@ def _file_build_codon_table(path: "str | Path", mode: str = "heg") -> tuple:
     except OSError as exc:
         return None, f"Could not read {p.name}: {exc}", None
     if data[:2] == b"\x1f\x8b":                       # gzip magic — NCBI ships CDS .gz
+        # Stream with the cap, never `gzip.decompress`: the size check
+        # used to run AFTER inflating the whole file, so a 1.8 MB `.gz`
+        # (under the file cap) expanded to 1.75 GiB in RAM first — an OOM
+        # from the GUI picker or the agent's `add-codon-table` (audit
+        # 2026-10-23). Same bounded read as the HMM-DB pipeline.
+        import io as _io
         try:
-            data = gzip.decompress(data)
+            with gzip.GzipFile(fileobj=_io.BytesIO(data)) as _gz:
+                data = _gz.read(_CDS_FILE_MAX_BYTES + 1)
         except (OSError, EOFError) as exc:
             return None, f"Could not gunzip {p.name}: {exc}", None
         if len(data) > _CDS_FILE_MAX_BYTES:

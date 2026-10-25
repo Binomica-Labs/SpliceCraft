@@ -101,3 +101,19 @@ def test_log_event_never_logs_sequence_content(tmp_path):
     text = log_file.read_text(encoding="utf-8")
     assert "ACGTACGT" not in text, "sequence bases leaked into the log!"
     assert "<Seq" in text and "len=12" in text
+
+
+def test_scrub_filter_never_raises_on_surrogate_plus_non_ascii():
+    """`backslashreplace` + `.decode("ascii")` raised on any string holding a
+    lone surrogate AND another non-ASCII character — out of the filter and
+    out of the `_log` call. The agent's `create-gel` saved the gel, then
+    500'd on its log line; the client's retry made a duplicate gel."""
+    import logging as _logging
+    f = splicecraft_logging._SurrogateScrubFilter()
+    rec = _logging.LogRecord("splicecraft", _logging.INFO, __file__, 1,
+                             "gel %s", ("Gel é \udcff",), None)
+    assert f.filter(rec) is True
+    msg = rec.getMessage()
+    assert "é" in msg and "\\udcff" in msg
+    msg.encode("utf-8")                       # now always UTF-8-safe
+    sc._log.info("gel %s", "Gel é \udcff")     # and the logger call returns

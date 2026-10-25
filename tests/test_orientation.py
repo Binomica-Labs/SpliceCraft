@@ -274,6 +274,35 @@ class TestReOrigin:
         r = _mk()
         assert sc._rotate_seq_record(r, 0, keep_source=True) is r
 
+    def test_out_of_range_feature_is_dropped_not_left_behind(self, caplog):
+        """Same rule as the flip. Left unrotated, an off-the-end feature kept
+        its old coordinates while every base moved under it — the map then
+        clamped it onto bases it never covered, and the "N feature(s)
+        dropped" toast said 0 (audit 2026-10-23)."""
+        import logging
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        r = _mk()
+        n = len(SEQ)
+        r.features.append(SeqFeature(
+            FeatureLocation(n - 10, n + 5, strand=1), type="misc_feature",
+            qualifiers={"label": ["off-the-end"]}))
+        logger = logging.getLogger(sc._log.name)
+        prev = logger.level
+        logger.addHandler(caplog.handler)
+        logger.setLevel(logging.WARNING)
+        try:
+            rot = sc._rotate_seq_record(r, n // 2, keep_source=True)
+        finally:
+            logger.removeHandler(caplog.handler)
+            logger.setLevel(prev)
+        assert "off-the-end" not in _by_label(rot)
+        assert len(rot.features) == len(r.features) - 1
+        assert "off-the-end" in caplog.text
+        # Everything that CAN be mapped still is.
+        for lbl in ("fwd", "rev", "wrap"):
+            a, b = _by_label(r)[lbl], _by_label(rot)[lbl]
+            assert str(a.extract(r.seq)) == str(b.extract(rot.seq)), lbl
+
 
 # ── the canvas actions (driven through a real app) ────────────────────────
 

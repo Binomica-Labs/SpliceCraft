@@ -25,7 +25,7 @@ import re
 
 import splicecraft_state as _state
 from splicecraft_biology import (_rc, _enzyme_cuts, _feat_len,
-                                 _slice_circular)
+                                 _iter_match_starts, _slice_circular)
 from splicecraft_splice import (_splice_scan, _splice_model_summary)
 from splicecraft_codon import _CODON_TABLE, _STOP_CODONS
 from splicecraft_record import _gb_text_to_record
@@ -61,188 +61,165 @@ def _find_orfs(seq: str, *,
     n = len(seq)
     if n < 6:
         return []
-    seq_u = seq.upper()
+    # RNA's U reads as T: a FASTA import keeps U, and an ORF on its plus
+    # strand was invisible while the minus strand's complement found its twin.
+    seq_u = seq.upper().replace("U", "T")
     starts = {"ATG"}
     if include_alt_starts:
         starts |= {"GTG", "TTG"}
 
-    orfs: list[dict] = []
+    # (strand rank, start in the strand's own coordinates, ORF). Sorting on
+    # that key before the length sort keeps the order the per-frame scan
+    # always produced for equal lengths: plus strand first, then frame, then
+    # position.
+    found: "list[tuple[int, int, dict]]" = []
+
+    def _translate_from(ext: str, p: int, n_codons: int) -> str:
+        # `ext` is the strand plus its first two bases, so a codon at any
+        # position reads across the origin with one slice.
+        out = []
+        for _ in range(n_codons):
+            out.append(_CODON_TABLE.get(ext[p:p + 3], "?"))
+            p += 3
+            if p >= n:
+                p -= n
+        return "".join(out)
 
     for strand in (1, -1):
-        if strand == 1:
-            scan_seq = (seq_u + seq_u) if circular else seq_u
-        else:
-            rc_seq = _rc(seq_u)
-            scan_seq = (rc_seq + rc_seq) if circular else rc_seq
-        scan_n = len(scan_seq)
-
-        for frame in range(3):
-            current_start = -1
-            i = frame
-            # A CIRCULAR frame's scan window opens in the middle of the
-            # molecule, and starting with "no ORF open" silently asserts that
-            # a stop codon sits just before bp 0/1/2. It usually doesn't: an
-            # ORF crossing the origin is still open there, and the first ATG
-            # after the origin then opened a SECOND, shorter ORF sharing the
-            # real one's stop — a phantom gene nested inside a true one, whose
-            # presence and length depended on where the origin happened to
-            # sit. (Rotating a plasmid changed its ORF table; measured on
-            # 7/120 random circles.)
-            #
-            # So ASK whether the frame is open there, by walking one lap
-            # BACKWARD from the scan start: an in-frame stop first means the
-            # frame is closed and the next start codon really is a maximal
-            # start; a start codon first means an ORF is already open and the
-            # starts before the next stop are interior. Assuming "closed"
-            # invented the phantom; assuming "open" would lose a gene that
-            # begins at bp 0, which is where a re-origined plasmid usually
-            # puts its gene of interest.
-            primed = not circular
-            if circular:
-                j = frame + n - 3          # in-frame codon one lap back
-                while j >= frame:
-                    _c = scan_seq[j:j + 3]
-                    if _c in _STOP_CODONS:
-                        primed = True
-                        break
-                    if _c in starts:
-                        primed = False
-                        break
-                    j -= 3
-                else:
-                    primed = True          # frame carries neither — nothing open
-            saw_stop = False
-            while i + 3 <= scan_n:
-                codon = scan_seq[i:i+3]
-                if not primed:
-                    if codon in _STOP_CODONS:
-                        primed = True
-                        saw_stop = True
-                    i += 3
-                    continue
-                if current_start < 0:
-                    if codon in starts:
-                        current_start = i
-                else:
-                    if codon in _STOP_CODONS:
-                        saw_stop = True
+        s = seq_u if strand == 1 else _rc(seq_u)
+        rank = 0 if strand == 1 else 1
+        if not circular:
+            for frame in range(3):
+                current_start = -1
+                i = frame
+                while i + 3 <= n:
+                    codon = s[i:i + 3]
+                    if current_start < 0:
+                        if codon in starts:
+                            current_start = i
+                    elif codon in _STOP_CODONS:
                         aa_len = (i - current_start) // 3
-                        # Drop ORFs whose start codon falls in the
-                        # second copy of the doubled scan — they're
-                        # duplicates of one we already found from the
-                        # first copy.
-                        if (circular and current_start >= n) \
-                                or aa_len < min_aa:
-                            current_start = -1
-                            i += 3
-                            continue
-                        nt_seq = scan_seq[current_start:i + 3]  # incl. stop
-                        aa_seq = "".join(
-                            _CODON_TABLE.get(nt_seq[k:k+3], "?")
-                            for k in range(0, len(nt_seq), 3)
-                        )
-                        if strand == 1:
-                            o_s = current_start
-                            o_e = i + 3
-                            if circular and o_e > n:
-                                o_e -= n   # wrap: end < start
-                        else:
-                            p_rc = current_start
-                            e_rc = i + 3
-                            if circular:
-                                o_s = (n - e_rc) % n
-                                o_e = (n - p_rc) % n
+                        if aa_len >= min_aa:
+                            nt_seq = s[current_start:i + 3]   # incl. stop
+                            aa_seq = "".join(
+                                _CODON_TABLE.get(nt_seq[k:k + 3], "?")
+                                for k in range(0, len(nt_seq), 3))
+                            if strand == 1:
+                                o_s, o_e = current_start, i + 3
                             else:
-                                o_s = n - e_rc
-                                o_e = n - p_rc
-                        # Coding length in bases, INCLUDING the stop codon —
-                        # reported explicitly so no consumer ever has to infer
-                        # it from `(start, end)`, which on a circle cannot.
-                        nt_len = len(nt_seq)
-                        # An ORF that runs a full lap or more (a frame with no
-                        # in-frame stop for the whole molecule) has NO (start,
-                        # end) pair on an n-bp circle that can express it:
-                        # `(o_s + nt_len) % n` lands back inside the ORF, so the
-                        # arc drawn from it UNDER-states the ORF by whole turns
-                        # — an exactly-one-lap ORF even collapses to `o_e ==
-                        # o_s`, which `_feat_len` reads as length 0. Pin the
-                        # span to the near-full circle (the honest "it goes all
-                        # the way round" arc) and flag it; `length_aa` /
-                        # `nt_len` / `aa_seq` stay exact either way.
-                        over_lap = circular and nt_len >= n
+                                o_s, o_e = n - (i + 3), n - current_start
+                            found.append((rank, current_start, {
+                                "start": o_s, "end": o_e, "strand": strand,
+                                "length_aa": aa_len, "nt_len": len(nt_seq),
+                                "exceeds_one_lap": False, "has_stop": True,
+                                "aa_seq": aa_seq,
+                            }))
+                        current_start = -1
+                    i += 3
+            continue
+
+        # CIRCULAR: walk each reading CYCLE once, starting just after one of
+        # its stop codons. On a circle the frame is a cycle, not a line: when
+        # `n % 3 == 0` each of the three frames closes on itself after one
+        # lap; otherwise the three are ONE cycle of `n` codons (three laps),
+        # and an ORF can run for up to three laps. Starting the walk in the
+        # middle of the molecule and guessing whether a frame is open there
+        # is what made the answer depend on the origin: the doubled scan
+        # never reached the stop of an ORF longer than its window (a 146 bp
+        # circle reported NO ORFs at one rotation and two at another), and a
+        # one-lap look back called a frame closed that was open from two
+        # laps back, emitting interior starts as phantom ORFs (audit
+        # 2026-10-23). Right after a stop the frame is closed by definition,
+        # whatever the rotation, so the first start after each stop opens
+        # exactly one ORF and the next stop closes it.
+        ext = s + s[:2]
+        cycle_len = n // 3 if n % 3 == 0 else n
+        for r in ((0, 1, 2) if n % 3 == 0 else (0,)):
+            p = r
+            k0 = -1
+            for k in range(cycle_len):
+                if ext[p:p + 3] in _STOP_CODONS:
+                    k0 = k
+                    break
+                p += 3
+                if p >= n:
+                    p -= n
+            if k0 < 0:
+                # No stop anywhere on this cycle: the frame reads round the
+                # circle for ever. Reported once, from its lowest-coordinate
+                # start, with `exceeds_one_lap` and no stop — never as "no
+                # ORFs", which reads as clean. A lap rounds UP to whole
+                # codons, because on a molecule whose length is not a
+                # multiple of 3 a lap is not a whole number of them.
+                step = 3 if n % 3 == 0 else 1
+                first = next((q for q in range(r, n, step)
+                              if ext[q:q + 3] in starts), -1)
+                lap_nt = ((n + 2) // 3) * 3
+                if first >= 0 and lap_nt // 3 >= min_aa:
+                    nt_seq = "".join(s[(first + k) % n]
+                                     for k in range(lap_nt))
+                    o_s = (first if strand == 1
+                           else (n - (first + lap_nt)) % n)
+                    found.append((rank, first, {
+                        "start": o_s, "end": (o_s - 1) % n, "strand": strand,
+                        "length_aa": lap_nt // 3, "nt_len": lap_nt,
+                        "exceeds_one_lap": True,
+                        # No stop codon on this cycle, so every codon is a
+                        # residue: `length_aa` is NOT one less than
+                        # `nt_len // 3` the way it is for a stopped ORF.
+                        "has_stop": False,
+                        "aa_seq": "".join(
+                            _CODON_TABLE.get(nt_seq[k:k + 3], "?")
+                            for k in range(0, lap_nt, 3)),
+                    }))
+                continue
+            p = (r + 3 * (k0 + 1)) % n
+            open_k = open_p = -1
+            for k in range(k0 + 1, k0 + 1 + cycle_len):
+                codon = ext[p:p + 3]
+                if open_k < 0:
+                    if codon in starts:
+                        open_k, open_p = k, p
+                elif codon in _STOP_CODONS:
+                    aa_len = k - open_k
+                    if aa_len >= min_aa:
+                        # Coding length in bases INCLUDING the stop, reported
+                        # explicitly: on a circle `(start, end)` cannot
+                        # express an ORF of a full lap or more.
+                        nt_len = (aa_len + 1) * 3
+                        if strand == 1:
+                            o_s = open_p
+                            o_e = (open_p + nt_len - 1) % n + 1
+                        else:
+                            o_s = (n - (open_p + nt_len)) % n
+                            o_e = (n - open_p) % n
+                        # A full lap or more has NO (start, end) pair on an
+                        # n-bp circle that can express it — `(o_s + nt_len) %
+                        # n` lands back inside the ORF and an exactly-one-lap
+                        # ORF collapses to `o_e == o_s`, which `_feat_len`
+                        # reads as 0. Pin the span to the near-full circle and
+                        # flag it; `length_aa` / `nt_len` / `aa_seq` stay
+                        # exact.
+                        over_lap = nt_len >= n
                         if over_lap:
                             o_e = (o_s - 1) % n
-                        orfs.append({
-                            "start":     o_s,
-                            "end":       o_e,
-                            "strand":    strand,
-                            "length_aa": aa_len,
-                            "nt_len":    nt_len,
-                            "exceeds_one_lap": over_lap,
-                            "has_stop":  True,
-                            "aa_seq":    aa_seq,
-                        })
-                        current_start = -1
-                i += 3
+                        found.append((rank, open_p, {
+                            "start": o_s, "end": o_e, "strand": strand,
+                            "length_aa": aa_len, "nt_len": nt_len,
+                            "exceeds_one_lap": over_lap, "has_stop": True,
+                            "aa_seq": _translate_from(ext, open_p,
+                                                      aa_len + 1),
+                        }))
+                    open_k = -1
+                p += 3
+                if p >= n:
+                    p -= n
 
-            if circular and not saw_stop:
-                # This frame has NO in-frame stop anywhere on the molecule,
-                # so the reading frame runs right round the circle. The
-                # docstring has always promised such an ORF is reported with
-                # `exceeds_one_lap=True`, but it could never be emitted: an
-                # ORF is only ever appended from inside the stop branch, so a
-                # whole-plasmid reading frame came back as NO ORFs AT ALL —
-                # which reads as "clean". Reachable on ORF-only minicircles
-                # and synthetic constructs.
-                first_start = -1
-                j = frame
-                while j + 3 <= n:
-                    if scan_seq[j:j + 3] in starts:
-                        first_start = j
-                        break
-                    j += 3
-                if first_start >= 0:
-                    # Round UP to whole codons: the frame reads at least one
-                    # full lap, and on a molecule whose length is not a
-                    # multiple of 3 a lap is not a whole number of codons, so
-                    # rounding down would report an ORF flagged
-                    # `exceeds_one_lap` whose `nt_len` is SHORTER than the
-                    # molecule.
-                    lap_nt = ((n + 2) // 3) * 3
-                    lap_aa = lap_nt // 3           # no stop ⇒ all residues
-                    if lap_aa >= min_aa:
-                        _lap = scan_seq[:n]        # one lap of this strand
-                        nt_seq = "".join(
-                            _lap[(first_start + k) % n]
-                            for k in range(lap_nt)
-                        )
-                        aa_seq = "".join(
-                            _CODON_TABLE.get(nt_seq[k:k + 3], "?")
-                            for k in range(0, len(nt_seq), 3)
-                        )
-                        if strand == 1:
-                            o_s = first_start % n
-                        else:
-                            o_s = (n - (first_start + lap_nt)) % n
-                        orfs.append({
-                            "start":     o_s,
-                            "end":       (o_s - 1) % n,
-                            "strand":    strand,
-                            "length_aa": lap_aa,
-                            "nt_len":    lap_nt,
-                            "exceeds_one_lap": True,
-                            # No stop codon exists in this frame, so every
-                            # codon is a residue and `length_aa` is NOT one
-                            # less than `nt_len // 3` the way it is for a
-                            # stopped ORF.
-                            "has_stop":  False,
-                            "aa_seq":    aa_seq,
-                        })
-
-    # Dedupe identical (start, end, strand) tuples — can happen when the
-    # doubled-scan cycles past the origin and re-finds the same ORF, or
-    # when alt-starts inside an ATG-bounded region produce nested hits
-    # that then collapse onto the same boundary.
+    found.sort(key=lambda t: (t[0], t[1] % 3, t[1]))
+    orfs = [t[2] for t in found]
+    # Longest first. Then dedupe identical (start, end, strand) tuples: an
+    # alternative start inside an ATG-bounded region can collapse onto the
+    # same boundary.
     orfs.sort(key=lambda o: o["length_aa"], reverse=True)
     seen: set[tuple] = set()
     unique: list[dict] = []
@@ -791,9 +768,33 @@ def _synthesis_lint(seq, *, circular: bool = True, expect_cds: bool = False,
     (assembly killers → error), extreme overall + windowed GC, long homopolymer
     runs, tandem repeats, degenerate/non-ACGT bases, and — when ``expect_cds``
     — a clean full-length ORF. ``score`` starts at 100; each finding deducts by
-    severity (error −20, warn −8, info −2, floored at 0)."""
+    severity (error −20, warn −8, info −2, floored at 0).
+
+    Every bound here is the value still ACCEPTED: ``homopolymer_max`` runs are
+    fine and longer ones are flagged, ``gc_window_lo``/``gc_window_hi`` are
+    inclusive, and ``min_gc``/``max_gc`` likewise. ``repeat_min_copies`` is
+    the other kind — the first count that IS reported — because that is what
+    its name says."""
     raw = (seq or "").upper()
     s = "".join(c for c in raw if c in "ACGT")
+    # Positions are reported in the CALLER's frame. The enzyme + GC scans run
+    # on the ACGT-filtered string (that is what they are validated against),
+    # so their indices are mapped back through `_raw_pos`: unmapped, every
+    # position in a record carrying ambiguous bases — any Sanger / nanopore
+    # consensus — pointed at unrelated bases (audit 2026-10-23). The run and
+    # repeat scans read `raw` directly, because stripping those bases also
+    # FUSED runs that the sequence does not contain.
+    _acgt_at = [i for i, c in enumerate(raw) if c in "ACGT"]
+
+    def _raw_pos(i: "int | None") -> "int | None":
+        if i is None:
+            return None
+        i = int(i)
+        if i < 0:
+            return 0
+        if i < len(_acgt_at):
+            return _acgt_at[i]
+        return len(raw)
     warnings: "list[dict]" = []
 
     def add(level, kind, message, start=None, end=None):
@@ -821,7 +822,7 @@ def _synthesis_lint(seq, *, circular: bool = True, expect_cds: bool = False,
         for c in cuts[:max_warnings_per_kind]:
             add("error", "type_iis_site",
                 f"internal {enz} site — cut during Golden Gate / MoClo assembly "
-                "(domesticate it out)", start=c.get("top"))
+                "(domesticate it out)", start=_raw_pos(c.get("top")))
         if len(cuts) > max_warnings_per_kind:
             add("info", "type_iis_site",
                 f"…and {len(cuts) - max_warnings_per_kind} more {enz} site(s)")
@@ -831,21 +832,48 @@ def _synthesis_lint(seq, *, circular: bool = True, expect_cds: bool = False,
         add("warn", "gc_overall",
             f"overall GC {gc*100:.0f}% is outside the {min_gc*100:.0f}–"
             f"{max_gc*100:.0f}% synthesis-friendly range")
-    ww = _lint_worst_gc_window(s, gc_window)
+    # A circular molecule has no ends, so a window straddling the origin is
+    # scanned too — the enzyme scan above already does (`circular=`), and a
+    # report that is wrap-aware for one hazard and not the others reads as
+    # wrap-aware for all of them (audit 2026-10-23).
+    _n_raw = len(raw)
+    _gc_src = (s + s[:gc_window - 1]) if (circular and len(s) > 1) else s
+    ww = _lint_worst_gc_window(_gc_src, gc_window)
     if ww is not None and (ww[1] < gc_window_lo or ww[1] > gc_window_hi):
+        _ws = _raw_pos(ww[0] % len(s)) if s else ww[0]
         add("warn", "gc_window",
-            f"a {gc_window} bp window at +{ww[0]} is {ww[1]*100:.0f}% GC — local "
-            "extremes hurt synthesis + PCR", start=ww[0], end=ww[0] + gc_window)
+            f"a {gc_window} bp window at +{_ws} is {ww[1]*100:.0f}% GC — local "
+            "extremes hurt synthesis + PCR", start=_ws,
+            end=(_ws or 0) + gc_window)
 
-    for start, base, length in _lint_homopolymer_runs(
-            s, homopolymer_max)[:max_warnings_per_kind]:
+    # Runs and repeats are read off `raw`, where a non-ACGT base BREAKS a run
+    # instead of being removed from the middle of one (7 A's + 25 N + 7 A's
+    # was reported as one 14xA run). A run of the ambiguous bases themselves
+    # is not a homopolymer hazard — `degenerate_bases` already named them.
+    _run_src = (raw + raw[:_n_raw - 1]) if (circular and _n_raw > 1) else raw
+    # `homopolymer_max` is the longest run ALLOWED, so the flag is on
+    # `> max` — `_lint_homopolymer_runs` takes a minimum-to-report. Passing
+    # the bound straight through flagged a run of exactly 9 at
+    # `homopolymer_max=9`, reading the name as "minimum to flag" while
+    # `gc_window_lo` / `gc_window_hi` right above are inclusive bounds
+    # (exactly 20% / 80% is not flagged) — one of the two names had to be
+    # wrong (audit 2026-10-24).
+    _runs = [(st, base, min(ln, _n_raw))
+             for st, base, ln in _lint_homopolymer_runs(_run_src,
+                                                        homopolymer_max + 1)
+             if st < _n_raw and base in "ACGT"]
+    for start, base, length in _runs[:max_warnings_per_kind]:
         add("warn", "homopolymer",
             f"{length}×{base} homopolymer run — synthesis-hard (slippage)",
             start=start, end=start + length)
 
-    for start, unit, copies in _lint_tandem_repeats(
-            s, unit_min=2, unit_max=repeat_unit_max,
-            min_copies=repeat_min_copies)[:max_warnings_per_kind]:
+    _reps = [(st, unit, copies)
+             for st, unit, copies in _lint_tandem_repeats(
+                 _run_src, unit_min=2, unit_max=repeat_unit_max,
+                 min_copies=repeat_min_copies)
+             if st < _n_raw and all(c in "ACGT" for c in unit)
+             and copies * len(unit) <= _n_raw]
+    for start, unit, copies in _reps[:max_warnings_per_kind]:
         add("warn", "tandem_repeat",
             f"{copies}×({unit}) tandem repeat — synthesis + assembly hazard",
             start=start, end=start + copies * len(unit))
@@ -879,7 +907,10 @@ def _synthesis_lint(seq, *, circular: bool = True, expect_cds: bool = False,
     return {
         "score": max(0, 100 - penalty),
         "warnings": warnings,
-        "stats": {"length": len(s), "gc": round(gc, 4),
+        # The length the CALLER handed in. `len(s)` (ACGT only) silently
+        # disagreed with the record by the ambiguous-base count, which
+        # `degenerate_bases` right below already states (audit 2026-10-23).
+        "stats": {"length": len(raw), "gc": round(gc, 4),
                   "degenerate_bases": n_degenerate, "orf_count": orf_count,
                   "circular": bool(circular)},
     }
@@ -1368,7 +1399,8 @@ def _kozak_context(mrna: str, atg_pos: int) -> dict:
 
 
 def _tx_map_span(gs: int, ge: int, a: int, total: int,
-                 strand: int, pre_len: int) -> "tuple[int, int] | None":
+                 strand: int, pre_len: int,
+                 circular: bool = True) -> "tuple[int, int] | None":
     """Map a genomic half-open span onto pre-mRNA coordinates.
 
     `a` is the plus-strand genomic start of the transcription unit and
@@ -1381,9 +1413,20 @@ def _tx_map_span(gs: int, ge: int, a: int, total: int,
     transcript reads 3'→5' along the plus strand, so its first base is the
     unit's LAST plus-strand base. Getting this backwards is the classic
     origin-and-strand fault, so it is derived once here and tested against a
-    sequence whose content identifies its own coordinates."""
+    sequence whose content identifies its own coordinates.
+
+    On a LINEAR record nothing wraps, so the offsets are plain differences:
+    folding them made a span ending on the last base of a unit that starts
+    at bp 0 look empty."""
     if total <= 0 or pre_len <= 0:
         return None
+    if not circular:
+        off_s, off_e = gs - a, ge - a
+        if off_s < 0 or off_e > pre_len or off_s >= off_e:
+            return None
+        if strand >= 0:
+            return (off_s, off_e)
+        return (pre_len - off_e, pre_len - off_s)
     off_s = (gs - a) % total
     off_e = (ge - a) % total
     # `off_e == 0` means the span ends where the unit STARTS, which can only
@@ -1615,9 +1658,16 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
 
     def _coord(v):
         try:
-            return int(v) % total
+            iv = int(v)
         except (TypeError, ValueError):
             return None
+        # A LINEAR molecule's last edge is `total` itself. `% total` moved it
+        # to bp 0, so every unit ending on the last base "crossed the origin"
+        # and was refused (audit 2026-10-23) — the trap
+        # `_tx_promoter_fires_at` documents.
+        if not circular and iv == total:
+            return total
+        return iv % total
 
     if tx_start is not None or tx_end is not None:
         a_opt, b_opt = _coord(tx_start), _coord(tx_end)
@@ -1657,7 +1707,8 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
         cs, ce = _coord(gs), _coord(ge)
         if cs is None or ce is None:
             return None
-        return _tx_map_span(cs, ce, a, total, strand, pre_len)
+        return _tx_map_span(cs, ce, a, total, strand, pre_len,
+                            circular=circular)
 
     cds_parts_tx = []
     for ps, pe in _tx_feature_parts(cds_feat):
@@ -2024,26 +2075,58 @@ def _tx_promoter_fires_at(prom: dict, total: int,
             raw = int(prom["tss"])
         except (TypeError, ValueError):
             raw = None
+        else:
+            # `tss` names the first transcribed BASE, and the walk starts at
+            # that base's upstream EDGE: its left edge (the base's own index)
+            # on the plus strand, its right edge (one past it) on the minus
+            # strand. Using the base itself as the boundary on both put every
+            # minus-strand leader one base short (audit 2026-10-23).
+            if strand < 0:
+                raw += 1
     if raw is None:
         raw = e if strand >= 0 else s
     return ((raw % total) if circular else raw), strand
 
 
-def _tx_between(a: int, b: int, direction: int, total: int, pos: int,
-                circular: bool = True) -> bool:
-    """Is `pos` strictly on the stretch travelled from `a` to `b`?"""
+def _tx_terminator_edge(term: dict, direction: int) -> int:
+    """Where a walk in `direction` first meets terminator `term`: its
+    ``start`` going rightwards, its ``end`` going leftwards — both EDGES, so
+    the two strands mirror exactly."""
+    key = "start" if direction >= 0 else "end"
+    return int(term.get(key, 0) or 0)
+
+
+def _tx_terminator_in_path(fire: int, target: int, direction: int,
+                           total: int, term: dict,
+                           circular: bool = True) -> bool:
+    """Does transcription from `fire` meet terminator `term` before it
+    reaches `target` (the CDS's 5' end)?
+
+    The terminator counts when the edge the polymerase meets first lies on
+    ``[fire, target)`` in travel order. So one touching the promoter's 3' end
+    is met at once; one touching or straddling the gene's 5' end ends the
+    transcript before or inside the gene; one starting at or past the 5' end
+    is not between them; and one straddling the fire point is never wholly
+    transcribed (its stem's upstream half lies behind the start site).
+
+    Testing the terminator's ``start`` on both strands made each touching
+    case count on one strand only — the plus strand meets ``start`` first, the
+    minus strand meets ``end`` (audit 2026-10-23).
+    """
     if total <= 0:
         return False
+    edge = _tx_terminator_edge(term, direction)
     if not circular:
-        lo, hi = (a, b) if direction >= 0 else (b, a)
-        return lo < pos < hi
+        if direction >= 0:
+            return fire <= edge < target
+        return target < edge <= fire
     if direction >= 0:
-        span = _tx_arc(a, b, total)
-        off = _tx_arc(a, pos, total)
+        span = _tx_arc(fire, target, total)
+        off = _tx_arc(fire, edge, total)
     else:
-        span = _tx_arc(b, a, total)
-        off = _tx_arc(pos, a, total)
-    return 0 < off < span if span else False
+        span = _tx_arc(target, fire, total)
+        off = _tx_arc(edge, fire, total)
+    return off < span
 
 
 def _tx_readthrough_verdict(terms: "list[dict]") -> str:
@@ -2297,11 +2380,13 @@ def _map_transcription(seq: str, features: "list[dict]", *,
             between = [t for t in terminators
                        if t["strand"] == (prom["strand"] if g_strand == 0
                                           else g_strand)
-                       and _tx_between(fire, target, direction, total,
-                                       int(t.get("start", 0)), circular)]
-            between.sort(key=lambda t: _tx_arc(fire, int(t["start"]), total)
-                         if direction >= 0
-                         else _tx_arc(int(t["start"]), fire, total))
+                       and _tx_terminator_in_path(fire, target, direction,
+                                                  total, t, circular)]
+            # In the order the polymerase meets them.
+            between.sort(key=lambda t: _tx_arc(
+                fire, _tx_terminator_edge(t, direction), total)
+                if direction >= 0
+                else _tx_arc(_tx_terminator_edge(t, direction), fire, total))
             reach.append({
                 "promoter": prom,
                 "distance_bp": dist,
@@ -2725,13 +2810,39 @@ def _plan_chromosome_segments(
     offtarget_checked = (total <= _SEGMENT_OFFTARGET_MAX_BP
                          and work <= _SEGMENT_OFFTARGET_BUDGET)
     if offtarget_checked:
+        # `str.count` is forward-only, non-overlapping and blind to the
+        # origin, while the junction-vs-junction check a few lines up already
+        # treats an RC match as a collision — this scan was the inconsistent
+        # half of the same function, and Gibson / yeast-HR homology is
+        # DOUBLE-STRANDED. Measured: the RC of a junction's 30 bp overlap
+        # planted elsewhere in the target gave `offtarget_hits: None` and no
+        # warning, an overlap duplicated across bp 0 of a circular target was
+        # invisible, and `"ATATATATAT".count("ATAT")` is 2 where 4 occur —
+        # which matters at Golden Gate's 4 nt (audit 2026-10-24).
+        scan = s + s[:max(0, ov - 1)] if circular else s
         for j in junctions:
-            extra = s.count(j["overlap"]) - 1
-            if extra > 0:
-                j["offtarget_hits"] = extra
+            overlap = j["overlap"]
+            fwd = max(0, sum(1 for _ in _iter_match_starts(
+                re.compile(re.escape(overlap)), scan)) - 1)
+            rc_ov = _rc(overlap)
+            rev = (0 if rc_ov == overlap else
+                   sum(1 for _ in _iter_match_starts(
+                       re.compile(re.escape(rc_ov)), scan)))
+            if fwd or rev:
+                j["offtarget_hits"] = fwd + rev
+                j["offtarget_hits_forward"] = fwd
+                j["offtarget_hits_reverse"] = rev
+                parts = []
+                if fwd:
+                    parts.append(f"{fwd} other place(s) on this strand")
+                if rev:
+                    # Reported apart because the consequence differs: a
+                    # reverse-complement match recombines INVERTED.
+                    parts.append(f"{rev} place(s) reverse-complemented, "
+                                 f"where a segment would land INVERTED")
                 j["warnings"].append(
-                    f"this overlap also occurs {extra} other place(s) in the "
-                    f"target — it can recombine there instead")
+                    "this overlap also occurs at " + " and ".join(parts)
+                    + " in the target — it can recombine there instead")
     else:
         warnings.append(
             f"off-target homology NOT checked: {total:,} bp x "
@@ -2747,12 +2858,27 @@ def _plan_chromosome_segments(
         warnings.append(
             f"{n_seg_warn} of {len(segments)} segments carry synthesis "
             f"warnings — read each segment's own `warnings`")
+    # Non-ACGT bases were dropped before any of this ran, silently: every
+    # `start` / `end` below then indexed the FILTERED sequence while the
+    # caller reads them against the molecule they passed in, and the segment
+    # `seq`s together spell a molecule missing those bases. A plan nobody can
+    # order (no vendor synthesises an N) and that would not reassemble into
+    # the input is not a plan to hand over quietly (audit 2026-10-24).
+    n_degenerate = len(raw) - total
+    if n_degenerate:
+        warnings.append(
+            f"{n_degenerate} non-ACGT / ambiguous base(s) were REMOVED "
+            f"before planning: every coordinate below indexes the remaining "
+            f"{total:,} bp, not the {len(raw):,} bp you passed, and the "
+            f"segments together spell the filtered sequence. Most synthesis "
+            f"vendors reject degenerate positions — resolve them first.")
     return {
         "ok": not errors,
         "strategy": strat_key, "strategy_label": strat["label"],
         "n_segments": len(segments), "n_junctions": len(junctions),
         "segment_bp": seg_bp, "overlap_bp": ov, "stride_bp": stride,
-        "total_bp": total, "circular": bool(circular),
+        "total_bp": total, "input_bp": len(raw),
+        "n_degenerate": n_degenerate, "circular": bool(circular),
         "n_ambiguous_junctions": n_dup,
         "offtarget_checked": offtarget_checked,
         "segments": segments, "junctions": junctions,

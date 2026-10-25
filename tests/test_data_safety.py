@@ -1409,11 +1409,12 @@ class TestSweep30SafeSaveJson:
             if self == p:  # only fault the target's prior-content read
                 raise OSError("simulated EIO on read")
             return real_read(self, *a, **k)
-        monkeypatch.setattr(type(p), "read_bytes", unreadable)
-
-        with pytest.raises(OSError):
-            sc._safe_save_json(p, [], "test")  # a would-be nuke-to-empty
-        monkeypatch.undo()
+        # A SEPARATE MonkeyPatch, never `monkeypatch.undo()`: that would also
+        # revert conftest's sandboxing of the data files (they share it).
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(type(p), "read_bytes", unreadable)
+            with pytest.raises(OSError):
+                sc._safe_save_json(p, [], "test")  # a would-be nuke-to-empty
         # The original file survived intact — the refusal preserved it.
         assert p.read_bytes() == original
         assert json.loads(p.read_text())["entries"] == [

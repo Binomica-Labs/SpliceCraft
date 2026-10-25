@@ -2639,3 +2639,133 @@ class TestPrimerSearchAndMarks:
             screen._clear_primer_marks(None)
             await pilot.pause()
             assert screen._lib_selected == set() and screen._move_marked == set()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Primers with DESIGNED mismatches must be drawn where they anneal
+# ═══════════════════════════════════════════════════════════════════════════
+# Placement required a 12 bp exact 3' stretch, so 70 % of the app's own
+# SOE / QuikChange inner primers (median 9 bp past the edit) and every
+# destabilised allele-specific primer were refused as "does not bind this
+# plasmid" — though they anneal at ~90 % identity (audit 2026-10-23). A
+# foreign primer must still never be drawn.
+
+def _inner_case(rng):
+    import splicecraft_primer as P
+    from Bio.Seq import Seq
+    codons = [a + b + c for a in "ACGT" for b in "ACGT" for c in "ACGT"]
+    sense = [c for c in codons if str(Seq(c).translate()) != "*"]
+    while True:
+        nc = rng.randint(30, 80)
+        cds = "ATG" + "".join(rng.choice(sense) for _ in range(nc - 2)) + "TAA"
+        back = "".join(rng.choice("ACGT") for _ in range(2500))
+        off = rng.randint(0, 2500)
+        plasmid = back[:off] + cds + back[off:]
+        k = rng.randint(0, len(plasmid) - 1)            # some cross the origin
+        plasmid = plasmid[k:] + plasmid[:k]
+        cds_off = (off - k) % len(plasmid)
+        prot = str(Seq(cds).translate())
+        pos = rng.randint(8, nc - 8)
+        wt = prot[pos - 1]
+        mut = rng.choice([a for a in "ACDEFGHIKLMNPQRSTVWY" if a != wt])
+        try:
+            inner = P._mut_design_inner(cds, pos, mut, wt)
+        except Exception:                                # noqa: BLE001
+            continue
+        best = inner["candidates"][0]
+        return plasmid, (cds_off + best["lo"]) % len(plasmid), best
+
+
+def test_mutagenic_inner_primers_are_placed_at_their_footprint():
+    import splicecraft_primer as P
+    rng = random.Random(900)
+    for _ in range(60):
+        plasmid, start, best = _inner_case(rng)
+        n = len(plasmid)
+        for seq, strand in ((best["fwd"], 1), (best["rev"], -1)):
+            rb = P._primer_binding_for_map(seq, strand, plasmid, n, None)
+            end = (start + len(seq) - 1) % n + 1
+            assert rb is not None, "a mutagenic primer was refused"
+            assert rb == (start, end) or rb == P._rederive_primer_binding(
+                seq, strand, plasmid, n), (rb, start, end)
+
+
+def test_inner_primer_attaches_and_shows_exactly_its_designed_mismatches():
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    rng = random.Random(404)
+    plasmid, start, best = _inner_case(rng)
+    rec = SeqRecord(Seq(plasmid), id="p", name="p",
+                    annotations={"molecule_type": "DNA",
+                                 "topology": "circular"})
+    added = sc._attach_named_primers_to_record(
+        rec, [{"seq": best["fwd"], "strand": 1, "label": "INNER_FWD"}])
+    assert added == 1, "the inner primer was refused"
+
+    class _D:
+        pass
+    feats = [f for f in sc.PlasmidMap._parse(_D(), rec)
+             if f.get("type") == "primer_bind"]
+    assert len(feats) == 1
+    f = feats[0]
+    n = len(plasmid)
+    fwd = best["fwd"]
+    # Drawn flush on its footprint: 3' end where it anneals, flap + bound =
+    # the whole primer, and every BOUND base it paints is the template's own
+    # base unless flagged as a mismatch (a 5'-proximal edit is drawn as flap
+    # by the renderer's own rule).
+    assert f["end"] % n == (start + len(fwd)) % n
+    assert f.get("_bound_len", 0) + f.get("_flap_len", 0) == len(fwd)
+    flap = f.get("_flap_len", 0)
+    flagged = set(f.get("_bound_mismatch", {}))
+    for j in range(flap, len(fwd)):
+        col = (start + j) % n
+        assert (fwd[j] == plasmid[col]) or (col in flagged), (j, col)
+
+
+def test_destabilised_allele_specific_primer_is_placed():
+    import splicecraft_primer as P
+    rng = random.Random(3)
+    tmpl = "".join(rng.choice("ACGT") for _ in range(4000))
+    checked = 0
+    for _ in range(40):
+        pos = rng.randint(300, 3600)
+        alt = rng.choice([b for b in "ACGT" if b != tmpl[pos]])
+        allele = tmpl[:pos] + alt + tmpl[pos + 1:]
+        for orient, strand in (("fwd", 1), ("rev", -1)):
+            d = P._design_allele_specific_primer(
+                allele, pos, alt_base=alt, orientation=orient,
+                destabilize=True)
+            if not d:
+                continue
+            checked += 1
+            rb = P._primer_binding_for_map(d["seq"], strand, allele,
+                                           len(allele), None)
+            assert rb == (d["binding_start"], d["binding_end"]), (rb, d)
+    assert checked >= 40
+
+
+def test_a_foreign_primer_is_never_placed():
+    import splicecraft_primer as P
+    rng = random.Random(11)
+    tmpl = "".join(rng.choice("ACGT") for _ in range(20000))
+    for _ in range(200):
+        f = "".join(rng.choice("ACGT") for _ in range(rng.randint(15, 30)))
+        for strand in (1, -1):
+            assert P._primer_binding_for_map(f, strand, tmpl, len(tmpl),
+                                             None) is None
+
+
+def test_an_ambiguous_mismatched_primer_needs_its_stored_site():
+    import splicecraft_primer as P
+    rng = random.Random(7)
+    site = "".join(rng.choice("ACGT") for _ in range(24))
+    pad = lambda k: "".join(rng.choice("ACGT") for _ in range(k))
+    tmpl = pad(300) + site + pad(700) + site + pad(300)
+    # The edit sits 7 bases from the 3' end, so no 12 bp exact 3' stretch
+    # exists and the exact path cannot answer — only the full-footprint one.
+    primer = site[:16] + ("A" if site[16] != "A" else "C") + site[17:]
+    n = len(tmpl)
+    assert P._rederive_primer_binding(primer, 1, tmpl, n) is None
+    assert P._primer_binding_for_map(primer, 1, tmpl, n, None) is None
+    assert P._primer_binding_for_map(primer, 1, tmpl, n, 1020)[0] == 1024

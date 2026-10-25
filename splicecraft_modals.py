@@ -24,7 +24,8 @@ import re
 from datetime import date as _date
 from pathlib import Path
 from rich.text import Text
-from textual import on, work
+from textual import on
+from splicecraft_widgets import _safe_work as work  # noqa: E402
 from textual.app import ComposeResult
 from textual.await_complete import AwaitComplete
 from textual.binding import Binding
@@ -3868,6 +3869,12 @@ class RenamePlasmidModal(_OneShotDismissScreen, ModalScreen):
         status   = self.query_one("#rename-status", Static)
         if not new_name:
             status.update("[red]Name cannot be empty.[/red]")
+            return
+        if len(new_name) > 200:
+            # Refuse rather than store a silently cut name (audit 2026-10-23,
+            # W13 — the cut name could also collide with another plasmid).
+            status.update(f"[red]That name is {len(new_name)} characters — "
+                          f"the limit is 200.[/red]")
             return
         if new_name == self.current_name:
             # No-op rename — treat as cancel so the app doesn't bother writing.

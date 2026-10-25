@@ -14,6 +14,273 @@
 
 ---
 
+## [Unreleased]
+
+A deep audit of the whole app — saving and loading, file formats, the
+cloning and analysis engines, the agent API and the interface at genome
+scale. Most of what it found was quiet: things that looked fine and weren't.
+
+### Bug fixes — your data
+
+- **Ctrl+S no longer rewrites the `.dna` or FASTA file you opened.** It wrote
+  GenBank text into it, keeping the original name. Those files are now left
+  exactly as they are; GenBank files you opened are still saved back.
+- **Save & Quit keeps your edits.** The save was handed to a background step
+  that quitting cancelled — and the crash-recovery copy had already been
+  deleted, so the edit was gone (8 times in 10 in testing).
+- **Renaming a plasmid with unsaved edits keeps it marked unsaved.** It used
+  to read as saved, so moving to another plasmid asked nothing and the edit
+  was lost.
+- **A hard kill or power cut right after a save can no longer undo it at the
+  next launch.** The library file and its collection are written one after
+  the other; a crash between the two used to restore the older collection
+  over the newer library, silently.
+- **A queued background save can no longer overwrite newer work.** A product
+  saved from the Constructor, PCR or Gibson tools, or a collection renamed or
+  deleted while a library change was still being written, could be reverted
+  by the older write — and lost at the next launch.
+- **A parts-bin edit made while a rename is being written is kept.** The
+  background writer saved the parts bin as it stood when the rename started,
+  so a part added or renamed in between vanished from disk while still
+  showing in the panel — invisible until the next launch.
+- **Importing a folder of `.dna` files can no longer drop a primer** you
+  saved from the primer panel while the import was finishing.
+- **Importing a Migrate Data archive is all or nothing.** A full disk part-way
+  through used to leave the imported collections pointing at sequences that
+  were never copied, and the import replaced this machine's stored sequences
+  outright. It now merges sequences in first, changes nothing unless every
+  piece lands, and can't be overwritten by a save that was in flight.
+- **A momentary read error is no longer treated as a corrupt library.** A
+  network home folder or an antivirus lock that failed one read used to set
+  your newest data aside and restore an older backup.
+- **Crash-recovery copies older than 30 days are shown before they're
+  deleted.** If you didn't reopen SpliceCraft within a month of a crash, the
+  only copy of the unsaved edits was removed without a word.
+- **The daily snapshot is taken before anything at launch writes**, so it
+  holds the data as you left it rather than what the launch made of it.
+- **A data file that is a symlink stops the launch with an explanation**
+  instead of crashing every time.
+- **Moving or copying the open plasmid while it has unsaved edits asks you to
+  save first.** The copy that landed lacked the edits, and the next Ctrl+S
+  filed a second, different copy back where it came from.
+- **The same plasmid in two collections shows each collection's own copy**,
+  and Ctrl+S saves into the collection it was pressed in — not into one you
+  switched to a moment later.
+- **Declining a name collision ("Keep original" / "Cancel") puts the previous
+  plasmid back on the canvas.** The import stayed there, and Ctrl+S then added
+  a second entry of the same name.
+- **Exporting to `.dna` includes your unsaved edits**, like the GenBank export
+  already did.
+- **Saving from the "unsaved changes" prompt keeps where the plasmid came from
+  and when it was added**, the same as Ctrl+S.
+- **Undo history survives saving and switching away**, including after a
+  rename.
+- **A name too long to store is refused, not silently cut**, and the duplicate
+  check looks at the name as it would actually be stored.
+- **Ctrl+S on a GenBank file with a placeholder accession no longer invents
+  one** and writes it into your file.
+- **Stored sequences that a newer SpliceCraft still uses are never cleaned
+  up**, and temporary files left by an interrupted save are now removed.
+- **An error in a background task is reported instead of closing the app**
+  (and losing unsaved work with it).
+
+### Bug fixes — sequences and annotations
+
+- **Spliced genes keep their exons through restriction cloning, a PCR insert,
+  a digest cut inside an intron, and copying a region.** The exons were left
+  at their old coordinates, so the product's CDS translated to nonsense.
+- **Feature types of 16 or more characters survive the library.** A feature
+  such as `origin_of_replication` was dropped on reload and its text glued
+  into the feature before it — with no warning.
+- **Qualifier text is kept as written:** a wrapped note containing a quote
+  and a slash is no longer split into a nameless qualifier, a qualifier name
+  with a space stays one name, and a tab inside a value stays a tab.
+- **A feature written as a whole-molecule join reads as the whole molecule**,
+  not as a zero-length mark that vanished from the map and from digests.
+- **An unknown position (`?`) no longer shrinks a feature to one base**, and a
+  record holding one can be saved again.
+- **Set origin drops a feature whose coordinates don't fit the molecule and
+  says so**, the way Flip already did, instead of leaving it on bases it
+  never covered.
+- **Inserting bases at the very start or end of a circular plasmid from a
+  script no longer splits features that cross the origin** into two pieces
+  with a fake intron.
+- **Editing a feature's label keeps its partial-end marks (`<` / `>`).**
+- **Translations read RNA and ambiguity codes.** A `U` on the forward strand
+  read as `?` while the reverse strand translated it; `GGN`, `TRA` and similar
+  codons that can only be one residue now translate to it.
+
+### Bug fixes — analysis and design tools
+
+- **The transcription map gives the same answer from either strand.** A
+  terminator touching a gene or a promoter was counted on one strand and
+  ignored on the other, so the same construct drawn the other way round could
+  read as expressed or as blocked.
+- **Predicted minus-strand promoters report the right leader length and box
+  positions** (they were one base short, and the −35/−10 starts pointed five
+  bases into the box's flank).
+- **Transcript prediction accepts a linear record whose unit ends on its last
+  base** instead of refusing it as "crossing the origin".
+- **The ORF finder on small circles finds every ORF longer than one lap,
+  whatever the origin** — at some rotations it reported none, at others two.
+- **Mutagenesis primers and allele-specific primers can be added to the map.**
+  Most of the app's own mutagenic primers were refused as "do not bind this
+  plasmid".
+- **"Amplify feature" finds its own primer inside a long repeat**, instead of
+  warning that it wasn't found where it was designed, and the mispriming
+  warning counts every other site.
+- **A protocol built from a construction history can't plant references or
+  links** from names inside the `.dna` file.
+- **The synthesis linter points at the right bases.** In a sequence with any
+  ambiguous bases every position was shifted, a 14×A run at bp 325 was
+  reported at bp 298 as "17×A", and runs were fused across stripped `N`s into
+  lengths the sequence never had. Runs, repeats and extreme-GC windows that
+  straddle the origin of a circular sequence are reported too.
+- **`homopolymer_max` now means the longest run allowed.** A run of exactly
+  the limit was flagged, while the GC-window bounds beside it are inclusive —
+  so with the default of 9, runs of 10 and longer are flagged.
+- **Segment planning reports homology on both strands and across the
+  origin.** A junction whose homology also occurs reverse-complemented
+  elsewhere — where a segment would go in backwards — was reported as unique,
+  as was a second copy spanning bp 0 of a circular target.
+- **Segment planning says when it removed ambiguous bases** instead of
+  quietly planning a different molecule from the one you passed.
+- **An assembly whose part carries the assembly enzyme's own site says so**,
+  with the position: that part is cut in the same one-pot reaction.
+- **A custom 5' overhang ending in `ATG` warns when the body also starts with
+  `ATG`** rather than quietly building two start codons, and an unnamed source
+  in a multi-part assembly gets the same start-codon handling as a named one.
+
+### Bug fixes — files and imports
+
+- **A damaged `.ab1` trace shows an error instead of closing the app.**
+- **High-accuracy FASTQ reads (HiFi, duplex, consensus) keep their quality
+  scores.** They were read as an old Illumina encoding, 31 points too low,
+  which made the read checks discard real evidence.
+- **GFF3:** an origin-crossing CDS keeps its reading frame through a round
+  trip, a free-text note containing an escaped `=` stays a note, and spaces
+  or line numbers in the `##FASTA` section are no longer read as bases.
+- **A feature that wraps the whole circle keeps its sequence through a GFF3
+  round trip.** On the minus strand it came back starting from bp 0 instead of
+  where it actually starts, which reads out as a different sequence — the
+  GenBank path already kept it.
+- **A corrupt `.ab1` trace can no longer hang the app for hours.** A
+  217-byte file whose header claimed four billion directory entries kept
+  SpliceCraft busy for two to three hours and then returned an ordinary
+  50-base read, so nothing downstream ever learned the file was bad.
+
+### Bug fixes — checking reads against a plasmid
+
+- **A sequencing read longer than about 7.4 kb can be checked at all.** Every
+  partial read past that length was refused — against a documented 200 kb
+  limit — so ordinary 8–10 kb nanopore reads were unverifiable. 16 perfect
+  reads of 7.5–9.5 kb now come back clean in under a second each; one of them
+  used to come back as a mismatch carrying 1,837 differences that were not
+  there, and 7 were refused with the wrong reason ("shares no exact 16-bp
+  stretch" about a plasmid they matched base for base). A 50 kb read on a
+  60 kb plasmid takes about a second and a half.
+- **A read that only partly covers the plasmid is checked across the origin
+  in "local" mode too.** It was trimmed to one side of bp 0 and a real
+  single-base change in the trimmed half was missed every time (40 out of 40
+  in testing), on forward reads as much as reverse-complemented ones.
+- **A mixed culture whose basecalls are all poor is no longer reported as
+  clonal.** A true 50/50 mixture read at Q15 — ordinary for older nanopore
+  runs — came back `clonal` with nothing listed and no warning, because the
+  reads were dropped from the evidence but kept in the depth. Such a position
+  is now reported, with the reason it was set aside, and the verdict says
+  `inconclusive` rather than claiming one sequence.
+- **"Matches" is never reported beside a confirmed difference.** Two reads
+  both showing the same 100 bp deletion verified as a match, because a 100 bp
+  deletion in a 10 kb plasmid is 99% identity — while the same answer listed
+  the deletion as confirmed. An identity threshold cannot express "no indel".
+- **"Inverted" now means only the orientation is wrong.** A read with an
+  inversion *and* an unrelated 400 bp deletion was reported as merely
+  inverted, at 83% identity.
+- **A read that says nothing is no longer reported as a failed build.** A
+  trace that came back as all no-calls was reported as a mismatch at 0%
+  identity — "your construct is wrong" from a read carrying no information at
+  all, which costs a good clone. Such a read is now marked as having no
+  comparable base, with a warning saying so, and the answer is
+  "inconclusive"; one usable read beside it still decides.
+- **A corrupted alignment on disk no longer breaks the report.** A stored
+  alignment whose saved result was not readable raised an error out of the
+  verification report, the Alignment Manager's gap count and the sequencing
+  overlay instead of simply contributing nothing, and a corrupted gap count
+  could report one indel on a clean read.
+- **A read hanging off the end of a linear sequence still matches.** 30 bases
+  of adapter made a perfect read a mismatch, while the same response called
+  the consensus clean.
+- **Reads covering none of the plasmid are not "clonal".** Three all-`N`
+  reads reported a clonal culture over nothing at all; thin coverage now says
+  how thin.
+- **The verification report, the alignment manager and the per-read verdict
+  agree.** A perfect 800 bp Sanger read was listed as carrying 2 insertions
+  or deletions and jumped the cursor to bp 0, and 20 unread bases were listed
+  as 20 single-base changes, while the consensus called the same read clean.
+- **One deletion across the origin is counted once**, not as the two halves
+  the alignment splits it into ("2 real changes" for one 9 bp deletion).
+- **A deletion next to other changes stays one deletion.** A 3 bp deletion
+  with a single-base change 12 bases away was reported as two separate 1 bp
+  deletions.
+- **A trace's usable window matches the trim the editor shows.** One lucky
+  good base kept 75 poor ones inside the "usable" span.
+- **Aligning a Plasmidsaurus run no longer reports a rename that never
+  happened** for any plasmid whose name contains a space, and the name it
+  reports is the one you can look the plasmid up by.
+- **Impossible quality values are refused with a clear message** instead of
+  failing the whole request, and a read with a trailing newline is accepted
+  beside a correctly sized quality array.
+
+### Security
+
+- **A shared Migrate Data archive can no longer install scripts that BABS
+  would run**, or change this machine's network and tool permissions.
+- **Feature labels can no longer send control sequences to your terminal**
+  (a crafted file could write to the clipboard of many terminals).
+- **A notebook entry can no longer pull an arbitrary local file into an
+  export.**
+- **A compressed codon-usage file can no longer exhaust memory** by expanding
+  far beyond its size on disk.
+- **The version check no longer runs Python files from the current folder**,
+  and tokens hidden in URL paths or parameters are kept out of the log.
+
+### Performance
+
+- **Genome-sized records stay responsive.** The feature list draws only what
+  is on screen (a 200,000-feature record froze for 37 s on load); edits keep
+  the current rotation; rotating a chromosome moves the view instead of
+  rebuilding it; memory no longer grows by over 100 MB per edit.
+- **The restriction scan doesn't run while overlays are hidden**, stops when
+  a newer one supersedes it, and the default one-cutters view decides each
+  enzyme without visiting every site (2 Mb: 3.3 s → 16 ms).
+- **Find feature (Ctrl+/) opens instantly on large records**; saving redraws
+  only the saved row of a large library; looking up a plasmid no longer waits
+  behind a save in progress.
+- **Promoter and terminator prediction is 13× and 2.6× faster**, so the
+  transcription map with predicted elements is practical on a genome; the
+  ORF finder is twice as fast on circles.
+- **Digests with thousands of cuts and features are fast again**, and a
+  digest with the wrong number of cuts is refused immediately.
+- **Map image export of large records** (10,000 features took 10–18 s) is now
+  quick, and an out-of-range feature can no longer use up memory.
+- **The splash screen no longer slows down a large file loading under it.**
+- **Toggling the map view (`v`) writes nothing to disk**; the view is saved
+  with your next save — and Ctrl+S no longer undoes it, and launch reopens the
+  first plasmid in its stored view.
+
+### Agent API & command line
+
+- **Exports can no longer overwrite files inside the data directory**, which
+  could destroy a stored sequence beyond recovery.
+- **An edit that lost a race with another edit returns 409** instead of
+  silently disappearing; reads are taken from one consistent snapshot.
+- **Idempotency keys protect concurrent retries**, and an invalid key is
+  refused rather than ignored.
+- **BLAST with a long query no longer uses gigabytes of memory**; malformed
+  numbers return 400 instead of 500; a read-only guest sees what the host
+  writes; a stale "restart the daemon" banner no longer appears on editable
+  installs; the CLI reports timeouts and dropped connections cleanly.
+
 ## [1.3.11] — 2026-10-16
 
 ### New features

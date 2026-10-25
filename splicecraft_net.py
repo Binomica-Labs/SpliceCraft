@@ -252,25 +252,61 @@ def _redact_url_credentials(url: str) -> str:
     download link (Plasmidsaurus results are served from one) carries its
     `X-Amz-Signature` / `X-Amz-Credential` / security token there, and those
     grant the file to anyone who reads the log — or the diagnostic bundle the
-    log ships in. Only the userinfo used to be scrubbed."""
+    log ships in. Only the userinfo used to be scrubbed.
+
+    Secrets live outside query values too, and each of these reached a log
+    line intact (audit 2026-10-23): a matrix parameter (``;jsessionid=…``), a
+    key-only query whose KEY is the token (``?<token>``), and a capability
+    token as a path segment — redacted when it is long and mixes letters with
+    digits, the shape of a token rather than a word. The userinfo is cut at
+    the last ``@`` without parsing the port, because an unparseable port made
+    ``.port`` raise and the fallback then returned the URL unchanged —
+    credentials and all. A URL that cannot be parsed at all comes back as its
+    scheme and host only, never as itself."""
     if not isinstance(url, str):
         return ""
     try:
-        from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+        from urllib.parse import parse_qsl, quote_plus, urlparse, urlunparse
         parts = urlparse(url)
-        if parts.username or parts.password:
-            netloc = parts.hostname or ""
-            if parts.port:
-                netloc = f"{netloc}:{parts.port}"
-            parts = parts._replace(netloc=netloc)
+        if "@" in parts.netloc:
+            parts = parts._replace(netloc=parts.netloc.rsplit("@", 1)[1])
+        if parts.params:
+            parts = parts._replace(params="REDACTED")
+        if parts.path:
+            parts = parts._replace(path="/".join(
+                "REDACTED" if _URL_TOKEN_SEGMENT_RE.fullmatch(seg) else seg
+                for seg in parts.path.split("/")))
         if parts.query:
             pairs = parse_qsl(parts.query, keep_blank_values=True)
-            parts = parts._replace(query=urlencode(
-                [(k, "REDACTED") for k, _v in pairs] if pairs
-                else [("query", "REDACTED")]))
+            parts = parts._replace(query="&".join(
+                f"{quote_plus(k)}=REDACTED" if v else "REDACTED"
+                for k, v in pairs) if pairs else "query=REDACTED")
         if parts.fragment:
             parts = parts._replace(fragment="")
         return urlunparse(parts)
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         pass
-    return url
+    m = _URL_SCHEME_HOST_RE.match(url)
+    if not m:
+        return "[unparseable URL]"
+    # The host has to LOOK like one before it is echoed. A malformed IPv6
+    # literal (`http://user:pw@[::1/x`) matched the character class with a
+    # bare `[`, so the fallback logged `http://[/REDACTED` — safe, but it
+    # reads as a real URL that someone will try to chase (audit 2026-10-24).
+    # The SCHEME is still reported either way: a log line has to say which
+    # protocol was used, which is why this fallback exists at all.
+    if _URL_HOST_PLAUSIBLE_RE.fullmatch(m.group(2) or ""):
+        return f"{m.group(1)}://{m.group(2)}/REDACTED"
+    return f"{m.group(1)}://REDACTED"
+
+
+# A path segment shaped like a token, not a word: long, and mixing letters with
+# digits. Accessions, file names and directory names stay short of it.
+_URL_TOKEN_SEGMENT_RE = _re_mod.compile(
+    r"(?=[^/]*\d)(?=[^/]*[A-Za-z])[A-Za-z0-9_.~%=+-]{32,}")
+_URL_SCHEME_HOST_RE = _re_mod.compile(
+    r"([A-Za-z][A-Za-z0-9+.-]*)://(?:[^@/?#]*@)?([^/?#@:;]*)")
+# A host worth echoing in a log line: a name or IPv4, or a COMPLETE bracketed
+# IPv6 literal. A fragment of one is not a host.
+_URL_HOST_PLAUSIBLE_RE = _re_mod.compile(
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])")

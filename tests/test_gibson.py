@@ -976,3 +976,20 @@ class TestGibsonHardening:
             # duplicate inserts (the worker hasn't finished).
             save_btn = pane.query_one("#btn-gib-save", sc.Button)
             assert save_btn.disabled is True
+
+
+def test_gibson_simulate_is_the_timed_operation(monkeypatch):
+    """`@_timed("op.gibson_simulate")` sat above a 12-line comment block and
+    decorated `_gibson_failure` instead (audit 2026-10-23): a SUCCESSFUL
+    assembly was never timed, and the only `op.gibson_simulate` events came
+    from failures (always ~0 ms) — the log misstated Gibson performance."""
+    import splicecraft_logging
+    events = []
+    monkeypatch.setattr(splicecraft_logging, "_log_event",
+                        lambda ev, **kw: events.append((ev, kw.get("path"))))
+    oh = "ACGTACGTACGTACGTACGT"
+    r = sc._simulate_gibson_assembly(
+        [_frag("F1", "AAAAA" + oh), _frag("F2", oh + "TTTTT")],
+        min_overlap=15, circular=False)
+    assert r["success"] is True
+    assert ("op.timed", "op.gibson_simulate") in events

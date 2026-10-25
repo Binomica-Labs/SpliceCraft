@@ -4179,7 +4179,8 @@ class TestLocalModePositions:
 def _d_ent(name, seed):
     from Bio.Seq import Seq
     from Bio.SeqRecord import SeqRecord
-    s = "".join(random.Random(seed).choice("ACGT") for _ in range(120))
+    rng = random.Random(seed)
+    s = "".join(rng.choice("ACGT") for _ in range(120))
     gb = sc._record_to_gb_text(SeqRecord(
         Seq(s), id=name, name=name, description=name,
         annotations={"molecule_type": "DNA", "topology": "circular"}))

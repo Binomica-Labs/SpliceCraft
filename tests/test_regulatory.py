@@ -652,3 +652,216 @@ class TestAgentEndpoints:
                      "map-transcription"):
             res = _call(name, {"name": "no such plasmid anywhere"})
             assert isinstance(res, tuple) and res[1] == 404, name
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Strand mirror (audit 2026-10-23, A1 / A5 / A6)
+# ══════════════════════════════════════════════════════════════════════
+#
+# The reverse complement of a construct is the same molecule read from the
+# other strand, so every answer about it must come back identical. Each check
+# below failed on exactly one strand before the fix — a terminator touching
+# the gene or the promoter was seen on one strand only, the minus-strand box
+# starts pointed at each box's LAST base, and a predicted minus-strand
+# promoter reported its leader one base short.
+
+def _mirror(seq, feats):
+    """The same construct drawn from the other strand."""
+    n = len(seq)
+    out = []
+    for f in feats:
+        g = dict(f)
+        g["start"], g["end"] = n - f["end"], n - f["start"]
+        g["strand"] = -f["strand"]
+        out.append(g)
+    return _rc(seq), out
+
+
+def _p_to_g(res):
+    """The P -> G reach, reduced to what must not depend on the strand."""
+    gene = _gene(res, "G")
+    hits = [r for r in gene["reachable_from"]
+            if r["promoter"]["label"] == "P"]
+    assert len(hits) == 1, hits
+    r = hits[0]
+    return (r["distance_bp"], r["readthrough"],
+            [t["label"] for t in r["terminators_between"]])
+
+
+# (terminator start, terminator end) relative to a layout of
+#   pad 60 | promoter P [60, 90) | 120 bp | gene G [210, 510) | pad 60
+_TERM_PLACEMENTS = {
+    "touches the gene's 5' end": ((170, 210), ["T"]),
+    "touches the promoter's 3' end": ((90, 130), ["T"]),
+    "straddles the gene start": ((190, 230), ["T"]),
+    "strictly between": ((130, 170), ["T"]),
+    "inside the gene": ((300, 340), []),
+    "straddles the promoter's fire point": ((80, 100), []),
+}
+
+
+class TestTranscriptionMapIsStrandSymmetric:
+
+    @pytest.mark.parametrize("circular", [False, True])
+    @pytest.mark.parametrize("where", sorted(_TERM_PLACEMENTS))
+    def test_a_terminator_reads_the_same_from_either_strand(
+            self, where, circular):
+        (ts, te), expect = _TERM_PLACEMENTS[where]
+        seq = _rand(570, 5100)
+        feats = [
+            {"start": 60, "end": 90, "strand": 1, "type": "promoter",
+             "label": "P"},
+            {"start": ts, "end": te, "strand": 1, "type": "terminator",
+             "label": "T"},
+            {"start": 210, "end": 510, "strand": 1, "type": "CDS",
+             "label": "G"},
+        ]
+        fwd = _p_to_g(sa._map_transcription(seq, feats, circular=circular,
+                                            include_predicted=False))
+        mseq, mfeats = _mirror(seq, feats)
+        rev = _p_to_g(sa._map_transcription(mseq, mfeats, circular=circular,
+                                            include_predicted=False))
+        assert fwd == rev, (where, fwd, rev)
+        assert fwd[0] == 120 and fwd[2] == expect, (where, fwd)
+
+    @pytest.mark.parametrize("trial", range(6))
+    def test_a_predicted_promoter_reports_its_true_leader_on_both_strands(
+            self, trial):
+        """The leader is the transcribed stretch from the start site to the
+        CDS: `gene_start - tss` bases on the plus strand. Its mirror was one
+        base short — the minus-strand TSS is a base, and was used as the
+        boundary on its far side."""
+        r = random.Random(5200 + trial)
+        leader = r.randint(10, 60)
+        left = _rand(r.randint(80, 200), 5300 + trial)
+        head = left + _PERFECT_PROMOTER
+        tss = len(left) + len(_PERFECT_PROMOTER) - 6 + reg._TSS_OFFSET_FROM_MINUS10
+        gap = _rand(tss + leader - len(head), 5400 + trial)
+        seq = head + gap + _rand(300, 5500 + trial) + _rand(80, 5600 + trial)
+        g0 = tss + leader
+        feats = [{"start": g0, "end": g0 + 300, "strand": 1, "type": "CDS",
+                  "label": "G"}]
+
+        def leader_of(s, fs, strand):
+            res = sa._map_transcription(s, fs, circular=False,
+                                        include_predicted=True)
+            planted = [x for x in _gene(res, "G")["reachable_from"]
+                       if x["promoter"]["source"] == "predicted"
+                       and x["promoter"]["strand"] == strand
+                       and x["promoter"].get("score", 0) > 0.99]
+            assert planted, "the planted promoter did not reach the gene"
+            return min(x["distance_bp"] for x in planted)
+
+        assert leader_of(seq, feats, 1) == leader
+        mseq, mfeats = _mirror(seq, feats)
+        assert leader_of(mseq, mfeats, -1) == leader
+
+
+class TestPromoterBoxesReadBackOnTheirOwnStrand:
+    """`minus35_start` / `minus10_start` are forward-strand coordinates like
+    every other field: the six bases there, read on the hit's own strand, ARE
+    the box. For a minus-strand hit they pointed at the box's last base."""
+
+    @pytest.mark.parametrize("circular", [False, True])
+    @pytest.mark.parametrize("trial", range(8))
+    def test_box_starts_point_at_the_boxes(self, trial, circular):
+        r = random.Random(5700 + trial)
+        el = "TTGACA" + _rand(17, 5800 + trial) + "TATAAT"
+        left = _rand(r.randint(40, 200), 5900 + trial)
+        right = _rand(r.randint(40, 200), 6000 + trial)
+        for strand, seq in ((1, left + el + right),
+                            (-1, left + _rc(el) + right)):
+            n = len(seq)
+            hits = [h for h in reg._scan_promoters(seq, circular=circular)
+                    if h["strand"] == strand and h["score"] > 0.99]
+            assert hits, (strand, "the planted promoter was not found")
+            for h in hits:
+                for box in ("minus35", "minus10"):
+                    p = h[box + "_start"]
+                    six = (seq + seq)[p:p + 6] if circular else seq[p:p + 6]
+                    read = six if strand == 1 else _rc(six)
+                    assert read == h[box], (strand, box, p, n, read, h[box])
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Speed without a change of answer (audit 2026-10-23, A9)
+# ══════════════════════════════════════════════════════════════════════
+#
+# The promoter scan rescored every window and built a components dict per
+# candidate (32 s/Mbp); the terminator scan tried every stem/loop register with
+# a fresh slice (44 s/Mbp) — `map-transcription` with predicted elements was a
+# multi-minute call on a genome. Both are now exact rewrites. The digest below
+# was computed with the PRE-rewrite scanners over a fixed corpus; a deliberate
+# change to what the scanners report updates this ONE constant, an accidental
+# one fails here.
+
+_SCANNER_OUTPUT_DIGEST = (
+    "8da0bbff1d8a04af7b6f84c5774ef9905b7dd16c249b91ed844110eef7814289")
+
+
+def _scanner_corpus():
+    """Ten molecules with planted promoters and terminators. A 64-bit LCG,
+    not `random`, so the corpus is the same bytes on every Python."""
+    prom = "TTGACA" + "ACGTGCATGCATGCATG" + "TATAAT"
+    stem = "GCCGCCAGTT"
+    term = stem + "CGAA" + _rc(stem) + "TTTTTTTT"
+    x = 20261024
+
+    def nxt(m):
+        nonlocal x
+        x = (x * 6364136223846793005 + 1442695040888963407) % (1 << 64)
+        return (x >> 33) % m
+    out = []
+    for k in range(10):
+        n = 800 + nxt(3200)
+        alph = ("ACGT", "GCGCAT", "ATATGC", "ACGTN")[k % 4]
+        s = [alph[nxt(len(alph))] for _ in range(n)]
+        for _ in range(4):
+            el = (prom, term)[nxt(2)]
+            el = el if nxt(2) else _rc(el)
+            p = nxt(n - len(el))
+            s[p:p + len(el)] = el
+        out.append(("".join(s), k % 2 == 0))
+    return out
+
+
+class TestScannersAreFastAndUnchanged:
+
+    def test_the_answers_are_the_pre_rewrite_answers(self):
+        import hashlib
+        import json
+        h = hashlib.sha256()
+        for seq, circ in _scanner_corpus():
+            for res in (reg._scan_promoters(seq, circular=circ),
+                        reg._scan_terminators(seq, circular=circ),
+                        reg._scan_promoters(seq, circular=circ, min_score=0.5),
+                        reg._scan_terminators(seq, circular=circ, min_stem=4,
+                                              min_u_tract=3)):
+                h.update(json.dumps(res, sort_keys=True, default=str).encode())
+        assert h.hexdigest() == _SCANNER_OUTPUT_DIGEST
+
+    def test_each_promoter_box_is_scored_once_per_hexamer(self, monkeypatch):
+        calls = [0]
+        real = reg._hexamer_score
+
+        def counting(*a, **k):
+            calls[0] += 1
+            return real(*a, **k)
+        monkeypatch.setattr(reg, "_hexamer_score", counting)
+        reg._scan_promoters(_rand(20_000, 3), circular=True)
+        # <= 4,096 distinct hexamers per box per strand; was 320,320.
+        assert calls[0] <= 20_000, calls[0]
+
+    def test_the_hairpin_search_does_not_retry_every_register(
+            self, monkeypatch):
+        class Counting(frozenset):
+            n = 0
+
+            def __contains__(self, item):
+                Counting.n += 1
+                return frozenset.__contains__(self, item)
+        monkeypatch.setattr(reg, "_COMPLEMENT_PAIRS",
+                            Counting(reg._COMPLEMENT_PAIRS))
+        reg._scan_terminators(_rand(20_000, 3), circular=True)
+        # 285k pair tests now; 959k when every register was sliced afresh.
+        assert Counting.n <= 500_000, Counting.n

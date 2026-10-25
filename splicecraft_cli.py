@@ -28,6 +28,7 @@ session exposes (handy when wiring a new tool surface for the agent).
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -120,6 +121,10 @@ def _read_session() -> tuple[str, int, str]:
                 f"Refusing to read symlinked token file {f}. "
                 f"Restart the GUI to regenerate."
             )
+        if not _stat.S_ISREG(st.st_mode):
+            # a directory raised IsADirectoryError; a FIFO would block forever
+            sys.exit(f"Token path {f} is not a regular file. "
+                     f"Restart the GUI to regenerate.")
         size = st.st_size
     except OSError as exc:
         sys.exit(f"Could not stat token file {f}: {exc}")
@@ -129,7 +134,11 @@ def _read_session() -> tuple[str, int, str]:
             f"({size:,} bytes > {_CLI_TOKEN_FILE_MAX_BYTES}-byte cap). "
             f"Restart the GUI to regenerate."
         )
-    lines = f.read_text(encoding="utf-8").strip().splitlines()
+    try:
+        lines = f.read_text(encoding="utf-8").strip().splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        sys.exit(f"Could not read token file {f}: {exc}. "
+                 f"Restart the GUI to regenerate.")
     if len(lines) < 2:
         sys.exit(
             f"Malformed token file at {f} "
@@ -166,6 +175,13 @@ def _request(endpoint: str, method: str = "GET",
               timeout: float = 30.0,
               idempotency_key: "str | None" = None) -> dict:
     host, port, token = _read_session()
+    if method != "POST" and payload:
+        # A GET carries no body: the payload was silently dropped and the
+        # read answered for its DEFAULT target instead (AG8).
+        raise _AgentCliError(
+            "Error: a GET request carries no body, so the JSON payload would "
+            "be ignored. Use --method POST (read endpoints accept it) or omit "
+            "--method.")
     url = f"http://{host}:{port}/{endpoint}"
     data = (json.dumps(payload or {}).encode("utf-8")
             if method == "POST" else None)
@@ -189,9 +205,9 @@ def _request(endpoint: str, method: str = "GET",
                     f"{_CLI_RESPONSE_MAX_BYTES:,}-byte cap "
                     f"(endpoint={endpoint!r}). Refusing to read."
                 )
-            body = raw.decode("utf-8")
+            body = raw.decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8") if exc.fp else ""
+        body = exc.read().decode("utf-8", "replace") if exc.fp else ""
         err_payload: "dict | None" = None
         try:
             parsed = json.loads(body) if body else {}
@@ -213,6 +229,14 @@ def _request(endpoint: str, method: str = "GET",
             f"Could not reach SpliceCraft at {host}:{port} ({exc.reason}).\n"
             f"  Is the GUI still running with --agent-api?"
         )
+    except (OSError, http.client.HTTPException) as exc:
+        # `getresponse()` errors are NOT wrapped in URLError: a read timeout
+        # (TimeoutError) or a dropped connection (RemoteDisconnected) escaped
+        # as a traceback, breaking `call`'s structured-error promise (AG8).
+        raise _AgentCliError(
+            f"Error: no complete answer from SpliceCraft at {host}:{port} "
+            f"({type(exc).__name__}: {exc}). The call may still have run -- "
+            f"retry with --idempotency-key to make the retry safe.")
     try:
         return json.loads(body) if body else {}
     except json.JSONDecodeError:

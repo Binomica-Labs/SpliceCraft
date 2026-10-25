@@ -271,7 +271,9 @@ class TestAuthOnReadEndpoints:
         unauthenticated probes for unknown paths uniformly 401
         (don't leak endpoint-list oracle via 404)."""
         import inspect
-        src = inspect.getsource(sc._AgentRequestHandler._handle)
+        # The routing body moved into `_handle_inner` (2026-10-23, AG7): `_handle`
+        # wraps it so an idempotency claim is released on every exit.
+        src = inspect.getsource(sc._AgentRequestHandler._handle_inner)
         # Find positions of the token check and the handler lookup.
         token_pos = src.find("_check_token")
         handler_pos = src.find("_AGENT_HANDLERS.get(path_part)")
@@ -863,7 +865,9 @@ class TestSweep26LogEventTimingAfterSend:
 
     def test_source_order_send_then_log(self):
         import inspect
-        src = inspect.getsource(sc._AgentRequestHandler._handle)
+        # The routing body moved into `_handle_inner` (2026-10-23, AG7): `_handle`
+        # wraps it so an idempotency claim is released on every exit.
+        src = inspect.getsource(sc._AgentRequestHandler._handle_inner)
         # Find positions of the send call and the success-log emit.
         send_pos = src.find("self._send(payload, status)")
         log_pos = src.find('"agent.write.ok"')

@@ -221,6 +221,35 @@ async def test_amplify_flags_a_primer_that_binds_twice():
         assert any("mispriming" in w for w in out["warnings"])
 
 
+async def test_amplify_finds_its_own_site_inside_a_long_repeat():
+    """The designed site was looked up in a binding-site list capped at 20 and
+    ranked lowest-coordinate first; in a 30-copy repeat the designed copy fell
+    off the end and the endpoint said "not found at its designed site — do not
+    order it" about a primer that anneals perfectly there (audit 2026-10-23).
+    The misprime warning must count every other site, not the shown five."""
+    rng = random.Random(4242)
+    unit = "".join(rng.choice("ACGT") for _ in range(60))
+    rec = SeqRecord(Seq(unit * 30), id="pREP", name="pREP",
+                    description="tandem repeat")
+    rec.annotations["topology"] = "circular"
+    rec.annotations["molecule_type"] = "DNA"
+    rec.features = [SeqFeature(FeatureLocation(1500, 1560, strand=1),
+                               type="misc_feature",
+                               qualifiers={"label": ["copy26"]})]
+    app = sc.PlasmidApp()
+    async with app.run_test(size=_TERM) as pilot:
+        await _loaded_app(pilot, app, rec)
+        out = sc._h_amplify_feature(app, {"name": "copy26"})
+        assert out["forward"]["binds_as_designed"], out["forward"]
+        assert out["reverse"]["binds_as_designed"], out["reverse"]
+        assert not any("designed site" in w for w in out["warnings"]), \
+            out["warnings"]
+        import re
+        counts = [int(m.group(1)) for w in out["warnings"]
+                  for m in [re.search(r"at least (\d+) other site", w)] if m]
+        assert len(counts) == 2 and min(counts) >= 19, out["warnings"]
+
+
 async def test_amplify_ambiguity_linear_wrap_and_validation():
     app = sc.PlasmidApp()
     async with app.run_test(size=_TERM) as pilot:

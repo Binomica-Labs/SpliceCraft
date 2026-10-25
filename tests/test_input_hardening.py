@@ -216,3 +216,173 @@ def test_agent_rejects_nonloopback_host(host_server):
 def test_agent_allows_loopback_host(host_server):
     assert _get_status(host_server, "/tools") == 200  # default 127.0.0.1 Host
     assert _get_status(host_server, "/tools", f"localhost:{host_server}") == 200
+
+
+# ── audit 2026-10-23: escape sequences in a FILE's feature text ─────────────
+
+_ESC = "\x1b"
+_OSC52 = _ESC + "]52;c;UFdORUQ=" + _ESC + "\\"      # OSC 52 clipboard write
+_OSC0 = _ESC + "]0;PWNED" + _ESC + "\\"              # OSC 0 window title
+
+
+def _hostile_gb() -> str:
+    seq = "ATGACCATGATTACGGATTCACTGGCCGTCGTTTTACAACGTCGTGACTGGGAAAACCCTGGCG" * 8
+    lines = [f"LOCUS       ESCTEST               {len(seq)} bp    DNA     "
+             f"circular SYN 01-JAN-2026",
+             "FEATURES             Location/Qualifiers",
+             "     CDS             1..300",
+             f'                     /label="lab{_OSC52}el"',
+             f'                     /note="note{_OSC52}{_OSC0}"',
+             "     misc_feature    310..400",
+             f'                     /SpliceCraft_type="t{_OSC52}"',
+             "ORIGIN"]
+    for i in range(0, len(seq), 60):
+        c = seq[i:i + 60]
+        lines.append(f"{i + 1:>9} " + " ".join(c[j:j + 10]
+                                              for j in range(0, len(c), 10)))
+    return "\n".join(lines + ["//", ""])
+
+
+def test_feature_labels_and_types_carry_no_terminal_escapes():
+    """A `/label` is painted straight to the terminal (map, sidebar, sequence
+    lanes): its ESC was a live `ESC ] 52` clipboard write on OSC-52
+    terminals. Restored long types are file text too."""
+    rec = sc._gb_text_to_record(_hostile_gb(), cache=False)
+    for f in rec.features:
+        assert _ESC not in sc._feat_label_full(f)
+        assert _ESC not in f.type
+
+
+async def test_hostile_labels_never_reach_the_terminal_stream():
+    rec = sc._gb_text_to_record(_hostile_gb(), cache=False)
+    app = sc.PlasmidApp()
+    async with app.run_test(size=(200, 60)) as pilot:
+        for _ in range(4):
+            await pilot.pause()
+        app._apply_record(rec)
+        for _ in range(6):
+            await pilot.pause()
+        out = app.screen._compositor.render_update(full=True) \
+            .render_segments(app.console)
+    assert (_ESC + "]") not in out
+
+
+def _hostile_migrate_archive(tmp_path, settings_entries, plugin_files):
+    import hashlib
+    import json
+    import zipfile
+    settings_bytes = json.dumps(
+        {"_schema_version": 1, "entries": settings_entries}).encode()
+    manifest = {"schema_version": 1,
+                "files": [{"attr": "_SETTINGS_FILE", "name": "settings.json",
+                           "sha256": hashlib.sha256(settings_bytes)
+                           .hexdigest()}],
+                "directories": [{"attr": "_PLUGINS_DIR", "name": "plugins"}]}
+    zpath = tmp_path / "colleague-library.zip"
+    with zipfile.ZipFile(zpath, "w") as zf:
+        zf.writestr("splicecraft-migrate.json", json.dumps(
+            {"format": "splicecraft-migrate", "format_version": 1,
+             "snapshot_subdir": "data"}))
+        zf.writestr("data/manifest.json", json.dumps(manifest))
+        zf.writestr("data/settings.json", settings_bytes)
+        for name in plugin_files:
+            zf.writestr(f"data/plugins/{name}", "")
+    return zpath
+
+
+def test_a_migrate_archive_cannot_choose_where_babs_runs_code(
+        tmp_path, monkeypatch):
+    """An archive is a file someone can send you. Its settings.json pointed
+    `babs_home` at its own `plugins/` (holding `bb_learn.py` + `rag_bot.py`),
+    and every BABS chat turn then ran the archive's script (audit
+    2026-10-23)."""
+    for k in ("SPLICECRAFT_BABS_HOME", "BABS_HOME"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    sc._set_setting("allow_online_search", False)
+    sc._settings_flush_sync()
+    plugins = sc._state._PLUGINS_DIR
+    zpath = _hostile_migrate_archive(
+        tmp_path,
+        [{"key": "babs_home", "value": str(plugins)},
+         {"key": "allow_online_search", "value": True},
+         {"key": "show_restr", "value": True}],
+        ["bb_learn.py", "rag_bot.py", "bb_snowball.py"])
+    summary = sc._import_migrate_archive(zpath)
+    sc._bust_all_data_caches()
+    assert not (plugins / "rag_bot.py").exists(), "archive plugins installed"
+    assert sc._learn_resolve_babs_home() is None
+    assert sc._get_setting("babs_home", "") in ("", None)
+    assert sc._get_setting("allow_online_search", None) is False
+    # Ordinary settings still travel with the archive.
+    assert sc._get_setting("show_restr", None) is True
+    assert "babs_home" in summary["kept_local_settings"]
+
+
+def test_babs_home_inside_the_data_dir_is_refused(tmp_path):
+    fake = sc._state._DATA_DIR / "somewhere"
+    fake.mkdir(parents=True, exist_ok=True)
+    (fake / "bb_learn.py").write_text("")
+    assert sc._babs_home_allowed(fake) is False
+    elsewhere = tmp_path.parent / (tmp_path.name + "-babs")
+    elsewhere.mkdir(exist_ok=True)
+    assert sc._babs_home_allowed(elsewhere) is True
+
+
+def test_version_probe_never_imports_from_the_launch_directory(
+        tmp_path, monkeypatch):
+    """`python -c` puts the CWD first on sys.path; the metadata read imports
+    stdlib modules, so a planted `operator.py` in the launch directory ran on
+    `splicecraft update` and every authenticated agent response."""
+    planted = tmp_path / "launch-dir"
+    planted.mkdir()
+    marker = tmp_path / "ran"
+    for mod in ("operator", "json", "email", "zipfile", "pathlib",
+                "contextlib", "typing", "warnings", "csv", "textwrap"):
+        (planted / f"{mod}.py").write_text(
+            f"open({str(marker)!r}, 'a').write({mod!r})\n"
+            f"raise ImportError('planted')\n")
+    monkeypatch.chdir(planted)
+    sc._query_installed_version(timeout=30)
+    assert not marker.exists(), marker.read_text()
+
+
+def test_cds_gz_is_never_fully_inflated_before_the_size_check(
+        tmp_path, monkeypatch):
+    """The size check ran AFTER `gzip.decompress` inflated the whole file —
+    a 1.8 MB `.gz` became 1.75 GiB in RAM first (OOM from the GUI picker or
+    the agent's `add-codon-table`)."""
+    import gzip
+    import splicecraft_codon as scc
+    monkeypatch.setattr(scc, "_CDS_FILE_MAX_BYTES", 1_000_000)
+    bomb = tmp_path / "cds_from_genomic.fna.gz"
+    bomb.write_bytes(gzip.compress(b">x\n" + b"A" * 5_000_000))
+    whole = []
+    real = gzip.decompress
+    monkeypatch.setattr(gzip, "decompress",
+                        lambda *a, **k: whole.append(1) or real(*a, **k))
+    raw, msg, meta = scc._file_build_codon_table(bomb)
+    assert raw is None and "too large" in msg
+    assert not whole, "the whole bomb was inflated before the cap applied"
+
+
+def test_notebook_attachments_are_confined_to_the_entry_folder(tmp_path):
+    """An absolute / `..` image path in experiments.json (hand-edited, or
+    from an imported archive) made the HTML export read and embed an
+    arbitrary local file into a document the user then shares."""
+    import base64
+    secret = tmp_path / "id_rsa_DECOY"
+    secret.write_text("DECOY-PRIVATE-KEY-MATERIAL\n")
+    entry = sc._normalise_experiment_entry(
+        {"id": "exp1", "title": "t", "body_md": "x",
+         "image_paths": [str(secret), "../../x", "sub/a.png",
+                         "img-1-abc.png"]})
+    assert entry["image_paths"] == ["img-1-abc.png"]
+    # The exporter refuses an escape even if a raw entry reaches it.
+    sc._experiment_attach_dir("exp1", create=True)
+    raw = dict(entry, image_paths=[str(secret)])
+    srcs, _ = sc.ExperimentExportModal._image_srcs(None, [raw], embed=True)
+    assert not srcs
+    html = sc._experiment_html_document([raw], image_srcs=srcs,
+                                        generated_at="t")
+    assert base64.b64encode(secret.read_bytes()).decode() not in html

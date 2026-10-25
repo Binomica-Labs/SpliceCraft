@@ -17,6 +17,7 @@ Two pre-fix bugs under regression-guard here (both found 2026-04-13):
   being dropped.
 """
 
+import pytest
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
@@ -367,3 +368,27 @@ class TestRebuildEditEdgeCases:
         new_rec = app._rebuild_record_with_edit(
             "C" * 10, "replace", 0, 100, "C" * 10)
         assert _first_by_label(new_rec, "wrapCDS") is None
+
+
+class TestZeroLengthReplaceIsAnInsert:
+    """`replace-sequence` with start == end — the agent's only way to insert
+    — skipped the origin-wrap rule that `mode="insert"` (the Ctrl+E dialog)
+    takes, so an insert at bp 0 or n opened a phantom intron of inserted
+    bases inside every origin-crossing feature (audit 2026-10-23)."""
+
+    @pytest.mark.parametrize("strand", [1, -1])
+    @pytest.mark.parametrize("at", [0, 60])
+    def test_matches_insert_at_the_origin(self, strand, at):
+        rec = _wrap_record(total=60, tail_start=48, head_end=12)
+        for f in rec.features:
+            f.location = CompoundLocation(
+                [FeatureLocation(p.start, p.end, strand)
+                 for p in f.location.parts]) if len(f.location.parts) > 1 \
+                else FeatureLocation(f.location.start, f.location.end, strand)
+        seq = str(rec.seq)
+        new = seq[:at] + "GGG" + seq[at:]
+        app = _make_app(rec)
+        ins = app._rebuild_record_with_edit(new, "insert", at, at, "GGG")
+        rep = app._rebuild_record_with_edit(new, "replace", at, at, "GGG")
+        assert [str(f.location) for f in rep.features] == \
+            [str(f.location) for f in ins.features]

@@ -608,12 +608,23 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   below the consensus is invisible. A population of escapers each carrying a
   different inactivating mutation, none dominant, consenses back to wild type
   and reads as a clean clonal culture. Returns `positions` (each `{pos, ref,
-  alt, alt_reads, depth, fraction, mean_phred, contradicted}`) and a `verdict`
-  of `clonal` / `minor_variants` / `mixed`. **The denominator is every read
-  that COVERED the base**, including the ones that disagreed; observations
-  whose backing basecall is below `min_phred` are excluded and counted in
+  alt, alt_reads, low_quality_reads, depth, fraction, observed_fraction,
+  mean_phred, contradicted}`) and a `verdict` of `clonal` / `minor_variants` /
+  `mixed` / `inconclusive` / `no_reads`. **The denominator is every read that
+  COVERED the base**, including the ones that disagreed; observations whose
+  backing basecall is below `min_phred` get no vote and are counted in
   `n_filtered_low_quality`, because at 1% every instrument's error floor looks
-  like a sub-population. **A no-call is not an allele:** an `N` in a read means
+  like a sub-population — but the position is still REPORTED, with
+  `muted_by: "low_quality"` and `observed_fraction` showing what the reads
+  showed before the filter. Dropping it outright left those reads in `depth`
+  with nothing to form a fraction from, so a true 50/50 mixture basecalled at
+  Q15 came back `clonal` with an empty `positions` and no warning; a position
+  whose ONLY support fell below the threshold shows a SUBSTANTIAL apparent
+  mixture (at/above `mixed_fraction`) now makes the verdict `inconclusive`
+  instead. A smaller apparent fraction in poor basecalls IS the instrument's
+  error floor — that stays `clonal`, but with a warning naming what was set
+  aside rather than in silence. `no_reads` covers nothing aligned AND nothing
+  covered — `covered_bp: 0` is never `clonal`. **A no-call is not an allele:** an `N` in a read means
   the basecaller could not read that base, so those observations are excluded
   and counted in `n_no_call_observations` rather than reported as a
   sub-population — long reads carry N runs routinely, and counting them made a
@@ -703,12 +714,26 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   verify-against-reads (the "I built X, I got reads back — do they match?"
   check: a bare or library-resolved `reference` vs a list of raw `reads`
   (Nanopore / Sanger / a consensus), each aligned rotation + RC-aware; returns
-  per-read identity% + a `match`/`inverted`/`mismatch` `verdict` against
-  `min_identity`. `inverted` is its own verdict because a construct built
+  per-read identity% + a `match`/`inverted`/`mismatch`/`inconclusive`
+  `verdict` against `min_identity`. A read with no comparable base at all — a
+  trace that came back all `N`, or one the aligner placed over no reference
+  base — carries `no_data: true` and gets a warning naming it; when EVERY
+  read is like that the verdict is `inconclusive`, never `mismatch`, because
+  "your construct is wrong" from a read that says nothing costs a good clone
+  (the same "no data is not a verdict" rule `analyse-read-heterogeneity`
+  applies with `no_reads`). `inverted` is its own verdict because a construct built
   BACKWARDS is a different next step from one that simply failed: each read
   reports the spans matching the reference's reverse complement in
-  `inversions` + `inverted_bp`. `multi-align` rows and `diff-plasmid` carry
-  the same `inverted_segments`).
+  `inversions` + `inverted_bp`, plus `identity_outside_inversions_pct` and
+  `inversions_only` — the verdict is `inverted` only when the orientation is
+  the ONLY thing wrong, since an inversion beside an unrelated 400 bp deletion
+  read as merely inverted at 83% identity. `match` additionally requires that
+  the `consensus` holds no difference the reads AGREE on and no indel more
+  reads show than contradict: `min_identity` is a tolerance for substitution
+  noise and cannot express "no indel" — two reads both carrying a 100 bp
+  deletion in a 10 kb plasmid are 99% identity and used to verify as a match
+  while the same response confirmed the deletion. `multi-align` rows and
+  `diff-plasmid` carry the same `inverted_segments`).
 - **History** — get-history returns the parsed `<HistoryTree>`
   lineage as nested JSON — the FULL per-node record, matching what the
   History tab shows: name / operation / length / topology / date /

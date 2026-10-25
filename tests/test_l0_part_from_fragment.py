@@ -806,3 +806,93 @@ class TestPartFeaturePlacement:
         must not annotate a bare start codon as if it were the part."""
         top = "CTCG" + "AATG" + "GCTT"
         assert self._place(top, "") == (0, len(top), 1)
+
+
+# ── audit 2026-10-23: the IIS sim SAYS when it had to fuse or will self-cut ──
+# It cannot tell a legitimate two-tier nest (part declares the INTERNAL pair,
+# the acceptor releases the EXTERNAL one — 8 bp longer by design) from a part
+# dropped in the wrong slot: both present overhangs the acceptor did not
+# release. So it builds the product either way and REPORTS what it did, on the
+# record as `_sc_clone_warnings`. User's call, 2026-10-24: warn, never refuse.
+
+_ESP = "CGTCTC"
+
+
+def _plain_acceptor(oh5, oh3, stuffer_len=100):
+    """A one-tier acceptor: backbone + site + oh5 + stuffer + oh3 + site."""
+    import random
+    rng = random.Random(11)
+    bb = "".join(rng.choice("ACGT") for _ in range(400))
+    stuffer = "".join(rng.choice("ACGT") for _ in range(stuffer_len))
+    seq = (bb + _ESP + "A" + oh5 + stuffer + oh3 + "T" + sc._rc(_ESP))
+    return {"name": "pACC", "gb_text": _gb(seq, "pACC", "circular")}
+
+
+def _body(n=120, seed=12):
+    import random
+    rng = random.Random(seed)
+    return "ATG" + "".join(rng.choice("ACGT") for _ in range(n)) + "TAA"
+
+
+class TestTheSimSaysWhatItFused:
+
+    def _clone(self, oh5, oh3, body=None, acc=("GGAG", "AATG")):
+        grammar = sc._all_grammars()["gb_l0"]
+        part = {"name": "P", "type": "CDS", "oh5": oh5, "oh3": oh3,
+                "sequence": body or _body()}
+        return sc._clone_part_into_entry_vector(
+            part, _plain_acceptor(*acc), grammar)
+
+    def test_matching_overhangs_warn_about_nothing(self):
+        rec = self._clone("GGAG", "AATG")
+        assert rec is not None
+        assert not getattr(rec, "_sc_clone_warnings", [])
+
+    @pytest.mark.parametrize("oh5,oh3", [("GCTT", "CGCT"),   # wrong slot
+                                          ("TTTT", "AAAA")])  # no grammar
+    def test_a_fused_pair_is_named_in_the_warning(self, oh5, oh3):
+        rec = self._clone(oh5, oh3)
+        assert rec is not None, "the product must still be built"
+        warns = getattr(rec, "_sc_clone_warnings", [])
+        assert warns, "the fusion was silent"
+        joined = " ".join(warns)
+        assert oh5 in joined and oh3 in joined, joined
+        assert "GGAG" in joined and "AATG" in joined, joined
+
+    def test_a_legitimate_two_tier_nest_still_builds(self, grammar):
+        """It warns (the engine cannot prove the nest), but never refuses —
+        and the product is the same circle as before."""
+        built = _fragment(grammar, "CDS", nested=True)
+        vec_seq = _entry_vector(grammar, built["entry_oh5"],
+                                built["entry_oh3"])
+        part = cl._l0_part_from_syn_fragment(
+            built["fragment"], vec_seq, grammar=grammar, part_type="CDS",
+            name="P")
+        rec = sc._clone_part_into_entry_vector(
+            {"name": "P", "type": part["type"], "oh5": part["oh5"],
+             "oh3": part["oh3"], "sequence": part["sequence"]},
+            {"name": "EV", "gb_text": _gb(vec_seq, "EV", "circular")},
+            grammar)
+        assert rec is not None
+        rt, sim = str(rec.seq).upper(), part["cloned_seq"].upper()
+        assert len(rt) == len(sim) and rt in (sim + sim)
+
+    def test_an_internal_step_enzyme_site_is_named_with_its_position(self):
+        """A part carrying the step's own site gets cut inside the one-pot
+        reaction; the product silently carried three Esp3I cuts."""
+        body = _body() + "CGTCTC" + _body(60, seed=13)
+        at = body.index("CGTCTC")
+        rec = self._clone("GGAG", "AATG", body=body)
+        assert rec is not None
+        warns = " ".join(getattr(rec, "_sc_clone_warnings", []))
+        assert "Esp3I" in warns, warns
+        # The CUT bond, the same coordinate `_synthesis_lint` reports for
+        # this hazard — Esp3I cuts 1 nt past its 6 bp site.
+        cut = cl._enzyme_cuts(body, ["Esp3I"], circular=False)[0]["top"]
+        assert cut == at + 7, (cut, at)
+        assert str(cut) in warns, (cut, warns)
+
+    def test_a_clean_body_is_not_accused_of_an_internal_site(self):
+        rec = self._clone("GGAG", "AATG")
+        assert "Esp3I" not in " ".join(
+            getattr(rec, "_sc_clone_warnings", []))

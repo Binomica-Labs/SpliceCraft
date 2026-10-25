@@ -266,6 +266,17 @@ auto-align** matches a whole folder in one pass. The **Verification Report**
 grades every construct (✓ verified / ⚠ near / ~ partial / ⇄ inverted /
 ✗ divergent), and a true sub-100% identity never rounds up to "100%".
 
+Reads that cover only part of the plasmid are placed on their own terms, at
+any length: a 10 kb nanopore read or a 50 kb one is anchored on the stretch of
+reference it actually spans, so an insert it is missing shows up as the
+deletion it is rather than as a wall of invented differences. A verdict only
+ever describes the bases a read reached and the basecalls good enough to
+judge — "matches" is never reported beside a difference the reads agree on,
+and "inverted" means the orientation is the *only* thing wrong. A read with
+nothing readable in it at all comes back "inconclusive" rather than
+"mismatch": no information is not evidence against your clone, and one usable
+read beside it still decides.
+
 Drop in a Sanger `.ab1` and **Check against canvas** asks the question you
 actually care about: *is that mismatch real?* Both ends of every trace are
 unreliable, so SpliceCraft reads the basecall quality under each difference and
@@ -279,8 +290,10 @@ sub-population shows up as "this base is 10% T" rather than being averaged
 away. It matters because a consensus is a single read — a population of
 escapers each carrying a different inactivating mutation, none of them
 dominant, consenses back to wild type and looks perfectly clean. Differences
-sitting in unreliable basecalls are excluded and counted separately, because at
-1% the instrument's own error floor looks like a sub-population. Tell it the platform —
+sitting in unreliable basecalls don't get a vote — at 1% the instrument's own
+error floor looks like a sub-population — but they are still reported, with
+the reason they were set aside, because a mixture nobody could read clearly is
+not the same answer as a clonal culture. Tell it the platform —
 nanopore, Illumina or Sanger — and the noise floor matches the instrument;
 homopolymer indels are shown but don't get a vote, because every sequencer
 miscalls run length. The verdict reads the *shape* of the distribution rather

@@ -240,14 +240,26 @@ def _score_promoter(minus35: str, spacer_len: int, minus10: str,
     """
     s35 = _hexamer_score(minus35, _P35_CONSENSUS, _P35_WEIGHTS)
     s10 = _hexamer_score(minus10, _P10_CONSENSUS, _P10_WEIGHTS)
+    score, spacer_pen, ext = _promoter_raw(s35, s10, spacer_len, ext10)
+    return score, _promoter_components(s35, s10, spacer_pen, ext)
+
+
+def _promoter_raw(s35: float, s10: float, spacer_len: int,
+                  ext10: str) -> "tuple[float, float, float]":
+    """``(score, spacer_penalty, ext_bonus)`` from the two box scores — the
+    ONE copy of the composite, shared by `_score_promoter` and the scan."""
     spacer_pen = abs(int(spacer_len) - _SPACER_OPT) * _SPACER_PENALTY_PER_BP
     ext = _EXT10_BONUS if ext10 == _EXT10_MOTIF else 0.0
     # The -10 carries more weight than the -35: sigma-70 makes its
     # sequence-specific, strand-opening contact there, and an extended -10 can
     # drive a promoter with essentially no -35 at all.
     raw = (0.40 * s35) + (0.60 * s10) + ext - spacer_pen
-    score = max(0.0, min(1.0, raw))
-    return score, {
+    return max(0.0, min(1.0, raw)), spacer_pen, ext
+
+
+def _promoter_components(s35: float, s10: float, spacer_pen: float,
+                         ext: float) -> dict:
+    return {
         "minus35_match": round(s35, 3),
         "minus10_match": round(s10, 3),
         "spacer_penalty": round(spacer_pen, 3),
@@ -267,15 +279,41 @@ def _scan_promoters_one_strand(seq: str, circular: bool,
     scan = _scan_window(seq, circular, span)
     limit = n if circular else len(scan)
     out: "list[dict]" = []
+    # Each box score depends only on its six bases, so it is computed once per
+    # DISTINCT hexamer (at most 4,096 of them on ACGT) and the components dict
+    # only for the winning register: rescoring every window from scratch and
+    # building a dict per candidate was 92 s/Mbp, which made
+    # `map-transcription` with predicted elements a multi-minute call on a
+    # genome (audit 2026-10-23). Same functions, so the same floats.
+    memo35: "dict[str, float]" = {}
+    memo10: "dict[str, float]" = {}
     for i in range(0, limit):
         w35 = scan[i:i + 6]
         if len(w35) < 6:
             break
-        s35 = _hexamer_score(w35, _P35_CONSENSUS, _P35_WEIGHTS)
+        s35 = memo35.get(w35)
+        if s35 is None:
+            s35 = memo35[w35] = _hexamer_score(w35, _P35_CONSENSUS,
+                                               _P35_WEIGHTS)
         # Cheap rejection: even a perfect -10 with the extended motif and no
         # spacer penalty cannot reach `min_score` from here, so the inner
         # spacer loop would be wasted work on most of the molecule.
         if (0.40 * s35) + 0.60 + _EXT10_BONUS < min_score:
+            continue
+        # Tighter, still exact: the best -10 this anchor can reach, with the
+        # bonus and no penalty, bounds every candidate's score from above.
+        # (The bound is >= 0.1, so a `min_score` of 0 never trips it.)
+        top10 = 0.0
+        for j in range(i + 6 + _SPACER_MIN, i + 7 + _SPACER_MAX):
+            w10 = scan[j:j + 6]
+            if len(w10) == 6:
+                s10 = memo10.get(w10)
+                if s10 is None:
+                    s10 = memo10[w10] = _hexamer_score(w10, _P10_CONSENSUS,
+                                                       _P10_WEIGHTS)
+                if s10 > top10:
+                    top10 = s10
+        if (0.40 * s35) + (0.60 * top10) + _EXT10_BONUS < min_score:
             continue
         best = None
         for spacer in range(_SPACER_MIN, _SPACER_MAX + 1):
@@ -283,15 +321,20 @@ def _scan_promoters_one_strand(seq: str, circular: bool,
             w10 = scan[j:j + 6]
             if len(w10) < 6:
                 continue
+            s10 = memo10.get(w10)
+            if s10 is None:
+                s10 = memo10[w10] = _hexamer_score(w10, _P10_CONSENSUS,
+                                                   _P10_WEIGHTS)
             ext10 = scan[j - 2:j] if j >= 2 else ""
-            score, comps = _score_promoter(w35, spacer, w10, ext10)
+            score, pen, ext = _promoter_raw(s35, s10, spacer, ext10)
             if score < min_score:
                 continue
             if best is None or score > best[0]:
-                best = (score, spacer, w10, j, comps)
+                best = (score, spacer, w10, j, (s35, s10, pen, ext))
         if best is None:
             continue
-        score, spacer, w10, j, comps = best
+        score, spacer, w10, j, parts = best
+        comps = _promoter_components(*parts)
         # One record per -35 anchor: the spacer that scores best IS the
         # register the polymerase would use, and emitting all five would be
         # the same redundancy bug the terminator scanner exists to avoid.
@@ -375,8 +418,13 @@ def _scan_promoters(seq: str, *, circular: bool = True,
                 # to the lower forward coordinate.
                 "start": fwd(h["minus10_start"] + 5),
                 "end": end % n if circular else end,
-                "minus35_start": fwd(h["minus35_start"]),
-                "minus10_start": fwd(h["minus10_start"]),
+                # A box's forward-strand START is where its LAST RC base
+                # lands; `fwd(box_start)` is its highest forward base, which
+                # put both starts five bases into the box's right flank
+                # (audit 2026-10-23). Same convention as the terminator's
+                # `hairpin_start` / `u_tract_start` below.
+                "minus35_start": fwd(h["minus35_start"] + 5),
+                "minus10_start": fwd(h["minus10_start"] + 5),
                 "tss": fwd(h["tss"]) if h["tss"] is not None else None,
             })
     for h in hits:
@@ -421,37 +469,48 @@ def _best_hairpin_before(seq: str, tract_start: int) -> "tuple | None":
     tighter loop. Searching per U-tract — rather than enumerating every
     stem/loop register in the molecule — is what makes one hairpin produce one
     record instead of one per register.
+
+    Every pair of a stem with `s` bases and a loop of `l` closing at
+    `stem3_end` lies on ONE anti-diagonal of the pairing matrix: the outer
+    pair is ``(stem3_end - D, stem3_end - 1)`` with ``D = 2s + l``, and each
+    pair inward moves one base in on both arms. So for each ``D`` one walk
+    inward from the outer pair finds the longest stem that diagonal can hold,
+    and the longest that also leaves a legal loop is the best hairpin on it.
+    That replaces trying every (stem, loop) register with a fresh slice-and-
+    pair check — 127 s/Mbp (audit 2026-10-23) — and ranks the same set of
+    hairpins by the same key, so the answer is the same.
     """
     best = None
     lo = max(0, tract_start - _TERM_UPSTREAM_WINDOW)
+    pairs = _COMPLEMENT_PAIRS
+    n = len(seq)
+    d_lo = 2 * _TERM_MIN_STEM + _TERM_MIN_LOOP
+    d_hi = 2 * _TERM_MAX_STEM + _TERM_MAX_LOOP
     # The stem's 3' side must end at (or within a couple of bases of) the
     # tract: an intrinsic terminator's hairpin sits immediately before the
     # U-tract, and a gap means the two are unrelated elements.
     for stem3_end in range(tract_start, max(lo, tract_start - 3) - 1, -1):
-        for stem in range(_TERM_MAX_STEM, _TERM_MIN_STEM - 1, -1):
-            for loop in range(_TERM_MIN_LOOP, _TERM_MAX_LOOP + 1):
-                stem3_start = stem3_end - stem
-                loop_start = stem3_start - loop
-                stem5_start = loop_start - stem
-                if stem5_start < lo:
-                    continue
-                left = seq[stem5_start:stem5_start + stem]
-                right = seq[stem3_start:stem3_end]
-                if len(left) != stem or len(right) != stem:
-                    continue
-                if "N" in left or "N" in right:
-                    continue
-                # `right` read 3'->5' pairs with `left` read 5'->3'.
-                ok = all((a, b) in _COMPLEMENT_PAIRS
-                         for a, b in zip(left, reversed(right)))
-                if not ok:
-                    continue
-                cand = (stem, -loop, stem5_start, stem3_end)
-                if best is None or cand > best:
-                    best = cand
-                # Longest stem wins for this (stem3_end, loop); no shorter
-                # stem at the same geometry can beat it.
-                break
+        if stem3_end > n or stem3_end < 1:
+            continue
+        q = stem3_end - 1
+        for d in range(d_lo, d_hi + 1):
+            p = stem3_end - d                  # the stem's 5' start
+            if p < lo:
+                break                          # a wider D only moves it left
+            # The longest stem whose loop is still >= the minimum, and the
+            # shortest whose loop is still <= the maximum.
+            s_cap = min(_TERM_MAX_STEM, (d - _TERM_MIN_LOOP) // 2)
+            s_min = max(_TERM_MIN_STEM, -(-(d - _TERM_MAX_LOOP) // 2))
+            if s_cap < s_min:
+                continue
+            r = 0
+            while r < s_cap and (seq[p + r], seq[q - r]) in pairs:
+                r += 1
+            if r < s_min:
+                continue
+            cand = (r, -(d - 2 * r), p, stem3_end)
+            if best is None or cand > best:
+                best = cand
     if best is None:
         return None
     stem, neg_loop, stem5_start, stem3_end = best
