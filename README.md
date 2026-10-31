@@ -234,6 +234,41 @@ number and the new amino acid, and the codon it resolves to is shown — through
 the strand, the reading frame offset, any introns and the origin — before
 anything changes.
 
+### Regulettuce
+
+Read the open plasmid the way a *plant* would. **`Alt+Shift+L`** gives you three
+scans, and the most useful column in all of them is the one saying how much the
+hit means.
+
+**Cis-elements** finds the curated plant regulatory set — ABRE, G-box, DRE/CRT,
+W-box, GARE, the light and seed and circadian elements — and shows next to every
+hit how often it turns up in DNA that *isn't* a promoter. Other tools will tell
+you your promoter contains a GT1-motif; this one tells you GT1-motif is in 94.8%
+of random 400 bp windows, so finding one means nothing. Every element is graded
+**enriched** through **ubiquitous** to **depleted**, measured over 3,089 verified
+plant transcription starts against a composition-matched genomic background, and
+the status line says how many of your hits chance alone explains on your own base
+composition.
+
+**TATA boxes** are measured *from a start site*, never hunted loose. `TATAWA`
+turns up once per 429 bp of real plant DNA — about 47 times on a 10 kb plasmid —
+so position is the whole signal; it reads the start sites off your CDS features
+and flags the hits landing in −40..−31, where real ones pile up. No anchor, and
+it tells you rather than showing an empty table, because an empty table reads as
+"none" when the truth is "not asked".
+
+**3'-end risk** catches the failure that costs a month: a stretch of your
+construct that a plant reads as the end of the message, truncating the transcript
+while the DNA sequences perfectly.
+
+**It will not predict a poly(A) site.** A position-specific model trained on 600
+real plant poly(A) sites located them *worse than chance*, so there's no arrow to
+draw and no field to hold one. There's no plant promoter-strength score either —
+the best composite managed AUC 0.646 — and no Y-patch scan, because the
+"plant-specific" pyrimidine patch measured 1.05× over background. Ask
+`regulettuce-calibration` and it hands back every number, including the ones that
+killed the features it doesn't have.
+
 ### Compare two sequences
 
 Press **`Alt+A`** to align library plasmids against whatever you have open — up
@@ -315,6 +350,24 @@ between a cassette that is silent by design and one that is silent in the
 strain you actually transformed. **Codon analysis** reads an existing CDS the
 way the optimiser writes one: GC3, CAI, rare-codon load, tandem rare runs, the
 worst window, and the 5' ramp on its own.
+
+And **what the ribosome actually sees.** Given an annotated transcription unit,
+SpliceCraft reconstructs the mature mRNA — splicing out annotated introns, never
+guessed ones — and scores every ATG a scanning ribosome meets on it. The upstream
+ones come back *ranked*, strongest initiation context first, because that is the
+one that captures ribosomes and starves your real start codon. Ranking is done
+with a plant initiation matrix trained against the upstream ATGs it has to
+compete with: it puts a real plant start above a competing upstream ATG 77% of
+the time, against 71% for the −3/+4 consensus rule everyone quotes, and unlike
+that rule it can still order the ATGs *inside* its own "strong" bucket — where
+38% of real plant starts and 13% of upstream ATGs land together. Scores read as
+a percentile against real plant start codons, and the model publishes what it
+refuses to do: no initiation rate, no window past +4 (extending it scores better
+by reading coding-vs-UTR base composition, which says nothing about
+initiation), and no number at all for an ATG too close to the 5' end to score.
+The separate answer that matters most is **which upstream ATGs splicing
+removes** — the ones a screen run against the plasmid sequence reports as
+hazards and the ribosome never meets.
 
 ### Experiments
 

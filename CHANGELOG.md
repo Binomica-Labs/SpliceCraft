@@ -14,11 +14,73 @@
 
 ---
 
-## [Unreleased]
+## [1.3.12] — 2026-10-31
 
 A deep audit of the whole app — saving and loading, file formats, the
 cloning and analysis engines, the agent API and the interface at genome
 scale. Most of what it found was quiet: things that looked fine and weren't.
+
+### New features
+
+- **Regulettuce — plant cis-regulatory annotation.** A new tab (`Alt+Shift+L`)
+  that reads the open plasmid the way a plant would, with three scans. It finds
+  the curated plant regulatory elements — ABRE, G-box, DRE/CRT, W-box, GARE,
+  the light, seed and circadian sets — and shows next to every hit how often
+  that element turns up in DNA that isn't a promoter. That column is the point:
+  other tools will tell you your promoter contains a GT1-motif, and this one
+  tells you GT1-motif is in 94.8% of random 400 bp windows, so finding one
+  means nothing. Every element is graded from "enriched" to "depleted" against
+  3,089 verified plant transcription starts, and the status line says how many
+  of your hits chance alone explains on your own sequence. TATA boxes are
+  measured from your record's CDS starts rather than hunted loose, because
+  `TATAWA` turns up once per 429 bp of real plant DNA — about 47 times on a
+  10 kb plasmid — so only its position carries information; if there's no
+  annotated start to measure from, it says so instead of showing you an empty
+  table. And a 3'-end scan catches the failure that costs a month: a stretch of
+  your construct that a plant treats as the end of the message, truncating the
+  transcript while the DNA sequences perfectly. Any row, or everything shown,
+  annotates onto the map in one step and comes back off with one `Ctrl+Z`.
+- **`predict-transcript` (scripting) now checks the other end of the message too.**
+  It already told you about cryptic splice sites, upstream ATGs and Kozak
+  context; it now also flags stretches of the message that a plant would read
+  as the *end* of it, where the transcript gets cut and polyadenylated before
+  your protein is finished. A hit in the 3'UTR is ignored — that's the
+  terminator doing its job — so only regions that would actually truncate the
+  protein are reported. It reads the spliced message rather than the raw
+  sequence, because plant introns are AT-rich enough to look like message ends
+  themselves, which would have flagged every intron you have.
+- **Regulettuce tells you what it can't do, with the numbers.** It will not
+  predict a poly(A) site: a model trained on 600 real plant poly(A) sites
+  located them *worse than chance*, so there is no arrow to draw and no field
+  to hold one. There's no plant promoter-strength score — the best one managed
+  to catch 5% of real promoters at a usable error rate — and no Y-patch scan,
+  because the "plant-specific" pyrimidine patch measured 1.05× over background,
+  which is no signal at all. Every one of those numbers, and the reference sets
+  behind them, is available from the new `regulettuce-calibration` scripting
+  endpoint, alongside `list-cis-elements`, `scan-cis-elements`,
+  `scan-tata-boxes` and `scan-3prime-risk`.
+- **Upstream ATGs are now ranked, not just listed.** When the scripting API
+  reconstructs a transcript, every ATG a ribosome meets on the mature message
+  is scored with a plant translation-initiation matrix trained for this
+  release, and ranked: `rank: 1` is the one most likely to capture a ribosome
+  and starve your real start codon. What this replaces is a two-point rule
+  borrowed from 1987 mammalian work, which put 38% of real plant start codons
+  and 13% of upstream ATGs in the same "strong" bucket and could not tell them
+  apart — asked which of four upstream ATGs mattered most, it had no answer.
+  The new matrix ranks a real plant start above a competing upstream ATG 77%
+  of the time against the rule's 71%, measured on genes it was never trained
+  on and in six of seven species held out one at a time, and it still
+  separates them *inside* each of the rule's buckets. Scores now read as a
+  percentile — "a stronger context than 62% of real plant start codons" —
+  and a CDS whose own start context is poorer than 95% of real plant starts
+  now says so in the warnings, because that one is fixable by changing the
+  leader. The old rule is still reported beside the matrix, and an ATG too
+  close to the 5' end to score says so instead of being given a number that
+  means something else. Two new scripting endpoints:
+  `score-initiation-context` scores a leader you are designing, and
+  `initiation-model` returns everything the numbers are calibrated against —
+  including the three things the model refuses to do, each with the
+  measurement that settled it.
 
 ### Bug fixes — your data
 
@@ -150,6 +212,32 @@ scale. Most of what it found was quiet: things that looked fine and weren't.
 - **A custom 5' overhang ending in `ATG` warns when the body also starts with
   `ATG`** rather than quietly building two start codons, and an unnamed source
   in a multi-part assembly gets the same start-codon handling as a named one.
+- **Regulettuce refuses a TATA anchor that isn't on the molecule.** Typing a
+  bp past the end — or asking the scripting API for one — used to wrap it
+  round and report TATA boxes measured from a base the sequence hasn't got
+  (99,999 on a 5 kb plasmid became bp 4,999). It now says so and names the
+  range that would work. Wrapping is still right on a circular molecule,
+  where bp 0 and bp *length* are the same base.
+- **"Annotate all shown" refuses a scan too dense to draw** instead of
+  dropping 2,000 arrows on the map. A 6 bp element turns up by chance every
+  2 kb per strand, so the whole catalogue on a 50 kb plasmid is thousands of
+  chance hits; above 250 it points you at the "Informative only" filter
+  rather than annotating a fraction and leaving you to think it was all of
+  them.
+- **A Regulettuce scan that fails says why** rather than leaving the dialog on
+  "Scanning…" with the Scan button dead for the rest of the session.
+- **Translation-initiation scores read lower-case and RNA sequences
+  correctly.** A message in lower case — which is how GenBank files store
+  sequence — came back "weak" from the consensus rule and "strong" from the
+  trained matrix at the same time, and a message spelled with `U` was scored
+  by the rule and refused by the matrix as "no ATG here".
+- **An initiation score asked for a position the message doesn't have is
+  refused.** A negative offset read its `+4` base from the far end of the
+  sequence and reported a confident verdict for it.
+- **An upstream ATG the initiation model can't score no longer blames the
+  wrong cause.** The warning said all of them sat too close to the 5' end;
+  an ambiguous base in the window does the same thing, and each ATG now
+  carries its own reason.
 
 ### Bug fixes — files and imports
 

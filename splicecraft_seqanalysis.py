@@ -27,6 +27,7 @@ import splicecraft_state as _state
 from splicecraft_biology import (_rc, _enzyme_cuts, _feat_len,
                                  _iter_match_starts, _slice_circular)
 from splicecraft_splice import (_splice_scan, _splice_model_summary)
+from splicecraft_kozak import _KOZAK_UP, _kozak_context
 from splicecraft_codon import _CODON_TABLE, _STOP_CODONS
 from splicecraft_record import _gb_text_to_record
 from splicecraft_dataaccess import _all_grammars, _load_entry_vectors
@@ -1364,38 +1365,12 @@ _TX_MAX_UORFS = 200
 _TX_MAX_SPLICE_HITS = 50
 
 
-def _kozak_context(mrna: str, atg_pos: int) -> dict:
-    """Score the translation-initiation context around `atg_pos` in `mrna`.
-
-    Returns ``{context, minus3, plus4, strength, score, truncated, model}``.
-    `context` is the 10 nt window ``[-6 .. +4]`` with the A of the ATG at
-    offset 6, so it reads the way the literature prints it.
-
-    **This is the positional consensus rule, not a trained matrix** — the two
-    positions that carry most of the signal are a purine at −3 and a G at +4,
-    and `score` just counts how many of those two are satisfied (0–2 →
-    weak / adequate / strong). It is reported as `model` on every result so a
-    caller never mistakes it for the calibrated PWM that
-    `splicecraft_splice` uses for splice sites. A context that runs off the
-    5' end of the message is marked `truncated` — a 5'UTR shorter than 6 nt
-    is itself a finding, and padding it would invent bases."""
-    n = len(mrna)
-    lo = atg_pos - 6
-    truncated = lo < 0 or atg_pos + 4 > n
-    context = mrna[max(0, lo):atg_pos + 4]
-    minus3 = mrna[atg_pos - 3] if atg_pos >= 3 else ""
-    plus4 = mrna[atg_pos + 3] if atg_pos + 4 <= n else ""
-    score = int(minus3 in ("A", "G")) + int(plus4 == "G")
-    return {
-        "context":   context,
-        "minus3":    minus3,
-        "plus4":     plus4,
-        "score":     score,
-        "strength":  ("strong" if score == 2
-                      else "adequate" if score == 1 else "weak"),
-        "truncated": truncated,
-        "model":     "positional -3/+4 consensus (not a trained PWM)",
-    }
+# `_kozak_context` is imported from `splicecraft_kozak` (L0) and re-exported
+# here: the initiation matrix it scores with is vendored, calibrated data, and
+# it belongs beside the splice matrices rather than inside the transcript
+# reader. The function's contract is unchanged for every existing caller --
+# `score` / `strength` are still the -3/+4 consensus rule -- and the trained
+# answer arrives in a nested `pwm` block.
 
 
 def _tx_map_span(gs: int, ge: int, a: int, total: int,
@@ -1567,6 +1542,7 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
                         promoter=None, cds=None, terminator=None,
                         tx_start=None, tx_end=None,
                         check_splice: bool = True,
+                        check_three_prime: bool = True,
                         min_uorf_aa: int = 1) -> dict:
     """Reconstruct the mature mRNA of one annotated transcription unit and
     score translation initiation on it.
@@ -1582,7 +1558,7 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
     and ``mature_mrna``, the ``exons`` / ``introns`` that separate them, the
     ``five_utr`` / ``cds`` / ``three_utr`` blocks, the ``kozak`` context, the
     ``uorfs`` found upstream of the start codon, the ``removed_by_splicing``
-    list, an advisory ``splice`` scan and any ``warnings``.
+    list, advisory ``splice`` and ``three_prime`` scans and any ``warnings``.
 
     **`removed_by_splicing` is the point of the whole function.** It lists
     every upstream ATG that IS in the unspliced sequence and is NOT in the
@@ -1807,6 +1783,16 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
                 "error": "the CDS start or end falls INSIDE an annotated "
                          "intron — the annotation is inconsistent",
                 "warnings": warnings}
+    if cds_start_m >= len(mature):
+        # `_mature_pos` returns the mature LENGTH for a pre-mRNA offset at or
+        # past the transcript's end, so this is "the start codon is not in the
+        # message". Refused rather than scored: every reader below it (the
+        # Kozak context, the translation, the uORF frames) would be describing
+        # bases at the far end of the message as though they were the start.
+        return {"ok": False,
+                "error": "the CDS start lies at or past the end of the mature "
+                         "message — check the terminator choice and strand",
+                "warnings": warnings}
     # ── 4. Upstream ATGs: which survive splicing, and which don't. ───────
     uorfs = []
     for p in range(0, max(0, cds_start_m)):
@@ -1834,8 +1820,40 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
         })
         if len(uorfs) >= _TX_MAX_UORFS:
             warnings.append(
-                f"more than {_TX_MAX_UORFS} upstream ATGs — list truncated")
+                f"more than {_TX_MAX_UORFS} upstream ATGs — list truncated at "
+                f"the first {_TX_MAX_UORFS} BY POSITION, so `rank` orders only "
+                "those")
             break
+
+    # Which upstream ATG is a scanning ribosome most likely to stop at?
+    # `rank` 1 is the strongest initiation context, by the calibrated matrix —
+    # the ordering the -3/+4 rule structurally cannot produce, since 13% of
+    # upstream ATGs share its top bucket and it cannot separate them.
+    #
+    # Ranked ONLY within the subset the model can actually score. A partial
+    # window sums fewer log-odds terms, so ordering those against full ones
+    # would compare numbers that do not mean the same thing; an ATG sitting
+    # closer than the window to the 5' end gets `rank: None` and carries the
+    # reason in its own `kozak.pwm.note`. The count is warned about rather
+    # than left for a reader to infer from a gap in the numbering.
+    rankable = [u for u in uorfs if u["kozak"]["pwm"]["score"] is not None]
+    for u in uorfs:
+        u["rank"] = None
+    for i, u in enumerate(sorted(rankable,
+                                 key=lambda u: (-u["kozak"]["pwm"]["score"],
+                                                u["position"])), start=1):
+        u["rank"] = i
+    if uorfs and len(rankable) < len(uorfs):
+        # The cause is named per ATG, in its own `kozak.pwm.note`, and NOT
+        # asserted here: the usual one is a window short of the 5' end, but an
+        # ambiguous base inside the window produces the same `None` and saying
+        # "sits closer than 12 nt to the 5' end" about an ATG sitting next to
+        # an N is simply false.
+        warnings.append(
+            f"{len(uorfs) - len(rankable)} of {len(uorfs)} upstream ATGs "
+            f"cannot be scored by the initiation model (most often fewer than "
+            f"{_KOZAK_UP} nt of 5' context; each carries the reason in its own "
+            "`kozak.pwm.note`) — they are reported with `rank: null`")
 
     # THE point of this function: upstream ATGs the plasmid sequence shows and
     # the mature message does not. A uATG screen run on the unspliced sequence
@@ -1886,6 +1904,77 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
             splice = {"skipped": True, "reason": str(exc)}
             warnings.append("cryptic-splice scan SKIPPED — " + str(exc))
 
+    # ── 6. Advisory premature-3'-end scan over the MATURE message. ───────
+    # The hazard: a stretch of the transcript that a plant reads as the END of
+    # the message, cutting and polyadenylating it before the protein is
+    # finished. The DNA then sequences perfectly and the protein is simply
+    # absent — the same silent failure mode the cryptic-splice scan above
+    # exists for.
+    #
+    # Two choices here are load-bearing:
+    #
+    #   * The MATURE message is scanned, not the pre-mRNA. Plant introns are
+    #     themselves AT- and U-rich, which is exactly what the 3'-end score
+    #     keys on, so scanning the unspliced sequence would flag every intron
+    #     as a hazard — the same class of false positive `removed_by_splicing`
+    #     exists to correct for upstream ATGs.
+    #   * Single strand only. An mRNA is read one way, so a 3'-end-like
+    #     composition on the complement is not a hazard — the rule
+    #     `_splice_scan` already applies for the same reason.
+    #
+    # And a hit in the 3'UTR is NOT reported: that region is SUPPOSED to look
+    # like a message end, because the terminator is doing its job. Only a
+    # region reaching the 5'UTR or the CDS can truncate the protein, so only
+    # those become a warning.
+    three_prime: dict = {"skipped": True, "reason": "not requested"}
+    if check_three_prime:
+        try:
+            from splicecraft_regulettuce import (_3P_WINDOW,
+                                                 _scan_3prime_risk)
+            if len(mature) < _3P_WINDOW:
+                three_prime = {
+                    "skipped": True,
+                    "reason": (f"mature message is {len(mature)} nt, shorter "
+                               f"than the {_3P_WINDOW} nt scoring window"),
+                }
+            else:
+                regions = _scan_3prime_risk(mature, circular=False,
+                                            both_strands=False)
+                premature = [r for r in regions if r["start"] < cds_end_m]
+                three_prime = {
+                    "skipped":    False,
+                    "scanned":    "mature_mrna",
+                    "n_regions":  len(regions),
+                    "regions":    regions[:_TX_MAX_SPLICE_HITS],
+                    "premature":  premature[:_TX_MAX_SPLICE_HITS],
+                    "n_premature": len(premature),
+                }
+                if premature:
+                    worst = max(premature, key=lambda r: r["score"])
+                    warnings.append(
+                        f"{len(premature)} region(s) of the message upstream "
+                        f"of the stop codon read like a plant 3' end (worst "
+                        f"at mature {worst['start']}-{worst['end']}, score "
+                        f"{worst['score']}) — the transcript could be cut "
+                        f"there and the protein never finished")
+        except (ImportError, ValueError) as exc:
+            # Not checked must never read as clean.
+            three_prime = {"skipped": True, "reason": str(exc)}
+            warnings.append("premature-3'-end scan SKIPPED — " + str(exc))
+
+    cds_kozak = _kozak_context(mature, cds_start_m)
+    # A weak start context on the CDS ITSELF is the finding most worth
+    # surfacing, because it is fixable by changing the leader. The trigger is
+    # anchored on measured biology rather than picked: `weak` means below the
+    # 5th percentile of real plant start codons, so it fires for a context
+    # poorer than 95% of the real thing.
+    _ck = cds_kozak["pwm"]
+    if _ck["tier"] == "weak" and _ck["percentile"] is not None:
+        warnings.append(
+            f"the CDS start context scores below {100 - _ck['percentile']:.0f}% "
+            f"of real plant start codons ({cds_kozak['context']}) — a stronger "
+            "leader would compete better with any upstream ATG")
+
     protein, stop = _tx_translate(mature, cds_start_m)
     if stop == -1:
         warnings.append(
@@ -1921,10 +2010,11 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
                       "protein": protein},
         "three_utr": {"seq": mature[cds_end_m:],
                       "length": max(0, len(mature) - cds_end_m)},
-        "kozak":     _kozak_context(mature, cds_start_m),
+        "kozak":     cds_kozak,
         "uorfs":     uorfs,
         "removed_by_splicing": removed,
         "splice":    splice,
+        "three_prime": three_prime,
         "warnings":  warnings,
     }
 

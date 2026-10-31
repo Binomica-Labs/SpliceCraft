@@ -149,6 +149,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `import-primers` | W | Load primers from a CSV order sheet into a primer collection — the inverse of `export-primers` `format: "generic"`, whose own docstring has… |
 | `index-library` | W | Index the user's OWN work - plasmids, primers, parts and lab-notebook entries - into a PRIVATE Babs pack, so Babs can answer questions about their… |
 | `ingest-url` | W | Persist ONE web page into Babs' knowledge corpus so she knows it in every future session. Body: `{url, title?}`. |
+| `initiation-model` | R | The calibration behind every Kozak / initiation score this API reports. |
 | `learn-list` | R | List Background Learning sessions on this machine: `{slug, topic, kept, status}` each. Read-only. |
 | `learn-merge` | W | Fold a finished Background Learning session's corpus into Babs' MAIN corpus, making what it learned permanent. Body: `{slug}`. |
 | `learn-results` | R | What a Background Learning session has KEPT so far. Body: `{slug, limit?}`. Per-paper records (title, url, relevance_score, hop) sorted by score,… |
@@ -159,6 +160,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `list-assembly-strategies` | R | The assembly chemistries `plan-chromosome-segments` can plan for, with the overlap sizes each one actually needs. Body: `{}`. |
 | `list-backups` | R | List recoverable backups for user-data files. Body: `{label?}`. |
 | `list-cas-variants` | R | The Cas nucleases `design-guides` supports. Returns `{variants: [{key, label, pam, pam_side, guide_len, cut_offsets, notes}, ...]}`. |
+| `list-cis-elements` | R | The curated plant cis-regulatory element catalogue. |
 | `list-codon-tables` | R | Available codon usage tables. Returns name, taxid, source (builtin/kazusa/user) and date added for each entry, plus the `active_taxid` field… |
 | `list-collections` | R | Plasmid collection buckets. Returns name + plasmid count for each collection, and which one is currently active. |
 | `list-custom-enzymes` | R | List every user-added custom enzyme. Built-in NEB enzymes are NOT included — fetch the combined view via list-restriction-sites or… |
@@ -235,6 +237,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `recover-qualifiers-from-dna` | W | Put back the qualifier VALUES SpliceCraft's `.dna` import used to drop — flags (`/pseudo`, `/ribosomal_slippage`, `/trans_splicing`, …), ranges… |
 | `redo` | W | Redo the last undone canvas mutation — the agent counterpart to Ctrl+Y. Body: `{}`. Returns `{ok, redone, redo_remaining, undo_available,… |
 | `reference-lookup` | R | Look a term up in Babs' CURATED reference registries - antibiotics and selection agents, promoters, terminators, UTRs/enhancers, plasmid origins,… |
+| `regulettuce-calibration` | R | Every measurement behind the plant cis-regulatory scanners. |
 | `remember-fact` | W | Save a durable fact to Babs' persistent memory. Body: `{fact, title?}`. |
 | `rename-collection` | W | Rename a collection. Body: `{old, new}`. |
 | `rename-experiment-project` | W | Rename a project. Body: `{name: str, new_name: str}`. If the renamed project is the active one, the active-pointer follows so subsequent… |
@@ -253,9 +256,13 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `save-custom-labware` | W | Save (or overwrite) a custom labware. Body: `{name, definition, collection?}` — `definition` is an Opentrons labware-definition object with a… |
 | `save-protein` | W | File a protein into a collection — the side door to the Operon tab's "paste a protein" / "from feature" / "fetch by accession" buttons. Body:… |
 | `save-protocol` | W | Save (or overwrite) a protocol. Body: `{name, plan, collection?}`. `plan` is a compile-able plan (see `ot2-compile`) — it is validated before… |
+| `scan-3prime-risk` | R | Regions that read like a plant 3'-end — where a message would be cut. |
+| `scan-cis-elements` | R | Find curated plant cis-regulatory elements, with the chance count. |
 | `scan-promoters` | R | Scan for sigma-70 (-35 / spacer / -10) promoters. |
+| `scan-tata-boxes` | R | TATA-box candidates positioned against a start site. |
 | `scan-terminators` | R | Scan for intrinsic (Rho-independent) terminators: a stem-loop followed by a U-tract. |
 | `score-guide` | R | Triage a spacer you already have. Body: `{guide: str, u6_driven?: bool}`. |
+| `score-initiation-context` | R | Score the translation-initiation context of an ATG in a message. |
 | `scrub-plasmid` | R | Plan a clone-free restriction-site scrub. Body: `{seq?, features?, enzymes?, overlap?, method?, circular?, codon_taxid?}`. |
 | `search-experiments` | R | Full-text search across notebook entries. Body: `{query?: str, tags?: list[str], project?: str, all_projects?: bool, limit?: int}`. |
 | `search-library` | R | Cross-collection plasmid name search. Body: `{query?: str, limit?: int}`. Empty `query` returns the first `limit` plasmids across all collections… |

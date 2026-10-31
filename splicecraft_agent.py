@@ -63,6 +63,7 @@ from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_des
 from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq,
                                 _topology_from_gb_text)
 from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _ncbi_taxid_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
+from splicecraft_kozak import _kozak_context, _kozak_model_summary
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _plan_chromosome_segments, _SEGMENT_STRATEGIES, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript, _map_transcription)
 from splicecraft_util import (_iso_instant, _variant_group_key, _PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _feat_spans, _feature_traversal, _phred_in_alignment_frame, _read_rotation_in_rows, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _degenerate_tm_bracket, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
@@ -74,6 +75,7 @@ from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, 
 from splicecraft_gels import (_AGAROSE_CHOICES, _GEL_HEIGHT_MAX, _GEL_HEIGHT_MIN, _GEL_LANE_WIDTH_MAX, _GEL_LANE_WIDTH_MIN, _GEL_MAX_LANES, _agarose_mobility, _gel_bands_for_lane, _gel_resolve_enzymes, _render_gel_image)
 from splicecraft_persistence import (_safe_save_json_mirror)
 from splicecraft_regulatory import (_PROMOTER_MIN_SCORE, _TERM_MAX_STEM, _TERM_MIN_STEM, _TERM_MIN_U_TRACT, _TERM_U_TRACT_WINDOW, _scan_promoters, _scan_terminators)
+from splicecraft_regulettuce import (_3P_MIN_SCORE, _3P_STEP, _3P_WINDOW, _TATA_WINDOW, _cis_element_catalogue, _cis_element_summary, _find_cis_element, _regulettuce_calibration, _scan_3prime_risk, _scan_cis_elements, _scan_tata_boxes)
 from splicecraft_primer import (_AS_MIN_LEN, _PRIMER_CHECK_MIN_LEN, _PRIMER_CHECK_SEED_LEN, _PRIMER_ANNEAL_BELOW_TM, _PRIMER_DIMER_TM_LIMIT, _TM_PROFILES, _design_allele_specific_primer, _design_cloning_primers_raw, _design_detection_primers, _design_generic_primers, _primer_binding_sites, _primer_check_confidence, _primer_pair_qc, _primer_tm, _TM_PROFILE_DEFAULT, _tm_profile_catalog, _tm_profile_kwargs, _tm_profile_resolve)
 
 
@@ -8994,6 +8996,335 @@ def _h_scan_terminators(app, payload):
                 "min_stem", "min_u_tract", "limit"})}
 
 
+@_agent_endpoint("list-cis-elements")
+def _h_list_cis_elements(app, payload):
+    """The curated plant cis-regulatory element catalogue.
+
+    Body: ``{}``. Returns every element with the measurement that decides
+    whether finding it means anything: ``{name, consensus, length,
+    responds_to, aliases, promoter_rate, null_rate, enrichment,
+    informativeness, palindromic}``.
+
+    ``promoter_rate`` is the fraction of 3,089 verified plant promoters (400 bp
+    upstream of a TSS confirmed by an annotated 5'UTR) carrying the element on
+    either strand; ``null_rate`` is the same over 12,000 composition-matched
+    windows from the same genome; ``enrichment`` is their ratio.
+
+    **Read `informativeness` before reporting a hit.** ``ubiquitous`` means the
+    element is in 80%+ of random DNA — `GT1-motif` is in 94.8% of random 400 bp
+    windows, so a promoter carrying one is not evidence of anything.
+    ``depleted`` means real promoters avoid it. Only ``enriched`` and ``weak``
+    are worth presenting as findings. Read-only."""
+    rows = _cis_element_catalogue()
+    by_class = {}
+    for r in rows:
+        by_class[r["informativeness"]] = by_class.get(
+            r["informativeness"], 0) + 1
+    return {"ok": True, "n_elements": len(rows),
+            "by_informativeness": by_class, "elements": rows,
+            "ignored": _agent_ignored_keys(payload, set())}
+
+
+@_agent_endpoint("scan-cis-elements")
+def _h_scan_cis_elements(app, payload):
+    """Find curated plant cis-regulatory elements, with the chance count.
+
+    Body: ``{sequence | id | name, circular?, both_strands?=true, names?,
+    min_enrichment?, include_uninformative?=true, limit?}``. Coordinates are
+    FORWARD-strand and 0-based for hits on either strand; on a circular
+    molecule an element spanning the origin is found at its real start.
+
+    Each hit: ``{name, consensus, start, end, strand, match, length,
+    enrichment, informativeness, responds_to, model}``. ``strand`` is 1, -1, or
+    **0** when the same bases read as the element either way (every palindromic
+    consensus) — one duplex, one record.
+
+    **Always report `summary` beside `hits`.** A 6 bp motif occurs by chance
+    about every 2 kb per strand, so a 10 kb plasmid carries a handful of nearly
+    every element in the catalogue and a bare hit list reads as a finding when
+    it is arithmetic. ``summary`` gives ``observed`` against ``expected`` on
+    THIS sequence's own base composition, plus a coarse ``verdict``. A hit is a
+    statement about the sequence, never a prediction that the factor binds:
+    occupancy depends on chromatin and tissue, which a string does not carry.
+    Read-only."""
+    seq, circular, _rec, label, err = _agent_resolve_scan_target(app, payload)
+    if err is not None:
+        return err
+    both = payload.get("both_strands")
+    if both is None:
+        both = True
+    else:
+        both = _coerce_bool(both, name="both_strands")
+        if isinstance(both, str):
+            return ({"error": both}, 400)
+    inc = payload.get("include_uninformative")
+    if inc is None:
+        inc = True
+    else:
+        inc = _coerce_bool(inc, name="include_uninformative")
+        if isinstance(inc, str):
+            return ({"error": inc}, 400)
+    names = payload.get("names")
+    if names is not None:
+        if isinstance(names, str):
+            names = [names]
+        if not isinstance(names, list) or not names:
+            return ({"error": "'names' must be a non-empty list of "
+                              "element names"}, 400)
+        if len(names) > 200:
+            return ({"error": "'names' accepts at most 200 entries"}, 400)
+        unknown = [n for n in names if _find_cis_element(str(n)) is None]
+        if unknown:
+            return ({"error": f"unknown cis-element(s): "
+                              f"{', '.join(map(str, unknown[:5]))}. Call "
+                              f"list-cis-elements for the catalogue."}, 400)
+        names = [str(n) for n in names]
+    min_enr = payload.get("min_enrichment")
+    if min_enr is not None:
+        try:
+            min_enr = float(min_enr)
+        except (TypeError, ValueError):
+            return ({"error": "'min_enrichment' must be a number"}, 400)
+        if min_enr < 0:
+            return ({"error": "'min_enrichment' must be >= 0"}, 400)
+    limit = _coerce_int(payload.get("limit", 2000), name="limit")
+    if isinstance(limit, str):
+        return ({"error": limit}, 400)
+    if limit < 1:
+        return ({"error": "'limit' must be >= 1"}, 400)
+    try:
+        # ONE uncapped scan feeds both the summary's arithmetic and the
+        # (capped) hit list below. Scanning twice doubled the cost of this
+        # endpoint for no new information.
+        hits = _scan_cis_elements(seq, circular=circular, both_strands=both,
+                                  names=names, min_enrichment=min_enr,
+                                  include_uninformative=inc,
+                                  max_hits_per_element=10 ** 9)
+        summary = _cis_element_summary(seq, circular=circular,
+                                       both_strands=both, names=names,
+                                       include_uninformative=inc, hits=hits)
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
+    except Exception as exc:
+        _log.exception("scan-cis-elements failed")
+        return ({"error": f"scan failed: {_scrub_path(str(exc))}"}, 500)
+    _log_event("scan.cis_elements", length=len(seq), n_hits=len(hits),
+               via="agent")
+    return {"ok": True, "plasmid": label, "length": len(seq),
+            "circular": circular, "both_strands": both,
+            "include_uninformative": inc,
+            "n_hits": len(hits), "truncated": len(hits) > limit,
+            "hits": hits[:limit], "summary": summary,
+            "ignored": _agent_ignored_keys(payload, {
+                "sequence", "id", "name", "circular", "both_strands", "names",
+                "min_enrichment", "include_uninformative", "limit"})}
+
+
+@_agent_endpoint("scan-tata-boxes")
+def _h_scan_tata_boxes(app, payload):
+    """TATA-box candidates positioned against a start site.
+
+    Body: ``{sequence | id | name, anchors, circular?, window?=[-60,-10],
+    limit?}``. ``anchors`` is **required**: a list of start sites to measure
+    from — an integer position (forward strand) or ``{position, strand, label}``
+    — typically a transcription start if known, otherwise a CDS start.
+
+    **The scan refuses to run unanchored, and that is deliberate.** ``TATAWA``
+    occurs once per 429 bp of real plant genomic DNA, so chance alone puts ~47
+    of them on a 10 kb plasmid read on both strands. Position is the entire
+    signal: against 3,089 verified plant TSSs the hits peak sharply in -40..-31
+    (3.17x enriched over composition-matched windows), and outside an anchor
+    there is nothing to measure that offset from.
+
+    Each hit: ``{start, end, strand, match, anchor, anchor_label, offset,
+    in_peak, tier, model}``. ``offset`` is in the ANCHOR's frame (negative =
+    upstream), so a reverse-strand anchor's upstream hits lie at HIGHER forward
+    coordinates and still report a negative offset. ``tier`` is ``peak`` inside
+    -40..-31 and ``window`` otherwise. There is no score: the measurement
+    supports a positional claim, not a promoter strength. Read-only."""
+    seq, circular, _rec, label, err = _agent_resolve_scan_target(app, payload)
+    if err is not None:
+        return err
+    raw = payload.get("anchors")
+    if raw is None:
+        return ({"error": "'anchors' is required: a list of start-site "
+                          "positions (int) or {position, strand, label} "
+                          "objects. An unanchored TATAWA scan returns chance "
+                          "hits -- one per 429 bp of real plant DNA."}, 400)
+    if isinstance(raw, (int, float)) or isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list) or not raw:
+        return ({"error": "'anchors' must be a non-empty list"}, 400)
+    if len(raw) > 500:
+        return ({"error": "'anchors' accepts at most 500 entries"}, 400)
+    anchors = []
+    for a in raw:
+        if isinstance(a, dict):
+            pos = _coerce_int(a.get("position"), name="anchor position")
+            if isinstance(pos, str):
+                return ({"error": pos}, 400)
+            strand = _coerce_int(a.get("strand", 1), name="anchor strand")
+            if isinstance(strand, str):
+                return ({"error": strand}, 400)
+            if strand not in (1, -1):
+                return ({"error": "anchor 'strand' must be 1 or -1"}, 400)
+            anchors.append({"position": pos, "strand": strand,
+                            "label": _sanitize_label(a.get("label") or "")})
+        else:
+            pos = _coerce_int(a, name="anchor position")
+            if isinstance(pos, str):
+                return ({"error": pos}, 400)
+            anchors.append({"position": pos, "strand": 1, "label": ""})
+    window = payload.get("window")
+    if window is not None:
+        if not isinstance(window, (list, tuple)) or len(window) != 2:
+            return ({"error": "'window' must be [low, high], both offsets "
+                              "relative to the anchor"}, 400)
+        lo = _coerce_int(window[0], name="window low")
+        if isinstance(lo, str):
+            return ({"error": lo}, 400)
+        hi = _coerce_int(window[1], name="window high")
+        if isinstance(hi, str):
+            return ({"error": hi}, 400)
+        if lo > hi:
+            return ({"error": "'window' must be [low, high] with low <= "
+                              "high"}, 400)
+        window = (lo, hi)
+    limit = _coerce_int(payload.get("limit", 500), name="limit")
+    if isinstance(limit, str):
+        return ({"error": limit}, 400)
+    if limit < 1:
+        return ({"error": "'limit' must be >= 1"}, 400)
+    try:
+        hits = _scan_tata_boxes(seq, anchors=anchors, circular=circular,
+                                window=window)
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
+    except Exception as exc:
+        _log.exception("scan-tata-boxes failed")
+        return ({"error": f"scan failed: {_scrub_path(str(exc))}"}, 500)
+    _log_event("scan.tata", length=len(seq), n_anchors=len(anchors),
+               n_hits=len(hits), via="agent")
+    return {"ok": True, "plasmid": label, "length": len(seq),
+            "circular": circular, "n_anchors": len(anchors),
+            "window": list(window or _TATA_WINDOW),
+            "n_hits": len(hits), "truncated": len(hits) > limit,
+            "hits": hits[:limit],
+            "ignored": _agent_ignored_keys(payload, {
+                "sequence", "id", "name", "anchors", "circular", "window",
+                "limit"})}
+
+
+@_agent_endpoint("scan-3prime-risk")
+def _h_scan_3prime_risk(app, payload):
+    """Regions that read like a plant 3'-end — where a message would be cut.
+
+    Body: ``{sequence | id | name, circular?, window?=160, step?=20,
+    min_score?=0.64, both_strands?=true, limit?}``.
+
+    The question: *is there a stretch of this construct a plant would treat as
+    the end of the message?* A cryptic 3' end inside a transgene truncates the
+    transcript — the protein disappears and the DNA sequences perfectly.
+
+    Each hit: ``{start, end, length, score, at_fraction, best_t_fraction,
+    strand, tier, model}``, FORWARD-strand and wrap-aware. ``tier`` is
+    ``strong`` / ``moderate``.
+
+    **There is no cleavage-site field, and that is a finding rather than an
+    omission.** A position-specific model trained on 600 real plant poly(A)
+    sites — the method that works for splice donors — located them BELOW
+    chance: its argmax fell within 20 nt of the true site in 27.2% of held-out
+    3' regions against 29.1% expected at random. Do not report a predicted
+    poly(A) position from this endpoint; report the region.
+
+    Calibration: AUC 0.895 against coding sequence, 0.575 against plant
+    genomic DNA. The honest claim is "this does not look like coding
+    sequence", **not** "this does not look like plant DNA" — plant intergenic
+    DNA is AT-rich too, so a hit inside a backbone means much less than one
+    inside a CDS being designed. Boundaries are quantised to ``step``; pass
+    ``step=1`` for base resolution. Read-only."""
+    seq, circular, _rec, label, err = _agent_resolve_scan_target(app, payload)
+    if err is not None:
+        return err
+    both = payload.get("both_strands")
+    if both is None:
+        both = True
+    else:
+        both = _coerce_bool(both, name="both_strands")
+        if isinstance(both, str):
+            return ({"error": both}, 400)
+    window = _coerce_int(payload.get("window", _3P_WINDOW), name="window")
+    if isinstance(window, str):
+        return ({"error": window}, 400)
+    if not (20 <= window <= 100000):
+        return ({"error": "'window' must be in [20, 100000]"}, 400)
+    step = _coerce_int(payload.get("step", _3P_STEP), name="step")
+    if isinstance(step, str):
+        return ({"error": step}, 400)
+    if not (1 <= step <= window):
+        return ({"error": "'step' must be in [1, window]"}, 400)
+    min_score = payload.get("min_score")
+    if min_score is not None:
+        try:
+            min_score = float(min_score)
+        except (TypeError, ValueError):
+            return ({"error": "'min_score' must be a number"}, 400)
+        if not (0.0 <= min_score <= 1.0):
+            return ({"error": "'min_score' must be in [0, 1]"}, 400)
+    limit = _coerce_int(payload.get("limit", 500), name="limit")
+    if isinstance(limit, str):
+        return ({"error": limit}, 400)
+    if limit < 1:
+        return ({"error": "'limit' must be >= 1"}, 400)
+    # Cost is (length / step) * window character-operations, not window COUNT
+    # — a cap on the count alone would wave through a step-1 scan of a
+    # megabase (160M ops, ~30 s on a worker thread). Measured: 200 kb at the
+    # default step of 20 is 1.6M ops in ~345 ms, so a 50M budget is a couple
+    # of seconds at worst.
+    work = (len(seq) // max(1, step)) * window
+    if work > 50_000_000:
+        return ({"error": f"scan too large: (length / step) * window is "
+                          f"{work:,} and the cap is 50,000,000. Raise "
+                          f"'step', shrink 'window', or scan a region."}, 400)
+    try:
+        hits = _scan_3prime_risk(seq, circular=circular, window=window,
+                                 step=step, min_score=min_score,
+                                 both_strands=both)
+    except Exception as exc:
+        _log.exception("scan-3prime-risk failed")
+        return ({"error": f"scan failed: {_scrub_path(str(exc))}"}, 500)
+    _log_event("scan.three_prime", length=len(seq), n_hits=len(hits),
+               via="agent")
+    return {"ok": True, "plasmid": label, "length": len(seq),
+            "circular": circular, "both_strands": both,
+            "window": window, "step": step,
+            "min_score": (_3P_MIN_SCORE if min_score is None else min_score),
+            "predicts_cleavage_site": False,
+            "n_hits": len(hits), "truncated": len(hits) > limit,
+            "hits": hits[:limit],
+            "ignored": _agent_ignored_keys(payload, {
+                "sequence", "id", "name", "circular", "both_strands",
+                "window", "step", "min_score", "limit"})}
+
+
+@_agent_endpoint("regulettuce-calibration")
+def _h_regulettuce_calibration(app, payload):
+    """Every measurement behind the plant cis-regulatory scanners.
+
+    Body: ``{}``. Returns the reference sets and their sizes, the catalogue
+    breakdown, the TATA and 3'-end thresholds with their sensitivity and
+    false-positive rates, and **``not_modelled``** — the three models that
+    were built, measured and refused, each with the number that killed it.
+
+    Call this before quoting any score from `scan-cis-elements`,
+    `scan-tata-boxes` or `scan-3prime-risk`. An annotator's refusals are as
+    informative as its findings, and reporting a plant promoter strength or a
+    poly(A) position from this subsystem would be reporting something it
+    measured itself unable to do. Read-only."""
+    return {"ok": True, **_regulettuce_calibration(),
+            "ignored": _agent_ignored_keys(payload, set())}
+
+
 @_agent_endpoint("map-transcription")
 def _h_map_transcription(app, payload):
     """Walk the circle from every promoter to every CDS — "what ELSE
@@ -9075,13 +9406,118 @@ def _h_map_transcription(app, payload):
     return out
 
 
+@_agent_endpoint("initiation-model")
+def _h_initiation_model(app, payload):
+    """The calibration behind every Kozak / initiation score this API reports.
+
+    Body: ``{}``. Returns the window, the provenance of the reference set, the
+    held-out AUCs for BOTH the trained matrix and the -3/+4 consensus rule it
+    is reported beside, the per-species and leave-one-species-out tables, the
+    tier cuts with the upstream-ATG rate each admits, and **``refused``** —
+    what the model deliberately does not do, each entry with the number that
+    settled it.
+
+    Read this before quoting a `kozak` block from `predict-transcript`. Two
+    entries in particular change how a result should be read: the model
+    produces **no initiation rate and no yield number** (it ranks contexts and
+    reports a percentile against real plant starts), and the scored window
+    **stops at +4** because extending it discriminates better by reading
+    coding-vs-UTR base composition rather than initiation context. Read-only."""
+    return {"ok": True, "model": _kozak_model_summary(),
+            "ignored": _agent_ignored_keys(payload, set())}
+
+
+@_agent_endpoint("score-initiation-context")
+def _h_score_initiation_context(app, payload):
+    """Score the translation-initiation context of an ATG in a message.
+
+    Body: ``{sequence, position?, limit?=500}``. `sequence` is the mRNA (or a
+    leader you are designing) — NOT a plasmid; a transcription unit on a
+    loaded record goes through `predict-transcript`, which splices first.
+    `position` is the 0-based offset of the ATG to headline; omit it to
+    headline the first ATG in `sequence`.
+
+    Returns ``{ok, position, codon, context, atgs, n_atgs}``. `context` is the
+    full scored block for `position`: the -6..+4 window as the literature
+    prints it, the consensus rule's `score` / `strength`, and a `pwm` block
+    carrying the trained matrix's `score`, `percentile` ("stronger than N% of
+    real plant start codons"), `tier` and the measured `uatg_rate` for that
+    tier. `atgs` lists EVERY ATG in `sequence` with `rank` 1 for the strongest
+    context — which is the question the consensus rule cannot answer, since
+    13% of upstream ATGs share its top bucket and it cannot order them.
+
+    `pwm.score` is `null`, with `pwm.note` saying which, when the ATG sits
+    closer than its window to the 5' end, when `position` holds no ATG, or
+    when the window carries a non-ACGT base. It is never a 0.0 standing in for
+    'no answer' — 0.0 is a real score meaning 'as likely a start as an
+    upstream ATG'. `rank` is `null` for the same ATGs, because a partial
+    window sums fewer log-odds terms and ordering it against a full one would
+    compare numbers that do not mean the same thing. Call `initiation-model`
+    for what the score is calibrated against. Read-only."""
+    seq, err = _sanitize_bases(payload.get("sequence"))
+    if err is not None:
+        return ({"error": err.replace("'bases'", "'sequence'")}, 400)
+    if len(seq) < 4:
+        return ({"error": "'sequence' must be at least 4 nt"}, 400)
+    limit = _coerce_int(payload.get("limit", 500), name="limit")
+    if isinstance(limit, str):
+        return ({"error": limit}, 400)
+    limit = max(1, min(int(limit), 5000))
+
+    starts = []
+    i = seq.find("ATG")
+    while i != -1:
+        starts.append(i)
+        i = seq.find("ATG", i + 1)
+
+    pos = payload.get("position")
+    if pos is None:
+        if not starts:
+            return ({"error": "no ATG in 'sequence' — pass 'position' to "
+                              "score a specific offset anyway"}, 400)
+        pos = starts[0]
+    else:
+        pos = _coerce_int(pos, name="position")
+        if isinstance(pos, str):
+            return ({"error": pos}, 400)
+        pos = int(pos)
+        if not 0 <= pos <= len(seq) - 3:
+            return ({"error": f"'position' must be between 0 and "
+                              f"{len(seq) - 3} for a {len(seq)} nt sequence"},
+                    400)
+
+    rows = []
+    for a in starts[:limit]:
+        k = _kozak_context(seq, a)
+        rows.append({"position": a, "context": k["context"],
+                     "strength": k["strength"], "score": k["score"],
+                     "pwm_score": k["pwm"]["score"],
+                     "percentile": k["pwm"]["percentile"],
+                     "tier": k["pwm"]["tier"], "rank": None,
+                     "note": k["pwm"]["note"]})
+    for rank, row in enumerate(
+            sorted((r for r in rows if r["pwm_score"] is not None),
+                   key=lambda r: (-r["pwm_score"], r["position"])), start=1):
+        row["rank"] = rank
+    out = {"ok": True, "position": pos, "codon": seq[pos:pos + 3],
+           "context": _kozak_context(seq, pos), "atgs": rows,
+           "n_atgs": len(starts),
+           "ignored": _agent_ignored_keys(
+               payload, {"sequence", "position", "limit"})}
+    if len(starts) > limit:
+        out["truncated"] = (f"{len(starts)} ATGs found; the first {limit} by "
+                            "position are listed, so `rank` orders only those")
+    return out
+
+
 @_agent_endpoint("predict-transcript")
 def _h_predict_transcript(app, payload):
     """Reconstruct the MATURE mRNA of an annotated transcription unit on the
     loaded record, and score translation initiation on it.
 
     Body: ``{promoter?, cds?, terminator?, tx_start?, tx_end?,
-    check_splice?=true, min_uorf_aa?=1, include_sequences?=true}``. Set
+    check_splice?=true, check_three_prime?=true, min_uorf_aa?=1,
+    include_sequences?=true}``. Set
     ``include_sequences: false`` to drop `pre_mrna` / `mature_mrna` / the UTR
     sequences and keep only the coordinates and verdicts — a long unit
     otherwise puts three copies of itself in the response, which a screening
@@ -9152,6 +9588,8 @@ def _h_predict_transcript(app, payload):
             tx_start=bounds.get("tx_start"),
             tx_end=bounds.get("tx_end"),
             check_splice=_payload_bool(payload, "check_splice", True),
+            check_three_prime=_payload_bool(payload, "check_three_prime",
+                                            True),
             min_uorf_aa=max(0, int(min_uorf_aa)),
         )
     except Exception as exc:

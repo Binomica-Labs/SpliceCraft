@@ -39,6 +39,11 @@ from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, List
 from splicecraft_crispr import (
     _CAS_VARIANTS, _design_guides, _guide_cloning_oligos,
 )
+from splicecraft_regulettuce import (
+    _3P_MIN_SCORE, _TATA_PEAK, _TATA_WINDOW, _cis_element_summary,
+    _regulettuce_calibration, _scan_3prime_risk, _scan_cis_elements,
+    _scan_tata_boxes,
+)
 import splicecraft_state as _state
 from splicecraft_cloning import (_cloned_plasmid_regenerated_sites,
                                  _simulate_cloned_plasmid, _simulate_primed_amplicon)
@@ -9331,6 +9336,460 @@ class CrisprGuideModal(_OneShotDismissScreen, ModalScreen):
         self.dismiss({"action": "annotate", "guide": g})
 
     @on(Button.Pressed, "#crispr-btn-close")
+    def _on_close(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class RegulettuceModal(_OneShotDismissScreen, ModalScreen):
+    """Regulettuce — plant cis-regulatory annotation of the loaded plasmid.
+
+    App-free by construction: the caller hands in the sequence, the topology, a
+    label and the anchor candidates (CDS / gene starts read off the record), so
+    this class stays in the dependency-clean L4 set and is unit-testable
+    without a `PlasmidApp`.
+
+    Dismisses with ``None`` on cancel, or
+    ``{"action": "annotate", "kind": "cis"|"tata"|"3prime",
+       "hits": [<hit dicts>]}`` — the caller turns them into features in ONE
+    undo step.
+
+    **The chance count is shown as prominently as the hit list, and that is the
+    design.** A 6 bp motif occurs by chance about every 2 kb per strand, so a
+    10 kb plasmid carries a handful of nearly every catalogued element; a bare
+    table of hits reads as a finding when it is arithmetic. Every cis row
+    carries its measured enrichment and its informativeness class, and the
+    status line reports observed against expected. See
+    `splicecraft_regulettuce`'s module docstring for what this subsystem
+    measured itself unable to do — there is no promoter-strength column and no
+    poly(A) site column because neither survived calibration.
+    """
+
+    _blocks_undo: bool = True   # hosts Inputs — keep app-level Ctrl+Z out
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #reg-dlg {
+        width: 150; height: 44;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #reg-title {
+        height: 1; text-style: bold; color: $accent;
+        text-align: center; margin-bottom: 1;
+    }
+    #reg-note { height: 3; color: $text-muted; margin-bottom: 1; }
+    #reg-controls { height: 3; margin-bottom: 1; }
+    #reg-mode { width: 24; margin-right: 1; }
+    #reg-filter { width: 22; margin-right: 1; }
+    #reg-anchor { width: 16; margin-right: 1; }
+    #reg-btn-scan { margin-right: 1; }
+    #reg-table { height: 1fr; }
+    #reg-status { height: 4; color: $text-muted; }
+    #reg-btns { height: 3; margin-top: 1; align: right middle; }
+    #reg-btns Button { margin-right: 1; }
+    """
+
+    _MODES = (
+        ("Cis-elements", "cis"),
+        ("TATA boxes", "tata"),
+        ("3'-end risk", "3prime"),
+    )
+    _FILTERS = (
+        ("Informative only", "informative"),
+        ("Whole catalogue", "all"),
+    )
+    # Ceiling on "Annotate all shown". Measured: the whole catalogue on a
+    # 50 kb record is ~2,100 chance-level hits, and [INV-223] established that
+    # feature COUNT is what makes a record slow to render. 250 is more arrows
+    # than any map can show and still well inside what the renderer handles.
+    _MAX_ANNOTATE_ALL = 250
+    # Columns per mode, as ``(label, width)``. The table is rebuilt on a mode
+    # change rather than carrying one superset of columns: three scanners
+    # answer three different questions and a shared header would have to lie
+    # about two of them.
+    #
+    # Widths are EXPLICIT because Textual's `auto_width` does not render what
+    # it measures: a column added with `width=None` tracks `content_width`
+    # correctly (9 for "DRE / CRT") but keeps `width` at the label's own length
+    # (7 for "Element"), so every cell longer than its header is silently
+    # truncated — "DRE / CRT" shows as "DRE / C" and "enriched" as "enric"
+    # while most of the table sits empty. Sized to fill the 150-column dialog.
+    _COLUMNS = {
+        "cis": (("Element", 22), ("Pos", 8), ("Str", 4), ("Match", 11),
+                ("Enrich", 7), ("Class", 14), ("Responds to", 62)),
+        "tata": (("Offset", 8), ("Pos", 9), ("Str", 4), ("Match", 8),
+                 ("Tier", 8), ("Anchor", 60)),
+        "3prime": (("Start", 9), ("End", 9), ("Length", 9), ("Score", 8),
+                   ("AT%", 6), ("T-rich%", 9), ("Str", 4), ("Tier", 10)),
+    }
+
+    def __init__(self, sequence: str, *, circular: bool = False,
+                 label: str = "plasmid", anchors: "list[dict] | None" = None,
+                 ) -> None:
+        super().__init__()
+        self._seq = (sequence or "").upper()
+        self._circular = bool(circular)
+        self._label = label or "plasmid"
+        # Anchors the caller read off the record (CDS / gene starts). The TATA
+        # scan REFUSES to run without one, so the modal must say so rather
+        # than show an empty table — an unanchored TATAWA scan is chance hits.
+        self._anchors = list(anchors or [])
+        self._hits: list = []
+        self._mode = "cis"
+        # Set by `_anchor_list` when the typed anchor bp is off the molecule,
+        # so the status line explains the empty table instead of blaming a
+        # missing annotation.
+        self._anchor_error = ""
+        # Bumped by every scan. One that finishes after a newer scan (another
+        # mode, another filter) is DROPPED rather than written over it — the
+        # guard `CrisprGuideModal` uses for its off-target pass.
+        self._scan_gen = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="reg-dlg"):
+            yield Static(f"Regulettuce — {self._label} "
+                         f"({len(self._seq):,} bp"
+                         f"{', circular' if self._circular else ''})",
+                         id="reg-title")
+            yield Static(
+                "Cis-element hits are sequence matches, not predictions that "
+                "the factor binds — every row carries how often the element "
+                "turns up in random DNA.\nTATA boxes are only meaningful "
+                "relative to a start site, so they are measured against the "
+                "record's CDS/gene starts.\nNo promoter-strength or poly(A) "
+                "site column: both were measured and refused (see "
+                "regulettuce-calibration).",
+                id="reg-note", markup=False,
+            )
+            with Horizontal(id="reg-controls"):
+                yield Select(list(self._MODES), value="cis",
+                             allow_blank=False, id="reg-mode")
+                yield Select(list(self._FILTERS), value="informative",
+                             allow_blank=False, id="reg-filter")
+                yield Input(placeholder="anchor bp", id="reg-anchor",
+                            restrict=r"[0-9]*")
+                yield Button("Scan", id="reg-btn-scan", variant="primary")
+            yield DataTable(id="reg-table", cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("", id="reg-status", markup=True)
+            with Horizontal(id="reg-btns"):
+                yield Button("Annotate row", id="reg-btn-annotate",
+                             variant="success")
+                yield Button("Annotate all shown", id="reg-btn-annotate-all")
+                yield Button("Close", id="reg-btn-close")
+
+    def on_mount(self) -> None:
+        self._rebuild_columns()
+        self._run_scan()
+
+    # ── scanning ──────────────────────────────────────────────────────────
+    def _rebuild_columns(self) -> None:
+        try:
+            t = self.query_one("#reg-table", DataTable)
+        except NoMatches:
+            return
+        t.clear(columns=True)
+        for label, width in self._COLUMNS[self._mode]:
+            t.add_column(label, width=width)
+
+    def _anchor_list(self) -> "list[dict]":
+        """The user's typed anchor if there is one, else the record's starts.
+
+        A typed bp past the end of the molecule is REFUSED rather than taken:
+        on a circle `_normalise_anchors` would wrap it (bp 99999 on a 5 kb
+        plasmid becomes bp 4999) and report offsets from a base the user did
+        not mean, and on a linear one it now raises. Falling back to the
+        record's own starts would be just as misleading — the user typed a
+        number and the table would answer about somewhere else."""
+        try:
+            raw = (self.query_one("#reg-anchor", Input).value or "").strip()
+        except NoMatches:
+            raw = ""
+        if not raw:
+            return list(self._anchors)
+        try:
+            pos = int(raw)
+        except ValueError:
+            return list(self._anchors)
+        if not 0 <= pos < max(1, len(self._seq)):
+            self._anchor_error = (
+                f"[yellow]Anchor {pos:,} is outside this "
+                f"{len(self._seq):,} bp molecule.[/yellow] Type a bp between "
+                f"0 and {max(0, len(self._seq) - 1):,}, or clear the box to "
+                f"measure from the record's own CDS/gene starts.")
+            return []
+        return [{"position": pos, "strand": 1, "label": "typed"}]
+
+    def _run_scan(self) -> None:
+        """Start a scan on a worker thread.
+
+        Measured on the UI thread: 1.1 s for the cis scan and 6.0 s for the
+        3'-end scan on a 2 Mbp record — and SpliceCraft opens chromosome-scale
+        records ([INV-223]), so a 30 Mbp one would freeze the app for a minute
+        and a half. Same reason `CrisprGuideModal` moved its off-target pass
+        off the UI thread, and the same generation guard against a stale
+        result landing on top of a newer one."""
+        informative = True
+        try:
+            informative = (self.query_one("#reg-filter", Select).value
+                           == "informative")
+        except NoMatches:
+            pass
+        self._scan_gen += 1
+        gen = self._scan_gen
+        mode = self._mode
+        self._anchor_error = ""
+        anchors = self._anchor_list() if mode == "tata" else []
+        if mode == "tata" and not anchors:
+            # Answered without scanning: an empty table reads as "no TATA
+            # boxes" when the truth is "nothing to measure from".
+            self._hits = []
+            self._fill_table()
+            self._set_status(self._anchor_error or (
+                "[yellow]No start site to measure from.[/yellow] "
+                "TATAWA turns up once per 429 bp of real plant DNA, so an "
+                "unanchored scan is chance hits. Annotate a CDS or type an "
+                "anchor bp above."))
+            return
+        self._set_scan_busy(True)
+        self._set_status("Scanning\u2026")
+        self._scan_worker(mode, informative, anchors, gen)
+
+    @work(thread=True, exclusive=True, group="regulettuce_scan")
+    def _scan_worker(self, mode: str, informative: bool, anchors: list,
+                     gen: int) -> None:
+        from textual.worker import get_current_worker
+        hits: list = []
+        summary: "list | None" = None
+        err: "str | None" = None
+        try:
+            if mode == "cis":
+                hits = _scan_cis_elements(
+                    self._seq, circular=self._circular,
+                    include_uninformative=not informative)
+                # Computed HERE, on the worker, from the hits just produced:
+                # it is the same scan again otherwise, and on the UI thread.
+                summary = _cis_element_summary(
+                    self._seq, circular=self._circular,
+                    include_uninformative=not informative, hits=hits)
+            elif mode == "tata":
+                hits = _scan_tata_boxes(self._seq, anchors=anchors,
+                                        circular=self._circular)
+            else:
+                hits = _scan_3prime_risk(self._seq, circular=self._circular)
+        except ValueError as exc:
+            err = str(exc)
+        except Exception as exc:          # noqa: BLE001 - reported, not hidden
+            # Anything else still has to reach `_scan_done`, or the dialog
+            # sits on "Scanning…" with the Scan button disabled for the rest
+            # of the session: the worker dies, nothing re-enables the button
+            # and the only way out is Escape. Logged with a traceback AND
+            # shown, so a bug here is debuggable rather than a frozen panel.
+            _log.exception("regulettuce %s scan failed", mode)
+            err = f"{type(exc).__name__}: {exc}"
+        if get_current_worker().is_cancelled:
+            return
+        self.app.call_from_thread(self._scan_done, mode, informative, hits,
+                                  summary, anchors, err, gen)
+
+    def _scan_done(self, mode: str, informative: bool, hits: list,
+                   summary: "list | None", anchors: list, err: "str | None",
+                   gen: int) -> None:
+        if gen != self._scan_gen:
+            return          # a newer scan replaced this one while it ran
+        self._set_scan_busy(False)
+        if err is not None:
+            self._hits = []
+            self._fill_table()
+            self._set_status(f"[red]{err}[/red]")
+            return
+        self._hits = hits
+        self._fill_table()
+        if mode == "cis":
+            self._cis_status(informative, summary or [])
+        elif mode == "tata":
+            self._tata_status(anchors)
+        else:
+            self._three_prime_status()
+
+    def _set_scan_busy(self, busy: bool) -> None:
+        try:
+            self.query_one("#reg-btn-scan", Button).disabled = busy
+        except NoMatches:
+            pass
+
+    def _tata_status(self, anchors: list) -> None:
+        peak = sum(1 for h in self._hits if h["tier"] == "peak")
+        self._set_status(
+            f"{len(self._hits):,} TATAWA in "
+            f"{_TATA_WINDOW[0]}..{_TATA_WINDOW[1]} of "
+            f"{len(anchors):,} start site(s); {peak:,} inside the "
+            f"measured {_TATA_PEAK[0]}..{_TATA_PEAK[1]} peak.\n"
+            f"[dim]Positional claim only \u2014 the peak is 3.17x enriched "
+            f"over composition-matched genomic windows. No strength is "
+            f"implied.[/dim]")
+
+    def _three_prime_status(self) -> None:
+        cal = _regulettuce_calibration()["three_prime"]
+        self._set_status(
+            f"{len(self._hits):,} region(s) scoring "
+            f">= {_3P_MIN_SCORE} over a {cal['window']} bp window.\n"
+            f"[dim]AUC {cal['auc_vs_coding']} against coding sequence, "
+            f"{cal['auc_vs_genomic']} against plant genomic DNA \u2014 so a "
+            f"hit inside a CDS you are designing matters, one in the "
+            f"backbone much less. No cleavage site is predicted.[/dim]")
+
+    def _cis_status(self, informative: bool, rows: list) -> None:
+        """Observed vs chance-expected, which is the number that matters.
+
+        `rows` comes from the worker, which built it from the same hits — the
+        summary is a second pass over the molecule and does not belong on the
+        UI thread."""
+        over = [r for r in rows
+                if r["observed"] and (r["ratio"] or 0) >= 2.0]
+        head = ", ".join(f"{r['name']} {r['observed']}x "
+                         f"(chance {r['expected']:.1f})" for r in over[:4])
+        self._set_status(
+            f"{len(self._hits):,} hit(s) across "
+            f"{sum(1 for r in rows if r['observed']):,} element(s)"
+            f"{'' if informative else ' — whole catalogue'}.\n"
+            f"[dim]Over-represented vs this sequence's own base composition: "
+            f"{head or 'none'}.[/dim]\n"
+            f"[dim]A match is sequence, not occupancy. Switch to 'Whole "
+            f"catalogue' to see elements that chance explains.[/dim]")
+
+    def _fill_table(self) -> None:
+        try:
+            t = self.query_one("#reg-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        for i, h in enumerate(self._hits):
+            t.add_row(*self._row_for(h), key=str(i))
+        if self._hits:
+            t.move_cursor(row=0)
+
+    @staticmethod
+    def _strand_glyph(strand: int) -> str:
+        # 0 means the same bases read as the element either way (a palindromic
+        # consensus) — one duplex, one record. "+/-" says that without
+        # claiming an orientation the sequence does not have.
+        return {1: "+", -1: "\u2212"}.get(int(strand), "+/-")
+
+    def _row_for(self, h: dict) -> tuple:
+        g = self._strand_glyph(h.get("strand", 1))
+        if self._mode == "cis":
+            cls = h.get("informativeness", "?")
+            colour = {"enriched": "green bold", "weak": "yellow",
+                      "depleted": "red", "ubiquitous": "red"}.get(cls, "dim")
+            enr = h.get("enrichment")
+            return (
+                Text(h["name"]),
+                Text(f"{h['start']:,}"),
+                Text(g),
+                Text(h.get("match", ""), style="dim"),
+                Text("—" if enr is None else f"{enr:.2f}x"),
+                Text(cls, style=colour),
+                Text(h.get("responds_to", ""), style="dim"),
+            )
+        if self._mode == "tata":
+            peak = h.get("tier") == "peak"
+            return (
+                Text(f"{h['offset']:+d}",
+                     style="green bold" if peak else ""),
+                Text(f"{h['start']:,}"),
+                Text(g),
+                Text(h.get("match", ""), style="dim"),
+                Text(h.get("tier", ""), style="green bold" if peak else "dim"),
+                Text(h.get("anchor_label") or f"{h.get('anchor', 0):,}",
+                     style="dim"),
+            )
+        strong = h.get("tier") == "strong"
+        return (
+            Text(f"{h['start']:,}"),
+            Text(f"{h['end']:,}"),
+            Text(f"{h['length']:,}"),
+            Text(f"{h['score']:.3f}", style="red bold" if strong else ""),
+            Text(f"{h['at_fraction'] * 100:.0f}"),
+            Text(f"{h['best_t_fraction'] * 100:.0f}"),
+            Text(g),
+            Text(h.get("tier", ""), style="red bold" if strong else "yellow"),
+        )
+
+    def _set_status(self, markup: str) -> None:
+        try:
+            self.query_one("#reg-status", Static).update(markup)
+        except NoMatches:
+            pass
+
+    def _picked(self) -> "dict | None":
+        try:
+            t = self.query_one("#reg-table", DataTable)
+        except NoMatches:
+            return None
+        if not self._hits:
+            return None
+        row = t.cursor_row
+        if row is None or not (0 <= row < len(self._hits)):
+            return None
+        return self._hits[row]
+
+    # ── handlers ──────────────────────────────────────────────────────────
+    @on(Button.Pressed, "#reg-btn-scan")
+    def _on_scan(self, _) -> None:
+        self._run_scan()
+
+    @on(Select.Changed, "#reg-mode")
+    def _on_mode(self, event) -> None:
+        value = event.value
+        if isinstance(value, str) and value in self._COLUMNS:
+            self._mode = value
+        self._rebuild_columns()
+        self._run_scan()
+
+    @on(Select.Changed, "#reg-filter")
+    def _on_filter(self, _) -> None:
+        self._run_scan()
+
+    @on(Button.Pressed, "#reg-btn-annotate")
+    def _on_annotate(self, _) -> None:
+        h = self._picked()
+        if h is None:
+            self._set_status("[yellow]Pick a row first.[/yellow]")
+            return
+        self.dismiss({"action": "annotate", "kind": self._mode, "hits": [h]})
+
+    @on(Button.Pressed, "#reg-btn-annotate-all")
+    def _on_annotate_all(self, _) -> None:
+        if not self._hits:
+            self._set_status("[yellow]Nothing to annotate.[/yellow]")
+            return
+        if len(self._hits) > self._MAX_ANNOTATE_ALL:
+            # REFUSED, not truncated. A 6 bp motif turns up by chance every
+            # ~2 kb per strand, so the whole catalogue on a 50 kb record is
+            # ~2,100 hits and on a chromosome tens of thousands — and feature
+            # COUNT, not bp, is what makes a record slow to render ([INV-223]).
+            # Silently annotating the first N would leave the user believing
+            # the map shows every hit.
+            self._set_status(
+                f"[yellow]{len(self._hits):,} hits is too many to annotate at "
+                f"once[/yellow] (cap {self._MAX_ANNOTATE_ALL:,}) — a map that "
+                f"dense is unreadable and slow to draw. Narrow the scan with "
+                f"'Informative only', or annotate the rows you want one at a "
+                f"time.")
+            return
+        self.dismiss({"action": "annotate", "kind": self._mode,
+                      "hits": list(self._hits)})
+
+    @on(Button.Pressed, "#reg-btn-close")
     def _on_close(self, _) -> None:
         self.dismiss(None)
 

@@ -271,14 +271,115 @@ class TestKozak:
         assert sa._kozak_context("TTTTTT" + "ATG" + "T", 6)["score"] == 0
         assert sa._kozak_context("TTTCTT" + "ATG" + "C", 6)["score"] == 0
 
-    def test_it_never_claims_to_be_a_trained_matrix(self):
-        """The splice model IS calibrated; this is not, and a caller must be
-        able to tell them apart."""
-        assert "not a trained PWM" in sa._kozak_context("A" * 10, 6)["model"]
+    def test_the_rule_and_the_matrix_each_name_their_own_basis(self):
+        """Both answers ship in one dict and they CAN disagree, so neither may
+        read as "the answer" on its own. `score` / `strength` stay the -3/+4
+        consensus rule; `pwm` is the calibrated matrix. The contract and the
+        matrix itself live in `splicecraft_kozak` (see `tests/test_kozak.py`);
+        what this pins is that the transcript reader surfaces both."""
+        k = sa._kozak_context("AAAAAAGCAACA" + "ATG" + "G", 12)
+        assert "consensus" in k["rule_model"]
+        assert "PWM" in k["model"] and "AUC" in k["model"]
+        assert k["pwm"]["percentile"] > 80
+        assert k["pwm"]["tier"] == "strong"
+        # A context the rule calls adequate and the matrix calls weak.
+        weak = sa._kozak_context("TTTTTTTTTTTT" + "ATG" + "G", 12)
+        assert weak["strength"] == "adequate" and weak["pwm"]["tier"] == "weak"
+
+    def test_the_matrix_abstains_rather_than_scoring_a_partial_window(self):
+        k = sa._kozak_context("AT" + "ATGG", 2)
+        assert k["pwm"]["score"] is None and k["pwm"]["note"]
+        assert k["score"] == 1          # the rule still answers
 
     def test_a_short_leader_is_marked_truncated_not_padded(self):
         k = sa._kozak_context("AT" + "ATGG", 2)
         assert k["truncated"] is True and len(k["context"]) < 10
+
+
+class TestUorfRanking:
+    """`rank` 1 is the upstream ATG a scanning ribosome is most likely to stop
+    at — the ordering the -3/+4 rule structurally cannot produce, since 38% of
+    real starts and 13% of upstream ATGs share its top bucket."""
+
+    def _leader(self, leader):
+        seq = PROM + leader + CDS + TERM
+        p1, p2 = len(PROM), len(PROM) + len(leader)
+        feats = [
+            {"start": 0, "end": p1, "strand": 1, "type": "promoter", "label": "p"},
+            {"start": p2, "end": p2 + len(CDS), "strand": 1, "type": "CDS", "label": "c"},
+            {"start": p2 + len(CDS), "end": len(seq), "strand": 1,
+             "type": "terminator", "label": "t"},
+        ]
+        r = sa._predict_transcript(seq, feats, circular=True)
+        assert r["ok"], r
+        return r
+
+    def test_rank_follows_the_calibrated_score_not_the_position(self):
+        # Three uORFs: a weak context FIRST, a strong one SECOND. Ranking by
+        # position would put them the other way round.
+        r = self._leader("TTTTTTTTTTTT" + "ATGCCCTGA"
+                         + "AAAAAAGCAACA" + "ATGCCCTGA" + "CACACACA")
+        ranked = sorted(r["uorfs"], key=lambda u: u["rank"])
+        assert [u["rank"] for u in ranked] == [1, 2]
+        assert ranked[0]["position"] > ranked[1]["position"]
+        assert (ranked[0]["kozak"]["pwm"]["score"]
+                > ranked[1]["kozak"]["pwm"]["score"])
+
+    def test_the_rule_cannot_order_what_the_matrix_can(self):
+        """Both uORFs here sit in the SAME rule bucket, so the rule is silent
+        and the matrix is not. This is the capability the model adds."""
+        r = self._leader("TTTTTTTTTATT" + "ATGCCCTGA"
+                         + "AAAAAAGCAACA" + "ATGCCCTGA" + "CACACACA")
+        assert len(r["uorfs"]) == 2
+        assert len({u["kozak"]["score"] for u in r["uorfs"]}) == 1
+        assert len({u["rank"] for u in r["uorfs"]}) == 2
+
+    def test_an_atg_too_close_to_the_cap_is_unranked_and_warned_about(self):
+        """A partial window sums fewer log-odds terms, so it cannot be ordered
+        against a full one. The count is warned about rather than left to be
+        inferred from a gap in the numbering."""
+        r = self._leader("ATGCCCTGA" + "CACACACA")
+        u = r["uorfs"][0]
+        assert u["position"] < 12
+        assert u["rank"] is None
+        assert u["kozak"]["pwm"]["score"] is None
+        assert any("cannot be scored" in w for w in r["warnings"]), r["warnings"]
+        # The warning counts them; the CAUSE is per-ATG, because an ambiguous
+        # base in the window produces the same `None` as a short 5' end.
+        assert any("kozak.pwm.note" in w for w in r["warnings"])
+
+    def test_a_scoreable_uorf_is_not_warned_about(self):
+        r = self._leader("AAAAAAGCAACA" + "ATGCCCTGA" + "CACACACA")
+        assert r["uorfs"][0]["rank"] == 1
+        assert not any("cannot score" in w for w in r["warnings"])
+
+
+class TestWeakStartWarning:
+    """A weak context on the CDS ITSELF is the finding worth surfacing: it is
+    fixable by changing the leader. The trigger is anchored on the measured
+    real-start distribution, not picked."""
+
+    def _with_leader(self, leader):
+        seq = PROM + leader + CDS + TERM
+        p1, p2 = len(PROM), len(PROM) + len(leader)
+        feats = [
+            {"start": 0, "end": p1, "strand": 1, "type": "promoter", "label": "p"},
+            {"start": p2, "end": p2 + len(CDS), "strand": 1, "type": "CDS", "label": "c"},
+            {"start": p2 + len(CDS), "end": len(seq), "strand": 1,
+             "type": "terminator", "label": "t"},
+        ]
+        return sa._predict_transcript(seq, feats, circular=True)
+
+    def test_it_fires_on_a_context_poorer_than_real_plant_starts(self):
+        r = self._with_leader("T" * 20)
+        assert r["kozak"]["pwm"]["tier"] == "weak", r["kozak"]["pwm"]
+        assert any("real plant start codons" in w for w in r["warnings"]), \
+            r["warnings"]
+
+    def test_it_stays_quiet_on_a_good_context(self):
+        r = self._with_leader("CACACACAAAAAAAGCAACA")
+        assert r["kozak"]["pwm"]["tier"] != "weak"
+        assert not any("real plant start" in w for w in r["warnings"])
 
 
 class TestUorfClassification:
@@ -545,3 +646,289 @@ class TestIncludeSequences:
     def test_on_by_default(self):
         r = sc._h_predict_transcript(_App(_record()), {})
         assert r["mature_mrna"] and r["pre_mrna"]
+
+
+# ── A longer unit, for the premature-3'-end scan ───────────────────────────
+# The default fixture's mature message is under the 160 nt scoring window in
+# places and its hand-typed "CDS" is AT-rich, which trips the scanner for the
+# wrong reason. This one is built from the GenBank-verified preset catalogue
+# instead: EGFP (720 bp, 62% GC — scores no 3'-end regions on its own) and the
+# NOS terminator (266 bp, 36% GC — scores one), which is what a real plant
+# cassette actually looks like.
+import splicecraft_presets as _presets
+
+
+def _preset_seq(name: str) -> str:
+    for f in _presets._preset_features():
+        if f["name"] == name:
+            return f["sequence"]
+    raise AssertionError(f"preset {name!r} missing")
+
+
+_L_PROM = _preset_seq("CaMV 35S promoter")
+_L_LEAD1 = "CGCCGCCACCGCCGCCACCGCCGCCACCGCCGCCACC"        # GC-rich, no ATG
+# A plant intron: GT..AG, long, and AT/U-rich — which is exactly what the
+# 3'-end score keys on. A PRE-mRNA scan would flag this; the mature one
+# must not.
+_L_INTRON = ("GT" + ("AAGTTTCTTCTTATCTTCTTTTTCTTTCTTTCTT"
+                     "ATTTATTTATTTTTATTCTTTTCTTTCTTATCT" * 4) + "AG")
+_L_LEAD2 = "CCACCGCCACC"
+_L_CDS = _preset_seq("EGFP")                             # ends in TAA
+# In-frame, stop-free and 100% AT — 30 codons of Asn-Leu, a stretch of CDS
+# that reads like the end of a message.
+_L_CDS_ATRICH = "AATTTA" * 30
+_L_TERM = _preset_seq("NOS terminator")
+
+
+def _long_unit(*, at_in_cds: bool = False):
+    """``(seq, feats)`` for the long cassette, optionally with an AT-rich
+    block spliced into the middle of the CDS, in frame."""
+    cds = _L_CDS
+    if at_in_cds:
+        cut = 300                                        # a codon boundary
+        cds = cds[:cut] + _L_CDS_ATRICH + cds[cut:]
+    seq = _L_PROM + _L_LEAD1 + _L_INTRON + _L_LEAD2 + cds + _L_TERM
+    p1 = len(_L_PROM)
+    p2 = p1 + len(_L_LEAD1)
+    p3 = p2 + len(_L_INTRON)
+    p4 = p3 + len(_L_LEAD2)
+    p5 = p4 + len(cds)
+    feats = [
+        {"start": 0, "end": p1, "strand": 1, "type": "promoter", "label": "35S"},
+        {"start": p2, "end": p3, "strand": 1, "type": "intron", "label": "leader intron"},
+        {"start": p4, "end": p5, "strand": 1, "type": "CDS", "label": "EGFP"},
+        {"start": p5, "end": p5 + len(_L_TERM), "strand": 1,
+         "type": "terminator", "label": "NOS"},
+    ]
+    return seq, feats
+
+
+def _predict_long(*, at_in_cds: bool = False, **kw):
+    seq, feats = _long_unit(at_in_cds=at_in_cds)
+    r = sa._predict_transcript(seq, feats, circular=True, **kw)
+    assert r["ok"], r
+    return r
+
+
+def _short_unit():
+    """A cassette whose mature message is under the 160 nt scoring window."""
+    prom, cds, term = _L_PROM, "ATG" + "GCT" * 20 + "TAA", "GCGC" * 10
+    seq = prom + cds + term
+    feats = [
+        {"start": 0, "end": len(prom), "strand": 1, "type": "promoter", "label": "p"},
+        {"start": len(prom), "end": len(prom) + len(cds), "strand": 1,
+         "type": "CDS", "label": "tiny"},
+        {"start": len(prom) + len(cds), "end": len(seq), "strand": 1,
+         "type": "terminator", "label": "t"},
+    ]
+    return seq, feats
+
+
+class TestPrematureThreePrimeEnd:
+    """A stretch of the message that a plant reads as the END of it.
+
+    The protein is never finished and the DNA sequences perfectly — the same
+    silent failure mode the cryptic-splice advisory exists for."""
+
+    def test_the_three_utr_is_not_reported_as_premature(self):
+        """The terminator is SUPPOSED to look like a message end.
+
+        Flagging it would bury every real hit under one that is working as
+        designed, on every correctly-built cassette."""
+        r = _predict_long()
+        tp = r["three_prime"]
+        assert tp["skipped"] is False
+        assert tp["n_regions"] >= 1, "the AT-rich NOS terminator should score"
+        assert tp["n_premature"] == 0, (
+            f"a 3'UTR hit is the terminator doing its job: {tp['premature']}")
+        assert not any("3' end" in w for w in r["warnings"])
+
+    def test_an_at_rich_block_inside_the_cds_is_flagged(self):
+        r = _predict_long(at_in_cds=True)
+        tp = r["three_prime"]
+        assert tp["n_premature"] >= 1, tp
+        cds_end = r["cds"]["end"]
+        assert all(x["start"] < cds_end for x in tp["premature"])
+        assert any("upstream of the stop codon" in w for w in r["warnings"])
+
+    def test_an_at_rich_intron_is_not_flagged(self):
+        """THE design decision, asserted rather than assumed.
+
+        Plant introns are AT- and U-rich — exactly what the 3'-end score keys
+        on — so scanning the PRE-mRNA would report every intron as a hazard.
+        This proves the mature message is what gets scanned, by showing the
+        pre-mRNA scan WOULD have fired on the intron."""
+        from splicecraft_regulettuce import _scan_3prime_risk
+        r = _predict_long()
+        pre_hits = _scan_3prime_risk(r["pre_mrna"], circular=False,
+                                     both_strands=False)
+        intron = r["introns"][0]
+        in_intron = [h for h in pre_hits
+                     if h["start"] < intron["end"]
+                     and h["end"] > intron["start"]]
+        assert in_intron, (
+            "fixture is not exercising the trap — the intron must be AT-rich "
+            "enough that a pre-mRNA scan would flag it")
+        assert r["three_prime"]["n_premature"] == 0, (
+            "the intron was flagged, so the scan is reading the pre-mRNA")
+
+    def test_a_message_shorter_than_the_window_says_so(self):
+        """Not checked must never read as clean."""
+        seq, feats = _short_unit()
+        r = sa._predict_transcript(seq, feats, circular=True)
+        assert r["ok"], r
+        tp = r["three_prime"]
+        assert tp["skipped"] is True
+        assert "shorter than" in tp["reason"]
+        assert "160" in tp["reason"]
+
+    def test_it_can_be_turned_off(self):
+        r = _predict_long(check_three_prime=False)
+        assert r["three_prime"]["skipped"] is True
+        assert r["three_prime"]["reason"] == "not requested"
+
+    def test_a_failing_scan_reads_as_not_checked(self, monkeypatch):
+        import splicecraft_regulettuce as rl
+
+        def _boom(*a, **k):
+            raise ValueError("scanner exploded")
+        monkeypatch.setattr(rl, "_scan_3prime_risk", _boom)
+        r = _predict_long()
+        assert r["three_prime"]["skipped"] is True
+        assert "exploded" in r["three_prime"]["reason"]
+        assert any("SKIPPED" in w for w in r["warnings"])
+
+    def test_the_scan_is_single_stranded(self):
+        """An mRNA is read one way, so a 3'-end-like composition on the
+        complement is not a hazard — the rule `_splice_scan` already
+        applies."""
+        from splicecraft_regulettuce import _scan_3prime_risk
+        r = _predict_long(at_in_cds=True)
+        one = _scan_3prime_risk(r["mature_mrna"], circular=False,
+                                both_strands=False)
+        got = {(h["start"], h["length"]) for h in r["three_prime"]["regions"]}
+        assert got == {(h["start"], h["length"]) for h in one}, (
+            "the transcript scan must use the single-strand result")
+
+
+class TestThreePrimeEndpoint:
+    def test_endpoint_passes_the_flag_through(self):
+        app = _App(_record())
+        on = sc._state._AGENT_HANDLERS["predict-transcript"][0](app, {})
+        off = sc._state._AGENT_HANDLERS["predict-transcript"][0](
+            app, {"check_three_prime": False})
+        for res in (on, off):
+            assert not isinstance(res, tuple), res
+        assert off["three_prime"]["skipped"] is True
+        assert off["three_prime"]["reason"] == "not requested"
+        assert "three_prime" in on
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  The initiation-model endpoints
+# ══════════════════════════════════════════════════════════════════════════
+
+def _call(name, payload, app=None):
+    return sc._state._AGENT_HANDLERS[name][0](app, payload)
+
+
+class TestInitiationEndpoints:
+    def test_both_are_registered_read_only(self):
+        """A `write=True` endpoint is refused outright by a `--read-only`
+        attach, which is how the GUI-is-open case is served."""
+        for name in ("score-initiation-context", "initiation-model"):
+            entry = sc._state._AGENT_HANDLERS.get(name)
+            assert entry is not None, f"{name} not registered"
+            assert entry[1] is False, f"{name} is registered as a write"
+
+    def test_the_model_endpoint_publishes_its_refusals(self):
+        m = _call("initiation-model", {})["model"]
+        assert m["trained"] is True and m["window"] == "-12..+4"
+        assert m["auc_vs_utr_uatg"] > m["rule_auc_vs_utr_uatg"]
+        assert set(m["refused"]) >= {"efficiency_rate", "partial_windows",
+                                     "window_past_plus4"}
+
+    def test_scoring_defaults_to_the_first_atg_and_ranks_the_rest(self):
+        seq = ("AAAAAAGCAACA" + "ATGGCT"          # strong context, pos 12
+               + "TTTTTTTTTTTT" + "ATGCCC")       # weak context, pos 30
+        r = _call("score-initiation-context", {"sequence": seq})
+        assert r["position"] == 12 and r["codon"] == "ATG"
+        assert r["n_atgs"] == 2
+        strong = next(a for a in r["atgs"] if a["position"] == 12)
+        weak = next(a for a in r["atgs"] if a["position"] == 30)
+        assert (strong["rank"], weak["rank"]) == (1, 2)
+        assert strong["percentile"] > weak["percentile"]
+        assert r["context"]["pwm"]["tier"] == "strong"
+
+    def test_a_position_without_an_atg_answers_rather_than_refusing(self):
+        """The caller asked about an offset; the honest answer names the codon
+        that is actually there instead of a 400 that hides it."""
+        r = _call("score-initiation-context",
+                  {"sequence": "A" * 12 + "CTGG" + "ATGG", "position": 12})
+        assert r["codon"] == "CTG"
+        assert r["context"]["pwm"]["score"] is None
+        assert "no ATG" in r["context"]["pwm"]["note"]
+
+    def test_an_atg_too_close_to_the_five_prime_end_is_unranked(self):
+        r = _call("score-initiation-context", {"sequence": "AT" + "ATGGCCGGC"})
+        row = r["atgs"][0]
+        assert row["rank"] is None and row["pwm_score"] is None
+        assert str(sa._KOZAK_UP) in row["note"]
+
+    @pytest.mark.parametrize("payload,frag", [
+        ({}, "sequence"),
+        ({"sequence": "ATG"}, "at least 4"),
+        ({"sequence": "ATGGZZ"}, "non-IUPAC"),
+        ({"sequence": "CCCCCCCC"}, "no ATG"),
+        ({"sequence": "ATGGCC", "position": 99}, "'position' must be"),
+        ({"sequence": "ATGGCC", "position": -1}, "'position' must be"),
+    ])
+    def test_malformed_input_is_refused_with_a_reason(self, payload, frag):
+        res = _call("score-initiation-context", payload)
+        assert isinstance(res, tuple) and res[1] == 400, res
+        assert frag in res[0]["error"], res[0]["error"]
+
+    def test_the_atg_list_is_capped_and_says_so(self):
+        r = _call("score-initiation-context",
+                  {"sequence": "ATGGCC" * 50, "limit": 10})
+        assert len(r["atgs"]) == 10 and r["n_atgs"] == 50
+        assert "rank` orders only those" in r["truncated"]
+
+
+class TestStartCodonIsAlwaysInTheMessage:
+    """`_predict_transcript` reads the Kozak context, the translation and
+    every uORF frame off `mature[cds_start_m:]`.
+
+    If `cds_start_m` could ever equal `len(mature)` — which is what
+    `_mature_pos` returns for a pre-mRNA offset at or past the transcript's
+    end — all three would be describing the bases at the far END of the
+    message as though they were the start codon, and the old `_kozak_context`
+    quietly obliged by reading `minus3` from there. The guard that refuses
+    that leans entirely on `_tx_map_span` never handing back a start at or
+    past `pre_len`, so THAT is what gets fuzzed here: the property, not the
+    branch it protects."""
+
+    def test_tx_map_span_never_starts_at_or_past_the_unit_end(self):
+        import itertools
+        rng = range(-3, 9)
+        for gs, ge, a, pre_len, strand, circ in itertools.product(
+                rng, rng, (0, 2, 5), (0, 1, 4, 8), (1, -1), (True, False)):
+            got = sa._tx_map_span(gs, ge, a, 8, strand, pre_len,
+                                  circular=circ)
+            if got is None:
+                continue
+            s, e = got
+            assert 0 <= s < pre_len, (gs, ge, a, pre_len, strand, circ, got)
+            assert s < e <= pre_len, (gs, ge, a, pre_len, strand, circ, got)
+
+    def test_the_cds_start_always_indexes_into_the_mature_message(self):
+        """Same claim, through the real function on every rotation: the start
+        codon the result reports must be a base the message actually has."""
+        for k in (0, 1, 37, len(SEQ) // 2, len(SEQ) - 1):
+            seq, feats = _rotate(SEQ, FEATS, k)
+            r = sa._predict_transcript(seq, feats, circular=True)
+            assert r["ok"], (k, r)
+            mature = r["mature_mrna"]
+            start = r["cds"]["start"]
+            assert 0 <= start < len(mature)
+            assert mature[start:start + 3] == "ATG", k

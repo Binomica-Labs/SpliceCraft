@@ -136,6 +136,12 @@ _MODAL_CASES = [
     ("CrisprGuideModal",           lambda: sc.CrisprGuideModal(
                                                "ACGTACGTAGGT" * 40,
                                                circular=True, label="pTest")),
+    ("RegulettuceModal",           lambda: sc.RegulettuceModal(
+                                               "ACGTACGTAGGT" * 40,
+                                               circular=True, label="pTest",
+                                               anchors=[{"position": 100,
+                                                         "strand": 1,
+                                                         "label": "CDS"}])),
     ("ReadConsensusModal",         lambda: sc.ReadConsensusModal(
                                                {"verdict": "confirmed",
                                                 "n_reads": 2, "total_bp": 3000,

@@ -1431,9 +1431,13 @@ class TestABulkImportFlushCannotLoseAPrimer:
         src = tmp_path / "dna_in"
         src.mkdir()
         here = Path(__file__).resolve().parent
-        fixtures = [here / "FFE 1 ENTRY UPD.dna",
-                    here.parent / "AB303066.dna"]
-        present = [f for f in fixtures if f.exists()]
+        # DISCOVERED, not named: any `.dna` will do — the test is about the
+        # import loop holding the cache lock, not about a particular file.
+        # Naming one put a plasmid name from the maintainer's own library into
+        # a repo that is pushed PUBLICLY (release.py's derived-name gate caught
+        # it, [INV-228]), and a glob cannot leak one.
+        present = sorted(here.glob("*.dna"))[:1] + \
+            sorted(here.parent.glob("*.dna"))[:1]
         if not present:
             pytest.skip(".dna fixtures not present")
         for f in present:

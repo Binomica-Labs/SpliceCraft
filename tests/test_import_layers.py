@@ -49,12 +49,18 @@ _LAYER_RULES = [
     ("splicecraft_mapimage", 1),    # circular plasmid-map image export (SVG + PNG); imports biology/util/logging L0
     ("splicecraft_splice", 0),      # plant splice-site PWM scoring; imports logging L0 only
     ("splicecraft_splice_model", 0),  # generated PWM data, no imports (longest-prefix wins over _splice)
+    ("splicecraft_kozak", 0),       # plant initiation-context PWM scoring; imports logging L0 only
+    ("splicecraft_kozak_model", 0),  # generated PWM + quantiles, no imports (longest prefix wins)
     ("splicecraft_cassette", 3),    # eukaryotic expression-cassette assembler; imports biology L0 + dataaccess L1
     ("splicecraft_presets", 0),  # curated built-in feature presets: pure data, stdlib only
     ("splicecraft_crispr", 1),      # CRISPR guide design: PAM scan + triage +
                                    # off-target + cloning oligos; imports biology/logging L0
     ("splicecraft_regulatory", 1),  # sigma-70 promoter + intrinsic terminator
                                    # scanners; imports biology/logging L0
+    ("splicecraft_regulettuce", 1),  # plant cis-element catalogue + anchored
+                                   # TATA + 3'-end-like regions; imports
+                                   # biology/logging L0 + regulatory L1
+                                   # (same layer, no cycle)
     ("splicecraft_cli_parser", 0),
     ("splicecraft_biology", 0),
     ("splicecraft_cli", 0),        # stdlib-only sidecar (standalone client)

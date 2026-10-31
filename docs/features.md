@@ -502,6 +502,104 @@ quality**, defaulting to Phred 20 (one wrong base in a hundred, the
 Sanger convention); set it to 0 to trust every base equally and see
 every mismatch as real.
 
+## Regulettuce — plant cis-regulatory annotation
+
+**Regulettuce** on the menu (or `Alt+Shift+L`) reads whatever plasmid you have
+open the way a plant would, and it is unusually frank about what it cannot
+tell you. Three scans, switched with the dropdown:
+
+**Cis-elements** finds the curated plant regulatory elements — ABRE, G-box,
+DRE/CRT, W-box, GCC-box, GARE, the light-responsive set, the seed and
+circadian elements and two dozen more — and shows, next to every hit, how
+often that element turns up in DNA that is *not* a promoter. That column is
+the point. The classic tools will happily tell you your promoter contains a
+GT1-motif; this one tells you GT1-motif is in 94.8% of random 400 bp windows,
+so finding one means nothing. Each element is labelled **enriched**,
+**weak**, **uninformative**, **ubiquitous** or **depleted** from measurements
+over 3,089 verified plant transcription starts against a
+composition-matched genomic background, and the status line reports how many
+hits chance alone explains on *your* sequence's base composition. Switch the
+filter to "Whole catalogue" to see the ones chance accounts for.
+
+A hit is a sequence match, not a promise that the factor binds — occupancy
+depends on chromatin and tissue, which a string does not carry. The notes
+written into the GenBank file say so too, so the caveat survives the export.
+
+**TATA boxes** are measured against a start site, not hunted across the
+plasmid. `TATAWA` turns up once every 429 bp in real plant DNA, so an
+unanchored scan on a 10 kb plasmid finds about 47 of them and means nothing
+by it; position is the whole signal. Regulettuce takes the start sites from
+your record's own CDS and gene features (or type a bp), and reports each hit's
+offset from the nearest one — flagging the ones inside −40..−31, where hits
+against verified plant transcription starts actually pile up. If there is no
+annotated start to measure from, it says so instead of showing you an empty
+table, because an empty table reads as "no TATA boxes" when the truth is "not
+asked".
+
+**3'-end risk** answers the question that costs people a month: *is there a
+stretch of this construct that a plant will treat as the end of the message?*
+A cryptic 3' end inside a transgene truncates the transcript — the protein
+disappears and the DNA sequences perfectly. It flags regions, with the AT
+fraction and the T-rich window that drove the score shown beside it. It does
+**not** mark a cleavage site, and that is a finding rather than a gap: a
+position-specific model trained on 600 real plant poly(A) sites located them
+*worse than chance*, so there is no arrow to draw. Drawing one anyway would be
+the most useful-looking wrong answer in the program.
+
+Any row (or everything shown) can be annotated onto the map in one step, and
+one `Ctrl+Z` takes all of it back off. Above 250 rows "Annotate all shown"
+declines rather than annotating a fraction of them: a 6 bp element occurs by
+chance every 2 kb per strand, so the whole catalogue on a 50 kb plasmid is
+thousands of chance hits, and a map that dense is unreadable. Narrow it with
+the "Informative only" filter, or annotate the rows you want one at a time.
+
+Typing an anchor bp that is not on the molecule is refused with the range that
+would work, rather than quietly wrapping it round to a different base.
+
+What Regulettuce deliberately does not offer: a plant promoter strength score
+(the best composite reached AUC 0.646 — at a usable background rate it caught
+5% of real promoters), a poly(A) site call, and a Y-patch scan (the
+"plant-specific" pyrimidine patch turned out 1.05× enriched over background,
+which is no signal at all). The agent endpoint `regulettuce-calibration`
+returns every one of those numbers if you want to check the working.
+
+## What the ribosome sees — mature message, uORFs, initiation context
+
+Reconstructs the MATURE mRNA of an annotated transcription unit and scores
+translation initiation on it (`predict-transcript`; no GUI — this one is
+driven from outside). Introns come from **annotation only** — `intron`
+features, or the gaps between a spliced location's parts — never from de-novo
+prediction.
+
+The field worth reading first is `removed_by_splicing`: every upstream ATG
+that is in the DNA and is **not** in the message, with the intron that deletes
+it. A uATG screen run against the plasmid sequence reports each of those as a
+hazard, and no ribosome ever meets them.
+
+The upstream ATGs that *do* survive come back **ranked** — `rank: 1` is the
+one most likely to capture a scanning ribosome and starve the real start
+codon. Ranking uses a plant initiation matrix trained against the upstream
+ATGs it has to compete with (`-12..+4`, measured on 2,526 genes from 7 plant
+species, held out by gene): it puts a real plant start above a competing
+upstream ATG 77% of the time, against 71% for the `-3` purine / `+4` G
+consensus rule, and — the part that matters — it still orders ATGs *inside*
+that rule's top bucket, where 38% of real plant starts and 13% of upstream
+ATGs sit together. Scores read as a percentile against real plant start
+codons, and a CDS whose own start context is poorer than 95% of real plant
+starts is called out in `warnings`, because that one is fixable by changing
+the leader.
+
+The rule is still reported beside the matrix, each labelled with what produced
+it — they can disagree, and a poly-T leader with a `+4` G is the case where
+they do. `initiation-model` returns everything the numbers are calibrated
+against, including the three things the model refuses to do: no initiation
+rate, no window past `+4` (extending it scores better by reading
+coding-vs-UTR base composition, which says nothing about initiation), and no
+score at all for an ATG too close to the 5' end — `null` with a reason, never
+a `0.0` that would read as "neutral". `score-initiation-context` does the same
+for a bare leader you are designing. A separate advisory flags cryptic splice
+sites in the pre-mRNA and a premature 3' end in the message.
+
 ## CRISPR guides
 
 **CRISPR** on the menu (or `Alt+G`) scans whatever plasmid you have open for
@@ -824,7 +922,7 @@ details. In short:
 
 - **Agent API** (`splicecraft --agent`) exposes a localhost JSON API
   with bearer-token auth, covering every GUI action external AI
-  agents need. ~269 endpoints; symlink-guarded write paths;
+  agents need. ~298 endpoints; symlink-guarded write paths;
   length/range/shape validation at the boundary.
 - **`splicecraft-cli`** — stdlib-only sidecar (~50 ms cold start)
   that reads connection details from the running session's token

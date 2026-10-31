@@ -1,6 +1,6 @@
 # The endpoint surface, organised by job
 
-291 endpoints as of SpliceCraft 1.3.11. **`splicecraft-cli tools --json` is
+298 endpoints as of SpliceCraft 1.3.11. **`splicecraft-cli tools --json` is
 always authoritative** — this file helps you find the right name and warns you
 about the sharp edges; the endpoint's own `doc_full` is the contract.
 
@@ -321,6 +321,7 @@ shifts, every feature keeps its coordinates, and it's undoable.
 
 `blast` `blast-online` `hmmscan` `hmmer-web` `multi-align` `diff-plasmid`
 `find-orfs` `map-transcription` `predict-transcript` `scan-promoters`
+`score-initiation-context` `initiation-model`
 `scan-terminators` `rbs-strength` `design-rbs` `assemble-operon` `fold-rna`
 `cofold-rna`
 `add-hmm-database` `get-hmm-database` `list-hmm-databases`
@@ -341,6 +342,18 @@ shifts, every feature keeps its coordinates, and it's undoable.
   separating real uORFs from ATGs `removed_by_splicing`. Introns come from
   **annotation only**; an unavailable model reports `skipped`, never an empty
   list that would read as clean.
+- `kozak.pwm` is the calibrated answer; `kozak.score`/`strength` is the -3/+4
+  consensus RULE kept beside it. Prefer `pwm.percentile` ("stronger than N% of
+  real plant start codons") — the rule puts 38% of real starts and 13% of
+  upstream ATGs in one bucket and cannot order them. uORFs carry `rank` 1 for
+  the strongest context; `rank: null` means the ATG sits closer than 12 nt to
+  the 5' end, where a partial window is not comparable. `pwm.score: null` is
+  never 0.0 standing in for "no answer" — 0.0 means "as likely a start as an
+  upstream ATG".
+- `score-initiation-context` does the same for a bare message or a leader you
+  are designing; `initiation-model` returns what it is calibrated against,
+  including the three things it **refuses** (no initiation rate, no window past
+  +4, no partial windows).
 - `scan-promoters`: `score` **ranks, it does not predict** — no trained model,
   not a transcription rate. `rbs-strength`'s `rel_strength` is relative-only.
 - `scan-terminators`: one record per hairpin (a scan reporting every register
@@ -348,6 +361,43 @@ shifts, every feature keeps its coordinates, and it's undoable.
 - `design-rbs` runs ~80 fold/cofold evaluations and blocks for a few seconds.
 - `diff-plasmid` is rotation- and RC-aware and reports `inverted_segments`;
   `multi-align` is the batch form (≤20 targets).
+
+## Plant cis-regulatory annotation (Regulettuce)
+
+`list-cis-elements` `scan-cis-elements` `scan-tata-boxes` `scan-3prime-risk`
+`regulettuce-calibration`
+
+- **Read `informativeness` before reporting a cis-element hit, and report
+  `summary` beside `hits`.** Each catalogue row carries its measured
+  `promoter_rate` (of 3,089 verified plant promoters) against `null_rate` (of
+  12,000 composition-matched genomic windows). `ubiquitous` means 80%+ of random
+  DNA — `GT1-motif` is in 94.8% of random 400 bp windows, so a promoter carrying
+  one is not evidence of anything; `depleted` means real promoters avoid it.
+  Only `enriched` and `weak` belong in a finding. `summary` gives `observed` vs
+  `expected` on the queried sequence's own base composition, because a 6 bp
+  motif occurs by chance every ~2 kb per strand. A hit is sequence, never
+  measured occupancy.
+- `strand: 0` means the same bases read as the element either way (palindromic
+  consensus) — one duplex, one record, not two hits.
+- `scan-tata-boxes` **requires `anchors` and 400s without them.** `TATAWA` is 1
+  per 429 bp of real plant DNA (~47 chance hits on a 10 kb plasmid read both
+  ways); position is the entire signal, peaking at −40..−31 (3.17×). `offset` is
+  in the anchor's frame, so a reverse-strand anchor's upstream hits sit at
+  HIGHER forward coordinates and still report a negative offset. No score. An
+  anchor off a LINEAR molecule 400s rather than wrapping to a base that exists;
+  on a circle it wraps, which is correct there.
+- `scan-3prime-risk` reports a REGION. **Never report a predicted poly(A)
+  position from it** — the response says `predicts_cleavage_site: false`,
+  because a position-specific model on 600 real plant poly(A) sites located them
+  BELOW chance (±20 nt in 27.2% vs 29.1% expected). AUC 0.895 vs CODING
+  sequence, 0.575 vs plant genomic: the claim is "unlike coding sequence", not
+  "unlike plant DNA", so a hit in a backbone means much less than one in a CDS
+  being designed.
+- `regulettuce-calibration` returns `not_modelled`: the three models built,
+  measured and refused (the poly(A) position; a plant promoter caller at AUC
+  0.646, 5.0% sensitivity at a usable background; the Y-patch at 1.05×). Call it
+  before quoting any score here. Reporting a plant promoter strength from this
+  subsystem would be reporting something it measured itself unable to do.
 
 ## CRISPR
 

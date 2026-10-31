@@ -535,7 +535,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   `exons` and `introns` between them (with donor/acceptor and a `canonical`
   GT–AG flag), `five_utr` / `cds` / `three_utr`, the `kozak` context, and
   `uorfs` classified `upstream` / `in_frame_extension` /
-  `out_of_frame_overlap`. **The field to read is `removed_by_splicing`:**
+  `out_of_frame_overlap`, each with a `rank` — 1 is the upstream ATG most
+  likely to capture a scanning ribosome, by the calibrated plant initiation
+  matrix (`initiation-model`). `rank` is `null` for an ATG sitting closer than
+  the matrix's 12 nt window to the 5' end: a partial window sums fewer
+  log-odds terms, so ordering it against a full one would compare numbers that
+  do not mean the same thing, and the count is warned about rather than left
+  to be inferred from a gap in the numbering. Inside `kozak`, `score` /
+  `strength` remain the -3 purine / +4 G consensus RULE and `pwm` is the
+  trained matrix's answer — prefer `pwm.percentile`, which reads "a stronger
+  context than N% of real plant start codons". **The field to read is `removed_by_splicing`:**
   every upstream ATG that is in the DNA and is NOT in the message, with the
   intron that deletes it — the false positives a uATG screen run against the
   plasmid sequence reports as hazards. Introns come from ANNOTATION only
@@ -544,7 +553,17 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   ADVISORY scan of the pre-mRNA with the calibrated plant PWM, marking sites
   that coincide with an annotated boundary so only genuinely cryptic ones are
   listed — and reporting `skipped` with a reason if the model is unavailable,
-  never an empty list that would read as clean. `include_sequences: false`
+  never an empty list that would read as clean. `three_prime` is the matching
+  advisory for the other end: regions of the message that read like a plant
+  3' end, where the transcript could be cut and polyadenylated before the
+  protein is finished. **Read `premature`, not `regions`** — a hit in the
+  3'UTR is the terminator doing its job and is deliberately not warned about;
+  only a region reaching the 5'UTR or the CDS can truncate the protein. It
+  scans the MATURE message on one strand: plant introns are themselves AT- and
+  U-rich, so scanning the pre-mRNA would flag every one of them, and an mRNA
+  is read one way. A message under the 160 nt window reports `skipped` with
+  the reason rather than an empty list. Turn it off with
+  `check_three_prime: false`. `include_sequences: false`
   drops `pre_mrna` / `mature_mrna` / the UTR sequences and keeps the
   coordinates and verdicts, for a screening loop over a whole collection.
 - **Regulatory elements** — `scan-promoters` finds sigma-70 (-35 / spacer /
@@ -569,6 +588,62 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   search limits: a floor above them could only ever return zero hits, and
   "0 terminators" reads as "this construct has none" rather than "that filter
   excluded every candidate", so it is refused with a 400.
+- **Plant cis-regulatory elements (Regulettuce)** — `list-cis-elements` is the
+  curated catalogue and `scan-cis-elements` finds its members on
+  `{sequence | id | name}`, wrap-aware with FORWARD-strand coordinates for hits
+  on either strand. **Read `informativeness` before reporting a hit, and
+  always report `summary` beside `hits`.** Every catalogue row carries the
+  fraction of 3,089 verified plant promoters that contain it (`promoter_rate`)
+  against 12,000 composition-matched genomic windows (`null_rate`) and their
+  `enrichment`; `ubiquitous` means the element is in 80%+ of random DNA —
+  `GT1-motif` is in 94.8% of random 400 bp windows, so a promoter carrying one
+  is not evidence of anything — and `depleted` means real promoters avoid it.
+  Only `enriched` and `weak` belong in a finding. `summary` gives `observed`
+  against `expected` on the queried sequence's own base composition, because a
+  6 bp motif occurs by chance about every 2 kb per strand and a bare hit list
+  reads as a discovery when it is arithmetic. A hit is a statement about the
+  sequence, never a prediction that the factor binds. `strand` is `1`, `-1`,
+  or **`0`** when the same bases read as the element either way (any
+  palindromic consensus) — one duplex, one record.
+- **Plant TATA boxes** — `scan-tata-boxes` needs `anchors`, a list of start
+  sites (an integer bp, or `{position, strand, label}`), and **refuses to run
+  without them with a 400.** That is deliberate: `TATAWA` occurs once per
+  429 bp of real plant genomic DNA, so chance alone puts ~47 of them on a 10 kb
+  plasmid read on both strands. Position is the entire signal — against 3,089
+  verified plant transcription starts the hits peak in −40..−31, 3.17× over the
+  null — and without an anchor there is nothing to measure an offset from.
+  `offset` is in the anchor's frame (negative = upstream), so a reverse-strand
+  anchor's upstream hits lie at HIGHER forward coordinates and still report a
+  negative offset. There is no score: the measurement supports a positional
+  claim, not a promoter strength. An anchor outside a **linear** molecule is a
+  400: `% length` is the coordinate system of a circle and nothing else, and
+  wrapping bp 99,999 of a 1,206 bp linear sequence to bp 640 would report an
+  offset from a base the molecule has not got. On a circular one it still
+  wraps, because there bp 0 and bp *length* are the same base.
+- **Plant 3'-end risk** — `scan-3prime-risk` finds regions whose composition
+  reads like a plant 3'-end / terminator region, answering *is there a stretch
+  of this construct a plant would treat as the end of the message?* A cryptic
+  3' end inside a transgene truncates the transcript while the DNA sequences
+  perfectly. AUC 0.895 against coding sequence, 0.575 against plant genomic
+  DNA — so the honest claim is "this does not look like CODING sequence", not
+  "this does not look like plant DNA", and a hit inside a backbone means much
+  less than one inside a CDS you are designing. **There is no cleavage-site
+  field, and the response says so (`predicts_cleavage_site: false`).** A
+  position-specific model trained on 600 real plant poly(A) sites located them
+  BELOW chance (argmax within ±20 nt in 27.2% of held-out regions against
+  29.1% expected at random), so do not report a predicted poly(A) position
+  from this endpoint — report the region. Boundaries are quantised to `step`;
+  pass `step=1` for base resolution. The scan caps on work:
+  `(length / step) * window` must be ≤ 50,000,000.
+- **What Regulettuce refuses** — `regulettuce-calibration` returns the
+  reference sets and their sizes, the thresholds with their sensitivity and
+  false-positive rates, and `not_modelled`: the three models that were built,
+  measured and refused, each with the number that killed it (the poly(A)
+  position above; a plant promoter caller at AUC 0.646 with 5.0% sensitivity
+  at a usable background; the Y-patch at 1.05× enrichment). Call it before
+  quoting any score from the three scans above. An annotator's refusals are as
+  informative as its findings, and reporting a plant promoter strength from
+  this subsystem would be reporting something it measured itself unable to do.
 - **Transcription mapping** — `map-transcription` walks the circle from every
   promoter to every CDS and answers **what ELSE transcribes this gene**. Body
   `{id? | name?, include_predicted?=true, min_promoter_score?, max_distance?}`;

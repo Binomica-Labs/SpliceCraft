@@ -1387,6 +1387,28 @@ _LIBRARY_LEAK_STOPWORDS = {
     # "Cauliflower mosaic virus 35S promoter" IS the name of the virus, and
     # HindIII IS the end of the pUC19 polylinker.
     "cauliflower", "constitutive", "hindiii", "inducible", "mosaic",
+    # 2026-10-31 ([INV-228]), same situation and same remedy, user-approved:
+    # eleven more ride-along tokens, each ordinary vocabulary this codebase
+    # cannot write around. `reference` and `annotation` alone fired 93 times
+    # across one release's prose and code comments, and a plasmid-ANNOTATION
+    # tool that may not write "annotation" is not a workable constraint;
+    # `alpha1` / `omega1` are the standard GoldenBraid cycle-position vector
+    # names and `nanopore` a sequencing platform. The five plant terms name
+    # the PUBLIC NCBI reference sets behind `splicecraft_regulettuce` and
+    # `splicecraft_kozak`'s measurements ([INV-226] / [INV-227]) — and
+    # `scripts/calibrate_*.py` has to query NCBI for those organisms anyway,
+    # so scrubbing the prose could only make the provenance unverifiable, not
+    # remove the identity. (Contrast the 2026-07-27 clade scrub above, where
+    # the clade list WAS the maintainer's own organism set.)
+    #
+    # Vetted the way the 2026-09-15 batch was, with a read-only script that
+    # prints verdicts and never a name: each appears in 1-2 library names, and
+    # the 4 names that would have lost their last distinctive 6+ char token to
+    # them are now guarded by whole-name regexes in the curated
+    # `.private-names` gate — stronger protection than the single tokens they
+    # replace, and each verified absent from the tracked tree first.
+    "annotation", "alpha1", "arabidopsis", "monocot", "nanopore", "nicotiana",
+    "omega1", "reference", "sample", "tabacum", "thaliana",
     "chloroplast", "chromosome", "circular", "cloning", "complete", "construct",
     "control", "default", "deleted", "digest", "domesticated", "downstream",
     "empty", "escherichia", "exonuclease", "flanks", "forward", "fragment",

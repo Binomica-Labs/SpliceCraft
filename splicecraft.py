@@ -43,13 +43,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.3.11"
+__version__ = "1.3.12"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-10-16"
+_RELEASE_DATE = "2026-10-31"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -1256,6 +1256,7 @@ from textual.worker import Worker, WorkerState  # noqa: E402
 from splicecraft_modals import (  # noqa: E402
     _OneShotDismissScreen as _OneShotDismissScreen,
     CrisprGuideModal as CrisprGuideModal,
+    RegulettuceModal as RegulettuceModal,
     ReadConsensusModal as ReadConsensusModal,
     PcrProgramModal as PcrProgramModal,
     ResidueEditModal as ResidueEditModal,
@@ -41250,8 +41251,8 @@ class MenuBar(Horizontal):
     # the action/modal/worker names stay `mutagenize` internally.
     MENUS = ["File", "Settings", "BLAST", "Enzymes", "Features", "Primers",
              "Mutato", "Synthesis", "Parts", "Constructor", "Simulator",
-             "CRISPR", "Sequencing", "Experiments", "History", "AUTOLAB",
-             "BABS"]
+             "CRISPR", "Regulettuce", "Sequencing", "Experiments", "History",
+             "AUTOLAB", "BABS"]
 
     def compose(self) -> ComposeResult:
         for name in self.MENUS:
@@ -41277,6 +41278,8 @@ class MenuBar(Horizontal):
             self.app.action_open_autolab()  # type: ignore[attr-defined]
         elif name == "CRISPR":
             self.app.action_open_crispr()  # type: ignore[attr-defined]
+        elif name == "Regulettuce":
+            self.app.action_open_regulettuce()  # type: ignore[attr-defined]
         else:
             self.app.open_menu(name, region.x, region.y + 1)  # type: ignore[attr-defined]
 
@@ -49619,6 +49622,31 @@ from splicecraft_regulatory import (  # noqa: E402
     _scan_promoters as _scan_promoters,
     _scan_terminators as _scan_terminators,
     _score_promoter as _score_promoter,
+)
+
+# ── Plant cis-regulatory annotation (L1) — the Regulettuce tab ─────────────
+# The eukaryotic/plant counterpart to the bacterial scanners above: a curated
+# plant cis-element catalogue that carries its OWN measured enrichment (so
+# "your promoter has a GT1-motif" comes with the 94.8% null rate attached),
+# TATA boxes positioned against an anchor (unanchored they are chance hits,
+# one per 429 bp of real plant DNA), and 3'-end-like REGIONS with no predicted
+# cleavage site. `splicecraft_regulettuce`'s module docstring records the three
+# models that were built, measured and REFUSED — including a poly(A) site
+# predictor that located sites below chance. [INV-226]
+from splicecraft_regulettuce import (  # noqa: E402
+    _CIS_ELEMENTS as _CIS_ELEMENTS,
+    _TATA_CONSENSUS as _TATA_CONSENSUS,
+    _TATA_PEAK as _TATA_PEAK,
+    _TATA_WINDOW as _TATA_WINDOW,
+    _3P_MIN_SCORE as _3P_MIN_SCORE,
+    _3P_WINDOW as _3P_WINDOW,
+    _cis_element_catalogue as _cis_element_catalogue,
+    _cis_element_summary as _cis_element_summary,
+    _find_cis_element as _find_cis_element,
+    _regulettuce_calibration as _regulettuce_calibration,
+    _scan_3prime_risk as _scan_3prime_risk,
+    _scan_cis_elements as _scan_cis_elements,
+    _scan_tata_boxes as _scan_tata_boxes,
 )
 
 # ── Built-in feature presets (read-only catalogue) ──────────────────────────
@@ -114545,6 +114573,13 @@ _AGENT_HEAVY_ENDPOINTS = frozenset({
     # for one guide, and a raw `fold-rna` of a long window is the same O(n³)
     # Turner evaluation the terminator scan is capped for (audit 2026-09-22).
     "design-guides", "guide-offtargets", "fold-rna",
+    # The 3'-end scan scores every window on BOTH strands, so it reverse-
+    # complements a `window`-sized slice per step: measured at 345 ms for
+    # 200 kb at the default step of 20, and its work cap allows ~50M character
+    # operations (a few seconds). Heavy by the same standard as the terminator
+    # scan. `scan-cis-elements` is NOT here -- 34 motifs over 200 kb measured
+    # at 126 ms, one C-level regex pass each.
+    "scan-3prime-risk",
 })
 _AGENT_HEAVY_CONCURRENCY = max(2, (os.cpu_count() or 4) // 2)
 _AGENT_HEAVY_SEMAPHORE = threading.BoundedSemaphore(_AGENT_HEAVY_CONCURRENCY)
@@ -119241,6 +119276,12 @@ NcbiTaxonPickerModal { align: center middle; }
         Binding("alt+g", "open_crispr",                     "CRISPR guides",
                 show=False),
         Binding("alt+shift+g", "edit_residue",              "Edit residue",
+                show=False),
+        # Regulettuce (plant cis-regulatory annotation). alt+l is taken and
+        # alt+r is Parts, so "L" for Lettuce via the Alt+Shift path — `ESC L`
+        # decodes cleanly in every terminal the Alt+Shift+C/F/P bindings
+        # already rely on.
+        Binding("alt+shift+l", "open_regulettuce",          "Regulettuce",
                 show=False),
         Binding("alt+u", "open_autolab",                    "AUTOLAB",       show=False),
         Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=False),
@@ -129966,6 +130007,9 @@ NcbiTaxonPickerModal { align: center middle; }
         if name == "AUTOLAB":
             self.action_open_autolab()
             return
+        if name == "Regulettuce":
+            self.action_open_regulettuce()
+            return
         if name == "CRISPR":
             self.action_open_crispr()
             return
@@ -131697,6 +131741,179 @@ NcbiTaxonPickerModal { align: center middle; }
             f"{plan['cds_label']} {plan['wt_aa']}{plan['residue']}"
             f"{plan['new_aa']}: {plan['wt_codon']} → {plan['new_codon']}"
             f"{extra}. Ctrl+Z to undo.", timeout=8)
+
+    def _regulettuce_anchors(self, rec) -> "list[dict]":
+        """Start sites to measure TATA boxes from: the record's own CDS and
+        gene starts.
+
+        A TATA box is only meaningful relative to a start site — unanchored,
+        ``TATAWA`` turns up once per 429 bp of real plant DNA. The 5' end of an
+        annotated CDS is the nearest thing a plasmid record carries to a
+        transcription start, so that is what gets used, and the anchor label
+        says which feature it came from so the user can see the offset is
+        measured from an ATG rather than a verified TSS.
+
+        A reverse-strand feature's start is its HIGHEST forward coordinate, and
+        it must be reported as such: anchoring it at the low end would search
+        the transcript body instead of the promoter ([INV-226])."""
+        out: "list[dict]" = []
+        n = len(getattr(rec, "seq", "") or "")
+        if not n:
+            return out
+        # Topology is passed, not guessed: on a LINEAR record a two-part
+        # compound location is a SPLICED feature, not an origin wrap, and
+        # letting `_feat_bounds` assume the wrap re-encodes it as
+        # `(exon2_start, exon1_end)` — which would anchor a spliced CDS at its
+        # last exon instead of its first.
+        circular = _record_is_circular(rec)
+        for feat in (getattr(rec, "features", None) or []):
+            if getattr(feat, "type", "") not in ("CDS", "gene"):
+                continue
+            bounds = _feat_bounds(feat, n, circular=circular)
+            if bounds is None:
+                # UnknownPosition / BetweenPosition — a documented None, not
+                # an error. A feature with no integer start has no start site
+                # to measure a TATA box from.
+                continue
+            start, end, strand = bounds
+            label = _sanitize_label(_feat_label(feat) or
+                                    getattr(feat, "type", "") or "feature")
+            out.append({
+                "position": (start % n) if strand != -1
+                            else ((end - 1) % n),
+                "strand": (-1 if strand == -1 else 1),
+                "label": label,
+            })
+            if len(out) >= 500:
+                break
+        return out
+
+    @_action_log("app.regulettuce.open")
+    def action_open_regulettuce(self) -> None:
+        """Regulettuce menu → plant cis-regulatory annotation of the plasmid.
+
+        The modal is app-free (it takes the sequence, not the app), so the
+        record is read HERE and the result applied here — which also means a
+        canvas swap while the modal is open cannot silently annotate the wrong
+        plasmid: `_guard_callback` drops the edit ([INV-62])."""
+        rec = getattr(self, "_current_record", None)
+        if rec is None or not len(getattr(rec, "seq", "") or ""):
+            self.notify("Load a plasmid first — a cis-element scan needs a "
+                        "sequence.", severity="warning", timeout=6)
+            return
+        modal = RegulettuceModal(
+            str(rec.seq),
+            circular=_record_is_circular(rec),
+            label=self._record_display_name(rec),
+            anchors=self._regulettuce_anchors(rec),
+        )
+        self.push_screen(
+            modal, self._guard_callback(self._regulettuce_result,
+                                        "Regulettuce"))
+
+    _REGULETTUCE_FEATURE_TYPE = {
+        # INSDC keys. A cis-element and a TATA box are both
+        # `regulatory`-class elements; a 3'-end-like REGION is not a known
+        # element at all, so it lands as `misc_feature` rather than
+        # `polyA_signal` — the scanner measured itself unable to call a
+        # poly(A) site, and the feature key must not claim what the scan
+        # refused to ([INV-226]).
+        "cis": "protein_bind",
+        "tata": "regulatory",
+        "3prime": "misc_feature",
+    }
+
+    def _regulettuce_result(self, result) -> None:
+        """Apply a `RegulettuceModal` dismissal.
+
+        Every accepted hit rides in through `_apply_annotation_transfers`,
+        which owns the undo push, the wrap-aware `CompoundLocation` build and
+        the `_apply_record` rebuild ([RECIPE]). One call means ONE undo that
+        restores all N — a bulk annotate that needed N presses to reverse
+        would read as reversed after the first."""
+        if not isinstance(result, dict) or result.get("action") != "annotate":
+            return
+        rec = getattr(self, "_current_record", None)
+        if rec is None:
+            return
+        hits = result.get("hits") or []
+        kind = str(result.get("kind") or "cis")
+        ftype = self._REGULETTUCE_FEATURE_TYPE.get(kind, "misc_feature")
+        n = len(getattr(rec, "seq", "") or "")
+        transfers: "list[dict]" = []
+        for h in hits:
+            try:
+                start = int(h["start"]) % n
+                end = int(h["end"]) % n if n else int(h["end"])
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                continue
+            # strand 0 means the same bases read as the element either way (a
+            # palindromic consensus). GenBank has no "both" strand, so it is
+            # recorded on the plus strand and the note says why.
+            strand = int(h.get("strand", 1) or 0) or 1
+            label, note = self._regulettuce_feature_text(kind, h)
+            transfers.append({
+                "target_start": start,
+                "target_end": end,
+                "target_strand": strand,
+                "type": ftype,
+                "label": label,
+                "qualifiers": {"note": note},
+            })
+        if not transfers:
+            self.notify("Nothing to annotate.", severity="warning", timeout=5)
+            return
+        # `_apply_annotation_transfers` owns the undo push, the rebuild, the
+        # dirty mark AND a success toast of its own, so neither is repeated
+        # here — the one message this flow adds is that a bulk annotate takes
+        # a SINGLE Ctrl+Z, which is the thing a user needs told after N arrows
+        # appear at once.
+        self._apply_annotation_transfers(transfers, rec)
+        _log_event("regulettuce.annotated", kind=kind, n=len(transfers),
+                   via="ui")
+        self.notify(
+            f"{len(transfers)} {kind} feature"
+            f"{'s' if len(transfers) != 1 else ''} annotated — Ctrl+Z undoes "
+            f"all of them in one press.", timeout=8)
+
+    @staticmethod
+    def _regulettuce_feature_text(kind: str, h: dict) -> "tuple[str, str]":
+        """``(label, note)`` for one annotated hit.
+
+        The note carries the measurement, not just the name: an `ABRE` arrow on
+        a map with no enrichment beside it is the overclaim this whole
+        subsystem is built to avoid, and the note is what survives into the
+        exported GenBank file."""
+        if kind == "cis":
+            enr = h.get("enrichment")
+            return (
+                str(h.get("name", "cis-element")),
+                (f"plant cis-regulatory element {h.get('name', '?')} "
+                 f"({h.get('consensus', '?')}); responds to "
+                 f"{h.get('responds_to', 'unknown')}; "
+                 f"{'' if enr is None else f'{enr}x enriched '}"
+                 f"in verified plant promoters, informativeness "
+                 f"{h.get('informativeness', '?')}. Sequence match, not "
+                 f"measured occupancy. Annotated by SpliceCraft Regulettuce."),
+            )
+        if kind == "tata":
+            return (
+                "TATA box",
+                (f"TATA-box candidate {h.get('match', '?')} at offset "
+                 f"{h.get('offset', '?')} from {h.get('anchor_label') or 'a'} "
+                 f"start site ({h.get('tier', '?')} window). Positional "
+                 f"candidate only -- no promoter strength is implied. "
+                 f"Annotated by SpliceCraft Regulettuce."),
+            )
+        return (
+            "3'-end-like region",
+            (f"composition reads like a plant 3'-end / terminator region "
+             f"(score {h.get('score', '?')}, AT {h.get('at_fraction', '?')}, "
+             f"best T-rich fraction {h.get('best_t_fraction', '?')}, "
+             f"{h.get('tier', '?')}). A cryptic 3' end here could truncate "
+             f"the transcript. NO cleavage site is predicted. Annotated by "
+             f"SpliceCraft Regulettuce."),
+        )
 
     @_action_log("app.crispr.open")
     def action_open_crispr(self) -> None:
