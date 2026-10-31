@@ -44,23 +44,49 @@ curl -s http://127.0.0.1:6701/status -H "Authorization: Bearer $TOKEN"
 
 - `GET /` serves `index.html`; any other asset-shaped path serves that file.
 - The bearer token is injected into every served `.html` as one global:
-  `window.SPLICECRAFT = {token, version}`.
+  `window.SPLICECRAFT = {token, version, data_dir}`. `data_dir` is the data
+  directory the session will read and write, home-scrubbed to `~/…` — so a
+  page can say *which* library it is about to touch before its first API
+  call. (It is the path, not the basename: the basename is the literal string
+  `splicecraft` on every default install and every `XDG_DATA_HOME`
+  relocation alike.)
 - Content types come from a fixed allow-list: `.html .js .mjs .wasm .css
   .json .map .webmanifest .png .svg .ico .gif .jpg .jpeg .webp .woff2 .woff
-  .ttf`. **Anything else is a 415** listing what *is* servable, never a
-  guessed `application/octet-stream` — and never `mimetypes`, whose map
-  depends on the machine's `/etc/mime.types`, so the same bundle would be
-  served with different types on two laptops.
-- A path that resolves outside the directory, a symlink, or a file over 32 MiB
-  is a 404 with no detail — this route answers before the token check, so a
-  specific message would be an unauthenticated filesystem oracle. The log line
-  carries the detail for whoever is running the server.
-- A **symlinked asset is refused even when it points inside the bundle**: the
-  check wants a regular file, because "it resolved somewhere under the
-  directory" is a weaker promise than "it is a file in the directory".
-  Symlink the whole `--workbench-dir` instead — that is resolved once, at
-  startup. A symlinked `index.html` draws a note at startup rather than a
-  mystery 404 later.
+  .ttf .pdb .cif .mmcif .bcif`. **Anything else is a 415** listing what *is*
+  servable, never a guessed `application/octet-stream` — and never
+  `mimetypes`, whose map depends on the machine's `/etc/mime.types`, so the
+  same bundle would be served with different types on two laptops. The four
+  structure formats are there so a page that draws molecular coordinates can
+  serve them from its own bundle instead of staging each one inside a `.json`
+  wrapper; all four are inert types, and every asset response carries
+  `X-Content-Type-Options: nosniff` so the browser honours the map rather
+  than sniffing a file into something executable.
+- A path that resolves outside the directory, a non-regular file (a FIFO,
+  socket or device), or a file over 32 MiB is a 404 with no detail — this
+  route answers before the token check, so a specific message would be an
+  unauthenticated filesystem oracle. The log line carries the reason for
+  whoever is running the server, and an escape out of the bundle is logged as
+  a WARNING, because that one usually means the bundle is mis-assembled
+  rather than the request mistyped.
+- **A symlink is followed; confinement is checked on the resolved target.**
+  So a symlinked asset, or a path through a symlinked subdirectory, is served
+  when the target is inside the bundle and refused when it is not:
+
+  | spelling | result |
+  |---|---|
+  | symlinked file → inside the bundle | served |
+  | symlinked file → outside | 404 |
+  | path through a symlinked directory → inside | served |
+  | path through a symlinked directory → outside | 404 |
+  | `../../../etc/hostname` | refused before the filesystem |
+
+  (Through v1.3.13 this was documented the other way round — "a symlinked
+  asset is refused even when it points inside" — which was never what the
+  code did. The security property was never the one in doubt: resolving
+  first and confining the target is the stronger check, and it is what runs.)
+  A symlink in the bundle whose target is *outside* draws a note at startup,
+  naming the link and where it points, because every asset under it 404s and
+  from the browser that is indistinguishable from a build that did not run.
 - **A root that contains your data directory is refused at startup.** `.json`
   is servable and assets answer before the token check, so
   `--workbench-dir ~` would publish `library.json` to any local process that
@@ -119,6 +145,16 @@ exactly what this API exists to prevent.
   attached --read-only while PID 4242 holds the data-dir lock. …",
  "read_only": true, "endpoint": "add-current-to-library", "holder_pid": 4242}
 ```
+
+`status` reports the mode up front: `read_only` (a boolean) and
+`lock_holder_pid` (the PID this session read out of the data-dir lockfile when
+it attached, or `null`). Before v1.3.14 a served UI could only discover it by
+attempting a write and catching the 409, so every write-shaped control was
+either optimistic — click, fail, apologise — or disabled for everyone. The
+PID is the same one the per-endpoint refusal names (it is recorded once at
+attach and deliberately not re-read, so the two cannot disagree); it is
+advisory, and `null` in an ordinary read-write session, which holds the lock
+itself.
 
 It implies `--headless` (a second TUI over one data dir is what the lock
 prevents, and it would render caches that go stale the moment the GUI saves),
@@ -230,8 +266,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   (`apply-gff3`).
 - **Workflows (one call each)** — `plasmid-overview` (the loaded plasmid's
   name, length, topology, every feature, and every enzyme that cuts it exactly
-  once with the feature(s) that cut lands in); `find-feature` `{name, type?,
-  max_seq?}` (a feature by NAME — forgiving of case, spacing, hyphens and Greek
+  once with the feature(s) that cut lands in — or a LIBRARY ENTRY's, with
+  `{entry}`, without loading it: see
+  [Reading a library entry without loading it](#reading-a-library-entry-without-loading-it-entry));
+  `find-feature` `{name, type?, max_seq?, entry?}` (a feature by NAME — forgiving of case, spacing, hyphens and Greek
   letters, best match first — with its coordinates both ways: 0-based
   end-exclusive `start`/`end` as every endpoint takes them, plus 1-based
   `start_1based`/`end_1based`; its own sequence 5'→3' on its strand, spliced
@@ -542,9 +580,11 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   off the end — earns a `warnings` entry when the topology was left to
   default. Pass `circular: false` for a PCR product, gBlock or genomic
   fragment.
-- **Restriction sites** — `list-restriction-sites` scans the LOADED record
+- **Restriction sites** — `list-restriction-sites` scans the LOADED record,
+  or a library entry with `{entry}`
   (singular `enzyme` accepted; omit it to scan the catalog, honouring your
-  active enzyme collection). Each hit carries `start` / `end` / `strand`,
+  active enzyme collection — a preference about which enzymes you own, so it
+  applies to an entry scan too). Each hit carries `start` / `end` / `strand`,
   both strand cuts (`cut_bp` / `bottom_cut_bp`), the recognition `site`, and
   `wraps`. Two rules keep a zero-site answer honest: **an unrecognised
   enzyme name is a `400`**, never `count: 0` (a typo used to read as "no
@@ -1447,6 +1487,79 @@ also needlessly double the API's largest response. Don't blindly read
   download endpoint streams over the same hardened, HTTPS-only,
   size-capped fetch path as the rest of the network layer and verifies
   a zip-archive magic header before writing to disk.
+
+## Reading a library entry without loading it (`entry`)
+
+Ten read endpoints take an optional **`entry`** — a library entry's display
+name or id — meaning *answer about this entry, do not touch the canvas*:
+
+```
+get-sequence   plasmid-overview   features / list-features   get-feature
+find-feature   list-restriction-sites   find-orfs   simulate-gel   get-history
+```
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" localhost:6701/plasmid-overview \
+     -d '{"entry": "pUC19"}'
+```
+
+Without `entry` nothing changes: every one of them answers about the loaded
+canvas exactly as before.
+
+**Why it exists.** `load-entry` is a *write* — it reseats a canvas a running
+GUI also owns — so a `--read-only` attachment could call `list-collections`,
+`list-library` and `search-library` and then do nothing with any result.
+Browsing a library you cannot open is close to useless. `entry` is a pure
+read: no lock, no mirror write, no canvas mutation, so it answers under
+`--read-only` exactly as it does in a normal session. (`load-entry` is
+deliberately **not** reclassified: a read-only guest mutating a shared canvas
+is a worse idea than this parameter.)
+
+The rules, each because its absence would be a wrong answer rather than a
+refusal:
+
+- **Resolution is `load-entry`'s own** — the same function, so a key cannot
+  mean one molecule to a load and another to a read. Active collection first,
+  then the others; a unique cross-collection hit answers and names its
+  `collection`; an ambiguous key is a `409` listing the holders; `collection`
+  pins the search.
+- **An unknown entry is a `404` naming it**, never an empty result — so "no
+  sites" and "no such entry" stay distinguishable.
+- **`collection` only qualifies `entry`.** On its own it is a `400`: it would
+  otherwise be dropped in silence while the caller believed they had selected
+  something.
+- **An inert value names no entry and is not an error.** `null`, `""`, `[]`,
+  `{}` and `false` leave the canvas as the target, on every endpoint —
+  including the ones that refuse `entry`, so a typed client or an LLM tool
+  layer that fills every field it knows about is not rejected for it. A value
+  that *looks* like a selector and selects nothing — a whitespace string, a
+  number — is a `400`, because that one is a mistake rather than an unset
+  field.
+- **Every entry-targeted response carries `entry` and `collection` back**, so
+  the basis of the answer is in the answer.
+- **An endpoint that does not implement `entry` refuses the key** (`400`,
+  listing the ones that do). Read endpoints echo no `ignored` list, so a
+  dropped `entry` would have answered about the canvas and read as an answer
+  about the entry.
+- Where an endpoint already has a selector of its own, passing both is a
+  `422`, not a silent precedence: `simulate-gel` with `entry` **and** a
+  non-empty `template_seq`, `get-history` with `entry` **and** `name`/`id`.
+  `simulate-gel`'s `template_circular` is the exception — with `entry` the
+  topology is the entry's own whatever the flag says, because `false` is the
+  unset value of a boolean for most typed clients; the response **echoes the
+  `template_circular` it used** rather than refusing or staying silent.
+
+Two notes on what the answers mean. `plasmid-overview`'s `unsaved` is `false`
+for an entry by construction — the answer is about what is on disk, and
+reporting the canvas's dirty flag beside an entry's features would be two
+molecules in one response. And the `idx` on an entry's feature rows is the
+index that feature *will* have once the entry is loaded; it is not a canvas
+handle, which is why `update-feature` / `delete-feature` refuse `entry`
+outright rather than accepting a row index resolved against another plasmid.
+
+`simulate-gel` and `get-history` were already canvas-free — the former takes
+its template from the caller, the latter always answered about a library entry
+— so `entry` buys them convenience and one uniform rule, not new reach.
 
 ## Cross-collection lookups
 

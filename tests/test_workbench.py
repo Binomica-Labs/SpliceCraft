@@ -275,8 +275,10 @@ class TestCannotBeWalkedOutOf:
     @pytest.mark.skipif(not hasattr(sc.Path, "symlink_to"),
                         reason="no symlink support")
     def test_a_symlink_out_of_the_bundle_is_refused(self, served):
-        """`resolve()` follows the link, so confinement catches it — and the
-        `lstat` regular-file check refuses a symlink outright besides."""
+        """`resolve()` follows the link and confinement then judges the
+        TARGET, which is the whole check. (The `lstat` does not also refuse
+        symlinks as such — it runs on the resolved path. See
+        `TestTheSymlinkRuleIsConfinementOnTheResolvedTarget`.)"""
         client, _token, root = served
         if not (root / "link.html").is_symlink():
             pytest.skip("symlink not created on this platform")
@@ -812,11 +814,12 @@ class TestTheBundleCannotPublishTheDataDir:
 class TestStartupAgreesWithServeTime:
     def test_a_symlinked_index_is_called_out_at_startup(self, monkeypatch,
                                                         capsys, tmp_path):
-        """`is_file()` follows symlinks and the server does not (it wants a
-        regular file via `lstat`), so a symlinked `index.html` passed the
-        startup check and then 404'd at serve time with nothing anywhere to
-        say why. The note now asks the same function the server asks, so the
-        two cannot disagree."""
+        """A startup check of its own disagreed with the server and the
+        browser got an unexplained 404. The note now asks the same function
+        the server asks, so the two cannot disagree — here the link points
+        OUTSIDE the bundle, which is why it is refused (an `index.html`
+        symlinked to a file INSIDE the bundle is served; see
+        `test_an_index_symlinked_inside_the_bundle_is_served`)."""
         root = tmp_path / "ui"
         root.mkdir()
         real = tmp_path / "real-index.html"
@@ -831,11 +834,35 @@ class TestStartupAgreesWithServeTime:
         assert app is not None
         assert "no servable index.html" in capsys.readouterr().err
 
+    def test_an_index_symlinked_inside_the_bundle_is_served(
+            self, monkeypatch, capsys, tmp_path):
+        """The case the docs had backwards. A bundle assembled with symlinks
+        works, as long as the targets are in it."""
+        root = tmp_path / "ui"
+        root.mkdir()
+        (root / "real-index.html").write_text("<html><head></head></html>",
+                                              encoding="utf-8")
+        try:
+            (root / "index.html").symlink_to(root / "real-index.html")
+        except (OSError, NotImplementedError):  # pragma: no cover - Windows
+            pytest.skip("symlinks unavailable")
+        app = _main_with(monkeypatch, ["splicecraft",
+                                       "--workbench-dir", str(root)])
+        assert app is not None
+        assert capsys.readouterr().err.strip() == ""
+        assert sc._workbench_resolve_asset(root.resolve(),
+                                           "index.html") is not None
+
     def test_a_real_index_draws_no_note(self, monkeypatch, capsys, bundle):
         app = _main_with(monkeypatch, ["splicecraft",
                                        "--workbench-dir", str(bundle)])
         assert app is not None
-        assert "index.html" not in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "index.html" not in err
+        # The fixture plants a symlink OUT of the bundle on purpose, and that
+        # one does draw its own note — see
+        # `TestAnEscapingSymlinkIsCalledOutAtStartup`.
+        assert "link.html" in err and "outside the bundle" in err
 
 
 class TestTheBundleTypesABrowserActuallyAsksFor:
@@ -918,3 +945,249 @@ class TestOriginIsNormalisedTheWayABrowserSendsIt:
                                        "HTTP://LocalHost:5173"])
         assert app is not None
         assert app._cors_origin == "http://localhost:5173"
+
+
+# ── molecular coordinates in the bundle (2026-10-31) ─────────────────────────
+
+class TestStructureFilesAreServable:
+    """A front end that draws a structure fetches the coordinates from its own
+    bundle. `.pdb` / `.cif` / `.mmcif` / `.bcif` answered 415, so the
+    workaround was staging every structure inside a `.json` wrapper: a
+    generation step and double the bytes for nothing."""
+
+    _FILES = (("model.pdb", "chemical/x-pdb",
+               "ATOM      1  N   MET A   1      11.104   6.134  -6.504\n"),
+              ("model.cif", "chemical/x-cif", "data_MODEL\n_entry.id MODEL\n"),
+              ("model.mmcif", "chemical/x-mmcif", "data_MODEL\n"),
+              ("model.bcif", "application/octet-stream", "\x83\xa7"))
+
+    def test_coordinates_serve_with_a_declared_inert_type(self, served):
+        client, _token, root = served
+        for name, ctype, text in self._FILES:
+            (root / name).write_text(text, encoding="utf-8")
+            status, hdrs, body = client.request(f"/{name}")
+            assert status == 200, (name, status)
+            assert hdrs["content-type"] == ctype, (name, hdrs)
+            assert body, name
+
+    def test_nothing_in_the_map_is_executable_by_a_browser(self):
+        """The allow-list only holds if the browser honours it, and none of
+        the four structure types may read as HTML or as script."""
+        for ext in (".pdb", ".cif", ".mmcif", ".bcif"):
+            ctype = sc._WORKBENCH_CONTENT_TYPES[ext]
+            assert "html" not in ctype and "javascript" not in ctype, ext
+
+    def test_every_asset_response_forbids_sniffing(self, served):
+        """Without `nosniff` a browser may decide a served file is HTML
+        whatever the header said — and HTML from this origin can read the
+        token out of `window.SPLICECRAFT`."""
+        client, _token, root = served
+        (root / "model.pdb").write_text("ATOM\n", encoding="utf-8")
+        for path in ("/", "/index.html", "/assets/app.js", "/style.css",
+                     "/model.pdb"):
+            _status, hdrs, _body = client.request(path)
+            assert hdrs.get("x-content-type-options") == "nosniff", path
+
+    def test_an_extension_nobody_added_is_still_a_415(self, served):
+        """Widening the list is not the same as softening the refusal."""
+        client, _token, root = served
+        (root / "coords.xyz").write_text("3\n", encoding="utf-8")
+        status, _hdrs, body = client.request("/coords.xyz")
+        assert status == 415 and b".pdb" in body
+
+
+# ── naming the library in the injected global (2026-10-31) ──────────────────
+
+class TestTheGlobalNamesTheDataDirectory:
+    """A page about to write wants to show WHICH library it will write to,
+    before its first API call. `list-collections` can only answer after one."""
+
+    def test_the_global_carries_the_data_directory(self, served):
+        client, token, _root = served
+        _status, _hdrs, body = client.request("/")
+        text = body.decode("utf-8")
+        assert '"data_dir"' in text
+        assert str(sc._state._DATA_DIR.name) in text
+        # Still the fields the front end already destructures.
+        assert token in text and '"version"' in text
+
+    def test_the_path_is_home_scrubbed(self, monkeypatch, tmp_path):
+        """The username is not part of the answer — same scrub `status`
+        applies to `source_path`."""
+        import pathlib
+        home = tmp_path / "home" / "someone"
+        (home / ".local" / "share" / "splicecraft").mkdir(parents=True)
+        monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: home))
+        monkeypatch.setattr(sc._state, "_DATA_DIR",
+                            home / ".local" / "share" / "splicecraft",
+                            raising=False)
+        out = sc._workbench_inject_token(b"<html><head></head></html>",
+                                         "TOK").decode("utf-8")
+        assert "~/.local/share/splicecraft" in out
+        assert "someone" not in out
+
+
+# ── the symlink rule, measured (2026-10-31) ─────────────────────────────────
+
+class TestTheSymlinkRuleIsConfinementOnTheResolvedTarget:
+    """`docs/agent-api.md` said a symlinked asset was refused even when it
+    pointed inside the bundle. It never was: `resolve()` runs before the
+    `lstat`, so the check sees the TARGET. The rule the code implements —
+    follow the link, then require the target to be inside the bundle — is the
+    right one for a directory people assemble with build tools, and the case
+    a front end actually hits (an `assets/` directory symlinked in from
+    elsewhere) was missing from the docs entirely."""
+
+    def _links(self, root, tmp_path):
+        outside = tmp_path / "outside"
+        (outside / "assets").mkdir(parents=True, exist_ok=True)
+        (outside / "assets" / "far.json").write_text("{}", encoding="utf-8")
+        (root / "near.json").write_text('{"near":1}', encoding="utf-8")
+        (root / "sub").mkdir(exist_ok=True)
+        (root / "sub" / "deep.json").write_text('{"deep":1}', encoding="utf-8")
+        try:
+            (root / "in_file.json").symlink_to(root / "near.json")
+            (root / "out_file.json").symlink_to(outside / "assets" /
+                                                "far.json")
+            (root / "in_dir").symlink_to(root / "sub",
+                                         target_is_directory=True)
+            (root / "out_dir").symlink_to(outside / "assets",
+                                          target_is_directory=True)
+        except (OSError, NotImplementedError):  # pragma: no cover - Windows
+            pytest.skip("symlinks unavailable")
+
+    def test_the_truth_table_through_the_server(self, served, tmp_path):
+        client, _token, root = served
+        self._links(root, tmp_path)
+        cases = {
+            "/near.json":      200,   # a plain file
+            "/sub/deep.json":  200,
+            "/in_file.json":   200,   # symlink -> inside the bundle
+            "/in_dir/deep.json": 200,  # path through a symlinked dir, inside
+            "/out_file.json":  404,   # symlink -> outside
+            "/out_dir/far.json": 404,  # path through a symlinked dir, outside
+        }
+        for path, want in cases.items():
+            status, _hdrs, _body = client.request(path)
+            assert status == want, (path, status, want)
+
+    def test_nothing_from_outside_arrives_whatever_the_spelling(self, served,
+                                                                tmp_path):
+        client, _token, root = served
+        self._links(root, tmp_path)
+        for path in ("/out_file.json", "/out_dir/far.json",
+                     "/in_dir/../out_file.json"):
+            _status, _hdrs, body = client.request(path)
+            assert b"far" not in body and b"OUTSIDE-MARKER" not in body
+
+    def test_an_escape_is_logged_with_its_reason(self, served, tmp_path):
+        """Four causes shared one bare `no such asset`, and the 404 body
+        cannot carry the detail (this route answers before the token check).
+        The log can, and an escape is the one that usually means the bundle
+        is mis-assembled rather than the request mistyped."""
+        import logging
+        client, _token, root = served
+        self._links(root, tmp_path)
+        logger = logging.getLogger(sc._log.name)
+        prev = logger.level
+        records: "list[logging.LogRecord]" = []
+
+        class _Grab(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = _Grab()
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        try:
+            client.request("/out_dir/far.json")
+            client.request("/nope.json")
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(prev)
+        escapes = [r for r in records
+                   if r.levelno >= logging.WARNING
+                   and "resolves outside" in r.getMessage()]
+        assert escapes, [r.getMessage() for r in records]
+        # A plain missing file stays a debug line: it is the ordinary case.
+        assert not [r for r in records if r.levelno >= logging.WARNING
+                    and "nope.json" in r.getMessage()]
+
+
+class TestAnEscapingSymlinkIsCalledOutAtStartup:
+    """Serve time cannot explain itself to a browser, so the explanation goes
+    where there is a terminal: once, at launch, like the missing-index note.
+    Without it, a symlinked `structures/` directory 404s every asset under it
+    and looks exactly like a build that did not run."""
+
+    def test_the_note_names_the_link_and_where_it_points(self, monkeypatch,
+                                                         capsys, tmp_path):
+        root = tmp_path / "ui"
+        root.mkdir()
+        (root / "index.html").write_text("<html><head></head></html>",
+                                         encoding="utf-8")
+        far = tmp_path / "shared" / "structures"
+        far.mkdir(parents=True)
+        try:
+            (root / "structures").symlink_to(far, target_is_directory=True)
+        except (OSError, NotImplementedError):  # pragma: no cover - Windows
+            pytest.skip("symlinks unavailable")
+        app = _main_with(monkeypatch, ["splicecraft", "--workbench-dir",
+                                       str(root)])
+        assert app is not None
+        err = capsys.readouterr().err
+        assert "structures" in err and str(far) in err
+        assert "outside the bundle" in err
+        # NOT fatal: the bundle still serves.
+        assert app._workbench_dir == root.resolve()
+
+    def test_a_link_that_stays_inside_draws_no_note(self, monkeypatch,
+                                                    capsys, tmp_path):
+        root = tmp_path / "ui"
+        (root / "real").mkdir(parents=True)
+        (root / "real" / "a.json").write_text("{}", encoding="utf-8")
+        (root / "index.html").write_text("<html><head></head></html>",
+                                         encoding="utf-8")
+        try:
+            (root / "assets").symlink_to(root / "real",
+                                         target_is_directory=True)
+        except (OSError, NotImplementedError):  # pragma: no cover - Windows
+            pytest.skip("symlinks unavailable")
+        app = _main_with(monkeypatch, ["splicecraft", "--workbench-dir",
+                                       str(root)])
+        assert app is not None
+        assert capsys.readouterr().err.strip() == ""
+        # And it is genuinely servable, which is why there is no note.
+        assert sc._workbench_resolve_asset(root.resolve(),
+                                           "assets/a.json") is not None
+
+    def test_the_scan_is_bounded_and_never_follows_a_link(self, tmp_path):
+        """A launch-path convenience, not an audit: it must not walk a
+        dependency tree, and it must not recurse into a link."""
+        root = tmp_path / "ui"
+        root.mkdir()
+        for i in range(3):
+            (root / f"d{i}").mkdir()
+            for j in range(40):
+                (root / f"d{i}" / f"f{j}.json").write_text("{}",
+                                                           encoding="utf-8")
+        loop = tmp_path / "loop"
+        loop.mkdir()
+        try:
+            (root / "self").symlink_to(root, target_is_directory=True)
+            (loop / "back").symlink_to(loop, target_is_directory=True)
+        except (OSError, NotImplementedError):  # pragma: no cover - Windows
+            pytest.skip("symlinks unavailable")
+        # `self` points INSIDE, so it is not reported — and the walk does not
+        # descend through it, so this returns rather than recursing forever.
+        assert sc._workbench_escaping_symlinks(root) == []
+        found = sc._workbench_escaping_symlinks(loop)
+        assert found == []
+        # The report is capped.
+        many = tmp_path / "many"
+        many.mkdir()
+        for i in range(6):
+            (many / f"l{i}").symlink_to(tmp_path / "shared-missing",
+                                        target_is_directory=True)
+        assert len(sc._workbench_escaping_symlinks(many)) == (
+            sc._WORKBENCH_SCAN_MAX_REPORT)

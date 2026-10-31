@@ -77,6 +77,14 @@ twin takes the *same payload*.
 
 `plasmid-overview` `features`(=`list-features`) `get-feature` `find-feature`
 `find-sequence` `get-sequence` `span-contains` `list-restriction-sites` `digest`
+
+- **`entry` reads a library entry in place.** `get-sequence`,
+  `plasmid-overview`, `features`/`list-features`, `get-feature`,
+  `find-feature`, `list-restriction-sites`, `find-orfs`, `simulate-gel` and
+  `get-history` take an optional `entry` (name or id, `collection` to pin it)
+  and answer about that entry without loading it. That is the way to browse a
+  library on a `--read-only` attach, where `load-entry` 409s. Any other
+  endpoint refuses `entry` instead of answering about the canvas.
 `list-enzymes` `find-orfs` `get-history` `get-plasmid-protocol` `diff-plasmid`
 `simulate-gel` `replace-sequence` `get-feature-colors` `set-feature-color`
 `set-origin` `reverse-complement`

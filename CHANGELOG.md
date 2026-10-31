@@ -14,6 +14,88 @@
 
 ---
 
+## [1.3.14] — 2026-11-01
+
+The second round of browser-front-end work: you can now read your library
+without taking over the canvas, and the page can tell you what it is about
+to write to.
+
+### New features
+
+- **Read a library entry without loading it.** Ten read endpoints —
+  `get-sequence`, `plasmid-overview`, `features` / `list-features`,
+  `get-feature`, `find-feature`, `list-restriction-sites`, `find-orfs`,
+  `simulate-gel`, `get-history` — now take an optional `entry` naming a
+  library entry, and answer about that entry instead of the plasmid on the
+  canvas. The canvas is left exactly as it was. This is what makes
+  `--agent --read-only` useful alongside a running SpliceCraft: *loading* an
+  entry is a write (it would reseat the canvas your GUI is looking at), but
+  *reading* one is not, so a read-only session could list every entry in
+  your library and open none of them. Pass `collection` alongside it to say which collection
+  you mean. The answer names the entry and its collection back, so you can
+  always tell what a result is about.
+- **`status` says whether this session can write.** It now reports
+  `read_only` and `lock_holder_pid` — the process holding the data directory.
+  Before this, a page or a script could only find out by trying a write and
+  reading the refusal, so every button that writes was either hopeful or
+  switched off for everyone.
+- **A bundle can serve molecular coordinates.** `.pdb`, `.cif`, `.mmcif` and
+  `.bcif` are now servable from `--workbench-dir`, so a page that draws a
+  structure can keep the coordinates beside its own files instead of wrapping
+  each one in a `.json` to get it through.
+- **The page is told which library it is talking to.**
+  `window.SPLICECRAFT` now carries `data_dir` — the data directory, with your
+  home folder shortened to `~` — so a page can name the library before its
+  first call rather than after it.
+
+### Bug fixes
+
+- **A correction to what 1.3.13 said about shortcuts and symlinks.** That
+  release claimed a symlinked file was refused even when it pointed inside
+  the served folder. It was not, and it never had been: a symlink is
+  followed, and what is checked is where it lands. So a symlink to something
+  *inside* the folder is served — which is what you want from a folder
+  assembled by a build tool — and a symlink pointing *out* of it is refused,
+  as it always was. Nothing escaped and nothing changed; the documentation
+  was describing a stricter rule than the one that ran, and it now describes
+  the real one, with the four cases spelled out.
+- **A folder symlinked into your bundle from somewhere else now explains
+  itself.** Every file under it was refused — correctly — with a bare "not
+  found" that was impossible to tell apart from a build that had not run.
+  SpliceCraft now says so at startup, naming the link and where it points,
+  and the server log records *which* of its checks refused a file instead of
+  logging all four the same way.
+- **Asking the wrong endpoint about a library entry is now refused.**
+  An endpoint that does not understand `entry` would have quietly answered
+  about the canvas instead, which reads as an answer about your entry. It
+  returns an error naming the endpoints that do. Same for `collection` on its
+  own, which selects nothing, and for passing two templates to `simulate-gel`
+  or two names to `get-history`. A field sent as `null` (or `""`, or an empty
+  list) names nothing and is simply ignored — clients that fill in every
+  field they know about are not punished for it.
+- **An unknown entry name is an error that names it**, not an empty result —
+  so "nothing on that plasmid" and "no such plasmid" stay distinguishable.
+
+### Hardening
+
+- **`simulate-gel` now tells you which topology it ran.** The response carries
+  `template_circular`, so a lane run from a library entry — whose own
+  topology wins — cannot quietly give you a supercoiled band where you were
+  expecting a linear one.
+- **Reading a library entry no longer narrates itself into the log.** Opening
+  a plasmid writes a line per origin-spanning and per spliced feature, which
+  is right once, for a load, with someone watching. Reading an entry can
+  happen on every click, and on a chromosome-sized entry that was hundreds of
+  identical lines per read, into a log that rotates. One summary line now
+  replaces them; loading a plasmid is unchanged.
+- Served files now carry `X-Content-Type-Options: nosniff`. SpliceCraft has
+  always served a bundle from a fixed list of file types; this is what makes
+  the browser honour that list rather than guessing from the contents — and
+  the page served from that address is the one holding your access token.
+- Loading an entry and reading one in place now go through the same lookup,
+  so a name that exists in two collections cannot mean one plasmid to a load
+  and a different one to a read.
+
 ## [1.3.13] — 2026-10-31
 
 You can now put a web page in front of SpliceCraft. The groundwork for a

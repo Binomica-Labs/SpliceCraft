@@ -43,13 +43,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.3.13"
+__version__ = "1.3.14"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-10-31"
+_RELEASE_DATE = "2026-11-01"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -18993,6 +18993,15 @@ class PlasmidMap(Widget):
         self._n_flattened   = 0
         self._n_skipped     = 0
         self._n_clamped     = 0
+        # Per-feature notices are for a LOAD: one plasmid, once, with a user
+        # watching. An off-canvas parse (`_agent_map_rows_for_record`, for an
+        # `entry`-targeted read) can run on every click, and a record with
+        # 800 spliced genes wrote 800 INFO lines per call into a ROTATING log
+        # — diagnostic history traded for the same sentence 800 times. That
+        # caller sets `_parse_quiet` and logs one aggregate line instead; the
+        # map widget never sets it, so a load says exactly what it said.
+        # `getattr` with a default, so `self` need not carry the attribute.
+        _quiet = bool(getattr(self, "_parse_quiet", False))
         total = len(record.seq) if getattr(record, "seq", None) is not None else 0
         # Sweep #41 (2026-05-27): cache the uppercased sequence
         # for the CDS premature-stop count below. Computed once
@@ -19027,10 +19036,11 @@ class PlasmidMap(Widget):
             # desynchronise them from this list.
             if not _feat_is_map_indexed(feat):
                 self._n_skipped += 1
-                _log.warning(
-                    "Skipped feature %s with unusable coords (type=%s)",
-                    _feat_label(feat), feat.type,
-                )
+                if not _quiet:
+                    _log.warning(
+                        "Skipped feature %s with unusable coords (type=%s)",
+                        _feat_label(feat), feat.type,
+                    )
                 continue
             start = int(feat.location.start)
             end   = int(feat.location.end)
@@ -19101,18 +19111,19 @@ class PlasmidMap(Widget):
                     or (fwd[i][1] == total and fwd[i + 1][0] == 0)
                     for i in range(len(fwd) - 1)
                 )
-                if end < start:
+                if end < start and not _quiet:
                     _log.info(
                         "Detected wrap feature %s (%d..%d → wraps origin)",
                         _feat_label(feat), start, end,
                     )
                 if not is_contiguous:
                     self._n_flattened += 1
-                    _log.info(
-                        "Compound feature %s (%d..%d) drawn as its outer "
-                        "span; exons kept for translation",
-                        _feat_label(feat), start, end,
-                    )
+                    if not _quiet:
+                        _log.info(
+                            "Compound feature %s (%d..%d) drawn as its outer "
+                            "span; exons kept for translation",
+                            _feat_label(feat), start, end,
+                        )
                 if not is_contiguous and len(fwd) >= 2:
                     feat_exons = [(int(a), int(b)) for a, b in fwd]
 
@@ -19121,12 +19132,13 @@ class PlasmidMap(Widget):
                 clamped_end   = max(0, min(end,   total))
                 if (clamped_start, clamped_end) != (start, end):
                     self._n_clamped += 1
-                    _log.warning(
-                        "Clamped feature %s coords (%d..%d → %d..%d) to "
-                        "sequence length %d",
-                        _feat_label(feat), start, end,
-                        clamped_start, clamped_end, total,
-                    )
+                    if not _quiet:
+                        _log.warning(
+                            "Clamped feature %s coords (%d..%d → %d..%d) to "
+                            "sequence length %d",
+                            _feat_label(feat), start, end,
+                            clamped_start, clamped_end, total,
+                        )
                     start, end = clamped_start, clamped_end
 
             idx    = len(feats)
@@ -104654,11 +104666,19 @@ from splicecraft_agent import (  # noqa: E402  (registers endpoints into _state.
     _coerce_int as _coerce_int,
     _sanitize_bases as _sanitize_bases,
     _agent_endpoint as _agent_endpoint,
+    _AGENT_ENTRY_PARAM_ENDPOINTS as _AGENT_ENTRY_PARAM_ENDPOINTS,
+    _agent_entry_selector as _agent_entry_selector,
+    _agent_entry_record as _agent_entry_record,
+    _agent_entry_subpayload as _agent_entry_subpayload,
+    _agent_resolve_library_entry as _agent_resolve_library_entry,
+    _agent_stamp_basis as _agent_stamp_basis,
+    _agent_target_record as _agent_target_record,
     _agent_save_or_500 as _agent_save_or_500,
     _agent_dirty_guard as _agent_dirty_guard,
     _agent_ignored_keys as _agent_ignored_keys,
     _agent_reject_dangerous_unknowns as _agent_reject_dangerous_unknowns,
     _agent_unread_routing_keys as _agent_unread_routing_keys,
+    _agent_routing_value_inert as _agent_routing_value_inert,
     _agent_payload_keys as _agent_payload_keys,
     _payload_bool as _payload_bool,
     _coerce_bool as _coerce_bool,
@@ -106579,6 +106599,19 @@ def _h_status(app, payload):
         "dirty":       bool(getattr(app, "_unsaved", False)),
         "source_path": scrubbed_source,
         "view":        view,
+        # `--read-only` attach, reported UP FRONT (2026-10-31). A served
+        # browser UI could only discover the mode by attempting a write and
+        # catching the 409, so every write-shaped control was either
+        # optimistic (click, fail, apologise) or disabled for everyone.
+        # `lock_holder_pid` is the PID this session read out of the data-dir
+        # lockfile when it attached: advisory and deliberately NOT re-read
+        # (see `_data_dir_lock_holder_pid`), so it names the SAME process the
+        # per-endpoint 409 names and the two can never disagree. `null` when
+        # nothing was recorded, and in an ordinary read-write session — which
+        # holds the lock itself, and whose `read_only: false` is the whole
+        # answer a UI needs.
+        "read_only":       bool(_state._AGENT_READ_ONLY),
+        "lock_holder_pid": _state._AGENT_READ_ONLY_HOLDER_PID or None,
         # `version` == the RUNNING code's version (kept for back-compat).
         # `installed_version` is what's on disk NOW — they diverge when the
         # user ran `splicecraft update` while this daemon kept running the
@@ -106721,6 +106754,54 @@ def _h_shutdown(app, payload):
     return {"ok": True, "shutting_down": True, "pid": os.getpid()}
 
 
+class _FeatRowScratch:
+    """The whole of the `self` `PlasmidMap._parse` needs: the three counters
+    it stamps for the caller to inspect after a load.
+
+    `__slots__` is the point — a future `_parse` that reaches for any OTHER
+    attribute of the map raises `AttributeError` in the suite rather than
+    quietly returning a feature table built from half a widget."""
+
+    __slots__ = ("_n_flattened", "_n_skipped", "_n_clamped", "_parse_quiet")
+
+    def __init__(self) -> None:
+        self._n_flattened = 0
+        self._n_skipped = 0
+        self._n_clamped = 0
+        # One aggregate line from the caller instead of one per feature —
+        # see the note on `_parse_quiet` in `PlasmidMap._parse`.
+        self._parse_quiet = True
+
+
+def _agent_map_rows_for_record(rec) -> "list[dict]":
+    """The `PlasmidMap._feats` table for a record that is NOT on the canvas —
+    the rows an `entry`-targeted read answers from.
+
+    Runs the SAME `PlasmidMap._parse` a load runs, deliberately: the rows
+    carry wrap encoding, arrowless strand, the `_exons` of a spliced feature,
+    colours and the premature-stop count, and a second "simpler" parse for
+    off-canvas reads is how `features` and `features {"entry": …}` would come
+    to disagree about the same molecule. `idx` is therefore the index that
+    feature WILL have once the entry is loaded — but it is not a canvas
+    handle, which is why the write endpoints refuse `entry` outright instead
+    of accepting a row index resolved against a different plasmid.
+
+    Measured at 0.23 s for 2 Mbp / 4,000 features, so it is not gated — but
+    it is `_parse_quiet`, because the per-feature notices a LOAD writes would
+    otherwise repeat on every click of a UI (800 INFO lines per call on that
+    record) into a rotating log. The counters `_parse` stamps are reported
+    once instead, and only when there is something to report.
+    """
+    scratch = _FeatRowScratch()
+    rows = PlasmidMap._parse(scratch, rec)             # type: ignore[arg-type]
+    if scratch._n_skipped or scratch._n_flattened or scratch._n_clamped:
+        _log.info("off-canvas parse of %r: %d feature(s) skipped, "
+                  "%d flattened, %d clamped",
+                  getattr(rec, "name", "?"), scratch._n_skipped,
+                  scratch._n_flattened, scratch._n_clamped)
+    return rows
+
+
 @_agent_endpoint("features")
 @_agent_endpoint("list-features")
 def _h_features(app, payload):
@@ -106728,26 +106809,44 @@ def _h_features(app, payload):
 
     Registered under both ``features`` and ``list-features`` — the latter
     is a natural-guess alias so a client following the ``list-*`` convention
-    (list-parts / list-collections / list-primers / …) doesn't 404."""
-    # ONE snapshot on the UI thread: the record and the map's feature table
-    # were read at two moments on this thread, so a canvas swap between them
-    # reported one plasmid's features measured against the other's length
-    # (AG9) -- and `idx` from here feeds update-/delete-feature.
-    def _snap():
-        r = getattr(app, "_current_record", None)
-        if r is None:
-            return None
-        try:
-            m = app.query_one("#plasmid-map", PlasmidMap)
-        except (NoMatches, AttributeError):
-            return None
-        return r, list(m._feats)
-    snap = _agent_on_ui(app, _snap)
-    if snap is None:
-        return {"features": []}
-    rec, feats = snap
+    (list-parts / list-collections / list-primers / …) doesn't 404.
+
+    Body: ``{entry?, collection?}``. ``entry`` lists a library entry's
+    features without loading it (see `get-sequence`) — a pure read, so it
+    answers under ``--read-only``. The rows are the ones the map would show
+    for that entry, but `idx` is NOT a canvas handle there: `update-feature`
+    / `delete-feature` act on what is loaded and refuse ``entry``."""
+    key, _coll, sel_err = _agent_entry_selector(payload)
+    if sel_err is not None:
+        return sel_err
+    basis = None
+    if key is not None:
+        # Off the UI thread on purpose: this is a parse, not a canvas read,
+        # and a big entry would otherwise block the interface for it.
+        rec, basis, err = _agent_target_record(app, payload)
+        if err is not None:
+            return err
+        feats = _agent_map_rows_for_record(rec)
+    else:
+        # ONE snapshot on the UI thread: the record and the map's feature table
+        # were read at two moments on this thread, so a canvas swap between them
+        # reported one plasmid's features measured against the other's length
+        # (AG9) -- and `idx` from here feeds update-/delete-feature.
+        def _snap():
+            r = getattr(app, "_current_record", None)
+            if r is None:
+                return None
+            try:
+                m = app.query_one("#plasmid-map", PlasmidMap)
+            except (NoMatches, AttributeError):
+                return None
+            return r, list(m._feats)
+        snap = _agent_on_ui(app, _snap)
+        if snap is None:
+            return {"features": []}
+        rec, feats = snap
     total = _seq_len(rec)
-    return {"features": [
+    return _agent_stamp_basis({"features": [
         {
             "idx":    i,
             "label":  f.get("label") or "",
@@ -106768,7 +106867,7 @@ def _h_features(app, payload):
         }
         for i, f in enumerate(feats)
         if f.get("type") not in ("site", "recut")
-    ]}
+    ]}, basis)
 
 
 # ── Workflow endpoints (2026-09-21) ────────────────────────────────────────
@@ -107215,7 +107314,14 @@ def _agent_resolve_one_feature(app, payload):
     rec = getattr(app, "_current_record", None)
     if rec is None:
         return None, None, None, ({"error": "no plasmid is loaded"}, 409)
-    rows = (_h_features(app, {}) or {}).get("features", [])
+    # `_h_features` can refuse (it takes `entry` now), so a caller must not
+    # assume a dict. This one never passes `entry`, so the refusal is
+    # unreachable here — but asserting it beats a `.get` on a tuple the day
+    # that changes.
+    rows_res = _h_features(app, {})
+    if not isinstance(rows_res, dict):
+        return None, None, None, rows_res
+    rows = rows_res.get("features", [])
     if payload.get("idx") is not None:
         raw_idx = payload["idx"]
         try:
@@ -107252,7 +107358,12 @@ def _h_plasmid_overview(app, payload):
     """One call for a first look at the LOADED plasmid: name, length,
     topology, unsaved state, its features, and every enzyme that cuts it
     exactly ONCE together with the feature(s) that cut lands in. Body:
-    ``{max_features?: int = 60}``.
+    ``{max_features?: int = 60, entry?, collection?}``.
+
+    ``entry`` gives the same first look at a LIBRARY ENTRY without loading
+    it (see `get-sequence`) — which is how a read-only session, or a browser
+    UI attached while the GUI holds the lock, opens something. `unsaved` is
+    then false by construction: the answer is about what is on disk.
 
     Features come exactly as `features` returns them (0-based, end-exclusive;
     `end < start` = crosses the origin). The unique cutters come from
@@ -107264,7 +107375,9 @@ def _h_plasmid_overview(app, payload):
     overlapping features is listed under both — so "which enzymes cut once
     inside X?" is a lookup. `unique_cutter_count` counts each enzyme once.
     Read-only."""
-    rec = getattr(app, "_current_record", None)
+    rec, basis, err = _agent_target_record(app, payload)
+    if err is not None:
+        return err
     if rec is None:
         return ({"error": "no plasmid is loaded"}, 409)
     try:
@@ -107272,7 +107385,12 @@ def _h_plasmid_overview(app, payload):
     except (TypeError, ValueError, OverflowError):
         return ({"error": "'max_features' must be an integer"}, 400)
     cap = max(1, min(cap, 500))
-    rows = (_h_features(app, {}) or {}).get("features", [])
+    # Same molecule for every half of this answer (see `find-feature`).
+    sub_payload = _agent_entry_subpayload(payload)
+    rows_res = _h_features(app, sub_payload)
+    if not isinstance(rows_res, dict):
+        return rows_res
+    rows = rows_res.get("features", [])
     total = _seq_len(rec)
     feats = []
     for r in rows[:cap]:
@@ -107281,7 +107399,8 @@ def _h_plasmid_overview(app, payload):
             f["wraps"] = True
         feats.append(f)
     from splicecraft_util import _record_is_circular
-    cut_res = _h_list_restriction_sites(app, {"unique_only": True})
+    cut_res = _h_list_restriction_sites(
+        app, dict(sub_payload, unique_only=True))
     # Grouped by the feature each cut falls in, in code. Measured on the bench:
     # handed a flat list tagged with `inside`, a 7B asked "which enzymes cut
     # once inside AmpR?" saw all 13 and named ONE; with a grouped copy as well
@@ -107306,7 +107425,11 @@ def _h_plasmid_overview(app, payload):
         "name": PlasmidApp._record_display_name(rec) or getattr(rec, "id", "") or "",
         "length": total,
         "topology": "circular" if _record_is_circular(rec) else "linear",
-        "unsaved": bool(getattr(app, "_unsaved", False)),
+        # The canvas dirty flag describes the canvas. An entry read from disk
+        # has nothing unsaved about it, and reporting the canvas's flag beside
+        # an entry's features would be two molecules in one answer.
+        "unsaved": (False if basis is not None
+                    else bool(getattr(app, "_unsaved", False))),
         "feature_count": len(rows),
         "features": feats,
         "unique_cutters": grouped,
@@ -107320,7 +107443,7 @@ def _h_plasmid_overview(app, payload):
         out["features_truncated"] = f"showing {cap} of {len(rows)}"
     if not isinstance(cut_res, dict):
         out["unique_cutters_error"] = "restriction scan failed"
-    return out
+    return _agent_stamp_basis(out, basis)
 
 
 @_agent_endpoint("find-feature")
@@ -107337,8 +107460,14 @@ def _h_find_feature(app, payload):
     (with `translation_matches_annotation` when the file carries a
     /translation), and `unique_cutters_inside` — the enzymes that cut the
     whole plasmid exactly once with that cut inside the feature. Up to 5
-    matches. Read-only."""
-    rec = getattr(app, "_current_record", None)
+    matches. Read-only.
+
+    Pass ``entry`` (+ optional ``collection``) to search a library entry
+    without loading it — see `get-sequence`. The features AND the unique
+    cutters then come from that entry, never a mix of it and the canvas."""
+    rec, basis, err = _agent_target_record(app, payload)
+    if err is not None:
+        return err
     if rec is None:
         return ({"error": "no plasmid is loaded"}, 409)
     name = payload.get("name")
@@ -107349,18 +107478,27 @@ def _h_find_feature(app, payload):
     except (TypeError, ValueError, OverflowError):
         return ({"error": "'max_seq' must be an integer"}, 400)
     max_seq = max(0, min(max_seq, _WORKFLOW_MAX_SEQ_CAP))
-    rows = (_h_features(app, {}) or {}).get("features", [])
+    # The inner reads answer about the SAME molecule as the outer one. An
+    # error from them is a race (the entry went away mid-call) and is
+    # returned verbatim rather than flattened into an empty feature list.
+    sub_payload = _agent_entry_subpayload(payload)
+    rows_res = _h_features(app, sub_payload)
+    if not isinstance(rows_res, dict):
+        return rows_res
+    rows = rows_res.get("features", [])
     ranked = _agent_rank_feature_matches(rows, name[:200], payload.get("type"))
     if not ranked:
         labels = sorted({str(r.get("label")) for r in rows if r.get("label")})
-        return {"query": name.strip(), "count": 0, "matches": [],
-                "note": "no feature by that name — these are the labels on "
-                        "the plasmid", "features": labels[:40]}
+        return _agent_stamp_basis(
+            {"query": name.strip(), "count": 0, "matches": [],
+             "note": "no feature by that name — these are the labels on "
+                     "the plasmid", "features": labels[:40]}, basis)
     kind = {0: "exact", 1: "starts with", 2: "contains", 3: "similar spelling"}
     # The enzymes that cut the plasmid ONCE with that cut inside the feature —
     # "what can I cut my gene with?" answered where the model is already
     # looking (the bench saw a 7B list 5 of 13 after wandering the overview).
-    cut_res = _h_list_restriction_sites(app, {"unique_only": True})
+    cut_res = _h_list_restriction_sites(
+        app, dict(sub_payload, unique_only=True))
     # `aliases` rides along: the scan labels one name per recognition site, so
     # without them a caller hunting `Esp3I` reads a BsmBI-cut gene as uncuttable
     # (audit 2026-09-22).
@@ -107383,7 +107521,7 @@ def _h_find_feature(app, payload):
            "coordinates": _WORKFLOW_COORDS_NOTE}
     if len(ranked) > len(matches):
         out["more_matches"] = len(ranked) - len(matches)
-    return out
+    return _agent_stamp_basis(out, basis)
 
 
 @_agent_endpoint("amplify-feature")
@@ -107719,43 +107857,14 @@ def _h_load_entry(app, payload):
                            max_len=200)
     if not key:
         return ({"error": "missing 'name' or 'id'"}, 400)
-    coll_in = payload.get("collection")
-    if coll_in not in (None, ""):
-        coll_name = _normalize_collection_name(coll_in)
-        if coll_name is None:
-            return ({"error": "invalid 'collection'"}, 400)
-        if _find_collection(coll_name) is None:
-            return ({"error": f"no collection named {coll_name!r}"}, 404)
-    else:
-        coll_name = None
-
-    hits = _agent_scan_library_for_key(key, coll_name)
-    if not hits:
-        # Sweep #26: no `available` enumeration list in the 404 body — it
-        # used to leak the 50 most-recent names (an enumeration oracle).
-        # Agents that want the catalog call `list-library` /
-        # `search-library` deliberately.
-        where = (f" in collection {coll_name!r}" if coll_name
-                 else " in any collection")
-        return ({"error": f"no library entry matching {key!r}{where}"}, 404)
-    if len(hits) > 1:
-        # Prefer the active collection when it's among the hits — keeps
-        # the historical "active collection wins" behaviour deterministic
-        # and silent. Only a genuinely cross-collection ambiguity (the
-        # key lives ONLY in non-active collections, in more than one)
-        # bounces to the caller for a qualifier.
-        active = _get_active_collection_name()
-        active_hits = [h for h in hits if h[0] == active]
-        if len(active_hits) == 1:
-            hits = active_hits
-        else:
-            holders = sorted({h[0] for h in hits})
-            return ({"error":
-                      f"{key!r} matches entries in multiple collections "
-                      f"({', '.join(holders)}) — pass "
-                      f"{{\"collection\": \"…\"}} to disambiguate",
-                      "collections": holders}, 409)
-    holder_name, match = hits[0]
+    # ONE resolver, shared with the `entry` parameter on the read endpoints
+    # (`_agent_resolve_library_entry`): a key that lives in two collections
+    # must mean the same molecule whether you load it or read it in place.
+    holder_name, match, err = _agent_resolve_library_entry(
+        key, payload.get("collection"))
+    if err is not None:
+        return err
+    assert match is not None
 
     gb_text = match.get("gb_text") or ""
     if not gb_text:
@@ -110705,14 +110814,43 @@ def _h_update_feature(app, payload):
 @_agent_endpoint("get-feature")
 def _h_get_feature(app, payload):
     """Detail for feature at `idx`. Returns label, type, start, end,
-    strand, color, qualifiers (= the full SeqFeature qualifiers dict)."""
-    rec = getattr(app, "_current_record", None)
-    if rec is None:
+    strand, color, qualifiers (= the full SeqFeature qualifiers dict).
+
+    Body: ``{idx, entry?, collection?}``. With ``entry``, `idx` indexes that
+    library entry's own feature rows (as `features {"entry": …}` numbers
+    them) and nothing on the canvas is read — see `get-sequence`."""
+    key, _coll, sel_err = _agent_entry_selector(payload)
+    if sel_err is not None:
+        return sel_err
+    if key is None and getattr(app, "_current_record", None) is None:
         return ({"error": "no plasmid loaded"}, 422)
     try:
         idx = int(payload["idx"])
     except (KeyError, ValueError, TypeError, OverflowError):
         return ({"error": "missing or invalid 'idx'"}, 400)
+    if key is not None:
+        rec, basis, err = _agent_target_record(app, payload)
+        if err is not None:
+            return err
+        rows = _agent_map_rows_for_record(rec)
+        if not (0 <= idx < len(rows)):
+            return ({"error": f"idx {idx} out of range "
+                              f"[0, {len(rows)})"}, 400)
+        sf = _agent_seqfeature_for_idx(rec, idx)
+        f = dict(rows[idx])
+        quals = ({k: list(v) if isinstance(v, list) else v
+                  for k, v in (sf.qualifiers or {}).items()}
+                 if sf is not None else {})
+        return _agent_stamp_basis({
+            "idx":        idx,
+            "label":      f.get("label", ""),
+            "type":       f.get("type", "misc_feature"),
+            "start":      f["start"],
+            "end":        f["end"],
+            "strand":     f.get("strand", 1),
+            "color":      f.get("color"),
+            "qualifiers": quals,
+        }, basis)
     # Row + qualifiers from ONE record, read on the UI thread (AG9): they
     # used to come from two reads at two moments, so a swap between them
     # returned plasmid B's coordinates with plasmid A's qualifiers.
@@ -114981,6 +115119,28 @@ def _agent_invoke(app, name: str, body, *, source: str = "http"):
                  "holder_pid": holder or None}, 409)
     if not isinstance(body, dict):
         body = {}
+    # `entry` is a TARGET selector: it decides WHICH molecule the answer is
+    # about. On an endpoint that does not implement it the key would be
+    # dropped in silence — read endpoints echo no `ignored` list — and the
+    # caller would read an answer about the canvas as an answer about their
+    # entry. Same reasoning as `_agent_unread_routing_keys` on the write
+    # side, applied to reads, where the damage is a wrong answer rather than
+    # a wrong write. An INERT value (`null`, `""`, `[]`, `false`) names no
+    # entry and passes: a typed client fills every field it knows about, and
+    # refusing those broke ~120 write endpoints when the same mistake was
+    # made on the write side (2026-09-25).
+    if ("entry" in body and name not in _AGENT_ENTRY_PARAM_ENDPOINTS
+            and not _agent_routing_value_inert(body.get("entry"))):
+        _log_event("agent.entry_param_refused", endpoint=name, source=source)
+        return ({"error":
+                 f"endpoint {name!r} does not take 'entry'. These reads do, "
+                 f"and they answer about a library entry WITHOUT loading it: "
+                 f"{', '.join(sorted(_AGENT_ENTRY_PARAM_ENDPOINTS))}. To put "
+                 f"an entry on the canvas instead, call load-entry with "
+                 f"{{\"name\": \"…\"}}. Nothing was changed.",
+                 "unsupported": ["entry"],
+                 "entry_accepted_by": sorted(_AGENT_ENTRY_PARAM_ENDPOINTS)},
+                400)
     if _state._AGENT_READ_ONLY:
         # The host owns the files and writes them under us (AG5).
         try:
@@ -115088,6 +115248,25 @@ _WORKBENCH_CONTENT_TYPES: "dict[str, str]" = {
     ".woff2": "font/woff2",
     ".woff":  "font/woff",
     ".ttf":   "font/ttf",
+    # Molecular coordinates (2026-10-31). A structure viewer in the bundle
+    # fetches these and parses them itself, so the only thing the type has to
+    # do is keep the browser from EXECUTING one — which is why every asset
+    # response also carries `X-Content-Type-Options: nosniff`. A `.pdb` is
+    # 80-column text, and a sniffing browser that decided a served file was
+    # HTML would run it on THIS origin: the one that hands out the token.
+    # None of the four is an IANA-registered type; `chemical/x-*` is the
+    # long-standing convention and an unregistered type is inert, which is
+    # exactly what is wanted here. Staging coordinates inside a `.json`
+    # wrapper was the workaround, at a generation step and double the bytes.
+    ".pdb":   "chemical/x-pdb",
+    ".cif":   "chemical/x-cif",
+    ".mmcif": "chemical/x-mmcif",
+    # BinaryCIF: the one binary member, and the format a viewer prefers for a
+    # large structure. `application/octet-stream` is NOT a guess here (the
+    # thing the allow-list refuses to do for an unknown extension) — it is
+    # the honest type for a format with no registered one, and it is the type
+    # browsers treat most conservatively.
+    ".bcif":  "application/octet-stream",
 }
 
 # One asset at a time, read whole into memory before sending. 32 MiB is far
@@ -115118,38 +115297,133 @@ def _workbench_resolve_asset(root: "Path", rel: str) -> "Path | None":
        absolute — so an absolute piece has to be refused before the join, not
        after. `%2f%2fetc%2fpasswd` unquotes to `//etc/passwd`, which is
        absolute, which is exactly why unquoting happens before this call.
-    3. **Confinement after `resolve()`**, mirroring
+    3. **Confinement on the RESOLVED target**, mirroring
        `splicecraft_backup._resolve_snapshot_member`: resolve, then
-       `is_relative_to` the resolved root. This is what catches a symlink
-       pointing out of the tree, since `resolve()` follows it.
-    4. **A regular file via `lstat`**, which refuses a symlink outright per
-       `[RECIPE]`'s file-traversal rule and `[INV-50]`. A symlinked asset
-       INSIDE the bundle is therefore refused too; that is deliberate — the
-       bundle is served to a browser, and "it resolved somewhere inside the
-       directory" is a weaker promise than "it is a file in the directory".
-       Symlink the whole `--workbench-dir` instead, which is resolved once at
-       startup.
+       `is_relative_to` the resolved root. Resolving follows symlinks, so
+       this is the check that holds the bundle shut — and it is the only one
+       that has to, because it judges where the bytes actually come from
+       rather than how the path was spelled.
+    4. **A regular file**, which now means a FIFO, socket, device or
+       directory — not a symlink. `resolve()` has already run by here, so
+       the `lstat` sees the TARGET; a symlink is followed, and whether it is
+       served is decided in (3) by where it points. Measured, 2026-10-31:
+
+         | spelling                                   | result  |
+         |--------------------------------------------|---------|
+         | symlinked file → inside the bundle         | served  |
+         | symlinked file → outside                   | refused |
+         | path through a symlinked dir → inside      | served  |
+         | path through a symlinked dir → outside     | refused |
+         | `../../etc/hostname`                       | refused |
+
+       This used to be documented the other way round — "a symlink is
+       refused even when it points inside" — which was never what the code
+       did, and the case a front end actually hits (an `assets/` or
+       `structures/` directory symlinked in from another tree) was the one
+       missing from the table. Following a symlink INTO the bundle is the
+       right behaviour for a directory people assemble with build tools; the
+       promise that matters is confinement, and that is checked where it can
+       be checked. A FIFO refusal is not paranoia either: reading one would
+       park this handler thread until something wrote to it.
+
+    Every refusal is logged with its REASON — four different causes shared
+    one bare `no such asset` 404, and the response cannot carry the detail
+    (this route answers before the token check, so anything specific would
+    be an unauthenticated filesystem oracle). An ESCAPE is a warning, not a
+    debug line: it is the one refusal that usually means the bundle is
+    mis-assembled rather than the request mistyped.
     """
     import stat as _stat
     safe = _sanitize_path(rel)
     if safe is None:
+        _log.debug("workbench: refused asset %r (unusable path)", rel[:200])
         return None
     if safe.is_absolute() or any(part == ".." for part in safe.parts):
+        _log.debug("workbench: refused asset %r (absolute or '..')",
+                   rel[:200])
         return None
     try:
         candidate = (root / safe).resolve()
         if not candidate.is_relative_to(root):
+            _log.warning(
+                "workbench: refused asset %r — it resolves outside %s. A "
+                "symlink pointing out of the bundle is served to nobody; "
+                "copy the file in, or point --workbench-dir at a tree that "
+                "contains it.", rel[:200], root)
             return None
         st = candidate.lstat()
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError) as exc:
+        _log.debug("workbench: refused asset %r (%s)", rel[:200], exc)
         return None
     if not _stat.S_ISREG(st.st_mode):
+        _log.debug("workbench: refused asset %r (not a regular file)",
+                   rel[:200])
         return None
     if st.st_size > _WORKBENCH_MAX_ASSET_BYTES:
         _log.warning("workbench: refused %d-byte asset (cap %d)",
                      st.st_size, _WORKBENCH_MAX_ASSET_BYTES)
         return None
     return candidate
+
+
+# How much of a bundle the startup symlink check will look at. A UI directory
+# is small; a directory with a dependency tree in it is not, and this runs on
+# the launch path.
+_WORKBENCH_SCAN_MAX_ENTRIES = 5000
+_WORKBENCH_SCAN_MAX_REPORT = 3
+
+
+def _workbench_escaping_symlinks(root: "Path") -> "list[tuple[str, str]]":
+    """``(relative path, where it points)`` for symlinks in `root` whose
+    target lies OUTSIDE it — the assets the server will refuse.
+
+    Serve time cannot explain itself to a browser (the 404 body has to stay
+    detail-free on an unauthenticated route), so the explanation goes where
+    there is a terminal to read it: once, at launch, like the missing
+    `index.html` note. The case that earns this is a `structures/` or
+    `assets/` directory symlinked in from another tree — every asset under
+    it 404s, and from the browser that is indistinguishable from a build
+    that did not run.
+
+    Bounded by `_WORKBENCH_SCAN_MAX_ENTRIES` and never follows a symlink
+    while walking: this is a launch-path convenience, not an audit.
+    """
+    found: "list[tuple[str, str]]" = []
+    seen = 0
+    try:
+        root = Path(root).resolve()
+    except OSError:
+        return found
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        here = Path(dirpath)
+        for name in list(dirnames) + list(filenames):
+            seen += 1
+            if seen > _WORKBENCH_SCAN_MAX_ENTRIES:
+                # Truncated, so "no note" stops meaning "no escaping link".
+                # Logged rather than printed: the cap is only reached by a
+                # bundle with a dependency tree in it, where a note about the
+                # scan would be noise on every launch.
+                _log.debug("workbench: symlink scan stopped at %d entries "
+                           "under %s; any further escaping link is "
+                           "unreported", _WORKBENCH_SCAN_MAX_ENTRIES, root)
+                return found
+            p = here / name
+            try:
+                if not p.is_symlink():
+                    continue
+                target = p.resolve()
+                if target.is_relative_to(root):
+                    continue
+            except OSError:
+                continue
+            try:
+                rel = str(p.relative_to(root))
+            except ValueError:            # pragma: no cover - p is under root
+                rel = p.name
+            found.append((rel, str(target)))
+            if len(found) >= _WORKBENCH_SCAN_MAX_REPORT:
+                return found
+    return found
 
 
 # A byte that may legally follow a tag NAME: whitespace, `/` (self-closing)
@@ -115310,8 +115584,21 @@ Finding that point is `_workbench_tag_insert_at`'s job, and it is fussier
     nothing needs escaping today; hand-quoting it would be a latent injection
     the day that stops being true.
     """
+    # `data_dir` answers "which library is this page about to write to?"
+    # before the first API call, which `list-collections` can only answer
+    # after one. It is `_scrub_path`-ed (home → `~`), and it is the PATH
+    # rather than the basename that was asked for because the basename is
+    # the literal string "splicecraft" on every default install and on every
+    # `XDG_DATA_HOME` relocation alike — a field that looks like an answer
+    # and is a constant. The token is in this same object, so the path shape
+    # is not the sensitive part of what this route hands out.
+    globals_payload = {
+        "token":    token or "",
+        "version":  __version__,
+        "data_dir": _scrub_path(str(_state._DATA_DIR)),
+    }
     script = (f"<script>window.{_WORKBENCH_GLOBAL}="
-              f"{json.dumps({'token': token or '', 'version': __version__})};"
+              f"{json.dumps(globals_payload)};"
               f"</script>").encode("utf-8")
     lowered = html.lower()
     cut = _workbench_tag_insert_at(lowered, b"<head")
@@ -115668,6 +115955,14 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # The allow-list fixes the type; this makes the BROWSER honour it.
+        # Without it a browser may sniff the body and decide a file is HTML
+        # whatever the header said — and HTML from this origin can read the
+        # token out of `window.SPLICECRAFT`. Costs nothing: every type in the
+        # map is already the correct one for its extension, so nothing that
+        # worked before stops working (a wrong `text/css` or JS type is what
+        # `nosniff` would break, and the map has none).
+        self.send_header("X-Content-Type-Options", "nosniff")
         # A bundle is rebuilt in place during development and the token is
         # baked into the HTML, so a cached copy is a stale token as well as
         # stale code. Loopback is fast enough that caching buys nothing.
@@ -133692,9 +133987,20 @@ def main():
             # 404'd at serve time with nothing anywhere to say why.
             if _workbench_resolve_asset(_wb, "index.html") is None:
                 print(f"Note: {_wb} has no servable index.html yet — GET / "
-                      f"will 404 until it does. (A symlink or a non-regular "
+                      f"will 404 until it does. (A FIFO or other non-regular "
                       f"file is refused too, by the same rule the server "
-                      f"applies.)", file=sys.stderr)
+                      f"applies; a symlink is followed, as long as it points "
+                      f"inside the bundle.)", file=sys.stderr)
+            # Also NOT fatal, and the one that reads as a broken build from
+            # the browser: a symlink out of the bundle. Confinement is
+            # checked on the resolved target, so every asset under such a
+            # link 404s — correctly, and with a body that cannot say why.
+            for _rel, _tgt in _workbench_escaping_symlinks(_wb):
+                print(f"Note: {_wb / _rel} is a symlink to {_tgt}, which is "
+                      f"outside the bundle — everything under it will 404. "
+                      f"Confinement is checked on the resolved target, so "
+                      f"copy it in, or point --workbench-dir at a directory "
+                      f"that contains both.", file=sys.stderr)
             # The static route hands the bearer token to anything that can
             # connect and send a loopback Host header, because the browser
             # cannot read the mode-600 token file. Same-user processes already

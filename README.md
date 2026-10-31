@@ -482,8 +482,17 @@ endpoint takes a `tm_profile` (`benchling_compatible` reads the same oligo on
 Benchling's scale, ~4–5 °C lower; `list-tm-profiles` gives the conditions).
 `--agent --read-only` attaches **alongside a running GUI** — every read answers,
 every write returns 409 naming the process holding the lock, and nothing on
-disk changes. `--workbench-dir ./ui` *also* serves a browser UI from the API's
-own origin, so a front-end needs neither CORS nor a hand-copied token (or
+disk changes (`status` reports `read_only` and that PID, so a UI can grey out
+its writing half with the reason attached instead of discovering it on a
+click). Ten reads — `get-sequence`, `plasmid-overview`, `features`,
+`get-feature`, `find-feature`, `list-restriction-sites`, `find-orfs`,
+`simulate-gel`, `get-history` — take an optional `entry` naming a library
+entry, so a read-only session can open what it is browsing without loading it
+onto a canvas the GUI owns. `--workbench-dir ./ui` *also* serves a browser UI
+from the API's own origin, so a front-end needs neither CORS nor a
+hand-copied token — it arrives as `window.SPLICECRAFT = {token, version,
+data_dir}`, and the bundle may serve molecular coordinates (`.pdb`, `.cif`,
+`.mmcif`, `.bcif`) alongside its own assets (or
 `--cors-origin http://localhost:5173` to allow one named origin while you
 develop against a hot-reloading dev server). See
 [`docs/agent-api.md`](docs/agent-api.md) and [`docs/cli.md`](docs/cli.md).

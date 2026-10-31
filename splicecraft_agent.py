@@ -81,7 +81,7 @@ from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
 from splicecraft_biology import (_covered_identity, _phred_trim_bounds, _read_extent_for, _read_is_clipped, _pos_in_spans, _variant_gate_pos, _digest_with_enzymes, _enzyme_aliases, _enzyme_site_methylation_targets, _methylated_base_positions, _enzyme_cuts, _enzyme_resolve_one, _enzyme_signature, _resolve_enzyme_names, _scan_restriction_sites)
 from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _build_synthesis_l0_fragment, _design_gb_primers, _entry_vector_acceptor_overhangs, _grammar_position_by_type, _insilico_pcr_amplicons, _l0_part_from_syn_fragment)
-from splicecraft_dataaccess import (_active_enzyme_resolution, _agent_scan_library_for_key, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
+from splicecraft_dataaccess import (_active_enzyme_resolution, _agent_scan_library_for_key, _find_collection, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
 from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member, _fastq_count_reads, _fastq_path_to_records)
 from splicecraft_gels import (_AGAROSE_CHOICES, _GEL_HEIGHT_MAX, _GEL_HEIGHT_MIN, _GEL_LANE_WIDTH_MAX, _GEL_LANE_WIDTH_MIN, _GEL_MAX_LANES, _agarose_mobility, _gel_bands_for_lane, _gel_resolve_enzymes, _render_gel_image)
 from splicecraft_persistence import (_safe_save_json_mirror)
@@ -377,15 +377,224 @@ def _agent_parse_read_quality(rq, cleaned_reads: "list[str]"
     return (out, None)
 
 
-def _agent_record_is_circular(app) -> bool:
-    """Topology of the record currently on the canvas.
+# ── Reading a library entry without loading it (`entry`) ────────────────────
+#
+# A read endpoint answers about the plasmid on the CANVAS. That is the right
+# default and stays the default, but it made a library unbrowsable from a
+# `--read-only` attachment: `load-entry` is a write (it reseats a canvas that
+# a running GUI also owns), so a guest could `list-library` every entry in
+# the collection and then read none of them.
+#
+# `entry` says "answer about THIS library entry, do not touch the canvas".
+# The whole path is a read: no lock, no mirror write, no `_apply_record`, so
+# it works under `--read-only` exactly as it does under a normal launch.
+# `load-entry` is deliberately NOT reclassified — a read-only guest mutating
+# a shared canvas is a worse idea than this parameter (workbench spec W3,
+# 2026-10-31).
+#
+# Three rules, each because its absence would be a wrong answer rather than a
+# refusal:
+#
+#   1. An endpoint that does not implement `entry` REFUSES it (400, in
+#      `_agent_invoke`) instead of silently answering about the canvas. Read
+#      endpoints do not echo ignored keys, so the caller would have read a
+#      canvas answer as an answer about their entry.
+#   2. `collection` only ever qualifies `entry`. On its own it names nothing.
+#   3. Every entry-targeted response carries `entry` + `collection` back, so
+#      the basis of the answer is in the answer — the same discipline that
+#      makes `analyse-cds` name the codon table it scored against.
+_AGENT_ENTRY_PARAM_ENDPOINTS = frozenset({
+    "get-sequence", "plasmid-overview", "features", "list-features",
+    "get-feature", "find-feature", "list-restriction-sites", "find-orfs",
+    "simulate-gel", "get-history",
+})
 
-    Only an EXPLICIT `linear` annotation means linear, matching
-    `splicecraft_util._record_is_circular` and the app's own reading."""
-    rec = getattr(app, "_current_record", None)
-    return str(
-        (getattr(rec, "annotations", {}) or {}).get("topology", "")
-    ).strip().lower() != "linear"
+
+def _agent_resolve_library_entry(key, coll_in):
+    """THE name-or-id to library-entry resolution. Returns
+    ``(collection_name, entry, None)`` or ``(None, None, (body, status))``.
+
+    Shared by `load-entry` and by the `entry` parameter, so the two cannot
+    disagree about which molecule a key names — which, for a key that lives
+    in two collections, is the difference between an answer about one plasmid
+    and an answer about another.
+
+    The ACTIVE collection is searched first (fast path). On a miss the others
+    are searched too: a UNIQUE cross-collection hit resolves and names its
+    collection, an AMBIGUOUS key is a 409 listing the holders. `collection`
+    pins the search to one.
+    """
+    key = _sanitize_label(key, max_len=200)
+    if not key:
+        return None, None, ({"error": "missing 'name' or 'id'"}, 400)
+    if coll_in not in (None, ""):
+        coll_name = _normalize_collection_name(coll_in)
+        if coll_name is None:
+            return None, None, ({"error": "invalid 'collection'"}, 400)
+        if _find_collection(coll_name) is None:
+            return None, None, ({"error": f"no collection named "
+                                          f"{coll_name!r}"}, 404)
+    else:
+        coll_name = None
+    hits = _agent_scan_library_for_key(key, coll_name)
+    if not hits:
+        # Sweep #26: no `available` enumeration list in the 404 body — it
+        # used to leak the 50 most-recent names (an enumeration oracle).
+        # Agents that want the catalog call `list-library` / `search-library`
+        # deliberately. A 404 NAMING the key is the point: "no such entry"
+        # and "that entry has nothing" must not read alike.
+        where = (f" in collection {coll_name!r}" if coll_name
+                 else " in any collection")
+        return None, None, ({"error": f"no library entry matching "
+                                      f"{key!r}{where}"}, 404)
+    if len(hits) > 1:
+        # Prefer the active collection when it's among the hits — keeps the
+        # historical "active collection wins" behaviour deterministic and
+        # silent. Only a genuinely cross-collection ambiguity (the key lives
+        # ONLY in non-active collections, in more than one) bounces to the
+        # caller for a qualifier.
+        active = _get_active_collection_name()
+        active_hits = [h for h in hits if h[0] == active]
+        if len(active_hits) == 1:
+            hits = active_hits
+        else:
+            holders = sorted({h[0] for h in hits})
+            return None, None, ({"error":
+                                 f"{key!r} matches entries in multiple "
+                                 f"collections ({', '.join(holders)}) — pass "
+                                 f"{{\"collection\": \"…\"}} to disambiguate",
+                                 "collections": holders}, 409)
+    return hits[0][0], hits[0][1], None
+
+
+def _agent_entry_record(key, coll_in):
+    """``(record, basis, None)`` for library entry `key`, else
+    ``(None, None, (body, status))``.
+
+    The record is parsed from the entry's stored GenBank text through the
+    same `_gb_text_to_record` (and its parse cache) `load-entry` uses, and
+    carries the entry's stored DISPLAY name as `_tui_display_name` — so a
+    name with spaces reads back as itself and not as the underscored
+    GenBank LOCUS ([INV-98]).
+    """
+    holder, match, err = _agent_resolve_library_entry(key, coll_in)
+    if err is not None:
+        return None, None, err
+    assert match is not None
+    gb_text = match.get("gb_text") or ""
+    if not gb_text:
+        return None, None, ({"error": "library entry has no stored "
+                                      "sequence"}, 422)
+    if not isinstance(gb_text, str):
+        # A hand-edited `collections.json` can put anything here. Handing it
+        # to the parser raised deep inside and came back as a scrubbed 500,
+        # which reads as "SpliceCraft broke" rather than "that entry is not
+        # storing text".
+        return None, None, ({"error": "library entry's stored sequence is "
+                                      f"not text ({type(gb_text).__name__})"},
+                            422)
+    try:
+        rec = _gb_text_to_record(gb_text)
+    except Exception as exc:
+        # Sweep #27: scrub exception text. The entry's gb_text is
+        # user-controlled; parse failures could reveal storage layout.
+        _log.exception("agent entry-target parse failed")
+        return None, None, ({"error":
+                             f"parse failed: {_scrub_path(str(exc))}"}, 500)
+    disp = _sanitize_label(match.get("name"), max_len=200)
+    if disp:
+        rec._tui_display_name = disp     # type: ignore[attr-defined]
+    return rec, {"entry": disp or str(match.get("id") or ""),
+                 "collection": holder}, None
+
+
+def _agent_entry_selector(payload):
+    """``(key, collection, err)`` — the entry a read was asked to answer
+    about. `key` is None when the caller named none, i.e. the canvas is the
+    target. ONE reader for the parameter, so the refusals below read the same
+    whichever endpoint produced them.
+
+    An INERT value (`null`, `""`, `[]`, `{}`, `false` — `_agent_routing_value_inert`)
+    names no entry and is NOT an error: a typed client or an LLM tool layer
+    fills every field it knows about, and refusing on a key's mere presence is
+    how ~120 write endpoints broke for those callers (round-2 hardening,
+    2026-09-25). A value that LOOKS like a selector and selects nothing — a
+    whitespace string, a number — is refused, because that one is a mistake
+    rather than an unset field.
+    """
+    if not isinstance(payload, dict):
+        return None, None, None
+    raw = payload.get("entry")
+    coll = payload.get("collection")
+    coll = None if _agent_routing_value_inert(coll) else coll
+    if _agent_routing_value_inert(raw):
+        if coll is not None:
+            # `collection` qualifies `entry` and nothing else here. Silently
+            # dropping it would answer about the canvas while the caller
+            # believed it had selected a collection.
+            return None, None, ({"error":
+                                 "'collection' only qualifies 'entry' — pass "
+                                 "{\"entry\": \"…\"} to read a library entry, "
+                                 "or drop 'collection'"}, 400)
+        return None, None, None
+    if not isinstance(raw, str) or not raw.strip():
+        return None, None, ({"error": "'entry' must be a non-empty library "
+                                      "entry name or id"}, 400)
+    return raw, coll, None
+
+
+def _agent_target_record(app, payload):
+    """Which record does this read answer about? Returns
+    ``(record, basis, err)``:
+
+    * no `entry` key → ``(the canvas record or None, None, None)`` — today's
+      behaviour, unchanged, including the per-endpoint "no plasmid loaded"
+      refusal the caller still owns.
+    * `entry` → ``(the entry's record, {"entry", "collection"}, None)``.
+    * anything unusable → ``(None, None, (body, status))``.
+
+    `basis` is both the flag ("this is not the canvas") and the stamp the
+    handler puts back on its response via `_agent_stamp_basis`.
+    """
+    key, coll, err = _agent_entry_selector(payload)
+    if err is not None:
+        return None, None, err
+    if key is None:
+        return getattr(app, "_current_record", None), None, None
+    return _agent_entry_record(key, coll)
+
+
+def _agent_stamp_basis(out, basis):
+    """Name the molecule a read answered about, when it was not the canvas.
+    Returns `out` so a handler can `return _agent_stamp_basis({...}, basis)`.
+
+    It OVERWRITES `entry` / `collection`, deliberately: the basis is the
+    authoritative statement of what was read, and a handler that grew a field
+    of either name would be describing something else under the same key. The
+    parity tests compare a canvas answer against an entry answer with the
+    basis removed, so such a collision fails there rather than shipping."""
+    if basis and isinstance(out, dict):
+        out.update(basis)
+    return out
+
+
+def _agent_entry_subpayload(payload):
+    """The `entry` / `collection` pair to forward to a sub-handler call, or
+    `{}`. `plasmid-overview` and `find-feature` answer by calling `features`
+    and `list-restriction-sites` in code; without this the inner calls would
+    answer about the CANVAS while the outer one answered about the entry —
+    two halves of one response describing two different plasmids.
+
+    The entry is resolved again inside each inner call. That is a library
+    lookup plus a cache-hit parse, deliberately paid rather than threading a
+    record through payloads that are otherwise plain JSON.
+    """
+    if not isinstance(payload, dict) or "entry" not in payload:
+        return {}
+    sub = {"entry": payload.get("entry")}
+    if payload.get("collection") not in (None, ""):
+        sub["collection"] = payload.get("collection")
+    return sub
 
 
 def _sanitize_bases(s: "str | None", *,
@@ -818,11 +1027,20 @@ def _agent_sanitize_qualifiers(raw):
 
 @_agent_endpoint("get-sequence")
 def _h_get_sequence(app, payload):
-    """Return DNA from `[start, end)`. Body: ``{start, end, bottom?}``.
+    """Return DNA from `[start, end)`. Body:
+    ``{start, end, bottom?, entry?, collection?}``.
     `bottom: true` returns the reverse-complement (5'→3' on the
     bottom strand). Wrap-aware: `end < start` is interpreted as a
-    span that wraps the origin."""
-    rec = getattr(app, "_current_record", None)
+    span that wraps the origin.
+
+    Pass ``entry`` (a library entry name or id) to read that entry's bases
+    WITHOUT loading it — a pure read, so it works under ``--read-only``
+    while a GUI holds the lock. The response then names the `entry` and its
+    `collection`. Topology comes from whichever record was read, so a wrap
+    is refused on a linear entry exactly as on a linear canvas."""
+    rec, basis, err = _agent_target_record(app, payload)
+    if err is not None:
+        return err
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
     seq = str(rec.seq).upper()
@@ -842,7 +1060,7 @@ def _h_get_sequence(app, payload):
         return ({"error": f"start/end out of range [0, {n}]"}, 400)
     if end >= start:
         sub = seq[start:end]
-    elif not _agent_record_is_circular(app):
+    elif not _record_is_circular(rec):
         # `end < start` means "wrap the origin", and a LINEAR molecule has no
         # origin to wrap. Answering it anyway returned bases that do not exist
         # as one contiguous span on that DNA.
@@ -852,14 +1070,14 @@ def _h_get_sequence(app, payload):
         sub = seq[start:] + seq[:end]
     if _payload_bool(payload, "bottom", False):
         sub = _rc(sub)
-    return {
+    return _agent_stamp_basis({
         "ok":     True,
         "start":  start,
         "end":    end,
         "bottom": _payload_bool(payload, "bottom", False),
         "length": len(sub),
         "seq":    sub,
-    }
+    }, basis)
 
 
 @_agent_endpoint("fold-rna")
@@ -1375,7 +1593,9 @@ def _h_lint_synthesis(app, payload):
 @_agent_endpoint("find-orfs")
 def _h_find_orfs(app, payload):
     """Six-frame ORF scan over the loaded record. Body:
-    ``{min_aa?: int, include_alt_starts?: bool}``. Defaults: 30 aa,
+    ``{min_aa?: int, include_alt_starts?: bool, entry?, collection?}``.
+    ``entry`` scans a library entry instead of the canvas, without loading
+    it (see `get-sequence`). Defaults: 30 aa,
     ATG only. The length cutoff is in AMINO ACIDS (`min_aa`); `min_length` /
     `min_bp` are rejected (400) so a bp-vs-aa unit mix-up can't silently return
     a default-length result. Returns
@@ -1383,7 +1603,9 @@ def _h_find_orfs(app, payload):
     sorted by length descending. ORFs that cross the origin on a
     circular plasmid are reported with `end < start` — the same
     wrap-feature convention used elsewhere."""
-    rec = getattr(app, "_current_record", None)
+    rec, basis, err = _agent_target_record(app, payload)
+    if err is not None:
+        return err
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
     # find-orfs filters by AMINO-ACID length (`min_aa`). `min_length` / `min_bp`
@@ -1408,7 +1630,7 @@ def _h_find_orfs(app, payload):
     alt = _payload_bool(payload, "include_alt_starts", False)
     seq = str(rec.seq) if rec.seq is not None else ""
     if not seq:
-        return {"orfs": [], "count": 0}
+        return _agent_stamp_basis({"orfs": [], "count": 0}, basis)
     # `_record_is_circular`, not `== "circular"`: a record with NO topology
     # annotation (a LOCUS line the writer left blank, most .dna imports) is a
     # plasmid by default everywhere else in the app — the map already draws it
@@ -1422,7 +1644,7 @@ def _h_find_orfs(app, payload):
         include_alt_starts=alt,
         circular=is_circular,
     )
-    return {"orfs": orfs, "count": len(orfs)}
+    return _agent_stamp_basis({"orfs": orfs, "count": len(orfs)}, basis)
 
 
 @_agent_endpoint("list-cas-variants")
@@ -5494,29 +5716,65 @@ def _history_node_to_dict(node) -> "dict | None":
 @_agent_endpoint("get-history")
 def _h_get_history(app, payload):
     """Return the construction-history tree for a library entry as
-    nested JSON. Body: ``{name}`` (or ``{id}``). Returns ``history=null``
-    when the entry has no recorded history (NOT a 404)."""
-    name = _sanitize_label(payload.get("name"), max_len=200)
-    eid_raw = payload.get("id")
-    eid = (_sanitize_label(eid_raw, max_len=200)
-           if isinstance(eid_raw, str) else "")
-    if not name and not eid:
-        return ({"error": "missing 'name' or 'id'"}, 400)
-    # Targeted finder clones only the matched entry instead of `_load_library()`
-    # deep-cloning the ENTIRE active-collection cache just to read one entry's
-    # history_xml — the per-call full-clone anti-pattern that sweep #11's
-    # `_find_library_entry_by_*` helpers exist to kill (this read-only handler
-    # was missed). `id` wins over `name`, matching the diff-plasmid precedence.
-    entry = _find_library_entry_by_id(eid) if eid else None
-    if entry is None and name:
-        entry = _find_library_entry_by_name(name)
-    if entry is None:
-        return ({"error": f"no entry matching name={name!r} id={eid!r}"},
-                404)
+    nested JSON. Body: ``{name}`` (or ``{id}``, or ``{entry}``). Returns
+    ``history=null`` when the entry has no recorded history (NOT a 404).
+
+    This endpoint always answered about a LIBRARY ENTRY rather than the
+    canvas, so it needed nothing to work under ``--read-only``; ``entry`` is
+    accepted as a spelling of ``name``/``id`` purely so one uniform "pass
+    `entry`" rule covers every read that can answer about an entry. Passing
+    both is a 422 rather than a silent precedence."""
+    if not _agent_routing_value_inert(payload.get("entry")):
+        if (not _agent_routing_value_inert(payload.get("name"))
+                or not _agent_routing_value_inert(payload.get("id"))):
+            return ({"error":
+                      "pass EITHER 'entry' or 'name'/'id' — they select the "
+                      "same thing, and preferring one silently would answer "
+                      "about an entry you did not ask for"}, 422)
+    sel_key, sel_coll, sel_err = _agent_entry_selector(payload)
+    if sel_err is not None:
+        return sel_err
+    basis = None
+    if sel_key is not None:
+        # `entry` resolves through the SHARED resolver, so it reaches other
+        # collections and answers an ambiguous key with a 409 — identical to
+        # `entry` on every other read. The legacy `name`/`id` path below is
+        # left exactly as it was: it searches the active collection's mirror,
+        # and changing that under callers who pass `name` would be a silent
+        # change of scope.
+        holder, entry, err = _agent_resolve_library_entry(sel_key, sel_coll)
+        if err is not None:
+            return err
+        assert entry is not None
+        basis = {"entry": _sanitize_label(entry.get("name"), max_len=200)
+                          or str(entry.get("id") or ""),
+                 "collection": holder}
+        name = str(entry.get("name") or "")
+        eid = str(entry.get("id") or "")
+    else:
+        name = _sanitize_label(payload.get("name"), max_len=200)
+        eid_raw = payload.get("id")
+        eid = (_sanitize_label(eid_raw, max_len=200)
+               if isinstance(eid_raw, str) else "")
+        if not name and not eid:
+            return ({"error": "missing 'name' or 'id'"}, 400)
+        # Targeted finder clones only the matched entry instead of
+        # `_load_library()` deep-cloning the ENTIRE active-collection cache
+        # just to read one entry's history_xml — the per-call full-clone
+        # anti-pattern that sweep #11's `_find_library_entry_by_*` helpers
+        # exist to kill (this read-only handler was missed). `id` wins over
+        # `name`, matching the diff-plasmid precedence.
+        entry = _find_library_entry_by_id(eid) if eid else None
+        if entry is None and name:
+            entry = _find_library_entry_by_name(name)
+        if entry is None:
+            return ({"error": f"no entry matching name={name!r} id={eid!r}"},
+                    404)
     xml = entry.get("history_xml") or ""
     if not xml:
-        return {"ok": True, "history": None,
-                "name": entry.get("name"), "id": entry.get("id")}
+        return _agent_stamp_basis({"ok": True, "history": None,
+                                   "name": entry.get("name"),
+                                   "id": entry.get("id")}, basis)
     try:
         root = _parse_commercialsaas_history(xml)
     except ValueError as exc:
@@ -5540,7 +5798,7 @@ def _h_get_history(app, payload):
     except Exception:
         _log.debug("agent get-history: consistency check skipped for %r",
                     entry.get("name"), exc_info=True)
-    return {
+    return _agent_stamp_basis({
         "ok": True,
         "name": entry.get("name"),
         "id":   entry.get("id"),
@@ -5548,7 +5806,7 @@ def _h_get_history(app, payload):
         # Claims the record makes that the sequence doesn't support.
         # Empty list = everything checks out.
         "warnings": warnings,
-    }
+    }, basis)
 
 
 # check-primer's bases, read STRICTLY. The old filter kept every IUPAC letter
@@ -8322,7 +8580,12 @@ def _site_wraps(rec_start, rec_end) -> bool:
 def _h_list_restriction_sites(app, payload):
     """Scan the loaded record for restriction sites. Body:
     ``{enzymes?: [str, ...], min_length?: int, unique_only?: bool,
-       respect_active_collection?: bool = true}``.
+       respect_active_collection?: bool = true, entry?, collection?}``.
+
+    ``entry`` scans a library entry instead of the canvas, without loading it
+    (see `get-sequence`); the active ENZYME collection still applies, since
+    that is a preference about which enzymes you own, not about which
+    molecule is on screen.
 
     Default scans the combined catalog (built-in NEB ∪ user-added
     custom enzymes) with `min_length=4` and `unique_only=False`.
@@ -8370,7 +8633,9 @@ def _h_list_restriction_sites(app, payload):
     Note that `min_length` does not apply to an explicit `enzymes` list (a
     hand-picked short cutter is kept) — passing both returns a `warnings`
     entry saying so."""
-    rec = getattr(app, "_current_record", None)
+    rec, basis, err = _agent_target_record(app, payload)
+    if err is not None:
+        return err
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
     enzymes = payload.get("enzymes")
@@ -8617,7 +8882,7 @@ def _h_list_restriction_sites(app, payload):
             resp["equivalent_enzymes"] = eq
     if warnings:
         resp["warnings"] = warnings
-    return resp
+    return _agent_stamp_basis(resp, basis)
 
 
 def _agent_enzyme_dict(name: str, site: str, fwd_cut: int,
@@ -12897,7 +13162,9 @@ def _h_simulate_gel(app, payload):
         pcr_amplicon?:   dict | null = null,
         height?:         int = 22,
         lane_width?:     int = 7,
-        include_image?:  bool = false}``.
+        include_image?:  bool = false,
+        entry?:          str,
+        collection?:     str}``.
 
     `source` is one of ``"empty" | "ladder" | "plasmid" | "digest" |
     "pcr"``. `detail` semantics depend on source: ladder → ladder
@@ -12909,6 +13176,18 @@ def _h_simulate_gel(app, payload):
     Returns structured band data per lane (bp / form / mobility /
     display row). When ``include_image=true``, also returns the
     rendered gel as a plain-text string (one line per row).
+
+    The template is ALWAYS supplied by the caller — this endpoint never
+    reads the canvas — so it already worked under ``--read-only``. Passing
+    ``entry`` fills the template from a library entry so a plasmid in the
+    library can be run on a lane without fetching its bases first. ``entry``
+    together with a non-empty ``template_seq`` is a 422: two templates, and
+    silently preferring one would run a digest on a molecule the caller did
+    not name. With ``entry`` the topology is the ENTRY's own, whatever
+    ``template_circular`` says — a boolean's unset value is `false` for most
+    typed clients, so refusing one would reject requests that meant nothing
+    by it. The response always echoes the ``template_circular`` it used, so
+    the answer says which molecule it ran.
 
     Read-only.
     """
@@ -12958,10 +13237,24 @@ def _h_simulate_gel(app, payload):
     template = payload.get("template_seq", "")
     if not isinstance(template, str):
         return ({"error": "'template_seq' must be a string"}, 400)
+    entry_rec, basis, err = _agent_target_record(app, payload)
+    if err is not None:
+        return err
+    if basis is not None:
+        if template:
+            return ({"error":
+                      "pass EITHER 'entry' or 'template_seq' — both name a "
+                      "template, and picking one for you would run these "
+                      "lanes on a molecule you did not name"}, 422)
+        template = str(getattr(entry_rec, "seq", "") or "")
+        if len(template) > _PCR_MAX_TEMPLATE_BP:
+            return ({"error": f"entry sequence exceeds "
+                      f"{_PCR_MAX_TEMPLATE_BP:,} bp cap"}, 413)
     if len(template) > _PCR_MAX_TEMPLATE_BP:
         return ({"error": f"'template_seq' exceeds "
                   f"{_PCR_MAX_TEMPLATE_BP:,} bp cap"}, 413)
-    template_circular = _payload_bool(payload, "template_circular", True)
+    template_circular = (_record_is_circular(entry_rec) if basis is not None
+                         else _payload_bool(payload, "template_circular", True))
     pcr_amplicon = payload.get("pcr_amplicon")
     if pcr_amplicon is not None and not isinstance(pcr_amplicon, dict):
         return ({"error": "'pcr_amplicon' must be a dict or null"}, 400)
@@ -13020,14 +13313,19 @@ def _h_simulate_gel(app, payload):
     except Exception as exc:
         _log.exception("agent simulate-gel: band computation failed")
         return ({"error": f"band computation failed: {_scrub_path(str(exc))}"}, 500)
-    response: dict = {
+    response: dict = _agent_stamp_basis({
         "ok":          True,
         "agarose_pct": min(_AGAROSE_CHOICES,
                             key=lambda g: abs(g - agarose)),
+        # Echoed, not just consumed: with `entry` the topology comes from the
+        # entry and a `template_circular` the caller sent is not used, so the
+        # answer has to say which it ran — a supercoiled band on what the
+        # caller thinks is a linear fragment is the whole lane misread.
+        "template_circular": bool(template_circular),
         "height":      height,
         "lane_width":  lane_width,
         "lanes":       lane_results,
-    }
+    }, basis)
     if include_image:
         try:
             rt = _render_gel_image(

@@ -926,9 +926,20 @@ details. In short:
   length/range/shape validation at the boundary.
 - **A browser front-end** (`splicecraft --workbench-dir ./ui`) is
   served from the API's own origin, so the page needs no CORS and no
-  hand-copied token — it arrives as `window.SPLICECRAFT`. Use
-  `--cors-origin http://localhost:5173` instead to point a
-  hot-reloading dev server at the API. Both imply `--agent`.
+  hand-copied token — it arrives as `window.SPLICECRAFT =
+  {token, version, data_dir}`, the last so the page can name the
+  library it is about to write to. The bundle may hold molecular
+  coordinates (`.pdb` / `.cif` / `.mmcif` / `.bcif`) as well as the
+  usual web assets. Use `--cors-origin http://localhost:5173`
+  instead to point a hot-reloading dev server at the API. Both imply
+  `--agent`.
+- **Reading the library without taking the canvas** — ten read
+  endpoints take `{entry}` (a library entry's name or id) and answer
+  about that entry, leaving the loaded plasmid alone. That is what
+  makes `--agent --read-only` useful alongside a running GUI: loading
+  an entry is a write, browsing one is not. `status` reports
+  `read_only` and the PID holding the data-dir lock, so a UI knows
+  which half of itself works before the user clicks.
 - **`splicecraft-cli`** — stdlib-only sidecar (~50 ms cold start)
   that reads connection details from the running session's token
   file. Intended for Claude Code, Cursor, aider, hand-rolled

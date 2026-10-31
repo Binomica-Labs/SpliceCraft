@@ -65,6 +65,36 @@ That's the right move when the user is working in the app — don't ask them to
 quit, and never set `SPLICECRAFT_SKIP_LOCK=1` to force in, which can corrupt the
 library cache.
 
+`status` tells you which half of the API you have: `read_only` (boolean) and
+`lock_holder_pid` (the process holding the data directory, or `null`). Read it
+once at the start instead of discovering the mode from a 409.
+
+**Reading the library on that path.** `load-entry` is a *write* — it reseats
+the canvas the user is looking at — so it 409s here. Don't ask them to quit:
+ten reads take an optional **`entry`** (a library entry's name or id) and
+answer about that entry without touching the canvas:
+
+```bash
+splicecraft-cli call plasmid-overview --json '{"entry": "pUC19"}'
+splicecraft-cli call find-feature --json '{"entry": "pUC19", "name": "lacZ alpha"}'
+```
+
+`get-sequence` `plasmid-overview` `features` `get-feature` `find-feature`
+`list-restriction-sites` `find-orfs` `simulate-gel` `get-history` — add
+`collection` to pin which collection you mean. The answer names the `entry`
+and `collection` back, so you can always tell what a result describes. An
+endpoint that doesn't take `entry` refuses it rather than quietly answering
+about the canvas, and an unknown entry is a 404 that names it (never an empty
+result, so "nothing there" and "no such entry" stay apart). Sending it as
+`null` or `""` is fine everywhere — that names no entry and is ignored, not
+an error.
+
+Two things not to misread: `plasmid-overview`'s `unsaved` is always `false`
+for an `entry` (you are being told about what is on disk, not about the
+canvas beside it), and the `idx` on an entry's feature rows is the index that
+feature will have *once loaded* — it is not a handle for `update-feature` /
+`delete-feature`, which act on the canvas and refuse `entry`.
+
 Use the `--read-only` **flag** and leave `SPLICECRAFT_READ_ONLY` unset. A
 read-only session publishes its port to `agent_token.readonly`, and the CLI falls
 back to that automatically when no host token exists — so discovery just works.
