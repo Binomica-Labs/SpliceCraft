@@ -673,9 +673,12 @@ class TestDamagedFiles:
                           for _ in range(100_000))
         text = _record('     misc_feature    1..10\n'
                        '                     /note="start\n' + lines + '"')
-        t0 = time.perf_counter()
+        t0 = time.process_time()
         (rec,) = _ours(text)
-        assert time.perf_counter() - t0 < 5
+        spent = time.process_time() - t0
+        # CPU time: the claim is that the continuation walk is linear, and a
+        # wall-clock budget under `-n auto` fails on starvation instead.
+        assert spent < 5, f"parse took {spent:.3f} s CPU (budget 5)"
         assert rec.features[0].qualifiers["note"][0].count("word") == 400_000
 
     def test_seeded_mutations_never_crash(self):

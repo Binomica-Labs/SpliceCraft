@@ -125,9 +125,12 @@ def test_primer_csv_import_sanitizes_name(tmp_path):
 
 def test_spellcheck_strip_is_linear_on_bracket_run():
     bomb = "[" * 60000  # O(n^2) form took seconds here; linear form ~1 ms
-    t0 = time.perf_counter()
+    t0 = time.process_time()
     out = sc._spellcheck_strip_code(bomb)
-    assert time.perf_counter() - t0 < 1.0
+    spent = time.process_time() - t0
+    # CPU time: the claim is "linear", and a wall-clock budget inside
+    # `-n auto` fails on scheduler starvation rather than on a regression.
+    assert spent < 1.0, f"strip took {spent:.3f} s CPU (budget 1.0)"
     assert len(out) == len(bomb)  # offset alignment preserved
 
 

@@ -625,9 +625,13 @@ class TestMalformedInput:
             {"start": p1 + len(lead) + len(CDS), "end": len(seq), "strand": 1,
              "type": "terminator", "label": "t"},
         ]
-        t = time.perf_counter()
+        t = time.process_time()
         r = sa._predict_transcript(seq, feats, circular=True)
-        assert r["ok"] and time.perf_counter() - t < 5.0
+        spent = time.process_time() - t
+        # CPU time: the claim is about the algorithm, and a wall-clock budget
+        # under `-n auto` fails on starvation instead.
+        assert r["ok"]
+        assert spent < 5.0, f"predict took {spent:.3f} s CPU (budget 5.0)"
 
 
 class TestIncludeSequences:

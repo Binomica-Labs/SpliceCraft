@@ -14,6 +14,79 @@
 
 ---
 
+## [1.3.13] — 2026-10-31
+
+You can now put a web page in front of SpliceCraft. The groundwork for a
+browser front-end, and the sweep that went over it before it shipped.
+
+### New features
+
+- **Drive SpliceCraft from a browser — `--workbench-dir ./ui`.** Point it at a
+  folder with an `index.html` and SpliceCraft serves that page from the agent
+  API's own address. That one detail is what makes a web front-end possible at
+  all: the page and the API share an origin, so the browser raises no
+  cross-origin objection, and the page is handed its access token on the way
+  out instead of you copying one in by hand. It arrives as
+  `window.SPLICECRAFT = {token, version}`. Implies `--agent`.
+- **`--cors-origin http://localhost:5173`** for the other way round: you are
+  building the page with a hot-reloading dev server and want it to call a
+  SpliceCraft you started separately. Allows exactly one address you name, and
+  nothing else — a wildcard is refused at startup, on purpose.
+
+### Security
+
+- **A folder containing your data directory is now refused.** The page has to
+  be served before the token is checked — a browser cannot attach a token to a
+  `<script>` tag — so `--workbench-dir ~` would have handed your plasmid
+  library to anything else running on the machine. SpliceCraft now refuses a
+  folder that contains (or is) the data directory, and refuses a home
+  directory or a drive root for the same reason. A folder *inside* the data
+  directory is still fine; only what it would expose matters.
+- **An empty `--workbench-dir` served the folder you launched from.** A blank
+  value now switches the feature off instead.
+- **Files are only served if they are real files.** A shortcut or symlink is
+  refused even when it points at something inside the folder, and the size
+  limit is now enforced against what is actually read, not against what the
+  file measured a moment earlier.
+- **Startup now warns about the things that would fail later.** A missing
+  `index.html` already drew a note; a shortcut standing in for one now does
+  too, because the server would have refused it and the only clue would have
+  been a 404 in the browser.
+
+### Bug fixes
+
+- **The page could load without its access token, with nothing to say why.**
+  Two ways. A page with no `<head>` of its own but a `<header>` somewhere in
+  the body got its token after the app had already looked for it. And a page
+  whose comments merely *mention* `<head>` — the sort of banner a bundler
+  writes — had the token tucked inside the comment, where the browser ignores
+  it entirely. In both cases the page appeared to load perfectly and then
+  could not talk to SpliceCraft.
+- **`--cors-origin` quietly did nothing if you typed the address differently
+  from the browser.** `HTTP://LocalHost:5173` or `http://localhost:80` were
+  accepted at startup and then matched no request, because a browser sends a
+  normalised form. The address you give is now normalised the same way, so it
+  matches. An IPv6 address keeps its brackets, and an address carrying only a
+  password is refused rather than silently stripped.
+- **A folder reached through a shortcut served nothing at all.** Every file in
+  it came back as missing.
+- **Browser requests for a favicon or a source map answered "unsupported".**
+  Every browser asks for `/favicon.ico` whether you mention it or not, and
+  devtools asks for source maps the moment you open a bundled file, so both
+  put an error in the console of every page load. The servable list now covers
+  the files a built page actually asks for — but it is still a list: an
+  extension that is not on it is refused by name, with the supported ones in
+  the message, rather than guessed at.
+
+### Agent API & command line
+
+- Endpoints always win over served files: `/status` is the endpoint, and a
+  mistyped `/stattus` still answers with the list of endpoints rather than
+  "no such file". A file is only looked for when the request looks like one.
+- The endpoint counts in the internal documentation were years-stale in both
+  directions (one said 109, another 202; it is 298). Corrected, and a test now
+  fails if they drift again.
+
 ## [1.3.12] — 2026-10-31
 
 A deep audit of the whole app — saving and loading, file formats, the

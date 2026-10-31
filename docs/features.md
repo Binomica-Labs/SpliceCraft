@@ -924,6 +924,11 @@ details. In short:
   with bearer-token auth, covering every GUI action external AI
   agents need. ~298 endpoints; symlink-guarded write paths;
   length/range/shape validation at the boundary.
+- **A browser front-end** (`splicecraft --workbench-dir ./ui`) is
+  served from the API's own origin, so the page needs no CORS and no
+  hand-copied token — it arrives as `window.SPLICECRAFT`. Use
+  `--cors-origin http://localhost:5173` instead to point a
+  hot-reloading dev server at the API. Both imply `--agent`.
 - **`splicecraft-cli`** — stdlib-only sidecar (~50 ms cold start)
   that reads connection details from the running session's token
   file. Intended for Claude Code, Cursor, aider, hand-rolled

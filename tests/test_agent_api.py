@@ -7705,3 +7705,64 @@ class TestAssembleIntoEntryVectorWarns:
         if isinstance(r, tuple):
             pytest.skip(f"this acceptor/part pair does not assemble: {r}")
         assert "warnings" not in r, r.get("warnings")
+
+
+class TestEndpointSplitIsDocumented:
+    """`splicecraft_agent`'s module docstring states how the ~300 endpoints
+    divide between the sibling and the hub, and it is the first thing an agent
+    reads about that file.
+
+    It was wrong for several releases — the docstring said 109 / 26 while
+    CLAUDE.md said 202 / 82 and the registry held 211 / 87 — because nothing
+    checked it. Three numbers in prose, each re-derivable in one line, is
+    exactly the shape `[INV-226]`'s "a threshold folded into a source comment
+    cannot be checked" is about. Adding an endpoint now updates one line of
+    that docstring; this test is what tells you.
+    """
+
+    def _counts(self):
+        total = len(sc._AGENT_HANDLERS)
+        sibling = sum(
+            1 for _n, (fn, _w) in sc._AGENT_HANDLERS.items()
+            if getattr(fn, "__module__", "") == "splicecraft_agent")
+        return total, sibling, total - sibling
+
+    def test_docstring_numbers_match_the_registry(self):
+        import splicecraft_agent as ag
+        total, sibling, hub = self._counts()
+        doc = ag.__doc__ or ""
+        assert f"{sibling} here" in doc, (
+            f"module docstring does not state the real data-only count "
+            f"({sibling}); registry says {sibling} sibling / {hub} hub / "
+            f"{total} total")
+        assert f"{hub} hub-side" in doc, (
+            f"module docstring does not state the real app-coupled count "
+            f"({hub})")
+        assert f"{total} registered" in doc, (
+            f"module docstring does not state the real total ({total})")
+
+    def test_claude_md_agrees_with_the_registry(self):
+        """CLAUDE.md carries the same split in its sibling map. The two
+        drifted apart once already; a disagreement between them is worse than
+        either being stale, because there is no way to tell which to trust."""
+        from pathlib import Path
+        md = (Path(__file__).resolve().parent.parent / "CLAUDE.md")
+        if not md.is_file():                       # pragma: no cover
+            pytest.skip("CLAUDE.md not present")
+        text = md.read_text(encoding="utf-8")
+        total, sibling, hub = self._counts()
+        assert f"{sibling} data-only endpoints" in text, (
+            f"CLAUDE.md's splicecraft_agent entry does not say "
+            f"{sibling} data-only endpoints")
+        assert f"{hub} app-coupled" in text, (
+            f"CLAUDE.md's splicecraft_agent entry does not say "
+            f"{hub} app-coupled")
+
+    def test_every_handler_lives_in_one_of_the_two_places(self):
+        """A handler registered from a third module would make both numbers
+        meaningless without either of them looking wrong."""
+        stray = sorted(
+            n for n, (fn, _w) in sc._AGENT_HANDLERS.items()
+            if getattr(fn, "__module__", "") not in ("splicecraft",
+                                                      "splicecraft_agent"))
+        assert stray == [], f"handlers registered outside the two homes: {stray}"

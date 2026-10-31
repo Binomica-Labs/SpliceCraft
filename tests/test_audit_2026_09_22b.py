@@ -2880,11 +2880,20 @@ class TestNotebookExportShowsEachAttachmentOnce:
         import time
         import splicecraft_experiments as E
         body = "![a](" * 200_000                      # the 1 MB body cap
-        t = time.perf_counter()
+        t = time.process_time()
         E._experiment_html_document([self._e(body, [])])
         E._experiment_markdown_document(self._e(body, ["gel.png"]),
                                         image_srcs=self._srcs())
-        assert time.perf_counter() - t < 2.0          # was ~45 s at 160 KB
+        spent = time.process_time() - t
+        # CPU time, not wall clock. The guard is "this is linear, not
+        # quadratic" (it was ~45 s at 160 KB), and a wall-clock deadline
+        # inside `-n auto` fails on scheduler starvation instead: measured
+        # 0.002 s idle and 0.003 s under 10x CPU load on 16 cores, so every
+        # wall-clock failure it produced was this process being descheduled,
+        # never the renderer. CPU time is also the TIGHTER bound on the thing
+        # actually under test. The number is in the message because a bare
+        # `< 2.0` makes a genuine failure unreadable.
+        assert spent < 2.0, f"render took {spent:.3f} s CPU (budget 2.0)"
 
     def test_a_numbered_list_keeps_its_start(self):
         import splicecraft_experiments as E

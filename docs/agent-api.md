@@ -22,7 +22,85 @@ splicecraft --agent                  # default port 6701
 splicecraft --agent --agent-port 6800  # alternative port
 splicecraft --headless               # agent API only, NO terminal UI (CI / no-pty)
 splicecraft --agent --read-only      # attach ALONGSIDE a running GUI (reads only)
+splicecraft --workbench-dir ./ui     # ALSO serve a browser UI from this origin
 ```
+
+### Driving the API from a browser (`--workbench-dir`)
+
+A browser cannot call this API from any other origin. There is no CORS
+handling by default, and that is deliberate: the server binds loopback and
+every endpoint wants a bearer token the page has no way to read.
+
+`--workbench-dir PATH` serves a local single-page UI from **the API's own
+origin**, which removes both problems at once — no preflight, and no token to
+copy by hand. It implies `--agent`, and refuses at startup if `PATH` is
+missing or is not a directory.
+
+```bash
+splicecraft --workbench-dir ./ui --headless
+curl -s http://127.0.0.1:6701/            # index.html, token injected
+curl -s http://127.0.0.1:6701/status -H "Authorization: Bearer $TOKEN"
+```
+
+- `GET /` serves `index.html`; any other asset-shaped path serves that file.
+- The bearer token is injected into every served `.html` as one global:
+  `window.SPLICECRAFT = {token, version}`.
+- Content types come from a fixed allow-list: `.html .js .mjs .wasm .css
+  .json .map .webmanifest .png .svg .ico .gif .jpg .jpeg .webp .woff2 .woff
+  .ttf`. **Anything else is a 415** listing what *is* servable, never a
+  guessed `application/octet-stream` — and never `mimetypes`, whose map
+  depends on the machine's `/etc/mime.types`, so the same bundle would be
+  served with different types on two laptops.
+- A path that resolves outside the directory, a symlink, or a file over 32 MiB
+  is a 404 with no detail — this route answers before the token check, so a
+  specific message would be an unauthenticated filesystem oracle. The log line
+  carries the detail for whoever is running the server.
+- A **symlinked asset is refused even when it points inside the bundle**: the
+  check wants a regular file, because "it resolved somewhere under the
+  directory" is a weaker promise than "it is a file in the directory".
+  Symlink the whole `--workbench-dir` instead — that is resolved once, at
+  startup. A symlinked `index.html` draws a note at startup rather than a
+  mystery 404 later.
+- **A root that contains your data directory is refused at startup.** `.json`
+  is servable and assets answer before the token check, so
+  `--workbench-dir ~` would publish `library.json` to any local process that
+  can reach the port. A home directory or a filesystem root is refused for the
+  same reason. A *subdirectory* of the data dir is fine — confinement means it
+  exposes only itself.
+- **Endpoints always win.** A request is only treated as an asset if its last
+  path component contains a dot, and never if the endpoint registry knows the
+  name. So `/status` is still the endpoint and a mistyped `/stattus` still
+  returns the endpoint list.
+
+**What serving the token costs.** `GET /` has to answer before the page has a
+token, so that one route is unauthenticated. A process running as *you* could
+already read the token file; a process running as **another local user** can
+reach loopback but cannot read a mode-600 file, so for that case this does
+widen exposure. It is opt-in, it is logged at startup, and the `Host`
+anti-rebinding check still applies. Do not pass this flag on a shared machine.
+
+### A dev server instead (`--cors-origin`)
+
+For hot-reloading development, `--cors-origin ORIGIN` allows browser calls
+from exactly one origin:
+
+```bash
+splicecraft --cors-origin http://localhost:5173 --headless
+```
+
+It adds `OPTIONS` preflight support and `Access-Control-Allow-{Origin,Headers,
+Methods}` for that origin and no other. **Never a wildcard** — `*` is refused
+at startup, as is anything that is not a bare `scheme://host[:port]`. Without
+this flag no `Access-Control-*` header is emitted anywhere and `OPTIONS`
+returns 405.
+
+The value is normalised at startup to the serialisation a browser actually
+sends (RFC 6454): scheme and host lower-cased, a default port dropped. So
+`--cors-origin HTTP://LocalHost:5173` and `http://localhost:80` work rather
+than matching nothing — the comparison against the request's `Origin` is exact
+equality, so an un-normalised value would look accepted and silently never
+fire. `Vary: Origin` is sent on every response whenever the flag is set,
+matched or not, so no cache can hand one origin's headers to another.
 
 ### Attaching while the GUI is open (`--read-only`)
 

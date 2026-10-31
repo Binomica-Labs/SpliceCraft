@@ -23,10 +23,21 @@ rotation picker, the PCR sim, settings-flush, the master-delete + assembly-
 fragment cache busts, the experiment blob delete, the entry-vector binder). The
 "deferred chase" relocated the movable blockers — active-name getters/finders →
 dataaccess, the restore-from-backup engine → backup, the PCR caps → cloning — so
-ALL 109 data-only endpoints live here; only the 26 app-coupled handlers stay hub.
+ALL data-only endpoints live here; only the app-coupled handlers stay hub.
 `_sanitize_path` / `_ENZYME_CUT_RANGE` were relocated to L0 (util / biology) as
 prerequisites. Top layer among the siblings (imports the whole domain stack ≤L3);
 nothing imports it but the hub.
+
+**The split, as of 1.3.12: 211 here, 87 hub-side, 298 registered in total.**
+Those three numbers were stale for several releases (the docstring said 109 / 26
+and CLAUDE.md said 202 / 82) and this is the first thing an agent reads about
+this file, so they are now pinned by
+`tests/test_agent_api.py::TestEndpointSplitIsDocumented` — adding an endpoint
+updates one line here and the test says so. Re-derive them with::
+
+    len(sc._AGENT_HANDLERS)                      # total
+    [n for n, (fn, _w) in sc._AGENT_HANDLERS.items()
+     if fn.__module__ == "splicecraft_agent"]    # data-only
 """
 from __future__ import annotations
 

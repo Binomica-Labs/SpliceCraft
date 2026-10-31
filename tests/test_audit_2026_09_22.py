@@ -688,9 +688,12 @@ class TestNotebookHtmlExport:
     def test_a_run_of_brackets_exports_in_linear_time(self):
         import time
         import splicecraft_experiments as ex
-        t0 = time.perf_counter()
+        t0 = time.process_time()
         ex._markdown_subset_to_html("[" * 40_000 + "](x)")
-        assert time.perf_counter() - t0 < 2.0
+        spent = time.process_time() - t0
+        # CPU time, not wall clock — see the note on the 1 MB sibling of this
+        # test: a wall-clock budget under `-n auto` fails on starvation.
+        assert spent < 2.0, f"export took {spent:.3f} s CPU (budget 2.0)"
 
 
 # ── SEC9: OT-2 protocol text is spliced in as real Python literals ─────────

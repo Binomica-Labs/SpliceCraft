@@ -227,10 +227,13 @@ class TestAbifHeaderDirectoryBounds:
         p = tmp_path / "dos.ab1"
         p.write_bytes(_abif(self._entries(), head_stride=0,
                             head_count=100_000_000))
-        t0 = time.perf_counter()
+        t0 = time.process_time()
         with pytest.raises(ValueError, match="(?i)corrupt ab1 header"):
             sc._ab1_path_to_record(str(p))
-        assert time.perf_counter() - t0 < 1.0
+        spent = time.process_time() - t0
+        # CPU time: the pathology is a 100-million-entry header loop, not
+        # I/O, and a wall-clock budget under `-n auto` fails on starvation.
+        assert spent < 1.0, f"refusal took {spent:.3f} s CPU (budget 1.0)"
 
     def test_an_honest_header_still_parses(self, tmp_path):
         """The guard is arithmetic on the real layout, so the builder's own

@@ -43,7 +43,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.3.12"
+__version__ = "1.3.13"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
@@ -115042,6 +115042,290 @@ def _agent_json_finite_float(text):
     return value
 
 
+# ── Workbench static bundle (`--workbench-dir`) ───────────────────────────────
+# A local single-page UI that drives this API is served from the API's OWN
+# origin, which is what makes it work at all: a browser on any other origin
+# cannot call these endpoints, because there is no CORS handling here by design
+# (the server binds loopback only). Same-origin removes the preflight AND the
+# token-distribution problem in one move. `--cors-origin` exists as an explicit,
+# single-origin dev escape for a hot-reloading dev server; it is never a
+# wildcard.
+#
+# EXPLICIT allow-list, and an unknown extension is a 415 rather than
+# `application/octet-stream`: guessing a type for an arbitrary file is how a
+# static route becomes a way to make the browser execute something the server
+# never meant to hand it. `mimetypes` is deliberately NOT used — its map is
+# platform- and `/etc/mime.types`-dependent, so the same bundle would be served
+# with different types on two machines.
+# An entry earns its place by being something a BROWSER loads as part of a
+# page. `.txt`, `.csv`, `.pdf` and friends are deliberately absent: a bundle
+# does not need them, and every entry widens what this unauthenticated route
+# will hand out.
+_WORKBENCH_CONTENT_TYPES: "dict[str, str]" = {
+    # Document + code.
+    ".html":  "text/html; charset=utf-8",
+    ".js":    "text/javascript; charset=utf-8",
+    ".mjs":   "text/javascript; charset=utf-8",
+    ".wasm":  "application/wasm",
+    ".css":   "text/css; charset=utf-8",
+    # Data a page fetches about itself. `.map` is what devtools asks for the
+    # moment anyone opens a bundled file; without it a source map reads as an
+    # unexplained 415 in the console.
+    ".json":  "application/json",
+    ".map":   "application/json",
+    ".webmanifest": "application/manifest+json",
+    # Images. `.ico` earns its place by being requested WITHOUT markup — every
+    # browser asks for `/favicon.ico` unprompted, so leaving it out put a 415
+    # in the console of every single page load.
+    ".png":   "image/png",
+    ".svg":   "image/svg+xml",
+    ".ico":   "image/vnd.microsoft.icon",
+    ".gif":   "image/gif",
+    ".jpg":   "image/jpeg",
+    ".jpeg":  "image/jpeg",
+    ".webp":  "image/webp",
+    # Fonts.
+    ".woff2": "font/woff2",
+    ".woff":  "font/woff",
+    ".ttf":   "font/ttf",
+}
+
+# One asset at a time, read whole into memory before sending. 32 MiB is far
+# above any plausible SPA bundle (a wasm blob is the big one) and bounds what a
+# single request can make the handler thread hold — the same reasoning as
+# `_MAX_BODY_BYTES` on the way in.
+_WORKBENCH_MAX_ASSET_BYTES = 32 << 20
+
+# The JS global injected into `index.html` at serve time. An OBJECT rather than
+# a bare string so a later field can be added without changing the shape the
+# front-end destructures.
+_WORKBENCH_GLOBAL = "SPLICECRAFT"
+
+
+def _workbench_resolve_asset(root: "Path", rel: str) -> "Path | None":
+    """Resolve `rel` (a URL path, already stripped of `/` and `?`) inside
+    `root`, or None if it escapes, is not a regular file, or is too large.
+
+    Four separate refusals, because each catches a different thing and the
+    cheap ones short-circuit the syscalls:
+
+    1. **`_sanitize_path`** (util L0) is borrowed rather than re-rolled — it
+       owns the NUL-byte and ``~user`` refusals and the `~` expansion. What it
+       deliberately does NOT do is confinement ("the user owns their
+       filesystem"), so it cannot be the whole check here.
+    2. **No absolute path and no `..` component.** `Path("/a") / "/etc/passwd"`
+       is `/etc/passwd` — pathlib DISCARDS the left side when the right is
+       absolute — so an absolute piece has to be refused before the join, not
+       after. `%2f%2fetc%2fpasswd` unquotes to `//etc/passwd`, which is
+       absolute, which is exactly why unquoting happens before this call.
+    3. **Confinement after `resolve()`**, mirroring
+       `splicecraft_backup._resolve_snapshot_member`: resolve, then
+       `is_relative_to` the resolved root. This is what catches a symlink
+       pointing out of the tree, since `resolve()` follows it.
+    4. **A regular file via `lstat`**, which refuses a symlink outright per
+       `[RECIPE]`'s file-traversal rule and `[INV-50]`. A symlinked asset
+       INSIDE the bundle is therefore refused too; that is deliberate — the
+       bundle is served to a browser, and "it resolved somewhere inside the
+       directory" is a weaker promise than "it is a file in the directory".
+       Symlink the whole `--workbench-dir` instead, which is resolved once at
+       startup.
+    """
+    import stat as _stat
+    safe = _sanitize_path(rel)
+    if safe is None:
+        return None
+    if safe.is_absolute() or any(part == ".." for part in safe.parts):
+        return None
+    try:
+        candidate = (root / safe).resolve()
+        if not candidate.is_relative_to(root):
+            return None
+        st = candidate.lstat()
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not _stat.S_ISREG(st.st_mode):
+        return None
+    if st.st_size > _WORKBENCH_MAX_ASSET_BYTES:
+        _log.warning("workbench: refused %d-byte asset (cap %d)",
+                     st.st_size, _WORKBENCH_MAX_ASSET_BYTES)
+        return None
+    return candidate
+
+
+# A byte that may legally follow a tag NAME: whitespace, `/` (self-closing)
+# or `>`. Anything else means the match is a DIFFERENT tag whose name merely
+# starts the same way, and `<header>` vs `<head>` is the whole reason this
+# exists.
+_WORKBENCH_TAG_NAME_END = b" \t\r\n/>"
+
+
+def _workbench_tag_insert_at(lowered: bytes, tag: bytes) -> "int | None":
+    """Offset just past the `>` of the first REAL `tag` in `lowered` (which
+    must already be lower-cased), or None when there isn't one.
+
+    Two refusals, both found by probing the first draft, which matched the
+    tag as a bare prefix anywhere in the document:
+
+    1. **A tag-name boundary is required.** `<head` is a prefix of
+       `<header>`, and a document with no `<head>` element but a `<header>`
+       is valid HTML5 (the parser infers the head). The token script was
+       spliced in after `<header>` instead — and when that element sits
+       after the bundle's own `<script src>`, the global is defined AFTER
+       the app has already read it. Measured: undefined token, nothing in
+       any log.
+    2. **Not inside a comment.** A build banner that merely MENTIONS
+       `<head>` swallowed the injected `<script>` whole. The page then
+       loads perfectly and cannot authenticate, which is the worst of both
+       outcomes — no error to chase anywhere.
+    """
+    at = -1
+    while True:
+        at = lowered.find(tag, at + 1)
+        if at == -1:
+            return None
+        after = lowered[at + len(tag):at + len(tag) + 1]
+        if after and after not in _WORKBENCH_TAG_NAME_END:
+            continue                      # `<header>` is not `<head>`
+        opened = lowered.rfind(b"<!--", 0, at)
+        if opened != -1:
+            closed = lowered.find(b"-->", opened + 4)
+            if closed == -1 or closed > at:
+                continue                  # inside a comment (or an unclosed one)
+        close = lowered.find(b">", at + len(tag))
+        if close == -1:
+            return None
+        return close + 1
+
+
+def _workbench_normalise_origin(raw: str) -> "tuple[str | None, str | None]":
+    """`(origin, None)` for one usable origin, or `(None, why_not)`.
+
+    Returns the ASCII serialisation a browser actually SENDS (RFC 6454 §6.2):
+    scheme and host lower-cased, a default port omitted. `_cors_allowed_origin`
+    compares for exact equality, so `--cors-origin http://LocalHost:5173` or
+    `http://localhost:80` would otherwise match no request any browser ever
+    sends — and the only symptom would be that CORS silently never works, from
+    a flag that read as accepted. Normalising here is what keeps "the flag was
+    taken" and "the flag has an effect" from being two different things.
+    """
+    origin = (raw or "").strip()
+    if origin == "":
+        return None, "an empty origin matches nothing; omit the flag instead"
+    if origin == "*":
+        return None, ("a wildcard origin would open this control surface to "
+                      "every page the browser visits")
+    import urllib.parse as _uparse
+    try:
+        parsed = _uparse.urlparse(origin)
+        port = parsed.port   # urlparse defers the port parse to THIS access
+    except ValueError:
+        return None, "could not be parsed as an origin (is the port a number?)"
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        return None, ("expected scheme://host[:port], e.g. "
+                      "http://localhost:5173")
+    if (parsed.path or parsed.query or parsed.fragment
+            or parsed.username or parsed.password):
+        return None, ("an Origin is scheme + host + port only — no path, "
+                      "query, fragment or credentials")
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None, "no host in the origin"
+    if ":" in host:              # IPv6 — `hostname` strips the brackets
+        host = f"[{host}]"
+    if port is not None and port == (80 if scheme == "http" else 443):
+        port = None              # a browser omits the default port
+    return f"{scheme}://{host}" + (f":{port}" if port is not None else ""), None
+
+
+def _workbench_server_root(raw: object) -> "Path | None":
+    """Normalise whatever reached the server into a RESOLVED directory.
+
+    `_workbench_resolve_asset` compares a resolved candidate against this
+    root, so an UNRESOLVED root — one holding a symlinked component, a `..`,
+    or simply relative — makes `is_relative_to` false for every asset and
+    404s the entire bundle with nothing to explain it. `main()` resolves
+    before setting the attribute, but the server reads it off the app with
+    `getattr`, so an embedder or a test rig can hand over a raw string.
+    Normalise at the boundary rather than trusting every future caller to.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str) and not raw.strip():
+        # `Path("").resolve()` is the CURRENT WORKING DIRECTORY, so an empty
+        # value would quietly serve whatever directory the process happened to
+        # be launched in — the repo root, typically, with every `.json` and
+        # `.svg` in it on an unauthenticated route. Blank means off.
+        return None
+    if not isinstance(raw, (str, os.PathLike)):
+        # Narrowed before the `Path()` call rather than caught after it: the
+        # parameter is `object` because this reads whatever a caller put on
+        # the app, and a type that is not a path at all should be named as
+        # such, not discovered through a TypeError.
+        _log.warning("workbench: ignoring unusable directory %r", raw)
+        return None
+    try:
+        return Path(raw).resolve()
+    except (OSError, ValueError, TypeError) as exc:
+        _log.warning("workbench: ignoring unusable directory %r (%s)",
+                     raw, exc)
+        return None
+
+
+def _workbench_inject_token(html: bytes, token: "str | None") -> bytes:
+    """Put the bearer token into `index.html` as a single JS global.
+
+    The front-end cannot read the mode-600 token file and cannot attach an
+    `Authorization` header to a `<script src>`, so a same-origin bundle has to
+    be handed the token by the server that serves it.
+
+    **This is the one place the token leaves the token file, and it leaves it
+    UNAUTHENTICATED** — `GET /` has to answer before the browser has a token,
+    or nothing loads. The exposure that buys:
+
+    * A process running as THIS user already has the token: it can read
+      `_state._AGENT_TOKEN_FILE` directly. For that case this changes nothing.
+    * A process running as ANOTHER local user can connect to loopback but
+      CANNOT read a mode-600 file. For that case this genuinely does widen
+      exposure, which is why it is behind an explicit opt-in flag, is logged at
+      startup, and keeps the `Host`-header anti-rebinding check.
+
+    The global goes in as early as the document allows, so it is defined
+    before any bundled script runs: just inside `<head>` when there is one,
+    else just inside `<html>`, else after the doctype, else at the very front.
+
+Finding that point is `_workbench_tag_insert_at`'s job, and it is fussier
+    than it looks: the tag carries attributes (`<head lang="en">`) so it
+    cannot be matched as a literal, it must not be confused with a longer
+    name that starts the same way (`<header>`), and it must not be matched
+    inside a comment. Each of those three got the script into a place where
+    it silently did not do its job — see that function for the measured
+    failure of each. Matching the literal `<head>` was the first draft: a
+    `<head lang="en">` document fell through to the final branch and got the
+    script spliced in AHEAD of its own `<!DOCTYPE>`, which puts the browser
+    in quirks mode — a layout bug with no visible cause, out of a security
+    feature.
+
+    `json.dumps` does the escaping. The token is URL-safe base64 today, so
+    nothing needs escaping today; hand-quoting it would be a latent injection
+    the day that stops being true.
+    """
+    script = (f"<script>window.{_WORKBENCH_GLOBAL}="
+              f"{json.dumps({'token': token or '', 'version': __version__})};"
+              f"</script>").encode("utf-8")
+    lowered = html.lower()
+    cut = _workbench_tag_insert_at(lowered, b"<head")
+    if cut is None:
+        cut = _workbench_tag_insert_at(lowered, b"<html")
+    if cut is None:
+        cut = _workbench_tag_insert_at(lowered, b"<!doctype")
+    if cut is None:
+        # A fragment with no doctype, html or head of its own: the front is
+        # the only place left, and there is no doctype here to displace.
+        cut = 0
+    return html[:cut] + script + html[cut:]
+
+
 class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
     """Routes `/<name>` to the registered handler. JSON in, JSON out.
     Bearer-token auth on write endpoints; no CORS handling since we
@@ -115182,8 +115466,68 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self._send_cors_headers()
         self.end_headers()
         self.wfile.write(body)
+
+    # ── CORS: one named origin, opt-in, never a wildcard ──────────────────
+    def _cors_allowed_origin(self) -> "str | None":
+        """The request's `Origin` if it EXACTLY matches `--cors-origin`.
+
+        Returns None otherwise, including when no origin was configured — in
+        which case no `Access-Control-*` header is emitted at all and a
+        cross-origin browser is refused by the browser itself, which is the
+        default and the intended posture. A wildcard is never produced: the
+        configured value is compared for equality, so `--cors-origin '*'` is
+        refused at parse time rather than reflected here.
+        """
+        want = getattr(self.server, "_cors_origin", None)
+        if not want:
+            return None
+        got = (self.headers.get("Origin") or "").strip()
+        return got if got and got == want else None
+
+    def _send_cors_headers(self) -> None:
+        """Emit the three `Access-Control-*` headers when, and only when, the
+        request carries the one configured origin.
+
+        `Vary: Origin` goes out whenever an origin is CONFIGURED, matched or
+        not: the response differs by `Origin`, and a cache that does not know
+        that would serve the allowed origin's headers to another one."""
+        if not getattr(self.server, "_cors_origin", None):
+            return
+        self.send_header("Vary", "Origin")
+        allowed = self._cors_allowed_origin()
+        if allowed is None:
+            return
+        self.send_header("Access-Control-Allow-Origin", allowed)
+        self.send_header("Access-Control-Allow-Headers",
+                         "Authorization, Content-Type, X-Idempotency-Key")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+    def do_OPTIONS(self):
+        """Preflight, answered ONLY for a configured `--cors-origin`.
+
+        Without `--cors-origin` this 405s exactly as an unknown method did
+        before, so the default surface is unchanged: the API has no CORS story
+        by design and `--workbench-dir` is the supported way to put a browser
+        in front of it. The `Host` anti-rebinding check runs here too — a
+        preflight that skipped it would be the one unguarded door."""
+        host = (self.headers.get("Host") or "").strip()
+        if host:
+            hostname = host.rsplit(":", 1)[0].strip("[]").lower()
+            if hostname not in ("127.0.0.1", "localhost", "::1"):
+                return self._send({"error": "forbidden host"}, 403)
+        if self._cors_allowed_origin() is None:
+            return self._send(
+                {"error": "CORS is not enabled for this origin; serve the UI "
+                          "from this origin with --workbench-dir, or pass "
+                          "--cors-origin ORIGIN for a dev server"}, 405)
+        self.send_response(204)
+        self._send_cors_headers()
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _check_token(self) -> bool:
         import secrets
@@ -115233,6 +115577,105 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  return self._handle("GET")
     def do_POST(self): return self._handle("POST")
 
+    # ── Workbench static routes ───────────────────────────────────────────
+    #
+    # A request is claimed by the static route when `--workbench-dir` is set
+    # and the path is ASSET-SHAPED: empty (`GET /` → `index.html`) or with a
+    # dot in its last component. Nothing else, and never a path the endpoint
+    # registry knows.
+    #
+    # The dot rule is what keeps the two surfaces from fighting, and it holds
+    # because **no endpoint name contains a dot** — all 298 are kebab-case
+    # alphanumeric. `tests/test_workbench.py` asserts that, so a future
+    # endpoint named `foo.bar` fails the suite rather than quietly becoming
+    # unreachable behind a 404. Without it, a mistyped `/stattus` would be
+    # answered by the static 404 and an agent would lose the endpoint-list
+    # hint that the registry 404 carries.
+    _STATIC_CLAIM_EXEMPT = frozenset({"healthz"})
+
+    def _workbench_claims(self, method: str, path_part: str) -> bool:
+        """Does the static route own this request?"""
+        if method != "GET" or getattr(self.server, "_workbench_dir", None) is None:
+            return False
+        # The endpoint ALWAYS wins. Checked explicitly as well as implied by
+        # the dot rule, because the dot rule is a property of today's names
+        # and this is the invariant.
+        if path_part in _AGENT_HANDLERS or path_part in self._STATIC_CLAIM_EXEMPT:
+            return False
+        if path_part == "":
+            return True
+        return "." in path_part.rsplit("/", 1)[-1]
+
+    def _serve_workbench(self, path_part: str) -> None:
+        """Serve one file from `--workbench-dir`. Always responds.
+
+        `GET /` is `index.html`, with the bearer token injected (see
+        `_workbench_inject_token` for what that exposes and why it is
+        acceptable only on a loopback bind). Any other asset is served
+        verbatim.
+
+        The URL path is UNQUOTED first, so `%2e%2e%2f` is `../` by the time
+        `_workbench_resolve_asset` judges it — percent-encoding is the obvious
+        way to smuggle a traversal past a textual check, and decoding before
+        the check rather than after is the only ordering that works.
+        """
+        import urllib.parse
+        root = getattr(self.server, "_workbench_dir", None)
+        if root is None:                      # pragma: no cover - guarded above
+            return self._send({"error": "no workbench directory"}, 404)
+        rel = "index.html" if path_part == "" else path_part
+        try:
+            rel = urllib.parse.unquote(rel, errors="strict")
+        except (UnicodeDecodeError, ValueError):
+            return self._send({"error": "malformed asset path"}, 400)
+        suffix = Path(rel).suffix.lower()
+        ctype = _WORKBENCH_CONTENT_TYPES.get(suffix)
+        if ctype is None:
+            # 415, not a guessed type. Listing what IS servable makes a
+            # missing entry a one-line fix rather than a mystery.
+            return self._send(
+                {"error": f"unsupported asset type {suffix or '(none)'!r}",
+                 "supported": sorted(_WORKBENCH_CONTENT_TYPES)}, 415)
+        target = _workbench_resolve_asset(root, rel)
+        if target is None:
+            # ONE message for "outside the directory", "not a regular file"
+            # and "too big", and deliberately no endpoint list: this route
+            # answers before the token check, so anything specific here would
+            # be an unauthenticated filesystem oracle. The log line carries
+            # the detail for the person running the server.
+            _log.debug("workbench: refused asset %r", rel[:200])
+            return self._send({"error": "no such asset"}, 404)
+        try:
+            # Bounded read, not `read_bytes()`. The size came from an `lstat`
+            # a syscall ago, so on its own it is advisory: a rebuild (or a
+            # deliberate swap) between the check and the read would pull the
+            # whole new file into this handler thread no matter what the cap
+            # says. Reading cap+1 makes the cap the thing that actually
+            # holds.
+            with open(target, "rb") as _fh:
+                body = _fh.read(_WORKBENCH_MAX_ASSET_BYTES + 1)
+        except OSError as exc:
+            _log.warning("workbench: could not read %s: %s", target.name, exc)
+            return self._send({"error": "asset unreadable"}, 404)
+        if len(body) > _WORKBENCH_MAX_ASSET_BYTES:
+            _log.warning("workbench: %s passed the size check and then read "
+                         "past the %d-byte cap; refused",
+                         target.name, _WORKBENCH_MAX_ASSET_BYTES)
+            return self._send({"error": "no such asset"}, 404)
+        if path_part == "" or suffix == ".html":
+            body = _workbench_inject_token(
+                body, getattr(self.server, "_token", None))
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        # A bundle is rebuilt in place during development and the token is
+        # baked into the HTML, so a cached copy is a stale token as well as
+        # stale code. Loopback is fast enough that caching buys nothing.
+        self.send_header("Cache-Control", "no-store")
+        self._send_cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
     def _handle(self, method: str) -> None:
         # An idempotency key claimed by `_handle_inner` is released here, on
         # EVERY exit (cached or not, handler crash, failed send), after the
@@ -115262,6 +115705,15 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
             hostname = host.rsplit(":", 1)[0].strip("[]").lower()
             if hostname not in ("127.0.0.1", "localhost", "::1"):
                 return self._send({"error": "forbidden host"}, 403)
+        # Static bundle, when `--workbench-dir` is set. AFTER the Host check —
+        # the anti-rebinding guard covers the static routes too, and a route
+        # that serves the bearer token is the last one that should skip it —
+        # and BEFORE the token check, because it has to: a browser cannot put
+        # an `Authorization` header on a `<script src>`, and `GET /` has to
+        # answer before the page has a token at all. `_workbench_claims` is
+        # what keeps this from shadowing an endpoint.
+        if self._workbench_claims(method, path_part):
+            return self._serve_workbench(path_part)
         if path_part == "healthz":
             # Unauthenticated readiness/liveness probe (snag #4). Once
             # the server is accepting connections this returns 200, so an
@@ -115369,6 +115821,10 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
                 "allow": "POST",
             }).encode("utf-8")
             self.send_header("Content-Length", str(len(err_body)))
+            # This path writes its headers by hand rather than through
+            # `_send`, so the CORS headers have to be added here too — a 405
+            # a browser cannot read is a 405 the developer cannot debug.
+            self._send_cors_headers()
             self.end_headers()
             self.wfile.write(err_body)
             return
@@ -115636,6 +116092,14 @@ class _AgentAPIServer(ThreadingMixIn, http.server.HTTPServer):
                        "never ship a token-free agent server.")
         # Surfaced by the unauthenticated `/healthz` probe (snag #4).
         self._headless = bool(getattr(app, "_headless", False))
+        # Static-bundle + dev-CORS opt-ins, read off the app the same way
+        # `_headless` is. Both default to None, which is "behave exactly as
+        # before": no static routes, no `Access-Control-*` header anywhere,
+        # `do_OPTIONS` 405s. `main()` has already validated the directory and
+        # the origin, so nothing here re-checks them.
+        self._workbench_dir = _workbench_server_root(
+            getattr(app, "_workbench_dir", None))
+        self._cors_origin = getattr(app, "_cors_origin", None)
 
 
 def _start_agent_api(app, port: int = _AGENT_API_PORT_DEFAULT):
@@ -133076,6 +133540,18 @@ def main():
                                    "SpliceCraft already holds (e.g. the GUI). "
                                    "Serves every read endpoint; refuses every "
                                    "write with 409. Implies --agent --headless.")
+    main_parser.add_argument("--workbench-dir", metavar="PATH", default=None,
+                              dest="workbench_dir",
+                              help="Serve a local single-page UI from the "
+                                   "agent API's own origin, so a browser can "
+                                   "drive this session without CORS or a "
+                                   "hand-copied token. Implies --agent.")
+    main_parser.add_argument("--cors-origin", metavar="ORIGIN", default=None,
+                              dest="cors_origin",
+                              help="Allow browser calls from exactly this one "
+                                   "origin (e.g. http://localhost:5173) for "
+                                   "local UI development. Never a wildcard. "
+                                   "Implies --agent.")
 
     try:
         parsed, rest = main_parser.parse_known_args(sys.argv[1:])
@@ -133145,6 +133621,95 @@ def main():
                     f"SPLICECRAFT_AGENT_API names port {want}, which is "
                     f"outside 1-65535")
             agent_port = want
+    # `--workbench-dir`: serve a local single-page UI from the API's own
+    # origin. Validated HERE, at parse time, and refused loudly — a flag that
+    # accepted a missing directory and then 404'd every asset would look like
+    # a broken UI rather than a mistyped path.
+    workbench_dir = None
+    if parsed.workbench_dir is not None:
+        _wb = _sanitize_path(parsed.workbench_dir)
+        if _wb is None:
+            main_parser.error(
+                f"--workbench-dir {parsed.workbench_dir!r} is not a usable "
+                f"path")
+        else:
+            try:
+                _wb = _wb.resolve()
+                _is_dir = _wb.is_dir()
+            except OSError as exc:
+                main_parser.error(f"--workbench-dir {parsed.workbench_dir!r} "
+                                  f"could not be read ({exc})")
+                _is_dir = False
+            if not _is_dir:
+                main_parser.error(
+                    f"--workbench-dir {parsed.workbench_dir!r} is not a "
+                    f"directory. Point it at the folder holding the UI's "
+                    f"index.html.")
+            # REFUSED: a root that CONTAINS the user's data directory.
+            # Assets are served before the token check (they have to be — a
+            # browser cannot put a bearer header on a `<script src>`) and
+            # `.json` is a servable type, so `--workbench-dir ~` would hand
+            # `library.json` and `collections.json` to any local process that
+            # can reach this port. The data is the product; a flag meant for
+            # a UI bundle does not get to serve it.
+            #
+            # Scoped to "contains or IS", deliberately not "or sits inside".
+            # A bundle in a subdirectory of the data dir exposes only itself
+            # — confinement already holds — so refusing it would cost a
+            # harmless layout and buy nothing.
+            try:
+                _data = Path(_state._DATA_DIR).resolve()
+            except OSError:
+                _data = Path(_state._DATA_DIR)
+            if _wb == _data or _wb in _data.parents:
+                main_parser.error(
+                    f"--workbench-dir {parsed.workbench_dir!r} resolves to "
+                    f"{_wb}, which is the data directory {_data} or contains "
+                    f"it. Assets are served before the token check, so that "
+                    f"would publish your library to any local process. Point "
+                    f"it at the UI bundle only.")
+            try:
+                _home = Path.home().resolve()
+            except (OSError, RuntimeError):
+                _home = None
+            if _wb == Path(_wb.anchor) or (_home is not None and _wb == _home):
+                main_parser.error(
+                    f"--workbench-dir {parsed.workbench_dir!r} resolves to "
+                    f"{_wb}. A home or filesystem root is never a UI bundle, "
+                    f"and every servable file beneath it would be readable "
+                    f"without a token. Point it at the bundle directory.")
+            workbench_dir = _wb
+            enable_agent_api = True
+            # NOT fatal: a dev may well launch before the first build lands,
+            # and `GET /` says so with a 404 of its own. Worth a word at
+            # startup either way, because an empty bundle directory and a
+            # wrong path look identical from the browser.
+            #
+            # Asked through `_workbench_resolve_asset`, which is the function
+            # the SERVER will use, so the two cannot disagree. `is_file()`
+            # was the first draft and it follows symlinks, which the server
+            # refuses — a symlinked `index.html` passed this check and then
+            # 404'd at serve time with nothing anywhere to say why.
+            if _workbench_resolve_asset(_wb, "index.html") is None:
+                print(f"Note: {_wb} has no servable index.html yet — GET / "
+                      f"will 404 until it does. (A symlink or a non-regular "
+                      f"file is refused too, by the same rule the server "
+                      f"applies.)", file=sys.stderr)
+            # The static route hands the bearer token to anything that can
+            # connect and send a loopback Host header, because the browser
+            # cannot read the mode-600 token file. Same-user processes already
+            # had the token; another local USER did not. Say so once, out
+            # loud, rather than only in a docstring.
+            _log.warning("workbench: serving %s with the bearer token "
+                         "injected into index.html — any local process able "
+                         "to reach this port can read it", _wb)
+    # `--cors-origin`: the explicit dev escape, for exactly one origin.
+    cors_origin = None
+    if parsed.cors_origin is not None:
+        cors_origin, _why = _workbench_normalise_origin(parsed.cors_origin)
+        if cors_origin is None:
+            main_parser.error(f"--cors-origin {parsed.cors_origin!r}: {_why}")
+        enable_agent_api = True
     # Headless mode (snag #3): run the agent API with no Textual UI, so
     # CI / agent contexts don't need a pty (no more `script -qfc`
     # wrapping). It implies the agent API — a headless app with no API
@@ -133222,7 +133787,16 @@ def main():
             f"                            # 127.0.0.1:{_AGENT_API_PORT_DEFAULT} so Claude Code /\n"
             "                            # another agent can drive this session\n"
             "                            # (alias for --agent-api; pair with\n"
-            "                            #  --agent-port=PORT to override port)\n\n"
+            "                            #  --agent-port=PORT to override port)\n"
+            "  splicecraft --workbench-dir ./ui\n"
+            "                            # also serve a local browser UI from\n"
+            "                            # that folder on the SAME origin as\n"
+            "                            # the API, so no CORS and no token\n"
+            "                            # copying is needed (implies --agent)\n"
+            "  splicecraft --cors-origin http://localhost:5173\n"
+            "                            # dev only: allow browser calls from\n"
+            "                            # exactly that one origin, e.g. a\n"
+            "                            # hot-reloading dev server\n\n"
             "Data files (library, parts, primers) live in:\n"
             f"  {_state._DATA_DIR}\n"
             "Override with $SPLICECRAFT_DATA_DIR.\n"
@@ -133466,6 +134040,11 @@ def main():
     if enable_agent_api:
         app._agent_api_port = agent_port  # type: ignore[attr-defined]
     app._headless = headless  # type: ignore[attr-defined]
+    # Read by `_AgentAPIServer.__init__`, like `_headless`. Already validated
+    # above; None on both means the HTTP surface behaves exactly as it did
+    # before these flags existed.
+    app._workbench_dir = workbench_dir   # type: ignore[attr-defined]
+    app._cors_origin = cors_origin       # type: ignore[attr-defined]
 
     if arg:
         looks_like_file = arg.lower().endswith((".gb", ".gbk", ".genbank", ".dna"))
