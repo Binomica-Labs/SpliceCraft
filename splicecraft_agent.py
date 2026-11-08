@@ -53,7 +53,7 @@ from splicecraft_dataaccess import (_load_custom_labware, _load_protocol_collect
 from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _feat_len, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len, _span_full_lap_len, _span_in_span)
 from splicecraft_cloning import (_cloned_plasmid_regenerated_sites, _GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _acceptor_vector_features, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi, _enzyme_is_type_iis)
-from splicecraft_codon import (_CODON_RAMP_CODONS, _CODON_RARE_W, _codon_relative_adaptiveness, _CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_ambiguous_stops, _codon_cai, _codon_diversify, _codon_table_for, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_fix_splice_sites, _CODON_SPLICE_MAX_REPORT, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
+from splicecraft_codon import (_CODON_MAX_EXTERNAL_SITES, _CODON_RAMP_CODONS, _CODON_RARE_W, _codon_relative_adaptiveness, _CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_ambiguous_stops, _codon_cai, _codon_diversify, _codon_table_for, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_fix_splice_sites, _CODON_SPLICE_MAX_REPORT, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
 from splicecraft_splice import (_SPLICE_PAIR_FLOOR, _splice_model_summary,
                                _splice_pair_risk, _splice_scan,
                                _splice_scan_basis, _splice_threshold)
@@ -2245,7 +2245,8 @@ def _h_optimize_protein(app, payload):
     table from the registry. Body: ``{protein, table?, stops?,
     transl_table?, mode?, hazard_hosts?, forbidden_motifs?, min_gc?,
     max_gc?, gc_window?, avoid_repeats_with?, max_repeat?,
-    check_splice?, scrub_splice_sites?, splice_margin?}`` where
+    check_splice?, scrub_splice_sites?, splice_margin?,
+    splice_external_sites?}`` where
 
     `hazard_hosts` pulls built-in host-expression hazards to scrub out of the
     CDS — ``"plant"`` (polyA signal AATAAA, cryptic splice donor GTRAG),
@@ -2296,6 +2297,19 @@ def _h_optimize_protein(app, payload):
     actually used and drops the recorded sensitivity when it was overridden,
     since that figure was measured at the calibrated cutoff and does not
     describe a different one.
+
+    `splice_external_sites` closes the fact that the repair is CDS-LOCAL. It
+    only ever sees the coding sequence, so it cannot ask whether a weakened
+    site still PAIRS with a partner outside the CDS — and on a real construct
+    it dropped a cryptic acceptor to 3.287, under its own bar and still above
+    the real intron's acceptor at 3.248, leaving the genuine upstream donor
+    paired with it and the whole 5' end of the CDS excisable. Pass the sites
+    flanking the CDS as ``[{kind, offset, score}]`` — `kind` is `donor` or
+    `acceptor`, `offset` is RELATIVE TO THE CDS START (negative for upstream,
+    the motivating case) and `score` is the log-odds score, all three exactly
+    as `scan-splice-sites` reports them. Such a site then becomes repairable
+    **even when its own score is under the bar**, which is what the residual
+    needed: a guard alone cannot fix a site nothing targets.
 
     Each entry in `splice.pairs` carries `both_above_threshold` and
     `sub_threshold_ends`: the pairing stage scans LOWER than the reporting
@@ -2448,6 +2462,18 @@ def _h_optimize_protein(app, payload):
     # `splice_margin` lowers the REPAIR bar (and the re-measurement with it).
     # Validated here so a bad number is a 400 naming the bound, not a
     # ValueError from inside the optimizer.
+    splice_ext = payload.get("splice_external_sites")
+    if splice_ext is not None and not isinstance(splice_ext, (list, tuple)):
+        return ({"error": "'splice_external_sites' must be a list of "
+                          "{kind, offset, score} objects"}, 400)
+    # Normalised to a list: the isinstance check above admits a tuple, and
+    # the helper's contract is a list.
+    splice_ext = None if splice_ext is None else list(splice_ext)
+    if splice_ext is not None and len(splice_ext) > _CODON_MAX_EXTERNAL_SITES:
+        return ({"error": f"'splice_external_sites' has {len(splice_ext)} "
+                          f"entries (max {_CODON_MAX_EXTERNAL_SITES}) — that "
+                          f"is more flanking sites than any real flank "
+                          f"carries"}, 400)
     splice_margin = payload.get("splice_margin", 0.0)
     if isinstance(splice_margin, bool):
         return ({"error": "'splice_margin' is a number of BITS, not a flag — "
@@ -2609,7 +2635,7 @@ def _h_optimize_protein(app, payload):
             try:
                 dna, splice_fixes, _rem = _codon_fix_splice_sites(
                     dna, body, entry["raw"], sites=scrub or None,
-                    margin=splice_margin,
+                    margin=splice_margin, external_sites=splice_ext,
                     has_appended_stop=has_stop, transl_table=transl_table)
             except RuntimeError as exc:
                 # `_splice_scan` refuses when no model is loaded. Scoped to

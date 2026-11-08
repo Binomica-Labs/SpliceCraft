@@ -4145,3 +4145,161 @@ class TestSpliceRepairDoesNotTradeForA3PrimeSite:
         for motif in ("GGTCTC", "CGTCTC"):
             assert motif not in out
             assert sc._rc(motif) not in out
+
+
+class TestSpliceRepairSeesPartnersOutsideTheCds:
+    """Field report 2026-11-08, round 3. The repair is CDS-LOCAL: it only ever
+    sees the coding sequence, so its acceptance test could not ask whether a
+    weakened site still PAIRS with a partner outside the CDS. On the reporting
+    construct it dropped a cryptic acceptor to 3.287 — under its own repair
+    bar and still above the real intron's acceptor at 3.248 — leaving the
+    genuine upstream donor paired with it and the 5' end of the CDS
+    excisable. Same class as the 3'-end gap, one level up."""
+
+    EXT = [{"kind": "donor", "offset": -1500, "score": 5.829}]
+
+    def _gate(self):
+        from splicecraft_splice import _splice_threshold
+        d, a = _splice_threshold("donor"), _splice_threshold("acceptor")
+        assert d is not None and a is not None
+        return d + a
+
+    def _paired(self, dna):
+        """Acceptors that still pair with the external donor above the gate —
+        scanned at the PAIR FLOOR, since the residual sat under the bar."""
+        from splicecraft_splice import _SPLICE_PAIR_FLOOR, _splice_scan
+        out = []
+        for h in _splice_scan(dna, kind="acceptor",
+                              acceptor_threshold=_SPLICE_PAIR_FLOOR):
+            span = h["position"] + 2 - self.EXT[0]["offset"]
+            if 60 <= span <= 3000 and \
+                    h["score"] + self.EXT[0]["score"] >= self._gate():
+                out.append(h)
+        return out
+
+    # Derived by search: the plain repair leaves one acceptor at 3.314 —
+    # below the margin=1.0 bar of 3.439, above the 2.376 a 5.829 donor needs
+    # to still make a pair.
+    DNA = ("ATGGCATCACACTGGAGCCTGCGTCCCCTATTATATATTTTCTTTGTTATATGTGTGACT"
+           "CTTCATTCTCAAATGTCAAAGGTTAGTCTTGATTTATTAAATTTGCACGTGCAGGGAGGG"
+           "GCCCTACTCTTTATACCTACGCGAATCGTTGTAGAGATTTTCCATCATGCTAGTAGCTCT")
+
+    def _protein(self, dna):
+        return "".join(sc._CODON_TABLE.get(dna[i:i + 3], "X")
+                       for i in range(0, len(dna) - 2, 3))
+
+    def _run(self, ext):
+        prot = self._protein(self.DNA)
+        return _codon._codon_fix_splice_sites(
+            self.DNA, prot, sc._CODON_BUILTIN_K12, kind="acceptor",
+            margin=1.0, has_appended_stop=False, external_sites=ext)
+
+    def test_the_fixture_is_a_valid_in_frame_cds(self):
+        assert len(self.DNA) % 3 == 0
+        assert "X" not in self._protein(self.DNA)
+        assert "*" not in self._protein(self.DNA)
+
+    def test_without_the_partner_a_paired_residual_survives(self):
+        """The premise: CDS-local repair leaves a site that still pairs."""
+        out, fixes, _rem = self._run(None)
+        assert fixes, "fixture must be repairable"
+        assert self._paired(out), (
+            "fixture must leave an externally-paired residual, or the rest "
+            "of this class proves nothing")
+
+    def test_with_the_partner_the_residual_is_cleared(self):
+        out, fixes, _rem = self._run(self.EXT)
+        assert fixes
+        assert self._paired(out) == []
+
+    def test_a_sub_threshold_site_becomes_repairable(self):
+        """A guard alone cannot fix this — nothing targeted a site under the
+        bar. The externally-paired site has to become a TARGET."""
+        plain, fp, _ = self._run(None)
+        guarded, fg, _ = self._run(self.EXT)
+        assert len(fg) > len(fp), (fp, fg)
+        assert guarded != plain
+
+    def test_the_protein_is_untouched(self):
+        prot = self._protein(self.DNA)
+        for ext in (None, self.EXT):
+            out, _f, _r = self._run(ext)
+            assert self._protein(out) == prot
+
+    def test_the_guard_is_comparative_not_an_absolute_veto(self):
+        """An absolute "no site may still pair" rule refused a strictly
+        BETTER swap and left the original site, which was above the bar AND
+        paired — worse on both counts. Caught while building this."""
+        out, fixes, _rem = self._run(self.EXT)
+        # it must not have given up: at least as many fixes as plain
+        _plain, fp, _ = self._run(None)
+        assert len(fixes) >= len(fp)
+
+    def test_an_acceptor_partner_downstream_is_handled_too(self):
+        """Symmetry: a CDS donor reaching an annotated acceptor downstream is
+        the mirror case and must not be ignored."""
+        ext = [{"kind": "acceptor", "offset": len(self.DNA) + 1200,
+                "score": 5.5}]
+        out, _f, _r = _codon._codon_fix_splice_sites(
+            self.DNA, self._protein(self.DNA), sc._CODON_BUILTIN_K12,
+            kind="donor", margin=1.0, has_appended_stop=False,
+            external_sites=ext)
+        assert self._protein(out) == self._protein(self.DNA)
+
+    @pytest.mark.parametrize("bad,needle", [
+        ("nope", "must be a list"),
+        ([42], "must be a dict"),
+        ([{"kind": "x", "offset": 0, "score": 1}], "must be 'donor' or"),
+        ([{"kind": "donor", "score": 1}], "numeric 'offset'"),
+        ([{"kind": "donor", "offset": 0, "score": float("nan")}], "finite"),
+    ])
+    def test_malformed_entries_are_refused(self, bad, needle):
+        with pytest.raises(ValueError, match=needle):
+            _codon._codon_fix_splice_sites(
+                "ATGAAACCTTAA", "MKP*", sc._CODON_BUILTIN_K12,
+                has_appended_stop=False, external_sites=bad)
+
+    @pytest.mark.parametrize("entry,needle", [
+        ({"kind": "donor", "offset": -100, "score": True}, "not flags"),
+        ({"kind": "donor", "offset": True, "score": 5.0}, "not flags"),
+        ({"kind": "donor", "offset": 1.7, "score": 5.0}, "whole number"),
+        ({"kind": "donor", "offset": float("inf"), "score": 5.0}, "finite"),
+    ])
+    def test_silent_coercions_are_refused(self, entry, needle):
+        """`int(True)` is 1 and `float(True)` is 1.0, so a flag would become a
+        coordinate or a score; truncating 1.7 to 1 shifts the pair geometry by
+        a base and nothing downstream could tell. Same rule as `margin`."""
+        with pytest.raises(ValueError, match=needle):
+            _codon._codon_fix_splice_sites(
+                self.DNA, self._protein(self.DNA), sc._CODON_BUILTIN_K12,
+                has_appended_stop=False, external_sites=[entry])
+
+    def test_the_list_is_bounded(self):
+        """`_external_pairs` is sites x external_sites per surviving
+        candidate; a 10 kb flank carries well under a hundred sites."""
+        big = [{"kind": "donor", "offset": -100 - i, "score": 5.0}
+               for i in range(_codon._CODON_MAX_EXTERNAL_SITES + 1)]
+        with pytest.raises(ValueError, match="more flanking sites"):
+            _codon._codon_fix_splice_sites(
+                self.DNA, self._protein(self.DNA), sc._CODON_BUILTIN_K12,
+                has_appended_stop=False, external_sites=big)
+
+    def test_duplicates_are_collapsed_not_re_walked(self):
+        """Identical entries cost work and change nothing."""
+        one = self._run(self.EXT)[0]
+        many, _f, _r = _codon._codon_fix_splice_sites(
+            self.DNA, self._protein(self.DNA), sc._CODON_BUILTIN_K12,
+            kind="acceptor", margin=1.0, has_appended_stop=False,
+            external_sites=self.EXT * 200)
+        assert many == one
+
+    def test_it_composes_with_the_3prime_guard(self):
+        """Both guards on the same swap must not interfere."""
+        prot = self._protein(self.DNA)
+        out, fixes, _rem = _codon._codon_fix_splice_sites(
+            self.DNA, prot, sc._CODON_BUILTIN_K12, kind="acceptor",
+            margin=1.0, has_appended_stop=False,
+            external_sites=self.EXT, guard_3prime=True)
+        assert fixes
+        assert self._protein(out) == prot
+        assert self._paired(out) == []

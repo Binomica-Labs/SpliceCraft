@@ -598,6 +598,12 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   intron spacing — a PAIR is what actually excises sequence, and
   `in_frame_loss` marks the ones that delete whole codons without shifting the
   frame, so the product can still be antibody-positive while being wrong).
+  `unit.genomic` states its convention: `start`/`end` are **0-based
+  half-open** — exactly what `tx_start`/`tx_end` and `list-features` take —
+  with `start_1based`/`end_1based` given beside them, because a bare
+  `{start: 2070, end: 4384}` reads as 1-based inclusive and has cost a caller
+  a base off their first exon.
+
   `check_splice: false` skips the scan; `check_splice: true` runs it for a
   non-plant host (the model is plant-trained — the wrong ruler for an animal
   cell). `scrub_splice_sites: true` REPAIRS what it finds by synonymous
@@ -783,8 +789,14 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   never an empty list that would read as clean. It also reports `n_pairs` /
   `pairs` (a donor reaching an acceptor at intron spacing is what actually
   excises sequence; a lone site removes nothing) with `annotated_ends` per
-  pair, so the real intron's own ends are distinguishable from a cryptic pair,
-  and `n_pairs_fully_cryptic` is what the warning fires on. `splice.basis`
+  pair, so the real intron's own ends are distinguishable from a cryptic pair.
+  **The line to read is `n_pairs_excising_cds`,** not the fully-cryptic count:
+  a pair is classified by WHERE the excision lands, because a real donor
+  reaching a cryptic acceptor that outscores its own partner is exon skipping,
+  and an annotated end makes that MORE credible rather than less. (Gating the
+  warning on "neither end annotated" hid the single strongest pair in a real
+  construct — combined 10.964, in-frame, enough to splice the whole CDS out.)
+  `n_pairs_fully_cryptic` remains its own headline. `splice.basis`
   carries the sensitivity behind the counts: these cutoffs are
   false-positive-anchored, so `n_cryptic: 0` is a weaker statement than clean
   and says so in `warnings`. `three_prime` is the matching

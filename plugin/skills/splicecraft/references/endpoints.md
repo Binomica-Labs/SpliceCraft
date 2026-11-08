@@ -328,6 +328,18 @@ shifts, every feature keeps its coordinates, and it's undoable.
   that traded a splice site for a polyadenylation site — which once came back
   with a *better* CAI and a worse construct. Report both blocks, not just
   `splice`.
+- **In `predict-transcript`, read `n_pairs_excising_cds`.** A pair is judged
+  by where the excision lands, not by whether an end is annotated — a REAL
+  donor reaching a cryptic acceptor that outscores its own partner is exon
+  skipping, and a real donor makes it likelier, not safer. Report
+  `in_frame_loss` pairs explicitly: they delete whole codons, so the product
+  can still be antibody-positive while being wrong.
+- `predict-transcript`'s `unit.genomic` is **0-based half-open** and says so,
+  with 1-based values beside it. `tx_start`/`tx_end` take the 0-based form.
+- `optimize-protein` takes `splice_external_sites` ([{kind, offset, score}],
+  offset relative to the CDS start, negative upstream) so the splice repair
+  can see partners outside the CDS. Without it a weakened site can stay
+  paired with the real upstream donor and still excise the CDS.
 - `splice-model` / `scan-splice-sites` are the model's own doors — the latter
   scores a bare transcribed sequence (`margin`, explicit thresholds,
   `annotated_edges` to mark real intron boundaries). For a unit on a loaded

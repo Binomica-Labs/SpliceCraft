@@ -1272,3 +1272,135 @@ class TestOutOfUnitWarningsAreBounded:
         # whole list
         assert f"…and {30 - cap} more intron/exon feature(s)" in " ".join(w)
         assert f"…and {30 - cap} more annotated intron(s)" in " ".join(w)
+
+
+class TestPairsThatEatTheCdsAreNeverSilent:
+    """Field report 2026-11-08, round 3. The pair warning was gated on
+    "neither end annotated", on the reasoning that one annotated end means
+    the model missed the real partner. That was true of the case that
+    prompted it and wrong as a rule: a REAL donor — one the spliceosome
+    demonstrably uses — reaching a cryptic acceptor that OUTSCORES its own
+    partner is exon skipping, and an annotated end makes it MORE credible,
+    not less. On the reporting construct the strongest pair in the unit
+    (combined 10.964, both ends over threshold, in-frame loss) would have
+    spliced the entire CDS out while the response said nothing.
+
+    Dedicated fixture: the annotated intron OPENS with a strong donor, and a
+    strong cryptic acceptor sits inside the CDS 124 nt downstream — codon
+    aligned as `TTT`x6 + `AGG` so it spells a real pyrimidine tract without
+    a stop. `n_pairs_fully_cryptic` is 0 here, so the pre-fix gate made this
+    silent."""
+
+    PROM = "TTGACA" + "C" * 40 + "TATAAT"
+    LEAD1 = "CAC" * 13                              # no ATG
+    INTRON = "GTAAGT" + "CTTCTTCTTCTTCTTCTT" * 3 + "TGCAG"
+    LEAD2 = "CCACCACCA"
+    CDS = ("ATGGCTAAAGGTGAAGAATTATTCACTGGT"
+           + "TTT" * 6 + "AGG"
+           + "GTTGTCCCAATTTTGGTTGAATTAGATGGTGATGTTAAT" + "TAA")
+    TERM = "AATAAA" + "G" * 30
+    SEQ = PROM + LEAD1 + INTRON + LEAD2 + CDS + TERM
+    Q1 = len(PROM)
+    Q2 = Q1 + len(LEAD1)
+    Q3 = Q2 + len(INTRON)
+    Q4 = Q3 + len(LEAD2)
+    Q5 = Q4 + len(CDS)
+    Q6 = Q5 + len(TERM)
+    FEATS = [
+        {"start": 0,   "end": Q1, "strand": 1, "type": "promoter",   "label": "P"},
+        {"start": Q2,  "end": Q3, "strand": 1, "type": "intron",     "label": "ivr"},
+        {"start": Q4,  "end": Q5, "strand": 1, "type": "CDS",        "label": "gene"},
+        {"start": Q5,  "end": Q6, "strand": 1, "type": "terminator", "label": "T"},
+    ]
+
+    def _res(self):
+        r = sa._predict_transcript(self.SEQ, self.FEATS, circular=True,
+                                   check_splice=True)
+        assert r["ok"], r
+        return r
+
+    def test_the_fixture_poses_the_case_the_old_gate_missed(self):
+        """The premise. If `fully_cryptic` ever becomes non-zero here the
+        fixture has drifted and the rest of the class proves less."""
+        sb = self._res()["splice"]
+        assert sb["n_pairs_excising_cds"] >= 1
+        assert sb["n_pairs_fully_cryptic"] == 0
+        into = sb["pairs_excising_cds"]
+        assert any(p["annotated_ends"] == ["donor"] for p in into), into
+
+    def test_an_annotated_end_does_not_buy_silence(self):
+        r = self._res()
+        assert any("would excise part of the CDS" in w
+                   for w in r["warnings"]), r["warnings"]
+        assert any("MORE credible" in w for w in r["warnings"])
+
+    def test_the_warning_names_the_worst_pair(self):
+        r = self._res()
+        worst = max(r["splice"]["pairs_excising_cds"],
+                    key=lambda p: p["combined_score"])
+        assert any(str(worst["combined_score"]) in w
+                   for w in r["warnings"]), r["warnings"]
+
+    def test_every_listed_pair_is_a_plausible_intron(self):
+        sb = self._res()["splice"]
+        assert sb["pairs_excising_cds"], "fixture must list one"
+        for pair in sb["pairs_excising_cds"]:
+            d = pair["donor"]["position"]
+            a = pair["acceptor"]["position"] + 2
+            assert max(d, a) > min(d, a)
+            assert 60 <= pair["intron_len"] <= 3000
+
+    def test_a_clean_unit_still_reports_the_all_clear_caveat(self):
+        """The empty-scan caveat must account for the new class too, not
+        fire while a CDS-excising pair is listed."""
+        r = self._res()
+        sb = r["splice"]
+        if sb["n_pairs_excising_cds"] or sb["n_cryptic"]:
+            assert not any("weaker statement than a clean sequence" in w
+                           for w in r["warnings"])
+
+
+class TestUnitCoordinatesStateTheirBasis:
+    """Third coordinate-basis misread in three rounds. `{start: 2070, end:
+    4384}` reads as 1-based inclusive; it is 0-based half-open, and a caller
+    passing 2070 where 2069 was meant silently clipped a base off exon 1."""
+
+    def test_genomic_span_is_labelled_and_given_both_ways(self):
+        r = _predict()
+        g = r["unit"]["genomic"]
+        assert g["basis"] == "0-based half-open"
+        assert g["start_1based"] == g["start"] + 1
+        assert g["end_1based"] == g["end"]
+
+    def test_the_0_based_values_are_what_tx_start_takes(self):
+        """The echoed `start` must be exactly what you passed, so the two
+        cannot drift apart."""
+        r = sa._predict_transcript(SEQ, FEATS, circular=True,
+                                   tx_start=P1, tx_end=P5)
+        assert r["unit"]["genomic"]["start"] == P1
+        assert r["unit"]["genomic"]["end"] == P5
+
+
+class TestExonOutsideTheUnitIsMissingNotRetained:
+    """One template served both feature types and the consequence was
+    backwards for an exon: an exon left outside the unit is not "retained
+    instead of spliced", it is absent from the message."""
+
+    def test_an_intron_says_not_spliced_out(self):
+        r = sa._predict_transcript(
+            SEQ, TestPromoterSwallowingTheIntron.FEATS_SWALLOWED,
+            circular=True)
+        hits = [w for w in r["warnings"] if "INSIDE the chosen promoter" in w]
+        assert hits and "NOT spliced out of this message" in hits[0]
+
+    def test_an_exon_says_missing_from_the_message(self):
+        feats = TestPromoterSwallowingTheIntron.FEATS_SWALLOWED + [
+            {"start": P1, "end": P2, "strand": 1, "type": "exon",
+             "label": "leader exon 1"},
+        ]
+        r = sa._predict_transcript(SEQ, feats, circular=True)
+        exon_w = [w for w in r["warnings"]
+                  if "INSIDE the chosen promoter" in w and "exon" in w]
+        assert exon_w, r["warnings"]
+        assert "MISSING from this message" in exon_w[0]
+        assert "NOT spliced out" not in exon_w[0]

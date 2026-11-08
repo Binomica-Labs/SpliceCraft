@@ -14,6 +14,53 @@
 
 ---
 
+## [1.3.18] — 2026-11-08
+
+A cryptic splice pair that would delete the coding sequence is no longer
+reported as nothing when one of its ends is a real splice site.
+
+### Bug fixes
+
+- **A splice pair that would delete part of the CDS is no longer silent when
+  one of its ends is a real annotated boundary.** Transcript prediction warned
+  only about pairs where *neither* end was annotated, on the reasoning that an
+  annotated end usually means the model missed the real partner. That reading
+  was backwards for the dangerous case: a real splice donor reaching a cryptic
+  acceptor that scores *better* than its own natural partner is exon skipping,
+  and the fact that the donor is real makes it more likely, not less. On one
+  construct the single strongest pair in the whole transcription unit — which
+  would have spliced the entire coding sequence out — was reported as nothing
+  at all. Pairs are now classified by whether the excision lands in the CDS,
+  which is what actually matters.
+- **An exon annotated inside the chosen promoter was described with the wrong
+  consequence.** One message served both introns and exons: an intron left
+  outside the transcript "is not spliced out", but an exon left outside it is
+  simply *missing from the message* — the worse of the two outcomes, described
+  as the milder one.
+
+### New features
+
+- **The splice repair can now be told about sites outside the coding
+  sequence.** It only ever sees the CDS, so it could not tell whether a site
+  it had weakened still pairs with a donor upstream — and on a real construct
+  it left one just under its own bar, still paired with the real intron's
+  donor, with the whole 5' end of the CDS removable. Pass the flanking sites
+  and such a site becomes repairable even when its own score is below the
+  reporting bar, which is what the leftover needed: nothing was looking at it.
+
+### Hardening
+
+- The flanking-site list the splice repair accepts now refuses `true` where a
+  coordinate or score belongs (it would have become base 1 / 1.0 bits) and a
+  fractional offset (silently truncated, shifting the pair by a base), and is
+  length-checked.
+- Transcription-unit coordinates now say which convention they use, and give
+  the 1-based numbers alongside the 0-based ones. `{start: 2070, end: 4384}`
+  reads as 1-based inclusive and is not, which had quietly cost a caller one
+  base off their first exon.
+
+---
+
 ## [1.3.17] — 2026-11-08
 
 `splicecraft update` can now actually install a just-published release, and
@@ -37,17 +84,6 @@ another.
   synonymous codon that satisfies both rather than giving up. If no codon
   satisfies both, the splice site is reported with its score instead of being
   fixed at the transcript's expense.
-
-### New features
-
-- **Codon optimization now reports the plant transcript-end screen too.**
-  Asking for a plant design returns a `three_prime` block alongside the
-  cryptic-splice one, measured on the coding sequence actually being returned.
-  The GC-window and diversify passes run before the splice repair and have no
-  such guard, so reporting is what catches anything they introduce. A sequence
-  shorter than the screen's 160-base window says so rather than reporting zero
-  hits.
-
 - **`splicecraft update` could report "already at latest" for up to ten
   minutes after a new release, and never update.** PyPI tells pip its package
   index is good for ten minutes, so right after a release pip reuses a cached
@@ -67,6 +103,26 @@ another.
   and waiting is pointless; if it is not there yet, the release is still
   publishing and waiting is exactly right. The suggested command is also built
   for your actual install method instead of assuming pipx.
+
+### New features
+
+- **Codon optimization now reports the plant transcript-end screen too.**
+  Asking for a plant design returns a `three_prime` block alongside the
+  cryptic-splice one, measured on the coding sequence actually being returned.
+  The GC-window and diversify passes run before the splice repair and have no
+  such guard, so reporting is what catches anything they introduce. A sequence
+  shorter than the screen's 160-base window says so rather than reporting zero
+  hits.
+
+### Hardening
+
+- The plant transcript-end screen now reports the sensitivity behind its
+  count, like the cryptic-splice screen does, and says so in writing when it
+  finds nothing — at its default cutoff it catches about 57% of real cases, so
+  an empty result is not a guarantee. Its region list is capped while the
+  count stays exact.
+
+---
 
 ## [1.3.16] — 2026-11-08
 
@@ -124,11 +180,6 @@ The cryptic-splice screen was telling you it looked twice as hard as it does.
 
 ### Hardening
 
-- The plant transcript-end screen now reports the sensitivity behind its
-  count, like the cryptic-splice screen does, and says so in writing when it
-  finds nothing — at its default cutoff it catches about 57% of real cases, so
-  an empty result is not a guarantee. Its region list is capped while the
-  count stays exact.
 - **Scanning a long sequence for splice-site pairs is 16x faster.** The pair
   search compared every candidate donor against every candidate acceptor
   anywhere in the molecule, then threw away over 99% of them for being too far

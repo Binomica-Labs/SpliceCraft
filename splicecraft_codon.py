@@ -32,7 +32,8 @@ from splicecraft_util import _natural_sort_key, _sanitize_path
 # L0 — the trained plant splice PWM. `_codon_fix_splice_sites` is the pass that
 # consults it; the hazard-motif dict above is only a floor.
 from splicecraft_splice import (
-    _SPLICE_MAX_WINDOW, _splice_scan, _splice_threshold, _splice_window_span,
+    _SPLICE_MAX_WINDOW, _SPLICE_PAIR_FLOOR, _splice_scan, _splice_threshold,
+    _splice_window_span,
 )
 from splicecraft_net import (
     _HMM_DB_RETRY_BACKOFF_S, _NCBI_MAX_RESPONSE_BYTES, _build_hardened_url_opener,
@@ -895,12 +896,19 @@ def _codon_swap_ok(seq: str, codon_start: int, alt: str, site: str, idx: int,
 # screening loop's response small — the COUNT is always exact beside it.
 _CODON_SPLICE_MAX_REPORT = 20
 
+# `_external_pairs` runs sites x external_sites on every candidate swap that
+# survives the cheaper guards. A 10 kb flank scanned at the pair floor yields
+# well under a hundred sites (measured ~8 donors per kb on AT-rich DNA), so
+# this is generous for any real flank and bounds an adversarial payload.
+_CODON_MAX_EXTERNAL_SITES = 2000
+
 
 def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
                             kind: str = "both",
                             sites: "dict | None" = None,
                             margin: float = 0.0,
                             guard_3prime: bool = True,
+                            external_sites: "list[dict] | None" = None,
                             has_appended_stop: bool = True,
                             transl_table: "int | None" = None) -> tuple:
     """Substitute synonymous codons to remove cryptic splice sites that the
@@ -941,8 +949,10 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
 
       1. drops the target site below threshold,
       2. creates no NEW at-or-above-threshold site,
-      3. creates no new ``sites`` motif (forward or RC), and
-      4. creates no new plant 3'-END-like region (``guard_3prime``)
+      3. creates no new ``sites`` motif (forward or RC),
+      4. leaves no site PAIRED with a partner outside the CDS
+         (``external_sites``), and
+      5. creates no new plant 3'-END-like region (``guard_3prime``)
 
     so running this after `_codon_fix_sites` can never re-introduce a
     restriction site that scrub just removed, and the two passes cannot
@@ -964,6 +974,29 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
     change can affect, which is exact for a linear scan — the argument
     `_codon_swap_ok` spells out — and keeps the pass O(hits x len) rather
     than O(codons x synonyms x len).
+
+    ``external_sites`` closes the fact that this pass is CDS-LOCAL. It only
+    ever sees the coding sequence, so its acceptance test could not ask the
+    question that actually matters for an excision: *does the weakened site
+    still pair with a partner outside the CDS?* On the reporting construct it
+    dropped a cryptic acceptor to 3.287 — under the repair bar, and still
+    ABOVE the real intron's own acceptor at 3.248 — leaving the real upstream
+    donor paired with it and the whole 5' end of the CDS excisable (field
+    report 2026-11-08, round 3; the same class as the 3'-end gap, one level
+    up). Pass the sites flanking the CDS and a swap is kept only if nothing in
+    the window it can move still pairs with one.
+
+    Each entry is ``{kind, offset, score}``: `kind` is ``donor`` or
+    ``acceptor``, `offset` is the site's position RELATIVE TO THE CDS START
+    (negative for upstream, which is the motivating case — a 5'UTR intron's
+    donor), and `score` is its log-odds score, as `scan-splice-sites` reports
+    both. The gate is the same combined one `_splice_pair_risk` uses, so a
+    partner only counts when the two together carry as much evidence as two
+    individually-passing sites.
+
+    Sites are matched at the PAIR floor, not the repair bar: a site under the
+    reporting threshold still carries half a pair's evidence, which is the
+    whole reason the residual above survived the first fix.
 
     Codons are tried nearest-the-anchor first (the GT/AG dinucleotide itself
     is invariant in both populations, so the bases that actually carry the
@@ -1012,6 +1045,68 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
                     f"a window stops looking like a real site at all; the "
                     f"largest useful {_k} margin is {_cal:g}")
             _scan_kw[_name] = _cal - margin
+    # Validated up front so a malformed entry is a clear ValueError the agent
+    # layer turns into a 400, not an IndexError from inside the swap loop.
+    ext_sites: "list[tuple[str, int, float]]" = []
+    if external_sites is not None and not isinstance(external_sites,
+                                                     (list, tuple)):
+        # A bare string would otherwise iterate into characters and report a
+        # confusing per-entry error.
+        raise ValueError("external_sites must be a list of "
+                         "{kind, offset, score} dicts")
+    if external_sites is not None and \
+            len(external_sites) > _CODON_MAX_EXTERNAL_SITES:
+        # Bounded: `_external_pairs` is sites x external_sites on every
+        # surviving candidate. A 10 kb flank scanned at the pair floor yields
+        # well under a hundred sites, so a list past this is not a flank.
+        raise ValueError(
+            f"external_sites has {len(external_sites)} entries (max "
+            f"{_CODON_MAX_EXTERNAL_SITES}) — that is more flanking sites than "
+            f"any real flank carries")
+    _seen_ext: set = set()
+    for _e in (external_sites or []):
+        if not isinstance(_e, dict):
+            raise ValueError("each external_sites entry must be a dict of "
+                             "{kind, offset, score}")
+        _k = str(_e.get("kind") or "").strip().lower()
+        if _k not in ("donor", "acceptor"):
+            raise ValueError("external_sites kind must be 'donor' or "
+                             "'acceptor'")
+        _raw_off, _raw_sc = _e.get("offset"), _e.get("score")
+        # `int(True)` is 1 and `float(True)` is 1.0, so a flag would silently
+        # become a coordinate or a score. Same refusal as `margin`.
+        if isinstance(_raw_off, bool) or isinstance(_raw_sc, bool):
+            raise ValueError("external_sites 'offset' and 'score' are "
+                             "numbers, not flags")
+        try:
+            _off_f = float(_raw_off)                # type: ignore[arg-type]
+            _sc = float(_raw_sc)                    # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise ValueError("each external_sites entry needs a numeric "
+                             "'offset' and 'score'") from None
+        if _off_f != _off_f or _off_f in (float("inf"), float("-inf")):
+            raise ValueError("external_sites offset must be finite")
+        if _off_f != int(_off_f):
+            # Silently truncating 1.7 to 1 shifts the pair geometry by a base
+            # and nothing downstream could tell.
+            raise ValueError("external_sites 'offset' must be a whole number "
+                             "of bases")
+        _off = int(_off_f)
+        if _sc != _sc or _sc in (float("inf"), float("-inf")):
+            raise ValueError("external_sites score must be finite")
+        _key = (_k, _off, _sc)
+        if _key in _seen_ext:
+            continue                    # duplicates cost work and change nothing
+        _seen_ext.add(_key)
+        ext_sites.append((_k, _off, _sc))
+    _cal_d, _cal_a = _splice_threshold("donor"), _splice_threshold("acceptor")
+    if ext_sites and (_cal_d is None or _cal_a is None):
+        raise RuntimeError(
+            "splice model has no calibrated threshold — cannot derive the "
+            "pair gate external_sites is judged against")
+    _pair_gate = (0.0 if _cal_d is None or _cal_a is None
+                  else _cal_d + _cal_a)
+
     dna = (dna or "").upper()
     if not dna:
         return dna, [], []
@@ -1077,6 +1172,46 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
                          "skipping guard 4")
             _scan3 = None
 
+    def _external_pairs(chars: list) -> "list[tuple]":
+        """``[(combined, kind, position)]`` for every site that pairs with a
+        caller-supplied site outside the CDS, above the pair gate.
+
+        Scanned at `_SPLICE_PAIR_FLOOR`, deliberately: the residual this
+        exists to catch was a site BELOW the repair bar that still carried
+        half a pair's evidence. Only opposite kinds pair, and only in the
+        direction biology allows — a donor 5' of its acceptor."""
+        if not ext_sites:
+            return []
+        out: "list[tuple]" = []
+        seq_s = "".join(chars)
+        for h in _splice_scan(seq_s, kind=kind,
+                              donor_threshold=_SPLICE_PAIR_FLOOR,
+                              acceptor_threshold=_SPLICE_PAIR_FLOOR):
+            pos = int(h["position"])
+            for e_kind, e_off, e_score in ext_sites:
+                if e_kind == "donor" and h["kind"] == "acceptor":
+                    span = pos + 2 - e_off
+                elif e_kind == "acceptor" and h["kind"] == "donor":
+                    span = e_off + 2 - pos
+                else:
+                    continue
+                combined = h["score"] + e_score
+                if 60 <= span <= 3000 and combined >= _pair_gate:
+                    out.append((combined, h["kind"], pos))
+                    break
+        return out
+
+    def _external_pair_max(chars: list) -> float:
+        """Worst external pairing, or ``-inf`` when there is none.
+
+        **Compared, never vetoed absolutely.** An absolute "no site may still
+        pair" rule refused a strictly BETTER swap and left the original site
+        in place — which was above the repair bar AND paired, i.e. worse on
+        both counts (caught while testing this, 2026-11-08). The same mistake
+        guard 5 avoids by comparing coverage."""
+        pairs_ext = _external_pairs(chars)
+        return max((c for c, _k, _p in pairs_ext), default=float("-inf"))
+
     def _3prime_cover(chars: list) -> int:
         """Flagged BASES over the WHOLE sequence, or -1 when the model cannot
         answer (absent, or a sequence under its 160 nt window).
@@ -1133,11 +1268,33 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
     # budget is belt-and-braces against a pathological table.
     for _round in range(max(1, len(dna_list) // 3)):
         seq = "".join(dna_list)
-        live = [h for h in _splice_scan(seq, **_scan_kw)
-                if (h["kind"], int(h["position"])) not in stuck]
+        # Targets are sites at/above the repair bar PLUS any site that pairs
+        # with a partner outside the CDS, whatever its own score. Without the
+        # second set the residual is unreachable: the reporting construct's
+        # cryptic acceptor sat at 3.287 — under the bar, so never targeted
+        # again — while still paired with the real upstream donor and still
+        # able to excise the 5' end of the CDS (field report 2026-11-08,
+        # round 3). A guard alone cannot fix that; it has to be repairable.
+        _seen: dict = {}
+        for h in _splice_scan(seq, **_scan_kw):
+            _seen.setdefault((h["kind"], int(h["position"])), h)
+        _ext_targets: set = set()
+        if ext_sites:
+            _floor_kw = dict(_scan_kw)
+            _floor_kw["donor_threshold"] = _SPLICE_PAIR_FLOOR
+            _floor_kw["acceptor_threshold"] = _SPLICE_PAIR_FLOOR
+            _by_pos = {(h["kind"], int(h["position"])): h
+                       for h in _splice_scan(seq, **_floor_kw)}
+            for _c, _k, _pos in _external_pairs(dna_list):
+                _key = (_k, _pos)
+                _ext_targets.add(_key)
+                if _key in _by_pos:
+                    _seen.setdefault(_key, _by_pos[_key])
+        live = [h for key, h in _seen.items() if key not in stuck]
         if not live:
             break
-        target = live[0]                     # `_splice_scan` sorts by score
+        live.sort(key=lambda h: -h["score"])
+        target = live[0]                     # worst first
         t_kind, t_pos = target["kind"], int(target["position"])
         ws, we = _splice_window_span(t_kind, t_pos)
         before_hits = (_forbidden_hit_set(seq, forbidden) if forbidden
@@ -1146,6 +1303,7 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
         # one swap before breaking out, so every candidate it tries is
         # measured against this same starting sequence.
         base_3p = _3prime_cover(dna_list)
+        base_ext = _external_pair_max(dna_list)
         lo_codon = max(0, ws // 3)
         hi_codon = min((we - 1) // 3 + 1, len(protein))
         applied = False
@@ -1167,7 +1325,19 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
                                             before_hits)):
                     dna_list[codon_start:codon_start + 3] = list(current)
                     continue
-                # Guard 4, LAST and exact: refuse a swap that trades the
+                # External-partner guard, COMPARATIVE: a swap may not make
+                # the worst external pairing worse, and when the target IS an
+                # externally-paired site it must strictly improve it —
+                # otherwise a sub-bar target would "succeed" without changing
+                # the thing that made it a target.
+                if ext_sites:
+                    after_ext = _external_pair_max(dna_list)
+                    _target_paired = (t_kind, t_pos) in _ext_targets
+                    if (after_ext > base_ext
+                            or (_target_paired and after_ext >= base_ext)):
+                        dna_list[codon_start:codon_start + 3] = list(current)
+                        continue
+                # Guard 5, LAST and exact: refuse a swap that trades the
                 # splice site for a plant 3'-END-like region. Running it here
                 # — after the cheap guards have rejected almost everything —
                 # is what makes a whole-sequence rescan affordable. `-1` is

@@ -2140,12 +2140,22 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
                 "tx_start at the real transcription start"
                 if bounds_from == "annotation" else
                 "widen tx_start/tx_end if it belongs to this transcript")
+            # The CONSEQUENCE differs by feature type and the shared
+            # template had it backwards for an exon: an exon left outside the
+            # unit is not "retained instead of spliced", it is simply absent
+            # from the message, which is the worse outcome of the two (field
+            # report 2026-11-08, round 3).
+            _ftype = str(f.get("type") or "?").lower()
+            consequence = (
+                "so it is NOT spliced out of this message"
+                if _ftype == "intron" else
+                "so it is MISSING from this message — the transcript starts "
+                "downstream of it")
             warnings.append(
-                f"{str(f.get('type') or '?').lower()} {_feat_label_or(f)!r} "
+                f"{_ftype} {_feat_label_or(f)!r} "
                 f"is annotated INSIDE the chosen promoter "
                 f"{_feat_label_or(prom)!r} and falls outside this "
-                f"transcription unit, so it is NOT spliced out of this "
-                f"message — {remedy}")
+                f"transcription unit, {consequence} — {remedy}")
         if n_blocked > _TX_MAX_OUT_OF_UNIT:
             warnings.append(
                 f"…and {n_blocked - _TX_MAX_OUT_OF_UNIT} more intron/exon "
@@ -2354,14 +2364,38 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
             # reaching an acceptor at intron spacing is what excises sequence.
             # `annotated_edges` is known here and nowhere else, so this is the
             # one place a pair can be told apart from the real intron's own
-            # ends — without it the list showed the REAL donor reaching past
-            # its own partner to a cryptic acceptor, indistinguishable from a
-            # fully cryptic hazard (field report 2026-11-08). That pattern is
-            # usually the model missing the real acceptor, which a
-            # 0.33-sensitivity test does two times in three.
+            # ends.
+            #
+            # **An annotated end makes a pair MORE credible, not less, and
+            # gating the warning on "neither end annotated" was wrong.** The
+            # first report of this showed a real donor reaching past its own
+            # 3' site to a cryptic acceptor, and that case WAS an artefact of
+            # the model missing the real partner — but generalising it into
+            # silence hid the opposite case: a REAL donor, which the
+            # spliceosome demonstrably uses, reaching a cryptic acceptor that
+            # OUTSCORES the real one it competes with (4.038 against 3.248).
+            # That is exon skipping, and on the reporting construct the
+            # strongest pair in the whole unit — combined 10.964, both ends
+            # over threshold, `in_frame_loss` — would have spliced the entire
+            # CDS out while the response said nothing (field report
+            # 2026-11-08, round 3). What matters is not whether an end is
+            # annotated but WHERE the excision lands.
             pairs = _splice_pair_risk(pre, kind="both",
                                       annotated_edges=annotated_edges)
             fully_cryptic = [p for p in pairs if not p["annotated_ends"]]
+
+            def _excises_cds(pr: dict) -> bool:
+                """Would this pair remove any of the CDS? `pre` is already the
+                sense strand, so the excised span runs donor -> acceptor."""
+                try:
+                    d = int(pr["donor"]["position"])
+                    a = int(pr["acceptor"]["position"]) + 2
+                except (KeyError, TypeError, ValueError):   # pragma: no cover
+                    return False
+                lo, hi = min(d, a), max(d, a)
+                return hi > cds_tx_start and lo < cds_tx_end
+
+            into_cds = [p for p in pairs if _excises_cds(p)]
             splice = {
                 "skipped":  False,
                 "model":    _splice_model_summary().get("source", "?"),
@@ -2372,23 +2406,43 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
                 "sites":    cryptic[:_TX_MAX_SPLICE_HITS],
                 "n_pairs":  len(pairs),
                 "n_pairs_fully_cryptic": len(fully_cryptic),
+                "n_pairs_excising_cds": len(into_cds),
                 "pairs":    pairs[:_TX_MAX_SPLICE_HITS],
+                "pairs_excising_cds": into_cds[:_TX_MAX_SPLICE_HITS],
             }
             if cryptic:
                 warnings.append(
                     f"{len(cryptic)} cryptic splice site(s) in the pre-mRNA "
                     "score as strongly as real sites — they compete with the "
                     "annotated ones")
+            if into_cds:
+                # The serious line, and it is deliberately NOT gated on
+                # whether an end is annotated.
+                _fl = [p for p in into_cds if p.get("in_frame_loss")]
+                _ann = [p for p in into_cds if p.get("annotated_ends")]
+                _worst = max(into_cds, key=lambda p: p.get("combined_score", 0))
+                warnings.append(
+                    f"{len(into_cds)} donor/acceptor PAIR(s) would excise part "
+                    f"of the CDS (worst: combined {_worst['combined_score']} "
+                    f"over {_worst['intron_len']} nt)"
+                    + (f"; {len(_ann)} of them have one end on an ANNOTATED "
+                       f"boundary — a real donor reaching a cryptic acceptor "
+                       f"that outscores its own partner is exon skipping, "
+                       f"which an annotated end makes MORE credible, not "
+                       f"less" if _ann else "")
+                    + (f"; {len(_fl)} would delete a whole number of codons, "
+                       f"so the product can still be antibody-positive while "
+                       f"being wrong" if _fl else ""))
             if fully_cryptic:
-                _fl = [p for p in fully_cryptic if p.get("in_frame_loss")]
+                _flc = [p for p in fully_cryptic if p.get("in_frame_loss")]
                 warnings.append(
                     f"{len(fully_cryptic)} donor/acceptor PAIR(s) with NEITHER "
                     f"end on an annotated boundary sit at plausible intron "
                     f"spacing in the pre-mRNA — a pair is what actually "
                     f"excises sequence from the message"
-                    + (f"; {len(_fl)} would delete a whole number of codons"
-                       if _fl else ""))
-            if not cryptic and not fully_cryptic:
+                    + (f"; {len(_flc)} would delete a whole number of codons"
+                       if _flc else ""))
+            if not cryptic and not fully_cryptic and not into_cds:
                 # A count of 0 is unreadable without the detection power
                 # behind it: these cutoffs admit under half of real donors.
                 warnings.append(
@@ -2505,7 +2559,17 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
         "unit": {
             "strand":      strand,
             "bounds_from": bounds_from,
-            "genomic":     {"start": a, "end": b, "length": pre_len},
+            # Both ways, like the other endpoints that echo coordinates:
+            # `start`/`end` are 0-based half-open (what `tx_start`/`tx_end`
+            # and `list-features` take), and the 1-based inclusive pair is
+            # spelled out beside them. A bare `{start: 2070, end: 4384}` reads
+            # as 1-based inclusive and cost a caller one base off exon 1
+            # (field report 2026-11-08, round 3) — the third coordinate-basis
+            # misread in as many rounds, so it is labelled rather than
+            # documented.
+            "genomic":     {"start": a, "end": b, "length": pre_len,
+                            "basis": "0-based half-open",
+                            "start_1based": a + 1, "end_1based": b},
             "wraps_origin": bool(b < a or (b == a and pre_len == total)),
             "promoter":    (prom or {}).get("label") or None,
             "cds":         cds_feat.get("label") or None,
