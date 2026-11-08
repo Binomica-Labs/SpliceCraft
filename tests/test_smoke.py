@@ -11769,21 +11769,29 @@ class TestUpdateSubcommandCommandBuilder:
     def test_pipx_normal(self):
         # Eager by default: forward --upgrade-strategy to the pip pipx invokes,
         # as a SINGLE `--pip-args=<value>` token — a separate token that starts
-        # with `--` makes real pipx exit 2 with a usage error.
+        # with `--` makes real pipx exit 2 with a usage error ([INV-163]).
+        # Several pip flags live INSIDE that one token, space-separated; pipx
+        # shlex-splits the value (verified against real pipx 1.8.0).
         cmd = sc._build_upgrade_command("pipx", force=False)
         assert cmd == ["pipx", "upgrade", "splicecraft",
-                       "--pip-args=--upgrade-strategy=eager"]
+                       "--pip-args=--upgrade-strategy=eager --no-cache-dir"]
         assert "--pip-args" not in cmd   # NOT the broken two-token form
 
-    def test_pipx_keep_deps_omits_pip_args(self):
+    def test_pipx_keep_deps_still_bypasses_the_cache(self):
+        # --keep-deps drops the eager strategy but NOT the cache bypass: a
+        # stale pip index page is what silently pins you to the previous
+        # release, and that is orthogonal to how deps are resolved.
         cmd = sc._build_upgrade_command("pipx", force=False, eager=False)
-        assert cmd == ["pipx", "upgrade", "splicecraft"]
+        assert cmd == ["pipx", "upgrade", "splicecraft",
+                       "--pip-args=--no-cache-dir"]
 
     def test_pipx_force_uses_install_force(self):
         # `pipx upgrade` is a no-op when versions match; --force has to
         # use `install --force` to actually re-run.
         cmd = sc._build_upgrade_command("pipx", force=True)
-        assert cmd == ["pipx", "install", "--force", "splicecraft"]
+        assert cmd == ["pipx", "install", "--force", "splicecraft",
+                       "--pip-args=--no-cache-dir"]
+
 
     def test_pip_user(self):
         cmd = sc._build_upgrade_command("pip-user", force=False)
@@ -11863,10 +11871,12 @@ class TestUpdateSubcommandCommandBuilder:
         assert cmd[-1] == "splicecraft"      # package name still last
 
     def test_pip_keep_deps_omits_upgrade_strategy(self):
+        # --keep-deps drops the eager strategy; the cache bypass stays, since
+        # a stale index page is orthogonal to how deps get resolved.
         cmd = sc._build_upgrade_command("pip-venv", force=False, eager=False)
         assert "--upgrade-strategy" not in cmd
         assert cmd == [sys.executable, "-m", "pip", "install",
-                       "--upgrade", "splicecraft"]
+                       "--upgrade", sc._PIP_NO_CACHE_ARG, "splicecraft"]
 
     def test_pip_user_eager_keeps_package_last(self):
         cmd = sc._build_upgrade_command("pip-user", force=False)
@@ -11884,6 +11894,63 @@ class TestUpdateSubcommandCommandBuilder:
         cmd = sc._build_upgrade_command("pipx", force=False,
                                         pin_version="0.8.10")
         assert "--pip-args" not in cmd
+
+
+class TestUpgradeBypassesThePipIndexCache:
+    """PyPI serves its Simple API with `Cache-Control: max-age=600`, so pip is
+    entitled to reuse a cached index page for ten minutes — and right after a
+    release it does, resolving "latest" as the version already installed.
+    MEASURED 2026-11-08 on v1.3.16: `pip index versions splicecraft` said
+    1.3.15 while `--no-cache-dir` said 1.3.16 and PyPI's Simple API was
+    serving both the wheel and the sdist. Four consecutive `splicecraft
+    update` runs failed identically, because the ten-minute window runs from
+    pip's FIRST fetch."""
+
+    @pytest.mark.parametrize("method", ["pipx", "pip-user", "pip-venv",
+                                        "pip-system"])
+    @pytest.mark.parametrize("kw", [
+        {"force": False},
+        {"force": True},
+        {"force": False, "eager": False},
+        {"force": False, "pin_version": "1.2.3"},
+    ])
+    def test_every_pip_front_end_disables_the_cache(self, method, kw):
+        cmd = sc._build_upgrade_command(method, **kw)
+        assert cmd is not None
+        assert any(sc._PIP_NO_CACHE_ARG in str(a) for a in cmd), cmd
+
+    @pytest.mark.parametrize("kw", [
+        {"force": False},
+        {"force": True},
+        {"force": False, "eager": False},
+        {"force": False, "pin_version": "1.2.3"},
+    ])
+    def test_pipx_keeps_pip_args_a_single_token(self, kw):
+        """[INV-163]: a second token starting with `--` makes real pipx exit 2
+        with a usage error, so the flags must share ONE token."""
+        cmd = sc._build_upgrade_command("pipx", **kw)
+        assert cmd is not None
+        assert "--pip-args" not in cmd
+        joined = [a for a in cmd if str(a).startswith("--pip-args=")]
+        assert len(joined) == 1, cmd
+
+    def test_force_is_not_an_escape_hatch_without_the_bypass(self):
+        """On pipx, `--force` becomes `install --force splicecraft`, which
+        re-resolves "latest" through the SAME cache — which is why the old
+        failure hint's advice to run `--force` could not have worked."""
+        cmd = sc._build_upgrade_command("pipx", force=True)
+        assert cmd is not None
+        assert "--force" in cmd
+        assert any(sc._PIP_NO_CACHE_ARG in str(a) for a in cmd)
+
+    @pytest.mark.parametrize("method", ["uv-tool", "uv-venv", "pixi-global"])
+    def test_non_pip_front_ends_are_left_alone(self, method):
+        """They have their own caches and their own flags; the measured
+        mechanism is pip's, and inventing flags for unverified tools would
+        risk breaking those users' upgrades."""
+        cmd = sc._build_upgrade_command(method, force=False)
+        assert cmd is not None
+        assert not any(sc._PIP_NO_CACHE_ARG in str(a) for a in cmd), cmd
 
 
 class TestUpdateSubcommandFlow:
@@ -12100,7 +12167,8 @@ class TestUpdateSubcommandFlow:
         rc = sc._run_update_subcommand(["--yes"])
         assert rc == 0
         assert fake.calls == [["pipx", "upgrade", "splicecraft",
-                               "--pip-args=--upgrade-strategy=eager"]]
+                               "--pip-args=--upgrade-strategy=eager "
+                               "--no-cache-dir"]]
 
     def test_keep_deps_flag_runs_plain_upgrade(self, monkeypatch, capsys):
         # --keep-deps opts out of the eager dependency upgrade → the bare
@@ -12116,7 +12184,8 @@ class TestUpdateSubcommandFlow:
                               lambda *a, **k: "99.0.0.0")
         rc = sc._run_update_subcommand(["--yes", "--keep-deps"])
         assert rc == 0
-        assert fake.calls == [["pipx", "upgrade", "splicecraft"]]
+        assert fake.calls == [["pipx", "upgrade", "splicecraft",
+                               "--pip-args=--no-cache-dir"]]
 
     def test_force_with_same_version_still_runs(self, monkeypatch, capsys):
         self._patch_detect(monkeypatch, "pipx")
@@ -12134,7 +12203,8 @@ class TestUpdateSubcommandFlow:
         rc = sc._run_update_subcommand(["--force", "--yes"])
         assert rc == 0
         # --force must use `install --force` rather than `upgrade`.
-        assert fake.calls == [["pipx", "install", "--force", "splicecraft"]]
+        assert fake.calls == [["pipx", "install", "--force", "splicecraft",
+                               "--pip-args=--no-cache-dir"]]
 
     def test_pip_venv_invokes_python_m_pip(self, monkeypatch, capsys):
         self._patch_detect(monkeypatch, "pip-venv")
@@ -15414,8 +15484,11 @@ class TestUpdateVersionPin:
     def test_build_upgrade_command_pipx_pin(self):
         cmd = sc._build_upgrade_command("pipx", force=False,
                                           pin_version="0.8.10")
+        # The cache bypass rides along on a pin too: a rollback resolved
+        # through a stale index can silently reinstall what you already have.
         assert cmd == ["pipx", "install", "--force",
-                       "splicecraft==0.8.10"]
+                       "splicecraft==0.8.10",
+                       "--pip-args=--no-cache-dir"]
 
     def test_build_upgrade_command_uv_tool_pin(self):
         cmd = sc._build_upgrade_command("uv-tool", force=False,
@@ -15461,7 +15534,8 @@ class TestUpdateVersionPin:
         # eager default just adds the dependency-upgrade flags on top.
         cmd = sc._build_upgrade_command("pipx", force=False,
                                           pin_version=None, eager=False)
-        assert cmd == ["pipx", "upgrade", "splicecraft"]
+        assert cmd == ["pipx", "upgrade", "splicecraft",
+                       "--pip-args=--no-cache-dir"]
         cmd = sc._build_upgrade_command("pipx", force=False, pin_version=None)
         assert cmd[:3] == ["pipx", "upgrade", "splicecraft"]
         assert "splicecraft==" not in " ".join(cmd)   # no accidental pin
@@ -17367,3 +17441,169 @@ class TestWrapResiteArrowBelowName:
         rows = {id(f): r for f, r in sc._pack_features_2d([a, b], 0, 160, 160)}
         assert rows[id(a)] != rows[id(b)], \
             "isoschizomers (different enzymes) must not share a row"
+
+
+class TestPypiSimpleIndexProbe:
+    """`_pypi_simple_has_version` exists only to make a failed upgrade's
+    explanation TRUE. Two causes give the identical symptom — PyPI's Simple
+    API still catching up with its JSON metadata ([INV-111]), or pip reusing
+    an index page it may hold for ten minutes — and the advice for them is
+    opposite: wait, versus stop waiting and bypass the cache."""
+
+    def _fake_urlopen(self, payload, *, status_ok=True):
+        import io as _io
+        import json as _json
+
+        class _Resp:
+            def __enter__(_s):
+                return _s
+
+            def __exit__(_s, *a):
+                return False
+
+            def read(_s, n=-1):
+                body = (payload if isinstance(payload, bytes)
+                        else _json.dumps(payload).encode())
+                return body[:n] if n and n > 0 else body
+
+        def _open(req, timeout=None):
+            if not status_ok:
+                import urllib.error
+                raise urllib.error.URLError("boom")
+            _Resp._req = req
+            return _Resp()
+        return _open
+
+    def test_version_present_is_true(self, monkeypatch):
+        import urllib.request
+        monkeypatch.delenv("SPLICECRAFT_PYPI_URL", raising=False)
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            self._fake_urlopen({"versions": ["1.2.3", "9.9.9"]}))
+        assert sc._pypi_simple_has_version("9.9.9") is True
+
+    def test_version_absent_is_false(self, monkeypatch):
+        import urllib.request
+        monkeypatch.delenv("SPLICECRAFT_PYPI_URL", raising=False)
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            self._fake_urlopen({"versions": ["1.2.3"]}))
+        assert sc._pypi_simple_has_version("9.9.9") is False
+
+    def test_falls_back_to_filenames_when_versions_absent(self, monkeypatch):
+        import urllib.request
+        monkeypatch.delenv("SPLICECRAFT_PYPI_URL", raising=False)
+        monkeypatch.setattr(urllib.request, "urlopen", self._fake_urlopen(
+            {"files": [{"filename": "splicecraft-9.9.9-py3-none-any.whl"},
+                       {"filename": "splicecraft-9.9.9.tar.gz"}]}))
+        assert sc._pypi_simple_has_version("9.9.9") is True
+        monkeypatch.setattr(urllib.request, "urlopen", self._fake_urlopen(
+            {"files": [{"filename": "splicecraft-1.2.3.tar.gz"}]}))
+        assert sc._pypi_simple_has_version("9.9.9") is False
+
+    def test_network_failure_is_unknown_not_a_guess(self, monkeypatch):
+        import urllib.request
+        monkeypatch.delenv("SPLICECRAFT_PYPI_URL", raising=False)
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            self._fake_urlopen(None, status_ok=False))
+        assert sc._pypi_simple_has_version("9.9.9") is None
+
+    def test_a_mirror_override_is_unknown(self, monkeypatch):
+        """A mirror's Simple API is not derivable from its JSON URL, and
+        probing pypi.org would describe the wrong index."""
+        monkeypatch.setenv("SPLICECRAFT_PYPI_URL",
+                           "https://mirror.example/pypi/splicecraft/json")
+        assert sc._pypi_simple_has_version("9.9.9") is None
+
+    @pytest.mark.parametrize("bad", ["", None])
+    def test_no_version_asked_is_unknown(self, bad):
+        assert sc._pypi_simple_has_version(bad) is None
+
+    def test_sends_no_cache_so_a_proxy_cannot_confirm_the_bug(self,
+                                                              monkeypatch):
+        """A probe served from the same stale copy that caused the failure
+        would agree with the bug."""
+        import urllib.request
+        seen = {}
+        monkeypatch.delenv("SPLICECRAFT_PYPI_URL", raising=False)
+
+        def _open(req, timeout=None):
+            seen["headers"] = {k.lower(): v for k, v in req.header_items()}
+            return self._fake_urlopen({"versions": ["9.9.9"]})(req, timeout)
+        monkeypatch.setattr(urllib.request, "urlopen", _open)
+        sc._pypi_simple_has_version("9.9.9")
+        assert seen["headers"].get("Cache-control".lower()) == "no-cache"
+
+    def test_does_not_raise_on_garbage(self, monkeypatch):
+        import urllib.request
+        monkeypatch.delenv("SPLICECRAFT_PYPI_URL", raising=False)
+        for payload in (b"not json", {"versions": "not-a-list"}, [1, 2, 3]):
+            monkeypatch.setattr(urllib.request, "urlopen",
+                                self._fake_urlopen(payload))
+            assert sc._pypi_simple_has_version("9.9.9") is None
+
+
+class TestStaleIndexFailureIsExplainedNotGuessed:
+    """The no-change failure path used to assert the timing cause
+    unconditionally and send users to `--force` — which on pipx re-resolves
+    "latest" through the very cache that was stale, so it could not have
+    worked. MEASURED 2026-11-08: four consecutive `splicecraft update` runs
+    failed identically while PyPI's Simple API already served v1.3.16."""
+
+    def _run(self, monkeypatch, tmp_path, probe):
+        class _P:
+            returncode = 0
+        monkeypatch.setattr(sc.subprocess, "run", lambda *a, **k: _P())
+        # [INV-112] is SACRED: never trust the subprocess exit code — the
+        # readback is what decides. Mocked, as that invariant instructs.
+        monkeypatch.setattr(sc, "_query_installed_version",
+                            lambda **k: sc.__version__)
+        monkeypatch.setattr(sc, "_pypi_simple_has_version", probe)
+        cmd = sc._build_upgrade_command("pipx", force=False)
+        rc = sc._update_run_install(cmd, tmp_path / "snap", "pipx", None,
+                                    "9.9.9")
+        return rc
+
+    def test_index_has_it_blames_the_cache_not_pypi(self, monkeypatch,
+                                                    tmp_path, capsys):
+        rc = self._run(monkeypatch, tmp_path, lambda v: True)
+        err = capsys.readouterr().err
+        assert rc == 1                      # honest failure, [INV-112]
+        assert "HAS 9.9.9" in err
+        assert "not" in err and "catching up" in err
+        assert "max-age=600" in err
+        assert "clock runs from the first fetch" in err
+
+    def test_index_lacks_it_says_waiting_is_right(self, monkeypatch,
+                                                  tmp_path, capsys):
+        rc = self._run(monkeypatch, tmp_path, lambda v: False)
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "does NOT yet list 9.9.9" in err
+        assert "waiting is the right move" in err
+        # and it must NOT send them cache-busting for a release that is
+        # genuinely not published yet
+        assert "max-age" not in err
+
+    def test_unknown_states_both_causes(self, monkeypatch, tmp_path, capsys):
+        rc = self._run(monkeypatch, tmp_path, lambda v: None)
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "Could not check PyPI's package index" in err
+        assert "either" in err
+
+    def test_the_retry_command_matches_the_front_end(self, monkeypatch,
+                                                     tmp_path, capsys):
+        """Hardcoding a `pipx` line is wrong advice for a pip-venv or uv
+        install, so the suggestion is built for the detected method."""
+        class _P:
+            returncode = 0
+        monkeypatch.setattr(sc.subprocess, "run", lambda *a, **k: _P())
+        monkeypatch.setattr(sc, "_query_installed_version",
+                            lambda **k: sc.__version__)
+        monkeypatch.setattr(sc, "_pypi_simple_has_version", lambda v: True)
+        cmd = sc._build_upgrade_command("pip-venv", force=False)
+        sc._update_run_install(cmd, tmp_path / "snap", "pip-venv", None,
+                               "9.9.9")
+        err = capsys.readouterr().err
+        assert "pipx" not in err
+        assert "-m pip install" in err
+        assert sc._PIP_NO_CACHE_ARG in err

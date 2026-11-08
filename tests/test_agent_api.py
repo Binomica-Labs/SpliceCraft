@@ -7984,3 +7984,93 @@ class TestSpliceMarginIsNotAFlag:
             assert m["pair_combined_threshold"] is None
         finally:
             sp._splice_load_model(*saved)
+
+
+class TestOptimizeProteinReportsThe3PrimeScreen:
+    """Field report 2026-11-08: the splice screen and the plant 3'-end screen
+    both live in SpliceCraft, both are right, and nothing arbitrated between
+    them — so a repair could trade a splice site for a polyadenylation site
+    and the response never mentioned it. The splice REPAIR now refuses such a
+    swap, but the GC band and the diversify pass have no such guard and run
+    BEFORE it, so the answer reports what is actually being returned."""
+
+    def _h(self, name):
+        return sc._state._AGENT_HANDLERS[name][0]
+
+    # AT-rich by construction: Lys/Asn/Ile/Phe/Leu/Tyr have only AT-rich
+    # codons, so the emitted CDS reads like a plant 3' end.
+    AT_PROT = "M" + "KNIFLYKNIFLYKNIFLY" * 12
+    MIXED_PROT = "MGSSHHHHHHSSGLVPRGSHMASMTGGQQMGRGSEFEKLVKTLDGLFQ" * 3
+
+    def test_an_at_rich_cds_is_flagged(self):
+        r = self._h("optimize-protein")(None, {
+            "protein": self.AT_PROT, "hazard_hosts": ["plant"]})
+        assert not isinstance(r, tuple), r
+        tp = r["three_prime"]
+        assert tp["skipped"] is False
+        assert tp["scanned"] == "cds"
+        assert tp["n_regions"] >= 1, tp
+        assert any("read like a plant 3' end" in w for w in r["warnings"])
+        assert any("silently" in w for w in r["warnings"])
+
+    def test_the_block_is_present_whenever_the_splice_screen_runs(self):
+        r = self._h("optimize-protein")(None, {
+            "protein": self.MIXED_PROT, "hazard_hosts": ["plant"]})
+        assert "three_prime" in r
+        assert r["three_prime"]["skipped"] is False
+
+    def test_not_requested_is_marked_skipped_not_clean(self):
+        r = self._h("optimize-protein")(None, {
+            "protein": self.MIXED_PROT, "check_splice": False})
+        tp = r["three_prime"]
+        assert tp["skipped"] is True
+        assert "reason" in tp
+
+    def test_a_short_cds_says_why_rather_than_reporting_zero(self):
+        """Zero regions and "too short to look" are different answers."""
+        r = self._h("optimize-protein")(None, {
+            "protein": "MGSSHHHHHH", "hazard_hosts": ["plant"]})
+        tp = r["three_prime"]
+        assert tp["skipped"] is True
+        assert "shorter than" in tp["reason"]
+        assert "scoring window" in tp["reason"]
+
+    def test_regions_carry_their_extent_and_score(self):
+        r = self._h("optimize-protein")(None, {
+            "protein": self.AT_PROT, "hazard_hosts": ["plant"]})
+        for reg in r["three_prime"]["regions"]:
+            for key in ("start", "end", "score", "tier"):
+                assert key in reg, reg
+            # [INV-226]: there is deliberately NO cleavage_site field
+            assert "cleavage_site" not in reg
+
+    def test_the_block_ships_its_detection_power(self):
+        """[INV-233]'s rule, applied to the block it inspired: a count is
+        unreadable without the sensitivity behind it. This model's sensitivity
+        at its default cutoff is 0.573, so `n_regions: 0` is again a weaker
+        statement than "clean"."""
+        r = self._h("optimize-protein")(None, {
+            "protein": self.MIXED_PROT, "hazard_hosts": ["plant"]})
+        b = r["three_prime"]["basis"]
+        assert b["sensitivity"] == 0.573
+        assert b["window"] == 160
+        assert b["auc_vs_coding"] > b["auc_vs_genomic"]
+        assert "PLANT" in b["note"]
+        assert "no cleavage site" in b["note"]
+
+    def test_an_empty_scan_says_what_empty_means(self):
+        r = self._h("optimize-protein")(None, {
+            "protein": self.MIXED_PROT, "hazard_hosts": ["plant"]})
+        if r["three_prime"]["n_regions"]:
+            pytest.skip("this protein is not clean")
+        assert any("weaker statement than a clean sequence" in w
+                   and "3'-end" in w for w in r["warnings"]), r["warnings"]
+
+    def test_regions_are_capped_but_the_count_is_exact(self):
+        """Same unbounded-answer rule as [INV-232](a): truncate the list,
+        never the count."""
+        r = self._h("optimize-protein")(None, {
+            "protein": self.AT_PROT * 4, "hazard_hosts": ["plant"]})
+        tp = r["three_prime"]
+        assert len(tp["regions"]) <= sc._CODON_SPLICE_MAX_REPORT
+        assert tp["n_regions"] >= len(tp["regions"])

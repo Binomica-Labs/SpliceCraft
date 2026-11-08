@@ -118,6 +118,18 @@ What you can do without leaving the terminal.
   false alarm costs one codon. `splice-model` and `scan-splice-sites`
   expose the model directly, the latter scoring any transcribed sequence
   at a threshold you choose.
+- **The splice repair and the transcript-end screen now arbitrate.** A
+  plant design is screened for two hazards that fail the same silent
+  way — a cryptic splice site, and a stretch read as the end of the
+  message. Removing one used to be able to create the other: on a real
+  construct a repair cleared the last cryptic donor and opened a
+  280-base region reading as a transcript end, with a slightly better
+  codon-adaptation score, so nothing about the result looked wrong. Each
+  codon change is now checked against both screens, and the repair
+  reaches for a different synonymous codon rather than making the trade.
+  A plant optimisation also reports the transcript-end screen for the
+  sequence it hands back, since the GC and diversify passes run earlier
+  and have no such guard.
 
 ## Cloning
 

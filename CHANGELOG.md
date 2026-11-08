@@ -14,6 +14,60 @@
 
 ---
 
+## [1.3.17] — 2026-11-08
+
+`splicecraft update` can now actually install a just-published release, and
+the plant cryptic-splice repair no longer fixes one silent failure by causing
+another.
+
+### Bug fixes
+
+- **Removing a cryptic splice site could add a cryptic transcript END
+  instead.** SpliceCraft screens plant designs for two hazards that fail the
+  same silent way — a cryptic splice site that cuts a chunk out of the
+  message, and a stretch the plant reads as the end of the message and
+  polyadenylates early. Either way the protein disappears and the DNA
+  sequences perfectly. The two screens never consulted each other, so asking
+  for a splice repair could hand back a CDS that had traded one for the other:
+  on a real construct it cleared the last cryptic donor, opened a 280-base
+  region that reads as a transcript end, and pushed the terminator's effective
+  reach from 80 to 320 bases — with a slightly *better* codon-adaptation score,
+  so nothing in the result looked wrong. The repair now checks both screens
+  before accepting a codon change, and in practice picks a different
+  synonymous codon that satisfies both rather than giving up. If no codon
+  satisfies both, the splice site is reported with its score instead of being
+  fixed at the transcript's expense.
+
+### New features
+
+- **Codon optimization now reports the plant transcript-end screen too.**
+  Asking for a plant design returns a `three_prime` block alongside the
+  cryptic-splice one, measured on the coding sequence actually being returned.
+  The GC-window and diversify passes run before the splice repair and have no
+  such guard, so reporting is what catches anything they introduce. A sequence
+  shorter than the screen's 160-base window says so rather than reporting zero
+  hits.
+
+- **`splicecraft update` could report "already at latest" for up to ten
+  minutes after a new release, and never update.** PyPI tells pip its package
+  index is good for ten minutes, so right after a release pip reuses a cached
+  copy, concludes you are already current, and exits successfully. The version
+  check then correctly reported that nothing had changed — so every layer was
+  honest and the result was still a failed update. Retrying did not help,
+  because the ten minutes run from the first attempt. Every pip-based install
+  method now upgrades with the index cache disabled, which costs nothing (an
+  upgrade downloads new versions either way). uv and pixi installs are
+  unaffected; they use their own caches.
+- **The advice printed after such a failure was wrong on all three counts.**
+  It blamed PyPI for still publishing the release, told you to wait, and
+  suggested `--force` — which on a pipx install re-resolves "latest" through
+  the very cache that was stale, so it could not have helped. The message now
+  asks PyPI whether the version is actually downloadable and says which of the
+  two situations you are in: if it is there, your resolver used a stale index
+  and waiting is pointless; if it is not there yet, the release is still
+  publishing and waiting is exactly right. The suggested command is also built
+  for your actual install method instead of assuming pipx.
+
 ## [1.3.16] — 2026-11-08
 
 The cryptic-splice screen was telling you it looked twice as hard as it does.
@@ -70,6 +124,11 @@ The cryptic-splice screen was telling you it looked twice as hard as it does.
 
 ### Hardening
 
+- The plant transcript-end screen now reports the sensitivity behind its
+  count, like the cryptic-splice screen does, and says so in writing when it
+  finds nothing — at its default cutoff it catches about 57% of real cases, so
+  an empty result is not a guarantee. Its region list is capped while the
+  count stays exact.
 - **Scanning a long sequence for splice-site pairs is 16x faster.** The pair
   search compared every candidate donor against every candidate acceptor
   anywhere in the molecule, then threw away over 99% of them for being too far

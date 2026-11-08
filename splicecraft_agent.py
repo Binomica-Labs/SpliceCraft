@@ -2741,6 +2741,88 @@ def _h_optimize_protein(app, payload):
             # Not checked must never read as clean.
             splice_block = {"skipped": True, "reason": str(exc)}
             warnings.append("cryptic-splice scan SKIPPED — " + str(exc))
+    # ── Plant premature-3'-end screen on the FINAL coding sequence ───────
+    # Reported whenever the splice screen runs, because the two hazards are
+    # the same failure mode (the protein disappears and the DNA sequences
+    # perfectly) and until now only one of them was ever mentioned. The splice
+    # REPAIR refuses a swap that would add 3'-end-like sequence, but the GC
+    # band and the diversify pass have no such guard and run before it — so
+    # this is measured on what is actually being returned, not inferred from
+    # which passes ran (field report 2026-11-08).
+    three_prime_block: dict = {"skipped": True, "reason": "not requested"}
+    if check_splice:
+        try:
+            from splicecraft_regulettuce import (
+                _3P_AUC_VS_CODING, _3P_AUC_VS_GENOMIC, _3P_MIN_SCORE,
+                _3P_SENSITIVITY_AT_DEFAULT, _3P_STEP, _3P_STRONG_SCORE,
+                _3P_WINDOW, _scan_3prime_risk)
+            if len(dna) < _3P_WINDOW:
+                three_prime_block = {
+                    "skipped": True,
+                    "reason": (f"CDS is {len(dna)} nt, shorter than the "
+                               f"{_3P_WINDOW} nt scoring window"),
+                }
+            else:
+                # Single-stranded and linear: a CDS is read one way, as part
+                # of a message. Every hit is upstream of the terminator by
+                # construction, so unlike `predict-transcript` there is no
+                # 3'UTR here whose hits would be the terminator doing its job.
+                _regions = _scan_3prime_risk(dna, circular=False,
+                                             both_strands=False)
+                three_prime_block = {
+                    "skipped":   False,
+                    "scanned":   "cds",
+                    "n_regions": len(_regions),
+                    "regions":   _regions[:_CODON_SPLICE_MAX_REPORT],
+                    # Same rule the splice block follows since [INV-233]: a
+                    # count is unreadable without the detection power behind
+                    # it, and this model's sensitivity at its default cutoff
+                    # is 0.573 — so `n_regions: 0` is again a weaker
+                    # statement than "clean". Stated rather than left for the
+                    # caller to look up.
+                    "basis": {
+                        "model": "plant 3'-end composition",
+                        "window": _3P_WINDOW,
+                        "step": _3P_STEP,
+                        "min_score": _3P_MIN_SCORE,
+                        "strong_score": _3P_STRONG_SCORE,
+                        "sensitivity": _3P_SENSITIVITY_AT_DEFAULT,
+                        "auc_vs_coding": _3P_AUC_VS_CODING,
+                        "auc_vs_genomic": _3P_AUC_VS_GENOMIC,
+                        "note": (
+                            "trained on PLANT sequence and calibrated against "
+                            "coding sequence (AUC 0.895), which is what is "
+                            "being scanned here; against plant genomic DNA it "
+                            "is 0.575, so the honest claim is 'this does not "
+                            "look like coding sequence'. Sensitivity at the "
+                            "default cutoff is 0.573, so 0 regions is not a "
+                            "guarantee. Region boundaries are quantised to "
+                            "`step`, and there is deliberately no cleavage "
+                            "site: a position-specific model located real "
+                            "poly(A) sites WORSE than chance. Call "
+                            "`regulettuce-calibration` for the full record."),
+                    },
+                }
+                if _regions:
+                    _w3 = max(_regions, key=lambda r: r.get("score", 0))
+                    warnings.append(
+                        f"{len(_regions)} region(s) of this CDS read like a "
+                        f"plant 3' end (worst at {_w3['start']}-{_w3['end']}, "
+                        f"score {_w3['score']}) — the transcript could be cut "
+                        f"and polyadenylated there and the protein never "
+                        f"finished. A cryptic 3' end fails exactly the way a "
+                        f"cryptic splice site does, silently")
+                else:
+                    warnings.append(
+                        "plant 3'-end scan found nothing — its sensitivity at "
+                        "the default cutoff is 0.573 (see three_prime.basis), "
+                        "so this is a weaker statement than a clean sequence, "
+                        "the same caveat the cryptic-splice scan carries")
+        except (ImportError, ValueError) as exc:
+            # Not checked must never read as clean.
+            three_prime_block = {"skipped": True, "reason": str(exc)}
+            warnings.append("plant 3'-end scan SKIPPED — " + str(exc))
+
     body_dna = dna[:len(dna) - 3 * n_stop_codons] if n_stop_codons else dna
     body_codons = len(body_dna) // 3
     gc3 = round(_codon_gc3(body_dna), 2)
@@ -2775,6 +2857,7 @@ def _h_optimize_protein(app, payload):
         "gc_window_min":    round(win_lo, 2),
         "gc_window_max":    round(win_hi, 2),
         "splice":            splice_block,
+        "three_prime":       three_prime_block,
         "warnings":          warnings,
         # Display/report-only metrics, matching the Synthesis + Mutato toasts.
         # Scored against the SAME genetic code the sequence was optimised under
@@ -10096,10 +10179,16 @@ def _h_scan_splice_sites(app, payload):
 
     `both_strands` defaults to false and should usually stay there: an mRNA is
     single-stranded and only the sense strand is spliced, so a reverse-strand
-    "site" in a CDS is not a hazard. `annotated_edges` is a list of positions
-    that are REAL intron boundaries; each pair then reports which of its ends
-    sits on one, so the real donor reaching past its own partner to a cryptic
-    acceptor is not read as a fully cryptic hazard. Read-only."""
+    "site" in a CDS is not a hazard.
+
+    `annotated_edges` is a list of positions that are REAL intron boundaries,
+    **0-based and on the same basis as the `position` each site reports** —
+    i.e. what `predict-transcript`'s feature `start`/`end` give you directly,
+    with no +/-1. (Reading them as 1-based silently shifts the set by one and
+    the real donor then looks cryptic, which is what happened on 2026-11-08.)
+    Each pair reports which of its ends sits on one, so the real donor
+    reaching past its own partner to a cryptic acceptor is not read as a fully
+    cryptic hazard. Read-only."""
     seq, err = _sanitize_bases(payload.get("sequence"))
     if err is not None:
         return ({"error": err.replace("'bases'", "'sequence'")}, 400)

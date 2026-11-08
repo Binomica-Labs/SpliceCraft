@@ -320,6 +320,14 @@ shifts, every feature keeps its coordinates, and it's undoable.
   Pairs carry `both_above_threshold` / `sub_threshold_ends`, because the
   pairing stage scans lower than the reporting stage: a mediocre donor plus a
   strong acceptor is the shape two separate cutoffs miss.
+- **Two plant screens, one answer.** A plant optimisation also returns a
+  `three_prime` block — regions the plant would read as the END of the
+  message, which fails exactly as silently as a cryptic splice site. The
+  splice repair refuses a synonymous swap that would add such a region
+  (it picks another codon instead), so you can no longer be handed a CDS
+  that traded a splice site for a polyadenylation site — which once came back
+  with a *better* CAI and a worse construct. Report both blocks, not just
+  `splice`.
 - `splice-model` / `scan-splice-sites` are the model's own doors — the latter
   scores a bare transcribed sequence (`margin`, explicit thresholds,
   `annotated_edges` to mark real intron boundaries). For a unit on a loaded

@@ -43,7 +43,7 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.3.16"
+__version__ = "1.3.17"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
@@ -29078,6 +29078,84 @@ class WhatsNewModal(_OneShotDismissScreen, ModalScreen):
 _PYPI_JSON_URL = "https://pypi.org/pypi/splicecraft/json"
 
 
+# The Simple API (PEP 691) — what pip/pipx RESOLVE against, as opposed to the
+# JSON metadata above, which is what our update CHECK reads. The two can
+# disagree, and which one is ahead decides what a failed upgrade means, so the
+# failure path asks this endpoint directly instead of guessing ([INV-233b]).
+_PYPI_SIMPLE_URL = "https://pypi.org/simple/splicecraft/"
+
+
+def _pypi_simple_has_version(version: str,
+                             timeout: "float | None" = None
+                             ) -> "bool | None":
+    """Does PyPI's Simple API list `version` as installable?
+
+    ``True`` / ``False``, or ``None`` when we cannot tell — a mirror override
+    is configured (we cannot infer a mirror's Simple-API URL from its JSON
+    one), the network failed, or the payload was not what PEP 691 describes.
+
+    This exists ONLY to make a failed upgrade's explanation true. "The upgrade
+    reported success but the version did not change" has two causes with
+    identical symptoms: PyPI's Simple API still catching up with its JSON
+    metadata (`[INV-111]`), or pip reusing a cached index page it is entitled
+    to hold for ten minutes (`_PIP_NO_CACHE_ARG`). Asking the Simple API
+    distinguishes them, and the advice for the two is opposite — wait, versus
+    stop waiting and bypass the cache.
+
+    Sends `Cache-Control: no-cache` so an intermediate proxy cannot hand back
+    the same stale page that caused the failure, which would make the probe
+    agree with the bug. Never raises: a diagnostic that can throw would
+    replace a useful failure message with a traceback."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+    # Resolved at CALL time, not as a def-time default: this function is
+    # defined above `_UPDATE_CHECK_TIMEOUT_S`, and a default argument would
+    # bind whatever the name meant when the module was being read.
+    if timeout is None:
+        timeout = _UPDATE_CHECK_TIMEOUT_S
+    if os.environ.get("SPLICECRAFT_PYPI_URL", "").strip():
+        # A mirror is in play. Its Simple API is not derivable from the JSON
+        # override, and probing pypi.org would describe the wrong index.
+        return None
+    want = str(version or "").strip()
+    if not want:
+        return None
+    try:
+        _demo_block_network("PyPI index probe")
+        req = urllib.request.Request(
+            _PYPI_SIMPLE_URL,
+            headers={
+                "User-Agent": f"splicecraft/{__version__} (update-check)",
+                "Accept": "application/vnd.pypi.simple.v1+json",
+                "Cache-Control": "no-cache",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(_PYPI_MAX_RESPONSE_BYTES + 1)
+        if len(raw) > _PYPI_MAX_RESPONSE_BYTES:
+            return None
+        doc = _json.loads(raw.decode("utf-8", "replace"))
+        if not isinstance(doc, dict):
+            return None
+        versions = doc.get("versions")
+        if isinstance(versions, list):
+            return want in {str(v).strip() for v in versions}
+        # Older PEP 691 responses carry `files` without `versions`; the
+        # filenames still say which releases exist.
+        files = doc.get("files")
+        if isinstance(files, list):
+            names = [str(f.get("filename", "")) for f in files
+                     if isinstance(f, dict)]
+            return any(f"-{want}-" in n or n.endswith(f"-{want}.tar.gz")
+                       for n in names)
+        return None
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError,
+            ValueError, TypeError, KeyError, _json.JSONDecodeError) as exc:
+        _log.debug("PyPI simple-index probe failed: %r", exc)
+        return None
+
+
 def _resolve_pypi_url() -> str:
     """Return the URL that the PyPI update-check should hit. Honours
     `$SPLICECRAFT_PYPI_URL` so ops / corporate environments behind a
@@ -29692,6 +29770,34 @@ def _detect_install_method() -> dict:
     return info
 
 
+# Why every pip-based upgrade runs with the cache disabled.
+#
+# PyPI serves the Simple API index with `Cache-Control: max-age=600, public`,
+# so pip is ENTITLED to reuse its cached index page for ten minutes — and
+# right after a release it does. The result (measured 2026-11-08, v1.3.16):
+#
+#     pip index versions splicecraft                 -> 1.3.15
+#     pip index versions splicecraft --no-cache-dir  -> 1.3.16
+#
+# while PyPI's Simple API was already serving BOTH the 1.3.16 wheel and sdist.
+# `pipx upgrade` therefore resolved "latest" as the version already installed,
+# pip truthfully reported "already at latest", and `[INV-112]`'s readback
+# truthfully reported no change. Three honest layers, one wrong conclusion —
+# and because the ten-minute window runs from pip's FIRST fetch, every retry
+# inside it fails identically (the reporting user ran it four times).
+#
+# `[INV-111]`/`[INV-112]` blamed this on PyPI's Simple API lagging its JSON
+# metadata. That is a real second cause with identical symptoms, but it was
+# NOT this one: the index had the files. The blanket fix covers both.
+#
+# The cache costs us nothing on an upgrade: almost everything pip installs
+# here is a version that was never in the cache. It only forgoes reusing a
+# locally-built wheel for an sdist-only dependency, and re-fetches index
+# pages, which are small. Not applied to the uv / pixi front-ends — they have
+# their own caches and their own flags, and the mechanism above is pip's.
+_PIP_NO_CACHE_ARG = "--no-cache-dir"
+
+
 def _build_upgrade_command(method: str, *, force: bool, pre: bool = False,
                             pin_version: "str | None" = None,
                             eager: bool = True) -> "list[str] | None":
@@ -29730,24 +29836,33 @@ def _build_upgrade_command(method: str, *, force: bool, pre: bool = False,
     pkg_spec = f"splicecraft=={pin_version}" if pin_version else "splicecraft"
     pinned = pin_version is not None
     if method == "pipx":
+        # Every pipx branch bypasses pip's cache — see `_PIP_NO_CACHE_ARG`.
+        # MUST stay a SINGLE `--pip-args=<value>` token ([INV-163]): pipx's
+        # `--pip-args` is a single-value option, and a following token that
+        # itself starts with `--` is parsed as a separate flag ("expected one
+        # argument"), so `["--pip-args", "--upgrade-strategy=eager"]` makes
+        # `pipx upgrade` exit 2 with a usage error. pipx shlex-splits the
+        # value, so several space-separated pip flags inside ONE token are
+        # fine.
         if force or pinned:
             # `pipx upgrade` is a no-op when versions match; `install
             # --force` re-runs the install end-to-end (re-resolving deps to
             # the latest compatible for free). Also the only way to install a
-            # specific version (incl. older).
-            return ["pipx", "install", "--force", pkg_spec]
-        cmd = ["pipx", "upgrade", "splicecraft"]
+            # specific version (incl. older). It resolves "latest" through
+            # the SAME pip index cache, so without the bypass `--force` is
+            # not an escape hatch from a stale index at all — which is what
+            # made the old failure hint's advice useless (2026-11-08).
+            return ["pipx", "install", "--force", pkg_spec,
+                    f"--pip-args={_PIP_NO_CACHE_ARG}"]
+        pip_args = []
         if eager:
             # `pipx upgrade` runs pip with the default only-if-needed
             # strategy, so a stale-but-satisfying dep is left alone. Forward
             # an eager upgrade-strategy to the pip it invokes underneath.
-            # MUST be a SINGLE `--pip-args=<value>` token: pipx's `--pip-args`
-            # is a single-value option, and a following token that itself
-            # starts with `--` is parsed as a separate flag ("expected one
-            # argument"), so `["--pip-args", "--upgrade-strategy=eager"]`
-            # makes `pipx upgrade` exit 2 with a usage error.
-            cmd.append("--pip-args=--upgrade-strategy=eager")
-        return cmd
+            pip_args.append("--upgrade-strategy=eager")
+        pip_args.append(_PIP_NO_CACHE_ARG)
+        return ["pipx", "upgrade", "splicecraft",
+                "--pip-args=" + " ".join(pip_args)]
     if method == "uv-tool":
         if force or pinned:
             # `uv tool upgrade` is also a no-op when versions match;
@@ -29781,8 +29896,9 @@ def _build_upgrade_command(method: str, *, force: bool, pre: bool = False,
             # and use --force-reinstall so the pinned spec replaces the
             # installed package regardless of direction.
             return [sys.executable, "-m", "pip", "install", "--user",
-                    "--force-reinstall", pkg_spec]
-        cmd = [sys.executable, "-m", "pip", "install", "--user", "--upgrade"]
+                    "--force-reinstall", _PIP_NO_CACHE_ARG, pkg_spec]
+        cmd = [sys.executable, "-m", "pip", "install", "--user", "--upgrade",
+               _PIP_NO_CACHE_ARG]
         if eager:
             cmd += ["--upgrade-strategy", "eager"]
         if pre:
@@ -29795,8 +29911,9 @@ def _build_upgrade_command(method: str, *, force: bool, pre: bool = False,
     # decides whether to run it or just print it.
     if pinned:
         return [sys.executable, "-m", "pip", "install",
-                "--force-reinstall", pkg_spec]
-    cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
+                "--force-reinstall", _PIP_NO_CACHE_ARG, pkg_spec]
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade",
+           _PIP_NO_CACHE_ARG]
     if eager:
         cmd += ["--upgrade-strategy", "eager"]
     if pre:
@@ -31148,17 +31265,75 @@ def _update_run_install(cmd: "list[str]", snap_path: Path,
                 + (f" — it did not update to {target}." if target else "."),
                 file=sys.stderr,
             )
-            print(
-                "  • This is almost always a timing issue right after a new\n"
-                "    release: PyPI can take a minute or two to make a new\n"
-                "    version installable even once it's listed.\n"
-                "  • Wait a minute or two, then run `splicecraft update` again.\n"
-                "  • If it's still stuck after several minutes, force a clean\n"
-                "    reinstall:\n"
-                "      splicecraft update --force\n"
-                f"  Pre-update snapshot: {snap_path}",
-                file=sys.stderr,
-            )
+            # WHY, not a guess. Two causes produce this exact symptom and
+            # their remedies are opposite, so ask PyPI which one it is
+            # rather than printing the more common one and hoping
+            # ([INV-233b]). The old text asserted the timing cause
+            # unconditionally and sent users to `--force`, which on pipx
+            # re-resolves "latest" through the very cache that was stale.
+            on_index = _pypi_simple_has_version(target) if target else None
+            # Both derived from THIS run, never assumed: whether the command
+            # we actually ran bypassed the cache, and what the right
+            # cache-busting retry is for THIS front-end. Hardcoding a `pipx`
+            # line is wrong advice for a pip-venv or uv install, and claiming
+            # "we already pass --no-cache-dir" is wrong for the uv / pixi
+            # front-ends, which take neither that flag nor pip's cache.
+            bypassed = any(_PIP_NO_CACHE_ARG in str(a) for a in cmd)
+            retry_cmd = _build_upgrade_command(method, force=True,
+                                               pin_version=target)
+            retry_line = ("      " + " ".join(retry_cmd) + "\n"
+                          if retry_cmd else "")
+            if on_index is True:
+                _log_event("update.install.stale_index_cache",
+                           installed=installed, target=target or "")
+                print(
+                    f"  • PyPI's package index HAS {target} — so this is not\n"
+                    "    PyPI catching up. The resolver used a stale index.\n"
+                    "  • Most likely your local pip cache: PyPI serves its\n"
+                    "    index with `max-age=600`, so pip may reuse a copy up\n"
+                    "    to 10 minutes old and conclude you are already on the\n"
+                    "    newest version. Retrying inside that window fails the\n"
+                    "    same way, because the clock runs from the first fetch.\n"
+                    + ("  • This upgrade already ran with "
+                       f"`{_PIP_NO_CACHE_ARG}`, so the\n"
+                       "    stale copy is likely further out — a proxy, or a\n"
+                       "    second install shadowing this one.\n"
+                       if bypassed else
+                       "  • This upgrade did NOT bypass the resolver's cache,\n"
+                       "    which is the first thing to rule out.\n")
+                    + ("  • Force a clean reinstall:\n" + retry_line
+                       if retry_line else "")
+                    + "  • Or wait 10 minutes and re-run `splicecraft update`.\n"
+                    + f"  Pre-update snapshot: {snap_path}",
+                    file=sys.stderr,
+                )
+            elif on_index is False:
+                _log_event("update.install.index_not_ready",
+                           installed=installed, target=target or "")
+                print(
+                    f"  • PyPI's package index does NOT yet list {target},\n"
+                    "    even though its metadata announces it — the release\n"
+                    "    is still being published. This is the one case where\n"
+                    "    waiting is the right move.\n"
+                    "  • Wait a minute or two, then run `splicecraft update`\n"
+                    "    again. Nothing is wrong with your install.\n"
+                    f"  Pre-update snapshot: {snap_path}",
+                    file=sys.stderr,
+                )
+            else:
+                # Could not reach the index (offline, mirror, demo mode).
+                # Say both causes rather than asserting either.
+                print(
+                    "  • Could not check PyPI's package index, so this is\n"
+                    "    either a release still being published or a stale\n"
+                    "    index cache in the resolver.\n"
+                    "  • Wait a minute or two, then run `splicecraft update`\n"
+                    "    again.\n"
+                    + ("  • If it persists, force a clean reinstall:\n"
+                       + retry_line if retry_line else "")
+                    + f"  Pre-update snapshot: {snap_path}",
+                    file=sys.stderr,
+                )
         else:
             # Changed, but not to the expected version — surface it raw.
             print(

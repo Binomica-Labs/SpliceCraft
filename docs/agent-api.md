@@ -632,6 +632,19 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   margin with `scrub_splice_sites` left off to merely SEE what is sitting just
   under the bar.
 
+  **A `three_prime` block comes back beside `splice`,** scanning the FINAL
+  coding sequence for regions a plant would read as the END of the message.
+  The two hazards fail identically — the transcript is truncated or spliced,
+  the protein disappears, and the DNA sequences perfectly — and until v1.3.17
+  only one of them was ever mentioned. The splice REPAIR now also refuses any
+  synonymous swap that would add 3'-end-like sequence, so it can no longer
+  clear a cryptic donor by opening a polyadenylation site instead (measured on
+  a real construct: the repaired CDS had the better CAI and the worse
+  construct). It usually finds a different synonym that satisfies both screens
+  rather than giving up; when it cannot, the splice site stays in
+  `splice.sites` with its score. A CDS shorter than the model's 160 nt window
+  reports `skipped` with the reason, never a bare zero.
+
   Each entry in `splice.pairs` carries `both_above_threshold` and
   `sub_threshold_ends`: the pairing stage deliberately scans LOWER than the
   reporting stage, because a pair carries two independent pieces of evidence

@@ -4045,3 +4045,103 @@ class TestSpliceScrubMarginIsNotAFlag:
             self.DNA, self._protein(self.DNA), sc._CODON_BUILTIN_K12,
             kind="donor", margin=0.5, has_appended_stop=False)
         assert self._protein(out) == self._protein(self.DNA)
+
+
+class TestSpliceRepairDoesNotTradeForA3PrimeSite:
+    """The two plant screens did not consult each other (field report
+    2026-11-08). Both are right on their own and nothing arbitrated between
+    them, so a repair could clear the last cryptic splice donor and open a
+    POLYADENYLATION site instead — measured on a real construct, the returned
+    DNA had the better CAI (0.8257 vs 0.8240) and the worse construct.
+
+    Both failure modes are silent in the same way: the protein disappears and
+    the DNA sequences perfectly. Neither gets to be fixed at the other's
+    expense."""
+
+    # Found by search, not written by hand: an AT-rich block sitting near the
+    # 3'-end threshold with repairable cryptic acceptors on either side. The
+    # unguarded repair pushes coverage 320 -> 340 bp; the guard holds it at
+    # 320 and still fixes every site, by choosing different synonyms.
+    DNA = ("ATGCCTACTAGCAGCGGAACTTCTTTCCTTCCTTTCAGCACTCTTACTTCTCCTTCTAGC"
+           "TCTCTTACTTTCAGCCTTCTTCCTGCTAGCGCTGCTTTCACTCCTGCTGCTATAAATATT"
+           "AAATTATTAAAATTAAAGAAATTAATATTAAATTTTAAAATTTATAAGAATTTAAAGTTA"
+           "ATTAATAAGAAATTTAATATTTATAATAATATATTAAAGAAAATATTTTATAAGTATAAG"
+           "ATAAAAATAAATTATTATTTAAAACCTACTAGCAGCGGAACTTCTTTCCTTCCTTTCAGC"
+           "ACTCTTACTTCTCCTTCTAGCTCTCTTACTTTCAGCCTTCTTCCTGCTAGCGCTGCTTTC"
+           "ACTCCTGCTGCT")
+
+    def _protein(self, dna):
+        return "".join(sc._CODON_TABLE.get(dna[i:i + 3], "X")
+                       for i in range(0, len(dna) - 2, 3))
+
+    def _cover(self, dna):
+        """Flagged 3'-end-like bases, the quantity the guard compares."""
+        from splicecraft_regulettuce import _scan_3prime_risk
+        return sum(max(0, r["end"] - r["start"])
+                   for r in _scan_3prime_risk(dna, circular=False,
+                                              both_strands=False))
+
+    def _run(self, guard):
+        prot = self._protein(self.DNA)
+        return _codon._codon_fix_splice_sites(
+            self.DNA, prot, sc._CODON_BUILTIN_K12, margin=1.0,
+            has_appended_stop=False, guard_3prime=guard)
+
+    def test_the_fixture_really_poses_the_trade(self):
+        """Without the guard the repair makes the 3'-end risk WORSE. If this
+        stops being true the fixture has drifted and the rest of the class is
+        no longer testing anything."""
+        out, fixes, _rem = self._run(False)
+        assert fixes, "fixture must have repairable splice sites"
+        assert self._cover(out) > self._cover(self.DNA)
+
+    def test_the_guard_refuses_to_make_it_worse(self):
+        out, _fixes, _rem = self._run(True)
+        assert self._cover(out) <= self._cover(self.DNA)
+
+    def test_it_still_repairs_the_splice_sites(self):
+        """Refusing one synonym must not mean giving up: the guard should
+        reach for another synonym that satisfies both screens."""
+        guarded, g_fixes, _ = self._run(True)
+        unguarded, u_fixes, _ = self._run(False)
+        assert len(g_fixes) == len(u_fixes), (g_fixes, u_fixes)
+        assert guarded != unguarded, "the guard must change the chosen codons"
+
+    def test_the_protein_is_untouched_either_way(self):
+        prot = self._protein(self.DNA)
+        for guard in (True, False):
+            out, _f, _r = self._run(guard)
+            assert self._protein(out) == prot
+
+    def test_guard_off_reproduces_the_unguarded_behaviour(self):
+        """`guard_3prime=False` is the escape hatch for a caller who wants the
+        old DNA back; it must not quietly keep guarding."""
+        out, _f, _r = self._run(False)
+        assert self._cover(out) > self._cover(self.DNA)
+
+    def test_a_cds_under_the_models_window_is_not_blocked(self):
+        """The 3'-end model needs 160 nt. A shorter CDS must still get its
+        splice repair — `-1` means "cannot answer", never "risky"."""
+        from splicecraft_regulettuce import _3P_WINDOW
+        short = ("ATGAAACCTGGTTCTGCTAAGGTAACTGGTGCTAAACCTGGTTCTGCTGAT"
+                 "GAAACCTGGTTCTGCTAAACCTTAA")
+        assert len(short) < _3P_WINDOW
+        prot = self._protein(short)
+        out, fixes, remaining = _codon._codon_fix_splice_sites(
+            short, prot, sc._CODON_BUILTIN_K12,
+            sites=sc._codon_hazard_motifs("plant"), guard_3prime=True)
+        assert fixes, "a short CDS must still be repairable"
+        assert remaining == []
+        assert self._protein(out) == prot
+
+    def test_the_guard_cannot_resurrect_a_restriction_site(self):
+        """Guard 4 runs last, so it must not be able to accept something
+        guards 1-3 rejected."""
+        prot = self._protein(self.DNA)
+        out, _f, _r = _codon._codon_fix_splice_sites(
+            self.DNA, prot, sc._CODON_BUILTIN_K12, margin=1.0,
+            sites={"BsaI": "GGTCTC", "Esp3I": "CGTCTC"},
+            has_appended_stop=False, guard_3prime=True)
+        for motif in ("GGTCTC", "CGTCTC"):
+            assert motif not in out
+            assert sc._rc(motif) not in out

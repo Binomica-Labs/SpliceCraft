@@ -422,8 +422,9 @@ def _splice_pair_risk(seq: str, *, pair_floor: "float | None" = None,
     from the richer one and a relaxed pair is never mistaken for a confirmed
     one.
 
-    `annotated_edges` is a set of positions that are REAL annotated intron
-    boundaries; `annotated_ends` then lists which end of each pair sits on one
+    `annotated_edges` is a set of 0-based positions — the same basis as a
+    hit's `position`, and the same basis a feature's `start`/`end` use — that
+    are REAL annotated intron boundaries; `annotated_ends` then lists which end of each pair sits on one
     (`[]`, `["donor"]`, `["acceptor"]` or both). A pair with one annotated end
     is a different animal from a fully cryptic one — it is usually the real
     donor reaching past its own partner because the model missed the real

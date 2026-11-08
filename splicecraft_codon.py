@@ -900,6 +900,7 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
                             kind: str = "both",
                             sites: "dict | None" = None,
                             margin: float = 0.0,
+                            guard_3prime: bool = True,
                             has_appended_stop: bool = True,
                             transl_table: "int | None" = None) -> tuple:
     """Substitute synonymous codons to remove cryptic splice sites that the
@@ -939,12 +940,27 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
     A candidate swap is kept only when it
 
       1. drops the target site below threshold,
-      2. creates no NEW at-or-above-threshold site, and
-      3. creates no new ``sites`` motif (forward or RC)
+      2. creates no NEW at-or-above-threshold site,
+      3. creates no new ``sites`` motif (forward or RC), and
+      4. creates no new plant 3'-END-like region (``guard_3prime``)
 
     so running this after `_codon_fix_sites` can never re-introduce a
     restriction site that scrub just removed, and the two passes cannot
-    undo each other. Both guards are evaluated on the LOCAL slice a 3-base
+    undo each other.
+
+    Guard 4 exists because the two plant screens did not consult each other.
+    Both are right on their own and nothing arbitrated between them, so a
+    repair could trade a splice site for a POLYADENYLATION site — measured on
+    a real construct (field report 2026-11-08): at `margin=1.0` a swap cleared
+    the last cryptic donor and opened a 280 bp region scoring 0.80 inside the
+    CDS, pushing the terminator's reach from 80 bp to 320 bp. The returned DNA
+    had the better CAI (0.8257 vs 0.8240) and the worse construct, which is
+    exactly the trade a caller cannot see. Both failure modes are silent in
+    the same way — the protein disappears and the DNA sequences perfectly — so
+    neither gets to be fixed at the other's expense. A swap that would create
+    one is refused, and the site it would have fixed stays in ``remaining``
+    with its score, which is the documented behaviour for "no synonym can fix
+    this". Both guards are evaluated on the LOCAL slice a 3-base
     change can affect, which is exact for a linear scan — the argument
     `_codon_swap_ok` spells out — and keeps the pass O(hits x len) rather
     than O(codons x synonyms x len).
@@ -1048,6 +1064,53 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
                 out.add((h["kind"], pos))
         return out
 
+    # Local 3'-end coverage. Imported here rather than at module scope to
+    # match how seqanalysis reaches this model, and resolved ONCE per call
+    # rather than per candidate swap.
+    _scan3 = _win3 = None
+    if guard_3prime:
+        try:
+            from splicecraft_regulettuce import (        # L1, downward
+                _3P_WINDOW as _win3, _scan_3prime_risk as _scan3)
+        except ImportError:                 # pragma: no cover - defensive
+            _log.warning("Codon splice-scrub: plant 3'-end model unavailable, "
+                         "skipping guard 4")
+            _scan3 = None
+
+    def _3prime_cover(chars: list) -> int:
+        """Flagged BASES over the WHOLE sequence, or -1 when the model cannot
+        answer (absent, or a sequence under its 160 nt window).
+
+        **Exact, not windowed, and that is affordable because of WHERE it is
+        called.** A local slice looked attractive — 0.16 ms and
+        length-independent against 1.6 ms at 1.5 kb and 3.1 ms at 3 kb — but
+        measured against the whole-sequence answer over 4,000 random swaps it
+        disagreed on 2.9% of them (115/4000): the slice loses the neighbouring
+        flagged windows that `_scan_3prime_risk` merges regions across, so a
+        region's measured extent shifts. Every disagreement was a FALSE
+        REJECT, never a false accept, so the slice was safe — but it silently
+        cost repairs, and a guard that refuses a harmless swap 3% of the time
+        is a guard nobody can reason about.
+
+        The exact scan is cheap here because guard 4 runs LAST: guards 1-3
+        reject almost every candidate, so this runs on the few that survive —
+        a handful per site, not once per candidate synonym. Coverage (flagged
+        bases) rather than a set of regions because `_scan_3prime_risk`
+        returns MERGED regions, so a swap that merely extends an existing one
+        would read as a brand-new region under set difference."""
+        if _scan3 is None:
+            return -1
+        seq_s = "".join(chars)
+        if _win3 is not None and len(seq_s) < _win3:
+            return -1
+        total = 0
+        for r in _scan3(seq_s, circular=False, both_strands=False):
+            try:
+                total += max(0, int(r["end"]) - int(r["start"]))
+            except (KeyError, TypeError, ValueError):   # pragma: no cover
+                continue
+        return total
+
     def _makes_forbidden(chars: list, codon_start: int,
                          before_hits: set) -> bool:
         """Did the swap at ``codon_start`` create a forbidden-motif hit? Same
@@ -1079,6 +1142,10 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
         ws, we = _splice_window_span(t_kind, t_pos)
         before_hits = (_forbidden_hit_set(seq, forbidden) if forbidden
                        else set())
+        # One baseline per ROUND, not per candidate: a round applies at most
+        # one swap before breaking out, so every candidate it tries is
+        # measured against this same starting sequence.
+        base_3p = _3prime_cover(dna_list)
         lo_codon = max(0, ws // 3)
         hi_codon = min((we - 1) // 3 + 1, len(protein))
         applied = False
@@ -1100,6 +1167,22 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
                                             before_hits)):
                     dna_list[codon_start:codon_start + 3] = list(current)
                     continue
+                # Guard 4, LAST and exact: refuse a swap that trades the
+                # splice site for a plant 3'-END-like region. Running it here
+                # — after the cheap guards have rejected almost everything —
+                # is what makes a whole-sequence rescan affordable. `-1` is
+                # "the model cannot answer" and must never read as "no risk",
+                # so the two sides are compared only when BOTH have a number.
+                if base_3p >= 0:
+                    after_3p = _3prime_cover(dna_list)
+                    if after_3p > base_3p:
+                        _log.debug("Codon splice-scrub: refused %s->%s at "
+                                   "codon %d — would add %d bp of plant "
+                                   "3'-end-like sequence",
+                                   current, alt, codon_idx + 1,
+                                   after_3p - base_3p)
+                        dna_list[codon_start:codon_start + 3] = list(current)
+                        continue
                 fixes.append(
                     f"{t_kind} at nt {t_pos + 1} (score {target['score']} "
                     f">= {target['threshold']}): {current}->{alt} "
