@@ -27,7 +27,8 @@ import splicecraft_state as _state
 from splicecraft_biology import (_rc, _digest_with_enzymes, _enzyme_cuts,
                                  _enzyme_signature, _feat_len,
                                  _iter_match_starts, _slice_circular)
-from splicecraft_splice import (_splice_scan, _splice_model_summary)
+from splicecraft_splice import (_splice_scan, _splice_model_summary,
+                               _splice_pair_risk, _splice_scan_basis)
 from splicecraft_kozak import _KOZAK_UP, _kozak_context
 from splicecraft_codon import _CODON_TABLE, _STOP_CODONS
 from splicecraft_record import _gb_text_to_record
@@ -2103,6 +2104,17 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
     # 5'UTR — the whole point of this function, silently invisible (field
     # report 2026-11-08). Nothing here can know where the real TSS is, so the
     # collision is SAID rather than guessed at.
+    # The warning is gated on the OUTCOME, not on the overlap. Overlapping the
+    # promoter is only a problem when the feature really does fall outside the
+    # unit, and `_to_tx` is the same predicate section 3 uses to decide that.
+    # Firing on the overlap alone meant a caller who did exactly what the
+    # warning told them — pass `tx_start` at the real TSS — got back
+    # `introns: 1, spliced: true, removed_by_splicing: 17` AND three warnings
+    # insisting the intron "lies upstream of the transcript and is NOT spliced
+    # out of this message", with the remedy being the thing they had already
+    # done. One response, two halves contradicting each other (field report
+    # 2026-11-08) — the exact shape section 2 was written to eliminate for the
+    # bounds, reintroduced one block later.
     tss_blocked: "set[int]" = set()
     if prom is not None:
         n_blocked = 0
@@ -2113,21 +2125,31 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
                 continue
             if not _spans_overlap(f, prom):
                 continue
+            # Still recorded, so section 3's generic out-of-unit message does
+            # not also fire for a feature whose cause is named here.
             tss_blocked.add(id(f))
+            if _to_tx(f.get("start"), f.get("end")) is not None:
+                continue            # in the message after all — nothing to say
             n_blocked += 1
             if n_blocked > _TX_MAX_OUT_OF_UNIT:
                 continue
+            # The remedy depends on what bounded the unit. Telling a caller who
+            # passed explicit bounds to pass them is the contradiction above.
+            remedy = (
+                "if that promoter feature covers the transcribed 5'UTR, pass "
+                "tx_start at the real transcription start"
+                if bounds_from == "annotation" else
+                "widen tx_start/tx_end if it belongs to this transcript")
             warnings.append(
                 f"{str(f.get('type') or '?').lower()} {_feat_label_or(f)!r} "
                 f"is annotated INSIDE the chosen promoter "
-                f"{_feat_label_or(prom)!r}, so it lies upstream of the "
-                f"transcript and is NOT spliced out of this message — if that "
-                f"promoter feature covers the transcribed 5'UTR, pass tx_start "
-                f"at the real transcription start")
+                f"{_feat_label_or(prom)!r} and falls outside this "
+                f"transcription unit, so it is NOT spliced out of this "
+                f"message — {remedy}")
         if n_blocked > _TX_MAX_OUT_OF_UNIT:
             warnings.append(
                 f"…and {n_blocked - _TX_MAX_OUT_OF_UNIT} more intron/exon "
-                f"feature(s) inside that promoter")
+                f"feature(s) inside that promoter and outside this unit")
 
     # ── 3. Introns: annotated only. ───────────────────────────────────────
     introns: "list[list]" = []
@@ -2328,19 +2350,52 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
                 h["annotated"] = (h.get("position") in annotated_edges
                                   or h.get("position", -9) + 2 in annotated_edges)
             cryptic = [h for h in hits if not h["annotated"]]
+            # PAIRS, not just sites: a lone donor removes nothing, a donor
+            # reaching an acceptor at intron spacing is what excises sequence.
+            # `annotated_edges` is known here and nowhere else, so this is the
+            # one place a pair can be told apart from the real intron's own
+            # ends — without it the list showed the REAL donor reaching past
+            # its own partner to a cryptic acceptor, indistinguishable from a
+            # fully cryptic hazard (field report 2026-11-08). That pattern is
+            # usually the model missing the real acceptor, which a
+            # 0.33-sensitivity test does two times in three.
+            pairs = _splice_pair_risk(pre, kind="both",
+                                      annotated_edges=annotated_edges)
+            fully_cryptic = [p for p in pairs if not p["annotated_ends"]]
             splice = {
                 "skipped":  False,
                 "model":    _splice_model_summary().get("source", "?"),
+                "basis":    _splice_scan_basis(),
                 "scanned":  "pre_mrna",
                 "n_sites":  len(hits),
                 "n_cryptic": len(cryptic),
                 "sites":    cryptic[:_TX_MAX_SPLICE_HITS],
+                "n_pairs":  len(pairs),
+                "n_pairs_fully_cryptic": len(fully_cryptic),
+                "pairs":    pairs[:_TX_MAX_SPLICE_HITS],
             }
             if cryptic:
                 warnings.append(
                     f"{len(cryptic)} cryptic splice site(s) in the pre-mRNA "
                     "score as strongly as real sites — they compete with the "
                     "annotated ones")
+            if fully_cryptic:
+                _fl = [p for p in fully_cryptic if p.get("in_frame_loss")]
+                warnings.append(
+                    f"{len(fully_cryptic)} donor/acceptor PAIR(s) with NEITHER "
+                    f"end on an annotated boundary sit at plausible intron "
+                    f"spacing in the pre-mRNA — a pair is what actually "
+                    f"excises sequence from the message"
+                    + (f"; {len(_fl)} would delete a whole number of codons"
+                       if _fl else ""))
+            if not cryptic and not fully_cryptic:
+                # A count of 0 is unreadable without the detection power
+                # behind it: these cutoffs admit under half of real donors.
+                warnings.append(
+                    "cryptic-splice scan found nothing — note this model is "
+                    "calibrated for a ~1% false-positive rate, not for "
+                    "sensitivity (see splice.basis), so a clean scan is a "
+                    "weaker statement than a clean sequence")
         except (RuntimeError, ValueError) as exc:
             # An untrained model must read as NOT CHECKED, never as clean.
             splice = {"skipped": True, "reason": str(exc)}

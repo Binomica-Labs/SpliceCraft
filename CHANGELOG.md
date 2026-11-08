@@ -14,6 +14,84 @@
 
 ---
 
+## [1.3.16] — 2026-11-08
+
+The cryptic-splice screen was telling you it looked twice as hard as it does.
+
+### Bug fixes
+
+- **A clean splice scan no longer overstates itself.** The screen's
+  documentation said its cutoffs were set so that anything above them was "as
+  strong as 95% of genuine splice sites". They are not: they are set where the
+  false-alarm rate hits 1%, which admits about 46% of real donors and 33% of
+  real acceptors. A sequence carrying a usable splice site could therefore come
+  back looking clean. Every result that reports a site count now reports that
+  sensitivity beside it, and an empty scan says in writing that it means
+  "nothing clears a 1%-false-positive bar" rather than "nothing a plant would
+  splice". By the same arithmetic, the screen missing a real intron's own 3'
+  site is expected behaviour, not a fault.
+- **A cryptic intron made of one mediocre and one strong end is no longer
+  invisible.** The pair check only considered donors and acceptors that each
+  cleared the single-site bar on their own, so a middling donor reaching a
+  strong acceptor — a real excision risk, and a common one — was never
+  reported. Pairs are now found at a lower bar and judged on their combined
+  strength, and each one says which of its ends was the weaker. Measured on
+  real coding sequence this reports 0.19 rather than 0.06 pairs per kilobase;
+  nothing that was reported before has stopped being reported.
+- **Transcript prediction no longer contradicts itself on a bounded unit.**
+  Giving `tx_start` to fix a promoter annotation that swallows the leader
+  intron — exactly what the warning told you to do — returned an answer saying
+  the intron *was* spliced alongside three warnings insisting it was not, each
+  advising you to pass `tx_start`. The warning now only fires when the intron
+  really does fall outside the unit, and when you set the bounds yourself it
+  suggests widening them instead.
+- **A real intron's own ends are now distinguishable from a cryptic pair.**
+  Pair listings carried no indication of which ends sat on an annotated
+  boundary, so a genuine splice donor reaching past its own partner to a
+  cryptic acceptor looked exactly like a brand-new hazard. Transcript
+  prediction now labels them, and warns only about pairs with neither end
+  annotated.
+
+### New features
+
+- **Ask the splice screen to look harder.** `splice_margin` on
+  `optimize-protein` lowers the repair bar by a number of bits, so a site
+  sitting just under the cutoff gets fixed too instead of being merely
+  reported. It applies to everything the repair does — what it hunts, what it
+  accepts as a fix, and what it re-measures afterwards — so the result always
+  describes the bar it actually used. Leave the repair switched off and the
+  same keyword simply shows you what is lurking under the bar.
+- **Two new endpoints for the splice model itself:** `splice-model` reports
+  what it was trained on and how it was calibrated, and `scan-splice-sites`
+  scores any transcribed sequence at a threshold you choose, pairing the hits
+  and letting you mark the real intron boundaries so they are not counted as
+  cryptic. Previously the model could only be reached as a side effect of
+  codon-optimizing or predicting a transcript.
+
+### Hardening
+
+- **Scanning a long sequence for splice-site pairs is 16x faster.** The pair
+  search compared every candidate donor against every candidate acceptor
+  anywhere in the molecule, then threw away over 99% of them for being too far
+  apart to be an intron. It now looks only inside the intron-length window. On
+  a megabase that is 0.4 seconds instead of 6.6, with identical results.
+- The scan now records each hit's standing against the calibrated bar directly,
+  instead of leaving callers to compare a rounded score — a site at 3.76599
+  printed as 3.766 and compared as clearing a 3.766 cutoff it actually failed.
+- A splice margin past the point where a sequence stops resembling a splice
+  site at all is refused, with the largest useful value named, at all three
+  places that accept one — as is `true` in place of a number, which used to
+  quietly mean "one bit", and a margin asked of a model that has no calibrated
+  threshold to be relative to.
+- A list of annotated intron boundaries is now length-checked, and a
+  not-a-number threshold is refused rather than silently matching nothing and
+  reporting no risk.
+- The internal verifier harness's data-directory safety check referred to a
+  path that moved during the module split, so it raised an error instead of
+  checking anything. It also now tells probe authors to copy only the small
+  data files and never the plasmid blob store, which is large enough to fill a
+  RAM-backed temporary directory in a few runs.
+
 ## [1.3.15] — 2026-11-08
 
 A plant-construct review found six places where SpliceCraft had the right

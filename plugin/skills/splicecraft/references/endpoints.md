@@ -1,6 +1,6 @@
 # The endpoint surface, organised by job
 
-299 endpoints as of SpliceCraft 1.3.15. **`splicecraft-cli tools --json` is
+301 endpoints as of SpliceCraft 1.3.16. **`splicecraft-cli tools --json` is
 always authoritative** — this file helps you find the right name and warns you
 about the sharp edges; the endpoint's own `doc_full` is the contract.
 
@@ -311,6 +311,19 @@ shifts, every feature keeps its coordinates, and it's undoable.
   `scrub_splice_sites: true` repairs them by synonymous swap; the repair is
   opt-in so an already-ordered design keeps coming back the same, and a site no
   synonym can fix stays listed with its score. `check_splice: false` skips.
+- **A clean splice scan is not a clean sequence.** The matrix cutoffs are
+  anchored at a ~1% decoy FALSE-POSITIVE rate, not at a sensitivity target:
+  they admit ~46% of real donors and ~33% of real acceptors. Read
+  `splice.basis` (or `splice-model`) before telling a user their CDS is clear,
+  and pass `splice_margin` (bits) to repair sites sitting just under the bar —
+  a miss silently deletes protein, a false alarm costs one synonymous codon.
+  Pairs carry `both_above_threshold` / `sub_threshold_ends`, because the
+  pairing stage scans lower than the reporting stage: a mediocre donor plus a
+  strong acceptor is the shape two separate cutoffs miss.
+- `splice-model` / `scan-splice-sites` are the model's own doors — the latter
+  scores a bare transcribed sequence (`margin`, explicit thresholds,
+  `annotated_edges` to mark real intron boundaries). For a unit on a loaded
+  record use `predict-transcript`, which splices first.
 - Three tables ship (*E. coli* K12, *Nicotiana tabacum* 4097, *N. benthamiana*
   4100); `add-codon-table` fetches any other from Kazusa by taxid, builds from
   an NCBI genome, or imports a local CDS FASTA offline. `list-codon-tables`

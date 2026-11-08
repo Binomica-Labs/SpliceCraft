@@ -104,6 +104,20 @@ What you can do without leaving the terminal.
   the repair (`scrub_splice_sites`) removes them by synonymous
   substitution; a site no synonym can fix is reported with its score
   rather than quietly left. Via `optimize-protein`.
+- **The screen reports its own detection power, because a clean scan is
+  not a clean sequence.** The matrix cutoffs are set where the
+  false-positive rate hits 1%, not where sensitivity hits some target,
+  and the sensitivity that buys is measured: about 46% of real donors
+  and 33% of real acceptors clear the bar. Every result that carries a
+  site count now carries that figure beside it, and an empty scan says
+  in writing that it means "nothing clears a 1%-false-positive bar"
+  rather than "nothing a spliceosome would use". `splice_margin` (in
+  bits) lowers the bar so a site sitting just underneath — previously
+  visible to the scan and unrepairable by the tool — gets fixed too,
+  which is what you want when a miss silently deletes protein and a
+  false alarm costs one codon. `splice-model` and `scan-splice-sites`
+  expose the model directly, the latter scoring any transcribed sequence
+  at a threshold you choose.
 
 ## Cloning
 

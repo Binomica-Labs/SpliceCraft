@@ -3849,6 +3849,112 @@ class TestBuiltInPlantTables:
         assert gc3_plant < gc3_coli - 10, (gc3_plant, gc3_coli)
 
 
+class TestSpliceScrubMargin:
+    """Field report 2026-11-08: a site sitting just under the calibrated bar
+    was visible to the scan and unrepairable by the tool, so the caller had to
+    do the synonymous swap by hand. The cutoffs are anchored at a ~1% decoy
+    FALSE-POSITIVE rate, not at a sensitivity target (0.4593 donor / 0.3325
+    acceptor), which is exactly when you want to ask for a margin."""
+
+    # In-frame CDS, CLEAN at the calibrated 3.766 donor bar, carrying exactly
+    # one donor within 0.6 bits of it (3.313 at nt 32). Derived by search, not
+    # written by hand — a fixture that merely looks borderline proves nothing.
+    DNA = ("ATGATTCTGACTCAAAGGCCTCGAGAACACGGTCAGCTTGCCCCACGTTTTCGATGCCCT"
+           "CTTTCCTTACTTCCTACGTTCTTCACTAGTAGGTGCTTATCTTCCACAAGAGGGGTCAGC"
+           "TTG")
+
+    def _protein(self, dna):
+        return "".join(sc._CODON_TABLE.get(dna[i:i + 3], "X")
+                       for i in range(0, len(dna) - 2, 3))
+
+    def _near(self, dna, margin=0.6):
+        from splicecraft_splice import _splice_scan, _splice_threshold
+        cal = _splice_threshold("donor")
+        assert cal is not None, "the vendored model must carry a donor cutoff"
+        bar = cal - margin
+        return [h for h in _splice_scan(dna, kind="donor",
+                                        donor_threshold=bar)
+                if h["above_calibrated"] is False]
+
+    def test_the_fixture_really_sits_just_under_the_bar(self):
+        from splicecraft_splice import _splice_scan
+        assert _splice_scan(self.DNA, kind="donor") == [], \
+            "fixture must be CLEAN at the calibrated bar"
+        assert self._near(self.DNA), \
+            "fixture must carry a donor within 0.6 bits of the bar"
+        assert self._protein(self.DNA).count("X") == 0
+
+    def test_margin_zero_leaves_it_alone(self):
+        prot = self._protein(self.DNA)
+        out, fixes, _rem = _codon._codon_fix_splice_sites(
+            self.DNA, prot, sc._CODON_BUILTIN_K12, kind="donor",
+            has_appended_stop=False)
+        assert fixes == []
+        assert out == self.DNA
+        assert self._near(out), "nothing was asked for, nothing should change"
+
+    def test_a_margin_repairs_it(self):
+        prot = self._protein(self.DNA)
+        out, fixes, _rem = _codon._codon_fix_splice_sites(
+            self.DNA, prot, sc._CODON_BUILTIN_K12, kind="donor",
+            margin=0.6, has_appended_stop=False)
+        assert len(fixes) >= 1, "the sub-threshold donor should be repaired"
+        assert self._near(out) == [], "and it should be gone afterwards"
+
+    def test_the_protein_is_still_untouched(self):
+        """The invariant the whole subsystem rests on, under a margin too."""
+        prot = self._protein(self.DNA)
+        out, _f, _r = _codon._codon_fix_splice_sites(
+            self.DNA, prot, sc._CODON_BUILTIN_K12, kind="donor",
+            margin=0.6, has_appended_stop=False)
+        assert self._protein(out) == prot
+
+    def test_remaining_is_measured_at_the_relaxed_bar(self):
+        """`remaining` must describe the bar the repair ran at, or the two
+        halves of one answer disagree."""
+        prot = self._protein(self.DNA)
+        _out, _f, remaining = _codon._codon_fix_splice_sites(
+            self.DNA, prot, sc._CODON_BUILTIN_K12, kind="donor",
+            margin=0.6, has_appended_stop=False)
+        from splicecraft_splice import _splice_threshold
+        cal = _splice_threshold("donor")
+        assert cal is not None, "the vendored model must carry a donor cutoff"
+        bar = cal - 0.6
+        assert all(h["threshold"] == pytest.approx(bar) for h in remaining)
+
+    def test_a_negative_margin_is_refused(self):
+        prot = self._protein(self.DNA)
+        with pytest.raises(ValueError, match=">= 0"):
+            _codon._codon_fix_splice_sites(
+                self.DNA, prot, sc._CODON_BUILTIN_K12, margin=-0.5,
+                has_appended_stop=False)
+
+    def test_a_margin_past_break_even_is_refused_with_the_bound(self):
+        """Below 0.0 bits a window stops looking like a site at all, so
+        'repairing' one is meaningless churn against the CAI."""
+        prot = self._protein(self.DNA)
+        with pytest.raises(ValueError, match="break-even"):
+            _codon._codon_fix_splice_sites(
+                self.DNA, prot, sc._CODON_BUILTIN_K12, margin=99,
+                has_appended_stop=False)
+
+    def test_a_non_numeric_margin_is_refused(self):
+        prot = self._protein(self.DNA)
+        with pytest.raises(ValueError, match="number of bits"):
+            _codon._codon_fix_splice_sites(
+                self.DNA, prot, sc._CODON_BUILTIN_K12, margin="lots",
+                has_appended_stop=False)
+
+    def test_the_margin_also_guards_what_a_swap_creates(self):
+        """The relaxed bar applies to the 'did this swap create a new site'
+        test too, so a repair cannot move a site to just under the bar."""
+        prot = self._protein(self.DNA)
+        out, _f, _r = _codon._codon_fix_splice_sites(
+            self.DNA, prot, sc._CODON_BUILTIN_K12, kind="donor",
+            margin=0.6, has_appended_stop=False)
+        assert self._near(out) == []
+
+
 class TestSpliceScrubEdgeCases:
     """What the pass does with input it could not have expected (hardening
     sweep, 2026-11-08)."""
@@ -3906,3 +4012,36 @@ class TestSpliceScrubEdgeCases:
         out, fixes, rem = _codon._codon_fix_splice_sites(dna, "MKVT", {})
         assert (out, fixes) == (dna, [])
         assert rem, "the site must still be REPORTED when it cannot be fixed"
+
+
+class TestSpliceScrubMarginIsNotAFlag:
+    """`float(True)` is 1.0 — a boolean margin would silently become a 1-bit
+    bar nobody chose."""
+
+    DNA = "ATGAAACCTGGTTCTGCTTAA"
+
+    def _protein(self, dna):
+        return "".join(sc._CODON_TABLE.get(dna[i:i + 3], "X")
+                       for i in range(0, len(dna) - 2, 3))
+
+    @pytest.mark.parametrize("val", [True, False])
+    def test_a_boolean_margin_is_refused(self, val):
+        with pytest.raises(ValueError, match="not a flag"):
+            _codon._codon_fix_splice_sites(
+                self.DNA, self._protein(self.DNA), sc._CODON_BUILTIN_K12,
+                margin=val, has_appended_stop=False)
+
+    @pytest.mark.parametrize("val", [float("nan"), float("inf")])
+    def test_a_non_finite_margin_is_refused(self, val):
+        with pytest.raises(ValueError, match="finite"):
+            _codon._codon_fix_splice_sites(
+                self.DNA, self._protein(self.DNA), sc._CODON_BUILTIN_K12,
+                margin=val, has_appended_stop=False)
+
+    def test_a_single_kind_scan_does_not_need_the_other_cutoff(self):
+        """With `kind="donor"` a missing acceptor threshold is irrelevant, and
+        refusing over it would be a complaint about an unused number."""
+        out, _f, _r = _codon._codon_fix_splice_sites(
+            self.DNA, self._protein(self.DNA), sc._CODON_BUILTIN_K12,
+            kind="donor", margin=0.5, has_appended_stop=False)
+        assert self._protein(out) == self._protein(self.DNA)

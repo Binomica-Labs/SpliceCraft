@@ -224,7 +224,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-~269 endpoints across:
+~301 endpoints across:
 
 - **Records** — `new-plasmid` (create from a raw sequence, the Ctrl+N
   flow; pass `parts: [[start, end], …]` on a feature to author a SPLICED
@@ -607,6 +607,38 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   vanishing — and asking to repair with `check_splice: false` is a 400, since
   a repair whose result is not measured is a claim rather than a result.
 
+  **Read `splice.basis` before quoting `n_sites: 0`.** The model's cutoffs are
+  anchored at a ~1% decoy FALSE-POSITIVE rate, **not** at a sensitivity
+  target: they admit about **46% of real donors and 33% of real acceptors**.
+  So a clean scan means "nothing clears a 1%-FPR bar", which is a much weaker
+  statement than "nothing a spliceosome would use", and an empty result now
+  carries a warning saying exactly that (field report 2026-11-08,
+  `[INV-233]`; the module docstring claimed a 95%-sensitivity anchor until
+  then, overstating the scan ~2x on donors and ~3x on acceptors). By the same
+  arithmetic, the model missing a real intron's own 3' site is the measured
+  behaviour of a 0.33-sensitivity test, not a bug.
+
+  `splice_margin` (bits, default 0) lowers that bar, so a site sitting just
+  under the cutoff — visible to the scan and, without it, unrepairable through
+  this API — gets repaired too. Ask for one whenever a miss costs more than a
+  needless synonymous swap, which for a gene you are about to order it usually
+  does. The margin applies to the sites hunted, the "did the swap clear it"
+  test, the "did the swap create a new one" guard AND the re-measurement, so
+  `splice.sites` always describes the bar the repair ran at. A margin past the
+  calibrated threshold is a `400` naming the bound (below 0.0 bits a window
+  stops looking like a splice site at all), and `splice.basis` drops the
+  recorded sensitivity whenever a cutoff was overridden, because that figure
+  was measured at the calibrated bar and does not describe another one. Pass a
+  margin with `scrub_splice_sites` left off to merely SEE what is sitting just
+  under the bar.
+
+  Each entry in `splice.pairs` carries `both_above_threshold` and
+  `sub_threshold_ends`: the pairing stage deliberately scans LOWER than the
+  reporting stage, because a pair carries two independent pieces of evidence
+  and requiring each end to clear a lone-site cutoff hid the shape that
+  actually bites — a mediocre donor plus a strong acceptor. The pair is gated
+  on the combined score instead.
+
   Three tables ship — E. coli K12, *Nicotiana tabacum* (4097) and *N.
   benthamiana* (4100) — and `add-codon-table` fetches any other host from
   Kazusa by taxid, builds one from an NCBI genome, or imports a local CDS
@@ -614,6 +646,25 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   counted from, because that is what decides how far to trust it: the
   benthamiana table comes from 100 CDS / 43,763 codons against tobacco's 1,534
   CDS / 609,684 — plenty for per-codon frequencies, a thin sample of genes.
+- **Cryptic splicing** — `splice-model` (the calibration behind every splice
+  number this API reports: window geometry, provenance, per-kind AUC, and the
+  `basis` giving each cutoff with the SENSITIVITY it buys — read it before
+  quoting a clean scan — plus `pair_floor` / `pair_combined_threshold`, the
+  relaxed bar the PAIRING stage uses) and `scan-splice-sites` (score a bare
+  sequence: `{sequence, kind?, donor_threshold?, acceptor_threshold?, margin?,
+  both_strands?, annotated_edges?, limit?}` → sites with
+  `score` / `above_calibrated` / `window` and pairs with `intron_len` /
+  `combined_score` / `in_frame_loss` / `both_above_threshold` /
+  `sub_threshold_ends` / `annotated_ends`). `sequence` is DNA **as
+  transcribed** — the sense strand of a message or a CDS, not a plasmid; a
+  transcription unit on a loaded record goes through `predict-transcript`,
+  which splices first and knows where the real intron boundaries are.
+  `margin` is the keyword to reach for first, for the false-positive-anchoring
+  reason above; `both_strands` defaults to false and should usually stay there,
+  since an mRNA is single-stranded and only the sense strand is spliced.
+  `annotated_edges` marks REAL intron boundaries so the real donor reaching
+  past its own partner to a cryptic acceptor is not read as a fully cryptic
+  hazard. Both read-only.
 - **Simulate** — simulate-pcr (exact-match in-silico amplification,
   wrap-aware on circular templates) and simulate-gel (per-lane band
   positions + optional rendered ASCII gel image; ladder / plasmid /
@@ -716,7 +767,14 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   ADVISORY scan of the pre-mRNA with the calibrated plant PWM, marking sites
   that coincide with an annotated boundary so only genuinely cryptic ones are
   listed — and reporting `skipped` with a reason if the model is unavailable,
-  never an empty list that would read as clean. `three_prime` is the matching
+  never an empty list that would read as clean. It also reports `n_pairs` /
+  `pairs` (a donor reaching an acceptor at intron spacing is what actually
+  excises sequence; a lone site removes nothing) with `annotated_ends` per
+  pair, so the real intron's own ends are distinguishable from a cryptic pair,
+  and `n_pairs_fully_cryptic` is what the warning fires on. `splice.basis`
+  carries the sensitivity behind the counts: these cutoffs are
+  false-positive-anchored, so `n_cryptic: 0` is a weaker statement than clean
+  and says so in `warnings`. `three_prime` is the matching
   advisory for the other end: regions of the message that read like a plant
   3' end, where the transcript could be cut and polyadenylated before the
   protein is finished. **Read `premature`, not `regions`** — a hit in the

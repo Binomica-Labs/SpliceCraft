@@ -75,7 +75,7 @@ from splicecraft_codon import (   # L2 (downward; codon never imports cassette)
 from splicecraft_dataaccess import _BUILTIN_GRAMMARS
 from splicecraft_logging import _log
 from splicecraft_splice import (   # L0
-    _splice_model_summary, _splice_pair_risk, _splice_scan,
+    _splice_model_summary, _splice_pair_risk, _splice_scan, _splice_scan_basis,
 )
 
 # ── Element order. This IS the cassette's grammar: the tuple order is the
@@ -738,8 +738,17 @@ def _assemble_expression_cassette(promoter, utr5=None, intron=None,
             for p in pairs:
                 p['donor']['position'] += tx_start
                 p['acceptor']['position'] += tx_start
+            relaxed = [p for p in pairs if not p['both_above_threshold']]
             splice = {'skipped': False, 'sites': hits, 'pairs': pairs[:20],
+                      'n_pairs': len(pairs),
+                      'n_pairs_both_ends_above_threshold':
+                          len(pairs) - len(relaxed),
                       'transcript_start': tx_start,
+                      # The detection power ships WITH the counts: these
+                      # cutoffs are false-positive-anchored and admit under
+                      # half of real donors, so an empty `sites` is a weaker
+                      # statement than a clean transcript.
+                      'basis': _splice_scan_basis(),
                       'model': _splice_model_summary().get('source', '?')}
             in_coding = [h for h in hits
                          if coding_span and coding_span[0] <= h['position']
@@ -753,6 +762,9 @@ def _assemble_expression_cassette(promoter, utr5=None, intron=None,
                 warnings.append(
                     f"{len(pairs)} donor/acceptor PAIR(S) at plausible intron "
                     f"spacing — these can excise sequence from the transcript"
+                    + (f" ({len(relaxed)} with one end below its own "
+                       f"single-site cutoff — the shape a two-cutoff test "
+                       f"misses)" if relaxed else "")
                     + (f"; {len(frame_losing)} would delete a whole number of "
                        "codons, so the product could still be ELISA-positive "
                        "while being wrong" if frame_losing else ""))

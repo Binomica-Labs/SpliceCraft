@@ -28,7 +28,7 @@ ALL data-only endpoints live here; only the app-coupled handlers stay hub.
 prerequisites. Top layer among the siblings (imports the whole domain stack ≤L3);
 nothing imports it but the hub.
 
-**The split, as of 1.3.15: 211 here, 88 hub-side, 299 registered in total.**
+**The split, as of 1.3.16: 213 here, 88 hub-side, 301 registered in total.**
 Those three numbers were stale for several releases (the docstring said 109 / 26
 and CLAUDE.md said 202 / 82) and this is the first thing an agent reads about
 this file, so they are now pinned by
@@ -54,8 +54,9 @@ from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _feat_len, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len, _span_full_lap_len, _span_in_span)
 from splicecraft_cloning import (_cloned_plasmid_regenerated_sites, _GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _acceptor_vector_features, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi, _enzyme_is_type_iis)
 from splicecraft_codon import (_CODON_RAMP_CODONS, _CODON_RARE_W, _codon_relative_adaptiveness, _CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_ambiguous_stops, _codon_cai, _codon_diversify, _codon_table_for, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_fix_splice_sites, _CODON_SPLICE_MAX_REPORT, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
-from splicecraft_splice import (_splice_model_summary, _splice_pair_risk,
-                                _splice_scan)
+from splicecraft_splice import (_SPLICE_PAIR_FLOOR, _splice_model_summary,
+                               _splice_pair_risk, _splice_scan,
+                               _splice_scan_basis, _splice_threshold)
 from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _flush_dirty_mirror_before_switch, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_all_experiments, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _library_append_unique, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
 from splicecraft_experiments import (_EXPERIMENT_ACTIONS, _as_str_list, _tag_values, _experiment_duplicate, _experiment_html_document, _experiment_markdown_document, _experiment_project_markdown, _experiment_ref_token_ok, _experiment_search, _experiment_snippet, _experiment_search_terms, _experiment_template_markdown, _experiments_referencing, _new_experiment_id, _normalise_experiment_entry, _protocol_steps_markdown, _sanitize_experiment_id)
 from splicecraft_fileio import (_ab1_path_to_record, _insdc_qualifier_name, _PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
@@ -2244,7 +2245,7 @@ def _h_optimize_protein(app, payload):
     table from the registry. Body: ``{protein, table?, stops?,
     transl_table?, mode?, hazard_hosts?, forbidden_motifs?, min_gc?,
     max_gc?, gc_window?, avoid_repeats_with?, max_repeat?,
-    check_splice?, scrub_splice_sites?}`` where
+    check_splice?, scrub_splice_sites?, splice_margin?}`` where
 
     `hazard_hosts` pulls built-in host-expression hazards to scrub out of the
     CDS — ``"plant"`` (polyA signal AATAAA, cryptic splice donor GTRAG),
@@ -2274,6 +2275,33 @@ def _h_optimize_protein(app, payload):
     site no synonym can fix stays in `splice.sites` with its score rather than
     vanishing — which is why asking to repair with ``check_splice: false`` is
     a 400 rather than an edit nobody measured.
+
+    **Read `splice.basis` before quoting `n_sites: 0`.** The model's cutoffs
+    are anchored at a ~1% decoy FALSE-POSITIVE rate, NOT at a sensitivity
+    target: they admit about 46% of real donors and 33% of real acceptors. A
+    clean scan therefore means "nothing clears a 1%-FPR bar", not "nothing a
+    spliceosome would use". `splice_margin` (bits, default 0) lowers the bar
+    for the REPAIR by that much, so a site sitting just under the cutoff —
+    visible to the scan and, without this, unrepairable by the tool — gets
+    fixed too. Ask for one whenever a miss is costlier than a needless
+    synonymous swap, which for a gene you are about to order it usually is.
+    The margin applies to the sites hunted, the "did the swap clear it" test
+    and the "did the swap create a new one" guard alike, and `splice.sites` is
+    re-measured at the same relaxed bar. A margin past the calibrated
+    threshold is a 400 (below 0.0 bits a window stops looking like a site at
+    all). It lowers the REPORTING bar by the same amount, so `splice.sites`
+    always describes the bar the repair ran at — and a caller who wants to see
+    what is sitting just under the cutoff without editing anything can pass a
+    margin with `scrub_splice_sites` left off. `splice.basis` states the bar
+    actually used and drops the recorded sensitivity when it was overridden,
+    since that figure was measured at the calibrated cutoff and does not
+    describe a different one.
+
+    Each entry in `splice.pairs` carries `both_above_threshold` and
+    `sub_threshold_ends`: the pairing stage scans LOWER than the reporting
+    stage, because a pair carries two independent pieces of evidence and
+    requiring each end to clear a lone-site cutoff hid the shape that actually
+    bites — a mediocre donor plus a strong acceptor.
 
     `avoid_repeats_with` takes DNA sequences you have ALREADY built and breaks
     any perfect-identity run of `max_repeat`+ bases (default 25) that the new
@@ -2417,6 +2445,42 @@ def _h_optimize_protein(app, payload):
         return ({"error": "'scrub_splice_sites' with 'check_splice': false "
                           "would repair the CDS without reporting what is "
                           "left — drop one of the two"}, 400)
+    # `splice_margin` lowers the REPAIR bar (and the re-measurement with it).
+    # Validated here so a bad number is a 400 naming the bound, not a
+    # ValueError from inside the optimizer.
+    splice_margin = payload.get("splice_margin", 0.0)
+    if isinstance(splice_margin, bool):
+        return ({"error": "'splice_margin' is a number of BITS, not a flag — "
+                          "pass e.g. 0.5, or omit it"}, 400)
+    try:
+        splice_margin = float(splice_margin)
+    except (TypeError, ValueError):
+        return ({"error": "'splice_margin' must be a number of bits"}, 400)
+    if splice_margin != splice_margin or splice_margin in (
+            float("inf"), float("-inf")):
+        return ({"error": "'splice_margin' must be a finite number"}, 400)
+    if splice_margin < 0:
+        return ({"error": "'splice_margin' must be >= 0 — it LOWERS the "
+                          "repair bar"}, 400)
+    if splice_margin:
+        # Same bound and same refusal as `scan-splice-sites` and
+        # `_codon_fix_splice_sites`: a rule that depends on which door you came
+        # through is not a rule. `or 0.0` would have turned an uncalibrated
+        # model into "the largest usable margin is 0", blaming the caller's
+        # number for the model's missing one.
+        _cal_d = _splice_threshold("donor")
+        _cal_a = _splice_threshold("acceptor")
+        if _cal_d is None or _cal_a is None:
+            return ({"error": "this splice model records no calibrated "
+                              "threshold, so 'splice_margin' has nothing to "
+                              "be relative to"}, 400)
+        _worst = min(_cal_d, _cal_a)
+        if splice_margin > _worst:
+            return ({"error": f"'splice_margin' {splice_margin:g} would put a "
+                              f"bar below the 0.0-bit break-even where a "
+                              f"window stops looking like a splice site at "
+                              f"all; the largest usable margin is "
+                              f"{_worst:g}"}, 400)
     motifs = payload.get("forbidden_motifs")
     if motifs is not None:
         if isinstance(motifs, dict):
@@ -2545,6 +2609,7 @@ def _h_optimize_protein(app, payload):
             try:
                 dna, splice_fixes, _rem = _codon_fix_splice_sites(
                     dna, body, entry["raw"], sites=scrub or None,
+                    margin=splice_margin,
                     has_appended_stop=has_stop, transl_table=transl_table)
             except RuntimeError as exc:
                 # `_splice_scan` refuses when no model is loaded. Scoped to
@@ -2611,15 +2676,33 @@ def _h_optimize_protein(app, payload):
     splice_block: dict = {"skipped": True, "reason": "not requested"}
     if check_splice:
         try:
-            _sites = _splice_scan(dna, kind="both")
-            _pairs = _splice_pair_risk(dna, kind="both")
+            # Report at the SAME bar the repair used. Scanning at the
+            # calibrated cutoff while repairing at a relaxed one would show a
+            # clean `sites` list for a margin the caller asked for and the
+            # engine honoured — two halves of one answer disagreeing.
+            _skw: dict = {"kind": "both"}
+            if splice_margin:
+                for _k, _n in (("donor", "donor_threshold"),
+                               ("acceptor", "acceptor_threshold")):
+                    _c = _splice_threshold(_k)
+                    if _c is not None:
+                        _skw[_n] = _c - splice_margin
+            _sites = _splice_scan(dna, **_skw)
+            _pairs = _splice_pair_risk(dna, **_skw)
+            _relaxed = [p for p in _pairs if not p["both_above_threshold"]]
             splice_block = {
                 "skipped":   False,
                 "model":     _splice_model_summary().get("source", "?"),
+                "basis":     _splice_scan_basis(
+                    donor_threshold=_skw.get("donor_threshold"),
+                    acceptor_threshold=_skw.get("acceptor_threshold")),
                 "scrubbed":  bool(scrub_splice),
+                "margin":    splice_margin,
                 "n_sites":   len(_sites),
                 "sites":     _sites[:_CODON_SPLICE_MAX_REPORT],
                 "n_pairs":   len(_pairs),
+                "n_pairs_both_ends_above_threshold":
+                    len(_pairs) - len(_relaxed),
                 "pairs":     _pairs[:_CODON_SPLICE_MAX_REPORT],
             }
             if _sites:
@@ -2637,9 +2720,23 @@ def _h_optimize_protein(app, payload):
                     f"{len(_pairs)} donor/acceptor PAIR(s) at plausible plant "
                     f"intron spacing — a pair is what actually excises "
                     f"sequence from the message"
+                    + (f" ({len(_relaxed)} of them carry one end below its "
+                       f"own single-site cutoff, which is the shape a "
+                       f"two-cutoff test misses)" if _relaxed else "")
                     + (f"; {len(_fl)} would delete a whole number of codons, "
                        "so the product can still be antibody-positive while "
                        "being wrong" if _fl else ""))
+            if not _sites and not _pairs:
+                # A bare 0 overstates the all-clear: see `splice.basis`.
+                warnings.append(
+                    "cryptic-splice scan found nothing — this model is "
+                    "calibrated for a ~1% false-positive rate, not for "
+                    "sensitivity (it admits ~46% of real donors and ~33% of "
+                    "real acceptors; see splice.basis), so a clean scan is a "
+                    "weaker statement than a clean sequence"
+                    + ("" if splice_margin else
+                       ". Pass splice_margin to repair sites sitting just "
+                       "under the bar"))
         except (RuntimeError, ValueError) as exc:
             # Not checked must never read as clean.
             splice_block = {"skipped": True, "reason": str(exc)}
@@ -9925,6 +10022,211 @@ def _h_score_initiation_context(app, payload):
     if len(starts) > limit:
         out["truncated"] = (f"{len(starts)} ATGs found; the first {limit} by "
                             "position are listed, so `rank` orders only those")
+    return out
+
+
+# Two boundaries per intron, so this is thousands of introns' worth: ample for
+# any real record, and a bound on how much integer coercion one request buys.
+_SPLICE_MAX_ANNOTATED_EDGES = 20_000
+
+
+@_agent_endpoint("splice-model")
+def _h_splice_model(app, payload):
+    """The calibration behind every cryptic-splice number this API reports.
+
+    Body: ``{}``. Returns the window geometry, the provenance of the training
+    set, the per-kind held-out AUC, and — the part that changes how a result
+    should be read — the `basis`: each cutoff with the SENSITIVITY it buys.
+
+    **The cutoffs are anchored at a ~1% decoy false-positive rate, not at a
+    sensitivity target.** They admit about 46% of real donors and 33% of real
+    acceptors, so `n_sites: 0` from `optimize-protein` or `predict-transcript`
+    means "nothing clears a 1%-FPR bar" and NOT "nothing a spliceosome would
+    use". A real intron's own 3' site scoring 3.2 against the 4.439 acceptor
+    bar is a 0.33-sensitivity test behaving as measured, not a defect. Read
+    this before quoting a clean scan, and use `splice_margin`
+    (`optimize-protein`) or an explicit threshold (`scan-splice-sites`) when a
+    miss costs more than a needless synonymous swap.
+
+    `pair_floor` and `pair_combined_threshold` report the relaxed bar the
+    PAIRING stage uses: a pair carries two independent pieces of evidence, so
+    its ends are found below the single-site cutoff and gated on their
+    combined score instead. Read-only."""
+    summary = _splice_model_summary()
+    basis = _splice_scan_basis()
+    _d, _a = _splice_threshold("donor"), _splice_threshold("acceptor")
+    return {"ok": True,
+            "model": summary,
+            "basis": basis,
+            "pair_floor": _SPLICE_PAIR_FLOOR,
+            "pair_combined_threshold": (None if _d is None or _a is None
+                                        else round(_d + _a, 3)),
+            "ignored": _agent_ignored_keys(payload, set())}
+
+
+@_agent_endpoint("scan-splice-sites")
+def _h_scan_splice_sites(app, payload):
+    """Score every cryptic splice site in a sequence with the trained plant
+    model, and pair them into excisable introns.
+
+    Body: ``{sequence, kind?="both", donor_threshold?, acceptor_threshold?,
+    margin?, both_strands?=false, annotated_edges?, limit?=200}``. `sequence`
+    is DNA as transcribed — the sense strand of a message or a CDS, NOT a
+    plasmid; a transcription unit on a loaded record goes through
+    `predict-transcript`, which splices first and knows where the real intron
+    boundaries are.
+
+    Returns ``{ok, n_sites, sites, n_pairs, pairs, basis}``. Each site is
+    ``{kind, position, score, threshold, above_calibrated, window, strand}``
+    with `position` the 0-based offset of the GT or AG on the FORWARD strand,
+    worst-first. Each pair adds `intron_len`, `combined_score`,
+    `in_frame_loss` (an excision that is a multiple of 3 — the insidious kind,
+    deleting whole residues without shifting the frame, so the product can
+    still be antibody-positive while being wrong), `both_above_threshold`,
+    `sub_threshold_ends` and `annotated_ends`.
+
+    **`margin` (bits) lowers both cutoffs**, and is the keyword to reach for
+    first: the calibrated bars sit at a ~1% decoy false-positive rate and
+    admit under half of real donors, so the default scan is specific rather
+    than sensitive. `basis` ships that detection power WITH the counts, and
+    drops the recorded sensitivity when a cutoff was overridden, because the
+    figure was measured at the calibrated bar and does not describe another
+    one. `donor_threshold` / `acceptor_threshold` set a bar outright and win
+    over `margin`.
+
+    `both_strands` defaults to false and should usually stay there: an mRNA is
+    single-stranded and only the sense strand is spliced, so a reverse-strand
+    "site" in a CDS is not a hazard. `annotated_edges` is a list of positions
+    that are REAL intron boundaries; each pair then reports which of its ends
+    sits on one, so the real donor reaching past its own partner to a cryptic
+    acceptor is not read as a fully cryptic hazard. Read-only."""
+    seq, err = _sanitize_bases(payload.get("sequence"))
+    if err is not None:
+        return ({"error": err.replace("'bases'", "'sequence'")}, 400)
+    if len(seq) < 4:
+        return ({"error": "'sequence' must be at least 4 nt"}, 400)
+
+    kind = str(payload.get("kind") or "both").strip().lower()
+    if kind not in ("both", "donor", "acceptor"):
+        return ({"error": "'kind' must be 'both', 'donor' or 'acceptor'"}, 400)
+
+    def _num(key):
+        v = payload.get(key)
+        if v is None:
+            return None, None
+        if isinstance(v, bool):
+            # `float(True)` is 1.0 — a flag would silently become a specific
+            # bar the caller never chose.
+            return None, (f"'{key}' is a number of BITS, not a flag — pass "
+                          f"e.g. 0.5, or omit it")
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None, f"'{key}' must be a number of bits"
+        if f != f or f in (float("inf"), float("-inf")):
+            return None, f"'{key}' must be a finite number"
+        return f, None
+
+    margin, e = _num("margin")
+    if e:
+        return ({"error": e}, 400)
+    if margin is not None and margin < 0:
+        return ({"error": "'margin' must be >= 0 — it LOWERS the bar"}, 400)
+    if margin:
+        # Same bound as `optimize-protein`'s `splice_margin` and
+        # `_codon_fix_splice_sites`: below the 0.0-bit break-even a window
+        # stops looking like a site at all, and a scan that reports every
+        # GT/AG is the regex failure this whole model exists to avoid. An
+        # explicit `donor_threshold` / `acceptor_threshold` is NOT bounded —
+        # that is a deliberate override, not a relative convenience.
+        _cal_d = _splice_threshold("donor")
+        _cal_a = _splice_threshold("acceptor")
+        if _cal_d is None or _cal_a is None:
+            # Nothing for a margin to be relative to. Say that, rather than
+            # computing a bound of 0.0 and blaming the caller's number.
+            return ({"error": "this splice model records no calibrated "
+                              "threshold, so 'margin' has nothing to be "
+                              "relative to — pass 'donor_threshold' / "
+                              "'acceptor_threshold' outright"}, 400)
+        _worst = min(_cal_d, _cal_a)
+        if margin > _worst:
+            return ({"error": f"'margin' {margin:g} would put a bar below the "
+                              f"0.0-bit break-even where a window stops "
+                              f"looking like a splice site at all; the largest "
+                              f"usable margin is {_worst:g}. Pass "
+                              f"'donor_threshold'/'acceptor_threshold' to set "
+                              f"a bar outright."}, 400)
+    d_thr, e = _num("donor_threshold")
+    if e:
+        return ({"error": e}, 400)
+    a_thr, e = _num("acceptor_threshold")
+    if e:
+        return ({"error": e}, 400)
+    # An explicit threshold wins; `margin` is relative to the calibrated bar.
+    if margin:
+        if d_thr is None:
+            _c = _splice_threshold("donor")
+            d_thr = None if _c is None else _c - margin
+        if a_thr is None:
+            _c = _splice_threshold("acceptor")
+            a_thr = None if _c is None else _c - margin
+
+    edges = payload.get("annotated_edges")
+    edge_set: set = set()
+    if edges is not None:
+        if not isinstance(edges, (list, tuple)):
+            return ({"error": "'annotated_edges' must be a list of "
+                              "0-based positions"}, 400)
+        # Bounded: a real molecule has two boundaries per intron, so a list
+        # longer than this is not an annotation. Unbounded, it is a cheap way
+        # to make the server coerce millions of integers.
+        if len(edges) > _SPLICE_MAX_ANNOTATED_EDGES:
+            return ({"error": f"'annotated_edges' has {len(edges)} entries "
+                              f"(max {_SPLICE_MAX_ANNOTATED_EDGES}) — that is "
+                              f"more boundaries than any annotated molecule "
+                              f"has"}, 400)
+        for v in edges:
+            iv = _coerce_int(v, name="annotated_edges entry")
+            if isinstance(iv, str):
+                return ({"error": iv}, 400)
+            edge_set.add(int(iv))
+
+    limit = _coerce_int(payload.get("limit", 200), name="limit")
+    if isinstance(limit, str):
+        return ({"error": limit}, 400)
+    limit = max(1, min(int(limit), 5000))
+
+    skw: dict = {"kind": kind}
+    if d_thr is not None:
+        skw["donor_threshold"] = d_thr
+    if a_thr is not None:
+        skw["acceptor_threshold"] = a_thr
+    if _payload_bool(payload, "both_strands", False):
+        skw["both_strands"] = True
+
+    try:
+        sites = _splice_scan(seq, **skw)
+        pairs = _splice_pair_risk(seq, annotated_edges=edge_set, **skw)
+    except RuntimeError as exc:
+        # No trained model, or no calibrated cutoff. Must never read as clean.
+        return ({"error": f"cryptic-splice scan unavailable: {exc}"}, 503)
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
+
+    out = {"ok": True,
+           "n_sites": len(sites), "sites": sites[:limit],
+           "n_pairs": len(pairs), "pairs": pairs[:limit],
+           "n_pairs_both_ends_above_threshold":
+               len([p for p in pairs if p["both_above_threshold"]]),
+           "basis": _splice_scan_basis(donor_threshold=d_thr,
+                                       acceptor_threshold=a_thr),
+           "ignored": _agent_ignored_keys(
+               payload, {"sequence", "kind", "donor_threshold",
+                         "acceptor_threshold", "margin", "both_strands",
+                         "annotated_edges", "limit"})}
+    if len(sites) > limit or len(pairs) > limit:
+        out["truncated"] = (f"{len(sites)} site(s) and {len(pairs)} pair(s) "
+                            f"found; the {limit} worst of each are listed")
     return out
 
 

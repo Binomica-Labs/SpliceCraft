@@ -29,7 +29,7 @@ come from real cloning, and so do the fixes.
 - **Fast and local.** No Electron, no web app, no login. `pipx install splicecraft` and you're designing in seconds.
 - **It does the whole job.** View → edit → design → clone → simulate → verify → document — one tool that understands how those steps connect.
 - **It guards your data like it's irreplaceable** (because it is — see below).
-- **It's scriptable.** A 260+ endpoint local API and a stdlib CLI let an agent or a shell script drive every workflow.
+- **It's scriptable.** A 300+ endpoint local API and a stdlib CLI let an agent or a shell script drive every workflow.
 
 ## Quick start
 
@@ -169,7 +169,10 @@ codons in from your chosen table as you type, with a built-in motif library
 builds tables from an NCBI genome, a local CDS file, Kazusa, or TSV. Three
 tables ship — E. coli K12 and both *Nicotiana* — and a plant design is also
 screened with the trained splice matrix, not just the `GTRAG` consensus the
-matrix outscores.
+matrix outscores. That screen tells you how hard it looked: its cutoffs sit at
+a 1% false-positive rate, so roughly half of real donors fall under the bar,
+and every result says so rather than letting an empty list read as "clean".
+Ask for a `splice_margin` and it repairs the near-misses too.
 **Operon Design** reverse-designs every RBS in its real assembled context, and
 domesticates a *natural* operon by curing forbidden Type IIS sites with
 primer-encoded synonymous edits.
@@ -474,7 +477,7 @@ enzyme-collection, and codon-table editors.
 
 ### Scripting
 
-A 290+ endpoint localhost JSON API (`splicecraft --agent`, or `--headless` for
+A 300+ endpoint localhost JSON API (`splicecraft --agent`, or `--headless` for
 a no-UI server with a `/healthz` probe) and a stdlib-only CLI
 (`splicecraft-cli`, including a `call` passthrough to every endpoint) drive
 every workflow. `/tools` self-describes each endpoint's request schema.

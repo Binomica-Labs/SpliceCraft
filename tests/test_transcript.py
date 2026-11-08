@@ -1031,6 +1031,104 @@ class TestPromoterSwallowingTheIntron:
                    for w in r["warnings"]), r["warnings"]
 
 
+class TestBoundedUnitDoesNotContradictItself:
+    """Field report 2026-11-08. The promoter-collision warning fired on the
+    OVERLAP alone, so a caller who did exactly what it told them — pass
+    `tx_start` at the real TSS — got back `introns: 1, spliced: true,
+    removed_by_splicing: N` together with warnings insisting the intron "lies
+    upstream of the transcript and is NOT spliced out of this message", whose
+    remedy was the thing they had already done. One response, two halves
+    contradicting each other."""
+
+    FEATS = TestPromoterSwallowingTheIntron.FEATS_SWALLOWED
+
+    def _bounded(self):
+        # tx_start at the REAL transcription start, inside the promoter
+        # feature and upstream of the leader intron.
+        return sa._predict_transcript(SEQ, self.FEATS, circular=True,
+                                      tx_start=P1, tx_end=P6)
+
+    def test_the_intron_is_actually_spliced_now(self):
+        r = self._bounded()
+        assert r["ok"], r
+        assert len(r["introns"]) == 1, r["introns"]
+        assert r["spliced"] is True
+
+    def test_no_warning_claims_it_is_unspliced(self):
+        r = self._bounded()
+        bad = [w for w in r["warnings"]
+               if "NOT spliced out of this message" in w]
+        assert bad == [], (
+            "the answer says the intron IS spliced; a warning saying it is "
+            f"not contradicts it: {bad}")
+
+    def test_the_promoter_collision_warning_is_gone(self):
+        r = self._bounded()
+        assert not [w for w in r["warnings"]
+                    if "INSIDE the chosen promoter" in w], r["warnings"]
+
+    def test_the_override_is_still_stated(self):
+        """Silencing the contradiction must not silence the real notice that
+        annotation did not define the unit."""
+        r = self._bounded()
+        assert any("did NOT define it" in w for w in r["warnings"]), \
+            r["warnings"]
+
+    def test_the_warning_survives_where_it_is_still_true(self):
+        """Gated on the OUTCOME, not removed: with the unit bounded so the
+        intron really does fall outside it, the diagnostic must still fire —
+        and must not advise passing tx_start, which the caller just did."""
+        r = sa._predict_transcript(SEQ, self.FEATS, circular=True,
+                                   tx_start=P3, tx_end=P6)
+        assert r["ok"], r
+        assert r["introns"] == []
+        hits = [w for w in r["warnings"] if "INSIDE the chosen promoter" in w]
+        assert len(hits) == 1, r["warnings"]
+        assert "outside this transcription unit" in hits[0]
+        assert "pass tx_start at the real transcription start" not in hits[0]
+        assert "widen tx_start/tx_end" in hits[0]
+
+    def test_annotation_bounded_still_gets_the_tx_start_remedy(self):
+        r = sa._predict_transcript(SEQ, self.FEATS, circular=True)
+        hits = [w for w in r["warnings"] if "INSIDE the chosen promoter" in w]
+        assert len(hits) == 1, r["warnings"]
+        assert "tx_start" in hits[0]
+
+
+class TestSpliceBlockCarriesItsDetectionPower:
+    """A site count is unreadable without the sensitivity behind it, and a
+    pair list is unreadable without knowing which ends are REAL boundaries."""
+
+    def test_basis_is_reported_beside_the_counts(self):
+        r = sa._predict_transcript(SEQ, FEATS, circular=True,
+                                   check_splice=True)
+        sb = r["splice"]
+        assert sb["skipped"] is False, sb
+        assert sb["basis"]["donor"]["sensitivity"] is not None
+        assert sb["basis"]["fpr_target"] is not None
+
+    def test_pairs_are_reported_and_carry_annotated_ends(self):
+        r = sa._predict_transcript(SEQ, FEATS, circular=True,
+                                   check_splice=True)
+        sb = r["splice"]
+        assert "n_pairs" in sb and "pairs" in sb
+        assert "n_pairs_fully_cryptic" in sb
+        for pair in sb["pairs"]:
+            assert "annotated_ends" in pair
+            assert "both_above_threshold" in pair
+
+    def test_an_empty_scan_says_what_empty_means(self):
+        """`n_cryptic: 0` on a false-positive-anchored model is a weaker claim
+        than 'clean', and the response has to say so."""
+        r = sa._predict_transcript(SEQ, FEATS, circular=True,
+                                   check_splice=True)
+        sb = r["splice"]
+        if sb.get("n_cryptic") or sb.get("n_pairs_fully_cryptic"):
+            pytest.skip("this fixture is not clean")
+        assert any("weaker statement than a clean sequence" in w
+                   for w in r["warnings"]), r["warnings"]
+
+
 class TestTandemStopCodons:
     """`TGA TGA` is a terminator, not a stale annotation."""
 

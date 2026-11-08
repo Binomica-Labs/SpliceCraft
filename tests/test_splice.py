@@ -204,3 +204,327 @@ class TestModelSummary:
         assert s["donor"]["auc"] > 0.90
         assert s["acceptor"]["auc"] > 0.90
         assert s["donor"]["decoy_fpr"] <= 0.02
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Field report 2026-11-08: the scan's advertised sensitivity, the pairing
+# stage's pre-filter, and the annotated-end flag.
+# ──────────────────────────────────────────────────────────────────────────
+
+class TestAdvertisedSensitivityMatchesCalibration:
+    """The docstring is the sentence a reader uses to decide what `0 sites`
+    means, so it must not promise a sensitivity the model does not have.
+
+    Pre-fix it claimed the cutoff was the 5th percentile of REAL site scores
+    ("as strong as 95% of genuine splice sites"). The shipped calibration is
+    FPR-anchored at `fpr_target` 0.01, giving 0.4593 / 0.3325 sensitivity —
+    roughly 2x and 3x overstated, which is what made a sequence carrying a
+    usable donor read as clean."""
+
+    def test_docstring_does_not_claim_a_sensitivity_anchor(self):
+        # The old CLAIM, not the historical note that records it was wrong:
+        # the correction paragraph quotes the phrase on purpose, so match the
+        # affirmative wording instead of the bare words.
+        doc = " ".join((sp.__doc__ or "").split())
+        assert "Thresholds are sensitivity-anchored" not in doc
+        assert "a candidate scoring above it is as strong as 95%" not in doc
+        assert "The default is the 5th percentile of REAL site scores" not in doc
+        # and it must state the real anchoring
+        assert "FALSE-POSITIVE-anchored" in doc
+        assert "a clean scan is not a clean sequence" in doc.lower()
+        assert "fpr_target" in doc
+
+    def test_docstring_sensitivity_figures_match_the_shipped_meta(self):
+        doc = sp.__doc__ or ""
+        for kind in ("donor", "acceptor"):
+            sens = sp._SPLICE_MODEL_META[kind]["sensitivity"]
+            assert f"{sens:.4f}" in doc, (
+                f"{kind} sensitivity {sens} is not the figure the docstring "
+                f"quotes — prose and calibration have drifted apart")
+
+    def test_basis_ships_sensitivity_with_the_threshold(self):
+        b = sp._splice_scan_basis()
+        for kind in ("donor", "acceptor"):
+            meta = sp._SPLICE_MODEL_META[kind]
+            assert b[kind]["threshold"] == meta["threshold"]
+            assert b[kind]["sensitivity"] == meta["sensitivity"]
+        assert b["fpr_target"] == sp._SPLICE_MODEL_META["fpr_target"]
+        assert "not 'no usable site'" in b["note"]
+
+    def test_basis_withholds_sensitivity_when_the_cutoff_is_overridden(self):
+        # The recorded figure was measured AT the calibrated threshold. Reusing
+        # it for a different bar would be a measurement claim nobody made.
+        b = sp._splice_scan_basis(donor_threshold=1.0)
+        assert b["donor"]["threshold"] == 1.0
+        assert b["donor"]["sensitivity"] is None
+        assert b["donor"]["decoy_fpr"] is None
+        assert b["donor"]["calibrated_threshold"] == \
+            sp._SPLICE_MODEL_META["donor"]["threshold"]
+        # the untouched kind keeps its figures
+        assert b["acceptor"]["sensitivity"] == \
+            sp._SPLICE_MODEL_META["acceptor"]["sensitivity"]
+
+
+class TestAboveCalibratedIsStampedByTheScan:
+    """A relaxed scan must not have to re-derive 'did this clear the real bar'
+    from the reported score: `score` is rounded to 3 dp, so a site at 3.76599
+    reads as exactly 3.766 and compares as >= the 3.766 bar it actually
+    fails."""
+
+    def test_every_hit_carries_the_stamp(self):
+        hits = sp._splice_scan("ACGT" * 10 + STRONG_DONOR + "ACGT" * 10)
+        assert hits
+        assert all(h["above_calibrated"] is True for h in hits)
+
+    def test_stamp_is_independent_of_the_scan_threshold(self):
+        seq = "ACGT" * 10 + STRONG_DONOR + "ACGT" * 10
+        relaxed = sp._splice_scan(seq, kind="donor", donor_threshold=-99.0)
+        assert len(relaxed) > 1, "a relaxed scan should admit weak GTs too"
+        assert any(h["above_calibrated"] is False for h in relaxed), \
+            "weak GTs admitted by a relaxed bar must be marked sub-threshold"
+        assert any(h["above_calibrated"] is True for h in relaxed)
+
+    def test_stamp_uses_the_unrounded_score(self):
+        cal = sp._splice_threshold("donor")
+        # A window whose score rounds TO the threshold but sits below it.
+        borderline = [h for h in sp._splice_scan(
+            "C" * 20 + "CAAGTAAGA" + "C" * 20, kind="donor",
+            donor_threshold=-99.0) if h["score"] == pytest.approx(cal, abs=5e-4)]
+        if not borderline:
+            pytest.skip("no borderline window in this fixture")
+        for h in borderline:
+            raw = sp._splice_score_donor("C" * 20 + "CAAGTAAGA" + "C" * 20,
+                                         h["position"])
+            assert h["above_calibrated"] is (raw >= cal), (
+                "the stamp disagrees with the unrounded comparison — this is "
+                "exactly the rounding trap it exists to close")
+
+
+class TestPairStageScansBelowTheReportingStage:
+    """A pair carries two independent pieces of evidence, so gating each end on
+    a cutoff sized for a LONE site discards the shape that actually bites: a
+    mediocre donor plus a strong acceptor. Measured case from the field
+    report: donor 3.596 (below the 3.766 bar) + acceptor 5.135 (above 4.439),
+    invisible to the default scan and only reachable by pushing
+    `donor_threshold` through `**kw` by hand."""
+
+    # donor whose score sits just BELOW the calibrated bar
+    WEAK_DONOR = "CAAGTAAGA"
+    # acceptor well above it
+    STRONG_ACC = "TCCTCTTCTTGCTTTTGCAGGCT"
+
+    def _seq(self, gap=120):
+        filler = ("CTCTCTCTCT" * ((gap // 10) + 1))[:gap]
+        return "C" * 20 + self.WEAK_DONOR + filler + self.STRONG_ACC + "C" * 20
+
+    def test_the_weak_donor_really_is_below_its_own_cutoff(self):
+        s = sp._splice_score_window(self.WEAK_DONOR, sp._SPLICE_DONOR_PWM)
+        assert s < sp._splice_threshold("donor")
+        a = sp._splice_score_window(self.STRONG_ACC, sp._SPLICE_ACCEPTOR_PWM)
+        assert a > sp._splice_threshold("acceptor")
+        assert s + a >= (sp._splice_threshold("donor")
+                         + sp._splice_threshold("acceptor")), \
+            "the fixture must clear the combined gate while failing one end"
+
+    def test_mediocre_donor_plus_strong_acceptor_is_reported_by_default(self):
+        pairs = sp._splice_pair_risk(self._seq(), kind="both")
+        assert pairs, ("a sub-threshold donor reaching a strong acceptor at "
+                       "intron spacing must be visible without the caller "
+                       "hand-lowering donor_threshold")
+
+    def test_the_relaxed_end_is_named_not_hidden(self):
+        p = sp._splice_pair_risk(self._seq(), kind="both")[0]
+        assert p["both_above_threshold"] is False
+        assert p["sub_threshold_ends"] == ["donor"]
+
+    def test_a_pair_below_the_combined_gate_is_not_reported(self):
+        gate = (sp._splice_threshold("donor")
+                + sp._splice_threshold("acceptor"))
+        pairs = sp._splice_pair_risk(self._seq(), kind="both")
+        assert all(p["combined_score"] >= gate for p in pairs)
+        # raising the gate past the fixture's own score drops it
+        high = sp._splice_pair_risk(self._seq(), kind="both",
+                                    combined_threshold=99.0)
+        assert high == []
+
+    def test_strict_pairs_are_still_labelled_as_such(self):
+        both = ("ACGT" * 20 + STRONG_DONOR + "ACGT" * 30
+                + STRONG_ACCEPTOR + "ACGT" * 20)
+        pairs = sp._splice_pair_risk(both, kind="both")
+        assert pairs
+        assert pairs[0]["both_above_threshold"] is True
+        assert pairs[0]["sub_threshold_ends"] == []
+
+    def test_rule_is_a_superset_of_the_old_both_ends_pass_rule(self):
+        """Relaxing the floor may only ADD pairs. Every pair the old rule
+        reported — both ends over their own cutoff — must still be there."""
+        import random
+        gate = (sp._splice_threshold("donor")
+                + sp._splice_threshold("acceptor"))
+        lost = 0
+        for r in range(12):
+            random.seed(2000 + r)
+            s = "".join(random.choices("ACGT", k=6000))
+            strict = sp._splice_pair_risk(
+                s, kind="both",
+                donor_threshold=sp._splice_threshold("donor"),
+                acceptor_threshold=sp._splice_threshold("acceptor"),
+                combined_threshold=gate)
+            got = {(p["donor"]["position"], p["acceptor"]["position"],
+                    p["donor"]["strand"]) for p in
+                   sp._splice_pair_risk(s, kind="both")}
+            for p in strict:
+                if (p["donor"]["position"], p["acceptor"]["position"],
+                        p["donor"]["strand"]) not in got:
+                    lost += 1
+        assert lost == 0
+
+    def test_floor_below_break_even_adds_nothing(self):
+        """MEASURED saturation: nothing under 0.0 bits can reach the combined
+        gate, which is why `_SPLICE_PAIR_FLOOR` is a compute bound rather than
+        a judgement call. If this fails, the floor was picked wrong."""
+        import random
+        for r in range(4):
+            random.seed(700 + r)
+            s = "".join(random.choices("ACGT", k=8000))
+            at_floor = sp._splice_pair_risk(s, kind="both")
+            lower = sp._splice_pair_risk(s, kind="both", pair_floor=-3.0)
+            assert len(lower) == len(at_floor)
+
+    def test_explicit_threshold_still_wins_over_the_floor(self):
+        tight = sp._splice_pair_risk(self._seq(), kind="both",
+                                     donor_threshold=99.0)
+        assert tight == []
+
+    def test_uncalibrated_model_refuses_rather_than_inventing_a_gate(self):
+        saved = (sp._SPLICE_DONOR_PWM, sp._SPLICE_ACCEPTOR_PWM,
+                 sp._SPLICE_MODEL_META)
+        try:
+            sp._splice_load_model(saved[0], saved[1],
+                                  {"source": "no thresholds"})
+            with pytest.raises(RuntimeError, match="calibrated"):
+                sp._splice_pair_risk("ACGT" * 100)
+        finally:
+            sp._splice_load_model(*saved)
+
+
+class TestPairAnnotatedEnds:
+    """A pair with one end on a REAL annotated boundary is a different animal
+    from a fully cryptic one — usually the real donor reaching past its own
+    partner because the model missed the real acceptor, which a
+    0.33-sensitivity test does two times in three. Pre-fix the key did not
+    exist and nothing distinguished them."""
+
+    def _seq(self):
+        return ("ACGT" * 20 + STRONG_DONOR + "ACGT" * 30
+                + STRONG_ACCEPTOR + "ACGT" * 20)
+
+    def test_absent_annotation_means_no_annotated_ends(self):
+        for p in sp._splice_pair_risk(self._seq(), kind="both"):
+            assert p["annotated_ends"] == []
+
+    def test_donor_on_an_annotated_edge_is_flagged(self):
+        pairs = sp._splice_pair_risk(self._seq(), kind="both")
+        assert pairs
+        dpos = pairs[0]["donor"]["position"]
+        flagged = sp._splice_pair_risk(self._seq(), kind="both",
+                                       annotated_edges={dpos})
+        assert flagged[0]["annotated_ends"] == ["donor"]
+
+    def test_both_ends_annotated_is_the_real_intron(self):
+        pairs = sp._splice_pair_risk(self._seq(), kind="both")
+        dpos = pairs[0]["donor"]["position"]
+        apos = pairs[0]["acceptor"]["position"]
+        flagged = sp._splice_pair_risk(self._seq(), kind="both",
+                                       annotated_edges={dpos, apos})
+        assert flagged[0]["annotated_ends"] == ["donor", "acceptor"]
+
+    def test_edge_matches_the_far_base_of_the_dinucleotide_too(self):
+        pairs = sp._splice_pair_risk(self._seq(), kind="both")
+        dpos = pairs[0]["donor"]["position"]
+        flagged = sp._splice_pair_risk(self._seq(), kind="both",
+                                       annotated_edges={dpos + 2})
+        assert flagged[0]["annotated_ends"] == ["donor"]
+
+
+class TestPairWindowingIsExhaustiveEquivalent:
+    """The pairing loop walks a bisected SLICE of the sorted acceptors rather
+    than all of them. That is a pure optimization on a correctness-critical
+    path, so it is asserted against the exhaustive walk it replaced — not
+    merely timed. Without it the loop is O(donors x acceptors) over the whole
+    molecule: 1 Mbp of AT-rich sequence put 8,352 donors against 6,346
+    acceptors (53M combinations, 6.6 s), and relaxing the pair floor is what
+    multiplied both counts ~10x."""
+
+    @staticmethod
+    def _exhaustive(seq, **kw):
+        kw.setdefault("donor_threshold", sp._SPLICE_PAIR_FLOOR)
+        kw.setdefault("acceptor_threshold", sp._SPLICE_PAIR_FLOOR)
+        gate = (sp._splice_threshold("donor")
+                + sp._splice_threshold("acceptor"))
+        hits = sp._splice_scan(seq, **kw)
+        out = []
+        for strand in ("+", "-"):
+            ds = sorted((h for h in hits if h["kind"] == "donor"
+                         and h.get("strand", "+") == strand),
+                        key=lambda h: h["position"])
+            acc = sorted((h for h in hits if h["kind"] == "acceptor"
+                          and h.get("strand", "+") == strand),
+                         key=lambda h: h["position"])
+            for d in ds:
+                for a in acc:
+                    span = (a["position"] + 2 - d["position"] if strand == "+"
+                            else d["position"] + 2 - a["position"])
+                    if 60 <= span <= 3000 and d["score"] + a["score"] >= gate:
+                        out.append((strand, d["position"], a["position"], span))
+        return sorted(out)
+
+    @pytest.mark.parametrize("both_strands", [False, True])
+    def test_matches_the_exhaustive_walk(self, both_strands):
+        import random
+        for r in range(24):
+            random.seed(3000 + r)
+            gc = (0.3, 0.45, 0.6)[r % 3]
+            n = (400, 2000, 7000)[r % 3]
+            seq = "".join(random.choices(
+                "ACGT", weights=[(1 - gc) / 2, gc / 2, gc / 2, (1 - gc) / 2],
+                k=n))
+            kw = {"kind": "both"}
+            if both_strands:
+                kw["both_strands"] = True
+            got = sorted((p["donor"]["strand"], p["donor"]["position"],
+                          p["acceptor"]["position"], p["intron_len"])
+                         for p in sp._splice_pair_risk(seq, **kw))
+            assert got == self._exhaustive(seq, **kw), f"seed {3000 + r}"
+
+    def test_a_pair_at_each_end_of_the_intron_window_survives(self):
+        """Boundary check on the bisect bounds: exactly 60 and exactly 3000
+        must both still pair, and 59 / 3001 must not."""
+        for gap, expect in ((60, True), (3000, True), (59, False),
+                            (3001, False)):
+            # donor GT at offset 23; acceptor AG placed so the span is `gap`
+            head = "C" * 20 + STRONG_DONOR
+            apos = 23 + gap - 2            # AG start for this span
+            pad = apos - len(head) - (len(STRONG_ACCEPTOR) - 3)
+            if pad < 0:
+                pytest.skip("geometry does not fit")
+            seq = head + "C" * pad + STRONG_ACCEPTOR + "C" * 20
+            spans = [p["intron_len"] for p in sp._splice_pair_risk(seq,
+                                                                   kind="both")]
+            assert (gap in spans) is expect, (gap, spans)
+
+
+class TestPairStageRefusesUnusableNumbers:
+    """A NaN cutoff compares False against every score, so every pair would be
+    dropped and the answer would read as 'no excisable intron'. Silence
+    standing in for a refusal is the failure mode this module keeps being
+    audited for."""
+
+    def test_nan_combined_threshold_refuses(self):
+        with pytest.raises(ValueError, match="NaN"):
+            sp._splice_pair_risk("ACGT" * 100,
+                                 combined_threshold=float("nan"))
+
+    def test_nan_pair_floor_refuses(self):
+        with pytest.raises(ValueError, match="NaN"):
+            sp._splice_pair_risk("ACGT" * 100, pair_floor=float("nan"))

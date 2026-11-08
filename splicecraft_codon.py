@@ -32,7 +32,7 @@ from splicecraft_util import _natural_sort_key, _sanitize_path
 # L0 — the trained plant splice PWM. `_codon_fix_splice_sites` is the pass that
 # consults it; the hazard-motif dict above is only a floor.
 from splicecraft_splice import (
-    _SPLICE_MAX_WINDOW, _splice_scan, _splice_window_span,
+    _SPLICE_MAX_WINDOW, _splice_scan, _splice_threshold, _splice_window_span,
 )
 from splicecraft_net import (
     _HMM_DB_RETRY_BACKOFF_S, _NCBI_MAX_RESPONSE_BYTES, _build_hardened_url_opener,
@@ -899,10 +899,32 @@ _CODON_SPLICE_MAX_REPORT = 20
 def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
                             kind: str = "both",
                             sites: "dict | None" = None,
+                            margin: float = 0.0,
                             has_appended_stop: bool = True,
                             transl_table: "int | None" = None) -> tuple:
     """Substitute synonymous codons to remove cryptic splice sites that the
     TRAINED plant model scores at or above its calibrated threshold.
+
+    ``margin`` lowers that bar by a fixed number of bits, so a site scoring
+    within `margin` of the cutoff is repaired too. It exists because the
+    cutoffs are anchored at a ~1% decoy FALSE-POSITIVE rate, not at a
+    sensitivity target: they admit under half of real donors and a third of
+    real acceptors (`_splice_scan_basis`). A site sitting just under the bar is
+    therefore visible to the scan and, without this keyword, unrepairable by
+    the tool — the caller had to do the swap by hand (field report
+    2026-11-08). A margin is exactly the thing you want to be able to ask for
+    when a miss silently deletes protein and a false alarm costs one codon.
+
+    The margin applies to EVERY stage — the sites hunted, the "did this swap
+    clear it" test and the "did this swap create a new one" guard — so a
+    repair can never leave a site just under the relaxed bar or move one
+    there. ``remaining`` is likewise re-scanned at the relaxed bar.
+
+    Raises ValueError for a negative margin, or one that would push either
+    cutoff below 0.0 bits. 0.0 is the log-odds break-even: below it a window
+    looks more like an unused GT/AG than a real site, so "repairing" it is
+    meaningless churn against the CAI. The bound is the calibrated threshold
+    itself, and the error names it.
 
     Returns ``(new_dna, fixes, remaining)``. ``remaining`` is `_splice_scan`
     re-run on the FINAL sequence — measured, not inferred from the fixes — so
@@ -934,10 +956,50 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
     """
     if kind not in ("both", "donor", "acceptor"):
         raise ValueError("kind must be 'both', 'donor' or 'acceptor'")
+    if isinstance(margin, bool):
+        # `float(True)` is 1.0, so `margin=True` would silently become a
+        # specific 1-bit bar the caller never chose. A boolean is almost
+        # certainly someone meaning "switch the margin on".
+        raise ValueError("margin is a number of BITS, not a flag — pass e.g. "
+                         "0.5, or omit it to use the calibrated threshold")
+    try:
+        margin = float(margin)
+    except (TypeError, ValueError):
+        raise ValueError("margin must be a number of bits") from None
+    if margin != margin or margin in (float("inf"), float("-inf")):
+        raise ValueError("margin must be a finite number of bits")
+    if margin < 0:
+        raise ValueError("margin must be >= 0 — it LOWERS the repair bar; to "
+                         "repair fewer sites, raise the model's threshold "
+                         "instead of tightening here")
+    # Relaxed cutoffs, computed ONCE and threaded through every stage below.
+    _scan_kw: dict = {"kind": kind}
+    if margin:
+        # Only the kinds actually being scanned need a calibrated bar: with
+        # `kind="donor"` a missing acceptor threshold is irrelevant, and
+        # refusing over it would be a complaint about an unused number.
+        _kinds = (("donor", "donor_threshold"), ("acceptor", "acceptor_threshold"))
+        for _k, _name in [kv for kv in _kinds
+                          if kind in ("both", kv[0])]:
+            _cal = _splice_threshold(_k)
+            if _cal is None:
+                # Same refusal class as `_splice_scan`: no calibrated bar means
+                # there is nothing for a margin to be relative to.
+                raise RuntimeError(
+                    f"splice model has no calibrated {_k} threshold — a margin "
+                    f"is relative to it. Retrain the model, or scan with an "
+                    f"explicit threshold.")
+            if margin > _cal:
+                raise ValueError(
+                    f"margin {margin:g} would put the {_k} bar at "
+                    f"{_cal - margin:.3f} bits, below the 0.0 break-even where "
+                    f"a window stops looking like a real site at all; the "
+                    f"largest useful {_k} margin is {_cal:g}")
+            _scan_kw[_name] = _cal - margin
     dna = (dna or "").upper()
     if not dna:
         return dna, [], []
-    initial = _splice_scan(dna, kind=kind)      # raises when untrained
+    initial = _splice_scan(dna, **_scan_kw)     # raises when untrained
     if not initial:
         return dna, [], []
 
@@ -979,7 +1041,7 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
         lo = max(0, codon_start - _SPLICE_MAX_WINDOW + 1)
         hi = min(n, codon_start + 3 + _SPLICE_MAX_WINDOW)
         out: set = set()
-        for h in _splice_scan("".join(chars[lo:hi]), kind=kind):
+        for h in _splice_scan("".join(chars[lo:hi]), **_scan_kw):
             pos = lo + int(h["position"])
             ws, we = _splice_window_span(h["kind"], pos)
             if we > codon_start and ws < codon_start + 3:
@@ -1008,7 +1070,7 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
     # budget is belt-and-braces against a pathological table.
     for _round in range(max(1, len(dna_list) // 3)):
         seq = "".join(dna_list)
-        live = [h for h in _splice_scan(seq, kind=kind)
+        live = [h for h in _splice_scan(seq, **_scan_kw)
                 if (h["kind"], int(h["position"])) not in stuck]
         if not live:
             break
@@ -1051,7 +1113,7 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
             # next round attacks a different site instead of spinning, and let
             # `remaining` report it with its score.
             stuck.add((t_kind, t_pos))
-    return "".join(dna_list), fixes, _splice_scan("".join(dna_list), kind=kind)
+    return "".join(dna_list), fixes, _splice_scan("".join(dna_list), **_scan_kw)
 
 
 def _codon_fix_sites(dna: str, protein: str, raw: dict,

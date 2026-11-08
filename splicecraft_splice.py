@@ -35,17 +35,38 @@ matrix trained on a mismatched clade carries the wrong bias into the design
 and will mis-rank sites. Retrain with `_splice_train` if a better-matched set
 arrives.
 
-**Thresholds are sensitivity-anchored,** not arbitrary. The default is the 5th
-percentile of REAL site scores: a candidate scoring above it is as strong as
-95% of genuine splice sites. That is an interpretable claim ("this is as good a
-donor as a real one") rather than an arbitrary cutoff, and the decoy
-false-positive rate at that threshold is recorded alongside it so the flagging
-burden is known up front.
+**Thresholds are FALSE-POSITIVE-anchored,** and that is the single most
+important thing to know before reading a result. The cutoff is set where the
+DECOY rate hits `fpr_target` (0.01) — about one chance hit per 100 unused
+GT/AG dinucleotides — and the sensitivity that buys is then MEASURED and
+recorded, not chosen:
+
+    donor     threshold 3.766   sensitivity 0.4593   decoy FPR 0.00998
+    acceptor  threshold 4.439   sensitivity 0.3325   decoy FPR 0.0092
+
+So **a clean scan is not a clean sequence.** At these cutoffs the model flags
+fewer than half of genuine donors and a third of genuine acceptors; a real
+plant intron's own 3' site scoring 3.2 against the 4.439 bar is the expected
+behaviour of a 0.33-sensitivity test, not a defect. `0 sites found` means "none
+that clears a 1%-false-positive bar", which is a much weaker statement than
+"nothing a spliceosome would use". Read `_splice_scan_basis()` alongside any
+count — it ships the sensitivity WITH the result so a caller cannot quote the
+count without the detection power — and pass an explicit lower
+`donor_threshold` / `acceptor_threshold` (or a `margin`, for the codon
+scrubber) when a miss is costlier than a needless synonymous swap. It usually
+is: a missed site silently deletes protein, a false alarm costs one codon.
+
+An earlier version of this paragraph claimed the cutoff was the 5th percentile
+of real-site scores, i.e. 95% sensitivity. It never was — that is ~2x the real
+donor figure and ~3x the acceptor one, and since this is the sentence a reader
+uses to decide what "0 sites" means, the overstatement made clean-looking
+scans out of sequences carrying usable sites (field report 2026-11-08).
 
 Layer L0: imports only logging. Pure functions over strings.
 """
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from math import log2
 
 from splicecraft_logging import _log
@@ -182,15 +203,62 @@ def _splice_threshold(kind: str) -> "float | None":
     return meta.get("threshold")
 
 
+def _splice_scan_basis(*, donor_threshold: "float | None" = None,
+                       acceptor_threshold: "float | None" = None) -> dict:
+    """The detection power behind a scan, for shipping WITH its result.
+
+    ``{donor: {threshold, calibrated_threshold, sensitivity, decoy_fpr},
+    acceptor: {...}, fpr_target, note}``.
+
+    This exists because a bare count is unreadable. The cutoffs are anchored
+    at a 1% decoy false-positive rate, which buys ~0.46 donor / ~0.33 acceptor
+    sensitivity, so `n_sites: 0` means "nothing clearing a 1%-FPR bar" and NOT
+    "nothing a spliceosome would use" — the distinction a reader cannot make
+    from the number alone. Every consumer that reports a site count reports
+    this beside it.
+
+    `sensitivity` is reported as `None` when the caller overrode the cutoff:
+    the recorded figure was measured at the calibrated threshold and does not
+    describe a different one. Saying nothing is correct; re-using the number
+    would be a measurement claim nobody made."""
+    out: dict = {}
+    for kind, override in (("donor", donor_threshold),
+                           ("acceptor", acceptor_threshold)):
+        meta = _SPLICE_MODEL_META.get(kind) or {}
+        cal = meta.get("threshold")
+        used = cal if override is None else float(override)
+        same = override is None or (cal is not None and float(override) == cal)
+        out[kind] = {
+            "threshold": used,
+            "calibrated_threshold": cal,
+            "sensitivity": meta.get("sensitivity") if same else None,
+            "decoy_fpr": meta.get("decoy_fpr") if same else None,
+        }
+    out["fpr_target"] = _SPLICE_MODEL_META.get("fpr_target")
+    out["note"] = (
+        "thresholds are anchored at a ~1% decoy false-positive rate, NOT at a "
+        "sensitivity target: a count of 0 means 'no site clears a 1%-FPR bar', "
+        "not 'no usable site'. Fewer than half of real donors and a third of "
+        "real acceptors clear it.")
+    return out
+
+
 def _splice_scan(seq: str, *, kind: str = "both",
                  donor_threshold: "float | None" = None,
                  acceptor_threshold: "float | None" = None,
                  both_strands: bool = False) -> "list[dict]":
     """Every cryptic splice site in `seq` scoring at or above threshold.
 
-    Returns ``[{kind, position, score, threshold, window, strand}]`` sorted by
-    descending score. `position` is the 0-based offset of the GT (donor) or AG
-    (acceptor) dinucleotide on the FORWARD strand.
+    Returns ``[{kind, position, score, threshold, above_calibrated, window,
+    strand}]`` sorted by descending score. `position` is the 0-based offset of
+    the GT (donor) or AG (acceptor) dinucleotide on the FORWARD strand.
+
+    `above_calibrated` is the hit's standing against the MODEL's own cutoff,
+    independent of the `threshold` this scan ran at, and is computed from the
+    unrounded score (`None` when the model records no cutoff). It is what a
+    relaxed scan — the pairing stage — uses to say which ends are genuinely
+    sub-threshold; re-deriving it from the rounded `score` gets borderline
+    sites wrong.
 
     `both_strands` is off by default and should usually stay off: an mRNA is
     single-stranded and only the sense strand is spliced, so a reverse-strand
@@ -226,6 +294,20 @@ def _splice_scan(seq: str, *, kind: str = "both",
         comp = str.maketrans("ACGT", "TGCA")
         strands.append(("-", seq.translate(comp)[::-1]))
 
+    # Each hit records whether it clears the CALIBRATED cutoff, computed here
+    # from the UNROUNDED score. A caller scanning at a relaxed threshold (the
+    # pairing stage) must not re-derive this from the reported `score`: that
+    # one is rounded to 3 dp, so a site at 3.76599 reads as exactly 3.766 and
+    # compares as >= the 3.766 bar it actually fails. Two halves answering the
+    # same question differently is the bug class this whole module keeps
+    # tripping over, so the scan answers it ONCE.
+    _cal = {"donor": _splice_threshold("donor"),
+            "acceptor": _splice_threshold("acceptor")}
+
+    def _above(kind: str, score: float) -> "bool | None":
+        cal = _cal.get(kind)
+        return None if cal is None else score >= cal
+
     hits: "list[dict]" = []
     for strand, s in strands:
         n = len(s)
@@ -238,6 +320,7 @@ def _splice_scan(seq: str, *, kind: str = "both",
                     hits.append({"kind": "donor", "position": pos,
                                  "score": round(score, 3),
                                  "threshold": donor_threshold,
+                                 "above_calibrated": _above("donor", score),
                                  "window": s[i - _SPLICE_DONOR_GT:
                                              i - _SPLICE_DONOR_GT + _SPLICE_DONOR_LEN],
                                  "strand": strand})
@@ -248,6 +331,7 @@ def _splice_scan(seq: str, *, kind: str = "both",
                     hits.append({"kind": "acceptor", "position": pos,
                                  "score": round(score, 3),
                                  "threshold": acceptor_threshold,
+                                 "above_calibrated": _above("acceptor", score),
                                  "window": s[i - _SPLICE_ACCEPTOR_AG:
                                              i - _SPLICE_ACCEPTOR_AG + _SPLICE_ACCEPTOR_LEN],
                                  "strand": strand})
@@ -273,7 +357,44 @@ def _splice_window_span(kind: str, position: int) -> "tuple[int, int]":
     raise ValueError("kind must be 'donor' or 'acceptor'")
 
 
-def _splice_pair_risk(seq: str, **kw) -> "list[dict]":
+# ── Pair-stage calibration ────────────────────────────────────────────────
+# The pairing stage deliberately scans LOWER than the reporting stage. A pair
+# carries two independent pieces of evidence, so requiring each end to clear a
+# cutoff sized for a LONE site discards the shape that actually bites: a
+# mediocre donor plus a strong acceptor. Measured on a real case (field report
+# 2026-11-08) a donor at 3.596 against the 3.766 bar paired with an acceptor at
+# 5.135 — combined 8.73, comfortably over the bar for a pair — and the default
+# scan could not see it at all.
+#
+# Two numbers, neither invented:
+#
+#   * `_SPLICE_PAIR_FLOOR = 0.0` is the log-odds break-even the module
+#     docstring already defines ("more like a real site than like an unused
+#     one"). MEASURED: the gated pair count SATURATES at or above this floor —
+#     identical output at floors +0.5, 0.0 and -1.0 across GC 0.35/0.45/0.55/
+#     0.65 — so nothing below 0.0 can reach the combined gate and a lower
+#     floor only costs scan time. It is a compute bound, not a judgement.
+#   * the combined gate is `donor_threshold + acceptor_threshold`, i.e. a pair
+#     must carry as much total evidence as two individually-passing sites.
+#     Derived from the two calibrated cutoffs, so it moves with a retrained
+#     model and adds no third magic number.
+#
+# Flagging burden, MEASURED against the old both-ends-pass rule: on 15.5 kb of
+# real GenBank-extracted coding sequence, 0.06 -> 0.19 pairs per kb; on random
+# DNA at GC 0.45, 0.6 -> 5.2 per kb (random sequence carries far more chance
+# pyrimidine tracts than real CDS, which is what the acceptor matrix keys on).
+# The rule is a strict SUPERSET of the old one — every pair the old default
+# reported still qualifies, verified over 12 x 6 kb in test_splice.py — so this
+# can only add, never silence. The asymmetry is deliberate and matches
+# `splicecraft_regulatory`: a MISSED pair silently deletes protein from the
+# product, a false alarm costs one synonymous codon.
+_SPLICE_PAIR_FLOOR = 0.0
+
+
+def _splice_pair_risk(seq: str, *, pair_floor: "float | None" = None,
+                      combined_threshold: "float | None" = None,
+                      annotated_edges: "set | None" = None,
+                      **kw) -> "list[dict]":
     """Donor/acceptor PAIRS that could excise a real cryptic intron.
 
     A lone strong donor is much less dangerous than a donor followed, at a
@@ -281,11 +402,34 @@ def _splice_pair_risk(seq: str, **kw) -> "list[dict]":
     actually removes sequence from the message. Plant introns are short
     (training-set median ~150 nt), so the window checked is 60–3000 nt.
 
-    Returns ``[{donor, acceptor, intron_len, combined_score, in_frame_loss}]``
-    sorted by combined score. `in_frame_loss` flags an excision that is a
-    multiple of 3: those are the truly insidious ones, since they delete
-    residues without frameshifting and the product may still be detected by an
-    antibody while being biologically wrong.
+    Because a pair carries two independent pieces of evidence, the SITES are
+    found at a relaxed `pair_floor` (default `_SPLICE_PAIR_FLOOR`) and the PAIR
+    is then gated on `combined_threshold` (default: the sum of the two
+    calibrated single-site cutoffs) rather than on two separate cutoffs. See
+    the block comment above for why, and for the measured burden. An explicit
+    `donor_threshold` / `acceptor_threshold` in `kw` still wins — it replaces
+    the floor for that kind — so a caller can tighten or loosen either end.
+
+    Returns ``[{donor, acceptor, intron_len, combined_score, in_frame_loss,
+    both_above_threshold, sub_threshold_ends, annotated_ends}]`` sorted by
+    combined score. `in_frame_loss` flags an excision that is a multiple of 3:
+    those are the truly insidious ones, since they delete residues without
+    frameshifting and the product may still be detected by an antibody while
+    being biologically wrong.
+
+    `both_above_threshold` / `sub_threshold_ends` say WHICH ends cleared their
+    own calibrated cutoff, so the stricter old answer is still recoverable
+    from the richer one and a relaxed pair is never mistaken for a confirmed
+    one.
+
+    `annotated_edges` is a set of positions that are REAL annotated intron
+    boundaries; `annotated_ends` then lists which end of each pair sits on one
+    (`[]`, `["donor"]`, `["acceptor"]` or both). A pair with one annotated end
+    is a different animal from a fully cryptic one — it is usually the real
+    donor reaching past its own partner because the model missed the real
+    acceptor (a 0.33-sensitivity test misses two in three) — and without the
+    key nothing distinguishes them. The caller owns the annotation because
+    this layer knows nothing about features.
 
     Splicing is STRAND-SPECIFIC, so a donor is only ever paired with an
     acceptor on its OWN strand. `_splice_scan` reports both strands in
@@ -296,6 +440,43 @@ def _splice_pair_risk(seq: str, **kw) -> "list[dict]":
     ``both_strands=True``) invented plus-donor/minus-acceptor "introns"
     that cannot splice, and discarded every genuine minus-strand pair,
     whose forward-coordinate span is negative."""
+    floor = _SPLICE_PAIR_FLOOR if pair_floor is None else float(pair_floor)
+    cal_d, cal_a = _splice_threshold("donor"), _splice_threshold("acceptor")
+    # `_splice_scan` stamps `above_calibrated` per hit, so the pair stage never
+    # compares the rounded `score` against a cutoff itself.
+    # An explicit per-kind threshold wins over the floor: a caller asking for a
+    # specific cutoff must get it, not a relaxed one.
+    kw.setdefault("donor_threshold", floor)
+    kw.setdefault("acceptor_threshold", floor)
+    if combined_threshold is None:
+        if cal_d is None or cal_a is None:
+            # Same class as `_splice_scan`'s guard: an uncalibrated model must
+            # refuse, never quietly gate on a number it does not have.
+            raise RuntimeError(
+                "splice model has no calibrated threshold — cannot derive the "
+                "pair gate. Retrain the model, or pass combined_threshold.")
+        gate = cal_d + cal_a
+    else:
+        gate = float(combined_threshold)
+        # A NaN gate compares False against every score, so EVERY pair would
+        # be dropped and the answer would read as "no excisable intron" —
+        # silence standing in for a refusal, which is the failure mode this
+        # module keeps being audited for.
+        if gate != gate:
+            raise ValueError("combined_threshold must be a number, not NaN")
+    if floor != floor:
+        raise ValueError("pair_floor must be a number, not NaN")
+
+    edges = annotated_edges or set()
+
+    def _ann(h) -> bool:
+        """Does this hit sit on an annotated boundary? Both the dinucleotide
+        start and its far base count, matching `_predict_transcript`."""
+        if h.get("annotated"):
+            return True
+        pos = h.get("position")
+        return pos in edges or (pos is not None and pos + 2 in edges)
+
     hits = _splice_scan(seq, **kw)
     pairs = []
     for strand in ("+", "-"):
@@ -306,16 +487,44 @@ def _splice_pair_risk(seq: str, **kw) -> "list[dict]":
                             if h["kind"] == "acceptor"
                             and h.get("strand", "+") == strand],
                            key=lambda h: h["position"])
+        # Only acceptors inside the 60..3000 nt intron window can pair with a
+        # given donor, and `acceptors` is sorted by position, so the candidates
+        # are a CONTIGUOUS slice — found by bisect instead of walked. Without
+        # this the loop is O(donors x acceptors) over the whole molecule: a
+        # 1 Mbp AT-rich sequence at the relaxed pair floor put 8,352 donors
+        # against 6,346 acceptors, i.e. 53 million combinations and 6.6 s, all
+        # but ~0.5% of them rejected by the span test. Relaxing the floor (the
+        # 2026-11-08 field report) multiplied the hit counts ~10x each, which
+        # is what turned a tolerable quadratic into a reachable one — the
+        # endpoint takes a sequence straight from the caller. Same output,
+        # asserted against the exhaustive walk in test_splice.py.
+        apos = [a["position"] for a in acceptors]
         for d in donors:
-            for a in acceptors:
-                span = (a["position"] + 2 - d["position"] if strand == "+"
-                        else d["position"] + 2 - a["position"])
-                if 60 <= span <= 3000:
-                    pairs.append({
-                        "donor": d, "acceptor": a, "intron_len": span,
-                        "combined_score": round(d["score"] + a["score"], 3),
-                        "in_frame_loss": span % 3 == 0,
-                    })
+            dp = d["position"]
+            if strand == "+":
+                lo, hi = dp + 60 - 2, dp + 3000 - 2
+            else:
+                lo, hi = dp + 2 - 3000, dp + 2 - 60
+            for a in acceptors[bisect_left(apos, lo):bisect_right(apos, hi)]:
+                span = (a["position"] + 2 - dp if strand == "+"
+                        else dp + 2 - a["position"])
+                if not (60 <= span <= 3000):
+                    continue
+                combined = d["score"] + a["score"]
+                if combined < gate:
+                    continue
+                sub = [k for k, h in (("donor", d), ("acceptor", a))
+                       if h.get("above_calibrated") is False]
+                pairs.append({
+                    "donor": d, "acceptor": a, "intron_len": span,
+                    "combined_score": round(combined, 3),
+                    "in_frame_loss": span % 3 == 0,
+                    "both_above_threshold": not sub,
+                    "sub_threshold_ends": sub,
+                    "annotated_ends": [k for k, h in (("donor", d),
+                                                      ("acceptor", a))
+                                       if _ann(h)],
+                })
     pairs.sort(key=lambda p: -p["combined_score"])
     return pairs
 

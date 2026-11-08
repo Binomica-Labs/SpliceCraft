@@ -260,6 +260,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `scan-3prime-risk` | R | Regions that read like a plant 3'-end — where a message would be cut. |
 | `scan-cis-elements` | R | Find curated plant cis-regulatory elements, with the chance count. |
 | `scan-promoters` | R | Scan for sigma-70 (-35 / spacer / -10) promoters. |
+| `scan-splice-sites` | R | Score every cryptic splice site in a sequence with the trained plant model, and pair them into excisable introns. |
 | `scan-tata-boxes` | R | TATA-box candidates positioned against a start site. |
 | `scan-terminators` | R | Scan for intrinsic (Rho-independent) terminators: a stem-loop followed by a U-tract. |
 | `score-guide` | R | Triage a spacer you already have. Body: `{guide: str, u6_driven?: bool}`. |
@@ -287,6 +288,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `simulate-pcr` | R | Run an in-silico PCR. Body: `{template_seq, fwd_primer, rev_primer, circular?: bool = true, max_amplicon?: int = 20000}`. Natural-guess aliases… |
 | `simulate-traditional-cloning` | R | Dry-run a traditional restriction-cloning reaction: digest a vector and an insert with the chosen enzymes, then ligate. Body: `{vector_seq,… |
 | `span-contains` | R | Circular-aware containment: does a span contain a base or another span, on a molecule where either may cross the origin? |
+| `splice-model` | R | The calibration behind every cryptic-splice number this API reports. |
 | `status` | R | Current session state: loaded record, dirty flag, source path. |
 | `store-alignment` | W | Align a sequencing READ against a library plasmid and PERSIST the result onto that entry — the side door to Alt+A / the Sequencing screen's bulk… |
 | `taxon-search` | R | Resolve an ORGANISM NAME to an NCBI taxid. Body: `{query, max_hits?}`. |

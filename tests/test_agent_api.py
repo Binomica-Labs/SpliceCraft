@@ -7766,3 +7766,221 @@ class TestEndpointSplitIsDocumented:
             if getattr(fn, "__module__", "") not in ("splicecraft",
                                                       "splicecraft_agent"))
         assert stray == [], f"handlers registered outside the two homes: {stray}"
+
+
+class TestSpliceEndpoints:
+    """`splice-model` / `scan-splice-sites` (field report 2026-11-08).
+
+    The trained plant splice model was reachable only as a side effect of
+    `optimize-protein` and `predict-transcript`, so inspecting it — or asking
+    it about a bare sequence at a chosen threshold — meant importing the
+    sibling and calling private helpers by hand. Both endpoints are read-only.
+    """
+
+    def _h(self, name):
+        return sc._state._AGENT_HANDLERS[name][0]
+
+    # A sub-threshold donor reaching a strong acceptor at intron spacing: the
+    # shape a two-separate-cutoff pairing test cannot see.
+    SEQ = ("C" * 20 + "CAAGTAAGA" + "CTCTCTCTCT" * 12
+           + "TCCTCTTCTTGCTTTTGCAGGCT" + "C" * 20)
+
+    def test_splice_model_reports_sensitivity_not_just_thresholds(self):
+        r = self._h("splice-model")(None, {})
+        assert r["ok"] is True
+        for kind in ("donor", "acceptor"):
+            b = r["basis"][kind]
+            assert b["threshold"] is not None
+            assert b["sensitivity"] is not None, (
+                "a threshold without its sensitivity is the thing that made a "
+                "clean scan unreadable")
+        assert r["basis"]["fpr_target"] == 0.01
+        assert "not 'no usable site'" in r["basis"]["note"]
+
+    def test_splice_model_reports_the_pair_stage_calibration(self):
+        r = self._h("splice-model")(None, {})
+        assert r["pair_floor"] == 0.0
+        assert r["pair_combined_threshold"] == pytest.approx(
+            r["basis"]["donor"]["threshold"]
+            + r["basis"]["acceptor"]["threshold"], abs=1e-6)
+
+    def test_scan_reports_sites_pairs_and_basis(self):
+        r = self._h("scan-splice-sites")(None, {"sequence": self.SEQ})
+        assert r["ok"] is True
+        assert r["n_pairs"] >= 1, r
+        assert r["basis"]["donor"]["sensitivity"] is not None
+        p = r["pairs"][0]
+        assert p["both_above_threshold"] is False
+        assert p["sub_threshold_ends"] == ["donor"]
+        assert p["annotated_ends"] == []
+        assert r["n_pairs_both_ends_above_threshold"] == 0
+
+    def test_margin_widens_the_scan_and_drops_the_sensitivity_claim(self):
+        base = self._h("scan-splice-sites")(None, {"sequence": self.SEQ})
+        wide = self._h("scan-splice-sites")(None, {"sequence": self.SEQ,
+                                                   "margin": 0.5})
+        assert wide["n_sites"] >= base["n_sites"]
+        assert wide["basis"]["donor"]["threshold"] < \
+            base["basis"]["donor"]["threshold"]
+        # the recorded figure was measured at the calibrated bar only
+        assert wide["basis"]["donor"]["sensitivity"] is None
+
+    def test_annotated_edges_label_a_real_boundary(self):
+        base = self._h("scan-splice-sites")(None, {"sequence": self.SEQ})
+        dpos = base["pairs"][0]["donor"]["position"]
+        r = self._h("scan-splice-sites")(None, {"sequence": self.SEQ,
+                                                "annotated_edges": [dpos]})
+        assert r["pairs"][0]["annotated_ends"] == ["donor"]
+
+    def test_explicit_threshold_wins_over_margin(self):
+        r = self._h("scan-splice-sites")(None, {"sequence": self.SEQ,
+                                                "margin": 0.5,
+                                                "donor_threshold": 99.0})
+        assert r["basis"]["donor"]["threshold"] == 99.0
+        assert all(h["kind"] != "donor" for h in r["sites"])
+
+    @pytest.mark.parametrize("payload,needle", [
+        ({"sequence": "AC"}, "at least 4 nt"),
+        ({"sequence": "ACGTACGT", "kind": "wat"}, "'kind' must be"),
+        ({"sequence": "ACGTACGT", "margin": -1}, "must be >= 0"),
+        ({"sequence": "ACGTACGT", "margin": 99}, "break-even"),
+        ({"sequence": "ACGTACGT", "margin": "lots"}, "number of bits"),
+        ({"sequence": "ACGTACGT", "annotated_edges": "nope"}, "must be a list"),
+    ])
+    def test_bad_input_is_a_400_naming_the_problem(self, payload, needle):
+        r = self._h("scan-splice-sites")(None, payload)
+        assert isinstance(r, tuple) and r[1] == 400, r
+        assert needle in r[0]["error"], r[0]["error"]
+
+    def test_unknown_keys_are_echoed_not_silently_dropped(self):
+        r = self._h("scan-splice-sites")(None, {"sequence": self.SEQ,
+                                                "nonsense": 1})
+        assert "nonsense" in r["ignored"]
+
+
+class TestOptimizeProteinSpliceMargin:
+    """`optimize-protein` gained `splice_margin` (field report 2026-11-08): a
+    site just under the calibrated bar was visible to the scan and
+    unrepairable through the API."""
+
+    def _h(self, name):
+        return sc._state._AGENT_HANDLERS[name][0]
+
+    PROT = "MILTQRPREHGQLAPRFRCPLSLLPTFFTSRCLSSTRGSA"
+
+    def test_margin_lowers_the_reported_bar_too(self):
+        """Repairing at one bar while reporting at another is two halves of
+        one answer disagreeing."""
+        r = self._h("optimize-protein")(None, {
+            "protein": self.PROT, "hazard_hosts": ["plant"],
+            "scrub_splice_sites": True, "splice_margin": 0.6})
+        assert not isinstance(r, tuple), r
+        sb = r["splice"]
+        assert sb["margin"] == 0.6
+        assert sb["basis"]["donor"]["threshold"] == pytest.approx(
+            sb["basis"]["donor"]["calibrated_threshold"] - 0.6)
+        assert sb["basis"]["donor"]["sensitivity"] is None
+
+    def test_default_keeps_the_calibrated_bar_and_its_sensitivity(self):
+        r = self._h("optimize-protein")(None, {
+            "protein": self.PROT, "hazard_hosts": ["plant"]})
+        assert not isinstance(r, tuple), r
+        sb = r["splice"]
+        assert sb["margin"] == 0.0
+        assert sb["basis"]["donor"]["sensitivity"] is not None
+
+    def test_a_clean_scan_says_what_clean_means(self):
+        r = self._h("optimize-protein")(None, {
+            "protein": self.PROT, "hazard_hosts": ["plant"]})
+        sb = r["splice"]
+        if sb["n_sites"] or sb["n_pairs"]:
+            pytest.skip("this protein is not clean")
+        assert any("weaker statement than a clean sequence" in w
+                   for w in r["warnings"]), r["warnings"]
+        assert any("splice_margin" in w for w in r["warnings"])
+
+    @pytest.mark.parametrize("margin,needle", [
+        (-1, "must be >= 0"),
+        (99, "break-even"),
+        ("lots", "number of bits"),
+    ])
+    def test_a_bad_margin_is_a_400(self, margin, needle):
+        r = self._h("optimize-protein")(None, {
+            "protein": self.PROT, "hazard_hosts": ["plant"],
+            "scrub_splice_sites": True, "splice_margin": margin})
+        assert isinstance(r, tuple) and r[1] == 400, r
+        assert needle in r[0]["error"], r[0]["error"]
+
+
+class TestSpliceMarginIsNotAFlag:
+    """`float(True)` is 1.0, so a boolean `margin` would silently become a
+    specific 1-bit bar the caller never chose — and `"margin": true` is almost
+    certainly someone meaning "switch the margin on". All three doors that
+    accept one refuse a bool, so the rule does not depend on which you used."""
+
+    def _h(self, name):
+        return sc._state._AGENT_HANDLERS[name][0]
+
+    SEQ = "ACGT" * 60
+    PROT = "MILTQRPREHGQLAPRFRCPLSLLPTFFTSRCLSSTRGSA"
+
+    @pytest.mark.parametrize("key", ["margin", "donor_threshold",
+                                     "acceptor_threshold"])
+    @pytest.mark.parametrize("val", [True, False])
+    def test_scan_refuses_a_boolean(self, key, val):
+        r = self._h("scan-splice-sites")(None, {"sequence": self.SEQ,
+                                                key: val})
+        assert isinstance(r, tuple) and r[1] == 400, r
+        assert "not a flag" in r[0]["error"]
+
+    @pytest.mark.parametrize("val", [True, False])
+    def test_optimize_protein_refuses_a_boolean(self, val):
+        r = self._h("optimize-protein")(None, {
+            "protein": self.PROT, "hazard_hosts": ["plant"],
+            "scrub_splice_sites": True, "splice_margin": val})
+        assert isinstance(r, tuple) and r[1] == 400, r
+        assert "not a flag" in r[0]["error"]
+
+    def test_annotated_edges_is_bounded(self):
+        """Unbounded, it is a cheap way to make the server coerce millions of
+        integers; a real molecule has two boundaries per intron."""
+        r = self._h("scan-splice-sites")(None, {
+            "sequence": self.SEQ, "annotated_edges": list(range(300_000))})
+        assert isinstance(r, tuple) and r[1] == 400, r
+        assert "more boundaries than any annotated molecule" in r[0]["error"]
+
+    def test_an_empty_edge_list_is_fine(self):
+        r = self._h("scan-splice-sites")(None, {"sequence": self.SEQ,
+                                                "annotated_edges": []})
+        assert not isinstance(r, tuple), r
+
+    def test_margin_without_a_calibrated_model_says_so(self):
+        """Not 'your number is too big' — there is nothing for it to be
+        relative to."""
+        import splicecraft_splice as sp
+        saved = (sp._SPLICE_DONOR_PWM, sp._SPLICE_ACCEPTOR_PWM,
+                 sp._SPLICE_MODEL_META)
+        try:
+            sp._splice_load_model(saved[0], saved[1], {"source": "no cal"})
+            r = self._h("scan-splice-sites")(None, {"sequence": self.SEQ,
+                                                    "margin": 0.5})
+            assert isinstance(r, tuple) and r[1] == 400, r
+            assert "nothing to be relative to" in r[0]["error"]
+        finally:
+            sp._splice_load_model(*saved)
+
+    def test_an_untrained_model_is_a_503_not_an_empty_list(self):
+        import splicecraft_splice as sp
+        saved = (sp._SPLICE_DONOR_PWM, sp._SPLICE_ACCEPTOR_PWM,
+                 sp._SPLICE_MODEL_META)
+        try:
+            sp._splice_load_model([], [], {})
+            r = self._h("scan-splice-sites")(None, {"sequence": self.SEQ})
+            assert isinstance(r, tuple) and r[1] == 503, r
+            assert "not trained" in r[0]["error"]
+            # and the model endpoint still answers, honestly
+            m = self._h("splice-model")(None, {})
+            assert m["model"]["trained"] is False
+            assert m["pair_combined_threshold"] is None
+        finally:
+            sp._splice_load_model(*saved)

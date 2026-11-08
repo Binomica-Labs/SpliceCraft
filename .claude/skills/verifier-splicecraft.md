@@ -26,18 +26,51 @@ os.environ.setdefault("SPLICECRAFT_SKIP_LOCK", "1")
 sys.path.insert(0, "/home/seb/SpliceCraft")
 import splicecraft as sc
 
-assert "sc-verify-" in str(sc._DATA_DIR), \
-    f"sandbox not active — _DATA_DIR={sc._DATA_DIR}"
+# `_DATA_DIR` lives in `_state` since the modularization — `sc._DATA_DIR`
+# raises AttributeError, so an assert written against it never guards
+# anything. Read it through `_state`, which is the single source of truth.
+assert "sc-verify-" in str(sc._state._DATA_DIR), \
+    f"sandbox not active — _DATA_DIR={sc._state._DATA_DIR}"
 
 # L2 chokepoint (2026-05-22): authorise writes against the sandbox.
 # Without this, every `_save_*` raises RuntimeError. The helper
 # itself refuses if the data dir isn't under the OS tempdir, so
 # you can't bypass it without first sandboxing.
-sc._authorize_writes_for_sandbox(sc._DATA_DIR)
+sc._authorize_writes_for_sandbox(sc._state._DATA_DIR)
 ```
 
 After the probe finishes, `shutil.rmtree(_sandbox, ignore_errors=True)`
 or just leave it for the OS to clean — they're in `/tmp` either way.
+
+### Seeding the sandbox: JSON only, NEVER the blob store
+
+An empty sandbox is the default and the right one for most probes. When a
+probe genuinely needs the real library to reproduce something, copy the
+**JSON files only** — `collections.json`, `library.json`, `primers.json`,
+`parts_bin.json`, `features.json`, … — and leave the blobs where they are.
+
+`plasmid_blobs/` and `dna_originals/` are hundreds of megabytes across
+thousands of files. `/tmp` is a **7.5 GB tmpfs**, i.e. RAM: a handful of
+probe runs that each copy the blob store fill it, and the failure is not a
+clean "disk full" but `EDQUOT` out of unrelated commands — the whole session
+stops working (field report 2026-11-08). Blobs are also content-addressed and
+read-only in every read path, so copying them buys nothing.
+
+```python
+import shutil, pathlib
+_real = pathlib.Path.home() / ".local/share/splicecraft"
+_dst  = pathlib.Path(_sandbox) / "splicecraft"
+_dst.mkdir(parents=True, exist_ok=True)
+for _f in _real.glob("*.json"):          # JSON ONLY — no dirs, no .bak
+    shutil.copy2(_f, _dst / _f.name)
+```
+
+A probe that needs real blob CONTENT should point the app at the real blob
+dir read-only (`sc._state._DNA_ORIGINALS_DIR`) rather than copy it, and must
+not write there — the L2 chokepoint refuses writes outside the sandbox
+anyway. If a probe run is interrupted, delete **only your own**
+`/tmp/sc-verify-*` directories; other agents and other projects keep scratch
+under `/tmp` too.
 
 ## Drive the app
 
@@ -194,7 +227,7 @@ rec = sc._gff3_path_to_record("/tmp/x.gff3")
 
 ## Pre-flight before reporting
 
-- [ ] Sandboxed (`assert "sc-verify-" in str(sc._DATA_DIR)`)
+- [ ] Sandboxed (`assert "sc-verify-" in str(sc._state._DATA_DIR)`)
 - [ ] No `~/.local/share/splicecraft/` paths in captured output
 - [ ] Each touchpoint has at least one PASS/FAIL line with the actual
       screen / widget name as evidence
