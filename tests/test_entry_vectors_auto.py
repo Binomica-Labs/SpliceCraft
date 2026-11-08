@@ -860,3 +860,343 @@ def test_auto_detect_uses_batched_save():
         "_set_entry_vector(per-role) leaked back into the worker; "
         "use _set_entry_vectors_batch for the bulk write"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Field report 2026-11-08 — "is this actually an acceptor?", asked out loud
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Two α/Ω entry vectors in daily use carry FOUR sites of the assembly enzyme:
+# a second cassette in the backbone brought its own pair, and one of the
+# surplus fragments comes out with AATG/GCTT ends — the exact overhang pair an
+# incoming L0 CDS part presents, so it competes for BOTH junctions of every
+# assembly that vector is used in. Nothing said so, because nothing was asking
+# the question: `_detect_entry_vector_role` returned None, the overhang lookup
+# turned its own refusal into "no vector configured", and `_synthesis_lint`
+# with the grammar's enzymes as `forbidden_enzymes` scored a WORKING acceptor
+# 20/100 because an acceptor is SUPPOSED to carry those sites.
+
+
+def _build_four_site_acceptor(part_oh5="AATG", part_oh3="GCTT"):
+    """An α1-shaped acceptor carrying a SECOND inner-enzyme pair in its
+    backbone, releasing a fragment whose ends are a real grammar part pair.
+    The synthetic equivalent of the reported vectors."""
+    bsa_fwd, bsa_rc = "GGTCTC" + "A", "T" + sc._rc("GGTCTC")
+    extra = (bsa_fwd + part_oh5 + "CCTTGGAACC" * 30 + part_oh3 + bsa_rc)
+    return _build_acceptor(
+        oh5_inner="GGAG", oh3_inner="CGCT",
+        oh5_outer="GGAG", oh3_outer="GTCA",
+        inner_enzyme_site="GGTCTC", outer_enzyme_site="CGTCTC",
+        backbone_body="ATCGATCGAT" * 60 + extra + "ATCGATCGAT" * 60,
+    )
+
+
+
+def _gb_text(rec) -> str:
+    """GenBank text for a built record — what an entry-vector binding stores."""
+    from io import StringIO
+    from Bio import SeqIO
+    buf = StringIO()
+    rec.annotations.setdefault("molecule_type", "DNA")
+    SeqIO.write(rec, buf, "genbank")
+    return buf.getvalue()
+
+
+class TestAcceptorVectorCheck:
+    def _check(self, rec):
+        return sc._check_acceptor_vector(
+            str(rec.seq), circular=True,
+            grammar=sc._all_grammars()["gb_l0"],
+            features=sc._acceptor_vector_features(rec))
+
+    def test_a_clean_alpha1_passes_on_both_enzymes(self):
+        rec = _build_acceptor(
+            oh5_inner="GGAG", oh3_inner="CGCT",
+            oh5_outer="GGAG", oh3_outer="GTCA")
+        res = self._check(rec)
+        assert res["ok"] is True
+        assert sorted(res["usable_enzymes"]) == ["BsaI", "Esp3I"]
+        assert res["warnings"] == []
+
+    def test_the_four_site_vector_is_refused_for_that_enzyme(self):
+        res = self._check(_build_four_site_acceptor())
+        row = next(r for r in res["enzymes"] if r["enzyme"] == "BsaI")
+        assert row["n_sites"] == 4
+        assert row["usable"] is False
+        assert "exactly 2" in row["note"]
+
+    def test_and_the_competing_fragment_is_named_with_its_overhangs(self):
+        """The finding the endpoint exists for: not "digest failed" but WHICH
+        fragment impersonates a part, and at which junction."""
+        res = self._check(_build_four_site_acceptor())
+        row = next(r for r in res["enzymes"] if r["enzyme"] == "BsaI")
+        comp = [x for x in row["extra"] if x["collides_with"]]
+        assert comp, row["extra"]
+        assert any(set(x["collides_with"]) >= {"AATG", "GCTT"} for x in comp)
+        assert any("COMPETES with a real part at BOTH junctions" in w
+                   for w in res["warnings"]), res["warnings"]
+
+    def test_the_other_enzyme_still_works_and_says_so(self):
+        """A vector can be a perfect Esp3I acceptor and a hazard under BsaI;
+        `ok` must not flatten that."""
+        res = self._check(_build_four_site_acceptor())
+        assert res["usable_enzymes"] == ["Esp3I"]
+        assert res["ok"] is True
+
+    def test_the_dropout_is_found_by_marker_exclusion_not_size(self):
+        """Sacred — `feedback_never_assume_smaller_frag_is_payload`. The
+        stuffer here is BIGGER than the backbone."""
+        rec = _build_acceptor(
+            oh5_inner="GGAG", oh3_inner="CGCT",
+            oh5_outer="GGAG", oh3_outer="GTCA",
+            backbone_body="ATCGATCGAT" * 70,
+            stuffer_body="TTGGAACCAA" * 200)
+        res = self._check(rec)
+        row = next(r for r in res["enzymes"] if r["enzyme"] == "BsaI")
+        assert row["usable"] is True
+        assert row["dropout"]["has_backbone_marker"] is False
+        assert row["dropout"]["length"] > max(
+            f["length"] for f in row["fragments"]
+            if f is not row["dropout"])
+
+    def test_a_single_site_is_named_as_a_linearisation(self):
+        seq = ("GGTCTCA" + "GGAG" + "TTGGAACCAA" * 40 + "ATCGATCGAT" * 40)
+        res = sc._check_acceptor_vector(
+            seq, circular=True, grammar=sc._all_grammars()["gb_l0"])
+        row = next(r for r in res["enzymes"] if r["enzyme"] == "BsaI")
+        assert row["n_sites"] == 1 and row["usable"] is False
+        assert "linearises" in row["note"]
+
+    def test_a_linear_record_is_refused_with_a_reason(self):
+        res = sc._check_acceptor_vector(
+            "ACGT" * 100, circular=False,
+            grammar=sc._all_grammars()["gb_l0"])
+        assert res["ok"] is False
+        assert any("LINEAR" in e for e in res["errors"])
+
+    def test_an_enzyme_that_does_not_cut_is_not_silently_fine(self):
+        rec = _build_acceptor(
+            oh5_inner="GGAG", oh3_inner="CGCT",
+            oh5_outer="GGAG", oh3_outer="GTCA",
+            outer_enzyme_site="GGTCTC")       # no Esp3I anywhere
+        res = self._check(rec)
+        row = next(r for r in res["enzymes"] if r["enzyme"] == "Esp3I")
+        assert row["usable"] is False
+        assert "does not cut" in row["note"]
+
+
+class TestSynthesisLintAcceptorMode:
+    def test_forbidden_mode_punishes_a_working_acceptor(self):
+        """The premise — and it is CORRECT behaviour for a part, which is why
+        the fix is a separate mode and not a changed rule."""
+        rec = _build_acceptor(oh5_inner="GGAG", oh3_inner="CGCT",
+                              oh5_outer="GGAG", oh3_outer="GTCA")
+        rep = sc._synthesis_lint(str(rec.seq), circular=True,
+                                 forbidden_enzymes=("BsaI", "Esp3I"))
+        assert any(w["kind"] == "type_iis_site" for w in rep["warnings"])
+
+    def test_acceptor_mode_expects_two_sites_and_deducts_nothing(self):
+        rec = _build_acceptor(oh5_inner="GGAG", oh3_inner="CGCT",
+                              oh5_outer="GGAG", oh3_outer="GTCA")
+        rep = sc._synthesis_lint(str(rec.seq), circular=True,
+                                 acceptor_enzymes=("BsaI", "Esp3I"))
+        assert rep["stats"]["acceptor_sites"] == {"BsaI": 2, "Esp3I": 2}
+        assert not [w for w in rep["warnings"]
+                    if w["kind"] in ("acceptor_site", "type_iis_site")]
+
+    def test_acceptor_mode_errors_on_four_sites(self):
+        rec = _build_four_site_acceptor()
+        rep = sc._synthesis_lint(str(rec.seq), circular=True,
+                                 acceptor_enzymes=("BsaI", "Esp3I"))
+        bad = [w for w in rep["warnings"] if w["kind"] == "acceptor_site"]
+        assert len(bad) == 1 and bad[0]["level"] == "error"
+        assert "exactly" in bad[0]["message"]
+        assert rep["stats"]["acceptor_sites"]["BsaI"] == 4
+
+    def test_an_acceptor_enzyme_is_not_also_scanned_as_forbidden(self):
+        rec = _build_acceptor(oh5_inner="GGAG", oh3_inner="CGCT",
+                              oh5_outer="GGAG", oh3_outer="GTCA")
+        rep = sc._synthesis_lint(str(rec.seq), circular=True,
+                                 forbidden_enzymes=("BsaI", "Esp3I"),
+                                 acceptor_enzymes=("BsaI", "Esp3I"))
+        assert not [w for w in rep["warnings"]
+                    if w["kind"] == "type_iis_site"]
+
+    def test_an_isoschizomer_of_an_acceptor_enzyme_is_excused_too(self):
+        """Esp3I and BsmBI are the same CGTCTC site cut the same way. Excusing
+        one by name while flagging the other described ONE physical site two
+        contradictory ways."""
+        rec = _build_acceptor(oh5_inner="GGAG", oh3_inner="CGCT",
+                              oh5_outer="GGAG", oh3_outer="GTCA")
+        assert sc._enzyme_signature("BsmBI") == sc._enzyme_signature("Esp3I")
+        rep = sc._synthesis_lint(str(rec.seq), circular=True,
+                                 forbidden_enzymes=("BsmBI",),
+                                 acceptor_enzymes=("Esp3I",))
+        assert not [w for w in rep["warnings"]
+                    if w["kind"] == "type_iis_site"], rep["warnings"]
+
+
+class TestWhichEnzymeReleasesWhichLevel:
+    """The Golden-Braid convention, pinned against REAL vectors.
+
+    `_enzyme_for_level_up(gb_l0, 0)` returns Esp3I — the DOMESTICATION enzyme,
+    because that is what `gb_l0.enzyme` means — while a real pDGB3-convention
+    α acceptor is assembled with BsaI and released with Esp3I. The code below
+    `_resolve_acceptor_role` has always had it right and a comment above it
+    once had it backwards; these assertions are against the plasmids, not
+    against either one, so the next reader cannot "fix" the code to match the
+    parity (field report 2026-11-08).
+    """
+
+    def test_alpha1_fixture_detects_as_alpha1(self):
+        rec = sc.load_genbank("tests/FFE 2 ENTRY A1.dna")
+        assert sc._detect_entry_vector_role(
+            rec, sc._all_grammars()["gb_l0"]) == ("Alpha1", "strict")
+
+    def test_omega1_fixture_detects_as_omega1(self):
+        rec = sc.load_genbank("tests/FFE 4 ENTRY O1.dna")
+        assert sc._detect_entry_vector_role(
+            rec, sc._all_grammars()["gb_l0"]) == ("Omega1", "strict")
+
+    def test_an_alpha_acceptor_takes_its_part_in_on_the_level_up_enzyme(self):
+        """BsaI — `level_up_enzyme` — is what releases the canonical TU
+        boundary stuffer from α, i.e. what an L0 part is assembled with."""
+        gb = sc._all_grammars()["gb_l0"]
+        rec = sc.load_genbank("tests/FFE 2 ENTRY A1.dna")
+        cls = sc._classify_part_from_plasmid(str(rec.seq), circular=True)
+        assert cls is not None
+        assert (cls["position"]["oh5"], cls["position"]["oh3"]) == \
+            sc._grammar_tu_overhangs(gb)
+        assert cls["release_enzyme"] == gb["level_up_enzyme"] == "BsaI"
+
+    def test_an_omega_acceptor_takes_its_tu_in_on_the_primary_enzyme(self):
+        gb = sc._all_grammars()["gb_l0"]
+        rec = sc.load_genbank("tests/FFE 4 ENTRY O1.dna")
+        cls = sc._classify_part_from_plasmid(str(rec.seq), circular=True)
+        assert cls is not None
+        assert cls["release_enzyme"] == gb["enzyme"] == "Esp3I"
+
+    def test_the_level_up_parity_disagrees_and_the_fallback_covers_it(self):
+        """Not a bug report — a pinned fact. If someone "simplifies"
+        `_assembly_fragment_enzyme_candidates` down to the parity's single
+        enzyme, every L0→α assembly on a real GoldenBraid library breaks."""
+        gb = sc._all_grammars()["gb_l0"]
+        assert sc._enzyme_for_level_up(gb, 0) == "Esp3I"      # the parity
+        cands = sc._assembly_fragment_enzyme_candidates(gb, "Esp3I")
+        assert "BsaI" in cands, cands
+
+
+class TestAcceptorQcInTheModal:
+    """The warning has to reach the screen where the user binds the vector —
+    the report's whole complaint is that nothing on any surface said it."""
+
+    def test_a_clean_vector_produces_no_line(self):
+        rec = _build_acceptor(oh5_inner="GGAG", oh3_inner="CGCT",
+                              oh5_outer="GGAG", oh3_outer="GTCA")
+        gb_text = _gb_text(rec)
+        assert sc.EntryVectorsModal._acceptor_qc_lines(
+            sc._all_grammars()["gb_l0"], "Alpha1", gb_text) == []
+
+    def test_the_four_site_vector_produces_one_compact_line(self):
+        gb_text = _gb_text(_build_four_site_acceptor())
+        lines = sc.EntryVectorsModal._acceptor_qc_lines(
+            sc._all_grammars()["gb_l0"], "Alpha1", gb_text)
+        assert len(lines) == 1, lines
+        line = lines[0]
+        assert line.startswith("Alpha1: 4 BsaI sites")
+        assert "competes with a real part" in line
+        assert "AATG/GCTT" in line
+
+    def test_an_oversized_vector_is_skipped_not_digested_on_the_ui_thread(self):
+        """`_refresh_table` runs this once per bound vector on every refresh.
+        A chromosome bound by mistake must not freeze the modal."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        big = SeqRecord(Seq("ATCG" * 60_000), id="big", name="big",
+                        annotations={"topology": "circular",
+                                     "molecule_type": "DNA"})
+        assert sc.EntryVectorsModal._acceptor_qc_lines(
+            sc._all_grammars()["gb_l0"], "Alpha1", _gb_text(big)) == []
+
+    def test_unparseable_gb_text_is_not_fatal(self):
+        """A QC that cannot run must never stop the user configuring their
+        vectors."""
+        assert sc.EntryVectorsModal._acceptor_qc_lines(
+            sc._all_grammars()["gb_l0"], "Alpha1", "not genbank at all") == []
+        assert sc.EntryVectorsModal._acceptor_qc_lines(
+            sc._all_grammars()["gb_l0"], "Alpha1", "") == []
+
+
+@pytest.mark.asyncio
+async def test_entry_vectors_modal_flags_a_bound_four_site_vector():
+    gb_text = _gb_text(_build_four_site_acceptor())
+    app = sc.PlasmidApp()
+    async with app.run_test(size=(160, 48)) as pilot:
+        await pilot.pause()
+        sc._set_entry_vector("gb_l0", {
+            "name": "four-site α1", "size": len(gb_text),
+            "source": "test", "id": "foursite", "gb_text": gb_text},
+            "Alpha1")
+        modal = sc.EntryVectorsModal("gb_l0")
+        app.push_screen(modal)
+        for _ in range(4):
+            await pilot.pause()
+        from textual.widgets import Static, DataTable
+        status = modal.query_one("#ev-status", Static)
+        # Textual keeps a Static's content on different attributes across
+        # versions; read whichever holds it rather than pinning one.
+        text = str(getattr(status, "_content", "")
+                   or getattr(status, "_renderable", "")
+                   or status.render())
+        assert "4 BsaI sites" in text, text
+        assert "competes with a real part" in text
+        # and the row itself is marked, so the table alone is not reassuring
+        t = modal.query_one("#ev-table", DataTable)
+        row = t.get_row_at(1)
+        assert "⚠" in str(row[1])
+
+
+class TestAcceptorCheckIsBounded:
+    """A 60-site plasmid answered with a 16 KB response, almost all of it
+    fragments nobody will read."""
+
+    SEQ = "GGTCTCAGGAGCCTTAA" * 60
+
+    def _row(self):
+        res = sc._check_acceptor_vector(
+            self.SEQ, circular=True, grammar=sc._all_grammars()["gb_l0"])
+        return next(r for r in res["enzymes"] if r["enzyme"] == "BsaI")
+
+    def test_the_lists_are_capped(self):
+        row = self._row()
+        cap = sc._ACCEPTOR_MAX_FRAGMENTS
+        assert len(row["fragments"]) == cap
+        assert len(row["extra"]) == cap
+        assert len(row["cut_positions"]) == cap
+        assert row["cut_positions_truncated"] is True
+
+    def test_but_the_counts_are_exact(self):
+        """A truncated answer must not read as a complete one."""
+        row = self._row()
+        assert row["n_sites"] == 60
+        assert row["n_fragments"] == 60
+        assert row["n_extra"] == 60
+
+    def test_the_response_stays_small(self):
+        import json
+        res = sc._check_acceptor_vector(
+            self.SEQ, circular=True, grammar=sc._all_grammars()["gb_l0"])
+        assert len(json.dumps(res, default=str)) < 12_000
+
+
+def test_check_acceptor_vector_refuses_a_chromosome_scale_record():
+    """An acceptor is a plasmid; a chromosome would digest into thousands of
+    fragments nobody can act on."""
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    rec = SeqRecord(Seq("ATCG" * 60_000), id="big", name="big",
+                    annotations={"topology": "circular",
+                                 "molecule_type": "DNA"})
+    app = type("A", (), {"_current_record": rec})()
+    body, code = sc._h_check_acceptor_vector(app, {})
+    assert code == 413 and "capped at" in body["error"]

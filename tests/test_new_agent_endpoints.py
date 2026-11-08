@@ -616,3 +616,190 @@ def test_list_plasmidsaurus_items_alias_registered():
     h = sc._state._AGENT_HANDLERS
     assert "list-plasmidsaurus-items" in h
     assert h["list-plasmidsaurus-items"] == h["plasmidsaurus-items"]
+
+
+# ── check-acceptor-vector + the optimizer's splice block (2026-11-08) ────────
+
+
+def _acceptor_rec(extra_pair: "tuple[str, str] | None" = None,
+                  extra_site: str = "GGTCTC"):
+    """An α1-shaped acceptor; with `extra_pair`, a SECOND pair of `extra_site`
+    cuts in the backbone releasing a fragment with those overhangs (the
+    reported four-site vector)."""
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    from Bio.SeqFeature import SeqFeature, FeatureLocation
+    bsa_f, bsa_r = "GGTCTC" + "A", "T" + sc._rc("GGTCTC")
+    esp_f, esp_r = "CGTCTC" + "A", "T" + sc._rc("CGTCTC")
+    inner = bsa_f + "GGAG" + "TTGGAACCAA" * 20 + "CGCT" + bsa_r
+    outer = esp_f + "GGAG" + inner + "GTCA" + esp_r
+    backbone = "ATCGATCGAT" * 60
+    if extra_pair:
+        x_f, x_r = extra_site + "A", "T" + sc._rc(extra_site)
+        backbone += (x_f + extra_pair[0] + "CCTTGGAACC" * 30
+                     + extra_pair[1] + x_r + "ATCGATCGAT" * 60)
+    seq = outer + backbone
+    rec = SeqRecord(Seq(seq), id="acc", name="acc",
+                    annotations={"topology": "circular",
+                                 "molecule_type": "DNA"})
+    rec.features.append(SeqFeature(
+        FeatureLocation(len(outer) + 100, len(outer) + 500),
+        type="rep_origin", qualifiers={"label": ["ori"]}))
+    return rec
+
+
+def test_check_acceptor_vector_passes_a_clean_acceptor():
+    app = type("A", (), {"_current_record": _acceptor_rec()})()
+    res = sc._h_check_acceptor_vector(app, {})
+    assert res["ok"] is True
+    assert sorted(res["usable_enzymes"]) == ["BsaI", "Esp3I"]
+    assert res["role"] == {"detected": True, "name": "Alpha1",
+                           "label": "Alpha1", "confidence": "strict"}
+
+
+def test_check_acceptor_vector_explains_a_failed_detection():
+    """The silence this endpoint exists to end: auto-detect returned None and
+    said nothing, for years."""
+    app = type("A", (), {"_current_record": _acceptor_rec(("AATG", "GCTT"))})()
+    res = sc._h_check_acceptor_vector(app, {})
+    assert res["role"]["detected"] is False
+    assert "4 BsaI sites" in res["role"]["reason"]
+    row = next(r for r in res["enzymes"] if r["enzyme"] == "BsaI")
+    assert row["extra"][0]["matches_slot"] == "CDS"
+    assert any("COMPETES" in w for w in res["warnings"])
+
+
+def test_check_acceptor_vector_rejects_unknown_enzyme_loudly():
+    app = type("A", (), {"_current_record": _acceptor_rec()})()
+    body, code = sc._h_check_acceptor_vector(app, {"enzymes": ["NotAnEnzyme"]})
+    assert code == 400 and "unknown enzyme" in body["error"]
+
+
+def test_check_acceptor_vector_needs_a_record():
+    app = type("A", (), {"_current_record": None})()
+    body, code = sc._h_check_acceptor_vector(app, {})
+    assert code == 422
+
+
+def test_check_acceptor_vector_rejects_unknown_grammar():
+    app = type("A", (), {"_current_record": _acceptor_rec()})()
+    body, code = sc._h_check_acceptor_vector(app, {"grammar": "nope"})
+    assert code == 404
+
+
+def test_optimize_protein_reports_cryptic_splice_sites_for_a_plant_host():
+    """`hazard_hosts: ["plant"]` buys a 2-motif floor; the response has to say
+    what the trained model sees, whether or not the repair was asked for."""
+    res = sc._h_optimize_protein(None, {
+        "protein": "MKPGSAKVTGAKPGSADETWFCTWFCWFCTL",
+        "table": "4097", "hazard_hosts": ["plant"]})
+    assert not isinstance(res, tuple), res
+    assert res["splice"]["skipped"] is False
+    assert res["splice"]["scrubbed"] is False
+    assert "n_sites" in res["splice"] and "n_pairs" in res["splice"]
+    assert res["splice"]["model"]
+
+
+def test_optimize_protein_can_scrub_the_sites_it_reports():
+    """A protein whose frequency-mode optimisation spells a real donor: the
+    opt-in repair must clear it and the response must prove it."""
+    body = {"protein": "MKVTGGVNGTAGGVNRTGGVNATGGLKDVNGTSGGVNGTYGGVNHTGG",
+            "table": "4097", "hazard_hosts": ["plant"]}
+    plain = sc._h_optimize_protein(None, dict(body))
+    assert not isinstance(plain, tuple), plain
+    scrubbed = sc._h_optimize_protein(None, dict(body, scrub_splice_sites=True))
+    assert not isinstance(scrubbed, tuple), scrubbed
+    assert scrubbed["splice"]["scrubbed"] is True
+    assert scrubbed["splice"]["n_sites"] <= plain["splice"]["n_sites"]
+    # whatever it changed, the protein is the invariant
+    assert sc._mut_translate(scrubbed["dna"]).rstrip("*") == body["protein"]
+
+
+def test_optimize_protein_skips_the_scan_when_told_to():
+    res = sc._h_optimize_protein(None, {
+        "protein": "MKPGSAKVTG", "table": "4097",
+        "hazard_hosts": ["plant"], "check_splice": False})
+    assert res["splice"]["skipped"] is True
+    assert res["splice"]["reason"]
+
+
+def test_optimize_protein_does_not_scan_for_a_non_plant_host():
+    """The model is plant-trained — it is the wrong ruler for an animal cell,
+    and a silent wrong answer is worse than no answer."""
+    res = sc._h_optimize_protein(None, {
+        "protein": "MKPGSAKVTG", "table": "83333",
+        "hazard_hosts": ["bacterial"]})
+    assert res["splice"]["skipped"] is True
+
+
+def test_lint_synthesis_acceptor_enzymes_round_trip():
+    rec = _acceptor_rec(("AATG", "GCTT"))
+    res = sc._h_lint_synthesis(None, {"sequence": str(rec.seq),
+                                      "acceptor_enzymes": ["BsaI", "Esp3I"]})
+    assert res["ok"] is True
+    assert res["stats"]["acceptor_sites"] == {"BsaI": 4, "Esp3I": 2}
+    assert any(w["kind"] == "acceptor_site" and w["level"] == "error"
+               for w in res["warnings"])
+
+
+def test_lint_synthesis_rejects_an_unknown_acceptor_enzyme():
+    body, code = sc._h_lint_synthesis(None, {"sequence": "ACGT" * 50,
+                                             "acceptor_enzymes": ["Nope"]})
+    assert code == 400 and "unknown enzyme" in body["error"]
+
+
+@pytestmark_protect
+def test_design_gb_part_says_when_its_entry_vector_is_not_a_clean_acceptor():
+    """`_entry_vector_acceptor_overhangs` answers None for BOTH "nothing
+    configured" and "the configured vector doesn't cut cleanly", and the
+    designer treats both as "use the one-tier layout" — so a design built
+    against a four-site vector came back looking normal."""
+    # four ESP3I sites: that is the enzyme the domestication design digests
+    # the entry vector with, so this is the vector shape that silently
+    # degraded the design to one tier.
+    rec = _acceptor_rec(("AATG", "GCTT"), extra_site="CGTCTC")
+    from io import StringIO
+    from Bio import SeqIO
+    buf = StringIO()
+    SeqIO.write(rec, buf, "genbank")
+    gb_text = buf.getvalue()
+    sc._set_entry_vector("gb_l0", {"name": "four-site UPD",
+                                   "size": len(str(rec.seq)),
+                                   "source": "test", "id": "four",
+                                   "gb_text": gb_text}, "")
+    try:
+        res = sc._h_design_gb_part(None, {
+            "template": "ATG" + "GCTAAACCTGGTTCTGCT" * 6 + "TAA",
+            "start": 0, "end": 3 + 18 * 6 + 3, "part_type": "CDS"})
+        assert not isinstance(res, tuple), res
+        warns = res["result"].get("warnings") or []
+        assert any("not a clean Esp3I acceptor" in w for w in warns), warns
+        assert any("check-acceptor-vector" in w for w in warns), warns
+    finally:
+        sc._set_entry_vector("gb_l0", None, "")
+
+
+@pytestmark_protect
+def test_design_gb_part_is_quiet_when_no_entry_vector_is_configured():
+    """No vector is the ordinary one-tier case, not a problem to report."""
+    sc._set_entry_vector("gb_l0", None, "")
+    res = sc._h_design_gb_part(None, {
+        "template": "ATG" + "GCTAAACCTGGTTCTGCT" * 6 + "TAA",
+        "start": 0, "end": 3 + 18 * 6 + 3, "part_type": "CDS"})
+    assert not isinstance(res, tuple), res
+    assert not [w for w in (res["result"].get("warnings") or [])
+                if "acceptor" in w]
+
+
+def test_optimize_protein_refuses_to_repair_without_reporting():
+    """A repair whose result is not measured is a claim, not a result."""
+    body, code = sc._h_optimize_protein(None, {
+        "protein": "MKVTGG", "table": "4097",
+        "scrub_splice_sites": True, "check_splice": False})
+    assert code == 400 and "drop one of the two" in body["error"]
+
+
+def test_check_acceptor_vector_dedups_a_repeated_enzyme():
+    app = type("A", (), {"_current_record": _acceptor_rec()})()
+    res = sc._h_check_acceptor_vector(app, {"enzymes": ["BsaI", "BsaI"]})
+    assert [r["enzyme"] for r in res["enzymes"]] == ["BsaI"]

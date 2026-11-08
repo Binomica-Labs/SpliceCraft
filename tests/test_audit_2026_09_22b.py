@@ -2887,13 +2887,21 @@ class TestNotebookExportShowsEachAttachmentOnce:
         spent = time.process_time() - t
         # CPU time, not wall clock. The guard is "this is linear, not
         # quadratic" (it was ~45 s at 160 KB), and a wall-clock deadline
-        # inside `-n auto` fails on scheduler starvation instead: measured
-        # 0.002 s idle and 0.003 s under 10x CPU load on 16 cores, so every
+        # inside `-n auto` fails on scheduler starvation instead: every
         # wall-clock failure it produced was this process being descheduled,
         # never the renderer. CPU time is also the TIGHTER bound on the thing
         # actually under test. The number is in the message because a bare
-        # `< 2.0` makes a genuine failure unreadable.
-        assert spent < 2.0, f"render took {spent:.3f} s CPU (budget 2.0)"
+        # budget makes a genuine failure unreadable.
+        #
+        # The budget is 5 s, not 2 s (2026-11-08). CPU time is immune to
+        # DESCHEDULING but not to a saturated machine: measured 0.89-1.05 s
+        # idle on 16 cores and 2.08 s inside a full `-n auto` run, where every
+        # worker competes for memory bandwidth and the clock drops — so a 2 s
+        # budget was a 2x margin against a 2.2x effect, and it duly failed a
+        # clean tree. 5 s still catches the regression this exists for by
+        # three orders of magnitude; what it stops catching is the machine
+        # being busy, which was never the thing under test.
+        assert spent < 5.0, f"render took {spent:.3f} s CPU (budget 5.0)"
 
     def test_a_numbered_list_keeps_its_start(self):
         import splicecraft_experiments as E

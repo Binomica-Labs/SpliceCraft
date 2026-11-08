@@ -28,7 +28,7 @@ ALL data-only endpoints live here; only the app-coupled handlers stay hub.
 prerequisites. Top layer among the siblings (imports the whole domain stack ≤L3);
 nothing imports it but the hub.
 
-**The split, as of 1.3.12: 211 here, 87 hub-side, 298 registered in total.**
+**The split, as of 1.3.15: 211 here, 88 hub-side, 299 registered in total.**
 Those three numbers were stale for several releases (the docstring said 109 / 26
 and CLAUDE.md said 202 / 82) and this is the first thing an agent reads about
 this file, so they are now pinned by
@@ -52,8 +52,10 @@ from splicecraft_dataaccess import (_load_custom_labware, _load_protocol_collect
                                     _save_custom_labware, _save_protocol_collections)
 from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _feat_len, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len, _span_full_lap_len, _span_in_span)
-from splicecraft_cloning import (_cloned_plasmid_regenerated_sites, _GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi, _enzyme_is_type_iis)
-from splicecraft_codon import (_CODON_RAMP_CODONS, _CODON_RARE_W, _codon_relative_adaptiveness, _CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_ambiguous_stops, _codon_cai, _codon_diversify, _codon_table_for, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
+from splicecraft_cloning import (_cloned_plasmid_regenerated_sites, _GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _acceptor_vector_features, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi, _enzyme_is_type_iis)
+from splicecraft_codon import (_CODON_RAMP_CODONS, _CODON_RARE_W, _codon_relative_adaptiveness, _CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_ambiguous_stops, _codon_cai, _codon_diversify, _codon_table_for, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_fix_splice_sites, _CODON_SPLICE_MAX_REPORT, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
+from splicecraft_splice import (_splice_model_summary, _splice_pair_risk,
+                                _splice_scan)
 from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _flush_dirty_mirror_before_switch, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_all_experiments, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _library_append_unique, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
 from splicecraft_experiments import (_EXPERIMENT_ACTIONS, _as_str_list, _tag_values, _experiment_duplicate, _experiment_html_document, _experiment_markdown_document, _experiment_project_markdown, _experiment_ref_token_ok, _experiment_search, _experiment_snippet, _experiment_search_terms, _experiment_template_markdown, _experiments_referencing, _new_experiment_id, _normalise_experiment_entry, _protocol_steps_markdown, _sanitize_experiment_id)
 from splicecraft_fileio import (_ab1_path_to_record, _insdc_qualifier_name, _PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
@@ -75,7 +77,7 @@ from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq,
                                 _topology_from_gb_text)
 from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _ncbi_taxid_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
 from splicecraft_kozak import _kozak_context, _kozak_model_summary
-from splicecraft_seqanalysis import (_classify_part_from_plasmid, _plan_chromosome_segments, _SEGMENT_STRATEGIES, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript, _map_transcription)
+from splicecraft_seqanalysis import (_classify_part_from_plasmid, _check_acceptor_vector, _plan_chromosome_segments, _SEGMENT_STRATEGIES, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript, _map_transcription)
 from splicecraft_util import (_iso_instant, _variant_group_key, _PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _feat_spans, _feature_traversal, _phred_in_alignment_frame, _read_rotation_in_rows, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _degenerate_tm_bracket, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
@@ -406,7 +408,7 @@ def _agent_parse_read_quality(rq, cleaned_reads: "list[str]"
 _AGENT_ENTRY_PARAM_ENDPOINTS = frozenset({
     "get-sequence", "plasmid-overview", "features", "list-features",
     "get-feature", "find-feature", "list-restriction-sites", "find-orfs",
-    "simulate-gel", "get-history",
+    "simulate-gel", "get-history", "check-acceptor-vector",
 })
 
 
@@ -1514,7 +1516,7 @@ def _h_lint_synthesis(app, payload):
     """Synthesis / assembly-readiness pre-flight for a construct — the "is it
     safe to order + assemble?" check. Body:
     ``{sequence | id | name, circular?=true, expect_cds?=false,
-        forbidden_enzymes?: [str]}``.
+        forbidden_enzymes?: [str], acceptor_enzymes?: [str]}``.
 
     Resolves the sequence from a bare ``sequence`` OR a saved library entry
     (``id``/``name`` — its stored topology sets ``circular`` unless you pass
@@ -1523,7 +1525,18 @@ def _h_lint_synthesis(app, payload):
     homopolymer runs, tandem repeats, degenerate bases, and — with
     ``expect_cds`` — a clean full-length ORF. Returns ``{ok, score, warnings,
     stats}`` where ``score`` is 0-100 (100 = clean) and each ``warnings`` entry
-    is ``{level, kind, message, start?, end?}``. Read-only."""
+    is ``{level, kind, message, start?, end?}``. Read-only.
+
+    ``acceptor_enzymes`` is for a VECTOR rather than a part: an acceptor is
+    supposed to carry the assembly enzyme's sites — exactly two of them — so
+    the enzymes named there are checked for a count of 2 instead of for
+    absence. Pass a grammar's own enzymes as ``forbidden_enzymes`` and you get
+    the opposite of what you meant: a working α1 acceptor scores 20/100 and a
+    4-site one 0/100, which is literally correct and backwards in intent
+    (field report 2026-11-08). For the full answer on a vector — which
+    fragment is the stuffer, what overhangs it presents, and which surplus
+    fragment competes with a real part at a junction — use
+    ``check-acceptor-vector``."""
     if "enzymes" in payload and "forbidden_enzymes" not in payload:
         # The parameter is `forbidden_enzymes`; `enzymes` was silently
         # ignored and the lint answered score 100 with no warning — a clean
@@ -1577,6 +1590,23 @@ def _h_lint_synthesis(app, payload):
                       f"unknown enzyme(s) in 'forbidden_enzymes': {unknown[:8]}"},
                     400)
         kwargs["forbidden_enzymes"] = tuple(fenz)
+    aenz = payload.get("acceptor_enzymes")
+    if aenz is not None:
+        if not isinstance(aenz, list) or not all(isinstance(x, str) and x
+                                                  for x in aenz):
+            return ({"error":
+                      "'acceptor_enzymes' must be a list of enzyme names"}, 400)
+        if len(aenz) > 32:
+            return ({"error": "'acceptor_enzymes' too long (max 32)"}, 400)
+        # Same fail-loud rule as `forbidden_enzymes`: an expectation that was
+        # never evaluated must not come back as a clean score.
+        catalog = _state._all_enzymes_hook()
+        unknown = [x for x in aenz if x not in catalog]
+        if unknown:
+            return ({"error":
+                      f"unknown enzyme(s) in 'acceptor_enzymes': {unknown[:8]}"},
+                    400)
+        kwargs["acceptor_enzymes"] = tuple(aenz)
     try:
         result = _synthesis_lint(seq, circular=circular,
                                  expect_cds=_payload_bool(payload, "expect_cds", False),
@@ -1587,7 +1617,7 @@ def _h_lint_synthesis(app, payload):
     return {"ok": True, **result,
             "ignored": _agent_ignored_keys(payload, {
                 "sequence", "id", "name", "circular", "expect_cds",
-                "forbidden_enzymes"})}
+                "forbidden_enzymes", "acceptor_enzymes"})}
 
 
 @_agent_endpoint("find-orfs")
@@ -2147,16 +2177,25 @@ def _h_analyse_cds(app, payload):
 @_agent_endpoint("list-codon-tables")
 def _h_list_codon_tables(app, payload):
     """Available codon usage tables. Returns name, taxid, source
-    (builtin/kazusa/user) and date added for each entry, plus the
+    (builtin/kazusa/user), date added and `n_codons` for each entry, plus the
     `active_taxid` field showing which is currently the persisted
     default (read by SynthesisScreen's `_init_codon_table`). Use
-    the taxid as the `table` arg to ``optimize-protein``."""
+    the taxid as the `table` arg to ``optimize-protein``.
+
+    `n_codons` is the total number of codons the table was COUNTED from, and
+    it is reported because it is not uniform and it decides how much the table
+    can be trusted: the built-in Nicotiana benthamiana table comes from 100
+    CDS (43,763 codons) against tobacco's 1,534 CDS (609,684), which is plenty
+    for per-codon frequencies and a thin sample of GENES. Three tables ship
+    (E. coli K12 + the two Nicotiana); ``add-codon-table`` fetches any other
+    host."""
     return {
         "tables": [
             {"name":   e.get("name", "?"),
              "taxid":  e.get("taxid", ""),
              "source": e.get("source", "user"),
-             "added":  e.get("added", "")}
+             "added":  e.get("added", ""),
+             "n_codons": sum(int(n) for _aa, n in (e.get("raw") or {}).values())}
             for e in _codon_tables_load()
         ],
         "active_taxid": str(
@@ -2204,7 +2243,8 @@ def _h_optimize_protein(app, payload):
     """Codon-optimize a 1-letter AA sequence to DNA using a codon
     table from the registry. Body: ``{protein, table?, stops?,
     transl_table?, mode?, hazard_hosts?, forbidden_motifs?, min_gc?,
-    max_gc?, gc_window?, avoid_repeats_with?, max_repeat?}`` where
+    max_gc?, gc_window?, avoid_repeats_with?, max_repeat?,
+    check_splice?, scrub_splice_sites?}`` where
 
     `hazard_hosts` pulls built-in host-expression hazards to scrub out of the
     CDS — ``"plant"`` (polyA signal AATAAA, cryptic splice donor GTRAG),
@@ -2214,6 +2254,26 @@ def _h_optimize_protein(app, payload):
     complement is scrubbed too. `min_gc` / `max_gc` (PERCENT) then pull every
     `gc_window`-base window (default 50) into that band by further synonymous
     swaps, guarded so they cannot re-create a motif the scrub just removed.
+
+    **The hazard motifs are a FLOOR, not a screen.** They are consensus
+    STRINGS, and a string cannot rank a site: ``GTRAG`` does not match
+    ``GGTAAC``, which the trained plant PWM scores at 5.602 against its
+    calibrated 3.766 threshold — a donor 1.5x over the cutoff in a CDS that
+    had just passed the scrub (field report 2026-11-08). So naming the
+    ``"plant"`` host also runs that model and the response carries a `splice`
+    block: `n_sites` / `sites` (every donor/acceptor at or above threshold,
+    worst first, with its score) and `n_pairs` / `pairs` (a donor and an
+    acceptor at plausible plant intron spacing — a PAIR is what actually
+    excises sequence, and `in_frame_loss` marks the insidious ones that delete
+    whole codons without shifting the frame). Set `check_splice: false` to
+    skip the scan, or `check_splice: true` to run it for a non-plant host (the
+    model is plant-trained — it is the wrong ruler for an animal cell).
+    `scrub_splice_sites: true` REPAIRS what it finds by synonymous
+    substitution; that one is opt-in on purpose, so the same request keeps
+    returning the same DNA for a caller who has already ordered the gene. A
+    site no synonym can fix stays in `splice.sites` with its score rather than
+    vanishing — which is why asking to repair with ``check_splice: false`` is
+    a 400 rather than an edit nobody measured.
 
     `avoid_repeats_with` takes DNA sequences you have ALREADY built and breaks
     any perfect-identity run of `max_repeat`+ bases (default 25) that the new
@@ -2252,9 +2312,10 @@ def _h_optimize_protein(app, payload):
     individual residue can get a worse synonym than a native gene used;
     ``"max_cai"`` gives every position its most-frequent synonym, which
     maximises CAI and can never downgrade a residue, at the cost of a much
-    more repetitive sequence. Only one table (E. coli K12) ships — use
-    ``add-codon-table`` to fetch your host from Kazusa by taxid, build one
-    from an NCBI genome, or import a local CDS FASTA. `table`
+    more repetitive sequence. Three tables ship (E. coli K12,
+    Nicotiana tabacum, Nicotiana benthamiana) — use ``add-codon-table`` to
+    fetch any other host from Kazusa by taxid, build one from an NCBI genome,
+    or import a local CDS FASTA. `table`
     is a taxid (defaults to E. coli K12 = 83333) and `stops`
     (0–3, default 1) is how many stop codons to append when `protein`
     has no trailing '*'. A trailing '*' run in `protein` (1–3) is honored
@@ -2327,6 +2388,7 @@ def _h_optimize_protein(app, payload):
     # ── optional scrub passes (all no-ops unless asked for) ──────────────
     scrub: "dict[str, str]" = {}
     hosts = payload.get("hazard_hosts")
+    plant_host = False
     if hosts is not None:
         if not isinstance(hosts, (list, str)):
             return ({"error": "'hazard_hosts' must be a list of host names"},
@@ -2335,6 +2397,26 @@ def _h_optimize_protein(app, payload):
             scrub.update(_codon_hazard_motifs(hosts))
         except ValueError as exc:
             return ({"error": str(exc)}, 400)
+        _host_list = [hosts] if isinstance(hosts, str) else hosts
+        plant_host = any(str(h or "").strip().lower() == "plant"
+                         for h in _host_list)
+    # The trained plant splice PWM. The SCAN is not opt-in when a plant host is
+    # named — the hazard motifs are a documented floor and `GTRAG` misses
+    # donors the model scores at 1.5x threshold (field report 2026-11-08), so a
+    # silent pass would read as a clean construct. The REPAIR is opt-in,
+    # because the same request must keep returning the same DNA for a caller
+    # who has already ordered the gene.
+    scrub_splice = _payload_bool(payload, "scrub_splice_sites", False)
+    check_splice = _payload_bool(payload, "check_splice",
+                                 plant_host or scrub_splice)
+    if scrub_splice and not check_splice:
+        # A repair whose result is not measured is a claim, not a result: the
+        # whole point of `splice.sites` is that a site no synonym could fix
+        # comes back WITH its score. Refused rather than silently honouring
+        # one half of a contradictory request.
+        return ({"error": "'scrub_splice_sites' with 'check_splice': false "
+                          "would repair the CDS without reporting what is "
+                          "left — drop one of the two"}, 400)
     motifs = payload.get("forbidden_motifs")
     if motifs is not None:
         if isinstance(motifs, dict):
@@ -2455,6 +2537,23 @@ def _h_optimize_protein(app, payload):
                 avoid_kmers=_codon_kmer_set(refs, max_repeat) if refs else None,
                 kmer_len=max_repeat if refs else 0)
             fixes.extend(gc_fixes)
+        # LAST, after the GC band: its own guards cover the motif set (so it
+        # cannot re-create a site the scrub removed), while the GC window and
+        # the repeat runs are RE-MEASURED below and reported — a 1-base GC
+        # excursion that is shown beats a cryptic splice site that is not.
+        if scrub_splice:
+            try:
+                dna, splice_fixes, _rem = _codon_fix_splice_sites(
+                    dna, body, entry["raw"], sites=scrub or None,
+                    has_appended_stop=has_stop, transl_table=transl_table)
+            except RuntimeError as exc:
+                # `_splice_scan` refuses when no model is loaded. Scoped to
+                # THIS call so an unrelated RuntimeError is never labelled a
+                # splice-model failure — and a repair that could not run must
+                # not look like one that found nothing.
+                return ({"error":
+                          f"cryptic-splice scrub unavailable: {exc}"}, 503)
+            fixes.extend(splice_fixes)
     except ValueError as exc:
         return ({"error": str(exc)}, 400)
 
@@ -2503,6 +2602,48 @@ def _h_optimize_protein(app, payload):
     # so counting their wobble base skewed the metric AND let a 30-codon protein
     # plus three stops clear a floor meant to keep GC3 off short sequences
     # (audit 2026-09-22).
+    # ── Cryptic splice sites, MEASURED on the final sequence ─────────────
+    # Reported whether or not the repair ran: `hazard_hosts: ["plant"]` buys a
+    # 2-motif floor, and the floor is weaker than the model (field report
+    # 2026-11-08 — `AAGGTAACT` at 5.602 vs a 3.766 threshold, invisible to
+    # `GTRAG`). Single strand: an mRNA is read one way, so a reverse-strand
+    # "site" in a CDS is not a hazard — the rule `_splice_scan` defaults to.
+    splice_block: dict = {"skipped": True, "reason": "not requested"}
+    if check_splice:
+        try:
+            _sites = _splice_scan(dna, kind="both")
+            _pairs = _splice_pair_risk(dna, kind="both")
+            splice_block = {
+                "skipped":   False,
+                "model":     _splice_model_summary().get("source", "?"),
+                "scrubbed":  bool(scrub_splice),
+                "n_sites":   len(_sites),
+                "sites":     _sites[:_CODON_SPLICE_MAX_REPORT],
+                "n_pairs":   len(_pairs),
+                "pairs":     _pairs[:_CODON_SPLICE_MAX_REPORT],
+            }
+            if _sites:
+                warnings.append(
+                    f"{len(_sites)} cryptic splice site(s) in this CDS score "
+                    f"as strongly as real plant splice sites — the "
+                    f"`hazard_hosts` motifs are a FLOOR (GTRAG cannot see a "
+                    f"GGTAAC donor)"
+                    + ("" if scrub_splice else
+                       "; pass scrub_splice_sites: true to remove them by "
+                       "synonymous substitution"))
+            if _pairs:
+                _fl = [p for p in _pairs if p.get("in_frame_loss")]
+                warnings.append(
+                    f"{len(_pairs)} donor/acceptor PAIR(s) at plausible plant "
+                    f"intron spacing — a pair is what actually excises "
+                    f"sequence from the message"
+                    + (f"; {len(_fl)} would delete a whole number of codons, "
+                       "so the product can still be antibody-positive while "
+                       "being wrong" if _fl else ""))
+        except (RuntimeError, ValueError) as exc:
+            # Not checked must never read as clean.
+            splice_block = {"skipped": True, "reason": str(exc)}
+            warnings.append("cryptic-splice scan SKIPPED — " + str(exc))
     body_dna = dna[:len(dna) - 3 * n_stop_codons] if n_stop_codons else dna
     body_codons = len(body_dna) // 3
     gc3 = round(_codon_gc3(body_dna), 2)
@@ -2536,6 +2677,7 @@ def _h_optimize_protein(app, payload):
         "gc_window":         gc_window,
         "gc_window_min":    round(win_lo, 2),
         "gc_window_max":    round(win_hi, 2),
+        "splice":            splice_block,
         "warnings":          warnings,
         # Display/report-only metrics, matching the Synthesis + Mutato toasts.
         # Scored against the SAME genetic code the sequence was optimised under
@@ -13442,6 +13584,45 @@ def _agent_entry_vector_check(grammar, gid, role, part):
                      "vector")}
 
 
+def _agent_entry_vector_shape_warning(gid: str, grammar: dict,
+                                      enzyme: str) -> "str | None":
+    """Why the configured L0 entry vector for `gid` could not be read as an
+    acceptor — or None when there is no vector, or it is fine.
+
+    `_entry_vector_acceptor_overhangs` answers None for BOTH "nothing is
+    configured" and "the configured vector does not cut to a clean
+    2-fragment acceptor", and its callers treat both as "use the classic
+    one-tier layout". For a vector with four sites of the assembly enzyme
+    that is a design silently built against the wrong vector (field report
+    2026-11-08). This separates the two cases so the design can SAY it.
+    """
+    try:
+        ev = _get_entry_vector(gid, "")
+    except Exception:
+        _log.exception("entry-vector shape check: lookup failed")
+        return None
+    if not isinstance(ev, dict) or not (ev.get("gb_text") or ""):
+        return None                      # nothing configured — not a problem
+    try:
+        rec = _gb_text_to_record(ev.get("gb_text") or "")
+        res = _check_acceptor_vector(
+            str(getattr(rec, "seq", "") or ""),
+            circular=_record_is_circular(rec), grammar=grammar,
+            features=_acceptor_vector_features(rec), enzymes=[enzyme])
+    except Exception:
+        _log.exception("entry-vector shape check: digest failed")
+        return None
+    row = next((r for r in res.get("enzymes", []) if r.get("enzyme") == enzyme),
+               None)
+    if row is None or row.get("usable"):
+        return None
+    name = ev.get("name") or "(unnamed)"
+    return (f"the configured L0 entry vector {name!r} is not a clean {enzyme} "
+            f"acceptor ({row.get('note') or 'no single stuffer'}), so this "
+            f"design used the one-tier layout — run check-acceptor-vector on "
+            f"it before building")
+
+
 @_agent_endpoint("design-gb-part")
 def _h_design_gb_part(app, payload):
     """Design Golden Braid / MoClo domestication primers. Body:
@@ -13553,6 +13734,8 @@ def _h_design_gb_part(app, payload):
     enzyme = grammar.get("enzyme") if isinstance(grammar, dict) else None
     entry_overhangs = (_entry_vector_acceptor_overhangs(gid, "", enzyme)
                        if enzyme else None)
+    shape_warning = (_agent_entry_vector_shape_warning(gid, grammar, enzyme)
+                     if enzyme and entry_overhangs is None else None)
     try:
         result = _design_gb_primers(
             template_clean, start, end, part_type,
@@ -13582,6 +13765,8 @@ def _h_design_gb_part(app, payload):
             result["entry_vector_check"] = {
                 "checkable": False,
                 "note": f"entry-vector check failed: {_scrub_path(str(exc))}"}
+    if shape_warning and isinstance(result, dict):
+        result.setdefault("warnings", []).append(shape_warning)
     return {"ok": True, "result": result}
 
 
@@ -13661,6 +13846,8 @@ def _h_design_synthesis_fragment(app, payload):
                  "'oh5'+'oh3'"}, 400)
     enzyme = grammar.get("enzyme") or ""
     ext = _entry_vector_acceptor_overhangs(gid, "", enzyme) if enzyme else None
+    shape_warning = (_agent_entry_vector_shape_warning(gid, grammar, enzyme)
+                     if enzyme and ext is None else None)
     try:
         result = _build_synthesis_l0_fragment(
             seq, cat5, cat3, grammar=grammar,
@@ -13687,6 +13874,8 @@ def _h_design_synthesis_fragment(app, payload):
             f"carries two (M-M). Custom overhangs are taken verbatim, so "
             f"nothing was removed; drop the body's leading ATG to get the "
             f"single start codon a typed {('CDS')!r} part produces.")
+    if shape_warning:
+        result.setdefault("warnings", []).append(shape_warning)
     return {"ok": True, "result": result}
 
 

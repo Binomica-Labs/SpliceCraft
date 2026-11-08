@@ -709,3 +709,32 @@ def test_a_load_still_narrates_every_feature():
     assert [m for m in said if "Compound feature" in m], said[:5]
     assert [m for m in said if "Detected wrap feature" in m], said[:5]
     assert not [m for m in said if "off-canvas parse" in m]
+
+
+# ── check-acceptor-vector joins the `entry` family (2026-11-08) ────────────
+
+
+@pytest.mark.usefixtures("_protect_user_data")
+def test_check_acceptor_vector_answers_about_an_entry():
+    """Screening a whole shelf of entry vectors is the motivating use, and it
+    must not reseat the canvas to do it."""
+    _seed()
+    app = type("A", (), {"_current_record": None})()
+    res = sc._h_check_acceptor_vector(app, {"entry": ENTRY})
+    assert not isinstance(res, tuple), res
+    assert res["basis"]["entry"] == ENTRY
+    assert "enzymes" in res and "role" in res
+    assert app._current_record is None
+
+
+@pytest.mark.usefixtures("_protect_user_data")
+def test_check_acceptor_vector_404s_an_unknown_entry():
+    _seed()
+    app = type("A", (), {"_current_record": None})()
+    body, code = sc._h_check_acceptor_vector(app, {"entry": "no such plasmid"})
+    assert code == 404 and "no such plasmid" in body["error"]
+
+
+def test_check_acceptor_vector_is_in_the_entry_allow_set():
+    import splicecraft_agent as _ag
+    assert "check-acceptor-vector" in _ag._AGENT_ENTRY_PARAM_ENDPOINTS

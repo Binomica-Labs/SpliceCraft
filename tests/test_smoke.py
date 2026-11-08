@@ -14936,7 +14936,35 @@ class TestRobustnessHardening:
         monkeypatch.delenv("DISPLAY", raising=False)
         monkeypatch.delenv("TERMUX_VERSION", raising=False)
         monkeypatch.delenv("PREFIX", raising=False)
-        assert ["wl-copy"] in sc._clipboard_native_commands()
+        assert (["wl-copy", "--type", "text/plain"]
+                in sc._clipboard_native_commands())
+
+    def test_native_cmds_wayland_pins_text_mime_type(self, monkeypatch):
+        """REGRESSION (2026-11-02, user: Ptyxis → LibreOffice Calc).
+
+        Bare `wl-copy` CONTENT-SNIFFS its stdin to pick a MIME type.
+        MPEG-TS magic is sync byte 0x47 — ASCII `G` — every 188 bytes,
+        so a DNA sequence carrying a G at offsets 0/188/376/564 is
+        published as `video/mp2t` and nothing else: the copy reports
+        success (exit 0, toast fires, `wl-paste` round-trips it) while
+        Ctrl+V in every text application silently does nothing. Golden
+        Braid L0 parts open `GGTCTCA…` (BsaI) so they satisfy offset 0
+        for free. The type must be PINNED, never inferred."""
+        monkeypatch.setattr(sc.sys, "platform", "linux")
+        monkeypatch.setattr(sc, "_is_wsl", lambda: False)
+        monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("TERMUX_VERSION", raising=False)
+        monkeypatch.delenv("PREFIX", raising=False)
+        wl = [c for c in sc._clipboard_native_commands()
+              if c and c[0] == "wl-copy"]
+        assert wl, "a Wayland session must still offer wl-copy"
+        for cmd in wl:
+            assert "--type" in cmd, (
+                f"wl-copy must pin an explicit MIME type, got {cmd!r} — "
+                "without it a GGTCTCA… part is offered as video/mp2t "
+                "and no text application can paste it")
+            assert cmd[cmd.index("--type") + 1].startswith("text/plain")
 
     def test_native_cmds_linux_x11(self, monkeypatch):
         monkeypatch.setattr(sc.sys, "platform", "linux")

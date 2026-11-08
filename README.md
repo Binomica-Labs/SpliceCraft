@@ -166,7 +166,10 @@ His tag is two keystrokes away; an inserted preset carries its GenBank
 accession into the annotation. **Protein** fills
 codons in from your chosen table as you type, with a built-in motif library
 (His6, FLAG, HA, TEV, P2A, NLS, +30) and a tabbed codon-table manager that
-builds tables from an NCBI genome, a local CDS file, Kazusa, or TSV.
+builds tables from an NCBI genome, a local CDS file, Kazusa, or TSV. Three
+tables ship — E. coli K12 and both *Nicotiana* — and a plant design is also
+screened with the trained splice matrix, not just the `GTRAG` consensus the
+matrix outscores.
 **Operon Design** reverse-designs every RBS in its real assembled context, and
 domesticates a *natural* operon by curing forbidden Type IIS sites with
 primer-encoded synonymous edits.

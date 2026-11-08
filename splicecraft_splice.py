@@ -61,6 +61,12 @@ _SPLICE_ACCEPTOR_AG = 18
 
 _SPLICE_BASES = "ACGT"
 
+# Longest scoring window of either kind. A change of a few bases can only move
+# the score of a window that OVERLAPS those bases, so this is the half-width a
+# caller needs to rescan locally instead of rescanning the whole sequence
+# (`_codon_fix_splice_sites` leans on exactly that).
+_SPLICE_MAX_WINDOW = max(_SPLICE_DONOR_LEN, _SPLICE_ACCEPTOR_LEN)
+
 # Pseudocount as a FRACTION of the sample, not a flat count. This matters more
 # than it looks. The real and decoy sets differ in size by ~18x, so a flat
 # Laplace +1 smooths them by different amounts: at an invariant position (the
@@ -247,6 +253,24 @@ def _splice_scan(seq: str, *, kind: str = "both",
                                  "strand": strand})
     hits.sort(key=lambda h: -h["score"])
     return hits
+
+
+def _splice_window_span(kind: str, position: int) -> "tuple[int, int]":
+    """``(start, end)`` of the scoring window behind a `_splice_scan` hit.
+
+    `position` is the hit's GT / AG offset; the window reaches BACK over the
+    exon for a donor and FORWARD into the exon for an acceptor, so neither
+    span is centred on the dinucleotide. Exposed because a caller editing the
+    sequence (synonymous-codon scrubbing) has to know which bases carry a
+    site's score — deriving it from the window STRING works only until a
+    sequence repeats itself."""
+    if kind == "donor":
+        s = position - _SPLICE_DONOR_GT
+        return (s, s + _SPLICE_DONOR_LEN)
+    if kind == "acceptor":
+        s = position - _SPLICE_ACCEPTOR_AG
+        return (s, s + _SPLICE_ACCEPTOR_LEN)
+    raise ValueError("kind must be 'donor' or 'acceptor'")
 
 
 def _splice_pair_risk(seq: str, **kw) -> "list[dict]":

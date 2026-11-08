@@ -335,6 +335,8 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   `junction_sites` and a warning, since it would be cut in its own assembly),
   delete-part, move-part (reassign a part to another bin in one atomic
   call), classify-part (overhang-pair lookup against every grammar),
+  check-acceptor-vector (see Cloning below — run it on an entry vector before
+  trusting any Golden Gate step through it),
   make-l0-part-from-fragment (turn a saved synthetic FRAG into a
   Level-0 part *and the L0 plasmid it lives on*, by SIMULATING the
   clone into the grammar's entry vector — body `{fragment, part_type,
@@ -424,7 +426,24 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   `sequence` or a library `id`/`name`: internal Type IIS sites, extreme
   overall + windowed GC, long homopolymer runs, tandem repeats, degenerate
   bases, and — with `expect_cds` — a full-length ORF check, rolled into a
-  0-100 `score` + line-item `warnings`; read-only), design-mutagenesis,
+  0-100 `score` + line-item `warnings`; read-only. That Type IIS rule is for
+  a PART. For a VECTOR pass `acceptor_enzymes` instead: an acceptor is
+  SUPPOSED to carry the assembly enzyme's sites — exactly two of them — so
+  those enzymes are checked for a count of 2 rather than for absence, and
+  their isoschizomers are excused with them. Pass a grammar's own enzymes as
+  `forbidden_enzymes` and you get the opposite of what you meant: a working
+  α1 acceptor scores 20/100), check-acceptor-vector ("is this plasmid a
+  usable acceptor for this grammar?", read-only, `entry` supported — per
+  enzyme: the site count, every fragment with its overhangs, which one is the
+  `dropout` (identified by the ABSENCE of a backbone marker, never by size)
+  and the pair an insert must present; plus the detected α/Ω `role` **with
+  the reason when detection fails**, and for every SURPLUS fragment
+  `collides_with` and `matches_slot` — the grammar position whose exact
+  overhang pair it reproduces. That last field is the point: a four-site
+  acceptor releases a fragment with the grammar's own CDS overhangs, which
+  competes with a real part at both junctions of every assembly through that
+  vector. Read the per-enzyme rows, not just `ok` — a vector can be a perfect
+  Esp3I acceptor and a hazard under BsaI), design-mutagenesis,
   scrub-plasmid (clone-free restriction-site removal: silent / synonymous
   cures inside CDSes + minimal swaps elsewhere; scrubs the loaded record or
   an explicit `seq`+`features`, optional `codon_taxid` biases coding cures to
@@ -566,9 +585,35 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   AT- or GC-biased host stacks that host's single top codon everywhere,
   collapsing GC3 — a silencing / mRNA-instability risk — while overall
   `gc` still looks healthy, so it warns; on such a host prefer `frequency`
-  mode (matches the native GC3) or set `min_gc`). Only E. coli K12 ships
-  as a table — `add-codon-table` fetches your host from Kazusa by taxid,
-  builds one from an NCBI genome, or imports a local CDS FASTA.
+  mode (matches the native GC3) or set `min_gc`).
+
+  **The `hazard_hosts` motifs are a FLOOR, not a screen.** They are consensus
+  STRINGS, and a string cannot rank a site: `GTRAG` does not match `GGTAAC`,
+  which the trained plant PWM scores at 5.602 against its calibrated 3.766
+  threshold — a donor 1.5x over the cutoff in a CDS that had just passed the
+  scrub (field report 2026-11-08, `[INV-232]`). So naming the `"plant"` host
+  also runs that model, and the response carries a `splice` block: `n_sites` /
+  `sites` (every donor/acceptor at or above threshold, worst first, with its
+  score) and `n_pairs` / `pairs` (a donor and an acceptor at plausible plant
+  intron spacing — a PAIR is what actually excises sequence, and
+  `in_frame_loss` marks the ones that delete whole codons without shifting the
+  frame, so the product can still be antibody-positive while being wrong).
+  `check_splice: false` skips the scan; `check_splice: true` runs it for a
+  non-plant host (the model is plant-trained — the wrong ruler for an animal
+  cell). `scrub_splice_sites: true` REPAIRS what it finds by synonymous
+  substitution; that one is opt-in on purpose, so the same request keeps
+  returning the same DNA for a caller who has already ordered the gene. A site
+  no synonym can fix stays in `splice.sites` with its score rather than
+  vanishing — and asking to repair with `check_splice: false` is a 400, since
+  a repair whose result is not measured is a claim rather than a result.
+
+  Three tables ship — E. coli K12, *Nicotiana tabacum* (4097) and *N.
+  benthamiana* (4100) — and `add-codon-table` fetches any other host from
+  Kazusa by taxid, builds one from an NCBI genome, or imports a local CDS
+  FASTA. `list-codon-tables` reports each table's `n_codons`, the total it was
+  counted from, because that is what decides how far to trust it: the
+  benthamiana table comes from 100 CDS / 43,763 codons against tobacco's 1,534
+  CDS / 609,684 — plenty for per-codon frequencies, a thin sample of genes.
 - **Simulate** — simulate-pcr (exact-match in-silico amplification,
   wrap-aware on circular templates) and simulate-gel (per-lane band
   positions + optional rendered ASCII gel image; ladder / plasmid /
@@ -684,6 +729,25 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   `check_three_prime: false`. `include_sequences: false`
   drops `pre_mrna` / `mature_mrna` / the UTR sequences and keeps the
   coordinates and verdicts, for a screening loop over a whole collection.
+
+  **Three things it refuses to be quiet about** (field report 2026-11-08,
+  `[INV-232]`). (1) An `intron` or `exon` feature annotated INSIDE the chosen
+  promoter is warned about by name: a genomic promoter feature routinely spans
+  the transcribed 5'UTR *and its intron*, and since the unit starts at the
+  promoter's END (a promoter is bound, not transcribed) that intron sits
+  upstream of the TSS — `introns: []`, `removed_by_splicing: []`, a 1-nt
+  5'UTR, and the one answer this endpoint exists for silently invisible.
+  Nothing here can know where the real TSS is, so the warning names
+  `tx_start` as the way out. An intron that misses the unit for any other
+  reason gets its own line. (2) `cds.stop_codons` counts the in-frame stops
+  the annotation encloses, so a deliberate tandem terminator (`TGA TGA`,
+  standard readthrough insurance) is visible instead of being reported as a
+  shifted frame — the "the annotation is stale" warning now fires only for
+  trailing bases that are NOT stops. (3) `unit.bounds_from` says whether the
+  unit came from `annotation` or from `tx_start/tx_end`, and explicit bounds
+  that override an annotated promoter or terminator say so in `warnings`:
+  the response used to name the auto-picked features either way, reading as
+  though they had defined the unit.
 - **Regulatory elements** — `scan-promoters` finds sigma-70 (-35 / spacer /
   -10) promoters and `scan-terminators` finds intrinsic (Rho-independent)
   terminators, on `{sequence | id | name}`, wrap-aware, with FORWARD-strand

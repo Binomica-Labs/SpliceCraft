@@ -69,7 +69,8 @@ What you can do without leaving the terminal.
   topology, and a `synthesised in SpliceCraft` provenance note.
 - **Protein synthesis composer** (`Synthesis → Protein`) — design at
   the AA level. Paste a protein sequence, pick a codon-usage table
-  (E. coli K12 / S. cerevisiae / H. sapiens / +100 Kazusa tables), and
+  (three ship — E. coli K12, *Nicotiana tabacum*, *N. benthamiana* — and
+  the Kazusa catalog is one fetch away), and
   the composer back-translates to optimised DNA while scrubbing
   forbidden Type IIS sites against the active cloning grammar.
   In-editor protein-motif highlighting (signal peptide, NLS, mito
@@ -86,7 +87,23 @@ What you can do without leaving the terminal.
   any table as the classic genetic-code grid —
   each codon annotated with its within-family usage (relative synonymous
   usage), each amino-acid family's single most-used codon highlighted in
-  bold green (family-wide; stops counted as one family).
+  bold green (family-wide; stops counted as one family). Every table
+  listing reports the number of codons it was COUNTED from, because that
+  is what decides how far to trust it — the built-in *N. benthamiana*
+  table comes from 100 CDS where tobacco's comes from 1,534.
+- **Plant cryptic-splice screening on an optimised CDS** — asking for the
+  `plant` expression-hazard scrub buys two consensus motifs (`AATAAA`,
+  `GTRAG`), and consensus strings cannot rank a site: `GTRAG` does not
+  match `GGTAAC`, a donor the trained plant matrix scores at 1.5x its
+  calibrated threshold. So a plant host now also gets the matrix: the
+  result reports every cryptic donor and acceptor with its score, and
+  every donor/acceptor PAIR at plausible plant intron spacing — a pair is
+  what actually excises sequence from the message, and the ones that
+  delete a whole number of codons are flagged, because that product can
+  still be antibody-positive while being biologically wrong. Asking for
+  the repair (`scrub_splice_sites`) removes them by synonymous
+  substitution; a site no synonym can fix is reported with its score
+  rather than quietly left. Via `optimize-protein`.
 
 ## Cloning
 
@@ -292,6 +309,23 @@ What you can do without leaving the terminal.
   a missing entry vector and duplicate names each fail with the specific
   reason. Scriptable — and available to Babs — via the
   `make-l0-part-from-fragment` agent endpoint.
+- **Acceptor-vector check** — an acceptor exists to release ONE stuffer
+  between two Type IIS cuts, and until now a vector that couldn't do that
+  was discovered by everything downstream going quiet: the digest refused,
+  the domestication design fell back to a one-tier layout, Auto-detect
+  skipped the vector without a word. `check-acceptor-vector` asks directly,
+  per enzyme: how many sites, which fragment is the stuffer (found by the
+  ABSENCE of a backbone marker, never by size), what overhangs an insert
+  must present, which α/Ω role it detects — **and the reason when detection
+  fails**. The finding it exists for is the surplus fragment: a vector with
+  four sites of the assembly enzyme releases extra pieces, and when one
+  comes out with the grammar's own CDS overhangs it competes with a real
+  part at BOTH junctions of every assembly through that vector. The Entry
+  Vectors screen now shows a ⚠ with the count and the competing fragment for
+  any bound vector that fails the check. `lint-synthesis` also gained
+  `acceptor_enzymes`, which expects exactly two sites instead of none — pass
+  a grammar's enzymes as `forbidden_enzymes` and you score a working
+  acceptor near zero, which is literally correct and backwards in intent.
 - **Sanger trace viewer (`.ab1`)** — Sequencing → Sanger tab.
   Browse a directory for AB1 traces (highlighted sky-blue), pick
   one to see the base-called length, mean Phred quality, and a
@@ -922,7 +956,7 @@ details. In short:
 
 - **Agent API** (`splicecraft --agent`) exposes a localhost JSON API
   with bearer-token auth, covering every GUI action external AI
-  agents need. ~298 endpoints; symlink-guarded write paths;
+  agents need. ~299 endpoints; symlink-guarded write paths;
   length/range/shape validation at the boundary.
 - **A browser front-end** (`splicecraft --workbench-dir ./ui`) is
   served from the API's own origin, so the page needs no CORS and no

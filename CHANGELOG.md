@@ -14,6 +14,122 @@
 
 ---
 
+## [1.3.15] — 2026-11-08
+
+A plant-construct review found six places where SpliceCraft had the right
+answer and said nothing, and one where it said something untrue.
+
+### Bug fixes
+
+- **A CDS ending in a double stop codon no longer reads as a broken
+  annotation.** `TGA TGA` is standard readthrough insurance, and a transcript
+  prediction over one came back warning "the first in-frame stop is at 1081,
+  but the CDS annotation ends at 1087 — splicing may have shifted the frame,
+  or the annotation is stale". Nothing was wrong. The in-frame stop run is now
+  counted, reported as part of the CDS block, and only trailing bases that are
+  *not* stops still raise that warning.
+- **A promoter feature drawn over the transcribed leader no longer silently
+  hides the intron inside it.** Plant promoters are routinely annotated across
+  the 5'UTR and its intron. The transcript starts at the promoter's end — a
+  promoter is bound, not transcribed — so that intron sat upstream of the
+  transcript and the prediction answered "no introns, nothing removed by
+  splicing, a 1-nucleotide 5'UTR", which is the one question it exists to
+  answer. It now says so by name and tells you to bound the unit with
+  `tx_start` if the promoter annotation covers transcribed sequence. Any other
+  annotated intron that falls outside the unit gets a line too.
+- **Bounding a transcript by hand no longer credits the features it
+  overrode.** Passing explicit start/end coordinates kept naming the
+  annotated promoter and terminator in the answer, reading as though they had
+  defined the unit. The answer now says which of the two bounded it, and warns
+  when annotation was overridden.
+- **A vector's own assembly sites are no longer scored as contamination.**
+  Running the synthesis pre-flight on an acceptor vector with its grammar's
+  enzymes marked forbidden scored a perfectly good α1 vector 20/100 and a
+  four-site one 0/100 — literally correct and backwards in intent, since an
+  acceptor is *supposed* to carry those sites. Pass `acceptor_enzymes` and
+  they are checked for a count of two instead, isoschizomers included (Esp3I
+  and BsmBI are one site; excusing one and flagging the other described the
+  same base two contradictory ways).
+
+### New features
+
+- **Cryptic-splice screening on a codon-optimised plant CDS.** Asking for the
+  plant expression-hazard scrub bought two consensus motifs, and a consensus
+  string cannot rank a site: `GTRAG` does not match `GGTAAC`, a splice donor
+  the trained plant matrix scores at one and a half times its calibrated
+  threshold. A real construct cleared the scrub carrying exactly that, 21 bases
+  upstream of its stop codon and paired with a real acceptor downstream — a
+  cryptic intron that would have deleted the stop. Naming a plant host now
+  also runs the matrix: every cryptic donor and acceptor comes back with its
+  score, and so does every donor/acceptor *pair* at plausible plant intron
+  spacing, which is what actually removes sequence from the message. Pairs
+  that delete a whole number of codons are flagged separately, because that
+  product can still be antibody-positive while being wrong. The scan runs
+  whether or not you ask; the repair is opt-in (`scrub_splice_sites`), so an
+  already-ordered design keeps coming back the same. A site no synonymous
+  codon can fix is reported with its score rather than quietly left behind.
+- **"Is this actually an acceptor vector?", asked directly.** Two entry
+  vectors in daily use turned out to carry four sites of the assembly enzyme
+  instead of two, and one of the extra fragments comes out with the grammar's
+  own CDS overhangs — so it competes with a real part at *both* junctions of
+  every assembly through that vector. Nothing had ever said so, because
+  nothing was asking: the digest refused, the domestication designer fell back
+  to a one-tier layout, and auto-detect skipped the vector without a word. The
+  new `check-acceptor-vector` reports, per enzyme, how many sites there are,
+  which fragment is the stuffer (found by the absence of a backbone marker,
+  never by size), the overhangs an insert must present, the α/Ω role it
+  detects **and the reason when detection fails** — plus, for every surplus
+  fragment, which of the grammar's part slots its overhang pair reproduces. It
+  works on a library entry without loading it, so a whole collection can be
+  screened. The Entry Vectors screen now marks any bound vector that fails the
+  check with a ⚠, the count and the competing fragment.
+- **Two Nicotiana codon tables ship.** Until now a plant-focused tool shipped
+  one table, for E. coli. *N. tabacum* (taxid 4097) and *N. benthamiana*
+  (4100) are now built in, fetched through SpliceCraft's own Kazusa importer
+  with each species name checked against its taxid. Table listings also report
+  how many codons each table was counted from, because that is what decides
+  how far to trust it: the benthamiana table comes from 100 genes where the
+  tobacco one comes from 1,534.
+
+### Hardening
+
+- Documented, in the three places that mislead, that a cloning grammar's
+  `enzyme` field means different things in the two shipped grammars — the
+  enzyme that *releases* a Level-0 part for MoClo, the enzyme that clones one
+  *into* the entry vector for Golden Braid. The level-alternation helper is
+  therefore a first guess, not an answer, and the fallback that tries the
+  other enzyme is load-bearing rather than an optimisation: on canonical
+  Golden Braid vectors it fires on every L0→α step. Measured on real α/Ω
+  vectors and pinned by tests against the committed fixtures, so a future
+  cleanup that trusts the alternation breaks a test instead of a library.
+- A saved grammar reported as having its enzymes inverted turned out to be a
+  byte-identical copy of the built-in it was duplicated from. No data was
+  wrong; the inversion was in a code comment, corrected the wrong way by an
+  earlier audit.
+- The acceptor check answers in bounded space: a 60-site plasmid used to come
+  back with every fragment listed twice over (16 KB of mostly unreadable
+  detail), and a chromosome-scale record is now refused with its size rather
+  than digested into thousands of pieces nobody can act on. The counts beside
+  each truncated list stay exact, so a shortened answer never reads as a
+  complete one. A repeated enzyme name answers once.
+- Transcript warnings are bounded the same way. One line per out-of-unit
+  intron is right for a plasmid and wrong for a chromosome record, where every
+  gene's introns are "outside this unit"; past ten they are counted in one
+  line instead of burying the rest of the answer.
+- Asking to repair cryptic splice sites while turning the scan off is now a
+  refusal rather than an edit nobody measured.
+- The acceptor check uses the same backbone-marker test as the engines whose
+  verdicts it explains, so the explanation cannot disagree with the thing it
+  is explaining.
+- A notebook-export timing guard no longer fails on a clean tree when the
+  machine is busy. Its CPU-time budget was calibrated on an idle box (1 s
+  measured, 2 s allowed) and the test suite always runs every core saturated,
+  where the same work costs 2.1 s. The budget is now 5 s, which still catches
+  the quadratic blow-up it exists for — that one took 45 s — by three orders
+  of magnitude.
+
+---
+
 ## [1.3.14] — 2026-11-01
 
 The second round of browser-front-end work: you can now read your library

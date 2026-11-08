@@ -24,14 +24,17 @@ from __future__ import annotations
 import re
 
 import splicecraft_state as _state
-from splicecraft_biology import (_rc, _enzyme_cuts, _feat_len,
+from splicecraft_biology import (_rc, _digest_with_enzymes, _enzyme_cuts,
+                                 _enzyme_signature, _feat_len,
                                  _iter_match_starts, _slice_circular)
 from splicecraft_splice import (_splice_scan, _splice_model_summary)
 from splicecraft_kozak import _KOZAK_UP, _kozak_context
 from splicecraft_codon import _CODON_TABLE, _STOP_CODONS
 from splicecraft_record import _gb_text_to_record
 from splicecraft_dataaccess import _all_grammars, _load_entry_vectors
-from splicecraft_cloning import _excise_fragment_pair, _grammar_tu_overhangs
+from splicecraft_cloning import (_excise_fragment_pair,
+                                 _frag_carries_backbone_marker,
+                                 _grammar_tu_overhangs)
 from splicecraft_logging import _log, _log_event
 from splicecraft_util import _feat_bounds, _primer_tm_safe, _record_is_circular
 
@@ -754,8 +757,295 @@ def _lint_worst_gc_window(seq: str, window: int) -> "tuple[int, float] | None":
     return worst_i, worst_gc
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  Is this plasmid a well-formed ACCEPTOR? (`_check_acceptor_vector`)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# An acceptor vector has exactly ONE job: present two Type IIS cuts around a
+# stuffer, so the stuffer drops out and the incoming part drops in. Two sites,
+# one dropout, two defined overhangs. Everything in the codebase that uses an
+# acceptor already DEPENDS on that and every one of those paths discovers a
+# violation by failing quietly:
+#
+#   * `_excise_fragment_pair` refuses with "got 4 cut sites … need exactly 2",
+#     and `_entry_vector_acceptor_overhangs` turns that refusal into `None` —
+#     indistinguishable from "no vector configured", so `design-gb-part`
+#     silently falls back to the one-tier layout.
+#   * `_detect_entry_vector_role` returns `None`, so Auto-detect just skips
+#     the vector and the user is left to bind it by hand, never told why.
+#   * `_synthesis_lint` with the grammar's enzymes as `forbidden_enzymes`
+#     scores it 0/100 — literally correct and backwards in intent, since an
+#     acceptor is SUPPOSED to carry those sites. A correct acceptor scored
+#     20/100 in the same test.
+#
+# The field report that prompted this (2026-11-08) is the cost: two α/Ω entry
+# vectors in daily use carry FOUR BsaI sites each — a second cassette inside
+# the backbone brought its own pair — and one of the extra fragments comes out
+# with AATG/GCTT ends, the exact overhang pair an incoming L0 CDS part
+# presents. It competes for both junctions of every BsaI assembly that vector
+# is used in. Nothing in the app said so for years, because nothing was ASKING
+# this question; each consumer only noticed its own digest was unusable.
+#
+# So this asks it directly, per enzyme, and names every number: how many
+# sites, which fragment is the dropout (by backbone-marker exclusion, NEVER by
+# size — `feedback_never_assume_smaller_frag_is_payload`), what overhangs it
+# presents, and for every EXTRA fragment whether its ends collide with the
+# grammar's own overhang alphabet. Read-only; no grammar guessing — the caller
+# names the grammar.
+
+
+# How many fragments / cut positions one enzyme row carries. A 60-site
+# plasmid already answers with a 16 KB response and a chromosome would answer
+# with hundreds of KB, almost all of it fragments nobody will read — while the
+# finding (how many sites, and which surplus pieces impersonate a part) needs
+# only the worst few. The exact COUNTS ride beside the lists, so a truncated
+# answer never reads as a complete one.
+_ACCEPTOR_MAX_FRAGMENTS = 24
+
+
+def _acceptor_frag_overhangs(frag: dict) -> "tuple[str, str]":
+    """``(oh5, oh3)`` of a digest fragment, upper-cased, '' when undefined."""
+    return (((frag.get("left") or {}).get("overhang_seq") or "").upper(),
+            ((frag.get("right") or {}).get("overhang_seq") or "").upper())
+
+
+def _check_acceptor_vector(seq: str, *, circular: bool, grammar: dict,
+                           features: "list[dict] | None" = None,
+                           enzymes: "list[str] | None" = None) -> dict:
+    """Does `seq` behave as an acceptor vector under `grammar`?
+
+    Returns ``{ok, grammar_id, grammar_name, enzymes: [...], usable_enzymes,
+    errors, warnings}``. Each entry of ``enzymes`` is
+    ``{enzyme, n_sites, cut_positions, usable, fragments, dropout, extra,
+    note}``:
+
+      * ``n_sites`` / ``cut_positions`` — what the enzyme actually finds.
+      * ``usable`` — exactly 2 sites AND a single identifiable dropout.
+      * ``dropout`` — the fragment an insert replaces, identified by the
+        ABSENCE of a backbone marker (`rep_origin` / selection marker), with
+        the ``oh5`` / ``oh3`` an incoming part must present.
+      * ``extra`` — every further fragment, each flagged with
+        ``collides_with`` when one of its ends is an overhang this grammar
+        uses, and ``matches_slot`` when its exact PAIR reproduces one of the
+        grammar's part slots: that second one is a fragment which will compete
+        with a real part at BOTH junctions of the assembly. Sorted worst
+        first. ``fragments`` / ``extra`` / ``cut_positions`` are truncated at
+        ``_ACCEPTOR_MAX_FRAGMENTS``; ``n_fragments`` / ``n_extra`` /
+        ``n_sites`` are always exact, so a truncated answer cannot read as a
+        complete one.
+      * ``note`` — why it is not usable, in words, never a bare False.
+
+    ``ok`` is True when at least one enzyme is usable. A linear record is
+    refused outright: an acceptor has to be a circle to have a backbone.
+    """
+    gid = str(grammar.get("id") or "") if isinstance(grammar, dict) else ""
+    gname = (str(grammar.get("name") or gid) if isinstance(grammar, dict)
+             else "")
+    out: dict = {"ok": False, "grammar_id": gid, "grammar_name": gname,
+                 "enzymes": [], "usable_enzymes": [],
+                 "errors": [], "warnings": []}
+    seq_u = (seq or "").upper()
+    if not seq_u:
+        out["errors"].append("empty sequence")
+        return out
+    if not circular:
+        out["errors"].append(
+            "this record is LINEAR — an acceptor vector has to be circular to "
+            "carry a backbone, so there is nothing to check")
+        return out
+    if not isinstance(grammar, dict):
+        out["errors"].append("no grammar given")
+        return out
+    names: "list[str]" = []
+    for e in (enzymes or []):
+        nm = str(e or "").strip()
+        if nm and nm not in names:      # deduped, order preserved: two
+            names.append(nm)            # identical rows answer nothing twice
+    if not names:
+        # The grammar's own two enzymes, in declaration order, deduped. Which
+        # one SHOULD cut an acceptor of a given role depends on the lab's
+        # convention (see `_classify_part_from_plasmid`'s note on the two
+        # Golden-Braid conventions), so both are reported and neither is
+        # assumed.
+        for key in ("enzyme", "level_up_enzyme"):
+            nm = str(grammar.get(key) or "")
+            if nm and nm not in names:
+                names.append(nm)
+    if not names:
+        out["errors"].append(
+            f"grammar {gid or '?'} declares no Type IIS enzyme to check")
+        return out
+
+    alphabet = _grammar_canonical_overhangs(grammar)
+    tu_start, tu_end = _grammar_tu_overhangs(grammar)
+    for oh in (tu_start, tu_end):
+        if oh:
+            alphabet.add(oh.upper())
+            alphabet.add(_rc(oh.upper()))
+    # The grammar's PART SLOTS, by their exact overhang pair. A surplus
+    # fragment that reproduces one of these is not merely "carrying a familiar
+    # overhang" — as far as the ligase is concerned it IS a part of that type,
+    # and it will substitute for the real one. That is the distinction the
+    # report drew by hand ("the same overhang pair as an incoming L0 CDS
+    # part"), so it is named rather than left for a reader to spot.
+    slot_by_pair: "dict[tuple, str]" = {}
+    for pos in (grammar.get("positions") or []):
+        if not isinstance(pos, dict):
+            continue
+        p5 = str(pos.get("oh5") or "").upper()
+        p3 = str(pos.get("oh3") or "").upper()
+        if len(p5) == 4 and len(p3) == 4:
+            slot_by_pair.setdefault(
+                (p5, p3), str(pos.get("type") or pos.get("name") or "part"))
+    if tu_start and tu_end:
+        slot_by_pair.setdefault(
+            (tu_start.upper(), tu_end.upper()), "TU boundary")
+
+    for enz in names:
+        row: dict = {"enzyme": enz, "n_sites": 0, "cut_positions": [],
+                     "usable": False, "fragments": [], "dropout": None,
+                     "extra": [], "note": ""}
+        try:
+            cuts = _enzyme_cuts(seq_u, [enz], circular=True)
+        except Exception:
+            _log.exception("_check_acceptor_vector: %s cut scan failed", enz)
+            row["note"] = f"{enz} is not in the enzyme catalog"
+            out["enzymes"].append(row)
+            continue
+        row["n_sites"] = len(cuts)
+        row["cut_positions"] = [c.get("top")
+                                for c in cuts[:_ACCEPTOR_MAX_FRAGMENTS]]
+        if len(cuts) > _ACCEPTOR_MAX_FRAGMENTS:
+            row["cut_positions_truncated"] = True
+        if not cuts:
+            row["note"] = (f"{enz} does not cut this plasmid — it cannot "
+                           f"accept a part through {enz}")
+            out["enzymes"].append(row)
+            continue
+        if len(cuts) == 1:
+            row["note"] = (f"only ONE {enz} site: the plasmid linearises "
+                           f"instead of releasing a stuffer, so there is no "
+                           f"second junction for an insert to ligate into")
+            out["enzymes"].append(row)
+            continue
+        frags = _digest_with_enzymes(seq_u, [enz], circular=True,
+                                      features=features)
+        marked = []
+        for frag in frags:
+            oh5, oh3 = _acceptor_frag_overhangs(frag)
+            marked.append({
+                "length": len(frag.get("top_seq", "")),
+                "oh5": oh5, "oh3": oh3,
+                "start": frag.get("start"),
+                # cloning's marker test, NOT this module's mirror of it: the
+                # engines this QC exists to explain (`_detect_entry_vector_role`,
+                # `_entry_vector_acceptor_overhangs`) call that one, and an
+                # explanation that can disagree with the verdict it explains
+                # is worse than no explanation.
+                "has_backbone_marker": _frag_carries_backbone_marker(frag),
+            })
+        row["n_fragments"] = len(marked)
+        row["fragments"] = marked[:_ACCEPTOR_MAX_FRAGMENTS]
+        no_marker = [f for f in marked if not f["has_backbone_marker"]]
+        if len(no_marker) == 1:
+            row["dropout"] = no_marker[0]
+        elif len(cuts) == 2 and len(marked) == 2:
+            # Two fragments, and the marker signal can't separate them (both
+            # annotated, or neither). Say so instead of picking by size.
+            row["note"] = (
+                f"{enz} gives a clean 2-fragment digest, but "
+                f"{'both halves carry' if no_marker == [] else 'neither half carries'}"
+                f" a backbone marker (rep_origin / selection marker), so which "
+                f"one is the stuffer cannot be decided from the annotation — "
+                f"annotate the backbone and re-check")
+        if len(cuts) != 2:
+            # The headline case. Name every surplus fragment and whether its
+            # ends can impersonate a real part.
+            for f in marked:
+                if f is row["dropout"]:
+                    continue
+                if f["has_backbone_marker"]:
+                    continue
+                collides = sorted({oh for oh in (f["oh5"], f["oh3"])
+                                   if oh and oh in alphabet})
+                entry = dict(f)
+                entry["collides_with"] = collides
+                entry["matches_slot"] = slot_by_pair.get(
+                    (f["oh5"], f["oh3"]))
+                row["extra"].append(entry)
+            # Worst first, and "worst" is MEASURED, not positional: a fragment
+            # that reproduces a whole part slot outranks one that merely shares
+            # both overhangs, which outranks one sharing a single end. The UI
+            # line and the warnings both read [0], so the order is the finding.
+            row["extra"].sort(key=lambda f: (-(1 if f.get("matches_slot") else 0),
+                                             -len(f["collides_with"]),
+                                             -f["length"]))
+            row["n_extra"] = len(row["extra"])
+            row["extra"] = row["extra"][:_ACCEPTOR_MAX_FRAGMENTS]
+            row["note"] = (
+                f"{len(cuts)} {enz} sites — an acceptor needs exactly 2. The "
+                f"digest releases {len(marked)} fragments, so the stuffer is "
+                f"not uniquely defined and every junction has more than one "
+                f"candidate partner")
+            # EVERY colliding fragment is named, both-ends-collide first: a
+            # fragment that impersonates a part at ONE junction is a
+            # by-product, one that does it at BOTH is a competing insert.
+            for f in [f for f in row["extra"] if f["collides_with"]][:8]:
+                both = len(f["collides_with"]) > 1
+                out["warnings"].append(
+                    f"{enz}: a {f['length']} bp fragment comes out with "
+                    f"{f['oh5']}/{f['oh3']} ends"
+                    + (f", this grammar's {f['matches_slot']} pair"
+                       if f.get("matches_slot") else
+                       f", which this grammar uses "
+                       f"({', '.join(f['collides_with'])})")
+                    + " — it COMPETES with a real part at "
+                    + ("BOTH junctions" if both else "that junction")
+                    + f" of any {enz} assembly using this vector")
+            out["enzymes"].append(row)
+            continue
+        if row["dropout"] is not None:
+            row["usable"] = True
+            d = row["dropout"]
+            row["note"] = (
+                f"2 {enz} sites, one dropout of {d['length']} bp presenting "
+                f"{d['oh5'] or '?'}/{d['oh3'] or '?'} — an insert must present "
+                f"that pair")
+            if not (len(d["oh5"]) == 4 and len(d["oh3"]) == 4):
+                row["usable"] = False
+                row["note"] = (
+                    f"2 {enz} sites, but the released stuffer's overhangs are "
+                    f"{d['oh5'] or '(none)'}/{d['oh3'] or '(none)'} rather than "
+                    f"a 4-nt pair — nothing can be designed against them")
+            elif not ({d["oh5"], d["oh3"]} & alphabet):
+                # Three readings, and nothing here can choose between them, so
+                # all three are offered. The first is a DESIGN this codebase
+                # supports on purpose: a two-tier Golden-Braid UPD vector's
+                # external entry overhangs (CTCG/TGAG) are deliberately
+                # outside the category alphabet, and `design-gb-part` nests
+                # the category pair inside them.
+                out["warnings"].append(
+                    f"{enz}: the dropout presents {d['oh5']}/{d['oh3']}, "
+                    f"neither of which is an overhang {gname or gid} uses — "
+                    f"either a two-tier UPD/domestication vector whose "
+                    f"EXTERNAL entry overhangs differ from the category pair "
+                    f"(which is nested inside them), an acceptor for another "
+                    f"grammar, or a vector whose stuffer has been replaced")
+        out["enzymes"].append(row)
+
+    out["usable_enzymes"] = [r["enzyme"] for r in out["enzymes"]
+                             if r.get("usable")]
+    out["ok"] = bool(out["usable_enzymes"])
+    if not out["ok"] and not out["errors"]:
+        out["errors"].append(
+            "no declared enzyme releases a single identifiable stuffer from "
+            "this plasmid, so it cannot be used as an acceptor as it stands")
+    return out
+
+
 def _synthesis_lint(seq, *, circular: bool = True, expect_cds: bool = False,
                     forbidden_enzymes=_SYNTHESIS_FORBIDDEN_ENZYMES,
+                    acceptor_enzymes=(),
                     min_gc: float = 0.30, max_gc: float = 0.70,
                     gc_window: int = 50, gc_window_lo: float = 0.20,
                     gc_window_hi: float = 0.80, homopolymer_max: int = 9,
@@ -770,6 +1060,19 @@ def _synthesis_lint(seq, *, circular: bool = True, expect_cds: bool = False,
     runs, tandem repeats, degenerate/non-ACGT bases, and — when ``expect_cds``
     — a clean full-length ORF. ``score`` starts at 100; each finding deducts by
     severity (error −20, warn −8, info −2, floored at 0).
+
+    ``acceptor_enzymes`` inverts the Type IIS rule for the enzymes named: an
+    ACCEPTOR vector is SUPPOSED to carry the assembly enzyme's sites, and
+    exactly two of them, so those enzymes are checked for a count of 2 instead
+    of for absence (and are skipped by the forbidden scan even if
+    ``forbidden_enzymes`` also lists them). Without it, passing a grammar's own
+    enzymes as ``forbidden_enzymes`` is a category error that scores a WORKING
+    α1 acceptor 20/100 and a 4-site one 0/100 — literally correct, backwards in
+    intent (field report 2026-11-08). The counts land in
+    ``stats["acceptor_sites"]`` whether they pass or fail; the full
+    grammar-aware answer (which fragment is the stuffer, what overhangs it
+    presents, which surplus fragment competes with a real part) is
+    `_check_acceptor_vector`.
 
     Every bound here is the value still ACCEPTED: ``homopolymer_max`` runs are
     fine and longer ones are flagged, ``gc_window_lo``/``gc_window_hi`` are
@@ -813,7 +1116,19 @@ def _synthesis_lint(seq, *, circular: bool = True, expect_cds: bool = False,
             "vendors reject degenerate positions")
 
     catalog = _state._all_enzymes_hook()
+    acceptor_set = {str(e) for e in (acceptor_enzymes or ()) if str(e or "")}
+    # Isoschizomers come too. Esp3I and BsmBI are the same CGTCTC site cut the
+    # same way — no scan can tell them apart — so excusing one by NAME and
+    # flagging the other reports one physical site two contradictory ways
+    # (which is what the default forbidden list did the first time this mode
+    # ran: "2 Esp3I sites, as an acceptor should have" beside "internal BsmBI
+    # site — domesticate it out", pointing at the same base).
+    _acceptor_sigs = {sig for sig in (_enzyme_signature(e)
+                                      for e in acceptor_set) if sig}
     for enz in forbidden_enzymes:
+        if enz in acceptor_set or (_acceptor_sigs
+                                   and _enzyme_signature(enz) in _acceptor_sigs):
+            continue          # expected in an acceptor, checked for COUNT below
         if enz not in catalog:
             continue
         try:
@@ -879,6 +1194,32 @@ def _synthesis_lint(seq, *, circular: bool = True, expect_cds: bool = False,
             f"{copies}×({unit}) tandem repeat — synthesis + assembly hazard",
             start=start, end=start + copies * len(unit))
 
+    # Acceptor expectation: exactly two sites, so one stuffer drops out.
+    acceptor_counts: "dict[str, int]" = {}
+    for enz in sorted(acceptor_set):
+        if enz not in catalog:
+            add("info", "acceptor_site",
+                f"{enz} is not in the enzyme catalog — its acceptor sites were "
+                f"NOT checked")
+            continue
+        try:
+            a_cuts = _enzyme_cuts(s, [enz], circular=circular)
+        except Exception:
+            _log.exception("synthesis lint: acceptor scan failed for %s", enz)
+            add("info", "acceptor_site",
+                f"{enz} acceptor-site scan failed — not checked")
+            continue
+        acceptor_counts[enz] = len(a_cuts)
+        if len(a_cuts) == 2:
+            continue          # the expectation met — nothing to deduct for
+        add("error", "acceptor_site",
+            f"{len(a_cuts)} {enz} site(s) — an acceptor vector needs exactly "
+            f"2, so no single stuffer drops out and every junction has more "
+            f"than one candidate partner"
+            + (" (check-acceptor-vector names the competing fragments and "
+               "their overhangs)" if len(a_cuts) > 2 else ""),
+            start=_raw_pos(a_cuts[0].get("top")) if a_cuts else None)
+
     orf_count = 0
     if s:
         try:
@@ -913,7 +1254,8 @@ def _synthesis_lint(seq, *, circular: bool = True, expect_cds: bool = False,
         # `degenerate_bases` right below already states (audit 2026-10-23).
         "stats": {"length": len(raw), "gc": round(gc, 4),
                   "degenerate_bases": n_degenerate, "orf_count": orf_count,
-                  "circular": bool(circular)},
+                  "circular": bool(circular),
+                  "acceptor_sites": acceptor_counts},
     }
 
 
@@ -1363,6 +1705,12 @@ def _part_level_label(level: int) -> str:
 
 _TX_MAX_UORFS = 200
 _TX_MAX_SPLICE_HITS = 50
+# How many out-of-unit intron/exon features get a line of their own. One line
+# each is right for the handful a plasmid carries and wrong for a chromosome
+# record, where every gene's introns are "outside this unit" and the warnings
+# list would bury everything else in the answer. Past the cap they are
+# COUNTED in one line instead of dropped.
+_TX_MAX_OUT_OF_UNIT = 10
 
 
 # `_kozak_context` is imported from `splicecraft_kozak` (L0) and re-exported
@@ -1570,6 +1918,19 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
     bound, not transcribed — the same reasoning `_assemble_expression_cassette`
     uses for its splice scan) and to run to the end of the terminator. Introns
     are read from annotation only; see the module note above.
+    ``unit.bounds_from`` says which of the two bounded this unit
+    (``"annotation"`` / ``"tx_start/tx_end"``).
+
+    **Three things it refuses to be quiet about** (field report 2026-11-08):
+    an ``intron`` / ``exon`` feature annotated INSIDE the chosen promoter — a
+    genomic promoter feature routinely spans the transcribed 5'UTR and its
+    intron, which puts that intron upstream of the TSS and makes the one
+    answer this function exists for read as "no introns"; an intron that falls
+    outside the unit for any other reason; and ``tx_start`` / ``tx_end``
+    overriding an annotated promoter or terminator. ``cds.stop_codons`` counts
+    the in-frame stops the annotation encloses, so a deliberate tandem
+    terminator (``TGA TGA``) is visible instead of being reported as a shifted
+    frame.
     """
     seq_u = (seq or "").upper()
     total = len(seq_u)
@@ -1645,13 +2006,28 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
             return total
         return iv % total
 
+    bounds_from = "annotation"
     if tx_start is not None or tx_end is not None:
+        bounds_from = "tx_start/tx_end"
         a_opt, b_opt = _coord(tx_start), _coord(tx_end)
         if a_opt is None or b_opt is None:
             return {"ok": False,
                     "error": "tx_start and tx_end must BOTH be integers when "
                              "either is given",
                     "warnings": warnings}
+        # Explicit bounds WIN over annotation, and the response used to name
+        # the auto-picked promoter/terminator anyway — reading as though those
+        # features had defined the unit (field report 2026-11-08). They are
+        # still reported (a caller may want to know what is there), but the
+        # override is stated.
+        _ignored = [n for n, v in (("promoter", prom), ("terminator", term))
+                    if v is not None]
+        if _ignored:
+            warnings.append(
+                f"tx_start/tx_end bounded this unit, so the annotated "
+                f"{' and '.join(_ignored)} "
+                f"({', '.join(_feat_label_or(v) for v in (prom, term) if v)}) "
+                f"did NOT define it")
     elif prom is None or term is None:
         return {"ok": False, "error": _tx_missing_anchor(prom, term),
                 "warnings": warnings}
@@ -1698,8 +2074,64 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
                 "warnings": warnings}
     cds_parts_tx.sort()
 
+    def _fstrand(f) -> int:
+        """A feature dict's strand as -1/0/+1; 0 = no direction recorded."""
+        v = f.get("strand")
+        try:
+            return int(v) if v is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _spans_overlap(f1, f2) -> bool:
+        """Do two plus-strand feature dicts share a base? Wrap-aware: two arcs
+        on a circle overlap iff one's start lies inside the other's span."""
+        try:
+            s1, e1 = int(f1["start"]) % total, int(f1["end"]) % total
+            s2, e2 = int(f2["start"]) % total, int(f2["end"]) % total
+        except (KeyError, TypeError, ValueError):
+            return False
+        l1, l2 = _feat_len(s1, e1, total), _feat_len(s2, e2, total)
+        if l1 <= 0 or l2 <= 0:
+            return False
+        return ((s1 - s2) % total) < l2 or ((s2 - s1) % total) < l1
+
+    # ── 2b. Annotated splicing the chosen TSS puts out of reach. ──────────
+    # A genomic promoter feature very often spans the transcribed 5'UTR AND
+    # the intron sitting inside it. This unit starts at the promoter's END (a
+    # promoter is bound, not transcribed), which puts that intron UPSTREAM of
+    # the transcript: `introns: []`, `removed_by_splicing: []` and a 1-nt
+    # 5'UTR — the whole point of this function, silently invisible (field
+    # report 2026-11-08). Nothing here can know where the real TSS is, so the
+    # collision is SAID rather than guessed at.
+    tss_blocked: "set[int]" = set()
+    if prom is not None:
+        n_blocked = 0
+        for f in feats:
+            if str(f.get("type") or "").lower() not in ("intron", "exon"):
+                continue
+            if _fstrand(f) not in (0, strand):
+                continue
+            if not _spans_overlap(f, prom):
+                continue
+            tss_blocked.add(id(f))
+            n_blocked += 1
+            if n_blocked > _TX_MAX_OUT_OF_UNIT:
+                continue
+            warnings.append(
+                f"{str(f.get('type') or '?').lower()} {_feat_label_or(f)!r} "
+                f"is annotated INSIDE the chosen promoter "
+                f"{_feat_label_or(prom)!r}, so it lies upstream of the "
+                f"transcript and is NOT spliced out of this message — if that "
+                f"promoter feature covers the transcribed 5'UTR, pass tx_start "
+                f"at the real transcription start")
+        if n_blocked > _TX_MAX_OUT_OF_UNIT:
+            warnings.append(
+                f"…and {n_blocked - _TX_MAX_OUT_OF_UNIT} more intron/exon "
+                f"feature(s) inside that promoter")
+
     # ── 3. Introns: annotated only. ───────────────────────────────────────
     introns: "list[list]" = []
+    n_outside = 0
     for f in feats:
         if str(f.get("type") or "").lower() != "intron":
             continue
@@ -1716,12 +2148,7 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
         # a genomic 5'UTR intron is the motivating case for this whole
         # function ([INV-188] — the intronic upstream ATGs that splicing
         # removes), and it sits entirely BEFORE the CDS.
-        _fs = f.get("strand")
-        try:
-            _fs = int(_fs) if _fs is not None else 0
-        except (TypeError, ValueError):
-            _fs = 0
-        if _fs not in (0, strand):
+        if _fstrand(f) not in (0, strand):
             warnings.append(
                 f"ignored intron {str(f.get('label') or '?')!r}: it is "
                 f"annotated on the opposite strand, so it belongs to a gene "
@@ -1729,8 +2156,23 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
             continue
         m = _to_tx(f.get("start"), f.get("end"))
         if m is None:
+            # Outside the unit ⇒ not in this message. The promoter-overlap
+            # pass above already named the common cause; anything else still
+            # gets said, because a dropped intron is the one thing a reader of
+            # `introns: []` cannot infer.
+            if id(f) not in tss_blocked:
+                n_outside += 1
+                if n_outside <= _TX_MAX_OUT_OF_UNIT:
+                    warnings.append(
+                        f"intron {_feat_label_or(f)!r} lies OUTSIDE this "
+                        f"transcription unit, so it is not spliced out of "
+                        f"this message")
             continue
         introns.append([m[0], m[1], str(f.get("label") or "")])
+    if n_outside > _TX_MAX_OUT_OF_UNIT:
+        warnings.append(
+            f"…and {n_outside - _TX_MAX_OUT_OF_UNIT} more annotated intron(s) "
+            f"outside this transcription unit")
     # Gaps BETWEEN a spliced location's parts, computed in transcript
     # coordinates so an origin-crossing CDS needs no special case.
     for (s1, e1), (s2, _e2) in zip(cds_parts_tx, cds_parts_tx[1:]):
@@ -1976,20 +2418,38 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
             "leader would compete better with any upstream ATG")
 
     protein, stop = _tx_translate(mature, cds_start_m)
+    # How many in-frame stops does the annotation actually enclose? `TGA TGA`
+    # is a deliberate tandem terminator, used throughout real libraries as
+    # readthrough insurance, and a CDS annotated over both legitimately ends
+    # 3 (or 6, or 9) nt past the FIRST stop. Comparing `stop + 3` to the
+    # annotated end therefore called every double-stopped CDS a shifted frame
+    # or a stale annotation (field report 2026-11-08). The run is MEASURED
+    # before anything is claimed; `max(1, …)` keeps the old meaning for a
+    # first stop that is not wholly inside the annotation, which IS the
+    # disagreement the warning exists for.
+    n_stops = 0
+    _p = stop
+    while stop >= 0 and _p + 3 <= cds_end_m and mature[_p:_p + 3] in _STOP_CODONS:
+        n_stops += 1
+        _p += 3
+    stop_run_end = stop + 3 * max(1, n_stops)
     if stop == -1:
         warnings.append(
             "the CDS has no in-frame stop inside the mature message — the "
             "annotation and the spliced sequence disagree")
-    elif stop + 3 != cds_end_m:
+    elif stop_run_end != cds_end_m:
         warnings.append(
-            f"the first in-frame stop is at mature position {stop}, but the "
-            f"CDS annotation ends at {cds_end_m} — splicing may have shifted "
-            "the frame, or the annotation is stale")
+            f"the first in-frame stop is at mature position {stop}"
+            + (f" (a tandem run of {n_stops} stops, ending at {stop_run_end})"
+               if n_stops > 1 else "")
+            + f", but the CDS annotation ends at {cds_end_m} — splicing may "
+              "have shifted the frame, or the annotation is stale")
 
     return {
         "ok": True,
         "unit": {
             "strand":      strand,
+            "bounds_from": bounds_from,
             "genomic":     {"start": a, "end": b, "length": pre_len},
             "wraps_origin": bool(b < a or (b == a and pre_len == total)),
             "promoter":    (prom or {}).get("label") or None,
@@ -2007,7 +2467,10 @@ def _predict_transcript(seq: str, features: "list[dict]", *,
         "five_utr":  {"seq": mature[:cds_start_m], "length": cds_start_m},
         "cds":       {"start": cds_start_m, "end": cds_end_m,
                       "length": cds_end_m - cds_start_m,
-                      "protein": protein},
+                      "protein": protein,
+                      # In-frame stop codons the annotation encloses: 2+ is a
+                      # tandem terminator, 0 means the message never stops.
+                      "stop_codons": n_stops},
         "three_utr": {"seq": mature[cds_end_m:],
                       "length": max(0, len(mature) - cds_end_m)},
         "kozak":     cds_kozak,

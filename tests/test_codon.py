@@ -160,7 +160,18 @@ class TestRegistry:
         sc._codon_tables_load()
         assert any(e["taxid"] == "83333"
                    for e in sc._codon_search("coli"))
-        assert sc._codon_search("") == sc._codon_tables_load()
+        # An empty query returns the WHOLE registry — same entries, and (as
+        # `_codon_search` documents) natural-sorted by display name rather
+        # than in disk-insertion order. Comparing the two lists directly was
+        # only ever true because one table shipped; with three built-ins the
+        # orders legitimately differ, so compare content and pin the order
+        # the docstring actually promises.
+        everything = sc._codon_search("")
+        registry = sc._codon_tables_load()
+        assert {e["taxid"] for e in everything} == {e["taxid"] for e in registry}
+        assert len(everything) == len(registry)
+        assert [e["name"] for e in everything] == sorted(
+            (e["name"] for e in registry), key=sc._natural_sort_key)
         assert sc._codon_search("no_such_species_xyz") == []
 
     def test_search_by_genus_prefix(self):
@@ -3656,3 +3667,242 @@ class TestAnalyseCdsReadsTheRealCodingSequence:
 
 def _rc_str(s: str) -> str:
     return s.translate(str.maketrans("ACGT", "TGCA"))[::-1]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Field report 2026-11-08 — the hazard motifs are a FLOOR
+# ══════════════════════════════════════════════════════════════════════════
+#
+# A plant CDS cleared `hazard_hosts: ["plant"]` carrying a cryptic donor
+# `AAGGTAACT` that the trained PWM in this same codebase scores at 5.602
+# against its calibrated 3.766 threshold — paired with a real acceptor
+# downstream, i.e. a cryptic intron that would have deleted the stop codon.
+# `GGTAAC` is not `GTRAG`, so no consensus string could have caught it.
+#
+# The tests lead with that exact window, because the whole claim rests on it:
+# if the string pattern ever did match it, the feature would be pointless.
+
+
+class TestTheHazardMotifFloor:
+    def test_gtrag_does_not_match_the_reported_donor(self):
+        assert sc._iupac_pattern("GTRAG").search("AAGGTAACT") is None
+
+    def test_but_the_trained_model_scores_it_well_over_threshold(self):
+        from splicecraft_splice import _splice_scan
+        hits = _splice_scan("CCCCCCCCCCAAGGTAACTCCCCCCCCCC", kind="donor")
+        assert len(hits) == 1, hits
+        h = hits[0]
+        assert h["window"] == "AAGGTAACT"
+        assert h["score"] >= h["threshold"]
+        # not marginal — the gap is the point
+        assert h["score"] > h["threshold"] * 1.4
+
+    def test_the_motif_set_says_it_is_a_floor(self):
+        """A docstring claim, pinned: the next reader must not take the
+        2-motif plant set for a screen."""
+        import splicecraft_codon as _c
+        assert "FLOOR" in (_c._codon_hazard_motifs.__doc__ or "")
+
+    def test_the_plant_set_is_still_exactly_the_two_motifs(self):
+        """The floor is not quietly grown either — growing it is what the
+        model is for."""
+        assert sc._codon_hazard_motifs("plant") == {
+            "plant polyA signal": "AATAAA",
+            "cryptic splice donor": "GTRAG",
+        }
+
+
+class TestCodonFixSpliceSites:
+    """`_codon_fix_splice_sites` — the model-backed pass."""
+
+    # A CDS carrying the reported context in frame: ... AAG GTA ACT ...
+    DNA = ("ATGAAACCTGGTTCTGCTAAGGTAACTGGTGCTAAACCTGGTTCTGCTGATGAAACCT"
+           "GGTTCTGCTAAACCTGGTTCTGCTGGTTCTGCTAAACCTTAA")
+
+    def _protein(self, dna):
+        return "".join(sc._CODON_TABLE.get(dna[i:i + 3], "X")
+                       for i in range(0, len(dna) - 2, 3))
+
+    def test_the_input_really_carries_the_donor(self):
+        from splicecraft_splice import _splice_scan
+        hits = _splice_scan(self.DNA, kind="donor")
+        assert [h["window"] for h in hits] == ["AAGGTAACT"]
+
+    def test_it_is_removed(self):
+        prot = self._protein(self.DNA)
+        fixed, fixes, remaining = _codon._codon_fix_splice_sites(
+            self.DNA, prot, sc._CODON_BUILTIN_K12,
+            sites=sc._codon_hazard_motifs("plant"))
+        assert remaining == []
+        assert len(fixes) == 1
+        assert "donor" in fixes[0]
+
+    def test_the_protein_is_untouched(self):
+        """The invariant the whole subsystem rests on."""
+        prot = self._protein(self.DNA)
+        fixed, _fixes, _rem = _codon._codon_fix_splice_sites(
+            self.DNA, prot, sc._CODON_BUILTIN_K12)
+        assert self._protein(fixed) == prot
+        assert len(fixed) == len(self.DNA)
+        assert set(fixed) <= set("ACGT")
+
+    def test_a_clean_cds_is_returned_unchanged(self):
+        clean = "ATGGCTGCTGCTGCTGCTGCTGCTTAA"
+        out, fixes, remaining = _codon._codon_fix_splice_sites(
+            clean, self._protein(clean), sc._CODON_BUILTIN_K12)
+        assert (out, fixes, remaining) == (clean, [], [])
+
+    def test_it_does_not_create_a_forbidden_motif(self):
+        """The guard that lets this run AFTER `_codon_fix_sites` without
+        undoing it."""
+        prot = self._protein(self.DNA)
+        fixed, _f, _r = _codon._codon_fix_splice_sites(
+            self.DNA, prot, sc._CODON_BUILTIN_K12,
+            sites={"polyA": "AATAAA", "BsaI": "GGTCTC"})
+        for motif in ("AATAAA", "GGTCTC"):
+            assert sc._iupac_pattern(motif).search(fixed) is None
+            assert sc._iupac_pattern(sc._rc(motif)).search(fixed) is None
+
+    def test_the_appended_stop_is_never_swapped(self):
+        prot = self._protein(self.DNA)
+        fixed, _f, _r = _codon._codon_fix_splice_sites(
+            self.DNA, prot, sc._CODON_BUILTIN_K12, has_appended_stop=True)
+        assert fixed[-3:] == self.DNA[-3:]
+
+    def test_an_unfixable_site_is_reported_not_dropped(self):
+        """Met and Trp have one codon each, so a donor spelled entirely by
+        them cannot be removed — and must come back MEASURED."""
+        # ATG TGG ... the window around a GT inside a Met/Trp run
+        dna = "ATG" + "TGGATG" * 6 + "TAA"
+        prot = self._protein(dna)
+        out, fixes, remaining = _codon._codon_fix_splice_sites(
+            dna, prot, sc._CODON_BUILTIN_K12)
+        from splicecraft_splice import _splice_scan
+        assert remaining == _splice_scan(out, kind="both")
+
+    def test_property_sweep_over_random_proteins(self):
+        """Zero-tolerance subsystem: the five invariants on every trial, and
+        the pass must never INCREASE the hit count."""
+        import random
+        from splicecraft_splice import _splice_scan
+        rng = random.Random(1108)
+        aas = "ACDEFGHIKLMNPQRSTVWY"
+        repaired = 0
+        for _ in range(60):
+            p = "M" + "".join(rng.choice(aas) for _ in range(rng.randint(40, 140)))
+            dna = sc._codon_optimize(p, sc._CODON_BUILTIN_K12)
+            before = len(_splice_scan(dna, kind="both"))
+            out, fixes, remaining = _codon._codon_fix_splice_sites(
+                dna, p, sc._CODON_BUILTIN_K12,
+                sites=sc._codon_hazard_motifs("plant"))
+            repaired += len(fixes)
+            assert self._protein(out)[:len(p)] == p
+            assert len(out) == len(dna) and len(out) % 3 == 0
+            assert set(out) <= set("ACGT")
+            assert "*" not in self._protein(out)[:len(p)]
+            assert len(remaining) <= before
+        assert repaired > 0, "the sweep never exercised a repair"
+
+
+class TestBuiltInPlantTables:
+    """Field report 2026-11-08: no Nicotiana table shipped, so a tobacco
+    construct had to be optimised against a related species' table as a
+    stand-in."""
+
+    def test_three_tables_ship(self):
+        taxids = {t["taxid"] for t in sc._CODON_BUILTIN_TABLES}
+        assert taxids == {"83333", "4097", "4100"}
+
+    def test_each_is_a_complete_64_codon_table(self):
+        for t in sc._CODON_BUILTIN_TABLES:
+            raw = t["raw"]
+            assert len(raw) == 64, t["name"]
+            # every codon's amino acid agrees with the standard code — the
+            # same check `_codon_raw_from_json` enforces on stored tables
+            for codon, (aa, n) in raw.items():
+                assert sc._CODON_GENETIC_CODE[codon] == aa, (t["name"], codon)
+                assert n >= 0
+
+    def test_each_carries_its_fetch_basis(self):
+        """A codon table nobody can trace is a table nobody should optimise a
+        gene against."""
+        for t in sc._CODON_BUILTIN_TABLES:
+            assert t.get("basis"), t["name"]
+
+    def test_the_nicotiana_tables_round_trip_a_protein(self):
+        aa = "MAEVKLAGHIKQRSTVWYFND"
+        for taxid in ("4097", "4100"):
+            raw = next(t["raw"] for t in sc._CODON_BUILTIN_TABLES
+                       if t["taxid"] == taxid)
+            dna = sc._codon_optimize(aa, raw)
+            assert sc._mut_translate(dna) == aa
+
+    def test_tobacco_prefers_at_rich_synonyms(self):
+        """A sanity check against pasting the wrong organism's numbers: plant
+        codon usage is AT-biased at the wobble position, unlike E. coli K12,
+        which leans GC3-rich. GC3 is measured, not asserted from memory."""
+        aa = "AGLPRSTV" * 12
+        ntab = next(t["raw"] for t in sc._CODON_BUILTIN_TABLES
+                    if t["taxid"] == "4097")
+        gc3_plant = sc._codon_gc3(sc._codon_optimize(aa, ntab))
+        gc3_coli = sc._codon_gc3(sc._codon_optimize(aa, sc._CODON_BUILTIN_K12))
+        assert gc3_plant < gc3_coli - 10, (gc3_plant, gc3_coli)
+
+
+class TestSpliceScrubEdgeCases:
+    """What the pass does with input it could not have expected (hardening
+    sweep, 2026-11-08)."""
+
+    def _p(self, dna):
+        return "".join(sc._CODON_TABLE.get(dna[i:i + 3], "X")
+                       for i in range(0, len(dna) - 2, 3))
+
+    def test_empty_and_none_dna(self):
+        for bad in ("", None):
+            assert _codon._codon_fix_splice_sites(
+                bad, "", sc._CODON_BUILTIN_K12) == ("", [], [])
+
+    def test_lowercase_input_is_still_scanned(self):
+        """A silently un-scanned sequence is the one thing this must not do."""
+        out, fixes, rem = _codon._codon_fix_splice_sites(
+            "atgaaggtaacttaa", "MKVT", sc._CODON_BUILTIN_K12)
+        assert fixes and rem == []
+        assert out.isupper()
+
+    def test_ambiguous_bases_do_not_crash_or_hide_a_site(self):
+        out, fixes, rem = _codon._codon_fix_splice_sites(
+            "ATGNNNAAGGTAACTTAA", "MXKVT", sc._CODON_BUILTIN_K12)
+        assert fixes and rem == []
+
+    def test_a_protein_shorter_than_the_dna_reports_rather_than_edits(self):
+        """Only codons the protein covers may be swapped — anything else
+        would be changing a residue nobody declared."""
+        dna = "ATGAAGGTAACTTAA"
+        out, fixes, rem = _codon._codon_fix_splice_sites(
+            dna, "M", sc._CODON_BUILTIN_K12)
+        assert out == dna and fixes == []
+        assert [h["window"] for h in rem] == ["AAGGTAACT"]
+
+    def test_a_length_not_divisible_by_three_is_handled(self):
+        dna = "ATGAAGGTAACTTAAG"
+        out, _f, _r = _codon._codon_fix_splice_sites(
+            dna, "MKVT", sc._CODON_BUILTIN_K12)
+        assert len(out) == len(dna)
+        assert out[-1] == "G"            # the partial codon is never touched
+
+    def test_a_bad_kind_raises_rather_than_scanning_half(self):
+        with pytest.raises(ValueError, match="kind must be"):
+            _codon._codon_fix_splice_sites(
+                "ATGTAA", "M", sc._CODON_BUILTIN_K12, kind="nope")
+
+    def test_junk_in_the_forbidden_sites_is_skipped_not_fatal(self):
+        out, fixes, rem = _codon._codon_fix_splice_sites(
+            "ATGAAGGTAACTTAA", "MKVT", sc._CODON_BUILTIN_K12,
+            sites={"bad": "ZZZZ", "empty": "", "none": None})
+        assert fixes and rem == []
+
+    def test_an_empty_table_cannot_edit_anything(self):
+        dna = "ATGAAGGTAACTTAA"
+        out, fixes, rem = _codon._codon_fix_splice_sites(dna, "MKVT", {})
+        assert (out, fixes) == (dna, [])
+        assert rem, "the site must still be REPORTED when it cannot be fixed"

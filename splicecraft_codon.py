@@ -29,6 +29,11 @@ from splicecraft_biology import (
     _IUPAC_BASES, _forbidden_hit_set, _iupac_pattern, _mut_revcomp,
 )
 from splicecraft_util import _natural_sort_key, _sanitize_path
+# L0 — the trained plant splice PWM. `_codon_fix_splice_sites` is the pass that
+# consults it; the hazard-motif dict above is only a floor.
+from splicecraft_splice import (
+    _SPLICE_MAX_WINDOW, _splice_scan, _splice_window_span,
+)
 from splicecraft_net import (
     _HMM_DB_RETRY_BACKOFF_S, _NCBI_MAX_RESPONSE_BYTES, _build_hardened_url_opener,
     _sanitize_accession,
@@ -306,6 +311,17 @@ _CODON_DEFAULT_FORBIDDEN: dict[str, str] = {
 # 2026-07-23). Degenerate codes are used where the consensus is degenerate;
 # each entry is a sequence motif whose presence INSIDE a CDS causes trouble in
 # that host, not a cut site.
+#
+# ** THIS IS A FLOOR, NOT A SCREEN. ** Every entry is a consensus STRING, and a
+# consensus string is strictly weaker than a scored window: the plant set's
+# `GTRAG` misses `GGTAAC`, which the trained PWM in `splicecraft_splice` scores
+# at 5.602 against a 3.766 threshold — a donor 1.5x over the cutoff, inside a
+# CDS that had just passed this scrub (field report 2026-11-08, the exact case
+# that added this note). Keep the motifs — they are cheap, host-general, and
+# the polyA signal is something no splice PWM knows about — but for a PLANT
+# host the real screen is `_codon_fix_splice_sites` / `_splice_scan`, which
+# `codon-optimize` reports on in its `splice` block whether or not the caller
+# asked for the repair.
 _CODON_HOST_HAZARD_MOTIFS: "dict[str, dict[str, str]]" = {
     "bacterial": {
         # Internal ribosome-binding site — drives spurious internal
@@ -330,6 +346,11 @@ _CODON_HOST_HAZARD_MOTIFS: "dict[str, dict[str, str]]" = {
 def _codon_hazard_motifs(hosts) -> "dict[str, str]":
     """Merge the built-in hazard motifs for each host in ``hosts`` into the
     ``{name: motif}`` shape `_codon_fix_sites` consumes.
+
+    These are a documented FLOOR of consensus strings, not a full screen — see
+    the note on `_CODON_HOST_HAZARD_MOTIFS`. For a plant host, pair it with
+    `_codon_fix_splice_sites` (the trained PWM), which catches donors no
+    `GTRAG` pattern can.
 
     Raises ValueError naming the unknown host rather than silently returning
     a smaller set — a typo'd host that quietly scrubbed nothing would read as
@@ -847,6 +868,190 @@ def _codon_swap_ok(seq: str, codon_start: int, alt: str, site: str, idx: int,
     if (site, idx) in after_hits:
         return False
     return not (after_hits - before_hits)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Cryptic splice sites: the TRAINED model, not the motif floor
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `_CODON_HOST_HAZARD_MOTIFS["plant"]` is a 2-motif floor, and `GTRAG` is
+# strictly weaker than the PWM that ships in this same codebase. The report
+# that prompted this pass (2026-11-08) had a plant CDS clear the motif scrub
+# while carrying `AAGGTAACT` — a donor scoring 5.602 against the calibrated
+# 3.766 threshold, 21 bp upstream of the stop codon and paired with a real
+# acceptor downstream, i.e. a cryptic intron that would have deleted the stop.
+# `GGTAAC` is not `GTRAG`, so no string pattern could have seen it.
+#
+# This pass is OPT-IN and the scan that reports it is not. A caller who has
+# already ordered a gene must keep getting the same DNA back from the same
+# request, so the repair only runs when asked for; the measurement runs every
+# time a plant host is named, because a hazard nobody mentioned reads as a
+# clean construct. Same rule as `remaining_motifs` and the GC band: MEASURE
+# the result, never imply it.
+
+
+# How many splice sites / pairs a response carries. A hazard list is read, not
+# paged, and the scores are sorted worst-first, so the cap is about keeping a
+# screening loop's response small — the COUNT is always exact beside it.
+_CODON_SPLICE_MAX_REPORT = 20
+
+
+def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
+                            kind: str = "both",
+                            sites: "dict | None" = None,
+                            has_appended_stop: bool = True,
+                            transl_table: "int | None" = None) -> tuple:
+    """Substitute synonymous codons to remove cryptic splice sites that the
+    TRAINED plant model scores at or above its calibrated threshold.
+
+    Returns ``(new_dna, fixes, remaining)``. ``remaining`` is `_splice_scan`
+    re-run on the FINAL sequence — measured, not inferred from the fixes — so
+    a site no synonym could remove is reported with its score instead of
+    disappearing.
+
+    Raises RuntimeError (out of `_splice_scan`) when no model is loaded: an
+    untrained scan returning ``[]`` would read as "no cryptic sites" when it
+    means "not checked". Callers that must degrade gracefully catch it and
+    report `skipped` WITH the reason.
+
+    A candidate swap is kept only when it
+
+      1. drops the target site below threshold,
+      2. creates no NEW at-or-above-threshold site, and
+      3. creates no new ``sites`` motif (forward or RC)
+
+    so running this after `_codon_fix_sites` can never re-introduce a
+    restriction site that scrub just removed, and the two passes cannot
+    undo each other. Both guards are evaluated on the LOCAL slice a 3-base
+    change can affect, which is exact for a linear scan — the argument
+    `_codon_swap_ok` spells out — and keeps the pass O(hits x len) rather
+    than O(codons x synonyms x len).
+
+    Codons are tried nearest-the-anchor first (the GT/AG dinucleotide itself
+    is invariant in both populations, so the bases that actually carry the
+    score are the ones around it) and, at equal distance, commonest-synonym
+    first, so the repair costs as little CAI as it can.
+    """
+    if kind not in ("both", "donor", "acceptor"):
+        raise ValueError("kind must be 'both', 'donor' or 'acceptor'")
+    dna = (dna or "").upper()
+    if not dna:
+        return dna, [], []
+    initial = _splice_scan(dna, kind=kind)      # raises when untrained
+    if not initial:
+        return dna, [], []
+
+    _gc_code = (_CODON_GENETIC_CODE if transl_table in (None, 1)
+                else _codon_table_for(transl_table))
+    aa_codons, _frac = _codon_build_aa_map(raw, genetic_code=_gc_code)
+
+    # Same forward+RC expansion as `_codon_fix_sites`, so "don't create a new
+    # site" means the same thing in every pass.
+    all_forbidden: "list[str]" = []
+    for _name, site in (sites or {}).items():
+        s = str(site or "").upper()
+        if not s:
+            continue
+        try:
+            _iupac_pattern(s)
+        except ValueError:
+            continue
+        all_forbidden.append(s)
+        rc = _mut_revcomp(s)
+        if rc != s:
+            all_forbidden.append(rc)
+    forbidden = tuple(all_forbidden)
+    maxlen = max((len(s) for s in forbidden), default=0)
+
+    dna_list = list(dna)
+    # The appended synthetic stop is never swapped — `_codon_fix_sites`
+    # documents why (the caller added it; it is not a residue).
+    last_safe = len(dna_list) - 3 if has_appended_stop else len(dna_list)
+    fixes: "list[str]" = []
+    stuck: set = set()
+
+    def _local_sites(chars: list, codon_start: int) -> set:
+        """``{(kind, position)}`` for every at-or-above-threshold site whose
+        scoring window OVERLAPS the three bases at ``codon_start``. A 3-base
+        change can move no other window, so comparing this set before and
+        after a swap is exactly as strong as rescanning the whole sequence."""
+        n = len(chars)
+        lo = max(0, codon_start - _SPLICE_MAX_WINDOW + 1)
+        hi = min(n, codon_start + 3 + _SPLICE_MAX_WINDOW)
+        out: set = set()
+        for h in _splice_scan("".join(chars[lo:hi]), kind=kind):
+            pos = lo + int(h["position"])
+            ws, we = _splice_window_span(h["kind"], pos)
+            if we > codon_start and ws < codon_start + 3:
+                out.add((h["kind"], pos))
+        return out
+
+    def _makes_forbidden(chars: list, codon_start: int,
+                         before_hits: set) -> bool:
+        """Did the swap at ``codon_start`` create a forbidden-motif hit? Same
+        windowed comparison `_codon_swap_ok` proves equivalent to a full
+        rescan."""
+        if not forbidden:
+            return False
+        a_lo = max(0, codon_start - maxlen + 1)
+        a_hi = codon_start + 3
+        s_hi = min(len(chars), a_hi + maxlen - 1)
+        sub = "".join(chars[a_lo:s_hi])
+        after_win = {(p, a_lo + off)
+                     for (p, off) in _forbidden_hit_set(sub, forbidden)
+                     if a_lo + off < a_hi}
+        before_win = {(p, q) for (p, q) in before_hits if a_lo <= q < a_hi}
+        return bool(after_win - before_win)
+
+    # Every accepted swap removes one site and may create none, so the round
+    # count is bounded by the number of sites present at entry; the codon
+    # budget is belt-and-braces against a pathological table.
+    for _round in range(max(1, len(dna_list) // 3)):
+        seq = "".join(dna_list)
+        live = [h for h in _splice_scan(seq, kind=kind)
+                if (h["kind"], int(h["position"])) not in stuck]
+        if not live:
+            break
+        target = live[0]                     # `_splice_scan` sorts by score
+        t_kind, t_pos = target["kind"], int(target["position"])
+        ws, we = _splice_window_span(t_kind, t_pos)
+        before_hits = (_forbidden_hit_set(seq, forbidden) if forbidden
+                       else set())
+        lo_codon = max(0, ws // 3)
+        hi_codon = min((we - 1) // 3 + 1, len(protein))
+        applied = False
+        for codon_idx in sorted(range(lo_codon, hi_codon),
+                                key=lambda c: abs(c * 3 + 1 - t_pos)):
+            codon_start = codon_idx * 3
+            if codon_start + 3 > last_safe:
+                continue
+            aa = protein[codon_idx].upper()
+            current = "".join(dna_list[codon_start:codon_start + 3])
+            before = _local_sites(dna_list, codon_start)
+            for alt, afrac in aa_codons.get(aa, []):
+                if alt == current:
+                    continue
+                dna_list[codon_start:codon_start + 3] = list(alt)
+                after = _local_sites(dna_list, codon_start)
+                if ((t_kind, t_pos) in after or (after - before)
+                        or _makes_forbidden(dna_list, codon_start,
+                                            before_hits)):
+                    dna_list[codon_start:codon_start + 3] = list(current)
+                    continue
+                fixes.append(
+                    f"{t_kind} at nt {t_pos + 1} (score {target['score']} "
+                    f">= {target['threshold']}): {current}->{alt} "
+                    f"(codon {codon_idx + 1} {aa}, freq={afrac:.3f})")
+                applied = True
+                break
+            if applied:
+                break
+        if not applied:
+            # No synonym can take this one below threshold. Remember it so the
+            # next round attacks a different site instead of spinning, and let
+            # `remaining` report it with its score.
+            stuck.add((t_kind, t_pos))
+    return "".join(dna_list), fixes, _splice_scan("".join(dna_list), kind=kind)
 
 
 def _codon_fix_sites(dna: str, protein: str, raw: dict,

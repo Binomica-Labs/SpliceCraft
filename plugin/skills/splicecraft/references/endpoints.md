@@ -1,6 +1,6 @@
 # The endpoint surface, organised by job
 
-298 endpoints as of SpliceCraft 1.3.11. **`splicecraft-cli tools --json` is
+299 endpoints as of SpliceCraft 1.3.15. **`splicecraft-cli tools --json` is
 always authoritative** — this file helps you find the right name and warns you
 about the sharp edges; the endpoint's own `doc_full` is the contract.
 
@@ -29,7 +29,7 @@ twin takes the *same payload*.
 | 13 | `simulate-traditional-cloning` → `traditional-clone` | Restriction cloning, with the self-ligation off-target report |
 | 14 | `design-primers` / `amplify-feature` | Primer design with binding verified |
 | 15 | `check-primer-pair` / `check-primer` | Is the pair sound — Tm gap, hairpins, dimers — where does each bind, and what does it produce |
-| 16 | `optimize-protein` | Codon optimization with host-hazard scrubbing |
+| 16 | `optimize-protein` | Codon optimization with host-hazard + cryptic-splice scrubbing |
 | 17 | `verify-against-reads` | The other end: reads came back, does the clone match |
 | 18 | `digest` | Overhang-aware digest of a **raw sequence you supply** — QC any junction you just designed |
 | 19 | `create-experiment` | Write the bench record |
@@ -229,7 +229,8 @@ Preview → commit: `simulate-golden-gate`→`golden-gate-assemble` ·
 
 Pipeline: `design-gb-part` `design-synthesis-fragment` `domesticate-part`
 `domesticate-parts` `make-l0-part-from-fragment` `assemble-into-entry-vector`
-`classify-part` `auto-detect-entry-vectors` `scrub-plasmid` `lint-synthesis`
+`classify-part` `auto-detect-entry-vectors` `check-acceptor-vector`
+`scrub-plasmid` `lint-synthesis`
 `assemble-operon` `simulate-pcr` `pcr-program`
 
 Entry vectors / grammars / parts bins: `list-entry-vectors` `get-entry-vector`
@@ -259,8 +260,20 @@ Entry vectors / grammars / parts bins: `list-entry-vectors` `get-entry-vector`
 - `domesticate-part` and `assemble-into-entry-vector` **fail loud (422)** rather
   than emit a stub backbone — a stub L0 is a wrong construct an automated caller
   can't distinguish from a real clone. Treat the 422 as information.
-- `lint-synthesis` is the pre-order pre-flight (internal Type IIS sites, GC
-  extremes, homopolymers, repeats, ORF check, 0–100 score).
+- `lint-synthesis` is the pre-order pre-flight for a PART (internal Type IIS
+  sites, GC extremes, homopolymers, repeats, ORF check, 0–100 score). For a
+  VECTOR pass `acceptor_enzymes` instead of `forbidden_enzymes`: an acceptor is
+  supposed to carry the assembly enzyme's sites — exactly two — so naming them
+  as forbidden scores a working acceptor near zero, which is literally correct
+  and backwards.
+- `check-acceptor-vector` answers "is this plasmid a usable acceptor for this
+  grammar": sites per enzyme, which fragment is the stuffer and what overhangs
+  it presents, the detected α/Ω role (**with the reason when detection fails**),
+  and — the finding it exists for — every SURPLUS fragment whose ends match one
+  of the grammar's own part slots, because that fragment competes with a real
+  part at both junctions of the assembly. Run it on an entry vector before
+  trusting any Golden Gate step through it; `entry` works, so a whole library
+  can be screened without loading anything.
 - `scrub-plasmid` plans a clone-free, protein-preserving site scrub; an
   unrecognised enzyme name is a 400, never a scrub that quietly removes nothing.
 
@@ -290,8 +303,19 @@ shifts, every feature keeps its coordinates, and it's undoable.
   `hazard_hosts` (plant/mammalian/bacterial), `forbidden_motifs`, GC banding and
   `avoid_repeats_with` to diversify a panel. GC-window and diversify passes are
   capped at 1500 codons. Check `remaining_motifs`/`remaining_repeats`/`fixes`.
-- Only *E. coli* K12 ships as a table; `add-codon-table` fetches from Kazusa by
-  taxid, builds from an NCBI genome, or imports a local CDS FASTA offline.
+- **`hazard_hosts` is a FLOOR of consensus strings, not a screen** — `GTRAG`
+  does not match `GGTAAC`, a donor the trained plant matrix scores at 1.5x its
+  threshold. Naming the `plant` host therefore also runs that matrix and the
+  reply carries a `splice` block (`n_sites`/`sites` with scores, `n_pairs`/
+  `pairs` with `in_frame_loss` — a PAIR is what actually excises sequence).
+  `scrub_splice_sites: true` repairs them by synonymous swap; the repair is
+  opt-in so an already-ordered design keeps coming back the same, and a site no
+  synonym can fix stays listed with its score. `check_splice: false` skips.
+- Three tables ship (*E. coli* K12, *Nicotiana tabacum* 4097, *N. benthamiana*
+  4100); `add-codon-table` fetches any other from Kazusa by taxid, builds from
+  an NCBI genome, or imports a local CDS FASTA offline. `list-codon-tables`
+  gives each table's `n_codons` — the benthamiana table is 100 CDS against
+  tobacco's 1,534, which is what decides how far to trust it.
 - `analyse-cds` is the read half: CAI, GC3, `rare_pct`, `tandem_rare_runs`,
   `worst_window`, 5′ `ramp`.
 

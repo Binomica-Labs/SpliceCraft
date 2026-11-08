@@ -408,6 +408,35 @@ _CODON_GENETIC_CODE: dict[str, str] = {
 }
 
 
+# ── Built-in codon-usage tables ───────────────────────────────────────────
+# Counts are per-codon OCCURRENCES in the source CDS set, which is what
+# `_codon_build_aa_map` turns into per-amino-acid fractions; the absolute
+# magnitudes never matter, only the ratios within one amino acid.
+#
+# PROVENANCE, because a codon table nobody can trace is a table nobody should
+# optimise a gene against: the two Nicotiana tables were FETCHED on 2026-11-08
+# through SpliceCraft's own `_codon_fetch_kazusa` (Kazusa Codon Usage
+# Database, GenBank-derived counts) and the species name on each response was
+# checked against the taxid before the numbers were pasted here — the same
+# rule `splicecraft_presets` follows ("every sequence was EXTRACTED from a
+# public record, never typed from memory"). The fetch basis is recorded per
+# table because it is not uniform and it is not a detail: N. tabacum is 1,534
+# CDS / 609,684 codons, N. benthamiana only 100 CDS / 43,763 codons. 43,763
+# codons is plenty for per-codon FREQUENCIES (~680 counts per codon on
+# average), but 100 genes is a thin GENE sample, so a benthamiana-specific
+# preference drawn from it carries sampling bias that no amount of counting
+# fixes. `list-codon-tables` reports `n_codons` so the basis is visible rather
+# than implied.
+#
+# Why these two and not a catalogue: tobacco and benthamiana are what this
+# codebase's users actually transform, and the field report that prompted them
+# (2026-11-08) had to fall back on another Solanaceae species' table as a
+# stand-in because neither shipped. Every other
+# host stays one `add-codon-table` call away (Kazusa by taxid, an NCBI genome,
+# or a local CDS FASTA) — shipping a wall of vendored tables nobody asked for
+# would be data this repo cannot keep fresh.
+
+
 _CODON_BUILTIN_K12: dict[str, tuple[str, int]] = {
     "GGG": ("G",  44), "GGA": ("G",  47), "GGT": ("G", 109), "GGC": ("G", 171),
     "GAG": ("E",  94), "GAA": ("E", 224), "GAT": ("D", 194), "GAC": ("D", 105),
@@ -427,6 +456,64 @@ _CODON_BUILTIN_K12: dict[str, tuple[str, int]] = {
     "CCG": ("P", 137), "CCA": ("P",  34), "CCT": ("P",  43), "CCC": ("P",  33),
     "TAA": ("*",   9), "TAG": ("*",   0), "TGA": ("*",   5),
 }
+
+
+_CODON_BUILTIN_NTAB: dict[str, tuple[str, int]] = {
+    "GGG": ("G",   6420), "GGA": ("G",  14130), "GGT": ("G",  13585), "GGC": ("G",   6856),
+    "GAG": ("E",  17945), "GAA": ("E",  21936), "GAT": ("D",  22478), "GAC": ("D",  10294),
+    "GTG": ("V",  10161), "GTA": ("V",   6937), "GTT": ("V",  16340), "GTC": ("V",   6742),
+    "GCG": ("A",   3546), "GCA": ("A",  14055), "GCT": ("A",  19003), "GCC": ("A",   7617),
+    "AGG": ("R",   7466), "AGA": ("R",   9774), "AGT": ("S",   8094), "AGC": ("S",   6070),
+    "AAG": ("K",  20430), "AAA": ("K",  19851), "AAT": ("N",  17042), "AAC": ("N",  10916),
+    "ATG": ("M",  15251), "ATA": ("I",   8509), "ATT": ("I",  16937), "ATC": ("I",   8445),
+    "ACG": ("T",   2761), "ACA": ("T",  10634), "ACT": ("T",  12399), "ACC": ("T",   5901),
+    "TGG": ("W",   7428), "TGT": ("C",   5969), "TGC": ("C",   4375), "TAT": ("Y",  10827),
+    "TAC": ("Y",   8220), "TTG": ("L",  13614), "TTA": ("L",   8186), "TTT": ("F",  15282),
+    "TTC": ("F",  10986), "TCG": ("S",   3232), "TCA": ("S",  10733), "TCT": ("S",  12211),
+    "TCC": ("S",   6207), "CGG": ("R",   2251), "CGA": ("R",   3213), "CGT": ("R",   4583),
+    "CGC": ("R",   2359), "CAG": ("Q",   9149), "CAA": ("Q",  12639), "CAT": ("H",   8169),
+    "CAC": ("H",   5328), "CTG": ("L",   6205), "CTA": ("L",   5754), "CTT": ("L",  14658),
+    "CTC": ("L",   7524), "CCG": ("P",   3028), "CCA": ("P",  12101), "CCT": ("P",  11372),
+    "CCC": ("P",   3995), "TAA": ("*",    656), "TAG": ("*",    303), "TGA": ("*",    602),
+}
+
+
+_CODON_BUILTIN_NBEN: dict[str, tuple[str, int]] = {
+    "GGG": ("G",    485), "GGA": ("G",    986), "GGT": ("G",   1065), "GGC": ("G",    500),
+    "GAG": ("E",   1351), "GAA": ("E",   1541), "GAT": ("D",   1686), "GAC": ("D",    719),
+    "GTG": ("V",    684), "GTA": ("V",    435), "GTT": ("V",   1142), "GTC": ("V",    465),
+    "GCG": ("A",    283), "GCA": ("A",   1029), "GCT": ("A",   1452), "GCC": ("A",    550),
+    "AGG": ("R",    569), "AGA": ("R",    690), "AGT": ("S",    642), "AGC": ("S",    469),
+    "AAG": ("K",   1662), "AAA": ("K",   1269), "AAT": ("N",   1272), "AAC": ("N",    741),
+    "ATG": ("M",   1044), "ATA": ("I",    530), "ATT": ("I",   1170), "ATC": ("I",    610),
+    "ACG": ("T",    236), "ACA": ("T",    665), "ACT": ("T",    762), "ACC": ("T",    443),
+    "TGG": ("W",    542), "TGT": ("C",    404), "TGC": ("C",    315), "TAT": ("Y",    690),
+    "TAC": ("Y",    562), "TTG": ("L",   1062), "TTA": ("L",    559), "TTT": ("F",   1036),
+    "TTC": ("F",    771), "TCG": ("S",    247), "TCA": ("S",    752), "TCT": ("S",    974),
+    "TCC": ("S",    453), "CGG": ("R",    233), "CGA": ("R",    253), "CGT": ("R",    335),
+    "CGC": ("R",    183), "CAG": ("Q",    745), "CAA": ("Q",    790), "CAT": ("H",    566),
+    "CAC": ("H",    360), "CTG": ("L",    522), "CTA": ("L",    404), "CTT": ("L",   1091),
+    "CTC": ("L",    545), "CCG": ("P",    284), "CCA": ("P",    734), "CCT": ("P",    826),
+    "CCC": ("P",    278), "TAA": ("*",     32), "TAG": ("*",     29), "TGA": ("*",     39),
+}
+
+
+# Seeded into the registry on first load, in this order. Keyed by taxid: a
+# user who edits a built-in keeps their edit (the seed only fills what is
+# ABSENT), and a table deleted from the library comes back on the next load —
+# which is how the K12 seed has always behaved.
+_CODON_BUILTIN_TABLES: list[dict] = [
+    {"name": "E. coli K12",         "taxid": "83333",
+     "raw": _CODON_BUILTIN_K12,
+     "basis": "Kazusa, 4,290 CDS"},
+    {"name": "Nicotiana tabacum",   "taxid": "4097",
+     "raw": _CODON_BUILTIN_NTAB,
+     "basis": "Kazusa 2026-11-08, 1,534 CDS / 609,684 codons"},
+    {"name": "Nicotiana benthamiana", "taxid": "4100",
+     "raw": _CODON_BUILTIN_NBEN,
+     "basis": "Kazusa 2026-11-08, 100 CDS / 43,763 codons "
+              "(thin GENE sample — see the note above)"},
+]
 
 
 def _codon_raw_to_json(raw: dict) -> dict:
@@ -472,8 +559,10 @@ def _codon_raw_from_json(blob: dict) -> dict:
 def _codon_tables_load() -> list[dict]:
     """Load codon-table registry. Returns a deep copy so caller-side
     mutation of the `raw` dict (e.g. an in-progress Kazusa import edit)
-    can't poison the cache — matches invariant #17. Seeds built-in
-    E. coli K12 on first run so the library is never empty."""
+    can't poison the cache — matches invariant #17. Seeds the built-in
+    tables (`_CODON_BUILTIN_TABLES`: E. coli K12 + the two Nicotiana) on
+    first run so the library is never empty and a plant host is present
+    without a network round-trip."""
     # Double-checked locking (match `_load_features`): lock-free cache hit; the
     # populate (incl. the K12 seed + its save) holds `_cache_lock` so it can't
     # race a concurrent `_codon_tables_save` (agent thread) and lose the write.
@@ -499,26 +588,35 @@ def _codon_tables_load() -> list[dict]:
                     "added":  e.get("added", ""),
                     "raw":    raw,
                 })
-            # Seed built-in K12 if not present
-            if not any(e.get("taxid") == "83333" for e in fixed):
-                fixed.insert(0, {
-                    "name":   "E. coli K12",
-                    "taxid":  "83333",
+            # Seed every built-in that is ABSENT, keyed by TAXID. Absent, not
+            # different: a user who re-fetched or hand-edited a built-in keeps
+            # their version. A table they DELETED does come back on the next
+            # load, which is how the K12 seed has always behaved.
+            have = {str(e.get("taxid") or "") for e in fixed}
+            seeded = False
+            for i, builtin in enumerate(_CODON_BUILTIN_TABLES):
+                if builtin["taxid"] in have:
+                    continue
+                fixed.insert(min(i, len(fixed)), {
+                    "name":   builtin["name"],
+                    "taxid":  builtin["taxid"],
                     "source": "builtin",
                     "added":  _date.today().isoformat(),
-                    "raw":    dict(_CODON_BUILTIN_K12),
+                    "raw":    dict(builtin["raw"]),
                 })
-                _state._codon_tables_cache = fixed
+                seeded = True
+            _state._codon_tables_cache = fixed
+            if seeded:
                 # Module-level seed path — no `app` context to notify. Log-only
-                # so a disk-full first launch surfaces in the log bundle and
-                # the cache (in memory) still has the K12 seed.
+                # so a disk-full first launch (or a read-only agent, where the
+                # L2 chokepoint refuses the write) surfaces in the log bundle
+                # while the in-memory cache still carries the seeds.
                 try:
                     _codon_tables_save(fixed)
                 except (OSError, RuntimeError):
-                    _log.exception("Codon tables: K12 seed save failed (in-memory "
-                                   "cache populated; disk write deferred)")
-            else:
-                _state._codon_tables_cache = fixed
+                    _log.exception("Codon tables: built-in seed save failed "
+                                   "(in-memory cache populated; disk write "
+                                   "deferred)")
         return _typed_clone(_state._codon_tables_cache)
 
 

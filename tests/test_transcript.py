@@ -936,3 +936,241 @@ class TestStartCodonIsAlwaysInTheMessage:
             start = r["cds"]["start"]
             assert 0 <= start < len(mature)
             assert mature[start:start + 3] == "ATG", k
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Field report 2026-11-08 — three things the answer used to leave unsaid
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Reported from a real plant construct driven through the headless API:
+#
+#   * a genomic promoter feature that SPANS the transcribed 5'UTR and its
+#     intron (which is how plant polyubiquitin promoters are usually
+#     annotated) made the function answer `introns: []`,
+#     `removed_by_splicing: 0`, 5'UTR 1 nt — the one thing it exists to
+#     report, silently invisible;
+#   * a CDS ending in the `TGA TGA` tandem-stop idiom — used throughout the
+#     reporter's own library — came back warned as "splicing may have shifted
+#     the frame, or the annotation is stale";
+#   * `tx_start` / `tx_end` bounded the unit while the response still named
+#     the annotated promoter and terminator, reading as though those features
+#     had defined it.
+
+
+class TestPromoterSwallowingTheIntron:
+    """A promoter feature drawn over the transcribed leader."""
+
+    # Same construct, but the promoter annotation runs to the end of the
+    # leader intron instead of stopping at the TSS.
+    FEATS_SWALLOWED = [
+        {"start": 0,  "end": P3, "strand": 1, "type": "promoter",
+         "label": "Pdemo"},
+        {"start": P2, "end": P3, "strand": 1, "type": "intron",
+         "label": "leader intron"},
+        {"start": P4, "end": P5, "strand": 1, "type": "CDS", "label": "GFP"},
+        {"start": P5, "end": P6, "strand": 1, "type": "terminator",
+         "label": "NOS"},
+    ]
+
+    def test_the_intron_really_does_vanish(self):
+        """The premise: the TSS is the promoter's END, so an intron inside the
+        promoter is upstream of the transcript and cannot be spliced. That is
+        correct behaviour and it is why the warning has to exist."""
+        r = sa._predict_transcript(SEQ, self.FEATS_SWALLOWED, circular=True)
+        assert r["ok"], r
+        assert r["introns"] == []
+        assert r["removed_by_splicing"] == []
+
+    def test_and_it_is_now_said_out_loud(self):
+        r = sa._predict_transcript(SEQ, self.FEATS_SWALLOWED, circular=True)
+        hits = [w for w in r["warnings"]
+                if "INSIDE the chosen promoter" in w]
+        assert len(hits) == 1, r["warnings"]
+        w = hits[0]
+        assert "leader intron" in w and "Pdemo" in w
+        # and it names the way out, which is the only actionable part
+        assert "tx_start" in w
+
+    def test_an_exon_feature_inside_the_promoter_counts_too(self):
+        feats = self.FEATS_SWALLOWED + [
+            {"start": P1, "end": P2, "strand": 1, "type": "exon",
+             "label": "leader exon 1"},
+        ]
+        r = sa._predict_transcript(SEQ, feats, circular=True)
+        assert any("exon" in w and "INSIDE the chosen promoter" in w
+                   for w in r["warnings"]), r["warnings"]
+
+    def test_an_intron_on_the_other_strand_is_not_warned_about(self):
+        """It belongs to a gene transcribed the other way; warning about it
+        would be noise, and the existing opposite-strand rule already says so
+        for introns inside the unit."""
+        feats = [dict(f) for f in self.FEATS_SWALLOWED]
+        feats[1] = dict(feats[1], strand=-1)
+        r = sa._predict_transcript(SEQ, feats, circular=True)
+        assert not [w for w in r["warnings"]
+                    if "INSIDE the chosen promoter" in w], r["warnings"]
+
+    def test_the_normal_annotation_stays_silent(self):
+        """The promoter that stops at the TSS must not pick up a warning."""
+        r = _predict()
+        assert not [w for w in r["warnings"]
+                    if "INSIDE the chosen promoter" in w], r["warnings"]
+
+    def test_an_intron_outside_the_unit_is_reported_too(self):
+        """Any other reason an annotated intron misses the unit is the same
+        class of silence: `introns: []` with no explanation."""
+        feats = [f for f in FEATS if f["type"] != "intron"] + [
+            {"start": P5 + 10, "end": P5 + 30, "strand": 1, "type": "intron",
+             "label": "downstream intron"},
+        ]
+        # bound the unit short so the extra intron falls outside it
+        r = sa._predict_transcript(SEQ, feats, circular=True,
+                                   tx_start=P1, tx_end=P5)
+        assert r["ok"], r
+        assert any("lies OUTSIDE this transcription unit" in w
+                   for w in r["warnings"]), r["warnings"]
+
+
+class TestTandemStopCodons:
+    """`TGA TGA` is a terminator, not a stale annotation."""
+
+    # CDS as above but with a second in-frame stop, and the annotation drawn
+    # over both — exactly what the reporter's library does.
+    CDS2 = CDS + "TGA"
+    SEQ2 = PROM + LEAD1 + INTRON + LEAD2 + CDS2 + TERM
+    Q4 = P4
+    Q5 = Q4 + len(CDS2)
+    Q6 = Q5 + len(TERM)
+    FEATS2 = [
+        {"start": 0,  "end": P1, "strand": 1, "type": "promoter", "label": "35S"},
+        {"start": P2, "end": P3, "strand": 1, "type": "intron",
+         "label": "leader intron"},
+        {"start": Q4, "end": Q5, "strand": 1, "type": "CDS", "label": "GFP"},
+        {"start": Q5, "end": Q6, "strand": 1, "type": "terminator",
+         "label": "NOS"},
+    ]
+
+    def _run(self):
+        r = sa._predict_transcript(self.SEQ2, self.FEATS2, circular=True)
+        assert r["ok"], r
+        return r
+
+    def test_the_premise_two_in_frame_stops(self):
+        assert self.CDS2.endswith("TAATGA")
+        assert len(self.CDS2) % 3 == 0
+
+    def test_no_stale_annotation_warning(self):
+        r = self._run()
+        assert not [w for w in r["warnings"] if "annotation is stale" in w], \
+            r["warnings"]
+
+    def test_the_count_is_reported_instead(self):
+        r = self._run()
+        assert r["cds"]["stop_codons"] == 2
+
+    def test_a_single_stop_still_reports_one(self):
+        r = _predict()
+        assert r["cds"]["stop_codons"] == 1
+
+    def test_a_genuinely_stale_annotation_is_still_warned_about(self):
+        """The warning must keep working for what it was written for: trailing
+        bases that are NOT stops."""
+        feats = [dict(f) for f in self.FEATS2]
+        feats[2] = dict(feats[2], end=self.Q5 + 9)   # 3 extra sense codons
+        r = sa._predict_transcript(self.SEQ2, feats, circular=True)
+        assert any("annotation is stale" in w for w in r["warnings"]), \
+            r["warnings"]
+
+    def test_three_tandem_stops_are_fine_too(self):
+        cds3 = CDS + "TGATAG"
+        seq3 = PROM + LEAD1 + INTRON + LEAD2 + cds3 + TERM
+        q5 = P4 + len(cds3)
+        feats = [
+            {"start": 0,  "end": P1, "strand": 1, "type": "promoter", "label": "P"},
+            {"start": P4, "end": q5, "strand": 1, "type": "CDS", "label": "GFP"},
+            {"start": q5, "end": q5 + len(TERM), "strand": 1,
+             "type": "terminator", "label": "T"},
+        ]
+        r = sa._predict_transcript(seq3, feats, circular=True)
+        assert r["ok"], r
+        assert r["cds"]["stop_codons"] == 3
+        assert not [w for w in r["warnings"] if "annotation is stale" in w]
+
+
+class TestExplicitBoundsAreAttributed:
+    """`tx_start` / `tx_end` win, and the response says so."""
+
+    def test_bounds_from_annotation_by_default(self):
+        assert _predict()["unit"]["bounds_from"] == "annotation"
+
+    def test_bounds_from_tx_when_given(self):
+        r = sa._predict_transcript(SEQ, FEATS, circular=True,
+                                   tx_start=P1, tx_end=P6)
+        assert r["ok"], r
+        assert r["unit"]["bounds_from"] == "tx_start/tx_end"
+
+    def test_the_overridden_features_are_named(self):
+        r = sa._predict_transcript(SEQ, FEATS, circular=True,
+                                   tx_start=P1, tx_end=P6)
+        assert any("did NOT define it" in w for w in r["warnings"]), \
+            r["warnings"]
+
+    def test_one_sided_bounds_still_refuse_with_a_reason(self):
+        """Not a silent failure — the report suspected one, and the refusal is
+        what proves it isn't."""
+        r = sa._predict_transcript(SEQ, FEATS, circular=True, tx_start=P1)
+        assert r["ok"] is False
+        assert "tx_start and tx_end must BOTH be integers" in r["error"]
+
+    def test_every_refusal_carries_an_error_string(self):
+        """Audited because the report read `ok: False` as "no reason given"."""
+        for kw in ({"tx_start": P1},
+                   {"tx_end": P6},
+                   {"tx_start": 10, "tx_end": 10},
+                   {"tx_start": P6, "tx_end": P1},
+                   {"tx_start": P5 + 5, "tx_end": P6}):
+            r = sa._predict_transcript(SEQ, FEATS, circular=True, **kw)
+            if r.get("ok"):
+                continue
+            assert r.get("error"), kw
+
+
+class TestOutOfUnitWarningsAreBounded:
+    """One line each is right for a plasmid and wrong for a chromosome
+    record, where every gene's introns are "outside this unit"."""
+
+    def _run(self, n_in, n_out):
+        pad = "ACGT" * 200
+        seq = SEQ + pad
+        feats = [
+            {"start": 0, "end": P3, "strand": 1, "type": "promoter",
+             "label": "P"},
+            {"start": P4, "end": P5, "strand": 1, "type": "CDS", "label": "C"},
+            {"start": P5, "end": P6, "strand": 1, "type": "terminator",
+             "label": "T"},
+        ]
+        for i in range(n_in):
+            feats.append({"start": P2 + i, "end": P2 + i + 5, "strand": 1,
+                          "type": "intron", "label": f"in{i}"})
+        for i in range(n_out):
+            feats.append({"start": P6 + 10 * i, "end": P6 + 10 * i + 5,
+                          "strand": 1, "type": "intron", "label": f"out{i}"})
+        r = sa._predict_transcript(seq, feats, circular=True)
+        assert r["ok"], r
+        return r["warnings"]
+
+    def test_a_handful_each_get_their_own_line(self):
+        w = self._run(3, 2)
+        assert sum("INSIDE the chosen promoter" in x for x in w) == 3
+        assert sum("lies OUTSIDE this" in x for x in w) == 2
+        assert not [x for x in w if x.startswith("…and")]
+
+    def test_past_the_cap_they_are_counted_not_dropped(self):
+        w = self._run(30, 30)
+        cap = sa._TX_MAX_OUT_OF_UNIT
+        assert sum("INSIDE the chosen promoter" in x for x in w) == cap
+        assert sum("lies OUTSIDE this" in x for x in w) == cap
+        # the remainder is stated, so a truncated list never reads as the
+        # whole list
+        assert f"…and {30 - cap} more intron/exon feature(s)" in " ".join(w)
+        assert f"…and {30 - cap} more annotated intron(s)" in " ".join(w)

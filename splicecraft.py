@@ -43,13 +43,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.3.14"
+__version__ = "1.3.15"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-11-01"
+_RELEASE_DATE = "2026-11-08"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -6694,6 +6694,8 @@ from splicecraft_codon import (  # noqa: E402
     _codon_allocate as _codon_allocate,
     _codon_optimize as _codon_optimize,
     _codon_fix_sites as _codon_fix_sites,
+    _codon_fix_splice_sites as _codon_fix_splice_sites,
+    _CODON_SPLICE_MAX_REPORT as _CODON_SPLICE_MAX_REPORT,
     _CODON_HOST_HAZARD_MOTIFS as _CODON_HOST_HAZARD_MOTIFS,
     _codon_hazard_motifs as _codon_hazard_motifs,
     _CODON_GC_WINDOW_DEFAULT as _CODON_GC_WINDOW_DEFAULT,
@@ -9208,7 +9210,7 @@ def _clipboard_native_commands() -> "list[list[str]]":
       * WSL              → `clip.exe`, then `powershell.exe Set-Clipboard`
                            (Linux tools have no display; the clipboard is
                            on the Windows side)
-      * Linux/BSD Wayland→ `wl-copy`
+      * Linux/BSD Wayland→ `wl-copy --type text/plain`
       * Linux/BSD X11    → `xclip`, then `xsel`
       * Termux (Android) → `termux-clipboard-set`
 
@@ -9235,7 +9237,20 @@ def _clipboard_native_commands() -> "list[list[str]]":
              "$input | Set-Clipboard"],
         ]
     if os.environ.get("WAYLAND_DISPLAY"):
-        cmds.append(["wl-copy"])
+        # `--type text/plain` is REQUIRED, not cosmetic. With no --type,
+        # wl-copy CONTENT-SNIFFS the payload to choose a MIME type, and a
+        # bare DNA string is pathological input for that sniffer: MPEG-TS's
+        # magic is sync byte 0x47 — ASCII `G` — repeating every 188 bytes,
+        # so any sequence carrying a G at offsets 0/188/376/564 is published
+        # as `video/mp2t` AND NOTHING ELSE. The copy still "succeeds" (exit
+        # 0, our toast fires, `wl-paste` round-trips the bytes) but no
+        # text-accepting application — LibreOffice, a browser, an editor —
+        # is offered a type it will take, so the user's Ctrl+V silently
+        # does nothing. Golden Braid L0 parts open `GGTCTCA…` (BsaI), which
+        # satisfies offset 0 for free; a 3,206 bp L0 construct hit all four
+        # (2026-11-02 user report: Ptyxis → LibreOffice Calc on Wayland).
+        # We are ALWAYS copying text, so never let it guess.
+        cmds.append(["wl-copy", "--type", "text/plain"])
     if os.environ.get("DISPLAY"):
         cmds.append(["xclip", "-selection", "clipboard"])
         cmds.append(["xsel", "--clipboard", "--input"])
@@ -10596,6 +10611,7 @@ from splicecraft_cloning import (  # noqa: E402
     _enzyme_is_type_iis as _enzyme_is_type_iis,
     _excise_pcr_insert as _excise_pcr_insert,
     _excise_fragment_pair as _excise_fragment_pair,
+    _acceptor_vector_features as _acceptor_vector_features,
     _fragment_is_ligatable as _fragment_is_ligatable,
     _ligatable_fragments as _ligatable_fragments,
     _pick_linear_ligatable_fragment as _pick_linear_ligatable_fragment,
@@ -10653,6 +10669,9 @@ from splicecraft_seqanalysis import (  # noqa: E402
     _grammar_acceptor_tu_pairs as _grammar_acceptor_tu_pairs,
     _ACCEPTOR_TU_PAIRS_CACHE_MAX as _ACCEPTOR_TU_PAIRS_CACHE_MAX,
     _classify_part_from_plasmid as _classify_part_from_plasmid,
+    _check_acceptor_vector as _check_acceptor_vector,
+    _ACCEPTOR_MAX_FRAGMENTS as _ACCEPTOR_MAX_FRAGMENTS,
+    _synthesis_lint as _synthesis_lint,
     _grammar_canonical_overhangs as _grammar_canonical_overhangs,
     _part_level_label as _part_level_label,
     _map_transcription as _map_transcription,
@@ -45505,8 +45524,18 @@ def _assembly_fragment_enzyme_candidates(
     level-up enzyme's sites during the L0→TU clone, so the OTHER
     enzyme is the right cutter for that user's TU→MOD step. The
     fallback picks whichever enzyme yields a clean 2-fragment circular
-    digest — properly-designed standard GB vectors hit the primary
-    first and the fallback never triggers (no behaviour change)."""
+    digest.
+
+    **The fallback is load-bearing, not an optimisation.** The claim it used
+    to carry — "properly-designed standard GB vectors hit the primary first
+    and the fallback never triggers" — is false for the canonical pDGB3
+    convention, and that is the common case: `gb_l0.enzyme` is the
+    DOMESTICATION enzyme, so `_enzyme_for_level_up(gb_l0, 0)` names Esp3I
+    while a real L0 part in a UPD vector carries two BsaI sites and zero Esp3I
+    sites (measured, field report 2026-11-08). The first candidate finds no
+    cuts, this loop moves to the second, and the step works. Keep both
+    candidates; a "cleanup" that trusts the parity would break every L0→α
+    assembly on a real GoldenBraid library."""
     candidates: list[str] = [primary_enzyme]
     for cand in (str(grammar.get("enzyme") or ""),
                   str(grammar.get("level_up_enzyme") or "")):
@@ -47404,25 +47433,39 @@ _ACCEPTOR_TU_PAIRS_CACHE = _state._ACCEPTOR_TU_PAIRS_CACHE
 # Golden Braid binary-assembly architecture (gb_l0 with primary=Esp3I,
 # level_up=BsaI, per Sarrion-Perdigones 2013 / pDGB3):
 #
-# Which concrete enzyme is INNER at a given level comes from the grammar, not
-# from a name written here: `_enzyme_for_level_up(grammar, source_level)` is
-# THE answer (primary on even levels, `level_up_enzyme` on odd), so for
-# `gb_l0` the L0→α assembly runs on Esp3I and BsaI is the outer release pair.
-# An earlier revision of this block named them the other way round, which
-# contradicted that function and every path driven by it (audit 2026-10-24) —
-# the detector below reads the grammar, so describe the ROLES and let the
-# grammar supply the names.
-#
-#   α-vectors (L1):  INNER = `_enzyme_for_level_up(g, 0)` (assembly)
-#                    OUTER = the other one               (release)
+#   α-vectors (L1):  INNER = `level_up_enzyme`  (assembly: BsaI for gb_l0)
+#                    OUTER = `enzyme`           (release:  Esp3I)
 #                    INNER stuffer = (GGAG, CGCT)  (canonical TU boundary)
 #                    OUTER stuffer = (GGAG, GTCA)  → Alpha1
 #                                  = (GTCA, CGCT)  → Alpha2
 #
-#   Ω-vectors (L2):  the two swap — INNER = `_enzyme_for_level_up(g, 1)`
+#   Ω-vectors (L2):  the two swap — INNER = `enzyme` (Esp3I), OUTER = BsaI
 #                    INNER stuffer = (GGAG, CGCT)  (canonical TU boundary)
 #                    OUTER stuffer = (GGAG, GTCA)  → Omega1
 #                                  = (GTCA, CGCT)  → Omega2
+#
+# **This is NOT `_enzyme_for_level_up`'s parity, and the difference is real.**
+# An earlier revision of this block described α's inner cutter as
+# `_enzyme_for_level_up(g, 0)` (= `enzyme`, Esp3I) to agree with that function
+# (audit 2026-10-24). It agreed with the function and disagreed with
+# `_resolve_acceptor_role` right below — and with the plasmids. MEASURED on
+# real pDGB3-convention α/Ω vectors (field report 2026-11-08): an empty α1
+# releases its (GGAG, CGCT) stuffer with **BsaI**, an empty Ω1 releases the
+# same pair with **Esp3I**, and an L0 CDS part sitting in a UPD vector carries
+# two BsaI sites and ZERO Esp3I sites — so BsaI is what takes a part from L0
+# into α, which is exactly what the code below says and the opposite of what
+# the parity says.
+#
+# `_enzyme_for_level_up` is left alone deliberately. `gb_l0.enzyme` is the
+# DOMESTICATION enzyme (the one whose site the primers add, `_GB_L0_ENZYME_SITE`
+# = CGTCTC, to get a part INTO the UPD vector), while `moclo_plant.enzyme` is
+# the enzyme that RELEASES an L0 part — the field carries two different
+# meanings in the two shipped grammars, which is why one parity cannot be right
+# for both. Nothing breaks today because `_assembly_fragment_enzyme_candidates`
+# tries the other enzyme when the first yields no clean 2-fragment digest: on
+# canonical GB vectors that fallback fires on EVERY L0→α step, so it is
+# load-bearing, not an optimisation. `_classify_part_from_plasmid` makes the
+# same allowance (it tries both enzymes and documents both conventions).
 #
 # The canonical TU boundary on the INNER enzyme distinguishes α from Ω
 # (the OUTER enzyme is the one whose stuffer pair encodes the role).
@@ -47898,7 +47941,20 @@ def _enzyme_for_level_up(grammar: dict, source_level: int) -> str:
     wraps back to ``grammar.enzyme``. Parity on ``source_level`` picks
     the right one. Falls back to ``grammar.enzyme`` when a custom
     grammar omits ``level_up_enzyme`` (older custom grammars predate
-    iterative cycle support)."""
+    iterative cycle support).
+
+    **Read this as a FIRST GUESS, not as the answer.** ``enzyme`` does not
+    mean the same thing in the two shipped grammars: ``moclo_plant.enzyme``
+    (BsaI) is the enzyme that RELEASES an L0 part, while ``gb_l0.enzyme``
+    (Esp3I, site ``_GB_L0_ENZYME_SITE``) is the DOMESTICATION enzyme that puts
+    a part INTO the UPD vector — the part that comes out carries BsaI sites
+    and no Esp3I sites at all. So for ``gb_l0`` this parity names the wrong
+    enzyme for an L0→α step, and the right one for MoClo. Every caller
+    tolerates that because `_assembly_fragment_enzyme_candidates` tries the
+    other enzyme when the first yields no clean digest; nothing here should be
+    "simplified" to trust the parity alone. Measured on real pDGB3-convention
+    vectors — see the note above `_resolve_acceptor_role` (field report
+    2026-11-08)."""
     primary = str(grammar.get("enzyme") or "")
     secondary = str(grammar.get("level_up_enzyme") or "") or primary
     return primary if (source_level % 2) == 0 else secondary
@@ -50484,6 +50540,9 @@ from splicecraft_dataaccess import _extract_feature_entries_from_record as _extr
 from splicecraft_dataaccess import (  # noqa: E402
     _CODON_GENETIC_CODE as _CODON_GENETIC_CODE,
     _CODON_BUILTIN_K12 as _CODON_BUILTIN_K12,
+    _CODON_BUILTIN_NTAB as _CODON_BUILTIN_NTAB,
+    _CODON_BUILTIN_NBEN as _CODON_BUILTIN_NBEN,
+    _CODON_BUILTIN_TABLES as _CODON_BUILTIN_TABLES,
     _codon_raw_to_json as _codon_raw_to_json,
     _codon_raw_from_json as _codon_raw_from_json,
     _codon_tables_load as _codon_tables_load,
@@ -61246,6 +61305,12 @@ class EntryVectorsModal(_OneShotDismissScreen, ModalScreen):
         roles = self._roles_for_grammar(self._grammar_id)
         n_bound = 0
         backbones = _CONSTRUCTOR_BACKBONES.get(self._grammar_id, {})
+        grammar_dict = _all_grammars().get(self._grammar_id) or {}
+        # Acceptor-shape problems with the vectors actually BOUND here. The
+        # Constructor used to find these silently — a vector with four sites of
+        # the assembly enzyme just failed to digest and the step fell back or
+        # skipped, with nothing on screen (field report 2026-11-08).
+        acceptor_lines: "list[str]" = []
         # `family_markers[family]` → list of (role_key, detected_marker)
         # for every BOUND role with a detectable marker. Drives the
         # intra-pair-mismatch + cross-family-collision warnings below.
@@ -61270,6 +61335,15 @@ class EntryVectorsModal(_OneShotDismissScreen, ModalScreen):
                 hint = (
                     f"{note} · {marker_label}" if note else marker_label
                 )
+                qc = self._acceptor_qc_lines(
+                    grammar_dict, role_key,
+                    str(ev.get("gb_text", "") or ""),
+                )
+                if qc:
+                    acceptor_lines.extend(qc)
+                    vector_text = Text(
+                        f"{name}  ·  {size:,} bp  ⚠", style="bold yellow",
+                    )
             else:
                 vector_text = Text("(not set)", style="dim italic")
             t.add_row(
@@ -61299,7 +61373,69 @@ class EntryVectorsModal(_OneShotDismissScreen, ModalScreen):
         ]
         for w in warnings:
             status_lines.append(f"  [yellow]⚠ {w}[/yellow]")
+        for w in acceptor_lines:
+            status_lines.append(f"  [yellow]⚠ {w}[/yellow]")
         status.update("\n".join(status_lines))
+
+    @staticmethod
+    def _acceptor_qc_lines(grammar: dict, role_key: str,
+                           gb_text: str) -> "list[str]":
+        """Compact acceptor-shape findings for ONE bound vector.
+
+        An acceptor exists to release a single stuffer between two Type IIS
+        cuts. A bound vector that cannot do that is not a configuration
+        detail — every downstream step either refuses or silently falls back,
+        and until this line existed none of them said so. The full report
+        (every fragment, its overhangs, which surplus one impersonates a real
+        part) is the `check-acceptor-vector` endpoint; this is the one-line
+        form that fits a modal.
+
+        Never raises: a QC that cannot run must not stop the user configuring
+        their vectors.
+        """
+        if not gb_text or not isinstance(grammar, dict):
+            return []
+        try:
+            rec = _gb_text_to_record(gb_text)
+            seq = str(getattr(rec, "seq", "") or "")
+            if len(seq) > _PAIRWISE_MAX_LEN:
+                # This runs on the UI thread, once per bound vector, on every
+                # refresh of the table. A chromosome bound by mistake would
+                # digest into thousands of fragments and freeze the modal —
+                # the same reason the endpoint refuses one. Say nothing
+                # rather than block: the row is still usable.
+                return []
+            res = _check_acceptor_vector(
+                seq,
+                circular=_record_is_circular(rec),
+                grammar=grammar,
+                features=_acceptor_vector_features(rec),
+            )
+        except Exception:
+            _log.exception(
+                "entry vectors: acceptor QC failed for role %r", role_key)
+            return []
+        label = role_key or "UPD"
+        out: "list[str]" = []
+        for row in res.get("enzymes", []):
+            if row.get("usable") or int(row.get("n_sites") or 0) <= 2:
+                continue
+            competing = [x for x in row.get("extra", [])
+                         if x.get("collides_with")]
+            line = (f"{label}: {row['n_sites']} {row['enzyme']} sites — an "
+                    f"acceptor needs exactly 2")
+            if competing:
+                c = competing[0]
+                line += (f"; a {c['length']} bp fragment comes out with "
+                         f"{c['oh5']}/{c['oh3']} ends"
+                         + (f" (this grammar's {c['matches_slot']} pair)"
+                            if c.get("matches_slot") else "")
+                         + " and competes with a real part")
+            out.append(line)
+        if not res.get("ok") and not out:
+            out.append(f"{label}: no declared enzyme releases a single "
+                       f"stuffer from this vector")
+        return out
 
     @staticmethod
     def _marker_warnings(
@@ -113150,6 +113286,112 @@ def _h_rename_plasmid(app, payload):
 
 
 
+
+
+@_agent_endpoint("check-acceptor-vector")
+def _h_check_acceptor_vector(app, payload):
+    """Is this plasmid a well-formed ACCEPTOR vector for a cloning grammar?
+    Body: ``{grammar?="gb_l0", enzymes?: [str], entry?, collection?}``.
+
+    An acceptor has one job: two Type IIS cuts around a stuffer, so the
+    stuffer drops out and the part drops in. Everything in the app that uses
+    an acceptor depends on that, and every one of those paths discovers a
+    violation by going QUIET — `_excise_fragment_pair` refuses, the
+    entry-vector overhang lookup turns the refusal into "no vector
+    configured" and the domestication design falls back to a one-tier layout;
+    Auto-detect skips the vector without saying why; and `lint-synthesis` with
+    the grammar's enzymes as ``forbidden_enzymes`` scores a WORKING acceptor
+    20/100 because an acceptor is supposed to carry those sites. This asks the
+    question directly instead.
+
+    For each enzyme (the grammar's own two unless ``enzymes`` names others) it
+    reports ``n_sites`` / ``cut_positions``, every fragment with its
+    overhangs, which one is the ``dropout`` — identified by the ABSENCE of a
+    backbone marker, never by size — and, when there are more than two sites,
+    every surplus fragment with ``collides_with``: the overhangs it shares
+    with this grammar's own alphabet. That last one is the finding this
+    endpoint exists for. Two α/Ω vectors in daily use turned out to carry FOUR
+    BsaI sites, and one surplus fragment came out with AATG/GCTT ends — the
+    exact pair an incoming L0 CDS part presents, so it competes for BOTH
+    junctions of every BsaI assembly that vector is used in (field report
+    2026-11-08).
+
+    ``role`` carries what the Constructor's auto-detect makes of the same
+    plasmid (``{name, confidence}``, or ``detected: false`` with the reason
+    the check found) so a vector that silently failed to bind says why.
+    ``entry`` answers about a library entry without loading it (see
+    `get-sequence`). ``ok`` is true when at least one enzyme releases a single
+    identifiable stuffer — read the per-enzyme rows and ``warnings``, not just
+    ``ok``: a vector can be a perfect Esp3I acceptor and a hazard under BsaI.
+    Read-only."""
+    rec, basis, err = _agent_target_record(app, payload)
+    if err is not None:
+        return err
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    gid = payload.get("grammar", "gb_l0")
+    if not isinstance(gid, str) or not gid:
+        return ({"error": "'grammar' must be a grammar id"}, 400)
+    grammar = _all_grammars().get(gid)
+    if grammar is None:
+        return ({"error": f"unknown grammar id {gid!r}"}, 404)
+    enzymes = payload.get("enzymes")
+    if enzymes is not None:
+        if (not isinstance(enzymes, list)
+                or not all(isinstance(x, str) and x for x in enzymes)):
+            return ({"error": "'enzymes' must be a list of enzyme names"}, 400)
+        if len(enzymes) > 8:
+            return ({"error": "'enzymes' too long (max 8)"}, 400)
+        catalog = _all_enzymes()
+        unknown = [x for x in enzymes if x not in catalog]
+        if unknown:
+            # Same fail-loud rule as `lint-synthesis`: an expectation that was
+            # never evaluated must not come back as a clean verdict.
+            return ({"error": f"unknown enzyme(s): {unknown[:8]}"}, 400)
+    seq = str(getattr(rec, "seq", "") or "")
+    if len(seq) > _PAIRWISE_MAX_LEN:
+        # An acceptor is a plasmid. A chromosome-scale record would digest
+        # into thousands of fragments nobody can act on, so it is refused
+        # with its size rather than answered slowly.
+        return ({"error": f"this record is {len(seq):,} bp; "
+                          f"check-acceptor-vector is capped at "
+                          f"{_PAIRWISE_MAX_LEN:,} bp (an acceptor vector is a "
+                          f"plasmid)"}, 413)
+    try:
+        result = _check_acceptor_vector(
+            seq,
+            circular=_record_is_circular(rec),
+            grammar=grammar,
+            features=_acceptor_vector_features(rec),
+            enzymes=enzymes,
+        )
+    except Exception as exc:
+        _log.exception("agent check-acceptor-vector failed")
+        return ({"error": f"acceptor check failed: {_scrub_path(str(exc))}"},
+                500)
+    # What the Constructor's own detector makes of it, so the two never
+    # disagree in front of the user.
+    role: dict
+    try:
+        detected = _detect_entry_vector_role(rec, grammar)
+    except Exception:
+        _log.exception("agent check-acceptor-vector: role detection failed")
+        detected = None
+    if detected:
+        role = {"detected": True, "name": detected[0] or "",
+                "label": detected[0] or "L0 / UPD singleton",
+                "confidence": detected[1]}
+    else:
+        role = {"detected": False,
+                "reason": "; ".join(
+                    [r["note"] for r in result.get("enzymes", [])
+                     if r.get("note") and not r.get("usable")]
+                    or result.get("errors", [])
+                    or ["both enzyme digests match a known acceptor pattern, "
+                        "but not one this grammar has a role mapping for"])}
+    return {**result, "role": role, "basis": basis,
+            "ignored": _agent_ignored_keys(
+                payload, {"grammar", "enzymes", "entry", "collection"})}
 
 
 @_agent_endpoint("set-entry-vector", write=True)

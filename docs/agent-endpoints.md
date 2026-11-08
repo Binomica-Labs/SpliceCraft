@@ -30,6 +30,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `bulk-export-collection` | W | Write every plasmid in `collection` to `dir` as files of `format`. Body: `{collection, format, dir}`. `format` ∈ {"genbank", "embl", "fasta",… |
 | `bulk-import-folder` | W | Import every `.dna` / `.gb` / `.gbk` / `.genbank` file in a folder into a target collection. Body: `{folder, collection}`. The collection is… |
 | `capture-snapshot` | W | Write a Markdown UI snapshot (same content as Alt+D) and return the file path. Useful for an agent assembling a bug report: snapshot first, then… |
+| `check-acceptor-vector` | R | Is this plasmid a well-formed ACCEPTOR vector for a cloning grammar? Body: `{grammar?="gb_l0", enzymes?: [str], entry?, collection?}`. |
 | `check-primer` | R | Check ONE primer against a template: melting temp, GC%, and every 3'-anchored binding site (both strands, wrap-aware on a circular template).… |
 | `check-primer-duplicates` | R | Scan the primer library for duplicate sequences. Returns a list of groups where multiple entries share the same canonical primer sequence — useful… |
 | `check-primer-pair` | R | Check one PCR primer PAIR as a whole: the Tm of each annealing arm and their difference, the secondary structures Primer3 screens for (hairpin,… |
@@ -107,7 +108,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `features` | R | List features on the loaded record (idx, label, type, start, end, strand). |
 | `fetch` | W | Fetch a GenBank record from NCBI by accession and load it into the canvas. Body: `{accession, force?}`. |
 | `find-feature` | R | Find features on the LOADED plasmid by NAME — forgiving of case, spacing, hyphens and Greek letters (`lacZ alpha` finds `LacZ-α`), best match… |
-| `find-orfs` | R | Six-frame ORF scan over the loaded record. Body: `{min_aa?: int, include_alt_starts?: bool}`. Defaults: 30 aa, ATG only. The length cutoff is in… |
+| `find-orfs` | R | Six-frame ORF scan over the loaded record. Body: `{min_aa?: int, include_alt_starts?: bool, entry?, collection?}`. `entry` scans a library entry… |
 | `find-sequence` | R | Locate a DNA subsequence / IUPAC motif on the loaded record. Body: `{query, both_strands?, max_hits?}`. |
 | `fold-rna` | R | Fold a sequence to its minimum-free-energy RNA secondary structure. Body: `{sequence}` (alias `{seq}`). DNA `T` is read as RNA `U`. Returns `{ok,… |
 | `fpbase-search` | R | Search FPbase (fpbase.org) for FLUORESCENT PROTEINS by name. Body: `{query, max_hits?}` (`query` is a substring, e.g. "mCherry", "GFP"). |
@@ -130,14 +131,14 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `get-feature-preset` | R | Fetch one built-in preset by name, including its bases. Body: `{name, feature_type?}`. Name match is exact but case-insensitive. 404 when there is… |
 | `get-gel` | R | Fetch one saved gel snapshot (full lane payload + notes). |
 | `get-grammar` | R | Return the full grammar dict for `grammar_id`. Body: `{grammar_id}`. |
-| `get-history` | R | Return the construction-history tree for a library entry as nested JSON. Body: `{name}` (or `{id}`). Returns `history=null` when the entry has no… |
+| `get-history` | R | Return the construction-history tree for a library entry as nested JSON. Body: `{name}` (or `{id}`, or `{entry}`). Returns `history=null` when the… |
 | `get-hmm-database` | R | Detail for one HMM database by `id`. |
 | `get-part` | R | Fetch a single part by `name` (and optional `grammar` to disambiguate when two grammars carry a part with the same name). Returns the full entry… |
 | `get-plasmid-protocol` | R | A plasmid's recorded construction history as a bench protocol. Body: `{id: str, collection?: str}`. |
 | `get-primer` | R | Return a primer-library entry by `{name\|id}` or exact (case-insensitive) `{sequence}`. Optional `{collection}` scopes the lookup to that… |
 | `get-protein-collection` | R | One protein collection's full contents. Body: `{name}`. |
 | `get-protocol` | R | The saved `plan` for a protocol. Body: `{name}`. The plan is compile-able by `ot2-compile` / `ot2-run`. |
-| `get-sequence` | R | Return DNA from `[start, end)`. Body: `{start, end, bottom?}`. `bottom: true` returns the reverse-complement (5'→3' on the bottom strand).… |
+| `get-sequence` | R | Return DNA from `[start, end)`. Body: `{start, end, bottom?, entry?, collection?}`. `bottom: true` returns the reverse-complement (5'→3' on the… |
 | `get-settings` | R | Return every allowlisted user-toggle setting with its current value, default, and validator hint. Useful for an agent that wants to inspect which… |
 | `gibson-assemble` | W | Run a Gibson simulation AND save the product to the library. Body extends `simulate-gibson` with: |
 | `golden-gate-assemble` | W | Run a Golden Gate / MoClo (Type IIS) assembly AND save the product to the library — the Type IIS counterpart to `gibson-assemble`. Body extends… |
@@ -161,7 +162,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `list-backups` | R | List recoverable backups for user-data files. Body: `{label?}`. |
 | `list-cas-variants` | R | The Cas nucleases `design-guides` supports. Returns `{variants: [{key, label, pam, pam_side, guide_len, cut_offsets, notes}, ...]}`. |
 | `list-cis-elements` | R | The curated plant cis-regulatory element catalogue. |
-| `list-codon-tables` | R | Available codon usage tables. Returns name, taxid, source (builtin/kazusa/user) and date added for each entry, plus the `active_taxid` field… |
+| `list-codon-tables` | R | Available codon usage tables. Returns name, taxid, source (builtin/kazusa/user), date added and `n_codons` for each entry, plus the `active_taxid`… |
 | `list-collections` | R | Plasmid collection buckets. Returns name + plasmid count for each collection, and which one is currently active. |
 | `list-custom-enzymes` | R | List every user-added custom enzyme. Built-in NEB enzymes are NOT included — fetch the combined view via list-restriction-sites or… |
 | `list-custom-labware` | R | Every custom labware definition as `[{name, collection}]`. |
