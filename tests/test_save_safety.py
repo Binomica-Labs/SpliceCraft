@@ -1486,3 +1486,116 @@ class TestABulkImportFlushCannotLoseAPrimer:
         assert "prPANEL" in ids, ids
         # And the import's own primers are still there.
         assert len(on_disk) > 1, on_disk
+
+
+# ── The pop window the barrier could not see (audit 2026-11-09) ─────────────
+# `_land_pending_collection_sync` — the barrier `_collections_transaction` and
+# `_migrate_import_transaction` use to satisfy [INV-224] #3/#4 — only ever
+# inspected `_state._collection_sync_pending`. The background worker POPS that
+# slot and only THEN blocks on `_cache_lock`, so for essentially the whole life
+# of every deferred mirror the barrier answered "nothing queued": the
+# transaction went ahead, and the mirror was afterwards dropped as an orphan
+# together with the `.mirror-dirty` marker that was the newer library file's
+# only protection.
+#
+# Tested WITHOUT the live daemon, on purpose. conftest forces mirrors
+# synchronous because a real deferred write bleeds across tests, and no test
+# exercised the async path — which is why this survived. The worker's two
+# steps are tiny and are reproduced here exactly, so the handoff is pinned
+# deterministically.
+
+def _simulate_worker_pop():
+    """Exactly what `_drain_collection_sync_loop` does: take `_pending` and
+    publish it as in-flight, in ONE hold, then (in the real worker) block on
+    `_cache_lock`. Returns the popped payload."""
+    with sc._collection_sync_lock:
+        payload = sc._state._collection_sync_pending
+        sc._state._collection_sync_pending = None
+        sc._state._collection_sync_inflight = payload
+    return payload
+
+
+class TestTheBarrierSeesAPoppedMirror:
+    def _queue(self):
+        entries = [_plain_entry("aOne", "ACGT" * 150),
+                   _plain_entry("queued", "TTGCA" * 100)]
+        sc._safe_save_json(sc._state._LIBRARY_FILE, entries,
+                           "Plasmid library")
+        sc._state._library_cache = sc._typed_clone(entries)
+        seq = sc._mark_mirror_pending()
+        sc._state._collection_sync_pending = (
+            "Main", [dict(e) for e in entries], seq)
+        return entries, seq
+
+    def test_the_barrier_lands_a_mirror_the_worker_already_popped(self):
+        _seed({"Main": [_plain_entry("aOne", "ACGT" * 150)]}, "Main")
+        entries, _seq = self._queue()
+        payload = _simulate_worker_pop()
+        assert payload is not None, "premise: a mirror was queued"
+        assert sc._state._collection_sync_pending is None, \
+            "premise: the worker emptied the queued slot"
+        # Pre-fix this returned False — the barrier saw an empty queue and the
+        # transaction proceeded as if nothing were in flight.
+        assert sc._land_pending_collection_sync("test barrier") is True
+        names = [p.get("name")
+                 for c in sc._load_collections() if c.get("name") == "Main"
+                 for p in (c.get("plasmids") or [])]
+        assert "queued" in names, (
+            f"the popped mirror never landed; Main holds {names}")
+
+    def test_the_worker_declines_a_mirror_the_barrier_took_over(self):
+        """The other half: once a barrier has claimed it, the worker must NOT
+        write its own (now older) payload on top."""
+        _seed({"Main": [_plain_entry("aOne", "ACGT" * 150)]}, "Main")
+        _entries, seq = self._queue()
+        payload = _simulate_worker_pop()
+        assert sc._land_pending_collection_sync("test barrier") is True
+        # The worker now reaches `_land_deferred_mirror` with `inflight=True`.
+        assert sc._claim_inflight_mirror(seq) is False, (
+            "the worker re-claimed a mirror the barrier had already taken")
+
+    def test_a_claim_succeeds_when_nobody_stole_it(self):
+        """Control — the claim must not refuse the normal path, or every
+        deferred mirror would stop landing."""
+        _seed({"Main": [_plain_entry("aOne", "ACGT" * 150)]}, "Main")
+        _entries, seq = self._queue()
+        _simulate_worker_pop()
+        assert sc._claim_inflight_mirror(seq) is True
+        assert sc._state._collection_sync_inflight is None
+
+    def test_an_empty_queue_still_reports_nothing(self):
+        """Control: with neither slot populated the barrier must say so, or
+        every transaction would think it had work to do."""
+        _seed({"Main": [_plain_entry("aOne", "ACGT" * 150)]}, "Main")
+        with sc._collection_sync_lock:
+            sc._state._collection_sync_pending = None
+            sc._state._collection_sync_inflight = None
+        assert sc._land_pending_collection_sync("test barrier") is False
+
+
+class TestABustedCacheDropsTheMirror:
+    """`_land_deferred_mirror`'s D6 rule is "write the AUTHORITATIVE library,
+    never the queue-time snapshot". The `isinstance` guard simply fell through
+    when `_library_cache` was None — precisely the post-
+    `_bust_all_data_caches()` state of an import / restore / master-delete —
+    so the stale queue-time snapshot was written and erased a newer save."""
+
+    def test_a_none_cache_drops_rather_than_writing_the_snapshot(self):
+        _seed({"Main": [_plain_entry("aOne", "ACGT" * 150)]}, "Main")
+        stale = [_plain_entry("aOne", "ACGT" * 150),
+                 _plain_entry("stale", "TTGCA" * 100)]
+        newer = [_plain_entry("aOne", "ACGT" * 150),
+                 _plain_entry("newer", "GGCCA" * 100)]
+        # A newer synchronous commit lands `newer` in the collection.
+        sc._save_library(newer)
+        # Then the caches are busted, as an import / restore does.
+        sc._state._library_cache = None
+        seq = sc._mark_mirror_pending()
+        sc._land_deferred_mirror("Main", [dict(e) for e in stale], seq)
+        names = [p.get("name")
+                 for c in sc._load_collections() if c.get("name") == "Main"
+                 for p in (c.get("plasmids") or [])]
+        assert "stale" not in names, (
+            f"the queue-time snapshot was written over a newer save; "
+            f"Main holds {names}")
+        assert "newer" in names, f"the newer save was lost; Main holds {names}"

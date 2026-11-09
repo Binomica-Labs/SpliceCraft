@@ -1385,6 +1385,10 @@ def _h_assemble_expression_cassette(app, payload):
         if not isinstance(raw_excl, (list, tuple)):
             return ({"error": "'repeat_exclude' must be a list of "
                               "[start, end] spans"}, 400)
+        if len(raw_excl) > _SCAN_REPEATS_MAX_EXCLUDE:
+            return ({"error": f"'repeat_exclude' has {len(raw_excl)} spans "
+                              f"(max {_SCAN_REPEATS_MAX_EXCLUDE}) — every "
+                              f"hit is tested against all of them"}, 400)
         spans: "list[tuple[int, int]]" = []
         for span in raw_excl:
             if not isinstance(span, (list, tuple)) or len(span) != 2 \
@@ -10006,6 +10010,12 @@ _SCAN_REPEATS_MAX_BP = 200_000
 # noise as a hazard — the same "is finding this informative" discipline
 # `splicecraft_regulettuce` applies to its cis-element rates.
 _SCAN_REPEATS_MIN_LEN = 20
+# `_cassette_internal_repeats` tests each hit against EVERY excluded span
+# (`any(...)`), so the list is a per-hit multiplier. A construct has a handful
+# of intentionally-duplicated elements — a flanking MAR pair is the motivating
+# case — so a list past this is not describing one. Bounded for the same
+# reason `_CODON_MAX_EXTERNAL_SITES` is.
+_SCAN_REPEATS_MAX_EXCLUDE = 256
 
 
 @_agent_endpoint("scan-repeats")
@@ -10074,6 +10084,12 @@ def _h_scan_repeats(app, payload):
         if not isinstance(raw_excl, (list, tuple)):
             return ({"error": "'exclude' must be a list of [start, end] "
                               "spans"}, 400)
+        if len(raw_excl) > _SCAN_REPEATS_MAX_EXCLUDE:
+            return ({"error": f"'exclude' has {len(raw_excl)} spans (max "
+                              f"{_SCAN_REPEATS_MAX_EXCLUDE}) — every hit is "
+                              f"tested against all of them, and a construct "
+                              f"does not have that many intentionally "
+                              f"duplicated elements"}, 400)
         for span in raw_excl:
             if not isinstance(span, (list, tuple)) or len(span) != 2:
                 return ({"error": "each 'exclude' entry must be a "

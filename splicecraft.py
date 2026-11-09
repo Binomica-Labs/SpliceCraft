@@ -43,13 +43,13 @@ from io import StringIO as StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "1.3.18"
+__version__ = "1.3.19"
 
 # Release date of `__version__`, stamped by release.py alongside the version
 # bump (ISO `YYYY-MM-DD`). Used for the publication year in `--citation` /
 # CITATION.cff — the CURRENT year would be wrong for anyone citing an older
 # install, so the year travels with the build rather than the clock.
-_RELEASE_DATE = "2026-11-08"
+_RELEASE_DATE = "2026-11-10"
 
 # `_RUNTIME_PLATFORM` (the once-at-import platform string, INV-36) lives in
 # splicecraft_util (L0) so the hub + the backup sibling share one cached value;
@@ -67725,6 +67725,16 @@ class SequencingScreen(Screen):
         """Worker: parse a Plasmidsaurus run zip, then apply it to the screen
         on the UI thread. Split out of `_on_zip_picked` so a 14-second parse
         can't hold the event loop (see the note there)."""
+        # Capture `self.app` ONCE, at thread entry, while the widget's
+        # app-context is still valid — the rule sweep #30 established for
+        # exactly this shape. Re-resolving `.app` after the parse (which is
+        # the whole point of this worker, and can take seconds) raises
+        # NoActiveAppError if the user navigated away meanwhile, which would
+        # drop the parsed run AND raise out of the worker.
+        # `App.call_from_thread` on a captured reference does not depend on
+        # the per-thread active-app context.
+        app = self.app
+
         def _fail(markup: str) -> None:
             if not self.is_mounted or gen != self._zip_parse_gen:
                 return
@@ -67739,8 +67749,8 @@ class SequencingScreen(Screen):
         try:
             parsed = _parse_plasmidsaurus_zip(path)
         except ValueError as exc:
-            self.app.call_from_thread(_fail,
-                                      f"[red]{_esc_md(str(exc))}[/red]")
+            app.call_from_thread(_fail,
+                                 f"[red]{_esc_md(str(exc))}[/red]")
             return
         except (OSError, RuntimeError, MemoryError) as exc:
             # OSError covers filesystem hiccups during stat / open;
@@ -67753,13 +67763,13 @@ class SequencingScreen(Screen):
             _log.exception(
                 "SequencingScreen: unexpected zip parse failure",
             )
-            self.app.call_from_thread(
+            app.call_from_thread(
                 _fail,
                 f"[red]Could not parse zip: "
                 f"{_esc_md(type(exc).__name__)}[/red]")
             return
-        self.app.call_from_thread(self._apply_parsed_zip, path, cur_sig,
-                                  parsed, gen)
+        app.call_from_thread(self._apply_parsed_zip, path, cur_sig,
+                             parsed, gen)
 
     def _apply_parsed_zip(self, path: Path,
                           cur_sig: "tuple[int, int] | None",
@@ -122284,10 +122294,30 @@ NcbiTaxonPickerModal { align: center middle; }
             # Spawned as a daemon thread — compressing a 274 MB backup is
             # CPU-heavy and must not block launch. Best-effort; reuses the
             # `_skip_snapshot` guard so tests don't fan out to disk.
+            def _housekeeping_quietly(data_dir) -> None:
+                """Run housekeeping, logging anything it raises.
+
+                The existing guard wrapped only `.start()`, so an exception
+                in the thread BODY reached `threading.excepthook` and printed
+                a raw traceback — straight over a running TUI. Housekeeping
+                gained a real raise when the L2 chokepoint grew its delete
+                half: it now refuses outright in an unauthorised process
+                rather than silently pruning the backup rotation. The normal
+                launch authorises before this spawn and read-only sets
+                `_skip_snapshot`, so this should never fire — which is
+                exactly why it must be logged rather than drawn."""
+                try:
+                    _run_data_dir_housekeeping(data_dir)
+                except Exception:
+                    _log.exception(
+                        "Data-dir housekeeping failed (non-fatal) — backups "
+                        "and the lost_entries/ spillover were not pruned "
+                        "this launch")
+
             try:
                 import threading
                 threading.Thread(
-                    target=_run_data_dir_housekeeping,
+                    target=_housekeeping_quietly,
                     args=(_state._DATA_DIR,),
                     name="sc-housekeeping",
                     daemon=True,

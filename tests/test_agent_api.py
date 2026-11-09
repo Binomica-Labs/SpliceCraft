@@ -8701,3 +8701,71 @@ class TestCassetteHasADoor:
         out = self._call("assemble-expression-cassette",
                          {"promoter": "ACGTACGTACGT", "cds": "ATGXXXTAA"})
         assert isinstance(out, tuple) and out[1] == 400, str(out)[:200]
+
+
+class TestExcludeListsAreBounded:
+    """`_cassette_internal_repeats` tests each hit against EVERY excluded
+    span, so the list is a per-hit multiplier. A construct has a handful of
+    intentionally-duplicated elements; an unbounded list is a way to make a
+    read endpoint slow (2026-11-09 hardening)."""
+
+    SEQ = _audit_rand_dna(3000, seed=41)
+
+    def _call(self, endpoint, payload):
+        app = MockApp(record=None)
+        handler = sc._state._AGENT_HANDLERS[endpoint]
+        fn = handler[0] if isinstance(handler, tuple) else handler
+        return fn(app, payload)
+
+    def test_at_the_cap_is_accepted(self):
+        import splicecraft_agent as _a
+        n = _a._SCAN_REPEATS_MAX_EXCLUDE
+        out = self._call("scan-repeats", {
+            "sequence": self.SEQ, "min_length": 100,
+            "exclude": [[i * 10, i * 10 + 5] for i in range(n)]})
+        assert not isinstance(out, tuple), str(out)[:200]
+
+    def test_one_over_the_cap_is_refused(self):
+        import splicecraft_agent as _a
+        n = _a._SCAN_REPEATS_MAX_EXCLUDE + 1
+        out = self._call("scan-repeats", {
+            "sequence": self.SEQ, "min_length": 100,
+            "exclude": [[i * 10, i * 10 + 5] for i in range(n)]})
+        assert isinstance(out, tuple) and out[1] == 400, str(out)[:200]
+        assert "exclude" in out[0]["error"]
+
+    def test_the_cassette_repeat_exclude_is_bounded_too(self):
+        import splicecraft_agent as _a
+        n = _a._SCAN_REPEATS_MAX_EXCLUDE + 1
+        out = self._call("assemble-expression-cassette", {
+            "promoter": _audit_rand_dna(300, seed=31),
+            "cds": _audit_rand_cds(80, seed=34),
+            "scrub_motifs": False, "check_splice": False,
+            "repeat_exclude": [[i, i + 1] for i in range(n)]})
+        assert isinstance(out, tuple) and out[1] == 400, str(out)[:200]
+        assert "repeat_exclude" in out[0]["error"]
+
+
+class TestCassetteRefusalsSurfaceAs400:
+    """The engine-side refusals added by the 2026-11-09 hardening must reach
+    the caller as a 400 naming the problem, not a scrubbed 500."""
+
+    BASE = {"promoter": _audit_rand_dna(300, seed=31),
+            "cds": _audit_rand_cds(80, seed=34),
+            "scrub_motifs": False, "check_splice": False}
+
+    def _call(self, payload):
+        app = MockApp(record=None)
+        handler = sc._state._AGENT_HANDLERS["assemble-expression-cassette"]
+        fn = handler[0] if isinstance(handler, tuple) else handler
+        return fn(app, payload)
+
+    @pytest.mark.parametrize("extra,needle", [
+        ({"utr5": {"name": "x"}}, "no sequence"),
+        ({"repeat_min": -5}, "repeat_min"),
+        ({"gc_min": 80.0, "gc_max": 20.0}, "gc_max"),
+    ], ids=["part-without-seq", "non-positive-repeat_min", "inverted-gc-band"])
+    def test_refusal_is_a_400_that_names_it(self, extra, needle):
+        out = self._call({**self.BASE, **extra})
+        assert isinstance(out, tuple) and out[1] == 400, str(out)[:200]
+        assert needle in out[0]["error"], out[0]["error"]

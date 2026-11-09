@@ -402,3 +402,101 @@ class TestDryRun:
         assert dry["dry_run"] is True and wet["dry_run"] is False
         assert dry["sequence"] == wet["sequence"]
         assert dry["layout"] == wet["layout"]
+
+
+# ── 2026-11-09 hardening: a filter that cannot report is refused ────────────
+# Three inputs were accepted and then produced a REPORT that reads as clean,
+# which is the shape `[INV-234]` kept finding:
+#   * a part dict carrying no sequence was dropped from the layout silently,
+#     so a typo'd key assembled the cassette WITHOUT that element at 200 OK;
+#   * `repeat_min <= 0` makes `_cassette_internal_repeats` return [] at once,
+#     so `repeats: []` meant "switched off", not "none found";
+#   * `gc_min > gc_max` is a band no sequence can satisfy.
+
+def _h_dna(n: int, seed: int) -> str:
+    """`n` bases from ONE seeded rng, asserted actually random.
+
+    `random.Random(seed).choice(...)` inside the comprehension re-seeds per
+    character and yields a one-base run — which has a genuine (n-1) bp
+    internal repeat and would make these fixtures lie ([INV-224]/[INV-234])."""
+    import random
+    rng = random.Random(seed)
+    out = "".join(rng.choice("ACGT") for _ in range(n))
+    assert len(set(out)) == 4, "fixture is not random DNA"
+    return out
+
+
+def _h_cds(n_codons: int, seed: int) -> str:
+    import random
+    rng = random.Random(seed)
+    body = "".join(rng.choice(["GCT", "AAA", "GGT", "TTC", "CTG", "ATC"])
+                   for _ in range(n_codons))
+    return "ATG" + body + "TAA"
+
+
+@pytest.fixture
+def _h_base():
+    return {"promoter": _h_dna(300, 31), "cds": _h_cds(80, 34),
+            "scrub_motifs": False, "check_splice": False}
+
+
+class TestASuppliedPartMustCarryASequence:
+    def test_a_dict_with_no_seq_is_refused(self, _h_base):
+        with pytest.raises(ValueError) as exc:
+            cas._assemble_expression_cassette(**_h_base,
+                                              utr5={"name": "my 5UTR"})
+        msg = str(exc.value)
+        assert "utr5" in msg and "no sequence" in msg, msg
+        # The message must name the key to use, or the caller cannot act.
+        assert "seq" in msg, msg
+
+    def test_the_dropped_part_really_would_have_vanished(self, _h_base):
+        """The premise: a part that IS supplied properly appears in the
+        layout, so its absence was a real loss and not a no-op."""
+        r = cas._assemble_expression_cassette(**_h_base,
+                                              utr5=_h_dna(60, 33))
+        assert any(e["kind"] == "utr5" for e in r["layout"])
+
+    @pytest.mark.parametrize("value", [None, ""])
+    def test_absent_still_means_absent(self, _h_base, value):
+        """`None` and `''` are DOCUMENTED as absent and must stay that way —
+        the refusal is for a dict, which is never a way to say "none"."""
+        r = cas._assemble_expression_cassette(**_h_base, utr5=value)
+        assert not any(e["kind"] == "utr5" for e in r["layout"])
+
+    @pytest.mark.parametrize("key", ["seq", "sequence"])
+    def test_both_documented_key_spellings_still_work(self, _h_base, key):
+        r = cas._assemble_expression_cassette(
+            **_h_base, utr5={"name": "u", key: _h_dna(60, 35)})
+        assert any(e["kind"] == "utr5" for e in r["layout"])
+
+
+class TestAnUnreportableFilterIsRefused:
+    @pytest.mark.parametrize("bad", [0, -1, -500])
+    def test_non_positive_repeat_min_is_refused(self, _h_base, bad):
+        with pytest.raises(ValueError) as exc:
+            cas._assemble_expression_cassette(**_h_base, repeat_min=bad)
+        assert "repeat_min" in str(exc.value)
+
+    def test_the_repeat_check_really_reports_at_a_valid_floor(self):
+        """Premise, so the refusal above is not guarding a dead check: the
+        same cassette DOES report a constructed repeat."""
+        rep = _h_dna(120, 51)
+        prom = _h_dna(200, 52) + rep + _h_dna(150, 53) + rep
+        r = cas._assemble_expression_cassette(
+            promoter=prom, cds=_h_cds(80, 34), scrub_motifs=False,
+            check_splice=False, repeat_min=100)
+        assert r["repeats"], "premise broken: no repeat reported"
+
+    def test_an_inverted_gc_band_is_refused(self, _h_base):
+        with pytest.raises(ValueError) as exc:
+            cas._assemble_expression_cassette(**_h_base, gc_min=80.0,
+                                              gc_max=20.0)
+        msg = str(exc.value)
+        assert "gc_min" in msg and "gc_max" in msg, msg
+
+    def test_an_equal_band_is_still_allowed(self, _h_base):
+        """Degenerate but satisfiable — not the same thing as empty."""
+        r = cas._assemble_expression_cassette(**_h_base, gc_min=50.0,
+                                              gc_max=50.0)
+        assert r["sequence"]

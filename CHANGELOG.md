@@ -14,7 +14,7 @@
 
 ---
 
-## [Unreleased]
+## [1.3.19] — 2026-11-10
 
 ### Bug fixes
 
@@ -200,6 +200,29 @@
   and 14 seconds for a 26 MB one — five per cent of the size the reader
   accepts — with no repaint and no progress shown. It now parses in the
   background behind a status line, and a second click supersedes the first.
+- **A cassette part supplied as an object with no sequence is now refused
+  instead of quietly disappearing.** `{"name": "my 5UTR"}` — a typo'd key, or
+  a lookup that came back empty — dropped that element from the assembly with
+  no warning and a success code, so the cassette you got was not the one you
+  described. Omitting a part, or passing null or an empty string, still means
+  "leave it out", as documented.
+- **Two settings that could only ever report "nothing found" are refused.** A
+  repeat threshold of zero or less switched the repeat check off entirely and
+  reported an empty list, which reads as "this construct is clean" rather than
+  "not checked" — the same cassette reports two repeats at the default. And a
+  minimum GC above the maximum is a band no sequence can satisfy.
+- **The exclude list on both repeat scans is bounded.** Every hit is tested
+  against every excluded span, so an unbounded list was a way to make a
+  read-only request slow.
+- **A long archive parse that outlives the screen no longer loses its
+  result.** The new background parse resolved the app reference after the
+  parse rather than at thread entry, so navigating away during a 14-second
+  read raised inside the worker and dropped the finished run — the exact
+  failure a 2026-05-28 sweep fixed for the primer-usage scan.
+- **Data-directory housekeeping can no longer print a traceback over the
+  interface.** It runs in a background thread whose body was unguarded; now
+  that it refuses outright in an unauthorised process, a refusal is logged
+  instead of drawn.
 
 ## [1.3.18] — 2026-11-08
 

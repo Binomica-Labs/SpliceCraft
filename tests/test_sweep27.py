@@ -979,3 +979,87 @@ class TestMirrorWriteHelper:
             "Bare mirror writes found (INV-83 violation):\n  - "
             + "\n  - ".join(violations)
         )
+
+
+# ── The chokepoint's DELETE half now covers the pruners (2026-11-09) ────────
+# `_refuse_unauthorized_delete` existed and its docstring named this exact
+# threat — "a maintenance helper … that walks `_DATA_DIR` to prune rotated
+# backups, expired snapshots, or stale crash-recovery files could be imported
+# by an unsandboxed probe" — and NO pruner called it. So one
+# `sc._run_data_dir_housekeeping(sc._state._DATA_DIR)` from an ad-hoc
+# `import splicecraft` compressed and pruned every registry file's `.bak`
+# rotation, pruned `lost_entries/`, quarantined blobs and hard-deleted
+# already-quarantined ones — the four-layer recovery net that saved the
+# 2026-05-22 incident — while the ADD-only `_snapshot_data_files` was
+# correctly gated. See [INV-234].
+
+
+class TestDataDirPrunersAreGated:
+    """Every pruner must refuse in an unauthorised process, and still run in
+    an authorised one (the app authorises before launch spawns housekeeping;
+    read-only sets `_skip_snapshot`, which gates the spawn entirely)."""
+
+    # (callable name, args builder) — each takes a path under the data dir.
+    PRUNERS = [
+        "_prune_backups",
+        "_compress_old_backups",
+        "_prune_lost_entries",
+        "_prune_old_snapshots",
+        "_run_data_dir_housekeeping",
+        "_gc_orphan_blobs",
+        "_prune_blob_quarantine",
+        "_enforce_ui_snapshot_retention",
+    ]
+
+    def _invoke(self, name, tmp_path):
+        fn = getattr(sc, name)
+        if name in ("_prune_backups", "_compress_old_backups"):
+            return fn(sc._state._LIBRARY_FILE)
+        if name == "_prune_lost_entries":
+            return fn(tmp_path / "lost_entries")
+        if name == "_prune_old_snapshots":
+            return fn(tmp_path / "snapshots")
+        if name == "_run_data_dir_housekeeping":
+            return fn(sc._state._DATA_DIR)
+        if name == "_prune_blob_quarantine":
+            return fn(tmp_path / "quarantine")
+        if name == "_enforce_ui_snapshot_retention":
+            return fn(tmp_path / "ui-snapshots")
+        return fn()                      # _gc_orphan_blobs
+
+    @pytest.mark.parametrize("name", PRUNERS)
+    def test_refuses_when_writes_are_not_authorised(self, name, monkeypatch,
+                                                     tmp_path):
+        monkeypatch.setattr(sc._state, "_SAVES_AUTHORIZED", False)
+        with pytest.raises(RuntimeError, match="not authorised"):
+            self._invoke(name, tmp_path)
+
+    @pytest.mark.parametrize("name", PRUNERS)
+    def test_runs_when_authorised(self, name, monkeypatch, tmp_path):
+        """The other half — a gate that also blocks the sanctioned caller
+        would silently stop pruning and the backup dir would grow forever."""
+        monkeypatch.setattr(sc._state, "_SAVES_AUTHORIZED", True)
+        for sub in ("lost_entries", "snapshots", "quarantine",
+                    "ui-snapshots"):
+            (tmp_path / sub).mkdir(exist_ok=True)
+        # Must not raise. These are all best-effort and may do nothing on an
+        # empty dir; the point is that the gate lets them through.
+        self._invoke(name, tmp_path)
+
+    def test_the_delete_guard_is_what_refuses(self, monkeypatch, tmp_path):
+        """Pin the MECHANISM, not just the symptom: the refusal must come
+        from `_refuse_unauthorized_delete`, so a future pruner that forgets
+        to call it is not accidentally covered by something else."""
+        seen: list = []
+        real = sc._refuse_unauthorized_delete
+
+        def spy(path, label):
+            seen.append(label)
+            return real(path, label)
+
+        monkeypatch.setattr(sc._state, "_SAVES_AUTHORIZED", True)
+        monkeypatch.setattr(sc, "_refuse_unauthorized_delete", spy)
+        import splicecraft_backup as B
+        monkeypatch.setattr(B, "_refuse_unauthorized_delete", spy)
+        B._run_data_dir_housekeeping(sc._state._DATA_DIR)
+        assert seen, "housekeeping never consulted the delete guard"

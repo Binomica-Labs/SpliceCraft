@@ -322,3 +322,130 @@ class TestMigrateImportIsAllOrNothing:
         plasmids = next(c["plasmids"] for c in sc._load_collections()
                         if c.get("name") == "Default")
         assert [p["id"] for p in plasmids] == ["p1"]
+
+
+# ── all-or-nothing really is (audit 2026-11-09) ─────────────────────────────
+# `_restore_snapshot_all_or_nothing` staged and sha256-verified every file,
+# then replaced them ONE AT A TIME and continued past a failure, never setting
+# `aborted`. `plasmid_library.json` and `collections.json` are a MIRROR PAIR,
+# so a partial is not "most of the restore" — the next launch resolves the
+# mismatch by discarding the half that landed. Measured: the archive's library
+# landed, collections failed EACCES, and the imported plasmids were gone at the
+# next start. EACCES is the realistic trigger on Windows, a supported
+# platform, where `os.replace` fails if the target is held open by a sync
+# client, antivirus, or a second SpliceCraft.
+
+def _mig_entry(name: str, seq: str = "ACGT" * 40) -> dict:
+    return {"id": f"id-{name}", "name": name, "size": len(seq),
+            "n_feats": 0, "gb_text": "", "source": ""}
+
+
+def _mig_write_generation(tag: str, n: int) -> list:
+    entries = [_mig_entry(f"p{i}") for i in range(n)]
+    sc._save_collections([{"name": "C", "description": tag,
+                           "plasmids": entries}])
+    sc._save_library(entries)
+    sc._set_active_collection_name("C")
+    return entries
+
+
+def _mig_state() -> tuple:
+    lib = sc._load_library()
+    col = next((c for c in sc._load_collections()
+                if c.get("name") == "C"), {})
+    return len(lib), len(col.get("plasmids") or []), col.get("description")
+
+
+class TestAllOrNothingRestoreIsAtomic:
+    def _snapshot_of(self, tag: str, n: int, backup_dir):
+        import splicecraft_backup as B
+        _mig_write_generation(tag, n)
+        return B._create_pre_update_snapshot("1.3.18", backup_dir=backup_dir)
+
+    def test_a_failed_metadata_replace_restores_everything(self, tmp_path):
+        import os as _os
+        import splicecraft_backup as B
+        bk = tmp_path / "bk"
+        bk.mkdir()
+        snap = self._snapshot_of("ARCHIVE", 8, bk)
+        _mig_write_generation("THIS-MACHINE", 3)
+        assert _mig_state() == (3, 3, "THIS-MACHINE"), "fixture premise"
+
+        real_replace = _os.replace
+        fired: list = []
+
+        def one_shot(src, dst, *a, **k):
+            # Fail the FIRST replace of collections.json only, so the
+            # rollback is allowed to succeed as it would in reality.
+            if str(dst).endswith("collections.json") and not fired:
+                fired.append(1)
+                raise OSError(13, "Permission denied")
+            return real_replace(src, dst, *a, **k)
+
+        # A SEPARATE MonkeyPatch, never the test's own `monkeypatch` +
+        # `.undo()`: that would also revert conftest's sandboxing of the data
+        # dir (they share it) and point the next save at the user's real
+        # library. The L2 chokepoint refuses that — which is how this very
+        # test caught itself doing it — but the test would then be proving
+        # nothing. Same rule as `test_save_safety.py`.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_os, "replace", one_shot)
+            summary = B._restore_pre_update_snapshot(snap, backup_dir=bk,
+                                                      all_or_nothing=True)
+        assert fired, "premise: the injected failure never fired"
+
+        # The caller must be able to TELL. Pre-fix `aborted` was never set.
+        assert summary.get("aborted") is True, summary
+        assert not summary.get("restored_files"), summary
+        # And the generation it found must be intact — a mixed mirror pair is
+        # the state the next launch resolves by throwing data away.
+        with sc._cache_lock:
+            for attr in sc._MASTER_DELETE_CACHE_ATTRS:
+                sc._reset_master_delete_cache(attr)
+        n_lib, n_col, desc = _mig_state()
+        assert (n_lib, n_col, desc) == (3, 3, "THIS-MACHINE"), (
+            f"left a mixed generation: library={n_lib} collections={n_col} "
+            f"({desc})")
+
+    def test_no_stash_files_are_left_behind(self, tmp_path):
+        """The rollback copies each original aside; none of those copies may
+        survive a successful restore or an aborted one."""
+        import os as _os
+        import splicecraft_backup as B
+        bk = tmp_path / "bk"
+        bk.mkdir()
+        snap = self._snapshot_of("ARCHIVE", 8, bk)
+        _mig_write_generation("THIS-MACHINE", 3)
+        real_replace = _os.replace
+        fired: list = []
+
+        def one_shot(src, dst, *a, **k):
+            if str(dst).endswith("collections.json") and not fired:
+                fired.append(1)
+                raise OSError(13, "Permission denied")
+            return real_replace(src, dst, *a, **k)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_os, "replace", one_shot)
+            B._restore_pre_update_snapshot(snap, backup_dir=bk,
+                                            all_or_nothing=True)
+        leftovers = sorted(p.name for p in sc._state._DATA_DIR.iterdir()
+                            if ".restore-orig" in p.name)
+        assert not leftovers, leftovers
+
+    def test_a_clean_restore_still_lands_both_halves(self, tmp_path):
+        """Control: the atomicity must not have broken the happy path."""
+        import splicecraft_backup as B
+        bk = tmp_path / "bk"
+        bk.mkdir()
+        snap = self._snapshot_of("ARCHIVE", 8, bk)
+        _mig_write_generation("THIS-MACHINE", 3)
+        summary = B._restore_pre_update_snapshot(snap, backup_dir=bk,
+                                                  all_or_nothing=True)
+        assert not summary.get("aborted"), summary
+        with sc._cache_lock:
+            for attr in sc._MASTER_DELETE_CACHE_ATTRS:
+                sc._reset_master_delete_cache(attr)
+        n_lib, n_col, desc = _mig_state()
+        assert (n_lib, n_col, desc) == (8, 8, "ARCHIVE"), (
+            f"library={n_lib} collections={n_col} ({desc})")

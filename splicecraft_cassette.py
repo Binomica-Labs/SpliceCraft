@@ -165,15 +165,30 @@ def _cassette_part(value, label: str) -> dict:
     slot), or None/empty (absent). Raises ValueError on a non-ACGT sequence
     rather than letting an ambiguity code reach the codon layer, where it
     would surface as a confusing translation error three frames later."""
+    original = value
     if value is None:
         return {}
     if isinstance(value, str):
         value = {'name': label, 'seq': value}
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a dict, a string, or None")
+    supplied_dict = not isinstance(original, (str, type(None)))
     seq = str(value.get('seq') or value.get('sequence') or '').strip().upper()
     seq = seq.replace('U', 'T')
     if not seq:
+        if supplied_dict:
+            # A DICT with no usable sequence is a mistake, not an absence.
+            # `None` and `''` are documented as "absent" and stay that way,
+            # but returning `{}` for `{'name': 'my 5UTR'}` dropped the part
+            # from the layout with no warning and a 200 OK — so a typo'd key
+            # (or a lookup that came back empty) assembled the cassette
+            # WITHOUT that element and nothing said so. That is the
+            # silently-dropped-parameter shape; refuse and name the keys
+            # (audit 2026-11-09 hardening).
+            raise ValueError(
+                f"{label} was given as an object but carries no sequence — "
+                f"expected a 'seq' (or 'sequence') key with DNA, or omit "
+                f"{label} entirely to leave it out")
         return {}
     bad = set(seq) - set('ACGT')
     if bad:
@@ -599,6 +614,27 @@ def _assemble_expression_cassette(promoter, utr5=None, intron=None,
     present = [e for e in _CASSETTE_ELEMENTS if parts.get(e)]
     if not present:
         raise ValueError("cassette is empty — supply at least a promoter and a CDS")
+
+    # A filter that cannot report anything is refused rather than obeyed. Both
+    # of these used to be accepted and then produce a REPORT that reads as
+    # clean (audit 2026-11-09 hardening):
+    #   * `repeat_min <= 0` makes `_cassette_internal_repeats` return `[]`
+    #     immediately, so `repeats: []` meant "the check was switched off",
+    #     indistinguishable from "this cassette has none" — measured against
+    #     the same cassette reporting 2 repeats at the default.
+    #   * `gc_min > gc_max` is an empty band; the window scrub can never
+    #     satisfy it, so every window is simultaneously too low and too high.
+    # Same discipline as `scan-terminators` refusing a `min_stem` above its
+    # own search ceiling: "0 found" must never be able to mean "not checked".
+    if repeat_min <= 0:
+        raise ValueError(
+            f"repeat_min must be >= 1 (got {repeat_min}) — a non-positive "
+            f"value reports no repeats for every cassette, which reads as "
+            f"'none found' rather than 'not checked'")
+    if gc_min > gc_max:
+        raise ValueError(
+            f"gc_min ({gc_min:g}) is above gc_max ({gc_max:g}) — an empty "
+            f"band no sequence can satisfy")
 
     # Validate the enzyme up front: it is a plain argument error, and finding
     # out about it only after translating the ORF buries the real complaint

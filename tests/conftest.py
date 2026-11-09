@@ -135,6 +135,14 @@ def _protect_user_data(tmp_path, monkeypatch):
     # collections cache → flaky row counts in delete/save tests
     # (TestDeleteFocusRouting, 2026-05-29). Synchronous = deterministic.
     monkeypatch.setattr(sc, "_collection_sync_force_sync", True)
+    # Both deferred-mirror slots start EMPTY for every test. Sync mode means
+    # nothing populates them normally, so this was unnecessary — until tests
+    # began driving the handoff by hand (the pop-window regressions in
+    # test_save_safety.py). A test that sets a slot and then fails partway
+    # would otherwise leak it into the next test, which is precisely the
+    # cross-test bleed the sync-mode comment above exists to prevent.
+    monkeypatch.setattr(sc._state, "_collection_sync_pending", None)
+    monkeypatch.setattr(sc._state, "_collection_sync_inflight", None)
 
     # Crash-recovery autosave dir: redirect so tests can't leave files in
     # the user's real _DATA_DIR/crash_recovery on disk.
