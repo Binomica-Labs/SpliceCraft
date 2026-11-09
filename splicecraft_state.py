@@ -89,6 +89,19 @@ _MIRROR_DIRTY_RECOVERY_KINDS: "set[str]" = set()
 _SPELLCHECK_ENGINE: "_Any | None" = None
 _WHATS_NEW_CACHE: "tuple[str, float, str] | None" = None  # (path, mtime, body_md)
 _collection_sync_pending: "tuple[str, list[dict], int] | None" = None
+# The deferred mirror the background worker has POPPED off `_pending` but not
+# yet written. It exists because `_land_pending_collection_sync` — the barrier
+# `_collections_transaction` / `_migrate_import_transaction` use to satisfy
+# [INV-224] #3/#4 — only ever looked at `_pending`, while the worker pops that
+# slot and only THEN blocks on `_cache_lock`. In that window the barrier
+# answered "nothing in flight", the transaction renamed/deleted/imported over
+# it, and the mirror was dropped afterwards along with the `.mirror-dirty`
+# marker that was the newer library file's only protection — losing a library
+# change, or landing this machine's old library inside a freshly imported
+# collection (audit 2026-11-09). The barrier now takes a popped mirror OVER
+# rather than waiting for it, which cannot deadlock: the worker is blocked on
+# the very lock the barrier's caller holds.
+_collection_sync_inflight: "tuple[str, list[dict], int] | None" = None
 _collection_sync_thread: "threading.Thread | None" = None
 # Per mirror kind: the sequence number of the latest live-file write whose
 # container mirror was deferred (`_mark_mirror_pending`). A deferred mirror

@@ -242,3 +242,59 @@ class TestBackupRegistryIdentity:
                      "_OPERATIONAL_FILE_ATTRS"):
             assert getattr(sc, attr) is getattr(_bk, attr), (
                 f"{attr} drifted between the hub and splicecraft_backup")
+
+
+# ── Merged enzyme attribution is order- and cache-independent (2026-11-09) ──
+
+class TestMergedEnzymeLabelIsReproducible:
+    """`_enzyme_cuts`' LRU key is `tuple(sorted(set(enzyme_names)))`, so it
+    cannot distinguish `["EcoRI", "EcoRI-HF"]` from `["EcoRI-HF", "EcoRI"]` —
+    but the coincident-cut merge composed its `enzyme` string in the order the
+    caller listed them. The label on a fragment end therefore depended on
+    which order had primed the cache: prime one way, ask the other, and you
+    got the primed spelling. Composing it SORTED makes the result
+    order-independent, which is what makes the sorted key correct (and matches
+    the "sorted enzyme set" convention the scar notes already use)."""
+
+    SEQ = ("TTGGCCAATTGGCC" + "GAATTC" + "AACCGGTTAACCGGTT" * 4
+           + "GGATCC" + "TTAACCGGTTAACC")
+    A = ["EcoRI", "EcoRI-HF"]
+    B = ["EcoRI-HF", "EcoRI"]
+
+    def _labels(self, names):
+        return [c["enzyme"] for c in
+                sc._enzyme_cuts(self.SEQ, names, circular=True)]
+
+    def _fresh(self):
+        sc._state._ENZYME_CUTS_CACHE.clear()
+
+    def test_the_isoschizomer_pair_really_does_merge(self):
+        """Premise, so this class cannot pass vacuously: the two names must
+        reach the SAME bond and be merged into one composite."""
+        self._fresh()
+        labels = self._labels(self.A)
+        assert any("/" in x for x in labels), labels
+        composite = next(x for x in labels if "/" in x)
+        assert set(composite.split("/")) == {"EcoRI", "EcoRI-HF"}
+
+    def test_caller_order_does_not_change_the_label(self):
+        self._fresh()
+        a = self._labels(self.A)
+        self._fresh()
+        b = self._labels(self.B)
+        assert a == b, f"order changed the label: {a} vs {b}"
+
+    def test_cache_state_does_not_change_the_label(self):
+        self._fresh()
+        cold_b = self._labels(self.B)
+        self._fresh()
+        self._labels(self.A)                   # prime with the other order
+        warm_b = self._labels(self.B)
+        assert cold_b == warm_b, (
+            f"a warm cache changed the answer: cold {cold_b} vs warm {warm_b}")
+
+    def test_the_composite_is_sorted(self):
+        self._fresh()
+        composite = next(x for x in self._labels(self.B) if "/" in x)
+        parts = composite.split("/")
+        assert parts == sorted(parts), composite

@@ -4303,3 +4303,103 @@ class TestSpliceRepairSeesPartnersOutsideTheCds:
         assert fixes
         assert self._protein(out) == prot
         assert self._paired(out) == []
+
+
+class TestACleanCdsStillGetsTheExternalPairChecked:
+    """Field report 2026-11-08, round 4 — the hole UNDER the round-3 fix.
+
+    `external_sites` targets a site at `_SPLICE_PAIR_FLOOR`, because the site
+    it exists for is BELOW the reporting bar by construction: it carries only
+    half a pair's evidence on its own. But the pass opened with a fast path —
+    "nothing at the repair bar, nothing to do" — and took it before the
+    target list was ever built. So on a CDS that scans CLEAN the keyword was
+    accepted, validated, and then did nothing at all.
+
+    That is exactly the construct it was written for. On the reporting
+    construct the caller's CDS had zero sites at the calibrated bar and an
+    acceptor inside it scoring 2.642 against a 4.439 bar, still pairing with
+    the real upstream donor (5.829) at combined 8.471 over the 8.205 gate —
+    able to excise the first 48 codons. The tool returned it unchanged, with
+    no fix and no warning, and the fix had to be made by hand.
+    """
+
+    EXT = [{"kind": "donor", "offset": -1500, "score": 5.829}]
+
+    # Derived by search (seed 20261109, trial 5), not written by hand: an
+    # in-frame CDS that scans CLEAN at the calibrated bar while carrying two
+    # acceptors — 4.377 (just under the 4.439 cutoff) and 3.421 — that each
+    # pair with a 5.829 donor 1500 nt upstream, over the gate.
+    DNA = ("ATGAAAATCCCGTGCCGTGCGCTCCATTTCTCACCATGCCCCAATTTATGTCGCGCTTAC"
+           "GGCATCGGCTTTAACCTGATTGGTATCCGCGGTCTGACAGTCTTCCTCGCAGGAGTTATT"
+           "ATGTACAACGCGTTTCGCTATATCGCTCATGAATCTACCGGTGCTGCAGGAGTCGGCTTC")
+
+    def _protein(self, dna):
+        return "".join(sc._CODON_TABLE.get(dna[i:i + 3], "X")
+                       for i in range(0, len(dna) - 2, 3))
+
+    def _gate(self):
+        from splicecraft_splice import _splice_threshold
+        d, a = _splice_threshold("donor"), _splice_threshold("acceptor")
+        assert d is not None and a is not None
+        return d + a
+
+    def _paired(self, dna):
+        from splicecraft_splice import _SPLICE_PAIR_FLOOR, _splice_scan
+        out = []
+        for h in _splice_scan(dna, kind="acceptor",
+                              acceptor_threshold=_SPLICE_PAIR_FLOOR):
+            span = h["position"] + 2 - self.EXT[0]["offset"]
+            if 60 <= span <= 3000 and \
+                    h["score"] + self.EXT[0]["score"] >= self._gate():
+                out.append(h)
+        return out
+
+    def _run(self, ext):
+        return _codon._codon_fix_splice_sites(
+            self.DNA, self._protein(self.DNA), sc._CODON_BUILTIN_K12,
+            kind="acceptor", has_appended_stop=False, external_sites=ext)
+
+    def test_the_fixture_is_a_valid_in_frame_cds(self):
+        assert len(self.DNA) % 3 == 0
+        prot = self._protein(self.DNA)
+        assert "X" not in prot and "*" not in prot
+
+    def test_the_fixture_scans_clean_at_the_calibrated_bar(self):
+        """The premise. If anything in it reached the bar, the fast path
+        would not be the thing under test."""
+        from splicecraft_splice import _splice_scan
+        assert _splice_scan(self.DNA) == []
+
+    def test_the_fixture_is_externally_paired_anyway(self):
+        """A clean scan is not a clean sequence: two sub-threshold acceptors
+        still carry half a pair each."""
+        assert len(self._paired(self.DNA)) == 2
+
+    def test_a_clean_cds_is_still_repaired_when_a_partner_is_supplied(self):
+        """THE regression. Before the fix this returned the DNA verbatim."""
+        out, fixes, _rem = self._run(self.EXT)
+        assert fixes, "the externally-paired sites were never targeted"
+        assert out != self.DNA
+        assert self._paired(out) == []
+
+    def test_the_protein_is_untouched(self):
+        out, _f, _r = self._run(self.EXT)
+        assert self._protein(out) == self._protein(self.DNA)
+
+    def test_without_a_partner_a_clean_cds_is_left_alone(self):
+        """The fast path is still right when there is no outside partner:
+        a clean CDS with nothing to pair against is not churned."""
+        out, fixes, rem = self._run(None)
+        assert out == self.DNA
+        assert fixes == [] and rem == []
+
+    def test_an_empty_partner_list_is_the_same_as_none(self):
+        """`[]` is "I looked and there are none", not "go hunting"."""
+        assert self._run([])[0] == self.DNA
+
+    def test_a_clean_cds_with_a_partner_that_cannot_pair_is_left_alone(self):
+        """A partner too far away to make an intron must not make the pass
+        start editing: the gate is geometry AND score."""
+        far = [{"kind": "donor", "offset": -40_000, "score": 5.829}]
+        out, fixes, _rem = self._run(far)
+        assert out == self.DNA and fixes == []

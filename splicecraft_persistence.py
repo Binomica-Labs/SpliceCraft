@@ -463,6 +463,15 @@ def _prune_backups(path: Path, keep: "int | None" = None) -> None:
     this function — it's overwritten on every save. `keep` and both caps
     are read at call time (not bound as default arguments) so a test can
     monkeypatch the module constants and observe the new values."""
+    # L2 chokepoint, DELETE half. `_refuse_unauthorized_delete`'s own
+    # docstring names this exact threat — "a maintenance helper … that walks
+    # `_DATA_DIR` to prune rotated backups … could be imported by an
+    # unsandboxed probe" — and no pruner called it, so an ad-hoc
+    # `import splicecraft` could delete the user's whole `.bak` rotation
+    # while the ADD-only `_snapshot_data_files` was correctly gated (audit
+    # 2026-11-09). These are the recovery copies that saved the 2026-05-22
+    # incident.
+    _refuse_unauthorized_delete(path, "rotated backups")
     if keep is None:
         keep = _state._BACKUP_RETENTION_COUNT
     # A retention of 0 would delete EVERY rotated backup (and a negative one
@@ -540,6 +549,9 @@ def _compress_old_backups(path: Path) -> None:
     already-`.gz` backups are skipped, failures logged and skipped, never
     raised. Runs off the interactive path (startup housekeeping) so the
     CPU of compressing a 274 MB backup never adds latency to a save."""
+    # Compression REPLACES each plain backup with a `.gz` and unlinks the
+    # original, so it is a data-dir delete and takes the same gate.
+    _refuse_unauthorized_delete(path, "backup compression")
     import gzip
     baks = _iter_backups(path)   # oldest → newest (lex sort)
     if len(baks) <= 1:
@@ -701,6 +713,10 @@ def _prune_lost_entries(lost_dir: "Path | None" = None) -> None:
     `<path>.parent / _state._LOST_ENTRIES_DIR_NAME` explicitly."""
     if lost_dir is None:
         lost_dir = _state._DATA_DIR / _state._LOST_ENTRIES_DIR_NAME
+    # The spillover directory IS the crash-recovery copy the shrink guard
+    # writes before it refuses a suspicious save; pruning it unauthorised is
+    # deleting the user's last resort.
+    _refuse_unauthorized_delete(lost_dir, "lost-entries spillover")
     try:
         files = [p for p in lost_dir.iterdir() if p.is_file()]
     except OSError:
@@ -1329,12 +1345,28 @@ def _safe_save_json(path: Path, entries: list, label: str,
             # safe: refuse so the caller surfaces it. (A legitimately
             # ABSENT file never reaches here — only the present-but-
             # unreadable case does.)
-            msg = (
-                f"Refusing to save {label}: prior file at {path} exists "
-                f"but could not be read to back it up ({exc}). "
-                f"Overwriting would destroy un-backed-up data. Resolve "
-                f"the read error (permissions / disk) and retry."
-            )
+            # This handler spans the backup WRITES as well as the read, and
+            # those raise their own `OSError("backup rotation failed …")`. A
+            # full disk during rotation was therefore reported as a READ
+            # failure advising the user to fix permissions — the read had
+            # succeeded (audit 2026-11-09). Distinguish by the marker the
+            # rotation raises, so the remediation matches the fault; the save
+            # correctly aborts either way and the previous-good file is
+            # intact.
+            if "backup rotation failed" in str(exc):
+                msg = (
+                    f"Refusing to save {label}: its prior file at {path} "
+                    f"could not be BACKED UP ({exc}). Overwriting would "
+                    f"destroy the only copy. Free disk space (or fix write "
+                    f"permissions on the data directory) and retry."
+                )
+            else:
+                msg = (
+                    f"Refusing to save {label}: prior file at {path} exists "
+                    f"but could not be read to back it up ({exc}). "
+                    f"Overwriting would destroy un-backed-up data. Resolve "
+                    f"the read error (permissions / disk) and retry."
+                )
             _log.error(msg)
             raise OSError(msg) from exc
 
@@ -1699,7 +1731,15 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
                 "Starting empty."
             )
         try:
-            raw = json.loads(bak.read_text(encoding="utf-8"))
+            # `utf-8-sig`, matching every other reader in the recovery chain
+            # (the main-file read, `_backup_info`, `_read_backup_entries`;
+            # the rotated-chain read passes bytes, which `json.loads` handles
+            # BOM-and-all). This was the ONE reader that rejected a
+            # BOM-prefixed file, so a perfectly good legacy `.bak` written by
+            # an editor that adds one fell through to the rotation — and with
+            # the rotation pruned it would have been the only surviving copy
+            # (audit 2026-11-09).
+            raw = json.loads(bak.read_text(encoding="utf-8-sig"))
             entries, _ = _extract_entries(raw, label)
             if entries is not None:
                 _log.info("Restored %s from backup %s (%d entries)",

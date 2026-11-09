@@ -896,3 +896,120 @@ class TestTheSimSaysWhatItFused:
         rec = self._clone("GGAG", "AATG")
         assert "Esp3I" not in " ".join(
             getattr(rec, "_sc_clone_warnings", []))
+
+
+# ── Backbone chaining is rotation-invariant (audit 2026-11-09) ───────────────
+# `_clone_syn_fragment_into_entry_vector` ligated the surviving vector pieces
+# in DIGEST order (the order `_digest_with_enzymes` lists them, i.e. cut order
+# around the molecule) rather than in circular order starting after the
+# dropout. That only chains end-to-end when the dropout happens to sit first,
+# so at other ROTATIONS of the very same plasmid the pieces arrive out of
+# order, `_ligate_fragments` refuses, and the user is told to "check that the
+# fragment and vector share a grammar" — a misdiagnosis of a vector that
+# assembles perfectly well. It only shows up past two cut sites, which is
+# exactly the real alpha/Omega shape (`[INV-232]`'s field report names two
+# entry vectors in daily use carrying four BsaI sites each).
+#
+# The hub's sibling `_clone_part_build_backbone_chain` already walked
+# `(dropout_idx + 1 + i) % n`; this was the two-halves-disagreeing case, and
+# the L3 docstring claimed the hub's behaviour.
+
+_BSA = "GGTCTC"
+
+
+def _ev_filler(n: int, seed: int) -> str:
+    import random
+    rng = random.Random(seed)
+    return "".join(rng.choice("ACGT") for _ in range(n))
+
+
+def _ev_fw(oh: str) -> str:
+    return _BSA + "N" + oh
+
+
+def _ev_rev(oh: str) -> str:
+    return sc._rc(_BSA + "N" + sc._rc(oh))
+
+
+def _ev_vector(n_extra_cassettes: int, seed: int = 5) -> str:
+    """An acceptor whose dropout presents AATG/GCTT, plus `n_extra_cassettes`
+    further BsaI pairs in the backbone."""
+    out = (_ev_fw("AATG") + _ev_filler(40, seed) + _ev_rev("GCTT")
+           + _ev_filler(60, seed + 1))
+    for k in range(n_extra_cassettes):
+        out += (_ev_fw("TTTT") + _ev_filler(25, seed + 10 + k)
+                + _ev_rev("CCCC") + _ev_filler(30, seed + 20 + k))
+    return out
+
+
+def _ev_insert(seed: int = 9) -> str:
+    return _ev_fw("AATG") + _ev_filler(90, seed) + _ev_rev("GCTT")
+
+
+def _canon(seq: str) -> str:
+    """Rotation-free key for a circular product."""
+    return min((seq[i:] + seq[:i]) for i in range(len(seq)))
+
+
+@pytest.mark.parametrize("n_extra,n_sites", [(0, 2), (1, 4), (2, 6)])
+def test_backbone_chain_is_rotation_invariant(n_extra, n_sites):
+    vec, ins = _ev_vector(n_extra), _ev_insert()
+    n = len(vec)
+    step = max(1, n // 24)
+    products, refused = set(), []
+    for k in range(0, n, step):
+        rotated = vec[k:] + vec[:k]
+        try:
+            res = cl._clone_syn_fragment_into_entry_vector(
+                ins, rotated, grammar={"enzyme": "BsaI"})
+        except ValueError as exc:
+            refused.append((k, str(exc)))
+            continue
+        products.add(_canon(res["sequence"]))
+    assert not refused, (
+        f"{len(refused)} of {len(range(0, n, step))} rotations of the same "
+        f"{n_sites}-site entry vector were refused, e.g. k={refused[0][0]}: "
+        f"{refused[0][1]}")
+    assert len(products) == 1, (
+        f"rotating the vector changed the product: {len(products)} distinct "
+        f"molecules")
+
+
+def test_an_ambiguous_dropout_is_refused_by_name():
+    """Two pieces presenting the insert's overhang pair means the dropout is
+    genuinely ambiguous. Previously BOTH were dropped and the assembly came
+    back missing a chunk of backbone; now it is refused and says why — the
+    same discipline as "never assume the smaller fragment is the payload"."""
+    # Two cassettes, both AATG/GCTT: nothing can say which is the slot.
+    vec = (_ev_fw("AATG") + _ev_filler(40, 1) + _ev_rev("GCTT")
+           + _ev_filler(50, 2)
+           + _ev_fw("AATG") + _ev_filler(45, 3) + _ev_rev("GCTT")
+           + _ev_filler(55, 4))
+    with pytest.raises(ValueError) as exc:
+        cl._clone_syn_fragment_into_entry_vector(
+            _ev_insert(), vec, grammar={"enzyme": "BsaI"})
+    msg = str(exc.value)
+    assert "ambiguous" in msg, msg
+    assert "AATG" in msg and "GCTT" in msg, msg
+
+
+def test_a_single_site_vector_still_refuses_with_its_own_message():
+    """The control: the pre-existing refusals must not have been swallowed by
+    the new one."""
+    vec = _ev_fw("AATG") + _ev_filler(60, 7)
+    with pytest.raises(ValueError) as exc:
+        cl._clone_syn_fragment_into_entry_vector(
+            _ev_insert(), vec, grammar={"enzyme": "BsaI"})
+    assert "cut twice" in str(exc.value), str(exc.value)
+
+
+def test_a_wrong_grammar_vector_still_says_so():
+    """An acceptor whose dropout presents a different pair must still get the
+    'matches nothing the vector releases' message, not the new ambiguity
+    one."""
+    vec = (_ev_fw("CTCG") + _ev_filler(40, 11) + _ev_rev("TGAG")
+           + _ev_filler(60, 12))
+    with pytest.raises(ValueError) as exc:
+        cl._clone_syn_fragment_into_entry_vector(
+            _ev_insert(), vec, grammar={"enzyme": "BsaI"})
+    assert "match nothing" in str(exc.value), str(exc.value)

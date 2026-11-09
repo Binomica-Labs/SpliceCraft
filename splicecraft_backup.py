@@ -398,6 +398,12 @@ def _prune_old_snapshots(snap_dir: Path,
     `retain_days`. `retain_days` defaults to
     `_SNAPSHOT_RETENTION_DAYS`, but is read at call time so a test
     can monkeypatch the module constant. Best-effort — never raises."""
+    # L2 chokepoint, DELETE half — see `_prune_backups`. The ADD-only
+    # `_snapshot_data_files` was gated while the pruner that removes those
+    # same snapshots was not (audit 2026-11-09). Raised rather than folded
+    # into the best-effort policy below: an authorisation refusal is a
+    # programming error in the caller, not a disk hiccup.
+    _refuse_unauthorized_delete(snap_dir, "expired launch snapshots")
     import re as _re
     if retain_days is None:
         retain_days = _SNAPSHOT_RETENTION_DAYS
@@ -511,6 +517,16 @@ def _run_data_dir_housekeeping(data_dir: Path) -> None:
     disrupts launch. `_USER_DATA_FILE_ATTRS` is read via globals() so
     this can be defined ahead of that table (same pattern as
     `_snapshot_data_files`)."""
+    # L2 chokepoint, DELETE half. This one function is the whole attack: a
+    # single `sc._run_data_dir_housekeeping(sc._state._DATA_DIR)` from an
+    # unsandboxed `import splicecraft` compressed and pruned every registry
+    # file's `.bak` rotation, pruned `lost_entries/`, quarantined blobs and
+    # hard-deleted quarantined ones past retention — i.e. mutated and partly
+    # destroyed the four-layer recovery net, while the write gate saw nothing
+    # because no `_save_*` was involved (audit 2026-11-09). Gated here as
+    # well as in each step, because the steps below swallow their own errors
+    # and a refusal must not be swallowed with them.
+    _refuse_unauthorized_delete(data_dir, "data-dir housekeeping")
     g = globals()
     for attr in g.get("_USER_DATA_FILE_ATTRS", ()):
         p = _state._resolve_data_attr_hook(attr)
@@ -1785,17 +1801,79 @@ def _restore_snapshot_all_or_nothing(snap_path: Path, manifest: dict,
                                target)
         return _abort(current, str(exc))
 
-    for name, tmp, target in staged:
-        try:
+    # **Step 4 is all-or-nothing too.** It used to replace each metadata file
+    # independently and CONTINUE past a failure, never setting `aborted`, so
+    # no caller could tell a partial from a success — while the function's
+    # name and its docstring both promise otherwise. These files are not
+    # independent: `plasmid_library.json` and `collections.json` are a MIRROR
+    # PAIR, so a partial between them is not "most of the restore", it is a
+    # state the next launch resolves by throwing the restored half away.
+    # Measured: an archive's 8-plasmid library landed, `collections.json`
+    # failed with EACCES, and the next launch reverted the library to this
+    # machine's 3 — the imported data lost (audit 2026-11-09). EACCES is the
+    # realistic trigger: on Windows, a supported platform, `os.replace` fails
+    # when the target is held open by a sync client, antivirus or a second
+    # SpliceCraft. So each original is stashed beside its target first, and
+    # any failure puts every one of them back.
+    file_stash: "list[tuple[Path, Path]]" = []       # (target, stashed_orig)
+    landed: "list[str]" = []
+    try:
+        for name, tmp, target in staged:
+            if target.exists():
+                keep = target.with_name(target.name + ".restore-orig")
+                # A leftover from a previous crashed restore must not block
+                # this one, and it is not data — the real original is still
+                # at `target`.
+                try:
+                    if keep.exists():
+                        keep.unlink()
+                except OSError:
+                    pass
+                # COPY, not move. Moving the original aside would leave no
+                # file at `target` until the replace lands, so a failure in
+                # BOTH the replace and the rollback would leave the user with
+                # no `collections.json` at all — strictly worse than the
+                # mixed generation this is fixing. With a copy, `target` is
+                # never absent.
+                shutil.copy2(target, keep)
+                file_stash.append((target, keep))
             os.replace(tmp, target)
             _fsync_path(target.parent)
-            summary["restored_files"].append(name)
-        except OSError as exc:
-            summary["failed"].append((name, str(exc)))
+            landed.append(name)
+    except OSError as exc:
+        failed_name = next((n for n, _t, _g in staged if n not in landed),
+                           "metadata")
+        for target, keep in reversed(file_stash):
             try:
-                tmp.unlink()
+                if target.exists():
+                    target.unlink()
+                os.replace(keep, target)
+                _fsync_path(target.parent)
             except OSError:
-                pass
+                _log.exception(
+                    "restore: rolling back %s failed — the pre-restore "
+                    "snapshot holds its contents", target)
+        # The folders landed in step 3, so put those back as well: a restore
+        # that reports `aborted` must leave the generation it found.
+        for target, stash_parent, stashed in reversed(replaced):
+            try:
+                if target.exists():
+                    shutil.rmtree(target)
+                if stashed is not None:
+                    os.rename(stashed, target)
+                if stash_parent is not None:
+                    shutil.rmtree(stash_parent, ignore_errors=True)
+            except OSError:
+                _log.exception("restore: rolling back %s failed — the "
+                               "pre-restore snapshot holds its contents",
+                               target)
+        return _abort(failed_name, str(exc))
+    summary["restored_files"].extend(landed)
+    for _target, keep in file_stash:
+        try:
+            keep.unlink()
+        except OSError:
+            pass
     for _target, stash_parent, _stashed in replaced:
         if stash_parent is not None:
             shutil.rmtree(stash_parent, ignore_errors=True)

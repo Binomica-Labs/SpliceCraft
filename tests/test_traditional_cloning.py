@@ -4848,3 +4848,121 @@ class TestExcisionRefusesBeforeBuilding:
                                              circular=True)
         assert err is None and len(frags) == 2
         assert sum(len(f["top_seq"]) for f in frags) >= len(seq)
+
+
+# ── Reverse-orientation INTERNAL junction position (audit 2026-11-09) ────────
+# `_annotate_scars_on_product`'s reverse branch derived each internal junction
+# position as `forward_chain_len - pos_in_chain`, which assumes the RC'd chain
+# maps onto the forward chain base for base. It does not: `_rc_fragment` moves
+# overhang bases between `top_seq` and the bottom strand whenever a fragment's
+# two ends differ in overhang GEOMETRY (5' vs 3' vs blunt) — i.e. on every
+# directional insert.
+#
+# Two consequences, the second much worse than the first: the light-blue
+# overhang `misc_feature` named the wrong four bases, AND `_classify_junction`
+# reads a +/-6 bp window centred on the same position, so the
+# re-cuttable-vs-scar VERDICT was computed on a shifted window. Every pair
+# below reported an intact, uniquely-cuttable internal site as a destroyed
+# scar — while the FORWARD orientation of the same construct correctly called
+# it re-cuttable. That is the `[INV-190]` symptom, fixed there for the
+# vector<->insert junction and left here on the old arithmetic.
+
+_RJ_SITES = {"EcoRI": "GAATTC", "KpnI": "GGTACC", "BamHI": "GGATCC",
+             "PstI": "CTGCAG", "XbaI": "TCTAGA", "SalI": "GTCGAC",
+             "HindIII": "AAGCTT", "SphI": "GCATGC", "SacI": "GAGCTC",
+             "ApaI": "GGGCCC", "XhoI": "CTCGAG", "BglII": "AGATCT"}
+
+
+def _rj_filler(n: int, seed: int) -> str:
+    import random
+    rng = random.Random(seed)
+    return "".join(rng.choice("ACGT") for _ in range(n))
+
+
+def _rj_frag(left: str, right: str, body: int, seed: int):
+    seq = (_rj_filler(14, seed) + _RJ_SITES[left] + _rj_filler(body, seed + 1)
+           + _RJ_SITES[right] + _rj_filler(14, seed + 2))
+    for p in sc._digest_with_enzymes(seq, [left, right], circular=False):
+        if (p["left"].get("kind") != "linear"
+                and p["right"].get("kind") != "linear"):
+            return p
+    return None
+
+
+def _rj_vector(enz: str, seed: int = 99):
+    seq = _rj_filler(60, seed) + _RJ_SITES[enz] + _rj_filler(70, seed + 1)
+    for p in sc._digest_with_enzymes(seq, [enz], circular=True):
+        return p
+    return None
+
+
+# `outer` closes the chain at both ends; `inner` is the internal junction.
+_RJ_PAIRS = [("EcoRI", "KpnI"), ("EcoRI", "PstI"), ("BamHI", "PstI"),
+             ("EcoRI", "SacI"), ("BamHI", "ApaI"), ("XbaI", "PstI"),
+             ("HindIII", "SphI"), ("XhoI", "PstI"), ("BglII", "ApaI"),
+             ("SalI", "PstI")]
+
+
+@pytest.fixture(params=_RJ_PAIRS, ids=[f"{a}-{b}" for a, b in _RJ_PAIRS])
+def _rj_case(request):
+    outer, inner = request.param
+    vec = _rj_vector(outer)
+    f1 = _rj_frag(outer, inner, 60, 11)
+    f2 = _rj_frag(inner, outer, 75, 23)
+    if not (vec and f1 and f2):
+        pytest.skip(f"fragment prep failed for {outer}/{inner}")
+    res = sc._simulate_traditional_cloning_multi([f1, f2], vec)
+    if not (res.get("reverse") or {}).get("compatible"):
+        pytest.skip(f"{outer}/{inner} reverse not compatible")
+    inner_oh = (f1["right"].get("overhang_seq") or "").upper()
+    assert inner_oh, "premise: the inner enzyme must leave an overhang"
+    return outer, inner, inner_oh, res
+
+
+def test_reverse_internal_junction_names_the_inner_overhang(_rj_case):
+    """Ground truth that is NOT self-consistent: the overhang that anneals at
+    the internal junction is the inner enzyme's own, which the fragment end
+    dict reports as `overhang_seq`. Read at the wrong position, the annotation
+    names four other bases — or, as measured, goes missing entirely."""
+    _outer, _inner, inner_oh, res = _rj_case
+    rev = res["reverse"]
+    want = {inner_oh, sc._rc(inner_oh).upper()}
+    labels = {str(f.get("label") or "").upper()
+              for f in (rev.get("features") or [])}
+    assert labels & want, (
+        f"the reverse product carries no annotation naming the internal "
+        f"{inner_oh} overhang; labels present: {sorted(labels)}")
+
+
+def test_reverse_internal_junction_spans_what_it_names(_rj_case):
+    _outer, _inner, inner_oh, res = _rj_case
+    rev = res["reverse"]
+    top = rev.get("top_seq", "")
+    want = {inner_oh, sc._rc(inner_oh).upper()}
+    for f in (rev.get("features") or []):
+        lab = str(f.get("label") or "").upper()
+        if lab not in want:
+            continue
+        s, e = int(f["start"]), int(f["end"])
+        spanned = (top[s:e] if e <= len(top)
+                   else top[s:] + top[:e % len(top)]).upper()
+        assert spanned == lab, (
+            f"annotation says {lab!r} but bases [{s}:{e}] are {spanned!r}")
+
+
+def test_reverse_internal_junction_agrees_with_forward_on_recuttability(
+        _rj_case):
+    """The consequence that mattered. These constructs have the SAME internal
+    junction in both orientations — the same two enzyme ends anneal — so a
+    junction that is re-cuttable forward cannot be a destroyed scar in
+    reverse. Pre-fix every pair said exactly that."""
+    _outer, inner, _oh, res = _rj_case
+    notes = res.get("warnings") or []
+    fwd = [w for w in notes
+           if "insert 1 ↔ insert 2" in w and "(forward orientation)" in w]
+    rev = [w for w in notes if "(reverse)" in w and "insert" in w]
+    assert fwd and rev, (fwd, rev)
+    assert "re-cuttable" in fwd[0], f"premise: forward should be re-cuttable: {fwd[0]}"
+    assert "re-cuttable" in rev[0], (
+        f"forward says re-cuttable but reverse says: {rev[0]}")
+    assert inner in rev[0], rev[0]

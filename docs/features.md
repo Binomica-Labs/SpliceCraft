@@ -982,7 +982,7 @@ details. In short:
 
 - **Agent API** (`splicecraft --agent`) exposes a localhost JSON API
   with bearer-token auth, covering every GUI action external AI
-  agents need. ~299 endpoints; symlink-guarded write paths;
+  agents need. ~303 endpoints; symlink-guarded write paths;
   length/range/shape validation at the boundary.
 - **A browser front-end** (`splicecraft --workbench-dir ./ui`) is
   served from the API's own origin, so the page needs no CORS and no
@@ -993,6 +993,24 @@ details. In short:
   usual web assets. Use `--cors-origin http://localhost:5173`
   instead to point a hot-reloading dev server at the API. Both imply
   `--agent`.
+- **Two checks that exist only here** (no GUI surface yet).
+  `scan-repeats` finds long internal **direct and inverted** repeats
+  in a construct. This is not what the synthesis pre-flight screens:
+  that one reports only short *tandem* repeats — a unit of at most 4
+  bases repeated 5 or more times, i.e. microsatellites, which are a
+  synthesis-vendor problem. Two copies of the same 250 bp terminator,
+  or a promoter duplicated head-to-head, are a different hazard
+  entirely: a direct repeat recombines out the DNA between its
+  copies, and an inverted one folds into the hairpin that seeds
+  silencing. In a clonally propagated host neither can be bred out,
+  so it is a permanent liability rather than an F2 inconvenience.
+  `assemble-expression-cassette` is the eukaryotic counterpart to the
+  bacterial operon assembler: it stacks promoter / 5'UTR / intron /
+  signal peptide / CDS / C-tag / terminator and answers frame across
+  the signal-peptide→CDS→tag reading frame, motif hygiene (by
+  synonymous rewrite of the coding block only — a promoter has no
+  synonymous form, so a motif there is reported, never edited), Type
+  IIS scar compatibility, and internal repeats.
 - **Reading the library without taking the canvas** — ten read
   endpoints take `{entry}` (a library entry's name or id) and answer
   about that entry, leaving the loaded plasmid alone. That is what

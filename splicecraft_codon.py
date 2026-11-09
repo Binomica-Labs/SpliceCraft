@@ -903,6 +903,74 @@ _CODON_SPLICE_MAX_REPORT = 20
 _CODON_MAX_EXTERNAL_SITES = 2000
 
 
+def _codon_validate_external_sites(
+        external_sites: "list[dict] | None") -> "list[tuple[str, int, float]]":
+    """Normalise + validate `external_sites` into ``[(kind, offset, score)]``.
+
+    THE one validator, so the endpoint can reject a malformed list up front —
+    before deciding whether the repair will even run — and the repair cannot
+    drift from it. Without that, `splice_external_sites` was only ever checked
+    when `scrub_splice_sites` happened to be on: passing it without the repair
+    was accepted, ignored, and unmentioned, malformed or not (found while
+    verifying 1.3.18). That is the silently-dropped-parameter shape
+    `_agent_ignored_keys` exists to prevent.
+
+    Raises ValueError, which the agent layer turns into a 400."""
+    ext_sites: "list[tuple[str, int, float]]" = []
+    if external_sites is not None and not isinstance(external_sites,
+                                                     (list, tuple)):
+        # A bare string would otherwise iterate into characters and report a
+        # confusing per-entry error.
+        raise ValueError("external_sites must be a list of "
+                         "{kind, offset, score} dicts")
+    if external_sites is not None and \
+            len(external_sites) > _CODON_MAX_EXTERNAL_SITES:
+        # Bounded: `_external_pairs` is sites x external_sites on every
+        # surviving candidate. A 10 kb flank scanned at the pair floor yields
+        # well under a hundred sites, so a list past this is not a flank.
+        raise ValueError(
+            f"external_sites has {len(external_sites)} entries (max "
+            f"{_CODON_MAX_EXTERNAL_SITES}) — that is more flanking sites than "
+            f"any real flank carries")
+    _seen_ext: set = set()
+    for _e in (external_sites or []):
+        if not isinstance(_e, dict):
+            raise ValueError("each external_sites entry must be a dict of "
+                             "{kind, offset, score}")
+        _k = str(_e.get("kind") or "").strip().lower()
+        if _k not in ("donor", "acceptor"):
+            raise ValueError("external_sites kind must be 'donor' or "
+                             "'acceptor'")
+        _raw_off, _raw_sc = _e.get("offset"), _e.get("score")
+        # `int(True)` is 1 and `float(True)` is 1.0, so a flag would silently
+        # become a coordinate or a score. Same refusal as `margin`.
+        if isinstance(_raw_off, bool) or isinstance(_raw_sc, bool):
+            raise ValueError("external_sites 'offset' and 'score' are "
+                             "numbers, not flags")
+        try:
+            _off_f = float(_raw_off)                # type: ignore[arg-type]
+            _sc = float(_raw_sc)                    # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise ValueError("each external_sites entry needs a numeric "
+                             "'offset' and 'score'") from None
+        if _off_f != _off_f or _off_f in (float("inf"), float("-inf")):
+            raise ValueError("external_sites offset must be finite")
+        if _off_f != int(_off_f):
+            # Silently truncating 1.7 to 1 shifts the pair geometry by a base
+            # and nothing downstream could tell.
+            raise ValueError("external_sites 'offset' must be a whole number "
+                             "of bases")
+        _off = int(_off_f)
+        if _sc != _sc or _sc in (float("inf"), float("-inf")):
+            raise ValueError("external_sites score must be finite")
+        _key = (_k, _off, _sc)
+        if _key in _seen_ext:
+            continue                    # duplicates cost work and change nothing
+        _seen_ext.add(_key)
+        ext_sites.append((_k, _off, _sc))
+    return ext_sites
+
+
 def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
                             kind: str = "both",
                             sites: "dict | None" = None,
@@ -938,7 +1006,12 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
     Returns ``(new_dna, fixes, remaining)``. ``remaining`` is `_splice_scan`
     re-run on the FINAL sequence — measured, not inferred from the fixes — so
     a site no synonym could remove is reported with its score instead of
-    disappearing.
+    disappearing. With ``external_sites`` supplied it ALSO carries any site
+    that still pairs with one of them, stamped ``externally_paired`` (the
+    combined score). Those sit BELOW the reporting bar by construction — that
+    is why they needed ``external_sites`` to be repairable at all — so the
+    re-scan alone would silently drop them and leave the caller reading a
+    clean CDS.
 
     Raises RuntimeError (out of `_splice_scan`) when no model is loaded: an
     untrained scan returning ``[]`` would read as "no cryptic sites" when it
@@ -996,7 +1069,13 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
 
     Sites are matched at the PAIR floor, not the repair bar: a site under the
     reporting threshold still carries half a pair's evidence, which is the
-    whole reason the residual above survived the first fix.
+    whole reason the residual above survived the first fix. For the same
+    reason a supplied list DISABLES the "nothing at the repair bar, nothing to
+    do" fast path: taking it made the keyword inert on exactly the construct
+    it was written for — a CDS scanning clean while an acceptor inside it at
+    2.642 (bar 4.439) still paired with the real upstream donor at 5.829,
+    combined 8.471 over the 8.205 gate, able to excise the first 48 codons
+    (field report 2026-11-08, round 4).
 
     Codons are tried nearest-the-anchor first (the GT/AG dinucleotide itself
     is invariant in both populations, so the bases that actually carry the
@@ -1047,58 +1126,7 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
             _scan_kw[_name] = _cal - margin
     # Validated up front so a malformed entry is a clear ValueError the agent
     # layer turns into a 400, not an IndexError from inside the swap loop.
-    ext_sites: "list[tuple[str, int, float]]" = []
-    if external_sites is not None and not isinstance(external_sites,
-                                                     (list, tuple)):
-        # A bare string would otherwise iterate into characters and report a
-        # confusing per-entry error.
-        raise ValueError("external_sites must be a list of "
-                         "{kind, offset, score} dicts")
-    if external_sites is not None and \
-            len(external_sites) > _CODON_MAX_EXTERNAL_SITES:
-        # Bounded: `_external_pairs` is sites x external_sites on every
-        # surviving candidate. A 10 kb flank scanned at the pair floor yields
-        # well under a hundred sites, so a list past this is not a flank.
-        raise ValueError(
-            f"external_sites has {len(external_sites)} entries (max "
-            f"{_CODON_MAX_EXTERNAL_SITES}) — that is more flanking sites than "
-            f"any real flank carries")
-    _seen_ext: set = set()
-    for _e in (external_sites or []):
-        if not isinstance(_e, dict):
-            raise ValueError("each external_sites entry must be a dict of "
-                             "{kind, offset, score}")
-        _k = str(_e.get("kind") or "").strip().lower()
-        if _k not in ("donor", "acceptor"):
-            raise ValueError("external_sites kind must be 'donor' or "
-                             "'acceptor'")
-        _raw_off, _raw_sc = _e.get("offset"), _e.get("score")
-        # `int(True)` is 1 and `float(True)` is 1.0, so a flag would silently
-        # become a coordinate or a score. Same refusal as `margin`.
-        if isinstance(_raw_off, bool) or isinstance(_raw_sc, bool):
-            raise ValueError("external_sites 'offset' and 'score' are "
-                             "numbers, not flags")
-        try:
-            _off_f = float(_raw_off)                # type: ignore[arg-type]
-            _sc = float(_raw_sc)                    # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            raise ValueError("each external_sites entry needs a numeric "
-                             "'offset' and 'score'") from None
-        if _off_f != _off_f or _off_f in (float("inf"), float("-inf")):
-            raise ValueError("external_sites offset must be finite")
-        if _off_f != int(_off_f):
-            # Silently truncating 1.7 to 1 shifts the pair geometry by a base
-            # and nothing downstream could tell.
-            raise ValueError("external_sites 'offset' must be a whole number "
-                             "of bases")
-        _off = int(_off_f)
-        if _sc != _sc or _sc in (float("inf"), float("-inf")):
-            raise ValueError("external_sites score must be finite")
-        _key = (_k, _off, _sc)
-        if _key in _seen_ext:
-            continue                    # duplicates cost work and change nothing
-        _seen_ext.add(_key)
-        ext_sites.append((_k, _off, _sc))
+    ext_sites = _codon_validate_external_sites(external_sites)
     _cal_d, _cal_a = _splice_threshold("donor"), _splice_threshold("acceptor")
     if ext_sites and (_cal_d is None or _cal_a is None):
         raise RuntimeError(
@@ -1111,7 +1139,20 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
     if not dna:
         return dna, [], []
     initial = _splice_scan(dna, **_scan_kw)     # raises when untrained
-    if not initial:
+    if not initial and not ext_sites:
+        # Fast path: nothing at the repair bar and no outside partner to pair
+        # with, so there is nothing to target. `external_sites` has to be
+        # exempted, because with one supplied "nothing at the bar" stops
+        # meaning "nothing to do": the site the keyword exists for is BELOW
+        # the bar by construction (it is targeted at `_SPLICE_PAIR_FLOOR`
+        # because it carries only half a pair's evidence on its own). Taking
+        # this exit anyway made the keyword inert on exactly the construct it
+        # was written for — a CDS that scans clean while a sub-threshold
+        # acceptor inside it still pairs with the real upstream donor and
+        # excises the 5' end (field report 2026-11-08, round 4; the in-CDS
+        # acceptor scored 2.642 against a 4.439 bar, combined 8.471 over the
+        # 8.205 gate). The round loop below does the real check and breaks on
+        # its own when the target list comes back empty.
         return dna, [], []
 
     _gc_code = (_CODON_GENETIC_CODE if transl_table in (None, 1)
@@ -1366,7 +1407,42 @@ def _codon_fix_splice_sites(dna: str, protein: str, raw: dict, *,
             # next round attacks a different site instead of spinning, and let
             # `remaining` report it with its score.
             stuck.add((t_kind, t_pos))
-    return "".join(dna_list), fixes, _splice_scan("".join(dna_list), **_scan_kw)
+    final = "".join(dna_list)
+    remaining = _splice_scan(final, **_scan_kw)
+    if ext_sites:
+        # An externally-paired site that no synonym could remove is UNDER the
+        # reporting bar by construction — that is the whole reason it needed
+        # `external_sites` to become a target at all — so the re-scan above
+        # cannot see it, and "no fixes, nothing remaining" would come back
+        # describing a clean CDS. The promise this function makes is that a
+        # site no synonym can fix is reported WITH its score; it has to hold
+        # for these too. Measured on the FINAL sequence, never inferred from
+        # the fixes, and stamped `externally_paired` (the combined score) so a
+        # reader can tell why a 2.6-bit site sits in a list of at-bar ones.
+        _ext_now = {(_k, _pos): _c
+                    for _c, _k, _pos in _external_pairs(dna_list)}
+        if _ext_now:
+            _by_key = {(h["kind"], int(h["position"])): h for h in remaining}
+            _missing = [k for k in _ext_now if k not in _by_key]
+            _at_floor: dict = {}
+            if _missing:
+                _floor_kw = dict(_scan_kw)
+                _floor_kw["donor_threshold"] = _SPLICE_PAIR_FLOOR
+                _floor_kw["acceptor_threshold"] = _SPLICE_PAIR_FLOOR
+                _at_floor = {(h["kind"], int(h["position"])): h
+                             for h in _splice_scan(final, **_floor_kw)}
+            for _key, _c in _ext_now.items():
+                _hit = _by_key.get(_key)
+                if _hit is not None:
+                    # Already reported (it also clears the bar) — annotate in
+                    # place so filtering on the stamp finds the whole set.
+                    _hit["externally_paired"] = round(_c, 3)
+                    continue
+                _hit = _at_floor.get(_key)
+                if _hit is None:            # pragma: no cover - defensive
+                    continue
+                remaining.append(dict(_hit, externally_paired=round(_c, 3)))
+    return final, fixes, remaining
 
 
 def _codon_fix_sites(dna: str, protein: str, raw: dict,

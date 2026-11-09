@@ -8074,3 +8074,630 @@ class TestOptimizeProteinReportsThe3PrimeScreen:
         tp = r["three_prime"]
         assert len(tp["regions"]) <= sc._CODON_SPLICE_MAX_REPORT
         assert tp["n_regions"] >= len(tp["regions"])
+
+
+class TestExternalSitesIsNeverSilentlyDropped:
+    """Found while verifying 1.3.18: `splice_external_sites` was only
+    validated when `scrub_splice_sites` happened to be on. Passing it without
+    the repair was accepted, ignored and unmentioned — malformed or not. That
+    is the silently-dropped-parameter shape `_agent_ignored_keys` exists to
+    prevent, and it was inconsistent with the neighbouring rule where
+    `scrub_splice_sites` + `check_splice: false` is a 400."""
+
+    def _h(self):
+        return sc._state._AGENT_HANDLERS["optimize-protein"][0]
+
+    PROT = "M" + "GSSHHHHHHSSGLVPRGSHMASM" * 4
+    BAD = [{"kind": "donor", "offset": True, "score": 1}]
+    OK = [{"kind": "donor", "offset": -1500, "score": 5.829}]
+
+    @pytest.mark.parametrize("extra", [
+        {"hazard_hosts": ["plant"], "scrub_splice_sites": True},   # repair runs
+        {},                                                        # repair skipped
+        {"hazard_hosts": ["plant"]},                               # scan only
+    ])
+    def test_malformed_is_a_400_whether_or_not_the_repair_runs(self, extra):
+        r = self._h()(None, dict({"protein": self.PROT,
+                                  "splice_external_sites": self.BAD}, **extra))
+        assert isinstance(r, tuple) and r[1] == 400, r
+        assert "splice_external_sites" in r[0]["error"]
+        assert "not flags" in r[0]["error"]
+
+    @pytest.mark.parametrize("extra", [{}, {"hazard_hosts": ["plant"]}])
+    def test_valid_but_inert_says_so(self, extra):
+        """Accepted, valid, and about to do nothing — the one outcome that
+        must not be silent."""
+        r = self._h()(None, dict({"protein": self.PROT,
+                                  "splice_external_sites": self.OK}, **extra))
+        assert not isinstance(r, tuple), r
+        note = [w for w in r["warnings"] if "splice_external_sites" in w]
+        assert note, r["warnings"]
+        assert "NO effect" in note[0]
+        assert "scrub_splice_sites" in note[0]
+
+    def test_no_note_when_the_sites_are_actually_used(self):
+        r = self._h()(None, {"protein": self.PROT,
+                             "hazard_hosts": ["plant"],
+                             "scrub_splice_sites": True,
+                             "splice_external_sites": self.OK})
+        assert not isinstance(r, tuple), r
+        assert not [w for w in r["warnings"] if "splice_external_sites" in w]
+
+    def test_no_note_when_none_supplied(self):
+        r = self._h()(None, {"protein": self.PROT,
+                             "hazard_hosts": ["plant"]})
+        assert not [w for w in r["warnings"] if "splice_external_sites" in w]
+
+    def test_the_endpoint_and_the_repair_share_one_validator(self):
+        """One rule, two doors: whatever the helper refuses, the endpoint must
+        refuse identically, or the two can drift."""
+        import splicecraft_codon as _c
+        for bad in (True,
+                    [{"kind": "x", "offset": 0, "score": 1}],
+                    [{"kind": "donor", "offset": 1.7, "score": 1}],
+                    [{"kind": "donor", "offset": 0, "score": float("nan")}]):
+            with pytest.raises(ValueError):
+                _c._codon_validate_external_sites(bad)
+            r = self._h()(None, {"protein": self.PROT,
+                                 "splice_external_sites": bad})
+            assert isinstance(r, tuple) and r[1] == 400, (bad, r)
+
+
+class TestSpliceMarginIsNotSilentlyInert:
+    """Checked after the `splice_external_sites` fix, because the two have the
+    same dependency shape — a parameter whose effect lives behind another
+    parameter. `splice_margin` had HALF the hole: its validation is
+    unconditional (a malformed value 400s even with nothing to consume it,
+    which is the dangerous half and was already right), but with
+    `check_splice` false it did nothing and said nothing."""
+
+    def _h(self):
+        return sc._state._AGENT_HANDLERS["optimize-protein"][0]
+
+    PROT = "M" + "GSSHHHHHHSSGLVPRGSHMASM" * 4
+
+    def _note(self, r):
+        return [w for w in r["warnings"]
+                if w.startswith("'splice_margin'")]
+
+    @pytest.mark.parametrize("bad,needle", [
+        (True, "not a flag"),
+        (-1, "must be >= 0"),
+        (99, "break-even"),
+        ("lots", "number of bits"),
+    ])
+    def test_validation_is_reachable_with_nothing_consuming_it(self, bad,
+                                                               needle):
+        """The dangerous half, already correct and now pinned: a malformed
+        margin must 400 even with no plant host and no repair, or its
+        validation is only as reachable as the feature that uses it."""
+        r = self._h()(None, {"protein": self.PROT, "splice_margin": bad})
+        assert isinstance(r, tuple) and r[1] == 400, r
+        assert needle in r[0]["error"], r[0]["error"]
+
+    @pytest.mark.parametrize("extra", [
+        {},                                                  # scan defaults off
+        {"hazard_hosts": ["plant"], "check_splice": False},  # scan turned off
+    ])
+    def test_an_inert_margin_says_so(self, extra):
+        r = self._h()(None, dict({"protein": self.PROT,
+                                  "splice_margin": 0.5}, **extra))
+        assert not isinstance(r, tuple), r
+        assert r["splice"]["skipped"] is True
+        note = self._note(r)
+        assert note, r["warnings"]
+        assert "NO effect" in note[0]
+        assert "check_splice" in note[0]
+
+    @pytest.mark.parametrize("extra", [
+        {"hazard_hosts": ["plant"]},                            # scan only
+        {"hazard_hosts": ["plant"], "scrub_splice_sites": True},  # scan+repair
+    ])
+    def test_an_active_margin_is_not_warned_about(self, extra):
+        """It is NOT inert when the scan runs without the repair — it lowers
+        the reporting bar, which is a documented use."""
+        r = self._h()(None, dict({"protein": self.PROT,
+                                  "splice_margin": 0.5}, **extra))
+        assert not isinstance(r, tuple), r
+        assert r["splice"]["skipped"] is False
+        assert r["splice"]["margin"] == 0.5
+        assert self._note(r) == []
+
+    def test_a_zero_margin_is_not_warned_about(self):
+        """0 means "not asked for", so there is nothing to report."""
+        r = self._h()(None, {"protein": self.PROT, "splice_margin": 0})
+        assert self._note(r) == []
+
+
+class TestASurvivingExternalPairIsNotSilent:
+    """Field report 2026-11-08, round 4. `splice_external_sites` makes a
+    sub-threshold site REPAIRABLE — and a site that needed it is under the
+    reporting bar by construction. So when no synonym could remove one,
+    `splice.sites` could not show it (it scans at the bar) and
+    `splice.pairs` could not either (`_splice_pair_risk` needs BOTH ends
+    inside the scanned CDS). The response then read exactly like a clean
+    one: no fixes, no sites, no pairs, plus the standard "scan found
+    nothing" all-clear. A pair with one end outside the CDS still excises
+    coding sequence."""
+
+    def _h(self):
+        return sc._state._AGENT_HANDLERS["optimize-protein"][0]
+
+    PROT = "M" + "GSSHHHHHHSSGLVPRGSHMASM" * 4
+    OK = [{"kind": "donor", "offset": -1500, "score": 5.829}]
+
+    def _ask(self, **extra):
+        return self._h()(None, dict({"protein": self.PROT,
+                                     "hazard_hosts": ["plant"],
+                                     "scrub_splice_sites": True,
+                                     "splice_external_sites": self.OK},
+                                    **extra))
+
+    def test_the_count_is_reported_whenever_partners_were_supplied(self):
+        """A 0 here is a measurement — the question was asked and answered."""
+        r = self._ask()
+        assert not isinstance(r, tuple), r
+        assert r["splice"]["n_sites_paired_outside_the_cds"] == 0
+        assert r["splice"]["sites_paired_outside_the_cds"] == []
+
+    def test_the_key_is_absent_when_no_partners_were_supplied(self):
+        """Nothing was measured, so there is nothing to report."""
+        r = self._h()(None, {"protein": self.PROT,
+                             "hazard_hosts": ["plant"],
+                             "scrub_splice_sites": True})
+        assert not isinstance(r, tuple), r
+        assert "n_sites_paired_outside_the_cds" not in r["splice"]
+
+    def _with_survivor(self, monkeypatch):
+        """Stub the ENGINE (pinned by test_codon.py) to leave one survivor,
+        because the thing under test is the REPORTING layer."""
+        import splicecraft_agent as _a
+        real = _a._codon_fix_splice_sites
+
+        def fake(dna, protein, raw, **kw):
+            out, fixes, rem = real(dna, protein, raw, **kw)
+            rem = list(rem) + [{"kind": "acceptor", "position": 42,
+                                "score": 2.642, "threshold": 0.0,
+                                "above_calibrated": False,
+                                "window": "N" * 23, "strand": "+",
+                                "externally_paired": 8.471}]
+            return out, fixes, rem
+        monkeypatch.setattr(_a, "_codon_fix_splice_sites", fake)
+
+    def test_a_survivor_is_listed_with_its_combined_score(self, monkeypatch):
+        self._with_survivor(monkeypatch)
+        r = self._ask()
+        assert not isinstance(r, tuple), r
+        assert r["splice"]["n_sites_paired_outside_the_cds"] == 1
+        left = r["splice"]["sites_paired_outside_the_cds"][0]
+        assert left["score"] == 2.642
+        assert left["externally_paired"] == 8.471
+
+    def test_a_survivor_is_warned_about(self, monkeypatch):
+        self._with_survivor(monkeypatch)
+        r = self._ask()
+        note = [w for w in r["warnings"]
+                if "splice_external_sites" in w and "still PAIR" in w]
+        assert note, r["warnings"]
+        assert "8.471" in note[0]
+        assert "below the reporting bar" in note[0].lower()
+
+    def test_a_survivor_suppresses_the_all_clear(self, monkeypatch):
+        """"found nothing" is the one sentence this must never produce while
+        a pair is still live."""
+        self._with_survivor(monkeypatch)
+        r = self._ask()
+        assert not [w for w in r["warnings"]
+                    if "cryptic-splice scan found nothing" in w], r["warnings"]
+
+    def test_without_the_survivor_the_all_clear_still_fires(self):
+        """The guard must not have turned the all-clear off for everyone."""
+        r = self._ask()
+        assert [w for w in r["warnings"]
+                if "cryptic-splice scan found nothing" in w], r["warnings"]
+
+
+# ── 2026-11-09 system audit ───────────────────────────────────────────────────
+
+
+def _audit_rand_dna(n: int, *, seed: int) -> str:
+    """`n` bases of random DNA from ONE seeded generator.
+
+    A helper rather than an inline comprehension on purpose. Writing
+    ``random.Random(seed).choice("ACGT")`` inside the comprehension
+    re-constructs the generator for every character, so every base comes out
+    the same and the "random" fixture is a one-base run — which has a
+    genuine (n-1) bp internal repeat and made a correct engine look broken.
+    That is the vacuous-probe trap recorded in `[INV-224]`; this class tripped
+    it on first writing, so the fixture now asserts its own randomness."""
+    import random
+    rng = random.Random(seed)
+    out = "".join(rng.choice("ACGT") for _ in range(n))
+    assert len(set(out)) == 4, "fixture is not random DNA"
+    return out
+
+
+def _audit_rand_cds(n_codons: int, *, seed: int) -> str:
+    """An in-frame ATG…TAA CDS of `n_codons` sense codons, one seeded rng."""
+    import random
+    rng = random.Random(seed)
+    body = "".join(rng.choice(["GCT", "AAA", "GGT", "TTC", "CTG"])
+                   for _ in range(n_codons))
+    return "ATG" + body + "TAA"
+# Three defect classes, each with its own class below:
+#   1. no `_coerce_float`, so a JSON bool became a threshold (HTTP 200)
+#   2. `_ot2_opt_float` turned an unparseable number into "not supplied"
+#   3. `get-part` / `get-experiment` answered out of the ACTIVE container
+#      while their `list-*` siblings took a selector
+# plus the two endpoints that un-orphan `splicecraft_cassette`.
+
+
+class TestCoerceFloatRefusesABool:
+    """`_coerce_int` has refused a bool since the `rbs-strength` fix — "`True`
+    is not 1 for an API that takes coordinates and indices". There was no
+    float counterpart, so every threshold rolled its own `float(...)` and
+    `float(True)` is `1.0`, which then PASSES the range check because 1.0 is a
+    legal threshold everywhere it appears. A flag silently became a cutoff."""
+
+    def test_bool_is_refused(self):
+        import splicecraft_agent as _a
+        for v in (True, False):
+            got = _a._coerce_float(v, name="x")
+            assert isinstance(got, str), f"{v!r} was coerced to {got!r}"
+            assert "boolean" in got
+
+    def test_real_numbers_pass(self):
+        import splicecraft_agent as _a
+        assert _a._coerce_float(1.5, name="x") == 1.5
+        assert _a._coerce_float(2, name="x") == 2.0
+        assert _a._coerce_float("3.5", name="x") == 3.5
+
+    def test_non_finite_is_refused_as_float_and_as_string(self):
+        """`float("nan")` parses happily from a string, so the string door
+        needs the same finiteness check as the numeric one."""
+        import splicecraft_agent as _a
+        for v in (float("nan"), float("inf"), float("-inf"),
+                  "nan", "inf", "-inf"):
+            got = _a._coerce_float(v, name="x")
+            assert isinstance(got, str), f"{v!r} -> {got!r}"
+            assert "finite" in got
+
+    def test_junk_is_refused(self):
+        import splicecraft_agent as _a
+        for v in ("abc", None, [], {}):
+            assert isinstance(_a._coerce_float(v, name="x"), str)
+
+
+class TestBoolThresholdsAre400:
+    """The endpoint-level half: a bool on a threshold parameter must be a 400,
+    not a silently-substituted cutoff. `verify-against-reads` is the sharp
+    one — with `min_identity: true` the bar became 1 %, so a read off an
+    unrelated plasmid came back ``verdict: "match"``, and that endpoint's whole
+    job is "the reads came back, did my clone work". `scan-promoters` with
+    `min_score: false` was MEASURED at 6,000 "promoters" in 3 kb of random DNA
+    against 0 at the default."""
+
+    REF = _audit_rand_dna(1200, seed=777)
+    SEQ3K = _audit_rand_dna(3000, seed=5)
+    CDS = _audit_rand_cds(60, seed=8)
+
+    # (endpoint, base payload, threshold key)
+    CASES = [
+        ("verify-against-reads", {"reference": REF, "reads": [REF]},
+         "min_identity"),
+        ("analyse-read-heterogeneity", {"reference": REF, "reads": [REF]},
+         "min_fraction"),
+        ("analyse-read-heterogeneity", {"reference": REF, "reads": [REF]},
+         "noise_floor"),
+        ("scan-promoters", {"sequence": SEQ3K}, "min_score"),
+        ("scan-3prime-risk", {"sequence": SEQ3K}, "min_score"),
+        ("scan-cis-elements", {"sequence": SEQ3K}, "min_enrichment"),
+        ("check-primer", {"primer": "ACGTACGTACGTACGTAC", "template": REF},
+         "min_identity"),
+        ("analyse-cds", {"sequence": CDS}, "rare_w"),
+        ("optimize-protein", {"protein": "MKVTAGGRS"}, "min_gc"),
+        ("optimize-protein", {"protein": "MKVTAGGRS"}, "max_gc"),
+    ]
+
+    @pytest.mark.parametrize("endpoint,base,key", CASES,
+                             ids=[f"{e}:{k}" for e, _b, k in CASES])
+    @pytest.mark.parametrize("flag", [True, False], ids=["true", "false"])
+    def test_a_bool_threshold_is_refused(self, endpoint, base, key, flag):
+        app = MockApp(record=None)
+        handler = sc._state._AGENT_HANDLERS[endpoint]
+        fn = handler[0] if isinstance(handler, tuple) else handler
+        out = fn(app, {**base, key: flag})
+        assert isinstance(out, tuple) and out[1] == 400, (
+            f"{endpoint} accepted {key}={flag!r} -> {str(out)[:200]}")
+
+    def test_the_measured_case_a_zero_bar_is_not_reachable_by_a_flag(self):
+        """The premise, so this class cannot pass vacuously: at a 0.0 bar the
+        promoter scan really does report thousands of chance hits, which is
+        what `min_score: false` used to buy."""
+        app = MockApp(record=None)
+        handler = sc._state._AGENT_HANDLERS["scan-promoters"]
+        fn = handler[0] if isinstance(handler, tuple) else handler
+        wide = fn(app, {"sequence": self.SEQ3K, "min_score": 0.0})
+        assert not isinstance(wide, tuple), wide
+        default = fn(app, {"sequence": self.SEQ3K})
+        assert not isinstance(default, tuple), default
+        assert wide["n_hits"] > 100 * max(1, default["n_hits"]), (
+            f"premise broken: 0.0 bar gave {wide['n_hits']}, "
+            f"default gave {default['n_hits']}")
+
+
+class TestOt2FloatsDoNotVanish:
+    """`_ot2_opt_float` returned None for an UNPARSEABLE value, and every
+    caller reads None as "the key was omitted". So `{"final_volume": "50 uL"}`
+    silently dropped the documented top-up-to-volume branch and returned 200
+    with sample volumes only. And `float(True)` became 1 ng BEFORE the engine
+    saw it, defeating `_ot2_normalize_volumes`' own `_pos` guard, which
+    refuses a bool on purpose. These volumes drive a real robot."""
+
+    ITEMS = [{"name": "A1", "well": "A1", "concentration": 100.0},
+             {"name": "A2", "well": "A2", "concentration": 50.0}]
+
+    def _call(self, payload):
+        app = MockApp(record=None)
+        handler = sc._state._AGENT_HANDLERS["ot2-normalize"]
+        fn = handler[0] if isinstance(handler, tuple) else handler
+        return fn(app, payload)
+
+    def test_unparseable_volume_is_400_not_silently_absent(self):
+        """In `target_ng` mode `final_volume` is the OPTIONAL top-up, so a
+        dropped one is invisible — the engine cannot complain about a value it
+        was told was absent. (In `target_conc` mode the engine requires it, so
+        the drop was accidentally caught there; that is why this test uses
+        `target_ng`, which is the case the bug actually reached.)"""
+        good = self._call({"items": self.ITEMS, "target_ng": 100,
+                           "final_volume": 50.0})
+        assert not isinstance(good, tuple), str(good)[:200]
+        assert good["normalized"][0]["diluent_ul"] is not None, (
+            "premise broken: final_volume does not drive a top-up in "
+            "target_ng mode")
+        out = self._call({"items": self.ITEMS, "target_ng": 100,
+                          "final_volume": "50 uL"})
+        assert isinstance(out, tuple) and out[1] == 400, (
+            f"a mistyped final_volume was accepted and the top-up silently "
+            f"dropped: {str(out)[:200]}")
+        assert "final_volume" in out[0]["error"]
+
+    def test_a_bool_target_is_refused_before_the_engine(self):
+        out = self._call({"items": self.ITEMS, "target_ng": True})
+        assert isinstance(out, tuple) and out[1] == 400, str(out)[:200]
+        assert "boolean" in out[0]["error"]
+
+    def test_a_numeric_string_still_works(self):
+        """The fix must not refuse the strings `_coerce_int` has always
+        taken."""
+        out = self._call({"items": self.ITEMS, "target_conc": 10,
+                          "final_volume": "50"})
+        assert not isinstance(out, tuple), str(out)[:200]
+        assert out["normalized"][0]["diluent_ul"] is not None
+
+    def test_a_valid_final_volume_still_tops_up(self):
+        out = self._call({"items": self.ITEMS, "target_conc": 10,
+                          "final_volume": 50.0})
+        assert not isinstance(out, tuple), str(out)[:200]
+        assert out["normalized"][0]["diluent_ul"] == 20.0
+
+    def test_an_explicit_zero_resolution_is_not_substituted(self):
+        """`resolution=... or 0.1` turned an explicit 0 back into the default
+        — the `cycles or 30` silent-substitution shape. 0 means "do not
+        round", which the engine's `_round` already handles. Asserted by
+        OUTCOME: a volume that 0.1 rounds must come back unrounded at 0."""
+        # 1000 ng / 7.1 ng/µL = 140.845… µL — inside p300_single's range, so
+        # the answer is not clamped to the pipette floor and the ROUNDING is
+        # what the two calls differ by.
+        items = [{"name": "A1", "well": "A1", "concentration": 7.1}]
+        at_zero = self._call({"items": items, "target_ng": 1000,
+                              "resolution": 0})
+        at_tenth = self._call({"items": items, "target_ng": 1000,
+                               "resolution": 0.1})
+        assert not isinstance(at_zero, tuple), str(at_zero)[:200]
+        assert not isinstance(at_tenth, tuple), str(at_tenth)[:200]
+        v0 = at_zero["normalized"][0]["sample_ul"]
+        v1 = at_tenth["normalized"][0]["sample_ul"]
+        assert round(v1, 6) == 140.8, f"premise broken: 0.1 gave {v1}"
+        assert v0 != v1, (
+            f"resolution 0 was substituted with the default: both gave {v0}")
+        assert abs(v0 - 140.84507) < 1e-4, v0
+
+
+class TestContainerSelectorOnTheReadHalf:
+    """`list-parts` takes `bin` and `list-experiments` takes `project`, but
+    `get-part` and `get-experiment` read only the ACTIVE container and dropped
+    the key in silence (reads do not run the routing-key guard). Parts are
+    keyed (name, grammar) PER BIN, so holding one name in two bins is the
+    normal use of bins — the pre-fix answer was a DIFFERENT part under the
+    requested name, at HTTP 200."""
+
+    def _call(self, endpoint, payload):
+        app = MockApp(record=None)
+        handler = sc._state._AGENT_HANDLERS[endpoint]
+        fn = handler[0] if isinstance(handler, tuple) else handler
+        return fn(app, payload)
+
+    def test_get_part_reads_the_bin_key(self):
+        out = self._call("get-part", {"name": "nope", "bin": "NoSuchBin"})
+        assert isinstance(out, tuple), str(out)[:200]
+        # Pre-fix `bin` was ignored, so this 404'd on the part name instead of
+        # the bin — the bin never entered the answer at all.
+        assert "NoSuchBin" in out[0]["error"], out[0]["error"]
+
+    def test_get_part_says_which_bin_it_looked_in(self):
+        out = self._call("get-part", {"name": "nope"})
+        assert isinstance(out, tuple) and out[1] == 404
+        assert "active bin" in out[0]["error"], out[0]["error"]
+
+    def test_get_experiment_reads_the_project_key(self):
+        out = self._call("get-experiment",
+                         {"id": "abcd1234", "project": "NoSuchProject"})
+        assert isinstance(out, tuple), str(out)[:200]
+        assert "NoSuchProject" in out[0]["error"], out[0]["error"]
+
+    def test_get_experiment_says_which_project_it_looked_in(self):
+        out = self._call("get-experiment", {"id": "abcd1234"})
+        assert isinstance(out, tuple) and out[1] == 404
+        assert "active project" in out[0]["error"], out[0]["error"]
+
+    def test_create_experiment_documents_its_project_parameter(self):
+        """It was implemented and documented as "the active project" only, so
+        an agent reading the contract believed it had to mutate global active
+        state first (or create-then-move).
+
+        Asserting `"project" in doc` is VACUOUS — the pre-fix sentence "in the
+        active project" contains the word. The contract is that `project`
+        appears in the documented BODY shape, the way every sibling spells
+        it."""
+        handler = sc._state._AGENT_HANDLERS["create-experiment"]
+        fn = handler[0] if isinstance(handler, tuple) else handler
+        doc = fn.__doc__ or ""
+        assert "project?" in doc, (
+            "create-experiment accepts `project` but does not list it in its "
+            "documented body shape")
+        # And the sibling it must agree with really does spell it this way,
+        # so this is the house style rather than an invented token.
+        sibling = sc._state._AGENT_HANDLERS["list-experiments"]
+        sfn = sibling[0] if isinstance(sibling, tuple) else sibling
+        assert "project" in (sfn.__doc__ or "")
+
+
+class TestCassetteHasADoor:
+    """`splicecraft_cassette` was packaged in the wheel, registered at L3 and
+    covered by `tests/test_cassette.py`, with NO production importer and no
+    endpoint — the `[INV-199]` write-only-subsystem shape. Its
+    `_cassette_internal_repeats` was also the only detector in the tree for
+    long direct/inverted repeats: the reachable one, `_lint_tandem_repeats`
+    via `lint-synthesis`, caps at a 4 bp unit repeated 5 times, i.e.
+    microsatellites. Two identical 250 bp terminators in one construct were
+    invisible through every reachable path."""
+
+    def _call(self, endpoint, payload):
+        app = MockApp(record=None)
+        handler = sc._state._AGENT_HANDLERS[endpoint]
+        fn = handler[0] if isinstance(handler, tuple) else handler
+        return fn(app, payload)
+
+    def test_both_endpoints_are_registered_with_docstrings(self):
+        for name in ("scan-repeats", "assemble-expression-cassette"):
+            handler = sc._state._AGENT_HANDLERS.get(name)
+            assert handler is not None, f"{name} is not registered"
+            fn = handler[0] if isinstance(handler, tuple) else handler
+            # The catalogue reads __doc__; a docstring lost to an expression
+            # statement is the [INV-202] "channel rationed the registry" bug.
+            assert len(fn.__doc__ or "") > 50, f"{name} has no docstring"
+
+    def test_both_are_heavy_classified(self):
+        for name in ("scan-repeats", "assemble-expression-cassette"):
+            assert name in sc._AGENT_HEAVY_ENDPOINTS, name
+
+    def test_a_constructed_direct_repeat_is_found_at_its_real_length(self):
+        import random
+        rng = random.Random(4242)
+        block = "".join(rng.choice("ACGT") for _ in range(120))
+        filler = "".join(rng.choice("ACGT") for _ in range(200))
+        tail = "".join(rng.choice("ACGT") for _ in range(150))
+        out = self._call("scan-repeats",
+                         {"sequence": block + filler + block + tail,
+                          "min_length": 100})
+        assert not isinstance(out, tuple), str(out)[:200]
+        assert out["n_direct"] == 1, out
+        hit = out["hits"][0]
+        # ONE finding at the MAXIMAL run, not one per overlapping window.
+        assert hit["kind"] == "direct"
+        assert hit["length"] >= 120
+        assert hit["positions"][:2] == [0, 320]
+
+    def test_a_constructed_inverted_repeat_is_found(self):
+        import random
+        rng = random.Random(99)
+        arm = "".join(rng.choice("ACGT") for _ in range(110))
+        mid = "".join(rng.choice("ACGT") for _ in range(80))
+        out = self._call("scan-repeats",
+                         {"sequence": arm + mid + sc._rc(arm),
+                          "min_length": 100})
+        assert not isinstance(out, tuple), str(out)[:200]
+        assert out["n_inverted"] >= 1, out
+
+    def test_a_clean_sequence_reports_zero(self):
+        import random
+        # ONE Random instance, reused. `random.Random(7).choice(...)` inside
+        # the comprehension re-seeds per character and builds 4,000 IDENTICAL
+        # bases, which genuinely contain a 3,999 bp direct repeat — so the
+        # first draft of this test "failed" against a correct engine
+        # (`[INV-224]`'s one-base-sequence trap).
+        rng = random.Random(7)
+        clean = "".join(rng.choice("ACGT") for _ in range(4000))
+        assert len(set(clean)) == 4, "fixture is not random DNA"
+        out = self._call("scan-repeats", {"sequence": clean,
+                                          "min_length": 100})
+        assert not isinstance(out, tuple), str(out)[:200]
+        assert out["n_hits"] == 0, out
+
+    def test_the_reachable_tandem_lint_cannot_see_a_long_repeat(self):
+        """The premise this endpoint exists for, asserted so the class cannot
+        pass vacuously: `lint-synthesis`' repeat screen is scoped to short
+        tandem units and does NOT report a 120 bp duplicated block."""
+        import random
+        rng = random.Random(4242)
+        block = "".join(rng.choice("ACGT") for _ in range(120))
+        filler = "".join(rng.choice("ACGT") for _ in range(200))
+        seq = block + filler + block
+        out = self._call("lint-synthesis", {"sequence": seq})
+        if isinstance(out, tuple):            # pragma: no cover - shape guard
+            pytest.skip(f"lint-synthesis refused this input: {out[0]}")
+        runs = out.get("repeat_runs") or out.get("repeats") or []
+        assert not [r for r in runs
+                    if int(r.get("length") or 0) >= 100], (
+            "premise broken: lint-synthesis already reports long repeats, so "
+            "scan-repeats would be redundant")
+
+    def test_min_length_below_the_noise_floor_is_refused(self):
+        import random
+        rng = random.Random(7)
+        clean = "".join(rng.choice("ACGT") for _ in range(2000))
+        out = self._call("scan-repeats", {"sequence": clean,
+                                          "min_length": 8})
+        assert isinstance(out, tuple) and out[1] == 400, str(out)[:200]
+
+    def test_exclude_coordinates_refuse_a_flag(self):
+        import random
+        rng = random.Random(7)
+        clean = "".join(rng.choice("ACGT") for _ in range(2000))
+        out = self._call("scan-repeats",
+                         {"sequence": clean, "min_length": 100,
+                          "exclude": [[True, 50]]})
+        assert isinstance(out, tuple) and out[1] == 400, str(out)[:200]
+
+    def test_the_assembler_tiles_its_layout(self):
+        """The contract `assemble-operon` guarantees and this mirrors:
+        `sequence[start:end]` is exactly that element, no gap, no overlap."""
+        import random
+        rng = random.Random(11)
+        cds = ("ATG" + "".join(rng.choice(["GCT", "AAA", "GGT", "TTC"])
+                               for _ in range(99)) + "TAA")
+        prom = "".join(rng.choice("ACGT") for _ in range(300))
+        term = "".join(rng.choice("ACGT") for _ in range(220))
+        out = self._call("assemble-expression-cassette",
+                         {"promoter": prom, "cds": cds, "terminator": term,
+                          "scrub_motifs": False, "check_splice": False})
+        assert not isinstance(out, tuple), str(out)[:200]
+        assert len(out["sequence"]) == len(prom) + len(cds) + len(term)
+        pos = 0
+        for elem in out["layout"]:
+            assert elem["start"] == pos, out["layout"]
+            assert out["sequence"][elem["start"]:elem["end"]]
+            pos = elem["end"]
+        assert pos == len(out["sequence"])
+
+    def test_the_assembler_requires_promoter_and_cds(self):
+        for payload in ({"cds": "ATGGCTAAATAA"},
+                        {"promoter": "ACGTACGTACGT"}):
+            out = self._call("assemble-expression-cassette", payload)
+            assert isinstance(out, tuple) and out[1] == 400, str(out)[:200]
+
+    def test_the_assembler_refuses_non_acgt(self):
+        out = self._call("assemble-expression-cassette",
+                         {"promoter": "ACGTACGTACGT", "cds": "ATGXXXTAA"})
+        assert isinstance(out, tuple) and out[1] == 400, str(out)[:200]

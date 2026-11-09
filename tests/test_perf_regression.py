@@ -299,3 +299,208 @@ class TestPerfHarness:
             )
         finally:
             original_ops.pop("_harness_self_test", None)
+
+
+# ── 2026-11-09: the gate covered 6 operations ([INV-234]) ───────────────────
+# The digest, the codon optimizer, the scanners, the GenBank reader/writer and
+# the data layer were all ungated, so any of them could regress silently. Each
+# test below CLEARS the LRU it would otherwise hit: with a warm
+# `_ENZYME_CUTS_CACHE` the digest measured 0.01 ms, i.e. it measured nothing.
+
+
+@pytest.fixture(scope="module")
+def random_5kb() -> str:
+    rng = random.Random(0x5EED)
+    return "".join(rng.choice("ACGT") for _ in range(5_000))
+
+
+@pytest.fixture(scope="module")
+def random_50kb() -> str:
+    rng = random.Random(0x5A5A)
+    return "".join(rng.choice("ACGT") for _ in range(50_000))
+
+
+@pytest.fixture(scope="module")
+def flat_codon_table() -> dict:
+    """A full 64-codon usage table in the registry's own
+    ``{codon: (aa, count)}`` shape. A bare ``{codon: count}`` unpacks wrong
+    inside `_codon_build_aa_map` — the optimizer would raise instead of being
+    timed."""
+    import splicecraft_codon as _codon
+    return {c: (aa, 100.0) for c, aa in _codon._CODON_GENETIC_CODE.items()}
+
+
+@pytest.fixture(scope="module")
+def protein_500() -> str:
+    rng = random.Random(11)
+    return "M" + "".join(rng.choice("ACDEFGHIKLMNPQRSTVWY")
+                         for _ in range(499))
+
+
+@pytest.mark.slow
+class TestEnginePerf:
+    """The construction + serialization engines every save and every clone
+    goes through."""
+
+    def test_digest_with_enzymes_50kb(self, baseline, random_50kb):
+        feats = [{"type": "CDS", "start": i * 400, "end": i * 400 + 300,
+                  "strand": 1, "label": f"g{i}"} for i in range(100)]
+        enzymes = ["EcoRI", "BamHI", "HindIII", "PstI", "SalI", "XbaI"]
+
+        def _work():
+            sc._state._ENZYME_CUTS_CACHE.clear()
+            sc._digest_with_enzymes(random_50kb, enzymes, circular=True,
+                                    features=list(feats))
+
+        best = _measure("digest_with_enzymes_50kb", baseline, _work)
+        _assert_within_budget("digest_with_enzymes_50kb", baseline, best)
+
+    def test_record_to_gb_text_100kb(self, baseline):
+        rec = _synth_record_module(100_000, 500)
+
+        def _work():
+            sc._record_to_gb_text(rec)
+
+        best = _measure("record_to_gb_text_100kb", baseline, _work)
+        _assert_within_budget("record_to_gb_text_100kb", baseline, best)
+
+    def test_gb_text_to_record_100kb(self, baseline):
+        import splicecraft_record as _rec
+        gb = sc._record_to_gb_text(_synth_record_module(100_000, 500))
+
+        def _work():
+            _rec._GB_PARSE_CACHE.clear()
+            sc._gb_text_to_record(gb)
+
+        best = _measure("gb_text_to_record_100kb", baseline, _work)
+        _assert_within_budget("gb_text_to_record_100kb", baseline, best)
+
+    def test_insdc_parse_genbank_100kb(self, baseline):
+        import splicecraft_insdc as _insdc
+        gb = sc._record_to_gb_text(_synth_record_module(100_000, 500))
+
+        def _work():
+            _insdc.parse_genbank(gb)
+
+        best = _measure("insdc_parse_genbank_100kb", baseline, _work)
+        _assert_within_budget("insdc_parse_genbank_100kb", baseline, best)
+
+
+@pytest.mark.slow
+class TestDesignEnginePerf:
+    """The codon optimizer is mission-critical and the splice scan runs
+    unasked on every plant-host optimize, so both are hot paths."""
+
+    def test_codon_optimize_500aa(self, baseline, protein_500,
+                                   flat_codon_table):
+        def _work():
+            sc._codon_optimize(protein_500, flat_codon_table)
+
+        best = _measure("codon_optimize_500aa", baseline, _work)
+        _assert_within_budget("codon_optimize_500aa", baseline, best)
+
+    def test_splice_scan_5kb(self, baseline, random_5kb):
+        import splicecraft_splice as _splice
+
+        def _work():
+            _splice._splice_scan(random_5kb)
+
+        best = _measure("splice_scan_5kb", baseline, _work)
+        _assert_within_budget("splice_scan_5kb", baseline, best)
+
+    def test_codon_fix_splice_sites_300aa(self, baseline, flat_codon_table):
+        """The fixture genuinely needs TWO synonymous repairs, so this gates
+        the repair loop rather than just the scan — asserted below, because a
+        fixture that drifted to scanning clean would quietly turn this into a
+        much weaker test."""
+        import splicecraft_codon as _codon
+        rng = random.Random(12)
+        prot = "M" + "".join(rng.choice("ACDEFGHIKLMNPQRSTVWY")
+                             for _ in range(299))
+        dna = _codon._codon_optimize(prot, flat_codon_table)
+        _out, _fixes, _rem = _codon._codon_fix_splice_sites(
+            dna, prot, flat_codon_table)
+        assert len(_fixes) >= 1, (
+            "fixture no longer needs a repair, so this would time the clean "
+            "fast path instead of the repair loop")
+
+        def _work():
+            _codon._codon_fix_splice_sites(dna, prot, flat_codon_table)
+
+        best = _measure("codon_fix_splice_sites_300aa", baseline, _work)
+        _assert_within_budget("codon_fix_splice_sites_300aa", baseline, best)
+
+
+@pytest.mark.slow
+class TestScannerPerf:
+    """The regulatory / repeat scanners. `scan-terminators` folds a hairpin
+    per candidate, so it is the heaviest per base and is heavy-classified on
+    the agent side for that reason."""
+
+    def test_scan_promoters_10kb(self, baseline, random_10kb):
+        import splicecraft_regulatory as _reg
+
+        def _work():
+            _reg._scan_promoters(random_10kb)
+
+        best = _measure("scan_promoters_10kb", baseline, _work)
+        _assert_within_budget("scan_promoters_10kb", baseline, best)
+
+    def test_scan_terminators_5kb(self, baseline, random_5kb):
+        import splicecraft_regulatory as _reg
+
+        def _work():
+            _reg._scan_terminators(random_5kb)
+
+        best = _measure("scan_terminators_5kb", baseline, _work)
+        _assert_within_budget("scan_terminators_5kb", baseline, best)
+
+    def test_cassette_internal_repeats_10kb(self, baseline, random_10kb):
+        import splicecraft_cassette as _cas
+
+        def _work():
+            _cas._cassette_internal_repeats(random_10kb, 100)
+
+        best = _measure("cassette_internal_repeats_10kb", baseline, _work)
+        _assert_within_budget("cassette_internal_repeats_10kb", baseline, best)
+
+    def test_find_orfs_50kb(self, baseline, random_50kb):
+        def _work():
+            sc._find_orfs(random_50kb, circular=True)
+
+        best = _measure("find_orfs_50kb", baseline, _work)
+        _assert_within_budget("find_orfs_50kb", baseline, best)
+
+
+@pytest.mark.slow
+class TestDataLayerPerf:
+    """`_typed_clone` is what sacred #17 costs on every `_load_X()`, and
+    `PlasmidMap.load_record` is the repaint tail undo / redo / flip share —
+    both scale with COUNT, not bp ([INV-223])."""
+
+    def test_typed_clone_library_1000(self, baseline):
+        lib = [{"id": f"id{i}", "name": f"plasmid_{i}", "size": 5000,
+                "n_feats": 12, "gb_text": "", "source": "",
+                "features": [{"type": "CDS", "start": 100 + j * 300,
+                              "end": 400 + j * 300, "strand": 1,
+                              "label": f"g{j}",
+                              "qualifiers": {"product": [f"p{j}"]}}
+                             for j in range(12)]}
+               for i in range(1000)]
+
+        def _work():
+            sc._typed_clone(lib)
+
+        best = _measure("typed_clone_library_1000", baseline, _work)
+        _assert_within_budget("typed_clone_library_1000", baseline, best)
+
+    def test_plasmid_map_load_record_2000_feats(self, baseline):
+        rec = _synth_record_module(20_000, 2000)
+        pm = sc.PlasmidMap()
+
+        def _work():
+            pm.load_record(rec)
+
+        best = _measure("plasmid_map_load_record_2000_feats", baseline, _work)
+        _assert_within_budget("plasmid_map_load_record_2000_feats",
+                              baseline, best)

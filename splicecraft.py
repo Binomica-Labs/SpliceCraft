@@ -2399,7 +2399,12 @@ def _gc_orphan_blobs() -> int:
         re-stamped so retention runs from quarantine time), NEVER
         hard-deleted — so even a wrong ref-set is recoverable.
     Best-effort; never raises."""
+    # L2 chokepoint, DELETE half — see `_prune_backups`. Quarantining MOVES
+    # blobs out of the live store, so an unauthorised run relocates the
+    # user's `.dna` originals (audit 2026-11-09). Raised, not swallowed by
+    # the best-effort policy: an authorisation refusal is a caller bug.
     blob_dir = _plasmid_blob_dir()
+    _refuse_unauthorized_delete(blob_dir, "orphan-blob quarantine")
     try:
         if not blob_dir.is_dir():
             return 0
@@ -2499,6 +2504,10 @@ _state._gc_orphan_blobs_hook = _gc_orphan_blobs
 def _prune_blob_quarantine(quarantine: Path) -> None:
     """Delete quarantined orphan blobs older than
     `_BLOB_ORPHAN_RETENTION_DAYS` (by quarantine mtime). Best-effort."""
+    # L2 chokepoint, DELETE half. This is the one step in the housekeeping
+    # chain that HARD-deletes — quarantine is the recoverable stage, this is
+    # the end of it.
+    _refuse_unauthorized_delete(quarantine, "blob quarantine")
     try:
         files = [p for p in quarantine.iterdir() if p.is_file()]
     except OSError:
@@ -3709,6 +3718,11 @@ def _enforce_ui_snapshot_retention(
     """Prune oldest UI snapshots so disk doesn't grow without bound
     after months of bug-report captures. Best-effort; never raises."""
     d = snapshots_dir if snapshots_dir is not None else _state._UI_SNAPSHOTS_DIR
+    # L2 chokepoint, DELETE half. `_save_ui_snapshot` is gated, and its
+    # docstring even reasons about this retention sweep evicting dumps —
+    # while the sweep that does the unlinking was not gated (audit
+    # 2026-11-09).
+    _refuse_unauthorized_delete(d, "UI snapshot retention")
     if keep < 0:
         keep = 0
     try:
@@ -5555,8 +5569,25 @@ _collection_sync_event = threading.Event()
 _collection_sync_force_sync: bool = False
 
 
+def _claim_inflight_mirror(seq: int) -> bool:
+    """Take ownership of the in-flight deferred mirror numbered `seq`.
+
+    True when this caller now owns it; False when someone else already did —
+    which for the background worker means a transaction barrier took the
+    mirror over and has already written it, so the worker must NOT write it
+    again from its own (now older) payload. See
+    `_state._collection_sync_inflight`."""
+    with _collection_sync_lock:
+        infl = _state._collection_sync_inflight
+        if infl is not None and infl[2] == seq:
+            _state._collection_sync_inflight = None
+            return True
+        return False
+
+
 def _land_deferred_mirror(name: str, snapshot: "list[dict]", seq: int,
-                          what: str = "async active-collection mirror") -> None:
+                          what: str = "async active-collection mirror",
+                          *, inflight: bool = False) -> None:
     """Write one deferred active-collection mirror, then clear its pending
     marker. Shared by the background drain and the shutdown flush so the two
     can never disagree about what lands.
@@ -5576,12 +5607,39 @@ def _land_deferred_mirror(name: str, snapshot: "list[dict]", seq: int,
     # cannot interleave between our load and save.
     try:
         with _cache_lock:
+            # The worker reaches here having POPPED this payload before
+            # blocking on `_cache_lock`. If a transaction barrier ran in that
+            # window it took the mirror over and has already written it, so
+            # writing again from this payload would reinstate an older
+            # library. Claim-or-bail; the barrier's own call passes
+            # `inflight=False` because it claimed the payload when it took it.
+            if inflight and not _claim_inflight_mirror(seq):
+                return
             if _get_active_collection_name() != name:
                 _clear_mirror_pending(seq)
                 return
             if isinstance(_state._library_cache, list):
                 snapshot = [_typed_clone(e) for e in _state._library_cache
                             if isinstance(e, dict)]
+            else:
+                # **A busted cache means DISK is newer than anything in
+                # memory, so this mirror must be DROPPED — not written from
+                # the queue-time snapshot.** `_library_cache is None` is
+                # precisely the post-`_bust_all_data_caches()` state: the
+                # migrate import, the agent restore-from-backup and the
+                # master-delete reset all leave it that way after replacing
+                # the files on disk. The `isinstance` guard above used to
+                # simply fall through, so the D6 rule ("the AUTHORITATIVE
+                # library is written, never the snapshot captured at queue
+                # time") silently degraded to its opposite in the one
+                # situation where the snapshot is guaranteed stale — and a
+                # newer committed save was erased by it (measured: a
+                # collection holding `plasmid88` came back holding
+                # `plasmid77`, audit 2026-11-09). Clearing the marker is
+                # right here: whatever replaced the files wrote the library
+                # and its container together, so the two already agree.
+                _clear_mirror_pending(seq)
+                return
             colls = _load_collections()
             for c in colls:
                 if c.get("name") == name:
@@ -5617,6 +5675,12 @@ def _drain_collection_sync_loop() -> None:
         with _collection_sync_lock:
             payload = _state._collection_sync_pending
             _state._collection_sync_pending = None
+            # Publish it as IN FLIGHT in the same hold that empties
+            # `_pending`, so there is no instant in which a deferred mirror is
+            # invisible to `_land_pending_collection_sync`. Popping first and
+            # only then blocking on `_cache_lock` is what made that barrier a
+            # no-op for the whole life of the mirror.
+            _state._collection_sync_inflight = payload
         if payload is None:
             return
         # Shutdown gate: if `_flush_pending_collection_sync` set the
@@ -5625,7 +5689,7 @@ def _drain_collection_sync_loop() -> None:
         # holding the wake-up cycle). After draining, exit so process
         # shutdown can complete without leaving a daemon mid-write.
         name, snapshot, seq = payload
-        _land_deferred_mirror(name, snapshot, seq)
+        _land_deferred_mirror(name, snapshot, seq, inflight=True)
         if _collection_sync_shutdown.is_set():
             # Refuse NEW work; any pending mutations queued during
             # this save are deliberately dropped at shutdown — the
@@ -5808,7 +5872,12 @@ def _flush_pending_collection_sync(timeout_s: float = 5.0) -> None:
     with _collection_sync_lock:
         thread = _state._collection_sync_thread
         pending = _state._collection_sync_pending
-    if pending is None and (thread is None or not thread.is_alive()):
+        # An in-flight (popped, unwritten) mirror must keep this function
+        # alive too, or a worker that died between the pop and the write
+        # takes the library change with it.
+        inflight = _state._collection_sync_inflight
+    if (pending is None and inflight is None
+            and (thread is None or not thread.is_alive())):
         return
     # Wake the worker (in case it hasn't yet) and wait for it to
     # drain the queue. The worker exits when pending is None after a
@@ -5837,6 +5906,12 @@ def _flush_pending_collection_sync(timeout_s: float = 5.0) -> None:
     with _collection_sync_lock:
         leftover = _state._collection_sync_pending
         _state._collection_sync_pending = None
+        if leftover is None:
+            # A mirror the worker popped but never wrote (it exited on the
+            # shutdown gate, or died) is just as unwritten as a queued one,
+            # and at shutdown there is no next mutation to supersede it.
+            leftover = _state._collection_sync_inflight
+            _state._collection_sync_inflight = None
     if leftover is not None:
         name, snapshot, seq = leftover
         _land_deferred_mirror(
@@ -30523,13 +30598,36 @@ def _bust_all_data_caches() -> None:
 def _land_pending_collection_sync(what: str) -> bool:
     """Land a queued deferred active-collection mirror NOW, on this thread,
     instead of whenever the background drain gets to it. Returns whether one
-    was queued."""
+    was queued.
+
+    Takes over a mirror the worker has already POPPED but not yet written, as
+    well as one still queued. Looking only at `_pending` made this barrier a
+    no-op for essentially the whole life of every deferred mirror: the worker
+    empties that slot and only THEN blocks on `_cache_lock` — the lock this
+    function's caller is holding. So the transaction proceeded believing
+    nothing was in flight, renamed / deleted / imported over the target, and
+    the mirror was afterwards dropped as an orphan together with the
+    `.mirror-dirty` marker that was the newer library file's ONLY protection.
+    Measured: a plasmid added and then the collection renamed lost the plasmid
+    outright, and a migrate import ended up with this machine's old library
+    inside the imported collection of the same name — verbatim the
+    `[INV-224]` #4 regression (audit 2026-11-09).
+
+    Taking it OVER rather than waiting for it is deliberate and is the only
+    deadlock-free option: the worker is blocked on the very lock our caller
+    holds, so waiting would deadlock. `_land_deferred_mirror` re-checks
+    ownership inside `_cache_lock`, so the worker finds the mirror claimed and
+    declines to write its older payload."""
     with _collection_sync_lock:
         payload = _state._collection_sync_pending
         _state._collection_sync_pending = None
+        if payload is None:
+            payload = _state._collection_sync_inflight
+            _state._collection_sync_inflight = None
     if payload is None:
         return False
     name, snapshot, seq = payload
+    # `inflight=False`: ownership was taken above, in one hold.
     _land_deferred_mirror(name, snapshot, seq, what=what)
     return True
 
@@ -67047,6 +67145,12 @@ class SequencingScreen(Screen):
         # re-runs Plasmidsaurus and overwrites the local zip with
         # new data). `None` means no zip loaded yet.
         self._zip_signature: "tuple[int, int] | None" = None
+        # Bumped on every pick so a superseded parse cannot land its rows
+        # over a newer one. `exclusive=True` cancels the previous worker, but
+        # a thread worker already past its cancellation point still returns,
+        # so the generation is what actually decides (same guard shape as
+        # `_restr_scan_worker` / `_align_worker`).
+        self._zip_parse_gen: int = 0
         # `_members` retained for back-compat with tests / agent paths
         # that scrape the flat .gbk member list off the screen state.
         # New code reads `_parsed_run["samples"]` instead.
@@ -67599,11 +67703,44 @@ class SequencingScreen(Screen):
                 "Samples / Quality / Align tabs.[/dim]"
             )
             return
+        # **The parse runs OFF the event loop.** It was synchronous here, so
+        # a single click in the directory tree froze the whole app for the
+        # entire parse — measured 123 ms for a 12-sample run, 802 ms at 96
+        # samples, 2.8 s at 48x40 kb and 14.2 s for a 26 MB / 48x200 kb zip,
+        # with no repaint and no feedback at all (the "Picked:" line is only
+        # written after the parse returns, so the screen sat on the previous
+        # run's state). Nothing capped the TIME: the guards are bytes and
+        # member count, and 26 MB is 5% of the 500 MB ceiling. This is the
+        # pattern already used ~20 times in this file, including
+        # `_align_worker` on this same screen (audit 2026-11-09).
+        sel.update(f"[dim]Parsing:[/dim] {_esc_md(path.name)} …")
+        meta.update("[dim]Reading the run archive…[/dim]")
+        self._zip_parse_gen += 1
+        self._parse_zip_worker(path, cur_sig, self._zip_parse_gen)
+
+    @work(thread=True, exclusive=True, group="plasmidsaurus_parse")
+    def _parse_zip_worker(self, path: Path,
+                          cur_sig: "tuple[int, int] | None",
+                          gen: int) -> None:
+        """Worker: parse a Plasmidsaurus run zip, then apply it to the screen
+        on the UI thread. Split out of `_on_zip_picked` so a 14-second parse
+        can't hold the event loop (see the note there)."""
+        def _fail(markup: str) -> None:
+            if not self.is_mounted or gen != self._zip_parse_gen:
+                return
+            try:
+                self.query_one("#align-selected-zip", Static).update(
+                    f"[dim]Picked:[/dim] {_esc_md(str(path))}")
+                self.query_one("#plasmidsaurus-run-meta", Static).update(
+                    markup)
+            except NoMatches:
+                pass
+
         try:
             parsed = _parse_plasmidsaurus_zip(path)
         except ValueError as exc:
-            sel.update(f"[dim]Picked:[/dim] {_esc_md(str(path))}")
-            meta.update(f"[red]{_esc_md(str(exc))}[/red]")
+            self.app.call_from_thread(_fail,
+                                      f"[red]{_esc_md(str(exc))}[/red]")
             return
         except (OSError, RuntimeError, MemoryError) as exc:
             # OSError covers filesystem hiccups during stat / open;
@@ -67616,11 +67753,25 @@ class SequencingScreen(Screen):
             _log.exception(
                 "SequencingScreen: unexpected zip parse failure",
             )
-            sel.update(f"[dim]Picked:[/dim] {_esc_md(str(path))}")
-            meta.update(
+            self.app.call_from_thread(
+                _fail,
                 f"[red]Could not parse zip: "
-                f"{_esc_md(type(exc).__name__)}[/red]"
-            )
+                f"{_esc_md(type(exc).__name__)}[/red]")
+            return
+        self.app.call_from_thread(self._apply_parsed_zip, path, cur_sig,
+                                  parsed, gen)
+
+    def _apply_parsed_zip(self, path: Path,
+                          cur_sig: "tuple[int, int] | None",
+                          parsed: dict, gen: int) -> None:
+        """Publish a parsed run onto the screen. UI thread only."""
+        # A newer pick supersedes this one; landing its rows would show the
+        # wrong run under the right filename.
+        if not self.is_mounted or gen != self._zip_parse_gen:
+            return
+        try:
+            sel = self.query_one("#align-selected-zip", Static)
+        except NoMatches:
             return
         self._zip_path = path
         self._zip_signature = cur_sig
@@ -115115,6 +115266,13 @@ _AGENT_HEAVY_ENDPOINTS = frozenset({
     # ("blocks for a few seconds"); the operon assembler does it per gene. Cap
     # concurrency so a burst can't pin every ThreadingMixIn worker thread.
     "design-rbs", "assemble-operon",
+    # The eukaryotic assembler runs up to `scrub_rounds` synonymous-rewrite
+    # passes over the coding block, a trained-PWM splice scan and a k-mer
+    # repeat index — the operon assembler's cost shape without the per-gene
+    # fold, so it belongs in the same class. `scan-repeats` indexes every
+    # k-mer and then walks the reverse complement of a molecule up to
+    # `_SCAN_REPEATS_MAX_BP`.
+    "assemble-expression-cassette", "scan-repeats",
     # One rotation-aware alignment per read, over up to `_HETERO_READS_MAX`
     # reads — the same cost shape as `verify-against-reads`, multiplied.
     "analyse-read-heterogeneity",

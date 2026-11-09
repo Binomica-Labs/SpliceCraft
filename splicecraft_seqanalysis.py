@@ -1155,13 +1155,28 @@ def _synthesis_lint(seq, *, circular: bool = True, expect_cds: bool = False,
     # wrap-aware for all of them (audit 2026-10-23).
     _n_raw = len(raw)
     _gc_src = (s + s[:gc_window - 1]) if (circular and len(s) > 1) else s
+    # Every hazard span below reports its `end` through `_lint_end`, so all
+    # three use the ENGINE's one wrap convention (`end < start`) instead of
+    # running off the end of the molecule. The scans deliberately search a
+    # DOUBLED source on a circular record so a hazard straddling bp 0 is
+    # found; reporting `start + length` unmodded then handed back a
+    # coordinate outside the sequence, so a consumer slicing `seq[start:end]`
+    # got half the hazard and a UI highlight clamped. The GC window already
+    # did `% len(s)` on the START and left the END unmodded — three hazards,
+    # two conventions (audit 2026-11-09).
+    def _lint_end(start: int, length: int) -> int:
+        if _n_raw <= 0:
+            return start + length
+        end = start + length
+        return end % _n_raw if end > _n_raw else end
+
     ww = _lint_worst_gc_window(_gc_src, gc_window)
     if ww is not None and (ww[1] < gc_window_lo or ww[1] > gc_window_hi):
         _ws = _raw_pos(ww[0] % len(s)) if s else ww[0]
         add("warn", "gc_window",
             f"a {gc_window} bp window at +{_ws} is {ww[1]*100:.0f}% GC — local "
             "extremes hurt synthesis + PCR", start=_ws,
-            end=(_ws or 0) + gc_window)
+            end=_lint_end(_ws or 0, gc_window))
 
     # Runs and repeats are read off `raw`, where a non-ACGT base BREAKS a run
     # instead of being removed from the middle of one (7 A's + 25 N + 7 A's
@@ -1182,7 +1197,7 @@ def _synthesis_lint(seq, *, circular: bool = True, expect_cds: bool = False,
     for start, base, length in _runs[:max_warnings_per_kind]:
         add("warn", "homopolymer",
             f"{length}×{base} homopolymer run — synthesis-hard (slippage)",
-            start=start, end=start + length)
+            start=start, end=_lint_end(start, length))
 
     _reps = [(st, unit, copies)
              for st, unit, copies in _lint_tandem_repeats(
@@ -1193,7 +1208,7 @@ def _synthesis_lint(seq, *, circular: bool = True, expect_cds: bool = False,
     for start, unit, copies in _reps[:max_warnings_per_kind]:
         add("warn", "tandem_repeat",
             f"{copies}×({unit}) tandem repeat — synthesis + assembly hazard",
-            start=start, end=start + copies * len(unit))
+            start=start, end=_lint_end(start, copies * len(unit)))
 
     # Acceptor expectation: exactly two sites, so one stuffer drops out.
     acceptor_counts: "dict[str, int]" = {}

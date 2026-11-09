@@ -2584,7 +2584,21 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
             if prev is not None:
                 names = prev["enzyme"].split("/")
                 if ename not in names:
-                    prev["enzyme"] = "/".join(names + [ename])
+                    # SORTED, so the composite does not depend on the order
+                    # the caller happened to list the enzymes in. The LRU key
+                    # (`_ENZYME_CUTS_CACHE`) is `tuple(sorted(set(names)))`,
+                    # so it cannot tell `["EcoRI", "EcoRI-HF"]` from
+                    # `["EcoRI-HF", "EcoRI"]` — while this string could. The
+                    # label on a fragment end therefore flipped with CACHE
+                    # STATE: primed one way, asked the other, you got the
+                    # primed spelling (audit 2026-11-09). Making the result
+                    # order-independent is what makes the sorted key correct,
+                    # and it matches the "sorted enzyme set" convention the
+                    # scar notes already use. Overhang `length`/`kind` are
+                    # pinned per merged group — the merge key is the
+                    # (top, bot) bond — so which name sorts first cannot move
+                    # the overhang `_junction_overhang_span` derives.
+                    prev["enzyme"] = "/".join(sorted(names + [ename]))
                 # AND, not OR: the bond is origin-dependent only if EVERY site
                 # that severs it is. One enzyme reaching this bond from a site
                 # wholly inside the molecule makes the cut real on a linear

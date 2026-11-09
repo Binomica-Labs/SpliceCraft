@@ -28,7 +28,7 @@ ALL data-only endpoints live here; only the app-coupled handlers stay hub.
 prerequisites. Top layer among the siblings (imports the whole domain stack ≤L3);
 nothing imports it but the hub.
 
-**The split, as of 1.3.16: 213 here, 88 hub-side, 301 registered in total.**
+**The split, as of 1.3.19: 215 here, 88 hub-side, 303 registered in total.**
 Those three numbers were stale for several releases (the docstring said 109 / 26
 and CLAUDE.md said 202 / 82) and this is the first thing an agent reads about
 this file, so they are now pinned by
@@ -53,7 +53,8 @@ from splicecraft_dataaccess import (_load_custom_labware, _load_protocol_collect
 from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _feat_len, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len, _span_full_lap_len, _span_in_span)
 from splicecraft_cloning import (_cloned_plasmid_regenerated_sites, _GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _acceptor_vector_features, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi, _enzyme_is_type_iis)
-from splicecraft_codon import (_CODON_MAX_EXTERNAL_SITES, _CODON_RAMP_CODONS, _CODON_RARE_W, _codon_relative_adaptiveness, _CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_ambiguous_stops, _codon_cai, _codon_diversify, _codon_table_for, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_fix_splice_sites, _CODON_SPLICE_MAX_REPORT, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
+from splicecraft_codon import (_CODON_RAMP_CODONS,
+    _codon_validate_external_sites, _CODON_RARE_W, _codon_relative_adaptiveness, _CODON_GC3_HIGH, _CODON_GC3_LOW, _CODON_GC3_MIN_CODONS, _CODON_GC_WINDOW_DEFAULT, _CODON_GENETIC_CODE, _CODON_MODES, _CODON_REPEAT_RUN_DEFAULT, _CODON_SCRUB_MAX_CODONS, _codon_ambiguous_stops, _codon_cai, _codon_diversify, _codon_table_for, _codon_fetch_kazusa, _codon_fix_gc_window, _codon_fix_sites, _codon_fix_splice_sites, _CODON_SPLICE_MAX_REPORT, _codon_gc, _codon_gc3, _codon_gc_window_range, _codon_hazard_motifs, _codon_kmer_set, _codon_optimize, _codon_shared_runs, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
 from splicecraft_splice import (_SPLICE_PAIR_FLOOR, _splice_model_summary,
                                _splice_pair_risk, _splice_scan,
                                _splice_scan_basis, _splice_threshold)
@@ -78,6 +79,11 @@ from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq,
                                 _topology_from_gb_text)
 from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_ITEMS_LIMIT, _PLASMIDSAURUS_ITEMS_TRUNCATED_HINT, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _ncbi_taxid_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_item_has_results, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
 from splicecraft_kozak import _kozak_context, _kozak_model_summary
+from splicecraft_cassette import (_CASSETTE_ELEMENTS, _CASSETTE_MAX_REPEAT_HITS,
+                                  _CASSETTE_REPEAT_MIN,
+                                  _CASSETTE_SCRUB_ROUNDS,
+                                  _assemble_expression_cassette,
+                                  _cassette_internal_repeats)
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _check_acceptor_vector, _plan_chromosome_segments, _SEGMENT_STRATEGIES, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint, _fragment_backbone_marker_labels, _predict_transcript, _map_transcription)
 from splicecraft_util import (_iso_instant, _variant_group_key, _PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _feat_spans, _feature_traversal, _phred_in_alignment_frame, _read_rotation_in_rows, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _degenerate_tm_bracket, _record_is_circular, _safe_color_for_write, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
@@ -314,6 +320,56 @@ def _coerce_int(value, *, name: str = "value") -> "int | str":
         except ValueError:
             return f"{name!r} must be an integer"
     return f"{name!r} must be an integer"
+
+
+def _coerce_float(value, *, name: str = "value") -> "float | str":
+    """Type-safe float coercion for agent-API JSON payloads — the counterpart
+    to `_coerce_int`, with the same ``float | str`` return shape so an
+    ``isinstance(result, str)`` guard narrows the value.
+
+    **Its reason for existing is the bool.** `_coerce_int` has refused one
+    since the `rbs-strength` fix, on the grounds that "`True` is not 1 for an
+    API that takes coordinates and indices". Every FLOAT parameter rolled its
+    own ``float(payload.get(...))``, and `float(True)` is `1.0` — which then
+    passes the range check that follows, because 1.0 is a legal threshold
+    everywhere it appears. So a flag became a cutoff, silently, with HTTP 200
+    and no warning, on exactly the parameters where the wrong value changes a
+    VERDICT rather than erroring (audit 2026-11-09):
+
+      * `verify-against-reads {"min_identity": true}` → a 1 %-identity bar, so
+        a read off an unrelated plasmid returns ``verdict: "match"``. That
+        endpoint's entire job is "the reads came back — did my clone work".
+      * `scan-promoters {"min_score": false}` → a 0.0 bar: MEASURED at 6,000
+        "promoters" in 3 kb of random DNA, against 0 at the default. The
+        thresholds in `splicecraft_regulatory` are measured, not picked, and a
+        bar of 0 throws that away.
+      * `map-transcription {"min_promoter_score": true}` → nothing clears the
+        bar, so every gene reports ``silent``.
+
+    NaN and ±Infinity are already refused one layer up by the JSON parser
+    (`parse_constant` / `parse_float`), but they are rejected here too so the
+    helper is safe for any caller, not just the HTTP one. Numeric strings are
+    accepted, matching `_coerce_int`.
+    """
+    import math as _m
+    if isinstance(value, bool):
+        # The whole point. A flag is not a number; refuse rather than guess,
+        # one policy with `_coerce_int`.
+        return f"{name!r} must be a number, not a boolean"
+    if isinstance(value, (int, float)):
+        if not _m.isfinite(value):
+            return f"{name!r} must be a finite number"
+        return float(value)
+    if isinstance(value, str):
+        try:
+            out = float(value)
+        except ValueError:
+            return f"{name!r} must be a number"
+        if not _m.isfinite(out):
+            # `float("nan")` / `float("inf")` parse happily from a string.
+            return f"{name!r} must be a finite number"
+        return out
+    return f"{name!r} must be a number"
 
 
 _AGENT_PHRED_MAX = 93              # Sanger FASTQ ceiling (chr 126 − 33)
@@ -1217,6 +1273,149 @@ def _h_assemble_operon(app, payload):
     return {"ok": True, **result}
 
 
+@_agent_endpoint("assemble-expression-cassette")
+def _h_assemble_expression_cassette(app, payload):
+    """Assemble a EUKARYOTIC (plant nuclear) transcription unit from
+    positional parts — the nuclear counterpart to `assemble-operon`.
+
+    Body: ``{promoter, cds}`` required, plus any of ``{utr5, intron,
+    signal_peptide, ctag, terminator}``. Each part is a DNA string or
+    ``{name, seq}``. Order is fixed:
+    promoter - utr5 - intron - signal_peptide - cds - ctag - terminator.
+
+    Options: ``{codon_table?, protein?, scrub_motifs?=true, enzyme?="BsaI",
+    grammar?="moclo_plant", forbidden_motifs?, transl_table?, scrub_rounds?,
+    gc_window?, gc_min?, gc_max?, repeat_min?, repeat_exclude?,
+    check_splice?=true, dry_run?}``.
+
+    Returns ``{ok, sequence, layout, frame, scrub, overhangs, repeats,
+    homopolymers, stats, warnings, dry_run}``. ``layout`` TILES the sequence
+    with no gap or overlap — the same contract `assemble-operon` guarantees —
+    so ``sequence[start:end]`` is exactly that element.
+
+    It answers the four things that make a eukaryotic TU different from an
+    operon: **frame** across the signal-peptide→CDS→C-tag ORF (a part whose
+    length is not a multiple of 3 frameshifts everything downstream — silent
+    in a plasmid map, fatal in planta), **motif hygiene** by synonymous
+    rewrite, **Type IIS scar compatibility** across the part chain, and
+    **internal repeats**.
+
+    **Scrubbing only ever touches the coding block**, and needs a
+    translation: pass ``codon_table`` (a raw ``{codon: [aa, count]}`` usage
+    dict, the shape `list-codon-tables` reports) plus either ``protein`` or a
+    coding block whose length is a multiple of 3. Without them the scrub is
+    SKIPPED with a warning rather than the sequence being silently rewritten
+    against a guessed frame. A motif landing in a promoter or terminator — or
+    straddling a junction where no codon swap can clear it — is reported as a
+    residual, never edited, because those parts have no synonymous
+    representation.
+
+    Cryptic splice sites are SCORED against the trained plant PWMs, never
+    regexed (GT and AG each occur every ~16 bp by chance, so a pattern match
+    flags the whole CDS), and are reported rather than auto-edited. With no
+    model loaded the check says so instead of returning an empty list that
+    would read as clean.
+
+    ``dry_run`` marks the result so a caller knows not to emit files; the
+    assembly is pure either way. Bad input → 400."""
+    if not isinstance(payload, dict):
+        return ({"error": "body must be an object"}, 400)
+    parts: dict = {}
+    for key in _CASSETTE_ELEMENTS:
+        val = payload.get(key)
+        if val is None:
+            continue
+        # A bare string or a {name, seq} dict; the engine validates the bases
+        # and raises ValueError, which becomes a 400 below. Anything else is
+        # refused here so the error names the key.
+        if not isinstance(val, (str, dict)):
+            return ({"error": f"'{key}' must be a DNA string or a "
+                              f"{{name, seq}} object"}, 400)
+        parts[key] = val
+    if "promoter" not in parts or "cds" not in parts:
+        return ({"error": "'promoter' and 'cds' are required"}, 400)
+    kw: dict = {}
+    for key in ("enzyme", "grammar"):
+        val = payload.get(key)
+        if val is not None:
+            if not isinstance(val, str):
+                return ({"error": f"'{key}' must be a string"}, 400)
+            kw[key] = val
+    prot = payload.get("protein")
+    if prot is not None:
+        if not isinstance(prot, str):
+            return ({"error": "'protein' must be a string"}, 400)
+        kw["protein"] = prot
+    for key in ("codon_table", "forbidden_motifs"):
+        val = payload.get(key)
+        if val is not None:
+            if not isinstance(val, dict):
+                return ({"error": f"'{key}' must be an object"}, 400)
+            kw[key] = val
+    for key in ("scrub_motifs", "check_splice", "dry_run"):
+        if key in payload:
+            flag = _coerce_bool(payload.get(key), name=key)
+            if isinstance(flag, str):
+                return ({"error": flag}, 400)
+            kw[key] = flag
+    for key in ("transl_table", "scrub_rounds", "gc_window", "repeat_min"):
+        if key in payload:
+            num = _coerce_int(payload.get(key), name=key)
+            if isinstance(num, str):
+                return ({"error": num}, 400)
+            kw[key] = num
+    # `scrub_rounds` bounds the rewrite loop; an unbounded one on a long CDS
+    # is a worker pinned for minutes, and 0 would silently disable the scrub
+    # the caller just asked for.
+    if "scrub_rounds" in kw and not (1 <= kw["scrub_rounds"]
+                                     <= _CASSETTE_SCRUB_ROUNDS * 5):
+        return ({"error": f"'scrub_rounds' must be 1-"
+                          f"{_CASSETTE_SCRUB_ROUNDS * 5}"}, 400)
+    for key in ("gc_min", "gc_max"):
+        if key in payload:
+            val = payload.get(key)
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                return ({"error": f"'{key}' must be a percentage number"}, 400)
+            if not (0.0 <= float(val) <= 100.0):
+                return ({"error": f"'{key}' is a percentage, so it must be "
+                                  f"0-100"}, 400)
+            kw[key] = float(val)
+    raw_excl = payload.get("repeat_exclude")
+    if raw_excl is not None:
+        if not isinstance(raw_excl, (list, tuple)):
+            return ({"error": "'repeat_exclude' must be a list of "
+                              "[start, end] spans"}, 400)
+        spans: "list[tuple[int, int]]" = []
+        for span in raw_excl:
+            if not isinstance(span, (list, tuple)) or len(span) != 2 \
+                    or any(isinstance(v, bool) for v in span):
+                return ({"error": "each 'repeat_exclude' entry must be a "
+                                  "[start, end] pair of numbers"}, 400)
+            a = _coerce_int(span[0], name="repeat_exclude start")
+            if isinstance(a, str):
+                return ({"error": a}, 400)
+            b = _coerce_int(span[1], name="repeat_exclude end")
+            if isinstance(b, str):
+                return ({"error": b}, 400)
+            if not (0 <= a < b):
+                return ({"error": f"'repeat_exclude' span [{a}, {b}] must be "
+                                  f"a half-open range with start < end"}, 400)
+            spans.append((a, b))
+        kw["repeat_exclude"] = spans
+    try:
+        result = _assemble_expression_cassette(**parts, **kw)
+    except (ValueError, TypeError) as exc:
+        return ({"error": str(exc)}, 400)
+    _log_event("cassette.assemble", bp=len(result.get("sequence") or ""),
+               n_elements=len(result.get("layout") or ()), via="agent")
+    return {"ok": True, **result,
+            "ignored": _agent_ignored_keys(payload, set(_CASSETTE_ELEMENTS) | {
+                "codon_table", "protein", "scrub_motifs", "enzyme", "grammar",
+                "forbidden_motifs", "transl_table", "scrub_rounds",
+                "gc_window", "gc_min", "gc_max", "repeat_min",
+                "repeat_exclude", "check_splice", "dry_run"})}
+
+
 _EXPORT_DNA_EXTS     = (".dna",)
 
 
@@ -2065,10 +2264,10 @@ def _h_analyse_cds(app, payload):
             tt = _ti
             tt_source = "feature"
 
-    try:
-        rare_w = float(payload.get("rare_w", _CODON_RARE_W))
-    except (TypeError, ValueError):
-        return ({"error": "'rare_w' must be a number"}, 400)
+    rare_w = _coerce_float(payload.get("rare_w", _CODON_RARE_W),
+                           name="rare_w")
+    if isinstance(rare_w, str):
+        return ({"error": rare_w}, 400)
     if not (0.0 < rare_w <= 1.0):
         return ({"error": "'rare_w' must be in (0, 1]"}, 400)
     ramp_n = _coerce_int(payload.get("ramp_codons", _CODON_RAMP_CODONS),
@@ -2293,7 +2492,10 @@ def _h_optimize_protein(app, payload):
     all). It lowers the REPORTING bar by the same amount, so `splice.sites`
     always describes the bar the repair ran at — and a caller who wants to see
     what is sitting just under the cutoff without editing anything can pass a
-    margin with `scrub_splice_sites` left off. `splice.basis` states the bar
+    margin with `scrub_splice_sites` left off — but NOT with `check_splice`
+    false, which turns the scan off entirely and makes the margin inert; that
+    combination is warned about rather than silently dropped. `splice.basis`
+    states the bar
     actually used and drops the recorded sensitivity when it was overridden,
     since that figure was measured at the calibrated cutoff and does not
     describe a different one.
@@ -2309,7 +2511,28 @@ def _h_optimize_protein(app, payload):
     the motivating case) and `score` is the log-odds score, all three exactly
     as `scan-splice-sites` reports them. Such a site then becomes repairable
     **even when its own score is under the bar**, which is what the residual
-    needed: a guard alone cannot fix a site nothing targets.
+    needed: a guard alone cannot fix a site nothing targets. A CDS that scans
+    CLEAN is still checked against the list — skipping it there made the
+    parameter inert on exactly the construct it exists for (an in-CDS acceptor
+    at 2.642 against a 4.439 bar, still pairing with the real upstream donor
+    at 5.829 for a combined 8.471 over the 8.205 gate, able to excise the
+    first 48 codons). The list is
+    validated whether or not the repair runs, and supplying it WITHOUT
+    `scrub_splice_sites` earns a warning saying it had no effect — it only
+    ever feeds the repair's acceptance test.
+
+    When a site still pairs with one of them and **no synonym could remove
+    it**, the response says so: `splice.n_sites_paired_outside_the_cds` and
+    `splice.sites_paired_outside_the_cds` (each entry stamped
+    `externally_paired` with the combined score), plus a warning. Neither
+    `splice.sites` nor `splice.pairs` can show one — the first scans at the
+    reporting bar and the survivor is under it, the second needs BOTH ends
+    inside the CDS — so without those fields the answer reads exactly like a
+    clean one. Both keys are present whenever `splice_external_sites` was
+    supplied AND the scan ran, so a `0` there is a measurement and not a
+    default. With `check_splice` false there is no scan and no `splice` block
+    at all — the warning says the list had no effect rather than reporting a
+    hollow `0`.
 
     Each entry in `splice.pairs` carries `both_above_threshold` and
     `sub_threshold_ends`: the pairing stage scans LOWER than the reporting
@@ -2463,17 +2686,29 @@ def _h_optimize_protein(app, payload):
     # Validated here so a bad number is a 400 naming the bound, not a
     # ValueError from inside the optimizer.
     splice_ext = payload.get("splice_external_sites")
-    if splice_ext is not None and not isinstance(splice_ext, (list, tuple)):
-        return ({"error": "'splice_external_sites' must be a list of "
-                          "{kind, offset, score} objects"}, 400)
-    # Normalised to a list: the isinstance check above admits a tuple, and
-    # the helper's contract is a list.
-    splice_ext = None if splice_ext is None else list(splice_ext)
-    if splice_ext is not None and len(splice_ext) > _CODON_MAX_EXTERNAL_SITES:
-        return ({"error": f"'splice_external_sites' has {len(splice_ext)} "
-                          f"entries (max {_CODON_MAX_EXTERNAL_SITES}) — that "
-                          f"is more flanking sites than any real flank "
-                          f"carries"}, 400)
+    splice_ext = None if splice_ext is None else (
+        list(splice_ext) if isinstance(splice_ext, (list, tuple))
+        else splice_ext)
+    # Validated UP FRONT through the one validator the repair itself uses,
+    # whether or not the repair will run. Checking it only when
+    # `scrub_splice_sites` happened to be on meant a malformed list was
+    # accepted and ignored in silence (found verifying 1.3.18) — the
+    # silently-dropped-parameter shape `_agent_ignored_keys` exists for.
+    try:
+        _codon_validate_external_sites(splice_ext)
+    except ValueError as exc:
+        return ({"error": f"'splice_external_sites': {exc}"}, 400)
+    if splice_ext and not scrub_splice:
+        # Accepted, valid, and about to do nothing: the sites only ever feed
+        # the REPAIR's acceptance test. Said out loud rather than dropped.
+        _ext_ignored_note = (
+            f"{len(splice_ext)} 'splice_external_sites' entr"
+            f"{'y was' if len(splice_ext) == 1 else 'ies were'} supplied but "
+            f"no repair was requested, so they had NO effect — they only feed "
+            f"the splice repair's acceptance test. Pass "
+            f"'scrub_splice_sites': true to use them.")
+    else:
+        _ext_ignored_note = None
     splice_margin = payload.get("splice_margin", 0.0)
     if isinstance(splice_margin, bool):
         return ({"error": "'splice_margin' is a number of BITS, not a flag — "
@@ -2507,6 +2742,23 @@ def _h_optimize_protein(app, payload):
                               f"window stops looking like a splice site at "
                               f"all; the largest usable margin is "
                               f"{_worst:g}"}, 400)
+    # `splice_margin`'s VALIDATION is unconditional — deliberately, and unlike
+    # `splice_external_sites` before it was fixed — but its EFFECT is not: it
+    # lowers the repair bar AND the reporting bar, and both live behind
+    # `check_splice`. With the scan off it does nothing, so say so rather than
+    # drop it. (It is NOT inert when the scan runs without the repair: it
+    # lowers the reporting bar then, which is a documented use.) A warning
+    # rather than a 400, matching the `splice_external_sites` fix — the rest
+    # of the request is valid work and refusing it would be unhelpfully
+    # strict.
+    if splice_margin and not check_splice:
+        _margin_ignored_note = (
+            f"'splice_margin' {splice_margin:g} was supplied but "
+            f"'check_splice' is false, so no scan or repair ran and the "
+            f"margin had NO effect. It lowers the bar for the cryptic-splice "
+            f"scan and its repair; enable one of those to use it.")
+    else:
+        _margin_ignored_note = None
     motifs = payload.get("forbidden_motifs")
     if motifs is not None:
         if isinstance(motifs, dict):
@@ -2538,11 +2790,10 @@ def _h_optimize_protein(app, payload):
     for key in ("min_gc", "max_gc"):
         if payload.get(key) is None:
             continue
-        try:
-            bounds[key] = float(payload[key])
-        except (TypeError, ValueError):
-            return ({"error": f"'{key}' must be a number (percent, 0-100)"},
-                    400)
+        _gc = _coerce_float(payload[key], name=key)
+        if isinstance(_gc, str):
+            return ({"error": f"{_gc} (percent, 0-100)"}, 400)
+        bounds[key] = _gc
         if not 0.0 <= bounds[key] <= 100.0:
             return ({"error": f"'{key}' must be between 0 and 100 (percent)"},
                     400)
@@ -2586,6 +2837,11 @@ def _h_optimize_protein(app, payload):
                   f"this protein is {n_codons}. Optimize without that pass, or "
                   f"scrub the CDS in segments."}, 400)
 
+    # The engine's `remaining` — kept, because it is the only place a
+    # site that survives BELOW the reporting bar while still pairing with
+    # a `splice_external_sites` partner is visible (`_splice_scan` at the
+    # bar cannot see it, so dropping this read makes it silent).
+    splice_rem: "list[dict] | None" = None
     try:
         dna = _codon_optimize(protein, entry["raw"], stops=stops,
                               transl_table=transl_table, mode=mode)
@@ -2633,7 +2889,7 @@ def _h_optimize_protein(app, payload):
         # excursion that is shown beats a cryptic splice site that is not.
         if scrub_splice:
             try:
-                dna, splice_fixes, _rem = _codon_fix_splice_sites(
+                dna, splice_fixes, splice_rem = _codon_fix_splice_sites(
                     dna, body, entry["raw"], sites=scrub or None,
                     margin=splice_margin, external_sites=splice_ext,
                     has_appended_stop=has_stop, transl_table=transl_table)
@@ -2665,6 +2921,10 @@ def _h_optimize_protein(app, payload):
     # wobble position, which is a real silencing / mRNA-instability risk. Warn
     # when it is extreme so the caller isn't lulled by the top-line GC.
     warnings: list = []
+    if _ext_ignored_note:
+        warnings.append(_ext_ignored_note)
+    if _margin_ignored_note:
+        warnings.append(_margin_ignored_note)
     # How many of the emitted codons are terminators: a trailing '*' run in the
     # protein overrides `stops`, exactly as `_codon_optimize` documents.
     trailing_stars = len(protein) - len(protein.rstrip("*"))
@@ -2716,6 +2976,16 @@ def _h_optimize_protein(app, payload):
             _sites = _splice_scan(dna, **_skw)
             _pairs = _splice_pair_risk(dna, **_skw)
             _relaxed = [p for p in _pairs if not p["both_above_threshold"]]
+            # Sites that still pair with a caller-supplied partner OUTSIDE the
+            # CDS. `_splice_pair_risk` cannot find these — both ends have to
+            # be in the scanned sequence — and `_sites` cannot show them
+            # either, because a site that needed `splice_external_sites` to
+            # become repairable is under the bar by construction. Without this
+            # read, "I asked you to watch the flanking donor and you removed
+            # nothing" and "there is nothing left to remove" are the same
+            # response.
+            _ext_left = [h for h in (splice_rem or [])
+                         if h.get("externally_paired") is not None]
             splice_block = {
                 "skipped":   False,
                 "model":     _splice_model_summary().get("source", "?"),
@@ -2731,6 +3001,23 @@ def _h_optimize_protein(app, payload):
                     len(_pairs) - len(_relaxed),
                 "pairs":     _pairs[:_CODON_SPLICE_MAX_REPORT],
             }
+            if splice_ext is not None:
+                # Present exactly when the question was asked, so a 0 here is
+                # a measurement rather than a default.
+                splice_block["n_sites_paired_outside_the_cds"] = len(_ext_left)
+                splice_block["sites_paired_outside_the_cds"] = \
+                    _ext_left[:_CODON_SPLICE_MAX_REPORT]
+            if _ext_left:
+                _worst = max(h["externally_paired"] for h in _ext_left)
+                warnings.append(
+                    f"{len(_ext_left)} site(s) in this CDS still PAIR with a "
+                    f"site passed in splice_external_sites (worst combined "
+                    f"{_worst}) and no synonymous codon could remove them — "
+                    f"they score BELOW the reporting bar, so splice.sites "
+                    f"cannot list them; see "
+                    f"splice.sites_paired_outside_the_cds. A pair with one "
+                    f"end outside the CDS still excises coding sequence, and "
+                    f"only the non-coding end is left to change")
             if _sites:
                 warnings.append(
                     f"{len(_sites)} cryptic splice site(s) in this CDS score "
@@ -2752,7 +3039,7 @@ def _h_optimize_protein(app, payload):
                     + (f"; {len(_fl)} would delete a whole number of codons, "
                        "so the product can still be antibody-positive while "
                        "being wrong" if _fl else ""))
-            if not _sites and not _pairs:
+            if not _sites and not _pairs and not _ext_left:
                 # A bare 0 overstates the all-clear: see `splice.basis`.
                 warnings.append(
                     "cryptic-splice scan found nothing — this model is "
@@ -4458,6 +4745,19 @@ _AGENT_SETTINGS_ALLOWLIST: "dict[str, tuple]" = {
     # every feature drawn. 0 disables aggregation.
     "map_lod_feature_threshold": (_settings_validator_int_range(0, 1_000_000),
                                    2000),
+    # Three user-facing GUI toggles that had no agent read OR write — a human
+    # could change them in Settings and `get-settings` would not even report
+    # them (audit 2026-11-09). `ascii_map` matters most: it is the `[INV-134]`
+    # fallback for a terminal that cannot render the braille map, so an agent
+    # driving a remote session had no way to see or set the one switch that
+    # decides whether the map is legible at all. The credential / egress keys
+    # (`allow_online_*`, `hmm_db_allow_http`, the API keys, `ot2_host`) stay
+    # OUT on purpose, and so do the `active_*` keys that have dedicated
+    # endpoints.
+    "ascii_map":             (_settings_validator_bool,                  False),
+    "show_button_tooltips":  (_settings_validator_bool,                  True),
+    # 0 means "use the layout default"; the cap mirrors the Settings spinner.
+    "seq_panel_height":      (_settings_validator_int_range(0, 200),     0),
 }
 
 
@@ -4657,21 +4957,39 @@ def _h_get_part(app, payload):
     """Fetch a single part by `name` (and optional `grammar` to
     disambiguate when two grammars carry a part with the same name).
     Returns the full entry including `gb_text` + `sequence` so the
-    agent can parse it locally."""
+    agent can parse it locally.
+
+    Body: ``{name, grammar?, bin?}``. Pass ``{bin: "X"}`` to read bin X's own
+    parts; omit it for the active bin — the same selector `list-parts` takes.
+    Parts are keyed ``(name, grammar)`` PER BIN, so holding the same part name
+    in two bins is the normal use of bins: without this the endpoint answered
+    out of the active bin and returned a DIFFERENT part under the requested
+    name, with HTTP 200 and nothing to signal the substitution (audit
+    2026-11-09). The response echoes the resolved ``bin``."""
     name = _sanitize_label(payload.get("name"), max_len=200)
     if not name:
         return ({"error": "missing 'name'"}, 400)
     grammar = payload.get("grammar")
     if grammar is not None and not isinstance(grammar, str):
         return ({"error": "'grammar' must be string"}, 400)
-    for p in _load_parts_bin():
+    bin_in = payload.get("bin")
+    parts_src, berr = _agent_parts_bin_list(bin_in)
+    if berr is not None:
+        return berr
+    assert parts_src is not None         # berr is None ⇒ parts_src is populated
+    for p in parts_src:
         if p.get("name") != name:
             continue
         if grammar and (p.get("grammar") or "") != grammar:
             continue
-        return {"ok": True, "part": p}
+        out = {"ok": True, "part": p}
+        if bin_in not in (None, ""):
+            out["bin"] = str(bin_in)
+        return out
+    where = (f" in bin {str(bin_in)!r}" if bin_in not in (None, "")
+             else " in the active bin")
     return ({"error": f"no part named {name!r}"
-              + (f" in grammar {grammar!r}" if grammar else "")}, 404)
+              + (f" in grammar {grammar!r}" if grammar else "") + where}, 404)
 
 
 def _agent_part_dict(payload: dict) -> "dict | str":
@@ -6348,11 +6666,10 @@ def _h_check_primer(app, payload):
         return ({"error":
                   f"'template' exceeds {_PAIRWISE_MAX_LEN:,} bp cap"}, 413)
     circular = _payload_bool(payload, "circular", True)
-    min_identity = payload.get("min_identity", 0.0)
-    try:
-        min_identity = float(min_identity)
-    except (TypeError, ValueError):
-        return ({"error": "'min_identity' must be a number"}, 400)
+    min_identity = _coerce_float(payload.get("min_identity", 0.0),
+                                 name="min_identity")
+    if isinstance(min_identity, str):
+        return ({"error": min_identity}, 400)
     if not (0.0 <= min_identity <= 100.0):
         return ({"error": "'min_identity' must be in [0, 100]"}, 400)
     max_sites = _coerce_int(payload.get("max_sites", 50), name="max_sites")
@@ -7500,7 +7817,18 @@ def _agent_golden_gate_inputs(payload):
 @_agent_endpoint("simulate-golden-gate")
 def _h_simulate_golden_gate(app, payload):
     """Dry-run a Golden Gate / MoClo (Type IIS) one-pot assembly. Body:
-    ``{parts: [seq, …], vector, enzyme?="BsaI"}``.
+    ``{parts: [seq, …], vector, enzyme?="BsaI", part_circular?: [bool, …]}``.
+
+    **Parts are digested as LINEAR fragments** unless ``part_circular`` says
+    otherwise (one boolean per part, same order). That matters: a part handed
+    over as a whole circular PLASMID whose cassette spans bp 0 releases its
+    BACKBONE as the "part", and the assembly then reports ``ok: true`` for a
+    product that does not contain the part. ``result.parts_released`` reports
+    what each part actually gave up — length, overhang pair and the topology
+    it was read as — because there is no way to tell a linear fragment from a
+    plasmid from the bases alone (every shape releases two two-cut bodies when
+    read as a circle). A part declared circular that releases two fragments is
+    REFUSED naming both, rather than one being picked by size.
 
     Digests each part + the vector with the Type IIS enzyme (BsaI / BsmBI /
     BbsI / SapI / Esp3I) and chains the released fragments by their 4 nt
@@ -7541,10 +7869,34 @@ def _h_simulate_golden_gate(app, payload):
      carried, carry_err) = _agent_gg_carry_features(payload, parts, vseq)
     if carry_err is not None:
         return carry_err
+    # Per-part topology. Parts are digested as LINEAR fragments by default
+    # (unchanged), but a part supplied as a whole circular plasmid whose
+    # cassette spans bp 0 releases its BACKBONE instead of the part — and
+    # until `parts_released` landed, nothing in the response said so. There is
+    # no sequence-only way to tell the two apart (measured: every shape
+    # releases exactly two two-cut bodies read as a circle), so the caller
+    # declares it.
+    raw_circ = payload.get("part_circular")
+    part_circ: "list[bool] | None" = None
+    if raw_circ is not None:
+        if not isinstance(raw_circ, (list, tuple)):
+            return ({"error": "'part_circular' must be a list of booleans, "
+                              "one per part"}, 400)
+        if len(raw_circ) != len(parts):
+            return ({"error": f"'part_circular' has {len(raw_circ)} entries "
+                              f"but {len(parts)} parts were supplied — pass "
+                              f"one per part, in the same order"}, 400)
+        part_circ = []
+        for idx, v in enumerate(raw_circ):
+            flag = _coerce_bool(v, name=f"part_circular[{idx}]")
+            if isinstance(flag, str):
+                return ({"error": flag}, 400)
+            part_circ.append(flag)
     try:
         result = _simulate_golden_gate(
             parts, vseq, enzyme=enzyme,
-            part_features=part_feats, vector_features=vec_feats)
+            part_features=part_feats, vector_features=vec_feats,
+            part_circular=part_circ)
     except Exception as exc:
         _log.exception("agent simulate-golden-gate: assembler failed")
         return ({"error": f"assembler failed: {_scrub_path(str(exc))}"}, 500)
@@ -7853,22 +8205,46 @@ def _h_scrub_plasmid(app, payload):
 @_agent_endpoint("get-experiment")
 def _h_get_experiment(app, payload):
     """Fetch one notebook entry (full body + metadata) by id.
-    Body: ``{id: str}``."""
+
+    Body: ``{id, project?}``. Pass ``{project: "X"}`` to read project X's own
+    notebook; omit it for the active project — the same selector
+    `list-experiments` takes. Without it the endpoint could only ever see the
+    active project, so an agent that had just written an entry into a named
+    project could not read it back (audit 2026-11-09). The response echoes the
+    resolved ``project``."""
     eid = _sanitize_experiment_id(payload.get("id"))
     if eid is None:
         return ({"error": "missing or invalid 'id'"}, 400)
-    for e in _load_experiments():
+    proj_in = payload.get("project")
+    src, perr = _agent_project_experiments_list(proj_in)
+    if perr is not None:
+        return perr
+    assert src is not None               # perr is None ⇒ src is populated
+    for e in src:
         if e.get("id") == eid:
-            return {"experiment": _typed_clone(e)}
-    return ({"error": f"no experiment with id {eid!r}"}, 404)
+            out = {"experiment": _typed_clone(e)}
+            if proj_in not in (None, ""):
+                out["project"] = str(proj_in)
+            return out
+    where = (f" in project {str(proj_in)!r}" if proj_in not in (None, "")
+             else " in the active project")
+    return ({"error": f"no experiment with id {eid!r}{where}"}, 404)
 
 
 @_agent_endpoint("create-experiment", write=True)
 def _h_create_experiment(app, payload):
-    """Create a new notebook entry in the active project. Body:
+    """Create a new notebook entry. Body:
     ``{title?: str = "Untitled entry",
         body_md?: str = "",
-        tags?: list[str] = []}``.
+        tags?: list[str] = [],
+        project?: str}``.
+
+    ``project`` files the entry into that named project (404 if no such
+    project); omit it for the active one. It was implemented but documented as
+    "the active project" only, so an agent reading the contract believed it
+    had to `set-active-experiment-project` first — mutating global state a
+    human may be sharing in the same session — or create-then-`move-experiment`
+    (audit 2026-11-09). Every sibling endpoint documents the same selector.
 
     Routes through `_normalise_experiment_entry` so size caps + tag
     dedup + plasmid/action/gel xref extraction apply automatically.
@@ -9505,10 +9881,9 @@ def _h_scan_promoters(app, payload):
             return ({"error": both}, 400)
     min_score = payload.get("min_score")
     if min_score is not None:
-        try:
-            min_score = float(min_score)
-        except (TypeError, ValueError):
-            return ({"error": "'min_score' must be a number"}, 400)
+        min_score = _coerce_float(min_score, name="min_score")
+        if isinstance(min_score, str):
+            return ({"error": min_score}, 400)
         if not (0.0 <= min_score <= 1.0):
             return ({"error": "'min_score' must be in [0, 1]"}, 400)
     limit = _coerce_int(payload.get("limit", 500), name="limit")
@@ -9620,6 +9995,132 @@ def _h_scan_terminators(app, payload):
                 "min_stem", "min_u_tract", "limit"})}
 
 
+# The repeat scan indexes every `min_len`-mer and then walks the reverse
+# complement, so cost grows with length while the INTERESTING answer does not:
+# past this the honest move is to scan the insert rather than the chromosome.
+# Chosen to match `_synthesis_lint`'s own 200 kb ceiling so the two agree about
+# what counts as a construct.
+_SCAN_REPEATS_MAX_BP = 200_000
+# Below ~20 bp every sequence repeats by chance (4^20 is ~1e12, but a 10-mer
+# recurs every ~1 Mb and an 8-mer every ~65 kb), so a lower floor reports
+# noise as a hazard — the same "is finding this informative" discipline
+# `splicecraft_regulettuce` applies to its cis-element rates.
+_SCAN_REPEATS_MIN_LEN = 20
+
+
+@_agent_endpoint("scan-repeats")
+def _h_scan_repeats(app, payload):
+    """Find long internal DIRECT and INVERTED repeats in one molecule.
+
+    Body: ``{sequence | id | name, min_length?=100, exclude?, limit?}``.
+    ``exclude`` is a list of ``[start, end]`` spans whose repeats against each
+    OTHER are intentional (a deliberately duplicated flanking pair being the
+    motivating case); a hit is dropped only when BOTH copies sit inside
+    excluded spans, so an excluded element that accidentally repeats against
+    the promoter is still reported.
+
+    Each hit: ``{kind: "direct"|"inverted", length, positions, seq_head}``.
+    ``length`` is the MAXIMAL run, not the seed length, and one repeat is one
+    finding — reporting each of the ``run - min_length + 1`` overlapping
+    windows separately once ranked a 100 bp direct repeat above a 1200 bp
+    hairpin and called it "1101 internal repeats".
+
+    **Why this is its own endpoint.** `lint-synthesis` already screens
+    repeats, but only TANDEM ones with a unit of at most
+    ``repeat_unit_max`` (4) bases repeated ``repeat_min_copies`` (5) times —
+    i.e. microsatellites up to ~20 bp, which are a synthesis-vendor problem.
+    The hazard this scan covers is the opposite scale: two copies of the same
+    250 bp terminator, or a promoter duplicated head-to-head, anywhere in the
+    construct. A direct repeat recombines out the DNA between its copies; an
+    inverted repeat folds into the hairpin that seeds silencing. In a
+    clonally-propagated host neither can be segregated away, so it is a
+    permanent liability rather than an F2 inconvenience — and until this
+    endpoint existed the detector for it (`_cassette_internal_repeats`) was
+    reachable from no door in the application.
+
+    Coordinates are 0-based forward-strand. ``positions`` lists up to 8
+    starts; an inverted hit's second copy is reported at its forward-strand
+    start, so both entries index the same strand (sacred invariant #2).
+    Results are capped at ``limit`` findings, and the engine itself stops at
+    500 (``_CASSETTE_MAX_REPEAT_HITS``) — low-complexity input (an AT-rich
+    terminator pair) has a genuinely enormous number of distinct alignments
+    and every one of them is the same actionable fact; ``engine_capped`` says
+    when that ceiling was reached. Read-only; nothing is modified."""
+    seq, _circ, _rec, label, err = _agent_resolve_scan_target(app, payload)
+    if err is not None:
+        return err
+    if len(seq) > _SCAN_REPEATS_MAX_BP:
+        return ({"error": f"sequence is {len(seq)} bp; the repeat scan is "
+                          f"capped at {_SCAN_REPEATS_MAX_BP} bp because it "
+                          f"indexes every k-mer and then walks the reverse "
+                          f"complement. Scan the insert or the T-DNA rather "
+                          f"than a whole chromosome."}, 400)
+    min_len = _coerce_int(payload.get("min_length", _CASSETTE_REPEAT_MIN),
+                          name="min_length")
+    if isinstance(min_len, str):
+        return ({"error": min_len}, 400)
+    # A floor below the noise level would report chance matches as a hazard,
+    # and "47 internal repeats" on a clean construct is worse than no scan.
+    # Refused rather than clamped: silently substituting a different number
+    # answers a question the caller did not ask.
+    if min_len < _SCAN_REPEATS_MIN_LEN:
+        return ({"error": f"'min_length' must be >= {_SCAN_REPEATS_MIN_LEN} — "
+                          f"shorter k-mers recur by chance in any sequence "
+                          f"(an 8-mer about every 65 kb), so the hits would "
+                          f"be noise rather than a recombination hazard"}, 400)
+    raw_excl = payload.get("exclude")
+    exclude: "list[tuple[int, int]]" = []
+    if raw_excl is not None:
+        if not isinstance(raw_excl, (list, tuple)):
+            return ({"error": "'exclude' must be a list of [start, end] "
+                              "spans"}, 400)
+        for span in raw_excl:
+            if not isinstance(span, (list, tuple)) or len(span) != 2:
+                return ({"error": "each 'exclude' entry must be a "
+                                  "[start, end] pair"}, 400)
+            # `int(True)` is 1, so a flag would silently become a coordinate.
+            # Same refusal the splice keywords make.
+            if any(isinstance(v, bool) for v in span):
+                return ({"error": "'exclude' coordinates are numbers, not "
+                                  "flags"}, 400)
+            a = _coerce_int(span[0], name="exclude start")
+            if isinstance(a, str):
+                return ({"error": a}, 400)
+            b = _coerce_int(span[1], name="exclude end")
+            if isinstance(b, str):
+                return ({"error": b}, 400)
+            if not (0 <= a < b <= len(seq)):
+                return ({"error": f"'exclude' span [{a}, {b}] is not a "
+                                  f"half-open range inside 0-{len(seq)}"}, 400)
+            exclude.append((a, b))
+    limit = _coerce_int(payload.get("limit", 100), name="limit")
+    if isinstance(limit, str):
+        return ({"error": limit}, 400)
+    if limit < 1:
+        return ({"error": "'limit' must be >= 1"}, 400)
+    try:
+        hits = _cassette_internal_repeats(seq, min_len,
+                                          exclude=exclude or None)
+    except Exception as exc:
+        _log.exception("scan-repeats failed")
+        return ({"error": f"scan failed: {_scrub_path(str(exc))}"}, 500)
+    n_direct = sum(1 for h in hits if h.get("kind") == "direct")
+    _log_event("scan.repeats", length=len(seq), min_length=min_len,
+               n_hits=len(hits), via="agent")
+    return {"ok": True, "plasmid": label, "length": len(seq),
+            "min_length": min_len, "n_hits": len(hits),
+            "n_direct": n_direct, "n_inverted": len(hits) - n_direct,
+            # The engine's own cap is a separate ceiling from `limit`, and a
+            # caller who cannot tell them apart would read a capped scan as a
+            # complete one.
+            "engine_capped": len(hits) >= _CASSETTE_MAX_REPEAT_HITS,
+            "truncated": len(hits) > limit,
+            "hits": hits[:limit],
+            "ignored": _agent_ignored_keys(payload, {
+                "sequence", "id", "name", "circular", "min_length",
+                "exclude", "limit"})}
+
+
 @_agent_endpoint("list-cis-elements")
 def _h_list_cis_elements(app, payload):
     """The curated plant cis-regulatory element catalogue.
@@ -9705,10 +10206,9 @@ def _h_scan_cis_elements(app, payload):
         names = [str(n) for n in names]
     min_enr = payload.get("min_enrichment")
     if min_enr is not None:
-        try:
-            min_enr = float(min_enr)
-        except (TypeError, ValueError):
-            return ({"error": "'min_enrichment' must be a number"}, 400)
+        min_enr = _coerce_float(min_enr, name="min_enrichment")
+        if isinstance(min_enr, str):
+            return ({"error": min_enr}, 400)
         if min_enr < 0:
             return ({"error": "'min_enrichment' must be >= 0"}, 400)
     limit = _coerce_int(payload.get("limit", 2000), name="limit")
@@ -9889,10 +10389,9 @@ def _h_scan_3prime_risk(app, payload):
         return ({"error": "'step' must be in [1, window]"}, 400)
     min_score = payload.get("min_score")
     if min_score is not None:
-        try:
-            min_score = float(min_score)
-        except (TypeError, ValueError):
-            return ({"error": "'min_score' must be a number"}, 400)
+        min_score = _coerce_float(min_score, name="min_score")
+        if isinstance(min_score, str):
+            return ({"error": min_score}, 400)
         if not (0.0 <= min_score <= 1.0):
             return ({"error": "'min_score' must be in [0, 1]"}, 400)
     limit = _coerce_int(payload.get("limit", 500), name="limit")
@@ -10001,10 +10500,9 @@ def _h_map_transcription(app, payload):
             return ({"error": inc}, 400)
     min_score = payload.get("min_promoter_score")
     if min_score is not None:
-        try:
-            min_score = float(min_score)
-        except (TypeError, ValueError):
-            return ({"error": "'min_promoter_score' must be a number"}, 400)
+        min_score = _coerce_float(min_score, name="min_promoter_score")
+        if isinstance(min_score, str):
+            return ({"error": min_score}, 400)
         if not (0.0 <= min_score <= 1.0):
             return ({"error": "'min_promoter_score' must be in [0, 1]"}, 400)
     max_distance = payload.get("max_distance")
@@ -11165,10 +11663,10 @@ def _h_verify_against_reads(app, payload):
     mode = payload.get("mode", "global")
     if mode not in ("global", "local"):
         return ({"error": "'mode' must be 'global' or 'local'"}, 400)
-    try:
-        min_identity = float(payload.get("min_identity", 99.0))
-    except (TypeError, ValueError):
-        return ({"error": "'min_identity' must be a number"}, 400)
+    min_identity = _coerce_float(payload.get("min_identity", 99.0),
+                                 name="min_identity")
+    if isinstance(min_identity, str):
+        return ({"error": min_identity}, 400)
     if not (0.0 <= min_identity <= 100.0):
         return ({"error": "'min_identity' must be in [0, 100]"}, 400)
     ref_seq, circular, ref_err = _agent_resolve_read_reference(payload)
@@ -11921,11 +12419,11 @@ def _h_analyse_read_heterogeneity(app, payload):
     mode = payload.get("mode", "global")
     if mode not in ("global", "local"):
         return ({"error": "'mode' must be 'global' or 'local'"}, 400)
-    try:
-        min_fraction = float(payload.get("min_fraction",
-                                         _HETERO_MIN_FRACTION_DEFAULT))
-    except (TypeError, ValueError):
-        return ({"error": "'min_fraction' must be a number"}, 400)
+    min_fraction = _coerce_float(
+        payload.get("min_fraction", _HETERO_MIN_FRACTION_DEFAULT),
+        name="min_fraction")
+    if isinstance(min_fraction, str):
+        return ({"error": min_fraction}, 400)
     if not (0.0 < min_fraction <= 1.0):
         return ({"error": "'min_fraction' must be in (0, 1]"}, 400)
     min_phred = _coerce_int(payload.get("min_phred", 20), name="min_phred")
@@ -11944,10 +12442,9 @@ def _h_analyse_read_heterogeneity(app, payload):
     if noise_floor is None:
         noise_floor = _default_floor
     else:
-        try:
-            noise_floor = float(noise_floor)
-        except (TypeError, ValueError):
-            return ({"error": "'noise_floor' must be a number"}, 400)
+        noise_floor = _coerce_float(noise_floor, name="noise_floor")
+        if isinstance(noise_floor, str):
+            return ({"error": noise_floor}, 400)
         if not (0.0 <= noise_floor <= 1.0):
             return ({"error": "'noise_floor' must be in [0, 1]"}, 400)
     hp_filter = payload.get("homopolymer_filter")
@@ -13817,11 +14314,10 @@ def _h_simulate_gel(app, payload):
     pcr_amplicon = payload.get("pcr_amplicon")
     if pcr_amplicon is not None and not isinstance(pcr_amplicon, dict):
         return ({"error": "'pcr_amplicon' must be a dict or null"}, 400)
-    agarose = payload.get("agarose_pct", 1.0)
-    try:
-        agarose = float(agarose)
-    except (TypeError, ValueError):
-        return ({"error": "'agarose_pct' must be a number"}, 400)
+    agarose = _coerce_float(payload.get("agarose_pct", 1.0),
+                            name="agarose_pct")
+    if isinstance(agarose, str):
+        return ({"error": agarose}, 400)
     # _agarose_mobility snaps to nearest configured %, but reject
     # absurdly out-of-range values up front so the agent gets a
     # clear error instead of silent snapping.
@@ -14126,11 +14622,10 @@ def _h_design_gb_part(app, payload):
     grammar = _all_grammars().get(gid)
     if grammar is None:
         return ({"error": f"unknown grammar id {gid!r}"}, 404)
-    target_tm = payload.get("target_tm", 60.0)
-    try:
-        target_tm = float(target_tm)
-    except (TypeError, ValueError):
-        return ({"error": "'target_tm' must be a number"}, 400)
+    target_tm = _coerce_float(payload.get("target_tm", 60.0),
+                              name="target_tm")
+    if isinstance(target_tm, str):
+        return ({"error": target_tm}, 400)
     if not (40.0 <= target_tm <= 90.0):
         return ({"error": "'target_tm' must be in [40, 90] °C"}, 400)
     codon_raw = None
@@ -14337,10 +14832,10 @@ def _agent_design_allele_specific(template: str, payload,
     orientation = payload.get("orientation", "auto")
     if orientation not in ("auto", "fwd", "rev"):
         return ({"error": "'orientation' must be 'auto', 'fwd' or 'rev'"}, 400)
-    try:
-        target_tm = float(payload.get("target_tm", 60.0))
-    except (TypeError, ValueError):
-        return ({"error": "'target_tm' must be a number"}, 400)
+    target_tm = _coerce_float(payload.get("target_tm", 60.0),
+                              name="target_tm")
+    if isinstance(target_tm, str):
+        return ({"error": target_tm}, 400)
     if not (40.0 <= target_tm <= 90.0):
         return ({"error": "'target_tm' must be in [40, 90] °C"}, 400)
     circular = _payload_bool(payload, "circular", False)
@@ -14567,11 +15062,10 @@ def _h_design_primers(app, payload):
                   "'mode' must be 'cloning', 'detection', 'generic', or "
                   "'allele_specific'"},
                 400)
-    target_tm = payload.get("target_tm", 60.0)
-    try:
-        target_tm = float(target_tm)
-    except (TypeError, ValueError):
-        return ({"error": "'target_tm' must be a number"}, 400)
+    target_tm = _coerce_float(payload.get("target_tm", 60.0),
+                              name="target_tm")
+    if isinstance(target_tm, str):
+        return ({"error": target_tm}, 400)
     if not (40.0 <= target_tm <= 90.0):
         return ({"error": "'target_tm' must be in [40, 90] °C"}, 400)
     try:
@@ -15796,17 +16290,28 @@ def _h_ot2_run_control(app, payload):
 
 
 def _ot2_opt_float(payload, key, default=None):
-    """Read an optional finite positive-or-any float from a payload (None if absent
-    / unparseable)."""
-    v = payload.get(key, default)
+    """Read an optional float from an OT-2 payload.
+
+    Returns the float, ``None`` when the key is genuinely ABSENT or null, or an
+    error STRING the caller turns into a 400 — the `_coerce_float` shape.
+
+    It used to return ``None`` for an unparseable value too, which every
+    caller reads as "the key was omitted" (audit 2026-11-09). So
+    ``{"final_volume": "50 uL"}`` silently dropped the documented top-up-to-
+    volume branch and returned 200 with sample volumes only — the requested
+    well volume vanished with no warning. And ``{"target_ng": true}`` became
+    1 ng BEFORE the engine saw it, defeating `_ot2_normalize_volumes`' own
+    `_pos` guard, which refuses a bool on purpose. These volumes feed
+    `ot2-compile` → `ot2-run` on a real robot, so a silently-substituted
+    number is a mis-pipetted plate.
+    """
+    if key not in payload:
+        return default
+    v = payload.get(key)
     if v is None:
-        return None
-    try:
-        f = float(v)
-    except (TypeError, ValueError):
-        return None
-    import math as _m
-    return f if _m.isfinite(f) else None
+        # An explicit null is the documented way to say "use the default".
+        return default
+    return _coerce_float(v, name=key)
 
 
 @_agent_endpoint("ot2-normalize")
@@ -15835,16 +16340,33 @@ def _h_ot2_normalize(app, payload):
     if not isinstance(items, list) or not items:
         return ({"error": "missing 'items' (a list of {name, well, concentration})"}, 400)
     spec = _ot2._OT2_PIPETTES.get(str(payload.get("pipette", "p300_single")))
-    min_vol = _ot2_opt_float(payload, "min_vol", spec[0] if spec else 0.0) or 0.0
-    max_vol = _ot2_opt_float(payload, "max_vol", spec[1] if spec else None)
+    # Each is float | None | error-string; a bad number is a 400 naming the
+    # key, never a silent fall-back to the default (which is what made a
+    # mistyped `final_volume` vanish).
+    _vols: dict = {}
+    for _key, _dflt in (("min_vol", spec[0] if spec else 0.0),
+                        ("max_vol", spec[1] if spec else None),
+                        ("target_ng", None), ("target_conc", None),
+                        ("final_volume", None), ("resolution", 0.1)):
+        _got = _ot2_opt_float(payload, _key, _dflt)
+        if isinstance(_got, str):
+            return ({"error": _got}, 400)
+        _vols[_key] = _got
+    # `min_vol`/`resolution` must be real numbers for the engine's arithmetic,
+    # but `or 0.0` / `or 0.1` turned an EXPLICIT 0 back into the default —
+    # silent substitution, the `cycles or 30` shape. A zero resolution means
+    # "do not round", which `_round` already handles, so pass it through and
+    # only substitute when the value is genuinely absent.
+    min_vol = _vols["min_vol"] if _vols["min_vol"] is not None else 0.0
+    resolution = _vols["resolution"] if _vols["resolution"] is not None else 0.1
     try:
         normalized = _ot2._ot2_normalize_volumes(
             items,
-            target_ng=_ot2_opt_float(payload, "target_ng"),
-            target_conc=_ot2_opt_float(payload, "target_conc"),
-            final_volume=_ot2_opt_float(payload, "final_volume"),
-            min_vol=min_vol, max_vol=max_vol,
-            resolution=_ot2_opt_float(payload, "resolution", 0.1) or 0.1)
+            target_ng=_vols["target_ng"],
+            target_conc=_vols["target_conc"],
+            final_volume=_vols["final_volume"],
+            min_vol=min_vol, max_vol=_vols["max_vol"],
+            resolution=resolution)
     except _ot2.OT2Error as exc:
         return ({"error": str(exc)}, 400)
     n_off = sum(1 for r in normalized

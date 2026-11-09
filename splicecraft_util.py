@@ -1027,6 +1027,29 @@ def _feat_spans(feat, total: int, *, circular: "bool | None" = None):
     if len(parts) < 2:
         return s, e, strand, None
     exonic = sum(pe - ps for ps, pe in parts)
+    if total > 0 and s == e:
+        # **The traversal LAPS the circle** — it leaves bp `s` and arrives
+        # back at `s` — so the bounds PAIR cannot describe this feature at
+        # all: `_span_len_wrapaware(s, s, total)` is 0, and so is `_feat_len`,
+        # because `end < start` is the only wrap the dict model encodes and
+        # `end == start` is indistinguishable from an empty feature. `parts`
+        # is therefore the ONLY surviving description, and is kept here
+        # whatever `exonic` compares to.
+        #
+        # Dropping it (the arithmetic below can never be true against a span
+        # of 0) is how a `join(121..240,1..120)` CDS read off a third-party
+        # file became a ZERO-length feature in the map and the digest, and
+        # was DELETED outright by `_feature_location_for_dict` — which
+        # rebuilds from `parts` and gets `None` from a (k, k) bounds pair
+        # (audit 2026-11-09). It also contradicted `_traversal_bounds`, which
+        # deliberately keeps a lapping CDS's (k, k) bounds — "its start IS
+        # its reading frame" — precisely BECAUSE its parts carry the truth.
+        #
+        # This is not a loosening of the intron contract but an application
+        # of its actual rule: `parts` is present exactly when `(start, end)`
+        # does not already say everything. For a lap it says 0 bp, which is
+        # the one thing the feature certainly is not. See `[INV-221]`.
+        return s, e, strand, parts
     span = _span_len_wrapaware(s, e, total) if total > 0 else (e - s)
     return s, e, strand, (parts if exonic < span else None)
 
@@ -1111,6 +1134,15 @@ def _feat_dict_set_spans(fd: dict, spans, total: int) -> dict:
             merged.append([ps, pe])
     fd["start"], fd["end"] = merged[0][0], merged[-1][1]
     exonic = sum(pe - ps for ps, pe in merged)
+    if len(merged) > 1 and total > 0 and fd["start"] == fd["end"]:
+        # The spans LAP the circle (last ends where the first begins), so the
+        # bounds pair reads as ZERO length and `parts` is the only description
+        # left — the same blind spot `_feat_spans` has, reached from the dict
+        # side. Rotating a whole-molecule `[0, total)` annotation produces
+        # exactly this shape, and dropping `parts` turned an 80 bp feature
+        # into 0 bp (audit 2026-11-09).
+        fd["parts"] = merged
+        return fd
     span = (_span_len_wrapaware(fd["start"], fd["end"], total) if total > 0
             else fd["end"] - fd["start"])
     if len(merged) > 1 and exonic < span:

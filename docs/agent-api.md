@@ -638,6 +638,32 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   margin with `scrub_splice_sites` left off to merely SEE what is sitting just
   under the bar.
 
+  **`splice_external_sites` closes the fact that the repair is CDS-LOCAL.**
+  It only ever sees the coding sequence, so on its own it cannot ask whether
+  a weakened site still PAIRS with a partner outside the CDS — and on a real
+  construct that left a cryptic acceptor under its own bar, still paired with
+  the genuine upstream donor, with the whole 5' end of the CDS excisable.
+  Pass the flanking sites as `[{kind, offset, score}]` — `offset` relative to
+  the CDS START, negative upstream, all three exactly as `scan-splice-sites`
+  reports them — and such a site becomes repairable **even when its own score
+  is under the bar**, because a guard alone cannot fix a site nothing targets.
+  A CDS that scans CLEAN is checked against the list too: skipping it there
+  made the parameter inert on precisely the construct it exists for (an
+  in-CDS acceptor at 2.642 against a 4.439 bar, combined 8.471 over the 8.205
+  gate, able to excise the first 48 codons). The list is validated whichever
+  way the request is shaped, and passing it without `scrub_splice_sites`
+  earns a warning saying it had no effect.
+
+  When a site still pairs with one of them and **no synonym can remove it**,
+  `splice.n_sites_paired_outside_the_cds` and
+  `splice.sites_paired_outside_the_cds` say so, each entry stamped
+  `externally_paired` with the combined score, plus a warning — and the
+  "scan found nothing" all-clear is withheld. Neither `splice.sites` nor
+  `splice.pairs` can show such a survivor: the first scans at the reporting
+  bar and the site is under it, the second needs BOTH ends inside the CDS.
+  Both keys are present whenever you pass `splice_external_sites`, so a `0`
+  is a measurement rather than a default.
+
   **A `three_prime` block comes back beside `splice`,** scanning the FINAL
   coding sequence for regions a plant would read as the END of the message.
   The two hazards fail identically — the transcript is truncated or spliced,
@@ -1218,6 +1244,37 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   CDSs each with a target strength — context-aware RBS design + an
   element layout + per-gene achieved-vs-target report). DNA `T` read as
   `U`; ambiguous / over-length / bad input → 400.
+- **assemble-expression-cassette** — the EUKARYOTIC (plant nuclear)
+  counterpart to `assemble-operon`. Stacks promoter / 5'UTR / intron /
+  signal peptide / CDS / C-tag / terminator in that fixed order and
+  answers the four things a nuclear transcription unit gets wrong that
+  an operon does not: **frame** across the signal-peptide→CDS→C-tag ORF
+  (a part whose length is not a multiple of 3 frameshifts everything
+  after it — silent in a plasmid map, fatal in planta), **motif
+  hygiene** by synonymous rewrite of the coding block only, **Type IIS
+  scar compatibility** across the part chain, and **internal repeats**.
+  `layout` tiles the sequence with no gap or overlap, the same contract
+  `assemble-operon` guarantees. Scrubbing requires a translation — pass
+  `codon_table` plus either `protein` or a coding block of length % 3 ==
+  0 — otherwise it is SKIPPED with a warning rather than rewriting
+  against a guessed frame. A motif in a promoter or terminator is
+  reported as a residual, never edited: those parts have no synonymous
+  representation. Cryptic splice sites are SCORED against the trained
+  plant PWMs, never regexed, and reported rather than auto-edited.
+- **scan-repeats** — long internal DIRECT and INVERTED repeats in one
+  molecule. Body: `{sequence | id | name, min_length?=100, exclude?,
+  limit?}`; each hit `{kind, length, positions, seq_head}` where
+  `length` is the MAXIMAL run and one repeat is one finding. Distinct
+  from `lint-synthesis`' repeat screen, which covers only TANDEM repeats
+  with a unit of ≤4 bases repeated ≥5 times (microsatellites — a
+  synthesis-vendor concern): two copies of the same 250 bp terminator,
+  or a head-to-head duplicated promoter, are invisible to it. A direct
+  repeat recombines out the intervening DNA; an inverted one folds into
+  the hairpin that seeds silencing — and a clonally-propagated host
+  cannot segregate either away. `min_length` is floored at 20 because
+  shorter k-mers recur by chance in any sequence, and capped at 200 kb
+  of input. `exclude` drops a hit only when BOTH copies sit inside
+  excluded spans.
 - **HMM databases** — list / get / set-active / delete / add /
   download-hmm-database (the registry that backs hmmscan). `add`
   registers a custom `.hmm.gz` URL (mirrors the GUI "Add" form);

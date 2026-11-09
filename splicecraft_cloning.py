@@ -2471,17 +2471,38 @@ def _annotate_scars_on_product(
         # i+1` in forward, the reverse equivalent is `insert (n - i)
         # ↔ insert (n - i - 1)` with swapped enzymes.
         if internal_junctions:
-            # Walk forward chain junctions backwards.
-            for jf in reversed(internal_junctions):
+            # Walk forward chain junctions backwards. Index k of this walk is
+            # the k-th junction of the RC'd chain, because `internal_junctions`
+            # is in forward order and the RC chain runs the inserts backwards.
+            #
+            # **Position is accumulated from the RC'd fragments, not derived
+            # from the forward one.** `forward_chain_len - pos_in_chain`
+            # assumes the RC'd chain maps onto the forward chain base for
+            # base; it does not, because `_rc_fragment` moves overhang bases
+            # between `top_seq` and the bottom strand whenever a fragment's
+            # two ends differ in overhang GEOMETRY (5' vs 3' vs blunt) — i.e.
+            # on every directional insert. Measured offsets were -8 / +8 / ±4
+            # for the 5'/3', 3'/5' and blunt-mixed combinations (audit
+            # 2026-11-09).
+            #
+            # It mattered twice over: the light-blue overhang `misc_feature`
+            # named the wrong four bases, and `_classify_junction` reads a
+            # ±6 bp window centred on this same `pos`, so the
+            # re-cuttable-vs-scar VERDICT was computed on a shifted window —
+            # 72 of 96 reverse-orientation two-insert products reported an
+            # intact, uniquely-cuttable internal junction as a destroyed
+            # scar. That is the `[INV-190]` symptom, which was fixed for the
+            # vector<->insert junction and left here on the old arithmetic.
+            rc_order = list(reversed(insert_frags))
+            run = 0
+            for k, jf in enumerate(reversed(internal_junctions)):
+                run += len(_rc_fragment(rc_order[k]).get("top_seq", "") or "")
                 out.append({
                     "label":     jf["label"] + " (reverse)",
                     # Enzymes swap because chain is RC'd
                     "left_enz":  jf["right_enz"],
                     "right_enz": jf["left_enz"],
-                    "pos":       vec_len + (sum(
-                        len(f.get("top_seq", ""))
-                        for f in insert_frags
-                    ) - jf["pos_in_chain"]),
+                    "pos":       vec_len + run,
                 })
         # Closing junction (chain last → vec). chain_last was
         # insert_frags[0] in original order.
@@ -3585,6 +3606,7 @@ def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
                           enzyme: str = _SCRUB_GB_ENZYME,
                           part_features: "list[list[dict]] | None" = None,
                           vector_features: "list[dict] | None" = None,
+                          part_circular: "list[bool] | None" = None,
                           ) -> dict:
     """Simulate a Golden Gate / MoClo (Type IIS) one-pot assembly.
 
@@ -3636,20 +3658,74 @@ def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
         return {"ok": False, "errors": ["no parts supplied"], "warnings": []}
 
     part_feats = list(part_features or [])
+    part_circ = list(part_circular or [])
     part_frags: list[dict] = []
+    parts_released: "list[dict]" = []
     for i, ps in enumerate(part_seqs):
+        ps_u = (ps or "").upper()
+        is_circ = bool(part_circ[i]) if i < len(part_circ) else False
         try:
             bodies = _gg_released_bodies(
-                (ps or "").upper(), enzyme, circular=False,
+                ps_u, enzyme, circular=is_circ,
                 features=(part_feats[i] if i < len(part_feats) else None))
         except Exception as exc:               # pragma: no cover - defensive
             return {"ok": False, "warnings": [],
                     "errors": [f"part {i + 1}: digest failed: {exc}"]}
         if len(bodies) != 1:
+            # A declared-CIRCULAR part cut twice releases two two-cut pieces —
+            # the cassette and the backbone — and which one is the part cannot
+            # be read off the sequence. Refuse by NAME, with both candidates,
+            # rather than resolve it by size: "never assume the smaller
+            # fragment is the payload" is a standing invariant here, and
+            # `make-l0-part-from-fragment` already refuses this same input for
+            # the same reason.
+            if is_circ and len(bodies) == 2:
+                return {"ok": False, "warnings": [], "errors": [
+                    f"part {i + 1} is circular and {enzyme} releases TWO "
+                    f"fragments from it ("
+                    + " and ".join(
+                        f"{len(b.get('top_seq') or '')} bp "
+                        f"{(b.get('left') or {}).get('overhang_seq') or 'blunt'}"
+                        f"→"
+                        f"{(b.get('right') or {}).get('overhang_seq') or 'blunt'}"
+                        for b in bodies)
+                    + "), so which one is the part is ambiguous — excise it "
+                      "first and pass the linear fragment."]}
             return {"ok": False, "warnings": [], "errors": [
                 f"part {i + 1} released {len(bodies)} fragment(s) when cut "
                 f"with {enzyme} (expected exactly 1 between two {enzyme} "
                 f"sites — check the part's flanking sites / orientation)."]}
+        # **Say what was actually released from each part.** The default
+        # topology is LINEAR and is deliberately NOT being changed
+        # (`[INV-215]`: label the fiction, don't move the default) — but the
+        # wrong reading used to be SILENT. When a circular part plasmid's
+        # cassette spans bp 0, the two-cut piece IS THE BACKBONE and the
+        # part's own two halves become the discarded end stubs; `len(bodies)
+        # != 1` never fires, so the simulation returned `ok: true` with a
+        # product that does not contain the part, and the response was
+        # byte-identical to the correct case apart from its length. Measured:
+        # 5 of 9 rotations of one pUPD2-like L0 plasmid (audit 2026-11-09).
+        # `carry_annotations` on the agent endpoint REQUIRES a saved library
+        # entry's verbatim sequence — i.e. a circular plasmid — so this is a
+        # normal input shape, and `make-l0-part-from-fragment` already
+        # refuses it by name for exactly this reason.
+        #
+        # There is no sequence-only way to tell a linear fragment from a
+        # plasmid here, and that was MEASURED rather than assumed: read as a
+        # circle, every shape — bare cassette, flanked synthesis fragment,
+        # and plasmid at either rotation — releases exactly two two-cut
+        # bodies, and the linear read always takes the first. So this reports
+        # the fact instead of guessing, and a caller who knows the topology
+        # passes `part_circular`.
+        _lb = bodies[0]
+        parts_released.append({
+            "part":     i + 1,
+            "topology": "circular" if is_circ else "linear",
+            "length":   len(_lb.get("top_seq") or ""),
+            "oh5":      (_lb.get("left") or {}).get("overhang_seq") or "",
+            "oh3":      (_lb.get("right") or {}).get("overhang_seq") or "",
+            "input_bp": len(ps_u),
+        })
         part_frags.append(bodies[0])
 
     vec_seq_u = (vector_seq or "").upper()
@@ -3828,6 +3904,13 @@ def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
         "features":        prod_feats,
         "circular":        True,
         "n_parts":         len(part_frags),
+        # WHAT WAS RELEASED from each part, and under which topology. A part
+        # supplied as a circular plasmid whose cassette spans bp 0 releases
+        # its BACKBONE instead of the part, and the rest of this response
+        # cannot tell you that happened — `ok` is true, `n_parts` is 1 and the
+        # warnings are identical to the correct case. These rows are how a
+        # caller sees it (audit 2026-11-09). See `part_circular`.
+        "parts_released":  parts_released,
         "enzyme":          enzyme,
         "order":           [f.get("source_label") or f"frag{i}"
                             for i, f in enumerate(chain)],
@@ -4735,15 +4818,15 @@ def _clone_syn_fragment_into_entry_vector(
     # extra site: any number of survivors ligate end to end.
     want = (insert["left"].get("overhang_seq", ""),
             insert["right"].get("overhang_seq", ""))
-    keep = [p for p in vpieces
-            if (p["left"].get("overhang_seq", ""),
-                p["right"].get("overhang_seq", "")) != want]
-    if len(keep) == len(vpieces):
+    drop_idxs = [i for i, p in enumerate(vpieces)
+                 if (p["left"].get("overhang_seq", ""),
+                     p["right"].get("overhang_seq", "")) == want]
+    if not drop_idxs:
         raise ValueError(
             f"the insert's {want[0]}/{want[1]} overhangs match nothing the "
             f"vector releases — wrong entry vector for this grammar, or the "
             f"fragment was built against a different one.")
-    if not keep:
+    if len(drop_idxs) == len(vpieces):
         # Every piece looked like the dropout, which only happens on a
         # degenerate vector whose two cuts leave the SAME overhang on both
         # ends. Ligating nothing would close the insert on itself and report a
@@ -4752,8 +4835,37 @@ def _clone_syn_fragment_into_entry_vector(
             f"the entry vector leaves {want[0]}/{want[1]} at both cuts, so "
             f"nothing survives as a backbone — it can't take a directional "
             f"insert.")
+    if len(drop_idxs) > 1:
+        # More than one piece presents the insert's overhang pair, so which
+        # one is the dropout is genuinely ambiguous. Refuse BY NAME rather
+        # than taking the first (or, as before, dropping them all and
+        # assembling a vector that is missing a chunk) — the same rule
+        # `_pick_linear_ligatable_fragment` follows, and the reason
+        # "never assume the smaller fragment is the payload" is a standing
+        # invariant here.
+        raise ValueError(
+            f"the entry vector releases {len(drop_idxs)} pieces that all "
+            f"present {want[0]}/{want[1]} (lengths "
+            f"{', '.join(str(len(vpieces[i]['top_seq'])) for i in drop_idxs)} "
+            f"bp), so which one is the dropout is ambiguous — re-cut the "
+            f"vector with a grammar whose slot is unique, or remove the "
+            f"extra {enzyme} site.")
+    # **Circular order, starting AFTER the dropout** — not the order the
+    # digest happened to list the survivors in. `vpieces` is in cut order
+    # around the molecule, so a filtered list only ligates end-to-end when
+    # the dropout happens to sit first; at other ROTATIONS of the very same
+    # plasmid the survivors arrive out of order and `_ligate_fragments`
+    # refuses, reported as "check that the fragment and vector share a
+    # grammar" — a misdiagnosis of a vector that assembles fine. Measured on
+    # a 4-site entry vector of the shape `[INV-232]`'s field report names:
+    # 20 of 36 rotations refused (audit 2026-11-09). The hub's sibling
+    # `_clone_part_build_backbone_chain` already walked the circle this way;
+    # this copy did not, and the docstring above claimed the hub's behaviour.
+    dropout_idx = drop_idxs[0]
+    n_pieces = len(vpieces)
     chain = insert
-    for p in keep:
+    for step in range(1, n_pieces):
+        p = vpieces[(dropout_idx + step) % n_pieces]
         merged = _ligate_fragments(chain, p)
         if merged is None:
             raise ValueError(

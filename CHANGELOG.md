@@ -14,6 +14,193 @@
 
 ---
 
+## [Unreleased]
+
+### Bug fixes
+
+- **A plasmid you added could vanish if you renamed its collection a moment
+  later.** The library file is written immediately and mirrored into its
+  collection a beat afterwards, in the background. A rename, delete or data
+  import was supposed to flush that pending mirror first — but it only looked
+  for one still *waiting*, not one the background writer had already picked up
+  and was holding. In that window the rename went ahead, the mirror was then
+  discarded as an orphan, and the marker protecting the newer library file was
+  cleared with it. The next launch rebuilt the library from the collection and
+  the added plasmid was gone, with no warning and nothing in the recovery
+  folder. Measured on the real add-then-rename flow. The same window let a
+  *migrate-archive import* finish and then have this machine's old library
+  written into the freshly imported collection of the same name.
+- **A background mirror could overwrite a newer save after a data import or a
+  restore.** The mirror is meant to write the current library, never the
+  snapshot it captured when it was queued. That rule quietly inverted whenever
+  the in-memory library had been cleared — which is exactly what an import, a
+  restore-from-backup or a Master Delete does — and the stale snapshot won. A
+  collection that had just been saved holding one plasmid came back holding a
+  different, older one.
+- **An interrupted data import could leave half of one generation and half of
+  another, and report success.** The all-or-nothing restore staged and verified
+  every file, then replaced them one at a time and *continued past a failure*,
+  never flagging that it had aborted. The plasmid library and the collections
+  file are two halves of one record, so a partial is not "most of the restore":
+  the next launch resolves the mismatch by discarding the half that landed.
+  Reproduced with the library replaced, the collections file failing, and the
+  imported plasmids gone at the next start. Any failure now puts every file
+  back and says `aborted`.
+- **Golden Gate could assemble a part's backbone instead of the part, and call
+  it a success.** Parts were always cut as if they were linear fragments. Hand
+  it a whole circular part plasmid whose cassette happens to span the origin
+  and the piece released between the two sites *is the backbone* — the part's
+  own halves are thrown away. The result still said `ok`, still said "1 part",
+  and its only warning was identical to the correct case; nothing but the
+  product length gave it away. 5 of 9 rotations of one real-shaped L0 plasmid
+  were wrong. The result now reports what each part actually released, with its
+  overhang pair and the topology it was read as, and you can declare a part
+  circular — in which case an ambiguous two-piece digest is refused by name
+  rather than one piece being picked by size.
+- **Cloning the same entry vector could be refused depending on how the file
+  happened to be rotated.** With more than two sites in the vector — the shape
+  the α/Ω acceptors in daily use actually have — the surviving backbone pieces
+  were joined in the order the digest listed them rather than in the order they
+  sit around the circle. 20 of 36 rotations of one four-site vector were turned
+  away with "check that the fragment and vector share a grammar", a
+  misdiagnosis of a vector that assembles perfectly well.
+- **A reverse-orientation multi-insert clone reported an intact restriction
+  site as a destroyed one.** The internal junction between two inserts was
+  placed 4–8 bases off whenever an insert's two ends left different kinds of
+  overhang, which is every directional insert. The overhang label named the
+  wrong four bases, and — worse — the re-cuttable-or-scar verdict was decided
+  from that shifted position. Every enzyme pair tested called a uniquely
+  cuttable internal junction a scar, while the *forward* orientation of the
+  same construct correctly called it re-cuttable. That is exactly the answer
+  you use to plan a diagnostic digest.
+- **A feature annotated as spanning the whole circle read as zero bases long,
+  and was deleted outright when the plasmid was edited.** A location that
+  travels right around the molecule and back to where it started cannot be
+  described by a start/end pair, so the exon list is the only record of it —
+  and that list was being thrown away precisely there. Such a feature showed
+  as 0 bp on the map, rode onto every clone as an empty marker, and vanished
+  on any edit that rebuilt the record. Affected whole-circle coding sequences
+  and any spliced whole-circle feature of any type. Files on disk were never
+  altered.
+- **An unparseable volume in a robot normalisation was treated as "not
+  supplied".** `{"final_volume": "50 uL"}` silently dropped the dilution step
+  and returned per-sample volumes only, with no diluent and no warning — and a
+  `true` passed as a target mass became 1 ng, slipping past the engine's own
+  refusal to accept a flag as a number. These volumes drive a real pipetting
+  run. Both are now refused, naming the key; a plain numeric string still
+  works, and an explicit resolution of 0 is no longer swapped for the default.
+- **`get-part` and `get-experiment` answered from the active bin or project and
+  ignored the one you asked for.** Their `list-` siblings have always taken a
+  `bin` / `project` selector; these two dropped it in silence. Since parts are
+  keyed by name *per bin*, asking for a part in one bin returned a different
+  part of the same name from another, at HTTP 200. Both now honour the
+  selector, echo it back, and say which container they looked in when they find
+  nothing.
+- **A flag passed where a threshold belonged became a 1.0 cutoff instead of an
+  error.** Twelve parameters across ten endpoints took `true`/`false` as a
+  number. The sharpest was clone verification: `{"min_identity": true}` set a
+  1 % identity bar, so reads from an unrelated plasmid came back as a match —
+  from the endpoint whose entire job is "did my clone work". A promoter scan
+  given `false` reported 6,000 promoters in 3 kb of random DNA, against 0 at
+  the default. All twelve are refused now; real numbers and numeric strings are
+  unaffected.
+- **A hazard straddling the origin was reported ending past the end of the
+  molecule.** The synthesis pre-flight scans across the origin correctly but
+  gave a homopolymer or repeat that wraps an end coordinate outside the
+  sequence, so anything slicing that span got half the hazard.
+- **The merged name on a shared cut flipped depending on what had been looked
+  at before.** Two enzymes cutting the same bond are reported as one combined
+  label, built in whatever order the caller listed them — while the cache that
+  answers the second lookup ignores that order. The label is now always sorted,
+  so a digest describes itself the same way every time.
+- **A disk-full backup rotation was reported as a permissions problem.** The
+  save correctly refused and the previous file was never at risk, but the
+  message told the user to fix a read error that had not happened.
+
+- **The flanking-splice-site list did nothing on a coding sequence that
+  scanned clean — which is the exact case it was written for.** The splice
+  repair opened with a shortcut: nothing at the reporting bar, nothing to do.
+  But a site that needs `splice_external_sites` to become repairable is
+  *below* that bar by definition — that is why it needs a partner to be worth
+  repairing at all. So a CDS reporting zero cryptic sites, with an acceptor
+  inside it still pairing with the real upstream donor strongly enough to
+  excise the start of the protein, came back untouched, with no fix and no
+  warning, and the change had to be made by hand. Measured on a real plant
+  construct: an in-CDS acceptor scoring 2.642 against a 4.439 bar, combined
+  8.471 over the 8.205 pair gate, able to remove the first 48 codons. The
+  repair now reaches it, and picks the same single synonymous base change a
+  careful human did.
+- **A flanking pair that no synonymous codon could break disappeared from the
+  report.** Such a site scores below the reporting bar, so the site list could
+  not show it, and pair detection needs both ends inside the coding sequence,
+  so that could not either — leaving a response identical to a clean one,
+  all-clear warning included. `optimize-protein` now reports
+  `splice.n_sites_paired_outside_the_cds` and
+  `splice.sites_paired_outside_the_cds` (each with the combined score)
+  whenever you pass `splice_external_sites`, warns when one survives, and
+  withholds the "scan found nothing" all-clear while a pair is still live.
+  A `0` there is a measurement, not a default.
+- **A list of flanking splice sites passed without asking for the repair was
+  accepted, ignored, and never mentioned.** `splice_external_sites` only ever
+  feeds the splice repair's acceptance test, but it was checked only when the
+  repair happened to be switched on — so passing it with
+  `scrub_splice_sites` off did nothing, said nothing, and accepted malformed
+  entries without complaint. It is now validated whichever way the request is
+  shaped, and supplying it without a repair earns a warning saying it had no
+  effect and what to pass instead. The endpoint and the repair now share one
+  validator, so the two cannot drift apart.
+- **A splice margin asked for with the scan switched off also did nothing
+  silently.** Checked straight after the above, because the two parameters
+  have the same shape — an effect that lives behind another parameter.
+  `splice_margin` turned out to be half right: a malformed value was always
+  rejected, which is the half that matters, but a valid one passed with
+  `check_splice: false` quietly had no effect. It now says so. It is *not*
+  inert when the scan runs without a repair — it lowers the reporting bar
+  then, which is a supported use and stays unremarked.
+
+
+### New features
+
+- **`scan-repeats`** — find long internal direct *and* inverted repeats in a
+  construct. The existing pre-flight only looked for short tandem repeats
+  (microsatellites, a synthesis-vendor concern); two copies of the same 250 bp
+  terminator, or a promoter duplicated head-to-head, were invisible to every
+  reachable check. A direct repeat recombines out the DNA between its copies
+  and an inverted one folds into the hairpin that seeds silencing, so in a
+  clonally-propagated host neither can be bred out. One repeat is one finding,
+  reported at its real length.
+- **`assemble-expression-cassette`** — the eukaryotic counterpart to the
+  bacterial operon assembler, which was written and tested but had no way to
+  reach it. Stacks promoter / 5'UTR / intron / signal peptide / CDS / C-tag /
+  terminator and answers frame across the signal-peptide→CDS→tag reading frame,
+  motif hygiene by synonymous rewrite of the coding block only, Type IIS scar
+  compatibility, and internal repeats.
+- **Three Settings toggles are now readable and writable from the API** —
+  the ASCII plasmid map (the fallback for a terminal that cannot draw the
+  braille map), button tooltips, and the sequence-panel height. A human could
+  change all three and an agent could not even see them.
+- **`simulate-golden-gate` takes `part_circular`** and reports
+  `parts_released`, so what each part gave up is visible rather than inferred.
+
+### Hardening
+
+- **Pruning the data directory no longer works from an unauthorised process.**
+  The write chokepoint has always refused a save from an ad-hoc script; the
+  *deleters* were not covered, although the guard for them existed and its own
+  notes described this exact risk. One call could compress and prune every
+  file's backup rotation, prune the crash-recovery folder, quarantine stored
+  sequences and permanently delete already-quarantined ones — the recovery
+  chain that has saved real data before. All eight pruners are now gated.
+- A legacy backup file saved with a byte-order mark is now readable. It was the
+  one reader in the recovery chain that rejected one, so a perfectly good
+  backup was skipped — and with the rotation pruned it would have been the last
+  copy.
+- **Clicking a sequencing results archive no longer freezes the app.** The
+  whole run was parsed on the UI thread: a quarter of a second for a small run,
+  and 14 seconds for a 26 MB one — five per cent of the size the reader
+  accepts — with no repaint and no progress shown. It now parses in the
+  background behind a status line, and a second click supersedes the first.
+
 ## [1.3.18] — 2026-11-08
 
 A cryptic splice pair that would delete the coding sequence is no longer

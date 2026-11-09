@@ -1,6 +1,6 @@
 # The endpoint surface, organised by job
 
-301 endpoints as of SpliceCraft 1.3.16. **`splicecraft-cli tools --json` is
+303 endpoints as of SpliceCraft 1.3.19. **`splicecraft-cli tools --json` is
 always authoritative** — this file helps you find the right name and warns you
 about the sharp edges; the endpoint's own `doc_full` is the contract.
 
@@ -230,8 +230,8 @@ Preview → commit: `simulate-golden-gate`→`golden-gate-assemble` ·
 Pipeline: `design-gb-part` `design-synthesis-fragment` `domesticate-part`
 `domesticate-parts` `make-l0-part-from-fragment` `assemble-into-entry-vector`
 `classify-part` `auto-detect-entry-vectors` `check-acceptor-vector`
-`scrub-plasmid` `lint-synthesis`
-`assemble-operon` `simulate-pcr` `pcr-program`
+`scrub-plasmid` `lint-synthesis` `scan-repeats`
+`assemble-operon` `assemble-expression-cassette` `simulate-pcr` `pcr-program`
 
 Entry vectors / grammars / parts bins: `list-entry-vectors` `get-entry-vector`
 `set-entry-vector` `clear-entry-vectors-for-grammar` `list-grammars`
@@ -266,6 +266,32 @@ Entry vectors / grammars / parts bins: `list-entry-vectors` `get-entry-vector`
   supposed to carry the assembly enzyme's sites — exactly two — so naming them
   as forbidden scores a working acceptor near zero, which is literally correct
   and backwards.
+- `scan-repeats` finds long internal DIRECT and INVERTED repeats (default
+  `min_length` 100, floor 20 — below that k-mers recur by chance). This is NOT
+  what `lint-synthesis` screens: that one reports only TANDEM repeats with a
+  unit of at most 4 bases repeated 5+ times, i.e. microsatellites, a synthesis-
+  vendor problem. Two copies of the same 250 bp terminator, or a promoter
+  duplicated head-to-head, are invisible to it. A direct repeat recombines out
+  the DNA between its copies and an inverted one folds into the hairpin that
+  seeds silencing, so in a clonally-propagated host neither can be segregated
+  away. One repeat is ONE finding, at its maximal length.
+- `assemble-expression-cassette` is the EUKARYOTIC counterpart to
+  `assemble-operon`: it stacks promoter / 5'UTR / intron / signal peptide / CDS
+  / C-tag / terminator and answers the four things that make a nuclear TU
+  different — frame across the signal-peptide→CDS→tag ORF, motif hygiene by
+  synonymous rewrite (coding block ONLY), Type IIS scar compatibility, and
+  internal repeats. `layout` tiles the sequence with no gap or overlap, same
+  contract as `assemble-operon`. Scrubbing needs a translation: pass
+  `codon_table` plus either `protein` or a coding block whose length is a
+  multiple of 3, or the scrub is SKIPPED with a warning rather than the
+  sequence being rewritten against a guessed frame.
+- `simulate-golden-gate` reports `result.parts_released` — what each part
+  actually gave up, with its overhang pair and the topology it was read as.
+  Parts are digested as LINEAR fragments unless you pass `part_circular`. That
+  matters: a part handed over as a whole circular PLASMID whose cassette spans
+  bp 0 releases its BACKBONE as the "part", and `ok` is still true. There is no
+  way to tell a fragment from a plasmid from the bases alone, so check
+  `parts_released` or declare the topology.
 - `check-acceptor-vector` answers "is this plasmid a usable acceptor for this
   grammar": sites per enzyme, which fragment is the stuffer and what overhangs
   it presents, the detected α/Ω role (**with the reason when detection fails**),
@@ -339,7 +365,13 @@ shifts, every feature keeps its coordinates, and it's undoable.
 - `optimize-protein` takes `splice_external_sites` ([{kind, offset, score}],
   offset relative to the CDS start, negative upstream) so the splice repair
   can see partners outside the CDS. Without it a weakened site can stay
-  paired with the real upstream donor and still excise the CDS.
+  paired with the real upstream donor and still excise the CDS. **Pass it
+  even when the CDS scans clean** — a site that needs it is BELOW the
+  reporting bar by definition, so "0 sites" does not mean there is nothing
+  to repair. If one survives, read
+  `splice.n_sites_paired_outside_the_cds` / `sites_paired_outside_the_cds`:
+  nothing else in the response can show it, and only the non-coding end is
+  left to change.
 - `splice-model` / `scan-splice-sites` are the model's own doors — the latter
   scores a bare transcribed sequence (`margin`, explicit thresholds,
   `annotated_edges` to mark real intron boundaries). For a unit on a loaded

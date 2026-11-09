@@ -15,7 +15,15 @@
     "Baselines were measured 2026-05-17 on WSL2 Ubuntu 24.04 / Python 3.12",
     "with the suite already warm. Ceilings carry 3-5x headroom over the",
     "measured best-of-5 so machine-to-machine variance doesn't trip the",
-    "gate."
+    "gate.",
+    "",
+    "2026-11-09: the gate covered 6 operations, so the digest, the codon",
+    "optimizer, the scanners, the GenBank readers/writers and the data",
+    "layer could all regress silently (audit [INV-234]). 13 added below,",
+    "measured best-of-5 on Linux 7.0 / Python 3.14 with the machine quiet,",
+    "ceilings at ~4x per the headroom rule above. Each one CLEARS the LRU",
+    "it would otherwise hit \u2014 an uncleared `_ENZYME_CUTS_CACHE` made the",
+    "digest measure 0.01 ms, i.e. nothing at all."
   ],
   "operations": {
     "scan_restriction_sites_puc19": {
@@ -37,7 +45,7 @@
       "warmup_iterations": 3
     },
     "iupac_pattern_warm_200": {
-      "description": "_iupac_pattern lookup × 200 with a warm cache",
+      "description": "_iupac_pattern lookup \u00d7 200 with a warm cache",
       "budget_ms": 5,
       "samples": 10,
       "warmup_iterations": 3
@@ -53,6 +61,84 @@
       "budget_ms": 200,
       "samples": 3,
       "warmup_iterations": 1
+    },
+    "digest_with_enzymes_50kb": {
+      "description": "_digest_with_enzymes: 50 kb circular, 6 enzymes, 100 features carried onto the fragments, cold `_ENZYME_CUTS_CACHE`. The core cloning primitive, including the intron-aware feature carry.",
+      "budget_ms": 10,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "record_to_gb_text_100kb": {
+      "description": "_record_to_gb_text on 100 kb with 500 features \u2014 the save/export path.",
+      "budget_ms": 30,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "gb_text_to_record_100kb": {
+      "description": "_gb_text_to_record on 100 kb / 500-feature GenBank text, cold `_GB_PARSE_CACHE`. Every library load goes through this.",
+      "budget_ms": 25,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "insdc_parse_genbank_100kb": {
+      "description": "splicecraft_insdc.parse_genbank on 100 kb / 500 features \u2014 SpliceCraft's own GenBank reader, the one every door reads through ([INV-219]).",
+      "budget_ms": 20,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "codon_optimize_500aa": {
+      "description": "_codon_optimize on a 500-residue protein against a 64-codon table. Mission-critical; cheap, and a regression here would be felt in every synthesis design.",
+      "budget_ms": 2,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "splice_scan_5kb": {
+      "description": "_splice_scan on 5 kb, both strands \u2014 the trained plant donor/acceptor PWMs.",
+      "budget_ms": 10,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "codon_fix_splice_sites_300aa": {
+      "description": "_codon_fix_splice_sites on a 300-residue CDS whose fixture genuinely needs TWO synonymous repairs, so this gates the repair loop and not just the scan. (A first draft set the ceiling from a probe that had warmed state the test does not have, and measured 0.40 ms for what is really ~3.7 ms \u2014 measure through the test's own path.)",
+      "budget_ms": 15,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "scan_promoters_10kb": {
+      "description": "_scan_promoters (sigma70 -35 / spacer / -10) on 10 kb, both strands.",
+      "budget_ms": 175,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "scan_terminators_5kb": {
+      "description": "_scan_terminators on 5 kb \u2014 folds a hairpin per U-tract candidate (Turner NN), so it is the heaviest scanner per base. Linear in length with a large constant.",
+      "budget_ms": 300,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "cassette_internal_repeats_10kb": {
+      "description": "_cassette_internal_repeats on 10 kb at min_len 100 \u2014 direct AND inverted, indexes every k-mer then walks the reverse complement. Backs the scan-repeats endpoint.",
+      "budget_ms": 30,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "find_orfs_50kb": {
+      "description": "_find_orfs six-frame on 50 kb circular.",
+      "budget_ms": 75,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "typed_clone_library_1000": {
+      "description": "_typed_clone of a 1,000-entry library with 12 features each \u2014 the deep-clone-on-read that sacred #17 requires on every `_load_X()`. `_iter_X_readonly()` exists to avoid it on hot read paths; this gates the cost when it IS paid.",
+      "budget_ms": 85,
+      "samples": 5,
+      "warmup_iterations": 2
+    },
+    "plasmid_map_load_record_2000_feats": {
+      "description": "PlasmidMap.load_record on 20 kb with 2,000 features. Cost tracks FEATURE COUNT, not bp ([INV-223]); this is the repaint tail shared by undo, redo and flip.",
+      "budget_ms": 30,
+      "samples": 5,
+      "warmup_iterations": 2
     }
   }
 }

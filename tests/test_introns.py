@@ -777,3 +777,112 @@ def test_slotting_thousands_of_features_into_thousands_of_cuts_is_fast():
     # Every gene crosses exactly one cut: two pieces each.
     assert sum(len(v) for v in out.values()) == 4000
     assert dt < 1.0, f"{dt:.2f} s"                   # was 4.5 s
+
+
+# ── A lapping traversal must keep its parts (audit 2026-11-09) ──────────────
+# `_feat_spans` decides whether to carry `parts` by comparing the exonic sum
+# against `_span_len_wrapaware(start, end, total)`. When the traversal LAPS the
+# circle the bounds come back as `(k, k)`, that span is 0, `exonic < 0` can
+# never hold, and `parts` was dropped — in the one case where the bounds pair
+# describes nothing. Downstream, `_feature_location_for_dict` rebuilds from
+# `parts` and returns None for a (k, k) pair, so the feature was DELETED.
+#
+# The existing `test_a_whole_molecule_join_reads_as_the_whole_molecule` missed
+# it because `_traversal_bounds` normalises a CONTIGUOUS, NON-CDS whole-lap to
+# (0, total) — so the three types it parametrizes never reach the (k, k) path.
+# A CDS does (its start is its reading frame, deliberately kept), and so does
+# any SPLICED lap of any type (the rescue requires `sum(parts) == total`).
+
+def _lap_feature(parts, ftype, total):
+    from Bio.SeqFeature import CompoundLocation, SeqFeature, SimpleLocation
+    locs = [SimpleLocation(a, b, strand=1) for a, b in parts]
+    return SeqFeature(CompoundLocation(locs), type=ftype,
+                      qualifiers={"label": ["lap"]})
+
+
+@pytest.mark.parametrize("ftype", ["CDS", "misc_feature"])
+@pytest.mark.parametrize("parts,exonic", [
+    ([(120, 240), (0, 120)], 240),            # contiguous whole lap
+    ([(99, 150), (179, 240), (0, 99)], 211),  # SPLICED whole lap
+], ids=["contiguous", "spliced"])
+def test_a_lapping_feature_keeps_its_parts(ftype, parts, exonic):
+    total = 240
+    f = _lap_feature(parts, ftype, total)
+    s, e, strand, got = su._feat_spans(f, total, circular=True)
+    if s == e:
+        # The (k, k) path — the one that used to drop `parts`.
+        assert got is not None, (
+            f"parts dropped for a lapping {ftype}: bounds ({s}, {e}) describe "
+            f"a ZERO-length feature, so they are the only description left")
+        assert sum(b - a for a, b in got) == exonic
+    else:
+        # `_traversal_bounds` normalised it to (0, total); then the bounds DO
+        # say everything and `parts` is correctly absent.
+        assert (s, e) == (0, total)
+
+
+@pytest.mark.parametrize("ftype", ["CDS", "misc_feature"])
+@pytest.mark.parametrize("parts,exonic", [
+    ([(120, 240), (0, 120)], 240),
+    ([(99, 150), (179, 240), (0, 99)], 211),
+], ids=["contiguous", "spliced"])
+def test_a_lapping_feature_survives_the_rebuild(ftype, parts, exonic):
+    """The consequence that mattered: rebuilding the dict used to return None,
+    i.e. delete the feature. It must come back extracting the same bases
+    Biopython extracts."""
+    from Bio.Seq import Seq
+    from Bio.SeqFeature import SeqFeature
+    total = 240
+    seq = Seq("".join("ACGT"[(i * 7 + i // 4) % 4] for i in range(total)))
+    f = _lap_feature(parts, ftype, total)
+    want = len(f.extract(seq))
+    assert want == exonic, "fixture premise"
+    s, e, strand, got = su._feat_spans(f, total, circular=True)
+    fd = {"start": s, "end": e, "strand": strand, "type": ftype,
+          "label": "lap"}
+    if got:
+        fd["parts"] = got
+    loc = su._feature_location_for_dict(fd, total, strand)
+    assert loc is not None, "the feature was deleted on rebuild"
+    assert len(SeqFeature(loc).extract(seq)) == want
+
+
+def test_feat_dict_spans_reports_every_base_of_a_lap():
+    """`_feat_dict_spans` is the one reader for "what bases does this feature
+    cover"; for a lap it answered `[[k, k]]`, i.e. none of them."""
+    total = 240
+    f = _lap_feature([(120, 240), (0, 120)], "CDS", total)
+    s, e, strand, got = su._feat_spans(f, total, circular=True)
+    fd = {"start": s, "end": e, "strand": strand, "type": "CDS"}
+    if got:
+        fd["parts"] = got
+    covered = sum(b - a for a, b in su._feat_dict_spans(fd, total))
+    assert covered == total, f"a whole-circle CDS covered {covered} bp"
+
+
+@pytest.mark.parametrize("spans,total", [
+    ([[46, 80], [0, 46]], 80),         # a rotated whole-molecule annotation
+    ([[120, 240], [0, 120]], 240),
+])
+def test_set_spans_keeps_a_lap(spans, total):
+    """The dict-side mirror of the same blind spot. Rotating a whole-molecule
+    `[0, total)` annotation produces a lap in two spans; dropping `parts` there
+    turned the whole molecule into a 0 bp feature."""
+    fd = {"start": 0, "end": 0, "strand": 1}
+    su._feat_dict_set_spans(fd, spans, total)
+    covered = sum(b - a for a, b in su._feat_dict_spans(fd, total))
+    assert covered == sum(b - a for a, b in spans), fd
+
+
+def test_an_ordinary_spliced_feature_is_unchanged():
+    """The control: the lap branch must not alter the ordinary cases the
+    intron contract is actually about."""
+    total = 240
+    f = _lap_feature([(20, 60), (100, 140)], "CDS", total)
+    assert su._feat_spans(f, total, circular=True) == (
+        20, 140, 1, [[20, 60], [100, 140]])
+    # And a contiguous feature still reports NO parts — absent means
+    # contiguous, which is the half of the contract nothing may loosen.
+    from Bio.SeqFeature import SeqFeature, SimpleLocation
+    g = SeqFeature(SimpleLocation(10, 50, strand=1), type="CDS")
+    assert su._feat_spans(g, total, circular=True) == (10, 50, 1, None)

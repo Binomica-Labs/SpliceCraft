@@ -21,6 +21,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `analyse-read-heterogeneity` | R | Per-base ALLELE FRACTIONS from raw reads — "is this culture one thing?" |
 | `annotate-from-presets` | W | Annotate the LOADED record from the feature library and the built-in preset catalogue by exact sequence match, on both strands and across the… |
 | `apply-gff3` | W | Apply features from a sequence-less GFF3 file onto the currently-loaded record. Body: `{path}`. The GFF3 file MUST NOT carry a ##FASTA section —… |
+| `assemble-expression-cassette` | R | Assemble a EUKARYOTIC (plant nuclear) transcription unit from positional parts — the nuclear counterpart to `assemble-operon`. |
 | `assemble-into-entry-vector` | W | Assemble multiple sources into a configured Golden-Braid / MoClo acceptor — the multi-source level-up clone (L0 parts → α/L1 TU, or TUs → Ω/L2… |
 | `assemble-operon` | R | Assemble a contiguous bacterial operon from CDSs, each RBS reverse-designed (context-aware) to its target relative strength. Body: `{genes: [{cds,… |
 | `attach-experiment-image` | W | Attach a file to a lab-notebook experiment and embed a markdown reference in its body — the agent counterpart to the experiment screen's "Attach… |
@@ -42,7 +43,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `create-collection` | W | Create a new (empty) collection. Body: `{name, folder?}`. If `folder` is supplied, every importable file in that directory is bulk-imported into… |
 | `create-custom-enzyme` | W | Add a new custom enzyme. Body: `{name, site, fwd_cut, rev_cut, type?, supplier?}`. Returns 409 if `name` collides with an existing built-in OR… |
 | `create-enzyme-collection` | W | Create a new enzyme collection. Body: `{name, enzymes?: [str, ...] = []}`. Returns 409 if a collection with the same name already exists. Unknown… |
-| `create-experiment` | W | Create a new notebook entry in the active project. Body: `{title?: str = "Untitled entry", body_md?: str = "", tags?: list[str] = []}`. |
+| `create-experiment` | W | Create a new notebook entry. Body: `{title?: str = "Untitled entry", body_md?: str = "", tags?: list[str] = [], project?: str}`. |
 | `create-experiment-project` | W | Create a new (empty) experiment project. Body: `{name: str, description?: str = ""}`. Active-project pointer is NOT modified by this endpoint —… |
 | `create-feature-library` | W | Add a feature snippet to the persistent feature library. Body: see `_agent_feature_dict` for the schema. Returns 409 if a feature with the same… |
 | `create-gel` | W | Save a new gel snapshot. Body: `{name: str, lanes: list[dict], agarose_pct?: float = 1.0, notes?: str = ""}`. Routes through… |
@@ -124,7 +125,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `get-custom-labware` | R | The Opentrons `definition` for a custom labware. Body: `{name}`. Reference it from a plan's labware entry as `{"labware": name, "slot": N,… |
 | `get-entry-vector` | R | Return the entry vector for a grammar. Body: `{grammar_id}`. Includes the full `gb_text` in the response so the agent can parse + render it… |
 | `get-enzyme-collection` | R | Return one enzyme collection by `name`. Body: `{name}`. |
-| `get-experiment` | R | Fetch one notebook entry (full body + metadata) by id. Body: `{id: str}`. |
+| `get-experiment` | R | Fetch one notebook entry (full body + metadata) by id. |
 | `get-feature` | R | Detail for feature at `idx`. Returns label, type, start, end, strand, color, qualifiers (= the full SeqFeature qualifiers dict). |
 | `get-feature-colors` | R | Return the user's custom feature-type → colour overrides. Body: `{}`. |
 | `get-feature-library` | R | Fetch a feature-library entry by (name, feature_type). Body: `{name, feature_type?}`. If feature_type is omitted, matches the first entry by name.… |
@@ -260,6 +261,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `scan-3prime-risk` | R | Regions that read like a plant 3'-end — where a message would be cut. |
 | `scan-cis-elements` | R | Find curated plant cis-regulatory elements, with the chance count. |
 | `scan-promoters` | R | Scan for sigma-70 (-35 / spacer / -10) promoters. |
+| `scan-repeats` | R | Find long internal DIRECT and INVERTED repeats in one molecule. |
 | `scan-splice-sites` | R | Score every cryptic splice site in a sequence with the trained plant model, and pair them into excisable introns. |
 | `scan-tata-boxes` | R | TATA-box candidates positioned against a start site. |
 | `scan-terminators` | R | Scan for intrinsic (Rho-independent) terminators: a stem-loop followed by a U-tract. |
@@ -284,7 +286,7 @@ Regenerate with `python3 scripts/gen_agent_endpoint_index.py`.
 | `shutdown` | W | Stop the `--agent` daemon gracefully. Body: `{}`, or `{"force": true}` to quit with unsaved canvas edits. |
 | `simulate-gel` | R | Render an in-silico agarose gel. Body: `{lanes: [{name?, source, detail?}, ...], agarose_pct?: float = 1.0, template_seq?: str = "",… |
 | `simulate-gibson` | R | Dry-run a Gibson assembly without saving. Body: `{fragments: [{name, sequence, features?}, ...], min_overlap?: int = 15, circular?: bool = true}`. |
-| `simulate-golden-gate` | R | Dry-run a Golden Gate / MoClo (Type IIS) one-pot assembly. Body: `{parts: [seq, …], vector, enzyme?="BsaI"}`. |
+| `simulate-golden-gate` | R | Dry-run a Golden Gate / MoClo (Type IIS) one-pot assembly. Body: `{parts: [seq, …], vector, enzyme?="BsaI", part_circular?: [bool, …]}`. |
 | `simulate-pcr` | R | Run an in-silico PCR. Body: `{template_seq, fwd_primer, rev_primer, circular?: bool = true, max_amplicon?: int = 20000}`. Natural-guess aliases… |
 | `simulate-traditional-cloning` | R | Dry-run a traditional restriction-cloning reaction: digest a vector and an insert with the chosen enzymes, then ligate. Body: `{vector_seq,… |
 | `span-contains` | R | Circular-aware containment: does a span contain a base or another span, on a molecule where either may cross the origin? |
