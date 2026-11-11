@@ -1790,8 +1790,8 @@ def _authorize_writes_for_sandbox(data_dir: Path) -> None:
         import os, tempfile
         os.environ["XDG_DATA_HOME"] = tempfile.mkdtemp(prefix="sc-")
         import splicecraft as sc
-        assert "sc-" in str(sc._DATA_DIR)
-        sc._authorize_writes_for_sandbox(sc._DATA_DIR)
+        assert "sc-" in str(sc._state._DATA_DIR)
+        sc._authorize_writes_for_sandbox(sc._state._DATA_DIR)
         # ... now _save_* works against the tempdir ...
     """
     import tempfile as _tempfile

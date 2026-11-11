@@ -12,7 +12,7 @@ For every save through `_safe_save_json` (the only sanctioned path):
    (plus a parent-dir `fsync` so the rename is journalled), with the
    prior version copied to `*.json.bak` first. Before the swap the
    freshly-written temp file is **read back and validated** — a full
-   `json.loads` + entry-count check for files ≤ 32 MB, a cheap
+   `json.loads` + entry-count check for files ≤ 8 MB, a cheap
    "non-empty and closes with `}`" tail check for larger ones — so a
    silently-truncated write is caught and the live file is left intact
    instead of being overwritten with garbage.

@@ -61,8 +61,8 @@ os.environ.setdefault("SPLICECRAFT_SKIP_LOCK", "1")
 import splicecraft as sc  # noqa: E402
 
 _sandbox_root = tempfile.gettempdir()
-assert str(sc._DATA_DIR).startswith(_sandbox_root), (
-    f"refusing to run unsandboxed (data dir = {sc._DATA_DIR}; "
+assert str(sc._state._DATA_DIR).startswith(_sandbox_root), (
+    f"refusing to run unsandboxed (data dir = {sc._state._DATA_DIR}; "
     f"expected under {_sandbox_root})"
 )
 

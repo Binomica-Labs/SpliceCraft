@@ -51,7 +51,7 @@ def main() -> int:
         return 2
 
     print(f"Scanning {folder}")
-    print(f"Target data dir: {sc._DATA_DIR}")
+    print(f"Target data dir: {sc._state._DATA_DIR}")
     print(f"Target collection: '{coll_name}'\n")
 
     entries, failures = sc._bulk_import_folder(folder)

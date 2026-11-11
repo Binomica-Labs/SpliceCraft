@@ -84,10 +84,16 @@ PLATFORMS = [
 # calls shipped for 16 days with only CI seeing them ([INV-212]).
 ACCEPTED_GAPS = {
     # primer3-py ships no Linux-aarch64 wheel and no Apple-Silicon wheel
-    # for Python >=3.10 (only cp39 arm64); no release fixes this. Primer
-    # design is core with no fallback, so primer3-py stays required and
-    # ARM users compile it (build-essential / Xcode CLT). See the ARM
-    # rows in docs/PLATFORMS.md.
+    # for Python >=3.10 (only cp39 arm64); no release fixes this.
+    # Primer design DEGRADES without it rather than failing — `_primer_tm`
+    # falls back to the 2(A+T)+4(G+C) rule and the pair QC says the oligos
+    # are "NOT secondary-structure checked" — but the thermodynamic half
+    # (hairpin / dimer / end-stability, all via `_p3_thermo`) has no
+    # pure-Python substitute, so primer3-py stays REQUIRED and ARM users
+    # compile it (build-essential / Xcode CLT). Do not restate this as
+    # "no fallback": that wording reached a draft of the preprint and
+    # contradicted §2.7's accurate description of the degradation.
+    # See the ARM rows in docs/PLATFORMS.md.
     ("primer3-py", "linux-aarch64"),
     ("primer3-py", "macos-arm64"),
 }

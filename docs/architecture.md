@@ -176,8 +176,36 @@ op.<area>.<verb>       # operations
 <noun>.<verb>          # state (save.ok, record.loaded, migration.step)
 ```
 
-Sequence content is **never** logged — `_repr_for_log` truncates and
-tags anything DNA-shaped.
+Sequence content is kept out of the log by two mechanisms of **different
+strength**, and the distinction matters if you ever quote this.
+
+**Structured events (`_log_event`) ENFORCE a bound** on every field:
+a `str` over 200 chars becomes `v[:100] + "…[+N]"`; a `bytes` /
+`bytearray` is never rendered, only `<bytes len=N>`; a Biopython
+`Seq` / `SeqRecord` / `MutableSeq` becomes an opaque
+`<Seq id=… len=…>` tag — specifically because `repr(Seq)` embeds the
+first ~55 bases; and anything else falls to
+`_repr_for_log(v, max_len=200)`. Nothing a caller hands `_log_event`
+can carry sequence content through.
+
+**Plain `_log.*` calls are the weak half**: callers do not pass
+sequences, but that is a convention, not an enforcement, and nothing
+truncates them.
+
+So: sequence content **cannot** reach a structured event, and is merely
+**unlikely** to reach an ordinary log line. This paragraph previously
+claimed "never logged" (stronger than the code), and that overstatement
+propagated into a draft privacy claim elsewhere. A later correction
+over-swung the other way after an audit grepped the WRONG function —
+see the orphan note below.
+
+> **Two similarly-named helpers; only one is live.**
+> `splicecraft_logging._repr_for_log` (default `max_len=100`) is the
+> real one, called from `_log_event` and `splicecraft_dataaccess`.
+> `splicecraft._safe_data_repr` (`max_len=32`) is a hub duplicate with
+> **no production caller** — tests only. Grepping for the orphan and
+> concluding "there is no bound" is a mistake that has now been made
+> once in print; delete it or wire it up, but do not cite it.
 
 Design target: **user pastes log → AI parses → patch shipped same
 loop**. The agent-friendly event taxonomy is part of the observability

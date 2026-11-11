@@ -68,7 +68,7 @@ built to be a daily driver you never have to worry about:
   the whole batch back.
 - **The biology is correct, and proven.** Palindromes, Type IIS,
   origin-spanning cuts, wrap-around features, non-standard genetic codes, and
-  IUPAC are pinned to the base — behind **4,000+ tests** plus property-based
+  IUPAC are pinned to the base — behind **12,000+ tests** plus property-based
   fuzzing on the biology, crash-injection on the save path, and concurrency
   fuzzing on the data layer.
 - **We go looking for trouble.** A long list of sacred invariants
@@ -584,6 +584,16 @@ splicecraft --citation     # APA reference + BibTeX, pinned to your version
 
 The repository also ships a [`CITATION.cff`](CITATION.cff), so GitHub's **Cite
 this repository** button exports APA or BibTeX directly.
+
+### Preprint
+
+A manuscript describing SpliceCraft — its design principles, data-safety
+model, calibration discipline, and an account of what went wrong building it
+with LLM assistance — is being prepared for submission. The working draft
+lives in [`paper/`](paper/) and is **not peer-reviewed**; it is in the
+repository so that every figure in it can be checked against the code it
+describes, which is the point the paper itself argues for. Until it is
+posted, cite the software via the DOI above rather than the draft.
 
 ## License
 
