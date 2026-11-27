@@ -31,7 +31,11 @@
   A subfolder holding nothing importable stays quiet, so an ordinary
   `.git` or `backup/` sitting beside your records doesn't raise a false alarm.
   A subfolder it couldn't read is reported as exactly that, rather than
-  assumed empty. Reported as issue #31.
+  assumed empty. Reported as issue #31 by **@funnirudh** — with a
+  self-contained repro on public data, a control case that isolated the
+  fault to the subfolder level rather than the file, the exact line that
+  dropped them, and a note that the docstring said "Walk" where the code
+  scanned one level. Thank you; that is about as good as a bug report gets.
 - **A symlinked plasmid file was refused without explanation.** Symlinks are
   deliberately not imported (a `.gb` pointing at a device file used to be read
   until the app ran out of memory), but the refusal was silent — so pointing a
@@ -68,6 +72,34 @@
   `pipx install splicecraft` compile Biopython from source on an Intel Mac.
   The measurement now sits beside the pin so the next bump is a one-command
   decision.
+
+### Thanks
+
+This release is one person's find, and a good moment to thank everyone
+who has ever sent this project a bug rather than working around it.
+A tool that silently does the wrong thing to your DNA is worse than one
+that refuses, and every name here caught a case of exactly that.
+
+- **@funnirudh** — issue #31, this release: the silent subfolder skip,
+  reported with a repro anyone could run, a control case, the root cause
+  and a patch. It also turned up a second defect it hadn't set out to
+  find — the "N file(s) could not be read" phrasing that counted a
+  folder-level note as an unreadable file. Both are fixed here.
+- **@cory-mozza** — five reports (#9, #14, #15, #16, #17) covering wrong
+  restriction-enzyme names and recognition sites, a reading frame broken
+  by an intron, sequencing-run alignment failing, feature-name whitespace
+  mangled on import, and an `F5` crash in construction history. Several
+  of those were correctness bugs in the biology, which is the worst place
+  for them and the hardest kind to notice from the outside.
+- **@vojtace** — issue #22, adding a primer from the library to the map.
+- **Joshua Lerman (Angstrom Innovation)** — the stray 5′/3′ overhangs on
+  circular-plasmid alignments, found by eye in real data.
+
+Filing a good bug report is unpaid work, and the ones above were detailed
+enough to fix from. If you sent something that isn't in this release it
+isn't forgotten: the open queue is export-selected-region (#29),
+In-Fusion / Gateway cloning (#18), annotation search (#6) and finishing
+the argparse conversion (#11).
 
 ## [1.3.19] — 2026-11-10
 
