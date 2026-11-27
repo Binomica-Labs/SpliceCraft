@@ -14,6 +14,61 @@
 
 ---
 
+## [1.3.20] — 2026-11-27
+
+### Bug fixes
+
+- **Bulk import from a folder silently ignored subfolders, so a folder whose
+  plasmids all sat one level down looked empty.** You picked the folder, the
+  collection was created with 0 plasmids and 0 failures, and nothing said why
+  — there was no hint anywhere that folder import reads the top level only.
+  Every other skip in that code path already explained itself (files too
+  large, records with no bases, files it couldn't stat, the 5000-entry cap);
+  subfolders were the one case dropped without a word. Import is still
+  top-level only — that part was never the bug — but now, when a subfolder
+  actually holds files the import would have taken, it says so, names the
+  subfolders, counts the files and tells you to select each one individually.
+  A subfolder holding nothing importable stays quiet, so an ordinary
+  `.git` or `backup/` sitting beside your records doesn't raise a false alarm.
+  A subfolder it couldn't read is reported as exactly that, rather than
+  assumed empty. Reported as issue #31.
+- **A symlinked plasmid file was refused without explanation.** Symlinks are
+  deliberately not imported (a `.gb` pointing at a device file used to be read
+  until the app ran out of memory), but the refusal was silent — so pointing a
+  folder full of symlinks at the importer gave you 0 plasmids and no reason.
+  It now tells you, and only for files that look importable, so a folder's
+  ordinary symlinks stay quiet.
+- **"Imported 5, failed 1: my-plasmids"** — a folder-level message could be
+  counted and displayed as though a *file* by that name had failed to import.
+  Folder-level notes are now kept apart from per-file failures everywhere they
+  surface: the toast, both agent endpoints (`bulk-import-folder` and
+  `create-collection` carry them in a new `notices` field and leave the
+  failure count to real files), and `scripts/bulk_import.py`, which no longer
+  reports a non-zero exit for one.
+
+### Hardening
+
+- Names echoed into an import message are scrubbed of control characters and
+  length-capped. A folder name arrives from the filesystem — possibly from an
+  archive someone else made — and these messages reach both a terminal toast
+  and the agent API's JSON. A 255-character directory name produced a
+  328-character message, and a name containing a raw escape sequence or a
+  right-to-left override reached the terminal, where it could reorder the text
+  so that "NOT imported" need not read as what it says.
+- The subfolder check is bounded (500 directories) and never follows symlinks,
+  so it cannot be walked out of the folder you picked, and it never opens or
+  parses a file. When it runs out of budget it says the check was truncated
+  instead of implying the rest was checked and clean.
+
+### Dependencies
+
+- Re-verified the `biopython < 1.87` cap against PyPI (declining the proposed
+  bump to `< 1.89`): 1.87 and 1.88 still publish no macOS x86_64 wheel, where
+  1.86 publishes seven, so lifting the cap would make a clean
+  `pipx install splicecraft` compile Biopython from source on an Intel Mac.
+  The measurement now sits beside the pin so the next bump is a one-command
+  decision.
+
 ## [1.3.19] — 2026-11-10
 
 ### Bug fixes

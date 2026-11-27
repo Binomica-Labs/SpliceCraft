@@ -388,10 +388,18 @@ What you can do without leaving the terminal.
   canvas.
 - **Bulk import a folder** — from the collections-list view, click `+`,
   type a name, and pick a folder via the embedded directory tree.
-  Every `.dna` / `.gb` / `.gbk` / `.genbank` file inside is loaded
-  independently into a new collection; failures are isolated per file
-  and surfaced in a notify summary. Designed for migrating a
-  popular-commercial-plasmid-editor archive in one shot.
+  Every importable file inside — `.dna` / `.gb` / `.gbk` / `.genbank` /
+  `.embl`, FASTA, FASTQ, `.ab1` traces and GFF3 carrying an inline
+  `##FASTA` section — is loaded independently into a new collection;
+  failures are isolated per file and surfaced in a notify summary.
+  Designed for migrating a popular-commercial-plasmid-editor archive in
+  one shot. **The scan reads the top level of the folder only — it is
+  not recursive.** Pick each subfolder in turn to import a nested
+  archive; if a subfolder holds files the scan would have taken, the
+  summary names it and counts them rather than leaving you with an
+  apparently empty folder (issue #31). Symlinks are deliberately not
+  imported — a symlinked `.gb` could point anywhere, including at a
+  device file — and are now reported rather than silently dropped.
 - **`.dna` round-trip.** SpliceCraft reads the popular commercial
   plasmid editor's binary format (sequence + features + notes +
   primers + construction history) and writes it back — including the

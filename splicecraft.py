@@ -10774,6 +10774,17 @@ _BULK_IMPORT_EXTS = {
 # truncation note and the entries that did load.
 _BULK_IMPORT_MAX_FILES = 5000
 
+# How many directories ONE bulk import will list while checking whether
+# a refused subfolder holds importable files (issue #31). Reporting-only
+# probe — it never opens, stats or parses a file. Bounded for the same
+# reason `_BULK_IMPORT_MAX_FILES` is: the top level can hold 5000
+# entries and each one could be a directory tree of any depth, so an
+# unbounded probe would re-introduce the pinned-worker problem the
+# 2026-06-12 audit capped. 500 covers every realistic plasmid folder;
+# past it the notice says the check was truncated rather than implying
+# the rest was checked and clean.
+_BULK_IMPORT_SUBDIR_PEEK_DIRS = 500
+
 # Hard cap on display-name length stored in entry["name"]. The panel
 # truncates to 14 chars, but the full name lives in the JSON; keep it
 # from blowing up if someone hands us a 4 KB filename.
@@ -11645,18 +11656,152 @@ def _apply_entry_construction_history(
     _ensure_entry_origin_history(new_entry)
 
 
+# Longest single name echoed into a folder-level failure reason. The
+# reason travels into a Textual toast and into agent JSON, and the names
+# in it come off the FILESYSTEM — a folder holding a 4 KB directory name
+# would otherwise produce a 4 KB toast and a 4 KB JSON field. Rendering
+# is already `markup=False` everywhere these strings land, so this caps
+# LENGTH, not injection.
+_BULK_IMPORT_REASON_NAME_MAX = 60
+
+
+def _bulk_import_name_list(paths: "list[Path]", limit: int = 3) -> str:
+    """Format up to `limit` path names for a folder-level failure reason.
+
+    Each name is control-char scrubbed, then length-capped
+    (`_BULK_IMPORT_REASON_NAME_MAX`), and the remainder is summarised as
+    "… (+N more)", so one pathological filename cannot blow up a toast.
+
+    The scrub is `_CONTROL_CHARS_RE` — the same one the remote BLAST/HMM
+    hit text and the agent's writable name fields go through. A
+    DIRECTORY name is attacker-influenced in the same way those are (it
+    arrives off the filesystem, possibly from an unzipped archive), and
+    these reasons are rendered into a Textual toast and into agent JSON
+    a CLI client prints. A raw `\\x1b[` would reach that terminal, and a
+    U+202E RIGHT-TO-LEFT OVERRIDE would visually reorder the message —
+    Trojan-Source-style — so that "NOT imported" need not read as what
+    it says. `markup=False` at the render sites stops Rich tags, not
+    these.
+    """
+    shown: list[str] = []
+    for p in paths[:limit]:
+        # Scrub BEFORE capping so the cap is not spent on characters
+        # that are about to be removed.
+        name = _CONTROL_CHARS_RE.sub("", p.name)
+        if len(name) > _BULK_IMPORT_REASON_NAME_MAX:
+            name = name[:_BULK_IMPORT_REASON_NAME_MAX - 1] + "…"
+        shown.append(name)
+    out = ", ".join(shown)
+    if len(paths) > limit:
+        out += f", … (+{len(paths) - limit} more)"
+    return out
+
+
+def _bulk_import_peek_subdirs(
+    subdirs: "list[Path]",
+) -> "tuple[list[tuple[Path, int]], bool, list[Path]]":
+    """Which of `subdirs` hold files bulk import would have taken?
+
+    Reporting only — it feeds the "folder import is not recursive"
+    notice in `_bulk_import_folder` and imports nothing. It LISTS
+    directories; it never opens, stats or parses a file, so a hostile
+    tree costs directory reads and nothing else.
+
+    `followlinks=False` keeps the Sweep #10 posture exactly: a symlinked
+    subfolder is never descended, so this probe cannot be walked out of
+    the folder the user picked (a `sub -> /` symlink would otherwise
+    enumerate the filesystem). Directory listing is budgeted by
+    `_BULK_IMPORT_SUBDIR_PEEK_DIRS`.
+
+    Returns `(hits, truncated, unreadable)`:
+      * `hits` — `(top_level_subdir, n_importable_files)` for each
+        subfolder holding at least one, at ANY depth below it, counted
+        against its top-level parent (that is the folder the user has to
+        select, so that is the name worth reporting).
+      * `truncated` — the budget ran out with directories left
+        unlisted, so every count in `hits` is a FLOOR, not a total.
+      * `unreadable` — top-level subfolders that raised while listing.
+        Reported separately because "could not check" is not "nothing
+        there"; collapsing the two would restore the silence this whole
+        function exists to remove.
+    """
+    hits: list[tuple[Path, int]] = []
+    unreadable: list[Path] = []
+    budget = _BULK_IMPORT_SUBDIR_PEEK_DIRS
+    truncated = False
+    for sub in subdirs:
+        if budget <= 0:
+            # Abandoning a whole subfolder unchecked.
+            truncated = True
+            break
+        errs: "list[OSError]" = []
+        n_files = 0
+        for _root, dirnames, filenames in os.walk(
+                sub, onerror=errs.append, followlinks=False):
+            budget -= 1
+            n_files += sum(
+                1 for f in filenames
+                if os.path.splitext(f)[1].lower() in _BULK_IMPORT_EXTS
+            )
+            if budget <= 0 and dirnames:
+                # Abandoning this subfolder's own children.
+                truncated = True
+                dirnames[:] = []
+                break
+        if n_files:
+            hits.append((sub, n_files))
+        elif errs:
+            unreadable.append(sub)
+    return hits, truncated, unreadable
+
+
+def _bulk_import_split_failures(
+    folder: "Path",
+    failures: "list[tuple[Path, str]]",
+) -> "tuple[list[tuple[Path, str]], list[tuple[Path, str]]]":
+    """Split `_bulk_import_folder` failures into (per_file, folder_level).
+
+    A folder-level failure is keyed on the scanned folder itself rather
+    than on a file inside it: the `_BULK_IMPORT_MAX_FILES` entry cap, the
+    "not recursive" notice, the unreadable-subfolder notice and the
+    refused-special-file notice. Everything else is a real per-file
+    failure keyed on that file.
+
+    Callers need the split because several of them phrase their summary
+    as "N file(s) could not be read". Counting a folder-level notice as
+    an unreadable file is wrong twice over — it is not a file, and it
+    was not unread — and that mislabelling is exactly the kind of "`ok`
+    is not what happened" answer `[INV-207]` went through this code path
+    to remove.
+    """
+    per_file = [(p, r) for p, r in failures if p != folder]
+    folder_level = [(p, r) for p, r in failures if p == folder]
+    return per_file, folder_level
+
+
 @_timed("op.bulk_import_folder")
 def _bulk_import_folder(
     folder: Path,
     *,
     progress_cb: "_Callable | None" = None,
 ) -> "tuple[list[dict], list[tuple[Path, str]]]":
-    """Walk `folder` for .dna / .gb / .gbk / .genbank files and load each.
+    """Scan the TOP LEVEL of `folder` for importable files and load each.
+
+    NOT recursive — `iterdir()`, one level, by design (see the
+    folder-level reporting at the end of this function). The old
+    docstring opened "Walk `folder` …", which read as recursive and
+    was half of issue #31: the code was right and the word was wrong.
 
     Returns (entries, failures). Each file is loaded independently —
     a single corrupt file doesn't abort the batch. Entries are deduped
     by id within the batch; collisions get a `_2`, `_3`, ... suffix.
     Failures carry (path, reason) so the caller can surface them.
+
+    Failures are of two kinds, distinguished by their path: a per-FILE
+    failure is keyed on that file, while a FOLDER-level failure is keyed
+    on `folder` itself (the entry cap, and the two "skipped" notices
+    below). Callers that count failures as files must use
+    `_bulk_import_split_failures` to tell them apart.
 
     ``progress_cb``, if supplied, is called once per file as
     ``progress_cb(i, total, filename, ok)`` where ``i`` is 1-based.
@@ -11713,6 +11858,10 @@ def _bulk_import_folder(
     # failures (broken symlinks, special files) still become per-file
     # failures but don't pollute the progress denominator.
     importable: list[Path] = []
+    # Refused entries worth telling the user about (issue #31). Both are
+    # REPORTING accumulators only — nothing here relaxes a refusal.
+    subdirs: list[Path] = []          # real directories (not symlinks to one)
+    refused_special: list[Path] = []  # symlink/fifo/device w/ importable ext
     for path in children:
         # Sweep #10 (2026-05-20): `lstat` + `S_ISREG` refuses symlinks
         # outright. Pre-fix `path.is_file()` and `path.stat()` both
@@ -11726,11 +11875,26 @@ def _bulk_import_folder(
         except OSError as exc:
             failures.append((path, f"lstat failed: {exc}"))
             continue
-        from stat import S_ISREG as _S_ISREG
+        from stat import S_ISREG as _S_ISREG, S_ISDIR as _S_ISDIR
         if not _S_ISREG(st.st_mode):
             # Could be a symlink, device, fifo, dir, socket — none
             # is acceptable. Symlinks specifically would be a
             # security boundary violation.
+            #
+            # REFUSED, but no longer SILENTLY (issue #31). Refusal is
+            # correct; the absence of a message was the defect. We
+            # record what kind of thing we dropped so the folder-level
+            # reporting below can say so. `S_ISDIR` on the *lstat*
+            # result keeps the Sweep #10 posture exactly: a symlink to
+            # a directory is a symlink, not a directory, so it is
+            # refused AND counted as a special file, never peeked into.
+            if _S_ISDIR(st.st_mode):
+                subdirs.append(path)
+            elif path.suffix.lower() in _BULK_IMPORT_EXTS:
+                # A symlink / fifo / device that LOOKS importable. Only
+                # flagged when the extension matches, so we stay quiet
+                # about the unrelated symlinks a real folder carries.
+                refused_special.append(path)
             continue
         if path.suffix.lower() not in _BULK_IMPORT_EXTS:
             continue
@@ -11903,6 +12067,71 @@ def _bulk_import_folder(
                 "into primers.json",
                 exc,
             )
+
+    # ── Report what was refused (issue #31) ──────────────────────────
+    # Every other skip in this function is reported — oversized files,
+    # zero-length records, per-file lstat failures, the entry cap — but
+    # subfolders were dropped by a bare `continue` in the pre-filter, so
+    # a folder whose records all sat one level down created a collection
+    # with "0 plasmids, 0 failures" and said nothing. Refusing them is
+    # still right (no recursion here); the SILENCE was the bug.
+    #
+    # Deliberately NOT "n subfolder(s) skipped": a bare count is the
+    # uninformative answer. Nearly every real folder carries a
+    # `__pycache__`, a `.git` or a `backup/`, and crying "1 subfolder
+    # skipped" on those is the spurious-warning failure mode this
+    # codebase avoids elsewhere (cf. the measured thresholds in
+    # `splicecraft_regulatory`). So we PEEK — bounded, one level, no
+    # parsing — and speak only when a subfolder actually holds files
+    # this import would have taken. That also makes the message
+    # actionable: it names the folders and counts the files.
+    if subdirs:
+        hits, peek_truncated, unreadable = _bulk_import_peek_subdirs(subdirs)
+        if hits:
+            n_files = sum(n for _, n in hits)
+            names = _bulk_import_name_list([p for p, _ in hits])
+            failures.append((
+                folder,
+                f"{n_files} importable file(s) in {len(hits)} subfolder(s) "
+                f"were NOT imported ({names}) — folder import is not "
+                f"recursive; select each subfolder individually"
+                + (f". Stopped checking after "
+                   f"{_BULK_IMPORT_SUBDIR_PEEK_DIRS} subfolders, so there "
+                   f"may be more" if peek_truncated else ""),
+            ))
+        elif peek_truncated:
+            # Too many subfolders to check them all and no hit among the
+            # ones we did check. Saying nothing would imply "checked,
+            # nothing there"; this says what we actually know.
+            failures.append((
+                folder,
+                f"{len(subdirs)} subfolder(s) present; only the first "
+                f"{_BULK_IMPORT_SUBDIR_PEEK_DIRS} were checked for "
+                f"importable files — folder import is not recursive",
+            ))
+        if unreadable:
+            # A subfolder we could not even list. It may hold records;
+            # "not checked" is the honest answer, not "nothing there".
+            failures.append((
+                folder,
+                f"{len(unreadable)} subfolder(s) could not be read to check "
+                f"for importable files "
+                f"({_bulk_import_name_list(unreadable)})",
+            ))
+    if refused_special:
+        # Symlinks (and fifos/devices) carrying an importable extension.
+        # Sweep #10 refuses these for real security reasons and that does
+        # not change — but a user who symlinked their .gb files into one
+        # folder currently gets 0 imports and total silence, which is the
+        # same defect as the subfolder case.
+        names = _bulk_import_name_list(refused_special)
+        failures.append((
+            folder,
+            f"{len(refused_special)} entr{'y' if len(refused_special) == 1 else 'ies'} "
+            f"with an importable extension refused: not a regular file "
+            f"({names}) — symlinks and special files are not imported; "
+            f"copy the real file into the folder instead",
+        ))
     return entries, failures
 
 
@@ -25350,7 +25579,7 @@ class LibraryPanel(Widget):
                     entries, failures = _bulk_import_folder(folder)
                 plasmids = entries
                 description = f"Bulk imported from {folder}"
-                n_ok, n_fail = len(entries), len(failures)
+                n_ok = len(entries)
                 # markup=False so a hostile filename / folder path with
                 # Rich tags ([red]…[/]) renders literally instead of
                 # injecting style. _record_to_library_entry already
@@ -25365,7 +25594,16 @@ class LibraryPanel(Widget):
                 # emit the import-success toast immediately and
                 # dispatch the auto-bind to a worker that fires a
                 # FOLLOW-UP toast on completion.
-                if n_ok and not n_fail:
+                # Split per-FILE failures from folder-level notices
+                # (issue #31). A notice is not a failed file, so it must
+                # not land in the "failed N: <names>" tail — there it
+                # printed the folder's own name beside a file count and
+                # read as though a file called `sc-repro` had failed.
+                bad_files, folder_notes = _bulk_import_split_failures(
+                    folder, failures)
+                n_bad = len(bad_files)
+                notes_txt = " ".join(r for _, r in folder_notes)
+                if n_ok and not n_bad and not folder_notes:
                     self.app.notify(
                         f"Imported {n_ok} plasmid(s) into '{name}'. "
                         f"Auto-detecting entry vectors…",
@@ -25373,29 +25611,52 @@ class LibraryPanel(Widget):
                         timeout=4,
                     )
                     self._auto_bind_worker(list(entries), name)
-                elif n_ok and n_fail:
-                    tail = ", ".join(p.name for p, _ in failures[:3])
-                    if n_fail > 3:
-                        tail += f", … (+{n_fail - 3} more)"
-                    summary = f"Imported {n_ok}, failed {n_fail}: {tail}"
+                elif n_ok and n_bad:
+                    # Through the same scrub+cap helper as the
+                    # folder-level names: a FILENAME is filesystem-
+                    # derived too, so a 4 KB name or an embedded U+202E
+                    # reached this toast exactly as a directory name did.
+                    tail = _bulk_import_name_list([p for p, _ in bad_files])
+                    summary = f"Imported {n_ok}, failed {n_bad}: {tail}"
+                    if notes_txt:
+                        summary += f". {notes_txt}"
                     self.app.notify(
                         f"{summary}. Auto-detecting entry vectors",
                         severity="warning", timeout=4, markup=False,
                     )
                     self._auto_bind_worker(list(entries), name)
-                elif n_fail:
-                    # Folder-level failure (single tuple keyed on the
-                    # folder itself) shows up here. Surface the reason
-                    # so the user knows whether to fix permissions.
-                    reason = failures[0][1] if len(failures) == 1 else \
-                             f"{n_fail} file(s) failed to import"
+                elif n_ok:
+                    # Every file that was offered imported, but the
+                    # folder held more than a non-recursive scan reaches.
+                    # A warning, not a failure — and a longer timeout
+                    # than the happy path because there is something to
+                    # read and act on.
+                    self.app.notify(
+                        f"Imported {n_ok} plasmid(s) into '{name}'. "
+                        f"{notes_txt}",
+                        severity="warning", timeout=8, markup=False,
+                    )
+                    self._auto_bind_worker(list(entries), name)
+                elif n_bad or folder_notes:
+                    # Nothing imported. Lead with the folder-level
+                    # reason when there is one: it is the actionable
+                    # half ("select each subfolder individually",
+                    # "could not read folder", "fix permissions").
+                    if folder_notes:
+                        reason = notes_txt
+                        if n_bad:
+                            reason += f" ({n_bad} file(s) also failed)"
+                    elif n_bad == 1:
+                        reason = f"{bad_files[0][0].name}: {bad_files[0][1]}"
+                    else:
+                        reason = f"{n_bad} file(s) failed to import"
                     self.app.notify(
                         f"Import failed: {reason}",
                         severity="error", timeout=8, markup=False,
                     )
                 else:
                     self.app.notify(
-                        f"No .dna / .gb / .gbk files found in {folder}.",
+                        f"No importable files found in {folder}.",
                         severity="warning", markup=False,
                     )
             new_coll = {
@@ -113189,6 +113450,7 @@ def _h_create_collection(app, payload):
     folder = _sanitize_path(folder_raw) if folder_raw else None
     plasmids: list[dict] = []
     failures_summary: list[dict] = []
+    folder_notices: list[str] = []
     n_failures_total = 0
     description = ""
     if folder is not None:
@@ -113196,13 +113458,21 @@ def _h_create_collection(app, payload):
             return ({"error": dir_err}, 400)
         entries, failures = _bulk_import_folder(folder)
         plasmids = entries
-        n_failures_total = len(failures)
+        # `n_failures` counts FILES. Folder-level notices (issue #31's
+        # skipped subfolder, the entry cap) go to `notices` instead —
+        # they are not files, and a caller scripting against
+        # `n_failures == 0` must not see one because the folder had a
+        # `sub/` in it.
+        bad_files, folder_notes = _bulk_import_split_failures(
+            folder, failures)
+        n_failures_total = len(bad_files)
+        folder_notices = [r for _, r in folder_notes]
         description = f"Bulk imported from {folder}"
         # Truncate the per-file detail list so a folder with thousands
         # of failures doesn't return a huge JSON body. The total count
         # stays accurate via n_failures_total.
         failures_summary = [{"path": p.name, "reason": r}
-                              for p, r in failures[:25]]
+                              for p, r in bad_files[:25]]
 
     # Sweep #11 (2026-05-20): atomic check-then-save under
     # `_cache_lock`. Pre-fix a GUI user (or a second agent client)
@@ -113230,13 +113500,16 @@ def _h_create_collection(app, payload):
                 lambda: _save_collections(colls), "collections")) is not None:
             return err
     app.call_from_thread(_agent_refresh_library_panel, app)
-    return {
+    out = {
         "ok":          True,
         "name":        name,
         "n_plasmids":  len(plasmids),
         "n_failures":  n_failures_total,
         "failures":    failures_summary,
     }
+    if folder_notices:
+        out["notices"] = folder_notices
+    return out
 
 
 @_agent_endpoint("delete-collection", write=True)
@@ -113408,8 +113681,22 @@ def _h_bulk_import_folder(app, payload):
         # Nothing to import → create NOTHING. This used to add the empty
         # collection anyway, so fixing the folder and retrying the same call
         # was refused 409 "already exists" (audit 2026-09-22, AA8).
-        why = (f"{len(failures)} file(s) could not be read; see `failures`"
-               if failures else "it holds no .dna / .gb / .gbk / .genbank files")
+        # Phrase the reason from what actually happened. A folder-level
+        # notice (issue #31's skipped subfolder, the entry cap) is not a
+        # file and was not unread, so counting it as "N file(s) could
+        # not be read" answers the retry question wrongly: the caller
+        # would go looking for corrupt files that do not exist.
+        bad_files, folder_notes = _bulk_import_split_failures(folder, failures)
+        if bad_files and folder_notes:
+            why = (f"{len(bad_files)} file(s) could not be read and "
+                   f"{'; '.join(r for _, r in folder_notes)}; see `failures`")
+        elif bad_files:
+            why = f"{len(bad_files)} file(s) could not be read; see `failures`"
+        elif folder_notes:
+            why = "; ".join(r for _, r in folder_notes)
+        else:
+            why = ("it holds no importable files (.dna / GenBank / .embl / "
+                   "FASTA / FASTQ / .ab1 / GFF3)")
         return ({"ok": False,
                  "error": f"nothing was imported from {folder} — {why}. "
                           f"No collection was created.",
@@ -113440,18 +113727,31 @@ def _h_bulk_import_folder(app, payload):
     # `partial: true` and the files that failed. Answering `ok: false` here (the
     # first fix) dropped `data`, and a caller that retried got 409 — the
     # collection it had been told failed already existed.
+    # `n_failed` counts FILES, so the folder-level notices (issue #31's
+    # skipped subfolder, the entry cap) are split out into `notices`
+    # rather than inflating it. Pre-split, a clean import out of a folder
+    # that merely happened to contain a `sub/` reported `partial: true,
+    # n_failed: 1` and warned that a file "could not be read" — a
+    # retry-worthy failure that had not happened.
+    bad_files, folder_notes = _bulk_import_split_failures(folder, failures)
     out = {
         "ok":         True,
         "collection": name,
         "n_imported": len(entries),
-        "n_failed":   len(failures),
+        "n_failed":   len(bad_files),
         "failures":   [{"path": p.name, "reason": r}
-                        for p, r in failures[:25]],
+                        for p, r in bad_files[:25]],
     }
-    if failures:
+    if folder_notes:
+        out["notices"] = [r for _, r in folder_notes]
+    if bad_files:
         out["partial"] = True
         out["warnings"] = [f"imported {len(entries)} file(s) but "
-                           f"{len(failures)} could not be read; see `failures`"]
+                           f"{len(bad_files)} could not be read; see `failures`"]
+    elif folder_notes:
+        # Not `partial` — every file that was offered imported. The
+        # folder just held more than this non-recursive scan reaches.
+        out["warnings"] = list(out["notices"])
     return out
 
 

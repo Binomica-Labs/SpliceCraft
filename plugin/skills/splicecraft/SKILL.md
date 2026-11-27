@@ -276,6 +276,7 @@ field that says what it really means:
 | `transfer-annotations` | `count` | `skipped` — the default `min_len` of 30 drops every promoter, operator, RBS, overhang and restriction site *before* the search. |
 | `optimize-protein` | `dna`, `cai` | `remaining_motifs`, `remaining_repeats`, `fixes`, `gc_window_*` — a constraint can be physically unreachable, so the response reports what was *achieved*. For a plant host also read `splice`: the `hazard_hosts` motifs are a FLOOR and the trained matrix catches donors they cannot. |
 | `design-guides` | guide list | `offtarget_searched_bp` — `0` means **no off-target claim was made**. Silence is not "clean". |
+| `bulk-import-folder`, `create-collection` | `n_imported` / `n_failed` | `notices` — the scan is the folder's TOP LEVEL only, never recursive, and `n_failed` counts FILES. `n_imported: 0, n_failed: 0` therefore does NOT mean the folder is empty; it can mean every record sits one level down. A `notices` entry names the subfolders and counts the files it would have taken (and `422` says so when nothing imported) — so read it before concluding a folder held nothing, and import each subfolder in turn. |
 | `read-consensus` vs `analyse-read-heterogeneity` | verdict | A Plasmidsaurus consensus is depth 1, so a heterogeneous population consenses to wild type and reads as a clean clonal culture. |
 
 ### (c) An empty read that means "nothing is loaded", not "nothing is there"

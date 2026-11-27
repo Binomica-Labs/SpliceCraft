@@ -1000,6 +1000,379 @@ class TestBulkImportHardening:
         assert "[red]" in out
 
 
+_MIN_GB = (
+    "LOCUS       OK      10 bp ds-DNA  circular SYN 01-JAN-2026\n"
+    "FEATURES             Location/Qualifiers\n"
+    "ORIGIN\n"
+    "        1 acgtacgtac\n"
+    "//\n"
+)
+
+
+class TestBulkImportReportsSkippedSubfolders:
+    """Regression guard for issue #31 (2026-11-15): `_bulk_import_folder`
+    enumerates ONE level and dropped directories with a bare `continue`
+    in the pre-filter, so a folder whose records all sat one level down
+    created a collection with 0 plasmids and 0 failures and said nothing
+    about why. Every other skip in that function is reported (oversized
+    files, zero-length records, per-file lstat failures, the entry cap).
+
+    The refusal is still correct — import stays non-recursive. Only the
+    SILENCE was the bug, so these tests assert on the message.
+
+    The report is deliberately conditional on the subfolder actually
+    holding importable files: `test_subfolder_with_nothing_importable_*`
+    is the anti-noise half, and it is load-bearing because
+    `TestBulkImportFolder::test_imports_all_dna_fixtures` scans the real
+    `tests/` directory (which carries a `__pycache__`) and asserts
+    `failures == []`.
+    """
+
+    def test_subfolder_holding_records_is_reported(self, tmp_path):
+        # The issue's exact repro: the only importable file is one level
+        # down, so nothing imports.
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "pUC19.gb").write_text(_MIN_GB)
+        entries, failures = sc._bulk_import_folder(tmp_path)
+        assert entries == []
+        assert len(failures) == 1
+        path, reason = failures[0]
+        # Folder-level failure: keyed on the scanned folder itself.
+        assert path == tmp_path
+        # Says what was missed, where, and what to do about it.
+        assert "not recursive" in reason
+        assert "sub" in reason
+        assert "1 importable file" in reason
+        assert "individually" in reason
+
+    def test_subfolder_with_nothing_importable_stays_silent(self, tmp_path):
+        # A `__pycache__` / `.git` / `backup/` with no importable files
+        # must NOT produce a failure — a bare "1 subfolder skipped" count
+        # would cry wolf on nearly every real folder.
+        (tmp_path / "__pycache__").mkdir()
+        (tmp_path / "__pycache__" / "x.pyc").write_bytes(b"\x00\x01")
+        (tmp_path / "notes.txt").write_text("not a plasmid")
+        (tmp_path / "top.gb").write_text(_MIN_GB)
+        entries, failures = sc._bulk_import_folder(tmp_path)
+        assert len(entries) == 1
+        assert failures == []
+
+    def test_records_nested_deeper_than_one_level_are_found(self, tmp_path):
+        # The probe walks, so a record two levels down is still reported
+        # — and attributed to the TOP-level subfolder, because that is
+        # the one the user has to select.
+        deep = tmp_path / "sub" / "deeper"
+        deep.mkdir(parents=True)
+        (deep / "a.gb").write_text(_MIN_GB)
+        (deep / "b.gb").write_text(_MIN_GB)
+        entries, failures = sc._bulk_import_folder(tmp_path)
+        assert entries == []
+        assert len(failures) == 1
+        reason = failures[0][1]
+        assert "2 importable file(s)" in reason
+        assert "1 subfolder(s)" in reason
+        assert "(sub)" in reason
+
+    def test_top_level_still_imports_with_a_reported_subfolder(self, tmp_path):
+        # Mixed case: the top level imports normally AND the notice fires.
+        (tmp_path / "top.gb").write_text(_MIN_GB)
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "more.gb").write_text(_MIN_GB)
+        entries, failures = sc._bulk_import_folder(tmp_path)
+        assert len(entries) == 1
+        assert len(failures) == 1
+        assert failures[0][0] == tmp_path
+        assert "not recursive" in failures[0][1]
+
+    def test_control_selecting_the_subfolder_imports_it(self, tmp_path):
+        # The issue's control case: selecting the subfolder directly
+        # imports the record, which isolates the defect to the subfolder
+        # level rather than to the file.
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "pUC19.gb").write_text(_MIN_GB)
+        entries, failures = sc._bulk_import_folder(tmp_path / "sub")
+        assert len(entries) == 1
+        assert failures == []
+
+    def test_all_importable_extensions_count_in_the_probe(self, tmp_path):
+        # The probe must use the same extension set as the import, not a
+        # hardcoded .gb/.dna subset — a folder of FASTA or AB1 traces one
+        # level down is exactly as skipped.
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "x.fasta").write_text(">a\nACGT\n")
+        (tmp_path / "sub" / "y.EMBL").write_text("ID   x; ; circular;\n//\n")
+        entries, failures = sc._bulk_import_folder(tmp_path)
+        assert entries == []
+        assert "2 importable file(s)" in failures[0][1]
+
+    def test_unreadable_subfolder_is_reported_not_assumed_empty(
+            self, tmp_path):
+        # "Could not check" is not "nothing there". Collapsing the two
+        # would restore the silence the fix removes.
+        import os
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        (locked / "hidden.gb").write_text(_MIN_GB)
+        os.chmod(locked, 0)
+        try:
+            if os.access(locked, os.R_OK):
+                pytest.skip("running as root; chmod 0 is not enforced")
+            entries, failures = sc._bulk_import_folder(tmp_path)
+            assert entries == []
+            assert len(failures) == 1
+            assert "could not be read to check" in failures[0][1]
+            assert "locked" in failures[0][1]
+        finally:
+            os.chmod(locked, 0o755)   # so pytest cleanup can remove it
+
+    def test_peek_budget_truncation_is_declared(self, tmp_path, monkeypatch):
+        # When the probe runs out of budget it must say the check was
+        # truncated rather than implying the rest was checked and clean.
+        monkeypatch.setattr(sc, "_BULK_IMPORT_SUBDIR_PEEK_DIRS", 1)
+        for n in range(3):
+            d = tmp_path / f"sub{n}"
+            d.mkdir()
+            (d / "x.gb").write_text(_MIN_GB)
+        entries, failures = sc._bulk_import_folder(tmp_path)
+        assert entries == []
+        joined = " ".join(r for _, r in failures)
+        assert "Stopped checking" in joined or "only the first" in joined
+
+    def test_probe_never_imports_anything(self, tmp_path):
+        # The probe is reporting-only: it must not pull nested records
+        # into the batch (that would silently make import recursive).
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "a.gb").write_text(_MIN_GB)
+        entries, _ = sc._bulk_import_folder(tmp_path)
+        assert entries == []
+
+
+class TestBulkImportSubfolderProbeSecurity:
+    """The probe must not weaken the Sweep #10 (2026-05-20) posture:
+    symlinks are refused, and the probe must not be walkable out of the
+    folder the user picked."""
+
+    def test_symlinked_directory_is_not_descended(self, tmp_path):
+        # A `sub -> <elsewhere>` symlink must not be enumerated: with
+        # `followlinks=True` a `sub -> /` would walk the filesystem.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.gb").write_text(_MIN_GB)
+        folder = tmp_path / "import"
+        folder.mkdir()
+        try:
+            (folder / "sub").symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+        entries, failures = sc._bulk_import_folder(folder)
+        assert entries == []
+        # Not reported as a subfolder holding records — it is a symlink,
+        # so it was never descended.
+        joined = " ".join(r for _, r in failures)
+        assert "not recursive" not in joined
+        assert "secret" not in joined
+
+    def test_symlinked_importable_file_refused_and_reported(self, tmp_path):
+        # Hardening beside the fix: Sweep #10 refuses a symlinked `.gb`
+        # for real security reasons (a `.gb -> /dev/zero` passed the size
+        # cap and read until OOM), but it did so silently — so a user who
+        # symlinked their records into one folder got 0 imports and no
+        # explanation, the same defect as the subfolder case.
+        real = tmp_path / "real.gb"
+        real.write_text(_MIN_GB)
+        folder = tmp_path / "import"
+        folder.mkdir()
+        try:
+            (folder / "linked.gb").symlink_to(real)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+        entries, failures = sc._bulk_import_folder(folder)
+        # Still refused — the security contract is unchanged.
+        assert entries == []
+        assert len(failures) == 1
+        assert failures[0][0] == folder
+        assert "not a regular file" in failures[0][1]
+        assert "linked.gb" in failures[0][1]
+
+    def test_unrelated_symlink_stays_quiet(self, tmp_path):
+        # Only an IMPORTABLE extension is worth flagging; a folder's
+        # ordinary symlinks (a README, a tarball) must not produce noise.
+        real = tmp_path / "README.md"
+        real.write_text("hi")
+        folder = tmp_path / "import"
+        folder.mkdir()
+        (folder / "top.gb").write_text(_MIN_GB)
+        try:
+            (folder / "README.md").symlink_to(real)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+        entries, failures = sc._bulk_import_folder(folder)
+        assert len(entries) == 1
+        assert failures == []
+
+
+class TestBulkImportNoticeReachesTheToast:
+    """The whole point of issue #31 is what the USER sees, so the toast
+    branch is tested through the real modal flow, not just the helper.
+
+    Two branches are new: "imported N, and here is what was skipped"
+    (previously impossible — a notice could only arrive as a counted
+    failure) and the nothing-imported branch leading with the folder
+    reason instead of "N file(s) failed to import"."""
+
+    async def _run_import(self, folder, coll_name):
+        sc._save_collections([])
+        sc._set_active_collection_name(None)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib._view_mode = "collections"
+            lib._apply_view_mode()
+            lib._repopulate_collections()
+            lib.query_one("#btn-coll-add").action_press()
+            await pilot.pause(0.2)
+            modal = app.screen
+            assert isinstance(modal, sc.NewCollectionModal)
+            modal.query_one("#newcoll-name").value = coll_name
+            modal._selected_folder = folder
+            modal.query_one("#btn-newcoll-ok").action_press()
+            for _ in range(50):
+                await pilot.pause(0.1)
+                if any(n for n in app._notifications):
+                    break
+            toasts = [n.message for n in app._notifications]
+            sevs = [n.severity for n in app._notifications]
+            app.exit()
+            return toasts, sevs
+
+    async def test_imported_some_and_says_what_was_skipped(self, tmp_path):
+        (tmp_path / "top.gb").write_text(_MIN_GB)
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "more.gb").write_text(_MIN_GB)
+        toasts, sevs = await self._run_import(tmp_path, "Mixed")
+        joined = " ".join(toasts)
+        assert "Imported 1" in joined, toasts
+        assert "not recursive" in joined, toasts
+        # A notice is not a failure: it must not print as "failed 1",
+        # and must certainly not name the folder as a failed file.
+        assert "failed 1" not in joined, toasts
+        assert "warning" in sevs, sevs
+
+    async def test_nothing_imported_leads_with_the_folder_reason(
+            self, tmp_path):
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "pUC19.gb").write_text(_MIN_GB)
+        toasts, _ = await self._run_import(tmp_path, "AllNested")
+        joined = " ".join(toasts)
+        assert "Import failed" in joined, toasts
+        assert "not recursive" in joined, toasts
+        assert "individually" in joined, toasts
+        # Not the pre-fix dead end, which said nothing at all.
+        assert "file(s) failed to import" not in joined, toasts
+
+
+class TestBulkImportReasonStringHardening:
+    """The folder-level reason strings carry names that came off the
+    FILESYSTEM (possibly from an unzipped archive) into a Textual toast
+    and into agent JSON a CLI client prints. Length and control
+    characters are both bounded."""
+
+    def test_pathological_name_length_is_capped(self, tmp_path):
+        # A 255-byte directory name (the usual OS limit) must not become
+        # a 255-byte toast.
+        long_dir = tmp_path / ("A" * 255)
+        long_dir.mkdir()
+        (long_dir / "x.gb").write_text(_MIN_GB)
+        _, failures = sc._bulk_import_folder(tmp_path)
+        reason = failures[0][1]
+        assert len(reason) < 250, len(reason)
+        assert "…" in reason          # truncation is visible, not silent
+        assert "not recursive" in reason   # the actionable half survives
+
+    def test_many_names_are_summarised_not_listed(self, tmp_path):
+        for n in range(40):
+            d = tmp_path / f"sub{n:02d}"
+            d.mkdir()
+            (d / "x.gb").write_text(_MIN_GB)
+        _, failures = sc._bulk_import_folder(tmp_path)
+        reason = failures[0][1]
+        assert "+37 more" in reason
+        assert len(reason) < 300, len(reason)
+
+    @pytest.mark.parametrize("name,banned", [
+        ("we\tird\nname",            ["\t", "\n"]),
+        ("evil\x1b[31mRED\x1b[0m",   ["\x1b"]),
+        ("data‮gb.txt",         ["‮"]),
+        ("﻿plasmids",           ["﻿"]),
+        ("a\x85b",                   ["\x85"]),
+    ])
+    def test_control_chars_scrubbed_from_reason(self, tmp_path, name, banned):
+        """A raw ESC would reach the user's terminal, and U+202E
+        (RIGHT-TO-LEFT OVERRIDE) would visually reorder the message —
+        Trojan-Source-style — so "NOT imported" need not read as what it
+        says. `markup=False` at the render sites stops Rich tags, not
+        these. Same `_CONTROL_CHARS_RE` the remote BLAST/HMM hit text
+        and the agent's writable name fields go through."""
+        try:
+            d = tmp_path / name
+            d.mkdir()
+        except (OSError, ValueError):
+            pytest.skip(f"filesystem refuses the name {name!r}")
+        (d / "x.gb").write_text(_MIN_GB)
+        _, failures = sc._bulk_import_folder(tmp_path)
+        reason = failures[0][1]
+        for ch in banned:
+            assert ch not in reason, f"{ch!r} survived into: {reason!r}"
+        assert "not recursive" in reason
+
+    def test_name_list_helper_is_pure_and_bounded(self):
+        from pathlib import Path
+        assert sc._bulk_import_name_list([]) == ""
+        many = [Path(f"/x/f{i}") for i in range(10)]
+        out = sc._bulk_import_name_list(many, limit=2)
+        assert out == "f0, f1, … (+8 more)"
+        # Cap applies per name.
+        one = [Path("/x/" + "z" * 400)]
+        assert len(sc._bulk_import_name_list(one)) <= \
+            sc._BULK_IMPORT_REASON_NAME_MAX
+
+
+class TestBulkImportSplitFailures:
+    """`_bulk_import_split_failures` is what keeps a folder-level notice
+    from being counted and phrased as an unreadable FILE — the "`ok` is
+    not what happened" class of answer `[INV-207]` removed from this very
+    code path."""
+
+    def test_splits_on_the_folder_key(self, tmp_path):
+        from pathlib import Path
+        failures = [
+            (tmp_path / "a.gb", "empty sequence (no bases)"),
+            (tmp_path, "3 importable file(s) in 1 subfolder(s) …"),
+            (Path(tmp_path) / "b.dna", "file too large"),
+        ]
+        bad_files, notes = sc._bulk_import_split_failures(tmp_path, failures)
+        assert [p.name for p, _ in bad_files] == ["a.gb", "b.dna"]
+        assert len(notes) == 1
+        assert notes[0][0] == tmp_path
+
+    def test_empty_in_empty_out(self, tmp_path):
+        assert sc._bulk_import_split_failures(tmp_path, []) == ([], [])
+
+    def test_entry_cap_notice_is_folder_level(self, tmp_path, monkeypatch):
+        # The pre-existing `_BULK_IMPORT_MAX_FILES` notice is keyed on
+        # the folder too, so it classifies as a notice without any
+        # special-casing.
+        monkeypatch.setattr(sc, "_BULK_IMPORT_MAX_FILES", 2)
+        for n in range(4):
+            (tmp_path / f"f{n}.gb").write_text(_MIN_GB)
+        _, failures = sc._bulk_import_folder(tmp_path)
+        bad_files, notes = sc._bulk_import_split_failures(tmp_path, failures)
+        assert any("only the first" in r for _, r in notes)
+        assert bad_files == []
+
+
 class TestNewCollectionModalFlow:
     """End-to-end: clicking + on collections view → NewCollectionModal →
     submit name+folder → collection populated with imports."""

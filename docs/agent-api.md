@@ -302,7 +302,19 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   (symlink-guarded), bulk import a folder (`bulk-import-folder` answers
   `422` / `ok: false` when every file failed, and then creates no collection,
   so a retry is not met with a 409; when only some failed it is `ok: true`
-  with `partial: true`, the `failures` and a `warnings` line), bulk export a
+  with `partial: true`, the `failures` and a `warnings` line). **The scan is
+  the TOP LEVEL of the folder only — never recursive.** `n_failed` and
+  `failures` count FILES; anything that is a property of the folder rather
+  than of a file arrives in `notices` (a string list) and leaves `n_failed`
+  at 0 and `partial` unset. Two notices exist: a subfolder that holds files
+  the scan would have taken ("… were NOT imported … select each subfolder
+  individually", issue #31 — it names the subfolders and counts the files,
+  and stays silent when a subfolder holds nothing importable), and the
+  `_BULK_IMPORT_MAX_FILES` entry cap. A folder whose records all sit one
+  level down therefore answers `422` with the subfolder named, instead of
+  the pre-1.3.20 "0 imported, 0 failures" silence. `create-collection`
+  carries the same `notices` beside its own `n_failures`/`failures`. Also
+  bulk export a
   collection — to any of those formats or a circular-map image
   (`png` / `svg`) — via `bulk-export-collection`, or export the
   LOADED plasmid's circular map alone (`png` / `svg`) via

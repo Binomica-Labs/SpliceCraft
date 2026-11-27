@@ -53,6 +53,12 @@ dependencies = [
     # and reads the raw text — and 1.88's fix is in `Bio.Nexus`, unused
     # here. The suite passes against 1.88 too, so lifting the cap later is
     # a packaging decision, not a porting job.
+    # Re-checked 2026-11-27 (closing dependabot PR #6, which proposed
+    # `<1.89`): PyPI shows 1.87 → 0 and 1.88 → 0 macOS x86_64 wheels
+    # against 1.86's 7, and no 1.89 exists. With `<1.89` applied,
+    # `check_dep_wheels.py` fails 5 cells (macos-x86_64 × cp310–cp314),
+    # so the cap stands. DON'T re-file this bump without re-running that
+    # gate — it is the whole argument, in one command.
     "biopython>=1.86,<1.87",
     # No edlib (removed 2026-09-30, [INV-212]). It ran in front of the
     # built-in aligner only where it had a wheel (Python <= 3.13), picked

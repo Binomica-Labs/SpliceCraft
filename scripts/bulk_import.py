@@ -56,11 +56,18 @@ def main() -> int:
 
     entries, failures = sc._bulk_import_folder(folder)
 
+    # Folder-level notices (a skipped subfolder, the entry cap) are not
+    # failed files: they must not print as FAIL, inflate the file total,
+    # or flip the exit code. See issue #31.
+    bad_files, folder_notes = sc._bulk_import_split_failures(folder, failures)
+
     for entry in entries:
         print(f"  ok   {entry['source'][5:]}  "
               f"({entry['size']:,} bp, {entry['n_feats']} feats)")
-    for path, reason in failures:
+    for path, reason in bad_files:
         print(f"  FAIL {path.name}: {reason}")
+    for _, reason in folder_notes:
+        print(f"  NOTE {reason}")
 
     if not entries:
         print("\nNothing imported.", file=sys.stderr)
@@ -75,13 +82,15 @@ def main() -> int:
     })
     sc._save_collections(colls)
 
-    total = len(entries) + len(failures)
+    total = len(entries) + len(bad_files)
     print(f"\n{'='*60}")
     print(f"Imported  {len(entries)} / {total} file(s)")
-    if failures:
-        print(f"Failed    {len(failures)} (see log for tracebacks)")
+    if bad_files:
+        print(f"Failed    {len(bad_files)} (see log for tracebacks)")
+    for _, reason in folder_notes:
+        print(f"Note      {reason}")
     print(f"Written to collection '{coll_name}' in {sc._COLLECTIONS_FILE}")
-    return 0 if not failures else 1
+    return 0 if not bad_files else 1
 
 
 if __name__ == "__main__":

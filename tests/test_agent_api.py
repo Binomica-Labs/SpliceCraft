@@ -3825,6 +3825,90 @@ class TestNewLibraryEndpoints:
         )
         assert status == 400
 
+    # ── issue #31: a skipped subfolder is a NOTICE, not a failed file ──
+
+    _MIN_GB = (
+        "LOCUS       OK      10 bp ds-DNA  circular SYN 01-JAN-2026\n"
+        "FEATURES             Location/Qualifiers\n"
+        "ORIGIN\n"
+        "        1 acgtacgtac\n"
+        "//\n"
+    )
+
+    def test_bulk_import_folder_subfolder_is_a_notice_not_a_failure(
+        self, http_server, isolated_library, tmp_path
+    ):
+        """A folder-level notice must not inflate `n_failed` or set
+        `partial`. Pre-split it reported `n_failed: 1` + a warning that a
+        file "could not be read" — a retry-worthy failure that had not
+        happened, for a folder that merely contained a `sub/`."""
+        (tmp_path / "top.gb").write_text(self._MIN_GB)
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "more.gb").write_text(self._MIN_GB)
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/bulk-import-folder", method="POST",
+            body={"folder": str(tmp_path), "collection": "Sub Notice"},
+            token=token,
+        )
+        assert status == 200, payload
+        assert payload["n_imported"] == 1
+        # The notice is NOT a failed file.
+        assert payload["n_failed"] == 0
+        assert payload["failures"] == []
+        assert "partial" not in payload
+        # But it IS surfaced, and it says what to do.
+        assert payload["notices"], payload
+        joined = " ".join(payload["notices"])
+        assert "not recursive" in joined
+        assert "individually" in joined
+        # And the warning no longer claims a file could not be read.
+        assert "could not be read" not in " ".join(
+            payload.get("warnings", []))
+
+    def test_bulk_import_folder_422_explains_the_subfolder(
+        self, http_server, isolated_library, tmp_path
+    ):
+        """Nothing importable at the top level, records one level down:
+        the 422 must say so rather than "it holds no ... files" (which
+        sent the issue reporter looking for a missing file) or
+        "1 file(s) could not be read" (there is no such file)."""
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "pUC19.gb").write_text(self._MIN_GB)
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/bulk-import-folder", method="POST",
+            body={"folder": str(tmp_path), "collection": "Empty Top"},
+            token=token,
+        )
+        assert status == 422, payload
+        assert payload["ok"] is False
+        assert "not recursive" in payload["error"]
+        assert "file(s) could not be read" not in payload["error"]
+        # Nothing created, so the same call can be retried.
+        assert "Empty Top" not in [c["name"] for c in sc._load_collections()]
+
+    def test_create_collection_splits_notices_from_failures(
+        self, http_server, isolated_library, tmp_path
+    ):
+        """`create-collection`'s `n_failures` counts files too, so a
+        caller scripting against `n_failures == 0` must not trip over a
+        folder that happened to contain a subdirectory."""
+        (tmp_path / "top.gb").write_text(self._MIN_GB)
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "more.gb").write_text(self._MIN_GB)
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/create-collection", method="POST",
+            body={"name": "CC Notice", "folder": str(tmp_path)},
+            token=token,
+        )
+        assert status == 200, payload
+        assert payload["n_plasmids"] == 1
+        assert payload["n_failures"] == 0
+        assert payload["failures"] == []
+        assert any("not recursive" in n for n in payload["notices"])
+
     def test_search_library_across_collections(self, http_server,
                                                   isolated_library):
         """`search-library` walks every collection on disk and returns
